@@ -16,8 +16,8 @@
 //!    --state open --json number,labels` via [`GhWorkSource`], the direct
 //!    analogue of [`crate::epic_supervisor::forge::GhEpicSource`].
 //! 2. Filters out issues that are **already in flight** (present in the
-//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running` /
-//!    `Pending` sweep) or that defensively carry any [`SKIP_LABELS`] entry
+//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running`
+//!    sweep) or that defensively carry any [`SKIP_LABELS`] entry
 //!    (`loom:building` / `loom:blocked` / `loom:operator`).
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
@@ -60,7 +60,7 @@
 //!   a collision (e.g. a concurrent epic-supervisor sweep for the same child)
 //!   fails loudly and is logged, never double-dispatched.
 //! - **Registry dedup** — the authoritative "already in-flight" check is the
-//!   registry itself: an issue with a live `Running`/`Pending` entry is skipped
+//!   registry itself: an issue with a live `Running` entry is skipped
 //!   even if the forge still shows `loom:issue` (label-flip lag).
 //!
 //! A forge-query error aborts *that* tick only; the caller logs it and the next
@@ -163,7 +163,6 @@ pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::*;
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::OverflowSlot;
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{error_kind::DispatchErrorKind, Admission, RepoDepth, TickReport};
@@ -415,8 +414,8 @@ pub trait WorkSource {
 /// query). Splitting it out keeps [`tick`] unit-testable without a real
 /// registry or `gh` credentials.
 pub trait WorkDispatcher {
-    /// The set of issue numbers that currently have a live (`Running` /
-    /// `Pending`) sweep — the authoritative "already in-flight" view.
+    /// The set of issue numbers that currently have a live (`Running`)
+    /// sweep — the authoritative "already in-flight" view.
     fn in_flight(&self) -> HashSet<u32>;
 
     /// The set of issue numbers currently **quarantined** for repeated
@@ -678,24 +677,11 @@ pub trait WorkDispatcher {
     /// The caller logs and counts it; it is never fatal.
     fn dispatch(&mut self, issue: u32) -> Result<bool>;
 
-    /// [`dispatch`](Self::dispatch), additionally recording whether this is
-    /// the host's overflow sweep (#9244, inert since #11508) on the sweep
-    /// record. Defaults to plain `dispatch` (the flag dropped), so a
-    /// dispatcher that does not model overflow opts out with zero boilerplate.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`dispatch`](Self::dispatch).
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        let _ = overflow;
-        self.dispatch(issue)
-    }
-
     /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
     /// issues in `candidates` with a VERIFIED open linked PR, each mapped to
     /// that PR. Asked at most once per workspace per tick; the multi-workspace
     /// tick skips those candidates without calling
-    /// [`dispatch_with`](Self::dispatch_with). It can only remove candidates:
+    /// [`dispatch`](Self::dispatch). It can only remove candidates:
     /// anything not verified (unreadable listing included) must be left out,
     /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
     fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
@@ -728,13 +714,6 @@ pub trait WorkDispatcher {
     /// treats them as not backed off. Defaults to empty.
     fn lift_landed_cooldowns(&self, _held: &[u32]) -> HashSet<u32> {
         HashSet::new()
-    }
-
-    /// Whether a live sweep on this host is already marked `overflow`
-    /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
-    /// Defaults to `false`.
-    fn overflow_in_flight(&self) -> bool {
-        false
     }
 
     /// Whether this workspace's `main` is red by its latest CI conclusion —
@@ -1099,7 +1078,7 @@ pub fn tick_with_lanes(
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(item.number, false);
+        let outcome = dispatcher.dispatch(item.number);
         if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
             == Qd::Dispatched
         {
@@ -1248,8 +1227,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // The same-tick affected-files overlap gate (#9781): a scheduling signal,
     // not a cap.
     let mut overlap = affected_files::OverlapGate::default();
-    // The inert overflow slot (#11508) only reports a live legacy overflow sweep.
-    let overflow = OverflowSlot::for_workspaces(workspaces);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1642,7 +1619,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // A candidate with a verified open linked PR is resolved `OpenPr`
         // here without a dispatch attempt; every other one is dispatched and
         // counted (`record_dispatch_outcome`) exactly as before (#8865).
-        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, false, &mut report);
+        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, &mut report);
         ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
         if disposition == Qd::Dispatched {
             occupancy += 1;
@@ -1652,7 +1629,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
     report.note_halts(halted, halt_causes, workspaces.len()); // #11649
     report.occupancy = Some(occupancy);
-    report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
     report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();

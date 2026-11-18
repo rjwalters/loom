@@ -61,6 +61,12 @@ pub struct StepDispatch<'a> {
     pub captain: Option<&'a crate::fleet_dispatch::worker::Refusal>,
     /// The role draw's model against the model actually launched (#12748).
     pub models: Option<StepModels<'a>>,
+    /// The admitted runtime the step launches on (`loom.runtime`); `None`
+    /// when the step was refused before admission resolved one.
+    pub runtime: Option<&'a str>,
+    /// The launch's reasoning effort (`loom.effort`), when one was resolved
+    /// (#14167); `None` when the runtime keeps its session default.
+    pub effort: Option<&'a str>,
 }
 
 /// Selected versus launched model of a spawned step. Distinct on purpose: a
@@ -72,6 +78,24 @@ pub struct StepModels<'a> {
     /// The `--model` the child was launched with; `None` when the runtime
     /// picks its own.
     pub launched: Option<&'a str>,
+    /// The model the launch was configured for, before any selection-time
+    /// fallback (#13873); `None` when no model was resolved. Equal to
+    /// `launched` whenever no fallback fired — the pair is how an operator
+    /// sees how much work ran below its configured model.
+    pub configured: Option<&'a str>,
+    /// The selection-time fallback that changed configured → launched
+    /// (#13873), when one fired.
+    pub fallback: Option<StepModelFallback<'a>>,
+}
+
+/// One selection-time model fallback's facts (#13873): the configured model
+/// the launch fell back from, and the selector result that triggered it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepModelFallback<'a> {
+    /// The configured model the launch fell back from.
+    pub from: &'a str,
+    /// Always `no-account-for-class` today (`model_fallback::REASON`).
+    pub reason: &'static str,
 }
 
 /// The span for `step` in `repo` at `at`. Pure.
@@ -105,6 +129,12 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
     attributes.insert("loom.step.item".into(), item);
     attributes.insert("loom.role".into(), step.role.role_name().to_string());
     attributes.insert("loom.step.role".into(), step.role.as_str().to_string());
+    if let Some(runtime) = step.runtime {
+        attributes.insert("loom.runtime".into(), runtime.to_string());
+    }
+    if let Some(effort) = step.effort {
+        attributes.insert("loom.effort".into(), effort.to_string());
+    }
     attributes.insert("loom.dispatch.admission_result".into(), step.result.to_string());
     attributes.insert("loom.dispatch.reason".into(), step.reason.to_string());
     attributes.insert("loom.step.draw_attempt".into(), step.draw_attempt.to_string());
@@ -159,11 +189,19 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         }
     }
     if let Some(models) = step.models {
+        if let Some(configured) = models.configured {
+            attributes.insert("loom.step.model_configured".into(), configured.to_string());
+        }
         if let Some(selected) = models.selected {
             attributes.insert("loom.step.model_selected".into(), selected.to_string());
         }
         if let Some(launched) = models.launched {
             attributes.insert("loom.step.model_launched".into(), launched.to_string());
+        }
+        if let Some(fallback) = models.fallback {
+            attributes.insert("loom.step.model_fallback_from".into(), fallback.from.to_string());
+            attributes
+                .insert("loom.step.model_fallback_reason".into(), fallback.reason.to_string());
         }
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
@@ -221,6 +259,8 @@ mod tests {
             lineage: None,
             captain: None,
             models: None,
+            runtime: Some("claude"),
+            effort: Some("high"),
         }
     }
 
@@ -262,6 +302,8 @@ mod tests {
             models: Some(StepModels {
                 selected: Some("sonnet"),
                 launched: Some("opus"),
+                configured: None,
+                fallback: None,
             }),
             ..judge(RESULT_SPAWNED, "ok")
         };
@@ -274,6 +316,83 @@ mod tests {
         let none = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
         assert!(!none.attributes.contains_key("loom.step.model_selected"));
         assert!(!none.attributes.contains_key("loom.step.model_launched"));
+    }
+
+    /// #13873: the span names the configured model, and — when a
+    /// selection-time fallback fired — what it fell back from and why, so an
+    /// operator can see how much work ran below its configured model.
+    #[test]
+    fn a_step_span_names_the_configured_model_and_any_fallback() {
+        let step = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("opus"),
+                configured: Some("fable"),
+                fallback: Some(StepModelFallback {
+                    from: "fable",
+                    reason: "no-account-for-class",
+                }),
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let span = span(&step, None, Utc::now());
+        assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+        assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+        assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
+        assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
+        for key in [
+            "loom.step.model_configured",
+            "loom.step.model_fallback_from",
+            "loom.step.model_fallback_reason",
+        ] {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+                "{key} is dropped at export"
+            );
+        }
+        // Without a fallback the two keys stay absent — `model_configured`
+        // alone records the pre-fallback model.
+        let steady = StepDispatch {
+            models: Some(StepModels {
+                selected: None,
+                launched: Some("fable"),
+                configured: Some("fable"),
+                fallback: None,
+            }),
+            ..judge(RESULT_SPAWNED, "ok")
+        };
+        let steady_span = super::span(&steady, None, Utc::now());
+        assert_eq!(steady_span.attributes["loom.step.model_configured"], "fable");
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_from"));
+        assert!(!steady_span
+            .attributes
+            .contains_key("loom.step.model_fallback_reason"));
+    }
+
+    /// #14167: every admitted step names the runtime it launches on and its
+    /// resolved effort, so a per-step comparison joins `loom.dispatch.step`
+    /// the same way `loom.runtime.run` does; a step whose launch resolved
+    /// neither omits the keys rather than guessing. Both keys are on the
+    /// lifecycle span allowlist and the collector `keep_keys` (the
+    /// long-standing `loom.runtime.run` keys).
+    #[test]
+    fn an_admitted_step_names_its_runtime_and_effort() {
+        let span = span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
+        assert_eq!(span.attributes["loom.runtime"], "claude");
+        assert_eq!(span.attributes["loom.effort"], "high");
+        let unset = super::span(
+            &StepDispatch {
+                runtime: None,
+                effort: None,
+                ..judge(RESULT_SPAWNED, "ok")
+            },
+            None,
+            Utc::now(),
+        );
+        assert!(!unset.attributes.contains_key("loom.runtime"));
+        assert!(!unset.attributes.contains_key("loom.effort"));
     }
 
     /// #12450: a granted step carries the captain's assignment, and it

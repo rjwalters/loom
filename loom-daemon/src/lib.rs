@@ -206,6 +206,8 @@ pub mod epic_state;
 pub mod epic_supervisor;
 pub mod errors;
 pub mod event_bus;
+#[cfg(test)]
+pub(crate) mod exec_test_support;
 pub mod fetch_headroom;
 pub mod filing_lock;
 pub mod fleet;
@@ -262,7 +264,6 @@ pub mod generated_artifact;
 pub mod gh_invocation;
 pub mod gh_state_probe;
 pub mod git_ff_identical;
-pub mod git_parser;
 pub mod git_tmp_reclaim;
 pub mod git_utils;
 pub mod guard_wiring;
@@ -391,6 +392,7 @@ pub mod scratch_reclaim;
 pub mod script_helpers;
 /// Content scan for credential-shaped values before commit/push (#9133).
 pub mod secret_scan;
+pub mod self_spawn_log;
 pub mod self_update;
 pub mod serve;
 pub mod session_reconcile;

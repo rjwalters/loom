@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::render::{self, Mechanism};
 use super::{advisories, marker, out, platform, watchdog_job, Ctx};
+use crate::launchd_env_drift::is_secret_env_key;
 
 /// `tail -n 20 "$START_LOG"` inside the `[[ -s ]]` guard, on stderr.
 fn dump_start_log(start_log: &Path) {
@@ -553,9 +554,9 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
             None => problems.push(format!(
                 "launchd env verification: key '{key}' is in the plist but missing from the running job's reported environment."
             )),
-            Some((_, got)) if got != &expected => problems.push(format!(
-                "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
-            )),
+            Some((_, got)) if got != &expected => {
+                problems.push(env_mismatch_message(&key, &expected, got));
+            }
             Some(_) => {}
         }
     }
@@ -563,6 +564,51 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
         EnvVerdict::Match
     } else {
         EnvVerdict::Mismatch(problems.join("\n"))
+    }
+}
+
+/// Env keys whose values are safe to echo in a verification diagnostic:
+/// `PATH` and `HOME` (hard-coded by `render::launchd_plist`) plus every
+/// `LOOM_*` key whose name does not look secret-bearing — plain config (paths,
+/// booleans, small enums), the same classification
+/// `launchd_env_drift.rs::display_value` documents. `envh` forwards every
+/// `LOOM_*` var, so credentials such as `LOOM_PERSONAL_GH_TOKEN` or
+/// `LOOM_GITHUB_APP_KEY_PATH` stay withheld ([`looks_secret_env_key`]). Anything
+/// else (notably the forge tokens `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`
+/// that `envh` forwards into the plist) is reported by key only, and unknown
+/// keys fail closed (#14175 AC1, #14274).
+const NON_SECRET_ENV_KEYS: &[&str] = &["PATH", "HOME"];
+const NON_SECRET_ENV_KEY_PREFIX: &str = "LOOM_";
+
+/// Name fragments (matched case-insensitively) that mark a key as
+/// secret-bearing even under the `LOOM_` prefix.
+const SECRET_KEY_FRAGMENTS: &[&str] =
+    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL"];
+
+fn looks_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_KEY_FRAGMENTS.iter().any(|f| upper.contains(f))
+}
+
+fn env_key_printable(key: &str) -> bool {
+    (NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX))
+        && !is_secret_env_key(key)
+        && !looks_secret_env_key(key)
+}
+
+/// The mismatch line for one env key. Values are printed only for printable
+/// keys ([`env_key_printable`]); for every other key the message says the
+/// values differ and carries neither value (no fingerprint) so a credential
+/// never reaches stderr, scrollback or a support paste (#14175).
+fn env_mismatch_message(key: &str, expected: &str, got: &str) -> String {
+    if env_key_printable(key) {
+        format!(
+            "launchd env verification: key '{key}' expected [{expected}] but the running job reports [{got}]."
+        )
+    } else {
+        format!(
+            "launchd env verification: key '{key}' differs between the plist and the running job's reported environment (values withheld)."
+        )
     }
 }
 
@@ -723,6 +769,63 @@ mod tests {
         assert!(is_eio("Bootstrap failed: 5: Input/output error"));
         assert!(is_eio("5: Input/output error"));
         assert!(!is_eio("error 125: Input/output error"));
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_secret_values() {
+        let msg = env_mismatch_message("GH_TOKEN", "ghp_fake_expected_123", "ghp_fake_got_456");
+        assert!(msg.contains("GH_TOKEN"), "key is still named: {msg}");
+        assert!(!msg.contains("ghp_fake_expected_123"), "expected leaked: {msg}");
+        assert!(!msg.contains("ghp_fake_got_456"), "actual leaked: {msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_keeps_values_for_loom_config_keys() {
+        let msg = env_mismatch_message("LOOM_DAEMON_SUPERVISOR", "step-1", "step-2");
+        assert!(msg.contains("[step-1]") && msg.contains("[step-2]"), "{msg}");
+        let msg = env_mismatch_message("LOOM_FOO", "/a", "/b");
+        assert!(msg.contains("[/a]") && msg.contains("[/b]"), "{msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_loom_prefixed_credential_values() {
+        for key in [
+            "LOOM_PERSONAL_GH_TOKEN",
+            "LOOM_OPENWEIGHTS_API_KEY",
+            "LOOM_GITHUB_APP_KEY_PATH",
+            "LOOM_SOME_SECRET",
+            "loom_db_password",
+            "LOOM_X_CREDENTIAL",
+        ] {
+            let msg = env_mismatch_message(key, "sekrit_expected", "sekrit_got");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("sekrit_expected"), "expected leaked: {msg}");
+            assert!(!msg.contains("sekrit_got"), "got leaked: {msg}");
+        }
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_unknown_and_token_values() {
+        for key in ["GITEA_TOKEN", "FORGE_TOKEN", "SOMETHING_ELSE"] {
+            let msg = env_mismatch_message(key, "sekrit_expected", "sekrit_got");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("sekrit_expected"), "expected leaked: {msg}");
+            assert!(!msg.contains("sekrit_got"), "actual leaked: {msg}");
+        }
+    }
+
+    #[test]
+    fn env_mismatch_message_stays_fail_closed_for_unknown_non_loom_keys() {
+        let msg = env_mismatch_message("SOME_OTHER_VAR", "expected_val", "got_val");
+        assert!(!msg.contains("expected_val") && !msg.contains("got_val"), "{msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_keeps_values_for_allowlisted_keys() {
+        let msg = env_mismatch_message("PATH", "/usr/bin", "/bin");
+        assert!(msg.contains("[/usr/bin]") && msg.contains("[/bin]"), "{msg}");
+        let msg = env_mismatch_message("HOME", "/Users/a", "/Users/b");
+        assert!(msg.contains("[/Users/a]") && msg.contains("[/Users/b]"), "{msg}");
     }
 
     #[test]

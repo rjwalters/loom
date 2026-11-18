@@ -1,8 +1,7 @@
 //! Wire-payload unit tests for [`super`] — extracted from `types.rs`'s
-//! inline `mod tests` (#8514) so that file, already over
-//! `.loom/docs/file-size-policy.md`'s threshold, has room for the
-//! live drain-roll status field. A pure move: every test below is
-//! byte-identical to its inline original, only dedented.
+//! inline `mod tests` (#8514) to make room for the live drain-roll status
+//! field. A pure move: every test below is byte-identical to its inline
+//! original, only dedented.
 
 use super::*;
 
@@ -285,6 +284,7 @@ fn sample_repo_status(root_missing: bool) -> RepoStatus {
     RepoStatus {
         root: PathBuf::from("/repos/gamma"),
         maintain_only: None,
+        installed_behind: None,
         weight: 100,
         in_flight_count: 0,
         health_gate_halted: false,
@@ -640,4 +640,27 @@ fn misconfigured_endpoint_is_none_when_the_endpoint_itself_is_what_is_missing() 
     );
     assert!(status.endpoint.is_none());
     assert_eq!(status.classify(export_now()), ObservabilityExportState::Misconfigured);
+}
+
+// ---- #13831: `SweepState::Pending` removed; a stale filter is a parse error ----
+
+#[test]
+fn list_sweeps_state_filter_pending_is_rejected_not_silently_empty() {
+    // No daemon version ever emitted `Pending`, so an old client sending it as
+    // a `state_filter` gets a per-request parse error naming the unknown
+    // variant (the IPC loop turns this into a structured error frame), not an
+    // empty list.
+    let stale = r#"{"type":"ListSweeps","payload":{"state_filter":{"state":"Pending"}}}"#;
+    let err = serde_json::from_str::<Request>(stale)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Pending"), "{err}");
+
+    let live = r#"{"type":"ListSweeps","payload":{"state_filter":{"state":"Running"}}}"#;
+    match serde_json::from_str::<Request>(live).expect("Running filter parses") {
+        Request::ListSweeps { state_filter, .. } => {
+            assert_eq!(state_filter, Some(SweepState::Running));
+        }
+        other => panic!("unexpected request: {other:?}"),
+    }
 }

@@ -8,8 +8,8 @@
 //! test that does not observe the argv observes nothing.
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -64,11 +64,6 @@ echo "$loop_pid"
 /// fixture's session identity is unreadable and publish keeps its own id.
 const NO_SUCH_PID: u32 = 4_999_999;
 
-fn write_script(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// A temp checkout that `resolve_repo_root` accepts: a `.git` directory and a
 /// `.loom/` directory, with both lease scripts in place.
 fn checkout(publish: &str, renew: &str) -> TempDir {
@@ -76,8 +71,8 @@ fn checkout(publish: &str, renew: &str) -> TempDir {
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     let scripts = dir.path().join(".loom").join("scripts");
     fs::create_dir_all(&scripts).unwrap();
-    write_script(&scripts.join("sweep-lease-publish.sh"), publish);
-    write_script(&scripts.join("sweep-lease-renew.sh"), renew);
+    write_executable(&scripts.join("sweep-lease-publish.sh"), publish);
+    write_executable(&scripts.join("sweep-lease-renew.sh"), renew);
     dir
 }
 

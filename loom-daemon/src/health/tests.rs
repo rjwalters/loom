@@ -988,6 +988,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1022,6 +1023,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1094,6 +1096,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1533,6 +1536,7 @@ fn role_liveness_repo_with_intervals(
     crate::types::RepoStatus {
         root: PathBuf::from(root),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -2854,15 +2858,13 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 mod section_inventory;
 
 // Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
-// module so this file, already over `.loom/docs/file-size-policy.md`'s
-// threshold, does not grow to hold it.
+// module.
 mod auto_update_freshness;
 mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
 
-// Export-liveness coverage (#5083, #5337, #9015) — moved out of this file for
-// the same reason as the two modules above: it is over
-// `.loom/docs/file-size-policy.md`'s threshold and may not grow.
+// Export-liveness coverage (#5083, #5337, #9015) — its own child module, like
+// the two modules above.
 mod observability_export;

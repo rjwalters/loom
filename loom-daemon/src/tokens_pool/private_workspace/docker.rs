@@ -344,6 +344,11 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         "CARGO_HOME=/workspace/cache/cargo".into(),
         "CARGO_TARGET_DIR=/workspace/cache/target".into(),
         "npm_config_cache=/workspace/cache/npm".into(),
+        // `.loom/lease-renew/.lock` has been observed untracked in seat clones
+        // (#14160); the writer is not traced (#14226). It is not this
+        // container's `$HOME`, which is `/home/loom` here. Point the store at
+        // the cache volume so Loom's own lock stays out of the work tree.
+        "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {
         args.extend(["--env".into(), value]);
@@ -491,6 +496,114 @@ pub(super) fn prepare_target(
     // Resolved per exec (#13916): an App installation token outlives no job.
     let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
     prepare_with(config, target, id, branch, &auth)
+}
+
+/// Drive one clone's `private-workspace recover` verb under the job's auth
+/// context (#14030): the exec carries the same repository-scoped credential
+/// env as preparation, so a publish pushes only through that clone's helper.
+pub(super) fn recover_target(
+    config: &Config,
+    target: &Target,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+    auth: &forge_auth::ExecAuth,
+) -> Result<RecoverOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
+    let issue_flag = issue.map(|n| n.to_string());
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "recover",
+        "--account",
+        &config.account,
+        "--repository",
+        &target.repository,
+        "--base",
+        &target.base,
+    ]);
+    match action {
+        RecoverAction::Publish => args.extend(["--publish"]),
+        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::List => {}
+    }
+    if let Some(issue) = &issue_flag {
+        args.extend(["--issue", issue]);
+    }
+    for branch in branches {
+        args.extend(["--branch", branch]);
+    }
+    if let Some(slug) = &target.slug {
+        args.extend(["--slug", slug]);
+    }
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone recovery refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace recover returned an invalid report")
+}
+
+/// Drive the in-volume `private-workspace rebind` verb (#14357) under the
+/// credential scope of the CANONICAL repository.
+pub(super) fn rebind_target(
+    config: &Config,
+    from: &Registered,
+    to: &RepoId,
+    dry_run: bool,
+    auth: &forge_auth::ExecAuth,
+) -> Result<RebindOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", to.url);
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "rebind",
+        "--account",
+        &config.account,
+        "--from",
+        &from.repository,
+        "--from-slug",
+        &from.slug,
+        "--to",
+        &to.url,
+        "--to-slug",
+        &to.slug,
+        "--base",
+        &from.base,
+    ]);
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone rebind refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace rebind returned an invalid report")
 }
 
 pub(super) fn prepare_with(

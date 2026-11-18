@@ -803,8 +803,8 @@ pub enum Commands {
     },
 
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
-    /// issues with no live sweep tracking them and spawn-loop tasks with a
-    /// stale heartbeat + dead PID, and (with `--recover`) resets them. Also
+    /// issues with no live sweep tracking them, and (with `--recover`) resets
+    /// them. Also
     /// detects stale PR-side `loom:reviewing`/`loom:treating` claim overlays
     /// left behind by a dead Judge/Doctor (Issue #6167), sharing the same
     /// staleness threshold and liveness discipline as the daemon's periodic
@@ -896,6 +896,20 @@ pub enum Commands {
     /// precedence chain. The args and handler are shared with `loom-tools
     /// resolve-model` (#13878); this arm stays as the delegate.
     ResolveModel(ResolveModelArgs),
+
+    /// Resolve a role's model for an ATTENDED (Task-tool) subagent spawn
+    /// (issue #13956): the same chain the `/loom:sweep` skill applies by hand
+    /// — explicit `--model` > `terminals[].roleConfig.model` >
+    /// `.loom/roles/<role>.json` `suggestedModel` > inherit — reported with
+    /// the tier that supplied it (`--json`), so a per-role experiment can
+    /// confirm what a spawn ran on. Backs `resolve-role-model.sh`.
+    ///
+    /// Exit codes: `0` resolved (or `--json` printed), `2` usage error, `3`
+    /// nothing configured (no output) so the caller omits the Task `model`
+    /// parameter and the subagent keeps inheriting the parent session's
+    /// model. The args and handler are shared with `loom-tools
+    /// resolve-role-model`.
+    ResolveRoleModel(ResolveRoleModelArgs),
 
     /// Token-cost telemetry: `usage` (live, from the Anthropic OAuth API) and
     /// `ingest-transcripts` (#8059 — persist transcript token usage into
@@ -2230,8 +2244,9 @@ use super::cleanup_ops::{
 };
 use super::forge_action::{handle_forge_command, ForgeAction};
 use super::legacy_script_cmds::{
-    handle_checkpoint_command, handle_resolve_model_command, handle_strip_ansi_command,
-    handle_sweep_experiment_command, ResolveModelArgs,
+    handle_checkpoint_command, handle_resolve_model_command, handle_resolve_role_model_command,
+    handle_strip_ansi_command, handle_sweep_experiment_command, ResolveModelArgs,
+    ResolveRoleModelArgs,
 };
 use super::misc_cmds::{handle_update_gitignore_command, handle_validate_command};
 use super::stats::{handle_agent_metrics_command, handle_stats_command};
@@ -2245,6 +2260,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         // Script helpers (epic #4081 Phase 3 family 5, issue #4275).
         Commands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
         Commands::ResolveModel(args) => handle_resolve_model_command(&args),
+        Commands::ResolveRoleModel(args) => handle_resolve_role_model_command(&args),
         Commands::Telemetry(cmd) => cmd.run().await,
         Commands::Checkpoint { action } => handle_checkpoint_command(action),
         Commands::Claim { command, args } => {

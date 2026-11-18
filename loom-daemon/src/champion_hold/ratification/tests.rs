@@ -260,6 +260,52 @@ fn the_state_machine_walks_hold_release_rearm_clear() {
 #[test]
 fn an_unreadable_candidate_never_merges_and_never_drops_a_hold() {
     let unreadable = Verdict::Unreadable(vec!["spec/a.md".into()]);
-    assert_eq!(decide(&unreadable, &[], HEAD), Action::Defer);
+    // Unreachable from the CLI (#13932 fails closed first); if one arrives
+    // anyway it opens or keeps a hold, never a silent pass.
+    assert_eq!(decide(&unreadable, &[], HEAD), Action::Hold);
     assert_eq!(decide(&unreadable, &[hold_note(HEAD)], HEAD), Action::Stands);
+}
+
+/// #13932: a candidate whose head content could not be read is named by
+/// [`unreadable_candidates`] even when another file already holds — the verb
+/// exits 3 on a non-empty list instead of printing a truncated `files=`
+/// evidence line at rc=0. The old behaviour held on the readable hit and
+/// silently dropped the unreadable path.
+#[test]
+fn an_unreadable_candidate_is_named_even_when_another_file_holds() {
+    let cfg = Config::default();
+    let hit = file("spec/spec.md", "modified", Some("Ratified on merge."));
+    let unreadable = file("docs/decisions/0002.md", "added", None);
+    // The old behaviour: hold on the readable hit, unreadable dropped.
+    assert_eq!(
+        scan(&[hit.clone(), unreadable.clone()], &cfg),
+        Verdict::Hold(vec!["spec/spec.md".into()])
+    );
+    // The verb's fail-closed check: the unreadable candidate is named.
+    assert_eq!(
+        unreadable_candidates(&[hit, unreadable], &cfg),
+        ["docs/decisions/0002.md".to_string()]
+    );
+    // A renamed file matched by its old name is still read (at the new path)
+    // and still fail-closed when that read fails.
+    let mut renamed = file("docs/overview.md", "renamed", None);
+    renamed.previous_filename = Some("spec/spec.md".into());
+    assert_eq!(unreadable_candidates(&[renamed], &cfg), ["docs/overview.md".to_string()]);
+}
+
+/// Every candidate readable → the fail-closed check stays empty and the
+/// verdict is unchanged; a removed file is never read, a non-candidate is
+/// never read, and zero candidates is simply `clear`.
+#[test]
+fn readable_removed_and_non_candidates_leave_the_unreadable_list_empty() {
+    let cfg = Config::default();
+    let hit = file("spec/spec.md", "modified", Some("Ratified on merge."));
+    let plain = file("spec/other.md", "modified", Some("Nothing to hold on."));
+    let removed = file("spec/gone.md", "removed", None);
+    let non_candidate = file("rtl/fft.v", "modified", None);
+    let files = [hit, plain, removed, non_candidate];
+    assert_eq!(scan(&files, &cfg), Verdict::Hold(vec!["spec/spec.md".into()]));
+    assert!(unreadable_candidates(&files, &cfg).is_empty());
+    assert_eq!(scan(&[], &cfg), Verdict::Clear);
+    assert!(unreadable_candidates(&[], &cfg).is_empty());
 }

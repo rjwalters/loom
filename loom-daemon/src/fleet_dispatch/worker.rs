@@ -73,7 +73,8 @@ use super::client::{self, CallError, CallFacts};
 use super::fallback::{self, Hysteresis, Mode, Transition};
 use super::proto::{
     self, AckResponse, ClaimRequest, ClaimResponse, HeartbeatRequest, HeartbeatResponse, LiveStep,
-    NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest, ReleaseRequest,
+    NextRequest, NextResponse, ParkEndCause, ParkEndedRequest, RefusalReason, RefuseRequest,
+    ReleaseRequest,
 };
 use crate::step_role::StepRole;
 
@@ -561,11 +562,12 @@ pub fn take_park_orders(root: &Path) -> Vec<u32> {
 /// The park of `item` in the repo at `root` ended on this host (its
 /// quarantine TTL ran out, or an operator cleared it), or the captain ordered
 /// one and this host made none (#13919): tell the captain, so it stops
-/// refusing claims for the item and forgets its fast-fail streak. Sent
-/// without waiting. A no-op outside fleet mode; a call that gets no answer
+/// refusing claims for the item and forgets its fast-fail streak. `cause`
+/// says which: only an operator's clear ([`ParkEndCause::Cleared`]) also lifts
+/// the captain's no-progress hold (#14047). Sent without waiting. A no-op outside fleet mode; a call that gets no answer
 /// leaves the captain's own bound on the hold
 /// ([`super::table::FAST_FAIL_PARK_HOLD`]) to end it.
-pub fn park_ended(root: &Path, item: u32) {
+pub fn park_ended(root: &Path, item: u32, cause: ParkEndCause) {
     let Some(url) = host_endpoint(root) else {
         return;
     };
@@ -573,6 +575,7 @@ pub fn park_ended(root: &Path, item: u32) {
         host_id: host_id(),
         repo: repo_of(root),
         item: u64::from(item),
+        cause,
     };
     let facts = CallFacts {
         endpoint: proto::PARK_ENDED_PATH,

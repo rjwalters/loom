@@ -26,9 +26,12 @@ pub const BUCKET_EDGES: [f64; 2] = [0.90, 0.95];
 pub fn recorded_confidence(trusted: &[String]) -> Result<Option<f64>, String> {
     let mut found: Option<Result<f64, String>> = None;
     for body in trusted {
+        // The marker sits on its own line, but mid-comment in live Champion
+        // pre-merge posts (after the merge-criteria bullets, #14093) — not
+        // necessarily at the top.
         if !body
-            .trim_start()
-            .starts_with(MERGE_RISK_SELF_RELEASE_MARKER)
+            .lines()
+            .any(|l| l.trim() == MERGE_RISK_SELF_RELEASE_MARKER)
         {
             continue;
         }
@@ -152,6 +155,26 @@ mod tests {
         let v = vec![rec("0.91"), "noise".into(), rec("0.97")];
         assert_eq!(recorded_confidence(&v), Ok(Some(0.97)));
         assert!(recorded_confidence(&[rec("nan")]).is_err());
+    }
+
+    #[test]
+    fn recorded_confidence_matches_marker_mid_body() {
+        // The live Champion pre-merge comment shape (#13846): merge-criteria
+        // prose first, the self-release marker embedded after it, then the
+        // Confidence bullet. The record must still be recognised.
+        let live = format!(
+            "Champion Auto-Merge: merging.\n\n\
+             - All CI checks passing\n- Updated recently (0 hours ago)\n\n\
+             {MERGE_RISK_SELF_RELEASE_MARKER}\n\
+             **Champion self-release** (head 7743de6f):\n\n\
+             - **Axis**: Judge review depth\n\
+             - **Confidence**: 0.93 (threshold 0.9)\n\
+             - **Evidence**: revertability: git revert -m 1 fully undoes it\n"
+        );
+        assert_eq!(recorded_confidence(&[live]), Ok(Some(0.93)));
+        // A marker quoted inside a prose line is not a record.
+        let quoted = format!("As the notice says, {MERGE_RISK_SELF_RELEASE_MARKER} applies.");
+        assert_eq!(recorded_confidence(&[quoted]), Ok(None));
     }
 
     #[test]

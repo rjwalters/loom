@@ -101,8 +101,7 @@ fn truncate_tail_falls_back_to_byte_cut_for_a_single_giant_token() {
 
 // `find_failure_sentinel` / `describe_role_failure` (#6757 AC1/AC2, #8123)
 // tests live with their implementation in `role_runner/failure_sentinel.rs`
-// (`.loom/docs/file-size-policy.md` — new code for an over-threshold parent
-// goes to a new sibling module, not inline here).
+// rather than inline here.
 
 // -- had_ever_succeeded / failure_history_note (#6757 AC4) --------------
 
@@ -1419,7 +1418,11 @@ fn test_resolve_interval_for_role_with_source_tiers() {
 }
 
 // ===================================================================
-// Loop wiring — a scripted fake runner proves ticks + panics behave
+// Loop wiring — a scripted fake runner drives the production
+// multi-workspace loop (#13832) through its runner seam
+// (`spawn_multi_role_task_with`), so these tests exercise the drain
+// gate, admission, reaping and outcome handling the daemon actually
+// runs, not a second hand-maintained copy of the loop.
 // ===================================================================
 
 struct FakeRunner {
@@ -1439,6 +1442,78 @@ impl RoleInvocationRunner for FakeRunner {
     }
 }
 
+/// A [`concurrent_dispatch::RunnerFactory`] building a `FakeRunner` for
+/// whatever root the production loop dispatches.
+fn fake_runner_factory(
+    outcomes: Vec<RoleTickOutcome>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> concurrent_dispatch::RunnerFactory {
+    std::sync::Arc::new(move |_root| {
+        Box::new(FakeRunner {
+            outcomes: outcomes.clone(),
+            calls: calls.clone(),
+        })
+    })
+}
+
+/// The production loop re-reads two process-global paths every tick, so a
+/// test driving it points them at empty scratch state for its lifetime:
+/// [`crate::workspace_registry::REGISTRY_PATH_ENV`] at a registry file that
+/// does not exist (empty registry, so `effective_roots` reduces to the single
+/// `fallback_root`) and [`crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV`] at
+/// a scratch dir (the round-robin rotation cursor). Callers must be
+/// `#[serial]` with every other test that sets either variable.
+struct LoopEnv {
+    _scratch: tempfile::TempDir,
+    prior_registry: Option<std::ffi::OsString>,
+    prior_state_dir: Option<std::ffi::OsString>,
+}
+
+impl LoopEnv {
+    fn new() -> Self {
+        let scratch = tempfile::tempdir().unwrap();
+        let prior_registry = std::env::var_os(crate::workspace_registry::REGISTRY_PATH_ENV);
+        std::env::set_var(
+            crate::workspace_registry::REGISTRY_PATH_ENV,
+            scratch.path().join("workspaces.json"),
+        );
+        let prior_state_dir = std::env::var_os(crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV);
+        std::env::set_var(
+            crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV,
+            scratch.path().join("state"),
+        );
+        Self {
+            _scratch: scratch,
+            prior_registry,
+            prior_state_dir,
+        }
+    }
+}
+
+impl Drop for LoopEnv {
+    fn drop(&mut self) {
+        match self.prior_registry.take() {
+            Some(v) => std::env::set_var(crate::workspace_registry::REGISTRY_PATH_ENV, v),
+            None => std::env::remove_var(crate::workspace_registry::REGISTRY_PATH_ENV),
+        }
+        match self.prior_state_dir.take() {
+            Some(v) => std::env::set_var(crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV, v),
+            None => std::env::remove_var(crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV),
+        }
+    }
+}
+
+/// A workspace root the production loop will actually tick: it exists on
+/// disk (a missing root is filtered out) and enables the role runner in its
+/// own `.loom/config.json` — the first gate `decide_root_tick_detailed`
+/// checks. Without it every tick would skip as "disabled" and a zero-invoke
+/// assertion would pass for the wrong reason, leaving the test vacuous.
+fn loop_ticked_workspace() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(dir.path(), r#"{"autonomous":{"roleRunner":{"enabled":true}}}"#);
+    dir
+}
+
 async fn wait_for_calls(calls: &std::sync::atomic::AtomicUsize, target: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1455,26 +1530,25 @@ async fn wait_for_calls(calls: &std::sync::atomic::AtomicUsize, target: usize, t
 }
 
 #[tokio::test]
+#[serial]
 async fn test_loop_ticks_repeatedly_skipping_first_tick() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runner = FakeRunner {
-        outcomes: vec![RoleTickOutcome::Success; 3],
-        calls: calls.clone(),
-    };
     let spec = RoleSpec {
         name: "curator",
         prompt: "/loom:curator",
         default_interval_secs: 1,
         interval_default: true,
     };
-    let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = spawn_role_task(
-        runner,
+    let handle = spawn_multi_role_task_with(
         spec,
+        ws.path().to_path_buf(),
         Duration::from_millis(20),
-        drain,
-        PathBuf::from("/tmp/loom-test-root"),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         new_in_progress_guard(),
+        None,
+        fake_runner_factory(vec![RoleTickOutcome::Success; 3], calls.clone()),
     );
 
     wait_for_calls(&calls, 1, Duration::from_secs(2)).await;
@@ -1496,28 +1570,30 @@ async fn test_loop_ticks_repeatedly_skipping_first_tick() {
 /// and it is what would fail if someone later added a
 /// failure-count-gated skip.
 #[tokio::test]
+#[serial]
 async fn failure_outcome_is_retried_on_the_very_next_tick_never_benched() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runner = FakeRunner {
-        // Every tick fails, forever (the `unwrap_or_else(last)` fallback in
-        // `FakeRunner::invoke` repeats the final entry).
-        outcomes: vec![RoleTickOutcome::Failure("codex 400 (RECOVERABLE)".into())],
-        calls: calls.clone(),
-    };
     let spec = RoleSpec {
         name: "curator",
         prompt: "/loom:curator",
         default_interval_secs: 1,
         interval_default: true,
     };
-    let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = spawn_role_task(
-        runner,
+    let handle = spawn_multi_role_task_with(
         spec,
+        ws.path().to_path_buf(),
         Duration::from_millis(20),
-        drain,
-        PathBuf::from("/tmp/loom-test-root-6201-ac2"),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         new_in_progress_guard(),
+        None,
+        // Every tick fails, forever (the `unwrap_or_else(last)` fallback in
+        // `FakeRunner::invoke` repeats the final entry).
+        fake_runner_factory(
+            vec![RoleTickOutcome::Failure("codex 400 (RECOVERABLE)".into())],
+            calls.clone(),
+        ),
     );
 
     // Four consecutive failing ticks still produce four invocations: the
@@ -1534,7 +1610,10 @@ async fn failure_outcome_is_retried_on_the_very_next_tick_never_benched() {
 /// then the underlying condition is fixed) and asserts the very next tick
 /// succeeds.
 #[tokio::test]
+#[serial]
 async fn role_recovers_automatically_once_the_broken_runtime_works_again() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let outcomes = vec![
         RoleTickOutcome::Failure("codex: model not supported (RECOVERABLE)".into()),
@@ -1564,24 +1643,30 @@ async fn role_recovers_automatically_once_the_broken_runtime_works_again() {
         }
     }
 
+    let factory: concurrent_dispatch::RunnerFactory = {
+        let (outcomes, calls, observed) = (outcomes.clone(), calls.clone(), observed.clone());
+        std::sync::Arc::new(move |_root| {
+            Box::new(RecordingFake {
+                outcomes: outcomes.clone(),
+                calls: calls.clone(),
+                observed: observed.clone(),
+            })
+        })
+    };
     let spec = RoleSpec {
         name: "curator",
         prompt: "/loom:curator",
         default_interval_secs: 1,
         interval_default: true,
     };
-    let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = spawn_role_task(
-        RecordingFake {
-            outcomes,
-            calls: calls.clone(),
-            observed: observed.clone(),
-        },
+    let handle = spawn_multi_role_task_with(
         spec,
+        ws.path().to_path_buf(),
         Duration::from_millis(20),
-        drain,
-        PathBuf::from("/tmp/loom-test-root-6201-ac4"),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         new_in_progress_guard(),
+        None,
+        factory,
     );
 
     wait_for_calls(&calls, 4, Duration::from_secs(5)).await;
@@ -1649,17 +1734,18 @@ fn pre_spawn_skip_is_recorded_in_the_roles_own_log() {
 }
 
 /// A drain in progress (#4090) stops role ticks from *starting*: with the
-/// drain flag set before the loop runs, `spawn_role_task` performs ZERO
-/// `invoke` calls even after several tick intervals elapse. This is the
-/// highest-value new role-runner coverage (Finding 2 — role ticks had no
-/// halt gate at all before this).
+/// drain flag set before the loop runs, the production multi-workspace loop
+/// performs ZERO `invoke` calls even after several tick intervals elapse.
+/// This is the highest-value role-runner coverage (Finding 2 — role ticks
+/// had no halt gate at all before this), and driving it through
+/// `spawn_multi_role_task_with` means it pins the drain check the daemon
+/// actually runs each tick, not a copy of it.
 #[tokio::test]
+#[serial]
 async fn test_drain_stops_role_ticks_from_starting() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runner = FakeRunner {
-        outcomes: vec![RoleTickOutcome::Success; 3],
-        calls: calls.clone(),
-    };
     let spec = RoleSpec {
         name: "champion",
         prompt: "/loom:champion",
@@ -1668,13 +1754,14 @@ async fn test_drain_stops_role_ticks_from_starting() {
     };
     // Drain already engaged before the loop starts.
     let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let handle = spawn_role_task(
-        runner,
+    let handle = spawn_multi_role_task_with(
         spec,
+        ws.path().to_path_buf(),
         Duration::from_millis(20),
         drain.clone(),
-        PathBuf::from("/tmp/loom-test-root"),
         new_in_progress_guard(),
+        None,
+        fake_runner_factory(vec![RoleTickOutcome::Success; 3], calls.clone()),
     );
 
     // Let several tick intervals elapse; not a single invoke may fire.
@@ -1692,31 +1779,61 @@ async fn test_drain_stops_role_ticks_from_starting() {
     handle.abort();
 }
 
+/// A panicking invocation is contained (#6201's neighborhood): the panicked
+/// run is reaped, its in-progress guard is released on the unwind, and the
+/// production multi-workspace loop **keeps ticking** — one bad run must not
+/// stop the role for every workspace (`RoleDispatcher::handle_joined` logs
+/// the panic and carries on; the retired single-workspace loop used to stop
+/// itself, which is exactly the divergence #13832 removed). The loop task
+/// itself must stay alive, not hang and not finish.
 #[tokio::test]
-async fn test_loop_stops_cleanly_when_runner_panics() {
-    struct PanicOnceRunner;
-    impl RoleInvocationRunner for PanicOnceRunner {
+#[serial]
+async fn test_loop_keeps_ticking_when_a_run_panics() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct PanicRunner {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl RoleInvocationRunner for PanicRunner {
         fn invoke(&mut self, _role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             panic!("boom");
         }
     }
+    let factory: concurrent_dispatch::RunnerFactory = {
+        let calls = calls.clone();
+        std::sync::Arc::new(move |_root| {
+            Box::new(PanicRunner {
+                calls: calls.clone(),
+            })
+        })
+    };
     let spec = RoleSpec {
         name: "curator",
         prompt: "/loom:curator",
         default_interval_secs: 1,
         interval_default: true,
     };
-    let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = spawn_role_task(
-        PanicOnceRunner,
+    let handle = spawn_multi_role_task_with(
         spec,
+        ws.path().to_path_buf(),
         Duration::from_millis(20),
-        drain,
-        PathBuf::from("/tmp/loom-test-root"),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         new_in_progress_guard(),
+        None,
+        factory,
     );
-    let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
-    assert!(result.is_ok(), "loop task should finish (not hang) after the runner panics");
+
+    // The panicked run is reaped and later ticks dispatch again: the panic
+    // neither hangs nor ends the loop.
+    wait_for_calls(&calls, 3, Duration::from_secs(5)).await;
+    assert!(
+        !handle.is_finished(),
+        "the loop task must still be running after a panicked run"
+    );
+
+    handle.abort();
 }
 
 // ===================================================================
@@ -3273,38 +3390,37 @@ fn test_plan_idle_runs_skips_when_guard_already_held() {
 // Interval loop honors the shared in-progress guard (#4364)
 // ===================================================================
 
-/// A pre-held guard for (root, role) makes the interval loop skip every
-/// tick (0 invokes); clearing it resumes dispatch — proving the interval
-/// path also respects the shared guard, so an idle-triggered run in
-/// progress cannot be overlapped by an interval tick.
+/// A pre-held guard for (root, role) makes the production multi-workspace
+/// loop skip every tick (0 invokes); clearing it resumes dispatch — proving
+/// the interval path also respects the shared guard, so an idle-triggered
+/// run in progress cannot be overlapped by an interval tick.
 #[tokio::test]
+#[serial]
 async fn test_interval_loop_skips_while_guard_held() {
+    let _env = LoopEnv::new();
+    let ws = loop_ticked_workspace();
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let runner = FakeRunner {
-        outcomes: vec![RoleTickOutcome::Success; 3],
-        calls: calls.clone(),
-    };
     let spec = RoleSpec {
         name: "champion",
         prompt: "/loom:champion",
         default_interval_secs: 1,
         interval_default: true,
     };
-    let root = PathBuf::from("/tmp/loom-interval-guard");
+    let root = ws.path().to_path_buf();
     let in_progress = new_in_progress_guard();
     // Pre-hold the guard for (root, champion) so the loop cannot acquire it.
     in_progress
         .lock()
         .unwrap()
         .insert((root.clone(), "champion", 0));
-    let drain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = spawn_role_task(
-        runner,
+    let handle = spawn_multi_role_task_with(
         spec,
-        Duration::from_millis(20),
-        drain,
         root.clone(),
+        Duration::from_millis(20),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         in_progress.clone(),
+        None,
+        fake_runner_factory(vec![RoleTickOutcome::Success; 3], calls.clone()),
     );
 
     // Several intervals elapse; not a single invoke may fire.

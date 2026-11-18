@@ -121,11 +121,13 @@ out="$(cd "$WS" && env -u CODEX_HOME -u LOOM_CODEX_PROFILE \
     LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_WORKSPACE="$WS" \
     LOOM_CODEX_HOME="$PROFILE" HOME="$IDENT_HOME" GIT_CONFIG_NOSYSTEM=1 \
     LOOM_SWEEP_CLAIM_OWNED=20 LOOM_SWEEP_LEASE_RENEW_DISPATCHED=20 LOOM_LEASE_HOST_ID=fleet-host-7 \
+    LOOM_LEASE_PUBLISH_HOSTNAME=1 \
     bash "$SPAWN_CODEX" -p "hi" 2>&1 || true)"
 line="$(printf '%s\n' "$out" | grep '^spawn-codex would-exec:' || true)"
 assert_contains "--env LOOM_SWEEP_CLAIM_OWNED=20" "$line" "the claim marker is forwarded into the container"
 assert_contains "--env LOOM_SWEEP_LEASE_RENEW_DISPATCHED=20" "$line" "the dispatch's lease-renewal marker is forwarded with it"
 assert_contains "--env LOOM_LEASE_HOST_ID=fleet-host-7" "$line" "the dispatcher's lease host id is forwarded with it"
+assert_contains "--env LOOM_LEASE_PUBLISH_HOSTNAME=1" "$line" "the raw-publish opt-in travels with the lease host id (#13998): publish and compare must agree on the same form"
 assert_contains "--env GIT_AUTHOR_NAME=fleet-bot[bot]" "$line" "the host's git user.name is forwarded as the author name"
 assert_contains "--env GIT_COMMITTER_NAME=fleet-bot[bot]" "$line" "…and as the committer name"
 assert_contains "--env GIT_AUTHOR_EMAIL=1+fleet-bot[bot]@users.noreply.example.invalid" "$line" "the host's git user.email is forwarded as the author email"

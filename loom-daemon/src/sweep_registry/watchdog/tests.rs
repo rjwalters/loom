@@ -1484,7 +1484,6 @@ fn watchdog_latch_pruned_on_entry_gc() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     reg.watchdog_progressed.insert(sid.clone());
@@ -2583,7 +2582,7 @@ fn stale_sweep_watchdog_once_reaps_an_untracked_aged_sweep_exactly_once() {
     );
 
     // No double-reap: a second tick finds nothing (the entry is terminal,
-    // no longer Running/Pending).
+    // no longer Running).
     let reaped_again =
         reg.stale_sweep_watchdog_once(Duration::from_secs(3600), Duration::from_secs(2700));
     assert_eq!(reaped_again, 0, "bounded: never reaped twice");
@@ -2621,7 +2620,7 @@ fn stale_sweep_watchdog_once_leaves_a_healthy_untracked_sweep_alone() {
     assert!(
         reg.entries
             .get(&sweep_id)
-            .is_some_and(|i| matches!(i.state, SweepState::Running | SweepState::Pending)),
+            .is_some_and(|i| matches!(i.state, SweepState::Running)),
         "left running"
     );
 

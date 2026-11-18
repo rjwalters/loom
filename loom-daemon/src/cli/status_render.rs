@@ -462,6 +462,9 @@ pub(crate) fn build_status_json_value_for(
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
             "weight": r.weight,
+            // Installed files older than the daemon but compatible, so not
+            // held (#14015); null when not behind.
+            "installed_behind": r.installed_behind,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -1353,11 +1356,7 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
                 .kind
                 .role()
                 .map_or("-", crate::step_role::StepRole::as_str);
-            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
-            if s.overflow {
-                // #9244: the host's single over-limit starred sweep.
-                phase.push_str(" [overflow]");
-            }
+            let phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             let ctr = format_containment_column(s);
             let _ = writeln!(
                 out,
@@ -2394,6 +2393,15 @@ pub(crate) fn print_status_human(
             if let Some(mark) = &r.maintain_only {
                 println!("        {}: kept current, never dispatched into (#11186)", mark.label());
             }
+            // Behind this daemon but compatible: dispatching, on the older
+            // installed files, until the workspace resync lands (#14015).
+            if let Some(behind) = &r.installed_behind {
+                println!(
+                    "        installed Loom {} is older than daemon {} (compatible, not held; \
+                     files update with the workspace resync)",
+                    behind.installed, behind.running
+                );
+            }
             if r.lock_busy {
                 println!(
                     "        sweep registry lock busy — in-flight/quarantine data omitted (#13443)"
@@ -3208,7 +3216,6 @@ mod in_flight_repo_column_tests {
             effort: None,
             depends_on: None,
             repo: repo.map(str::to_string),
-            overflow: false,
         }
     }
 
@@ -3231,23 +3238,6 @@ mod in_flight_repo_column_tests {
     #[test]
     fn format_repo_column_falls_back_to_dash_when_none() {
         assert_eq!(format_repo_column(None), "-");
-    }
-
-    #[test]
-    fn overflow_sweep_is_marked_in_the_table() {
-        // #9244: an over-limit starred sweep must be visible in `status`.
-        let mut report = sample_report();
-        let mut over = mk(5, Some("/repos/loom"));
-        over.overflow = true;
-        report.in_flight = vec![mk(3, Some("/repos/loom")), over];
-        let table = render_in_flight_table(&report);
-        assert_eq!(table.matches("[overflow]").count(), 1, "{table}");
-        assert!(
-            table
-                .lines()
-                .any(|l| l.contains("#5") && l.contains("[overflow]")),
-            "{table}"
-        );
     }
 
     #[test]
@@ -3335,7 +3325,6 @@ mod containment_column_tests {
             effort: None,
             depends_on: None,
             repo: Some("/repos/loom".to_string()),
-            overflow: false,
         }
     }
 
@@ -4225,6 +4214,7 @@ mod stash_status_render_tests {
         crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,
@@ -4267,6 +4257,23 @@ mod stash_status_render_tests {
         assert_eq!(stash["total_count"], 5);
         assert_eq!(stash["quarantine_count"], 2);
         assert_eq!(stash["oldest_age_secs"], 3600);
+    }
+
+    /// #14015: `per_repo[].installed_behind` names the installed and running
+    /// versions of a behind-but-compatible repo, and is null for any other.
+    #[test]
+    fn per_repo_json_carries_installed_behind_only_when_behind() {
+        let mut behind = repo_with_stashes(0, 0, None);
+        behind.installed_behind = Some(crate::workspace_hold::InstalledBehind {
+            installed: "0.19.800".to_string(),
+            running: "0.19.880".to_string(),
+        });
+        let mut report = sample_report();
+        report.per_repo = vec![behind, repo_with_stashes(0, 0, None)];
+        let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+        assert_eq!(value["per_repo"][0]["installed_behind"]["installed"], "0.19.800");
+        assert_eq!(value["per_repo"][0]["installed_behind"]["running"], "0.19.880");
+        assert!(value["per_repo"][1]["installed_behind"].is_null(), "{value}");
     }
 
     #[test]
@@ -4475,6 +4482,7 @@ mod role_runner_diagnostic_source_render_tests {
         RepoStatus {
             root: std::path::PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: false,

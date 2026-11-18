@@ -1,8 +1,7 @@
 //! Per-model-class `.bad_tokens` marks (issue #8058) — the read/write rules
 //! that let an account bad-marked for one model class keep serving another.
 //!
-//! Its own file rather than more lines in `bad_tokens_tests.rs`: that file is
-//! already at `scripts/check-file-size-budget.sh`'s threshold, and this is a
+//! Its own file rather than more lines in `bad_tokens_tests.rs`: this is a
 //! self-contained behaviour with its own fixtures. `bad_tokens.rs` declares
 //! both with `#[path]` module declarations, so `super::*` below resolves to
 //! `bad_tokens` in either file.
@@ -251,4 +250,36 @@ fn class_match_is_case_insensitive() {
     mark_bad(tmp.path(), "agent-1", "exhausted: credits [model-class:Opus]").unwrap();
     assert!(is_bad_for_class(tmp.path(), "agent-1", Some("opus")));
     assert!(!is_bad_for_class(tmp.path(), "agent-1", Some("sonnet")));
+}
+
+/// #13873: the any-class scan — `blocking_entry_in_dir_any_class` — asks
+/// "does anything CLASS-LESS (or auth) block this account?": a class-scoped
+/// entry leaves the account usable for the classes it does not name, which
+/// is the readmission the selection-time model fallback's preflights
+/// depend on. The account-wide scan must keep disagreeing (it holds).
+#[test]
+fn any_class_scan_ignores_class_scoped_entries_only() {
+    let tmp = make_pool();
+    mark_bad_for_model(tmp.path(), "agent-1", "exhausted: hit your Fable limit", Some("fable"))
+        .unwrap();
+    let dir = pool_dir(tmp.path());
+    assert!(
+        blocking_entry_in_dir_any_class(&dir, "agent-1").is_none(),
+        "a fable-scoped mark must not block the any-class question"
+    );
+    assert!(
+        blocking_entry_in_dir_for_class(&dir, "agent-1", Some("fable")).is_some(),
+        "the class-scoped question must still see it"
+    );
+    assert!(
+        blocking_entry_in_dir(&dir, "agent-1").is_some(),
+        "the account-wide question must keep today's meaning"
+    );
+
+    // A class-less mark blocks all three questions — no rung can fall back
+    // past a broken-for-everything credential.
+    mark_bad(tmp.path(), "agent-1", "exhausted: weekly limit").unwrap();
+    assert!(blocking_entry_in_dir_any_class(&dir, "agent-1").is_some());
+    assert!(blocking_entry_in_dir_for_class(&dir, "agent-1", Some("opus")).is_some());
+    assert!(blocking_entry_in_dir(&dir, "agent-1").is_some());
 }

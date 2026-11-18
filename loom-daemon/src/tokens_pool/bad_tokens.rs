@@ -158,15 +158,37 @@ fn reason_blocks_class(reason: &str, queried_class: Option<&str>) -> bool {
     }
 }
 
+/// [`reason_blocks_class`] across every [`ClassQuery`] arm (#13873): the
+/// any-class arm blocks only entries that carry no recognizable class —
+/// a class-scoped entry leaves the account usable for the classes it does
+/// not name, which is exactly the readmission the selection-time model
+/// fallback depends on.
+fn reason_blocks_query(reason: &str, query: &ClassQuery<'_>) -> bool {
+    match query {
+        ClassQuery::AccountWide => true,
+        ClassQuery::Class(class) => reason_blocks_class(reason, Some(class)),
+        ClassQuery::AnyClass => reason_model_class(reason)
+            .and_then(model_class_of)
+            .is_none(),
+    }
+}
+
 /// On-disk retention for **non-auth** (exhaustion) entries on the routine
 /// cleanup path (#4643).
 ///
-/// 24h = 4× the default 6h read-time cooldown: an exhaustion line stays on
-/// disk long after it stopped blocking selection (so an operator debugging the
-/// previous night's incident still sees it), but `.bad_tokens` can no longer
-/// grow without bound — the live shared pool had accumulated entries for days
-/// because [`cleanup_bad_tokens`] had **zero callers** before #4643.
-pub const DEFAULT_CLEANUP_MAX_AGE_SECS: i64 = 24 * 3600;
+/// 8 days = the [`MAX_WEEKLY_RESET_HORIZON_SECS`] credibility horizon. Since
+/// #13893 a weekly exhaustion entry can be held at read time well past the 6h
+/// cooldown — until a still-`exhausted` re-probe's recorded 7d reset instant —
+/// so the on-disk clock must never prune the line while that hold can still
+/// be live: pruning it earlier would silently readmit a still-exhausted
+/// account mid-hold, exactly the back-door-expiry failure the auth floor
+/// below exists to prevent for the permanent class. (24h before #13893, when
+/// the longest possible read-side hold was the fixed 6h cooldown: 4× headroom
+/// for an operator debugging the previous night's incident.) An entry that
+/// has stopped blocking is inert on disk — expiry at read time is what
+/// readmits the account, not pruning — so the longer retention costs nothing
+/// but disk lines.
+pub const DEFAULT_CLEANUP_MAX_AGE_SECS: i64 = 8 * 24 * 3600;
 
 /// Floor retention for **auth** entries on the cleanup path (#4643).
 ///
@@ -185,11 +207,20 @@ pub const AUTH_ENTRY_MIN_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// override (whole seconds, `> 0`) or [`DEFAULT_EXHAUSTION_COOLDOWN_SECS`].
 #[must_use]
 pub fn exhaustion_cooldown_secs() -> i64 {
+    operator_exhaustion_cooldown_secs().unwrap_or(DEFAULT_EXHAUSTION_COOLDOWN_SECS)
+}
+
+/// The [`EXHAUSTION_COOLDOWN_ENV`] value when the operator set it explicitly
+/// (whole seconds, `> 0`), or `None` when running at the default. Separate
+/// from [`exhaustion_cooldown_secs`] so the #13893 hold extension can tell
+/// "the operator asked for a specific cooldown" — which caps how long a
+/// weekly entry is held past it — from "running at the default", which the
+/// extension deliberately outlives.
+fn operator_exhaustion_cooldown_secs() -> Option<i64> {
     std::env::var(EXHAUSTION_COOLDOWN_ENV)
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_EXHAUSTION_COOLDOWN_SECS)
 }
 
 fn tokens_dir(workspace: &Path) -> PathBuf {
@@ -359,12 +390,46 @@ fn session_window_has_reset(
     None
 }
 
-/// Two-signal early-release check for an **ambiguous** (non-session-limit-
-/// matching) exhaustion entry (issue #7538).
+/// What fresh `.ranking` evidence says about an **ambiguous**
+/// (non-session-limit-matching) exhaustion entry — the two-signal early
+/// release of issue #7538, extended by #13893 with a hold-until-reset verdict
+/// for a still-`exhausted` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousExhaustionEvidence {
+    /// A fresh `.ranking` row proves the entry can stop blocking now: the
+    /// probe's 7d verdict is not `exhausted` and 5h utilization is back under
+    /// the load gate (both #7538 signals), **or** the row is `exhausted` but
+    /// its recorded 7d reset instant has already passed (#13893 — the window
+    /// that row describes has rolled over).
+    Release,
+    /// A fresh `exhausted` row still reports the account 7d-exhausted, and
+    /// its recorded `limit_reset` instant is a credible hold-until: strictly
+    /// after the mark, and no more than [`MAX_WEEKLY_RESET_HORIZON_SECS`] in
+    /// the future (#13893). Hold until that instant instead of cycling the
+    /// fixed cooldown.
+    HoldUntil {
+        /// The parsed 7d reset instant (unix seconds).
+        reset_at: i64,
+    },
+    /// Fresh evidence exists but proves neither, or there is no usable
+    /// evidence at all: the fixed-TTL cooldown applies, unchanged (#7538).
+    FixedCooldown,
+}
+
+/// Upper bound on a credible weekly (7d) reset instant, measured from **now**
+/// at read time (#13893). `check::limit_reset` records the end of the
+/// account's current 7d window, so an instant further than 8 days out (the 7d
+/// window plus slack for probe cadence and clock skew) cannot be a real
+/// weekly reset — treat it as garbage and fall back to the fixed cooldown
+/// rather than freezing the account out until a corrupt instant.
+const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
+
+/// Read the fresh `.ranking` evidence for an ambiguous (non-session-limit-
+/// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`].
 ///
-/// [`session_window_has_reset`] is deliberately NOT reused here, and this is a
-/// distinct, separate check rather than a widened version of it: releasing an
-/// ambiguous entry on 5h evidence alone would risk readmitting a genuinely
+/// [`session_window_has_reset`] is deliberately NOT reused here, and this is
+/// a distinct, separate check rather than a widened version of it: releasing
+/// an ambiguous entry on 5h evidence alone would risk readmitting a genuinely
 /// **weekly**-exhausted account after only 5h, because a weekly-blocked
 /// account's 5h utilization reads "reset" too (its 5h usage is near zero
 /// regardless of the still-active 7-day block) — exactly the harm issue #4212
@@ -376,16 +441,30 @@ fn session_window_has_reset(
 ///    the same threshold [`session_window_has_reset`]'s fallback and
 ///    `select`'s own tier-1 pick use — not a second, unrelated cutoff), AND
 /// 2. 7d utilization under the exhausted threshold
-///    ([`super::check::EXHAUSTED_THRESHOLD`]).
+///    ([`super::check::EXHAUSTED_THRESHOLD`]). `.ranking`
+///    (`name|status|5h_util|limit_reset`, see
+///    [`super::select::parse_ranking_line`]) does not carry a raw 7d-utilization
+///    field — only the `status` string a probe already derived from it
+///    (`super::check::status_from_utilization`: `status == "exhausted"` iff 7d
+///    utilization cleared [`super::check::EXHAUSTED_THRESHOLD`]). So signal 2 is
+///    read off that pre-computed field (`row.status != "exhausted"`) rather than
+///    a second arithmetic comparison — it is the same threshold, just already
+///    applied by the probe that wrote the row.
 ///
-/// `.ranking` (`name|status|5h_util|limit_reset`, see
-/// [`super::select::parse_ranking_line`]) does not carry a raw 7d-utilization
-/// field — only the `status` string a probe already derived from it
-/// (`super::check::status_from_utilization`: `status == "exhausted"` iff 7d
-/// utilization cleared [`super::check::EXHAUSTED_THRESHOLD`]). So signal 2 is
-/// read off that pre-computed field (`row.status != "exhausted"`) rather than
-/// a second arithmetic comparison — it is the same threshold, just already
-/// applied by the probe that wrote the row.
+/// The converse is new in #13893: when the fresh row **is** `exhausted` (the
+/// probe's 7d verdict — the account is still weekly-blocked), releasing at
+/// the fixed 6h cooldown just guarantees a retry that insta-crashes and
+/// re-marks (the 6h re-mark churn the issue's evidence shows). Instead the
+/// entry is held until the row's recorded 7d reset instant — for an
+/// `exhausted` row [`super::check::limit_reset`] records the **7d** reset —
+/// provided that instant is credible: parseable, strictly after `marked_at`
+/// (a pre-mark instant describes the previous window, the same trap
+/// [`session_window_has_reset`] documents), and no more than
+/// [`MAX_WEEKLY_RESET_HORIZON_SECS`] in the future. An instant that has
+/// already passed releases (`AmbiguousExhaustionEvidence::Release`); a
+/// missing, unparseable, pre-mark, or beyond-horizon instant falls back to
+/// [`AmbiguousExhaustionEvidence::FixedCooldown`] — the 6h behaviour is
+/// unchanged wherever the evidence is not positive.
 ///
 /// Requires **freshness**, exactly like [`session_window_has_reset`]'s
 /// fallback branch: the `.ranking` file's mtime must be after `marked_at`, so
@@ -393,23 +472,19 @@ fn session_window_has_reset(
 /// probed) can never satisfy the check. This is what makes the widened
 /// probe-eligibility in `check::discover_tokens` (#7538) load-bearing — an
 /// ambiguous entry that has never been re-probed since it was marked bad has
-/// no fresh row to read, and correctly falls through to `None` (full
-/// fixed-TTL cooldown, unchanged).
-///
-/// Returns:
-/// - `Some(true)` — a fresh `.ranking` row proves both signals hold; safe to
-///   release early.
-/// - `Some(false)` — a fresh row exists but at least one signal does not hold.
-/// - `None` — no usable evidence (no `.ranking` file, no row for this
-///   account, the only row present predates the mark, or the row has no 5h
-///   utilization) — the caller falls back to the fixed-TTL cooldown.
-fn ambiguous_exhaustion_has_reset(
+/// no fresh row to read, and correctly falls through to
+/// [`AmbiguousExhaustionEvidence::FixedCooldown`] (full fixed-TTL cooldown,
+/// unchanged).
+fn ambiguous_exhaustion_evidence(
     tokens_dir: &Path,
     token_name: &str,
     marked_at: i64,
-) -> Option<bool> {
+    now: i64,
+) -> AmbiguousExhaustionEvidence {
     let ranking_path = tokens_dir.join(".ranking");
-    let meta = std::fs::metadata(&ranking_path).ok()?;
+    let Some(meta) = std::fs::metadata(&ranking_path).ok() else {
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    };
     let ranking_mtime: i64 = meta
         .modified()
         .ok()
@@ -417,17 +492,54 @@ fn ambiguous_exhaustion_has_reset(
         .map_or(0, |d| d.as_secs() as i64);
     if ranking_mtime <= marked_at {
         // No probe evidence taken since this entry was marked bad.
-        return None;
+        return AmbiguousExhaustionEvidence::FixedCooldown;
     }
-    let text = std::fs::read_to_string(&ranking_path).ok()?;
-    let row = text
+    let Ok(text) = std::fs::read_to_string(&ranking_path) else {
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    };
+    let Some(row) = text
         .lines()
         .filter_map(super::select::parse_ranking_line)
-        .find(|r| r.name == token_name)?;
-    let util_5h = row.util_5h?;
-    let five_h_under_load_gate = util_5h < super::select::resolve_load_gate();
-    let seven_d_under_exhausted_threshold = row.status != "exhausted";
-    Some(five_h_under_load_gate && seven_d_under_exhausted_threshold)
+        .find(|r| r.name == token_name)
+    else {
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    };
+    if row.status == "exhausted" {
+        // The probe's 7d verdict: still weekly-exhausted (#13893). Hold to
+        // the row's recorded 7d reset instant when it is credible; anything
+        // less falls back to the fixed cooldown. Note this arm must NOT
+        // require `row.util_5h`: `check::ranking_line`'s `(None, Some(r))`
+        // arm writes `name|exhausted||limit_reset` (empty third field, util
+        // unknown), and the codex probe emits exactly that for a
+        // weekly-blocked account whose 5h window has already rolled over —
+        // the steady state of the account class this hold exists for.
+        if let Some(reset) = row.limit_reset.as_deref() {
+            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(reset, "%Y-%m-%dT%H:%M:%SZ") {
+                let reset_at = naive.and_utc().timestamp();
+                if reset_at > marked_at && reset_at - now <= MAX_WEEKLY_RESET_HORIZON_SECS {
+                    return if reset_at <= now {
+                        AmbiguousExhaustionEvidence::Release
+                    } else {
+                        AmbiguousExhaustionEvidence::HoldUntil { reset_at }
+                    };
+                }
+            }
+        }
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    }
+    // Not `exhausted` (the probe's 7d signal is clear): release only when 5h
+    // utilization is also back under the load gate (#7538's two signals).
+    // `util_5h` is load-bearing only here — the release arm needs the actual
+    // utilization; an unknown utilization cannot prove recovery, so it falls
+    // back to the fixed cooldown.
+    let Some(util_5h) = row.util_5h else {
+        return AmbiguousExhaustionEvidence::FixedCooldown;
+    };
+    if util_5h < super::select::resolve_load_gate() {
+        AmbiguousExhaustionEvidence::Release
+    } else {
+        AmbiguousExhaustionEvidence::FixedCooldown
+    }
 }
 
 /// Append a bad-token entry atomically.
@@ -568,7 +680,13 @@ pub struct BlockingEntry {
 /// past [`exhaustion_cooldown_secs`] (#4122): weekly/session-limit exhaustion is
 /// transient, so a stale exhaustion line no longer keeps an otherwise-healthy
 /// account out of rotation even before [`cleanup_bad_tokens`] prunes it from
-/// disk. A line whose timestamp cannot be parsed is treated as permanent
+/// disk. Fresh `.ranking` probe evidence then narrows or — #13893 — extends
+/// that fixed TTL: a session-limit entry is capped at its own 5h window and
+/// released on proven rollover (#7522); an ambiguous entry is released early
+/// when a re-probe proves both windows recovered (#7538), or held past the
+/// cooldown until a still-`exhausted` re-probe's recorded 7d reset instant
+/// (#13893) — see [`ambiguous_exhaustion_evidence`]. A line whose timestamp
+/// cannot be parsed is treated as permanent
 /// (fail-closed). An *expired* entry does not short-circuit the scan — a later
 /// line for the same account may still block (this is the common live shape:
 /// every retry appends a fresh line, so the newest entry, not the oldest
@@ -621,6 +739,49 @@ pub fn blocking_entry_in_dir_for_class(
     token_name: &str,
     model_class: Option<&str>,
 ) -> Option<BlockingEntry> {
+    let query = match model_class.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(class) => ClassQuery::Class(class),
+        None => ClassQuery::AccountWide,
+    };
+    blocking_entry_in_dir_for_query(tokens_dir, token_name, query)
+}
+
+/// [`blocking_entry_in_dir_for_class`] asking the **class-less-entry**
+/// question (#13873): only class-LESS entries (and auth entries, which are
+/// never class-scoped) block. This is *not* the "could any class spawn"
+/// read: an account whose live marks name every known class has no
+/// class-less entry yet cannot serve any class — that question is answered
+/// by scanning each known class
+/// ([`super::select::usable_account_count_any_class`]); this scan is its
+/// tested primitive, pinned here so the `ClassQuery` arms stay explicit.
+#[must_use]
+pub fn blocking_entry_in_dir_any_class(
+    tokens_dir: &Path,
+    token_name: &str,
+) -> Option<BlockingEntry> {
+    blocking_entry_in_dir_for_query(tokens_dir, token_name, ClassQuery::AnyClass)
+}
+
+/// How a `.bad_tokens` scan scopes class-marked entries (#13873). The
+/// account-wide and one-class arms are #8058's two existing questions; the
+/// any-class arm is the fallback preflights' (#13873).
+pub(crate) enum ClassQuery<'a> {
+    /// The account-wide question: every live entry blocks.
+    AccountWide,
+    /// One model class: entries scoped to a *different* class do not block.
+    Class(&'a str),
+    /// Any class: only class-less (or auth) entries block — the account can
+    /// still serve a class none of its marks name.
+    AnyClass,
+}
+
+/// The single scan every [`ClassQuery`] arm shares (#8058's one-scan rule,
+/// extended by #13873), so the three questions can never drift apart.
+fn blocking_entry_in_dir_for_query(
+    tokens_dir: &Path,
+    token_name: &str,
+    query: ClassQuery<'_>,
+) -> Option<BlockingEntry> {
     let bad_file = bad_tokens_path(tokens_dir);
     let text = std::fs::read_to_string(&bad_file).ok()?;
     let pattern = name_pattern(token_name);
@@ -648,9 +809,9 @@ pub fn blocking_entry_in_dir_for_class(
                 cooldown_remaining_secs: None,
             });
         }
-        // #8058: an entry scoped to a different model class does not block
-        // this query. A class-less entry, or a class-less query, always does.
-        if !reason_blocks_class(reason, model_class) {
+        // #8058/#13873: an entry the query does not scope out does not block
+        // this scan. A class-less entry, or a class-less query, always does.
+        if !reason_blocks_query(reason, &query) {
             continue;
         }
         // Non-auth (exhaustion) entries expire after the cooldown. A
@@ -659,57 +820,91 @@ pub fn blocking_entry_in_dir_for_class(
             Ok(naive) => {
                 let marked_at = naive.and_utc().timestamp();
                 let age = now - marked_at;
-                // #7522: a session-limit (5h window) entry must not outlive
-                // its own window. Two independent relaxations apply, and ONLY
-                // to a reason that names the session window specifically —
-                // every other exhaustion reason (weekly, monthly, per-model,
-                // credits) keeps the unmodified fixed-TTL behavior:
-                //
-                //  1. the TTL is capped at `SESSION_WINDOW_SECS` (the provable
-                //     upper bound on the window's reset), so the entry clears
-                //     on its own even on a host with no usable `.ranking`
-                //     evidence at all; and
-                //  2. positive evidence that the window ALREADY rolled over
-                //     (`session_window_has_reset`) expires it earlier still.
                 let session_limit = is_session_limit_reason(reason);
-                let effective_cooldown = if session_limit {
-                    cooldown.min(SESSION_WINDOW_SECS)
+                if session_limit {
+                    // #7522: a session-limit (5h window) entry must not
+                    // outlive its own window. Two independent relaxations
+                    // apply, and ONLY to a reason that names the session
+                    // window specifically:
+                    //
+                    //  1. the TTL is capped at `SESSION_WINDOW_SECS` (the
+                    //     provable upper bound on the window's reset), so the
+                    //     entry clears on its own even on a host with no
+                    //     usable `.ranking` evidence at all; and
+                    //  2. positive evidence that the window ALREADY rolled
+                    //     over (`session_window_has_reset`) expires it
+                    //     earlier still.
+                    let effective_cooldown = cooldown.min(SESSION_WINDOW_SECS);
+                    let mut blocked = age < effective_cooldown;
+                    if blocked
+                        && session_window_has_reset(tokens_dir, token_name, marked_at, now)
+                            == Some(true)
+                    {
+                        blocked = false;
+                    }
+                    if blocked {
+                        return Some(BlockingEntry {
+                            timestamp: ts_str.to_string(),
+                            reason: reason.to_string(),
+                            class: BadReasonClass::Exhaustion,
+                            // Reported against the capped, EFFECTIVE cooldown
+                            // (#7522) so the operator-facing "clears in <N>"
+                            // line never promises a longer hold than the code
+                            // will actually honor.
+                            cooldown_remaining_secs: Some(effective_cooldown - age),
+                        });
+                    }
                 } else {
-                    cooldown
-                };
-                let mut blocked = age < effective_cooldown;
-                if blocked
-                    && session_limit
-                    && session_window_has_reset(tokens_dir, token_name, marked_at, now)
-                        == Some(true)
-                {
-                    blocked = false;
-                }
-                // #7538: an AMBIGUOUS (non-session-limit-matching) exhaustion
-                // reason gets its own, distinct two-signal release check —
-                // never the single-signal `session_window_has_reset` above,
-                // and never the `SESSION_WINDOW_SECS` cap baked into
-                // `effective_cooldown` (that stays scoped to `session_limit`
-                // only). See `ambiguous_exhaustion_has_reset` for why a
-                // second signal is required.
-                if blocked
-                    && !session_limit
-                    && ambiguous_exhaustion_has_reset(tokens_dir, token_name, marked_at)
-                        == Some(true)
-                {
-                    blocked = false;
-                }
-                if blocked {
-                    return Some(BlockingEntry {
-                        timestamp: ts_str.to_string(),
-                        reason: reason.to_string(),
-                        class: BadReasonClass::Exhaustion,
-                        // Reported against the EFFECTIVE cooldown so the
-                        // operator-facing "clears in <N>" line (claude-wrapper's
-                        // rotation log, `tokens check`'s table) never promises a
-                        // longer hold than the code will actually honor.
-                        cooldown_remaining_secs: Some(effective_cooldown - age),
-                    });
+                    // #7538, extended by #13893: an AMBIGUOUS
+                    // (non-session-limit-matching) exhaustion reason gets its
+                    // own, distinct evidence check — never the single-signal
+                    // `session_window_has_reset` above, and never the
+                    // `SESSION_WINDOW_SECS` cap (that stays scoped to
+                    // `session_limit` only). Fresh re-probe evidence can
+                    // RELEASE the entry early (both signals clear), or — new
+                    // in #13893 — EXTEND the hold past the fixed cooldown
+                    // until the probe-recorded 7d reset instant, so a
+                    // still-exhausted account is not readmitted every 6h
+                    // cycle to insta-crash and be re-marked.
+                    match ambiguous_exhaustion_evidence(tokens_dir, token_name, marked_at, now) {
+                        AmbiguousExhaustionEvidence::Release => {}
+                        AmbiguousExhaustionEvidence::HoldUntil { reset_at } => {
+                            // Hold until the probe-recorded 7d reset instant.
+                            // An explicitly configured
+                            // `EXHAUSTION_COOLDOWN_ENV` caps the extension —
+                            // the operator asked for that cooldown and gets
+                            // it; the DEFAULT does not cap, because holding
+                            // past it is the whole point of #13893.
+                            let hold_until = match operator_exhaustion_cooldown_secs() {
+                                Some(cap) => reset_at.min(marked_at.saturating_add(cap)),
+                                None => reset_at,
+                            };
+                            if hold_until > now {
+                                return Some(BlockingEntry {
+                                    timestamp: ts_str.to_string(),
+                                    reason: reason.to_string(),
+                                    class: BadReasonClass::Exhaustion,
+                                    // Reported against the hold instant so
+                                    // the operator-facing "clears in <N>"
+                                    // line (claude-wrapper's rotation log,
+                                    // `tokens check`'s table) never promises
+                                    // a longer hold than the code will
+                                    // actually honor.
+                                    cooldown_remaining_secs: Some(hold_until - now),
+                                });
+                            }
+                        }
+                        AmbiguousExhaustionEvidence::FixedCooldown => {
+                            if age < cooldown {
+                                return Some(BlockingEntry {
+                                    timestamp: ts_str.to_string(),
+                                    reason: reason.to_string(),
+                                    class: BadReasonClass::Exhaustion,
+                                    cooldown_remaining_secs: Some(cooldown - age),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             Err(_) => {

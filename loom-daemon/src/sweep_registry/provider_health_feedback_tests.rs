@@ -4,7 +4,7 @@
 //!
 //! Kept in a sibling file rather than an inline `mod tests`, matching the
 //! `*_empty_pool_tests.rs` precedent, so the production module stays small
-//! enough to hold in view (see `.loom/docs/file-size-policy.md`).
+//! enough to hold in view.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::sweep_registry::test_support::fixture_registry;
@@ -58,7 +58,6 @@ fn insert_codex_entry_with_prefixed_log(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
@@ -479,7 +478,6 @@ fn a_step_sweep_exiting_on_exhaustion_notes_it_for_its_end() {
                 effort: None,
                 depends_on: None,
                 repo: None,
-                overflow: false,
             },
         );
     };

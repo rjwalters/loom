@@ -38,6 +38,32 @@ check() {
         grep -qF -- "$k" "$J" && pass "$where judge: skip-check branch kept: $k" || fail "$where judge: skip-check branch kept: $k"
     done
 
+    # No-checks PRs (#13883): -NONE is not "safe to approve" on its own; Judge
+    # runs the repo's documented test command itself, or the verdict records
+    # "unverified by any test".
+    if grep -qF '`LOOM-CHECKS-GREEN` / `-NONE` (no checks) - Safe to approve' "$J"; then
+        fail "$where judge: -NONE must not share the -GREEN 'safe to approve' bullet"
+    else
+        pass "$where judge: -NONE must not share the -GREEN 'safe to approve' bullet"
+    fi
+    grep -qF -- 'LOOM-CHECKS-NONE` (no checks) - Continue the review' "$J" \
+        && pass "$where judge: -NONE has its own continue-the-review bullet" \
+        || fail "$where judge: -NONE has its own continue-the-review bullet"
+    grep -qF 'No-Checks PRs (`LOOM-CHECKS-NONE`): no test ever ran' "$J" \
+        && pass "$where judge: no-checks rule present (run the documented test)" \
+        || fail "$where judge: no-checks rule present (run the documented test)"
+    grep -qF 'unverified by any test' "$J" \
+        && pass "$where judge: undocumented repo → verdict says 'unverified by any test'" \
+        || fail "$where judge: undocumented repo → verdict says 'unverified by any test'"
+    grep -qF 'unverified by any test: only documented command is `<cmd>` (full suite, out of bounds per #11690)' "$J" \
+        && pass "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command" \
+        || fail "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command"
+    local fsrow
+    fsrow="$(grep -F '| **Full suite / build gate** |' "$J")"
+    grep -qF 'No-Checks PRs' <<< "$fsrow" \
+        && pass "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback" \
+        || fail "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback"
+
     # Unknown required contexts.
     grep -qF 'Unknown is never green.' "$J" && grep -qF 'required-contexts-unknown' "$J" \
         && pass "$where judge: unreadable required contexts are unknown, never green" \

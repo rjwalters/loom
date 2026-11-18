@@ -432,6 +432,23 @@ there was no shadow phase to compare: the incident sequences are replayed in
   already has the item). The captain then forgets the streak and the order, so
   the park comment's "clear the park, or wait for the TTL" holds for this lane
   and a later streak counts from zero.
+- **`park_ended` names its cause, and only an operator's clear lifts the
+  no-progress hold (#14047).** The no-progress ladder (30 min, 2 h, 6 h, 24 h,
+  keyed `(repo, item, step)`) is separate from the park order and was left
+  standing by `park_ended`, so an item could stay `cooldown`-refused for hours
+  after its park ended. Decision: `cause: "cleared"` (`loom-daemon quarantine
+  clear`) also drops the item's no-progress hold for every step and resets its
+  streak, matching what the same command already does to the local dispatch
+  backoff (#4485) and no-op cooldown (#6670): an explicit human override must
+  not look like it did nothing. `cause: "expired"` (TTL expiry, or an ordered
+  worker that made no park; also the default when `cause` is absent) ends the
+  streak and order but leaves the hold: the ladder is the fleet's intentional
+  backoff for an item that keeps failing, and an automatic one-hour release
+  must not defeat a 6 h or 24 h hold, or a hopeless item loops. Rejected:
+  clearing on both (re-opens the loop the ladder stops), and on neither
+  (the operator's clear looks like it did nothing). The park comment says so:
+  after the TTL the item may still be refused `cooldown`, and `quarantine
+  clear` lifts both.
 - A park-ended call is sent once and not retried, and an ordered worker can die
   before its reaper tick. So the order also lapses by itself one default
   quarantine TTL (3600 s) after it was made, and the streak with it. Worst

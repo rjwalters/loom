@@ -268,7 +268,7 @@ impl GhWorkSource {
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
 /// idempotency key, `mkdir`-atomic claim lock, and `loom:issue →
 /// loom:building` label flip — so the finder never reimplements the race
-/// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
+/// guard. `in_flight()` reads the registry's `Running` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
 }
@@ -313,12 +313,10 @@ impl WorkDispatcher for RegistryDispatcher {
             // against the concurrency budget and defer legitimate new dispatch.
             reg.reap_liveness();
             let mut set = HashSet::new();
-            for state in [SweepState::Running, SweepState::Pending] {
-                for info in reg.list(Some(&state)) {
-                    // A step holds its item's slot like a sweep (#11898).
-                    if let Some(n) = info.kind.item_number() {
-                        set.insert(n);
-                    }
+            for info in reg.list(Some(&SweepState::Running)) {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
+                    set.insert(n);
                 }
             }
             set
@@ -505,7 +503,27 @@ impl WorkDispatcher for RegistryDispatcher {
     }
 
     fn dispatch(&mut self, issue: u32) -> Result<bool> {
-        self.dispatch_with(issue, false)
+        log::info!("work_finder: attempting issue #{issue}");
+        // Resolve the model only after runtime admission. A Claude default must not become a native pin.
+        // Idempotency key + the registry's claim lock make a re-dispatch of
+        // an already-running issue a no-op (`was_new = false`) or a loud
+        // lock-collision error.
+        let key = format!("workfinder-{issue}");
+        // Issue #6688: extends the #6592 begin/poll/finish split (proven
+        // for the IPC `DispatchSweep` handler) to this call site, so the
+        // account-selection poll no longer holds the registry mutex a
+        // concurrent `DaemonStatus`/`health` IPC call's per-root
+        // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
+        let outcome = crate::sweep_registry::dispatch_model_releasing_poll_lock(
+            &self.registry,
+            &SweepKind::Issue(issue),
+            Some(key),
+            crate::sweep_registry::DispatchModel::Autonomous,
+            None,
+            None,
+            crate::sweep_registry::DispatchOrigin::WorkFinder,
+        )?;
+        Ok(outcome.was_new)
     }
 
     /// One read of this workspace's ETag-cached open-PR listing, classified
@@ -530,12 +548,6 @@ impl WorkDispatcher for RegistryDispatcher {
     /// [`super::landed_prefilter::lift_in`].
     fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
         super::landed_prefilter::lift_in(&self.registry, held)
-    }
-
-    /// Whether a live sweep in this registry is the host's overflow sweep
-    /// (#9244). The multi-workspace tick ORs this across every root.
-    fn overflow_in_flight(&self) -> bool {
-        self.with_registry(|reg| reg.overflow_in_flight())
     }
 
     /// The red-main-fix lane's CI fallback (#9244) for this workspace's repo.
@@ -576,41 +588,6 @@ impl WorkDispatcher for RegistryDispatcher {
         };
         let open_prs = |issues: &[u32]| self.open_pr_blocked(issues).into_keys().collect();
         super::main_red_autofile::tick(&root, lane, Some(target), &open_prs);
-    }
-
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        log::info!("work_finder: attempting issue #{issue}");
-        // Resolve the model only after runtime admission. A Claude default must not become a native pin.
-        // Idempotency key + the registry's claim lock make a re-dispatch of
-        // an already-running issue a no-op (`was_new = false`) or a loud
-        // lock-collision error.
-        let key = format!("workfinder-{issue}");
-        // Issue #6688: extends the #6592 begin/poll/finish split (proven
-        // for the IPC `DispatchSweep` handler) to this call site, so the
-        // account-selection poll no longer holds the registry mutex a
-        // concurrent `DaemonStatus`/`health` IPC call's per-root
-        // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
-        let outcome = crate::sweep_registry::dispatch_model_releasing_poll_lock(
-            &self.registry,
-            &SweepKind::Issue(issue),
-            Some(key),
-            crate::sweep_registry::DispatchModel::Autonomous,
-            None,
-            None,
-            crate::sweep_registry::DispatchOrigin::WorkFinder,
-        )?;
-        if overflow && outcome.was_new {
-            // Record the over-limit admission on the sweep itself (#9244), so
-            // `list_sweeps` / `get_sweep_status` / `loom-daemon status` show it
-            // and the next tick sees the slot as taken while it runs.
-            if let Ok(mut reg) = self.registry.lock() {
-                reg.mark_overflow(&outcome.sweep_id);
-            }
-            log::info!(
-                "work_finder: issue #{issue} dispatched as this host's overflow sweep (#9244)"
-            );
-        }
-        Ok(outcome.was_new)
     }
 }
 

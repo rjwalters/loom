@@ -37,6 +37,7 @@ const SOURCE_ALLOWLIST: &[(&str, &str)] = &[
     ("pr_planning.rs", "loom:"),
     ("premise_check/cli.rs", "loom:premise-check"),
     ("premise_check/record.rs", "loom:premise-check"),
+    ("stale_blocked/hold.rs", "loom:hold-restored"),
 ];
 
 /// `(script, token)` pairs in the shell scripts that are comment markers, not

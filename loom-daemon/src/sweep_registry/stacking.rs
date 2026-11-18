@@ -46,7 +46,7 @@ impl SweepRegistry {
     // Stacked-PR block-the-subtree (issue #3729, v1 item 4)
     // ------------------------------------------------------------------------
 
-    /// Return the issue numbers of every still-live (`Running`/`Pending`)
+    /// Return the issue numbers of every still-live (`Running`)
     /// sweep whose `depends_on` names `parent`. Terminal children are
     /// excluded — they no longer need blocking. Because `depends_on` is a
     /// single optional parent, this only ever returns the *direct* children
@@ -56,8 +56,7 @@ impl SweepRegistry {
         self.entries
             .values()
             .filter(|info| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && info.depends_on == Some(parent)
+                matches!(info.state, SweepState::Running) && info.depends_on == Some(parent)
             })
             .filter_map(|info| match &info.kind {
                 SweepKind::Issue(n) => Some(*n),
@@ -257,7 +256,6 @@ mod tests {
                     effort: None,
                     depends_on: dep,
                     repo: None,
-                    overflow: false,
                 },
             );
         }
@@ -305,7 +303,6 @@ mod tests {
                 effort: None,
                 depends_on: dep,
                 repo: None,
-                overflow: false,
             }
         }
         registry

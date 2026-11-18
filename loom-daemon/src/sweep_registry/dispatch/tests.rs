@@ -137,7 +137,7 @@ fn runtime_rejection_precedes_every_dispatch_side_effect() {
 /// chmod with the child's posix_spawn exec call and the script silently
 /// fails to launch (no shebang resolution, no exec-bit yet).
 /// #4431: the reaper's peer-claim heartbeat must re-advertise every live
-/// (`Running`/`Pending`) Issue sweep's claim — and ONLY those (a
+/// (`Running`) Issue sweep's claim — and ONLY those (a
 /// terminal-state entry is a dead sweep whose claim must be allowed to
 /// expire), and be a publisher-less no-op (safehouse disabled).
 #[test]
@@ -169,7 +169,6 @@ fn readvertise_republishes_live_issue_claims_only() {
         effort: None,
         depends_on: None,
         repo: None,
-        overflow: false,
     };
     let live_log = registry.compute_log_path(4431);
     let dead_log = registry.compute_log_path(999);
@@ -3943,10 +3942,8 @@ fn dispatch_refuses_operator_only_issue() {
 }
 
 // The vibesql#6664 operator-hold park-guard test lives in its own sibling
-// file rather than being appended here: this module is over the 1000-line
-// ratchet threshold and frozen at its current size
-// (`.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling
-// module"). Registered from here, the same shape `guards.rs` uses for
+// file rather than being appended here, to keep this module from growing
+// further. Registered from here, the same shape `guards.rs` uses for
 // `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "operator_hold_tests.rs"]
 mod operator_hold_tests;
@@ -4724,9 +4721,8 @@ fn a_slow_lease_renew_start_never_holds_the_registry_lock() {
 }
 
 // The #8065 prompt-shape invariant lives in its own sibling file rather than
-// being appended here: this module is over the 1000-line ratchet threshold and
-// frozen at its current size (`.loom/docs/file-size-policy.md` — "put the new
-// code in a NEW sibling module"). Registered from here, the same shape
+// being appended here, to keep this module from growing further. Registered
+// from here, the same shape
 // `guards.rs` uses for `guards_union_tests.rs` / `guards_preflip_tests.rs`.
 #[path = "prompt_shape_tests.rs"]
 mod prompt_shape_tests;

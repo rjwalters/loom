@@ -61,7 +61,7 @@ Spawn and manage a background pool of autonomous agents (tmux sessions) from
 ./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-Full command reference (including `attach`/`logs`/`health`/`scale`) and the
+Full command reference (including `attach`/`logs`/`health`) and the
 legacy-wrapper/session-safety notes: [`.loom/docs/agent-pool-cli.md`](.loom/docs/agent-pool-cli.md).
 
 > For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),
@@ -232,6 +232,21 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 **When spawning subagents**: each must run the full lifecycle — a PR labeled
 `loom:review-requested` is only the Builder stage. **`/loom:sweep` runs all
 stages automatically** — prefer it to avoid skipping any.
+
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
 
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools may skip Curator and label a new issue `loom:building`

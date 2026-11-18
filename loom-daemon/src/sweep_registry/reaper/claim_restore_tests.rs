@@ -4,10 +4,8 @@
 //! whether a reap whose sweep DID produce a PR seeds the #4123 dispatch
 //! guard's open-PR memo.
 //!
-//! Moved verbatim out of the sibling `tests.rs` — that file is over the
-//! file-size ratchet's 1000-line threshold and therefore frozen at its current
-//! size (`.loom/docs/file-size-policy.md`), so new tests in this family land
-//! here instead of growing it.
+//! Moved verbatim out of the sibling `tests.rs`, so new tests in this family
+//! land here instead of growing it.
 
 use super::*;
 use crate::sweep_registry::test_support::*;
@@ -65,7 +63,6 @@ fn reap_restores_label_for_orphaned_clean_exit_without_pr() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 
@@ -157,7 +154,6 @@ fn reap_seeds_open_pr_memo_when_pr_produced_without_checkpoint() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 
@@ -370,7 +366,6 @@ fn reap_clean_exit_that_produced_a_pr(registry: &mut SweepRegistry, issue: u32, 
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     // Retain the handle (mirrors `dispatch()`'s `self.children.insert`) so
@@ -615,7 +610,6 @@ fn cancel_restores_label_when_no_pr_produced() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 
@@ -682,7 +676,6 @@ fn cancel_does_not_restore_label_when_pr_produced() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 
@@ -748,7 +741,6 @@ fn cancel_prset_does_not_restore_label() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 

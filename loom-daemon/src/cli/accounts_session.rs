@@ -90,6 +90,52 @@ pub(crate) enum SessionAction {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// List, publish or discard the unpublished branches of the account's
+    /// private clones — the cure a preparation refusal names (issue #14030).
+    /// Runs under the same exclusive account lease as a job, so it cannot
+    /// race a running step. Without `--publish`/`--discard` only the
+    /// listing is printed.
+    Recover {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Push the unpublished branches to origin (fast-forward only).
+        #[arg(long, conflicts_with = "discard")]
+        publish: bool,
+        /// Delete the named branches with their unpublished commits;
+        /// requires `--branch` or `--issue`.
+        #[arg(long, conflicts_with = "publish")]
+        discard: bool,
+        /// Scope the action to one issue's own branch (`feature/issue-N`).
+        #[arg(long)]
+        issue: Option<u64>,
+        /// Scope the action to a named branch (repeatable).
+        #[arg(long, value_name = "BRANCH")]
+        branch: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an additional private-clone registration to the repository's
+    /// canonical URL after a forge transfer, keeping its clone, branches and
+    /// local changes (issue #14357). Runs under the exclusive idle account
+    /// lease; refuses (changing nothing) a busy or held account, a wrong
+    /// repository, and two populated clones. Safe to repeat.
+    Rebind {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The registered (pre-transfer) repository URL.
+        #[arg(long, value_name = "URL")]
+        from: String,
+        /// The canonical repository URL after the transfer.
+        #[arg(long, value_name = "URL")]
+        to: String,
+        /// Verify everything and report; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn handle_session_command(
@@ -210,6 +256,54 @@ pub(crate) fn handle_session_command(
         }
         Ok(())
     }
+    fn print_recover(report: &private::RecoverReport, json: bool) -> Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            return Ok(());
+        }
+        for clone in &report.clones {
+            if !clone.cloned {
+                println!(
+                    "{}: {} is registered but not cloned yet; nothing to recover",
+                    report.account, clone.repository
+                );
+                continue;
+            }
+            for branch in &clone.published {
+                println!("{}: published {}", report.account, branch);
+            }
+            for branch in &clone.discarded {
+                println!("{}: discarded {}", report.account, branch);
+            }
+            for name in &clone.ignored {
+                println!(
+                    "{}: no unpublished commits on {} in this clone; it was not touched",
+                    report.account, name
+                );
+            }
+            for branch in &clone.branches {
+                println!(
+                    "{}: still unpublished: {} ({} ahead)",
+                    report.account, branch.branch, branch.ahead
+                );
+            }
+            for head in &clone.detached {
+                println!(
+                    "{}: stranded on a detached HEAD: {} at {} ({} unpushed); \
+                     name it with a branch (git switch -c) — recover cannot clear it",
+                    report.account, head.path, head.revision, head.ahead
+                );
+            }
+            if clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.branches.is_empty()
+                && clone.detached.is_empty()
+            {
+                println!("{}: {} has no unpublished work", report.account, clone.repository);
+            }
+        }
+        Ok(())
+    }
     match action {
         SessionAction::Start {
             name,
@@ -242,6 +336,67 @@ pub(crate) fn handle_session_command(
             let code = private::run_job(&workspace, args)?;
             if code != 0 {
                 std::process::exit(code);
+            }
+            Ok(())
+        }
+        SessionAction::Recover {
+            name,
+            publish,
+            discard,
+            issue,
+            branch,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to recover");
+            }
+            let action = if publish {
+                private::RecoverAction::Publish
+            } else if discard {
+                private::RecoverAction::Discard
+            } else {
+                private::RecoverAction::List
+            };
+            print_recover(
+                &private::session_recover(&workspace, &name, action, issue, &branch)?,
+                json,
+            )
+        }
+        SessionAction::Rebind {
+            name,
+            from,
+            to,
+            dry_run,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to rebind");
+            }
+            let report = private::rebind(&workspace, &name, &from, &to, dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}: {:?}: {} -> {} (clone {}, registration {})",
+                    report.account,
+                    report.status,
+                    report.from,
+                    report.to,
+                    report.clone_path,
+                    if report.registration_changed {
+                        "updated"
+                    } else {
+                        "unchanged"
+                    },
+                );
+            }
+            if report.status == private::RebindStatus::BothPopulated {
+                anyhow::bail!(
+                    "both {} and the old location hold a clone; nothing was changed. Publish or \
+                     discard one with `accounts session recover {name}` (or attach and move the \
+                     work by hand), then rerun",
+                    report.clone_path
+                );
             }
             Ok(())
         }

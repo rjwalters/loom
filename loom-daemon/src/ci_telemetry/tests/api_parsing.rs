@@ -1,6 +1,5 @@
 //! `Link` header and raw `gh api --include` parsing (Issue #8824), moved out
-//! of `super` when #9088 needed its two lines: `tests.rs` is at the
-//! file-size ratchet.
+//! of `super` when #9088 needed its two lines.
 
 use crate::ci_telemetry::api::{normalise_api_path, parse_next_link, parse_raw};
 

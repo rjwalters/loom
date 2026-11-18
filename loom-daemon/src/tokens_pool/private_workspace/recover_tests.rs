@@ -40,6 +40,11 @@ struct Engine {
     start_dies: bool,
     /// `docker start` hits its deadline (a wedged engine).
     start_times_out: bool,
+    /// The verbatim body the fake returns for `private-workspace recover`
+    /// execs; `None` answers with an empty published report (#14030).
+    recover_response: Option<String>,
+    /// The verbatim body for `private-workspace rebind` execs (#14357).
+    rebind_response: Option<String>,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -189,6 +194,26 @@ impl Engine {
             ["exec", rest @ ..] if rest.contains(&"prepare") => {
                 Ok(json!({"protocol": PROTOCOL, "revision": "deadbeef"}).to_string())
             }
+            ["exec", rest @ ..] if rest.contains(&"rebind") => self
+                .rebind_response
+                .clone()
+                .context("no rebind response seeded"),
+            ["exec", rest @ ..] if rest.contains(&"recover") => match &self.recover_response {
+                Some(body) => Ok(body.clone()),
+                None => Ok(json!({
+                    "protocol": PROTOCOL,
+                    "outcome": {
+                        "repository": "https://forge.example/a/b",
+                        "cloned": true,
+                        "branches": [],
+                        "published": [],
+                        "discarded": [],
+                        "ignored": [],
+                        "detached": []
+                    }
+                })
+                .to_string()),
+            },
             ["stop", .., container] => {
                 let name = self.find_name(container).context("no such container")?;
                 self.containers.get_mut(&name).unwrap()["State"]["Running"] = json!(false);
@@ -447,6 +472,28 @@ impl Env {
         self.engine().mutations()
     }
     fn recover(&self, image: Option<&str>) -> Result<Status> {
+        // A git fork anywhere in this test binary (thousands of tests drive
+        // real git in parallel threads) inherits copies of every open
+        // descriptor between fork and exec, and can keep this lease's flock
+        // alive microseconds past its release (the #9409 transient). A real
+        // holder persists; the transient clears, so a bounded retry of the
+        // busy error — which `Lease::acquire` reports before any mutation —
+        // tells the two apart, exactly like `reacquire` does in tests.rs.
+        let mut attempt = 0;
+        loop {
+            match recover(self.workspace.path(), "alice", image, &|| Ok(())) {
+                Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Single-shot recovery for the tests that pin the exact engine-call
+    /// sequence, where a retried probe would show up in the record.
+    fn recover_strict(&self, image: Option<&str>) -> Result<Status> {
         recover(self.workspace.path(), "alice", image, &|| Ok(()))
     }
     fn held(&self) -> bool {
@@ -577,6 +624,17 @@ fn a_missing_private_session_is_recreated_only_against_its_surviving_volume() {
     assert!(created.mounts.iter().any(|m| {
         m["Type"] == "volume" && m["Name"] == env.config.volume && m["Destination"] == ROOT
     }));
+    // The lease-renewal store lives on the cache volume, never in the clone's
+    // work tree (#14160).
+    let envs: Vec<&str> = run[1..]
+        .windows(2)
+        .filter(|w| w[0] == "--env")
+        .map(|w| w[1])
+        .collect();
+    assert!(
+        envs.contains(&"LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew"),
+        "{envs:?}"
+    );
     // What it made passes the same validation a reused container must.
     let state = env.engine().containers[&env.config.container].clone();
     docker::validate_settings(&env.config, &state).unwrap();
@@ -610,7 +668,7 @@ fn recovery_refuses_another_engine_before_reading_any_container() {
     env.seed_volume();
     env.seed_container(CONTAINER_ID, false);
     env.with(|e| e.id = "engine-b".into());
-    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let error = env.recover_strict(Some(IMAGE)).unwrap_err();
     assert!(message(&error).contains("engine changed"), "{error:#}");
     assert_eq!(env.engine().calls, vec![vec!["info", "--format", "{{.ID}}"]]);
 }
@@ -661,7 +719,7 @@ fn recovery_never_breaks_the_exclusive_account_lease() {
     env.seed_volume();
     env.seed_container(CONTAINER_ID, false);
     let holder = lease::Lease::acquire(&env.dir).unwrap();
-    let error = env.recover(Some(IMAGE)).unwrap_err();
+    let error = env.recover_strict(Some(IMAGE)).unwrap_err();
     assert!(message(&error).contains("busy"), "{error:#}");
     assert_eq!(env.engine().calls, vec![vec!["info", "--format", "{{.ID}}"]]);
     drop(holder);
@@ -842,4 +900,580 @@ fn a_wedged_start_surfaces_the_typed_timeout_and_releases_the_lease() {
 fn long_execs_keep_a_budget_beyond_the_quick_call_default() {
     assert!(docker::EXEC_TIMEOUT > docker_cli::timeout_for(&["exec"]));
     assert_eq!(docker_cli::timeout_for(&["start", "c"]), docker_cli::DOCKER_CALL_TIMEOUT);
+}
+
+/// `session_recover` with the #9409 fork transient retried out (see
+/// [`Env::recover`]): a concurrent git fork can keep the previous call's
+/// released lease alive microseconds past its drop.
+fn recover_session(
+    workspace: &Path,
+    name: &str,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+) -> Result<RecoverReport> {
+    let mut attempt = 0;
+    loop {
+        match session_recover(workspace, name, action, issue, branches) {
+            Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// What `session recover` (#14030) asks under the job's guard policy: the
+/// exclusive lease is held for the whole call, a stopped or busy session is
+/// refused before any exec, and every registered clone of the account is
+/// addressed with the requested scope.
+#[test]
+#[serial]
+fn session_recover_follows_the_job_guard_policy_and_scopes_every_clone() {
+    let env = setup();
+    // No session at all: refused before any exec.
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap_err();
+    assert!(message(&error).contains("stopped"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // A live worker: not idle, refused like a job.
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap_err();
+    assert!(message(&error).contains("idle"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    // Back to idle: the guard checks pass exactly like a job's.
+    env.with(|e| {
+        e.processes.get_mut(&env.config.container).unwrap().pop();
+    });
+
+    // A second registered repository: the recover walk covers it too.
+    let mut config = env.config.clone();
+    let second = identify("https://forge.example/a/c").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: second.url.clone(),
+        base: "main".into(),
+        slug: second.slug.clone(),
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    // The fake reports a completed discard for the scoped call, so the
+    // report is a real action rather than a scoped no-op.
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({
+                "protocol": PROTOCOL,
+                "outcome": {
+                    "repository": "https://forge.example/a/b",
+                    "cloned": true,
+                    "branches": [],
+                    "published": [],
+                    "discarded": ["feature/issue-7"],
+                    "ignored": [],
+                    "detached": []
+                }
+            })
+            .to_string(),
+        )
+    });
+
+    // While the call runs, the exclusive account lease is held: the fake's
+    // handler executes between the acquire and the drop.
+    let engine = env.engine.clone();
+    let dir = env.dir.clone();
+    let probe = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let watcher = probe.clone();
+    let _wrap = docker::fake::install(Box::new(move |args| {
+        if args.contains(&"recover") {
+            watcher
+                .borrow_mut()
+                .push(lease::Lease::acquire(&dir).is_err());
+        }
+        engine.borrow_mut().handle(args)
+    }));
+    let report = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap();
+    assert_eq!(
+        probe.borrow().as_slice(),
+        &[true, true],
+        "the lease is exclusive during the call"
+    );
+    assert_eq!(report.account, "alice");
+    assert_eq!(report.clones.len(), 2);
+    // The primary is addressed without a slug, the additional with one, and
+    // both carry the requested scope and the repository-scoped env.
+    let engine = env.engine();
+    let recover_calls: Vec<_> = engine
+        .calls
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "recover"))
+        .collect();
+    assert_eq!(recover_calls.len(), 2);
+    let scoped_flags = |call: &[String]| -> Vec<String> {
+        call.windows(2)
+            .filter(|w| w[0].starts_with("--") && w[0] != "--env")
+            .map(|w| format!("{}={}", w[0], w[1]))
+            .collect()
+    };
+    let first = scoped_flags(recover_calls[0]);
+    assert!(first.iter().all(|f| !f.starts_with("--slug")));
+    assert_eq!(first.iter().filter(|f| f.starts_with("--branch")).count(), 1);
+    let second = scoped_flags(recover_calls[1]);
+    assert!(second.iter().any(|f| f.starts_with("--slug")));
+    for call in recover_calls.iter() {
+        let call: &[String] = call;
+        assert!(call.iter().any(|a| a == "--discard"));
+        assert!(call
+            .windows(2)
+            .any(|w| w[0] == "--branch" && w[1] == "feature/issue-7"));
+        assert!(call.windows(2).any(|w| w[0] == "--issue" && w[1] == "7"));
+        assert!(call.windows(2).any(|w| w[0] == "--base" && w[1] == "main"));
+    }
+    // The exec ran with the same repository-scoped auth context a job uses:
+    // each clone's credential scope is set on its own exec.
+    let scope_of = |call: &Vec<String>| -> Option<String> {
+        call.windows(2)
+            .find(|w| w[0] == "--env" && w[1].starts_with("LOOM_PRIVATE_REPOSITORY="))
+            .map(|w| w[1].clone())
+    };
+    assert_eq!(
+        scope_of(recover_calls[0]).as_deref(),
+        Some("LOOM_PRIVATE_REPOSITORY=https://forge.example/a/b")
+    );
+    assert_eq!(
+        scope_of(recover_calls[1]).as_deref(),
+        Some("LOOM_PRIVATE_REPOSITORY=https://forge.example/a/c")
+    );
+    // The lease went with the finished call; the account is not wedged.
+    drop(lease::Lease::acquire(&env.dir).unwrap());
+}
+
+#[test]
+#[serial]
+fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // A worker-side refusal surfaces with its message (#14030).
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({"protocol": PROTOCOL, "error": "discard requires an explicit branch scope"})
+                .to_string(),
+        )
+    });
+    let error = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap_err();
+    assert!(message(&error).contains("explicit branch scope"), "{error:#}");
+
+    // A clone that was never materialized reports cloned=false and is
+    // skipped; a scoped action that acted nowhere is refused, not silent.
+    env.with(|e| {
+        e.recover_response = Some(
+            json!({
+                "protocol": PROTOCOL,
+                "outcome": {
+                    "repository": "https://forge.example/a/b",
+                    "cloned": false,
+                    "branches": [],
+                    "published": [],
+                    "discarded": [],
+                    "ignored": ["feature/issue-7"],
+                    "detached": []
+                }
+            })
+            .to_string(),
+        )
+    });
+    let error = recover_session(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        Some(7),
+        &["feature/issue-7".into()],
+    )
+    .unwrap_err();
+    assert!(message(&error).contains("no clone"), "{error:#}");
+    // The listing form never refuses on a no-op.
+    let report =
+        recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap();
+    assert!(!report.clones[0].cloned);
+    // An unscoped publish with nothing to publish succeeds quietly.
+    let report =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
+    assert!(report.clones[0].published.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// #14111: converging a declared binding without an operator.
+// ---------------------------------------------------------------------------
+
+const NEW_REPO: &str = "https://forge.example/a/c";
+
+fn converge_one(env: &Env, repository: &str, base: &str) -> Result<Converged> {
+    converge(env.workspace.path(), "alice", repository, base, &|| Ok(()))
+}
+
+fn registered(env: &Env) -> Vec<String> {
+    load(&env.dir)
+        .unwrap()
+        .repositories
+        .into_iter()
+        .map(|r| r.repository)
+        .collect()
+}
+
+/// Calls that would remove, stop or recreate anything.
+fn destructive(env: &Env) -> Vec<String> {
+    env.mutations()
+        .into_iter()
+        .filter(|m| {
+            ["stop ", "rm ", "run ", "volume "]
+                .iter()
+                .any(|prefix| m.starts_with(prefix))
+        })
+        .collect()
+}
+
+#[test]
+#[serial]
+fn converge_registers_a_missing_repository_on_an_idle_session_and_keeps_everything() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Registered);
+    assert_eq!(registered(&env), [NEW_REPO]);
+    let config = load(&env.dir).unwrap();
+    assert_eq!(config.repository, "https://forge.example/a/b", "the primary is unchanged");
+    assert_eq!(destructive(&env), Vec::<String>::new(), "{:?}", env.mutations());
+    assert!(env.engine().containers[&env.config.container]["Id"] == CONTAINER_ID);
+    assert!(env.engine().volumes.contains_key(&env.config.volume));
+
+    // Converged: the repeat reads no engine state at all.
+    let calls = env.engine().calls.len();
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Present);
+    assert_eq!(
+        converge_one(&env, "https://forge.example/a/b.git", "main").unwrap(),
+        Converged::Present
+    );
+    assert_eq!(env.engine().calls.len(), calls, "a present binding costs no docker call");
+}
+
+#[test]
+#[serial]
+fn converge_defers_a_busy_account_and_never_interrupts_it() {
+    // A worker the lease does not name.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+
+    // A job holding the exclusive lease.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "refused before any docker call");
+    drop(held);
+}
+
+#[test]
+#[serial]
+fn converge_refuses_a_hold_and_never_lifts_it() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // The caller's probe, and the profile's own hold file.
+    let probed =
+        converge(env.workspace.path(), "alice", NEW_REPO, "main", &|| Err(OperatorHeld.into()));
+    assert!(probed.unwrap_err().downcast_ref::<OperatorHeld>().is_some());
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert!(env.held(), "an unattended binding never lifts an operator hold");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_fails_closed_before_docker_on_bad_input() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    for (repository, base, what) in [
+        ("http://forge.example/a/c", "main", "HTTPS"),
+        ("ssh://git@forge.example/a/c", "main", "HTTPS"),
+        ("https://user:token@forge.example/a/c", "main", "HTTPS"),
+        (NEW_REPO, "--upload-pack=x", "base"),
+    ] {
+        let error = converge_one(&env, repository, base).unwrap_err();
+        assert!(message(&error).contains(what), "{repository}: {error:#}");
+        assert!(!message(&error).contains("token"), "no credential is echoed: {error:#}");
+    }
+    let unknown =
+        converge(env.workspace.path(), "nobody", NEW_REPO, "main", &|| Ok(())).unwrap_err();
+    assert!(message(&unknown).contains("account not found"), "{unknown:#}");
+    // The registered repository with a different base is a conflict, not a change.
+    let error = converge_one(&env, "https://forge.example/a/b", "develop").unwrap_err();
+    assert!(message(&error).contains("already configured with base main"), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "every refusal precedes the first docker call");
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_does_not_convert_a_host_mounted_session_or_recreate_a_missing_container() {
+    // A host-mounted session: session-managed, no private workspace.
+    let env = setup();
+    std::fs::remove_file(env.dir.join("workspace.json")).unwrap();
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("host-mounted session"), "{error:#}");
+    assert!(env.engine().calls.is_empty());
+    assert!(!env.dir.join("workspace.json").exists());
+
+    // A configured account whose container is gone: recovery restores it with
+    // the recorded image; a binding must not create one with a default.
+    let env = setup();
+    env.seed_volume();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("refusing to recreate"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty(), "nothing was written");
+}
+
+#[test]
+#[serial]
+fn registered_repositories_lists_the_primary_then_the_additional_ones() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    converge_one(&env, NEW_REPO, "main").unwrap();
+    let got = registered_repositories(env.workspace.path(), "alice")
+        .unwrap()
+        .unwrap();
+    let urls: Vec<&str> = got.iter().map(|(url, _)| url.as_str()).collect();
+    assert_eq!(urls, ["https://forge.example/a/b", NEW_REPO]);
+    assert_eq!(got[1].1, "forge.example/a/c");
+    // check_binding yields the same key for any spelling.
+    assert_eq!(check_binding("https://Forge.example/a/c.git", "main").unwrap(), got[1].1);
+}
+
+const OLD_URL: &str = "https://forge.example/old/c";
+
+fn rebind_one(env: &Env, from: &str, to: &str, dry_run: bool) -> Result<RebindReport> {
+    // The #9409 fork transient: retry only a pre-mutation busy refusal.
+    let mut attempt = 0;
+    loop {
+        match rebind(env.workspace.path(), "alice", from, to, dry_run) {
+            Err(error) if attempt < 20 && error.to_string().contains("busy") => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}
+
+fn seed_rebind(env: &Env, status: &str, populated: bool) {
+    let state = json!({"path": "p", "populated": populated, "branches": [{"branch": "feature/issue-9", "ahead": 1}], "dirty": true, "detached": 0});
+    let empty =
+        json!({"path": "p", "populated": false, "branches": [], "dirty": false, "detached": 0});
+    let body = json!({"protocol": PROTOCOL, "outcome": {"status": status, "from": if status == "moved" { state.clone() } else { empty }, "to": state}});
+    env.with(|e| e.rebind_response = Some(body.to_string()));
+}
+
+fn register_old(env: &Env, also_new: bool) {
+    let mut config = env.config.clone();
+    config.schema_version = 2;
+    for url in std::iter::once(OLD_URL).chain(also_new.then_some(NEW_REPO)) {
+        let id = identify(url).unwrap();
+        config.repositories.push(Registered {
+            repository: id.url,
+            base: "main".into(),
+            slug: id.slug,
+        });
+    }
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+}
+
+fn rebind_calls(env: &Env) -> usize {
+    env.engine()
+        .calls
+        .iter()
+        .filter(|c| c.iter().any(|a| a == "rebind"))
+        .count()
+}
+
+#[test]
+#[serial]
+fn rebind_replaces_the_old_registration_after_the_volume_step_and_is_repeatable() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    seed_rebind(&env, "moved", true);
+
+    // A dry run asks the worker to verify and changes no registration.
+    seed_rebind(&env, "dry_run", true);
+    let dry = rebind_one(&env, OLD_URL, NEW_REPO, true).unwrap();
+    assert_eq!(dry.status, RebindStatus::DryRun);
+    assert_eq!(registered(&env), [OLD_URL]);
+    assert!(env
+        .engine()
+        .calls
+        .iter()
+        .any(|c| c.iter().any(|a| a == "--dry-run")));
+
+    seed_rebind(&env, "moved", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(report.status, RebindStatus::Moved);
+    assert!(report.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+    let new = identify(NEW_REPO).unwrap();
+    assert_eq!(load(&env.dir).unwrap().repositories[0].slug, new.slug);
+    assert_eq!(report.clone_path, format!("{WORK_ROOT}/{}", new.slug));
+    assert_eq!(load(&env.dir).unwrap().repository, "https://forge.example/a/b");
+    assert_eq!(destructive(&env), Vec::<String>::new(), "{:?}", env.mutations());
+    let call = env
+        .engine()
+        .calls
+        .iter()
+        .find(|c| c.iter().any(|a| a == "rebind"))
+        .cloned()
+        .unwrap();
+    assert!(call
+        .windows(2)
+        .any(|w| w[0] == "--env" && w[1] == format!("LOOM_PRIVATE_REPOSITORY={NEW_REPO}")));
+
+    // Re-running verifies the canonical clone and changes nothing.
+    seed_rebind(&env, "already_bound", true);
+    let again = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(again.status, RebindStatus::AlreadyBound);
+    assert!(!again.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+}
+
+#[test]
+#[serial]
+fn rebind_collapses_a_duplicate_registration_and_reports_two_populated_clones() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, true);
+    // Both populated: reported, nothing changes.
+    seed_rebind(&env, "both_populated", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert_eq!(report.status, RebindStatus::BothPopulated);
+    assert!(!report.registration_changed);
+    assert_eq!(registered(&env), [OLD_URL, NEW_REPO]);
+    // One side unpopulated: the duplicate registration is retired, once.
+    seed_rebind(&env, "already_bound", true);
+    let report = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap();
+    assert!(report.registration_changed);
+    assert_eq!(registered(&env), [NEW_REPO]);
+}
+
+#[test]
+#[serial]
+fn rebind_refuses_busy_held_firewalled_primary_and_unregistered_before_the_volume() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    seed_rebind(&env, "moved", true);
+
+    // Busy: a worker no lease names.
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into())
+    });
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    env.with(|e| {
+        e.processes.get_mut(&env.config.container).unwrap().pop();
+    });
+    // Busy: a job holds the lease.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let error = rebind(env.workspace.path(), "alice", OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    drop(held);
+    // Held: never lifted.
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert!(env.held());
+    assert_eq!(rebind_calls(&env), 0);
+    assert_eq!(registered(&env), [OLD_URL]);
+    session_hold::lift_holds(std::slice::from_ref(&env.config.profile)).unwrap();
+
+    // Primary, same repository in another spelling, and unregistered.
+    for (from, to) in [
+        ("https://forge.example/a/b", NEW_REPO),
+        (OLD_URL, "https://forge.example/a/b"),
+        (OLD_URL, "https://FORGE.example/old/c.git"),
+        ("https://forge.example/x/y", NEW_REPO),
+    ] {
+        assert!(rebind_one(&env, from, to, false).is_err(), "{from} -> {to}");
+    }
+    assert_eq!(rebind_calls(&env), 0, "refused before any volume exec");
+    assert_eq!(registered(&env), [OLD_URL]);
+}
+
+#[test]
+#[serial]
+fn rebind_keeps_the_registration_when_the_worker_refuses_a_wrong_repository() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    register_old(&env, false);
+    env.with(|e| {
+        e.rebind_response = Some(
+            json!({"protocol": PROTOCOL, "error": "wrong repository: shares no history"})
+                .to_string(),
+        )
+    });
+    let error = rebind_one(&env, OLD_URL, NEW_REPO, false).unwrap_err();
+    assert!(message(&error).contains("wrong repository"), "{error:#}");
+    assert_eq!(registered(&env), [OLD_URL]);
+    assert_eq!(destructive(&env), Vec::<String>::new());
+    drop(lease::Lease::acquire(&env.dir).unwrap());
 }

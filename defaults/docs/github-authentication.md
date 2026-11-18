@@ -920,6 +920,12 @@ Full recipe, the atomic create+label requirement, the scripted
 `forge_gh_create_issue_rl_safe` equivalent, and why `loom-daemon forge issue
 create` is NOT a fallback: [`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md).
 
+**Exception (#13978): a foreign public repo the App is not installed on.** There
+`create-issue.sh` and `forge create-issue` are refused (`NOT_IN_INSTALLATION`, the
+#9548 guard, unchanged) and a raw `gh issue create -R <repo>` is the sanctioned
+interim route; do not park the report for an operator. When and how:
+[`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md#foreign-public-repo-not_in_installation---raw-gh-issue-create--r-interim-13978).
+
 ### The duplicate backstop, and what makes it refuse (exit 3)
 
 Before filing, `create-issue.sh` runs `check-duplicate.sh` against **open

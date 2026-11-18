@@ -13,10 +13,9 @@
 //! `SweepRegistry::noop_cooldown_dispatch_block`'s doc comment for the incident
 //! shape (`2AMLogic/gf180-pll#127`).
 //!
-//! Sibling file rather than an inline `mod` on `dispatch/tests.rs`: that file
-//! is over the file-size ratchet threshold (`scripts/file-size-baseline.txt`),
-//! so new coverage is declared directly from `dispatch.rs` instead of growing
-//! it further — the same pattern `idempotency_inflight_tests.rs` uses.
+//! Sibling file rather than an inline `mod` on `dispatch/tests.rs`: the
+//! coverage is declared directly from `dispatch.rs` — the same pattern
+//! `idempotency_inflight_tests.rs` uses.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

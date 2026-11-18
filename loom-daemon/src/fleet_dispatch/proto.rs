@@ -321,19 +321,40 @@ pub struct ReleaseRequest {
     pub outcome: String,
 }
 
+/// Why a park ended (#14047). The captain's fast-fail streak and park order
+/// end on either; its no-progress hold ends only on an operator's clear.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkEndCause {
+    /// The quarantine's TTL ran out, or the ordered worker made no park. The
+    /// no-progress ladder stands: it is the fleet's backoff for an item that
+    /// keeps failing, and an automatic release must not defeat it. The
+    /// default, so a worker that names no cause never lifts a hold.
+    #[default]
+    Expired,
+    /// An operator ran `loom-daemon quarantine clear`: an explicit override
+    /// that also lifts the item's no-progress hold, for every step.
+    Cleared,
+}
+
 /// `POST /v1/park_ended`: the park of `(repo, item)` ended on this host (its
 /// quarantine TTL ran out, or an operator cleared it), or the captain ordered
 /// one and this host made none (#13919). The captain forgets the item's
-/// fast-fail streak and stops refusing claims for it. Names an item, not an
-/// assignment: the park outlives the step whose release ordered it. The
-/// answer's `known` says whether there was a streak to forget. An older
-/// captain answers `404`, which the worker treats like any failed call.
+/// fast-fail streak and stops refusing claims for it; an operator's clear
+/// (`cause: cleared`) also lifts its no-progress hold (#14047). Names an
+/// item, not an assignment: the park outlives the step whose release ordered
+/// it. The answer's `known` says whether there was a streak or hold to
+/// forget. An older captain answers `404`, which the worker treats like any
+/// failed call; it also ignores `cause`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParkEndedRequest {
     pub host_id: String,
     /// `owner/name`.
     pub repo: String,
     pub item: u64,
+    /// Why the park ended; absent means [`ParkEndCause::Expired`].
+    #[serde(default)]
+    pub cause: ParkEndCause,
 }
 
 /// `POST /v1/filing-lock`: "may I run an issue-filing burst?" (#13918). The
