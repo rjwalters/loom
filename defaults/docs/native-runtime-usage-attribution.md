@@ -63,6 +63,15 @@ caller-supplied set) plus the caller's wall-clock window:
   issue's worktree is excluded, so two concurrent sweeps in one workspace never
   fold each other in (the window alone cannot separate them).
 - **A role tick**: the workspace root alone; a tick never gets a worktree.
+- **A step** (#14048): the exact session ids the step's own log names, when it
+  names any — OpenCode's event stream carries `sessionID` on every event and
+  Codex prints a `session id: <uuid>` banner, both captured in the step's
+  per-item log. For OpenCode the id is the whole key (no directory, no window:
+  it cannot name another launch's session); the Codex arm still ANDs the
+  workspace directory and window on top of the ids. This is what separates two concurrent
+  same-role steps dispatched in one workspace. No ids in the log (a Claude
+  step, an unreadable log, a Kimi launch) falls back to directory+window on
+  the workspace root, the role-tick key.
 
 A session row whose five counters are all zero is skipped: OpenCode writes the
 row at creation, so a launch that produced no turns would otherwise publish a
