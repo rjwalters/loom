@@ -39,10 +39,12 @@
 //!
 //! The issue's own design note observes that a launch's native JSON event
 //! stream carries the exact `sessionID`s used, which is a *more* precise key
-//! than directory+window — and #14048 delivers exactly that for the consumer
-//! that has the stream: a step's log holds its launch's whole event output,
-//! so [`crate::usage_source::native_session_ids`] parses the ids out of it
-//! and [`tokens_by_model_for_ids`] selects the rows by identity. This matters
+//! than directory+window — and #14048 delivers exactly that for the consumers
+//! that have the stream: a step's log holds its launch's whole event output,
+//! so [`crate::usage_source::native_session_ids`] parses the ids out of it,
+//! [`tokens_by_model_for_ids`] selects the rows by identity for the step-close
+//! telemetry record, and [`tokens_by_session_ids`] does the same for a
+//! step-dispatched completion (#14018). This matters
 //! most where directory+window provably cannot separate work: two concurrent
 //! same-role steps dispatched in one workspace overlap in time by
 //! construction. Directory+window remains the key for consumers without a
@@ -475,6 +477,20 @@ pub fn sessions_in(
     Some(rows)
 }
 
+/// [`sessions_in`] keyed on **session id** instead of directory + window
+/// (#14018): exactly the rows whose `session.id` is in `ids`.
+///
+/// The directory is no key at all under step dispatch — every session in the
+/// repo shares the workspace root — so a launch's own id, read off its step
+/// log, is the only attribution that cannot pick up a neighbour's tokens.
+pub fn sessions_by_id_in(
+    db_path: &Path,
+    ids: &std::collections::HashSet<&str>,
+) -> Option<Vec<OpencodeSessionUsage>> {
+    let owned: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    sessions_in(db_path, &SessionFilter::ids(&owned), None)
+}
+
 /// A `session` row exactly as [`SESSION_QUERY`] returns it, before decoding.
 struct RawSessionRow {
     id: Option<String>,
@@ -619,6 +635,29 @@ pub fn tokens_by_model_for_ids(
     home: Option<&Path>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions_for_ids(ids, home))
+}
+
+/// Per-model token totals for exactly the sessions named in `ids`, across every
+/// installed OpenCode version's store (#14018) — [`tokens_by_model`] keyed on
+/// session id. The attribution a step-dispatched completion needs: a step's
+/// log names the sessions it ran, and the session store's `directory` is the
+/// workspace root shared by every session in the repo, so directory + window
+/// would fold in whichever neighbour overlapped. `None` — never
+/// `Some(vec![])` — when `ids` is empty, no store was found, or no named
+/// session recorded usage.
+#[must_use]
+pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
+    if ids.is_empty() {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let sessions = discover_opencode_dbs(home)
+        .into_iter()
+        .filter_map(|db| sessions_in(&db, &SessionFilter::ids(ids), None))
+        .flatten()
+        // A session reachable through two stores is one session, not two.
+        .filter(|s| seen.insert(s.session_id.clone().unwrap_or_default()));
+    fold_sessions(sessions)
 }
 
 /// Fold already-selected sessions into per-model totals — the whole of

@@ -2,8 +2,7 @@
 //! `decide`, with the state file loaded under a chosen running version (no
 //! rollback machinery is needed to create the situation it guards against).
 //!
-//! A child of `tests/floor_roll.rs`, reusing its fixtures, so neither that
-//! file nor `tests.rs` grows (`.loom/docs/file-size-policy.md`).
+//! A child of `tests/floor_roll.rs`, reusing its fixtures.
 
 use super::*;
 use crate::auto_update::persisted_state::{load, LoadOutcome, STATE_FILE};
@@ -292,6 +291,7 @@ fn a_terminal_failure_is_retried_at_the_ceiling_only_for_a_floor_target() {
             check: &check,
             tree_clean: true,
             in_flight: 0,
+            repo_source: None,
         };
         state.decide(at, &inputs, Duration::ZERO, DEFER)
     };

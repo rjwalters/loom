@@ -76,6 +76,19 @@ A session row whose five counters are all zero is skipped: OpenCode writes the
 row at creation, so a launch that produced no turns would otherwise publish a
 zero-token badge for a model that was never called.
 
+**Dispatched steps key on session id (#14018).** Every step runs from the
+workspace root, so directory+window would fold in whichever neighbouring session
+overlapped. A step's log (`.loom/logs/step-<role>-<item>.log`) captures the
+launch's native JSON event stream, whose events carry a top-level
+`"sessionID":"ses_…"`; a step-dispatched completion reads exactly those sessions
+(`opencode_usage::tokens_by_session_ids`) and sums them with the Claude
+transcripts of the same PR's Judge/Doctor/`champion --pr` steps. The published
+`runtime`/`provider`/`profile` come from the first step log present on the
+narrating host (Builder, else Doctor, Judge, `champion_merge`). Steps that ran
+on another host left nothing here, so the total stays partial until the
+cross-host per-stage report exists. A legacy `/loom:sweep` (no step logs) keeps
+directory+window.
+
 ## Reading the Kimi session store (Issue #8564)
 
 `loom-daemon/src/kimi_usage.rs` is the reader — the third implementation behind

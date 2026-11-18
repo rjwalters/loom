@@ -2,8 +2,8 @@
 //! claim whose post-flip re-check finds the issue closed is released without
 //! spawning a builder (and without re-adding `loom:issue`).
 //!
-//! Sibling file (declared from `dispatch.rs`) because `dispatch/tests.rs` is
-//! over the file-size ratchet threshold.
+//! Sibling file, declared from `dispatch.rs`, rather than part of
+//! `dispatch/tests.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

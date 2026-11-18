@@ -78,6 +78,7 @@ use crate::telemetry::{SweepOutcomeRecord, SweepResult, TelemetryRecord};
 
 mod first_pass;
 mod group_by;
+mod mix;
 
 pub use group_by::GroupBy;
 
@@ -832,6 +833,15 @@ pub struct GroupRow {
     /// judged sweeps, never a fabricated `0.0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_pass_approval_rate: Option<f64>,
+    /// How many of this group's sweeps had their PR timeline read
+    /// (`judge_verdicts` present) — the denominator behind `judge_rejections`
+    /// (Issue #14067). Zero means the bounce figures are unknown, not zero.
+    pub bounce_records: usize,
+    /// Review bounces: Judge `fail` verdicts across `bounce_records`.
+    pub judge_rejections: usize,
+    /// Completed Doctor cycles across the group's sweeps that carry
+    /// `doctor_cycles`.
+    pub doctor_cycles: usize,
 }
 
 /// The whole report.
@@ -970,6 +980,13 @@ struct Accum {
     /// Of `first_pass_judged`, how many had `judge_verdicts[0].verdict ==
     /// "pass"`.
     first_pass_approved: usize,
+    /// Records whose PR timeline was read (`judge_verdicts` present) — the
+    /// denominator behind the review-bounce counts (Issue #14067).
+    bounce_records: usize,
+    /// Judge `fail` verdicts summed over `bounce_records`.
+    judge_rejections: usize,
+    /// Completed Doctor cycles summed over records carrying `doctor_cycles`.
+    doctor_cycles: usize,
 }
 
 /// Aggregate `records` into a [`SummaryReport`].
@@ -1034,6 +1051,7 @@ pub fn summarize(
                 (host.to_string(), None)
             }
             GroupBy::Day => (entry.emitted_at.format("%Y-%m-%d").to_string(), None),
+            GroupBy::Mix => (mix::resolve_mix(record), None),
             GroupBy::Tap => {
                 let tap = resolve_tap(record);
                 if !tap_is_stamped(record) {
@@ -1066,6 +1084,7 @@ pub fn summarize(
             acc.doctor += 1;
         }
         first_pass::accumulate_first_pass(acc, record);
+        mix::accumulate_bounces(acc, record);
         if let Some(usd) = weighted_tokens_usd(record) {
             acc.weighted_usd += usd;
             acc.weighted_records += 1;
@@ -1179,6 +1198,9 @@ pub fn summarize(
                 #[allow(clippy::cast_precision_loss)]
                 first_pass_approval_rate: (acc.first_pass_judged > 0)
                     .then(|| acc.first_pass_approved as f64 / acc.first_pass_judged as f64),
+                bounce_records: acc.bounce_records,
+                judge_rejections: acc.judge_rejections,
+                doctor_cycles: acc.doctor_cycles,
             }
         })
         .collect();
@@ -1335,6 +1357,11 @@ pub fn render_text(report: &SummaryReport) -> String {
 
     if report.rows.is_empty() {
         out.push_str("No sweep.outcome records matched.\n");
+        return out;
+    }
+
+    if report.group_by == GroupBy::Mix {
+        out.push_str(&mix::render_rows(report));
         return out;
     }
 

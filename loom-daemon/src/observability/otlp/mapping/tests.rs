@@ -1,7 +1,6 @@
 //! Unit tests for [`super`] — extracted from the parent module's inline
-//! `#[cfg(test)] mod tests` (Issue #8056) so the parent stays inside the
-//! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
-//! unchanged apart from dedenting and the new-module additions.
+//! `#[cfg(test)] mod tests` (Issue #8056). Content is unchanged apart from
+//! dedenting and the new-module additions.
 
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 use opentelemetry_proto::tonic::resource::v1::Resource;

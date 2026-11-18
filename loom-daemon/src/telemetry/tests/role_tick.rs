@@ -1,8 +1,8 @@
 //! `role_tick.outcome` schema tests (Issue #8056) — the seventh record kind
 //! and the `CURRENT_SCHEMA_VERSION` bump it forces.
 //!
-//! A sibling module rather than more lines in `telemetry/tests.rs`, which is
-//! at the `scripts/check-file-size-budget.sh` threshold.
+//! A sibling module rather than more lines in the already-large
+//! `telemetry/tests.rs`.
 
 use super::super::*;
 use super::ts;

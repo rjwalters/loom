@@ -80,6 +80,21 @@ pub fn take_post(
         .remove(&(root.to_path_buf(), sweep_id.to_string()))
 }
 
+/// As [`take_post`], but leaves the noted post-state for the tick (#14234):
+/// the step's span close reads it before the classifier runs, and
+/// [`take_post`] must still hand it to `step_end::settle` afterwards.
+#[must_use]
+pub(crate) fn peek_post(
+    root: &Path,
+    sweep_id: &str,
+) -> Option<Option<crate::step_dispatch::outcome_ledger::PostState>> {
+    posts()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(root.to_path_buf(), sweep_id.to_string()))
+        .copied()
+}
+
 fn queue() -> &'static Mutex<Queue> {
     static QUEUE: OnceLock<Mutex<Queue>> = OnceLock::new();
     QUEUE.get_or_init(|| Mutex::new(HashMap::new()))

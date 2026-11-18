@@ -350,6 +350,101 @@ pub fn sweep_tokens_by_model(
     }
 }
 
+/// Whether a merged PR's work ran as dispatched **steps** on this host
+/// (#14018): at least one of its [`crate::launch_record::merge_step_logs`]
+/// exists. `false` means a legacy `/loom:sweep` (or a step that ran only on
+/// other hosts), which the sweep-keyed readers above already serve.
+#[must_use]
+pub fn has_merge_step_logs(workspace_root: &Path, issue: u32, pr: u32) -> bool {
+    !crate::launch_record::merge_step_logs(workspace_root, issue, pr).is_empty()
+}
+
+/// Per-`(model, speed, service_tier)` token totals for a **step-dispatched**
+/// merge of `pr` (closing `issue`), on this host only (#14018).
+///
+/// Two sources, summed, because the steps of one PR can run on different
+/// runtimes (an OpenCode Builder, a Claude Judge):
+///
+/// - **Claude transcripts** whose first message names the issue-keyed Builder
+///   or the PR-keyed Judge/Doctor/`champion --pr` command
+///   ([`crate::transcript_tokens::sum_item_tokens_by_model`]); `window` narrows
+///   these by file mtime, as for a sweep.
+/// - **OpenCode sessions** named by the `sessionID`s in the step logs
+///   ([`crate::opencode_usage::tokens_by_session_ids`]) — never directory +
+///   window, since the store's `directory` is shared repo-wide. No window
+///   applies: a session id already names exactly one session.
+///
+/// A step that ran on another host left no log or transcript here, so its usage
+/// is absent and the total stays partial. `None` — never `Some(vec![])` — when
+/// neither source found anything.
+#[must_use]
+pub fn merge_step_tokens_by_model(
+    workspace_root: &Path,
+    issue: u32,
+    pr: u32,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let claude = crate::transcript_tokens::claude_projects_dir().and_then(|projects| {
+        crate::transcript_tokens::sum_item_tokens_by_model(
+            &projects,
+            workspace_root,
+            issue,
+            Some(pr),
+            window,
+        )
+    });
+    let session_ids: Vec<String> = crate::launch_record::merge_step_logs(workspace_root, issue, pr)
+        .into_iter()
+        .filter_map(|(_, path)| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| crate::launch_record::opencode_session_ids(&contents))
+        .collect();
+    let opencode = crate::opencode_usage::tokens_by_session_ids(&session_ids, None);
+    combine_model_totals(claude.into_iter().chain(opencode).flatten())
+}
+
+/// Merge rows by `(model, speed, service_tier)`, summing every counter, sorted
+/// by that key. `None` when there are no rows.
+fn combine_model_totals(
+    rows: impl IntoIterator<Item = ModelUsageTotals>,
+) -> Option<Vec<ModelUsageTotals>> {
+    let mut merged: std::collections::BTreeMap<(String, String, String), ModelUsageTotals> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let entry = merged
+            .entry((row.model.clone(), row.speed.clone(), row.service_tier.clone()))
+            .or_insert_with(|| ModelUsageTotals {
+                model: row.model.clone(),
+                speed: row.speed.clone(),
+                service_tier: row.service_tier.clone(),
+                ..ModelUsageTotals::default()
+            });
+        entry.input = entry.input.saturating_add(row.input);
+        entry.cache_read = entry.cache_read.saturating_add(row.cache_read);
+        entry.cache_write_5m = entry.cache_write_5m.saturating_add(row.cache_write_5m);
+        entry.cache_write_1h = entry.cache_write_1h.saturating_add(row.cache_write_1h);
+        entry.output = entry.output.saturating_add(row.output);
+    }
+    (!merged.is_empty()).then(|| merged.into_values().collect())
+}
+
+/// The flat token total of `rows`: every counter summed, the same figure
+/// [`crate::transcript_tokens::sum_sweep_tokens`] reports for the same
+/// transcripts. `None` for a zero total, so an absent figure omits the key
+/// rather than publishing `0`.
+#[must_use]
+pub fn total_tokens(rows: &[ModelUsageTotals]) -> Option<u64> {
+    let total = rows.iter().fold(0_u64, |acc, row| {
+        let sum = row
+            .input
+            .saturating_add(row.cache_read)
+            .saturating_add(row.cache_write_5m)
+            .saturating_add(row.cache_write_1h)
+            .saturating_add(row.output);
+        acc.saturating_add(u64::try_from(sum).unwrap_or(0))
+    });
+    (total > 0).then_some(total)
+}
+
 /// Per-`(model, speed, service_tier)` token totals for one sweep, split across
 /// `slices` — the per-phase-attempt attribution `sweep.outcome`'s
 /// `phase_durations` carries (Issue #9443).

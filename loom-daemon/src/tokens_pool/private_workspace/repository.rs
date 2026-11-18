@@ -718,14 +718,51 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Loom's lease-renewal store (`Store::from_env`, `$HOME/.loom/lease-renew`
+/// unless overridden) is written inside a seat clone when the container's
+/// `$HOME` resolves to the clone root (#14160): an untracked
+/// `.loom/lease-renew/.lock` there is runtime residue, not stranded work,
+/// and must never refuse preparation. The seat env sets
+/// `LOOM_LEASE_RENEW_STATE_DIR` so new writes land on the cache volume; the
+/// exclude also forgives residue left by an older container.
+const LEASE_RENEW_EXCLUDE: &str = ":(exclude).loom/lease-renew";
+
+/// The dirty refusal names at most this many paths, so an operator can tell
+/// stranded work from residue without exhausting the message (#14160).
+const DIRTY_PATH_LIMIT: usize = 10;
+
 fn clean_worktrees(root: &Path, repo: &Path) -> Result<()> {
     for path in worktrees(repo)? {
         if !path.canonicalize()?.starts_with(root) {
             bail!("worktree points outside the private volume; refuse reuse");
         }
-        if !git(&path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
-            bail!("private clone/worktree is dirty; retain and recover its work before reuse");
+        let status = git(
+            &path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--",
+                ".",
+                LEASE_RENEW_EXCLUDE,
+            ],
+        )?;
+        if status.is_empty() {
+            continue;
         }
+        let total = status.lines().count();
+        let mut detail = status
+            .lines()
+            .take(DIRTY_PATH_LIMIT)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        if total > DIRTY_PATH_LIMIT {
+            detail.push_str(&format!("\n  … and {} more", total - DIRTY_PATH_LIMIT));
+        }
+        bail!(
+            "private clone/worktree is dirty; retain and recover its work before reuse ({}):\n  {detail}",
+            path.display()
+        );
     }
     Ok(())
 }

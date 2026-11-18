@@ -886,3 +886,51 @@ fn an_entirely_empty_filter_matches_nothing() {
         .expect("db opened")
         .is_empty());
 }
+
+// --- Session-id selection (#14018) ---------------------------------------
+
+#[test]
+fn session_id_selection_counts_only_the_named_sessions_not_their_directory_neighbours() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    let model = model_json("m", "p");
+    let mine = Row {
+        input: 100,
+        output: 10,
+        ..row(&model, "/repo", 1_000)
+    };
+    let neighbour = Row {
+        input: 9_999,
+        ..row(&model, "/repo", 1_000)
+    };
+    seed_db(&db, &[mine, neighbour]);
+    // `seed_db` names its rows `session-<index>`.
+    let ids = ["session-0"].into_iter().collect();
+    let sessions = sessions_by_id_in(&db, &ids).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id.as_deref(), Some("session-0"));
+    let rows = fold_sessions(sessions).unwrap();
+    assert_eq!((rows[0].input, rows[0].output), (100, 10));
+    // No directory or window narrows an id: a session elsewhere, long ago, is
+    // still the one the log named.
+    let elsewhere = Row {
+        input: 7,
+        ..row(&model, "/somewhere/else", 5)
+    };
+    seed_db(&tmp.path().join("other.db"), &[elsewhere]);
+    let ids = ["session-0"].into_iter().collect();
+    assert_eq!(
+        sessions_by_id_in(&tmp.path().join("other.db"), &ids)
+            .unwrap()
+            .len(),
+        1
+    );
+    // An id the store does not hold selects nothing (an empty read, not a failure).
+    let ids = ["ses_unknown"].into_iter().collect();
+    assert_eq!(sessions_by_id_in(&db, &ids).unwrap(), Vec::new());
+}
+
+#[test]
+fn no_session_ids_yield_no_totals() {
+    assert_eq!(tokens_by_session_ids(&[], None), None);
+}
