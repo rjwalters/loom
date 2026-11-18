@@ -2558,8 +2558,12 @@ every `autonomous.autoUpdate.intervalSecs` (default 900 s). Envelopes carry
 `schema_version: 12`. **OTLP-only** (native: `false`). The body is the
 record's JSON. The scalars ride as `loom.auto_update.*` attributes
 (`AUTO_UPDATE_LOG_ATTRIBUTE_KEYS`, which the collector's `transform/privacy`
-allowlists). The record time is the tick's start. Provenance is required:
-`loom` exports as `loom.auto_update.version` / `revision` / `tree_state` /
+allowlists). Three floor-diagnostic fields — `floor_not_rolling`,
+`floor_stall` and `roll_held` — are deliberately not in that list: they ride
+in the record body only, never as `loom.auto_update.*` attributes, so a
+dashboard that needs them must extract them from the body. The record time
+is the tick's start. Provenance is required: `loom` exports as
+`loom.auto_update.version` / `revision` / `tree_state` /
 `provenance_complete`, and a record whose provenance does not validate is
 never emitted. Severity is `ERROR` for `panic`, for a record carrying
 `floor_stall`, and for a `roll_held` with a `floor` (#10880). It is `WARN`
@@ -2581,6 +2585,7 @@ roll it reported; no record carries it any more.)
 | `in_flight` | integer? | in-flight sweeps, when the tick read them |
 | `drain` | object | `{armed, pending, target?}`: the roll or drain armed at tick start. Since #10831 `pending` means it can no longer be superseded (its pause has stopped an agent, or it is an operator drain) (#13492 dropped the always-zero `refusals`; stored records that carry it still parse) |
 | `floor_stall` | string? | the unsatisfiable-floor alert text (#10712), or an unsatisfiable repo-ahead demand (#10719); absent otherwise |
+| `floor_not_rolling` | string? | #11042: why a host below its fleet floor did not roll this tick; absent while the host is at or above the floor, has no fleet store, or is rolling to the floor. One of `unsatisfiable` (no published release meets the floor — the #10712 stall), `no_release` (no release resolved this tick, or its version cannot be compared), `unsupervised` (no launchd/systemd supervisor would relaunch the daemon, so the roll cannot start; the release is fetched once per target, then not again), `backoff` (the last fetch for this target failed; the loop is backing off), `terminal` (the last fetch for this target failed terminally) or `roll_refused` (the release is installed but the pause-and-roll refused to start for another reason — a live pause manifest, a roll-attempt backoff, no state directory; the daemon log names it) |
 | `roll_held` | object? | #10880: a release roll this tick left held, raised on every such tick: `{floor?, running, target, cause, attempts, last_failure?, next_retry?}`. `cause` is `failed_roll` (an armed roll did not take; the failed-roll guard holds it), `fetch_backoff` (three or more consecutive fetch failures) or `fetch_terminal`. `floor` is set when the host is below its fleet floor. `next_retry` is absent only for a terminal failure on a target that is not the floor's |
 | `consecutive_failures` | integer | retryable failures for the tracked target |
 | `duration_ms` | integer | wall time of the tick |
