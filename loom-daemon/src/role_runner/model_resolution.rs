@@ -49,9 +49,10 @@ impl ModelRuntimeMismatch {
         format!(
             "model/runtime mismatch: {} (model source={}); set \
              autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts — or to \
-             \"{}\" to pass through to the {} CLI's own default model, which is the only \
-             working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex \
-             account) — or point this role back at a Claude runtime",
+             \"{}\" to pass through to the {} CLI's own default model, the guaranteed-working \
+             shape on any seat (a ChatGPT-plan Codex account also accepts a model its own \
+             catalog lists, see `codex debug models`) — or point this role back at a Claude \
+             runtime",
             self.reason,
             self.model_source,
             self.role,
@@ -326,7 +327,8 @@ pub fn is_cli_default_model_sentinel(value: &str) -> bool {
 /// skips. Forever: the condition is a pure function of static config, so every
 /// subsequent tick skips identically (453+ consecutive skips on the host that
 /// filed #6565). And the "obvious" remedy of pinning a Codex model is not
-/// available on a ChatGPT-plan seat, which rejects every explicit pin — so that
+/// available on a ChatGPT-plan seat as of #6565, which rejected every explicit pin
+/// (#14121 later let a plan seat keep a model its own catalog lists) — so that
 /// configuration was simultaneously the only correct one and permanently
 /// unadmittable.
 ///
