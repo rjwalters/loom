@@ -1106,3 +1106,174 @@ fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
         recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
     assert!(report.clones[0].published.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #14111: converging a declared binding without an operator.
+// ---------------------------------------------------------------------------
+
+const NEW_REPO: &str = "https://forge.example/a/c";
+
+fn converge_one(env: &Env, repository: &str, base: &str) -> Result<Converged> {
+    converge(env.workspace.path(), "alice", repository, base, &|| Ok(()))
+}
+
+fn registered(env: &Env) -> Vec<String> {
+    load(&env.dir)
+        .unwrap()
+        .repositories
+        .into_iter()
+        .map(|r| r.repository)
+        .collect()
+}
+
+/// Calls that would remove, stop or recreate anything.
+fn destructive(env: &Env) -> Vec<String> {
+    env.mutations()
+        .into_iter()
+        .filter(|m| {
+            ["stop ", "rm ", "run ", "volume "]
+                .iter()
+                .any(|prefix| m.starts_with(prefix))
+        })
+        .collect()
+}
+
+#[test]
+#[serial]
+fn converge_registers_a_missing_repository_on_an_idle_session_and_keeps_everything() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Registered);
+    assert_eq!(registered(&env), [NEW_REPO]);
+    let config = load(&env.dir).unwrap();
+    assert_eq!(config.repository, "https://forge.example/a/b", "the primary is unchanged");
+    assert_eq!(destructive(&env), Vec::<String>::new(), "{:?}", env.mutations());
+    assert!(env.engine().containers[&env.config.container]["Id"] == CONTAINER_ID);
+    assert!(env.engine().volumes.contains_key(&env.config.volume));
+
+    // Converged: the repeat reads no engine state at all.
+    let calls = env.engine().calls.len();
+    assert_eq!(converge_one(&env, NEW_REPO, "main").unwrap(), Converged::Present);
+    assert_eq!(
+        converge_one(&env, "https://forge.example/a/b.git", "main").unwrap(),
+        Converged::Present
+    );
+    assert_eq!(env.engine().calls.len(), calls, "a present binding costs no docker call");
+}
+
+#[test]
+#[serial]
+fn converge_defers_a_busy_account_and_never_interrupts_it() {
+    // A worker the lease does not name.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    env.with(|e| {
+        e.processes
+            .get_mut(&env.config.container)
+            .unwrap()
+            .push("codex exec".into());
+    });
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+
+    // A job holding the exclusive lease.
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<AccountBusy>().is_some(), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "refused before any docker call");
+    drop(held);
+}
+
+#[test]
+#[serial]
+fn converge_refuses_a_hold_and_never_lifts_it() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // The caller's probe, and the profile's own hold file.
+    let probed =
+        converge(env.workspace.path(), "alice", NEW_REPO, "main", &|| Err(OperatorHeld.into()));
+    assert!(probed.unwrap_err().downcast_ref::<OperatorHeld>().is_some());
+    session_hold::write_hold(&env.config.profile, session_hold::now_unix_ms()).unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(error.downcast_ref::<OperatorHeld>().is_some(), "{error:#}");
+    assert!(env.held(), "an unattended binding never lifts an operator hold");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_fails_closed_before_docker_on_bad_input() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    for (repository, base, what) in [
+        ("http://forge.example/a/c", "main", "HTTPS"),
+        ("ssh://git@forge.example/a/c", "main", "HTTPS"),
+        ("https://user:token@forge.example/a/c", "main", "HTTPS"),
+        (NEW_REPO, "--upload-pack=x", "base"),
+    ] {
+        let error = converge_one(&env, repository, base).unwrap_err();
+        assert!(message(&error).contains(what), "{repository}: {error:#}");
+        assert!(!message(&error).contains("token"), "no credential is echoed: {error:#}");
+    }
+    let unknown =
+        converge(env.workspace.path(), "nobody", NEW_REPO, "main", &|| Ok(())).unwrap_err();
+    assert!(message(&unknown).contains("account not found"), "{unknown:#}");
+    // The registered repository with a different base is a conflict, not a change.
+    let error = converge_one(&env, "https://forge.example/a/b", "develop").unwrap_err();
+    assert!(message(&error).contains("already configured with base main"), "{error:#}");
+    assert!(env.engine().calls.is_empty(), "every refusal precedes the first docker call");
+    assert!(registered(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn converge_does_not_convert_a_host_mounted_session_or_recreate_a_missing_container() {
+    // A host-mounted session: session-managed, no private workspace.
+    let env = setup();
+    std::fs::remove_file(env.dir.join("workspace.json")).unwrap();
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("host-mounted session"), "{error:#}");
+    assert!(env.engine().calls.is_empty());
+    assert!(!env.dir.join("workspace.json").exists());
+
+    // A configured account whose container is gone: recovery restores it with
+    // the recorded image; a binding must not create one with a default.
+    let env = setup();
+    env.seed_volume();
+    let error = converge_one(&env, NEW_REPO, "main").unwrap_err();
+    assert!(message(&error).contains("refusing to recreate"), "{error:#}");
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert!(registered(&env).is_empty(), "nothing was written");
+}
+
+#[test]
+#[serial]
+fn registered_repositories_lists_the_primary_then_the_additional_ones() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    converge_one(&env, NEW_REPO, "main").unwrap();
+    let got = registered_repositories(env.workspace.path(), "alice")
+        .unwrap()
+        .unwrap();
+    let urls: Vec<&str> = got.iter().map(|(url, _)| url.as_str()).collect();
+    assert_eq!(urls, ["https://forge.example/a/b", NEW_REPO]);
+    assert_eq!(got[1].1, "forge.example/a/c");
+    // check_binding yields the same key for any spelling.
+    assert_eq!(check_binding("https://Forge.example/a/c.git", "main").unwrap(), got[1].1);
+}

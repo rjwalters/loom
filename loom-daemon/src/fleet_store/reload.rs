@@ -100,6 +100,12 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
+    // Re-read from the daemon root's effective config on every session
+    // reconcile pass (#14111) — `session_reconcile::converge_bindings` calls
+    // `bindings::read` each tick. The rest of `autonomous.sessionReconcile`
+    // (`enabled`, `intervalSecs`) is resolved once in `spawn_from_config`, so
+    // it keeps the restart-required default.
+    ("autonomous.sessionReconcile.privateClones", Reloadability::Live),
     // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
     // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
     // (`ram_scope_limit::resolve`), never cached by the daemon.
