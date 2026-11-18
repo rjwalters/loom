@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-use crate::fleet_dispatch::proto::{HeartbeatRequest, LiveStep, RefusalReason};
+use crate::fleet_dispatch::proto::{HeartbeatRequest, LiveStep, ParkEndCause, RefusalReason};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -1147,11 +1147,85 @@ fn a_park_that_ended_ends_the_hold_and_the_streak() {
     let mut t = ordered_park();
     let now = 9_300 + FAST_FAIL_PARK_HOLD.as_secs() - 60;
     assert!(order_refuses(&mut t, now));
-    assert!(t.end_fast_fail_park("acme/w", 5), "there was an order to end");
-    assert!(!t.end_fast_fail_park("acme/w", 5), "and it is gone");
-    assert!(!t.end_fast_fail_park("acme/w", 6), "another item had none");
+    assert!(
+        t.end_fast_fail_park("acme/w", 5, ParkEndCause::Expired),
+        "there was an order to end"
+    );
+    assert!(!t.end_fast_fail_park("acme/w", 5, ParkEndCause::Expired), "and it is gone");
+    assert!(
+        !t.end_fast_fail_park("acme/w", 6, ParkEndCause::Expired),
+        "another item had none"
+    );
     assert!(t.fast_fails.is_empty(), "a later streak counts from zero");
     assert!(!order_refuses(&mut t, now), "drawable again, by any host");
+}
+
+/// Whether a `builder` claim for item 5 is refused at `now` (#14047): the
+/// step the three failed Builder releases of `ordered_park` put a no-progress
+/// hold on.
+fn builder_refused(t: &mut Table, now: u64) -> bool {
+    t.heartbeat(at(now), A, &hb(A, vec![], 8));
+    match t.claim(at(now), A, "acme/w", 5, "builder") {
+        ClaimDecision::Refused { reason, .. } => {
+            assert_eq!(reason, RefusalReason::Held);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// #14047: an operator's clear lifts the no-progress hold the failed Builder
+/// releases set, for the item's every step, where it was refused before.
+#[test]
+fn an_operator_clear_lifts_the_no_progress_hold() {
+    let mut t = ordered_park();
+    // Third failure at 9 300 → the 6 h step; well past the park order's hold.
+    let now = 9_300 + FAST_FAIL_PARK_HOLD.as_secs() + 600;
+    assert!(builder_refused(&mut t, now), "refused `held` before the clear");
+    assert!(t.end_fast_fail_park("acme/w", 5, ParkEndCause::Cleared));
+    assert!(!builder_refused(&mut t, now), "granted right after the clear");
+    assert!(
+        !t.end_fast_fail_park("acme/w", 5, ParkEndCause::Cleared),
+        "a second clear finds nothing"
+    );
+}
+
+/// #14047: a TTL expiry ends the park but not the ladder's hold: otherwise an
+/// automatic release would defeat a 6 h/24 h backoff and a hopeless item
+/// would loop.
+#[test]
+fn a_ttl_expiry_leaves_the_no_progress_hold_standing() {
+    let mut t = ordered_park();
+    let now = 9_300 + FAST_FAIL_PARK_HOLD.as_secs() - 60;
+    assert!(order_refuses(&mut t, now), "the order stands");
+    assert!(builder_refused(&mut t, now));
+    assert!(t.end_fast_fail_park("acme/w", 5, ParkEndCause::Expired), "the order ended");
+    assert!(!order_refuses(&mut t, now), "the park order is gone");
+    assert!(builder_refused(&mut t, now), "the no-progress hold stands");
+}
+
+/// #14047 edge cases: a clear on an item with nothing to forget is not an
+/// error; a clear that finds only a hold (no streak) still lifts it; a
+/// fourth-failure 24 h hold goes too; another item and its hold are untouched.
+#[test]
+fn a_clear_with_only_a_hold_or_none_or_a_24h_hold() {
+    let mut t = three_hosts(at(100));
+    assert!(!t.end_fast_fail_park("acme/w", 5, ParkEndCause::Cleared), "nothing to forget");
+    // Four `failed` releases, each past the previous hold (30 min, 2 h, 6 h):
+    // no fast-fail streak, a 24 h builder hold from the fourth.
+    for (at_s, host) in [(100, A), (2_000, B), (9_300, C), (31_000, A)] {
+        run_release(&mut t, at_s, host, 5, "failed");
+    }
+    run_release(&mut t, 31_000, B, 6, "failed");
+    assert!(t.fast_fails.is_empty(), "only a no-progress hold exists");
+    let now = 32_000;
+    assert!(builder_refused(&mut t, now), "the 24 h step outlasts the 6 h one");
+    assert!(t.end_fast_fail_park("acme/w", 5, ParkEndCause::Cleared), "the hold was known");
+    assert!(!builder_refused(&mut t, now));
+    assert!(
+        t.cooldown(at(now), "acme/w", 6, "builder").is_some(),
+        "another item keeps its hold"
+    );
 }
 
 /// A park-ended call that never arrives: the order lapses by itself one
