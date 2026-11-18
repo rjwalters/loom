@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::render::{self, Mechanism};
 use super::{advisories, marker, out, platform, watchdog_job, Ctx};
+use crate::launchd_env_drift::is_secret_env_key;
 
 /// `tail -n 20 "$START_LOG"` inside the `[[ -s ]]` guard, on stderr.
 fn dump_start_log(start_log: &Path) {
@@ -591,6 +592,7 @@ fn looks_secret_env_key(key: &str) -> bool {
 
 fn env_key_printable(key: &str) -> bool {
     (NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX))
+        && !is_secret_env_key(key)
         && !looks_secret_env_key(key)
 }
 
@@ -810,6 +812,12 @@ mod tests {
             assert!(!msg.contains("sekrit_expected"), "expected leaked: {msg}");
             assert!(!msg.contains("sekrit_got"), "actual leaked: {msg}");
         }
+    }
+
+    #[test]
+    fn env_mismatch_message_stays_fail_closed_for_unknown_non_loom_keys() {
+        let msg = env_mismatch_message("SOME_OTHER_VAR", "expected_val", "got_val");
+        assert!(!msg.contains("expected_val") && !msg.contains("got_val"), "{msg}");
     }
 
     #[test]
