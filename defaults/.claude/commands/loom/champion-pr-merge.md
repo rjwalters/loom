@@ -365,7 +365,11 @@ sticky-hold precheck above and before judging the four axes below. If the
 PR's entire changed-file list is an exact-match subset of `{WORK_LOG.md,
 WORK_PLAN.md, README.md}` (three root-level filenames, matched exactly —
 never a substring or nested path, so `docs/README.md` and
-`mcp-loom/README.md` do NOT qualify), the `merge-risk` criterion is satisfied without
+`mcp-loom/README.md` do NOT qualify) **and the PR has no closing-issue
+reference** (#14182: `docs_only_fast_path_closing_check` in the code block
+below must return `ELIGIBLE` — it fails closed on any closing reference and
+on a failed read, because a docs-only diff that auto-closes an issue on
+merge is not a docs-only change), the `merge-risk` criterion is satisfied without
 judging the axes at all: there is no "load-bearing hunk" to name, blast
 radius is provably confined to non-executing docs, and `git revert -m 1
 <merge-sha>` undoes it. This is a shortcut on **this criterion

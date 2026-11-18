@@ -447,7 +447,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
    fi
    ```
 4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -1808,6 +1808,9 @@ immediately before the `gh pr edit` below):
 This PR's entire changed-file list was verified — via the paginated files
 API, not the PR's stated intent or any marker — to be an exact match against
 {WORK_LOG.md, WORK_PLAN.md, README.md}: $FILES
+
+The closing-issue set was verified empty via the closing-reference read
+(no closing references, #14182).
 
 A diff confined to this exact set needs no full code evaluation (no lint,
 type-check, tests, or functional review apply). All CI checks pass.
