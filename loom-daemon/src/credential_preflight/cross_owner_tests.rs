@@ -251,3 +251,85 @@ fn a_complete_or_empty_pass_owes_no_retry() {
     let pass = establish_cross_owner_credentials(tmp.path(), &home, &cross, &minter);
     assert!(pass.complete() && pass.established.is_empty(), "{pass:?}");
 }
+
+/// Publishes a by-owner writer credential (token, config, sidecar) for `owner`
+/// under `root`, as `publish_minted` leaves it.
+fn publish_owner_dir(root: &Path, owner: &str) -> PathBuf {
+    let dir = github_app_gh_config_dir_for_owner(root, owner);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["hosts.yml", "config.yml", "identity.json"] {
+        std::fs::write(dir.join(f), "x").unwrap();
+    }
+    dir
+}
+
+/// #14450: the root checkout changed owner, so the old root owner's by-owner
+/// directory (here without a sidecar, the case the #14445 expiry skip cannot
+/// see) is removed in the primary root and in a workspace; a still-cross-owner
+/// directory, a reader subdirectory and the live root credential are intact.
+#[test]
+#[serial_test::serial]
+fn a_by_owner_dir_for_the_root_owner_is_removed_everywhere_and_cross_owners_are_kept() {
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let (home, other) = (unique("home-"), unique("xo-"));
+    let (home_repo, other_repo) = (format!("{home}/loom"), format!("{other}/app"));
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let root = env.repo("b", &[("origin", &format!("https://github.com/{other_repo}.git"))]);
+    let managed = vec![
+        (workspace.clone(), home_repo.clone()),
+        (root.clone(), other_repo.clone()),
+    ];
+
+    // Stale: `home` is the root owner now. One copy lost its sidecar.
+    let stale_primary = publish_owner_dir(&workspace, &home);
+    std::fs::remove_file(stale_primary.join("identity.json")).unwrap();
+    let stale_workspace = publish_owner_dir(&root, &home);
+    // Live: the other owner's dir stays; a reader subdirectory under the root
+    // owner's dir keeps that dir (but not its writer token).
+    let live_other = publish_owner_dir(&workspace, &other);
+    let reader = stale_primary.join("4486636");
+    std::fs::create_dir_all(&reader).unwrap();
+    std::fs::write(reader.join("hosts.yml"), "reader").unwrap();
+    let live_root_cred = crate::credential_preflight::github_app_gh_config_dir(&workspace);
+    std::fs::create_dir_all(&live_root_cred).unwrap();
+    std::fs::write(live_root_cred.join("hosts.yml"), "live").unwrap();
+
+    let minter = ScriptedMinter::new(vec![minted()]);
+    let pass = establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+    assert_eq!(pass.established, vec![other.clone()]);
+
+    assert!(!stale_workspace.exists(), "workspace copy removed entirely");
+    assert!(!stale_primary.join("hosts.yml").exists(), "writer token removed");
+    assert!(!stale_primary.join("config.yml").exists());
+    assert!(reader.join("hosts.yml").is_file(), "reader App credential untouched");
+    assert!(live_other.join("hosts.yml").is_file(), "cross-owner dir intact");
+    assert!(live_root_cred.join("hosts.yml").is_file(), "root credential intact");
+}
+
+/// An owner whose managed repos are all gone is reaped from the primary root;
+/// an empty `managed` (a failed registry read) reaps nothing, and a missing
+/// by-owner directory is a no-op.
+#[test]
+#[serial_test::serial]
+fn an_unmanaged_owner_dir_is_reaped_but_an_empty_managed_list_reaps_nothing() {
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let (home, gone) = (unique("home-"), unique("gone-"));
+    let home_repo = format!("{home}/loom");
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let minter = ScriptedMinter::new(vec![minted()]);
+
+    let gone_dir = publish_owner_dir(&workspace, &gone);
+    establish_cross_owner_credentials(&workspace, &home, &[], &minter);
+    assert!(gone_dir.join("hosts.yml").is_file(), "empty managed list: nothing reaped");
+
+    let managed = vec![(workspace.clone(), home_repo)];
+    establish_cross_owner_credentials(&workspace, &home, &managed, &minter);
+    assert!(!gone_dir.exists(), "no managed repo left under that owner");
+
+    // Missing by-owner directory: no-op, no panic.
+    let bare = env.tmp.path().join("bare");
+    establish_cross_owner_credentials(&bare, &home, &managed, &minter);
+    assert_eq!(minter.calls.get(), 0, "no cross owner, no mint");
+}

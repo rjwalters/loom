@@ -121,7 +121,9 @@ pub fn establish_cross_owner_credentials(
     minter: &dyn GithubAppMinter,
 ) -> CrossOwnerPass {
     let mut pass = CrossOwnerPass::default();
-    for plan in plan_cross_owner_credentials(root_owner, managed) {
+    let plans = plan_cross_owner_credentials(root_owner, managed);
+    reap_stale_owner_credentials(workspace_root, root_owner, managed, &plans);
+    for plan in plans {
         let owner_dir = match gh_config_dir_for_owner_slug(&plan.representative_owner_repo) {
             Some(dir) => dir,
             None => match mint_and_publish(workspace_root, &plan, minter) {
@@ -139,6 +141,94 @@ pub fn establish_cross_owner_credentials(
         pass.established.push(plan.owner);
     }
     pass
+}
+
+/// The writer-credential files `publish_minted` leaves in a by-owner
+/// directory. A reader App's tokens live in `<owner>/<app id>/` subdirectories
+/// and are never in this list.
+const OWNER_WRITER_FILES: [&str; 4] = ["hosts.yml", "hosts.yml.tmp", "config.yml", "identity.json"];
+
+/// Remove the writer credential of every by-owner directory whose owner is
+/// no longer a cross-owner (#14450), so a leftover directory (for example
+/// the old root owner's after the root checkout changed owner) cannot be
+/// preferred over the live credential. Run on every establishment pass, over
+/// the primary root and every managed root:
+///
+/// - an owner equal to `root_owner` is stale in every root (the root owner's
+///   repos ride the process-global credential, never a by-owner directory);
+/// - in the primary root, an owner with no plan (no managed repo left) is
+///   stale too, unless `managed` is empty, which is indistinguishable from a
+///   registry or remote read that failed and must not wipe live credentials.
+///
+/// Only the writer files are removed, then the directory itself if that left
+/// it empty: a reader App's `<owner>/<app id>/` subdirectories, the live
+/// root-owner credential (`.loom/gh-config`) and every other cross-owner's
+/// directory are never touched. Failures are logged and skipped.
+fn reap_stale_owner_credentials(
+    workspace_root: &Path,
+    root_owner: &str,
+    managed: &[(PathBuf, String)],
+    plans: &[CrossOwnerCredentialPlan],
+) {
+    let mut roots: Vec<&Path> = vec![workspace_root];
+    for (root, _) in managed {
+        if !roots.contains(&root.as_path()) {
+            roots.push(root.as_path());
+        }
+    }
+    for root in roots {
+        let is_primary = root == workspace_root;
+        let by_owner = root.join(".loom").join("gh-config-by-owner");
+        let Ok(entries) = std::fs::read_dir(&by_owner) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type` does not follow a symlink: never reap through one.
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(owner) = name
+                .to_str()
+                .filter(|n| crate::forge_bucket_book::valid_owner(n))
+            else {
+                continue;
+            };
+            let stale = (!root_owner.is_empty() && owner == root_owner)
+                || (is_primary
+                    && !managed.is_empty()
+                    && !plans.iter().any(|plan| plan.owner == owner));
+            if stale {
+                remove_owner_writer_credential(&entry.path(), owner);
+            }
+        }
+    }
+}
+
+/// Delete `dir`'s writer files, then `dir` if empty (see
+/// [`reap_stale_owner_credentials`]).
+fn remove_owner_writer_credential(dir: &Path, owner: &str) {
+    let mut removed = false;
+    for file in OWNER_WRITER_FILES {
+        match std::fs::remove_file(dir.join(file)) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "credential_preflight: could not remove stale per-owner credential file {} \
+                 ({e}); continuing — #14450",
+                dir.join(file).display()
+            ),
+        }
+    }
+    // Non-recursive: fails (and is ignored) while reader subdirectories remain.
+    let emptied = std::fs::remove_dir(dir).is_ok();
+    if removed || emptied {
+        log::info!(
+            "credential_preflight: removed the stale per-owner credential for {owner} at {} — \
+             it is no longer a cross-owner (#14450)",
+            dir.display()
+        );
+    }
 }
 
 /// Mint and publish `plan`'s owner credential: `Ok(Some(dir))` once it is on
