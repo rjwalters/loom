@@ -4,7 +4,7 @@
 //! the `loom:curated` label is applied *only* by `curation-complete`, never bare.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use super::run_gh;
 use super::validate_phase::{report_milestone, ValidationResult, ValidationStatus};
@@ -82,22 +82,22 @@ pub(super) fn run_curation_complete(repo_root: &Path, issue: i64) -> Result<(), 
             .unwrap_or_else(|| "unknown".to_string())
     };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let out = Command::new(exe)
-        .args([
-            "curation-complete",
-            "--repo",
-            &repo,
-            "--issue",
-            &issue.to_string(),
-        ])
-        .args(["--model", &env_or("LOOM_CURATION_MODEL")])
-        .args(["--runtime", &env_or("LOOM_CURATION_RUNTIME")])
-        .args(["--completion-id", &uuid::Uuid::new_v4().to_string()])
-        .arg("--workspace-root")
-        .arg(repo_root)
-        .current_dir(repo_root)
-        .output()
-        .map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "curation-complete",
+        "--repo",
+        &repo,
+        "--issue",
+        &issue.to_string(),
+    ])
+    .args(["--model", &env_or("LOOM_CURATION_MODEL")])
+    .args(["--runtime", &env_or("LOOM_CURATION_RUNTIME")])
+    .args(["--completion-id", &uuid::Uuid::new_v4().to_string()])
+    .arg("--workspace-root")
+    .arg(repo_root)
+    .current_dir(repo_root);
+    let out =
+        output_tracked("validate_phase_curation_complete", &mut cmd).map_err(|e| e.to_string())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -112,10 +112,55 @@ pub(super) fn run_curation_complete(repo_root: &Path, issue: i64) -> Result<(), 
     }
 }
 
+/// `cmd.output()` for a `loom-daemon` self-spawn, attributed in `daemon.log`
+/// (#14417, #14100): a `self_spawn start` line when the child spawns and a
+/// `self_spawn exit` line (status, wall time, peak RSS) once it is reaped, so a
+/// kernel `Killed process <pid> (loom-daemon)` line names this site. Captures
+/// stdout and stderr exactly as `.output()` does (stdin stays inherited, as it
+/// was); a spawn failure is the same `Err` it always was.
+fn output_tracked(site: &'static str, cmd: &mut Command) -> std::io::Result<Output> {
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let tracked = crate::self_spawn_log::track(site, cmd, child.id());
+    let out = child.wait_with_output()?;
+    tracked.finish(out.status);
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_tracked_captures_output_and_logs_start_and_exit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo boom >&2; exit 7"]);
+        let mut out = None;
+        let records = crate::test_log_capture::capture_logs(|| {
+            out = Some(output_tracked("validate_phase_curation_complete", &mut cmd));
+        });
+        let out = out.unwrap().unwrap();
+        assert_eq!(out.status.code(), Some(7));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "boom");
+        let lines: Vec<&str> = records.iter().map(|(_, m)| m.as_str()).collect();
+        assert!(
+            lines.iter().any(|l| l.starts_with("self_spawn start pid=")
+                && l.contains("site=validate_phase_curation_complete")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("self_spawn exit pid=")
+                && l.contains("site=validate_phase_curation_complete")
+                && l.contains("exit status: 7")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn output_tracked_spawn_failure_is_an_err_not_a_panic() {
+        let mut cmd = Command::new("/nonexistent/loom-daemon");
+        assert!(output_tracked("validate_phase_curation_complete", &mut cmd).is_err());
+    }
 
     #[test]
     fn curator_recovery_failure_leaves_issue_curating() {
