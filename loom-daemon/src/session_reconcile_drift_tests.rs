@@ -90,6 +90,51 @@ fn an_idle_drifted_container_is_recreated_with_the_current_roots() {
 
 #[test]
 #[serial]
+fn a_drift_recreate_uses_the_configured_image_not_the_recorded_start_image() {
+    // Issue #14421 (regression guard for #14019): the configured
+    // `accounts.session.image` beats the recorded operator start's image.
+    let env = setup(&["alice"], &["alice"]);
+    let ws = Ws::new(&["a", "new"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    seed_running(&lifecycle, "alice", &ws, &["a"]);
+    register(&lifecycle, &ws, &["a", "new"]);
+    session_hold::record_operator_start(
+        &profile(&env, "alice"),
+        &ws.p("a"),
+        "example/session:recorded",
+        session_hold::now_unix_ms(),
+    )
+    .unwrap();
+    let config = SessionImageConfig {
+        image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
+        extra_mounts: Vec::new(),
+    };
+    let mut state = ReconcileState::default();
+    let out = pass_named_with_session_config(
+        &mut lifecycle,
+        &env.accounts,
+        &host,
+        Path::new("/srv/checkouts"),
+        &mut state,
+        0,
+        &config,
+    );
+    let out: Vec<Outcome> = out.into_iter().map(|o| o.outcome).collect();
+    assert_eq!(
+        out,
+        vec![Outcome::DriftRecreated {
+            workspace: ws.p("a"),
+            drift: missing(ws.roots(&["new"])),
+        }]
+    );
+    let creates = lifecycle.runner().creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0].1, "ghcr.io/example/session-mine@sha256:aa55");
+    assert_eq!(creates[0].2, ws.p("a"));
+}
+
+#[test]
+#[serial]
 fn a_busy_drifted_container_is_deferred_then_recreated_once_idle() {
     let env = setup(&["alice"], &["alice"]);
     let ws = Ws::new(&["a", "new"]);
