@@ -17,8 +17,7 @@
 #   7. degrade OPEN when the lock store is unusable (a FILE in the way).
 #   8. LOOM_FILING_LOCK=0 disables serialization entirely.
 #   9. re-entrancy — LOOM_FILING_LOCK_HELD makes a nested acquire a no-op.
-#  10. fleet tier — a live peer hold blocks filing and expires on its TTL.
-#  11. create-issue.sh actually takes the lock (the wiring, not just the lib).
+#  10. create-issue.sh actually takes the lock (the wiring, not just the lib).
 #
 # Style follows test-build-slot.sh: throwaway mktemp dirs, assert harness, no
 # network, no real ~/.loom.
@@ -246,39 +245,6 @@ DIR="$(new_store)"
     exit 0
 ) && CASE_RC=0 || CASE_RC=$?
 assert_true "$CASE_RC" "LOOM_FILING_LOCK_HELD makes a nested acquire a re-entrant no-op"
-
-echo ""
-echo "=== fleet tier: a mirrored peer hold blocks, then expires ==="
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_WAIT_SECS=1
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=3600
-    # What safehouse::PeerClaimSink writes on an observed peer FilingLock ad.
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    RC=0
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || RC=$?
-    [[ "$RC" -eq 75 ]] || exit 1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "a live peer hold defers local filing (the cross-host tier)"
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=1
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    sleep 1.1
-    # A peer that crashed without sending FilingUnlock must not wedge us.
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || exit 1
-    [[ ! -e "$DIR/peers/host-remote" ]] || exit 1
-    loom_filing_lock_release >/dev/null 2>&1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "an expired peer hold is pruned and never wedges filing"
 
 echo ""
 echo "=== store resolution ==="

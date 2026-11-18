@@ -1315,8 +1315,7 @@ JSON
     ///
     /// - `LOOM_GH_BIN` — every writer is `#[serial(loom_config_env)]`, and per
     ///   the #8465 / #8480 invariants it must stay that way;
-    /// - `LOOM_REPO` — every *other* writer in the crate (`peer_claims`,
-    ///   `claim_reconciliation`, `quarantine_reconciliation`, and the
+    /// - `LOOM_REPO` — every *other* writer in the crate (`claim_reconciliation`, `quarantine_reconciliation`, and the
     ///   `sweep_registry` test modules) is on the crate-default,
     ///   unnamed key.
     ///
