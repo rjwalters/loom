@@ -37,10 +37,6 @@ fn record(
     }
 }
 
-fn row(record: HoldTransitionRecord, ts_ns: i64) -> Row {
-    Row { record, ts_ns }
-}
-
 #[test]
 fn since_and_until_are_required_and_flags_parse() {
     assert!(crate::cli::whole_cli_parse::try_parse_cli(&[
@@ -145,9 +141,12 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
         100,
     );
     assert!(sql.contains("FROM signoz_logs.distributed_logs_v2 "), "{sql}");
+    assert!(sql.contains("SELECT body"), "{sql}");
     assert!(sql.contains("attributes_string['loom.kind'] = 'hold.transition'"), "{sql}");
-    assert!(sql.contains("timestamp >= fromUnixTimestamp64Nano(1000)"), "{sql}");
-    assert!(sql.contains("timestamp < fromUnixTimestamp64Nano(2000)"), "{sql}");
+    // The store's timestamp is UInt64 nanoseconds: the generated bounds are
+    // compared against the raw column, no DateTime64 conversion either way.
+    assert!(sql.contains("timestamp >= 1000"), "{sql}");
+    assert!(sql.contains("timestamp < 2000"), "{sql}");
     assert!(
         sql.contains("(attributes_string['loom.repo'] = {repo0:String} OR attributes_string['loom.repo'] = {repo1:String})"),
         "{sql}"
@@ -156,7 +155,7 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
         sql.contains("attributes_string['loom.hold.reason_code'] = {reason_code:String}"),
         "{sql}"
     );
-    assert!(sql.ends_with(" ORDER BY ts_ns ASC LIMIT 101"), "{sql}");
+    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 101"), "{sql}");
     assert_eq!(
         params,
         vec![
@@ -170,16 +169,16 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
     let (sql, params) = build_query(1, 2, &[], None, 5);
     assert!(!sql.contains("loom.repo"), "{sql}");
     assert!(!sql.contains("reason_code"), "{sql}");
-    assert!(sql.ends_with(" ORDER BY ts_ns ASC LIMIT 6"), "{sql}");
+    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 6"), "{sql}");
     assert!(params.is_empty());
 }
 
 #[test]
-fn rows_parse_from_ts_ns_and_body() {
+fn rows_parse_from_the_body_string() {
     // In the store the body column is a JSON *string* (JSONEachRow escapes
     // it), so the fixture double-encodes.
     let good = format!(
-        r#"{{"ts_ns": 116000000000, "body": {}}}"#,
+        r#"{{"body": {}}}"#,
         serde_json::to_string(
             &serde_json::to_string(&record("o/r", 42, reason::MERGE_RISK_SELF_RELEASE, Some(93)))
                 .unwrap()
@@ -187,34 +186,101 @@ fn rows_parse_from_ts_ns_and_body() {
         .unwrap()
     );
     let parsed = parse_row(&good).unwrap();
-    assert_eq!(parsed.ts_ns, 116_000_000_000);
-    assert_eq!(parsed.record.repo, "o/r");
-    assert_eq!(parsed.record.confidence_pct, Some(93));
+    assert_eq!(parsed.repo, "o/r");
+    assert_eq!(parsed.confidence_pct, Some(93));
 
     // A record with no confidence (null / absent) parses as None.
     let bare = record("o/r", 7, reason::MERGE_RISK_PASS, None);
     let good = format!(
-        r#"{{"ts_ns": 1, "body": {}}}"#,
+        r#"{{"body": {}}}"#,
         serde_json::to_string(&serde_json::to_string(&bare).unwrap()).unwrap()
     );
-    assert_eq!(parse_row(&good).unwrap().record.confidence_pct, None);
+    assert_eq!(parse_row(&good).unwrap().confidence_pct, None);
+
+    // Extra columns from the store (here `timestamp`) are ignored, not
+    // required: nothing but `body` is a parse requirement.
+    let with_extra = format!(
+        r#"{{"timestamp": 123, "body": {}}}"#,
+        serde_json::to_string(
+            &serde_json::to_string(&record("o/r", 42, reason::MERGE_RISK_PASS, None)).unwrap()
+        )
+        .unwrap()
+    );
+    assert_eq!(parse_row(&with_extra).unwrap().repo, "o/r");
 
     assert!(parse_row("not json").is_err());
-    assert!(parse_row(r#"{"body": "{}"}"#).is_err());
-    assert!(parse_row(r#"{"ts_ns": 1}"#).is_err());
-    assert!(parse_row(r#"{"ts_ns": 1, "body": "not a record"}"#).is_err());
+    assert!(parse_row(r#"{"timestamp": 1}"#).is_err());
+    assert!(parse_row(r#"{"body": "not a record"}"#).is_err());
+}
+
+#[test]
+fn collect_rows_refuses_a_capped_window_counting_unparseable_lines() {
+    // A capped fetch is cap+1 lines however they parse: with unparseable
+    // lines among them the parsed count alone must not sneak under the cap.
+    let body = ["not json"; 5].join("\n");
+    let err = format!("{}", collect_rows(&body, 4).unwrap_err());
+    assert!(err.contains("more than 4 records"), "{err}");
+
+    let good = |pr: u32| {
+        format!(
+            r#"{{"body": {}}}"#,
+            serde_json::to_string(
+                &serde_json::to_string(&record("o/r", pr, reason::MERGE_RISK_PASS, None)).unwrap()
+            )
+            .unwrap()
+        )
+    };
+    let mixed = format!("{}\n{}\n{}", good(1), "not json", good(2));
+    let err = format!("{}", collect_rows(&mixed, 2).unwrap_err());
+    assert!(err.contains("more than 2 records"), "{err}");
+    // At exactly cap lines there is no cap refusal (that is a cap+1 fetch),
+    // but the unparseable line still refuses the read.
+    let err = format!("{}", collect_rows(&mixed, 3).unwrap_err());
+    assert!(err.contains("did not decode"), "{err}");
+}
+
+#[test]
+fn collect_rows_refuses_any_unparseable_row_with_its_count_and_first_reason() {
+    let good = |pr: u32| {
+        format!(
+            r#"{{"body": {}}}"#,
+            serde_json::to_string(
+                &serde_json::to_string(&record("o/r", pr, reason::MERGE_RISK_PASS, None)).unwrap()
+            )
+            .unwrap()
+        )
+    };
+    // First reason is the malformed line, not the later bad record.
+    let body = format!("{}\nnot json\n{}", good(1), r#"{"body": "not a record"}"#);
+    let err = format!("{}", collect_rows(&body, 10).unwrap_err());
+    assert!(err.contains("2 fetched row(s)"), "{err}");
+    assert!(err.contains("first: malformed row"), "{err}");
+    assert!(err.contains("partial total"), "{err}");
+
+    // All lines parse: records pass through in fetch order.
+    let rows = collect_rows(&format!("{}\n{}", good(1), good(2)), 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].pr, 1);
+    assert_eq!(rows[1].pr, 2);
+    // Blank lines are not rows.
+    assert_eq!(
+        collect_rows(&format!("\n\n{}\n \n", good(1)), 10)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn aggregation_rolls_up_per_repo_and_overall() {
     let rows = vec![
-        row(record("o/a", 1, reason::MERGE_RISK_SELF_RELEASE, Some(80)), 1),
-        row(record("o/a", 2, reason::MERGE_RISK_SELF_RELEASE, Some(90)), 2),
-        row(record("o/a", 3, reason::MERGE_RISK_PASS, Some(99)), 3),
-        row(record("o/b", 4, reason::MERGE_RISK_SELF_RELEASE, Some(70)), 4),
+        record("o/a", 1, reason::MERGE_RISK_SELF_RELEASE, Some(80)),
+        record("o/a", 2, reason::MERGE_RISK_SELF_RELEASE, Some(90)),
+        record("o/a", 3, reason::MERGE_RISK_PASS, Some(99)),
+        record("o/b", 4, reason::MERGE_RISK_SELF_RELEASE, Some(70)),
         // A null-confidence self-release still counts; it carries no value.
-        row(record("o/b", 5, reason::MERGE_RISK_SELF_RELEASE, None), 5),
-        row(record("o/c", 6, "add", None), 6),
+        record("o/b", 5, reason::MERGE_RISK_SELF_RELEASE, None),
+        record("o/c", 6, "add", None),
     ];
     let mut outcome = Outcome {
         since: "s".to_string(),
@@ -223,9 +289,8 @@ fn aggregation_rolls_up_per_repo_and_overall() {
         reason_code: None,
         ..Outcome::default()
     };
-    aggregate(&rows, 2, &mut outcome);
+    aggregate(&rows, &mut outcome);
     assert_eq!(outcome.total_records, 6);
-    assert_eq!(outcome.unparseable_records, 2);
 
     let a = &outcome.by_repo["o/a"];
     assert_eq!(a.records, 3);
@@ -261,7 +326,7 @@ fn aggregation_rolls_up_per_repo_and_overall() {
 #[test]
 fn an_empty_window_aggregates_to_stated_zeroes() {
     let mut outcome = Outcome::default();
-    aggregate(&[], 0, &mut outcome);
+    aggregate(&[], &mut outcome);
     assert_eq!(outcome.total_records, 0);
     assert!(outcome.by_repo.is_empty());
     assert_eq!(outcome.overall_self_release, ConfidenceStats::default());

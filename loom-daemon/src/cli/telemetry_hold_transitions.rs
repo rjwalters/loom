@@ -38,15 +38,6 @@ const DEFAULT_MAX_ROWS: usize = 5_000;
 /// Hard ceiling on `--max-rows`.
 const MAX_MAX_ROWS: usize = 100_000;
 
-/// One fetched record plus its store-side timestamp.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Row {
-    /// The parsed `hold.transition` record (the log body).
-    pub record: HoldTransitionRecord,
-    /// The store's `timestamp`, as unix nanoseconds.
-    pub ts_ns: i64,
-}
-
 /// Confidence distribution over the self-release records of one scope.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub(crate) struct ConfidenceStats {
@@ -85,9 +76,6 @@ pub(crate) struct Outcome {
     pub reason_code: Option<String>,
     /// Parsed records in the window.
     pub total_records: usize,
-    /// Rows whose body did not decode as a `hold.transition` record; always
-    /// printed, never folded into the counts.
-    pub unparseable_records: usize,
     /// Per-repo rollups, keyed by `owner/repo`.
     pub by_repo: BTreeMap<String, RepoRollup>,
     /// Fleet-wide self-release breakout.
@@ -115,7 +103,17 @@ fn parse_bound(value: &str, date_only_until: bool) -> Result<DateTime<Utc>> {
 /// and the row cap are generated integers, validated before they reach this
 /// function, so they are inlined; the user-text filters (`--repo`,
 /// `--reason-code`) are bound, never interpolated.
-pub(crate) fn build_query(
+/// The store's `timestamp` is **`UInt64` unix nanoseconds** (the DDL the
+/// CI-executed replay creates), so the window compares the raw column against
+/// the generated integer bounds — never a `DateTime64` conversion in either
+/// direction (`host-export-queries.sql`, `pass-queries.sql`).
+///
+/// `#[doc(hidden)] pub`: a test seam — the replay proof in
+/// `tests/signoz_host_export_queries.rs` executes the statement this builds
+/// verbatim against the pinned ClickHouse, so a type inversion cannot hide
+/// behind a re-typed copy. Not public API.
+#[doc(hidden)]
+pub fn build_query(
     since_ns: i64,
     until_ns: i64,
     repos: &[String],
@@ -123,11 +121,11 @@ pub(crate) fn build_query(
     max_rows: usize,
 ) -> (String, Vec<(String, String)>) {
     let mut sql = format!(
-        "SELECT toUnixTimestamp64Nano(timestamp) AS ts_ns, body \
+        "SELECT body \
          FROM {LOGS_TABLE} \
          WHERE attributes_string['loom.kind'] = '{LOG_KIND}' \
-           AND timestamp >= fromUnixTimestamp64Nano({since_ns}) \
-           AND timestamp < fromUnixTimestamp64Nano({until_ns})"
+           AND timestamp >= {since_ns} \
+           AND timestamp < {until_ns}"
     );
     let mut params = Vec::new();
     if !repos.is_empty() {
@@ -145,25 +143,57 @@ pub(crate) fn build_query(
     }
     // One extra row: a full cap+1 fetch proves truncation (the caller
     // refuses rather than printing a capped total).
-    sql.push_str(&format!(" ORDER BY ts_ns ASC LIMIT {}", max_rows + 1));
+    sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {}", max_rows + 1));
     (sql, params)
 }
 
-/// Parse one `JSONEachRow` line into a [`Row`].
-fn parse_row(line: &str) -> std::result::Result<Row, String> {
+/// Parse one `JSONEachRow` line into its `hold.transition` record (the log
+/// `body`; the mapping writes the record JSON there).
+fn parse_row(line: &str) -> std::result::Result<HoldTransitionRecord, String> {
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("malformed row: {e}"))?;
-    let ts_ns = value
-        .get("ts_ns")
-        .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| "row has no integer ts_ns".to_string())?;
     let body = value
         .get("body")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "row has no body string".to_string())?;
-    let record: HoldTransitionRecord = serde_json::from_str(body)
-        .map_err(|e| format!("body is not a hold.transition record: {e}"))?;
-    Ok(Row { record, ts_ns })
+    serde_json::from_str(body).map_err(|e| format!("body is not a hold.transition record: {e}"))
+}
+
+/// Parse the reader's `JSONEachRow` response into records, refusing rather
+/// than printing twice: more than `max_rows` fetched lines — parsed or not —
+/// is a window that overflowed the `LIMIT max_rows + 1` fetch cap, and any
+/// line that did not decode is a record-shape drift, counted with its first
+/// reason. Both are non-zero exits; an unparseable line can never fold into
+/// a printed (partial) total.
+fn collect_rows(body: &str, max_rows: usize) -> Result<Vec<HoldTransitionRecord>> {
+    let mut rows = Vec::new();
+    let mut unparseable = 0usize;
+    let mut first_reason: Option<String> = None;
+    for line in body.lines().filter(|l| !l.trim().is_empty()) {
+        match parse_row(line) {
+            Ok(record) => rows.push(record),
+            Err(why) => {
+                if first_reason.is_none() {
+                    first_reason = Some(why);
+                }
+                unparseable += 1;
+            }
+        }
+    }
+    if rows.len() + unparseable > max_rows {
+        bail!(
+            "window holds more than {max_rows} records; refusing to print a capped count — \
+             raise --max-rows (up to {MAX_MAX_ROWS}) or narrow the window/repo filter"
+        );
+    }
+    if unparseable > 0 {
+        bail!(
+            "{unparseable} fetched row(s) did not decode as hold.transition records (first: {}) — \
+             refusing to print a partial total",
+            first_reason.as_deref().unwrap_or("unknown")
+        );
+    }
+    Ok(rows)
 }
 
 /// Confidence stats over one bucket: `count` is the number of *records*
@@ -194,9 +224,8 @@ fn confidence_stats(count: usize, values: impl Iterator<Item = Option<u8>>) -> C
     }
 }
 
-/// Roll the parsed rows into the printed outcome. `unparseable` lines were
-/// counted by the caller and only travel here.
-pub(crate) fn aggregate(rows: &[Row], unparseable: usize, outcome: &mut Outcome) {
+/// Roll the parsed rows into the printed outcome.
+pub(crate) fn aggregate(rows: &[HoldTransitionRecord], outcome: &mut Outcome) {
     #[derive(Default)]
     struct Bucket {
         records: usize,
@@ -207,7 +236,7 @@ pub(crate) fn aggregate(rows: &[Row], unparseable: usize, outcome: &mut Outcome)
     let mut buckets: BTreeMap<String, Bucket> = BTreeMap::new();
     let mut overall_records = 0usize;
     let mut overall_values: Vec<u8> = Vec::new();
-    for Row { record, .. } in rows {
+    for record in rows {
         let bucket = buckets.entry(record.repo.clone()).or_default();
         bucket.records += 1;
         *bucket
@@ -238,7 +267,6 @@ pub(crate) fn aggregate(rows: &[Row], unparseable: usize, outcome: &mut Outcome)
         })
         .collect();
     outcome.total_records = rows.len();
-    outcome.unparseable_records = unparseable;
     outcome.overall_self_release =
         confidence_stats(overall_records, overall_values.into_iter().map(Some));
 }
@@ -355,21 +383,7 @@ impl HoldTransitionsArgs {
             .post_with(&sql, &params)
             .map_err(|e| anyhow::anyhow!("telemetry-reader query failed: {e:?}"))?;
 
-        let mut rows = Vec::new();
-        let mut unparseable = 0usize;
-        for line in body.lines().filter(|l| !l.trim().is_empty()) {
-            match parse_row(line) {
-                Ok(row) => rows.push(row),
-                Err(_why) => unparseable += 1,
-            }
-        }
-        if rows.len() > self.max_rows {
-            bail!(
-                "window holds more than {} records; refusing to print a capped count — \
-                 raise --max-rows (up to {MAX_MAX_ROWS}) or narrow the window/repo filter",
-                self.max_rows
-            );
-        }
+        let rows = collect_rows(&body, self.max_rows)?;
 
         let mut outcome = Outcome {
             since: since.to_rfc3339(),
@@ -378,7 +392,7 @@ impl HoldTransitionsArgs {
             reason_code,
             ..Outcome::default()
         };
-        aggregate(&rows, unparseable, &mut outcome);
+        aggregate(&rows, &mut outcome);
         if self.json {
             println!("{}", serde_json::to_string(&outcome)?);
         } else {
@@ -391,8 +405,8 @@ impl HoldTransitionsArgs {
 /// The default human-readable rendering.
 fn print_text(outcome: &Outcome) {
     println!(
-        "hold.transition records {} .. {} (until exclusive): {} total, {} unparseable",
-        outcome.since, outcome.until, outcome.total_records, outcome.unparseable_records
+        "hold.transition records {} .. {} (until exclusive): {} total",
+        outcome.since, outcome.until, outcome.total_records
     );
     for (repo, roll) in &outcome.by_repo {
         let reasons: Vec<String> = roll
@@ -424,7 +438,7 @@ fn print_text(outcome: &Outcome) {
         "overall self-release: {} records; confidence_pct min {:?} / median {:?} / max {:?}",
         s.count, s.min, s.median, s.max
     );
-    if outcome.total_records == 0 && outcome.unparseable_records == 0 {
+    if outcome.total_records == 0 {
         println!("(no hold.transition records in the window)");
     }
 }

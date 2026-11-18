@@ -35,7 +35,7 @@ mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
 #[path = "telemetry_hold_transitions.rs"]
-mod telemetry_hold_transitions;
+pub(crate) mod telemetry_hold_transitions;
 #[path = "telemetry_join.rs"]
 mod telemetry_join;
 #[path = "telemetry_live.rs"]

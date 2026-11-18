@@ -374,3 +374,36 @@ fn replayed_lifecycle_query_reads_running_stopped_and_silent() {
 #[allow(dead_code)]
 #[path = "../src/live_gh_guard.rs"]
 mod live_gh_guard;
+
+// ------------------------------------------------- hold-transition replay ----
+
+/// `loom-daemon telemetry-hold-transitions` (#14094): the statement the CLI
+/// builds, executed verbatim — not a copy retyped here — against the CI DDL
+/// (`timestamp UInt64` ns) with the same bound user-text params the reader
+/// sends. Catches a type inversion (a `DateTime64` conversion applied to the
+/// UInt64 column) offline, with no live reader.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_hold_transitions_statement_reads_the_window_with_bound_params() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    let (sql, params) = loom_daemon::cli::hold_transitions_query(
+        1_000_000_000,
+        5_000_000_000,
+        &["o/one".to_string()],
+        Some("merge-risk-self-release"),
+        10,
+    );
+    let mut args = vec!["--format=JSONEachRow".to_string()];
+    for (name, value) in &params {
+        args.push(format!("--param_{name}={value}"));
+    }
+    let fixture = include_str!("fixtures/signoz_host_export/hold_transitions.sql");
+    let out = rows(&clickhouse_local::clickhouse_with(&format!("{fixture}\n{sql};"), &args));
+    let bodies: Vec<&str> = out.iter().map(|r| r["body"].as_str().unwrap()).collect();
+    // Kept: the inclusive since-edge row and the in-window match, oldest
+    // first. Dropped: wrong repo, wrong reason_code, wrong kind, and the
+    // exclusive until-edge row.
+    assert_eq!(bodies, vec![r#"{"pr":10}"#, r#"{"pr":42}"#]);
+}
