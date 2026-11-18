@@ -280,6 +280,58 @@ assert_doc_contains "$GUIDE_MD" \
     "Judge and Champion never trust it" \
     "guide.md documents that the marker is informational, not authoritative"
 
+# Regression guard for #14176: a closing keyword sitting directly before an
+# issue reference in the docs-PR body (`drops closed #286`) makes GitHub
+# parse it as a closing link, so merging a docs-only PR would close an
+# unrelated issue. The heredoc must carry the keyword-safety note, the
+# post-create backstop must read closingIssuesReferences and close the PR
+# when it is non-empty, and the heredoc itself must stay free of
+# closing-keyword adjacency — the note included, since it is posted
+# verbatim (its examples use "<keyword> #N" placeholders instead).
+echo
+echo "--- Doc pins: docs-PR body keyword safety (#14176) ---"
+
+# Mirror of the PROMPT_DIR probe above (#6725): installed layout keeps
+# .agents/skills at the repo root, source-tree layout under defaults/.
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    GUIDE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-guide/SKILL.md"
+else
+    GUIDE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-guide/SKILL.md"
+fi
+
+heredoc_free_of_closing_keyword() { # file description
+    local region
+    region="$(sed -n "/cat <<'PRBODY'/,/^PRBODY$/p" "$1")"
+    if grep -Eq '(close[sd]?|fix(es|ed)?|resolve[sd]?) #[0-9]' <<<"$region"; then
+        fail "$2 (found closing-keyword adjacency in $1's PRBODY heredoc)"
+    else
+        pass "$2"
+    fi
+}
+
+for f in "$GUIDE_MD" "$GUIDE_SKILL_MD"; do
+    assert_doc_contains "$f" \
+        "Keyword safety (#14176)" \
+        "$(basename "$f") PRBODY heredoc carries the closing-keyword-safety note"
+    assert_doc_contains "$f" \
+        "closingIssuesReferences" \
+        "$(basename "$f") post-create backstop reads closingIssuesReferences"
+    heredoc_free_of_closing_keyword "$f" \
+        "$(basename "$f") PRBODY heredoc is free of closing-keyword adjacency"
+done
+
+# Both shipped mirrors must stay byte-identical across the hunks #14176
+# touches: the PRBODY heredoc (with the note) through the post-create
+# backstop and the lock release that must still run afterward.
+extract_docs_pr_region() {
+    awk '/cat <<'"'"'PRBODY'"'"'/{inregion=1}
+         inregion {print}
+         inregion && /docs-guide-lock\.sh release/{exit}' "$1"
+}
+assert_eq "$(extract_docs_pr_region "$GUIDE_MD")" \
+          "$(extract_docs_pr_region "$GUIDE_SKILL_MD")" \
+          "guide.md and SKILL.md docs-PR hunks stay byte-identical"
+
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]] || exit 1

@@ -2850,6 +2850,7 @@ Automated document maintenance by Guide triage agent."
 Automated document maintenance by the Guide triage agent.
 
 ### Changes
+<!-- Keyword safety (#14176): never put a closing keyword (close, closes, or the fix/resolve families in any tense) immediately before an issue or PR reference — GitHub parses `<keyword> #N` as a closing link, and merging this docs-only PR would then close the referenced issue. Describe dropped or merged items as "drops completed <refs>" or "drops <refs>"; the intervening word breaks the link. -->
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
 - **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
 - **README.md**: Updated if architectural changes were detected
@@ -2894,6 +2895,26 @@ PRBODY
       --duration-sec "$DOCS_PHASE_AGE_SECS" \
       --files "${DOCS_CHANGED_FILES:-WORK_LOG.md,WORK_PLAN.md,README.md}" \
       || echo "guide-docs-telemetry.sh record failed — non-fatal, PR #$DOCS_PR_NUMBER already exists"
+  fi
+
+  # Keyword-safety backstop (issue #14176): a docs-only PR must never close
+  # an issue. If the model rewrote a `### Changes` bullet into a closing
+  # keyword sitting directly before an issue reference, GitHub parsed it as
+  # a closing link and merging would close an unrelated issue. Comment
+  # naming the numbers and close the PR — the next tick regenerates it with
+  # reworded bullets. Non-fatal to the tick: the telemetry above and the
+  # lock release below still run. A failed read is reported, NOT treated as
+  # clean.
+  if [[ "$DOCS_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    if ! DOCS_CLOSING_REFS="$(gh pr view "$DOCS_PR_NUMBER" --json closingIssuesReferences --jq '[.closingIssuesReferences[].number]' 2>/dev/null)"; then
+      echo "guide: WARNING (#14176) — could not read closingIssuesReferences for PR #$DOCS_PR_NUMBER; closing-link check inconclusive, not treated as clean."
+    elif [[ "$DOCS_CLOSING_REFS" != "[]" ]]; then
+      echo "guide: WARNING (#14176) — docs PR #$DOCS_PR_NUMBER would close issue(s) $DOCS_CLOSING_REFS via a closing keyword in its body. Commenting and closing it; the next tick regenerates."
+      gh pr comment "$DOCS_PR_NUMBER" --body "Closing this docs-only PR: its body has a closing keyword directly before an issue reference, so merging it would close unrelated issue(s) $DOCS_CLOSING_REFS. The next Guide tick regenerates it with reworded \`### Changes\` bullets (no closing keyword immediately before a reference)." >/dev/null 2>&1 \
+        || echo "guide: comment on PR #$DOCS_PR_NUMBER failed — non-fatal"
+      gh pr close "$DOCS_PR_NUMBER" >/dev/null 2>&1 \
+        || echo "guide: closing PR #$DOCS_PR_NUMBER failed — non-fatal"
+    fi
   fi
 
   # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
