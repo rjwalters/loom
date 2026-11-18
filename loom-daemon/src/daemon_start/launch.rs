@@ -568,16 +568,30 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
 
 /// Env keys whose values are safe to echo in a verification diagnostic:
 /// `PATH` and `HOME` (hard-coded by `render::launchd_plist`) plus every
-/// `LOOM_*` key — plain config (paths, booleans, small enums), the same
-/// classification `launchd_env_drift.rs::display_value` documents. Anything
+/// `LOOM_*` key whose name does not look secret-bearing — plain config (paths,
+/// booleans, small enums), the same classification
+/// `launchd_env_drift.rs::display_value` documents. `envh` forwards every
+/// `LOOM_*` var, so credentials such as `LOOM_PERSONAL_GH_TOKEN` or
+/// `LOOM_GITHUB_APP_KEY_PATH` stay withheld ([`looks_secret_env_key`]). Anything
 /// else (notably the forge tokens `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`
 /// that `envh` forwards into the plist) is reported by key only, and unknown
 /// keys fail closed (#14175 AC1, #14274).
 const NON_SECRET_ENV_KEYS: &[&str] = &["PATH", "HOME"];
 const NON_SECRET_ENV_KEY_PREFIX: &str = "LOOM_";
 
+/// Name fragments (matched case-insensitively) that mark a key as
+/// secret-bearing even under the `LOOM_` prefix.
+const SECRET_KEY_FRAGMENTS: &[&str] =
+    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL"];
+
+fn looks_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    SECRET_KEY_FRAGMENTS.iter().any(|f| upper.contains(f))
+}
+
 fn env_key_printable(key: &str) -> bool {
-    NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX)
+    (NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX))
+        && !looks_secret_env_key(key)
 }
 
 /// The mismatch line for one env key. Values are printed only for printable
@@ -769,6 +783,23 @@ mod tests {
         assert!(msg.contains("[step-1]") && msg.contains("[step-2]"), "{msg}");
         let msg = env_mismatch_message("LOOM_FOO", "/a", "/b");
         assert!(msg.contains("[/a]") && msg.contains("[/b]"), "{msg}");
+    }
+
+    #[test]
+    fn env_mismatch_message_withholds_loom_prefixed_credential_values() {
+        for key in [
+            "LOOM_PERSONAL_GH_TOKEN",
+            "LOOM_OPENWEIGHTS_API_KEY",
+            "LOOM_GITHUB_APP_KEY_PATH",
+            "LOOM_SOME_SECRET",
+            "loom_db_password",
+            "LOOM_X_CREDENTIAL",
+        ] {
+            let msg = env_mismatch_message(key, "sekrit_expected", "sekrit_got");
+            assert!(msg.contains(key), "key is still named: {msg}");
+            assert!(!msg.contains("sekrit_expected"), "expected leaked: {msg}");
+            assert!(!msg.contains("sekrit_got"), "got leaked: {msg}");
+        }
     }
 
     #[test]
