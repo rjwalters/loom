@@ -736,12 +736,13 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
             "CREATE TABLE session (
                  model TEXT, tokens_input INTEGER, tokens_output INTEGER,
                  tokens_reasoning INTEGER, tokens_cache_read INTEGER,
-                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+                 id TEXT
              );",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO session VALUES (?1, 500, 40, 0, 10, 2, ?2, ?3)",
+            "INSERT INTO session VALUES (?1, 500, 40, 0, 10, 2, ?2, ?3, 'ses_fixture')",
             rusqlite::params![
                 serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"}).to_string(),
                 root.to_string_lossy().into_owned(),
