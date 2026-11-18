@@ -1516,7 +1516,7 @@ pub(super) fn provisioned_roots(workspace_pool: &WorkspacePool) -> Vec<PathBuf> 
         .collect()
 }
 
-/// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)
+/// This host's currently in-flight (`Running`, i.e. non-terminal)
 /// sweep IDs, across every repo [`WorkspacePool::provisioned_registries`]
 /// currently tracks (Issue #4955). Feeds `host.health`'s `active_sweep_ids`
 /// so the Phase-2 dashboard's `FleetState` Durable Object can reconcile its
