@@ -161,6 +161,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::release_resolve::RepoSource;
 use crate::workspace_pool::WorkspacePool;
 
 mod dirty_paths;
@@ -751,6 +752,14 @@ pub trait AutoUpdateProbe: Send {
         ArtifactResolution::Unresolved("this probe does not resolve release artifacts".to_string())
     }
 
+    /// The repo this tick's resolution queries and which tier supplied it
+    /// (#14224), so a below-floor tick that resolves no release can name what
+    /// it asked. Defaults to `None` — a probe that does not resolve artifacts
+    /// has nothing to name.
+    fn resolved_repo(&self) -> Option<(String, RepoSource)> {
+        None
+    }
+
     /// Fetch + verify + provision the resolved release artifact (Issue #7609)
     /// — `loom-daemon-update.sh --fetch --no-restart`, i.e. with the source
     /// rebuild fallback **disabled**: this path never runs `cargo build`. A
@@ -906,6 +915,11 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
         // needed it to borrow the checkout's git remote, which `root` supplies.
         let _ = script;
         native_probe::native_resolution(&root)
+    }
+
+    fn resolved_repo(&self) -> Option<(String, RepoSource)> {
+        let root = self.script_root()?;
+        native_probe::fetch_repo_with_source(&root)
     }
 
     fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
@@ -1196,6 +1210,9 @@ pub struct TickInputs<'a> {
     pub tree_clean: bool,
     /// Cross-root in-flight (non-terminal) sweep count (gate 4).
     pub in_flight: usize,
+    /// The repo the tick's resolution asked and the tier that supplied it
+    /// (#14224), so a below-floor host with no release names both at WARN.
+    pub repo_source: Option<(&'a str, RepoSource)>,
 }
 
 /// The loop's mutable bookkeeping: settle-window tracking, backoff, and the
@@ -1319,6 +1336,7 @@ impl AutoUpdateState {
             check,
             tree_clean,
             in_flight,
+            repo_source,
         } = *inputs;
         match artifact {
             ArtifactResolution::Resolved(info) => {
@@ -1338,12 +1356,29 @@ impl AutoUpdateState {
                     self.clear_tracking();
                     let unchased = (check.update_available == Some(true))
                         .then_some("the source checkout's newer HEAD (no source rebuilds)");
+                    // #14224: "below the floor with no release to roll to" is
+                    // WARN from the FIRST such tick, not only after #11029's
+                    // streak — and it names the repo it asked and the tier
+                    // that supplied it, or a stale repo pin stays invisible
+                    // behind a generic wait line. `Unresolved` is exactly the
+                    // below-floor-with-no-comparable-release verdict:
+                    // `floor_verdict` answers `Satisfied` before it can
+                    // return `Unresolved`.
+                    let below_floor_no_release =
+                        matches!(self.floor.verdict(), floor_roll::FloorVerdict::Unresolved { .. });
+                    let asked = match (below_floor_no_release, repo_source) {
+                        (true, Some((repo, source))) => {
+                            format!(" (asked {repo}, from {})", source.label())
+                        }
+                        _ => String::new(),
+                    };
                     let note =
                         format!("no artifact ({reason}) → {}", self.floor.hold_reason(unchased));
-                    // #11029: a below-floor host that stays unresolved is not
-                    // an INFO-level wait for long.
-                    return if self.floor.unresolved_escalated() {
-                        TickDecision::SkipWarn(note)
+                    return if below_floor_no_release {
+                        // #11029: `hold_reason` swaps in the escalated
+                        // STILL-BELOW-THE-FLEET-FLOOR wording once the streak
+                        // is old enough; the level is WARN from the start.
+                        TickDecision::SkipWarn(format!("{note}{asked}"))
                     } else {
                         TickDecision::Skip(note)
                     };

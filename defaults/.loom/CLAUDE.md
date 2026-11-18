@@ -61,7 +61,7 @@ Spawn and manage a background pool of autonomous agents (tmux sessions) from
 ./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-Full command reference (including `attach`/`logs`/`health`/`scale`) and the
+Full command reference (including `attach`/`logs`/`health`) and the
 legacy-wrapper/session-safety notes: [`.loom/docs/agent-pool-cli.md`](.loom/docs/agent-pool-cli.md).
 
 > For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),

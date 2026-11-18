@@ -322,7 +322,7 @@ MIT
 ```markdown
 # Work Plan
 
-Backlog snapshot from current GitHub label state, maintained by the Guide role. Direction lives in the hand-written roadmap when the repo keeps one (`ROADMAP.md` / `docs/ROADMAP.md` / `docs/roadmap.md`) — link it here on first creation.
+Backlog snapshot from current GitHub label state, maintained by the Guide role.
 
 The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. The `_Generated:` stamp at the top of the generated region dates the snapshot; `git log -1 -- WORK_PLAN.md` finds the merge that wrote it.
 
@@ -378,6 +378,8 @@ Active epics with progress tracking.
 
 **Note:** Initial backlog seeded from project bootstrapping. Issue numbers above are placeholders — update after GitHub issues are created.
 ```
+
+When generating `WORK_PLAN.md`, if the repo already keeps a hand-written roadmap (`ROADMAP.md` / `docs/ROADMAP.md` / `docs/roadmap.md`), add a line `Direction lives in the hand-written roadmap — see <path>.` right after the first preamble sentence. A freshly bootstrapped repo usually has none; then omit the line entirely (the Guide's convention).
 
 ### WORK_LOG.md Template
 
