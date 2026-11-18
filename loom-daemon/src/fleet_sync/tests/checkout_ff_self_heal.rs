@@ -1094,8 +1094,15 @@ fn a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref() {
     let first = heal(&fx, much_later());
     let second = heal(&fx, much_later() + chrono::Duration::hours(1));
 
+    // `rehome` declines with a reason when `stranded` doubts the checkout
+    // (#14231); the reason travels in the pass result's `self_heal_left`.
     for pass in [&first, &second] {
-        assert!(kinds(pass).contains(&"repair-failed"), "{:?}", kinds(pass));
+        assert!(
+            kinds(pass).contains(&"repair-failed"),
+            "{:?}: {:?}",
+            kinds(pass),
+            pass.self_heal_left
+        );
         assert!(!kinds(pass).contains(&"rehomed"), "{:?}", kinds(pass));
     }
     assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "feature/issue-756");
@@ -1105,6 +1112,27 @@ fn a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref() {
     // Only the pass that made it reports making one.
     assert!(kinds(&first).contains(&"rescue-ref"), "{:?}", kinds(&first));
     assert!(!kinds(&second).contains(&"rescue-ref"), "{:?}", kinds(&second));
+}
+
+#[test]
+fn a_checkout_left_off_its_branch_says_why_it_was_not_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    // `late()` is inside the six-hour wait: `stranded` answers "HEAD moved recently".
+    let found = heal(&fx, late());
+
+    assert_eq!(only(&found).state, CheckoutState::WrongBranch, "{:?}", kinds(&found));
+    assert!(
+        found
+            .self_heal_left
+            .iter()
+            .any(|why| why.contains("HEAD moved recently")),
+        "{:?}",
+        found.self_heal_left
+    );
 }
 
 #[test]
