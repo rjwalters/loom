@@ -7,7 +7,7 @@
 #   loom attach --help            Show help
 #
 # Examples:
-#   loom attach shepherd-1        Attach to shepherd-1 terminal
+#   loom attach builder-1         Attach to builder-1 terminal
 #   loom attach terminal-2        Attach to terminal-2
 #
 # Keyboard shortcuts when attached:
@@ -45,7 +45,7 @@ ${YELLOW}USAGE:${NC}
     loom attach --help            Show this help
 
 ${YELLOW}EXAMPLES:${NC}
-    loom attach shepherd-1        Attach to shepherd-1 terminal
+    loom attach builder-1         Attach to builder-1 terminal
     loom attach terminal-2        Attach to terminal-2
 
 ${YELLOW}KEYBOARD SHORTCUTS (when attached):${NC}
@@ -55,11 +55,11 @@ ${YELLOW}KEYBOARD SHORTCUTS (when attached):${NC}
 
 ${YELLOW}SESSION NAMING:${NC}
     Loom uses tmux sessions with the naming pattern:
-      loom-<agent-name>           e.g., loom-shepherd-1, loom-terminal-2
+      loom-<agent-name>           e.g., loom-builder-1, loom-terminal-2
 
     You can specify either the full session name or just the agent name:
-      loom attach loom-shepherd-1  (full name)
-      loom attach shepherd-1       (short name - loom- prefix added)
+      loom attach loom-builder-1  (full name)
+      loom attach builder-1       (short name - loom- prefix added)
 EOF
 }
 

@@ -1192,24 +1192,30 @@ It is eligible only when **all** hold, each read live in this pass:
   renders (a `{{PLACEHOLDER}}` substituted on copy) never byte-matches and holds.
   `.claude/settings.json` has no upstream counterpart, so a bump that changes it holds, which
   keeps the rjwalters/repo#733 guard-wiring PRs held;
-- every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
-  (the daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
-  comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
-  under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
-  path sources it: it is compared byte-for-byte like any kept-set file (#13486);
-  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
-  byte-identical gate files land without a Judge when the tag is a published release, per
-  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
+- every changed file is under `.loom/`, `.claude/` or `.agents/skills/`. A merge-gate path (the
+  daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  comment-trust files, `config.json`) is no longer refused outright: it is byte-checked like any
+  kept-set file, and when any gate path is among the changed files the tag must additionally be a
+  published, non-draft release upstream — fail closed if the release cannot be read (operator
+  ruling 2026-11-17, #13982). The gate never waives a change to itself (#12945): a gate file that
+  differs from the tag by even one byte, has no upstream counterpart, or is renamed or removed,
+  holds. A file under `.loom/scripts/tests/` (name and previous name both) is not a gate path,
+  since no merge path sources it: it is compared byte-for-byte like any kept-set file (#13486).
+  The Repo Skills variant keeps refusing gate paths outright (the ruling concerns Loom's own
+  gate). Both proofs — the daemon's strict landing and Champion's non-strict waiver — apply this
+  same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
+  kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
-  `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
+  `defaults/` counterpart — through the surface map in `resync-installed.sh` (`.loom/hooks`,
   `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
-  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
-  `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
-  at the tag;
+  `.claude/agents`) plus the proof's own mappings for `.loom/roles` (→ `defaults/roles`) and
+  `.agents/skills` (→ `defaults/.agents/skills`, #13665); any other kept-set path, such as
+  `.claude/settings.json`, `.githooks/*` or `.loom/config.json`, has none and holds — and its
+  head blob SHA equals that counterpart's blob SHA at the tag;
 - the PR head did not move while it was read.
 
 A differing byte, a local-only file, a missing or unparsable tag, or any failed read gives
@@ -2727,8 +2733,11 @@ next tick unless the `critical-files`, `mergeable`, `recency` and `ci-green` cri
 operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
 PR still bearing a hold marker without it — never silently plain approved
-(a critical-file hold whose last marker is `-cleared` was auto-cleared, not listed).
-A sticky hold missing its label with no removal on record gets the label back
+(a critical-file or ratification hold whose last family marker is `-cleared`
+was auto-cleared, not listed; a released ratification hold — last marker
+`ratification-release-respected`, #14117 — IS listed, since "only a human
+releases this, then merges by hand" is exactly its design). A sticky hold
+missing its label with no removal on record gets the label back
 (precheck), so it stays in `HELD_COUNT`.
 
 ```bash
@@ -2761,9 +2770,17 @@ HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
 # markers: merge-risk clears via a contains() block (embedded in the
 # pre-merge comment), critical-file and ratification clear/release via
 # standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
+# #14117: a marker being present is not that hold standing — count the PR
+# when ANY kind stands (per kind, the hold marker's latest comment index
+# must outdate the kind's latest cleared/released notice: the MR_STANDS
+# rindex idiom from champion-critical-file-hold.md). The previous selector
+# excluded a PR on ANY cleared marker, dropping a held PR whose *other*
+# hold still stands.
 HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
-  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
-    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length')
+  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
+      ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length')
 HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
@@ -2781,9 +2798,13 @@ fi
 HELD_NOTE=""
 [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ] && HELD_NOTE=" — census read stalled: enumeration may be partial, structural fields unavailable (#13930)"
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}"
+# #14117: the ratification family is listed here too — its released state is
+# a LATEST `ratification-release-respected` marker (the one hold kind whose
+# design is "only a human releases this, then merges by hand"); a ratification
+# hold whose last family marker is `-cleared` was auto-cleared, not listed.
 RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
-  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
-    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")')
+  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
+    | "#\(.number)"] | join(" ")')
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
@@ -2814,7 +2835,14 @@ reason, `mergeable` status, base-staleness), persisted **durably across
 passes** under the same idempotency-marker convention already used for
 `champion:merge-risk-hold` / `champion:held-pr-conflict-notice` /
 `champion:stale-pr-notice` above: a single pinned tracking issue this pass
-**edits in place**, never a fresh comment or issue every tick.
+**edits in place**, never a fresh comment or issue every tick. That tracking
+issue is **singleton state** — exactly one open digest per install, and the
+only actor that reads it is the one that can create a second one (#13876) —
+so Step 0 reconciles duplicates and Step 2 re-checks before creating; the
+Step 0 reconcile (closing Champion's own duplicate digest losers, nothing
+else) is the narrow, bookkeeping-only exception to Champion's close authority
+and does not widen `champion-issue-promo.md` Step 4's premise-false close
+gate.
 
 **Step 0 — locate the existing digest issue and read its current body
 (#7020).** Step 1 below needs the *previous* pass's digest body to carry a
@@ -2835,9 +2863,39 @@ DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"
 # digest issue predating the marker convention — fall back to
 # the oldest (lowest-numbered) open title match instead of returning empty
 # and letting a duplicate get created (#7338).
-DIGEST_ISSUE=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
-  --state open --json number,body --limit 10 \
-  --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+DIGEST_LIST=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
+  --state open --json number,body --limit 10)
+DIGEST_ISSUE=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+
+# #13876 — reconcile duplicates here, where they are already visible. Two
+# concurrent passes can both read DIGEST_ISSUE empty and both create a digest
+# (Step 2's recheck narrows that window but cannot close it), and selection
+# above is deterministic, so every OTHER marker-tagged match is a write-frozen
+# loser: never read, never updated, still open, possibly pinned, drifting
+# further from reality while still looking like the digest. Point each loser
+# at the winner once (marker-guarded, so a close that failed and retried next
+# pass does not re-comment), unpin it, and close it "not planned" — closing
+# Champion's own duplicate bookkeeping artifact here is the narrow exception
+# named in the intro, NOT new close authority. Marker-less matches (the
+# #7338 fallback candidates) are never touched. Unpin is best-effort like
+# the pin in Step 2; a failed close just retried next pass.
+DIGEST_WINNER=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "[.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] | min_by(.number) | .number // empty")
+if [ -n "$DIGEST_WINNER" ]; then
+  for DIGEST_LOSER in $(printf '%s\n' "$DIGEST_LIST" | jq -r \
+      "[.[] | select(.body | startswith(\"$DIGEST_MARKER\")) | select(.number != $DIGEST_WINNER) | .number] | .[]"); do
+    if ! "$GH_READ" issue view "$DIGEST_LOSER" --json comments \
+        --jq "any(.comments[].body; startswith(\"<!-- champion:digest-duplicate-of:\"))" | grep -q true; then
+      ./.loom/scripts/post-comment.sh "$DIGEST_LOSER" --body "<!-- champion:digest-duplicate-of:$DIGEST_WINNER -->
+Duplicate \`$DIGEST_TITLE\` issue created by a concurrent Champion pass (#13876): both passes found no digest open and both created one. The live digest is #$DIGEST_WINNER — it is edited in place every pass. This duplicate is closed and will not be updated.
+
+*Automated by Champion role*"
+    fi
+    gh issue unpin "$DIGEST_LOSER" 2>/dev/null || true   # best-effort, like the pin in Step 2
+    gh issue close "$DIGEST_LOSER" --reason "not planned"
+  done
+fi
 
 if [ -n "$DIGEST_ISSUE" ]; then
   OLD_DIGEST_BODY=$("$GH_READ" issue view "$DIGEST_ISSUE" --json body --jq '.body')
@@ -2849,12 +2907,16 @@ fi
 **Step 1 — per-PR hold reason, and conflict-duration tracking (#7020).**
 `$HELD_JSON` carries `mergeable` and out-at-Doctor state, not *why* the PR was
 held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
-hold comment via the `$HOLD_TABLE` below — one `(marker, reason rule)` pair per
+hold comment via the `$HOLD_TABLE` below — one `(kind, hold marker, cleared/released test)` row per
 hold kind: the merge-risk marker of the `merge-risk` criterion, the
 critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
 and the ratification marker (#12992, #13885 — its notice has no axis bullet;
-its reason is built from the notice itself). The latest standing marker among
-the table wins; a hold comment whose marker is not in the table is reported as
+its reason is built from the notice itself). The winner is the latest marker
+among the kinds that still STAND — per kind, standing means the hold marker's
+latest comment outdates the kind's latest cleared/released notice (the
+`MR_STANDS` rindex idiom from `champion-critical-file-hold.md`; #14117) — so a
+cleared kind never beats a standing one posted earlier; a hold comment whose
+marker is not in the table is reported as
 an unknown marker, never as an unrecorded reason. One cached read per held PR, never a second
 bulk `gh pr list`. Conflict duration rides a per-PR
 `<!-- champion:conflict-since:PR=<n> TS=<iso> -->` marker carried forward from
@@ -2873,17 +2935,26 @@ census's structural fields, and the loop above already renders the Base cell
 as "structural fields unavailable: census read stalled".
 
 ```bash
-# #13885: hold kinds are a TABLE of (marker, reason rule) pairs — the one
-# place a hold kind is registered for this digest, so adding one is a single
-# edit. #12992 added the ratification kind; merge-risk and critical-file
-# share the axis-bullet rule ("The latest standing marker among the table
-# wins" is the selection rule below).
+# #13885: hold kinds are a TABLE of (kind, hold marker, cleared/released
+# test) rows — the one place a hold kind is registered for this digest, so
+# adding one is a single edit. #12992 added the ratification kind; merge-risk
+# and critical-file share the axis-bullet rule. #14117: the third field is
+# the per-kind "no longer standing" jq test the selection below applies —
+# a marker being present is not that hold standing; the kind's latest hold
+# marker must outdate its latest cleared/released notice (the MR_STANDS
+# rindex idiom). The cleared-marker asymmetry is deliberate: merge-risk's
+# cleared marker is embedded in the pre-merge comment (contains), the other
+# kinds' notices are standalone (startswith).
 HOLD_TABLE=(
-  "merge-risk|<!-- champion:merge-risk-hold -->"
-  "critical-file|<!-- champion:critical-file-hold -->"
-  "ratification|<!-- champion:ratification-hold -->"
+  "merge-risk|<!-- champion:merge-risk-hold -->|contains(\"<!-- champion:merge-risk-hold-cleared -->\")"
+  "critical-file|<!-- champion:critical-file-hold -->|startswith(\"<!-- champion:critical-file-hold-cleared -->\")"
+  "ratification|<!-- champion:ratification-hold -->|startswith(\"<!-- champion:ratification-hold-cleared -->\") or startswith(\"<!-- champion:ratification-release-respected -->\")"
 )
 CONFLICT_SINCE_PREFIX="<!-- champion:conflict-since:PR="
+# The table's bare hold markers as a JSON array — lets the fallback below
+# tell "a marker this table does not know" from "a known kind whose hold is
+# cleared" (#14117).
+KNOWN_MARKERS_JSON=$(printf '%s\n' "${HOLD_TABLE[@]}" | cut -d'|' -f2 | jq -R . | jq -s -c .)
 ROT_THRESHOLD_DAYS=3   # continuously CONFLICTING at least this long -> "rotting"
 DIGEST_ROWS=""
 CONFLICT_SINCE_MARKERS=""
@@ -2898,30 +2969,41 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
 
   # Cached ("$GH_READ") — an observation read, same rule as the aggregate
   # query above: this digest never gates a merge decision. ONE comment read
-  # per held PR; the hold kind is picked locally from $HOLD_TABLE by latest
-  # standing marker (a held PR carries one standing hold; cleared/released
-  # notices never startswith-match their hold marker, so they do not win —
-  # and a held PR's loom:blocked means one does stand).
+  # per held PR; the hold kind is the latest STANDING kind in $HOLD_TABLE —
+  # per kind, the hold marker's latest index must outdate the kind's latest
+  # cleared/released notice (the MR_STANDS rindex idiom), so a cleared kind
+  # never beats a standing one posted earlier (#14117). A held PR's
+  # loom:blocked means at least one kind stands; if the table finds none,
+  # the fallback below reports the anomaly.
   COMMENTS=$("$GH_READ" pr view "$PR_NUM" --json comments --jq '[.comments[].body]')
   HOLD_KIND=""; HOLD_BODY=""; WINNING_IDX=-1
   for TABLE_ENTRY in "${HOLD_TABLE[@]}"; do
-    KIND="${TABLE_ENTRY%%|*}"; MARKER="${TABLE_ENTRY#*|}"
+    KIND="${TABLE_ENTRY%%|*}"; T="${TABLE_ENTRY#*|}"
+    MARKER="${T%%|*}"; CLEAR="${T#*|}"
     IDX=$(jq --arg m "$MARKER" 'to_entries | map(select(.value | startswith($m))) | last | .key // -1' <<<"$COMMENTS")
-    if [ "$IDX" -gt "$WINNING_IDX" ]; then
+    [ "$IDX" -ge 0 ] || continue
+    STANDS=$(jq --arg m "$MARKER" '(map(startswith($m)) | rindex(true)) as $h | (map('"$CLEAR"') | rindex(true)) as $c | $h != null and ($c == null or $h > $c)' <<<"$COMMENTS")
+    if [ "$STANDS" = true ] && [ "$IDX" -gt "$WINNING_IDX" ]; then
       WINNING_IDX=$IDX; HOLD_KIND=$KIND
       HOLD_BODY=$(jq -r --argjson i "$IDX" '.[$i]' <<<"$COMMENTS")
     fi
   done
   if [ -z "$HOLD_KIND" ]; then
-    # Two distinct fallbacks (#13885): a held PR should always carry a
-    # champion hold comment, but distinguish HOW this table failed. A hold
-    # comment whose marker is NOT in $HOLD_TABLE means this prompt predates
-    # a hold kind — name the marker so the reader knows which table entry
-    # is missing. No champion hold comment at all is the real anomaly.
-    UNKNOWN_MARKER=$(jq -r 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->"))) | last // ""' <<<"$COMMENTS" \
+    # Three distinct fallbacks (#13885, #14117): a held PR should always
+    # carry a STANDING champion hold, but distinguish HOW this table failed.
+    # A hold comment whose marker is NOT in $HOLD_TABLE means this prompt
+    # predates a hold kind — name the marker so the reader knows which table
+    # entry is missing. A known kind whose every marker is cleared/released
+    # while loom:blocked persists is reported as such (#14117) — the table
+    # found no standing kind, so naming the cleared marker as "unknown"
+    # would be wrong. No champion hold comment at all is the real anomaly.
+    UNKNOWN_MARKER=$(jq -r --argjson known "$KNOWN_MARKERS_JSON" 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->") and (([. as $b | $known[] as $k | select($b | startswith($k))] | length) == 0))) | last // ""' <<<"$COMMENTS" \
       | head -1 | sed -nE 's/^(<!-- champion:[a-z0-9-]+-hold -->).*/\1/p')
+    KNOWN_HOLD_PRESENT=$(jq --argjson known "$KNOWN_MARKERS_JSON" '([.[] as $b | $known[] as $k | $b | startswith($k)] | any)' <<<"$COMMENTS")
     if [ -n "$UNKNOWN_MARKER" ]; then
       REASON="unknown hold marker $UNKNOWN_MARKER (digest prompt needs updating)"
+    elif [ "$KNOWN_HOLD_PRESENT" = true ]; then
+      REASON="no standing hold — every known hold marker on this PR is cleared/released (#14117)"
     else
       REASON="reason unrecorded (no champion hold marker found)"
     fi
@@ -2999,7 +3081,9 @@ it). It splits "held, clean" (`$HELD_CONFLICTING_CLEAN`) from "held, rotting"
 **Step 2 — write the digest to a durable tracking issue, and pin it.** Champion
 edits this issue's **body** in place every pass (not a comment thread) — the
 current pile belongs at the top of the issue, not buried in a comment
-scrollback. `$DIGEST_ISSUE` came from Step 0; this step only builds the new
+scrollback. `$DIGEST_ISSUE` came from Step 0 (or from the pre-create recheck
+below, when Step 0 read empty and a concurrent pass created the digest in
+between, #13876); this step only builds the new
 body (including the hidden `champion:conflict-since` markers Step 1 collected,
 which is how the clock survives into the *next* pass) and writes it:
 
@@ -3032,6 +3116,20 @@ $DIGEST_TABLE
 $CONFLICT_SINCE_MARKERS---
 *Automated by Champion role*"
 
+# #13876 — re-check immediately before creating. The digest is singleton
+# state, and the only actor that reads it is the one that can create a
+# second one: two passes can both read Step 0's DIGEST_ISSUE empty. Re-run
+# the title search UNCACHED (gh, not $GH_READ — Step 0's read may be a
+# cache hit from before the other pass's create landed) with the same
+# selector; a number now means the other pass won the race — adopt it and
+# take the edit branch below instead of creating. Same recheck shape as the
+# verdict-time recheck in champion-issue-promo.md: it narrows the race
+# window, and Step 0's reconcile repairs what still slips through.
+if [ -z "$DIGEST_ISSUE" ]; then
+  DIGEST_ISSUE=$(gh issue list --search "\"$DIGEST_TITLE\" in:title" \
+    --state open --json number,body --limit 10 \
+    --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+fi
 if [ -z "$DIGEST_ISSUE" ]; then
   # loom:blocked keeps this out of every role's work queue (Curator's
   # Priority 2 fallback excludes it outright, and no `loom:issue` /

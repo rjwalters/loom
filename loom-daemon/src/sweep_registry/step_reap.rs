@@ -212,7 +212,7 @@ impl SweepRegistry {
         let live: Vec<(u32, StepRole)> = self
             .entries
             .values()
-            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter(|info| matches!(info.state, SweepState::Running))
             .filter_map(|info| match info.kind {
                 SweepKind::Step { item, role } => Some((item, role)),
                 SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
