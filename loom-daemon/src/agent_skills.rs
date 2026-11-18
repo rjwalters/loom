@@ -9,7 +9,7 @@
 //! `.agents/skills/<name>/SKILL.md`, the cross-vendor skills convention (see
 //! `superset-sh/superset`'s `docs/agent-tooling.md`, whose provisioner this
 //! module's ownership marker mirrors). This is the SECOND single-source
-//! instruction surface alongside `generate-agents-md.sh` (which covers the
+//! instruction surface alongside `scripts/generate-agents-md.sh` (which covers the
 //! top-level repo guide, not the per-role skill files) — see
 //! `runtime-adapters.md` §5.
 //!

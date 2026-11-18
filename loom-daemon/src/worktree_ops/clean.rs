@@ -3037,6 +3037,11 @@ fn archived_sidecar_path(log: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Modification time of `path`; `None` when unreadable (callers keep).
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 /// Whether a step log's most recent dispatch attempt is known to have ended:
 /// the region after the last dispatch header
 /// ([`crate::sweep_registry::DISPATCH_HEADER_MARKER`]) contains a terminal
@@ -3167,7 +3172,12 @@ fn clean_log_files_with(
 /// archival:
 ///
 /// - the `.archived` sidecar ([`archived_sidecar_path`], the preserver's
-///   checksum-confirmed proof — a missing or unstat-able sidecar means keep),
+///   checksum-confirmed proof — a missing or unstat-able sidecar means keep)
+///   that is **at least as new as the log** (#14228): a step log is
+///   append-only across re-dispatched attempts, so its bytes can grow after
+///   the sidecar was written and a sidecar older than the log proves only
+///   the earlier bytes were archived, not the appended tail (any stat
+///   failure on either file means keep),
 /// - a terminal outcome line for the last dispatch attempt
 ///   ([`step_log_completed`]).
 ///
@@ -3201,6 +3211,24 @@ fn clean_step_log_file(
         println!("  Keeping unarchived step log: {name}");
         stats.kept_log_files += 1;
         return;
+    }
+    // The sidecar is a point-in-time proof (#14228): the log is append-only
+    // across re-dispatched attempts, so bytes can arrive after archival.
+    // Delete only when the sidecar is at least as new as the log; a sidecar
+    // older than the log means the appended tail was never archived — keep.
+    // Any unreadable mtime is ambiguous — keep.
+    match (modified_time(path), modified_time(&sidecar)) {
+        (Some(log_mtime), Some(sidecar_mtime)) if sidecar_mtime >= log_mtime => {}
+        (Some(_), Some(_)) => {
+            println!("  Keeping step log appended after its archival: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
+        _ => {
+            println!("  Keeping step log with an unreadable mtime: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
     }
     if !step_log_completed(path) {
         println!("  Keeping step log without a terminal outcome: {name}");

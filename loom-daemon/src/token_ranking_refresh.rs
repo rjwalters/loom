@@ -269,7 +269,8 @@ fn run_probe_with_timeout(
         }
     };
 
-    let mut child = match Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("tokens")
         .arg("check")
         .arg("--ranking")
@@ -279,21 +280,26 @@ fn run_probe_with_timeout(
         .env(round_summary::ROUND_SUMMARY_FILE_ENV, summary_path)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-    {
+        .stderr(Stdio::from(stderr_file));
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_file(&log_path);
             return RefreshOutcome::Failure(format!("could not spawn `{}`: {e}", bin.display()));
         }
     };
+    // #14100: the probe is the daemon's own binary; attribute its pid.
+    let tracked = crate::self_spawn_log::track("token_ranking_refresh", &command, child.id());
 
     let start = Instant::now();
     let result = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break RefreshOutcome::Success,
+            Ok(Some(status)) if status.success() => {
+                tracked.finish(status);
+                break RefreshOutcome::Success;
+            }
             Ok(Some(status)) => {
+                tracked.finish(status);
                 let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
                 break RefreshOutcome::Failure(format!(
                     "`{}` exited with {status}: {}",
@@ -305,6 +311,7 @@ fn run_probe_with_timeout(
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    tracked.finish("timed out");
                     break RefreshOutcome::Failure(format!(
                         "`{}` timed out after {}s",
                         bin.display(),

@@ -731,8 +731,16 @@ impl SweepRegistry {
         // this record's own `runtime`/`provider`/`profile` fields stay
         // launch-record-sourced (`apply_runtime_attribution` below), because
         // the marker carries no provider or profile to publish.
-        let usage_runtime = crate::usage_source::sweep_usage_runtime(
+        //
+        // Issue #14166: read the marker from the entry's OWN log. A
+        // step-dispatched run logs to `step-<role>-<item>.log`, which the
+        // per-issue `sweep-issue-<N>.log` lookup never saw — so a Codex step
+        // resolved to `None`, took the Claude reader, and produced no usage
+        // span. `resolve_runtime_attribution` already reads this same path.
+        let dispatch_log = self.entries.get(sweep_id).map(|i| i.log_path.clone());
+        let usage_runtime = crate::usage_source::sweep_usage_runtime_from_log(
             runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            dispatch_log.as_deref(),
             &self.config.workspace_root,
             issue,
         );
@@ -1133,6 +1141,16 @@ impl SweepRegistry {
         if let Some(cause) = &outcome_record.no_phase_cause {
             no_phase::insert_span_attributes(&mut metadata, cause);
         }
+        // #14166: `loom.runtime` on the usage spans is the runtime the usage
+        // was actually READ from. `outcome_record.runtime` is launch-record
+        // only, so a legacy-adapter Codex run (no `# LOOM_LAUNCH`) left the
+        // attribute absent even though its tokens were read; the resolved
+        // usage runtime fills that gap. Claude resolves to `None` on both
+        // sides, so its spans are unchanged.
+        let span_runtime = outcome_record
+            .runtime
+            .clone()
+            .or_else(|| usage_runtime.clone());
         // #9443: the same per-phase numbers `phase_durations` carries, on the
         // execution's own `loom.role_attempt` spans, so the D1/JSONL path and
         // the OTLP path report one set of per-phase costs. Before
@@ -1154,7 +1172,7 @@ impl SweepRegistry {
             &self.config.workspace_root,
             sweep_id,
             &phase_usage_spans,
-            outcome_record.runtime.as_deref(),
+            span_runtime.as_deref(),
         );
         // #8908: this execution's exact token usage, joined to its trace.
         crate::observability::runtime_usage::finish_sweep(
@@ -1162,7 +1180,7 @@ impl SweepRegistry {
             sweep_id,
             started_at,
             outcome_record.tokens_by_model.as_deref(),
-            outcome_record.runtime.as_deref(),
+            span_runtime.as_deref(),
         );
         let trace_context = crate::observability::lifecycle::finish_execution(
             &self.config.workspace_root,

@@ -16,16 +16,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_loom-daemon");
+mod exec_support;
+use exec_support::write_executable;
 
-fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-}
+const BIN: &str = env!("CARGO_BIN_EXE_loom-daemon");
 
 fn git(dir: &Path, args: &[&str]) -> Output {
     Command::new("git")
@@ -62,9 +56,9 @@ impl Tools {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("gh-calls.log");
         let answer = dir.path().join("repo.json");
-        write_exec(
+        write_executable(
             &dir.path().join("gh"),
-            &format!(
+            format!(
                 "#!/bin/sh\necho \"$*\" >> '{}'\n\
                  if [ \"$1\" = api ] && [ -f '{}' ]; then cat '{}'; exit 0; fi\n\
                  echo 'HTTP 403: Resource not accessible' >&2; exit 1\n",
