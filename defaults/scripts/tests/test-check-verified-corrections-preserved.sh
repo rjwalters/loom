@@ -593,6 +593,69 @@ printf '## Verified corrections\r\n\r\n- a replacement entry, not append-only\r\
 run_cvcp "$WORK_DIR/crlf-section-old.md" "$WORK_DIR/crlf-section-new.md"
 assert_eq "1" "$RC" "(22c) CRLF body, real section entry rewritten -> exit 1 (heading matching is CRLF-tolerant)"
 
+# --- Scenario 23: unterminated fence is named in a WARN (#14123) ----------
+# An unclosed fence swallows any later "## Verified corrections" section
+# (CommonMark: it runs to EOF), so the guard reports "nothing to preserve".
+# That stays deliberate -- exit codes are unchanged -- but a body that is no
+# longer protected at all must not look identical to one with no section:
+# the WARN names the opener's line.
+# shellcheck disable=SC2016  # the backticks are fixture content, not expansion
+printf 'prose:\n\n```\nstray unindented, unclosed\n\n## Verified corrections\n\n- a\n' > "$WORK_DIR/unclosed-old.md"
+# shellcheck disable=SC2016
+printf 'prose:\n\n```\nstray unindented, unclosed\n\n## Verified corrections\n\n- replaced\n' > "$WORK_DIR/unclosed-new.md"
+
+run_cvcp "$WORK_DIR/unclosed-old.md" "$WORK_DIR/unclosed-new.md"
+assert_eq "0" "$RC" "(23a) Unclosed fence swallows the section -> exit code unchanged (0)"
+assert_contains "$OUT" "WARN — old body line 3: unterminated code fence opened here" "(23a) WARN names the old body's opener line"
+assert_contains "$OUT" "NOT being checked" "(23a) WARN says the section is not being checked"
+assert_contains "$OUT" "nothing to preserve" "(23a) Absent-section OK still reported"
+
+# shellcheck disable=SC2016
+printf 'prose:\n\n    ```\n    stray in indented code block\n\n## Verified corrections\n\n- a\n' > "$WORK_DIR/unclosed-indent-old.md"
+# shellcheck disable=SC2016
+printf 'prose:\n\n    ```\n    stray in indented code block\n\n## Verified corrections\n\n- replaced\n' > "$WORK_DIR/unclosed-indent-new.md"
+
+run_cvcp "$WORK_DIR/unclosed-indent-old.md" "$WORK_DIR/unclosed-indent-new.md"
+assert_eq "0" "$RC" "(23b) 4-space-indented stray fence -> exit code unchanged (0)"
+assert_contains "$OUT" "WARN — old body line 3: unterminated code fence" "(23b) Indented stray fence also warns, naming its line"
+
+# A tilde fence toggles the same state, so it warns the same way.
+printf 'prose:\n\n~~~\nstray tilde fence\n\n## Verified corrections\n\n- a\n' > "$WORK_DIR/unclosed-tilde-old.md"
+
+run_cvcp "$WORK_DIR/unclosed-tilde-old.md" "$WORK_DIR/unclosed-tilde-old.md"
+assert_eq "0" "$RC" "(23c) Unclosed tilde fence -> exit code unchanged (0)"
+assert_contains "$OUT" "WARN — old body line 3: unterminated code fence" "(23c) Unclosed tilde fence warns"
+
+# Several fences, the last one unclosed: the WARN names the LAST opener, not
+# an earlier fence that did close.
+# shellcheck disable=SC2016
+printf 'a\n\n```\nclosed\n```\n\nb\n\n```\nnever closed\n' > "$WORK_DIR/unclosed-multi-old.md"
+
+run_cvcp "$WORK_DIR/unclosed-multi-old.md" "$WORK_DIR/unclosed-multi-old.md"
+assert_contains "$OUT" "WARN — old body line 9: unterminated code fence" "(23d) Multiple fences, last unclosed -> WARN names the last opener (line 9)"
+assert_not_contains "$OUT" "body line 3:" "(23d) The earlier, closed fence is not named"
+
+# The new body is checked too, and named as such. Old is fine; new swallows
+# the section after the stray fence, so the section is "removed" -> still the
+# existing FAIL (exit 1), plus the new-side WARN explaining why.
+printf '## Verified corrections\n\n- a\n' > "$WORK_DIR/unclosed-newside-old.md"
+# shellcheck disable=SC2016
+printf '```\nstray\n\n## Verified corrections\n\n- a\n' > "$WORK_DIR/unclosed-newside-new.md"
+
+run_cvcp "$WORK_DIR/unclosed-newside-old.md" "$WORK_DIR/unclosed-newside-new.md"
+assert_eq "1" "$RC" "(23e) New body's section swallowed by an unclosed fence -> still exit 1"
+assert_contains "$OUT" "WARN — new body line 1: unterminated code fence" "(23e) WARN names the new body and its opener line"
+
+# Regression: balanced fences (including a fence inside a real section) are
+# silent -- no new WARN noise.
+# shellcheck disable=SC2016
+printf 'a\n\n```\nclosed\n```\n\n## Verified corrections\n\n- a\n\n```\nexample\n```\n\n- b\n' > "$WORK_DIR/balanced.md"
+
+run_cvcp "$WORK_DIR/balanced.md" "$WORK_DIR/balanced.md"
+assert_eq "0" "$RC" "(23f) Balanced fences -> exit 0"
+assert_not_contains "$OUT" "WARN" "(23f) Balanced fences emit no WARN"
+assert_not_contains "$OUT" "unterminated" "(23f) Balanced fences emit no unterminated-fence line"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

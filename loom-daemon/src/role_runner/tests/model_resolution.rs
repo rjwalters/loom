@@ -99,7 +99,8 @@ fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
 /// "codex"` with NO `roleModels.judge` pin used to resolve the Claude-shaped
 /// shipped default (`sonnet`) and get refused as a `ModelRuntimeMismatch` —
 /// every tick, forever (453+ consecutive skips on the affected host), with no
-/// escape, because a ChatGPT-plan Codex seat rejects an explicit pin too. That
+/// escape, because a ChatGPT-plan Codex seat then rejected an explicit pin too
+/// (since #14121 it accepts one its own catalog lists). That
 /// configuration must now ADMIT: the unpinned conflict degrades to the runtime
 /// CLI's own default, so the adapter is actually spawned and receives no
 /// `--model` argument at all.
@@ -140,9 +141,11 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
 
 /// Issue #7894: the same admission is reachable *deliberately* — a
 /// `roleModels.<role> = "default"` pin is an explicit "let the runtime CLI pick
-/// its own model" statement (the only shape a ChatGPT-plan Codex seat accepts),
-/// and it must spawn with no `--model` rather than being resolved to a model
-/// name or falling through to the shipped Claude default.
+/// its own model" statement (the guaranteed-working shape on any seat,
+/// including a ChatGPT-plan Codex seat, which also accepts a pin its own
+/// catalog lists since #14121), and it must spawn with no `--model` rather
+/// than being resolved to a model name or falling through to the shipped
+/// Claude default.
 #[test]
 #[serial]
 fn test_invoke_admits_an_explicit_cli_default_sentinel_pin() {
@@ -197,8 +200,9 @@ fn test_invoke_succeeds_once_role_models_supplies_a_matching_model() {
 /// Issue #7894: a `"default"` pin is a sentinel, not a model name — it resolves
 /// to the empty string (which `run_role_with_timeout` renders as *no* `--model`
 /// argument) instead of falling through to a lower tier or being run through
-/// the `sweep.modelAliases` map. This is the only configuration a ChatGPT-plan
-/// Codex seat accepts, since such a seat rejects every explicit pin on the wire.
+/// the `sweep.modelAliases` map. This is the guaranteed-working configuration on
+/// any seat, including a ChatGPT-plan Codex seat (which also accepts a pin its
+/// own catalog lists, #14121).
 #[test]
 #[serial(loom_config_env)]
 fn test_resolve_role_runner_model_cli_default_sentinel() {
@@ -235,7 +239,7 @@ fn test_resolve_role_runner_model_cli_default_sentinel() {
     );
 
     // The global role-runner tier accepts the sentinel too, for a fleet whose
-    // every role runs on a seat that cannot serve a pinned model.
+    // every role runs on a seat where the CLI's own default is the safest choice.
     let global = tempfile::tempdir().unwrap();
     write_config(global.path(), r#"{"autonomous": {"roleRunner": {"model": "Default"}}}"#);
     assert_eq!(
@@ -329,8 +333,10 @@ fn test_reconcile_unpinned_model_with_runtime() {
 }
 
 /// Issue #7894 AC4: the mismatch detail no longer presents a `roleModels` model
-/// pin as the ONLY remedy — a pin is not viable at all on a ChatGPT-plan Codex
-/// seat, so the text must also name the CLI-default pass-through.
+/// pin as the ONLY remedy — when #6565 was filed, no pin was viable at all on a
+/// ChatGPT-plan Codex seat (catalog-listed pins have worked there since
+/// #14121), so the text must also name the CLI-default pass-through, the
+/// guaranteed-working shape on any seat.
 #[test]
 fn test_model_runtime_mismatch_detail_offers_the_cli_default_passthrough() {
     let detail = ModelRuntimeMismatch {
