@@ -643,6 +643,7 @@ fn run_preflight(
                 crate::tokens_pool::private_workspace::JobKind::Role,
                 None,
                 &owner,
+                false, // not a containment admission; the filter is unchanged (#14110)
             )
             .map_err(|e| LaunchError::config(e.to_string()))?,
         }

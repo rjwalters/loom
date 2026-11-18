@@ -315,6 +315,9 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     Ok(Status {
         workspace_mode: MODE,
         private_root: REPO,
+        image: state
+            .as_ref()
+            .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
         container_id: state
             .as_ref()
             .and_then(|s| s["Id"].as_str().map(str::to_owned)),

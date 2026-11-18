@@ -305,17 +305,22 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = match dispatch::Selection::prepare(root, "codex", model, kind, issue, owner) {
-        Ok(Some(selection)) => selection,
-        Ok(None) => {
-            return Err(rejection.with_containment_failure(
-                "host, sibling and peer repository isolation: no private-clone workspace is \
+    // `contained`: this launch was admitted ONLY through containment
+    // (`containment_eligible`), so the account draw must keep private-clone
+    // accounts registering this repository — never a host-mode account,
+    // which could only fail admission as UNPREPARED (#14110).
+    let selection =
+        match dispatch::Selection::prepare(root, "codex", model, kind, issue, owner, true) {
+            Ok(Some(selection)) => selection,
+            Ok(None) => {
+                return Err(rejection.with_containment_failure(
+                    "host, sibling and peer repository isolation: no private-clone workspace is \
                  configured for the selected Codex account (bare-host, shared-mount and ambient \
                  sessions keep the native partial capability and are refused here)",
-            ))
-        }
-        Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),
-    };
+                ))
+            }
+            Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),
+        };
     let proof = match selection.contain(root) {
         Ok(proof) => proof,
         Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),

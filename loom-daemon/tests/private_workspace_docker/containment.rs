@@ -219,6 +219,7 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
         JobKind::Role,
         None,
         "containment-not-leaked",
+        false,
     )
     .unwrap()
     .unwrap();
@@ -244,6 +245,7 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
         JobKind::Sweep,
         Some(8787),
         "containment-stale",
+        false,
     )
     .unwrap()
     .unwrap();

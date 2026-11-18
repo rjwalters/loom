@@ -105,6 +105,7 @@ pub(crate) fn prepare(
             JobKind::Sweep,
             issue,
             &owner,
+            false, // not a containment admission; the filter is unchanged (#14110)
         )?;
         (selection, resolved)
     };

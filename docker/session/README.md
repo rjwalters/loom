@@ -357,8 +357,17 @@ into place only when complete, so an interrupted clone is retried, never
 treated as ready. A repository the fleet roster marks `firewall: true`
 (notebook, corporate) is refused before any clone, and a job for an
 unregistered repository is refused. The account-wide lease still admits one
-job at a time across all of the account's clones. Dispatch admission remains
-primary-repository-only until #10796.
+job at a time across all of the account's clones, and every additional
+registration is HTTPS only (like the primary) and keeps the base chosen when
+it was registered: re-registering an existing repository with a different
+base is refused until its clone is resolved deliberately. Dispatch is no
+longer primary-repository-only (#10796): it resolves the workspace's
+repository exactly as `session job --repository` does, so a seat holding
+several repositories serves each of them. A launch admitted on private-clone
+containment (#8787) draws only accounts whose registrations (primary or
+additional) cover the workspace's repository; when no such account exists,
+the refusal is one line naming the repository and any host-mode accounts,
+which cannot provide containment (#14110).
 
 `session job` is the explicit lease-consuming primitive for future dispatch.
 `--kind role|sweep|interactive` shares one exclusion domain. It prepares the

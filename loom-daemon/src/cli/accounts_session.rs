@@ -218,15 +218,26 @@ pub(crate) fn handle_session_command(
         if json {
             println!("{}", serde_json::to_string_pretty(status)?);
         } else {
+            // The additional clones listed by URL, not counted (#14110):
+            // an operator reconciling a mixed host needs to see which
+            // repositories each seat registers.
+            let additional = status
+                .config
+                .repositories
+                .iter()
+                .map(|r| r.repository.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             println!(
-                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
+                "{}: {} (workspace_mode={}, private_root={}, volume={}, image={}, repository={}, additional_repositories=[{}], lease={})",
                 status.config.account,
                 if status.running { "running" } else { "stopped" },
                 status.workspace_mode,
                 status.private_root,
                 status.config.volume,
+                status.image.as_deref().unwrap_or("-"),
                 status.config.repository,
-                status.config.repositories.len(),
+                additional,
                 status
                     .lease
                     .as_ref()

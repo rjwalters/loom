@@ -139,6 +139,7 @@ pub(super) fn run_role_with_timeout(
             crate::tokens_pool::private_workspace::JobKind::Role,
             None,
             &format!("role-{role}-{}", uuid::Uuid::new_v4()),
+            false, // not a containment admission; the filter is unchanged (#14110)
         ),
     };
     let selection = match prepared {

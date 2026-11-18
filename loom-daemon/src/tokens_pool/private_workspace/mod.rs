@@ -192,6 +192,9 @@ pub struct Status {
     pub workspace_mode: &'static str,
     pub private_root: &'static str,
     pub config: Config,
+    /// The session image the container was created with, from the Docker
+    /// inspection; absent when no container exists (#14110).
+    pub image: Option<String>,
     pub container_id: Option<String>,
     pub running: bool,
     pub lease: Option<lease::Job>,

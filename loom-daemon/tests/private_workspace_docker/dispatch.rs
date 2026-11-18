@@ -237,7 +237,8 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
             None,
             loom_daemon::tokens_pool::private_workspace::JobKind::Role,
             None,
-            "legacy"
+            "legacy",
+            false
         )
         .unwrap()
         .is_none());
@@ -275,6 +276,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         loom_daemon::tokens_pool::private_workspace::JobKind::Role,
         None,
         "fixture-inaccessible",
+        false,
     )
     .err();
     std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -301,6 +303,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         JobKind::Sweep,
         Some(9999),
         "fixture-rejected-spawn",
+        false,
     )
     .unwrap()
     .unwrap();
@@ -311,11 +314,19 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     assert!(!root.join(".loom/private-jobs/issue-9999.json").exists());
     // Same production preflight as scheduled/explicit dispatch; the fake
     // free-form worker tests transport without claiming mutable capability.
-    let selection =
-        Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8786), "fixture-sweep")
-            .unwrap()
-            .unwrap();
-    let busy = Selection::prepare(&root, "codex", None, JobKind::Role, None, "fixture-concurrent");
+    let selection = Selection::prepare(
+        &root,
+        "codex",
+        None,
+        JobKind::Sweep,
+        Some(8786),
+        "fixture-sweep",
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    let busy =
+        Selection::prepare(&root, "codex", None, JobKind::Role, None, "fixture-concurrent", false);
     assert!(busy.err().unwrap().to_string().contains("busy"));
     let mut command = f.adapter(name, "mutate");
     command
@@ -362,10 +373,17 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .modified()
         .unwrap();
     let retained_log = root.join("retained.log");
-    let interrupted =
-        Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8786), "fixture-interrupted")
-            .unwrap()
-            .unwrap();
+    let interrupted = Selection::prepare(
+        &root,
+        "codex",
+        None,
+        JobKind::Sweep,
+        Some(8786),
+        "fixture-interrupted",
+        false,
+    )
+    .unwrap()
+    .unwrap();
     let mut retained_command = f.adapter(name, "retain");
     interrupted.apply(&mut retained_command);
     let result = retained_command
@@ -394,8 +412,15 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     }
     let retained = result.wait_with_output().unwrap();
     assert!(!retained.status.success());
-    let restarted =
-        Selection::prepare(&root, "claude", None, JobKind::Sweep, Some(8786), "fixture-restart");
+    let restarted = Selection::prepare(
+        &root,
+        "claude",
+        None,
+        JobKind::Sweep,
+        Some(8786),
+        "fixture-restart",
+        false,
+    );
     assert!(restarted
         .err()
         .unwrap()
@@ -476,6 +501,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         JobKind::Sweep,
         Some(8788),
         "fixture-container-loss",
+        false,
     )
     .unwrap()
     .unwrap();
@@ -507,9 +533,16 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     .unwrap();
     assert_eq!(record["account"], second.as_str());
     assert_ne!(record["outcome"], "completed");
-    assert!(
-        Selection::prepare(&root, "claude", None, JobKind::Sweep, Some(8788), "restarted").is_err()
-    );
+    assert!(Selection::prepare(
+        &root,
+        "claude",
+        None,
+        JobKind::Sweep,
+        Some(8788),
+        "restarted",
+        false
+    )
+    .is_err());
     assert!(std::fs::read_to_string(&lost_log)
         .unwrap()
         .contains("fixture-retained-ready"));
@@ -619,7 +652,7 @@ fn each_account_admission_is_bound_to_its_own_repository_clone() {
         );
     };
     let prepare =
-        |owner: &str| Selection::prepare(&root, "codex", None, JobKind::Role, None, owner);
+        |owner: &str| Selection::prepare(&root, "codex", None, JobKind::Role, None, owner, false);
     let wrong = "different repository clone";
 
     // Repository one runs on account `a`: its proof is valid for that clone only.
@@ -667,7 +700,7 @@ fn each_account_admission_is_bound_to_its_own_repository_clone() {
         // The established fallback: a non-Codex runtime gets no private selection,
         // so nothing runs in a clone and nothing falls through to the host.
         let fallback =
-            Selection::prepare(&root, "claude", None, JobKind::Role, None, "fallback-two");
+            Selection::prepare(&root, "claude", None, JobKind::Role, None, "fallback-two", false);
         assert!(fallback.unwrap().is_none());
     }
     // A repository no account holds is refused, never registered implicitly.

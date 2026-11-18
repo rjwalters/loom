@@ -1,4 +1,5 @@
 //! The selected account and its preparation lease travel together to spawn.
+use super::super::account_registry::AccountDescriptor;
 use super::*;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -58,6 +59,12 @@ pub fn uses_private(root: &Path) -> Result<bool> {
 }
 
 impl Selection {
+    /// `contained` marks a launch admitted on — or otherwise requiring —
+    /// verified private-clone containment: its account draw then keeps only
+    /// private-clone accounts registering the workspace repository, because
+    /// a host-mode account holds no owned clone and can never prove
+    /// containment (#14110). A launch that may still fall back to host mode
+    /// passes `false` and keeps the unchanged pre-#14110 filter.
     pub fn prepare(
         root: &Path,
         runtime: &str,
@@ -65,6 +72,7 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
+        contained: bool,
     ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
@@ -126,18 +134,18 @@ impl Selection {
                 export::check_failover(root, issue, "other-provider")?;
                 return Ok(None);
             }
-            // Only accounts that can serve THIS repository: a shared
-            // (host-mounted) account, or a private-clone account whose clone
-            // is of this repository. A private account bound to another
-            // repository would otherwise be picked at random and the launch
-            // refused below by `verify_repository` — on robb-studio after
-            // agent-1/2 moved to a gf180-parasynth canary (2026-10-02), every
-            // Codex role tick in every other workspace that drew one of them
-            // failed with "private workspace repository differs".
             let logical = logical_repository(root);
-            let account = select_codex_account_where(root, model, |account| {
-                serves_repository(&account.credential_reference, logical.as_deref())
-            })?;
+            // A launch admitted on containment must not draw a host-mode
+            // account: it passes `serves_repository` but holds no owned
+            // clone, so the launch would only fail later as an `UNPREPARED`
+            // refusal that names leases instead of the account's mode
+            // (#14110).
+            let keep =
+                |account: &AccountDescriptor| keeps_launch(contained, account, logical.as_deref());
+            if contained && !inventory.iter().any(|account| keep(account)) {
+                bail!("{}", contained_refusal(&inventory, logical.as_deref()));
+            }
+            let account = select_codex_account_where(root, model, keep)?;
             let AccountBinding::CodexHome { directory } = account.binding else {
                 unreachable!()
             };
@@ -343,6 +351,21 @@ pub(super) fn logical_repository(root: &Path) -> Option<String> {
     Some(normalized.trim_end_matches(".git").to_owned())
 }
 
+/// The account filter one dispatch draw applies: only accounts that can
+/// serve THIS repository — a shared (host-mounted) account, or a
+/// private-clone account whose clone is of that repository. A private
+/// account bound to another repository would otherwise be picked at random
+/// and the launch refused below by `verify_repository` — on robb-studio
+/// after agent-1/2 moved to a gf180-parasynth canary (2026-10-02), every
+/// Codex role tick in every other workspace that drew one of them failed
+/// with "private workspace repository differs". A launch requiring
+/// containment (`contained`, #14110) additionally keeps only private-clone
+/// accounts: a host-mode account can never prove containment.
+fn keeps_launch(contained: bool, account: &AccountDescriptor, logical: Option<&str>) -> bool {
+    serves_repository(&account.credential_reference, logical)
+        && (!contained || registers_repository(&account.credential_reference, logical))
+}
+
 /// Whether the account whose profile is `profile` can serve a launch for the
 /// `logical` repository: any account without private-clone state can (it is a
 /// shared, host-mounted account), and a private-clone account can only when
@@ -356,9 +379,49 @@ fn serves_repository(profile: &Path, logical: Option<&str>) -> bool {
     if !dir.join("workspace.json").exists() {
         return true;
     }
+    registers_repository(profile, logical)
+}
+
+/// The private-clone-only arm of [`serves_repository`]: whether `profile` is
+/// a private-clone account whose clone set (the primary or a registered
+/// additional clone) is of the `logical` repository. A launch admitted on
+/// containment may draw only accounts this accepts (#14110): a host-mode
+/// session holds no owned clone, so it can never prove containment.
+fn registers_repository(profile: &Path, logical: Option<&str>) -> bool {
+    let Ok(dir) = state_dir(profile) else {
+        return false;
+    };
+    if !dir.join("workspace.json").exists() {
+        return false;
+    }
     match (load(&dir), logical) {
         (Ok(config), Some(logical)) => config.target(Some(logical)).is_ok(),
         _ => false,
+    }
+}
+
+/// The one-line refusal for a contained launch whose inventory holds no
+/// private-clone account registering the workspace repository (#14110).
+/// Host-mode accounts are named by count, so the cause names the account's
+/// mode rather than pointing at leases.
+fn contained_refusal(inventory: &[AccountDescriptor], logical: Option<&str>) -> String {
+    let host_mode = inventory
+        .iter()
+        .filter(|account| {
+            state_dir(&account.credential_reference)
+                .is_ok_and(|dir| !dir.join("workspace.json").exists())
+        })
+        .count();
+    let host_note = if host_mode > 0 {
+        format!("; {host_mode} host-mode account(s) cannot provide containment")
+    } else {
+        String::new()
+    };
+    match logical {
+        Some(repository) => format!("no private-clone account registers {repository}{host_note}"),
+        None => format!(
+            "the workspace repository cannot be resolved, so no private-clone account is known to register it{host_note}"
+        ),
     }
 }
 
@@ -565,6 +628,143 @@ mod tests {
             "{drawn:?}"
         );
         assert!(none.is_err());
+    }
+
+    /// The private-clone-only arm (#14110): a host-mode seat never registers
+    /// a repository, a private seat of this repository does (a `.git` suffix
+    /// is not identity), a seat bound elsewhere does not, a multi-repository
+    /// seat registers through its additional registrations too, and
+    /// unreadable private state is refused rather than guessed.
+    #[test]
+    fn only_private_clone_accounts_register_a_repository() {
+        let _fork = super::super::tests::fork_guard();
+        let root = tempfile::tempdir().unwrap();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let host = root.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        let same = private_profile(root.path(), "same", &format!("{here}.git"));
+        let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
+        assert!(!registers_repository(&host, Some(here)));
+        assert!(registers_repository(&same, Some(here)), ".git suffix is not identity");
+        assert!(!registers_repository(&same, None));
+        assert!(!registers_repository(&other, Some(here)));
+        // Unreadable private state is left out, never guessed.
+        let corrupt = private_profile(root.path(), "corrupt", here);
+        std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
+        assert!(!registers_repository(&corrupt, Some(here)));
+        // A multi-repository seat registers each of its clones (#10796).
+        let seat = private_profile(root.path(), "seat", here);
+        let dir = state_dir(&seat).unwrap();
+        let mut seat_config = load(&dir).unwrap();
+        let id = identify("https://github.com/2AMLogic/vibesql").unwrap();
+        seat_config.repositories.push(Registered {
+            repository: id.url.clone(),
+            base: "main".into(),
+            slug: id.slug.clone(),
+        });
+        save(&dir.join("workspace.json"), &seat_config).unwrap();
+        assert!(registers_repository(&seat, Some(here)));
+        assert!(registers_repository(&seat, Some("https://github.com/2AMLogic/vibesql.git")));
+        assert!(!registers_repository(&seat, Some("https://github.com/2AMLogic/other")));
+    }
+
+    /// The contained-launch refusal (#14110): one line, naming the
+    /// repository and — when any exist — the host-mode seats that cannot
+    /// provide containment.
+    #[test]
+    fn contained_refusal_names_the_repository_and_host_mode_seats() {
+        use super::super::super::account_registry::{
+            AccountId, AccountProvider, CredentialKind, InventoryProvenance,
+        };
+        let _fork = super::super::tests::fork_guard();
+        let root = tempfile::tempdir().unwrap();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let host_profile = root.path().join("host");
+        std::fs::create_dir_all(&host_profile).unwrap();
+        let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
+        let descriptor = |name: &str, profile: &Path| AccountDescriptor {
+            id: AccountId {
+                provider: AccountProvider::Codex,
+                name: name.to_owned(),
+            },
+            credential_kind: CredentialKind::CodexHome,
+            credential_reference: profile.to_path_buf(),
+            enabled: true,
+            provenance: InventoryProvenance::Shared,
+            email: None,
+        };
+        let mixed = vec![
+            descriptor("host", &host_profile),
+            descriptor("other", &other),
+        ];
+        let refusal = contained_refusal(&mixed, Some(here));
+        assert_eq!(
+            refusal,
+            format!(
+                "no private-clone account registers {here}; \
+                 1 host-mode account(s) cannot provide containment"
+            )
+        );
+        // Host-mode seats absent: the refusal names only the missing registration.
+        let refusal = contained_refusal(&mixed[1..], Some(here));
+        assert_eq!(refusal, format!("no private-clone account registers {here}"));
+        // An unresolvable workspace repository still refuses in one line.
+        let refusal = contained_refusal(&mixed, None);
+        assert!(!refusal.contains('\n'), "{refusal}");
+        assert!(refusal.contains("cannot be resolved"), "{refusal}");
+    }
+
+    /// The contained draw (#14110): in a mixed inventory of host-mode seats
+    /// and private clones, a contained launch only ever draws the private
+    /// clone of this repository — never a host-mode seat and never a private
+    /// clone of another repository. (The unchanged non-contained filter is
+    /// covered by
+    /// [`pool_selection_never_draws_a_private_clone_of_another_repository`].)
+    #[test]
+    #[serial_test::serial]
+    fn a_contained_draw_never_picks_a_host_mode_account() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let ws = workspace_with_origin(&format!("{here}.git"));
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        for name in ["host-a", "host-b"] {
+            std::fs::create_dir_all(profiles.path().join(name)).unwrap();
+        }
+        private_profile(profiles.path(), "clone-here", &format!("{here}.git"));
+        private_profile(profiles.path(), "clone-other", "https://github.com/2AMLogic/vibesql");
+        let names = ["clone-here", "clone-other", "host-a", "host-b"];
+        let accounts = names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let logical = logical_repository(ws.path());
+        let mut drawn = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let account = select_codex_account_where(ws.path(), None, |account| {
+                keeps_launch(true, account, logical.as_deref())
+            })
+            .unwrap();
+            drawn.insert(account.id.name);
+        }
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert!(drawn.iter().all(|name| name == "clone-here"), "{drawn:?}");
     }
     fn fixture_config() -> Config {
         Config {

@@ -57,6 +57,9 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     let (config, dir) = lifecycle::resolve(&root, &name)?;
     let selection = if std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none() {
         Some(
+            // A manual invocation, not an admission draw: the pre-#14110
+            // filter applies (this launch may still resolve to a host
+            // session).
             dispatch::Selection::prepare(
                 &root,
                 "codex",
@@ -64,6 +67,7 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
                 JobKind::Role,
                 None,
                 &format!("manual-{}", uuid::Uuid::new_v4()),
+                false,
             )?
             .context("private profile was not selected")?,
         )
