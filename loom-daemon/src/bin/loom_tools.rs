@@ -3,7 +3,7 @@
 //!
 //! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
 //! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940), plus
-//! `resolve-model` (#13878): the
+//! `resolve-model` (#13878) and `resolve-role-model` (#13956): the
 //! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
 //! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config|resolve-model`
 //! call), so there is no second copy. This crate links `loom_daemon` and not
@@ -21,8 +21,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_resolve_model_command,
-    handle_strip_ansi_command, CheckpointAction, ConfigArgs, InstallBinaryCommand,
-    ReleaseFetchArgs, ResolveModelArgs, ResyncPayloadArgs,
+    handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
+    InstallBinaryCommand, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
+    ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -30,7 +31,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -68,6 +69,11 @@ enum ToolsCommands {
     /// same arguments, stdout and exit codes as `loom-daemon resolve-model`
     /// (#13878), so `resolve-model.sh` works with no daemon binary installed.
     ResolveModel(ResolveModelArgs),
+    /// Resolve a role's model for an attended (Task-tool) subagent spawn —
+    /// the same arguments, stdout and exit codes as `loom-daemon
+    /// resolve-role-model` (issue #13956), so `resolve-role-model.sh` works
+    /// with no daemon binary installed.
+    ResolveRoleModel(ResolveRoleModelArgs),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -133,6 +139,7 @@ fn run() -> Result<()> {
         ToolsCommands::ResyncPayload(args) => args.run(),
         // No forge call, so no mode gate (§10.3 gates `checkpoint read` only).
         ToolsCommands::ResolveModel(args) => handle_resolve_model_command(&args),
+        ToolsCommands::ResolveRoleModel(args) => handle_resolve_role_model_command(&args),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }

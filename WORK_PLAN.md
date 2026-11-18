@@ -1,6 +1,6 @@
 # Work Plan
 
-Prioritized roadmap of upcoming work, maintained by the Guide role.
+Backlog snapshot from current GitHub label state, maintained by the Guide role. Direction lives in the hand-written roadmap: [docs/ROADMAP.md](docs/ROADMAP.md).
 
 The body below is a snapshot of GitHub label state as of the last merged docs-maintenance PR — it may lag live labels until the next one merges. Date the snapshot with `git log -1 -- WORK_PLAN.md`.
 

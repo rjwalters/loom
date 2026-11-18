@@ -117,6 +117,86 @@ pub fn handle_resolve_model_command(args: &ResolveModelArgs) -> Result<()> {
     Ok(())
 }
 
+/// The shared `resolve-role-model` argument surface: one struct behind both
+/// clap roots (`loom-daemon resolve-role-model` and `loom-tools
+/// resolve-role-model`), so the two cannot drift apart (the #13878 pattern).
+#[derive(clap::Args)]
+pub struct ResolveRoleModelArgs {
+    /// A role name (`judge`, `Builder`, `judge.md` — normalized
+    /// case- and `.md`-suffix-insensitively).
+    #[arg(value_name = "ROLE")]
+    pub role: String,
+
+    /// Explicit tier-1 override; wins over every config tier. Blank = unset
+    /// (the same contract `resolve-model`'s callers apply to an explicit
+    /// dispatch param).
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Path to a `.loom/config.json` to read verbatim (default: resolve
+    /// the `./.loom` config tier chain, including `.loom-local/local.json`).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<String>,
+
+    /// Map the resolved model to the nearest Task-tool alias (#4282) before
+    /// printing — the one-call form a spawning session uses right before
+    /// passing the value to the Task `model` parameter. Exit 3 when the
+    /// resolved model has no Task-passable alias (caller omits the param).
+    #[arg(long = "task-alias")]
+    pub task_alias: bool,
+
+    /// Print a JSON record (`role`, `model`, `source`) instead of the bare
+    /// model, and always exit 0. The observability form (issue #13956):
+    /// `source` names the tier that supplied the model (`param` |
+    /// `roleConfig.model` | `suggestedModel` | `inherit`), so an experiment
+    /// can log what a spawn actually ran on.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `resolve-role-model` — backs `resolve-role-model.sh` (issue #13956).
+/// Served by both binaries: `loom-daemon resolve-role-model` and `loom-tools
+/// resolve-role-model`, both calling this one handler.
+///
+/// Exit codes: `0` resolved (or `--json` report printed), `2` (clap) when no
+/// role was supplied, and `3` with NO output when nothing is configured (or
+/// `--task-alias` has no mapping) so the caller omits the Task `model`
+/// parameter and the subagent inherits the parent session's model.
+pub fn handle_resolve_role_model_command(args: &ResolveRoleModelArgs) -> Result<()> {
+    use script_helpers::{model_tiers, role_model};
+
+    let cfg = model_tiers::load_config(args.config.as_deref().map(Path::new));
+    // The same cwd anchoring `model_tiers::load_config(None)` uses: the stubs
+    // are invoked as `./.loom/scripts/resolve-role-model.sh` from a repo root.
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolved =
+        role_model::resolve_role_model(&cfg, &repo_root, &args.role, args.model.as_deref());
+
+    if args.json {
+        let obj = serde_json::json!({
+            "role": args.role,
+            "model": resolved.model,
+            "source": resolved.source,
+        });
+        println!("{obj}");
+        return Ok(());
+    }
+
+    let Some(model) = resolved.model else {
+        std::process::exit(3);
+    };
+    if args.task_alias {
+        let alias = model_tiers::task_alias_of(&model);
+        if alias.is_empty() {
+            std::process::exit(3);
+        }
+        println!("{alias}");
+        return Ok(());
+    }
+    println!("{model}");
+    Ok(())
+}
+
 /// The worktree a checkpoint command targets: `--worktree` when given, else the
 /// current directory (matching the Python default).
 fn checkpoint_worktree(worktree: Option<&str>) -> PathBuf {
@@ -452,6 +532,37 @@ mod tests {
             let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             assert!(matches!(cli.command, Some(Commands::ResolveModel { .. })), "{argv:?}");
         }
+    }
+
+    /// #13956: `resolve-role-model` parses its surface — the bare role, and
+    /// each flag in composition.
+    #[test]
+    fn resolve_role_model_keeps_its_surface() {
+        for argv in [
+            &["loom-daemon", "resolve-role-model", "judge"][..],
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--model",
+                "claude-opus-5",
+            ],
+            &["loom-daemon", "resolve-role-model", "judge", "--task-alias"],
+            &["loom-daemon", "resolve-role-model", "judge", "--json"],
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--json",
+                "--config",
+                "x.json",
+            ],
+        ] {
+            let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(matches!(cli.command, Some(Commands::ResolveRoleModel { .. })), "{argv:?}");
+        }
+        // The role argument is required.
+        assert!(try_parse_cli(&["loom-daemon", "resolve-role-model"]).is_err());
     }
 
     /// #11665: tier-2.5 routing and the Jev tier shadow are deleted, so their
