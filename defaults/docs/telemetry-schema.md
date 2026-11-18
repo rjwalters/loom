@@ -1362,7 +1362,7 @@ gradeable by a model or prompt experiment.
 | `found_work` | bool | no | A **launched Judge** role-runner tick won a PR claim (or its prompt named a PR) or wrote a verdict (#12362). `false` is an observation (an idle, spawned tick), never a default; absent for any other role and for a tick that never launched. Mapped to `loom.found_work`. Additive. |
 | `noop_reason` | string | no | Set exactly when `found_work` is `false`: the session's own `LOOM_STEP_OUTCOME role=judge … reason=` (advisory, read from the role log after the tick's last `# LOOM_RUNTIME_RESOLVED` marker), else the daemon-observed `no_claim_no_verdict`. Mapped to `loom.noop_reason`. |
 | `verdicts` | array | no | One `{pr_number, head_sha?, verdict}` per PR a Judge tick wrote a verdict on, from the `forge verdict-labels` write via the pick journal (`verdict` is `approved` or `changes_requested`; `head_sha` is the `--sha` `post-verdict.sh` passed). Omitted when none. Mapped to `loom.role_tick.verdicts` (JSON). |
-| `step_class` / `step_reason` | string | no | On a step-sourced record: the step's `LOOM_STEP_OUTCOME` class and reason, which `result` collapses (`verdict`/`noop`/`refused` all read `success`). Mapped to `loom.role_tick.step_class` / `loom.role_tick.step_reason`. `result` itself is unchanged. |
+| `step_class` / `step_reason` | string | no | On a step-sourced record: the step's `LOOM_STEP_OUTCOME` class and reason, which `result` collapses (`verdict`/`noop`/`refused` all read `success`). `step_class` is `"none"` when the step wrote no parseable outcome line (#14168) — countable, never absent — with no `step_reason`; the reason is truncated to 64 `char`s (#14168). Mapped to `loom.role_tick.step_class` / `loom.role_tick.step_reason`. `result` itself is unchanged. |
 
 #### `result` — seven values, and why a skip is not a failure
 
@@ -1433,6 +1433,46 @@ action (`gh issue edit --add-label`, `gh pr comment`, `merge-pr.sh`, `gh api …
 is not counted, and a single command chaining several such invocations counts
 once per bucket. Under-counting is preferred to over-counting: a compound
 command must never inflate the number a fleet decision is made on.
+
+#### The step's `loom.sweep` close: outcome by runtime, model and role (#14168)
+
+The question "what did each step actually achieve — PR opened, parked,
+refused — and which runtime and model is best at which role?" is answered from
+the step's own `loom.sweep` span close, without grepping host step logs (whose
+three observed line framings — bare, backticked, inside a JSON text event —
+made a first-pass grep under-count one runtime by more than a factor of ten;
+the parser accepts all three, one test each). The close carries, beside the
+`loom.role` it already had:
+
+| span attribute | value |
+|---|---|
+| `loom.step.outcome.class` | The step's `LOOM_STEP_OUTCOME` class: `verdict`, `noop`, `refused` or `failed`. **`none`** when the step wrote no parseable outcome line — a countable value, never an absence (#13521 tracks why some steps end without one). A Champion step writes a `CHAMPION-STEP` line instead, so it closes `none` here; its class is on its `pass.verdict` record. |
+| `loom.step.outcome.reason` | The line's `reason` token as written (`-` folded to `_`), truncated to 64 `char`s. Absent when the class is `none`. A later issue may close the vocabulary. |
+| `loom.runtime` | The registry's runtime for the step (`claude`, `codex`, …), the same fact `SweepInfo.runtime` records; absent for a legacy entry. |
+
+`loom.configured_model` / `loom.effort` were already on the close. The
+`role_tick.outcome` record carries the same pair additively as
+`loom.role_tick.step_class` / `loom.role_tick.step_reason`, with
+`step_class="none"` in the no-line case. Additive; no `schema_version` bump.
+Both new keys are on the daemon export allowlist and the collector's span
+`keep_keys` (contract-tested).
+
+One query answers "outcomes by runtime, model and role" for a day
+(SigNoz; every span attribute is exported as a string):
+
+```sql
+SELECT
+  attributes_string['loom.runtime'] AS runtime,
+  attributes_string['loom.configured_model'] AS model,
+  attributes_string['loom.role'] AS role,
+  attributes_string['loom.step.outcome.class'] AS class,
+  count() AS steps
+FROM signoz_traces.signoz_index_v3
+WHERE attributes_string['loom.step.outcome.class'] != ''
+  AND timestamp >= now() - INTERVAL 1 DAY
+GROUP BY runtime, model, role, class
+ORDER BY steps DESC
+```
 
 ### `session.summary`
 
