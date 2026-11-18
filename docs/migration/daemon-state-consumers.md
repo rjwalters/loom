@@ -244,7 +244,7 @@ The only Rust references to `daemon-state.json` are in `loom-daemon/src/init/pos
 |---|---|---|---|
 | `loom-daemon/src/init/post_init.rs` | None (writes `.gitignore` patterns as static strings). | Adds ephemeral-files patterns to user `.gitignore` during install. | **docs-update / pattern-list-trim** — Phase 3 should drop `.loom/daemon-state.json`, `.loom/[0-9][0-9]-daemon-state.json`, `.loom/progress/`, `.loom/stuck-history.json`, `.loom/alerts.json`, `.loom/health-metrics.json` from this list. Replace with `.loom/spawn-loop-state.json`. The associated tests (lines 247, 249, 253, 283, 284, 297, 318, 322, 335, 502) also need their assertions updated. |
 
-Other Rust references in `loom-daemon/src/main.rs`, `loom-daemon/src/init/git.rs`, `loom-daemon/src/init/mod.rs`, `loom-daemon/src/forge_parser.rs`, `loom-daemon/src/git_parser.rs`, `loom-daemon/src/activity/test_parser.rs` are help text or string parsing — not state-file consumers. **already-decoupled** for the purpose of Phase 3.
+Other Rust references in `loom-daemon/src/main.rs`, `loom-daemon/src/init/git.rs`, `loom-daemon/src/init/mod.rs`, `loom-daemon/src/forge_parser.rs`, `loom-daemon/src/activity/test_parser.rs` are help text or string parsing — not state-file consumers. **already-decoupled** for the purpose of Phase 3.
 
 ## Category 6: Documentation
 

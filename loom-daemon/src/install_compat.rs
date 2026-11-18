@@ -47,14 +47,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 /// called by the host-export scripts (#10023); 0.19.1081 added `push-lease`
 /// (#9487, #10771). 0.19.1146 is the first release whose `curation-complete`
 /// applies `loom:curated` (#11676), called by `create-issue.sh` (#11787).
-/// 0.19.1311 is the first release with the `resolve-role-model` subcommand
-/// (#13956), called by the `resolve-role-model.sh` script-helper, whose hard
+/// 0.19.1312 is the first release with the `resolve-role-model` subcommand
+/// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
+/// `resolve-role-model.sh` script-helper, whose hard
 /// floor is the same release.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1311";
+pub const REQUIRES_DAEMON: &str = "0.19.1312";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree

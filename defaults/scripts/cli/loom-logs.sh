@@ -9,7 +9,7 @@
 #   loom logs --help              Show help
 #
 # Examples:
-#   loom logs shepherd-1          Tail shepherd-1 output
+#   loom logs builder-1           Tail builder-1 output
 #   loom logs terminal-1 -n 100   Show last 100 lines
 #   loom logs --all               Follow all agent logs
 
@@ -77,14 +77,14 @@ ${YELLOW}USAGE:${NC}
     loom logs --help              Show this help
 
 ${YELLOW}EXAMPLES:${NC}
-    loom logs shepherd-1          Tail shepherd-1 output (follows)
+    loom logs builder-1           Tail builder-1 output (follows)
     loom logs terminal-1 -n 100   Show last 100 lines then follow
     loom logs --all               Follow all agent logs interleaved
-    loom logs shepherd-1 --no-follow  Just show last lines, don't follow
+    loom logs builder-1 --no-follow  Just show last lines, don't follow
 
 ${YELLOW}LOG LOCATIONS:${NC}
     Agent output is captured to:
-      /tmp/loom-<agent-name>.out  e.g., /tmp/loom-shepherd-1.out
+      /tmp/loom-<agent-name>.out  e.g., /tmp/loom-builder-1.out
 
     Daemon log:
       .loom/daemon.log

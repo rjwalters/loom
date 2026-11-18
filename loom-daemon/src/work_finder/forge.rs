@@ -268,7 +268,7 @@ impl GhWorkSource {
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
 /// idempotency key, `mkdir`-atomic claim lock, and `loom:issue →
 /// loom:building` label flip — so the finder never reimplements the race
-/// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
+/// guard. `in_flight()` reads the registry's `Running` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
 }
@@ -313,12 +313,10 @@ impl WorkDispatcher for RegistryDispatcher {
             // against the concurrency budget and defer legitimate new dispatch.
             reg.reap_liveness();
             let mut set = HashSet::new();
-            for state in [SweepState::Running, SweepState::Pending] {
-                for info in reg.list(Some(&state)) {
-                    // A step holds its item's slot like a sweep (#11898).
-                    if let Some(n) = info.kind.item_number() {
-                        set.insert(n);
-                    }
+            for info in reg.list(Some(&SweepState::Running)) {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
+                    set.insert(n);
                 }
             }
             set

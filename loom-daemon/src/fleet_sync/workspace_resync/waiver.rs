@@ -3,8 +3,9 @@
 //!
 //! A `chore(loom): resync installed Loom to vX` PR copies files Loom already
 //! reviewed and merged. [`evaluate`] is the mechanical proof that a PR is
-//! exactly that: the title shape, an install-set-only file list with no
-//! merge-gate path, the metadata at the head naming the same version, the tag
+//! exactly that: the title shape, an install-set-only file list whose
+//! merge-gate paths, if any, are byte-copies of a published release's tag
+//! (#13982), the metadata at the head naming the same version, the tag
 //! existing, a complete file list, and every kept-set file byte-identical
 //! (blob SHA) to its `defaults/` counterpart at the tag. Every read that
 //! fails, and every surprise, is `NotEligible`: the proof fails closed.
@@ -122,8 +123,8 @@ fn matches_any(patterns: &[&str], path: &str) -> bool {
 
 /// The `defaults/` counterpart of an installed path, per the surface map in
 /// `resync-installed.sh`. `None` when the path has none. Roles and generated
-/// skill copies are unmapped here (#13313); the strict proof maps them through
-/// [`strict_upstream_path`] (#13665).
+/// skill copies are unmapped here (#13313); the Loom proof maps them through
+/// [`strict_upstream_path`] (#13665), strict or not (#13982).
 #[must_use]
 pub fn upstream_path(installed: &str) -> Option<String> {
     const MAP: &[(&str, &str)] = &[
@@ -142,10 +143,11 @@ pub fn upstream_path(installed: &str) -> Option<String> {
     })
 }
 
-/// [`upstream_path`] plus the two surfaces only the daemon's strict proof
-/// byte-checks (#13665): roles and the generated skill copies. Both are
-/// committed under `defaults/` in the tag, so a blob compare is equivalent to
-/// regenerating.
+/// [`upstream_path`] plus the two surfaces the install surface map leaves out
+/// (#13665): roles and the generated skill copies. Both are committed under
+/// `defaults/` in the tag, so a blob compare is equivalent to regenerating.
+/// The Loom proof uses it for the daemon's strict landing and Champion's
+/// non-strict waiver alike (#13982).
 fn strict_upstream_path(installed: &str) -> Option<String> {
     upstream_path(installed).or_else(|| {
         installed
@@ -230,10 +232,9 @@ impl Kind {
         }
     }
 
-    fn upstream_path(self, installed: &str, strict: bool) -> Option<String> {
+    fn upstream_path(self, installed: &str) -> Option<String> {
         match self {
-            Self::Loom if strict => strict_upstream_path(installed),
-            Self::Loom => upstream_path(installed),
+            Self::Loom => strict_upstream_path(installed),
             Self::RepoSkills => repo_skills_upstream_path(installed),
         }
     }
@@ -286,7 +287,8 @@ pub enum Verdict {
         head: String,
         /// One `(path, blob sha)` per kept-set file.
         record: Vec<(String, String)>,
-        /// Whether a merge-gate path is among the byte-checked files (#13665).
+        /// Whether a merge-gate path is among the byte-checked files
+        /// (#13665, #13982).
         gate_paths_included: bool,
     },
     NotEligible(String),
@@ -435,11 +437,14 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
             }
         }
     }
-    // Under the strict Loom proof a gate path is not refused outright: the
-    // release tag is the review point (operator ruling r7-q33, #13487), so a
-    // gate file lands only if it is byte-identical to the tag (checked below)
-    // and the tag is a published release (checked after the loop).
-    let relax_gate = strict && kind == Kind::Loom;
+    // Under the Loom proof — the daemon's strict landing and Champion's
+    // non-strict waiver alike (#13982) — a gate path is not refused outright:
+    // the release tag is the review point (operator rulings r7-q33, #13487,
+    // and 2026-11-17, #13982), so a gate file passes only if it is
+    // byte-identical to the tag (checked below) and the tag is a published
+    // release (checked after the loop). Any other change to a gate file still
+    // holds (#12945).
+    let relax_gate = kind == Kind::Loom;
     let mut gate_paths_included = false;
     let mut record = Vec::new();
     for f in &files {
@@ -475,7 +480,7 @@ fn prove(src: &dyn Source, number: u32, strict: bool) -> Verdict {
         if f.status != "added" && f.status != "modified" {
             return no(format!("{} is {}", f.filename, f.status));
         }
-        let Some(up) = kind.upstream_path(&f.filename, strict) else {
+        let Some(up) = kind.upstream_path(&f.filename) else {
             return no(format!("{} has no upstream counterpart", f.filename));
         };
         match src.upstream_blob(kind, &up, &tag) {
