@@ -21,10 +21,13 @@
 //! when the item is frozen); the Builder's `restore_builder_step` notes
 //! its read unconditionally too. The steps with no noted read are three:
 //! the `skip_label_flip` early return, a `ChampionMerge` step (no claim
-//! label), and a step whose item is held elsewhere — every caller of
-//! `restore_step_claim` (the reaper, startup adoption and a roll requeue)
-//! checks `step_claim_held_elsewhere` first and skips the release entirely,
-//! so no read and no note happen; the tick reads the item itself for those.
+//! label), and a step whose item is held elsewhere — the reaper and startup
+//! adoption check `step_claim_held_elsewhere` before `restore_step_claim`,
+//! and a roll requeue makes its own ownership check instead
+//! (`roll_claim_still_ours` for an issue role, `roll_pr_step_claim_still_ours`
+//! for a PR role, which does call `step_claim_held_elsewhere`); all three
+//! skip the release entirely, so no read and no note happen; the tick reads
+//! the item itself for those.
 //! The queue is per workspace root and
 //! in-memory: a step that ended just before a restart is not recorded, which
 //! costs at most one cooldown the ledger would have armed.
