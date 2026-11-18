@@ -51,11 +51,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.0";
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
 /// floor is the same release.
+/// 0.19.1314 is the next-patch floor for strict `lease ensure --require-ownership`
+/// (#14376), required by fresh Builder worktree admission. 0.19.1313 shipped
+/// before this flag; the compatibility contract permits the next patch while
+/// the daemon and installed-script change await their first release together.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.19.1312";
+pub const REQUIRES_DAEMON: &str = "0.19.1314";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree

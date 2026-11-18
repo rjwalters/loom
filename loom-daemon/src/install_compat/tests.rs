@@ -151,6 +151,19 @@ fn classify_needs_newer_daemon() {
 }
 
 #[test]
+fn strict_builder_files_hold_the_last_daemon_without_native_ownership() {
+    let installed = meta(Some(REQUIRES_DAEMON), Some(REQUIRES_DAEMON));
+    let mut host = DaemonCompat {
+        running: v("0.19.1313"),
+        supports_installed: v(SUPPORTS_INSTALLED),
+        floor: None,
+    };
+    assert_eq!(classify(&installed, &host), Compat::NeedsNewerDaemon);
+    host.running = v(REQUIRES_DAEMON);
+    assert_eq!(classify(&installed, &host), Compat::Compatible);
+}
+
+#[test]
 fn classify_boundary_loom_version_equal_to_supports_installed_is_compatible() {
     assert_eq!(
         classify(&meta(Some("0.19.500"), Some("0.19.400")), &daemon()),

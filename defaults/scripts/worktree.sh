@@ -1570,14 +1570,18 @@ _wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure
 # A label write carries no owner, so a fresh Builder checkout is handed over only
 # on POSITIVE ownership: `lease ensure --require-ownership` must print `OWNED`.
 # `PEER_OWNED` (exit 4) is a definitive refusal; `INDETERMINATE`, an unreadable
-# answer, a missing/old daemon (clap usage error, exit 2) or any failure is NOT
-# ownership and is refused too (return 5). The generic standalone
+# answer or any failure is NOT ownership and is refused too (return 5).
+# A missing/below-floor daemon is a separate actionable refusal (return 6).
+# The generic standalone
 # `lease ensure` (no flag) and Doctor reuse keep their fail-open contract:
 # they never reach this function. Returns 0 only when owned.
 _wt_lease_claim_owned() {
-    [[ -n "$_WT_DAEMON_BIN" ]] || return 5
+    [[ -n "$_WT_DAEMON_BIN" ]] || return 6
+    # Run the shared preflight in a subshell: its exit must not bypass the
+    # caller's discard of the fresh checkout or its machine-readable refusal.
+    (loom_daemon_version_preflight lease "$_WT_DAEMON_BIN") || return 6
     local _rc=0 _tok=""
-    # requires-daemon: lease-ownership required   #14376 a fresh Builder handoff needs positive ownership; a daemon predating `lease ensure --require-ownership` cannot prove it
+    # requires-daemon: lease >= 0.19.1314   #14376 strict ownership first ships in the next patch; generic standalone/Doctor lease calls still fail open
     _tok=$("$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 3>&-) || _rc=$?
     [[ "$_rc" -ne 4 ]] || return 4
     [[ "$_rc" -eq 0 && "$_tok" == "OWNED" ]] || return 5
@@ -1648,7 +1652,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     # 2) all fail OPEN, as #8553's check-issue call above does. The `.git`
     # probe keeps `git status` from walking up into the parent checkout.
     # shellcheck disable=SC2086  # $_ljson is intentionally unquoted: omits the flag when empty
-    # requires-daemon: lease optional   kicad-tools#5783 fails open on a daemon predating `lease co-occupancy`
+    # kicad-tools#5783: this reuse probe still fails open on an older daemon;
+    # the hard lease floor above applies to fresh Builder admission.
     [[ -z "${_WT_DAEMON_BIN:-}" || ! -e "$WORKTREE_PATH/.git" || -z "$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)" ]] || { _ljson=""; _lrc=0; [[ "$JSON_OUTPUT" == "true" ]] && _ljson="--json"; "$_WT_DAEMON_BIN" lease co-occupancy "$ISSUE_NUMBER" --repo "$WORKTREE_REPO_ROOT" $_ljson >&3 || _lrc=$?; [[ "$_lrc" -eq 1 ]] && exit 1; }
     _worktree_existing || exit 1
     # #9111: under --json the port is --quiet, so the success document for the
@@ -1880,7 +1885,13 @@ if _try_worktree_add; then
                 print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
             else
                 _own_tok=OWNERSHIP_UNVERIFIED
-                print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
+                if [[ "$_own_rc" -eq 6 ]]; then
+                    _own_tok=DAEMON_INCOMPATIBLE
+                    print_error "Issue #$ISSUE_NUMBER: a missing or below-floor daemon cannot verify Builder ownership; refusing to hand over a worktree."
+                else
+                    print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
+                fi
+                print_error "Builder admission requires loom-daemon >= $(_loom_daemon_declared_floor "${BASH_SOURCE[0]}" lease) with lease ensure --require-ownership. Roll this host with .loom/scripts/cli/loom-daemon-update.sh --fetch once that release is available, then retry; otherwise inspect the ownership error above."
             fi
             if [[ "$JSON_OUTPUT" == "true" ]]; then
                 echo '{"success": false, "error": "'"$_own_tok"'", "issueNumber": '"$ISSUE_NUMBER"'}' >&3

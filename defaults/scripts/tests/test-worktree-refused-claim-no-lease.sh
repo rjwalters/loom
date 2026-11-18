@@ -67,6 +67,7 @@ echo "$*" >> "$STUB_LOG"
 # with 0 (so the script takes the daemon path) and the real call with the value.
 opt_in() { [[ -n "$1" ]] || exit 2; [[ "$2" == "--help" ]] && exit 0; }
 case "$1" in
+    --version)    [[ -n "${STUB_VERSION:-}" ]] && echo "loom-daemon $STUB_VERSION" && exit 0 ;;
     forge)        [[ "$2" == "check-claim" ]] && exit "${STUB_CHECK_CLAIM_RC:-1}" ;;
     worktree-lock) exit "${STUB_CHECK_ISSUE_RC:-2}" ;;
     lease)
@@ -244,6 +245,22 @@ STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' run_wt 519
 if [[ "$RC" -ne 0 ]]; then pass "old daemon cannot prove ownership: refused (rc=$RC)"; else fail "unverified ownership admitted"; cat "$TMP/out.log"; fi
 no_peer_side_effects 519
 if grep -q "could not be positively verified" "$TMP/out.log"; then pass "refusal says ownership unverified"; else fail "refusal not explained"; cat "$TMP/out.log"; fi
+if grep -q 'requires loom-daemon >= 0.19.1314' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "unknown-version refusal names the floor and roll command"; else fail "no actionable roll advice"; cat "$TMP/out.log"; fi
+
+echo "Test 25: released daemon before strict ownership -> distinct refusal before lease publication"
+rm -f "$STUB_HOOK_MARK"
+STUB_VERSION=0.19.1313 run_wt --json 525
+expect_refused_no_lease 525 "below-floor daemon"
+no_peer_side_effects 525
+if grep -q '"error": "DAEMON_INCOMPATIBLE"' "$TMP/out.log" && grep -q 'Required:  >= 0.19.1314' "$TMP/out.log" && grep -q 'loom-daemon-update.sh --fetch' "$TMP/out.log"; then pass "old daemon refusal is actionable and distinct from a peer"; else fail "old daemon diagnosis missing"; cat "$TMP/out.log"; fi
+
+echo "Test 26: daemon at the strict-ownership floor still must establish ownership"
+STUB_VERSION=0.19.1314 run_wt 526
+if [[ "$RC" -eq 0 && -f .loom/worktrees/issue-526/.loom-managed ]] && grep -q '^lease ensure 526 --require-ownership ' "$LOG"; then pass "floor boundary admits exact OWNED"; else fail "at-floor admission failed"; cat "$LOG" "$TMP/out.log"; fi
+rm -f "$STUB_HOOK_MARK"
+STUB_VERSION=0.19.1314 STUB_OWNERSHIP_TOKEN=INDETERMINATE STUB_OWNERSHIP_RC=2 run_wt --json 527
+no_peer_side_effects 527
+if [[ "$RC" -ne 0 ]] && grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "sufficient version never substitutes for positive ownership"; else fail "at-floor unverifiable ownership admitted or mislabeled"; cat "$TMP/out.log"; fi
 
 echo "Test 21: INDETERMINATE ownership (exit 0) -> refused, nothing created"
 rm -f "$STUB_HOOK_MARK"
