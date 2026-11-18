@@ -1091,9 +1091,17 @@ fn peer_coordination(
         .env("LOOM_SOCKET_PATH", &paths.socket_path);
     let timeout =
         std::time::Duration::from_secs(env::num("LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS", 15));
-    let Some(out) = crate::sweep_registry::output_with_timeout(cmd, timeout)
-        .ok()
-        .flatten()
+    // #14100: attribute the peer-claims probe's pid (start line only; the
+    // child is short-lived and awaited below). `run_bounded_observed` is the
+    // observed runner `output_with_timeout` lacks: it hands the spawned pid
+    // to the closure and still returns the child's `Output` on
+    // `Completion::Exited`, with proc_exec's pipe draining in place of the
+    // `output_with_timeout` poll loop.
+    let argv = crate::fleet_sync::git_spawn_log::argv_of(&cmd);
+    let Ok(crate::proc_exec::Completion::Exited(out)) =
+        crate::proc_exec::run_bounded_observed(cmd, timeout, |pid| {
+            log::info!("{}", crate::self_spawn_log::start_line("watchdog_peer_claims", pid, &argv));
+        })
     else {
         return;
     };

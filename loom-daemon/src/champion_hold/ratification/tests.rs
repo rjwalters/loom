@@ -260,7 +260,9 @@ fn the_state_machine_walks_hold_release_rearm_clear() {
 #[test]
 fn an_unreadable_candidate_never_merges_and_never_drops_a_hold() {
     let unreadable = Verdict::Unreadable(vec!["spec/a.md".into()]);
-    assert_eq!(decide(&unreadable, &[], HEAD), Action::Defer);
+    // Unreachable from the CLI (#13932 fails closed first); if one arrives
+    // anyway it opens or keeps a hold, never a silent pass.
+    assert_eq!(decide(&unreadable, &[], HEAD), Action::Hold);
     assert_eq!(decide(&unreadable, &[hold_note(HEAD)], HEAD), Action::Stands);
 }
 

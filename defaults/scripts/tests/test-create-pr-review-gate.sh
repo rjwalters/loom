@@ -255,6 +255,95 @@ assert_contains "$OUTPUT" "#207" "Refusal names the partial-reference issue, not
 assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 207" "Guard consulted #207"
 assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "597" "Guard never consulted the narrated #597"
 
+# T10 (#14157): a `Part of` reference indented by exactly ONE space must
+# still drive the guard. The #13939 alternation's `^` branch required
+# column 0 and its prose branch needed a non-whitespace guard char, so a
+# one-space prefix satisfied no branch -- TARGET_ISSUE came back empty and
+# this pre-check was silently skipped (fail-open, #14157).
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-208-rc.txt"
+echo "559" > "$STUB_DIR/opr-208-stdout.txt"
+echo "feature/issue-208-alt" > "$STUB_DIR/pr-559-head.txt"
+run_create_pr --title "feat: slice" --body " Scope context.
+
+ Part of #208" --head "feature/issue-208"
+assert_eq "6" "$EXIT_CODE" "One-space-indented 'Part of #208' with rival open PR -> exit 6"
+assert_contains "$OUTPUT" "#208" "Refusal names the indented partial-reference issue"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 208" "Guard consulted the indented reference"
+
+# T11 (#14157): same false-negative class for exactly one TAB of indent,
+# with a closing keyword.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-209-rc.txt"
+echo "560" > "$STUB_DIR/opr-209-stdout.txt"
+echo "feature/issue-209-alt" > "$STUB_DIR/pr-560-head.txt"
+run_create_pr --title "fix: something" --body $'\tCloses #209' --head "feature/issue-209"
+assert_eq "6" "$EXIT_CODE" "One-tab-indented 'Closes #209' with rival open PR -> exit 6"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 209" "Guard consulted the tab-indented closing reference"
+
+# T12 (#14157): a whitespace-delimited token ending in a digit before the
+# keyword (`Phase 3`) -- the #13939 prose guard rejected ANY digit before
+# the whitespace run, over-rejecting `Phase 3 fixes #N` (no `#` in the
+# token), and the guard was skipped entirely.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-210-rc.txt"
+echo "561" > "$STUB_DIR/opr-210-stdout.txt"
+echo "feature/issue-210-alt" > "$STUB_DIR/pr-561-head.txt"
+run_create_pr --title "feat: slice" --body "Phase 3 fixes #210" --head "feature/issue-210"
+assert_eq "6" "$EXIT_CODE" "'Phase 3 fixes #210' with rival open PR -> exit 6 on #210"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 210" "Guard consulted #210"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 605" "Guard never consulted a narrated reference token"
+
+# T13 (#14255): a parenthesised narration (`PR #14082 (which fixes #300)`)
+# earlier in the body must not outrank the declared trailing `Closes #208` --
+# last-match: the guard consults #208, never the narrated #300.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-208-rc.txt"
+echo "559" > "$STUB_DIR/opr-208-stdout.txt"
+echo "feature/issue-208-alt" > "$STUB_DIR/pr-559-head.txt"
+run_create_pr --title "fix: something" --body "Follow-up to PR #14082 (which fixes #300).
+
+Closes #208" --head "feature/issue-208"
+assert_eq "6" "$EXIT_CODE" "Parenthesised narration + Closes #208 with rival PR -> exit 6 on #208"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 208" "Guard consulted the declared #208"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "300" "Guard never consulted the narrated #300"
+
+# T14 (#14255): `Closes #A` ... `Part of #B` -> the closing reference is the
+# PR's target regardless of order; the guard must not consult the family
+# issue #B (which routinely has open sibling PRs).
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-209-rc.txt"
+echo "560" > "$STUB_DIR/opr-209-stdout.txt"
+echo "feature/issue-209-alt" > "$STUB_DIR/pr-560-head.txt"
+run_create_pr --title "fix: something" --body "Closes #209
+
+Part of #400" --head "feature/issue-209"
+assert_eq "6" "$EXIT_CODE" "Closes #209 then Part of #400 -> exit 6 on #209"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 209" "Guard consulted the closing target #209"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "400" "Guard never consulted the partial #400"
+
+# T15 (#14255): reverse order (`Part of #B` then `Closes #A`) -> same answer.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-210-rc.txt"
+echo "561" > "$STUB_DIR/opr-210-stdout.txt"
+echo "feature/issue-210-alt" > "$STUB_DIR/pr-561-head.txt"
+run_create_pr --title "fix: something" --body "Part of #401
+
+Closes #210" --head "feature/issue-210"
+assert_eq "6" "$EXIT_CODE" "Part of #401 then Closes #210 -> exit 6 on #210"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "401" "Guard never consulted the partial #401"
+
+# T16 (#14255): two partial references -> the last one is the target.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-212-rc.txt"
+echo "562" > "$STUB_DIR/opr-212-stdout.txt"
+echo "feature/issue-212-alt" > "$STUB_DIR/pr-562-head.txt"
+run_create_pr --title "feat: slice" --body "Part of #402
+
+Part of #212" --head "feature/issue-212"
+assert_eq "6" "$EXIT_CODE" "Two Part of references -> last (#212) is the target"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "402" "Guard never consulted the earlier #402"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

@@ -755,6 +755,32 @@ fn execution_scope(active: &[ActiveSpan], root: &TraceContext, repo: &str) -> Tr
     scope
 }
 
+/// The execution scope a spawned child can stamp on its own runtime span
+/// (#14167): the repo, sweep id and item (`loom.issue` / `loom.pr_number`)
+/// its inherited execution root carries, with the repo resolved locally when
+/// tracing is enabled but there is no inherited context, or the root names
+/// none. An unknown item stays absent rather than guessed. With tracing
+/// disabled nothing consumes the attributes (the run span is never created),
+/// so this returns empty without paying the repo-facts resolution cost.
+#[must_use]
+pub fn inherited_scope(root: &Path) -> TraceAttributes {
+    if !super::tracing::enabled(root) {
+        return TraceAttributes::new();
+    }
+    let repo = TraceStore::repo_attribute(root);
+    let Some((journal, root_context, _)) = inherited_context(root) else {
+        let mut attrs = TraceAttributes::new();
+        if !repo.is_empty() {
+            attrs.insert("loom.repo".into(), repo);
+        }
+        return attrs;
+    };
+    let Ok(active) = journal.active() else {
+        return TraceAttributes::new();
+    };
+    execution_scope(&active, &root_context, &repo)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_observation(
     journal: &Journal,

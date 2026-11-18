@@ -281,29 +281,50 @@ EX_REVIEW_GATE_COLLISION=6
 
 # One keyword-reference extractor shared by the review-gate lookup (#9453
 # phase 5) and the superseded-target lookup (#6277) below, so the two cannot
-# drift (#13939). First-match semantics, as before.
+# drift (#13939). LAST-match semantics (#14255): the declared reference is the
+# trailing one (builder-pr.md puts `Closes #N` / `Part of #N` last), so a
+# narrated keyword earlier in the body (`v1.2 fixed #123, and this PR
+# Closes #456`, `PR #14082 (which fixes #13939)`) must not outrank it.
 #
 # The leading-guard alternation skips a keyword whose immediately preceding
 # token is a PR/issue reference: `PR #605 fixed #597` narrates history, it
-# does not close #597, so it must not win `head -1` over the real trailing
-# `Closes #N` (#13939). The three guard branches, most specific first:
-#   ^                            keyword opens the line (any body line)
+# does not close #597, so it must not win over the real trailing
+# `Closes #N` (#13939). The guard branches:
+#   ^[[:space:]]*                keyword opens the line, optionally indented
+#                                -- a one-space/one-tab prefix satisfies no
+#                                branch under the bare `^` of #13939, so
+#                                ` Closes #N` extracted nothing and both
+#                                guards were skipped (#14157)
+#   (^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+
+#                                a whitespace-delimited token that ENDS in a
+#                                digit and contains no `#` (`Phase 3`,
+#                                `v1.2`, `ADR-0015`) -- the #13939 prose
+#                                branch rejected ANY digit before the
+#                                whitespace run, over-rejecting these; the
+#                                no-`#` class keeps `PR #605 fixed #597`
+#                                narration unmatched
 #   [^#0-9][[:space:]]+          ordinary prose before the keyword -- a
 #                                digit/`#` right before the whitespace run
 #                                is the `#N`-reference narration signature
 #   [^[:alnum:]_#[:space:]]      punctuation attached with no space, the
 #                                `**Fixes #1**` / `(closes #1)` shapes the
 #                                old bare `\b` also admitted
-# The guard classes are digit-free by construction, so the trailing `#N` is
-# the only number run in the match and the final grep picks exactly it.
+# Only the digit-ending-token branch can put a number run in the match
+# before the trailing `#N`, so the extraction takes the LAST number run of
+# the LAST match -- for every other branch first and last coincide.
 _cpr_body_ref_issue() {
   # $1 = keyword alternation, e.g. 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?'
-  grep -ioE "(^|[^#0-9][[:space:]]+|[^[:alnum:]_#[:space:]])($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
-    | head -1 | grep -oE '[0-9]+' || true
+  grep -ioE "((^[[:space:]]*)|((^|[[:space:]])[^#[:space:]]*[0-9][[:space:]]+)|([^#0-9][[:space:]]+)|([^[:alnum:]_#[:space:]]))($1)[[:space:]]+#[0-9]+" <<< "$BODY" \
+    | tail -1 | grep -oE '[0-9]+' | tail -1 || true
 }
 
 # An empty body matches nothing (grep's no-match is absorbed by `|| true`).
-TARGET_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?|part of|contributes to')"
+# A closing reference outranks a partial one regardless of order (#14255): with
+# `Closes #A` ... `Part of #B` the PR's target is A, and the review gate must
+# not consult B (a family/epic that routinely has open sibling PRs). Only when
+# the body has no closing reference does the last partial reference apply.
+CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
+TARGET_ISSUE="${CLOSES_ISSUE:-$(_cpr_body_ref_issue 'part of|contributes to')}"
 
 # One daemon resolution, shared by every daemon call below (#10518).
 # shellcheck source=./lib/locate-daemon-bin.sh
@@ -355,7 +376,7 @@ fi
 # partial-increment references for a family/epic issue that intentionally
 # stays open across multiple PRs -- never match this pattern, so those PRs
 # are exempt by construction; no separate carve-out is needed.
-CLOSES_ISSUE="$(_cpr_body_ref_issue 'close[sd]?|closing|fix(e[sd])?|resolve[sd]?')"
+# (CLOSES_ISSUE is computed once above, alongside TARGET_ISSUE.)
 
 if [[ -n "$CLOSES_ISSUE" ]]; then
   # shellcheck disable=SC2054  # the comma is inside a single --json value, not an array separator

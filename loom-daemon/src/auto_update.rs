@@ -1158,7 +1158,8 @@ pub enum TickDecision {
     /// `loom-daemon status`.
     Skip(String),
     /// Do nothing, but at WARN rather than [`Self::Skip`]'s INFO: a
-    /// [`ArtifactVerdict::StaleRepo`] tick (#8513), where "nothing to do" is
+    /// [`ArtifactVerdict::StaleRepo`] tick (#8513) or a below-floor host
+    /// with no release resolved (#11029, #14224), where "nothing to do" is
     /// itself the symptom rather than a healthy host.
     SkipWarn(String),
     /// All gates passed — run the rebuild.

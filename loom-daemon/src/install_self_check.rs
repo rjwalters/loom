@@ -624,7 +624,14 @@ fn repair_token_ranking(repo_root: &Path, ctx: &RepairContext) -> RepairOutcome 
         },
     };
     let argv = ["tokens", "check", "--ranking", "--workspace"];
-    match run_with_timeout(&bin, &argv, Some(repo_root), repo_root, ctx.timeout) {
+    match run_with_timeout(
+        &bin,
+        &argv,
+        Some(repo_root),
+        repo_root,
+        ctx.timeout,
+        Some("install_self_check"),
+    ) {
         Ok(()) => RepairOutcome::Repaired(format!(
             "re-probed token pool and rewrote .ranking via `{} tokens check --ranking`",
             bin.display()
@@ -662,10 +669,10 @@ fn repair_mcp_bundle(repo_root: &Path, ctx: &RepairContext) -> RepairOutcome {
             },
         };
 
-    if let Err(e) = run_with_timeout(&npm, &["ci"], None, &mcp_dir, ctx.timeout) {
+    if let Err(e) = run_with_timeout(&npm, &["ci"], None, &mcp_dir, ctx.timeout, None) {
         return RepairOutcome::Failed(format!("`npm ci` failed: {e}"));
     }
-    if let Err(e) = run_with_timeout(&npm, &["run", "build"], None, &mcp_dir, ctx.timeout) {
+    if let Err(e) = run_with_timeout(&npm, &["run", "build"], None, &mcp_dir, ctx.timeout, None) {
         return RepairOutcome::Failed(format!("`npm run build` failed: {e}"));
     }
     RepairOutcome::Repaired(format!(
@@ -739,6 +746,7 @@ fn run_with_timeout(
     trailing_workspace: Option<&Path>,
     cwd: &Path,
     timeout: Duration,
+    self_spawn_site: Option<&'static str>,
 ) -> Result<(), String> {
     let log_path =
         std::env::temp_dir().join(format!("loom-install-self-check-{}.log", uuid::Uuid::new_v4()));
@@ -770,12 +778,19 @@ fn run_with_timeout(
             return Err(format!("could not spawn `{}`: {e}", bin.display()));
         }
     };
+    // #14100: when `bin` is the daemon's own binary, attribute its pid.
+    let mut tracked =
+        self_spawn_site.map(|site| crate::self_spawn_log::track(site, &command, child.id()));
 
     let start = Instant::now();
     let result = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) if status.success() => {
+                tracked.take().map(|t| t.finish(status));
+                break Ok(());
+            }
             Ok(Some(status)) => {
+                tracked.take().map(|t| t.finish(status));
                 let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
                 break Err(format!(
                     "`{}` exited with {status}: {}",
@@ -787,6 +802,7 @@ fn run_with_timeout(
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    tracked.take().map(|t| t.finish("timed out"));
                     break Err(format!(
                         "`{}` timed out after {}s",
                         bin.display(),

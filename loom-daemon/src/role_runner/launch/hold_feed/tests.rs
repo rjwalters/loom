@@ -13,13 +13,13 @@
 //! The #6201 tests in `role_runner/tests.rs` are deliberately untouched: they
 //! drive a `FakeRunner` that bypasses the walk and the launch path, so the
 //! hold cannot reach them. This is their sibling for the path that does.
+use crate::exec_test_support::write_executable;
 use crate::role_runner::{
     new_in_progress_guard, spawn_multi_role_task_with, RoleInvocationRunner, RoleSpec,
     RoleTickOutcome, ScriptRoleInvocationRunner,
 };
 use crate::runtime_preference::launch_failure_hold;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,11 +76,6 @@ impl Drop for Env {
             }
         }
     }
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// The production loop's process-global redirects, held for the guard's
@@ -159,7 +154,7 @@ fn doctor_workspace_with(root: &Path, opencode_output: &str) {
     let launches = root.join("launches");
     write_executable(
         &scripts.join("spawn-worker.sh"),
-        &format!(
+        format!(
             "#!/bin/sh\necho \"$LOOM_RUNTIME\" >> '{}'\n\
              if [ \"$LOOM_RUNTIME\" = opencode ]; then printf '%s\\n' '{opencode_output}'; fi\n\
              exit 0\n",
