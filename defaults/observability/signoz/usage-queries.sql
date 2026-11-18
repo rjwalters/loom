@@ -391,3 +391,47 @@ FROM (
 )
 ORDER BY input_side_total DESC, model
 LIMIT {top:UInt32};
+
+-- 7. The per-run comparison (#14167), from `loom.runtime.run` ALONE — no join
+--    to any other span, which is the whole point of the identity facts the
+--    spawn point now stamps: runs, median duration and result counts grouped
+--    by runtime, model, effort, role and account pool kind, for the window.
+--    An EMPTY cell is an ABSENT attribute (a map subscript yields ''), never a
+--    measured empty value: a runtime that reported no launched model groups
+--    under model='' instead of being folded into the configured one, and a
+--    run with no effort groups under effort=''. `runs` is span rows, `sweeps`
+--    the distinct sweep ids behind them, and `duration_p50_s` the median
+--    `duration_nano` of those spans. Read `credential_kind` beside the
+--    missing-account-name rule: the pool kind (`oauth-pool` | `chatgpt-seat`
+--    | `api-key`) is the finest attribution any span carries.
+WITH runs AS (
+    SELECT trace_id,
+           span_id,
+           any(attributes_string['loom.runtime']) AS runtime,
+           any(attributes_string['loom.model']) AS model,
+           any(attributes_string['loom.effort']) AS effort,
+           any(attributes_string['loom.role']) AS role,
+           any(attributes_string['loom.repo']) AS repo,
+           any(attributes_string['loom.result']) AS result,
+           any(attributes_string['llm.credential.kind']) AS credential_kind,
+           any(duration_nano) AS duration_nano
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'loom.runtime.run'
+      AND timestamp >= {since:DateTime}
+    GROUP BY trace_id, span_id
+)
+SELECT runtime,
+       model,
+       effort,
+       role,
+       credential_kind,
+       count() AS runs,
+       uniqExact(repo) AS repos,
+       uniqExact(trace_id) AS traces,
+       round(quantileExact(0.5)(duration_nano) / 1e9, 1) AS duration_p50_s,
+       countIf(result = 'success') AS success,
+       countIf(result != 'success') AS not_success
+FROM runs
+GROUP BY runtime, model, effort, role, credential_kind
+ORDER BY runs DESC, runtime, model, effort, role
+LIMIT {top:UInt32};
