@@ -280,6 +280,17 @@ impl OwnedClaim {
         Some(owned)
     }
 
+    /// The claim of an ATTENDED Builder that has just written its own claim
+    /// label (`--attended-claim`, #14376). Same admission as a dispatcher's
+    /// marker for the label leg, and a lease only from THIS host; another
+    /// host's fresh lease still blocks. The label carries no owner, so this
+    /// only stops the caller's own label from refusing it: ownership is then
+    /// established by `lease ensure --require-ownership`, which refuses a
+    /// peer's live lease. Pure over `raw_host` like [`Self::from_parts`].
+    pub(crate) fn attended(issue: u32, raw_host: String) -> Option<Self> {
+        Self::from_parts(Some(issue.to_string()), raw_host, issue)
+    }
+
     /// Is a fresh lease published from `host` this invoker's host's own?
     fn holds_lease_from(&self, host: &str) -> bool {
         self.lease_host.as_deref() == Some(host)
@@ -953,7 +964,7 @@ pub(crate) fn remote_branch_leg(git_bin: &Path, root: &Path, issue: u32) -> Bran
 /// the repository (a managed worktree included) and it answers about that
 /// repository. `LOOM_REPO` is honored per leg exactly as each leg's
 /// precedent reader honors it.
-pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
+pub fn handle(issue: u32, force_claim: bool, attended_claim: bool) -> Result<()> {
     let root: PathBuf = std::env::current_dir().context(
         "loom-daemon forge check-claim: could not resolve the current directory; \
          run it from inside the repository whose issue you are about to claim",
@@ -976,7 +987,11 @@ pub fn handle(issue: u32, force_claim: bool) -> Result<()> {
     // when every earlier leg is Clear (or, under --force-claim, when its
     // blocker/unreadable answer cannot change the verdict anyway — the walk
     // keeps collecting so the stderr warning names everything overridden).
-    let owned = OwnedClaim::from_env(issue);
+    let owned = OwnedClaim::from_env(issue).or_else(|| {
+        attended_claim
+            .then(|| OwnedClaim::attended(issue, crate::host_identity::lease_host_identity()))
+            .flatten()
+    });
     let owned = owned.as_ref();
     let open_pr = probe_open_linked_pr(&root, issue);
     let mut evidence = ClaimEvidence {
@@ -1322,6 +1337,48 @@ mod tests {
             );
             assert!(v.stderr.contains("safe to claim"), "{}", v.stderr);
         }
+    }
+
+    // --- An attended claim (--attended-claim, #14376) --------------------------
+
+    /// The attended flag passes the caller's own label and this host's lease
+    /// but never another host's lease, and never buys past an open PR.
+    #[test]
+    fn attended_claim_passes_own_label_but_not_a_peer_hosts_lease() {
+        let me = OwnedClaim::attended(42, "raw-host-a".to_string()).expect("known host");
+        let label = || {
+            evidence(
+                OpenPrProbe::NoneOpen,
+                Some(LabelLeg::Claimed(vec!["loom:building".to_string()])),
+                Some(LeaseLeg::NoneFresh),
+                Some(BranchLeg::Absent),
+            )
+        };
+        let v = decide_for(42, &label(), false, Some(&me));
+        assert_eq!(v.code, EX_SAFE_TO_CLAIM, "{}", v.stderr);
+
+        let me_host = me.lease_host.clone().expect("host");
+        let mut peer = label();
+        peer.lease = Some(held("host-peer"));
+        let v = decide_for(42, &peer, false, Some(&me));
+        assert_eq!(v.code, 0);
+        assert_eq!(v.stdout, "LEASE_ALREADY_HELD host-peer sweep-x");
+
+        let mut mine = label();
+        mine.lease = Some(held(&me_host));
+        assert_eq!(decide_for(42, &mine, false, Some(&me)).code, EX_SAFE_TO_CLAIM);
+
+        let mut pr = label();
+        pr.open_pr = OpenPrProbe::Open(7);
+        assert_eq!(decide_for(42, &pr, false, Some(&me)).code, 0);
+    }
+
+    /// An unresolvable host yields an attended claim that recognises no lease.
+    #[test]
+    fn attended_claim_with_an_unknown_host_recognises_no_lease() {
+        let me = OwnedClaim::attended(42, crate::host_identity::UNKNOWN_HOST.to_string())
+            .expect("owned");
+        assert_eq!(me.lease_host, None);
     }
 
     // --- An owned claim (LOOM_SWEEP_CLAIM_OWNED) ------------------------------

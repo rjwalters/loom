@@ -752,7 +752,11 @@ pub enum ForgeCmd {
     /// [`crate::forge_check_claim`]; see that module for the exit-code
     /// contract and the `--force-claim` rule (legs 2–4 only, never
     /// `OPEN_PR`).
-    CheckClaim { issue: u32, force_claim: bool },
+    CheckClaim {
+        issue: u32,
+        force_claim: bool,
+        attended_claim: bool,
+    },
     /// `forge check-branch <issue>` — the #9447 branch-collision hard-stop
     /// probe (#9453 Phase 4): does `feature/issue-N` already exist on
     /// `origin`? Implemented in [`crate::forge_check_branch`]; see that
@@ -871,9 +875,11 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             max_open,
             max_points,
         } => crate::forge_pr_congestion::handle(json, max_open, max_points),
-        ForgeCmd::CheckClaim { issue, force_claim } => {
-            crate::forge_check_claim::handle(issue, force_claim)
-        }
+        ForgeCmd::CheckClaim {
+            issue,
+            force_claim,
+            attended_claim,
+        } => crate::forge_check_claim::handle(issue, force_claim, attended_claim),
         ForgeCmd::CheckBranch(args) => crate::forge_check_branch::handle(args),
         ForgeCmd::AutoMerge {
             pr,

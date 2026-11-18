@@ -81,6 +81,10 @@ const DEFAULT_MAX_AGE_SECS: u64 = 14_400;
 /// it has already published + started renewal for (#7672).
 const DISPATCHED_MARKER: &str = "LOOM_SWEEP_LEASE_RENEW_DISPATCHED";
 
+/// Exit status of `lease ensure --require-ownership` when a live peer holds
+/// the lease (#14376). Matches `sweep-lease-publish.sh`'s own exit 4.
+pub(crate) const EX_PEER_OWNED: i32 = 4;
+
 /// Environment markers that mean "a durable agent session is hosting this
 /// call". Any one of them suffices.
 ///
@@ -104,8 +108,8 @@ pub(crate) enum LeaseCommand {
     /// Publish a lease for `<issue>` (unless the daemon already did) and start
     /// a bounded renewal loop.
     ///
-    /// Always exits `0` — this is best-effort, fail-open infrastructure
-    /// mirroring #6179's own contract. The `loom:building` label remains the
+    /// Always exits `0` (unless `--require-ownership`, see that flag) — this is
+    /// best-effort, fail-open infrastructure mirroring #6179's own contract. The `loom:building` label remains the
     /// authoritative claim; a lease only improves the evidence, so nothing here
     /// may block or fail a builder's actual work.
     Ensure(LeaseEnsureArgs),
@@ -186,6 +190,22 @@ pub(crate) struct LeaseEnsureArgs {
     /// discipline needed on every call.
     #[arg(long)]
     pub(crate) force: bool,
+
+    /// Builder-admission mode (#14376): report the OWNERSHIP verdict in the
+    /// exit status instead of always exiting `0`.
+    ///
+    /// * exit `0` + stdout `OWNED` — the claim is this caller's (published,
+    ///   reused, or daemon-dispatched);
+    /// * exit [`EX_PEER_OWNED`] (`4`) + stdout `PEER_OWNED` — a live peer holds
+    ///   the lease (publish exit 4): a definitive refusal. No deferred
+    ///   publisher is spawned for the rejected caller, and the peer's lease,
+    ///   labels and branch are left alone;
+    /// * exit `0` + stdout `INDETERMINATE` — ownership could not be decided
+    ///   (no session, scripts missing, `gh` failed, ...). This keeps the
+    ///   fail-open contract above, including the deferred retry of an
+    ///   availability failure.
+    #[arg(long)]
+    pub(crate) require_ownership: bool,
 
     /// Repo checkout to operate in. Defaults to the current directory.
     #[arg(long, default_value = ".")]
@@ -298,6 +318,27 @@ pub(crate) fn session_sweep_id(watch_pid: u32) -> Option<String> {
     (!token.is_empty()).then(|| format!("sweep-insession-s{watch_pid}-{token}"))
 }
 
+/// Who owns the claim, as `lease ensure --require-ownership` reports it (#14376).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ownership {
+    /// This caller holds (or already held) the lease.
+    Owned,
+    /// A live peer holds it: refuse, touch nothing of the peer's.
+    PeerOwned,
+    /// Could not be decided; the caller keeps the fail-open contract.
+    Indeterminate,
+}
+
+impl Ownership {
+    fn token(self) -> &'static str {
+        match self {
+            Self::Owned => "OWNED",
+            Self::PeerOwned => "PEER_OWNED",
+            Self::Indeterminate => "INDETERMINATE",
+        }
+    }
+}
+
 /// What one `lease ensure` run did. Every variant is a success from the
 /// caller's point of view — this is the diagnostic, not an error channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,6 +378,21 @@ impl Outcome {
     /// publisher retries only these; everything else is a settled answer.
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(self, Self::PublishDeclined(Some(2 | 4)))
+    }
+
+    /// The ownership verdict `--require-ownership` reports (#14376). Only a
+    /// publish exit 4 is a definitive peer refusal; an exit 2 (the publish
+    /// `gh` call failed), a missing session or missing scripts say nothing
+    /// about who owns the claim.
+    pub(crate) fn ownership(&self) -> Ownership {
+        match self {
+            Self::AlreadyDispatched
+            | Self::ReusedExisting { .. }
+            | Self::Renewing { .. }
+            | Self::RenewalFailed(_) => Ownership::Owned,
+            Self::PublishDeclined(Some(EX_PEER_OWNED)) => Ownership::PeerOwned,
+            _ => Ownership::Indeterminate,
+        }
     }
 
     /// The one stderr line this subcommand prints. Every path says something:
@@ -414,6 +470,17 @@ impl LeaseEnsureArgs {
         let line = outcome.describe(self.issue);
         eprintln!("lease ensure: {line}");
         deferred::record(&self.workspace, self.issue, &line);
+        let ownership = outcome.ownership();
+        if self.require_ownership {
+            println!("{}", ownership.token());
+            // #14376: a definitive peer refusal is final for THIS caller. No
+            // deferred publisher: it would keep retrying until the peer's
+            // lease aged out and then lease a claim the caller was told it
+            // does not hold.
+            if ownership == Ownership::PeerOwned {
+                std::process::exit(EX_PEER_OWNED);
+            }
+        }
         // #10570: a declined publish used to be final, so a claim made while a
         // released sweep's lease was still inside its TTL never got a lease of
         // its own and was reclaimed once that leftover aged out.

@@ -341,6 +341,15 @@ pub(crate) enum ForgeAction {
         /// closed.
         #[arg(long)]
         force_claim: bool,
+
+        /// The caller is an ATTENDED Builder that has just written its own
+        /// claim label (#14376): the claim label and this host's own lease
+        /// are not blockers, but another host's fresh lease, an open linked
+        /// PR and every never-overridable leg still are. Narrower than
+        /// `--force-claim` (which skips the lease leg entirely). Pair it with
+        /// `lease ensure --require-ownership`: a label alone carries no owner.
+        #[arg(long)]
+        attended_claim: bool,
     },
 
     /// `forge check-branch <issue>` — the #9447 branch-collision hard-stop
@@ -1381,9 +1390,15 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             max_open,
             max_points,
         },
-        ForgeAction::CheckClaim { issue, force_claim } => {
-            ForgeCmd::CheckClaim { issue, force_claim }
-        }
+        ForgeAction::CheckClaim {
+            issue,
+            force_claim,
+            attended_claim,
+        } => ForgeCmd::CheckClaim {
+            issue,
+            force_claim,
+            attended_claim,
+        },
         ForgeAction::CheckBranch {
             issue,
             branch,

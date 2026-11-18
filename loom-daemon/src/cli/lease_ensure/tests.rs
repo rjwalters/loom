@@ -82,6 +82,7 @@ fn args(dir: &TempDir) -> LeaseEnsureArgs {
         watch_pid: NO_SUCH_PID,
         max_age: DEFAULT_MAX_AGE_SECS,
         force: false,
+        require_ownership: false,
         workspace: dir.path().to_string_lossy().into_owned(),
         deferred: false,
         retry_interval: 60,
@@ -401,6 +402,30 @@ const PUBLISH_GH_FAILS: &str = r#"#!/usr/bin/env bash
 n=$(cat publish-attempts 2>/dev/null || echo 0); echo "$((n + 1))" > publish-attempts
 exit 2
 "#;
+
+/// #14376: `--require-ownership` tells a definitive peer refusal (publish exit
+/// 4) from an admitted claim and from an availability failure (publish exit 2).
+#[test]
+fn ownership_verdict_separates_owned_peer_and_indeterminate() {
+    let owned = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&in_session());
+    assert_eq!(owned.ownership(), Ownership::Owned);
+
+    let peer = args(&checkout(PUBLISH_PEER_HOLDS, RENEW_OK)).ensure(&in_session());
+    assert_eq!(peer.ownership(), Ownership::PeerOwned);
+
+    let down = args(&checkout(PUBLISH_GH_FAILS, RENEW_OK)).ensure(&in_session());
+    assert_eq!(down.ownership(), Ownership::Indeterminate);
+
+    let no_session = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&SessionEnv::default());
+    assert_eq!(no_session.ownership(), Ownership::Indeterminate);
+
+    let dispatched = SessionEnv {
+        dispatched_issue: Some("8193".into()),
+        ..Default::default()
+    };
+    let d = args(&checkout(PUBLISH_OK, RENEW_OK)).ensure(&dispatched);
+    assert_eq!(d.ownership(), Ownership::Owned);
+}
 
 fn attempts(dir: &TempDir) -> u32 {
     argv(dir, "publish-attempts").map_or(0, |s| s.trim().parse().unwrap())
