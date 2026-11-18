@@ -85,7 +85,12 @@ done <"$TEMPLATES"
 # Fixture: a main checkout with a real linked, .loom-managed worktree — the
 # state in which a worktree-write-confining guard is armed.
 REPO="$(make_wt_repo_linked)"
-trap 'rm -rf "$REPO" "$TEMPLATES"' EXIT
+cleanup_cross_tool() {
+    rm -rf "$REPO" "$TEMPLATES"
+    # This EXIT trap replaces the harness's; keep its abort report (#14020).
+    _guard_harness_on_exit "$1" "$2"
+}
+trap 'cleanup_cross_tool "$?" "$BASH_COMMAND"' EXIT
 
 # Print the permission decision (allow/ask/deny) a hook gives a Bash command.
 decision() { # <hook> <command> <cwd>
