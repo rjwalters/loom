@@ -2310,9 +2310,13 @@ non-draft GitHub Release in `rjwalters/loom` (a bare ref is not enough). Any
 other outcome keeps the `loom:review-requested` lane: a differing byte, a
 rename or removal, an unmapped file or one outside the install set, or a path
 pinned in `.loom/resync-ignore` at the PR head (or an unreadable pin file). The
-Repo Skills kind still refuses gate paths, and Champion's own (non-strict)
-`forge resync-waiver` proof is unchanged; `forge resync-waiver <PR> --strict` replays the
-daemon's strict proof read-only (#13668). The merge comment and the
+Repo Skills kind still refuses gate paths. Since operator ruling 2026-11-17
+(#13982) Champion's non-strict `forge resync-waiver` proof applies the same
+gate rule as the strict proof: byte-identical merge-gate, role and skill files
+waive against a published release tag, and a gate file that differs from the
+tag, has no upstream counterpart, or is renamed or removed still holds (#12945);
+the non-strict proof still byte-checks only the kept set. `forge resync-waiver
+<PR> --strict` replays the daemon's strict proof read-only (#13668). The merge comment and the
 `landed-by-daemon` status line record the tag, the file count and
 `gate_paths_included`; the daemon log line `resync_waiver: PR #N landed:` carries
 the same fields.
@@ -10289,9 +10293,8 @@ claim was acquired. Everything provably older is still a reap candidate. The
 same narrowing applies to the agent-runtime veto — an agent inside the resolved
 live sweep's own tree no longer vetoes the whole worktree; any other agent still
 does. When the root **cannot** be resolved (a stale lock, an unparseable owner,
-a claim tracked only through the legacy spawn-loop-state union with no lock dir),
-there is nothing to discriminate against and the whole worktree is protected
-exactly as before. An orphan tree that overlaps the live sweep's tree at all is
+no lock dir at all), there is nothing to discriminate against and the whole
+worktree is protected exactly as before. An orphan tree that overlaps the live sweep's tree at all is
 refused whole rather than partially reaped, and the claim is re-resolved
 immediately before each kill: a claim that appeared or *changed* since the plan
 was built fails closed.
