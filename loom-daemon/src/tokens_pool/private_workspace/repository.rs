@@ -654,8 +654,39 @@ fn clone_state(path: &Path) -> Result<CloneState> {
         path: path.to_string_lossy().into_owned(),
         populated: true,
         branches: unpublished_branches(path)?,
-        dirty: !git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty(),
+        dirty: is_dirty(path)?,
         detached: stranded_heads(path)?.len(),
+    })
+}
+
+fn is_dirty(path: &Path) -> Result<bool> {
+    Ok(!git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty())
+}
+
+/// The local work a move must leave exactly as it found it: every branch tip,
+/// the checked-out revision and the uncommitted files. Unlike [`CloneState`]
+/// this holds nothing derived from remote-tracking refs, so a branch published
+/// (or a remote ref pruned) while the move runs cannot change it.
+#[derive(Debug, PartialEq)]
+struct LocalWork {
+    tips: String,
+    head: String,
+    dirty: bool,
+}
+
+fn local_work(path: &Path) -> Result<LocalWork> {
+    Ok(LocalWork {
+        tips: git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+            ],
+        )?,
+        // An unborn HEAD has no revision to compare: both sides read empty.
+        head: git(path, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        dirty: is_dirty(path)?,
     })
 }
 
@@ -744,6 +775,7 @@ pub(super) fn rebind(root: &Path, args: &RebindArgs) -> Result<RebindOutcome> {
         bail!("workspace clone must be a real directory without symlinks");
     }
     let before = clone_state(repo)?;
+    let local_before = local_work(repo)?;
     // A linked worktree records absolute paths into the old location.
     if worktrees(repo)?.len() > 1 {
         bail!(
@@ -800,16 +832,17 @@ pub(super) fn rebind(root: &Path, args: &RebindArgs) -> Result<RebindOutcome> {
         std::fs::remove_file(&old_record)?;
     }
     git(&new, &["fetch", "--prune", "origin"])?;
-    let mut after = clone_state(&new)?;
-    let mut expected = before.clone();
-    expected.path.clone_from(&after.path);
-    if after != expected {
+    // Verify what the move could have lost (branch tips, HEAD, dirty files),
+    // not the unpublished counts: `fetch --prune` moves the remote-tracking
+    // refs those are derived from, so an upstream publish or prune is not a
+    // bad move (the report below shows the post-fetch counts).
+    if local_work(&new)? != local_before {
         bail!(
             "the clone's branches or files changed during the move; inspect {} before retrying",
             new.display()
         );
     }
-    after.path = new.to_string_lossy().into_owned();
+    let after = clone_state(&new)?;
     outcome(
         if old_pop {
             RebindStatus::Moved
