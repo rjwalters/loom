@@ -2143,7 +2143,7 @@ fn reaper_reaps_out_of_band_killed_child_and_transitions_state() {
     for _ in 0..80 {
         registry.reap_once();
         match registry.get(&sweep_id).map(|i| i.state.clone()) {
-            Some(SweepState::Running | SweepState::Pending) => {}
+            Some(SweepState::Running) => {}
             _ => {
                 transitioned = true;
                 break;

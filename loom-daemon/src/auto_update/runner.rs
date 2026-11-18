@@ -654,7 +654,9 @@ impl FloorFeed {
 ///
 /// #12072: while the floor is unsatisfiable the next tick is
 /// [`stall_recheck::STALL_RECHECK`] away, not `tuning.interval`, for the first
-/// [`stall_recheck::STALL_WINDOW`] of the stall.
+/// [`stall_recheck::STALL_WINDOW`] of the stall. #14016: and after a
+/// retryable failure the next tick is `min(interval, backoff_until - now)`
+/// away, so the retry happens at the back-off the tick's log line stated.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
@@ -695,8 +697,14 @@ pub(super) async fn run_loop<P, T>(
                 task_liveness::beat(AUTO_UPDATE, tuning.interval);
                 // #12072: a standing unsatisfiable floor is re-checked soon,
                 // so the roll starts minutes after the asset lands.
-                let delay =
-                    stall_recheck::delay_after_tick(&state.floor, Utc::now(), tuning.interval);
+                // #14016: and a retryable failure is retried when its log
+                // line said, not a full interval later.
+                let delay = stall_recheck::delay_after_tick_with_backoff(
+                    &state.floor,
+                    state.backoff_remaining(Instant::now()),
+                    Utc::now(),
+                    tuning.interval,
+                );
                 if delay < tuning.interval {
                     ticker = tokio::time::interval_at(
                         tokio::time::Instant::now() + delay,

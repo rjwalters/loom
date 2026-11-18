@@ -36,6 +36,9 @@
 #   (k) --host omitted publishes the OPAQUE form of this host's identity by
 #       default (Issue #6322/#6333), not the raw hostname; LOOM_LEASE_PUBLISH_
 #       HOSTNAME=1 opts back into the raw form
+#   (k3) blank and padded env values resolve like Rust's `non_blank`
+#       (#13998): whitespace-only LOOM_LEASE_HOST_ID falls through to
+#       LOOM_HOST_ID; padded trims to the same opaque id as its bare form
 #   (l) publish -> fence round trip: a lease this script just published is
 #       read back as "own, fresh" by sweep-lease-fence.sh's default (no
 #       --host) resolution -- the exact invocation builder-pr.md makes. This
@@ -477,6 +480,17 @@ assert_eq "host-60a4fb97 step-builder-6320-1" "$OUT" "(k2) ... and the identity 
 assert_eq "0" "$(post_count)" "(k2) ... with no duplicate lease published"
 run_script publish 6320 --sweep-id step-builder-6320-1
 assert_eq "4" "$RC" "(k2) without LOOM_LEASE_HOST_ID the same lease reads as a peer's -> exit 4"
+
+# --- (k3) blank and padded env values resolve like Rust's `non_blank`
+# (#13998): a whitespace-only value counts as unset and falls through to
+# LOOM_HOST_ID=studio-host, and a padded value trims to the same opaque id
+# as its bare form -- both publish the pinned opaque form, not a distinct one.
+reset_state
+LOOM_LEASE_HOST_ID="   " run_script publish 6320 --sweep-id sweep-run-A
+assert_eq "$OPAQUE_HOST sweep-run-A" "$OUT" "(k3) whitespace-only LOOM_LEASE_HOST_ID falls through to LOOM_HOST_ID's opaque form"
+reset_state
+LOOM_LEASE_HOST_ID=" studio-host " run_script publish 6320 --sweep-id sweep-run-A
+assert_eq "$OPAQUE_HOST sweep-run-A" "$OUT" "(k3) padded LOOM_LEASE_HOST_ID trims to studio-host's opaque form"
 
 # --- (l) publish -> fence round trip (regression test for #6333) ----------
 # Before the fix, publish wrote the RAW host while sweep-lease-fence.sh's
