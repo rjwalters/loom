@@ -751,7 +751,11 @@ pub enum Response {
     /// call is then a no-op — `consecutive` is also `0` in that case).
     NoopReleaseRecorded {
         issue: u32,
-        /// Consecutive no-op releases now on record for `issue`.
+        /// Consecutive no-op sweeps now on the durable hold streak for
+        /// `issue` — the fingerprint-aware count compared against
+        /// `holdThreshold` (#10156), reported here since #13861 in place of
+        /// the cooldown record's own counter. `0` also when the hold could
+        /// not read the issue (fail-open, #10156).
         consecutive: u32,
         /// Seconds until the next dispatch is allowed, or `None` when the
         /// cooldown mechanism is disabled.
@@ -1121,13 +1125,6 @@ pub struct SweepInfo {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// Whether this sweep was admitted through the host's
-    /// overflow slot (#9244, inert since #11508): an operator-starred issue
-    /// dispatched over the global and/or per-repo concurrency cap as this
-    /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
-    /// data and clients compatible (absent parses as `false`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub overflow: bool,
 }
 
 fn default_sweep_runtime() -> String {

@@ -20,7 +20,7 @@
 //! reader's 24 h stale rule.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,15 +56,6 @@ impl std::fmt::Debug for Ledger {
     }
 }
 
-/// `<loom_dir>`: the parent of `LOOM_SOCKET_PATH` when set (a test daemon on a
-/// tempdir socket never writes into the operator's `~/.loom`), else `~/.loom`.
-fn loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
-}
-
 /// Where the production ledger for `scope` lives. Never a real file in unit
 /// tests: those drive [`Ledger::at`] with their own path.
 #[must_use]
@@ -79,8 +70,12 @@ pub fn path_for(scope: &str) -> Option<PathBuf> {
     ledger_dir().map(|d| d.join(file))
 }
 
+/// `<loom_dir>/<DIR>` via the shared
+/// [`crate::autonomy_marker::resolve_loom_dir`] (#13833): the parent of
+/// `LOOM_SOCKET_PATH` when set (a test daemon on a tempdir socket never
+/// writes into the operator's `~/.loom`), else `~/.loom`.
 fn ledger_dir() -> Option<PathBuf> {
-    loom_dir().map(|d| d.join(DIR))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(DIR))
 }
 
 /// The output is off: nothing recorded can be delivered, so forget it all.

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::park_record::{self, BlockerRef, ParkRecord};
+use crate::park_record::{self, BlockerRef, ParkRecord, Withdrawn};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ParkRecordCommand {
@@ -54,6 +54,17 @@ pub(crate) enum ParkRecordCommand {
     /// a `hold.transition` of kind `decision`. Writes nothing to the forge; a
     /// no-op outside a role tick. Exit 0 always.
     Decision(DecisionArgs),
+
+    /// Withdraw one declared blocker (#13895): wrap every live park marker
+    /// naming `--blocked-by` in an inline code span — marker text unchanged,
+    /// so `parse`/`blockers` stop reading it — and append one visible
+    /// `Park withdrawn:` audit line. Idempotent: no live marker names the ref
+    /// → exit 0, nothing written. Refuses (exit 1, nothing changed) a marker
+    /// naming several refs (it would silently drop the others) and a blank
+    /// `--reason`. Edits the BODY only: it does NOT remove `loom:blocked` —
+    /// the caller or Guide's unblock sweep does. Re-parking appends a fresh
+    /// record with `apply --blocked-by`.
+    Retract(RetractArgs),
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -147,6 +158,48 @@ pub(crate) struct ApplyArgs {
 }
 
 #[derive(clap::Args)]
+pub(crate) struct RetractArgs {
+    /// The issue to withdraw the blocker from.
+    #[arg(
+        long,
+        value_name = "N",
+        required_unless_present_any = ["pr", "file"],
+        conflicts_with = "pr"
+    )]
+    pub issue: Option<u64>,
+
+    /// The PR to withdraw the blocker from.
+    #[arg(long, value_name = "N")]
+    pub pr: Option<u64>,
+
+    /// The blocker to withdraw: `N`, `#N` (this repo) or `OWNER/REPO#N`.
+    #[arg(long = "blocked-by", value_name = "REF")]
+    pub blocked_by: BlockerRef,
+
+    /// Why the blocker no longer gates this artifact. Required.
+    #[arg(long, value_name = "TEXT")]
+    pub reason: String,
+
+    /// Who is withdrawing it — a role name or `human`.
+    #[arg(long = "by", value_name = "ROLE")]
+    pub by: Option<String>,
+
+    /// Target repository; defaults to the checkout's remote.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub repo: Option<String>,
+
+    /// Compose against this body instead of the forge (`-` or a path; stdin
+    /// with `-`). Offline: the forge is never read, the planned body is
+    /// printed as for `--dry-run`, nothing is written.
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["issue", "pr"])]
+    pub file: Option<PathBuf>,
+
+    /// Print the planned body; mutate nothing.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+}
+
+#[derive(clap::Args)]
 pub(crate) struct RenderArgs {
     /// The blocker(s): `N`, `#N` or `OWNER/REPO#N`. Repeatable, and comma-separated
     /// values are accepted. Omit to render an explicit "blocker unstated"
@@ -195,6 +248,7 @@ impl ParkRecordCommand {
                 args.run();
                 Ok(())
             }
+            ParkRecordCommand::Retract(args) => args.run(),
         }
     }
 }
@@ -299,6 +353,46 @@ impl ApplyArgs {
     }
 }
 
+impl RetractArgs {
+    /// Never returns: exits with the command's own code.
+    fn run(self) -> Result<()> {
+        use crate::operator_decision::cli::{default_repo_root, GhForge};
+        use crate::park_record::apply::{retract, RetractRequest};
+        let req = RetractRequest {
+            number: self.issue.or(self.pr).unwrap_or_default(),
+            repo: self.repo.clone(),
+            blocked_by: self.blocked_by,
+            reason: self.reason,
+            by: self.by,
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            dry_run: self.dry_run,
+        };
+        let code = match self.file.as_deref() {
+            Some(p) => {
+                let body = match p {
+                    p if p == std::path::Path::new("-") => {
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf)?;
+                        buf
+                    }
+                    p => std::fs::read_to_string(p)?,
+                };
+                crate::park_record::apply::retract_offline(
+                    &req,
+                    &body,
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                )
+            }
+            None => {
+                let mut forge = GhForge::new(default_repo_root(), self.repo);
+                retract(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr())
+            }
+        };
+        std::process::exit(code)
+    }
+}
+
 /// A value in `-1.0..=1.0` from the clock's sub-second nanos: backoff jitter
 /// needs spread across hosts, not cryptographic randomness.
 fn random_unit() -> f64 {
@@ -324,6 +418,12 @@ impl ParseArgs {
 
         if self.json {
             let rows: Vec<_> = records.iter().map(record_json).collect();
+            // Retraction audit lines (#13895): a withdrawn blocker is no longer
+            // declared, so it appears only here — never in `blockers`.
+            let gone: Vec<_> = park_record::withdrawn(&body)
+                .iter()
+                .map(withdrawn_json)
+                .collect();
             println!(
                 "{}",
                 serde_json::json!({
@@ -334,6 +434,7 @@ impl ParseArgs {
                         None => serde_json::json!(b.number),
                         Some(_) => serde_json::json!(b.to_string()),
                     }).collect::<Vec<_>>(),
+                    "withdrawn": gone,
                     "declared": !records.is_empty(),
                 })
             );
@@ -354,6 +455,16 @@ impl ParseArgs {
         }
         Ok(())
     }
+}
+
+fn withdrawn_json(w: &Withdrawn) -> serde_json::Value {
+    serde_json::json!({
+        "blocker": w.blocker.number,
+        "blocker_repo": w.blocker.repo.clone(),
+        "by": w.by,
+        "at": w.at,
+        "reason": w.reason,
+    })
 }
 
 fn record_json(r: &ParkRecord) -> serde_json::Value {
@@ -386,6 +497,20 @@ mod tests {
 
     fn first_record_json(body: &str) -> serde_json::Value {
         record_json(&park_record::parse(body)[0])
+    }
+
+    #[test]
+    fn a_withdrawn_audit_line_surfaces_ref_by_at_and_reason_in_json() {
+        let w = park_record::parse_withdrawn(
+            "Park withdrawn: #5 \u{2014} by=guide at=2026-11-15T12:00:00Z reason=\"not a gate\"",
+        )
+        .unwrap();
+        let v = withdrawn_json(&w);
+        assert_eq!(v["blocker"], 5);
+        assert!(v["blocker_repo"].is_null());
+        assert_eq!(v["by"], "guide");
+        assert_eq!(v["at"], "2026-11-15T12:00:00Z");
+        assert_eq!(v["reason"], "not a gate");
     }
 
     #[test]

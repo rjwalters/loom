@@ -186,6 +186,20 @@ pub fn scan(files: &[ChangedFile], cfg: &Config) -> Verdict {
     }
 }
 
+/// The candidate files whose head content could not be read — [`scan`]'s
+/// selection minus every readable file. The ratification verb fails closed
+/// on a non-empty result (exit 3, the read-failed path) instead of printing
+/// a truncated `files=` evidence list at rc=0 (#13932): a hold must state
+/// why it is armed, completely.
+#[must_use]
+pub fn unreadable_candidates(files: &[ChangedFile], cfg: &Config) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| f.status != "removed" && is_candidate(f, cfg) && f.head_content.is_none())
+        .map(|f| f.filename.clone())
+        .collect()
+}
+
 /// A PR comment, as the hold reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {

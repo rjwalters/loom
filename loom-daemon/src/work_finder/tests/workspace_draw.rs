@@ -135,8 +135,8 @@ fn an_idle_tick_records_no_draw() {
 }
 
 /// #11508 (operator ruling): `loom:very-important` changes order, never
-/// admission. With the global cap full it waits like plain work; nothing
-/// takes an overflow slot. Both tick paths.
+/// admission. With the global cap full it waits like plain work. Both tick
+/// paths.
 #[test]
 fn very_important_never_goes_over_the_cap() {
     let vi = |n| issue(n, "2026-01-01T00:00:00Z", &[VERY_IMPORTANT_LABEL]);
@@ -149,15 +149,13 @@ fn very_important_never_goes_over_the_cap() {
         full(),
     )];
     let report = tick_multi(&mut multi, &[1], 2, &[false]);
-    assert_eq!((report.dispatched, report.dispatched_overflow), (0, 0));
-    assert!(multi[0].1.dispatched_overflow.is_empty());
+    assert_eq!(report.dispatched, 0);
     assert_eq!(report.deferred_capacity, 3, "every candidate waits for capacity");
 
     let mut dispatcher = full();
     let src = &mut FakeSource::once(vec![vi(1), vi(2), issue(3, "2026-01-01T00:00:00Z", &[])]);
     let report = tick(src, &mut dispatcher, 2, false).unwrap();
-    assert_eq!((report.dispatched_overflow, report.deferred_capacity), (0, 3));
-    assert!(dispatcher.dispatched_overflow.is_empty());
+    assert_eq!(report.deferred_capacity, 3);
 }
 
 /// #11742: a weight-0 workspace is never drawn; its ready issues are held as

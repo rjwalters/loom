@@ -33,10 +33,6 @@ pub const CHANGE_LIMIT: u32 = 200;
 /// Most follow-up pages one chunk reads per pass; the rest wait one cadence.
 pub const MAX_PAGES_PER_PASS: usize = 5;
 
-/// The types a missed-changes pass carries: every kind the change stream
-/// reports.
-pub const MISSED_TYPES: [&str; 3] = ["issues", "pull_request", "check_run"];
-
 /// The persisted cursors: one `seq` per repo, for one mirror origin.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursors {
@@ -91,40 +87,22 @@ pub fn save_cursors(path: &Path, cursors: &Cursors) -> std::io::Result<()> {
     crate::roll_pause::write_atomic(path, &body)
 }
 
-/// The webhook-style event name a change kind stands for.
+/// Whether `kind` is a change kind this daemon knows; an unknown (future)
+/// kind is skipped rather than counted.
 #[must_use]
-pub fn webhook_type(kind: &str, item_type: Option<&str>) -> Option<&'static str> {
-    match kind {
-        "issue" => Some("issues"),
-        "label" if item_type == Some("pr") => Some("pull_request"),
-        "label" => Some("issues"),
-        "pr" | "pr_merged" => Some("pull_request"),
-        "check" => Some("check_run"),
-        _ => None,
-    }
+pub fn is_known_kind(kind: &str) -> bool {
+    matches!(kind, "issue" | "label" | "pr" | "pr_merged" | "check")
 }
 
 /// What one pass learned.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Nudge {
-    /// Changes read (each repo's `kinds`, before dedupe).
-    pub count: usize,
-    /// Webhook-style type names of the changes.
-    pub types: BTreeSet<&'static str>,
     /// The repos that changed, or must be re-read.
     pub repos: BTreeSet<String>,
     /// Some repo's cursor was truncated or reset: changes may have been missed.
     pub missed: bool,
     /// `(repo, kind, seconds from the change to this pull)`.
     pub latencies: Vec<(String, String, f64)>,
-}
-
-impl Nudge {
-    /// Whether this pass read any change or lost track of some.
-    #[must_use]
-    pub fn prompts(&self) -> bool {
-        self.count > 0 || self.missed
-    }
 }
 
 /// Set every repo `page` names, and the mirror knows, to its latest change,
@@ -154,11 +132,9 @@ pub fn apply(
         if !asked.contains(&repo) {
             continue;
         }
-        let Some(kind) = webhook_type(&change.kind, change.item_type.as_deref()) else {
+        if !is_known_kind(&change.kind) {
             continue;
-        };
-        nudge.count += 1;
-        nudge.types.insert(kind);
+        }
         if let Some(at) = change
             .at
             .as_deref()
@@ -182,8 +158,6 @@ pub fn apply(
             // Missed changes, or the log restarted: re-read once, from now on.
             cursors.repos.insert(repo.clone(), latest);
             nudge.missed = true;
-            // Anything may have changed.
-            nudge.types.extend(MISSED_TYPES);
             nudge.repos.insert(repo);
             continue;
         }

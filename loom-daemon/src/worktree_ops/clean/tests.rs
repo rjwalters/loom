@@ -2182,18 +2182,35 @@ fn run_clean_returns_zero_when_no_errors_occurred() {
 fn clear_stale_locks_keeps_live_and_removes_dead() {
     let dir = tempfile::tempdir().unwrap();
     let locks = spawn_loop_locks_dir(dir.path());
-    std::fs::create_dir_all(locks.join("issue-1")).unwrap();
-    std::fs::create_dir_all(locks.join("issue-2")).unwrap();
-    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
-    std::fs::write(
-        dir.path().join(".loom").join("spawn-loop-state.json"),
-        r#"{"running": [{"issue": 1, "pid": 1}]}"#,
-    )
-    .unwrap();
+    let write_owner = |issue: u32, owner_pid: u32| {
+        let lock = locks.join(format!("issue-{issue}"));
+        std::fs::create_dir_all(&lock).unwrap();
+        std::fs::write(
+            lock.join("owner.json"),
+            format!(r#"{{"issue":{issue},"owner_pid":{owner_pid},"sweep_id":"s-{issue}"}}"#),
+        )
+        .unwrap();
+    };
+    // Live owner: this test process itself. Must survive.
+    write_owner(1, std::process::id());
+    // Dead owner: a pid far outside any plausible live range. Must go.
+    write_owner(2, 2_147_483_640);
     let removed = clear_stale_spawn_loop_locks(dir.path(), false);
     assert_eq!(removed, 1);
     assert!(locks.join("issue-1").exists());
     assert!(!locks.join("issue-2").exists());
+}
+
+#[test]
+fn clear_stale_locks_removes_lock_without_live_owner_json() {
+    // A lock dir with no readable owner.json naming a live pid is stale —
+    // the real writer (`acquire_lock`) always stamps one.
+    let dir = tempfile::tempdir().unwrap();
+    let locks = spawn_loop_locks_dir(dir.path());
+    std::fs::create_dir_all(locks.join("issue-3")).unwrap();
+    let removed = clear_stale_spawn_loop_locks(dir.path(), false);
+    assert_eq!(removed, 1);
+    assert!(!locks.join("issue-3").exists());
 }
 
 // --- quarantine_dirty_worktree (#6653) --------------------------------

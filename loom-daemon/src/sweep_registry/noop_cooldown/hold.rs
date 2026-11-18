@@ -3,8 +3,9 @@
 //! # The gap
 //!
 //! The cooldown in [`super`] is a single-shot, flat, in-memory window: it
-//! expires, and the issue is offered again. Nothing ever *acted* on
-//! [`NoopCooldownState::consecutive`](super::NoopCooldownState). An issue whose
+//! expires, and the issue is offered again. Nothing ever *acted* on the
+//! per-issue no-op counter its record used to carry (removed in #13861 —
+//! this streak is the only count). An issue whose
 //! remaining work is a human gate, or a dependency that has not landed, was
 //! therefore re-dispatched forever — 275 `unclassified:after-curator` outcomes
 //! on 33 issues in one 24h window (~600M input tokens), starred issues worst
@@ -243,8 +244,9 @@ const LINKED_PRS_JQ_TAIL: &str = "\") | {number: .source.issue.number, \
 const ISSUE_JQ: &str = "{state: .state, body: .body, labels: [(.labels // [])[] | .name]}";
 
 impl SweepRegistry {
-    /// Streak length for `issue` (0 when none). Observability and tests.
-    #[cfg(test)]
+    /// Streak length for `issue` (0 when none). Also the `consecutive` value
+    /// reported to `RecordNoopRelease` IPC callers (Issue #13861): this, not
+    /// the cooldown record, is the count that drives parking.
     #[must_use]
     pub(crate) fn noop_streak_count(&self, issue: u32) -> u32 {
         self.noop_cooldown

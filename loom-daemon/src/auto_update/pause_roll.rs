@@ -474,7 +474,6 @@ fn manifest_item(c: &Candidate, now: DateTime<Utc>, min_age: u64) -> ManifestIte
         lease_comment_id: None,
         lease_refreshed_at: None,
         log_path: c.log_path.clone(),
-        overflow: false,
         role: c.role.clone(),
         timeout_remaining_secs: c.timeout_remaining_secs,
         holds_issue_creation_mutex: c.holds_issue_creation_mutex,

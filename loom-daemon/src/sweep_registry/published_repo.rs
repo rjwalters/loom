@@ -74,7 +74,6 @@ impl SweepRegistry {
                 effort: None,
                 depends_on: None,
                 repo: None,
-                overflow: false,
             },
         );
     }
