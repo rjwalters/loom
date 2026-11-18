@@ -930,7 +930,7 @@ Usage:
   pnpm worktree <issue-number> --base <branch>          Branch off <branch> (stacked PR, #3729)
   pnpm worktree <issue-number> --sparse <paths...>      Cone-mode sparse checkout
   pnpm worktree <issue-number> --full                   Convert sparse worktree to full
-  pnpm worktree <issue-number> --force-claim            Send `forge check-claim --force-claim` on a fresh
+  pnpm worktree <issue-number> --force-claim            Send "forge check-claim --force-claim" on a fresh
                                                         branch (never implied; #14376). A fresh Builder
                                                         claim is refused (exit 1) when a peer holds the lease.
   pnpm worktree remove <N> [--keep-branch] [--force] [--dry-run]
@@ -1568,19 +1568,19 @@ _wt_lease_claim() { [[ -z "$_WT_DAEMON_BIN" ]] || "$_WT_DAEMON_BIN" lease ensure
 
 # --- Builder admission: require NATIVE ownership (#14376) --------------------
 # A label write carries no owner, so a fresh Builder checkout is handed over only
-# on `lease ensure --require-ownership`'s verdict: exit 0 = owned or undecidable
-# (availability failures, old daemon: the fail-open contract above, including the
-# deferred retry), exit 4 = a live peer holds the lease (definitive; no deferred
-# publisher is spawned for us). Returns 4 on that refusal, 0 otherwise. A daemon
-# predating the flag exits 2 (clap usage error): fall back to the plain call so
-# the lease is still published as before.
+# on POSITIVE ownership: `lease ensure --require-ownership` must print `OWNED`.
+# `PEER_OWNED` (exit 4) is a definitive refusal; `INDETERMINATE`, an unreadable
+# answer, a missing/old daemon (clap usage error, exit 2) or any failure is NOT
+# ownership and is refused too (return 5). The generic standalone
+# `lease ensure` (no flag) and Doctor reuse keep their fail-open contract:
+# they never reach this function. Returns 0 only when owned.
 _wt_lease_claim_owned() {
-    [[ -n "$_WT_DAEMON_BIN" ]] || return 0
-    local _rc=0
-    # requires-daemon: lease-ownership optional   #14376 fails open on a daemon predating `lease ensure --require-ownership`
-    "$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" > /dev/null 3>&- || _rc=$?
+    [[ -n "$_WT_DAEMON_BIN" ]] || return 5
+    local _rc=0 _tok=""
+    # requires-daemon: lease-ownership required   #14376 a fresh Builder handoff needs positive ownership; a daemon predating `lease ensure --require-ownership` cannot prove it
+    _tok=$("$_WT_DAEMON_BIN" lease ensure "$ISSUE_NUMBER" --require-ownership --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" 3>&-) || _rc=$?
     [[ "$_rc" -ne 4 ]] || return 4
-    [[ "$_rc" -eq 0 ]] || _wt_lease_claim
+    [[ "$_rc" -eq 0 && "$_tok" == *OWNED* && "$_tok" != *PEER_OWNED* && "$_tok" != *INDETERMINATE* ]] || return 5
     return 0
 }
 
@@ -1857,13 +1857,19 @@ if _try_worktree_add; then
     if [[ "$_WT_FRESH_BUILDER_CLAIM" == "true" ]]; then
         _own_rc=0
         _wt_lease_claim_owned || _own_rc=$?
-        if [[ "$_own_rc" -eq 4 ]]; then
+        if [[ "$_own_rc" -ne 0 ]]; then
             _wt_discard_unclaimed "$WORKTREE_PATH" "$BRANCH_NAME"
-            print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
-            if [[ "$JSON_OUTPUT" == "true" ]]; then
-                echo '{"success": false, "error": "PEER_OWNED", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+            _own_tok=PEER_OWNED
+            if [[ "$_own_rc" -eq 4 ]]; then
+                print_error "Issue #$ISSUE_NUMBER is owned by a peer (live lease held by another sweep); refusing to hand over a worktree. The peer's labels, lease and branch are untouched."
             else
-                echo "PEER_OWNED" >&3
+                _own_tok=OWNERSHIP_UNVERIFIED
+                print_error "Issue #$ISSUE_NUMBER: ownership could not be positively verified (lease ensure --require-ownership did not report OWNED); refusing to hand over a worktree."
+            fi
+            if [[ "$JSON_OUTPUT" == "true" ]]; then
+                echo '{"success": false, "error": "'"$_own_tok"'", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+            else
+                echo "$_own_tok" >&3
             fi
             exit 1
         fi

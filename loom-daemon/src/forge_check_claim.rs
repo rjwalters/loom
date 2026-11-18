@@ -282,13 +282,14 @@ impl OwnedClaim {
 
     /// The claim of an ATTENDED Builder that has just written its own claim
     /// label (`--attended-claim`, #14376). Same admission as a dispatcher's
-    /// marker for the label leg, and a lease only from THIS host; another
-    /// host's fresh lease still blocks. The label carries no owner, so this
-    /// only stops the caller's own label from refusing it: ownership is then
-    /// established by `lease ensure --require-ownership`, which refuses a
-    /// peer's live lease. Pure over `raw_host` like [`Self::from_parts`].
-    pub(crate) fn attended(issue: u32, raw_host: String) -> Option<Self> {
-        Self::from_parts(Some(issue.to_string()), raw_host, issue)
+    /// marker for the label leg, but it recognises NO lease: the caller has not
+    /// published one yet (and its own `LOOM_SWEEP_ID` lease is already filtered
+    /// out of the reading), so any fresh lease, same host or not, belongs to a
+    /// peer and blocks before a worktree is allocated. The label carries no
+    /// owner, so this only stops the caller's own label from refusing it:
+    /// ownership is then established by `lease ensure --require-ownership`.
+    pub(crate) fn attended(issue: u32, _raw_host: String) -> Option<Self> {
+        Self::from_marker(Some(&issue.to_string()), issue, None)
     }
 
     /// Is a fresh lease published from `host` this invoker's host's own?
@@ -1341,10 +1342,10 @@ mod tests {
 
     // --- An attended claim (--attended-claim, #14376) --------------------------
 
-    /// The attended flag passes the caller's own label and this host's lease
-    /// but never another host's lease, and never buys past an open PR.
+    /// The attended flag passes the caller's own label but never a fresh lease
+    /// (same host or another), and never buys past an open PR.
     #[test]
-    fn attended_claim_passes_own_label_but_not_a_peer_hosts_lease() {
+    fn attended_claim_passes_own_label_but_not_any_lease() {
         let me = OwnedClaim::attended(42, "raw-host-a".to_string()).expect("known host");
         let label = || {
             evidence(
@@ -1357,16 +1358,18 @@ mod tests {
         let v = decide_for(42, &label(), false, Some(&me));
         assert_eq!(v.code, EX_SAFE_TO_CLAIM, "{}", v.stderr);
 
-        let me_host = me.lease_host.clone().expect("host");
         let mut peer = label();
         peer.lease = Some(held("host-peer"));
         let v = decide_for(42, &peer, false, Some(&me));
         assert_eq!(v.code, 0);
         assert_eq!(v.stdout, "LEASE_ALREADY_HELD host-peer sweep-x");
 
-        let mut mine = label();
-        mine.lease = Some(held(&me_host));
-        assert_eq!(decide_for(42, &mine, false, Some(&me)).code, EX_SAFE_TO_CLAIM);
+        // A same-host sibling's lease blocks too: nothing identifies it as ours.
+        let mut sibling = label();
+        sibling.lease = Some(held("raw-host-a"));
+        let v = decide_for(42, &sibling, false, Some(&me));
+        assert_eq!(v.code, 0);
+        assert!(v.stdout.starts_with("LEASE_ALREADY_HELD"), "{}", v.stdout);
 
         let mut pr = label();
         pr.open_pr = OpenPrProbe::Open(7);

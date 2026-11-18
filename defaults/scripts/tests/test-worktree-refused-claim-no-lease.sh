@@ -27,7 +27,9 @@
 #         16 dispatcher-owned claim (LOOM_SWEEP_CLAIM_OWNED) -> admitted, no flag, lease ensure once
 #         17 attended uncontested claim                      -> admitted, ownership established
 #         18 explicit --force-claim                          -> the only way the flag is sent
-#         19 daemon predating --require-ownership (exit 2)   -> fail-open, plain lease ensure
+#         19 daemon predating --require-ownership (exit 2)   -> refused (ownership unverified)
+#         21 INDETERMINATE ownership token                   -> refused
+#         22 same-host sibling lease at the attended probe   -> refused before allocation
 
 set -euo pipefail
 
@@ -236,10 +238,27 @@ echo "Test 18: --force-claim is sent only when the caller asks for it"
 STUB_CHECK_CLAIM_RC=1 run_wt 518 --force-claim
 if [[ "$RC" -eq 0 ]] && grep -q '^forge check-claim 518 --force-claim$' "$LOG"; then pass "explicit force is explicit"; else fail "rc=$RC"; cat "$LOG"; fi
 
-echo "Test 19: daemon predating --require-ownership (exit 2) -> fail-open, plain lease ensure"
+echo "Test 19: daemon predating --require-ownership (exit 2) -> ownership unverified, refused"
+rm -f "$STUB_HOOK_MARK"
 STUB_OWNERSHIP_RC=2 STUB_OWNERSHIP_TOKEN='' run_wt 519
-if [[ "$RC" -eq 0 && -e .loom/worktrees/issue-519/.git ]]; then pass "old daemon fails open"; else fail "rc=$RC"; cat "$TMP/out.log"; fi
-if grep -q '^lease ensure 519 --watch-pid' "$LOG"; then pass "fell back to the plain lease publish"; else fail "no fallback lease"; cat "$LOG"; fi
+if [[ "$RC" -ne 0 ]]; then pass "old daemon cannot prove ownership: refused (rc=$RC)"; else fail "unverified ownership admitted"; cat "$TMP/out.log"; fi
+no_peer_side_effects 519
+if grep -q "could not be positively verified" "$TMP/out.log"; then pass "refusal says ownership unverified"; else fail "refusal not explained"; cat "$TMP/out.log"; fi
+
+echo "Test 21: INDETERMINATE ownership (exit 0) -> refused, nothing created"
+rm -f "$STUB_HOOK_MARK"
+STUB_OWNERSHIP_RC=0 STUB_OWNERSHIP_TOKEN=INDETERMINATE run_wt 521
+if [[ "$RC" -ne 0 ]]; then pass "indeterminate ownership refused (rc=$RC)"; else fail "indeterminate ownership admitted"; cat "$TMP/out.log"; fi
+no_peer_side_effects 521
+STUB_OWNERSHIP_RC=0 STUB_OWNERSHIP_TOKEN=INDETERMINATE run_wt --json 521
+if grep -q '"error": "OWNERSHIP_UNVERIFIED"' "$TMP/out.log"; then pass "--json carries OWNERSHIP_UNVERIFIED"; else fail "--json refusal missing"; cat "$TMP/out.log"; fi
+
+echo "Test 22: same-host sibling lease visible at the attended probe (check-claim exit 0) -> refused before allocation"
+rm -f "$STUB_HOOK_MARK"
+STUB_CHECK_CLAIM_RC=0 run_wt 522
+expect_refused_no_lease 522 "same-host sibling lease"
+no_peer_side_effects 522
+if grep -q '^forge check-claim 522 --attended-claim$' "$LOG"; then pass "attended probe asked (no lease passes it)"; else fail "wrong probe"; cat "$LOG"; fi
 
 echo "Test 20: indeterminate ownership (exit 0) and Doctor origin reuse keep the fail-open lease"
 git checkout -q -b feature/issue-520 && echo w > w520.txt && git add w520.txt && git commit -q -m w520
