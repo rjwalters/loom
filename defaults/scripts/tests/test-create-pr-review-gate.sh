@@ -344,6 +344,40 @@ Part of #212" --head "feature/issue-212"
 assert_eq "6" "$EXIT_CODE" "Two Part of references -> last (#212) is the target"
 assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "402" "Guard never consulted the earlier #402"
 
+# T17 (#14351): two closing references, the branch names the FIRST one ->
+# the branch-declared issue wins over last-match; the guard consults #14059
+# and never #14052.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-14059-rc.txt"
+echo "563" > "$STUB_DIR/opr-14059-stdout.txt"
+echo "feature/issue-14059-alt" > "$STUB_DIR/pr-563-head.txt"
+run_create_pr --title "fix: something" --body "Closes #14059
+Closes #14052" --head "feature/issue-14059"
+assert_eq "6" "$EXIT_CODE" "Two Closes, branch names the first -> exit 6 on #14059"
+assert_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "check-open-pr 14059" "Guard consulted the branch-declared #14059"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "14052" "Guard never consulted the other closing reference #14052"
+
+# T18 (#14351): two closing references, the branch names NEITHER -> existing
+# last-match behaviour is unchanged (#14052).
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-14052-rc.txt"
+echo "564" > "$STUB_DIR/opr-14052-stdout.txt"
+echo "feature/issue-9999-alt" > "$STUB_DIR/pr-564-head.txt"
+run_create_pr --title "fix: something" --body "Closes #14059
+Closes #14052" --head "feature/issue-9999"
+assert_eq "6" "$EXIT_CODE" "Two Closes, branch matches neither -> last-match #14052"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "14059" "Guard never consulted the earlier #14059"
+
+# T19 (#14351): a branch that is not `feature/issue-N` shaped -> last-match.
+reset_fixtures
+echo "0" > "$STUB_DIR/opr-14052-rc.txt"
+echo "565" > "$STUB_DIR/opr-14052-stdout.txt"
+echo "docs/other-branch-alt" > "$STUB_DIR/pr-565-head.txt"
+run_create_pr --title "fix: something" --body "Closes #14059
+Closes #14052" --head "docs/other-branch"
+assert_eq "6" "$EXIT_CODE" "Two Closes, non-issue branch -> last-match #14052"
+assert_not_contains "$(cat "$STUB_DIR/daemon-forge-calls.log")" "14059" "Guard never consulted the earlier #14059 on a non-issue branch"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
