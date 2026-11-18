@@ -2050,15 +2050,30 @@ fn transcript_tokens_enabled() -> bool {
 async fn fetch_transcript_tokens(
     workspace_root: &str,
     issue: u32,
+    pr: u32,
     window: (DateTime<Utc>, DateTime<Utc>),
 ) -> Option<u64> {
     if !transcript_tokens_enabled() {
         return None;
     }
-    let projects = crate::transcript_tokens::claude_projects_dir()?;
     let root = PathBuf::from(workspace_root);
+    // #14018: a step-dispatched merge reads its own step logs, the Claude
+    // transcripts of its PR-keyed steps and its OpenCode sessions by id (see
+    // `crate::usage_source::merge_step_tokens_by_model`); only a legacy sweep
+    // falls through to the issue-keyed Claude scan below.
+    if crate::usage_source::has_merge_step_logs(&root, issue, pr) {
+        let scan = tokio::task::spawn_blocking(move || {
+            crate::usage_source::merge_step_tokens_by_model(&root, issue, pr, Some(window))
+                .and_then(|rows| crate::usage_source::total_tokens(&rows))
+        });
+        return tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)
+            .await
+            .ok()?
+            .ok()?;
+    }
+    let projects = crate::transcript_tokens::claude_projects_dir()?;
     let scan = tokio::task::spawn_blocking(move || {
-        crate::transcript_tokens::sum_sweep_tokens(&projects, &root, issue, Some(window))
+        crate::transcript_tokens::sum_item_tokens(&projects, &root, issue, Some(pr), Some(window))
     });
     tokio::time::timeout(TOKEN_LOOKUP_TIMEOUT, scan)
         .await
@@ -2081,13 +2096,14 @@ async fn fetch_transcript_tokens(
 async fn fetch_issue_tokens(
     activity_db: Option<&Arc<Mutex<ActivityDb>>>,
     issue: u32,
+    pr: u32,
     workspace_root: &str,
     window: (DateTime<Utc>, DateTime<Utc>),
 ) -> Option<u64> {
     if let Some(total) = fetch_activity_db_tokens(activity_db, issue).await {
         return Some(total);
     }
-    fetch_transcript_tokens(workspace_root, issue, window).await
+    fetch_transcript_tokens(workspace_root, issue, pr, window).await
 }
 
 /// Bundles what [`build_and_narrate_completion`] needs to consult and update
@@ -2314,15 +2330,26 @@ async fn build_and_narrate_completion(
     // by a token lookup it would not have published. The window narrows the
     // transcript fallback's candidate set to sessions that overlap this
     // completion, so it must be computed before the lookup.
-    let tokens =
-        fetch_issue_tokens(activity_db, issue, workspace_root, (started_at, exited_at)).await;
+    let tokens = fetch_issue_tokens(
+        activity_db,
+        issue,
+        merged.number,
+        workspace_root,
+        (started_at, exited_at),
+    )
+    .await;
     // Issue #8507: what this sweep actually launched on, read off its own
     // `# LOOM_LAUNCH` record. Resolved BEFORE the per-model lookup because it
     // also selects that lookup's source — and published in its own right, so a
     // non-Claude completion is labelled even when no usage numbers exist.
     // `None` for a Claude/legacy spawn (writes no record).
-    let runtime_attribution =
-        crate::launch_record::sweep_runtime_attribution(Path::new(workspace_root), issue);
+    // #14018: under step dispatch the record is in the step logs, not the
+    // legacy sweep log (see `merge_runtime_attribution`).
+    let runtime_attribution = crate::launch_record::merge_runtime_attribution(
+        Path::new(workspace_root),
+        issue,
+        merged.number,
+    );
     // Per-model breakdown (#5740) — a second, independent lookup: it shares
     // the completion's window but not `tokens`' activity-DB fast path, since
     // that rollup has no per-model granularity to offer.
@@ -2330,6 +2357,7 @@ async fn build_and_narrate_completion(
         runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
         workspace_root,
         issue,
+        merged.number,
         (started_at, exited_at),
     )
     .await;

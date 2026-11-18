@@ -446,6 +446,17 @@ A non-positive or unparseable value at either tier is treated as absent (falls
 through to the next tier), never as "disable retention" — a config typo can
 never silently turn this pass into a no-op.
 
+**Step logs are excluded by default (#14177).** Per-step logs
+`step-<role>-<item>.log` (the durable `LOOM_STEP_OUTCOME` history) carry no
+`issue-` in their name and are never removed by this pass unless
+`LOOM_STEP_LOG_REQUIRE_ARCHIVE=1` is set. With the gate on, a step log is
+deleted — together with its `<log>.archived` sidecar, written by the off-host
+preserver only after a checksum-confirmed store put — only when it is past the
+retention window, its item has no live sweep and no sweep checkpoint, and its
+last dispatch attempt wrote a terminal outcome line. See
+*Daily-rolling `daemon.log`* → "Step-log archive gate" in
+[`daemon-reference.md`](daemon-reference.md).
+
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
 Loom before that fix accumulated one orphaned local branch per merged issue —

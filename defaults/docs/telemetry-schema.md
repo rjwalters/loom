@@ -609,11 +609,11 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
   "effort": "high",
   "config": { "runtime": "claude", "arm": "B" },
   "phase_durations": [
-    { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510 },
-    { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900 },
-    { "phase": "judge", "duration_sec": 60, "attempt": 1, "tokens_in": 3100, "tokens_out": 400 },
-    { "phase": "doctor", "duration_sec": 45, "attempt": 1, "tokens_in": 1800, "tokens_out": 200 },
-    { "phase": "judge", "duration_sec": 20, "attempt": 2 }
+    { "phase": "curator", "duration_sec": 12, "attempt": 1, "tokens_in": 4200, "tokens_out": 510, "effort": "high" },
+    { "phase": "builder", "duration_sec": 340, "attempt": 1, "tokens_in": 38000, "tokens_out": 4900, "effort": "high" },
+    { "phase": "judge", "duration_sec": 60, "attempt": 1, "tokens_in": 3100, "tokens_out": 400, "effort": "high" },
+    { "phase": "doctor", "duration_sec": 45, "attempt": 1, "tokens_in": 1800, "tokens_out": 200, "effort": "high" },
+    { "phase": "judge", "duration_sec": 20, "attempt": 2, "effort": "high" }
   ],
   "total_duration_sec": 512,
   "result": "success",
@@ -713,6 +713,7 @@ attempt's own cost as well as its duration:
 | `tokens_in` | integer | This attempt's input-side tokens, on exactly `tokens_in`'s axis (uncached input + cache reads + cache writes). |
 | `tokens_out` | integer | This attempt's output-side tokens, on `tokens_out`'s axis. Always present or absent together with `tokens_in`. |
 | `tokens_by_model` | array | The same attempt's usage grouped by `(model, speed, service_tier)` — the per-phase counterpart of the record-level `tokens_by_model`, which is what makes a phase priceable when the Doctor ladder ran it on a different model than the Builder. Same presence contract as `tokens_in`. |
+| `effort` | string | The reasoning effort this attempt's launch ran at (Issue #14242) — the per-phase counterpart of the record-level `effort`. A sweep session's phases all inherit the session-default effort (the in-session Task tool exposes no effort parameter, so no phase can run at anything else); a step sweep's single phase is its role's own resolved effort. Stamped from the launch, never re-derived from dispatch-time config. Omitted — never `default` — when unknown: a pre-#14242 record, or one whose entry could name no effort at all. |
 
 **Why per phase.** The record-level totals cannot separate *clean-landing cost*
 (curator + builder + the **first** judge) from *rework cost* (Doctor and
@@ -756,7 +757,8 @@ chunks straddle a phase boundary is counted once, in the phase it started in,
 which is what keeps the sum from exceeding the total.
 
 **The same numbers reach OTLP.** `loom.phase_durations`' nested entries carry
-`attempt`/`tokens_in`/`tokens_out` (same absent-not-zero discipline), and the
+`attempt`/`tokens_in`/`tokens_out` (same absent-not-zero discipline) and, since
+#14242, the phase's `effort` when it was stamped, and the
 remainder is exported beside the totals as `loom.tokens_unattributed_in` /
 `loom.tokens_unattributed_out`, so an OTLP consumer can check the same
 invariant. The per-phase `tokens_by_model` breakdown is deliberately **not**
