@@ -186,23 +186,6 @@ pub(crate) struct LockOwner {
     /// default — which is a genuinely unknown level, never a fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) effort: Option<String>,
-    /// Whether this sweep took the host's single overflow slot (#9244,
-    /// inert since #11508), stamped by [`SweepRegistry::mark_overflow`] the
-    /// moment the work finder admits the over-limit dispatch (Issue #9314).
-    ///
-    /// Same schema-evolution contract and the same *reason* as
-    /// [`model`](Self::model)/[`effort`](Self::effort): the fact is known only
-    /// to the dispatching daemon *instance*, so before this field existed a
-    /// restart erased it — [`SweepRegistry::reconstruct`] had nothing to
-    /// restore from and set `overflow: false` on every adopted entry. Safety
-    /// held either way (the `occupancy <= configured` gate bounds the host to
-    /// max+1 regardless), but `status`/`list_sweeps` lost the `[overflow]`
-    /// marker and, once one normal sweep ended, a *second* starred issue could
-    /// take a slot the first over-limit sweep was still occupying. `false` on
-    /// a pre-#9314 `owner.json` and on every ordinary in-cap dispatch — which
-    /// is the honest value for both.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) overflow: bool,
     /// Pause-and-roll identity (Issue #10830), stamped at spawn by
     /// [`resume_handle::DispatchSession::stamp`](super::resume_handle::DispatchSession::stamp):
     /// the item id that arms the pause hook, the systemd scope unit (the H4
@@ -223,7 +206,7 @@ pub(crate) struct LockOwner {
 impl LockOwner {
     /// A provisional owner record: the three fields every lock has from the
     /// moment it is created, with `acquired_at` stamped now and every
-    /// after-the-fact field (`pgid`, `model`, `effort`, `overflow`) unset.
+    /// after-the-fact field (`pgid`, `model`, `effort`) unset.
     ///
     /// Exists so the optional fields stay in ONE place. Each was added
     /// separately (#4980, #8056) and every construction site had to grow a
@@ -241,7 +224,6 @@ impl LockOwner {
             pgid: None,
             model: None,
             effort: None,
-            overflow: false,
             item_id: None,
             scope_unit: None,
             agent_started_at: None,
@@ -312,7 +294,7 @@ pub(crate) fn scan_unregistered_locked_issues(
 impl SweepRegistry {
     /// Cross-check `.loom/locks/issue-<N>/` against this registry's own
     /// in-memory entries and surface any issue whose lock has a **live**
-    /// `owner_pid` but no matching non-terminal (`Pending`/`Running`) registry
+    /// `owner_pid` but no matching non-terminal (`Running`) registry
     /// entry (Issue #4214).
     ///
     /// This is the structural fix for the "vanish window" incident: the
@@ -432,34 +414,6 @@ impl SweepRegistry {
         if let Some(effort) = effort.filter(|e| !e.is_empty()) {
             owner.effort = Some(effort.to_string());
         }
-        let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
-        std::fs::write(&owner_path, owner_json)
-            .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        Ok(())
-    }
-
-    /// Stamp `overflow: true` onto `issue`'s claim lock (Issue #9314), so
-    /// [`reconstruct`](Self::reconstruct) can restore the flag after a restart.
-    ///
-    /// A read-modify-write over the same `owner.json`
-    /// [`record_child_pid_in_lock`](Self::record_child_pid_in_lock) stamps, so
-    /// the two are order-independent: whichever runs second preserves the
-    /// other's fields. Called only from
-    /// [`mark_overflow`](Self::mark_overflow), which owns the in-memory half.
-    pub(crate) fn stamp_overflow_in_lock(&self, issue: u32) -> Result<()> {
-        let owner_path = self
-            .config
-            .locks_dir()
-            .join(format!("issue-{issue}"))
-            .join("owner.json");
-        let existing = std::fs::read_to_string(&owner_path)
-            .with_context(|| format!("read lock owner {}", owner_path.display()))?;
-        let mut owner: LockOwner =
-            serde_json::from_str(&existing).context("parse lock owner.json")?;
-        if owner.overflow {
-            return Ok(());
-        }
-        owner.overflow = true;
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
@@ -842,7 +796,7 @@ impl SweepRegistry {
         )
     }
 
-    /// Whether this registry has a non-terminal (`Pending`/`Running`) entry
+    /// Whether this registry has a non-terminal (`Running`) entry
     /// tracking a sweep for `issue` — shared by [`Self::live_claim_evidence`]
     /// (#5236) and [`Self::unregistered_locked_issues`] (#4214), both of
     /// which need the same "does our own bookkeeping know about this issue"
@@ -1087,14 +1041,6 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
-                        // Issue #9314: restored from the lock, which
-                        // `mark_overflow` stamps the moment the work finder
-                        // admits an over-limit starred dispatch. Before that
-                        // this was a hardcoded `false`, so a restart silently
-                        // freed the host's single overflow slot while the
-                        // over-limit sweep was still running — and dropped the
-                        // `[overflow]` marker from `status`/`list_sweeps`.
-                        overflow: owner.overflow,
                     },
                 );
                 crate::observability::lifecycle::execution_adopted(
@@ -1138,7 +1084,7 @@ impl SweepRegistry {
                 }
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
-                    matches!(info.state, SweepState::Running | SweepState::Pending)
+                    matches!(info.state, SweepState::Running)
                         && info.kind.issue_number() == Some(issue)
                 });
                 if already_running {
@@ -1189,13 +1135,6 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
-                        // A checkpoint-only entry is `Crashed`, and
-                        // `overflow_in_flight` only counts non-terminal
-                        // entries — so this can never hold the slot open,
-                        // whatever the departed sweep was (#9314). The lock
-                        // that would have carried the flag was already removed
-                        // as stale by the pass above.
-                        overflow: false,
                     },
                 );
                 admitted += 1;
@@ -1302,16 +1241,6 @@ impl SweepRegistry {
                     effort: None,
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
-                    // The machine journal records no overflow flag, and this
-                    // pass exists precisely for a survivor whose lock did NOT
-                    // survive — so there is nothing to restore from (#9314).
-                    // The residual gap is deliberate and bounded: such a sweep
-                    // is adopted without the marker, which can let ONE later
-                    // starred issue take the slot it still occupies. Fixing it
-                    // means widening the journal schema, which this pass's own
-                    // "read-only, adopt-only" contract keeps out of scope; the
-                    // `occupancy <= configured` gate still bounds the host.
-                    overflow: false,
                 },
             );
             adopted += 1;

@@ -43,14 +43,22 @@
 //! second state refusal of the same `(item, step)` with the **same reason**,
 //! with no other outcome in between, arms [`LedgerConfig::refusal_cooldown`]
 //! (10 min), doubling per further identical refusal up to
-//! [`MAX_SHORT_COOLDOWN`], broadcast like every window. A verdict or any
-//! other outcome on the pair resets the streak.
+//! [`MAX_SHORT_COOLDOWN`]. Unlike every other window this one is host-local,
+//! not broadcast (#11909): a refusal is this host's own (its exhausted pool,
+//! its claim race, its runtime or model pin) and says nothing about a peer's.
+//! A verdict or any other outcome on the pair resets the streak.
 //!
 //! `claim_lost` rides the same streak guard (#11969): one lost claim is a
 //! race and only redraws, but a pair whose claim is lost on every draw (a
 //! peer or an attended session holding it for longer than a tick) would
 //! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
 //! on the pair arms the same doubling refusal cooldown; it still redraws.
+//!
+//! So does a spawn-time admission refusal (#14032): `runtime_rejected`,
+//! `model_runtime_mismatch` and `admission_refused` map to the ledger's
+//! `admission` reason (`step_end::ledger_reason`) and fall through to this
+//! effect — a launch the runtime will not take says the pair cannot run now,
+//! so redrawing it on every tick only burns slots.
 //!
 //! [`PROVIDER_EXHAUSTED`] does **not** ride it (#13966). The streak is
 //! backpressure for a disagreement about the *item*; an exhausted api-key
@@ -101,7 +109,8 @@
 //! # Durability
 //!
 //! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
-//! landed cooldown's own ceiling), and the registry broadcasts each one on
+//! landed cooldown's own ceiling), and the registry broadcasts each one but a
+//! refusal's (host-local, #11909) on
 //! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
 //! a window after this host restarts. A host never gets its own windows back
 //! from peers (they never re-send them, and a host ignores its own ads), so
@@ -256,11 +265,33 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     Some(StepOutcome::new(class, &outcome.replace('-', "_")))
 }
 
-/// `key=value` fields of one outcome line.
+/// `key=value` fields of one outcome line. The value is
+/// [`token_value`]`(`v`)`: framing characters a runtime wraps the line in end
+/// the value instead of riding in it.
 fn fields(rest: &str) -> BTreeMap<&str, &str> {
     rest.split_whitespace()
-        .filter_map(|kv| kv.split_once('='))
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k, token_value(v))))
         .collect()
+}
+
+/// A framing-tolerant `key=value` value: the token's first run of value
+/// characters (`A-Za-z0-9_-`, the union of every field's own shape). The
+/// three observed framings of an outcome line (#14168) — bare, backticked,
+/// inside a JSON text event — all leave the value's characters intact and
+/// glue framing onto it (`` `verdict` ``, `verdict"}`, `pr_opened\n"}` as a
+/// literal JSON escape); the run ends at the first character that cannot be
+/// part of a value, whatever the wrapper added. Shared by both outcome-line
+/// parsers (`step_spawn::capture` and this module) so they cannot diverge.
+#[must_use]
+pub fn token_value(token: &str) -> &str {
+    fn is_value_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+    let rest = token.trim_start_matches(|c| !is_value_char(c));
+    match rest.find(|c| !is_value_char(c)) {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
 }
 
 /// The outcome a step session reported for `(target, step)`: the **last**
@@ -268,6 +299,10 @@ fn fields(rest: &str) -> BTreeMap<&str, &str> {
 /// `output` that names this role and target. A line for another role, mode or
 /// target, an unknown class or Champion word, is not this step's. A
 /// `LOOM_STEP_OUTCOME` line without `reason=` reads as [`UNCLASSIFIED`].
+/// The prefix may sit anywhere in the line — a runtime that wraps the
+/// session's output in a JSON text event glues it there (#14168) — and the
+/// role / mode / target / class checks still decide whether a match is this
+/// step's.
 ///
 /// Advisory only: [`classify`] decides with the forge post-state.
 #[must_use]
@@ -275,15 +310,16 @@ pub fn parse_outcome_line(output: &str, step: StepRole, target: u32) -> Option<S
     let champion = step.role_name() == "champion";
     output.lines().rev().find_map(|line| {
         let line = line.trim();
+        let rest = |prefix: &str| line.find(prefix).map(|at| &line[at + prefix.len()..]);
         if champion {
-            let f = fields(line.strip_prefix(CHAMPION_LINE_PREFIX)?);
+            let f = fields(rest(CHAMPION_LINE_PREFIX)?);
             let want_mode = if step.acts_on_pr() { "pr" } else { "issue" };
             if f.get("mode") != Some(&want_mode) || f.get("item")?.parse::<u32>().ok()? != target {
                 return None;
             }
             champion_outcome(step.acts_on_pr(), f.get("outcome")?)
         } else {
-            let f = fields(line.strip_prefix(OUTCOME_LINE_PREFIX)?);
+            let f = fields(rest(OUTCOME_LINE_PREFIX)?);
             if f.get("role") != Some(&step.role_name())
                 || f.get("target")?.parse::<u32>().ok()? != target
             {

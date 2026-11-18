@@ -21,6 +21,60 @@ Tier 2's keys can also be set per-host without committing them: `config_resolver
 
 The spawn plumbing also honors a `LOOM_MODEL` environment variable (`spawn-claude.sh`, `claude-wrapper.sh`): it is injected as `--model <value>` unless an explicit `--model` is already present in the args. Retries inside `claude-wrapper.sh` always reuse the same model — transport-level failures (token exhaustion, crashes, 5xx) are not quality signals and never change the model.
 
+### Attended subagents (Task-tool spawns)
+
+The chain above governs the **attended** path too — any session spawning a
+`loom-<role>` subagent through the Agent/Task tool — via a deterministic
+lookup instead of hand-reading config (issue #13956):
+
+```bash
+./.loom/scripts/resolve-role-model.sh <role> --json
+# -> {"role":"judge","model":"opus","source":"roleConfig.model"}
+```
+
+`source` names the tier that supplied the model (`param` | `roleConfig.model`
+| `suggestedModel` | `inherit`), so an experiment can confirm what actually
+ran. The bare form prints just the model; `--task-alias` returns the nearest
+Task-passable alias (the #4282 degradation — the Task tool's `model`
+parameter is alias-only). **Exit 3 with no output** means nothing is
+configured: the caller omits the Task `model` parameter and the subagent
+inherits the parent session's model — the zero-config behavior is
+byte-for-byte unchanged. The shipped `defaults/.claude/agents/*.md` carry no
+`model:` frontmatter (a test asserts it): a role's model comes from config at
+spawn time, never from a hardcoded tier — the #13956 operator ruling declined
+per-role pins in shipped files so per-role experiments stay possible.
+
+**Reasoning effort has no attended-path knob.** The Task tool's interface
+carries model only, so a `roleEfforts` setting remains a daemon-path setting
+(the role runner resolves effort per role in `role_runner/model_resolution.rs`).
+Configuring effort for attended subagents would require a harness change, not a
+Loom one.
+
+**Running the "opposite mix"** (the per-role experiment the ruling asks for):
+pin models per role in `.loom/config.json` (committed) or
+`.loom-local/local.json` (per-host, gitignored) — for example strong
+Curator/Judge with a cheaper Builder:
+
+```json
+{
+  "terminals": [
+    { "id": "curator", "roleConfig": { "roleFile": "curator.md", "model": "claude-opus-5" } },
+    { "id": "judge",   "roleConfig": { "roleFile": "judge.md",   "model": "claude-opus-5" } },
+    { "id": "builder", "roleConfig": { "roleFile": "builder.md", "model": "claude-sonnet-4-6" } }
+  ]
+}
+```
+
+…and the reverse (cheap Curator/Judge, strong Builder) by swapping the
+values. A tier-2 pin beats the role JSON's `suggestedModel` and is never
+overridden by the escalation ladder (see "Precedence interaction" above).
+Compare mixes on outcome telemetry — merged work, review bounces, cost via
+`agent-metrics.sh --by-model` (#3482) and the sweep records' `models_used` /
+`tokens_by_model` — not on impressions. The setting survives every
+reinstall/resync untouched: config lives outside `defaults/`, and the
+resolution happens at spawn time, so a config edit applies to the next spawn
+with no resync. The per-mix read-out report is tracked separately (#14067).
+
 **Escalation on Judge rejection (`sweep.escalation`, Phase 2, issue #3481)**:
 
 The `/loom:sweep` orchestrator escalates one rung up a capability ladder when the Judge rejects a PR (`loom:changes-requested`) and a Doctor is dispatched to address the feedback. The escalation decision is made by the sweep orchestrator at Doctor-dispatch time — never by `claude-wrapper.sh` retries, never by worker self-assessment. Mode C (`--prs`) inherits the same rule for its Doctor phase (step C1b).

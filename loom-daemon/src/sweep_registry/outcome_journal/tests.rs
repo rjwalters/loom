@@ -243,7 +243,6 @@ fn telemetry_outcome_records_cancel_as_cancelled() {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 

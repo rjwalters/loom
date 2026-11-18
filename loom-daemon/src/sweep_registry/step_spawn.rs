@@ -716,7 +716,6 @@ impl SweepRegistry {
                 effort: launch.effort.clone(),
                 depends_on: None,
                 repo: Some(self.config.workspace_root.display().to_string()),
-                overflow: false,
             },
         );
         if let Some(points) = request.story_points {
@@ -848,9 +847,7 @@ impl SweepRegistry {
         use crate::observability::ops::busy_slots::{self, LiveStep, LiveSteps};
         let mut running = LiveSteps::new();
         for info in self.entries.values() {
-            if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
-                (&info.kind, &info.state)
-            {
+            if let (SweepKind::Step { role, .. }, SweepState::Running) = (&info.kind, &info.state) {
                 running.entry(role.role_name()).or_default().push(LiveStep {
                     started_at: info.started_at,
                     points: self.step_points(&info.sweep_id),

@@ -1105,7 +1105,7 @@ impl SweepRegistry {
         }
     }
 
-    /// Re-advertise the peer claim of every live (`Running`/`Pending`) Issue
+    /// Re-advertise the peer claim of every live (`Running`) Issue
     /// sweep over the safehouse room (Issue #4431).
     ///
     /// The dispatch-time advertisement is a one-shot publish, and peer claims
@@ -1130,7 +1130,7 @@ impl SweepRegistry {
         let live: Vec<u32> = self
             .entries
             .values()
-            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter(|info| matches!(info.state, SweepState::Running))
             .filter_map(|info| match info.kind {
                 SweepKind::Issue(issue) => Some(issue),
                 // A step re-advertises its `(item, step)` shape below (#11898).
@@ -1150,7 +1150,7 @@ impl SweepRegistry {
         let live: Vec<(String, u32, crate::step_role::StepRole, DateTime<Utc>)> = self
             .entries
             .values()
-            .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter(|info| matches!(info.state, SweepState::Running))
             .filter_map(|info| match info.kind {
                 SweepKind::Step { item, role } => {
                     Some((info.sweep_id.clone(), item, role, info.started_at))
@@ -1905,7 +1905,6 @@ impl SweepRegistry {
             // get_sweep_status responses disambiguate this repo's issue #N from
             // another managed repo's identically-numbered issue.
             repo: Some(self.config.workspace_root.display().to_string()),
-            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 
@@ -2104,7 +2103,6 @@ impl SweepRegistry {
             effort: effort.filter(|e| !e.is_empty()).map(String::from),
             depends_on: None,
             repo: Some(self.config.workspace_root.display().to_string()),
-            overflow: false,
         };
         self.entries.insert(sweep_id.clone(), info);
 

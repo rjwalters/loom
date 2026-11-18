@@ -83,7 +83,6 @@ fn sweep(dir: &Path, id: &str, issue: u32) -> ManifestItem {
         lease_comment_id: None,
         lease_refreshed_at: None,
         log_path: None,
-        overflow: false,
         role: None,
         timeout_remaining_secs: None,
         holds_issue_creation_mutex: false,

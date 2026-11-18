@@ -74,7 +74,7 @@ fn the_marker_leads_the_order_only_on_a_red_main() {
 }
 
 #[test]
-fn a_labelled_red_main_fix_outranks_an_important_issue_without_overflow() {
+fn a_labelled_red_main_fix_outranks_an_important_issue_without_going_over_the_cap() {
     // The very-important fix goes first and nothing goes over the cap of 1.
     let important = WorkItem::new(5, vec!["loom:important".into()]);
     let items = vec![very_important(fix(9)), important];
@@ -135,7 +135,7 @@ fn a_hold_that_is_not_a_verified_red_main_admits_nothing() {
 }
 
 #[test]
-fn a_red_main_fix_does_not_get_the_overflow_slot() {
+fn a_red_main_fix_waits_for_capacity_when_the_cap_is_full() {
     let mut multi = vec![(
         FakeSource::once(vec![fix(9)]),
         RecordingDispatcher {

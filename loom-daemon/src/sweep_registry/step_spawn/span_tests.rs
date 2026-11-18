@@ -24,7 +24,18 @@ fn line(class: StepOutcomeClass) -> StepOutcomeLine {
 
 fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttributes) {
     let outcome = super::super::capture::tick_outcome(StepRole::Judge, end, line);
-    sweep_close(end, line, &outcome, StepRole::Judge, Some("opus"), None, None, None, false)
+    sweep_close(
+        end,
+        line,
+        &outcome,
+        StepRole::Judge,
+        None,
+        Some("opus"),
+        None,
+        None,
+        None,
+        false,
+    )
 }
 
 /// #12957: a sized step's close carries its points; an unsized one has no
@@ -38,6 +49,7 @@ fn a_sized_steps_close_carries_its_story_points() {
             None,
             &outcome,
             StepRole::Judge,
+            None,
             None,
             None,
             points,
@@ -59,6 +71,49 @@ fn a_clean_exit_closes_as_success_with_its_role_and_exit_code() {
     assert_eq!(close["loom.configured_model"], "opus");
     assert!(!close.contains_key("loom.effort"), "an unknown effort is absent");
     assert!(!close.contains_key("loom.failure_class"));
+}
+
+/// #14168: the step's own word on its work rides the close — class and
+/// reason for a parsed line, and `none` with no reason when the step wrote
+/// no parseable line, so "no outcome" is countable rather than an absence.
+#[test]
+fn a_close_carries_the_steps_outcome_class_and_reason() {
+    let verdict = line(StepOutcomeClass::Verdict);
+    let (_, with_line) = close_of(StepEnd::Exited(Some(0)), Some(&verdict));
+    assert_eq!(with_line["loom.step.outcome.class"], "verdict");
+    assert_eq!(with_line["loom.step.outcome.reason"], "r");
+    let (_, without) = close_of(StepEnd::Exited(Some(0)), None);
+    assert_eq!(without["loom.step.outcome.class"], "none");
+    assert!(
+        !without.contains_key("loom.step.outcome.reason"),
+        "no line, no reason: the absence is not a fabricated empty token"
+    );
+}
+
+/// #14168: the registry's runtime for the step rides the close, so
+/// "outcomes by runtime, model and role" is one query over the span. An
+/// unknown runtime is absent, never a fabricated name.
+#[test]
+fn a_close_carries_the_runtime_that_ran_the_step() {
+    let outcome = super::super::capture::tick_outcome(StepRole::Judge, StepEnd::TimedOut, None);
+    let close = |runtime| {
+        sweep_close(
+            StepEnd::TimedOut,
+            None,
+            &outcome,
+            StepRole::Judge,
+            runtime,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .1
+    };
+    assert_eq!(close(Some("codex"))["loom.runtime"], "codex");
+    assert!(!close(None).contains_key("loom.runtime"));
+    assert!(!close(Some("")).contains_key("loom.runtime"));
 }
 
 #[test]
@@ -126,7 +181,6 @@ fn insert_step(reg: &mut SweepRegistry, item: u32, role: StepRole, pid: u32) -> 
             effort: Some("high".into()),
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -310,6 +364,7 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
             None,
             None,
             None,
+            None,
             pr,
             false,
         )
@@ -336,6 +391,7 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
             None,
             None,
             None,
+            None,
             pr,
             false,
         )
@@ -353,8 +409,8 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
 fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     let outcome = RoleTickOutcome::Failure("step exited 1".to_string());
     let class = |end, exhausted| {
-        sweep_close(end, None, &outcome, StepRole::Builder, None, None, None, None, exhausted).1
-            [lifecycle::FAILURE_CLASS]
+        sweep_close(end, None, &outcome, StepRole::Builder, None, None, None, None, None, exhausted)
+            .1[lifecycle::FAILURE_CLASS]
             .clone()
     };
     assert_eq!(class(StepEnd::Exited(Some(1)), true), "provider-exhausted");

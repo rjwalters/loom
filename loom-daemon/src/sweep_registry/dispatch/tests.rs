@@ -137,7 +137,7 @@ fn runtime_rejection_precedes_every_dispatch_side_effect() {
 /// chmod with the child's posix_spawn exec call and the script silently
 /// fails to launch (no shebang resolution, no exec-bit yet).
 /// #4431: the reaper's peer-claim heartbeat must re-advertise every live
-/// (`Running`/`Pending`) Issue sweep's claim — and ONLY those (a
+/// (`Running`) Issue sweep's claim — and ONLY those (a
 /// terminal-state entry is a dead sweep whose claim must be allowed to
 /// expire), and be a publisher-less no-op (safehouse disabled).
 #[test]
@@ -169,7 +169,6 @@ fn readvertise_republishes_live_issue_claims_only() {
         effort: None,
         depends_on: None,
         repo: None,
-        overflow: false,
     };
     let live_log = registry.compute_log_path(4431);
     let dead_log = registry.compute_log_path(999);

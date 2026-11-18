@@ -250,6 +250,63 @@ pub fn recover(
     snapshot(config, &dir)
 }
 
+/// Publish, discard or just list the unpublished branches of an account's
+/// private clones (`accounts session recover`, #14030). Same guard policy as
+/// a job: resolved workspace identity, a validated running session, and the
+/// exclusive account lease held for the whole call — so it can never race a
+/// running step, and nothing touches the volume or a branch other than the
+/// ones named by an explicit discard scope.
+pub fn session_recover(
+    workspace: &Path,
+    name: &str,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+) -> Result<RecoverReport> {
+    let (config, dir) = resolve(workspace, name)?;
+    let targets = {
+        let mut targets = vec![config.primary()];
+        for registered in &config.repositories {
+            targets.push(config.target(Some(&registered.repository))?);
+        }
+        targets
+    };
+    // Parity with a job on an additional clone: an excluded forge never
+    // reaches git, not even for a publish.
+    for target in targets.iter().filter(|t| t.slug.is_some()) {
+        check_firewall(workspace, &identify(&target.repository)?)?;
+    }
+    let _lease = lease::Lease::acquire(&dir)?;
+    let state = docker::inspect(&config.container)?
+        .context("private session is stopped; start it first")?;
+    docker::validate(&config, &state)?;
+    if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
+        bail!("private session is not running and idle; refuse recover admission");
+    }
+    let mut clones = Vec::new();
+    for target in &targets {
+        let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
+        clones.push(docker::recover_target(&config, target, action, issue, branches, &auth)?);
+    }
+    let report = RecoverReport {
+        account: config.account.clone(),
+        clones,
+    };
+    if action != RecoverAction::List
+        && (issue.is_some() || !branches.is_empty())
+        && report
+            .clones
+            .iter()
+            .all(|clone| clone.published.is_empty() && clone.discarded.is_empty())
+    {
+        bail!(
+            "no clone of this account has unpublished commits on the named branches; \
+             run the listing form (`accounts session recover {name}`) to see what is unpublished"
+        );
+    }
+    Ok(report)
+}
+
 fn snapshot(config: Config, dir: &Path) -> Result<Status> {
     let state = docker::inspect(&config.container)?;
     if let Some(state) = &state {
