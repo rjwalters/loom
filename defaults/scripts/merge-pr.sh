@@ -1465,7 +1465,7 @@ _auto_reconcile_stacked_children || true
 # NOTE: Full label cleanup on linked issues remains intentionally skipped for
 # the `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case — MOST labels
 # on a closed issue are harmless, since every queue-driving agent filters on
-# open state. See: https://github.com/rjwalters/loom/issues/2838
+# open state. See: https://github.com/2AMLogic/loom/issues/2838
 #
 # EXCEPTION 1 (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
 # increment references leave the referenced issue OPEN after merge, so its
@@ -1490,7 +1490,7 @@ _auto_reconcile_stacked_children || true
 # `forge_pr_close_targets` (which delegates to GitHub's GraphQL
 # `closingIssuesReferences` field) to confirm closure. If you are debugging
 # why an unintended issue was closed, look at the PR body and Champion logs,
-# not at this script. See: https://github.com/rjwalters/loom/issues/3267
+# not at this script. See: https://github.com/2AMLogic/loom/issues/3267
 
 # Delete remote branch (skip if forge auto-deletes on merge)
 DELETE_BRANCH_ON_MERGE=$(forge_check_auto_delete "$REPO_NWO" "$GH")

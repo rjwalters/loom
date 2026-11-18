@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom step slots idle with work waiting",
-    "description": "Repo {{$labels.repo}} had drawable items (loom.step.actionable > 0) in every tick of the last 30 min, but the busiest host dispatching for it never filled more than {{$value}} of its slots (loom.dispatch.busy_slots role=sweep over loom.dispatch.max_concurrent). Look at pick.decision item_draw refused_* counts and loom.dispatch.step refusals for the repo. Issue rjwalters/loom#11909."
+    "description": "Repo {{$labels.repo}} had drawable items (loom.step.actionable > 0) in every tick of the last 30 min, but the busiest host dispatching for it never filled more than {{$value}} of its slots (loom.dispatch.busy_slots role=sweep over loom.dispatch.max_concurrent). Look at pick.decision item_draw refused_* counts and loom.dispatch.step refusals for the repo. Issue 2AMLogic/loom#11909."
   },
   "disabled": false
 }

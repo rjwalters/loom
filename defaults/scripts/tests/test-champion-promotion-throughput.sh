@@ -7,11 +7,11 @@
 # THE FAILURE MODES THIS GUARDS AGAINST
 #
 #   pass order    champion.md ran promotion only "if no PRs remain". A repo
-#                 with a held PR queue never reached it (rjwalters/loom on
+#                 with a held PR queue never reached it (2AMLogic/loom on
 #                 2026-10-07: 30 of 38 `loom:pr` PRs held by loom:operator).
 #   self-pinning  The informational Backlog Balance Check once counted issues
 #                 that cannot free a slot (waiting proposals, held issues: 19
-#                 counted vs 2 promoted in rjwalters/loom).
+#                 counted vs 2 promoted in 2AMLogic/loom).
 #
 # WHAT THIS SUITE DOES
 #

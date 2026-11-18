@@ -1,6 +1,6 @@
 # Fleet Observability: end-to-end reference
 
-> Epic [#4702](https://github.com/rjwalters/loom/issues/4702), Phase 4
+> Epic [#4702](https://github.com/2AMLogic/loom/issues/4702), Phase 4
 > (#4860). This is the single entry point tying the whole pipeline together —
 > **daemon config → wire schema → exporter → Cloudflare backend → dashboard
 > views** — matching the map-plus-links pattern `daemon-reference.md` and
@@ -163,7 +163,7 @@ exporter is configured**):
 
 OTLP is the only exporter (#12813 removed the native JSON-over-HTTPS `POST
 /ingest` one). `OtlpExporter` (epic Phase 4, issue
-[#4858](https://github.com/rjwalters/loom/issues/4858)) translates
+[#4858](https://github.com/2AMLogic/loom/issues/4858)) translates
 `TelemetryEnvelope` batches into OTLP logs (`/v1/logs`) and metrics
 (`/v1/metrics`) requests, batched (`batchSize`), retried with jitter, and
 backed by the durable disk queue so a sink outage or a sleeping host never

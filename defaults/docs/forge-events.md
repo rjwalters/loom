@@ -179,8 +179,8 @@ before. The fleet store fetch never depends on the mirror.
 
 ## See also
 
-- [ADR-0021](https://github.com/rjwalters/loom/blob/main/docs/adr/0021-forge-event-plane.md) — the decision and its
-  alternatives (the feed half is superseded) · [ADR-0014](https://github.com/rjwalters/loom/blob/main/docs/adr/0014-forge-coordination-decoupling.md) — the invariants
+- [ADR-0021](https://github.com/2AMLogic/loom/blob/main/docs/adr/0021-forge-event-plane.md) — the decision and its
+  alternatives (the feed half is superseded) · [ADR-0014](https://github.com/2AMLogic/loom/blob/main/docs/adr/0014-forge-coordination-decoupling.md) — the invariants
 - [`observability.md`](observability.md) — the sibling operator-deployed
   backend, same shape
 - [`credential-storage.md`](credential-storage.md) — where keys may live

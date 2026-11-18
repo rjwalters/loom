@@ -1,6 +1,6 @@
 # Network inputs to loom-daemon: audit and classification
 
-Audit for [#11711](https://github.com/rjwalters/loom/issues/11711), part of
+Audit for [#11711](https://github.com/2AMLogic/loom/issues/11711), part of
 the operator's config-only-inputs initiative. It answers one question: **what does `loom-daemon` accept
 or fetch from outside the process that can change what it does, and is each
 such input config, forge, a wake-only webhook, or removed?**
@@ -123,7 +123,7 @@ listed under "Not an input". Sweep 6's "no HTTP framework" applies to
 | # | Input | Direction | Code location | Transport / peer | What it changes in daemon behavior | Gating config key (default) | Class | Replacement or follow-up |
 |---|---|---|---|---|---|---|---|---|
 | 8 | ~~`/ingest` response: operator-priority and workspace-priority intents~~ | — | removed 2026-10-21 (#12813) | The exporter that read the ack was deleted; no daemon code reads a dashboard response | Nothing | — | `removed` | Priority controls as fleet config (outside this repo's scope) |
-| 9 | Safehouse peer claims (inbound room events) | in | `safehouse.rs` `spawn_peer_coordination` (dedicated inbound read task), `safehouse/claim_sink.rs` `PeerClaimSink::on_event`, `peer_claims.rs` `PeerClaimView`; consumed in `sweep_registry/guards.rs` (`detect_and_record_collision`) and `SweepRegistry::dispatch` | `AF_UNIX` NDJSON to the local `safehoused`, which holds a Matrix room. Peer: other hosts' claim advertisements | A live peer claim makes this host **back off an issue before dispatch**, retracting its own advertisement and lock. Soft, TTL-bound (`peerClaimTtlSecs`, 120) | `safehouse.enabled` (`false`; env `LOOM_SAFEHOUSE_ENABLED`), `safehouse.socket`, `safehouse.rooms.claims` (env `LOOM_SAFEHOUSE_ROOM_CLAIMS`) | `removed` | Replacement: `nothing`. ADR-0025 already decides the forge lease is the only cross-host claim. Covered by rjwalters/loom#11112 (safehouse removal) and #11712 step 3 |
+| 9 | Safehouse peer claims (inbound room events) | in | `safehouse.rs` `spawn_peer_coordination` (dedicated inbound read task), `safehouse/claim_sink.rs` `PeerClaimSink::on_event`, `peer_claims.rs` `PeerClaimView`; consumed in `sweep_registry/guards.rs` (`detect_and_record_collision`) and `SweepRegistry::dispatch` | `AF_UNIX` NDJSON to the local `safehoused`, which holds a Matrix room. Peer: other hosts' claim advertisements | A live peer claim makes this host **back off an issue before dispatch**, retracting its own advertisement and lock. Soft, TTL-bound (`peerClaimTtlSecs`, 120) | `safehouse.enabled` (`false`; env `LOOM_SAFEHOUSE_ENABLED`), `safehouse.socket`, `safehouse.rooms.claims` (env `LOOM_SAFEHOUSE_ROOM_CLAIMS`) | `removed` | Replacement: `nothing`. ADR-0025 already decides the forge lease is the only cross-host claim. Covered by 2AMLogic/loom#11112 (safehouse removal) and #11712 step 3 |
 | 10 | Safehouse filing-lock mirror | in | `safehouse/claim_sink.rs` `mirror_filing_lock_to_disk`, `filing_lock.rs` `record_peer_hold` / `clear_peer_hold` | Same channel as row 9, a `FilingLock` / `FilingUnlock` ad | Writes a marker file whose mtime (local receipt time) ages out a **peer's hold on issue filing**, which the local filing lock then respects | same as row 9 | `removed` | Replacement: `nothing` (host-only serialization, which `filing_lock.rs` documents as the degraded mode). Covered by #11112 |
 | 11 | Safehouse ChatOps and Concierge | in | No module at this commit: `rg safehouse_chatops` finds tests and comments only. Residue: `types.rs` `dispatch_origin` doc, per-repo `.loom/config.json` `chatops` / `concierge` blocks, and `defaults/docs/safehouse.md` sections that still describe them | Was Matrix room text via `safehoused` | Was: typed verbs (dispatch, cancel, ...) and an LLM persona proposing them. The daemon-side parser is gone (#11112 slice 1) | `safehouse.chatops.*`, `safehouse.concierge.*` (`enabled: false` everywhere) | `removed` | Replacement: `nothing`. Residual cleanup (stale seeds, stale doc sections, config schema keys) belongs to #11112's remaining slices |
 | 12 | loom-ui GitHub mirror route (`MIRROR_PATH`, `handleGhMirrorRoute`) | in | **No daemon client exists.** `rg -i 'MIRROR_PATH\|handleGhMirror\|gh.?mirror' loom-daemon/src` finds one doc comment in `forge_cmd.rs` (about the retired `forge_cli.py`). The `peer_claims.rs` hit for "mirror" is the filing-lock mirror, row 10. `forge_pr_congestion.rs`, `forge_disable_auto_merge.rs`, `forge_cached_*`, `forge_read_pool.rs` and `forge_etag_store*` all read through `gh` (row 17), not a dashboard | n/a | n/a | Nothing: the "push-not-poll via a loom-ui read mirror" idea (#10332) never landed in the daemon | none | `removed` | Replacement: `nothing` (daemon reads GitHub directly). Nothing to delete daemon-side. loom-ui owns removing the route itself |
@@ -207,7 +207,7 @@ nothing to remove daemon-side.
 | Row | Covered by |
 |---|---|
 | 8 `/ingest` control fields | Daemon side done (#11104); the exporter itself was removed in #12813. Priority controls as fleet config (outside this repo's scope) |
-| 9, 10, 11 Safehouse | rjwalters/loom#11112 (safehouse removal, ADR-0025) and #11712 step 3 |
+| 9, 10, 11 Safehouse | 2AMLogic/loom#11112 (safehouse removal, ADR-0025) and #11712 step 3 |
 | 12 loom-ui GitHub mirror | Nothing daemon-side; loom-ui removes its route |
 
 Fleet config changes needed (listed in the operator's fleet tracking, not
@@ -217,7 +217,7 @@ ruled for hardening, a fleet-wide signature policy.
 
 ## Related
 
-- rjwalters/loom#11711 (this audit), #11712, #11112, #11104
+- 2AMLogic/loom#11711 (this audit), #11712, #11112, #11104
 - [`forge-events.md`](forge-events.md) (the retained state mirror) and ADR-0021 (rows 6-7, superseded)
 - [`lease-record.md`](lease-record.md) and ADR-0025 for the forge lease that replaces rows 9-10
 - [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md) for rows 13-15

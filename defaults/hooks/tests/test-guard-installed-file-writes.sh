@@ -7,7 +7,7 @@
 #
 #   STEP 1 — the repo-identity discriminator
 #   (defaults/scripts/lib/installed-file-guard.sh, loom_repo_identity):
-#     - `upstream` for rjwalters/loom's OWN tree (asserted against this very
+#     - `upstream` for 2AMLogic/loom's OWN tree (asserted against this very
 #       checkout, not a fixture) and for a simulated Loom source tree
 #     - `consumer` for a simulated consumer-repo checkout
 #     - `unknown`, i.e. PERMISSIVE, whenever it cannot be determined: no
@@ -174,10 +174,10 @@ echo "--- discriminator (loom_repo_identity) ---"
 # shellcheck source=/dev/null
 source "$LIB_IFW"
 
-# AC: verified TRUE for rjwalters/loom itself. Asserted against this checkout,
+# AC: verified TRUE for 2AMLogic/loom itself. Asserted against this checkout,
 # not a fixture, so the discriminator cannot silently stop recognizing the one
 # tree whose Builders must never be denied.
-assert_eq "rjwalters/loom's own checkout classifies as 'upstream'" \
+assert_eq "2AMLogic/loom's own checkout classifies as 'upstream'" \
     "upstream" "$(loom_repo_identity "$REPO_ROOT")"
 
 # ...and from inside one of its managed worktrees, where a Builder actually

@@ -13,7 +13,7 @@ and how to roll back.
 `champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
 controls and the Champion handoff; the `merge_group` check workflow is the
 optional template `defaults/optional/github-workflows/merge-group-check.yml`.
-`rjwalters/loom` is user-owned, and GitHub documents merge queues for
+`2AMLogic/loom` is user-owned, and GitHub documents merge queues for
 organization-owned repositories, so this repository is **not eligible** for the
 live pilot. Its `ci.yml` carries a `merge_group` trigger anyway. The trigger is
 dormant here because GitHub only emits the event on a queue-enabled branch, and

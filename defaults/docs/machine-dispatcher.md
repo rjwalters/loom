@@ -500,7 +500,7 @@ boundary no matter where it is invoked. What one pass does:
    re-run rather than being re-derived. For a host whose dirt has *already* been
    committed (migration is a one-time pass, not an ongoing per-field fixer), the
    by-hand per-key procedure is
-   [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
+   [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md)
    §5 (in the Loom checkout — this doc ships into consumer repos, which have no
    `docs/design/`).
 3. **Untrack the committed implementation** per the manifest — `git rm --cached`

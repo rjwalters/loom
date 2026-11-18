@@ -24,7 +24,7 @@ AI development workers using git worktrees and a forge (GitHub or Gitea) as the
 coordination layer, via manual roles, continuous autonomous orchestration (the
 Rust `loom-daemon` binary), and a local tmux agent pool.
 
-**Loom Repository**: https://github.com/rjwalters/loom
+**Loom Repository**: https://github.com/2AMLogic/loom
 
 > **Forge note**: The `gh` commands shown below are for GitHub. For Gitea
 > repositories, Loom's scripts handle API calls internally — the label-based
@@ -379,7 +379,7 @@ concurrency errors are covered in
 
 ## Resources
 
-- **Main Repository**: https://github.com/rjwalters/loom
+- **Main Repository**: https://github.com/2AMLogic/loom
 - **Role Definitions**: `.loom/roles/*.md`
 - **Configuration**: `.loom/config.json` (committed, team-shared) ·
   `.loom-local/local.json` (gitignored — settings true of THIS host only, e.g.
@@ -404,8 +404,8 @@ concurrency errors are covered in
 ## Support
 
 For issues with Loom itself:
-- **GitHub Issues**: https://github.com/rjwalters/loom/issues
-- **Documentation**: https://github.com/rjwalters/loom/blob/main/CLAUDE.md
+- **GitHub Issues**: https://github.com/2AMLogic/loom/issues
+- **Documentation**: https://github.com/2AMLogic/loom/blob/main/CLAUDE.md
 
 For issues specific to this repository, use the repository's normal issue
 tracker; tag issues with Loom-related labels when applicable.

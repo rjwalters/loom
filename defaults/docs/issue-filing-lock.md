@@ -8,7 +8,7 @@ the one boundary it deliberately does not pretend to cross.
 
 ## Why a lock, and not a rule
 
-[#3707](https://github.com/rjwalters/loom/issues/3707) identified that parallel
+[#3707](https://github.com/2AMLogic/loom/issues/3707) identified that parallel
 issue-creating agents race on `gh issue create` and cross-contaminate bodies. It
 shipped a **documentation-only** mitigation: *"Do not run concurrent Architects
 — serialize issue creation."*
@@ -177,6 +177,6 @@ The corruption survived 13 days because **nothing looked**. A detection backstop
 — flagging an issue body whose content does not reference the repo it lives in
 (the Curator's own `git grep` test, mechanized at filing time) — is *not* part of
 this mechanism and is tracked in
-[#6771](https://github.com/rjwalters/loom/issues/6771). The lock prevents the
+[#6771](https://github.com/2AMLogic/loom/issues/6771). The lock prevents the
 corruption; the backstop would catch it if the lock ever has a gap — which is
 exactly how #3707's mitigation failed.

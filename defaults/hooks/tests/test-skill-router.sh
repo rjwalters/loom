@@ -9,7 +9,7 @@
 #   - the agent table is deduped per session (via session_id), appearing at
 #     most once; a missing session_id degrades gracefully
 #   - the two report example mis-routes ("...builders...", "open an issue
-#     with rjwalters/loom") no longer route
+#     with 2AMLogic/loom") no longer route
 #   - the hook never exits non-zero and never emits invalid JSON
 #
 # The hook + routing config under test are the canonical sources at
@@ -164,8 +164,8 @@ ctx=$(context_of "$out")
 assert_no_output "report example 'builders...' -> no route" "$out"
 
 reset_markers
-out=$(run_hook "please open an issue with rjwalters/loom about this")
-assert_no_output "report example 'open an issue with rjwalters/loom' -> no route" "$out"
+out=$(run_hook "please open an issue with 2AMLogic/loom about this")
+assert_no_output "report example 'open an issue with 2AMLogic/loom' -> no route" "$out"
 
 # --- Anti-route suppression: explicit declines near a route keyword (#5327) --
 # A prompt matching a route pattern (e.g. "fix") while explicitly declining

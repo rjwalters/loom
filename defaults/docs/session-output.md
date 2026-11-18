@@ -28,7 +28,7 @@ It is **off by default** and must be enabled deliberately. See
 
 | Not this | Why |
 |---|---|
-| `session.summary` / `session.analysis` | Post-hoc aggregates on a 900 s default cadence ([`activity/transcript_ingest.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/activity/transcript_ingest.rs)). Useful, but neither readable nor incremental. |
+| `session.summary` / `session.analysis` | Post-hoc aggregates on a 900 s default cadence ([`activity/transcript_ingest.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/activity/transcript_ingest.rs)). Useful, but neither readable nor incremental. |
 | A transcript archive | `session.output` publishes a bounded, redacted, **selected** subset. It never claims to be a complete transcript, and it signals its own gaps (see [Gaps](#gaps-truncation-and-loss)). |
 | A second log service | It reuses the existing observability exporter queues, the existing OTLP collector, and the existing identity resolution (#9445 / #9472). No new endpoint, no new sink. |
 | A way to export raw session JSONL | Structurally impossible — see [The content boundary](#the-content-boundary). |
@@ -45,16 +45,16 @@ relaxes any of them.
    results) and every internal bookkeeping record type are dropped **at parse
    time** — no record is constructed, so there is no ordering in which they
    could leak. Enforced in
-   [`observability/session_output/claude.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs).
+   [`observability/session_output/claude.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs).
 2. **The producer redacts.** `SessionOutputRecord::new_output` is the only
    constructor that accepts free text, and it always runs
-   [`redact::scrub`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output/redact.rs)
+   [`redact::scrub`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output/redact.rs)
    first. The applied policy name travels on the record as
    `loom.session.output.redaction` (currently `producer/v1`).
    Scrub-then-clip, never clip-then-scrub: clipping first can cut a secret in
    half and export the surviving prefix verbatim.
 3. **OTLP only.** The kind is declared an OTLP log (`otlp: Logs`) in the registry
-   ([`telemetry/kinds.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/telemetry/kinds.rs)), so the
+   ([`telemetry/kinds.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/telemetry/kinds.rs)), so the
    native HTTPS `/ingest` backend — the managed-cloud sink, removed in #12813 —
    never received it, on any configuration. Enabling live output cannot start shipping session
    text to a managed destination, and cannot add or alter an exporter: the sink
@@ -100,7 +100,7 @@ Identity keys are reused, not redefined:
 | `loom.sweep_id`, `loom.session_id`, `loom.attempt`, `loom.runtime`, `loom.role` | Run identity. `attempt` is what separates a retry from the original. |
 
 Identity is resolved by **#9445's own resolver**
-([`activity::session_context::SessionContext::resolve`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/activity/session_context.rs)),
+([`activity::session_context::SessionContext::resolve`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/activity/session_context.rs)),
 once per stream on first sight — not re-derived here. `repo` comes from the
 workspace's `origin` remote, so this feed and `session.summary` cannot disagree
 about whose session a row belongs to, and no `gh` subprocess runs on the tick
@@ -195,7 +195,7 @@ producer attached is replayed from its retained tail, and those events'
 timestamps can be hours old — subtracting them yields the file's **age**, and a
 single such sample would dominate p95 and report a stall that never occurred.
 
-[`latency::LagWindow::observe`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs)
+[`latency::LagWindow::observe`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs)
 therefore admits a sample only when `source_at >= watch_since`, and counts every
 refusal in `lag_historical_excluded` so the exclusion is visible on the wire
 rather than looking like missing data. A run that has measured nothing omits the
@@ -298,7 +298,7 @@ SELECT
   attributes_string['loom.session.output.event_id'] AS event_id,
   body
 FROM signoz_logs.distributed_logs_v2
-WHERE attributes_string['loom.repo']  = 'rjwalters/loom'
+WHERE attributes_string['loom.repo']  = '2AMLogic/loom'
   AND attributes_number['loom.issue'] = 9764
   AND attributes_number['loom.attempt'] = 1
   AND timestamp >= toUnixTimestamp64Nano(now64() - INTERVAL 30 MINUTE)
@@ -373,7 +373,7 @@ than producing a zero interval — pinned by
 
 The gateway config ships the `transform/session_output_redaction` stage and the
 `loom.session.output.*` allowlist entries already
-([`defaults/observability/collector/config.yaml`](https://github.com/rjwalters/loom/blob/main/defaults/observability/collector/config.yaml)).
+([`defaults/observability/collector/config.yaml`](https://github.com/2AMLogic/loom/blob/main/defaults/observability/collector/config.yaml)).
 An **existing** collector deployment must be restarted with the updated config,
 or every `loom.session.output.*` attribute is stripped by `transform/privacy`
 and the bodies arrive un-rescrubbed by the gateway (the producer still scrubs
@@ -400,7 +400,7 @@ before the removal still decode.
 | OpenCode | `unsupported` | As above. |
 
 `SUPPORTED_RUNTIMES` in
-[`observability/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output.rs)
+[`observability/session_output.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output.rs)
 is the single source of truth, and the unsupported path is tested
 (`an_unsupported_runtime_is_flagged_and_never_read`). An unsupported runtime is
 **never silently reported as live** — that is the whole purpose of the
@@ -479,7 +479,7 @@ repository's config → SigNoz):
 | Acceptance | Observed |
 |---|---|
 | Readable, correlated records before the run ends | 3 content rows for one in-flight run (2 × `output`, 1 × `tool_start`), published across successive passes while the transcript was still being appended |
-| Two concurrent issues separable | `loom.issue` 9764 / 9765, in two checkouts whose directory names resemble neither the repo nor each other; both rows carry `loom.repo = rjwalters/loom` |
+| Two concurrent issues separable | `loom.issue` 9764 / 9765, in two checkouts whose directory names resemble neither the repo nor each other; both rows carry `loom.repo = 2AMLogic/loom` |
 | Visibility + attribution reason on the wire | every row carried `loom.repo.visibility = private` and `loom.session_kind = sweep` through the gateway into SigNoz |
 | Two attempts of one issue separable | issue 9766 `loom.attempt` 1 and 2 — distinct `sweep_id`, `stream_id` and `event_id` |
 | Worktree name unrelated to forge repo | `loom.repo` is the forge slug on every row; no `stream_id` contains a path fragment |
@@ -493,10 +493,10 @@ repository's config → SigNoz):
 
 | File | Covers |
 |---|---|
-| [`telemetry/kinds/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output.rs) | The record, the closed vocabularies, `LagStats`, stable `event_id` |
-| [`telemetry/kinds/session_output/redact.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output/redact.rs) | Producer-edge redaction (`producer/v1`), scrub-then-clip |
-| [`observability/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output.rs) | Config/gate, sink over existing OTLP queues, run tracking, the tick loop |
-| [`observability/session_output/claude.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs) | The Claude adapter: incremental tail, content boundary, gap detection |
-| [`observability/session_output/latency.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs) | Producer-lag window, percentiles, historical-sample exclusion |
-| [`observability/otlp/mapping/session_output.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/observability/otlp/mapping/session_output.rs) | OTLP log mapping, dual timestamps, severity |
-| [`defaults/observability/collector/config.yaml`](https://github.com/rjwalters/loom/blob/main/defaults/observability/collector/config.yaml) | Gateway re-scrub stage + attribute allowlist |
+| [`telemetry/kinds/session_output.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output.rs) | The record, the closed vocabularies, `LagStats`, stable `event_id` |
+| [`telemetry/kinds/session_output/redact.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/telemetry/kinds/session_output/redact.rs) | Producer-edge redaction (`producer/v1`), scrub-then-clip |
+| [`observability/session_output.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output.rs) | Config/gate, sink over existing OTLP queues, run tracking, the tick loop |
+| [`observability/session_output/claude.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output/claude.rs) | The Claude adapter: incremental tail, content boundary, gap detection |
+| [`observability/session_output/latency.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/session_output/latency.rs) | Producer-lag window, percentiles, historical-sample exclusion |
+| [`observability/otlp/mapping/session_output.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/observability/otlp/mapping/session_output.rs) | OTLP log mapping, dual timestamps, severity |
+| [`defaults/observability/collector/config.yaml`](https://github.com/2AMLogic/loom/blob/main/defaults/observability/collector/config.yaml) | Gateway re-scrub stage + attribute allowlist |

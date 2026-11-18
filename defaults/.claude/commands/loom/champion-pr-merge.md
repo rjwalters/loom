@@ -1206,7 +1206,7 @@ It is eligible only when **all** hold, each read live in this pass:
   same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
   kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
-  `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
+  `refs/tags/v<X.Y.Z>` exists in `2AMLogic/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a

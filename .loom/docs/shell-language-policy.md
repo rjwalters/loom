@@ -7,7 +7,7 @@ to run before any binary exists, for vendored upstream files, and for tests of
 shell that already exists.
 
 This is
-[ADR-0018](https://github.com/rjwalters/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md)
+[ADR-0018](https://github.com/2AMLogic/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md)
 ("Rust owns behavior; shell exists only to reach it"), adopted by operator
 ruling on issue #7762.
 
@@ -47,6 +47,6 @@ into `loom-daemon`, and the file trends toward a thin stub ending in `exec`.
 
 ## Related
 
-- [ADR-0018](https://github.com/rjwalters/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md) — the accepted architectural decision.
+- [ADR-0018](https://github.com/2AMLogic/loom/blob/main/docs/adr/0018-rust-owns-behavior-shell-reaches-it.md) — the accepted architectural decision.
 - #7810 — the migration epic for shell that already exists.
 - #12106 — removal of the allowlist and shell-volume CI gates.

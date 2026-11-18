@@ -172,7 +172,7 @@ git branch feature/issue-N origin/feature/issue-N && ./.loom/scripts/worktree.sh
 ```
 
 This arm has no shell implementation of its own — `lib/worktree-forge-pr-check.sh`
-is `contract`-category (see [`shell-language-policy.md`](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+is `contract`-category (see [`shell-language-policy.md`](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)),
 so the decision lives once, in `loom-daemon worktree-closed-pr-branch`. A
 daemon predating the subcommand degrades to the pre-#9083 reuse behavior
 rather than surfacing a clap usage error.
@@ -2300,7 +2300,7 @@ exec-latency artifacts rather than contention. The narrative and its consequence
 for gate niceness live in [`build-gate.md`](build-gate.md) (the #4044 / #4046
 falsification passage). ADR-0011 also records this as a macOS-specific defect that
 is invisible to Linux CI by construction — see
-[`docs/adr/0011-ci-runner-platform.md`](https://github.com/rjwalters/loom/blob/main/docs/adr/0011-ci-runner-platform.md)
+[`docs/adr/0011-ci-runner-platform.md`](https://github.com/2AMLogic/loom/blob/main/docs/adr/0011-ci-runner-platform.md)
 (upstream Loom repo — not shipped to consumer installs).
 
 > **Historical note on timeouts.** Contemporaneous incident writeups mention a
@@ -2338,7 +2338,7 @@ loom-daemon status --json  # machine-readable
 | `dead_pid` | (instant) | PID in the daemon sweep registry is no longer alive |
 | `error_spike` | 5 errors | Multiple errors in `.loom/logs/sweep-issue-N.log` |
 
-The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level `./.loom/scripts/daemon.sh` launcher was removed in #3432, and the Rust daemon does not write progress files, so milestone-based heuristics no longer apply.
+The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/2AMLogic/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level `./.loom/scripts/daemon.sh` launcher was removed in #3432, and the Rust daemon does not write progress files, so milestone-based heuristics no longer apply.
 
 ### A killed Task/Agent-tool subagent leaves no teardown signal for external resources it held
 
@@ -2590,7 +2590,7 @@ cd mcp-loom && npm install && npm run build
 grep -c dispatch_sweep dist/index.js   # should now be > 0
 ```
 
-`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](https://github.com/rjwalters/loom/blob/main/mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) (upstream Loom repo — not shipped to consumer installs) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
+`scripts/setup-mcp.sh` now auto-rebuilds when `dist/index.js` is missing **or** older than any file under `mcp-loom/src/` (#3803), so `./scripts/setup-mcp.sh` is the safe one-shot path. Rebuilding the bundle does **not** refresh an already-running session — an MCP client caches its tool list at connect time, so you must **restart the Claude Code session** (or respawn the `loom` MCP subprocess) for the new tools to appear. See [`mcp-loom/README.md`](https://github.com/2AMLogic/loom/blob/main/mcp-loom/README.md#rebuilding-after-source-changes-reconnect-required) (upstream Loom repo — not shipped to consumer installs) for the full rebuild + reconnect procedure and a raw `tools/list` verification snippet.
 
 ### MCP tools hang with no response (~1800s), then abort
 
@@ -3220,7 +3220,7 @@ names them in its output. A refusal prints its reason and exits `1`. Only with
 no source tree AND no `loom-daemon` that has that subcommand does the script
 fail with `Could not locate a defaults/ source tree to sync from`
 (`check-main-freshness.sh` says which path is next). Fix for that case: install
-or update `loom-daemon`, or clone <https://github.com/rjwalters/loom> and run
+or update `loom-daemon`, or clone <https://github.com/2AMLogic/loom> and run
 `echo /path/to/local/loom-clone > .loom/loom-source-path`.
 
 **`.loom/loom-source-path` is a DURABLE pointer — never point it into scratch

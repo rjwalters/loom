@@ -122,7 +122,7 @@ fetch_live_bypass_actors() {
 #
 # A ruleset PUT REPLACES bypass_actors wholesale, so sending the hardcoded
 # admin-only list at an EXISTING ruleset silently deletes every other actor's
-# bypass (issue #8239). On rjwalters/loom that would have dropped the
+# bypass (issue #8239). On 2AMLogic/loom that would have dropped the
 # `loom-fleet-dispatch` App, whose post-merge `git push origin HEAD:main` in
 # .github/workflows/version-bump-on-merge.yml then depended on bypassing the
 # pull_request rule. Since #12063 that workflow publishes through the fleet
@@ -247,7 +247,7 @@ setup_github_branch_protection() {
   # Until #8103 this payload had no `required_status_checks` rule, so on every
   # repo it configured, CI was purely advisory: a red check could not block a
   # merge, and no rule could force a stale branch to re-run against the current
-  # base before landing. The incident that made this concrete is rjwalters/loom
+  # base before landing. The incident that made this concrete is 2AMLogic/loom
   # #8095 — a PR's only CI run measured a tree that `main` had since moved off,
   # the squash-merge tree was never measured by anything, and the first signal
   # was `main` going red after the fact.

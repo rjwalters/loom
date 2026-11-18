@@ -61,9 +61,9 @@ jobs:
           set -euo pipefail
           asset=loom-daemon-x86_64-unknown-linux-gnu
           if [ "$LOOM_VERSION" = latest ]; then
-            gh release download --repo rjwalters/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
+            gh release download --repo 2AMLogic/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
           else
-            gh release download "$LOOM_VERSION" --repo rjwalters/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
+            gh release download "$LOOM_VERSION" --repo 2AMLogic/loom --pattern "$asset*" --dir "$RUNNER_TEMP"
           fi
           (cd "$RUNNER_TEMP" && sha256sum -c "$asset.sha256")
           install -m 0755 "$RUNNER_TEMP/$asset" "$RUNNER_TEMP/loom-daemon"

@@ -2,7 +2,7 @@
 
 Reference detail for the `/loom:sweep` model-cost A/B experiment (#3725). Treated
 as the authoritative behavior contract by
-[`docs/model-selection-retune.md`](https://github.com/rjwalters/loom/blob/main/docs/model-selection-retune.md).
+[`docs/model-selection-retune.md`](https://github.com/2AMLogic/loom/blob/main/docs/model-selection-retune.md).
 
 ### Model-Cost Experiment (canary A/B, #3725)
 

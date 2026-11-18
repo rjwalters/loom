@@ -18,18 +18,18 @@
 # Edit/Write matcher) and `guard-loom-workflow.sh` (the Bash matcher).
 #
 # Only two dispositions are valid for such a change, and the deny message names
-# both: UPSTREAM it (a PR against `rjwalters/loom`'s matching
+# both: UPSTREAM it (a PR against `2AMLogic/loom`'s matching
 # `defaults/<relative path>`), or PIN it (`.loom/resync-ignore`).
 #
 # ---------------------------------------------------------------------------
 # THE REPO-IDENTITY DISCRIMINATOR (the decision #7995 asked a Builder to make)
 # ---------------------------------------------------------------------------
 # A guard that cannot tell "I am a Loom consumer repo" from "I am
-# rjwalters/loom itself" is worse than the prose-only status quo: it would deny
+# 2AMLogic/loom itself" is worse than the prose-only status quo: it would deny
 # Loom's own Builders every legitimate edit to `.loom/` in Loom's source tree.
 # Nothing in a hook could make that distinction before this file existed
 # (verified while curating #7883: zero matches for
-# `install-metadata|is_loom_repo|rjwalters/loom|dogfood` across
+# `install-metadata|is_loom_repo|2AMLogic/loom|dogfood` across
 # `defaults/hooks/guard-*.sh`).
 #
 # Three candidates were weighed (#7995's body):
@@ -40,7 +40,7 @@
 #      absent everywhere — so the guard is inert on exactly the repos that have
 #      been carrying installed copies the longest. It also adds a field whose
 #      only consumer is this guard.
-#   2. The forge remote (`rjwalters/loom`). REJECTED: wrong for forks (a fork
+#   2. The forge remote (`2AMLogic/loom`). REJECTED: wrong for forks (a fork
 #      of Loom IS an upstream source tree and must stay permissive), wrong for
 #      a locally-renamed remote, wrong for a mirror, and it reads git config
 #      rather than the filesystem.
@@ -233,7 +233,7 @@ loom_installed_guard_enabled() {
 # called after loom_installed_write_denied() has set LOOM_IFW_*.
 loom_installed_deny_reason() {
     local path="${1:-}" tool="${2:-Write}"
-    printf '%s' "BLOCKED: ${tool} to '${path}' edits an INSTALLED Loom file in place. This repository is a Loom consumer install ('${LOOM_IFW_ROOT}' has no defaults/.claude/commands/loom/, so it is not Loom's own source tree), where .loom/hooks|scripts|roles|docs|bin/ and .claude/commands/loom/ are resync-refreshed copies of Loom's defaults/. An edit here is reverted by the next 'resync-installed.sh' -- or, if you ADDED the file, orphaned with no upstream counterpart -- silently, after your PR merges. Two dispositions are valid; pick one. (1) UPSTREAM it: open a PR against rjwalters/loom's 'defaults/${LOOM_IFW_REL}'; the fix returns here via the normal 'chore: resync installed Loom surfaces' commit. (2) PIN it: add '${LOOM_IFW_REL}' to this repo's .loom/resync-ignore (with a comment saying why, and which upstream PR retires the pin if it is temporary), then re-run the edit. See .loom/docs/repo-owned-files.md. Do NOT retry this write through the other tool -- both the Edit/Write matcher and the Bash write idioms (>, >>, tee, sed -i, cp/mv) are confined the same way. Not a Builder and need to write here directly? Set guards.installedFileWrites:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_INSTALLED_FILE_WRITES=0 <command>' prefix does NOT work (this hook runs as a separate process). (#7995)"
+    printf '%s' "BLOCKED: ${tool} to '${path}' edits an INSTALLED Loom file in place. This repository is a Loom consumer install ('${LOOM_IFW_ROOT}' has no defaults/.claude/commands/loom/, so it is not Loom's own source tree), where .loom/hooks|scripts|roles|docs|bin/ and .claude/commands/loom/ are resync-refreshed copies of Loom's defaults/. An edit here is reverted by the next 'resync-installed.sh' -- or, if you ADDED the file, orphaned with no upstream counterpart -- silently, after your PR merges. Two dispositions are valid; pick one. (1) UPSTREAM it: open a PR against 2AMLogic/loom's 'defaults/${LOOM_IFW_REL}'; the fix returns here via the normal 'chore: resync installed Loom surfaces' commit. (2) PIN it: add '${LOOM_IFW_REL}' to this repo's .loom/resync-ignore (with a comment saying why, and which upstream PR retires the pin if it is temporary), then re-run the edit. See .loom/docs/repo-owned-files.md. Do NOT retry this write through the other tool -- both the Edit/Write matcher and the Bash write idioms (>, >>, tee, sed -i, cp/mv) are confined the same way. Not a Builder and need to write here directly? Set guards.installedFileWrites:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_INSTALLED_FILE_WRITES=0 <command>' prefix does NOT work (this hook runs as a separate process). (#7995)"
 }
 
 # loom_ifw_normalize_abs <path> [cwd]

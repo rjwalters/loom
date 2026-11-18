@@ -11,7 +11,7 @@
 # Nothing here makes a forge call.
 
 schema_version = 1
-inventory_source = "rjwalters/loom#9769"
+inventory_source = "2AMLogic/loom#9769"
 
 # The commit epic #9769's source enumeration was verified against. Raise it
 # (and re-verify the rows) when the enumeration is refreshed.

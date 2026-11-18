@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom step dispatch stalled",
-    "description": "Repo {{$labels.repo}} had at least {{$value}} items the step tick could draw (loom.step.actionable: weight > 0 after the live claims, so parked, held, operator, frozen, epic, claimed and cooling-down items are not counted) in every tick of the last 15 min, a host dispatching for it had a free slot, and no loom.dispatch.step was spawned for the repo. Since #11909 the step tick is the only item dispatch path, so dispatch for the repo has stopped. On a host that dispatches for it: the work_finder log's 'step tick' lines, loom.dispatch.step refusals by loom.dispatch.reason, and pick.decision item_draw (pools, exclusions, refused_* counts). Issue rjwalters/loom#11909."
+    "description": "Repo {{$labels.repo}} had at least {{$value}} items the step tick could draw (loom.step.actionable: weight > 0 after the live claims, so parked, held, operator, frozen, epic, claimed and cooling-down items are not counted) in every tick of the last 15 min, a host dispatching for it had a free slot, and no loom.dispatch.step was spawned for the repo. Since #11909 the step tick is the only item dispatch path, so dispatch for the repo has stopped. On a host that dispatches for it: the work_finder log's 'step tick' lines, loom.dispatch.step refusals by loom.dispatch.reason, and pick.decision item_draw (pools, exclusions, refused_* counts). Issue 2AMLogic/loom#11909."
   },
   "disabled": false
 }

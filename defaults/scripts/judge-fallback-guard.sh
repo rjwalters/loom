@@ -3,7 +3,7 @@
 # (defaults/.claude/commands/loom/judge.md §"Fallback Queue (When No Labeled
 # Work)"), issue #5455.
 #
-# Problem this closes: PR #4972 (rjwalters/loom) accumulated 199 fallback-mode
+# Problem this closes: PR #4972 (2AMLogic/loom) accumulated 199 fallback-mode
 # Judge comments over 37 hours before merging — a 2-line Dependabot Cargo.lock
 # bump. The existing SHA-based dedup (#5058) mostly works, but it is
 # prompt-embedded bash that an LLM must faithfully re-derive on every pass; a

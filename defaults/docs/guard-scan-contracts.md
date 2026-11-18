@@ -19,7 +19,7 @@ once, and precisely this way: `COMMAND_ASK_SCAN`'s comment stripping was
 justified as *"worst case is a missed ASK"*, then a later change routed the same
 copy into `extract_write_targets()`'s hard-DENY worktree-write confinement. The
 masking never changed — somebody **added a reader**. Root-caused and fixed in
-#6252 / [ADR-0016](https://github.com/rjwalters/loom/blob/main/docs/adr/0016-write-target-confinement-approach.md).
+#6252 / [ADR-0016](https://github.com/2AMLogic/loom/blob/main/docs/adr/0016-write-target-confinement-approach.md).
 
 Issue #7755 made the reservation machine-checkable:
 `scripts/check-guard-scan-contracts.sh`, wired into CI, which fails when a

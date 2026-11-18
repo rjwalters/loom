@@ -250,11 +250,11 @@ environment this adapter was built in, so the read/edit/test canary against a
 real model — #8561's last acceptance criterion — was **not** run, and no
 receipt of one was fabricated. It is tracked in **#8606**; the receipt it must
 produce has the same shape as
-[`native-harness-canary-2026-09-19.json`](https://github.com/rjwalters/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json).
+[`native-harness-canary-2026-09-19.json`](https://github.com/2AMLogic/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json).
 
 What *was* done instead is a **credential-free harness probe** of the real
 2.0.2 binary, recorded verbatim in
-[`docs/experiments/kimi-harness-probe-2026-09-22.json`](https://github.com/rjwalters/loom/blob/main/docs/experiments/kimi-harness-probe-2026-09-22.json):
+[`docs/experiments/kimi-harness-probe-2026-09-22.json`](https://github.com/2AMLogic/loom/blob/main/docs/experiments/kimi-harness-probe-2026-09-22.json):
 every claim this section makes about the CLI's flag surface, env family,
 model-selection routes and exit codes is an observation in that file. It is
 deliberately *not* filed as a canary — it proves the adapter targets the CLI
@@ -815,7 +815,7 @@ A metered key is one credential shared across every fleet host, so no per-host
 mechanism can bound its aggregate spend; the decision on how that ceiling is
 imposed (provider-side hard ceiling first, observability-backend aggregation as a
 scoped fallback) is recorded in
-[`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
+[`ADR-0020`](https://github.com/2AMLogic/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 
 **Kimi keeps its usage off the stdout stream entirely (issue #8564).** Unlike Pi
 and OpenCode, `kimi --output-format stream-json` carries **no** token counters:
@@ -869,7 +869,7 @@ Sources: [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-age
 [Z.ai OpenCode setup](https://docs.z.ai/devpack/tool/opencode),
 [OpenCode CLI](https://opencode.ai/docs/cli/).
 
-The [2026-09-19 canary receipt](https://github.com/rjwalters/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json)
+The [2026-09-19 canary receipt](https://github.com/2AMLogic/loom/blob/main/docs/experiments/native-harness-canary-2026-09-19.json)
 records CLI versions, observed model/provider IDs, token counters, event hashes
 and independent results. Pi passed; OpenCode initially selected the wrong
 working directory under stale `PWD`, then passed after explicit directory

@@ -124,7 +124,7 @@ only by keeping the volatile bytes out of the prefix — which is what
 
 ## 4. Experiment C — production correlation (→ #8146)
 
-`rjwalters/loom` role ticks from this host's transcript store, 2026-09-16 →
+`2AMLogic/loom` role ticks from this host's transcript store, 2026-09-16 →
 2026-09-18, joined to the account recorded in `.loom/logs/role-<role>.log`
 (`spawn-claude: using OAuth account '<name>'`). "Full hit" =
 `cache_creation_input_tokens == 0` on the first assistant message.

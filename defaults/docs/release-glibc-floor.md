@@ -12,7 +12,7 @@ On 2026-09-24 the fleet install surface replaced a worker's `loom-daemon`
 with a cross-host prebuilt requiring `GLIBC_2.38`/`GLIBC_2.39`, bricking the
 CLI (and its own self-repair path) on a glibc-2.35 (Ubuntu 22.04) host. #8837
 added a defensive gate — `loom-daemon/src/release_fetch/glibc.rs`
-(https://github.com/rjwalters/loom/blob/main/loom-daemon/src/release_fetch/glibc.rs)
+(https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/release_fetch/glibc.rs)
 at fetch time, `scripts/install/provision-daemon.sh` at install time — that
 now REFUSES an incompatible artifact rather than silently installing it. That
 gate treats the symptom: it stops a bad artifact from landing, but does
@@ -98,7 +98,7 @@ step, and this doc's decided-floor section.
 - [`release-cadence.md`](release-cadence.md) — when a release is cut at all;
   this doc governs what a cut release's Linux artifacts require, not when
   one happens.
-- Issue [#8837](https://github.com/rjwalters/loom/issues/8837) — the incident
+- Issue [#8837](https://github.com/2AMLogic/loom/issues/8837) — the incident
   and the install-time safety gate.
-- Issue [#8842](https://github.com/rjwalters/loom/issues/8842) — the
+- Issue [#8842](https://github.com/2AMLogic/loom/issues/8842) — the
   root-cause follow-up this doc satisfies.

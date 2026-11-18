@@ -113,7 +113,7 @@ loom-daemon inflight check --command "pnpm check:ci" --branch main
   the registry exists to prevent.
 - `claim` has no such window. The entry is a directory created with `mkdir`
   (POSIX-atomic across processes and languages, the same primitive
-  [`build-slot`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/build_slot.rs)
+  [`build-slot`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/build_slot.rs)
   and the per-issue claim lock use). Exactly one of N simultaneous claimants
   wins; the losers are handed the winner's record.
 

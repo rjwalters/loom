@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom role-runner item tick after the cutover",
-    "description": "Host {{$labels.host}} ran {{$value}} {{$labels.role}} role_tick.outcome records in 30 min that are not step-engine steps (loom.role_tick.source != step, #11988). Since #11909 Curator, Judge and Doctor run only as work-finder steps; a role-runner tick of one means the host still runs a pre-cutover daemon, or an interval loop survived, and it double-acts with the steps on the same items. Check the host's loom-daemon version and its role_runner log. Issue rjwalters/loom#11909."
+    "description": "Host {{$labels.host}} ran {{$value}} {{$labels.role}} role_tick.outcome records in 30 min that are not step-engine steps (loom.role_tick.source != step, #11988). Since #11909 Curator, Judge and Doctor run only as work-finder steps; a role-runner tick of one means the host still runs a pre-cutover daemon, or an interval loop survived, and it double-acts with the steps on the same items. Check the host's loom-daemon version and its role_runner log. Issue 2AMLogic/loom#11909."
   },
   "disabled": false
 }

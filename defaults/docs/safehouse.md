@@ -268,7 +268,7 @@ alias it asked for).
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
 ownership of the block is noted in
-[`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
+[`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 ## Operator setup: provisioning the persona (requires a safehoused restart)
 
@@ -607,7 +607,7 @@ issue `0` for a host-level condition.
 ```
 @operator:example.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
 Allow merge commits on the repository, or re-run the merge with squash.
-https://github.com/rjwalters/loom/issues/9268 · observed by host-a
+https://github.com/2AMLogic/loom/issues/9268 · observed by host-a
 ```
 
 - **The mention** comes from `safehouse.operatorMention` above; unset ⇒ the same
@@ -1864,7 +1864,7 @@ closed for the cooldown lanes, one mechanism later.
 The cost is arithmetic. Four dispatch hosts, each counting only its own
 attempts, spend up to `4 × threshold` claim/release cycles before **any** one
 of them reaches `threshold` — and post up to four near-identical "Attempt N of
-M" notes on the way. Observed on `rjwalters/loom#8812`, 2026-09-24: nine
+M" notes on the way. Observed on `2AMLogic/loom#8812`, 2026-09-24: nine
 claim/release cycles at roughly 90 s apart, four `Attempt 2 of 3` notes (one
 per host, none of them a hold), and only then one host's third release applying
 `loom:blocked`.

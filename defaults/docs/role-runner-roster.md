@@ -35,7 +35,7 @@ specific than this record — are collected in
 
 ## The gap this closes
 
-[#6374](https://github.com/rjwalters/loom/issues/6374) shipped a **static**
+[#6374](https://github.com/2AMLogic/loom/issues/6374) shipped a **static**
 shard assignment: each host carries `LOOM_ROLE_RUNNER_SHARD_INDEX` within a
 fleet-wide `autonomous.roleRunner.shardCount`, and a workspace's role rotation
 runs on the host where `fnv1a64(shard_key) % count == index`. Exactly one host

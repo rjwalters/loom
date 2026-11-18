@@ -1339,7 +1339,7 @@ removed_line_count() {
 #
 #     tooling: install Repo Skills and Loom into the map repo
 #     Upgrade Loom to 0.18.0 (resync installed surfaces + role prompts)
-#     Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)
+#     Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)
 #
 # So the first time upstream EDITED such a file, the old upstream text being
 # replaced was read as "lines unique to the installed copy" and the update was

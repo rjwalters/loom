@@ -35,7 +35,7 @@ After evaluating both queues:
 
 **Merge-risk hold census (mandatory line, #6720).** A held PR does not merge and
 does not report itself; without a standing count, a pile grows unseen. On
-`rjwalters/loom` it reached **21 held PRs, 20 of them conflicting**, and was
+`2AMLogic/loom` it reached **21 held PRs, 20 of them conflicting**, and was
 found only because an operator inspected PR labels by hand. Run the single
 `gh pr list` query in `champion-pr-merge.md` → "Held-PR Census" **in this pass**
 (never restate numbers from a previous one) and emit one line:
@@ -195,7 +195,7 @@ bare `state == OPEN` read — whenever the referenced issue carries
 `loom:epic`. This works without `LOOM_EPIC_SUPERVISOR` being enabled anywhere
 (that daemon mechanism only reconciles epics inside its own registered
 workspace and cannot see across repos — see
-[`daemon-reference.md`'s "Epic supervisor"](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#epic-supervisor-3842)
+[`daemon-reference.md`'s "Epic supervisor"](https://github.com/2AMLogic/loom/blob/main/defaults/docs/daemon-reference.md#epic-supervisor-3842)
 section for how the two complement each other).
 
 ### Step 1 — parse the reference (cross-repo aware)

@@ -8,7 +8,7 @@
 # reported success — with zero forge awareness of whether an open PR already
 # claims that branch name. This is blind to:
 #   - a cross-repository (fork) PR, whose head branch never shows up as
-#     origin/<branch> at all (rjwalters/loom#7765's headline case)
+#     origin/<branch> at all (2AMLogic/loom#7765's headline case)
 #   - a same-repo PR whose head simply wasn't fetched yet by the plain-name
 #     fetch (a variant of #4823's in-flight-cycle case, reachable even when
 #     that fetch fails/misses)
@@ -83,7 +83,7 @@ setup_repo() {
         git remote add origin "$tmp/origin.git"
         git push -q origin main
         if [[ "$with_forge_remote" == "true" ]]; then
-            git remote add forge https://github.com/rjwalters/loom.git
+            git remote add forge https://github.com/2AMLogic/loom.git
         fi
         mkdir -p .loom/scripts/lib .loom/hooks
         cp "$WORKTREE_SH" .loom/scripts/worktree.sh
@@ -149,10 +149,10 @@ if [[ "\$1" == "pr" && "\$2" == "list" ]]; then
     fi
     case "\${FAKE_GH_MODE:-none}" in
         cross_repo)
-            echo '[{"number": $pr_number, "isCrossRepository": true, "headRepository": {"nameWithOwner": "forkuser/loom"}, "headRefName": "'"\$branch"'", "url": "https://github.com/rjwalters/loom/pull/$pr_number"}]'
+            echo '[{"number": $pr_number, "isCrossRepository": true, "headRepository": {"nameWithOwner": "forkuser/loom"}, "headRefName": "'"\$branch"'", "url": "https://github.com/2AMLogic/loom/pull/$pr_number"}]'
             ;;
         same_repo)
-            echo '[{"number": $pr_number, "isCrossRepository": false, "headRepository": {"nameWithOwner": "rjwalters/loom"}, "headRefName": "'"\$branch"'", "url": "https://github.com/rjwalters/loom/pull/$pr_number"}]'
+            echo '[{"number": $pr_number, "isCrossRepository": false, "headRepository": {"nameWithOwner": "2AMLogic/loom"}, "headRefName": "'"\$branch"'", "url": "https://github.com/2AMLogic/loom/pull/$pr_number"}]'
             ;;
         none)
             echo "[]"

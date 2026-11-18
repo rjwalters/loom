@@ -609,7 +609,7 @@ precisely the defect this section exists to fix.
 pass also reclaims stale `loom:reviewing` (and `loom:treating`) on its tick,
 with the same env vars and defaults, aged from the label's own `labeled`
 event. See [`daemon-reference.md`'s "Stale-claim reconciliation"
-section](https://github.com/rjwalters/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
+section](https://github.com/2AMLogic/loom/blob/main/defaults/docs/daemon-reference.md#stale-claim-reconciliation--the-sweep-journal-3953-fixed-3975-extended-to-pr-side-claims-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch

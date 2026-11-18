@@ -756,7 +756,7 @@ machine-readable trailer:
 
 ```markdown
 Part of #123
-Loom-Issue: rjwalters/loom#123
+Loom-Issue: 2AMLogic/loom#123
 ```
 
 - `Part of #N` / `Contributes to #N` keeps the PR discoverable without triggering auto-close, so

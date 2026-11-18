@@ -39,7 +39,7 @@ A row with no repo or issue (a private row withheld from the public
 dashboard view) has nothing to fold on and stays one item per row.
 
 `step` is the role session that would advance the item: the step-dispatch
-design ([`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md)
+design ([`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md)
 §12, #11894) dispatches one step of one item at a time, so the same issue can
 be a Builder row on one host and a Judge row on another. Those are two
 pieces of work and fold to two fleet items; only rows at the same step fold

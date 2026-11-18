@@ -1,7 +1,7 @@
 # Loom
 
-[![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
-[![GitHub Release](https://img.shields.io/github/v/release/rjwalters/loom?include_prereleases)](https://github.com/rjwalters/loom/releases)
+[![codecov](https://codecov.io/gh/2AMLogic/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/2AMLogic/loom)
+[![GitHub Release](https://img.shields.io/github/v/release/2AMLogic/loom?include_prereleases)](https://github.com/2AMLogic/loom/releases)
 
 **AI-powered development orchestration using your forge as the coordination layer.**
 
@@ -29,7 +29,7 @@ installed, and the planned separation of CLI tools from the work engine.
 
 ```bash
 # Clone and install to your repository
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/2AMLogic/loom
 cd loom
 ./install.sh /path/to/your/repo
 
@@ -295,7 +295,7 @@ The read-only posture cannot claim issues, edit labels, build in worktrees,
 create PRs, or merge; restart Codex with the full-lifecycle posture before
 performing those operations. These flags configure only the interactive parent
 session. They do not configure Codex workers dispatched by `loom-daemon`; that
-policy is tracked in [#4478](https://github.com/rjwalters/loom/issues/4478).
+policy is tracked in [#4478](https://github.com/2AMLogic/loom/issues/4478).
 See the [Codex guardrail-parity document](defaults/docs/guardrail-parity-codex.md)
 for the runtime trust-boundary comparison.
 
@@ -388,7 +388,7 @@ gh pr create --label "loom:review-requested"
 
 ```bash
 # Clone and setup
-git clone https://github.com/rjwalters/loom
+git clone https://github.com/2AMLogic/loom
 cd loom
 
 # Run the daemon in dev mode
@@ -447,10 +447,10 @@ Creates a new GitHub repo with Loom pre-installed and initial roadmap.
 
 If your project was built with Loom, you can add a badge to your README:
 
-[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/2AMLogic/loom)
 
 ```markdown
-[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/rjwalters/loom)
+[![Built with Loom](https://img.shields.io/badge/Built_with-Loom-blue?logo=github)](https://github.com/2AMLogic/loom)
 ```
 
 ## License

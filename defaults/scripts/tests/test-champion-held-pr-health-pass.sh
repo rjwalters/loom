@@ -16,7 +16,7 @@
 # the recency criterion's stale route is the ONLY automated path from `loom:pr` to
 # `loom:changes-requested` — i.e. the only way a `loom:pr` PR reaches Doctor —
 # a held PR could never be reported as conflicting nor routed for a rebase.
-# Measured on rjwalters/loom 2026-08-22: 21 open PRs carried `loom:pr` +
+# Measured on 2AMLogic/loom 2026-08-22: 21 open PRs carried `loom:pr` +
 # `loom:blocked`, 20 of the 21 were CONFLICTING (two untouched for 63h), and
 # Doctor's `loom:changes-requested` queue was empty.
 #

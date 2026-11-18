@@ -1,7 +1,7 @@
 # Dispatcher Repo-Sharding (Issue #6243) — retired 2026-10-13
 
 **Status: retired from dispatch by operator ruling on 2026-10-13
-([#11682](https://github.com/rjwalters/loom/issues/11682)).** The shard ring
+([#11682](https://github.com/2AMLogic/loom/issues/11682)).** The shard ring
 itself is not retired: role runners still use it
 ([`role-runner-roster.md`](role-runner-roster.md), #6374).
 

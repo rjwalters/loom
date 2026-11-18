@@ -71,7 +71,7 @@ The issue template integrates with Loom's label-based workflow coordination. `.g
 is the authoritative label set (each label's `Applied by:` field states who sets it) — see that
 file rather than a table here, which would drift.
 
-See [WORKFLOWS.md](https://github.com/rjwalters/loom/blob/main/docs/workflows.md) for complete workflow documentation.
+See [WORKFLOWS.md](https://github.com/2AMLogic/loom/blob/main/docs/workflows.md) for complete workflow documentation.
 
 ## Benefits
 
