@@ -119,7 +119,8 @@ cat >"$FIXTURE_DIR/issues.json" <<'EOF'
  {"number":8,"title":"blocked verdict","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:blocked"}]},
  {"number":9,"title":"escalated","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:operator"}]},
  {"number":10,"title":"revise sent back to Curator","createdAt":"2026-09-29T00:00:00Z","labels":[{"name":"loom:hermit"},{"name":"loom:triage"}]},
- {"number":11,"title":"fresh hermit proposal","createdAt":"2026-09-28T00:00:00Z","labels":[{"name":"loom:hermit"}]}
+ {"number":11,"title":"fresh hermit proposal","createdAt":"2026-09-28T00:00:00Z","labels":[{"name":"loom:hermit"}]},
+ {"number":12,"title":"architect revise sent back","createdAt":"2026-09-27T00:00:00Z","labels":[{"name":"loom:architect"},{"name":"loom:triage"}]}
 ]
 EOF
 
@@ -171,7 +172,7 @@ else
     assert_eq "#1" "$(run_query p2.sh | numbers_of)" \
         "Priority 2 returns only the evaluable curated issue (skips issue, evaluating, blocked, operator)"
     assert_eq "#4 #11 #6" "$(run_query p3.sh | numbers_of)" \
-        "Priority 3 loops architect, hermit, auditor: the fresh hermit proposal is listed; the blocked hermit one and the revise-sent-back triage one are skipped (#13906)"
+        "Priority 3 loops architect, hermit, auditor: the fresh hermit proposal is listed; the blocked hermit one and the revise-sent-back triage ones (hermit #10, architect #12) are skipped (#13906, #13902)"
     assert_not_contains "$(cat "$FIXTURE_DIR/p2.sh" "$FIXTURE_DIR/p3.sh")" "needs-revision" \
         "neither query names the retired loom:needs-revision"
 fi

@@ -17,6 +17,7 @@
 //! |---|---|---|
 //! | [`log_filter`] | `strip-ansi.sh` | `loom_tools.log_filter` |
 //! | [`model_tiers`] | `resolve-model.sh` | `loom_tools.model_tiers` |
+//! | [`role_model`] | `resolve-role-model.sh` | new in #13956 (attended-subagent chain) |
 //! | [`usage`] | `check-usage.sh` | `loom_tools.common.usage` |
 //! | [`checkpoints`] | `checkpoint.sh` | `loom_tools.checkpoints` |
 //! | [`claim`] | `loom-claim` (PATH shim → `loom-daemon claim`) | `loom_tools.claim` |
@@ -36,6 +37,7 @@ pub mod claim;
 pub mod fleet_experiment;
 pub mod log_filter;
 pub mod model_tiers;
+pub mod role_model;
 pub mod sweep_experiment;
 pub mod sweep_experiment_arms;
 pub mod transcript_usage;

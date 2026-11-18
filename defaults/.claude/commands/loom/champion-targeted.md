@@ -157,7 +157,11 @@ add `loom:pr`.
    `/pull/` URL, a failed read, or a closed issue: outcome `not-eligible`. It
    must carry a proposal label (`loom:curated`, `loom:architect`, `loom:hermit`
    or `loom:auditor`) and neither `loom:issue` nor `loom:building`; otherwise
-   `not-eligible`; so is `loom:operator`. `loom:blocked` (#11860, #12078): the
+   `not-eligible`; so is `loom:operator`. A proposal carrying `loom:triage` is
+   `not-eligible` too: a revise verdict sent it back to Curator, which keeps
+   the proposal label, so it stays Curator's until Curator restores
+   `loom:curated` — the same turn-based exclusion Priority 3 applies
+   (#13906, #13902). `loom:blocked` (#11860, #12078): the
    work finder draws a curated, dependency-parked issue every time it comes up,
    without checking the blockers first, so this check is the only one. Re-read
    them now: when every blocker `loom-daemon park-record parse` reads from the

@@ -59,6 +59,7 @@ test-champion-out-of-band-ac-gate-switch.sh
 test-champion-merge-risk-self-release.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-park-marker-dedupe.sh
 test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
@@ -117,6 +118,7 @@ test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
+test-generate-agents-md-layouts.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
@@ -150,6 +152,7 @@ test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
+test-guide-work-plan-roadmap-convention.sh
 test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
@@ -368,3 +371,7 @@ test-create-issue-curated.sh
 # #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
 test-guide-park-record-precedence.sh
 test-guide-transient-first-at.sh
+# #13956: resolve-role-model.sh — tools-first slice wiring, exit-3 data-code
+# passthrough, the 0.19.1311 version floor, and the resync-keeps-the-setting
+# recheck (agents stay unpinned, config survives). Hermetic: mocks only.
+test-resolve-role-model.sh
