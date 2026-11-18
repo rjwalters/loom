@@ -221,3 +221,146 @@ fn config_get_mode_works_with_mode_unset() {
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(v["found"], false);
 }
+
+// ---- #14395: forge reads ------------------------------------------------
+//
+// `base()` gives a clean install: no `loom-daemon` on PATH, no fleet routing,
+// no forge credential. Each case runs the real `loom-tools forge <verb>`.
+
+/// Verbs whose answer is a nonzero exit or a stdin-derived line need no forge
+/// at all; both roots must agree on stdout and on the exit code, including
+/// exit 1 as data.
+#[test]
+fn forge_reads_match_loom_daemon_including_exit_codes_as_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `OK` (exit 0) and `REJECT` (exit 1: the data answer) for stdin bodies.
+    let ok = parity(
+        &["forge", "verdict-body-check"],
+        Some("Reviewed the diff and the tests; the change is sound.\n"),
+        tmp.path(),
+        tmp.path(),
+    );
+    assert_eq!(ok.status.code(), Some(0));
+    let reject = parity(&["forge", "verdict-body-check"], Some("-\n"), tmp.path(), tmp.path());
+    assert_eq!(reject.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&reject.stdout).contains("REJECT"));
+    // Not a fleet login: exit 1, nothing on stdout.
+    let fleet = parity(&["forge", "is-fleet", "some-human"], None, tmp.path(), tmp.path());
+    assert_eq!(fleet.status.code(), Some(1));
+    assert!(fleet.stdout.is_empty());
+    parity(&["forge", "dashboard-link", "acme/widgets", "7"], None, tmp.path(), tmp.path());
+    parity(
+        &["forge", "dashboard-link", "acme/widgets", "7", "--pr"],
+        None,
+        tmp.path(),
+        tmp.path(),
+    );
+}
+
+/// A write verb is refused before any handler runs, with a status no read
+/// verb uses as data (design §3.1 split; the writes are #14396).
+#[test]
+fn forge_write_verbs_are_refused_with_exit_64() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        &["forge", "comment", "7", "--body", "x"][..],
+        &["forge", "auto-merge", "7"],
+        &[
+            "forge",
+            "merge-queue",
+            "enqueue",
+            "7",
+            "--approved-sha",
+            "abc",
+        ],
+        &["forge", "parent", "link", "--parent", "1", "--child", "2"],
+    ] {
+        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        c.args(args);
+        let o = run(c, None);
+        assert_eq!(o.status.code(), Some(64), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(o.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("#14396") && err.contains("loom-daemon forge"), "{err}");
+    }
+}
+
+/// Design §7.3 / §10.3: a forge-reaching read resolves `mode` first. An
+/// inherited gateway variable with `mode` unset is the actionable error, not a
+/// silently honored (or shed) route.
+#[test]
+fn forge_read_with_unset_mode_and_fleet_variables_is_an_error() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let mut c = base(TOOLS, home.path(), wt.path());
+    c.env_remove("LOOM_MODE")
+        .env("LOOM_GH_GATEWAY_DIR", gw.path())
+        .args(["forge", "is-fleet", "some-human"]);
+    let o = run(c, None);
+    assert_eq!(o.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("LOOM_GH_GATEWAY_DIR") && err.contains("LOOM_MODE=session"),
+        "{err}"
+    );
+    assert!(o.stdout.is_empty());
+    // A verb with no forge call (stdin in, one line out) is not gated.
+    let mut c = base(TOOLS, home.path(), wt.path());
+    c.env_remove("LOOM_MODE")
+        .env("LOOM_GH_GATEWAY_DIR", gw.path())
+        .args(["forge", "verdict-body-check"]);
+    let o = run(c, Some("-\n"));
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("REJECT"));
+}
+
+/// `capabilities --json` is the one capability source: it lists the forge
+/// reads and none of the writes, and `install-compat show --json` prints the
+/// same list.
+#[test]
+fn capabilities_list_the_forge_reads_and_not_the_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = run(
+        {
+            let mut c = base(TOOLS, tmp.path(), tmp.path());
+            c.args(["capabilities", "--json"]);
+            c
+        },
+        None,
+    );
+    assert_eq!(t.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&t.stdout).unwrap();
+    let cmds: Vec<&str> = v["tools_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    for read in [
+        "forge check-claim",
+        "forge wait-checks",
+        "forge merge-queue status",
+        "forge issue",
+    ] {
+        assert!(cmds.contains(&read), "{read} missing from {cmds:?}");
+    }
+    for write in [
+        "forge comment",
+        "forge create-issue",
+        "forge auto-merge",
+        "forge rerun",
+    ] {
+        assert!(!cmds.contains(&write), "{write} must not be served: {cmds:?}");
+    }
+    let d = run(
+        {
+            let mut c = base(DAEMON, tmp.path(), tmp.path());
+            c.args(["install-compat", "show", "--json"]);
+            c
+        },
+        None,
+    );
+    let dv: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
+    assert_eq!(dv["tools_commands"], v["tools_commands"]);
+}
