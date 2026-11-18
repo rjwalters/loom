@@ -355,6 +355,26 @@ pub struct CommentArgs {
     pub patch_created: Option<String>,
 }
 
+/// Refuse an inline `--body` that is a lone `@`-token (`@path`, `@-`) before
+/// anything is posted (#14286). `--body` takes the literal text — it never
+/// expands `@path` the way `curl -d` does — so such a body would publish the
+/// literal string. Only this one rule is applied: the verdict-body length
+/// floor and the `-`/empty rules would break legitimate short comments
+/// (`LGTM`). The `--body-file` path never reaches here.
+///
+/// # Errors
+///
+/// When `text` is a lone `@`-token.
+fn reject_lone_at_body(text: &str) -> anyhow::Result<()> {
+    if crate::verdict_body::is_lone_at_token(text) {
+        anyhow::bail!(
+            "refusing to post: --body {:?} is a lone '@' token, which posts the literal string              and reads nothing — use --body-file <path> (or --body-file - for stdin)",
+            text.trim()
+        );
+    }
+    Ok(())
+}
+
 /// The `loom-daemon forge comment` verb (#9772): the same chokepoint the
 /// daemon's internal sites use, exposed so shell callers and agents
 /// (#9774's `post-comment.sh`) post through it instead of around it.
@@ -371,7 +391,10 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         anyhow::anyhow!("a NUMBER is required (or --patch-created <URL|owner/repo#N>)")
     })?;
     let body = match (&args.body, &args.body_file) {
-        (Some(text), None) => text.clone(),
+        (Some(text), None) => {
+            reject_lone_at_body(text)?;
+            text.clone()
+        }
         (None, Some(path)) => {
             if path.as_os_str() == "-" {
                 let mut buffer = String::new();
