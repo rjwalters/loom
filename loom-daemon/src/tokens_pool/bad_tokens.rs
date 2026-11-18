@@ -422,7 +422,7 @@ enum AmbiguousExhaustionEvidence {
 /// window plus slack for probe cadence and clock skew) cannot be a real
 /// weekly reset — treat it as garbage and fall back to the fixed cooldown
 /// rather than freezing the account out until a corrupt instant.
-const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
+pub(super) const MAX_WEEKLY_RESET_HORIZON_SECS: i64 = 8 * 24 * 3600;
 
 /// Read the fresh `.ranking` evidence for an ambiguous (non-session-limit-
 /// matching) exhaustion entry, as [`AmbiguousExhaustionEvidence`].
