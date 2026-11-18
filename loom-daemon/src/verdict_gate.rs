@@ -578,8 +578,9 @@ pub fn stale_read(
                      a hash-convention mismatch is not a spec change and needs no \
                      re-review, only the recomputed hash. The gate accepts the sha256 of \
                      the issue body with trailing newlines trimmed, that plus one newline, \
-                     or the raw body plus one newline (what gh api … --jq .body | \
-                     sha256sum yields); recompute yours with: printf %s \"$(gh \
+                     or the raw body plus one newline (what gh \
+                     api … --jq .body | sha256sum yields); recompute yours with: \
+                     printf %s \"$(gh \
                      api repos/OWNER/REPO/issues/{n} --jq .body)\" | sha256sum | cut -d' ' -f1"
                 ));
             }
