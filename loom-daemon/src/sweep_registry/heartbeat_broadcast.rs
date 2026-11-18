@@ -32,7 +32,7 @@
 //! heartbeat's `repo` field is now whichever workspace's reaper won the slot;
 //! no receiver reads it. Before this gate it was published on every reaper
 //! tick, regardless of live-sweep count — unlike [`SweepRegistry::readvertise_peer_claims`],
-//! which only republishes claims for `Running`/`Pending` entries. This is a
+//! which only republishes claims for `Running` entries. This is a
 //! standing, permanent addition to fleet-wide traffic on the shared
 //! safehouse channel, not an edge-triggered one like
 //! [`SweepRegistry::publish_peer_pool_hold_claim`]'s arm/clear ads — the
