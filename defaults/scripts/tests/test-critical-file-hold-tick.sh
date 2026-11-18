@@ -172,7 +172,26 @@ cat >"$T/w/.loom/scripts/merge-pr.sh" <<EOF
 #!/usr/bin/env bash
 echo "MERGE" >>"$T/writes"
 EOF
-chmod +x "$T/bin/gh" "$T/bin/loom-daemon" "$T/w/.loom/scripts/"*.sh
+# BSD `paste` (macOS) has no implicit-stdin mode: with no file operand it prints its
+# usage line and exits 1, where GNU `paste` reads stdin. Shadow `paste` on the tick's
+# PATH with that rule so a bare `... | paste -sd' '` fails here as it does on the macOS
+# leg (#13155); `paste -sd' ' -` and a file operand still work on both.
+cat >"$T/bin/paste" <<'EOF'
+#!/usr/bin/env bash
+ops=0; skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    -d) skip=1 ;;
+    -) ops=$((ops + 1)) ;;   # a bare `-` is the stdin operand
+    -*) ;;
+    *) ops=$((ops + 1)) ;;
+  esac
+done
+[ "$ops" -gt 0 ] || { echo "usage: paste [-s] [-d delimiters] file ..." >&2; exit 1; }
+PATH=${PATH#*:} exec paste "$@"
+EOF
+chmod +x "$T/bin/gh" "$T/bin/loom-daemon" "$T/bin/paste" "$T/w/.loom/scripts/"*.sh
 
 # --- harness -------------------------------------------------------------------
 reset() { # <head>

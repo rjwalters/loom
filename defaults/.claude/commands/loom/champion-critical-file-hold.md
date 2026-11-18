@@ -163,7 +163,7 @@ CF_SCOPE=$(jq -r --arg h "$HOLD_MARKER" --arg r "$RELEASED_MARKER" '
   | [$c[($i + 1):][]
      | select((.author.login | test("\\[bot\\]$") | not) and (.body | test("^<!-- champion:|Automated by [A-Za-z]+ role") | not))
      | .body | split("\n")[] | capture("^release-scope:[ \\t]+(?<p>.+)$").p][-1] // ""
-  | split(" ")[] | select(test("^[A-Za-z0-9._/@+-]+$"))' <<<"$CF_JSON" 2>/dev/null | head -50 | paste -sd' ')
+  | split(" ")[] | select(test("^[A-Za-z0-9._/@+-]+$"))' <<<"$CF_JSON" 2>/dev/null | head -50 | paste -sd' ' -)   # explicit `-`: BSD paste (macOS) has no implicit stdin
 
 # Head moved; did the PR's change? Sets CF_EQUIV_KIND (empty => re-arm), CF_EQUIV_WHY,
 # CF_EQUIV_CAUSE (`unread`: the forge compare never answered, #13114; `base-unread`: the PR base branch was unreadable, #13149).
