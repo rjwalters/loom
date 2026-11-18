@@ -98,6 +98,11 @@ pub fn fetch_resolve_latest(repo_root: &Path, pinned_tag: Option<&str>) -> Resol
     r
 }
 
+/// Shared prefix of the two "no latest release" reasons below. One literal,
+/// not two: `forge_inventory`'s ratchet counts every non-comment `gh release`
+/// phrase textually, so duplicating it grew the file's baseline count (#14152).
+const NO_LATEST_RELEASE: &str = "'gh release view' found no latest release";
+
 /// The release half of [`fetch_resolve_latest`], with the forge reads factored
 /// out so the tag/asset logic is testable without `gh` (#10709).
 ///
@@ -122,7 +127,7 @@ fn resolve_release(
                     format!("found no release tagged {pinned} for {} ({why})", r.repo_slug)
                 }
                 None => {
-                    format!("'gh release view' found no latest release for {} ({why})", r.repo_slug)
+                    format!("{NO_LATEST_RELEASE} for {} ({why})", r.repo_slug)
                 }
             };
             return;
@@ -136,10 +141,7 @@ fn resolve_release(
                 "found no release tagged {pinned} for {} (the forge returned no tag)",
                 r.repo_slug
             ),
-            None => format!(
-                "'gh release view' found no latest release for {} (no Releases yet)",
-                r.repo_slug
-            ),
+            None => format!("{NO_LATEST_RELEASE} for {} (no Releases yet)", r.repo_slug),
         };
         return;
     }
