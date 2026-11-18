@@ -42,7 +42,8 @@ parameter is alias-only and rejects a pinned ID (#14133). `task_model: null`
 the subagent inherits the parent session's model — the zero-config behavior is
 byte-for-byte unchanged. The bare form prints just the model and exits 3 with
 no output when nothing is configured; `--task-alias` (bare form only — a
-no-op under `--json`) prints the alias and exits 3 when there is none. The shipped `defaults/.claude/agents/*.md` carry no
+no-op under `--json`) prints the alias and exits 3 when there is none. The
+shipped `defaults/.claude/agents/*.md` carry no
 `model:` frontmatter (a test asserts it): a role's model comes from config at
 spawn time, never from a hardcoded tier — the #13956 operator ruling declined
 per-role pins in shipped files so per-role experiments stay possible.
