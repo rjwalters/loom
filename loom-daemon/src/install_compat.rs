@@ -421,6 +421,10 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    "lease pr claim",
+    "lease pr check",
+    "lease pr fence",
+    "lease pr release",
     "claim",
 ];
 

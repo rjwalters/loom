@@ -35,6 +35,9 @@ const TOKEN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) struct ExecAuth {
     names: Vec<&'static str>,
     secret: Option<String>,
+    /// The repository is on GitHub and neither the process environment nor
+    /// the owner's published App directory yielded a token (#14433).
+    github_unresolved: bool,
     /// A credential directory matched to this repository's owner exists but
     /// its token is provably expired, and no fresher one was found (#14435).
     expired: bool,
@@ -94,6 +97,7 @@ impl ExecAuth {
             return Self {
                 names,
                 secret: None,
+                github_unresolved: false,
                 expired: false,
             };
         }
@@ -105,6 +109,7 @@ impl ExecAuth {
             return Self {
                 names,
                 secret: None,
+                github_unresolved: false,
                 expired: false,
             };
         };
@@ -120,8 +125,9 @@ impl ExecAuth {
             names.push(TOKEN_ENV);
         }
         Self {
-            expired: secret.is_none() && choice.expired,
             names,
+            github_unresolved: secret.is_none(),
+            expired: secret.is_none() && choice.expired,
             secret,
         }
     }
@@ -150,6 +156,15 @@ impl ExecAuth {
     #[cfg(test)]
     pub(super) fn resolved(&self) -> bool {
         self.secret.is_some()
+    }
+
+    /// `true` for a GitHub repository with no write credential at all: no
+    /// `GH_TOKEN`/`GITHUB_TOKEN` in the process and no installation token read
+    /// from the owner's published App directory. A non-GitHub forge is never
+    /// unresolved here (it keeps its own `GITEA_TOKEN` path), and neither is a
+    /// process that carries a token (#14433).
+    pub(super) fn github_token_missing(&self) -> bool {
+        self.github_unresolved
     }
 }
 
@@ -389,6 +404,47 @@ mod tests {
         assert!(auth.resolved());
         assert_eq!(auth.names(), &["GH_TOKEN"]);
         assert_eq!(auth.child_env(), vec![("GH_TOKEN".into(), SECRET.into())]);
+    }
+
+    /// #14433: a GitHub repository is "missing" its write token only when the
+    /// process has none AND no owner App directory yields one; a published
+    /// directory (the operator-shell root fallback), a process token and a
+    /// non-GitHub forge are all not missing.
+    #[test]
+    fn github_token_missing_only_when_no_route_yields_a_credential() {
+        let repo = "https://github.com/acme/widget";
+        let empty = tempfile::tempdir().unwrap();
+        let none = env_of(&[]);
+        let unread = |_: &Path| -> Option<String> { None };
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &none, &unread, None);
+        assert!(auth.github_token_missing());
+        assert!(auth.names().is_empty() && auth.child_env().is_empty());
+
+        // The owner's App dir is published under the daemon root, and the
+        // process (an operator shell) has no env token and no registry.
+        let root = published_owner_workspace("acme");
+        let read = |_: &Path| Some(SECRET.to_owned());
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &none, &read, Some(root.path()));
+        assert!(!auth.github_token_missing());
+        assert!(auth.resolved());
+
+        // Published, but the token read yields nothing: still missing.
+        let auth =
+            ExecAuth::resolve_with_root(empty.path(), repo, &none, &unread, Some(root.path()));
+        assert!(auth.github_token_missing());
+
+        let with_env = env_of(&[("GITHUB_TOKEN", "from-process")]);
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &with_env, &unread, None);
+        assert!(!auth.github_token_missing());
+
+        let gitea = ExecAuth::resolve_with_root(
+            empty.path(),
+            "https://forge.example/acme/widget",
+            &none,
+            &unread,
+            None,
+        );
+        assert!(!gitea.github_token_missing());
     }
 
     #[test]

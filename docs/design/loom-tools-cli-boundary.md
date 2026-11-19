@@ -752,7 +752,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree and lease commands | #14397 (the checkout-local `claim` family moved in #14487, §13.6) |
+| Worktree operations and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). Checkout-local claims are available through `loom-tools claim` (#14487, §13.7). |
 
 ### 13.4 Gitea decision
 
@@ -765,13 +765,38 @@ is forge-neutral already (`git ls-remote`, no forge API call). A Rust port of
 specific reads is not cheap: `ForgeType::Gitea` appears in 23 library files
 (§12), so it is its own scope.
 
-### 13.6 Local claim commands (#14487)
+### 13.5 Shell wrappers
+
+No wrapper or locator changed. `loom_tools_serves` in
+`lib/locate-daemon-bin.sh` still lists the four slice commands; making the
+`forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
+which can now read the served list from `capabilities --json`.
+
+### 13.6 Role-keyed PR leases (#14489)
+
+`loom-tools lease pr claim|check|fence|release` shares the daemon CLI's
+arguments, handlers, lease states and result codes. GitHub actions resolve
+mode from the same canonical checkout selected by `--workspace`. Fleet
+reads use the configured gateway or reader pool. If neither can serve the
+request, the lease handler keeps its unreadable-state behavior. Writes use
+the existing repository scope and writer. In session and local-daemon modes, the local
+credential serves both and inherited fleet read routing is discarded.
+
+A successful claim starts the internal `renew-loop` in the same executable.
+The child receives the canonical workspace and the selected mode, then
+initializes its own read route before any forge operations. The watcher PID,
+process start identity and lease ownership guard keep detached renewal tied
+to the original claim. On Gitea, agent-facing leases return success with
+the label-only diagnostic and perform no forge lease operations. Scheduled
+`attach` and `reap` remain daemon service commands. Tools return 64 for them.
+
+### 13.7 Local claim commands (#14487)
 
 Part of #14475. `loom-tools claim <verb>` serves `claim`, `extend`, `check`,
 `release`, `list` and `cleanup` through the same `script_helpers::claim::run`
 that `loom-daemon claim` (and the `loom-claim` shim from
 `scripts/install/provision-daemon.sh`) calls; the argument shape is the same
-optional verb plus trailing positionals, and nothing was copied. The claim is the
+optional verb plus trailing positionals. The claim is the
 directory `.loom/claims/issue-<N>.lock` with its `claim.json`, found by walking up
 from the current directory to the checkout root.
 
@@ -784,15 +809,7 @@ or `release` leaves the owner's `claim.json` unchanged.
 
 `install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
 split into reads and writes, so no sub-verbs are listed). Forge claim checks
-(`forge check-claim`, §13.2), issue and PR lease records, and worktree creation
-remain #14397's.
-
-### 13.5 Shell wrappers
-
-No wrapper or locator changed. `loom_tools_serves` in
-`lib/locate-daemon-bin.sh` still lists the four slice commands; making the
-`forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
-which can now read the served list from `capabilities --json`.
+(§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 

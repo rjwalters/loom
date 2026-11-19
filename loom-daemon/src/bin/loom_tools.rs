@@ -15,7 +15,7 @@
 //! `forge <read verb>` (#14395) is the family of forge reads: the same
 //! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
 //! that write (#14396). It and `checkpoint read` (§10.3) are the commands
-//! behind the mode gate: it resolves `mode` ([`tools_mode`])
+//! behind the mode gate, as are role-keyed PR leases. The gate resolves `mode` ([`tools_mode`])
 //! before `forge_gateway::enable_cli_reads()` is considered, and enables it
 //! only on the fleet route. `strip-ansi`, the other checkpoint actions and
 //! `config get` never route, and `config get mode` must work with `mode` unset.
@@ -26,20 +26,18 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_forge_read_command,
-    handle_operator_decision_command, handle_park_record_command, handle_resolve_model_command,
-    handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
-    ForgeReadCli, InstallBinaryCommand, OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
+    handle_lease_command, handle_operator_decision_command, handle_park_record_command,
+    handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
+    CheckpointAction, ConfigArgs, ForgeReadCli, InstallBinaryCommand, LeaseCli,
+    OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
+    ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::script_helpers;
-use loom_daemon::tools_mode::{self, Route};
+use loom_daemon::tools_mode;
 
 #[derive(Parser)]
-#[command(
-    name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision, claim)"
-)]
+#[command(name = "loom-tools", about = "Loom agent tools")]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
     #[command(subcommand)]
@@ -96,6 +94,8 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
+    /// Claim, check, fence and release role-keyed pull-request leases.
+    Lease(LeaseCli),
     /// Atomic file-based issue claiming in this checkout (`claim`, `extend`,
     /// `release`, `check`, `list`, `cleanup`): the same arguments, stdout and
     /// exit codes as `loom-daemon claim` (#14487), so an attended builder can
@@ -146,21 +146,7 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
 fn mode_gate() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let resolution =
-        tools_mode::resolve(&tools_mode::inputs_from_env(&cwd)).map_err(anyhow::Error::msg)?;
-    for note in &resolution.notes {
-        eprintln!("{note}");
-    }
-    match resolution.route {
-        Route::Fleet => loom_daemon::forge_gateway::enable_cli_reads(),
-        // Nothing has read them yet; drop them so no later code honors them.
-        Route::Local => {
-            for var in &resolution.ignored_vars {
-                std::env::remove_var(var);
-            }
-        }
-    }
-    Ok(())
+    tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
 }
 
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
@@ -216,6 +202,7 @@ fn run() -> Result<()> {
             }
             handle_operator_decision_command(cli)
         }
+        ToolsCommands::Lease(cli) => handle_lease_command(cli),
         // Filesystem only (`.loom/claims/`), so no mode gate: it works with
         // `mode` unset, offline. Same handler `Commands::Claim` calls.
         ToolsCommands::Claim { command, args } => {

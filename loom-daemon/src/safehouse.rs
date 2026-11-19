@@ -53,7 +53,6 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::activity::ActivityDb;
 use crate::event_bus::{EventBus, RecvError};
-use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::types::{Event, SweepKind};
 
@@ -86,13 +85,10 @@ const PERSONA_ENV: &str = "LOOM_SAFEHOUSE_PERSONA";
 const ROOM_SIGNAL_ENV: &str = "LOOM_SAFEHOUSE_ROOM_SIGNAL";
 const ROOMS_BY_REPO_ENV: &str = "LOOM_SAFEHOUSE_ROOMS_BY_REPO";
 
-/// The dedicated peer-claim coordination room (#4713): when set, claim
-/// advertise/retract traffic rides this room instead of the signal room, so a
-/// human watching the signal room no longer sees the 30-second heartbeat
-/// cadence `sweep_registry::readvertise_peer_claims` re-publishes. Absent ⇒
-/// falls back to [`SafehouseConfig::signal_room`] — see
-/// [`SafehouseConfig::claims_room`].
-const ROOM_CLAIMS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_CLAIMS";
+/// The retired dedicated claims room (#4713, removed by #13945). Only its name
+/// survives, so a host that still exports it gets the one-time warning from
+/// [`warn_retired_claims_keys`] instead of silently ignoring it.
+const RETIRED_ROOM_CLAIMS_ENV: &str = "LOOM_SAFEHOUSE_ROOM_CLAIMS";
 
 /// The optional alerts room (#13070): when set, `handoff`-type envelopes
 /// (fleet-degraded edges and their `Cleared`, BLOCKED, crashed) go here instead
@@ -220,11 +216,10 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// operator who leaves `"rooms": {}` in config gets the unchanged single-room
 /// behavior rather than a routing mode with nothing to route to.
 ///
-/// A **claims-only** map (`claims` set, no `signal`, no `byRepo`) is kept — so
-/// [`SafehouseConfig::claims_room`] resolves — but it does **not** activate
-/// attention-class narration routing: [`routes_narration`](Self::routes_narration)
-/// gates narration on a narration target, keeping `claims` an independent knob
-/// (#4713's "opt-in, default-unchanged" contract).
+/// An **alerts-only** map (`alerts` set, no `signal`, no `byRepo`) is kept but
+/// does **not** activate attention-class narration routing:
+/// [`routes_narration`](Self::routes_narration) gates narration on a narration
+/// target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoomMap {
     /// The everyone/signal room (`loom-fleet`): operator ↔ fleet conversation,
@@ -238,20 +233,10 @@ pub struct RoomMap {
     /// map is created lazily as `fleet-<repo>` on first narration (see
     /// [`RoomRouter`]). `BTreeMap` for deterministic iteration in tests/logs.
     pub by_repo: std::collections::BTreeMap<String, String>,
-    /// The dedicated peer-claim coordination room (#4713), opt-in. `None` ⇒
-    /// fall back to [`signal`](Self::signal) (see
-    /// [`SafehouseConfig::claims_room`]) — the same "absent means
-    /// unchanged-default" contract `signal` itself has against the legacy
-    /// [`SafehouseConfig::room`] scalar. Setting this splits the machine-cadence
-    /// claim advertise/retract heartbeat out of the human-facing signal room
-    /// into its own coordination room; an operator who does this **must**
-    /// ensure every host's safehoused bot is joined to it (the same
-    /// cross-host-provisioning requirement documented for `signal`).
-    pub claims: Option<String>,
     /// Optional alerts room (#13070), opt-in. When set, `handoff` envelopes —
     /// and only those — resolve here; everything else routes exactly as it
-    /// would without it. Like `claims`, an alerts-only map does **not**
-    /// activate attention-class narration routing.
+    /// would without it. An alerts-only map does **not** activate
+    /// attention-class narration routing.
     pub alerts: Option<String>,
 }
 
@@ -260,18 +245,14 @@ impl RoomMap {
     /// callers normalize it to `None` (single-room mode).
     #[must_use]
     fn is_empty(&self) -> bool {
-        self.signal.is_none()
-            && self.by_repo.is_empty()
-            && self.claims.is_none()
-            && self.alerts.is_none()
+        self.signal.is_none() && self.by_repo.is_empty() && self.alerts.is_none()
     }
 
     /// Whether this map carries a **narration** routing target (`signal` and/or
-    /// a `byRepo` entry). A claims-only map does **not**: `claims` redirects the
-    /// peer-claim coordination connection only (#4713) and must never flip the
+    /// a `byRepo` entry). An alerts-only map does **not**: it must never flip the
     /// narration sink out of its byte-identical single-room mode as a side
     /// effect. Both [`SafehouseConfig::routes_by_attention`] and
-    /// [`RoomRouter::resolve`] gate on this, keeping the two knobs independent.
+    /// [`RoomRouter::resolve`] gate on this.
     #[must_use]
     fn routes_narration(&self) -> bool {
         self.signal.is_some() || !self.by_repo.is_empty()
@@ -326,10 +307,8 @@ impl SafehouseConfig {
     /// single-room mode this **is** `room`, which is what keeps the absent-map
     /// path byte-identical.
     ///
-    /// Also the **fallback** for the peer-claim coordination connection: since
-    /// #4713 [`run_coordination`] resolves [`claims_room`](Self::claims_room),
-    /// which lands here only while `rooms.claims` is unset — see
-    /// [`run_coordination`] for why claim ads default to the signal room.
+    /// Also the room the completion-dedup connection ([`run_coordination`])
+    /// joins — see there for why it rides the signal room.
     #[must_use]
     pub fn signal_room(&self) -> Option<&str> {
         self.rooms
@@ -338,27 +317,8 @@ impl SafehouseConfig {
             .or(self.room.as_deref())
     }
 
-    /// The room peer-claim advertise/retract traffic goes to (#4713):
-    /// `rooms.claims` when the map configures one, else falls back to
-    /// [`signal_room`](Self::signal_room) — which itself falls back to the
-    /// legacy scalar [`room`](Self::room). This chain is what keeps existing
-    /// deployments (no `rooms.claims` configured) byte-identical to pre-#4713
-    /// behavior: claim ads keep riding the signal room exactly as
-    /// [`run_coordination`]'s doc comment describes.
-    #[must_use]
-    pub fn claims_room(&self) -> Option<&str> {
-        self.rooms
-            .as_ref()
-            .and_then(|rooms| rooms.claims.as_deref())
-            .or_else(|| self.signal_room())
-    }
-
     /// Whether attention-class **narration** routing is active: the `rooms` map
-    /// configures a narration target (`signal` and/or `byRepo`). A claims-only
-    /// map deliberately does **not** activate it — `rooms.claims` is an
-    /// independent knob that only redirects the peer-claim coordination
-    /// connection ([`claims_room`](Self::claims_room)); narration stays in
-    /// single-room mode, byte-identical (#4713).
+    /// configures a narration target (`signal` and/or `byRepo`).
     #[must_use]
     pub fn routes_by_attention(&self) -> bool {
         self.rooms.as_ref().is_some_and(RoomMap::routes_narration)
@@ -372,7 +332,68 @@ impl SafehouseConfig {
 pub fn resolve_config(repo_root: &Path) -> SafehouseConfig {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
     let block = crate::config_resolver::get_path(&effective, "safehouse");
+    let retired = retired_claims_keys(block, |name| env_nonempty(name).is_some());
+    warn_retired_claims_keys_once(&RETIRED_CLAIMS_WARNED, &retired);
     apply_env_overrides(config_from_value(block))
+}
+
+/// `safehouse` config keys whose only consumer was the retired peer-claim
+/// channel and claims room (#13945). Still *accepted* — a leftover one must not
+/// stop a daemon starting — but ignored, and named once in a warning.
+const RETIRED_CLAIMS_CONFIG_KEYS: &[&str] = &["peerClaimTtlSecs"];
+
+/// Retired claims-channel environment variables, warned about the same way.
+const RETIRED_CLAIMS_ENV_KEYS: &[&str] = &[RETIRED_ROOM_CLAIMS_ENV, "LOOM_PEER_CLAIM_TTL_SECS"];
+
+/// Guards the one-per-process leftover-key warning.
+static RETIRED_CLAIMS_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Which retired claims-room keys are still set: `safehouse.rooms.claims`,
+/// `safehouse.peerClaimTtlSecs`, and the retired env vars (`env_set` answers
+/// whether one is exported, so tests need not mutate the process environment).
+#[must_use]
+fn retired_claims_keys(block: Option<&Value>, env_set: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(block) = block.and_then(Value::as_object) {
+        if block
+            .get("rooms")
+            .and_then(Value::as_object)
+            .is_some_and(|rooms| rooms.contains_key("claims"))
+        {
+            keys.push("safehouse.rooms.claims".to_owned());
+        }
+        for key in RETIRED_CLAIMS_CONFIG_KEYS {
+            if block.contains_key(*key) {
+                keys.push(format!("safehouse.{key}"));
+            }
+        }
+    }
+    keys.extend(
+        RETIRED_CLAIMS_ENV_KEYS
+            .iter()
+            .filter(|name| env_set(name))
+            .map(|name| (*name).to_owned()),
+    );
+    keys
+}
+
+/// Log the leftover-key warning at most once per `once`, however many times the
+/// config is re-resolved. Returns whether this call emitted it.
+fn warn_retired_claims_keys_once(once: &std::sync::Once, keys: &[String]) -> bool {
+    if keys.is_empty() {
+        return false;
+    }
+    let mut emitted = false;
+    once.call_once(|| {
+        emitted = true;
+        log::warn!(
+            "safehouse: ignoring retired peer-claim / claims-room settings ({}); the peer-claim \
+             channel was removed in #13945 and cross-host coordination runs on captain \
+             assignment plus forge leases. Delete these keys.",
+            keys.join(", ")
+        );
+    });
+    emitted
 }
 
 /// Read the config layer only (no env), so unit tests can assert
@@ -432,11 +453,6 @@ fn rooms_from_value(block: Option<&Value>) -> Option<RoomMap> {
             }
         }
     }
-    if let Some(claims) = rooms.get("claims").and_then(Value::as_str) {
-        if !claims.trim().is_empty() {
-            map.claims = Some(claims.trim().to_owned());
-        }
-    }
     if let Some(alerts) = rooms.get("alerts").and_then(Value::as_str) {
         if !alerts.trim().is_empty() {
             map.alerts = Some(alerts.trim().to_owned());
@@ -472,7 +488,6 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 /// default**:
 ///
 /// - `LOOM_SAFEHOUSE_ROOM_SIGNAL` overrides `rooms.signal` alone.
-/// - `LOOM_SAFEHOUSE_ROOM_CLAIMS` (#4713) overrides `rooms.claims` alone.
 /// - `LOOM_SAFEHOUSE_ROOM_ALERTS` (#13070) overrides `rooms.alerts` alone.
 /// - `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,repo=room…`) replaces the
 ///   **whole** `byRepo` map rather than merging into it, so an operator can
@@ -486,18 +501,14 @@ fn apply_env_overrides(mut cfg: SafehouseConfig) -> SafehouseConfig {
 #[must_use]
 fn apply_room_env_overrides(rooms: Option<RoomMap>) -> Option<RoomMap> {
     let signal = env_nonempty(ROOM_SIGNAL_ENV);
-    let claims = env_nonempty(ROOM_CLAIMS_ENV);
     let alerts = env_nonempty(ROOM_ALERTS_ENV);
     let by_repo = env_nonempty(ROOMS_BY_REPO_ENV).map(|raw| parse_by_repo_env(&raw));
-    if signal.is_none() && claims.is_none() && alerts.is_none() && by_repo.is_none() {
+    if signal.is_none() && alerts.is_none() && by_repo.is_none() {
         return rooms;
     }
     let mut map = rooms.unwrap_or_default();
     if let Some(signal) = signal {
         map.signal = Some(signal);
-    }
-    if let Some(claims) = claims {
-        map.claims = Some(claims);
     }
     if let Some(alerts) = alerts {
         map.alerts = Some(alerts);
@@ -567,17 +578,16 @@ fn env_nonempty(key: &str) -> Option<String> {
 //
 // Before #4345, `safehouse.enabled` false/absent, enabled-but-unreachable, and
 // enabled-and-connected all looked identical to an operator: silence. The
-// narration sink and peer-claim coordination task both already know their own
+// narration sink and completion-dedup task both already know their own
 // live connection state; this cell is how that knowledge reaches
 // `loom-daemon status` without a second, status-time connection attempt (a
 // CLI-side probe can't know "room joined" the way the daemon's own live
 // connection can).
 
 /// Live safehouse connection state, shared between the narration sink
-/// ([`run_sink`]) and the peer-claim coordination task ([`run_coordination`])
+/// ([`run_sink`]) and the completion-dedup task ([`run_coordination`])
 /// via a [`SharedSafehouseState`] cell — the same "shared `Arc<Mutex<..>>`
-/// updated by the task that owns the connection" shape [`PeerClaimView`]
-/// already uses. Both tasks connect to the same `safehoused` peer off the same
+/// updated by the task that owns the connection" shape. Both tasks connect to the same `safehoused` peer off the same
 /// resolved config, so in steady state they agree; a transient disagreement
 /// (one connection drops, the other has not yet) resolves to whichever task
 /// transitions last, which self-heals on the next reconnect attempt.
@@ -648,15 +658,15 @@ impl SafehouseState {
 }
 
 /// A shared, `Arc`-wrapped connection-state cell, injected into
-/// [`spawn_sink`]/[`spawn_peer_coordination`] (and their `run_*` loops) so
+/// [`spawn_sink`]/[`spawn_completion_dedup`] (and their `run_*` loops) so
 /// [`WorkspacePool`](crate::workspace_pool::WorkspacePool) can hold one cell
 /// per daemon and read it back for `loom-daemon status` without a second
-/// connection. Mirrors [`PeerClaimView`]'s `Arc<Mutex<..>>` injection shape.
+/// connection.
 pub type SharedSafehouseState = Arc<Mutex<SafehouseState>>;
 
 /// Construct a fresh cell defaulted to [`SafehouseState::NotConfigured`] — the
 /// correct starting value for a daemon that has not yet called
-/// [`spawn_sink`]/[`spawn_peer_coordination`] for this cell.
+/// [`spawn_sink`]/[`spawn_completion_dedup`] for this cell.
 #[must_use]
 pub fn new_shared_state() -> SharedSafehouseState {
     Arc::new(Mutex::new(SafehouseState::default()))
@@ -683,8 +693,8 @@ pub fn snapshot_state(cell: &SharedSafehouseState) -> SafehouseState {
 
 /// Set `cell` to [`SafehouseState::NotConfigured`] (#4345). Exposed (unlike
 /// [`set_state`]) for `workspace_pool.rs`'s disabled-config fast path in
-/// `start_peer_coordination`, which returns before ever calling
-/// [`spawn_peer_coordination`] — the one caller outside this module that needs
+/// `start_completion_dedup`, which returns before ever calling
+/// [`spawn_completion_dedup`] — the one caller outside this module that needs
 /// to report a transition directly rather than through a `spawn_*`/`run_*`
 /// entry point.
 pub fn set_not_configured(cell: &SharedSafehouseState) {
@@ -1282,9 +1292,8 @@ impl RoomRouter {
         // Absent `rooms` map ⇒ the pre-#4225 behavior, byte-identical: one room
         // for everything, `None` included. This is the migration default and the
         // single most important invariant of this change. A map with no
-        // narration target (claims-only, #4713) is deliberately treated the
-        // same: `rooms.claims` redirects the peer-claim coordination connection
-        // only, and must not switch narration into attention-class routing —
+        // narration target (alerts-only, #13070) is deliberately treated the
+        // same: it must not switch narration into attention-class routing —
         // per-repo lazy firehose creation included — as a side effect.
         // The alerts room (#13070) is checked first and independently of
         // narration routing: handoffs only, and it works in single-room mode.
@@ -1718,7 +1727,7 @@ async fn run_sink_gh(
             // Every failure is counted (#13156); the log below stays one-shot.
             crate::observability::ops::safehouse_forge_lookup::record_failed(
                 call,
-                &crate::peer_claims::repo_slug(workspace_root),
+                &crate::host_identity::repo_slug(workspace_root),
                 &u,
             );
             match u {
@@ -2108,36 +2117,29 @@ async fn fetch_issue_tokens(
 
 /// Bundles what [`build_and_narrate_completion`] needs to consult and update
 /// the **fleet-wide** completion dedup (Issue #6352), on top of the
-/// per-host-only `already_narrated`/persisted-file dedup that already existed
-/// (#4426/#4583): this host's own identity for the outbound `Completed` ad,
-/// the shared [`PeerClaimView`] to check/observe against, and the same
-/// outbound channel [`run_coordination`] already drains for
-/// `Advertise`/`Retract` ads (Option 1 from the issue's curation — reusing
-/// the existing cross-host soft-claim primitive rather than a new socket or
-/// protocol amendment).
+/// per-host-only `already_narrated`/persisted-file dedup (#4426/#4583): this
+/// host's own identity for the outbound completion ad, the shared
+/// [`CompletionView`] to check against, and the outbound channel
+/// [`run_coordination`] drains.
 ///
-/// Constructed once per [`run_sink`] invocation from the same
-/// `Arc<Mutex<PeerClaimView>>` + `mpsc::Sender<ClaimAd>` pair
-/// [`crate::workspace_pool::WorkspacePool::start_peer_coordination`] already
-/// hands to [`crate::sweep_registry::SweepRegistry`] for dispatch-side
-/// claims — see [`crate::workspace_pool::WorkspacePool::start_safehouse_narration`].
-/// `None` end-to-end (no coordination established, e.g. `safehouse.enabled`
-/// false) degrades every check below to "no peer info available", which is
-/// exactly the pre-#6352 per-host-only behavior — byte-for-byte unchanged
-/// when peer coordination is not running.
+/// Constructed once per [`run_sink`] invocation from the pair
+/// [`crate::workspace_pool::WorkspacePool::start_completion_dedup`] creates.
+/// `None` end-to-end (no connection established, e.g. `safehouse.enabled`
+/// false) degrades every check below to "no peer info available", which is the
+/// per-host-only behavior.
 #[derive(Clone)]
 pub struct PeerCompletionHandle {
     host: String,
     pid: u32,
-    publisher: tokio::sync::mpsc::Sender<ClaimAd>,
-    view: Arc<Mutex<PeerClaimView>>,
+    publisher: tokio::sync::mpsc::Sender<CompletedAd>,
+    view: Arc<Mutex<CompletionView>>,
 }
 
 impl PeerCompletionHandle {
     #[must_use]
     pub fn new(
-        publisher: tokio::sync::mpsc::Sender<ClaimAd>,
-        view: Arc<Mutex<PeerClaimView>>,
+        publisher: tokio::sync::mpsc::Sender<CompletedAd>,
+        view: Arc<Mutex<CompletionView>>,
     ) -> Self {
         Self {
             host: crate::sweep_registry::host_identity(),
@@ -2149,15 +2151,11 @@ impl PeerCompletionHandle {
 
     /// Whether a peer has already narrated `(repo, issue, pr)`'s completion,
     /// per the shared view, right now. A poisoned mutex degrades to "no peer
-    /// info" (`false`) rather than propagating a panic into the narration
-    /// sink.
+    /// info" (`false`) rather than propagating a panic into the narration sink.
     ///
-    /// Keyed on the **merged PR number**, not just the issue (Issue #6062):
-    /// an issue can legitimately merge more than one PR over its lifetime
-    /// (partial increments, `Part of #N`), and each one is a distinct
-    /// completion worth narrating once. Keying on issue alone (the pre-#6062
-    /// shape) would permanently suppress every merge after the first for a
-    /// still-open issue, fleet-wide, for the rest of the completion TTL.
+    /// Keyed on the **merged PR number**, not just the issue (Issue #6062): an
+    /// issue can legitimately merge more than one PR over its lifetime, and each
+    /// is a distinct completion worth narrating once.
     fn already_narrated_by_peer(&self, repo: &str, issue: u32, pr: u32) -> bool {
         match self.view.lock() {
             Ok(view) => view.is_narrated_at(repo, issue, pr, Instant::now()),
@@ -2167,15 +2165,11 @@ impl PeerCompletionHandle {
         }
     }
 
-    /// Publish this host's own `Completed` ad for `(repo, issue, pr)`.
-    /// Fire-and-forget / fail-open, mirroring
-    /// [`crate::sweep_registry::SweepRegistry::publish_peer_claim`]'s
-    /// contract exactly: a dropped ad (channel `Full`/`Closed`) never blocks
-    /// or unwinds the narration that already succeeded locally — the local
-    /// `completion` envelope has already been built and sent by the time
-    /// this is called.
+    /// Publish this host's own completion ad for `(repo, issue, pr)`.
+    /// Fire-and-forget / fail-open: a dropped ad (channel `Full`/`Closed`) never
+    /// blocks or unwinds the narration that already succeeded locally.
     fn publish_completed(&self, repo: &str, issue: u32, pr: u32) {
-        let ad = ClaimAd::completed(
+        let ad = CompletedAd::new(
             issue,
             repo.to_owned(),
             self.host.clone(),
@@ -2314,7 +2308,7 @@ async fn build_and_narrate_completion(
     // merge. `None` here (no peer coordination established) degrades
     // byte-for-byte to the pre-#6352 per-host-only behavior.
     if let Some(handle) = peer_completions {
-        let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
+        let repo_key = crate::host_identity::repo_slug(Path::new(workspace_root));
         if handle.already_narrated_by_peer(&repo_key, issue, merged.number) {
             already_narrated.insert(key);
             return None;
@@ -2398,7 +2392,7 @@ async fn build_and_narrate_completion(
             // they don't also narrate it. Fire-and-forget; a dropped ad
             // never unwinds a narration that already succeeded locally.
             if let Some(handle) = peer_completions {
-                let repo_key = crate::peer_claims::repo_slug(Path::new(workspace_root));
+                let repo_key = crate::host_identity::repo_slug(Path::new(workspace_root));
                 handle.publish_completed(&repo_key, issue, pr);
             }
             Some(envelope)
@@ -3122,10 +3116,10 @@ impl SafehouseClient {
             if value.get("event").is_some() {
                 // Interleaved async push (inbound room event) — demultiplex it
                 // out. The **narration** connection is emit-only and discards
-                // inbound; peer-claim consumption (#4028) runs on a *dedicated*
+                // inbound; completion-ad consumption runs on a *dedicated*
                 // read task ([`run_coordination`]) on its own connection, so an
-                // idle daemon that emits no narration still observes peer
-                // advertisements promptly (Gap 1a).
+                // idle daemon that emits no narration still hears peers'
+                // completions promptly.
                 continue;
             }
             return Ok(value);
@@ -3160,8 +3154,9 @@ impl SafehouseClient {
 /// `peer_completions` (Issue #6352) is the fleet-wide completion-dedup handle
 /// — see [`PeerCompletionHandle`] — built by
 /// [`crate::workspace_pool::WorkspacePool::start_safehouse_narration`] from
-/// the same peer-claim coordination context dispatch already uses. `None`
-/// (no peer coordination established) degrades byte-for-byte to the
+/// the context
+/// [`crate::workspace_pool::WorkspacePool::start_completion_dedup`] creates. `None`
+/// (no completion dedup established) degrades byte-for-byte to the
 /// pre-#6352 per-host-only dedup behavior.
 #[must_use]
 pub fn spawn_sink(
@@ -3773,70 +3768,38 @@ async fn run_sink(
 /// `try_send` drops on `Full` (fail-open) rather than blocking the dispatch path.
 pub const PEER_CLAIM_CHANNEL_CAP: usize = 256;
 
-/// A generic sink for inbound room events. Kept intentionally generic (rather
-/// than hard-wiring peer-claims) so the shared inbound read task can later fan an
-/// event out to additional consumers — e.g. inbound human steering (the
+/// A generic sink for inbound room events. Kept intentionally generic so the
+/// shared inbound read task can later fan an event out to additional consumers — e.g. inbound human steering (the
 /// follow-up noted at `.loom/docs/safehouse.md`) — without another connection.
 pub trait InboundEventSink: Send + Sync {
     /// Handle one inbound room-event push line (a JSON object carrying an
     /// `event` key). Best-effort: an implementation must never panic or block.
     fn on_event(&self, event: &Value);
-
-    /// Handle the outcome of one of THIS host's outbound sends on the same
-    /// connection (Issue #9294): `Some(reason)` when safehoused replied
-    /// `ok:false`, `None` when it accepted the send.
-    ///
-    /// Defaulted to a no-op so the outbound half stays optional for a sink that
-    /// only consumes. [`PeerClaimSink`] implements it, which is what lets
-    /// `loom-daemon status` distinguish "publishing into a room that refuses
-    /// every event" from "the fleet is quiet" — a distinction the previous
-    /// once-per-connection `warn!` could not make.
-    fn on_send_outcome(&self, _rejection: Option<&str>) {}
-
-    /// Handle one of THIS host's outbound sends being written to the socket
-    /// (Issue #9294) — the reply, if any, arrives later via
-    /// [`Self::on_send_outcome`].
-    ///
-    /// Needed because the measured 2026-09-29 outage produced **no reply at
-    /// all**: safehoused's send op never returned (matrix-sdk retries the
-    /// homeserver's 500 internally), so `on_send_outcome` was never called and
-    /// a rejection counter alone would have stayed at zero through a six-day
-    /// dead channel. Pairing writes with replies is what makes that shape
-    /// visible.
-    fn on_send_attempt(&self) {}
 }
 
 mod claim_sink;
-/// The peer-claim inbound consumer, defined in [`claim_sink`] (moved there in
-/// Issue #9294 to keep this file inside its size ratchet). Re-exported so every
-/// existing `safehouse::PeerClaimSink` call site is unchanged.
-pub use claim_sink::PeerClaimSink;
+/// The completion-dedup inbound consumer, view and ad (the surviving remnant of
+/// the retired peer-claim channel, #13945), defined in [`claim_sink`].
+pub use claim_sink::{
+    resolve_completion_ttl, CompletedAd, CompletionSink, CompletionView, DEFAULT_COMPLETION_TTL,
+};
 
-/// Build the `task`-typed advertisement envelope for a claim ad (Gap 2 of
-/// #4028): the envelope `type` enum is closed and owned by the safehouse repo, so
-/// a claim rides a `task` envelope with the structured payload in `body`.
+/// Bounded outbound completion-ad channel capacity. Ads are tiny and rare (one
+/// per narrated merge); the bound only matters during a safehoused outage, where
+/// [`PeerCompletionHandle::publish_completed`]'s `try_send` drops on `Full`
+/// (fail-open) rather than blocking narration.
+pub const COMPLETION_CHANNEL_CAP: usize = 256;
+
+/// Build the `task`-typed envelope for a completion ad: the envelope `type` enum
+/// is closed and owned by the safehouse repo, so the ad rides a `task` envelope
+/// with the structured payload in `body`.
 ///
 /// **No `task_id`.** safehoused threads every send that carries a `task_id`
-/// under the first root it saw for that id. Claim ads used to carry the bare
-/// issue number, which threaded the machine traffic into a handful of
-/// unrelated threads: every heartbeat and filing lock (sentinel issue `0`)
-/// piled into one ever-growing thread `0`, issue #N in two repos shared a
-/// thread, and a claims-room root could capture a narration line that used
-/// the same bare id. A claim ad is not a conversation, so it is sent as a
-/// plain top-level message. Receivers are unaffected: [`PeerClaimSink`] reads
-/// only the envelope `body` (falling back to a top-level `body`) and parses it
-/// with [`ClaimAd::from_body_str`]; it never reads `task_id`, `type` or the
-/// room, so a peer on an older version folds these ads exactly as before, and
-/// this host still folds an older peer's ads that do carry a `task_id`.
-///
-/// **Routing exception (#4225).** By the attention-class table this `task`
-/// envelope would belong in the per-repo firehose — claim ads *are* per-repo
-/// machine chatter. They deliberately stay on the **signal room** anyway; see
-/// [`run_coordination`] for the full rationale (in one line: it is the only room
-/// every host's bot is guaranteed to be joined to, and cross-host dedup is a
-/// correctness property, not a cosmetic one).
+/// under the first root it saw for that id, so a completion ad is sent as a plain
+/// top-level message. Receivers read only the envelope `body` (falling back to a
+/// top-level `body`) and never the `task_id`, `type` or room.
 #[must_use]
-pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
+pub fn completion_ad_to_envelope(ad: &CompletedAd) -> Envelope {
     Envelope {
         to: "*".to_owned(),
         kind: "task".to_owned(),
@@ -3846,28 +3809,26 @@ pub fn claim_ad_to_envelope(ad: &ClaimAd) -> Envelope {
     }
 }
 
-/// Spawn the peer-claim coordination task: one dedicated safehouse connection
-/// that **reads** inbound peer advertisements into `sink` and **writes** this
-/// daemon's outbound claim ads drained from `outbound`. Returns `None` — a
-/// byte-for-byte no-op (no socket, no task) — when safehouse is disabled or no
-/// socket resolves, mirroring [`spawn_sink`]'s contract.
+/// Spawn the completion-dedup task: one dedicated safehouse connection that
+/// **reads** inbound peer completion ads into `sink` and **writes** this
+/// daemon's outbound ads drained from `outbound`. Returns `None` — a no-op (no
+/// socket, no task) — when safehouse is disabled or no socket resolves,
+/// mirroring [`spawn_sink`]'s contract.
 ///
-/// This is the **dedicated inbound read task** the issue's Gap 1a requires: it
-/// drains the socket continuously via `select!`, so an idle daemon that emits no
-/// narration still observes peer claims promptly (the narration sink's
+/// It drains the socket continuously via `select!`, so an idle daemon that emits
+/// no narration still hears peers' completions (the narration sink's
 /// `read_reply` only drains while it is emitting).
 ///
 /// `state` (#4345) is updated with the resolved config-only state immediately
 /// (before any connection attempt) and further updated by [`run_coordination`]
-/// as connect/disconnect transitions happen — see [`SafehouseState`]. This
-/// task connects **eagerly** (unlike the narration sink's lazy first-event
-/// connect), so it is usually the first to observe a fresh daemon's true
-/// connection state.
+/// as connect/disconnect transitions happen — see [`SafehouseState`]. This task
+/// connects **eagerly** (unlike the narration sink's lazy first-event connect),
+/// so it is usually the first to observe a fresh daemon's true connection state.
 #[must_use]
-pub fn spawn_peer_coordination(
+pub fn spawn_completion_dedup(
     config: SafehouseConfig,
     sink: Arc<dyn InboundEventSink>,
-    outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+    outbound: tokio::sync::mpsc::Receiver<CompletedAd>,
     runtime: &tokio::runtime::Handle,
     state: SharedSafehouseState,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -3877,17 +3838,17 @@ pub fn spawn_peer_coordination(
     }
     let Some(socket) = resolve_socket(&config) else {
         log::warn!(
-            "safehouse: peer coordination enabled but no socket path resolved \
+            "safehouse: completion dedup enabled but no socket path resolved \
              (set safehouse.socket, $LOOM_SAFEHOUSE_SOCKET, or $SAFEHOUSED_SOCKET) — \
-             soft-claim coordination off"
+             cross-host completion dedup off"
         );
         // See spawn_sink's identical fallback: no socket resolved groups under
-        // "not configured", the AC's bucket for "nothing to even try".
+        // "not configured", the bucket for "nothing to even try".
         set_state(&state, SafehouseState::NotConfigured);
         return None;
     };
     log::info!(
-        "safehouse: peer-claim coordination enabled (persona={}, socket={})",
+        "safehouse: completion dedup enabled (persona={}, socket={})",
         config.persona,
         socket.display()
     );
@@ -3907,67 +3868,35 @@ pub fn spawn_peer_coordination(
 
 /// The coordination loop. Reconnects lazily with capped backoff; on each live
 /// connection it concurrently reads inbound room events (→ `sink`) and drains
-/// outbound claim ads (→ socket). Any I/O failure degrades to a reconnect — it
-/// never blocks or fails a dispatch. Returns when all outbound senders drop.
+/// outbound completion ads (→ socket). Any I/O failure degrades to a reconnect —
+/// it never blocks or fails narration. Returns when all outbound senders drop.
 ///
-/// # Room routing: claim ads default to the signal room, opt-in dedicated room (#4225, #4713)
+/// # Room routing: the signal room (#4225)
 ///
-/// Attention-class routing sends `task` envelopes to the per-repo firehose, and a
-/// claim ad *is* a per-repo `task` envelope — yet this connection deliberately
-/// advertises into (and reads from) [`SafehouseConfig::claims_room`], **not**
-/// the per-repo firehose. By default (`rooms.claims` unset) `claims_room()`
-/// resolves to the **signal room**, the one deliberate exception to
-/// "signal-only" #4225 established. Why the signal room is the *default*:
-///
-/// 1. **The signal room is the only room with guaranteed common membership.**
-///    Rooms are per-repo and created **lazily** by whichever host narrates that
-///    repo first (`RoomDecision::Create`), and hosts run **separate per-host bot
-///    accounts**. Host A creating `fleet-loom` does not join host B's bot to it,
-///    so an ad posted there is invisible to B until an operator invites it —
-///    silently disabling cross-host dedup with no error anywhere, exactly the
-///    failure class #4464 had to add a status state for. Every host's bot is
-///    already in the signal room; that is what makes it usable as a coordination
-///    channel at all.
-/// 2. **Dedup is correctness, room hygiene is cosmetics.** A missed claim ad
-///    costs a duplicate cross-host sweep (wasted tokens, two PRs for one issue).
-///    A little machine JSON in the signal room costs the operator some scroll.
-///    When those trade off, correctness wins — which is exactly why the
-///    dedicated-room escape hatch below is opt-in, not the new default.
-/// 3. **The reader must agree with the writer.** This task's inbound handler is
-///    unfiltered — it folds *any* inbound line carrying a parseable `loom_claim`
-///    body into the view — so it consumes ads from whatever rooms safehoused
-///    pushes to it. Keeping the write side and the read side on the same
-///    resolved room keeps the pair trivially consistent instead of depending on
-///    which rooms this host's bot happens to have joined.
-///
-/// Ads are low volume per dispatch / terminal outcome, but
-/// `sweep_registry::readvertise_peer_claims` re-publishes every live sweep's
-/// claim each 30s reaper tick (deliberately under the peer-claim TTL — the
-/// liveness contract requires the repetition), so at fleet scale the cadence is
-/// enough to flood the human-visible signal room (#4713). An operator who finds
-/// that disruptive may set `rooms.claims` (or `LOOM_SAFEHOUSE_ROOM_CLAIMS`) to
-/// route claim ads into a dedicated coordination room instead, keeping the
-/// signal room for sweep-lifecycle narration. **This is provisioning, not just
-/// routing**: every host's safehoused bot must already be joined to that room
-/// before it is configured, or that host silently stops seeing peers' claims —
-/// the exact cross-host dedup failure class reason 1 above exists to avoid.
-/// `rooms.claims` absent (the default) is byte-identical to pre-#4713 behavior.
+/// A completion ad *is* a per-repo `task` envelope, yet this connection
+/// deliberately advertises into (and reads from) [`SafehouseConfig::signal_room`],
+/// **not** the per-repo firehose. The signal room is the only room with
+/// guaranteed common membership: per-repo rooms are created **lazily** by
+/// whichever host narrates that repo first, and hosts run **separate per-host
+/// bot accounts**, so an ad posted in a per-repo room would be invisible to a
+/// peer's bot until an operator invited it — silently disabling cross-host dedup
+/// with no error anywhere. The reader is unfiltered (it folds any inbound line
+/// carrying a parseable completion ad), so keeping the write side and the read
+/// side on the same room keeps the pair trivially consistent.
 async fn run_coordination(
     config: SafehouseConfig,
     socket: PathBuf,
     sink: Arc<dyn InboundEventSink>,
-    mut outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+    mut outbound: tokio::sync::mpsc::Receiver<CompletedAd>,
     min_backoff: Duration,
     max_backoff: Duration,
     state: SharedSafehouseState,
 ) {
     let mut backoff = min_backoff;
     let mut warned = false;
-    // The claims room (see the routing rationale above): `rooms.claims` when
-    // configured (#4713), else the signal room. In single-room mode (no `rooms`
-    // block at all) this *is* `config.room`, so the pre-#4225/#4713 behavior is
-    // byte-identical.
-    let claims_room = config.claims_room().map(ToOwned::to_owned);
+    // In single-room mode (no `rooms` block at all) the signal room *is*
+    // `config.room`, so the pre-#4225 behavior is byte-identical.
+    let signal_room = config.signal_room().map(ToOwned::to_owned);
     loop {
         set_state(
             &state,
@@ -3975,12 +3904,12 @@ async fn run_coordination(
                 socket: socket.clone(),
             },
         );
-        let client = match SafehouseClient::connect(&socket, &config.persona, claims_room.clone())
+        let client = match SafehouseClient::connect(&socket, &config.persona, signal_room.clone())
             .await
         {
             Ok(client) => {
                 if warned {
-                    log::info!("safehouse: peer coordination reconnected to {}", socket.display());
+                    log::info!("safehouse: completion dedup reconnected to {}", socket.display());
                 }
                 backoff = min_backoff;
                 warned = false;
@@ -3988,7 +3917,7 @@ async fn run_coordination(
                     &state,
                     SafehouseState::Connected {
                         socket: socket.clone(),
-                        room: claims_room.clone(),
+                        room: signal_room.clone(),
                     },
                 );
                 client
@@ -3996,8 +3925,8 @@ async fn run_coordination(
             Err(err) => {
                 if !warned {
                     log::warn!(
-                        "safehouse: cannot reach safehoused for peer coordination at {} \
-                             ({err:#}); coordination paused, dispatch unaffected",
+                        "safehouse: cannot reach safehoused for completion dedup at {} \
+                             ({err:#}); dedup paused, narration unaffected",
                         socket.display()
                     );
                     warned = true;
@@ -4019,9 +3948,8 @@ async fn run_coordination(
 
         let (reader, mut writer, mut next_id, room) = client.into_parts();
         let mut lines = reader.lines();
-        // Per-connection dedup for the claim-ad rejection WARN (#4464): one WARN
-        // per outage, reset on each fresh connection — mirrors the sink's
-        // `send_rejected` discipline.
+        // Per-connection dedup for the ad-rejection WARN (#4464): one WARN per
+        // outage, reset on each fresh connection.
         let mut ad_rejected = false;
         let reconnect = loop {
             tokio::select! {
@@ -4039,52 +3967,34 @@ async fn run_coordination(
                                 sink.on_event(&value);
                             } else if value.get("id").is_some()
                                 && !value.get("ok").and_then(Value::as_bool).unwrap_or(true)
+                                && !ad_rejected
                             {
                                 // A rejected reply (has `id`, no `event`,
-                                // `ok:false`) to one of our own claim ads
-                                // (#4464). On a multi-room host with
-                                // `safehouse.room` unset these are rejected
-                                // server-side with no other signal, silently
-                                // disabling peer-claim dedup (#4028/#4431). WARN
-                                // once per outage and name the fix when it is a
-                                // missing room; dispatch is unaffected.
+                                // `ok:false`) to one of our own ads (#4464). On
+                                // a multi-room host with `safehouse.room` unset
+                                // these are rejected server-side with no other
+                                // signal. WARN once per outage and name the fix
+                                // when it is a missing room; narration is
+                                // unaffected.
                                 let reason = value
                                     .get("error")
                                     .and_then(Value::as_str)
                                     .unwrap_or("unknown error");
-                                // #9294: record EVERY rejection in the view.
-                                // The `warn!` below stays deduped per
-                                // connection (a hot loop of identical WARNs is
-                                // its own problem), but the counter must not
-                                // be — a six-day outage that produces one log
-                                // line and no status change is exactly the
-                                // failure this issue was filed for.
-                                sink.on_send_outcome(Some(reason));
-                                if !ad_rejected {
-                                    if reason.contains("'room' required") {
-                                        log::warn!(
-                                            "safehouse: peer claim-ad rejected — set \
-                                             safehouse.room — safehoused rejected send: \
-                                             {reason}; peer-claim dedup disabled, dispatch \
-                                             unaffected"
-                                        );
-                                    } else {
-                                        log::warn!(
-                                            "safehouse: peer claim-ad rejected (safehoused \
-                                             rejected send: {reason}); peer-claim dedup \
-                                             disabled, dispatch unaffected"
-                                        );
-                                    }
-                                    ad_rejected = true;
+                                if reason.contains("'room' required") {
+                                    log::warn!(
+                                        "safehouse: completion ad rejected — set \
+                                         safehouse.room — safehoused rejected send: \
+                                         {reason}; cross-host completion dedup disabled, \
+                                         narration unaffected"
+                                    );
+                                } else {
+                                    log::warn!(
+                                        "safehouse: completion ad rejected (safehoused \
+                                         rejected send: {reason}); cross-host completion \
+                                         dedup disabled, narration unaffected"
+                                    );
                                 }
-                            } else if value.get("id").is_some() {
-                                // An accepted reply echo (has `id`, `ok:true`)
-                                // to one of our own sends. #9294: this is the
-                                // only positive proof the channel actually
-                                // publishes, and it is what clears a prior
-                                // rejection (the #4464 stickiness rule — a mere
-                                // reconnect does not).
-                                sink.on_send_outcome(None);
+                                ad_rejected = true;
                             }
                         }
                         Ok(None) => break true,          // peer closed → reconnect
@@ -4097,7 +4007,7 @@ async fn run_coordination(
                 ad = outbound.recv() => {
                     match ad {
                         Some(ad) => {
-                            let env = claim_ad_to_envelope(&ad);
+                            let env = completion_ad_to_envelope(&ad);
                             let id = next_id;
                             next_id = next_id.wrapping_add(1);
                             match build_send_request(&env, id, room.as_deref()) {
@@ -4105,7 +4015,7 @@ async fn run_coordination(
                                     let mut line = match serde_json::to_string(&req) {
                                         Ok(s) => s,
                                         Err(e) => {
-                                            log::warn!("safehouse: cannot serialize claim ad ({e})");
+                                            log::warn!("safehouse: cannot serialize completion ad ({e})");
                                             continue;
                                         }
                                     };
@@ -4118,18 +4028,12 @@ async fn run_coordination(
                                         );
                                         break true;
                                     }
-                                    // #9294: the ad is on the wire and a reply
-                                    // is now owed. A send that is never
-                                    // answered is the shape the measured
-                                    // outage took, and it is invisible to the
-                                    // rejection path above.
-                                    sink.on_send_attempt();
                                 }
-                                // A claim ad that would be rejected by safehoused
+                                // An ad that would be rejected by safehoused
                                 // (bad type/task_id) is a bug, not a transport
                                 // failure — log and drop, do not reconnect.
                                 Err(e) => log::warn!(
-                                    "safehouse: refusing to send invalid claim ad ({e})"
+                                    "safehouse: refusing to send invalid completion ad ({e})"
                                 ),
                             }
                         }
@@ -4152,13 +4056,6 @@ async fn run_coordination(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests;
-
-// [`PeerClaimSink`]'s `ClaimKind::Heartbeat` routing (Issue #8736), in its own
-// sibling file rather than `tests` above — that module is at the line-budget
-// ratchet (`scripts/file-size-baseline.txt`).
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod heartbeat_tests;
 
 // Issue #8997: rate-limit breaker gating of the sink's forge lookups.
 #[cfg(test)]

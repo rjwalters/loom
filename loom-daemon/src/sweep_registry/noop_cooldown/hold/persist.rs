@@ -52,7 +52,7 @@ impl SweepRegistry {
             self.noop_cooldown
                 .streaks
                 .entry(issue)
-                .or_insert_with(|| NoopStreak::recovered(count, fingerprint, park));
+                .or_insert_with(|| NoopRun::recovered(count, fingerprint, park));
         }
         self.noop_cooldown.persisted = raw;
     }

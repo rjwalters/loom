@@ -326,7 +326,6 @@ pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
-pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;

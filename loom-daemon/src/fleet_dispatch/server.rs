@@ -595,10 +595,13 @@ impl<I: Identity> Server<I> {
             }
             outcome
         });
-        if outcome != RefuseOutcome::Unknown {
+        if outcome != RefuseOutcome::Unknown
+            && req.reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+        {
             if let Some((repo, item, _)) = &call.item {
-                // Only an accepted owner's refusal can suppress the candidate.
-                // Refreshing the same `updated_at` must not re-admit it (§10.3).
+                // An accepted owner's definitive refusal suppresses the candidate
+                // until its next forge revision (§10.3). A busy local seat
+                // only gives back the assignment so another worker may try.
                 if let Ok(item) = u32::try_from(*item) {
                     self.queue().tombstone(repo, item);
                 }
