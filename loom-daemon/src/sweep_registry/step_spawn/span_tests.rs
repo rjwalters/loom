@@ -298,6 +298,88 @@ fn a_step_a_roll_stopped_closes_as_interrupted_by_roll() {
     assert!(!spans[0].attributes.contains_key("loom.failure_class"));
 }
 
+/// Open the step's `loom.sweep` root plus the `loom.phase` / `loom.role_attempt`
+/// that `sweep-checkpoint begin` leaves open under it (#14407).
+fn open_step_with_attempt(root: &Path, sweep_id: &str, pid: u32, role: &str) -> Journal {
+    let span = lifecycle::begin(
+        root,
+        sweep_id,
+        SpanName::Sweep,
+        lifecycle::attributes(&[("loom.sweep_id", sweep_id)]),
+    )
+    .expect("tracing is on");
+    let attrs = lifecycle::attributes(&[
+        ("loom.role", role),
+        ("loom.timing_source", lifecycle::CHECKPOINT_BEGIN_SOURCE),
+    ]);
+    let phase = span.child(SpanName::Phase, attrs.clone()).unwrap();
+    phase.child(SpanName::RoleAttempt, attrs).unwrap();
+    drop(span);
+    lifecycle::child_spawned(root, sweep_id, pid);
+    Journal::for_context(&TraceStore::new(root).path(root, sweep_id))
+}
+
+/// #14407: a step-dispatched attempt on codex whose end was observed carries
+/// the step's result and runtime on its attempt and phase, not `exit_unobserved`.
+#[test]
+fn a_steps_end_gives_its_attempt_and_phase_the_result_and_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_407, StepRole::Builder, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "codex".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "builder");
+    assert_eq!(journal.active().unwrap().len(), 3);
+
+    reg.end_step(&id, 14_407, StepRole::Builder, Utc::now(), StepEnd::Exited(Some(2)));
+
+    assert!(journal.active().unwrap().is_empty());
+    let spans = drained(&journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], sweep.attributes["loom.result"], "{name:?}");
+        assert_eq!(s.attributes["loom.result"], "failure", "{name:?}");
+        assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+    }
+}
+
+/// #14407: a registry entry with no known runtime stamps none (never guessed),
+/// and a step a roll stopped was not observed to end, so it stays unobserved.
+#[test]
+fn an_unknown_runtime_is_not_stamped_and_a_roll_stopped_step_stays_unobserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_408, StepRole::Judge, pid);
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "judge");
+    reg.end_step(&id, 14_408, StepRole::Judge, Utc::now(), StepEnd::Exited(Some(0)));
+    let spans = drained(&journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "success");
+    assert!(!attempt.attributes.contains_key("loom.runtime"));
+
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_409, StepRole::Doctor, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "codex".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "doctor");
+    note_stopped(Some(pid), "item-14409", RollDisposition::Paused);
+    reg.end_step(&id, 14_409, StepRole::Doctor, Utc::now(), StepEnd::Cancelled);
+    let spans = drained(&journal);
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
+        assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+    }
+}
+
 fn write_lock(root: &Path, dir: &str, item: u32, sweep_id: &str, pid: u32, pgid: Option<u32>) {
     let lock = root.join(".loom/locks").join(dir);
     std::fs::create_dir_all(&lock).unwrap();

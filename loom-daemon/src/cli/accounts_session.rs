@@ -294,6 +294,21 @@ pub(crate) fn handle_session_command(
                     .as_ref()
                     .map_or("idle", |job| job.owner.as_str())
             );
+            println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!(
+                    "{}: extra read-only mounts: {}",
+                    status.config.account,
+                    mounts.join(", ")
+                );
+            }
         }
         Ok(())
     }
@@ -531,6 +546,15 @@ pub(crate) fn handle_session_command(
             // `shell` is start-if-absent, so it creates a container exactly
             // as `start` does and must carry the same configured image and
             // extra mounts (issue #14019).
+            //
+            // No unit test covers this arm (issue #14421): it builds a
+            // `ProcessContainerRunner` and shells out to `docker`, so it is
+            // not reachable without a real daemon. The guard is this call
+            // going through `configured_lifecycle`: do not replace it with
+            // `SessionLifecycle::new(.., None)`, which silently creates a
+            // stock-image container with no extra mounts. The reconciler's
+            // recreate paths (which carry the same preference) are covered
+            // in `session_reconcile_tests.rs` / `session_reconcile_drift_tests.rs`.
             let (lifecycle, pull) = configured_lifecycle(workspace, None)?;
             prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;

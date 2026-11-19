@@ -184,11 +184,43 @@ pub fn check_extra_mounts(
     credentials: &[PathBuf],
 ) -> Result<()> {
     let denials = Denials::load(workspace)?;
+    // The mounted workspace label is shielded as well as the registered
+    // roots (issue #14420): in the "parent of repositories" shape a target
+    // under the label but outside every root would otherwise pass here and
+    // then read as `MountDrift::extra` to the reconciler, churning one idle
+    // recreate before `DriftUnachievable`.
+    let mut shielded: Vec<PathBuf> = roots.to_vec();
+    shielded.push(workspace.to_path_buf());
     check_extra_mount_denials(
         mounts,
         denials.home.as_deref(),
         &denials.firewalled,
-        roots,
+        &shielded,
         credentials,
+    )
+}
+
+/// [`check_extra_mounts`] for a private-clone seat (#14451): the host source
+/// passes the same denials, and the container target may not shadow or nest
+/// inside any of `reserved_targets` — the seat's own `/workspace`, `CODEX_HOME`
+/// profile and forge-configuration mounts (the sealed bundle root is always
+/// reserved). A private seat mounts none of the host-mode workspace roots or
+/// credential directories, so those do not apply.
+///
+/// # Errors
+/// See [`check_extra_mount_denials`]; also when the cached fleet roster exists
+/// but cannot be read (fail closed).
+pub fn check_private_extra_mounts(
+    mounts: &[ExtraMount],
+    workspace: &Path,
+    reserved_targets: &[PathBuf],
+) -> Result<()> {
+    let denials = Denials::load(workspace)?;
+    check_extra_mount_denials(
+        mounts,
+        denials.home.as_deref(),
+        &denials.firewalled,
+        reserved_targets,
+        &[],
     )
 }

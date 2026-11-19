@@ -573,27 +573,17 @@ fn launchd_env_matches_plist(plist: &Path, print_output: &str) -> EnvVerdict {
 /// booleans, small enums), the same classification
 /// `launchd_env_drift.rs::display_value` documents. `envh` forwards every
 /// `LOOM_*` var, so credentials such as `LOOM_PERSONAL_GH_TOKEN` or
-/// `LOOM_GITHUB_APP_KEY_PATH` stay withheld ([`looks_secret_env_key`]). Anything
+/// `LOOM_GITHUB_APP_KEY_PATH` stay withheld ([`is_secret_env_key`], the one
+/// classifier shared with the drift warning, #14393). Anything
 /// else (notably the forge tokens `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN`
 /// that `envh` forwards into the plist) is reported by key only, and unknown
 /// keys fail closed (#14175 AC1, #14274).
 const NON_SECRET_ENV_KEYS: &[&str] = &["PATH", "HOME"];
 const NON_SECRET_ENV_KEY_PREFIX: &str = "LOOM_";
 
-/// Name fragments (matched case-insensitively) that mark a key as
-/// secret-bearing even under the `LOOM_` prefix.
-const SECRET_KEY_FRAGMENTS: &[&str] =
-    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL"];
-
-fn looks_secret_env_key(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    SECRET_KEY_FRAGMENTS.iter().any(|f| upper.contains(f))
-}
-
 fn env_key_printable(key: &str) -> bool {
     (NON_SECRET_ENV_KEYS.contains(&key) || key.starts_with(NON_SECRET_ENV_KEY_PREFIX))
         && !is_secret_env_key(key)
-        && !looks_secret_env_key(key)
 }
 
 /// The mismatch line for one env key. Values are printed only for printable
@@ -796,6 +786,7 @@ mod tests {
             "LOOM_SOME_SECRET",
             "loom_db_password",
             "LOOM_X_CREDENTIAL",
+            "LOOM_DB_PASSWD",
         ] {
             let msg = env_mismatch_message(key, "sekrit_expected", "sekrit_got");
             assert!(msg.contains(key), "key is still named: {msg}");

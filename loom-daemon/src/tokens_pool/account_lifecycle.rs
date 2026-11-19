@@ -2216,6 +2216,8 @@ mod tests {
                 volume: "loom-codex-workspace-alice".into(),
                 profile: profile.clone(),
                 gh_config: None,
+                session_image: None,
+                extra_mounts: Vec::new(),
             })
             .unwrap(),
         )

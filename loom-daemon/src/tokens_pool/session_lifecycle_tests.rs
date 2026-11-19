@@ -1352,6 +1352,45 @@ fn extra_mount_targets_shadowing_protected_paths_are_refused() {
 }
 
 #[test]
+fn extra_mount_targets_under_the_workspace_label_are_refused() {
+    // Issue #14420: the "parent of repositories" shape. The label is
+    // `/home/u/GitHub`, only `/home/u/GitHub/loom` is registered, so a target
+    // under the label but outside every root would read as workspace mount
+    // drift to the reconciler unless the gate shields the label itself.
+    let workspace = Path::new("/home/u/GitHub");
+    let roots = [PathBuf::from("/home/u/GitHub/loom")];
+    let credentials = [PathBuf::from("/home/u/loom-daemon/.loom/gh-config")];
+    for container in [
+        "/home/u/GitHub/data",      // under the label, outside every root
+        "/home/u/GitHub",           // the label itself
+        "/home/u/GitHub/data/deep", // nested under the label
+        "/home/u/",                 // an ancestor of the label (trailing slash)
+    ] {
+        let err = crate::tokens_pool::session_mount_gate::check_extra_mounts(
+            &[extra_mount("/opt/pdk", container)],
+            workspace,
+            &roots,
+            &credentials,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(container), "{container}: {err}");
+        assert!(err.contains("/home/u/GitHub"), "{container}: {err}");
+    }
+    // Targets outside the label stay accepted.
+    assert!(crate::tokens_pool::session_mount_gate::check_extra_mounts(
+        &[
+            extra_mount("/opt/pdk", "/opt/pdk"),
+            extra_mount("/data/models", "/data/models")
+        ],
+        workspace,
+        &roots,
+        &credentials,
+    )
+    .is_ok());
+}
+
+#[test]
 fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
     let relative = ExtraMount {
         host: PathBuf::from("/opt/pdk"),

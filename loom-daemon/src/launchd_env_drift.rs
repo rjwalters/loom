@@ -66,21 +66,32 @@ fn is_tracked_key(key: &str) -> bool {
     key.starts_with("LOOM_") || matches!(key, "GH_TOKEN" | "GITEA_TOKEN" | "FORGE_TOKEN")
 }
 
-/// Name suffixes that mark an environment variable as a credential. Matched
-/// case-insensitively against the end of the key, so it also catches keys under
-/// the `LOOM_` prefix (`LOOM_PERSONAL_GH_TOKEN`, `LOOM_OPENWEIGHTS_API_KEY`).
-const SECRET_ENV_KEY_SUFFIXES: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "API_KEY", "CREDENTIAL"];
+/// Name fragments that mark an environment variable as a credential. Matched
+/// case-insensitively anywhere in the key (substring, not suffix), so it
+/// catches credential-bearing names under the `LOOM_` prefix
+/// (`LOOM_PERSONAL_GH_TOKEN`, `LOOM_OPENWEIGHTS_API_KEY`) and credential-*path*
+/// names that do not end in the fragment (`LOOM_GITHUB_APP_KEY_PATH`).
+const SECRET_ENV_KEY_FRAGMENTS: &[&str] =
+    &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "CREDENTIAL"];
 
 /// The single answer to "must this env key's value be withheld from
 /// diagnostics?". Shared by [`display_value`] (drift warning) and
 /// `daemon_start::launch::env_mismatch_message` (launchd env verification) so
-/// the two sinks cannot drift apart (#14352). Name-pattern based rather than an
-/// exact denylist, so the next credential-named variable fails closed instead
-/// of open. Covers `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN` via the `TOKEN`
-/// suffix.
+/// the two sinks cannot drift apart (#14352, #14393). Name-pattern based rather
+/// than an exact denylist, so the next credential-named variable fails closed
+/// instead of open. Covers `GH_TOKEN` / `GITEA_TOKEN` / `FORGE_TOKEN` via the
+/// `TOKEN` fragment.
+///
+/// **`LOOM_*` is not a safe-by-construction prefix**:
+/// `envh::forwarded_env_pairs` forwards every `LOOM_*` variable from the daemon
+/// environment, including credentials such as `LOOM_PERSONAL_GH_TOKEN`, so the
+/// prefix alone never makes a value printable. The trade-off of substring
+/// matching is deliberate over-withholding of plain-config keys that merely
+/// contain a fragment (`LOOM_PER_TOKEN_CONCURRENCY`, `LOOM_SHARED_TOKENS_DIR`):
+/// the key name is still printed, only the value is withheld/masked.
 pub(crate) fn is_secret_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    SECRET_ENV_KEY_SUFFIXES.iter().any(|s| upper.ends_with(s))
+    SECRET_ENV_KEY_FRAGMENTS.iter().any(|f| upper.contains(f))
 }
 
 /// Resolve the launchd label this host's daemon runs under: `LOOM_LAUNCHD_LABEL`
@@ -531,6 +542,10 @@ mod tests {
             "LOOM_DB_PASSWORD",
             "LOOM_SERVICE_CREDENTIAL",
             "TOKEN",
+            "LOOM_GITHUB_APP_KEY_PATH",
+            "loom_db_passwd",
+            "LOOM_PER_TOKEN_CONCURRENCY",
+            "LOOM_SHARED_TOKENS_DIR",
         ] {
             assert!(is_secret_env_key(key), "{key} must be classified secret");
         }
@@ -544,10 +559,16 @@ mod tests {
             "LOOM_RUNTIME",
             "PATH",
             "HOME",
-            "LOOM_TOKEN_POOL_DIR",
         ] {
             assert!(!is_secret_env_key(key), "{key} must not be classified secret");
         }
+    }
+
+    #[test]
+    fn credential_path_values_are_masked_in_the_drift_display() {
+        let rendered =
+            display_value("LOOM_GITHUB_APP_KEY_PATH", &Some("/secrets/app.pem".to_string()));
+        assert!(!rendered.contains("/secrets"), "must not print the path: {rendered}");
     }
 
     #[test]

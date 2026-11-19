@@ -134,12 +134,12 @@ fn attributed_transcripts_filters_by_role_and_window() {
 
     // The window is anchored on "now" because the fixtures' mtimes are now.
     let now = Utc::now();
-    let found = attributed_transcripts(&projects, &root, "judge", now, now);
+    let found = attributed_transcripts(&projects, &root, "judge", None, now, now);
     assert_eq!(found, vec![mine.clone()]);
 
     // A window far in the past excludes everything, even the right role —
     // the mtime half of the key is load-bearing.
-    let stale = attributed_transcripts(&projects, &root, "judge", at(0), at(1));
+    let stale = attributed_transcripts(&projects, &root, "judge", None, at(0), at(1));
     assert!(stale.is_empty(), "out-of-window transcript must not attribute");
 }
 
@@ -994,7 +994,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
     let failed = RoleTickOutcome::Failure("free-form detail".into());
     let site = RoleFailure::new("resume-refused", None, "m");
     assert_eq!(
-        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        failure_class_of(&failed, None, Some(&site), false).as_deref(),
         Some("resume-refused")
     );
     assert_eq!(
@@ -1002,7 +1002,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
         Some(UNCLASSIFIED_PRE_LAUNCH)
     );
     assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
-    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(&site), false), None);
 }
 
 #[test]
@@ -1056,6 +1056,7 @@ fn emit_one_step(
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("zai-org/GLM-5.3", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            trace_context: None,
             failure: None,
             sweep_id,
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1322,7 +1323,9 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     fs::create_dir_all(&root).unwrap();
     // The transcript scan needs a fresh window; the usage line stamps itself
     // ten seconds after the fixture epoch, so re-stamp it into this step's.
-    let mut transcript = role_head("builder");
+    // #14406: a step's transcript must name its own item (`/loom:builder 42`).
+    let mut transcript = role_head("builder")
+        .replace("<command-args></command-args>", "<command-args>42</command-args>");
     transcript.push_str(
         &"{\"type\":\"assistant\",\"timestamp\":\"REPLACED\",\"message\":{\"model\":\
          \"claude-sonnet-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":34,\
@@ -1340,6 +1343,7 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            trace_context: None,
             failure: None,
             sweep_id: "step-builder-42-4",
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),

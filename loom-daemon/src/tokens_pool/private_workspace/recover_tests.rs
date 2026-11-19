@@ -45,6 +45,9 @@ struct Engine {
     recover_response: Option<String>,
     /// The verbatim body for `private-workspace rebind` execs (#14357).
     rebind_response: Option<String>,
+    /// What the sealed-bundle probe of a configured override image prints
+    /// (#14451); `None` fails the probe.
+    probe_output: Option<String>,
     calls: Vec<Vec<String>>,
     created: u32,
 }
@@ -155,6 +158,10 @@ impl Engine {
                 }
                 Ok(String::new())
             }
+            ["run", rest @ ..] if rest.contains(&"--rm") && rest.contains(&"/bin/sh") => self
+                .probe_output
+                .clone()
+                .context("fake Docker: bundle probe failed"),
             ["run", rest @ ..] if rest.contains(&"--rm") => {
                 if rest.ends_with(&["private-workspace", "provision-controls"]) {
                     Ok(json!({"protocol": PROTOCOL, "status": "ready"}).to_string())
@@ -413,6 +420,14 @@ fn session_container(config: &Config, id: &str, running: bool, image: &str) -> V
             "RW": false,
         }));
     }
+    for extra in &config.extra_mounts {
+        mounts.push(json!({
+            "Destination": extra.container,
+            "Type": "bind",
+            "Source": extra.host,
+            "RW": false,
+        }));
+    }
     Run {
         name: config.container.clone(),
         user: "1000:1000".into(),
@@ -532,6 +547,8 @@ fn setup() -> Env {
         volume: "loom-codex-workspace-alice".into(),
         profile: profile.clone(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let dir = state_dir(&account.credential_reference).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -1515,4 +1532,323 @@ fn rebind_keeps_the_registration_when_the_worker_refuses_a_wrong_repository() {
     assert_eq!(registered(&env), [OLD_URL]);
     assert_eq!(destructive(&env), Vec::<String>::new());
     drop(lease::Lease::acquire(&env.dir).unwrap());
+}
+
+// ---- #14451: accounts.session.image / extraMounts on a private-clone seat ----
+
+const DERIVED: &str =
+    "ghcr.io/example/derived@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OTHER_DERIVED: &str =
+    "ghcr.io/example/derived@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// What the bundle probe prints for an image whose sealed bundle is intact.
+fn intact_probe() -> String {
+    use crate::tokens_pool::session_image::BUNDLE_PROBE_MARKER;
+    let mut assets = BTreeMap::new();
+    for relative in bundle::sealed_assets() {
+        assets.insert((*relative).to_owned(), format!("digest-of-{relative}"));
+    }
+    let manifest = bundle::Manifest {
+        protocol: bundle::CONTROL_PROTOCOL.into(),
+        control_version: bundle::CONTROL_VERSION,
+        codex_cli: "codex-cli 0.0.0".into(),
+        codex_schema_pin: "0.0.0".into(),
+        assets: assets.clone(),
+        policy: bundle::expected_policy(),
+        registration: bundle::registration(),
+    };
+    let mut out = serde_json::to_string_pretty(&manifest).unwrap();
+    out.push_str(&format!("\n{BUNDLE_PROBE_MARKER}\n"));
+    for (path, digest) in assets {
+        out.push_str(&format!("{digest}  ./{path}\n"));
+    }
+    out
+}
+
+/// Write `accounts.session` into the workspace's own config tier.
+fn configure(env: &Env, image: Option<&str>, mounts: &[(&Path, &str)]) {
+    let mounts: Vec<Value> = mounts
+        .iter()
+        .map(|(host, container)| json!({"host": host, "container": container}))
+        .collect();
+    let mut session = json!({"extraMounts": mounts});
+    if let Some(image) = image {
+        session["image"] = json!(image);
+    }
+    let dir = env.workspace.path().join(".loom");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.json"), json!({"accounts": {"session": session}}).to_string())
+        .unwrap();
+}
+
+fn operator_start(env: &Env, image: Option<&str>) -> Result<Status> {
+    start(env.workspace.path(), "alice", &env.config.repository, "main", image)
+}
+
+/// The `docker run` (not `--rm`) calls, parsed.
+fn created_runs(env: &Env) -> Vec<Run> {
+    env.engine()
+        .calls
+        .iter()
+        .filter(|c| c[0] == "run" && !c.contains(&"--rm".to_owned()))
+        .map(|c| {
+            let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            parse_run(&args[1..])
+        })
+        .collect()
+}
+
+fn probes(env: &Env) -> usize {
+    env.engine()
+        .calls
+        .iter()
+        .filter(|c| c[0] == "run" && c.contains(&"/bin/sh".to_owned()))
+        .count()
+}
+
+fn recorded(env: &Env) -> Config {
+    load(&env.dir).unwrap()
+}
+
+#[test]
+#[serial]
+fn a_private_start_creates_from_the_configured_image_and_read_only_mounts() {
+    let env = setup();
+    env.seed_volume();
+    let pdk = tempfile::tempdir().unwrap();
+    configure(&env, Some(DERIVED), &[(pdk.path(), "/opt/pdk")]);
+    env.with(|e| e.probe_output = Some(intact_probe()));
+    let status = operator_start(&env, None).unwrap();
+
+    let runs = created_runs(&env);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].image, DERIVED);
+    let pdk_mount = runs[0]
+        .mounts
+        .iter()
+        .find(|m| m["Destination"] == "/opt/pdk")
+        .expect("the extra mount is created");
+    assert_eq!(pdk_mount["RW"], false);
+    assert_eq!(pdk_mount["Source"], json!(pdk.path()));
+    assert!(runs[0].labels.contains_key("loom.extra-mounts"));
+    // The probe ran before anything was created from the image.
+    assert_eq!(probes(&env), 1);
+    let calls = env.engine().calls.clone();
+    let probe_at = calls
+        .iter()
+        .position(|c| c.contains(&"/bin/sh".to_owned()))
+        .unwrap();
+    let create_at = calls
+        .iter()
+        .position(|c| c[0] == "run" && !c.contains(&"--rm".to_owned()))
+        .unwrap();
+    assert!(probe_at < create_at);
+    // Recorded, validated and reported.
+    let saved = recorded(&env);
+    assert_eq!(saved.session_image.as_deref(), Some(DERIVED));
+    assert_eq!(saved.extra_mounts.len(), 1);
+    assert_eq!(status.image.as_deref(), Some(DERIVED));
+    assert_eq!(status.extra_mounts, saved.extra_mounts);
+    let json = serde_json::to_value(&status).unwrap();
+    assert_eq!(json["image"], DERIVED);
+    assert_eq!(json["extra_mounts"][0]["container"], "/opt/pdk");
+}
+
+#[test]
+#[serial]
+fn an_explicit_image_beats_the_configured_one_and_is_not_probed_as_it() {
+    let env = setup();
+    env.seed_volume();
+    configure(&env, Some(DERIVED), &[]);
+    operator_start(&env, Some(IMAGE)).unwrap();
+    assert_eq!(created_runs(&env)[0].image, IMAGE);
+    assert_eq!(probes(&env), 0);
+    assert_eq!(recorded(&env).session_image, None);
+}
+
+#[test]
+#[serial]
+fn a_failing_bundle_probe_refuses_before_any_container_exists() {
+    let env = setup();
+    env.seed_volume();
+    let pdk = tempfile::tempdir().unwrap();
+    configure(&env, Some(DERIVED), &[(pdk.path(), "/opt/pdk")]);
+    env.with(|e| e.probe_output = None);
+    let error = operator_start(&env, None).unwrap_err();
+    assert!(message(&error).contains("override image"), "{error:#}");
+    assert!(created_runs(&env).is_empty());
+    assert!(env.engine().containers.is_empty());
+    assert_eq!(recorded(&env).session_image, None);
+    assert!(recorded(&env).extra_mounts.is_empty());
+}
+
+#[test]
+#[serial]
+fn a_recreate_after_stop_and_start_applies_the_new_configuration() {
+    let env = setup();
+    env.seed_volume();
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    configure(&env, Some(DERIVED), &[(first.path(), "/opt/pdk")]);
+    env.with(|e| e.probe_output = Some(intact_probe()));
+    operator_start(&env, None).unwrap();
+    stop(env.workspace.path(), "alice", false).unwrap();
+    assert!(env.engine().containers.is_empty());
+    configure(&env, Some(OTHER_DERIVED), &[(second.path(), "/opt/models")]);
+    operator_start(&env, None).unwrap();
+    let runs = created_runs(&env);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].image, OTHER_DERIVED);
+    assert!(runs[1]
+        .mounts
+        .iter()
+        .any(|m| m["Destination"] == "/opt/models"));
+    assert!(runs[1]
+        .mounts
+        .iter()
+        .all(|m| m["Destination"] != "/opt/pdk"));
+    assert_eq!(recorded(&env).session_image.as_deref(), Some(OTHER_DERIVED));
+}
+
+#[test]
+#[serial]
+fn recover_recreates_with_the_recorded_image_and_mounts_not_the_edited_config() {
+    let env = setup();
+    env.seed_volume();
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    configure(&env, Some(DERIVED), &[(first.path(), "/opt/pdk")]);
+    env.with(|e| e.probe_output = Some(intact_probe()));
+    operator_start(&env, None).unwrap();
+    // The container is lost; the config is edited behind the seat's back.
+    env.with(|e| {
+        e.containers.clear();
+        e.processes.clear();
+        e.images.push(DERIVED.into());
+    });
+    configure(&env, Some(OTHER_DERIVED), &[(second.path(), "/opt/models")]);
+    // Neither the stale hint nor the edited config decides: the record does.
+    env.recover(Some(IMAGE)).unwrap();
+    let runs = created_runs(&env);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].image, DERIVED);
+    assert!(runs[1]
+        .mounts
+        .iter()
+        .any(|m| m["Destination"] == "/opt/pdk" && m["RW"] == false));
+    assert!(runs[1]
+        .mounts
+        .iter()
+        .all(|m| m["Destination"] != "/opt/models"));
+    // Re-verified on the way.
+    assert_eq!(probes(&env), 2);
+}
+
+#[test]
+#[serial]
+fn recover_refuses_a_not_yet_rebuilt_override_image_and_never_substitutes_one() {
+    let env = setup();
+    env.seed_volume();
+    configure(&env, Some(DERIVED), &[]);
+    env.with(|e| e.probe_output = Some(intact_probe()));
+    operator_start(&env, None).unwrap();
+    // A daemon roll: the image's sealed bundle no longer matches.
+    env.with(|e| {
+        e.containers.clear();
+        e.processes.clear();
+        e.images.push(DERIVED.into());
+        e.probe_output = Some(intact_probe().replace(
+            &format!("\"control_version\": {}", bundle::CONTROL_VERSION),
+            &format!("\"control_version\": {}", bundle::CONTROL_VERSION + 1),
+        ));
+    });
+    let before = created_runs(&env).len();
+    let error = env.recover(Some(IMAGE)).unwrap_err();
+    assert!(message(&error).contains("override image"), "{error:#}");
+    assert_eq!(created_runs(&env).len(), before, "nothing was created, stock or otherwise");
+    assert!(env.engine().containers.is_empty());
+}
+
+#[test]
+#[serial]
+fn private_extra_mounts_pass_the_denylist_before_docker() {
+    let ok = tempfile::tempdir().unwrap();
+    let home = dirs::home_dir().expect("a home directory");
+    let cases: Vec<(&str, PathBuf, &str)> = vec![
+        ("host /", PathBuf::from("/"), "/opt/x"),
+        ("host home", home.clone(), "/opt/x"),
+        ("target is /", ok.path().to_path_buf(), "/"),
+        ("target is /workspace", ok.path().to_path_buf(), "/workspace"),
+        ("target in /workspace", ok.path().to_path_buf(), "/workspace/data"),
+        ("target is the profile", ok.path().to_path_buf(), "/home/loom/.codex-profile"),
+        (
+            "target nests in the profile",
+            ok.path().to_path_buf(),
+            "/home/loom/.codex-profile/pdk",
+        ),
+        ("target is the bundle root", ok.path().to_path_buf(), bundle::CONTROL_ROOT),
+        ("target is the forge config", ok.path().to_path_buf(), "/run/loom-gh"),
+    ];
+    for (what, host, target) in cases {
+        let env = setup();
+        env.seed_volume();
+        configure(&env, None, &[(&host, target)]);
+        let error = operator_start(&env, None).expect_err(what);
+        assert!(message(&error).contains("refusing"), "{what}: {error:#}");
+        assert!(created_runs(&env).is_empty(), "{what}: nothing reached docker run");
+        assert!(recorded(&env).extra_mounts.is_empty(), "{what}: nothing was recorded");
+    }
+    // Two overlapping extras are refused too.
+    let env = setup();
+    env.seed_volume();
+    configure(&env, None, &[(ok.path(), "/opt/pdk"), (ok.path(), "/opt/pdk/sub")]);
+    let error = operator_start(&env, None).unwrap_err();
+    assert!(message(&error).contains("overlapping"), "{error:#}");
+    assert!(created_runs(&env).is_empty());
+}
+
+#[test]
+#[serial]
+fn validation_counts_recorded_extra_mounts_and_still_fails_closed() {
+    let env = setup();
+    let pdk = tempfile::tempdir().unwrap();
+    let mut config = env.config.clone();
+    config.extra_mounts = vec![crate::tokens_pool::session_image::ExtraMount {
+        host: pdk.path().to_path_buf(),
+        container: PathBuf::from("/opt/pdk"),
+    }];
+    let good = session_container(&config, CONTAINER_ID, true, IMAGE);
+    docker::validate_settings(&config, &good).unwrap();
+    // A recorded mount the container lacks.
+    let mut missing = good.clone();
+    missing["Mounts"].as_array_mut().unwrap().pop();
+    assert!(docker::validate_settings(&config, &missing).is_err());
+    // A mount nobody recorded.
+    let unrecorded = session_container(&config, CONTAINER_ID, true, IMAGE);
+    assert!(docker::validate_settings(&env.config, &unrecorded).is_err());
+    // A recorded mount that is writable, or from another source.
+    let mut writable = good.clone();
+    writable["Mounts"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["RW"] = json!(true);
+    assert!(docker::validate_settings(&config, &writable).is_err());
+    let mut moved = good;
+    moved["Mounts"].as_array_mut().unwrap().last_mut().unwrap()["Source"] = json!("/etc");
+    assert!(docker::validate_settings(&config, &moved).is_err());
+}
+
+#[test]
+#[serial]
+fn without_the_configuration_a_private_start_is_unchanged() {
+    let env = setup();
+    env.seed_volume();
+    let status = operator_start(&env, None).unwrap();
+    let runs = created_runs(&env);
+    assert_eq!(runs[0].image, crate::tokens_pool::session_lifecycle::DEFAULT_SESSION_IMAGE);
+    assert_eq!(runs[0].mounts.len(), 2 + bundle::PROFILE_CONTROLS.len());
+    assert!(!runs[0].labels.contains_key("loom.extra-mounts"));
+    assert_eq!(probes(&env), 0);
+    assert!(status.extra_mounts.is_empty());
+    let text = std::fs::read_to_string(env.dir.join("workspace.json")).unwrap();
+    assert!(!text.contains("extra_mounts") && !text.contains("session_image"), "{text}");
 }
