@@ -1548,6 +1548,29 @@ fn session_mode_with_inherited_fleet_variables_writes_through_the_local_credenti
     }
 }
 
+/// Publish a fake fleet gateway the way the daemon does: the base and the
+/// owner profile are private directories (0700), `gh-ok` and `hosts.yml` are
+/// private files (0600), and the marker names `gh` canonically. The router's
+/// trust checks reject group/other-writable paths, so relying on the ambient
+/// umask makes the fixture pass under 0022 and shed under 0002. Chmod each
+/// path explicitly instead of touching the process-wide umask.
+fn publish_fake_gateway(gateway: &Path, owner: &str, gh: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let private = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let profile = gateway.join(owner);
+    std::fs::create_dir_all(&profile).unwrap();
+    private(gateway, 0o700);
+    private(&profile, 0o700);
+    let marker = gateway.join("gh-ok");
+    std::fs::write(&marker, gh.canonicalize().unwrap().as_os_str().as_encoded_bytes()).unwrap();
+    private(&marker, 0o600);
+    let hosts = profile.join("hosts.yml");
+    std::fs::write(&hosts, "github.com: {}\n").unwrap();
+    private(&hosts, 0o600);
+}
+
 /// Fleet issue reads have a gateway profile. Body, label and resolution
 /// writes have no corresponding fleet broker operation. An otherwise writable
 /// checkout must never send those operations to its ambient gh credential.
@@ -1559,9 +1582,7 @@ fn fleet_park_and_decision_writes_stop_before_the_local_writer() {
     let gh = shim.join("gh");
     let gateway = tmp.path().join("gateway/.loom/gh-config-gateway");
     let reader = gateway.join("acme");
-    std::fs::create_dir_all(&reader).unwrap();
-    std::fs::write(reader.join("hosts.yml"), "github.com: {}\n").unwrap();
-    std::fs::write(gateway.join("gh-ok"), gh.to_str().unwrap()).unwrap();
+    publish_fake_gateway(&gateway, "acme", &gh);
     let state = tmp.path().join("issue.json");
     let initial = std::fs::read(&state).unwrap();
 
