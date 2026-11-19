@@ -449,6 +449,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "guards",
     "install-compat",
     "hooks-home",
+    "claim",
 ];
 
 /// The identity of the installed-file payload this binary was built against:
