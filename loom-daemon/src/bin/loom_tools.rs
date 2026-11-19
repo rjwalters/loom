@@ -9,13 +9,14 @@
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
 //!
-//! `forge <read verb>` (#14395) is the family of forge reads: the same
-//! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
-//! that write (#14396). It and `checkpoint read` (§10.3) are the commands
-//! behind the mode gate, as are role-keyed PR leases. The gate resolves `mode` ([`tools_mode`])
-//! before `forge_gateway::enable_cli_reads()` is considered, and enables it
-//! only on the fleet route. `strip-ansi`, the other checkpoint actions and
-//! `config get` never route, and `config get mode` must work with `mode` unset.
+//! `forge <verb>` (#14395 reads, #14519 the shared non-queue writes) is the
+//! `forge` family: the same `ForgeAction` tree and handler `loom-daemon forge`
+//! runs, including the merge-queue verbs (#14520). A forge verb that can
+//! reach the forge, `checkpoint read` (§10.3), or a role-keyed PR lease
+//! resolves `mode` ([`tools_mode`]) before forge read routing is enabled.
+//! Routing is enabled only in fleet mode. `strip-ansi`, the other checkpoint
+//! actions, `config get`, `verdict-lock` and `journal-ci-refusal` run
+//! without the mode gate.
 //!
 //! The top-level reads and config-inspection commands (#14429, §13.7) are
 //! the same story one level up: the same Args trees and handlers
@@ -25,7 +26,7 @@
 //! `migrate`) behind the same gate and the write forms (`labels generate
 //! --write`, `labels undeclared --prune`, `labels migrate --apply`,
 //! `forge-probe --live-write`, `forge-inventory gate --update`) refused with
-//! exit 64 before any handler runs, exactly as a `forge` write verb is.
+//! exit 64 before any handler runs.
 
 use std::io::Write;
 
@@ -93,10 +94,12 @@ enum ToolsCommands {
     /// resolve-role-model` (issue #13956), so `resolve-role-model.sh` works
     /// with no daemon binary installed.
     ResolveRoleModel(ResolveRoleModelArgs),
-    /// The read-only `forge` verbs (`check-claim`, `wait-checks`, `issue`, ...):
-    /// the same arguments, stdout, stdin and exit codes as `loom-daemon forge`
-    /// (#14395), on the person's own forge credential. A verb that writes is
-    /// refused with exit 64 (served by `loom-daemon forge` until #14396).
+    /// The `forge` verbs (`check-claim`, `wait-checks`, `comment`,
+    /// `create-issue`, `verdict-lock`, ...): the same arguments, stdout, stdin
+    /// and exit codes as `loom-daemon forge` (#14395 reads; #14519 the shared
+    /// non-queue writes; #14520 the merge-queue verbs). A verb that can
+    /// reach the forge resolves `mode` first. Local verbs, including
+    /// `verdict-lock` and `journal-ci-refusal`, run offline.
     Forge(ForgeReadCli),
     /// Render, read, apply and retract the `loom:blocked` park record: the
     /// same arguments, stdin, stdout and exit codes as `loom-daemon
@@ -266,8 +269,10 @@ fn run() -> Result<()> {
         ToolsCommands::ResolveModel(args) => handle_resolve_model_command(&args),
         ToolsCommands::ResolveRoleModel(args) => handle_resolve_role_model_command(&args),
         ToolsCommands::Forge(cli) => {
-            // Refuse a write verb before the gate can enable any routing for it.
-            if cli.is_read() && cli.reaches_forge() {
+            // Refuse an unserved verb before the gate can enable any routing
+            // for it; the local verbs (verdict-lock, journal-ci-refusal) are
+            // served but never gated.
+            if cli.is_served() && cli.reaches_forge() {
                 mode_gate()?;
             }
             handle_forge_read_command(cli)
