@@ -251,3 +251,14 @@ Still open: the grant store is PR comments (not tamper-proof), the
 post-pass-to-merge window above, and no live pilot has yet confirmed the fake's
 model of GitHub's group semantics (2AMLogic/loom-ui, #10257).
 `INVARIANT_FULLY_DEMONSTRATED` stays `false`.
+
+### Broker-required policy and attempt evidence (#14632, #14636)
+
+A target is *broker-required* when the machine-level defaults tier
+(`~/.local/share/loom/config/defaults.json`, outside every checkout) lists it in
+`forge.mergeQueue.brokerRequiredRepos` (`["owner/repo", …]`). With no resolvable
+`forge.mergeQueue.statusCommand` the route is then refused — never the direct
+writer — even on a fresh host with no route history. The route log is a
+secondary signal only. Each probe and post attempt appends a bounded record with
+the exact PR/head and a typed `outcome` (`probe_ok`, `probe_refused`,
+`post_ok`, `post_failed`), including refusals that make no mutation.

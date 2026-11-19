@@ -347,7 +347,27 @@ impl GhLifecycleForge {
             StatusState::Failure => "failure",
         };
         let desc: String = description.chars().take(STATUS_DESCRIPTION_MAX).collect();
-        self.record_handoff(pr, commit);
+        let result = self.write_status_inner(pr, commit, state, &desc);
+        self.record_attempt(
+            "post_status",
+            if result.is_ok() {
+                "post_ok"
+            } else {
+                "post_failed"
+            },
+            pr,
+            Some(commit),
+        );
+        result
+    }
+
+    fn write_status_inner(
+        &self,
+        pr: Option<u32>,
+        commit: &str,
+        state: &str,
+        desc: &str,
+    ) -> Result<(), String> {
         match self.status_command() {
             Err(e) => return Err(e.clone()),
             Ok(Some(cmd)) => {
@@ -358,7 +378,7 @@ impl GhLifecycleForge {
                         sha: commit,
                         context: REQUIRED_CHECK_CONTEXT,
                         state,
-                        description: &desc,
+                        description: desc,
                         pr,
                     },
                 );
@@ -405,7 +425,28 @@ impl StatusApi for GhLifecycleForge {
         self.write_status(Some(pr), commit, state, description)
     }
 
+    fn begin_handoff(&self, pr: u32, head: &str) {
+        self.set_handoff(pr, head);
+    }
+
     fn can_post_statuses(&self) -> Result<(), String> {
+        let result = self.can_post_statuses_inner();
+        self.record_attempt(
+            "probe_status",
+            if result.is_ok() {
+                "probe_ok"
+            } else {
+                "probe_refused"
+            },
+            None,
+            None,
+        );
+        result
+    }
+}
+
+impl GhLifecycleForge {
+    fn can_post_statuses_inner(&self) -> Result<(), String> {
         // A configured poster replaces the writer App's permission as the gate.
         match self.status_command() {
             Err(e) => return Err(e.clone()),

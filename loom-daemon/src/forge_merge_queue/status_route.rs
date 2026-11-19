@@ -360,6 +360,10 @@ pub struct RouteRecord {
     /// The operation the record belongs to (`post_status`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation: Option<&'static str>,
+    /// Typed outcome of the attempt (`probe_ok` | `probe_refused` |
+    /// `post_ok` | `post_failed`): a token, never raw command output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<&'static str>,
 }
 
 /// `sha256:<12 hex>` of a root's canonical path — a stable opaque identity.
@@ -431,6 +435,7 @@ pub fn observe(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) -
         pr: None,
         head_sha: None,
         operation: None,
+        outcome: None,
     };
     log::info!(
         "merge-queue: status route for {} is {} (root class {}, command tier {})",
@@ -462,11 +467,13 @@ pub fn record_handoff(
     pr: Option<u32>,
     head_sha: &str,
     operation: &'static str,
+    outcome: &'static str,
 ) {
     let mut rec = base.clone();
     rec.pr = pr;
-    rec.head_sha = Some(head_sha.to_string());
+    rec.head_sha = (!head_sha.is_empty()).then(|| head_sha.to_string());
     rec.operation = Some(operation);
+    rec.outcome = Some(outcome);
     append(invocation_root, rec, false);
 }
 
@@ -551,20 +558,45 @@ fn tail_records(path: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Whether an earlier record in any of `roots`' route logs shows `target`
-/// routed through a command — i.e. a broker is required for it.
+/// Host-level policy key: `owner/repo` slugs whose status writes must go
+/// through [`CONFIG_KEY`]. It is read **only** from the machine-level defaults
+/// tier (outside every checkout), so a checkout whose fleet tier never
+/// materialized cannot lose it — and it does not depend on the diagnostic log.
+pub const BROKER_REQUIRED_KEY: &str = "forge.mergeQueue.brokerRequiredRepos";
+
+/// Whether the machine-level defaults tier declares `target` broker-required.
+fn policy_requires_broker(target: &str) -> bool {
+    crate::config_resolver::private_defaults_path()
+        .is_some_and(|path| policy_file_requires_broker(&path, target))
+}
+
+fn policy_file_requires_broker(path: &Path, target: &str) -> bool {
+    let cfg = crate::config_resolver::soft_read_json_object(path);
+    crate::config_resolver::get_path(&cfg, BROKER_REQUIRED_KEY)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|l| {
+            l.iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|t| t.eq_ignore_ascii_case(target))
+        })
+}
+
+/// Whether `target` needs a broker: declared by host policy
+/// ([`BROKER_REQUIRED_KEY`]), or — as a secondary signal — an earlier record
+/// in any of `roots`' route logs shows it routed through a command.
 fn broker_required(roots: &[&Path], target: &str) -> bool {
-    roots.iter().any(|root| {
-        tail_records(&root.join(ROUTE_LOG_RELATIVE_PATH))
-            .iter()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .any(|v| {
-                v["route"] == "command"
-                    && v["target"]
-                        .as_str()
-                        .is_some_and(|t| t.eq_ignore_ascii_case(target))
-            })
-    })
+    policy_requires_broker(target)
+        || roots.iter().any(|root| {
+            tail_records(&root.join(ROUTE_LOG_RELATIVE_PATH))
+                .iter()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|v| {
+                    v["route"] == "command"
+                        && v["target"]
+                            .as_str()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(target))
+                })
+        })
 }
 
 /// Two records are equivalent when every field except `at` matches.
@@ -869,7 +901,7 @@ mod tests {
         let base = observe(dir.path(), &r, "o/r");
         let sha = "a".repeat(40);
         for _ in 0..3 {
-            record_handoff(dir.path(), &base, Some(7), &sha, "post_status");
+            record_handoff(dir.path(), &base, Some(7), &sha, "post_status", "post_ok");
         }
         let text = std::fs::read_to_string(dir.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
         assert_eq!(text.lines().count(), 3);
@@ -877,11 +909,36 @@ mod tests {
         assert_eq!(v["pr"], 7);
         assert_eq!(v["head_sha"], sha.as_str());
         for _ in 0..4000 {
-            record_handoff(dir.path(), &base, Some(7), &sha, "post_status");
+            record_handoff(dir.path(), &base, Some(7), &sha, "post_status", "post_ok");
         }
         let len = std::fs::metadata(dir.path().join(ROUTE_LOG_RELATIVE_PATH))
             .unwrap()
             .len();
         assert!(len <= MAX_LOG_BYTES + 1024, "{len}");
+    }
+
+    #[test]
+    fn host_policy_marks_a_target_broker_required_without_any_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("defaults.json");
+        std::fs::write(&f, r#"{"forge":{"mergeQueue":{"brokerRequiredRepos":["O/R"]}}}"#).unwrap();
+        assert!(policy_file_requires_broker(&f, "o/r"));
+        assert!(!policy_file_requires_broker(&f, "o/other"));
+        assert!(!policy_file_requires_broker(&dir.path().join("absent.json"), "o/r"));
+    }
+
+    #[test]
+    fn an_attempt_record_carries_a_typed_outcome_and_exact_pr_and_head() {
+        let dir = checkout_of("o/r");
+        let r = resolve(dir.path(), "o/r", &[]);
+        let base = observe(dir.path(), &r, "o/r");
+        let sha = "b".repeat(40);
+        record_handoff(dir.path(), &base, Some(9), &sha, "probe_status", "probe_refused");
+        let text = std::fs::read_to_string(dir.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(v["pr"], 9);
+        assert_eq!(v["head_sha"], sha.as_str());
+        assert_eq!(v["operation"], "probe_status");
+        assert_eq!(v["outcome"], "probe_refused");
     }
 }

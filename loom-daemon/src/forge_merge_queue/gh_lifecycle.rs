@@ -52,6 +52,9 @@ pub struct GhLifecycleForge {
     /// The route observation made at construction, joined to each status
     /// write by [`Self::record_handoff`] (#14636).
     route_obs: super::status_route::RouteRecord,
+    /// The PR and approved head of the handoff in progress, set at the
+    /// handoff boundary so probe refusals carry them too (#14636).
+    handoff: std::sync::Mutex<Option<(u32, String)>>,
 }
 
 impl GhLifecycleForge {
@@ -110,6 +113,7 @@ impl GhLifecycleForge {
                     name: repo,
                     status_command: route.command,
                     route_obs,
+                    handoff: std::sync::Mutex::new(None),
                 })
             }
             _ => Err("repository must be an `owner/repo` slug".to_string()),
@@ -134,15 +138,37 @@ impl GhLifecycleForge {
         &self.command_root
     }
 
-    /// Record the route one specific status write takes, with its PR and the
-    /// approved head sha (#14636).
-    pub(super) fn record_handoff(&self, pr: Option<u32>, head_sha: &str) {
+    /// Remember the PR and head of the handoff in progress (#14636).
+    pub(super) fn set_handoff(&self, pr: u32, head_sha: &str) {
+        if let Ok(mut g) = self.handoff.lock() {
+            *g = Some((pr, head_sha.to_string()));
+        }
+    }
+
+    /// Record one attempt-level observation (#14636): the route and its typed
+    /// `outcome` for `operation` (`probe_status` | `post_status`), joined to
+    /// the exact PR/head — the handoff's own (set at the boundary) unless the
+    /// write names its own.
+    pub(super) fn record_attempt(
+        &self,
+        operation: &'static str,
+        outcome: &'static str,
+        pr: Option<u32>,
+        head_sha: Option<&str>,
+    ) {
+        let held = self.handoff.lock().ok().and_then(|g| g.clone());
+        let pr = pr.or(held.as_ref().map(|(p, _)| *p));
+        let head = head_sha
+            .map(str::to_string)
+            .or(held.map(|(_, h)| h))
+            .unwrap_or_default();
         super::status_route::record_handoff(
             &self.root,
             &self.route_obs,
             pr,
-            head_sha,
-            "post_status",
+            &head,
+            operation,
+            outcome,
         );
     }
 
