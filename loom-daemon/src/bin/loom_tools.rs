@@ -9,6 +9,9 @@
 //! call), so there is no second copy. This crate links `loom_daemon` and not
 //! `daemon_service`, which is private to the `loom-daemon` bin.
 //!
+//! `claim <verb>` (#14487) is the checkout-local claim family: the handler
+//! `loom-daemon claim` runs, on the filesystem only, so it has no mode gate.
+//!
 //! `forge <read verb>` (#14395) is the family of forge reads: the same
 //! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
 //! that write (#14396). It and `checkpoint read` (§10.3) are the commands
@@ -29,12 +32,13 @@ use loom_daemon::cli::{
     ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
+use loom_daemon::script_helpers;
 use loom_daemon::tools_mode::{self, Route};
 
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision, claim)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -92,6 +96,23 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
+    /// Atomic file-based issue claiming in this checkout (`claim`, `extend`,
+    /// `release`, `check`, `list`, `cleanup`): the same arguments, stdout and
+    /// exit codes as `loom-daemon claim` (#14487), so an attended builder can
+    /// claim with no daemon binary installed. Filesystem only: no forge call
+    /// and no mode gate.
+    ///
+    /// Exit codes: `0` success, `1` already claimed / general error, `2`
+    /// invalid arguments, `3` claim not found, `4` agent-ID mismatch.
+    Claim {
+        /// One of: `claim`, `extend`, `release`, `check`, `list`, `cleanup`.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
+        /// Positional command arguments (issue number, agent id, ttl).
+        #[arg(value_name = "ARGS", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -194,6 +215,12 @@ fn run() -> Result<()> {
                 use_this_binary_for_nested_filing();
             }
             handle_operator_decision_command(cli)
+        }
+        // Filesystem only (`.loom/claims/`), so no mode gate: it works with
+        // `mode` unset, offline. Same handler `Commands::Claim` calls.
+        ToolsCommands::Claim { command, args } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }

@@ -421,6 +421,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    "claim",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

@@ -796,3 +796,240 @@ fn capabilities_list_park_record_and_operator_decision() {
         assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `claim` family (#14487): the checkout-local claim commands, served by the
+// same `script_helpers::claim::run` handler from both binaries.
+// ---------------------------------------------------------------------------
+
+/// A checkout root (`.git` + `.loom`) with a nested directory to run from, so
+/// every test also proves root discovery from a subdirectory.
+struct Checkout {
+    _tmp: tempfile::TempDir,
+    root: std::path::PathBuf,
+    sub: std::path::PathBuf,
+}
+
+impl Checkout {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join(".loom")).unwrap();
+        let sub = root.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+        Self {
+            _tmp: tmp,
+            root,
+            sub,
+        }
+    }
+
+    fn lock(&self, issue: u32) -> std::path::PathBuf {
+        self.root
+            .join(".loom/claims")
+            .join(format!("issue-{issue}.lock"))
+    }
+
+    fn claim_json(&self, issue: u32) -> String {
+        std::fs::read_to_string(self.lock(issue).join("claim.json")).unwrap()
+    }
+
+    /// Run `claim <args>` with `bin` from the checkout's subdirectory, in a
+    /// clean environment with `mode` (when given) and no daemon anywhere.
+    fn claim(&self, bin: &str, mode: Option<&str>, args: &[&str]) -> Output {
+        let mut c = Command::new(bin);
+        c.current_dir(&self.sub)
+            .env_clear()
+            .env("HOME", &self.root)
+            .env("PATH", "/usr/bin:/bin")
+            .arg("claim")
+            .args(args);
+        if let Some(m) = mode {
+            c.env("LOOM_MODE", m);
+        }
+        run(c, None)
+    }
+}
+
+/// `mode` values the family must behave identically under, `None` being unset.
+const CLAIM_MODES: [Option<&str>; 4] = [None, Some("session"), Some("local-daemon"), Some("fleet")];
+
+fn code(o: &Output) -> i32 {
+    o.status.code().unwrap()
+}
+
+fn stdout(o: &Output) -> String {
+    String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// Replace every `YYYY-MM-DDTHH:MM:SSZ` timestamp so output from two
+/// checkouts compares equal.
+fn mask_timestamps(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let is_ts = i + 20 <= b.len()
+            && b[i..i + 20].iter().enumerate().all(|(k, c)| match k {
+                4 | 7 => *c == b'-',
+                10 => *c == b'T',
+                13 | 16 => *c == b':',
+                19 => *c == b'Z',
+                _ => c.is_ascii_digit(),
+            });
+        if is_ts {
+            out.push_str("<ts>");
+            i += 20;
+        } else {
+            out.push(b[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// All six verbs, the competing owner and every exit code, from a
+/// subdirectory, with no daemon, under each `mode` (including unset).
+#[test]
+fn claim_family_works_offline_in_every_mode_with_the_winner_intact() {
+    for mode in CLAIM_MODES {
+        let co = Checkout::new();
+        let t = |args: &[&str]| co.claim(TOOLS, mode, args);
+
+        // Acquire as A (0): the lock lands under the checkout root.
+        assert_eq!(code(&t(&["claim", "42", "agent-a", "3600"])), 0, "{mode:?}");
+        assert!(co.lock(42).is_dir(), "{mode:?}: lock under the checkout root");
+        assert!(!co.sub.join(".loom").exists(), "{mode:?}: nothing under the cwd");
+        let saved = co.claim_json(42);
+        let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(v["agent_id"], "agent-a");
+        assert_eq!(v["ttl_seconds"], 3600);
+
+        // check (0) and list show the claim.
+        let check = t(&["check", "42"]);
+        assert_eq!(code(&check), 0, "{mode:?}");
+        assert!(stdout(&check).contains("agent-a"), "{mode:?}");
+        let list = t(&["list"]);
+        assert_eq!(code(&list), 0, "{mode:?}");
+        assert!(
+            stdout(&list).contains("Issue #42 - Agent: agent-a"),
+            "{mode:?}: {}",
+            stdout(&list)
+        );
+
+        // A competing owner B: existing claim (1), mismatch (4) on extend and
+        // release. Each refusal leaves the winner's record byte-identical.
+        assert_eq!(code(&t(&["claim", "42", "agent-b", "60"])), 1, "{mode:?}");
+        assert_eq!(co.claim_json(42), saved, "{mode:?}: after competing claim");
+        assert_eq!(code(&t(&["extend", "42", "agent-b", "9999"])), 4, "{mode:?}");
+        assert_eq!(co.claim_json(42), saved, "{mode:?}: after foreign extend");
+        assert_eq!(code(&t(&["release", "42", "agent-b"])), 4, "{mode:?}");
+        assert!(co.lock(42).is_dir(), "{mode:?}: foreign release kept the lock");
+        assert_eq!(co.claim_json(42), saved, "{mode:?}: after foreign release");
+
+        // Extend as A with a distinct TTL: owner kept, TTL and expiry updated.
+        assert_eq!(code(&t(&["extend", "42", "agent-a", "7200"])), 0, "{mode:?}");
+        let v2: serde_json::Value = serde_json::from_str(&co.claim_json(42)).unwrap();
+        assert_eq!(v2["agent_id"], "agent-a", "{mode:?}");
+        assert_eq!(v2["ttl_seconds"], 7200, "{mode:?}");
+        assert_eq!(v2["claimed_at"], v["claimed_at"], "{mode:?}");
+        assert!(v2["expires_at"].as_str() > v["expires_at"].as_str(), "{mode:?}");
+
+        // Release as A (0): the lock directory is gone; check then reports 3.
+        assert_eq!(code(&t(&["release", "42", "agent-a"])), 0, "{mode:?}");
+        assert!(!co.lock(42).exists(), "{mode:?}: released");
+        assert_eq!(code(&t(&["check", "42"])), 3, "{mode:?}");
+        assert_eq!(code(&t(&["release", "42", "agent-a"])), 3, "{mode:?}");
+        assert_eq!(code(&t(&["extend", "42", "agent-a"])), 3, "{mode:?}");
+
+        // Bad input (2).
+        assert_eq!(code(&t(&["claim", "not-a-number"])), 2, "{mode:?}");
+        assert_eq!(code(&t(&["check"])), 2, "{mode:?}");
+        assert_eq!(code(&t(&["extend", "42"])), 2, "{mode:?}");
+        assert_eq!(code(&t(&["bogus"])), 2, "{mode:?}");
+    }
+}
+
+/// Cleanup removes only the expired claim and leaves the live one untouched.
+#[test]
+fn claim_cleanup_removes_only_the_expired_claim() {
+    for mode in CLAIM_MODES {
+        let co = Checkout::new();
+        assert_eq!(code(&co.claim(TOOLS, mode, &["claim", "7", "live-agent", "3600"])), 0);
+        let live = co.claim_json(7);
+        // An expired claim, seeded directly in the on-disk format.
+        std::fs::create_dir_all(co.lock(8)).unwrap();
+        std::fs::write(
+            co.lock(8).join("claim.json"),
+            r#"{"issue":8,"agent_id":"ghost","claimed_at":"2020-01-01T00:00:00Z","expires_at":"2020-01-01T00:30:00Z","ttl_seconds":1800}"#,
+        )
+        .unwrap();
+
+        assert_eq!(code(&co.claim(TOOLS, mode, &["cleanup"])), 0, "{mode:?}");
+        assert!(!co.lock(8).exists(), "{mode:?}: expired claim removed");
+        assert!(co.lock(7).is_dir(), "{mode:?}: live claim kept");
+        assert_eq!(co.claim_json(7), live, "{mode:?}: live record untouched");
+    }
+}
+
+/// `loom-tools claim` and `loom-daemon claim` agree on exit code and stdout
+/// for the same sequence, each run in its own equivalent checkout so one
+/// binary's mutations cannot affect the other's result.
+#[test]
+fn claim_family_matches_loom_daemon_on_separate_checkouts() {
+    for mode in CLAIM_MODES {
+        let (ct, cd) = (Checkout::new(), Checkout::new());
+        for args in [
+            vec!["claim", "5", "agent-a", "3600"],
+            vec!["claim", "5", "agent-b"],
+            vec!["check", "5"],
+            vec!["list"],
+            vec!["extend", "5", "agent-b"],
+            vec!["extend", "5", "agent-a", "100"],
+            vec!["release", "5", "agent-b"],
+            vec!["release", "5", "agent-a"],
+            vec!["check", "5"],
+            vec!["release", "5"],
+            vec!["claim", "x"],
+            vec!["cleanup"],
+            vec!["list"],
+            vec!["help"],
+            vec![],
+        ] {
+            let (t, d) = (ct.claim(TOOLS, mode, &args), cd.claim(DAEMON, mode, &args));
+            assert_eq!(code(&t), code(&d), "{mode:?} {args:?}: exit code differs");
+            assert_eq!(
+                mask_timestamps(&stdout(&t)),
+                mask_timestamps(&stdout(&d)),
+                "{mode:?} {args:?}: stdout differs"
+            );
+        }
+    }
+}
+
+/// Outside a Loom checkout the family exits 2, as the daemon does.
+#[test]
+fn claim_outside_a_checkout_exits_2() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = base(TOOLS, tmp.path(), tmp.path());
+    c.args(["claim", "check", "1"]);
+    assert_eq!(code(&run(c, None)), 2);
+}
+
+/// `capabilities --json` lists the claim family.
+#[test]
+fn capabilities_list_the_claim_family() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = base(TOOLS, tmp.path(), tmp.path());
+    c.args(["capabilities", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&run(c, None).stdout).unwrap();
+    assert!(
+        v["tools_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c == "claim"),
+        "claim missing from {v}"
+    );
+}

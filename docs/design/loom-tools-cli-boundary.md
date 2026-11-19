@@ -752,7 +752,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree, claim and lease commands | #14397 |
+| Worktree and lease commands | #14397 (the checkout-local `claim` family moved in #14487, §13.6) |
 
 ### 13.4 Gitea decision
 
@@ -764,6 +764,28 @@ behavior of those reads stays carried only by `forge-helpers.sh`. `check-branch`
 is forge-neutral already (`git ls-remote`, no forge API call). A Rust port of
 specific reads is not cheap: `ForgeType::Gitea` appears in 23 library files
 (§12), so it is its own scope.
+
+### 13.6 Local claim commands (#14487)
+
+Part of #14475. `loom-tools claim <verb>` serves `claim`, `extend`, `check`,
+`release`, `list` and `cleanup` through the same `script_helpers::claim::run`
+that `loom-daemon claim` (and the `loom-claim` shim from
+`scripts/install/provision-daemon.sh`) calls; the argument shape is the same
+optional verb plus trailing positionals, and nothing was copied. The claim is the
+directory `.loom/claims/issue-<N>.lock` with its `claim.json`, found by walking up
+from the current directory to the checkout root.
+
+**Mode:** none of the six verbs reaches the forge, so none passes through
+`mode_gate()`: they behave the same under `fleet`, `local-daemon`, `session` and
+with `mode` unset, offline, with no daemon binary. Exit codes are the
+handler's: 0 success, 1 existing claim or general error, 2 bad input (or no
+Loom checkout), 3 claim not found, 4 owner mismatch. A refused `claim`, `extend`
+or `release` leaves the owner's `claim.json` unchanged.
+
+`install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
+split into reads and writes, so no sub-verbs are listed). Forge claim checks
+(`forge check-claim`, §13.2), issue and PR lease records, and worktree creation
+remain #14397's.
 
 ### 13.5 Shell wrappers
 
