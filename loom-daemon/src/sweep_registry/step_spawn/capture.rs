@@ -122,6 +122,52 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
+/// The launcher's typed preflight-rejection reason for THIS attempt
+/// (#14634): the `# LOOM_LAUNCH_REJECTED` marker `worker_spawn::cli` writes
+/// at its own exit, read in this attempt's own region — after this sweep's
+/// dispatch header and before the next one — so an earlier attempt's marker
+/// in a reused per-item log is never this step's. Returns the stable ledger
+/// reason (`preflight_<stage>` / `preflight_rejected`), or `None` when the
+/// region carries no genuine marker.
+#[must_use]
+pub fn read_launch_rejection(log: &Path, sweep_id: &str) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
+    let anchor = format!("sweep_id={sweep_id} ");
+    let start = text.rfind(&anchor)?;
+    let region = match text[start + anchor.len()..]
+        .find(crate::sweep_registry::crash_signals::DISPATCH_HEADER_MARKER)
+    {
+        // The next dispatch header bounds this attempt's region: its lines
+        // belong to the next attempt, whatever they look like.
+        Some(at) => &text[start..start + anchor.len() + at],
+        None => &text[start..],
+    };
+    crate::worker_spawn::launch_rejection_reason(region)
+}
+
+/// Whether this attempt's end may spend the log's launch-rejection marker
+/// (#14634). All four guards must hold, so nothing but a genuine launcher
+/// rejection classifies as one:
+/// - the worker **exited 78** (the preflight class) — a timed-out,
+///   cancelled, status-unknown or post-start failure never reads as one,
+///   whatever a log line says;
+/// - the session wrote **no outcome line** (a launcher rejection exits
+///   before any agent ran; an agent's own word always outranks);
+/// - and the marker itself is genuine (anchored after this sweep's header,
+///   `code=78`, closed stage vocabulary — `read_launch_rejection`).
+#[must_use]
+pub fn launch_rejection_of(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    log: &Path,
+    sweep_id: &str,
+) -> Option<&'static str> {
+    if !matches!(end, StepEnd::Exited(Some(78))) || line.is_some() {
+        return None;
+    }
+    read_launch_rejection(log, sweep_id)
+}
+
 /// The `reason`s held as `ci_wait`: Judge's `ci_pending` (written
 /// `ci-pending` on the line; the parser folds it, #13500), and the Champion
 /// `requeued` outcome word. The captain is fed the outcome line's own reason,
@@ -570,6 +616,7 @@ impl SweepRegistry {
                     ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
+                    launch_rejection: launch_rejection_of(end, line.as_ref(), &log_path, sweep_id),
                 },
             );
         }

@@ -54,6 +54,14 @@ pub struct EndedStep {
     /// (#13966): the launch died on an empty api-key seat, so the ledger
     /// records a refusal (`provider_exhausted`), never a run or a cooldown.
     pub provider_exhausted: bool,
+    /// The launcher's own typed preflight-rejection reason for THIS attempt
+    /// (#14634), read off the step log after this sweep's dispatch header
+    /// when the worker exited 78 and wrote no outcome line: a
+    /// `preflight_<stage>` token from `worker_spawn::launch_rejection_reason`
+    /// (or the coarse `preflight_rejected`). The classifier spends it only
+    /// where it would otherwise have recorded `unclassified`; ownership
+    /// release, the `failed` class and the fast-fail ladder are unchanged.
+    pub launch_rejection: Option<&'static str>,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;
