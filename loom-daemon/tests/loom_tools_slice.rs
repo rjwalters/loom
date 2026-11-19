@@ -1027,6 +1027,61 @@ fn write_forms_of_the_new_commands_are_refused_with_exit_64() {
     }
 }
 
+#[test]
+fn label_writes_are_refused_before_mode_resolution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    let marker = tmp.path().join("gh-called");
+    std::fs::write(&gh, "#!/bin/sh\n: > gh-called\nexit 97\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    for (mode, read_error) in [
+        (None, "LOOM_GH_GATEWAY_DIR"),
+        (Some("invalid-test-mode"), "invalid mode"),
+    ] {
+        for (args, write_flag) in [
+            (
+                &[
+                    "labels",
+                    "undeclared",
+                    "--repo",
+                    "acme/widgets",
+                    "--labels-file",
+                    "f",
+                ][..],
+                "--prune",
+            ),
+            (&["labels", "migrate"][..], "--apply"),
+        ] {
+            let command = || {
+                let mut c = base(TOOLS, tmp.path(), tmp.path());
+                c.env_remove("LOOM_MODE")
+                    .env("LOOM_GH_GATEWAY_DIR", tmp.path())
+                    .env("LOOM_GH_BIN", &gh)
+                    .args(args);
+                if let Some(mode) = mode {
+                    c.env("LOOM_MODE", mode);
+                }
+                c
+            };
+            let mut write = command();
+            write.arg(write_flag);
+            let refused = run(write, None);
+            let err = String::from_utf8_lossy(&refused.stderr);
+            assert_eq!(refused.status.code(), Some(64), "{mode:?} {args:?} {write_flag}: {err}");
+            assert!(refused.stdout.is_empty() && err.contains("#14396"), "{err}");
+
+            let read = run(command(), None);
+            let err = String::from_utf8_lossy(&read.stderr);
+            assert_eq!(read.status.code(), Some(1), "{mode:?} {args:?}: {err}");
+            assert!(read.stdout.is_empty() && err.contains(read_error), "{err}");
+        }
+    }
+    assert!(!marker.exists(), "mode validation or refusal reached the fake forge");
+}
+
 /// Design §7.3 / §10.3: a forge-reaching form resolves `mode` first; an
 /// inherited gateway variable with `mode` unset is the actionable error, and
 /// an offline form with the same environment is not gated at all.

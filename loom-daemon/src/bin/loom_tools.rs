@@ -285,7 +285,7 @@ fn run() -> Result<()> {
         // and park-record families use, and the same exit-64 refusals for
         // the write forms (#14396).
         ToolsCommands::Labels(args) => {
-            if args.reaches_forge() {
+            if args.is_read() && args.reaches_forge() {
                 mode_gate()?;
             }
             handle_labels_read_command(args)
