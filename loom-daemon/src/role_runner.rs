@@ -2918,7 +2918,7 @@ pub fn observe_and_fire_idle(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut runner = ScriptRoleInvocationRunner::new(run_root.clone());
                 // Cross-host collision detection (#4623) — detection only.
-                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval)
+                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval).outcome
             })
             .await;
             let elapsed = tick_start.elapsed();
@@ -2975,17 +2975,16 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     role: &'static str,
     prompt: &str,
     interval: Duration,
-) -> RoleTickOutcome {
+) -> invocation::InvocationOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
     let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
-    // Ratification reviewer lane (#13345): a no-op unless `ratificationLane`
-    // is enabled for this root. Runs on the champion tick's blocking thread.
+    let invocation = invocation::InvocationOutcome::capture(outcome, runner);
     if role == "champion" {
         ratification_lane::tick_for_root(root, runner);
     }
-    outcome
+    invocation
 }
 
 /// Render a caught panic payload (`Box<dyn Any + Send>`, as produced by
