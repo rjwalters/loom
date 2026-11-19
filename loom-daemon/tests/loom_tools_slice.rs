@@ -1112,8 +1112,8 @@ fn unverifiable_gh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 /// #14621 extends the table with the #14519 write verbs (`forge comment`,
 /// `verdict-labels`, `verdict-reconcile`, `doctor-handback`, `rerun`,
 /// `create-issue` from the tools root, and `auto-merge`/`disable-auto-merge`).
-/// Their vet runs before every handler, so nothing is read first (`read` is
-/// false), and the refusal exit is each entry point's own: the central forge
+/// Their vet runs before any forge call (`read` is false), and the refusal
+/// exit is each entry point's own: the central forge
 /// gate and `create-issue` exit 1, `rerun` exits 3 with its sentinel on
 /// stdout — only `park-record`/`operator-decision` exit 4. The no-`--repo`
 /// auto-merge verbs run from a remoteless directory, so their target is
@@ -1288,18 +1288,37 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
         (vec!["forge", "auto-merge", "7"], None, 1, false, tmp.path()),
         (vec!["forge", "disable-auto-merge", "7"], None, 1, false, tmp.path()),
     ] {
-        let _ = std::fs::remove_file(&log);
+        std::fs::write(&log, "").unwrap();
         let mut c = base(TOOLS, tmp.path(), cwd);
         c.env("PATH", &path).args(&args);
         let o = run(c, stdin);
         let err = String::from_utf8_lossy(&o.stderr);
         let out = String::from_utf8_lossy(&o.stdout);
         assert_eq!(o.status.code(), Some(want), "{args:?}: {err}{out}");
-        assert!(
-            err.contains("#9548") || out.contains("#9548"),
-            "{args:?} must name the write-scope refusal: {err} | {out}"
-        );
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let rerun = args.starts_with(&["forge", "rerun"]);
+        if rerun {
+            assert!(
+                out.split_once('\n').is_some_and(|(line, rest)| {
+                    line.starts_with("LOOM-RERUN-ERROR ")
+                        && line.contains("#9548")
+                        && rest.is_empty()
+                }),
+                "{args:?} must print exactly one write-scope rerun error: {out:?}"
+            );
+        } else {
+            assert!(
+                err.contains("#9548"),
+                "{args:?} must name the write-scope refusal on stderr: {err}"
+            );
+        }
+        let calls = std::fs::read_to_string(&log).unwrap();
+        if args[0] == "forge" {
+            assert!(calls.is_empty(), "{args:?} made a forge call before the refusal:\n{calls}");
+            if !rerun {
+                assert!(o.stdout.is_empty(), "{args:?} must refuse with empty stdout: {out:?}");
+            }
+            continue;
+        }
         if read {
             assert!(
                 calls
@@ -1314,9 +1333,7 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "{args:?} issued a forge mutation ({mutation}):\n{calls}"
             );
         }
-        for marker in ["APPLIED=true", "LOOM-RERUN-OK", "\"number\""] {
-            assert!(!out.contains(marker), "{args:?} must not report a write ({marker}): {out}");
-        }
+        assert!(!out.contains("APPLIED=true"), "{args:?} must not report a write: {out}");
     }
 }
 
@@ -1373,18 +1390,16 @@ fn an_unverifiable_managed_target_is_refused_without_a_write() {
             err.contains("could not verify"),
             "{args:?} must refuse as unverifiable, not unmanaged: {err}"
         );
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            calls.contains("installation/repositories"),
-            "{args:?} never probed the credential:\n{calls}"
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls,
+            concat!(
+                "api --include installation/repositories?per_page=100&page=1\n",
+                "api repos/acme/widgets --jq .permissions // {}\n",
+            ),
+            "{args:?} must only make the two credential reads"
         );
-        for mutation in ["-X", "--input", "issue create", "issue edit"] {
-            assert!(
-                !calls.contains(mutation),
-                "{args:?} issued a forge mutation ({mutation}):\n{calls}"
-            );
-        }
-        assert!(!out.contains("\"number\""), "{args:?} must not report a write: {out}");
+        assert!(o.stdout.is_empty(), "{args:?} must refuse with empty stdout: {out:?}");
     }
 }
 
