@@ -31,8 +31,6 @@ impl SweepRegistry {
         item: u32,
         role: crate::step_role::StepRole,
     ) -> PathBuf {
-        self.config
-            .logs_dir()
-            .join(format!("step-{role}-{item}.log"))
+        crate::launch_record::step_log_path(&self.config.workspace_root, item, role)
     }
 }

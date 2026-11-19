@@ -28,6 +28,35 @@
       "curator"
     ]
   },
+  "zai-full": {
+    "billing": "subscription",
+    "model": "glm-5.3",
+    "providers": {
+      "pi": "zai",
+      "opencode": "zai-coding-plan"
+    },
+    "credentialEnv": "ZAI_API_KEY",
+    "credentialPool": "zai",
+    "effort": "max",
+    "allowedEfforts": [
+      "low",
+      "high",
+      "max"
+    ],
+    "credentialTargets": {
+      "pi": "ZAI_API_KEY",
+      "opencode": "ZHIPU_API_KEY"
+    },
+    "credentialProxy": {
+      "upstream": "https://api.z.ai/api/coding/paas/v4",
+      "header": "authorization-bearer",
+      "baseUrlConfig": "baseURL"
+    },
+    "excludedRoles": [
+      "judge",
+      "curator"
+    ]
+  },
   "quick-cerebras": {
     "billing": "api",
     "model": "gpt-oss-120b",

@@ -15,7 +15,7 @@
 # So the #6133 fix batches pending entries via TWO knobs evaluated together
 # (mirroring `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s shape, plus an entry-count
 # escape hatch WORK_PLAN has no equivalent of):
-#   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): a pending delta at or above
+#   - `workLogMinEntries` (default 5): a pending delta at or above
 #     this size writes IMMEDIATELY, debounce window or not -- the
 #     "no starvation" guarantee for a large accumulated delta.
 #   - `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30 min): below the
@@ -32,7 +32,7 @@
 #      `WORK_LOG.md` (mirrors #5929's WORK_PLAN.md filter).
 #   2. guide.md's `update_work_log()` gates the write behind BOTH
 #      `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800) and
-#      `LOOM_WORK_LOG_MIN_ENTRIES` (default 5).
+#      the repository threshold (default 5, environment override supported).
 #   3. THE REGRESSION, executed rather than grepped: a reconstruction of the
 #      debounce arithmetic, run against fixture timelines --
 #        a. a tick within the debounce window with a small pending delta
@@ -97,8 +97,8 @@ assert_grep 'LOOM_WORK_LOG_DEBOUNCE_SECS:-\$\(jq -r' "$GUIDE_MD" \
     "update_work_log() reads LOOM_WORK_LOG_DEBOUNCE_SECS, falling back to a config read (#6327)"
 assert_grep 'guide\.docsMaintenance\.workLogDebounceSecs // 1800' "$GUIDE_MD" \
     "update_work_log() reads guide.docsMaintenance.workLogDebounceSecs from .loom/config.json with a 1800s (30 min) default (#6327)"
-assert_grep 'LOOM_WORK_LOG_MIN_ENTRIES:-5' "$GUIDE_MD" \
-    "update_work_log() reads LOOM_WORK_LOG_MIN_ENTRIES with a 5-entry default"
+assert_grep 'guide\.docsMaintenance\.workLogMinEntries' "$GUIDE_MD" \
+    "update_work_log() reads the repository's work-log threshold"
 assert_grep 'update_work_log\(\) \{' "$GUIDE_MD" \
     "update_work_log() is defined"
 
@@ -235,6 +235,61 @@ JSON
     RESULT="$(run_debounce_line "600")"
     assert_eq "$RESULT" "600" \
         "LOOM_WORK_LOG_DEBOUNCE_SECS env var wins over the default when no config block is present"
+
+    echo ""
+    echo "Test 2c: resolve the repo threshold and execute the actual WORK_LOG gate"
+    WORK_LOG_GATE="$(printf '%s\n' "$UWL_BODY" | awk '
+        /if \[ "\$total_new" -eq 0 \]; then/ { in_gate = 1 }
+        /# Group entries by date/ { in_gate = 0 }
+        in_gate { print }
+    ')"
+
+    run_threshold_gate() (
+        cd "$SANDBOX" || exit 1
+        local total_new="$1" anchor="${4:-1000000}"
+        export LOOM_WORK_LOG_DEBOUNCE_NOW="$2"
+        export LOOM_WORK_LOG_MIN_ENTRIES="${3:-}"
+        unset LOOM_WORK_LOG_DEBOUNCE_SECS
+
+        # The extracted Guide gate calls this stub.
+        # shellcheck disable=SC2329
+        last_work_log_write_epoch() { printf '%s\n' "$anchor"; }
+        guide_gate() { eval "$WORK_LOG_GATE"; }
+        if guide_gate >/dev/null; then
+            echo "WRITE"
+        else
+            echo "SUPPRESS"
+        fi
+    )
+
+    assert_eq "$(run_threshold_gate 4 1000300)" "SUPPRESS" "missing config defaults to 5"
+    assert_eq "$(run_threshold_gate 5 1000300)" "WRITE" "the default threshold is inclusive"
+
+    cat > "$SANDBOX/.loom/config.json" <<'JSON'
+{"guide":{"docsMaintenance":{"workLogDebounceSecs":7200,"workLogMinEntries":12}}}
+JSON
+    assert_eq "$(run_threshold_gate 11 1001800)" "SUPPRESS" "11 entries batch inside the repo window"
+    assert_eq "$(run_threshold_gate 12 1001800)" "WRITE" "12 entries reach the repo threshold"
+    assert_eq "$(run_threshold_gate 6 1007199)" "SUPPRESS" "six entries wait one second before the boundary"
+    assert_eq "$(run_threshold_gate 6 1007200)" "WRITE" "six entries publish at the boundary"
+    assert_eq "$(run_threshold_gate 6 1001800 6)" "WRITE" "the environment overrides a higher repo threshold"
+    assert_eq "$(run_threshold_gate 1 1001800 0)" "WRITE" "the existing zero environment override still works"
+    assert_eq "$(run_threshold_gate 0 1007200)" "SUPPRESS" "an empty delta still skips an update"
+    assert_eq "$(run_threshold_gate 1 1001800 "" 0)" "WRITE" "a missing merge anchor still allows a real delta"
+
+    for exact_threshold in 12.0 1e2 9223372036854775807 9.223372036854775807e18; do
+        printf '{"guide":{"docsMaintenance":{"workLogMinEntries":%s}}}\n' "$exact_threshold" > "$SANDBOX/.loom/config.json"
+        assert_eq "$(run_threshold_gate 6 1000300)" "SUPPRESS" "integral repo threshold $exact_threshold retains its exact value"
+    done
+
+    for invalid_threshold in 0 -1 5.5 12.0000000000000001 9223372036854775808 '"12"' true null 1e100; do
+        printf '{"guide":{"docsMaintenance":{"workLogMinEntries":%s}}}\n' "$invalid_threshold" > "$SANDBOX/.loom/config.json"
+        assert_eq "$(run_threshold_gate 4 1000300)" "SUPPRESS" "invalid repo threshold $invalid_threshold uses the default"
+        assert_eq "$(run_threshold_gate 5 1000300)" "WRITE" "invalid repo threshold $invalid_threshold leaves the default inclusive"
+    done
+    echo '{"guide":' > "$SANDBOX/.loom/config.json"
+    assert_eq "$(run_threshold_gate 4 1000300)" "SUPPRESS" "malformed config uses the default threshold and time window"
+    assert_eq "$(run_threshold_gate 5 1000300)" "WRITE" "malformed config leaves the default inclusive"
 
     trap - EXIT
     cleanup_sandbox_wl

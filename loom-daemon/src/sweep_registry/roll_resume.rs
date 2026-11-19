@@ -128,6 +128,7 @@ impl RollResumeSpec {
 #[derive(Debug)]
 pub(crate) struct PreparedRollResume {
     pub(crate) child: Child,
+    rejection: Option<crate::worker_spawn::rejection::Receiver>,
     pub(crate) header_anchor: String,
     pub(crate) log_path: PathBuf,
     pub(crate) issue: u32,
@@ -489,9 +490,10 @@ impl SweepRegistry {
             Some(&spec.launch),
         );
         match spawned {
-            Ok((child, header_anchor)) => Ok(PreparedRollResume {
-                child,
-                header_anchor,
+            Ok(spawned) => Ok(PreparedRollResume {
+                child: spawned.child,
+                header_anchor: spawned.header_anchor,
+                rejection: spawned.rejection,
                 log_path,
                 issue,
                 kind: kind.clone(),
@@ -528,6 +530,7 @@ impl SweepRegistry {
     ) -> std::result::Result<ResumedSweep, RollResumeRefusal> {
         let PreparedRollResume {
             mut child,
+            rejection,
             header_anchor,
             log_path,
             issue,
@@ -552,6 +555,9 @@ impl SweepRegistry {
         // record: the claim was kept, so its one record is kept too.
         drop(self.start_lease_renewal_loop(issue, &lease_sweep_id, pid, &log_path));
         self.children.insert(sweep_id.clone(), child);
+        if let Some(receiver) = rejection {
+            self.launch_rejections.insert(sweep_id.clone(), receiver);
+        }
         if let Err(e) =
             self.record_child_pid_in_lock(issue, pid, pgid, model.as_deref(), effort.as_deref())
         {
@@ -643,6 +649,7 @@ impl SweepRegistry {
             );
             let _ = child.wait();
         }
+        self.launch_rejections.remove(sweep_id);
         self.entries.remove(sweep_id);
     }
 
@@ -673,6 +680,7 @@ impl SweepRegistry {
         }
         for id in sweep_ids {
             self.children.remove(*id);
+            self.launch_rejections.remove(*id);
             self.entries.remove(*id);
         }
     }

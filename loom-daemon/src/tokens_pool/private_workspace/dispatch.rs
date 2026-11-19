@@ -1,8 +1,15 @@
 //! The selected account and its preparation lease travel together to spawn.
 use super::*;
+use std::cell::Cell;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+
+/// Every matching seat is busy or could not be prepared; self-heals as seats free.
+pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
+/// The resolved repository is served by no inventoried account: a routing
+/// misconfiguration, not contention (#14512).
+pub(super) const NO_SEAT_SERVES_REPOSITORY: &str = "no seat serves this repository";
 
 /// The one descriptor a private dispatch hands its account lease down on.
 /// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
@@ -57,6 +64,58 @@ pub fn uses_private(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
+enum SeatPolicy {
+    Existing,
+    Idle { guarded: bool },
+}
+
+#[cfg(test)]
+impl Selection {
+    /// A held reservation (lease taken, job begun) for tests in other modules,
+    /// shaped like the one `reserve_seat` hands a read-only launch (#14481).
+    pub(crate) fn reserved_for_test(dir: &Path) -> Self {
+        let lease = lease::Lease::acquire(dir).unwrap();
+        lease
+            .begin(&lease::Job {
+                owner: "test".into(),
+                kind: JobKind::Role,
+                issue: None,
+                branch: None,
+                container_id: "a".repeat(64),
+                base_revision: String::new(),
+                host_pid: std::process::id(),
+                control: "c".repeat(64),
+                repository: String::new(),
+            })
+            .unwrap();
+        let config = Config {
+            schema_version: 1,
+            account: "fixture".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/owner/repo".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: PathBuf::from("/nonexistent"),
+            gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
+        };
+        Selection {
+            name: "fixture".into(),
+            profile: dir.join("profile"),
+            prepared: Some(Prepared {
+                lease,
+                target: Config::primary(&config),
+                record: None,
+                handed_off: std::cell::Cell::new(false),
+            }),
+        }
+    }
+}
+
 impl Selection {
     pub fn prepare(
         root: &Path,
@@ -65,6 +124,31 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, runtime, model, kind, issue, owner, SeatPolicy::Existing)
+    }
+
+    /// Reserve a seat for a host-admitted read-only launch. Try each eligible
+    /// seat at most once, and keep the successful lease through the spawn.
+    pub(super) fn prepare_idle(
+        root: &Path,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+        guarded: bool,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Idle { guarded })
+    }
+
+    fn prepare_with(
+        root: &Path,
+        runtime: &str,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+        policy: SeatPolicy,
     ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
@@ -97,52 +181,98 @@ impl Selection {
         use super::super::account_registry::{
             account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
         };
-        let inventory = account_inventory(root, AccountProvider::Codex)?;
-        let explicit = std::env::var("LOOM_CODEX_PROFILE")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let (name, profile) = if let Some(profile) = pinned {
+        let try_idle_seats = matches!(policy, SeatPolicy::Idle { .. });
+        let prepare = |name, profile| -> Result<Self> {
+            let selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
+            if matches!(policy, SeatPolicy::Idle { guarded: true }) && selection.lease().is_some() {
+                selection.contain(root)?;
+            }
+            Ok(selection)
+        };
+        if let Some(profile) = pinned {
             let profile = PathBuf::from(profile).canonicalize()?;
-            let account = inventory
-                .iter()
+            let account = account_inventory(root, AccountProvider::Codex)?
+                .into_iter()
                 .find(|a| a.credential_reference.canonicalize().ok().as_ref() == Some(&profile))
                 .context("explicit Codex profile is not an inventoried account")?;
-            (account.id.name.clone(), profile)
-        } else if let Some(name) = explicit {
+            return prepare(account.id.name, profile).map(Some);
+        }
+        if let Some(name) = std::env::var("LOOM_CODEX_PROFILE")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
             let account = account(root, &name)?;
-            (account.id.name, account.credential_reference)
-        } else {
-            let manifest = [
-                root.join(".loom/runtimes/codex.json"),
-                root.join("defaults/runtimes/codex.json"),
-            ]
-            .into_iter()
-            .find(|p| p.is_file());
-            let provider = manifest
-                .and_then(|p| std::fs::read(p).ok())
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-                .and_then(|value| value["accountProvider"].as_str().map(str::to_owned));
-            if provider.as_deref() != Some("codex") {
-                export::check_failover(root, issue, "other-provider")?;
-                return Ok(None);
-            }
-            // Only accounts that can serve THIS repository: a shared
-            // (host-mounted) account, or a private-clone account whose clone
-            // is of this repository. A private account bound to another
-            // repository would otherwise be picked at random and the launch
-            // refused below by `verify_repository` — on robb-studio after
-            // agent-1/2 moved to a gf180-parasynth canary (2026-10-02), every
-            // Codex role tick in every other workspace that drew one of them
-            // failed with "private workspace repository differs".
-            let logical = logical_repository(root);
+            return prepare(account.id.name, account.credential_reference).map(Some);
+        }
+        let manifest = [
+            root.join(".loom/runtimes/codex.json"),
+            root.join("defaults/runtimes/codex.json"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file());
+        let provider = manifest
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value["accountProvider"].as_str().map(str::to_owned));
+        if provider.as_deref() != Some("codex") {
+            export::check_failover(root, issue, "other-provider")?;
+            return Ok(None);
+        }
+
+        let logical = logical_repository(root);
+        let mut tried = std::collections::BTreeSet::new();
+        loop {
+            // A previous preparation establishes a match even if that
+            // account disappears from a later selection snapshot. Unknown
+            // routes also prevent a definite routing-miss diagnosis.
+            let routing_miss = Cell::new(logical.is_some() && tried.is_empty());
             let account = select_codex_account_where(root, model, |account| {
-                serves_repository(&account.credential_reference, logical.as_deref())
-            })?;
+                if tried.contains(&account.id.name) {
+                    return false;
+                }
+                let route = repository_route(&account.credential_reference, logical.as_deref());
+                if route != Some(false) {
+                    routing_miss.set(false);
+                }
+                route == Some(true)
+            });
+            let account = match account {
+                Err(error)
+                    if try_idle_seats
+                        && error.is::<super::super::health::NoHealthyAccountError>() =>
+                {
+                    // Use the selector's snapshot, before health/model
+                    // filtering. The original error still drives host-local
+                    // refusal classification even if inventory has changed.
+                    return Err(error.context(if routing_miss.get() {
+                        NO_SEAT_SERVES_REPOSITORY
+                    } else {
+                        NO_IDLE_SEAT
+                    }));
+                }
+                other => other?,
+            };
             let AccountBinding::CodexHome { directory } = account.binding else {
                 unreachable!()
             };
-            (account.id.name, directory)
-        };
+            match prepare(account.id.name.clone(), directory) {
+                Err(error) if try_idle_seats => {
+                    log::debug!("Codex seat {} could not be prepared: {error}", account.id.name);
+                    tried.insert(account.id.name);
+                }
+                result => return result.map(Some),
+            }
+        }
+    }
+
+    fn prepare_profile(
+        root: &Path,
+        name: String,
+        profile: PathBuf,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+    ) -> Result<Self> {
         let mut selection = Self {
             name,
             profile,
@@ -151,19 +281,36 @@ impl Selection {
         let dir = state_dir(&selection.profile)?;
         if !dir.join("workspace.json").exists() {
             export::check_failover(root, issue, &selection.name)?;
-            return Ok(Some(selection));
+            return Ok(selection);
         }
         adapter::check(Some(&selection.profile))?;
         let (config, dir) = lifecycle::resolve(root, &selection.name)?;
         export::check_failover(root, issue, &selection.name)?;
         let target = select_target(root, &config)?;
+        // Refuse BEFORE the lease, the container exec and the claim when the
+        // only forge credential this owner has is provably expired (#14435).
+        // Preparing would `git fetch` with a dead token, exit 128 and strand a
+        // step the seat was already handed; refusing here lets the draw fall
+        // through to a runtime that can serve it.
+        if forge_auth::ExecAuth::resolve(root, &target.repository).expired() {
+            bail!(
+                "private workspace forge credential for {} is expired and no fresher one is \
+                 published; the credential refresh has not renewed it",
+                target.repository
+            );
+        }
         let lease = lease::Lease::acquire(&dir)?;
         let state = docker::inspect(&config.container)?
             .context("private account session is unavailable (container stopped or missing)")?;
         docker::validate(&config, &state)?;
         lease.recover(&config, Some(&state))?;
-        if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
-            bail!("private account session is busy or not running; workspace was not claimed");
+        if state["State"]["Running"] != true {
+            bail!("private account session is not running; workspace was not claimed");
+        }
+        if !docker::idle(Some(&state), &config.container)? {
+            return Err(
+                AccountBusy("private account session is busy; workspace was not claimed").into()
+            );
         }
         let id = state["Id"].as_str().context("container ID missing")?;
         let mut job = lease::Job {
@@ -192,7 +339,7 @@ impl Selection {
             record: Some(record),
             handed_off: std::cell::Cell::new(false),
         });
-        Ok(Some(selection))
+        Ok(selection)
     }
 
     pub fn rebind(&self, _root: &Path, owner: &str) -> Result<()> {
@@ -343,23 +490,18 @@ pub(super) fn logical_repository(root: &Path) -> Option<String> {
     Some(normalized.trim_end_matches(".git").to_owned())
 }
 
-/// Whether the account whose profile is `profile` can serve a launch for the
-/// `logical` repository: any account without private-clone state can (it is a
-/// shared, host-mounted account), and a private-clone account can only when
-/// its clone is of that repository. Unreadable private state, or an
-/// unresolvable workspace repository, never matches a private account: it is
-/// left out of the draw rather than picked and refused.
-fn serves_repository(profile: &Path, logical: Option<&str>) -> bool {
+/// Whether this profile can serve the logical repository, or `None` when
+/// private routing evidence cannot be read. Only a confirmed match enters the
+/// draw. Accounts without private-clone state remain eligible as shared seats.
+fn repository_route(profile: &Path, logical: Option<&str>) -> Option<bool> {
     let Ok(dir) = state_dir(profile) else {
-        return true;
+        return Some(true);
     };
     if !dir.join("workspace.json").exists() {
-        return true;
+        return Some(true);
     }
-    match (load(&dir), logical) {
-        (Ok(config), Some(logical)) => config.target(Some(logical)).is_ok(),
-        _ => false,
-    }
+    let config = load(&dir).ok()?;
+    Some(config.target(Some(logical?)).is_ok())
 }
 
 /// What a durable job records for `target`: the canonical repository of an
@@ -419,6 +561,8 @@ mod tests {
             volume: format!("loom-codex-workspace-{name}"),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         save(&dir.join("workspace.json"), &config).unwrap();
         profile
@@ -452,17 +596,17 @@ mod tests {
         std::fs::create_dir_all(&shared).unwrap();
         let same = private_profile(root.path(), "same", &format!("{here}.git"));
         let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
-        assert!(serves_repository(&shared, Some(here)));
-        assert!(serves_repository(&same, Some(here)), ".git suffix is not identity");
-        assert!(!serves_repository(&other, Some(here)));
+        assert_eq!(repository_route(&shared, Some(here)), Some(true));
+        assert_eq!(repository_route(&same, Some(here)), Some(true), ".git suffix is not identity");
+        assert_eq!(repository_route(&other, Some(here)), Some(false));
         // An unresolvable workspace repository matches no private clone, but
         // shared accounts still serve it.
-        assert!(serves_repository(&shared, None));
-        assert!(!serves_repository(&same, None));
+        assert_eq!(repository_route(&shared, None), Some(true));
+        assert_eq!(repository_route(&same, None), None);
         // Unreadable private state is left out, never guessed.
         let corrupt = private_profile(root.path(), "corrupt", here);
         std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
-        assert!(!serves_repository(&corrupt, Some(here)));
+        assert_eq!(repository_route(&corrupt, Some(here)), None);
     }
 
     /// A seat holding several private clones serves each of its repositories
@@ -485,9 +629,12 @@ mod tests {
         });
         save(&dir.join("workspace.json"), &config).unwrap();
 
-        assert!(serves_repository(&profile, Some(primary)));
-        assert!(serves_repository(&profile, Some(&format!("{second}.git"))));
-        assert!(!serves_repository(&profile, Some("https://github.com/2AMLogic/other")));
+        assert_eq!(repository_route(&profile, Some(primary)), Some(true));
+        assert_eq!(repository_route(&profile, Some(&format!("{second}.git"))), Some(true));
+        assert_eq!(
+            repository_route(&profile, Some("https://github.com/2AMLogic/other")),
+            Some(false)
+        );
 
         let ws = workspace_with_origin(&format!("{second}.git"));
         let target = select_target(ws.path(), &config).unwrap();
@@ -547,14 +694,14 @@ mod tests {
         let mut drawn = std::collections::BTreeSet::new();
         for _ in 0..40 {
             let account = select_codex_account_where(ws.path(), None, |account| {
-                serves_repository(&account.credential_reference, logical.as_deref())
+                repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
             })
             .unwrap();
             drawn.insert(account.id.name);
         }
         // Nothing but the private clones of another repository: empty pool.
         let none = select_codex_account_where(ws.path(), None, |account| {
-            serves_repository(&account.credential_reference, logical.as_deref())
+            repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
                 && account.id.name.starts_with("agent-1")
         });
         std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
@@ -579,6 +726,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     }
     fn reservation(dir: &Path) -> Selection {

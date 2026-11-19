@@ -620,8 +620,9 @@ fn attributed_runtime(config: &serde_json::Value) -> (String, String) {
     std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
     std::fs::write(tmp.path().join(".loom/config.json"), config.to_string()).unwrap();
     let effective = crate::config_resolver::resolve_effective_config(tmp.path());
-    let (runtime, _source) =
-        crate::worker_spawn::resolve_launch_runtime(tmp.path(), &effective).unwrap();
+    let runtime = crate::worker_spawn::resolve_launch_runtime(tmp.path(), &effective)
+        .unwrap()
+        .runtime;
     let mut selection = crate::worker_spawn::profiles::Selection {
         provider: "anthropic".into(),
         model: "test-model".into(),

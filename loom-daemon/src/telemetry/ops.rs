@@ -200,6 +200,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
@@ -220,6 +222,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #13873: the configured model and, when a selection-time fallback
+    // fired, what it fell back from and why.
+    "loom.step.model_configured",
+    "loom.step.model_fallback_from",
+    "loom.step.model_fallback_reason",
     // #12957: the item's story points, on `loom.dispatch.step` and on the
     // step's `loom.sweep` close (the key `sweep.started` already exports).
     "loom.story_points",
@@ -361,6 +368,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
     "loom.fleet_dispatch.merge_slot_holder",
+    "loom.fleet_dispatch.hold_ms",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",

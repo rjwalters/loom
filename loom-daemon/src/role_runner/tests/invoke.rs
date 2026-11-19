@@ -3,8 +3,7 @@
 //! and timeout outcomes, model/effort resolution into argv, and the per-role
 //! log. Split out of `role_runner/tests.rs` when #9548 registered these
 //! launches' roots as writable checkouts (the real write-scope gate now runs
-//! in front of every tick), so the over-threshold parent shrinks rather than
-//! grows (`.loom/docs/file-size-policy.md`).
+//! in front of every tick).
 
 use super::*;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
@@ -332,6 +331,125 @@ fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root
     assert_eq!(fs::read_to_string(&observed).unwrap(), "__unset__");
 }
 
+/// A configured service tier reaches the child and is attributed in the role
+/// log. With none configured the child inherits the daemon's environment.
+#[test]
+#[serial(loom_config_env)]
+fn test_invoke_exports_resolved_service_tier_and_leaves_inherited_value_when_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    use crate::runtime_admission::{ResolvedRuntime, RuntimeSource};
+
+    let run = |config: &str, admission: Option<&ResolvedRuntime>| {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_config(&root, config);
+        let observed = root.join("observed-tier");
+        let script = write_fake_script(
+            &root,
+            "fake-spawn.sh",
+            &format!(
+                "printf '%s' \"${{LOOM_SERVICE_TIER:-__unset__}}\" > '{}'",
+                observed.display()
+            ),
+        );
+        let ws = crate::write_scope_test_support::WritableRoot::register(&root);
+        let outcome = if let Some(admission) = admission {
+            // A spawn override on ScriptRoleInvocationRunner skips admission.
+            // Supply the admitted runtime to the production launcher directly.
+            run_role_with_timeout(
+                &script,
+                &root,
+                &ws.gh,
+                "judge",
+                "/loom:judge",
+                root.join(".loom/logs"),
+                Duration::from_secs(30),
+                "sonnet",
+                "default",
+                "",
+                "unset",
+                Some(admission),
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            ScriptRoleInvocationRunner::new(root.clone())
+                .with_gh_bin(ws.gh.clone())
+                .with_spawn_bin(script)
+                .invoke("judge", "/loom:judge")
+        };
+        assert_eq!(outcome, RoleTickOutcome::Success);
+        let tier = fs::read_to_string(&observed).unwrap();
+        let log = fs::read_to_string(root.join(".loom/logs/role-judge.log")).unwrap();
+        let header = log
+            .lines()
+            .find(|line| line.starts_with("==== loom-daemon role_runner: "))
+            .unwrap()
+            .to_owned();
+        (tier, header)
+    };
+    let assert_launch = |config: &str,
+                         expected_tier: &str,
+                         expected_source: Option<&str>,
+                         admission: Option<&ResolvedRuntime>| {
+        let (tier, header) = run(config, admission);
+        assert_eq!(tier, expected_tier);
+        if let Some(source) = expected_source {
+            assert!(
+                header.contains(&format!(" service_tier={tier} (source={source}) ====")),
+                "header must explain the tier seen by the child: {header}",
+            );
+        } else {
+            assert!(!header.contains(" service_tier="), "{header}");
+        }
+    };
+
+    std::env::remove_var("LOOM_SERVICE_TIER");
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#,
+        "flex",
+        Some("autonomous.roleRunner.serviceTier"),
+        None,
+    );
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex",
+            "roleServiceTiers": {"judge": "priority"}}}}"#,
+        "priority",
+        Some("autonomous.roleRunner.roleServiceTiers.judge"),
+        None,
+    );
+    let admitted_claude = ResolvedRuntime {
+        role: "judge".into(),
+        runtime: "claude".into(),
+        source: RuntimeSource::RoleConfig,
+        adapter: PathBuf::from("/nonexistent/spawn-claude.sh"),
+        role_manifest: PathBuf::from("/nonexistent/judge.json"),
+        runtime_manifest: PathBuf::from("/nonexistent/claude.json"),
+        suggested_worker_type: None,
+        preference: None,
+        execution: None,
+    };
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex",
+            "roleServiceTiers": {"judge": "default", "judge@claude": "fast"}}}}"#,
+        "fast",
+        Some("autonomous.roleRunner.roleServiceTiers.judge@claude"),
+        Some(&admitted_claude),
+    );
+    assert_launch("{}", "__unset__", None, None);
+    std::env::set_var("LOOM_SERVICE_TIER", "operator");
+    assert_launch("{}", "operator", None, None);
+    assert_launch(
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#,
+        "flex",
+        Some("autonomous.roleRunner.serviceTier"),
+        None,
+    );
+    std::env::remove_var("LOOM_SERVICE_TIER");
+}
+
 /// Issue #4501: a role spawn pins the model explicitly — a role child must
 /// never inherit the account's interactive CLI default (`fable` on the host
 /// that filed the issue, where every child instantly died on "You've reached
@@ -390,6 +508,69 @@ fn test_invoke_config_model_override_wins() {
     assert!(
         argv.contains("--model\nclaude-sonnet-4-6\n"),
         "autonomous.roleRunner.model must win; argv: {argv}"
+    );
+}
+
+/// #13873: selection-time model fallback on the role-runner path — with
+/// `roleModels.judge = fable`, `modelFallback.enabled` and every pool
+/// account bad-marked `[model-class:fable]`, the tick still launches, on
+/// `opus`, instead of holding the pool. The per-role log header names the
+/// fallback through the model source label.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted() {
+    test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted_body();
+}
+
+#[serial]
+fn test_invoke_falls_back_a_model_rung_when_the_class_is_exhausted_body() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(
+        tmp.path(),
+        r#"{"autonomous": {"roleRunner": {
+                "enabled": true,
+                "roleModels": {"judge": "fable"}
+            },
+            "modelFallback": {"enabled": true}}}"#,
+    );
+    // The pool lives in the shared dir (a registered checkout's in-worktree
+    // per-repo pool is refused by design, #9135): two accounts, every one
+    // fable-class-marked (#13872's mark shape) — fable has nothing to
+    // select, opus still does.
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    fs::remove_file(pool.path().join("fake.token")).unwrap();
+    for account in ["alpha", "beta"] {
+        fs::write(pool.path().join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+    }
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    fs::write(
+        pool.path().join(".bad_tokens"),
+        format!(
+            "{now} alpha exhausted: hit your Fable limit [model-class:fable]\n\
+             {now} beta exhausted: hit your Fable limit [model-class:fable]\n"
+        ),
+    )
+    .unwrap();
+    // Precondition: the pool really is fable-exhausted, with opus capacity.
+    let state = crate::tokens_pool::select::spawnable_pool_state_for_class(tmp.path(), "fable");
+    assert_eq!((state.total, state.usable), (2, 0));
+    let state = crate::tokens_pool::select::spawnable_pool_state_for_class(tmp.path(), "opus");
+    assert_eq!(state.usable, 2);
+
+    let script = write_fake_script(
+        tmp.path(),
+        "fake-spawn.sh",
+        "printf '%s\\n' \"$@\" > argv-fallback.txt; exit 0",
+    );
+    let ws = crate::write_scope_test_support::WritableRoot::register(tmp.path());
+    let mut runner = ScriptRoleInvocationRunner::new(tmp.path().to_path_buf())
+        .with_gh_bin(ws.gh.clone())
+        .with_spawn_bin(script);
+    assert_eq!(runner.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+    let argv = fs::read_to_string(tmp.path().join("argv-fallback.txt")).unwrap();
+    assert!(
+        argv.contains("--model\nopus\n"),
+        "the tick must launch on the opus rung; argv: {argv}"
     );
 }
 

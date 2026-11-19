@@ -5,19 +5,23 @@ enqueue a Judge-approved PR rather than merging it directly. That
 only protects `main` if every suite Loom relies on validates the **combined
 merge-group tree**, meaning the base plus every PR queued ahead of this one. A
 workflow can list `merge_group` as a trigger and still skip the suites that
-matter on it. This document covers the read-only tooling that proves a
-repository's workflows are qualified, the prerequisites for enabling queue mode,
-and how to roll back.
+matter on it. This document covers the read-only qualification checks, the
+prerequisites for enabling queue mode, and how to roll back.
 
 **Status:** queue execution is compiled on (#12323) but opt-in via
 `champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
 controls and the Champion handoff; the `merge_group` check workflow is the
 optional template `defaults/optional/github-workflows/merge-group-check.yml`.
-`rjwalters/loom` is user-owned, and GitHub documents merge queues for
-organization-owned repositories, so this repository is **not eligible** for the
-live pilot. Its `ci.yml` carries a `merge_group` trigger anyway. The trigger is
-dormant here because GitHub only emits the event on a queue-enabled branch, and
-keeping it in place keeps the workflow qualified and audited.
+`2AMLogic/loom` is now organization-owned, so it is eligible for the pilot
+once the prerequisites below pass (#14159). As of 2026-11-17 its default branch
+requires `CI Result` and has **no** active `merge_queue` rule: it is in direct
+mode and stays there until the cutover. Its `ci.yml` carries a `merge_group`
+trigger and `.github/workflows/merge-group-check.yml` is installed (pinned
+`LOOM_VERSION`); both are dormant because GitHub only emits `merge_group` on a
+queue-enabled branch. The queue desired state is recorded, unapplied, in
+`docs/merge-queue-pilot/desired-state.json` (merge method MERGE, required
+contexts `CI Result` + `loom/merge-authorization`, one build at a time, 40 min
+check timeout).
 
 ## `loom-daemon merge-group-ci`
 
@@ -26,7 +30,7 @@ branch protection, and neither writes to any repository.
 
 | Verb | Exit 0 | Exit 1 | Exit 2 |
 |---|---|---|---|
-| `audit` | every relied-on suite and required context covers `merge_group` | a finding | could not run |
+| `audit` | the static audit passes | a finding | could not run |
 | `eligibility` | the repository may pilot queue mode | a named prerequisite failed | could not run |
 
 ```bash
@@ -44,9 +48,20 @@ path-filtered PR workflow is listed as advisory: a skipped required check never
 reports, so such a workflow cannot be a required gate. The audit evaluates each
 job and step of a relied-on workflow under synthetic `pull_request`, `push` and
 `merge_group` contexts with a small GitHub-expression evaluator. A value the
-evaluator cannot know statically, such as `matrix`, `steps`, or a `needs`
-output of a job that actually ran, counts as **unknown**, and an unknown
-counts as uncovered.
+evaluator cannot know statically, such as a `steps` output, is **unknown**.
+
+A relied-on job with an unknown `merge_group` condition is uncovered. For
+steps inside a job that is statically runnable on `merge_group`, the audit
+compares the `pull_request` and `merge_group` truth values in the order
+`false < unknown < true`. A lower value on `merge_group` produces a finding.
+Equal unknown values produce no step finding even when runtime outputs differ.
+
+`covered: true` for a required context means its matching job is relied on,
+its workflow has a `merge_group` trigger, and the job is statically evaluated
+to run and passes the per-job checks, including step checks. A workflow-wide
+finding can still name that job or one of its steps and cause the overall
+audit to fail. Verify suite execution from the job and step results on the
+exact merge-group SHA.
 
 | Code | Meaning |
 |---|---|
@@ -54,10 +69,11 @@ counts as uncovered.
 | `PR_ONLY_CONDITION` | a job's `if:` is false on `merge_group` (`github.event_name == 'pull_request'`, …) |
 | `SKIPPED_DEPENDENCY` | a job `needs:` a job skipped on `merge_group` and has no status function (`!cancelled() && …`) |
 | `PATH_FILTER_SKIP` | a job/step runs on `merge_group` only if a path-filter job's output says so |
-| `UNDETERMINED_CONDITION` | the condition cannot be decided on `merge_group` |
-| `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
+| `UNDETERMINED_CONDITION` | a job condition is unknown on `merge_group`, or a step condition is true on `pull_request` and unknown on `merge_group`, with no path-filter finding |
+| `PR_ONLY_STEP` | a step condition is false on `merge_group` and true or unknown on `pull_request` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
 | `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
+| `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` that contains both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (a text check for both clauses, not an evaluation of the condition; see Trust boundary below) |
 | `CANCELLING_CONCURRENCY` | `cancel-in-progress` is (or may be) true on `merge_group` |
 | `SHARED_CONCURRENCY_GROUP` | the group is not unique to the merge-group commit, so a pending run can be superseded |
 | `MISSING_REQUIRED_SUITE` | a required context matches no job name (matrix names are expanded) |
@@ -67,6 +83,45 @@ counts as uncovered.
 The output records each workflow's and job's `permissions:` for review, but
 permissions do not produce findings.
 
+#### Reproduce the step comparison
+
+In a disposable checkout, save this example as `.github/workflows/ci.yml` and
+run the audit locally.
+
+```yaml
+name: Audit example
+on: [pull_request, merge_group]
+jobs:
+  tests:
+    name: Dashboard Tests
+    runs-on: ubuntu-latest
+    steps:
+      - id: guide
+        if: github.event_name == 'merge_group'
+        run: echo "reuse=true" >> "$GITHUB_OUTPUT"
+      - name: Run suite
+        run: echo "suite ran"
+```
+
+```bash
+loom-daemon merge-group-ci audit --workflow ci.yml --required 'Dashboard Tests' --json
+```
+
+Run the same command after placing each `if:` in turn on `Run suite`.
+
+| Condition on `Run suite` | Exit | Required context | Step finding |
+|---|---:|---|---|
+| Omitted | 0 | Covered | None |
+| `github.event_name == 'pull_request'` | 1 | Uncovered | `PR_ONLY_STEP` |
+| `steps.guide.outputs.reuse != 'true'` | 0 | Covered | None |
+| `github.event_name != 'merge_group' \|\| steps.guide.outputs.reuse != 'true'` | 1 | Uncovered | `UNDETERMINED_CONDITION` |
+
+In the third case, the preceding step writes `reuse=true` only on
+`merge_group`, so the suite can be skipped there even though the static
+comparison passes. For a job-level control, omit the suite condition and add
+`if: vars.SUITE_ENABLED == 'true'` to the `tests` job. The unknown job condition
+produces `UNDETERMINED_CONDITION` and leaves the required context uncovered.
+
 The shipped `merge-group-check.yml` template needs `statuses: write`,
 `pull-requests: read`, `checks: read` and `contents: read`; without the reads
 `group-check` fails with `Resource not accessible by integration`. It also
@@ -74,7 +129,9 @@ triggers on `workflow_run` (`completed`, `gh-readonly-queue/**`) so the `pending
 status posted at `checks_requested` is re-evaluated when CI finishes; set
 `workflows:` to the name of your CI workflow. This is why the job needs no wait
 step; a copy that polls for CI holds a runner for the whole check duration and
-should drop the wait and keep this trigger.
+should drop the wait and keep this trigger. Its job-level `if:` admits a
+`workflow_run` only from a same-repo `merge_group` CI run. Keep that gate: the
+branch filter alone admits fork PRs (see "Trust boundary" below).
 
 A job that exists only to trim PR runs, such as `ci.yml`'s `changes`
 path-filter job, declares itself with a marker comment inside the job block:
@@ -172,13 +229,81 @@ run before the first grant write or revoke (#12579):
   the four image jobs, which must not be `Skipped` on push and must `Run` on
   `merge_group`.
 
+## Two contexts, two meanings
+
+- `CI Result` is the **test verdict**: the aggregate job in `ci.yml` over the
+  complete merge-group tree. It is a CI job, so `merge-group-ci audit` can match
+  it by job name.
+- `loom/merge-authorization` is an **authorization** context: a commit status
+  posted by `forge merge-queue group-check` (`merge-group-check.yml`) once the
+  Judge/Champion grant for every PR head in the group is live and the required
+  CI checks are green. It says "Loom still authorizes this group", never "tests
+  passed"; a revocation or head change turns it `failure`. Because it is a
+  status and not a job, `audit --required "loom/merge-authorization"` reports
+  `MISSING_REQUIRED_SUITE` by design. Audit the two contexts separately:
+
+```bash
+loom-daemon merge-group-ci audit --required "CI Result"        # QUALIFIED expected
+loom-daemon merge-group-ci audit -v --required "CI Result"     # also lists merge-group-check.yml
+```
+
+The audit covers every workflow in the checkout, so a QUALIFIED result also
+proves `merge-group-check.yml` has no `GROUP_CHECK_WITHOUT_CHECKOUT`,
+`GROUP_CHECK_UNGATED_WORKFLOW_RUN`, `CANCELLING_CONCURRENCY` or `SHARED_CONCURRENCY_GROUP` finding. (Do not pass
+`--workflow merge-group-check.yml` with `--required "CI Result"`: that
+restricts the audit to a file that does not host the job.)
+
+**Trust boundary.** The `workflow_run` `branches: ['gh-readonly-queue/**']`
+filter is **not** a security control. It matches the triggering CI run's head
+branch, and a fork PR author can name a fork branch `gh-readonly-queue/x`. Its
+`CI` run would then fire `merge-group-check.yml` in base-repo, default-branch
+context, with the `statuses: write` token. The job checks out that run's head,
+and `group-check` runs `forge.mergeQueue.statusCommand` from the checked-out
+`.loom/config.json` (`status_command::resolve`). Even with no queue, an empty
+group list still reaches `post_status`. What keeps untrusted code out is the
+**job-level `if:`**: it accepts a `merge_group` event, or a `workflow_run`
+whose triggering run had `event == 'merge_group'` and
+`head_repository.full_name == github.repository`. Merge groups exist only in
+the base repository, so a fork PR's CI run is skipped. A skipped run posts
+nothing, and nothing authorizes nothing (fail-closed). Keep the gate in every
+copy of the workflow, including copies made from
+`defaults/optional/github-workflows/merge-group-check.yml`.
+
+The audit's check of that gate (`GROUP_CHECK_UNGATED_WORKFLOW_RUN`) is a text
+tripwire against deleting the gate. It looks for both clauses as substrings of
+the whitespace-normalised `if:`; it does not evaluate the condition. An `||`
+between the two clauses is therefore not detected, so keep them joined by `&&`.
+The group-check scan also runs only for workflows with a `merge_group` trigger,
+so a `workflow_run`-only host of the `group-check` job is not audited.
+
+Two residual limits are known and accepted for the pilot:
+
+- On a genuine merge-group run, `.loom/config.json` comes from the group-head
+  checkout, so it includes queued PRs' edits. Those PRs are Judge-approved, but
+  a queued diff can still change the `statusCommand` that the writer runs.
+  Reading `.loom/` from `merge_group.base_sha` would close this, but the
+  `merge-group-ci` audit currently flags any checkout whose `ref:` is not the
+  merge-group head (`NON_MERGE_GROUP_CHECKOUT`). Changing that needs an audit
+  rule change, which is out of scope here.
+- The install step checks the binary's `.sha256`, which ships in the same
+  release. That is an integrity check only. The published `.sig`/`.pem` are not
+  verified, so the pinned `LOOM_VERSION` is the protection.
+
+Otherwise the workflow uses a sparse `.loom/` checkout of the merge-group
+commit. It holds `statuses: write`, `pull-requests: read`, `checks: read` and
+`contents: read`, and uses a non-cancelling per-head concurrency group.
+`workflow_run.workflows` names this repo's CI workflow (`CI`), which
+re-evaluates the `pending` status when CI completes.
+
 ## Enablement prerequisites (all required, in order)
 
 1. Phases A and B (#10255, #10256) have landed: the queue controls are present
    and the Champion handoff preserves the safety invariant.
 2. `loom-daemon merge-group-ci eligibility --repo <org>/<repo>` exits 0 for the
-   pilot repository. That requires an organization owner, push permission, an
-   active `merge_queue` rule, required checks, and a clean audit.
+   pilot repository (see "Pilot cutover" below for the full ordered procedure,
+   including broker/App enrollment and the publisher version-bump path). That
+   requires an organization owner, push permission, an active `merge_queue`
+   rule, required checks, and a clean audit.
 3. **Operator authorization.** Adding a `merge_queue` rule, changing required
    checks, or transferring a repository are protected settings changes. No
    agent makes them, and nothing in this tooling attempts them.
@@ -226,15 +351,71 @@ timed-out job(s); a `check-failure` drop whose group had cancelled runs, or
 whose refinement was skipped, names the guard that declined (failed step, real
 failure, run still in progress, unreadable read, no group commit, retry spent).
 
+## Pilot cutover (2AMLogic/loom)
+
+Every step is a read except step 6, which is an operator action. Do not set
+`champion.mergeMode: queue` or add the `merge_queue` rule before steps 1-5 pass.
+
+1. **Baseline (direct mode, one week or 20 merges).** Record: approval-to-merge
+   time (median/p90, `loom:pr` label to merge), CI runs and runner-minutes per
+   merged PR, queue ejections (zero in direct mode; the comparison column), and
+   red-main incidents (a failed `CI` push run on `main`). Example reads:
+   `gh run list --workflow CI --branch main --limit 100 --json conclusion,createdAt,updatedAt,event`
+   and `gh pr list --state merged --limit 50 --json number,mergedAt,labels`.
+2. **Audit:** the two commands under "Two contexts" above.
+3. **Eligibility / preflight (live, read-only):**
+   ```bash
+   loom-daemon merge-group-ci eligibility --repo 2AMLogic/loom --json
+   loom-daemon forge merge-queue preflight --repo 2AMLogic/loom
+   loom-daemon forge merge-queue mode        # must still print direct
+   ```
+   `NO_MERGE_QUEUE_RULE` is expected before step 6. `PERMISSION_UNKNOWN` is
+   also expected when the read uses a credential whose repository permissions
+   are not visible (the fleet App token, whose `can_push` reads `null`); no
+   other failure is allowed. Step 6's admin credential should show
+   `can_push: true` and so no `PERMISSION_UNKNOWN` (inferred from the `null`
+   under the App token, not yet run with an admin PAT). The daemon on the host
+   must include the `merge-group-ci` and `forge merge-queue` subcommands. `merge-group-ci` has shipped since
+   v0.19.695, `forge merge-queue preflight` since v0.19.761, `group-check`
+   since v0.19.879, and the `statusCommand` route since v0.19.1185. Running the
+   v0.19.1311 that `merge-group-check.yml` pins as `LOOM_VERSION` keeps the
+   host and the workflow on one version.
+4. **Broker / App enrollment (external, must be verified, not assumed).** The
+   writer identity that posts `loom/merge-authorization` needs `statuses: write`
+   on this repository. If the writer App's grant is read-only or too broad,
+   enroll the repository with the external status poster
+   (`forge.mergeQueue.statusCommand`, see
+   [merge-queue-authorization](merge-queue-authorization.md)) and confirm its
+   `--dry-run` probe passes (`eligibility` reports `facts.status_route`). The
+   broker allowlist and App installation are outside this repository.
+5. **Publisher version-bump / direct-push path (external, must be verified).**
+   `version-bump-on-merge.yml` posts the bump to the fleet publisher, which
+   commits to `main` directly. Under a `merge_queue` rule that direct commit must
+   still be accepted (publisher identity as a bypass actor limited to the
+   version-bump commit, or a queue-routed bump), or version bumps and releases
+   stall. Verify before step 6, and expect each bump to move the base under
+   queued entries (measure the rebuild churn).
+6. **Operator applies** `docs/merge-queue-pilot/desired-state.json`: the ruleset
+   `merge_queue` rule (merge method MERGE, required contexts `CI Result` and
+   `loom/merge-authorization`), then sets `champion.mergeMode: queue`. Re-run
+   step 3; `eligibility` must now exit 0.
+7. **Pilot week** compared to the step 1 baseline.
+
 ## Rollback to direct mode
 
 Direct mode is always available. To roll back:
 
-1. Switch the repository's merge mode back to direct with the Phase A setting.
-   The Champion then returns to `merge-pr.sh`.
-2. Have the operator disable or remove the `merge_queue` rule.
-3. Leave the `merge_group` trigger in place. It is inert without a queue and
-   keeps the workflow audited.
+1. Set the mode back to direct (remove `champion.mergeMode` or set it to
+   `direct`, or `LOOM_MERGE_MODE=direct`) and confirm:
+   `loom-daemon forge merge-queue mode`. The Champion then returns to
+   `merge-pr.sh`.
+2. Drain or dequeue in-flight entries:
+   `loom-daemon forge merge-queue status --pr <N>` and
+   `loom-daemon forge merge-queue dequeue --pr <N>` per queued PR.
+3. Have the operator disable or remove the `merge_queue` rule (a protected
+   settings change); keep `CI Result` required.
+4. Leave the `merge_group` trigger and `merge-group-check.yml` in place. They
+   are inert without a queue and keep the workflows audited.
 
 ## #9990 tier split (fast PR / full integration): evaluation
 

@@ -298,6 +298,8 @@ pub fn window(
 }
 
 #[cfg(test)]
+mod step_dispatch_tests;
+#[cfg(test)]
 mod tests;
 
 /// The #9454 plausibility ceiling: input tokens per wall-clock second above

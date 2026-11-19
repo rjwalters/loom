@@ -203,3 +203,166 @@ fn the_status_message_attribute_becomes_the_error_status_message() {
     }
     assert_eq!(spans[1].status.as_ref().unwrap().message, "", "no description off Error");
 }
+
+#[cfg(unix)]
+#[test]
+fn worker_preflight_fixture_process() {
+    let Ok(profile) = std::env::var("LOOM_TEST_REJECTION_PROFILE") else {
+        return;
+    };
+    crate::worker_spawn::cli(crate::worker_spawn::WorkerArgs {
+        scripts_dir: None,
+        args: ["-p", "fixture", "--profile", &profile]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
+    })
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_preflight_report_survives_the_journal_and_export_without_trusting_the_log() {
+    use crate::observability::lifecycle;
+    use crate::telemetry::trace::{journal::Journal, store::TraceStore};
+    use crate::worker_spawn::rejection::Receiver;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let pool = root.join(".loom/api-keys/fixture");
+    fs::create_dir_all(&pool).unwrap();
+    fs::write(pool.join("disabled.env"), "LOOM_FIXTURE_PREFLIGHT_KEY=inert-fixture-key\n").unwrap();
+    fs::write(pool.join(".disabled"), "disabled\n").unwrap();
+    fs::write(
+        root.join(".loom/config.json"),
+        r#"{
+            "observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"},
+            "runtimes":{"modelProfiles":{
+                "blocked":{"model":"fixture-model","providers":{"opencode":"fixture"},
+                    "credentialEnv":"LOOM_FIXTURE_PREFLIGHT_KEY","credentialPool":"fixture",
+                    "credentialTargets":{"opencode":"LOOM_FIXTURE_HARNESS_KEY"}},
+                "started":{"model":"fixture-model","providers":{"opencode":"fixture"}}
+            }}
+        }"#,
+    )
+    .unwrap();
+    let harness = root.join("fake-opencode");
+    fs::write(
+        &harness,
+        r#"#!/bin/sh
+if [ "${1:-}" = --version ]; then
+    echo 1.18.31
+    exit 0
+fi
+test -z "${LOOM_LAUNCH_REJECTION_FD+x}" || exit 1
+echo 'provider mentions sweep_id=older in an ordinary message'
+echo '# LOOM_LAUNCH_REJECTED code=78 stage=credential'
+exit 78
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let log_path = root.join("shared.log");
+    let attempt = |id: &str, profile: &str| {
+        let span = lifecycle::begin(root, id, SpanName::Sweep, TraceAttributes::new()).unwrap();
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(log, "==== loom-daemon dispatch: t sweep_id={id} item=7 step=builder ====")
+            .unwrap();
+        let mut worker = Command::new(std::env::current_exe().unwrap());
+        worker
+            .args([
+                "--exact",
+                "observability::otlp::traces::tests::worker_preflight_fixture_process",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root)
+            .env("LOOM_WORKSPACE", root)
+            .env("LOOM_RUNTIME", "opencode")
+            .env("LOOM_CONFIG_DEFAULTS_FILE", "")
+            .env("LOOM_SHARED_API_KEYS_DIR", "")
+            .env("LOOM_OPENCODE_BIN", &harness)
+            .env("LOOM_TEST_REJECTION_PROFILE", profile)
+            .current_dir(root)
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log));
+        span.command(&mut worker);
+        let receiver = Receiver::prepare(&mut worker, true).unwrap();
+        assert_eq!(
+            worker.status().unwrap().code(),
+            Some(78),
+            "{}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        receiver
+    };
+
+    let older = attempt("older", "started");
+    let current = attempt("current", "blocked");
+    let log = fs::read_to_string(&log_path).unwrap();
+    assert!(log.contains("# LOOM_CLI_START runtime=opencode"));
+    assert!(log.contains("provider mentions sweep_id=older"));
+    assert_eq!(
+        log.matches("# LOOM_LAUNCH_REJECTED code=78 stage=credential")
+            .count(),
+        2
+    );
+    assert_eq!(older.reason(), None, "the started child and reused log have no authority");
+    assert_eq!(current.reason(), Some("preflight_credential"));
+
+    let journal = Journal::for_context(&TraceStore::new(root).path(root, "current"));
+    let completed = journal.completed().unwrap();
+    let record = completed
+        .into_iter()
+        .find(|s| s.name == SpanName::RuntimePreflight)
+        .unwrap();
+    assert_eq!(record.status, SpanStatus::Error);
+    let expected = [
+        ("loom.admission.stage", "credential"),
+        ("loom.launch.runtime", "opencode"),
+        ("loom.launch.source", "global-environment"),
+    ];
+    let payload = serde_json::to_value(
+        build_traces_request(&[TelemetryEnvelope::new(
+            "fixture-host",
+            TelemetryRecord::Span(record.clone()),
+        )])
+        .unwrap(),
+    )
+    .unwrap();
+    let exported = payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"]
+        .as_array()
+        .unwrap();
+    let gateway = include_str!("../../../../../defaults/observability/collector/config.yaml");
+    let span_allowlist = gateway
+        .split("context: span\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("keep_keys(attributes"))
+        .unwrap();
+    for (key, value) in expected {
+        assert_eq!(record.attributes[key], value, "durable journal lost {key}");
+        assert!(
+            exported
+                .iter()
+                .any(|pair| pair["key"] == key && pair["value"]["stringValue"] == value),
+            "OTLP lost {key}"
+        );
+        assert!(span_allowlist.contains(&format!("\"{key}\"")), "gateway drops {key}");
+    }
+    assert!(!payload.to_string().contains("inert-fixture-key"));
+    assert!(!payload.to_string().contains("provider mentions"));
+}

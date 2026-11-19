@@ -812,6 +812,53 @@ fn offered(answer: &Value) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::capture::{
+        parse_outcome_line, seat_busy_exit_reason, StepEnd,
+    };
+
+    let mut snapshot = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+    snapshot.rows[0].is_pull_request = true;
+    snapshot.rows[0].labels = vec!["loom:review-requested".into()];
+    for early in [true, false] {
+        let s = open_server("node-a");
+        s.queue().refresh_repos([&snapshot]);
+        let first = ask_next(&s, A, 1, &["judge"]);
+        assert_eq!(offered(&first), [("acme/w".into(), 7)]);
+        let first_id = first["assignments"][0]["assignment_id"].as_str().unwrap();
+        assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
+        if early {
+            assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
+        } else {
+            let line = parse_outcome_line(
+                "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
+            );
+            let outcome = seat_busy_exit_reason(
+                StepRole::Judge,
+                7,
+                StepEnd::Exited(Some(REFUSAL_EXIT_CODE)),
+                line.as_ref(),
+            )
+            .unwrap();
+            let release = json!({"host_id": A, "assignment_id": first_id, "outcome": outcome});
+            let (reply, _) = s.handle(A, "/v1/release", release.to_string().as_bytes());
+            assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], true);
+        }
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (1, 0));
+        s.queue().refresh_repos([&snapshot]);
+        let second = ask_next(&s, B, 1, &["judge"]);
+        assert_eq!(offered(&second), [("acme/w".into(), 7)]);
+        assert_ne!(second["assignments"][0]["assignment_id"], first_id);
+    }
+}
+
+#[test]
 fn next_grants_up_to_free_slots_in_rounds_of_one_item_per_repo() {
     let s = open_server("node-a");
     let (w, x) = (next_snapshot("acme/w", &[1, 2, 3]), next_snapshot("acme/x", &[10, 11]));
@@ -1003,6 +1050,121 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
     let (reply, _) = s.handle(A, "/v1/park_ended", ended.as_bytes());
     assert_eq!(reply.status, 403);
+}
+
+// ---------------------------------------------------------------- the filing lock (#13918)
+
+fn filing_body(host: &str, holder: &str) -> Value {
+    json!({"host_id": host, "holder": holder, "label": "architect"})
+}
+
+fn filing_lock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> Value {
+    let (reply, call) =
+        s.handle(host, "/v1/filing-lock", filing_body(host, holder).to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(call.endpoint, "/v1/filing-lock");
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn filing_unlock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> bool {
+    let body = json!({"host_id": host, "holder": holder}).to_string();
+    let (reply, _) = s.handle(host, "/v1/filing-unlock", body.as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let v: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(v["server_epoch"], "epoch-test");
+    v["known"].as_bool().unwrap()
+}
+
+/// Two hosts at once: exactly one is granted, the other is held with a retry
+/// hint, and after the first unlocks the second is granted.
+#[test]
+fn two_hosts_filing_at_once_serialise_through_the_captain() {
+    let s = open_server("node-a");
+    let a = filing_lock(&s, A, "a-1");
+    assert_eq!(a["granted"], true);
+    assert_eq!(a["ttl_s"], 60);
+    let b = filing_lock(&s, B, "b-1");
+    assert_eq!(b["granted"], false);
+    assert_eq!(b["held_by"], A);
+    assert!(b["retry_after_s"].as_u64().unwrap() >= 1);
+    assert!(b.get("ttl_s").is_none());
+
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+#[test]
+fn an_unlock_from_a_non_holder_does_not_free_the_slot() {
+    let s = open_server("node-a");
+    filing_lock(&s, A, "a-1");
+    assert!(!filing_unlock(&s, B, "a-1"), "another host naming the holder id");
+    assert!(!filing_unlock(&s, A, "stale"), "a stale holder id");
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "still held");
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert!(!filing_unlock(&s, A, "a-1"), "a second unlock is a no-op");
+}
+
+/// A holder that never unlocks loses the slot at its TTL, and a refresh under
+/// the same holder id extends it.
+#[test]
+fn a_holder_that_never_unlocks_expires_and_a_refresh_extends_the_ttl() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    assert_eq!(filing_lock(&s, A, "a-1")["granted"], true);
+    clock.set(150);
+    let refreshed = filing_lock(&s, A, "a-1");
+    assert_eq!(refreshed["granted"], true, "the same holder is re-granted");
+    clock.set(200);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "refreshed to 210");
+    clock.set(210);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true, "A never unlocked: expired");
+    assert!(!filing_unlock(&s, A, "a-1"), "A's late unlock must not free B's hold");
+    assert_eq!(filing_lock(&s, A, "a-2")["granted"], false);
+}
+
+/// The sweep expires an abandoned hold without a request arriving.
+#[test]
+fn the_sweep_expires_an_abandoned_filing_hold() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    filing_lock(&s, A, "a-1");
+    clock.set(161);
+    s.sweep_points(chrono::Utc::now());
+    s.expire_filing();
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+/// A restart empties the slot (soft state): the holder's next refresh is
+/// granted again, it does not wedge.
+#[test]
+fn a_restarted_captain_grants_a_holders_refresh_again() {
+    let first = open_server("node-a");
+    filing_lock(&first, A, "a-1");
+    let second = open_server("node-a");
+    assert_eq!(filing_lock(&second, A, "a-1")["granted"], true);
+}
+
+/// Identity is the same `whois` as for claims, and the holder id is bounded.
+#[tokio::test]
+async fn filing_calls_need_a_roster_host_and_a_bounded_holder() {
+    let clock = Arc::new(ManualClock::default());
+    let addr = listen(server(StaticIdentity::default(), Arc::clone(&clock))).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["server_epoch"], "epoch-test");
+
+    let addr = listen(open_server("node-a")).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(B, "b-1")).await;
+    assert_eq!(status, 403, "host_id is not the caller's: {body}");
+    let (status, _) = post(addr, "/v1/filing-lock", &filing_body(A, "")).await;
+    assert_eq!(status, 400);
+    let long = "x".repeat(129);
+    let (status, _) = post(addr, "/v1/filing-unlock", &json!({"host_id": A, "holder": long})).await;
+    assert_eq!(status, 400);
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!((status, &body["granted"]), (200, &json!(true)));
 }
 
 /// #14047, end to end: the Builder step's no-progress hold survives a TTL

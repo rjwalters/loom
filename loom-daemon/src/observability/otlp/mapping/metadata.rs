@@ -181,6 +181,13 @@ pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
                 if let Some(attempt) = entry.attempt {
                     values.push(kv_int("attempt", i64::from(attempt)));
                 }
+                // #14242: the effort this phase's launch ran at; absent, never
+                // `default`, when no effort could be named.
+                if let Some(effort) = entry.effort.as_deref().map(str::trim) {
+                    if !effort.is_empty() {
+                        values.push(kv_string("effort", effort.to_string()));
+                    }
+                }
                 for (key, value) in [
                     ("tokens_in", entry.tokens_in),
                     ("tokens_out", entry.tokens_out),

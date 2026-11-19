@@ -89,6 +89,9 @@ pub struct RefState {
     /// without merging reads exactly like a closed issue, and only the second
     /// is a resolved blocker.
     pub is_pr: bool,
+    /// When it closed/merged (RFC 3339; the forge's `closed_at`), if it did
+    /// and the forge said so (#13889).
+    pub closed_at: Option<String>,
 }
 
 /// One PR declared to close an issue, as the batched query reports it.
@@ -148,6 +151,13 @@ pub trait StaleBlockedForge {
     /// Whether the rate-limit breaker is suppressing forge calls.
     fn breaker_open(&mut self) -> bool;
 
+    /// Whether the forge's trust rules believe an author with this login and
+    /// `author_association` (#13889: a body marker is read only from a
+    /// trusted author). Default: nobody — fail safe.
+    fn trusts_author(&mut self, _login: Option<&str>, _association: Option<&str>) -> bool {
+        false
+    }
+
     /// What the reads above have spent so far.
     fn meter(&self) -> Meter;
 }
@@ -202,6 +212,8 @@ struct Pending {
     unparsed_unchecked: usize,
     declared: Vec<crate::park_record::BlockerRef>,
     held: Option<super::Held>,
+    permanent_block: bool,
+    hold: Option<super::HoldComment>,
     closing: Vec<ClosingRef>,
     failed: Option<Unreadable>,
 }
@@ -374,6 +386,8 @@ fn read_text(
         unparsed_unchecked: 0,
         declared: Vec::new(),
         held: None,
+        permanent_block: false,
+        hold: None,
         closing: Vec::new(),
         failed: None,
         row,
@@ -398,6 +412,15 @@ fn read_text(
             }
         }
     };
+    // #13889: a trusted permanent-block marker (comment, or the body when its
+    // author is trusted) and the newest trusted hold comment. An unreadable
+    // listing never gets here — it is `failed` above, i.e. unevaluated.
+    p.permanent_block = comments
+        .iter()
+        .any(|c| c.trusted && super::hold::has_permanent_block(&c.body))
+        || (super::hold::has_permanent_block(&body)
+            && forge.trusts_author(p.row.author.as_deref(), p.row.author_association.as_deref()));
+    p.hold = super::hold::newest_hold(&comments);
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
     // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
@@ -646,12 +669,71 @@ fn evidence_for(
         remote,
         self_block: None,
         held: p.held.clone(),
+        permanent_block: p.permanent_block,
+        hold: p.hold.clone(),
+        resolved_at: None,
     };
+    // `classify` fails closed to "held" while `resolved_at` is unset, so ask
+    // whether the artifact would be stale *without* the hold before reading.
+    if evidence.hold.is_some() {
+        let without_hold = Evidence {
+            hold: None,
+            permanent_block: false,
+            ..evidence.clone()
+        };
+        if matches!(classify(&without_hold), Verdict::Stale(_)) {
+            evidence.resolved_at = resolution_time(forge, p, states, guard);
+        }
+    }
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
         guard.core_stop(&forge.meter())?;
         evidence.self_block = self_block(forge, &p.row)?;
     }
     Ok(evidence)
+}
+
+/// When the last resolved cited blocker closed (#13889), or `None` when any
+/// resolved one has no readable time — the caller fails closed to "held".
+///
+/// A ticked `## Dependencies` box is not in `states` (only unchecked entries
+/// are read run-wide), so it is read here, and only for an artifact that
+/// already has a hold comment and would otherwise be reported stale.
+fn resolution_time(
+    forge: &mut dyn StaleBlockedForge,
+    p: &Pending,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
+    guard: &mut Guard,
+) -> Option<String> {
+    use chrono::DateTime;
+    let mut keys: Vec<RefKey> = p.prose.iter().map(|n| (None, *n)).collect();
+    keys.extend(
+        p.declared
+            .iter()
+            .filter_map(|b| Some((Some(b.repo.clone()?), i64::try_from(b.number).ok()?))),
+    );
+    keys.extend(p.named.iter().map(|d| (d.repo.clone(), d.number)));
+    keys.sort();
+    keys.dedup();
+    let mut latest: Option<(DateTime<chrono::FixedOffset>, String)> = None;
+    for key in keys {
+        let state = match states.get(&key) {
+            Some(Ok(s)) => s.clone(),
+            Some(Err(_)) => return None,
+            None => {
+                guard.core_stop(&forge.meter()).ok()?;
+                forge.ref_state(key.0.as_deref(), key.1).ok()??
+            }
+        };
+        if !super::resolved(&state.state) {
+            continue;
+        }
+        let raw = state.closed_at?;
+        let at = DateTime::parse_from_rfc3339(raw.trim()).ok()?;
+        if latest.as_ref().is_none_or(|(l, _)| at > *l) {
+            latest = Some((at, raw));
+        }
+    }
+    latest.map(|(_, raw)| raw)
 }
 
 /// A parked PR's own superseding block. Labels come from the listing row; the
@@ -694,6 +776,8 @@ pub struct GhStaleBlockedForge {
     slug: String,
     /// What this run's evidence reads have spent.
     meter: Meter,
+    /// Who is believed (#13889), resolved on first use.
+    trust: Option<crate::comment_trust::TrustPolicy>,
 }
 
 impl GhStaleBlockedForge {
@@ -713,7 +797,14 @@ impl GhStaleBlockedForge {
             repo,
             slug,
             meter: Meter::default(),
+            trust: None,
         }
+    }
+
+    fn trust(&mut self) -> &crate::comment_trust::TrustPolicy {
+        let root = &self.root;
+        self.trust
+            .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(root))
     }
 
     /// A conditional GET through the shared ETag store. `repo` overrides the
@@ -770,7 +861,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
             let body = self
                 .get(ops::COMMENT_LIST, None, &url)?
                 .ok_or_else(|| anyhow!("gh api {url} failed: HTTP 404"))?;
-            let rows = parse_comments(&body).map_err(|e| anyhow!("parse {url}: {e}"))?;
+            let rows = parse_comments_with(&body, Some(self.trust()))
+                .map_err(|e| anyhow!("parse {url}: {e}"))?;
             let short = rows.len() < COMMENT_PAGE;
             all.extend(rows);
             if short {
@@ -863,6 +955,11 @@ impl StaleBlockedForge for GhStaleBlockedForge {
 
     fn breaker_open(&mut self) -> bool {
         crate::rate_limit_breaker::global_skip_pass(CALLER)
+    }
+
+    fn trusts_author(&mut self, login: Option<&str>, association: Option<&str>) -> bool {
+        let author = crate::comment_trust::Author::new(login, association);
+        self.trust().trusts(&author)
     }
 
     fn meter(&self) -> Meter {
@@ -1022,6 +1119,8 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
         labels: Vec<RawLabel>,
         #[serde(default)]
         pull_request: Option<RawPr>,
+        #[serde(default)]
+        closed_at: Option<String>,
     }
     let raw: Raw = serde_json::from_str(body.trim())?;
     let is_pr = raw.pull_request.is_some();
@@ -1037,6 +1136,7 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
         },
         labels: raw.labels.into_iter().map(|l| l.name).collect(),
         is_pr,
+        closed_at: raw.closed_at,
     })
 }
 
@@ -1077,27 +1177,34 @@ pub fn parse_pr_merge_state(body: &str) -> Result<(String, String)> {
 /// # Errors
 /// The body is not a comment array.
 pub fn parse_comments(body: &str) -> Result<Vec<extract::Comment>> {
-    #[derive(Deserialize)]
-    struct RawUser {
-        #[serde(default)]
-        login: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct Raw {
-        #[serde(default)]
-        body: Option<String>,
-        #[serde(default)]
-        user: Option<RawUser>,
-    }
-    let rows: Vec<Raw> = serde_json::from_str(body.trim())?;
+    parse_comments_with(body, None)
+}
+
+/// [`parse_comments`], also stamping each comment's `trusted` flag from
+/// `policy` (#13889). Without a policy nothing is trusted.
+///
+/// # Errors
+/// The body is not a comment array.
+pub fn parse_comments_with(
+    body: &str,
+    policy: Option<&crate::comment_trust::TrustPolicy>,
+) -> Result<Vec<extract::Comment>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body.trim())?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let login = r.user.and_then(|u| u.login).unwrap_or_default();
-            let login = login.strip_suffix("[bot]").unwrap_or(&login).to_string();
+        .map(|v| {
+            let text = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+            let login = v
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let login = login.strip_suffix("[bot]").unwrap_or(login).to_string();
             extract::Comment {
                 author: extract::Author { login },
-                body: r.body.unwrap_or_default(),
+                body: text("body").unwrap_or_default().to_string(),
+                created_at: text("created_at").map(str::to_string),
+                trusted: policy.is_some_and(|p| p.trusts_json(&v)),
             }
         })
         .collect())

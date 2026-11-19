@@ -2419,6 +2419,7 @@ mod tests {
         report.per_repo = vec![crate::types::RepoStatus {
             root: root.to_path_buf(),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -2674,7 +2675,6 @@ mod tests {
                 "queues",
                 "throughput",
                 "operator_attention",
-                "peer_coordination",
                 "stale_sweeps",
                 "auto_update",
                 "worktree_reaper",

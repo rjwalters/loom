@@ -34,6 +34,8 @@ mod record_rework;
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
+#[path = "telemetry_hold_transitions.rs"]
+pub(crate) mod telemetry_hold_transitions;
 #[path = "telemetry_join.rs"]
 mod telemetry_join;
 #[path = "telemetry_live.rs"]
@@ -58,6 +60,11 @@ pub(crate) enum TelemetryCommand {
     /// file, send one `host.export` probe, and read it back requiring
     /// `host.id == harness.ingest.principal == <host>`.
     TelemetryJoin(telemetry_join::JoinArgs),
+    /// Query `hold.transition` records from the telemetry store for a date
+    /// range across repos (Issue #14094): per-repo counts with a Champion
+    /// merge-risk self-release confidence breakout, through the
+    /// telemetry-reader. Fails closed on an unset or unreachable reader.
+    TelemetryHoldTransitions(telemetry_hold_transitions::HoldTransitionsArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
     TelemetryCapabilities {
         /// Fail when this artifact cannot export OTLP.
@@ -173,6 +180,7 @@ impl TelemetryCommand {
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryJoin(args) => args.run().await,
+            TelemetryCommand::TelemetryHoldTransitions(args) => args.run(),
             // The OTLP exporter is compiled unconditionally (#10700), so
             // `otlp` is always `true` and `--require-otlp` always passes. The
             // flag stays so build/roll probes (`daemon-build.sh`,

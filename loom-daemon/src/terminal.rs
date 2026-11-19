@@ -1,7 +1,6 @@
 use crate::types::{TerminalId, TerminalInfo};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,64 +57,6 @@ impl TerminalManager {
             })
             .map(Path::to_path_buf)
             .or_else(|| std::env::var("LOOM_WORKSPACE").ok().map(PathBuf::from))
-    }
-
-    /// Derive the repository root by walking up from a worktree path.
-    ///
-    /// Distinct from `find_repo_root` above (which starts from a tmux session's
-    /// `working_dir` / `LOOM_WORKSPACE`): this walks a *worktree* path
-    /// (e.g. `/repo/.loom/worktrees/issue-42` or `/Volumes/Ext/repo/issue-42`)
-    /// looking for the ancestor that contains both `.loom/` and `.git`, i.e. the
-    /// main workspace. Used by `destroy_terminal()` both to gate override-aware
-    /// worktree GC and to run `git worktree remove` from the repo root.
-    fn find_repo_root_from_worktree(worktree_path: &Path) -> Option<PathBuf> {
-        worktree_path
-            .ancestors()
-            .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
-            .map(Path::to_path_buf)
-    }
-
-    /// Whether `LOOM_PRESERVE_WORKTREE` disables worktree cleanup for this run.
-    ///
-    /// Mirrors `defaults/scripts/agent-destroy.sh`'s guard exactly: bash tests
-    /// `[[ "${LOOM_PRESERVE_WORKTREE:-0}" == "1" ]]`, i.e. an **exact-string**
-    /// comparison against `"1"` — *not* a truthy/falsy coercion. So
-    /// `LOOM_PRESERVE_WORKTREE=true` or `=yes` does NOT enable preserve, matching
-    /// bash. When set, cleanup is skipped unconditionally (the outermost guard).
-    fn preserve_worktree_env() -> bool {
-        std::env::var("LOOM_PRESERVE_WORKTREE").is_ok_and(|v| v == "1")
-    }
-
-    /// Whether the worktree at `worktree_path` is eligible for automatic removal
-    /// under the Loom ownership model (issue #3334).
-    ///
-    /// Mirrors `defaults/scripts/agent-destroy.sh` (~lines 129-160): only
-    /// worktrees carrying a `.loom-managed` sentinel file in their root are
-    /// Loom-created and thus eligible for cleanup. A missing sentinel means the
-    /// worktree is user-owned; we refuse to remove it and log a warning worded
-    /// identically to bash (`— refusing to remove (user-owned)`, using an em dash).
-    ///
-    /// The `LOOM_PRESERVE_WORKTREE=1` override is checked first (outermost), so a
-    /// preserve request short-circuits ahead of the sentinel check — parity with
-    /// bash's outer-to-inner guard ordering.
-    fn worktree_removal_allowed(worktree_path: &Path) -> bool {
-        if Self::preserve_worktree_env() {
-            log::info!(
-                "Worktree cleanup skipped (LOOM_PRESERVE_WORKTREE=1): {}",
-                worktree_path.display()
-            );
-            return false;
-        }
-
-        if !worktree_path.join(".loom-managed").is_file() {
-            log::warn!(
-                "Worktree at {} lacks .loom-managed sentinel — refusing to remove (user-owned)",
-                worktree_path.display()
-            );
-            return false;
-        }
-
-        true
     }
 
     /// Set up per-agent `CLAUDE_CONFIG_DIR` isolation for a tmux session.
@@ -398,7 +339,6 @@ impl TerminalManager {
             working_dir,
             created_at: chrono::Utc::now().timestamp(),
             role: role.cloned(),
-            worktree_path: None,
             agent_pid: None,
             agent_status: crate::types::AgentStatus::default(),
             last_interval_run: None,
@@ -487,80 +427,11 @@ impl TerminalManager {
         }
     }
 
-    pub fn set_worktree_path(&mut self, id: &TerminalId, worktree_path: &str) -> Result<()> {
-        let info = self
-            .terminals
-            .get_mut(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
-
-        info.worktree_path = Some(worktree_path.to_string());
-
-        // Set LOOM_WORKTREE_PATH on the tmux session so Claude Code's
-        // PreToolUse hook can block Edit/Write outside the worktree (issue #2441).
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "set-environment",
-                "-t",
-                &info.tmux_session,
-                "LOOM_WORKTREE_PATH",
-                worktree_path,
-            ])
-            .output();
-
-        log::info!("Set worktree path for terminal {id}: {worktree_path}");
-        Ok(())
-    }
-
     pub fn destroy_terminal(&mut self, id: &TerminalId) -> Result<()> {
         let info = self
             .terminals
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
-
-        // Capture worktree info before killing the session.
-        // We need to kill the tmux session FIRST to avoid leaving the shell's
-        // CWD pointing at a deleted worktree path (see issue #2413).
-        //
-        // The GC gate is override-aware (#3536): a worktree qualifies if it lives
-        // under the resolved worktree root (which honors LOOM_WORKTREE_ROOT /
-        // `.loom/config.json` → worktree.root) OR contains the historical
-        // `.loom/worktrees` substring. We derive `repo_root` from the worktree
-        // path *before* the gate so it's available both here and for the later
-        // `git worktree remove` invocation without duplicating the ancestor walk.
-        let worktree_to_remove: Option<(String, PathBuf, Option<PathBuf>)> =
-            if let Some(ref worktree_path) = info.worktree_path {
-                let path = PathBuf::from(worktree_path);
-                let repo_root = Self::find_repo_root_from_worktree(&path);
-                let is_worktree = match repo_root {
-                    Some(ref root) => crate::worktree_root::is_worktree_path(&path, root),
-                    // No repo root resolved (worktree already partly gone): fall
-                    // back to the historical substring check alone.
-                    None => path.to_string_lossy().contains(".loom/worktrees"),
-                };
-                if is_worktree {
-                    let other_users = self
-                        .terminals
-                        .values()
-                        .filter(|t| t.id != *id && t.worktree_path.as_ref() == Some(worktree_path))
-                        .count();
-
-                    if other_users == 0 {
-                        Some((worktree_path.clone(), path, repo_root))
-                    } else {
-                        log::info!(
-                            "Skipping worktree removal at {} ({} other terminal(s) still using it)",
-                            path.display(),
-                            other_users
-                        );
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
 
         // Stop pipe-pane (passing no command closes the pipe)
         let _ = Command::new("tmux")
@@ -578,67 +449,6 @@ impl TerminalManager {
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()
             .and_then(|mut c| c.wait());
-
-        // Now that the tmux session is dead, safe to remove the worktree
-        // without breaking any shell's working directory.
-        // Ownership-model guards (bash parity with agent-destroy.sh, #3334):
-        // honor LOOM_PRESERVE_WORKTREE=1 (outermost) and refuse to remove a
-        // worktree lacking the `.loom-managed` sentinel (user-owned). Both run
-        // before the actual `git worktree remove` (and its fs::remove_dir_all
-        // fallback). worktree_removal_allowed() logs the reason for a skip; when
-        // it returns false we skip only the removal and still fall through to the
-        // output-file / CLAUDE_CONFIG_DIR cleanup and registry removal below.
-        if let Some((worktree_path, path, repo_root)) = worktree_to_remove {
-            if Self::worktree_removal_allowed(&path) {
-                log::info!("Removing worktree at {} (no other terminals using it)", path.display());
-
-                // repo_root was resolved before the gate (via find_repo_root_from_worktree)
-                // and is reused here to run git from the repo root, avoiding
-                // CWD-inside-worktree issues.
-
-                // First try to remove the worktree via git
-                let mut cmd = Command::new("git");
-                cmd.args(["worktree", "remove", &worktree_path]);
-                if let Some(ref root) = repo_root {
-                    cmd.current_dir(root);
-                }
-                let output = cmd.output();
-
-                if let Ok(output) = output {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        log::warn!("git worktree remove failed: {stderr}");
-                        log::info!("Attempting force removal...");
-
-                        // Try force removal
-                        let mut cmd = Command::new("git");
-                        cmd.args(["worktree", "remove", "--force", &worktree_path]);
-                        if let Some(ref root) = repo_root {
-                            cmd.current_dir(root);
-                        }
-                        let _ = cmd.output();
-                    }
-                }
-
-                // Also try to remove directory manually as fallback
-                let _ = fs::remove_dir_all(&path);
-
-                // #5950: the daemon's terminal-destroy path is a worktree
-                // remover too, and (like agent-destroy.sh, its bash twin) it
-                // never consults issue-open state — destroying the terminal IS
-                // the request. Record it so the ledger's "no entry ⇒ no Loom
-                // path did it" reading stays true.
-                if let Some(ref root) = repo_root {
-                    crate::worktree_ops::removal_log::record(
-                        root,
-                        "terminal_destroy",
-                        &path,
-                        None,
-                        "terminal_destroyed",
-                    );
-                }
-            }
-        }
 
         // Clean up the output file
         let output_file = format!("/tmp/loom-{id}.out");
@@ -734,30 +544,6 @@ impl TerminalManager {
         log::debug!("Read {len} bytes successfully", len = buffer.len());
 
         Ok((buffer, file_size))
-    }
-
-    pub fn resize_terminal(&self, id: &TerminalId, cols: u16, rows: u16) -> Result<()> {
-        let info = self
-            .terminals
-            .get(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
-
-        // Resize tmux window (which resizes the pane when there's only one pane)
-        Command::new("tmux")
-            .args(["-L", "loom"])
-            .args([
-                "resize-window",
-                "-t",
-                &info.tmux_session,
-                "-x",
-                &cols.to_string(),
-                "-y",
-                &rows.to_string(),
-            ])
-            .spawn()?
-            .wait()?;
-
-        Ok(())
     }
 
     /// Restore terminals from existing tmux sessions.
@@ -911,7 +697,6 @@ impl TerminalManager {
                         working_dir: None,
                         created_at: chrono::Utc::now().timestamp(),
                         role: None,
-                        worktree_path: None,
                         agent_pid: None,
                         agent_status: crate::types::AgentStatus::default(),
                         last_interval_run: None,
@@ -1054,105 +839,6 @@ impl TerminalManager {
         );
 
         Ok(has_session)
-    }
-
-    /// List all available loom tmux sessions
-    #[allow(clippy::unused_self)]
-    pub fn list_available_sessions(&self) -> Vec<String> {
-        let output = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output();
-
-        // If tmux list-sessions fails (no server running), return empty vec
-        let Ok(output) = output else {
-            log::error!("Failed to execute tmux list-sessions command");
-            return Vec::new();
-        };
-
-        // Enhanced logging: Check for tmux server failure
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Self::handle_tmux_error(&stderr, "list_available_sessions");
-
-            return Vec::new();
-        }
-
-        let sessions = String::from_utf8_lossy(&output.stdout);
-        let loom_sessions: Vec<String> = sessions
-            .lines()
-            .filter(|s| s.starts_with("loom-"))
-            .map(std::string::ToString::to_string)
-            .collect();
-
-        log::info!("📊 Found {} loom sessions", loom_sessions.len());
-        loom_sessions
-    }
-
-    /// Attach an existing terminal record to a different tmux session
-    pub fn attach_to_session(&mut self, id: &TerminalId, session_name: String) -> Result<()> {
-        let info = self
-            .terminals
-            .get_mut(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
-
-        // Verify the session exists
-        let output = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args(["has-session", "-t", &session_name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            // Enhanced logging: Distinguish failure modes
-            if Self::handle_tmux_error(&stderr, "attach_to_session") {
-                return Err(anyhow!("tmux server is not running"));
-            }
-
-            log::error!("tmux has-session failed for '{session_name}': {stderr}");
-            return Err(anyhow!("Tmux session '{session_name}' does not exist"));
-        }
-
-        // Update the terminal info to point to the new session
-        info.tmux_session = session_name;
-
-        Ok(())
-    }
-
-    /// Kill a tmux session by name
-    #[allow(clippy::unused_self)]
-    pub fn kill_session(&self, session_name: &str) -> Result<()> {
-        // Verify the session exists
-        let check_output = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args(["has-session", "-t", session_name])
-            .output()?;
-
-        if !check_output.status.success() {
-            let stderr = String::from_utf8_lossy(&check_output.stderr);
-
-            // Enhanced logging: Distinguish failure modes
-            if Self::handle_tmux_error(&stderr, "kill_session") {
-                return Err(anyhow!("tmux server is not running"));
-            }
-
-            log::error!("tmux has-session failed for '{session_name}': {stderr}");
-            return Err(anyhow!("Tmux session '{session_name}' does not exist"));
-        }
-
-        // Kill process tree before destroying the session
-        Self::kill_process_tree(session_name, false);
-
-        // Kill the session (may already be dead from kill_process_tree)
-        let _ = Command::new("tmux")
-            .args(["-L", "loom"])
-            .args(["kill-session", "-t", session_name])
-            .spawn()
-            .and_then(|mut c| c.wait());
-
-        log::info!("Killed tmux session: {session_name}");
-        Ok(())
     }
 }
 
@@ -1325,7 +1011,6 @@ mod tests {
             working_dir: None,
             created_at: chrono::Utc::now().timestamp(),
             role: None,
-            worktree_path: None,
             agent_pid: None,
             agent_status: crate::types::AgentStatus::default(),
             last_interval_run: None,
@@ -1376,115 +1061,7 @@ mod tests {
         );
     }
 
-    // ===== worktree ownership-model guard tests (#3540) =====
-    //
-    // These cover the bash-parity guards added to destroy_terminal()'s removal
-    // path: the `.loom-managed` sentinel check and the LOOM_PRESERVE_WORKTREE=1
-    // override (mirroring defaults/scripts/agent-destroy.sh ~lines 129-160).
-    //
-    // std::env::set_var mutates process-global state; serialize env-touching
-    // tests so parallel `cargo test` execution doesn't race on
-    // LOOM_PRESERVE_WORKTREE. Same pattern as worktree_root.rs's ENV_LOCK.
+    // Serializes tests that mutate process-global env (LOOM_NO_RESTORE).
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Run `f` with LOOM_PRESERVE_WORKTREE set to `value` (or unset if None),
-    /// restoring the prior value afterward. Serialized via ENV_LOCK.
-    fn with_preserve_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("LOOM_PRESERVE_WORKTREE").ok();
-        match value {
-            Some(v) => std::env::set_var("LOOM_PRESERVE_WORKTREE", v),
-            None => std::env::remove_var("LOOM_PRESERVE_WORKTREE"),
-        }
-        let result = f();
-        match prev {
-            Some(p) => std::env::set_var("LOOM_PRESERVE_WORKTREE", p),
-            None => std::env::remove_var("LOOM_PRESERVE_WORKTREE"),
-        }
-        result
-    }
-
-    /// Create a worktree dir with a `.loom-managed` sentinel file (simulating a
-    /// Loom-created worktree).
-    fn make_managed_worktree() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(".loom-managed"), "").unwrap();
-        tmp
-    }
-
-    #[test]
-    fn removal_allowed_when_sentinel_present_and_env_unset() {
-        // The common case: worktree present, `.loom-managed` sentinel present,
-        // LOOM_PRESERVE_WORKTREE unset → removal proceeds (no behavior change).
-        let wt = make_managed_worktree();
-        with_preserve_env(None, || {
-            assert!(TerminalManager::worktree_removal_allowed(wt.path()));
-        });
-    }
-
-    #[test]
-    fn removal_skipped_when_sentinel_absent() {
-        // A worktree path recorded via set_worktree_path()/SetWorktreePath IPC
-        // that lacks `.loom-managed` (user-owned or an unvalidated IPC path) must
-        // NOT be removed — the guard refuses it.
-        let tmp = tempfile::tempdir().unwrap();
-        with_preserve_env(None, || {
-            assert!(!TerminalManager::worktree_removal_allowed(tmp.path()));
-        });
-    }
-
-    #[test]
-    fn removal_skipped_when_preserve_env_is_one() {
-        // LOOM_PRESERVE_WORKTREE=1 skips removal unconditionally, even with the
-        // sentinel present.
-        let wt = make_managed_worktree();
-        with_preserve_env(Some("1"), || {
-            assert!(!TerminalManager::worktree_removal_allowed(wt.path()));
-        });
-    }
-
-    #[test]
-    fn removal_skipped_when_preserve_env_is_one_even_without_sentinel() {
-        // The env override is the outermost guard: it short-circuits ahead of the
-        // sentinel check, so removal is skipped regardless of sentinel presence.
-        let tmp = tempfile::tempdir().unwrap();
-        with_preserve_env(Some("1"), || {
-            assert!(!TerminalManager::worktree_removal_allowed(tmp.path()));
-        });
-    }
-
-    #[test]
-    fn removal_allowed_when_preserve_env_is_non_one_value() {
-        // Parity with bash's exact-string check `[[ ... == "1" ]]`: non-"1"
-        // truthy-looking values do NOT enable preserve. With the sentinel present,
-        // removal still proceeds.
-        let wt = make_managed_worktree();
-        for value in ["true", "yes", "0", "", "TRUE", "11", "1 "] {
-            with_preserve_env(Some(value), || {
-                assert!(
-                    TerminalManager::worktree_removal_allowed(wt.path()),
-                    "LOOM_PRESERVE_WORKTREE={value:?} must not enable preserve"
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn preserve_worktree_env_matches_exact_string_one() {
-        with_preserve_env(Some("1"), || {
-            assert!(TerminalManager::preserve_worktree_env());
-        });
-        for value in ["true", "yes", "0", "", "01", "1x"] {
-            with_preserve_env(Some(value), || {
-                assert!(
-                    !TerminalManager::preserve_worktree_env(),
-                    "LOOM_PRESERVE_WORKTREE={value:?} must not be treated as preserve"
-                );
-            });
-        }
-        with_preserve_env(None, || {
-            assert!(!TerminalManager::preserve_worktree_env());
-        });
-    }
 }

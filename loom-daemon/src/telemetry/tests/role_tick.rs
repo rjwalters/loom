@@ -1,8 +1,8 @@
 //! `role_tick.outcome` schema tests (Issue #8056) — the seventh record kind
 //! and the `CURRENT_SCHEMA_VERSION` bump it forces.
 //!
-//! A sibling module rather than more lines in `telemetry/tests.rs`, which is
-//! at the `scripts/check-file-size-budget.sh` threshold.
+//! A sibling module rather than more lines in the already-large
+//! `telemetry/tests.rs`.
 
 use super::super::*;
 use super::ts;
@@ -47,6 +47,7 @@ pub(super) fn role_tick_outcome() -> TelemetryRecord {
         }),
         source: None,
         sweep_id: None,
+        stage: None,
         issue: None,
         pr_number: None,
         deferred_by: None,
@@ -126,6 +127,7 @@ fn role_tick_outcome_omits_every_unobserved_field() {
         actions: None,
         source: None,
         sweep_id: None,
+        stage: None,
         issue: None,
         pr_number: None,
         deferred_by: None,
@@ -351,4 +353,26 @@ fn role_tick_outcome_judge_and_step_fields_are_additive() {
     assert_eq!(back, record);
     let parsed: RoleTickOutcomeRecord = serde_json::from_value(bare).unwrap();
     assert_eq!(parsed.found_work, None);
+}
+
+/// #14048: the per-stage join keys this record now carries — `stage` and the
+/// launch identity `runtime`/`provider`/`profile` — must survive the gateway
+/// collector's log `keep_keys` allowlist, or the cross-host per-stage usage
+/// join silently loses exactly the attributes it exists on. Pinned the same
+/// way `work_started` pins its own keys.
+#[test]
+fn collector_keeps_the_step_stage_and_launch_identity_attributes() {
+    const CONFIG: &str = include_str!("../../../../defaults/observability/collector/config.yaml");
+    let keep = CONFIG
+        .lines()
+        .find(|l| l.contains("keep_keys(attributes, [") && l.contains("loom.ci.chunk_index"))
+        .expect("the transform/privacy log keep_keys line");
+    for key in [
+        "loom.stage",
+        "loom.profile",
+        "loom.runtime",
+        "loom.provider",
+    ] {
+        assert!(keep.contains(&format!("\"{key}\"")), "collector drops {key}");
+    }
 }

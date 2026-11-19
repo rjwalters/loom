@@ -604,7 +604,7 @@ Fail closed: `1` (the gate could not run) is handled as `10`, never as `0`.
 | Exit | Instead of enriching |
 |---|---|
 | `10`/`12` | Do the premise check now and post the record its `REASON=`/`EVIDENCE-CANDIDATE=` lines point at; re-run. |
-| `11` | Route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. |
+| `11` | Read `RESOLUTION=`. `pending`: route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. `stale`/`conflict`/`malformed`: the operator's recorded choice no longer matches the text; re-ask with the original premise record kept (never rewrite it to `verdict=clear`). `rejected`/`deferred`/`rescope`: not an approval to proceed. Never treat an un-park or an approval-sounding comment as the choice: only exit `0` with `RESOLUTION=approved` (a verified `loom-daemon operator-decision resolve`, #14399) lets a deliberate reversal be enriched. |
 | `13` | Premise false — close or rescope per "Issues Are Suggestions" above. |
 
 Record format, scoped population, and why the gate sits one stage before you:

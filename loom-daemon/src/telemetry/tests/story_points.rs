@@ -1,9 +1,9 @@
 //! `sweep.started` / `sweep.outcome` story-point field tests (Issue #9432,
 //! epic #9429).
 //!
-//! A sibling module rather than more lines in `telemetry/tests.rs`, which is at
-//! the `scripts/check-file-size-budget.sh` threshold — the same reason
-//! `complexity.rs` and `role_tick.rs` are split out beside this one.
+//! A sibling module rather than more lines in the already-large
+//! `telemetry/tests.rs` — the same reason `complexity.rs` and `role_tick.rs`
+//! are split out beside this one.
 //!
 //! The wire contract asserted here: `story_points` is additive (no
 //! `schema_version` bump — it is not a new record kind), carried on BOTH sweep
