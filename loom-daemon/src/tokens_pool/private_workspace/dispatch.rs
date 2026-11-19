@@ -76,6 +76,10 @@ enum SeatPolicy {
     Idle {
         guarded: bool,
     },
+    /// The one account a caller resolved by name and must launch on: never
+    /// walks, so a busy named seat refuses with its own reason instead of
+    /// handing back a different seat (#14627).
+    Named(String),
 }
 
 /// Why the bounded seat walk passed one candidate over.
@@ -224,6 +228,21 @@ impl Selection {
         Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained)
     }
 
+    /// Prepare exactly the one account `name` resolved to — no seat walk
+    /// (#14627). `transport::run` resolves a specific account up front and
+    /// must refuse on that account's own state (a busy session surfaces its
+    /// `AccountBusy` text), never on a different seat a pool walk would hand
+    /// back and the caller would misread as a wrong-clone mismatch.
+    pub(super) fn prepare_named(
+        root: &Path,
+        name: &str,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(name.into()))
+    }
+
     fn prepare_with(
         root: &Path,
         runtime: &str,
@@ -317,6 +336,14 @@ impl Selection {
         if provider.as_deref() != Some("codex") {
             export::check_failover(root, issue, "other-provider")?;
             return Ok(None);
+        }
+        // The caller resolved one account by name and must launch on it
+        // (#14627): prepare that seat and nothing else, so its own refusal
+        // (a busy session) reaches the caller instead of another seat.
+        if let SeatPolicy::Named(name) = &policy {
+            let account = account(root, name)?;
+            return prepare(account.id.name.clone(), account.credential_reference.clone())
+                .map(Some);
         }
 
         let logical = logical_repository(root);

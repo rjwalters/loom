@@ -2971,3 +2971,48 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     drop(held);
     drop(super::tests::reacquire(&env.dir));
 }
+
+#[test]
+#[serial]
+fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+    // The named account's seat is exclusively held; Bob's is idle.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+
+    // `transport::run` prepares ONLY the account it resolved (#14627): the
+    // refusal is the named seat's own busy error, never a different seat a
+    // pool walk would hand back and the caller would misread as WRONG_CLONE.
+    let error = dispatch::Selection::prepare_named(root, "alice", JobKind::Role, None, "manual-11")
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        error.downcast_ref::<AccountBusy>().is_some(),
+        "the named seat's own refusal: {error:#}"
+    );
+    // The idle sibling was never drawn: its lease stays free, and no durable
+    // job or admission record was left behind on it.
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+    assert!(lease::read(&bob.dir).unwrap().is_none());
+    assert!(!bob.dir.join(lease::ADMISSION).exists());
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}

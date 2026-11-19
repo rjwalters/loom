@@ -56,11 +56,13 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
     }
     let (config, dir) = lifecycle::resolve(&root, &name)?;
     let selection = if std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none() {
+        // The manual, unleased path launches on the account it resolved and
+        // no other: a busy named seat refuses with its own reason, never a
+        // different seat a pool walk would hand back (#14627).
         Some(
-            dispatch::Selection::prepare(
+            dispatch::Selection::prepare_named(
                 &root,
-                "codex",
-                None,
+                &name,
                 JobKind::Role,
                 None,
                 &format!("manual-{}", uuid::Uuid::new_v4()),
