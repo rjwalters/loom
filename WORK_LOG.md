@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14297**: ci: forbid the current owner's repo URL in installed templates
+- **PR #14276**: ci: gate .agents/skills mirrors on generate-agent-skills --check in lint
+- **PR #14171**: ci: add named nextest discovery step with stall diagnostics
+- **PR #14631**: test: publish fake fleet gateways with explicit private modes
 - **PR #14629**: test(loom-tools): per-verb denied-target evidence for the #14519 forge writes
 - **PR #14628**: feat(guide): configure the work-log batching threshold
 - **PR #14624**: test: name served forge commands accurately
@@ -23,6 +27,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #14616**: test: never rebind dead_url() ports in TestServer start/silent
 - **PR #14611**: docs: explain Fleet rescue-stash retention in troubleshooting
 - **PR #14531**: feat: serve the shared non-queue forge verbs through loom-tools
+- **Issue #14219** (closed): Two owner-identity leftovers after the transfer: the installed-template URL denylist and a stale mirrored comment in ci.yml
+- **Issue #14248** (closed): CI does not run `generate-agent-skills --check`, though two docs say it does
+- **Issue #14066** (closed): test flake: nextest discovery (lib binary --list) stalls past the 10-minute Run tests cap on Rust Unit Tests (3/5) — recurrence of #11121
+- **Issue #14630** (closed): Set explicit permissions on the fake gateways in loom_tools_slice fleet-routing tests
 - **Issue #14625** (closed): Make Guide work-log batching threshold configurable per repository
 - **Issue #14621** (closed): loom-tools: a denied write scope has no per-verb proof for the #14519 forge writes
 - **Issue #14618** (closed): Close the two residual dead-port windows left by #14616 (record-before-drop; test bypasses the dead set)
