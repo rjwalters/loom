@@ -47,7 +47,7 @@
 //! rate-limit breaker (it protects the API budget), the host-wide launch gap
 //! and `spawnConcurrency`, and the one-Champion-merge-per-repo rule. Disk
 //! hygiene still runs: the eager reclaim pass fires below the free-disk floor
-//! ([`crate::eager_reclaim::tick`]).
+//! ([`crate::eager_reclaim::spawn_tick`], detached, #14560).
 //!
 //! # Idempotency & fail-safe
 //!
@@ -1969,7 +1969,7 @@ pub fn spawn_multi_work_finder_task(
             tmpfs_warning::check_and_warn(&fallback_root);
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`,
             // due while free space is below the floor (#12406). Hygiene, not
-            // admission: it never changes the cap.
+            // admission: it never changes the cap; launched detached (#14560).
             // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
@@ -1978,7 +1978,7 @@ pub fn spawn_multi_work_finder_task(
             // With no published record (observability off, so no sampler tick)
             // fall back to the memoized raw sample, as before #12114.
             let (idle, phases) = tick_line::sample_pre_span(
-                crate::eager_reclaim::tick(&fallback_root),
+                || crate::eager_reclaim::spawn_tick(&fallback_root),
                 crate::host_status::filtered_cpu_idle_fraction,
                 async {
                     let _ =

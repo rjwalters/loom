@@ -2,7 +2,6 @@
 //! size-frozen `work_finder.rs`.
 
 use super::TickReport;
-use crate::eager_reclaim::EagerReclaimReport;
 use crate::step_dispatch::gather_budget::millis;
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::future::Future;
@@ -17,30 +16,30 @@ pub(super) struct TickTiming<'a> {
     pub(super) began: Instant,
 }
 
-/// The awaited pre-span steps that can hold the span's start back, so a long
+/// The pre-span steps that can hold the span's start back, so a long
 /// `pre_span_ms` can be attributed to one of them (#14560). Everything else in
 /// `pre_span_ms` is synchronous local work.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct PreSpanPhases {
-    /// Wall time awaiting [`crate::eager_reclaim::tick`] (free-space probe, plus
-    /// a whole reclaim pass when one was due).
+    /// Wall time launching the eager reclaim pass. The pass itself runs
+    /// detached ([`crate::eager_reclaim::spawn_tick`]); awaiting it here held a
+    /// tick's start back by up to 877 s, so this stays near zero.
     pub(super) reclaim: Duration,
-    /// Whether the report confirms that a reclaim pass ran.
-    pub(super) reclaim_ran: bool,
+    /// Whether this tick launched a pass task. `false` while the previous
+    /// pass is still running. A launched task may still find no pressure.
+    pub(super) reclaim_spawned: bool,
     /// Wall time of the CPU-idle fallback sample; zero when a published idle
     /// record made it unnecessary.
     pub(super) cpu_fallback: Duration,
 }
 
 pub(super) async fn sample_pre_span(
-    reclaim_pass: impl Future<Output = Option<EagerReclaimReport>>,
+    launch_reclaim: impl FnOnce() -> bool,
     filtered_idle: impl FnOnce() -> Option<f64>,
     raw_idle: impl Future<Output = Option<f64>>,
 ) -> (Option<f64>, PreSpanPhases) {
     let reclaim_started = Instant::now();
-    let reclaim_ran = reclaim_pass
-        .await
-        .is_some_and(|report| report.skipped.is_none());
+    let reclaim_spawned = launch_reclaim();
     let reclaim = reclaim_started.elapsed();
     let (idle, cpu_fallback) = match filtered_idle() {
         Some(idle) => (Some(idle), Duration::ZERO),
@@ -54,7 +53,7 @@ pub(super) async fn sample_pre_span(
         idle,
         PreSpanPhases {
             reclaim,
-            reclaim_ran,
+            reclaim_spawned,
             cpu_fallback,
         },
     )
@@ -93,7 +92,7 @@ impl TickTiming<'_> {
     ) -> String {
         format!(
             "work_finder: tick {} complete host_id={:?} process_instance_id={} span_started_at={} \
-             completed_at={} pre_span_ms={} reclaim_ms={} reclaim_ran={} cpu_fallback_ms={} \
+             completed_at={} pre_span_ms={} reclaim_ms={} reclaim_spawned={} cpu_fallback_ms={} \
              span_ms={} publish_ms={}",
             self.number,
             self.host_id,
@@ -102,7 +101,7 @@ impl TickTiming<'_> {
             completed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
             millis(span_started.saturating_duration_since(self.began)),
             millis(phases.reclaim),
-            phases.reclaim_ran,
+            phases.reclaim_spawned,
             millis(phases.cpu_fallback),
             millis(span_completed.saturating_duration_since(span_started)),
             millis(published.saturating_duration_since(span_completed)),
@@ -224,54 +223,49 @@ mod tests {
         assert!(!worth_logging(&TickReport::default()));
     }
 
-    fn reclaim_report(skipped: Option<&str>) -> EagerReclaimReport {
-        EagerReclaimReport {
-            repo_root: "/fixture".into(),
-            skipped: skipped.map(str::to_owned),
-            floor_gb: 64,
-            free_gb_before: Some(32),
-            free_gb_after: Some(32),
-            tiers_run: u8::from(skipped.is_none()),
-            worktree_reap_ran: false,
-            worktrees_removed: 0,
-            deep_clean: None,
-            docker: None,
-            scratch: None,
-            target_orphans: None,
-            at: Utc::now(),
-            git_tmp: None,
-            idle_targets: None,
+    #[tokio::test]
+    async fn reclaim_phase_reports_whether_a_pass_was_launched() {
+        for launched in [false, true] {
+            let (_, phases) = sample_pre_span(|| launched, || Some(0.5), async {
+                panic!("filtered idle was available")
+            })
+            .await;
+            assert_eq!(phases.reclaim_spawned, launched);
         }
     }
 
+    /// #14560: a below-floor pass ran 623-877 s on the measured host. The
+    /// pre-span step must cost only the launch, whatever the pass takes.
     #[tokio::test]
-    async fn reclaim_phase_distinguishes_skips_from_a_completed_pass() {
-        let wait = Duration::from_millis(5);
-        for (report, ran) in [
-            (None, false),
-            (Some(reclaim_report(Some("disabled"))), false),
-            (Some(reclaim_report(Some("cooldown"))), false),
-            (Some(reclaim_report(None)), true),
-        ] {
-            let (_, phases) = sample_pre_span(
-                async {
-                    tokio::time::sleep(wait).await;
-                    report
-                },
-                || Some(0.5),
-                async { panic!("filtered idle was available") },
-            )
-            .await;
-            assert_eq!(phases.reclaim_ran, ran);
-            assert!(phases.reclaim >= wait);
-        }
+    async fn a_slow_reclaim_pass_does_not_hold_the_pre_span_back() {
+        let pass = Duration::from_millis(400);
+
+        // Control: awaiting the pass in the tick, as before, takes its whole
+        // duration.
+        let awaited = Instant::now();
+        tokio::time::sleep(pass).await;
+        assert!(awaited.elapsed() >= pass);
+
+        let before = Instant::now();
+        let (_, phases) = sample_pre_span(
+            || {
+                tokio::spawn(tokio::time::sleep(pass));
+                true
+            },
+            || Some(0.5),
+            async { panic!("filtered idle was available") },
+        )
+        .await;
+        assert!(phases.reclaim_spawned);
+        assert!(phases.reclaim < pass / 4, "{:?}", phases.reclaim);
+        assert!(before.elapsed() < pass / 2, "{:?}", before.elapsed());
     }
 
     #[tokio::test]
     async fn cpu_phase_measures_only_the_raw_fallback() {
         let wait = Duration::from_millis(5);
         let (idle, phases) = sample_pre_span(
-            async { None },
+            || false,
             || {
                 std::thread::sleep(wait);
                 Some(0.5)
@@ -282,7 +276,7 @@ mod tests {
         assert_eq!(idle, Some(0.5));
         assert_eq!(phases.cpu_fallback, Duration::ZERO);
 
-        let (idle, phases) = sample_pre_span(async { None }, || None, async {
+        let (idle, phases) = sample_pre_span(|| false, || None, async {
             tokio::time::sleep(wait).await;
             Some(0.25)
         })
@@ -324,8 +318,8 @@ mod tests {
             span_completed,
             published,
             PreSpanPhases {
-                reclaim: Duration::from_secs(530),
-                reclaim_ran: true,
+                reclaim: Duration::from_millis(3),
+                reclaim_spawned: true,
                 cpu_fallback: Duration::from_millis(250),
             },
         );
@@ -334,8 +328,8 @@ mod tests {
             "work_finder: tick 42 complete host_id=\"host-fixture\" \
              process_instance_id=00000000-0000-0000-0000-000000000000 \
              span_started_at=2026-11-19T05:00:12.000000123Z \
-             completed_at=2026-11-19T05:01:51.000000123Z pre_span_ms=541000 reclaim_ms=530000 \
-             reclaim_ran=true cpu_fallback_ms=250 span_ms=99000 publish_ms=7"
+             completed_at=2026-11-19T05:01:51.000000123Z pre_span_ms=541000 reclaim_ms=3 \
+             reclaim_spawned=true cpu_fallback_ms=250 span_ms=99000 publish_ms=7"
         );
     }
 
