@@ -56,6 +56,10 @@ if [[ "$2" == list ]]; then
     if [[ "${!#}" == number,closingIssuesReferences ]]; then
       echo lookup >> "$0.calls"
       [[ "${FAIL_REFS:-}" == 1 ]] && exit 1
+      # #14575: a successful lookup that emits no JSON value (jq 1.6 exits 0
+      # on empty input without consuming a value) must not pass a bare title.
+      [[ "${EMPTY_REFS:-}" == 1 ]] && exit 0
+      [[ "${WS_REFS:-}" == 1 ]] && { printf '  \n\t '; exit 0; }
       jq 'map({number, closingIssuesReferences})' <<< "${VERIFY_PRS:-$APPROVED_PRS}"
     else
       jq -r "${!#}" <<< "$APPROVED_PRS"  # render_plan_body's --jq
@@ -142,6 +146,29 @@ FAIL_REFS=1 no "$approved_body" "unavailable refs"
 VERIFY_PRS='[]' no "$approved_body" "missing PRs"
 VERIFY_PRS="$(jq 'map(if .number == 4 then del(.closingIssuesReferences) else . end)' <<<"$APPROVED_PRS")" \
   no "$approved_body" "missing refs field on a plain-title row"
+# #14575: a single bare Approved row needs closing-reference evidence even when
+# the forge lookup succeeds — a zero-byte or whitespace-only response carries no
+# JSON value for the matching PR (jq 1.6 exits 0 on it). A jq 1.6 emulator on
+# PATH makes the regression real on hosts whose jq >= 1.7 already exits 4.
+JQ16_DIR="$STUB_DIR/jq16"
+mkdir -p "$JQ16_DIR"
+REAL_JQ="$(command -v jq)"
+cat >"$JQ16_DIR/jq" <<EOF
+#!/usr/bin/env bash
+# Emulate jq 1.6: a filter over stdin that carries no JSON value exits 0 with
+# no output instead of 4 ("no valid result was ever produced").
+input="\$(cat)"
+if [[ -z "\${input//[[:space:]]/}" ]]; then exit 0; fi
+exec "$REAL_JQ" "\$@" <<<"\$input"
+EOF
+chmod +x "$JQ16_DIR/jq"
+BARE_ROW=$'## Approved (Awaiting Merge)\n\n- **#1**: Add widget'
+PATH="$JQ16_DIR:$PATH" EMPTY_REFS=1 no "$BARE_ROW" "zero-byte refs lookup accepted for a bare row (jq 1.6)"
+PATH="$JQ16_DIR:$PATH" WS_REFS=1 no "$BARE_ROW" "whitespace-only refs lookup accepted for a bare row (jq 1.6)"
+# Positive: the forge explicitly returns an empty closingIssuesReferences array
+# for the PR — the bare row is correct and must pass.
+VERIFY_PRS="$(jq -c 'map(if .number == 1 then .closingIssuesReferences = [] else . end)' <<<"$APPROVED_PRS")" \
+  ok "$BARE_ROW" "explicit empty closingIssuesReferences accepted for a bare row"
 # A held PR may appear in both sections, with refs only in Approved.
 ok "$approved_body"$'\n## Operator Attention: Merge-Risk-Hold Pileup\n- **#1**: Add widget' "same PR in Approved and operator hold sections"
 no $'## Ready\n- **#1**: Add widget — closes #7, #42'

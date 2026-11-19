@@ -2570,6 +2570,12 @@ verify_plan_provenance() {
       if [ -z "$approved_json" ]; then
         approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,closingIssuesReferences) || return 1
       fi
+      # jq 1.6 exits 0 on zero-byte or whitespace-only input without consuming
+      # a JSON value, which would leave refs empty and accept a bare title:
+      # require an actual JSON value for the matching PR first (#14575).
+      [ -n "${approved_json//[[:space:]]/}" ] || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
       refs=$(jq -er --argjson n "$num" '.[] | select(.number == $n) | .closingIssuesReferences
         | arrays | select(all(.[]; .number | type == "number")) | map(.number) | sort | map("#" + tostring) | join(", ")' <<<"$approved_json") || {
         echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
