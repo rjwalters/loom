@@ -40,6 +40,19 @@ fn a_failed_notice_names_the_reason_and_a_verdict_gets_none() {
     assert!(outcome_notice_body(&run(OutcomeClass::Refused, "claimed", "s"), None).is_none());
 }
 
+/// #14634: the typed preflight reason flows into the receipt verbatim — the
+/// launcher's boundary token, never free-form diagnostic text.
+#[test]
+fn a_launch_rejected_notice_names_the_preflight_boundary() {
+    let body = outcome_notice_body(&run(OutcomeClass::Failed, "preflight_credential", "s"), None)
+        .expect("a failed step gets a notice");
+    assert!(body.contains("`preflight_credential`"), "{body}");
+    assert!(!body.contains("cannot resolve"), "{body}");
+    let coarse =
+        outcome_notice_body(&run(OutcomeClass::Failed, "preflight_rejected", "s"), None).unwrap();
+    assert!(coarse.contains("`preflight_rejected`"), "{coarse}");
+}
+
 #[test]
 fn the_excerpt_is_the_first_200_chars_of_the_marker_file() {
     let dir = tempdir().unwrap();
