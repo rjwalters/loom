@@ -3,13 +3,40 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value;
 
 type Handler = dyn Fn(&str, &Value) -> (u16, Value) + Send + Sync;
+
+/// Ports handed out by [`TestServer::dead_url`]. `start()`/`silent()` refuse to
+/// bind them, so a released "dead" port cannot be re-issued by the OS to a
+/// later server in the same process and silently bring the dead URL back to
+/// life (#14601, #14610).
+static DEAD_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+fn dead_ports() -> &'static Mutex<HashSet<u16>> {
+    DEAD_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Bind a fresh loopback port, retrying `127.0.0.1:0` while `rejected` says
+/// the drawn port is unavailable.
+fn bind_excluding(rejected: impl Fn(u16) -> bool) -> TcpListener {
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        if !rejected(listener.local_addr().unwrap().port()) {
+            return listener;
+        }
+    }
+}
+
+/// Bind a fresh loopback port that is not a recorded dead port.
+fn bind_live() -> TcpListener {
+    bind_excluding(|port| dead_ports().lock().unwrap().contains(&port))
+}
 
 /// One recorded request: its path and JSON body.
 pub type Recorded = (String, Value);
@@ -22,7 +49,7 @@ pub struct TestServer {
 impl TestServer {
     /// Serve `handler` on a loopback port until the test process ends.
     pub fn start(handler: impl Fn(&str, &Value) -> (u16, Value) + Send + Sync + 'static) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = bind_live();
         let addr = listener.local_addr().unwrap();
         let requests: Arc<Mutex<Vec<Recorded>>> = Arc::default();
         let handler: Arc<Handler> = Arc::new(handler);
@@ -38,7 +65,7 @@ impl TestServer {
 
     /// A server that accepts connections and never answers.
     pub fn silent() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = bind_live();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             let mut held = Vec::new();
@@ -53,10 +80,18 @@ impl TestServer {
     }
 
     /// A loopback URL nothing listens on.
+    ///
+    /// The port is released back to the OS ephemeral pool and recorded in a
+    /// process-global set that [`TestServer::start`] and [`TestServer::silent`]
+    /// refuse to bind: without that guard a later server in the same process
+    /// can be handed this exact port, the "dead" URL comes back to life, and a
+    /// call the test expects to fail silently succeeds — surfacing much later
+    /// at an unrelated assertion (#14601, fixed for one test in #14605).
     pub fn dead_url() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
+        dead_ports().lock().unwrap().insert(addr.port());
         format!("http://{addr}")
     }
 
@@ -123,4 +158,39 @@ fn serve(stream: TcpStream, handler: &Handler, seen: &Mutex<Vec<Recorded>>) {
          Connection: close\r\n\r\n{answer}",
         answer.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_excluding_retries_rejected_ports() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let listener =
+            bind_excluding(|_| attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert!(listener.local_addr().unwrap().is_ipv4());
+    }
+
+    #[test]
+    fn start_and_silent_never_bind_a_dead_port() {
+        let dead = TestServer::dead_url();
+        let port = dead
+            .trim_start_matches("http://")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        assert!(dead_ports().lock().unwrap().contains(&port));
+        for i in 0..50 {
+            let bound = if i % 2 == 0 {
+                TestServer::silent().addr
+            } else {
+                TestServer::start(|_, _| (200, Value::Null)).addr
+            };
+            assert_ne!(bound.port(), port);
+        }
+    }
 }
