@@ -23,7 +23,7 @@
 #       that reaches the forge fails open (ensure/co-occupancy exit 0) or exits 1
 #       (release), the offline renewer actions still work; `mode=session` drops
 #       the inherited fleet variables before any child sees them
-#   (j) `lease pr` is refused with 64
+#   (j) daemon-only `lease pr attach` is refused before mode resolution
 #
 # Needs a built loom-tools: LOOM_TOOLS_TEST_BIN=<path>. Without one the suite
 # prints SKIP and exits 0 (a bare shell CI leg has none); the cargo test
@@ -421,10 +421,10 @@ pkill -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null || 
 write_scope_register "$CO" acme/widget push
 rm -rf "$LOOM_WRITE_SCOPE_CACHE_DIR"
 
-echo "(j) lease pr is not served"
-OUT="$(loom-tools lease pr check 7 --role judge 2>&1)"
-assert_eq 64 "$?" "(j) lease pr exits 64"
-assert_match "loom-daemon lease pr" "$OUT" "(j) ...naming where it lives"
+echo "(j) a daemon-owned PR service action is refused before mode resolution"
+OUT="$(env -u LOOM_MODE LOOM_GH_GATEWAY_DIR=/nonexistent loom-tools lease pr attach 7 --role judge 2>&1)"
+assert_eq 64 "$?" "(j) lease pr attach exits 64"
+assert_match "daemon service operations" "$OUT" "(j) ...naming why it is refused"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

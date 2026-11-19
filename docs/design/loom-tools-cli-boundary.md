@@ -753,8 +753,9 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree and claim commands | #14397 |
-| Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | served since #14488, §15; `lease pr` (role-keyed PR leases) stays in `loom-daemon` for #14398 |
+| Worktree operations and checkout claims | #14397 and its child issues. |
+| Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | Served in `loom-tools` by #14488 (§15). |
+| Role-keyed PR leases | Available through `loom-tools lease pr` (#14489, §13.6). |
 
 ### 13.4 Gitea decision
 
@@ -773,6 +774,24 @@ No wrapper or locator changed. `loom_tools_serves` in
 `lib/locate-daemon-bin.sh` still lists the four slice commands; making the
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
 which can now read the served list from `capabilities --json`.
+
+### 13.6 Role-keyed PR leases (#14489)
+
+`loom-tools lease pr claim|check|fence|release` shares the daemon CLI's
+arguments, handlers, lease states and result codes. GitHub actions resolve
+mode from the same canonical checkout selected by `--workspace`. Fleet
+reads use the configured gateway or reader pool. If neither can serve the
+request, the lease handler keeps its unreadable-state behavior. Writes use
+the existing repository scope and writer. In session and local-daemon modes, the local
+credential serves both and inherited fleet read routing is discarded.
+
+A successful claim starts the internal `renew-loop` in the same executable.
+The child receives the canonical workspace and the selected mode, then
+initializes its own read route before any forge operations. The watcher PID,
+process start identity and lease ownership guard keep detached renewal tied
+to the original claim. On Gitea, agent-facing leases return success with
+the label-only diagnostic and perform no forge lease operations. Scheduled
+`attach` and `reap` remain daemon service commands. Tools return 64 for them.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 
@@ -834,18 +853,16 @@ list and the clap tree disagree.
 Part of #14475. An attended worker on a tools-only checkout can publish its
 `loom:building` lease, keep it renewed for the life of its session, ask whether
 a worktree is shared, hand the lease back, and run the builder's pre-push fence,
-with no `loom-daemon` installed. Role-keyed PR leases (`lease pr`) are not an
-issue lease and stay in `loom-daemon` (#14398); new nested `forge` actions are
-#14461.
+with no `loom-daemon` installed. Role-keyed PR leases use the shared
+dispatcher described in §13.6. New nested `forge` actions belong to #14461.
 
 ### 15.1 Mechanism
 
 `loom-tools lease <verb>` wraps the one `LeaseCommand` clap tree
 (`cli/lease_cli.rs`, `cli/lease_ensure.rs`) and runs the in-process handlers
-`loom-daemon lease` runs. Nothing was copied. `LeaseCli::is_served` and
-`LeaseCli::reaches_forge` are exhaustive `match`es with no wildcard arm, so a
-new verb does not compile until its author says whether it is served and whether
-it can reach the forge. `lease pr` exits **64** before any handler runs.
+`loom-daemon lease` runs. `LeaseCli::needs_issue_mode_gate` classifies each
+issue-lease verb by effect. The shared dispatcher sends role-keyed PR leases
+to their workspace-specific mode gate (§13.6).
 
 The whole process chain stays on the binary that was selected:
 
@@ -892,12 +909,13 @@ changes which credential the `gh` calls the scripts and handlers run on, and
 
 `install_compat::TOOLS_COMMANDS` gains `lease ensure`, `lease co-occupancy`,
 `lease release` and `lease renewer`; the unit test in `bin/loom_tools.rs` fails
-if the list and the clap tree disagree, and `loom_tools_slice.rs` pins that
-`lease pr` is absent and refused.
+if the list and the clap tree disagree. `loom_tools_slice.rs` checks the
+issue-lease capability entries and exercises both lease families.
 
 `defaults/scripts/tests/test-loom-tools-lease.sh` (run by
 `loom-daemon/tests/loom_tools_lease.rs` against the built binary) puts only
-`loom-tools` and a stateful stub forge on PATH and runs the real publish,
+`loom-tools` and a stateful stub forge on PATH. The shell suite is registered
+as covered by that Rust test in `ci-excluded.txt`. It runs the real publish,
 deferred retry, renew, release, co-occupancy and fence paths: one owner and one
 renewer for a repeated `ensure`; a live peer's record kept and never posted
 over; renewal and the deferred publisher stopping when the watched process

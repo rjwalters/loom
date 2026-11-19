@@ -12,7 +12,7 @@
 //! `forge <read verb>` (#14395) is the family of forge reads: the same
 //! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
 //! that write (#14396). It and `checkpoint read` (§10.3) are the commands
-//! behind the mode gate: it resolves `mode` ([`tools_mode`])
+//! behind the mode gate, as are role-keyed PR leases. The gate resolves `mode` ([`tools_mode`])
 //! before `forge_gateway::enable_cli_reads()` is considered, and enables it
 //! only on the fleet route. `strip-ansi`, the other checkpoint actions and
 //! `config get` never route, and `config get mode` must work with `mode` unset.
@@ -30,7 +30,7 @@ use loom_daemon::cli::{
     ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
-use loom_daemon::tools_mode::{self, Route};
+use loom_daemon::tools_mode;
 
 #[derive(Parser)]
 #[command(
@@ -93,10 +93,8 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
-    /// The issue lease verbs (`ensure`, `co-occupancy`, `release`, `renewer`):
-    /// the same arguments, stdout and exit codes as `loom-daemon lease`
-    /// (#14488), publishing, renewing and fencing on the person's own
-    /// credential. `lease pr` stays in `loom-daemon` (exit 64).
+    /// Publish and renew issue leases, or claim, check, fence and release
+    /// role-keyed pull-request leases.
     Lease(LeaseCli),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
@@ -131,21 +129,7 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
 fn mode_gate() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let resolution =
-        tools_mode::resolve(&tools_mode::inputs_from_env(&cwd)).map_err(anyhow::Error::msg)?;
-    for note in &resolution.notes {
-        eprintln!("{note}");
-    }
-    match resolution.route {
-        Route::Fleet => loom_daemon::forge_gateway::enable_cli_reads(),
-        // Nothing has read them yet; drop them so no later code honors them.
-        Route::Local => {
-            for var in &resolution.ignored_vars {
-                std::env::remove_var(var);
-            }
-        }
-    }
-    Ok(())
+    tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
 }
 
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
@@ -204,8 +188,8 @@ fn run() -> Result<()> {
         ToolsCommands::Lease(cli) => {
             // Classified by effect, from the parsed invocation: the renewer
             // actions, and an `ensure` the environment settles by itself, never
-            // resolve `mode`.
-            if cli.reaches_forge() {
+            // resolve `mode`. PR leases resolve it for their own workspace.
+            if cli.needs_issue_mode_gate() {
                 if let Err(err) = mode_gate() {
                     // `ensure` always exits 0 and `co-occupancy` fails open with
                     // 0 (its exit 1 means "refuse the shared worktree"): a mode
@@ -426,16 +410,16 @@ mod tests {
     #[test]
     fn lease_keeps_the_daemon_argv_and_classifies_by_effect() {
         on_main_sized_stack(|| {
-            // (argv tail, served, reaches the forge)
-            let table: [(&[&str], bool, bool); 6] = [
-                (&["ensure", "7", "--watch-pid", "1", "--force"], true, true),
-                (&["co-occupancy", "7"], true, true),
-                (&["release", "7"], true, true),
-                (&["renewer", "stop", "--issue", "7"], true, false),
-                (&["renewer", "sanitize-exec", "--check"], true, false),
-                (&["pr", "check", "7", "--role", "judge"], false, false),
+            // (argv tail, uses the issue-mode gate)
+            let table: [(&[&str], bool); 6] = [
+                (&["ensure", "7", "--watch-pid", "1", "--force"], true),
+                (&["co-occupancy", "7"], true),
+                (&["release", "7"], true),
+                (&["renewer", "stop", "--issue", "7"], false),
+                (&["renewer", "sanitize-exec", "--check"], false),
+                (&["pr", "check", "7", "--role", "judge"], false),
             ];
-            for (tail, served, forge) in table {
+            for (tail, issue_gate) in table {
                 let mut argv = vec!["loom-tools", "lease"];
                 argv.extend(tail);
                 let cli =
@@ -443,8 +427,7 @@ mod tests {
                 let ToolsCommands::Lease(c) = cli.command else {
                     panic!("{argv:?}")
                 };
-                assert_eq!(c.is_served(), served, "{argv:?}");
-                assert_eq!(c.reaches_forge(), forge, "{argv:?}");
+                assert_eq!(c.needs_issue_mode_gate(), issue_gate, "{argv:?}");
             }
         });
     }

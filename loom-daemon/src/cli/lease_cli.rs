@@ -1,22 +1,9 @@
-//! `loom-tools lease` — the issue lease verbs behind both binaries (#14488,
-//! epic #12708 Phase 3, design `docs/design/loom-tools-cli-boundary.md` §15).
-//!
-//! [`LeaseCli`] wraps the one [`LeaseCommand`] clap tree `loom-daemon lease`
-//! parses, and [`handle_lease_command`] runs the one in-process handler, so
-//! `loom-tools` and `loom-daemon` cannot drift. Nothing is copied. The served
-//! verbs are `ensure`, `co-occupancy`, `release` and every `renewer` action
-//! (`claim`, `check`, `release`, `stop`, `sanitize-exec`). `lease pr` — the
-//! role-keyed PR leases — is not an issue lease and stays in `loom-daemon`
-//! (#14398): it is refused with exit 64 before any handler runs.
-//!
-//! [`LeaseCli::reaches_forge`] decides whether `loom-tools` must resolve `mode`
-//! first. It is classified by effect, from the parsed invocation, and every
-//! `match` is exhaustive with no wildcard arm: a new verb does not compile
-//! until its author says which side it is on.
+//! Tools dispatch for the shared issue and role-keyed PR lease command tree.
+//! Issue leases preserve their per-verb mode failure contracts (#14488).
+//! PR leases select their own workspace and route (#14489).
 
 use anyhow::Result;
 
-use super::forge_read::EX_WRITE_VERB_NOT_MIGRATED;
 use super::lease_ensure::{LeaseCommand, SessionEnv};
 use super::lease_renewer::RenewerAction;
 
@@ -29,20 +16,9 @@ pub struct LeaseCli {
 }
 
 impl LeaseCli {
-    /// Whether `loom-tools` serves this verb. `false` for `lease pr`.
-    #[must_use]
-    pub fn is_served(&self) -> bool {
-        match &self.command {
-            LeaseCommand::Ensure(_)
-            | LeaseCommand::CoOccupancy(_)
-            | LeaseCommand::Release(_)
-            | LeaseCommand::Renewer(_) => true,
-            LeaseCommand::Pr(_) => false,
-        }
-    }
-
-    /// Whether this invocation can reach the forge, and so must pass the mode
-    /// gate (design §10.3) before it runs.
+    /// Whether the tools entry point must resolve mode in the current directory
+    /// for an issue-lease invocation. PR leases resolve their selected
+    /// workspace's mode in `PrLeaseAction::run_tools`.
     ///
     /// `ensure` reaches it unless its answer is settled from the environment
     /// alone (no agent session, or the daemon already dispatched it): those two
@@ -51,7 +27,7 @@ impl LeaseCli {
     /// yield. Every `renewer` action touches only the renewer ownership files
     /// and process table; `check` is handed the issue state by its caller.
     #[must_use]
-    pub fn reaches_forge(&self) -> bool {
+    pub fn needs_issue_mode_gate(&self) -> bool {
         match &self.command {
             LeaseCommand::Ensure(args) => args.reaches_forge(&SessionEnv::from_process()),
             LeaseCommand::CoOccupancy(_) | LeaseCommand::Release(_) => true,
@@ -96,23 +72,18 @@ impl LeaseCli {
     }
 }
 
-/// Run the lease verb through the one shared handler. Refuses (exit
-/// [`EX_WRITE_VERB_NOT_MIGRATED`]) a verb `loom-tools` does not serve.
+/// Dispatch lease commands through the handlers shared with the daemon.
 ///
 /// # Errors
-/// Whatever the handler returns; `release` and `co-occupancy` exit the process
-/// themselves with their documented codes.
+/// A handler can return an error, including an invalid PR lease workspace mode.
 pub fn handle_lease_command(cli: LeaseCli) -> Result<()> {
-    if !cli.is_served() {
-        eprintln!(
-            "loom-tools lease: `{}` is the role-keyed PR lease family and is not served by \
-             loom-tools (#14398); use `loom-daemon lease {}`.",
-            cli.verb(),
-            cli.verb()
-        );
-        std::process::exit(EX_WRITE_VERB_NOT_MIGRATED);
+    match cli.command {
+        LeaseCommand::Pr(action) => action.run_tools(),
+        command @ (LeaseCommand::Ensure(_)
+        | LeaseCommand::CoOccupancy(_)
+        | LeaseCommand::Release(_)
+        | LeaseCommand::Renewer(_)) => command.run(),
     }
-    cli.command.run()
 }
 
 #[cfg(test)]
@@ -148,26 +119,25 @@ mod tests {
     }
 
     #[test]
-    fn served_verbs_are_classified_by_effect() {
+    fn issue_mode_gate_is_classified_by_effect() {
         big_stack(|| {
-            // (argv tail, served, reaches the forge, fails open on a mode error)
-            let table: [(&[&str], bool, bool, bool); 9] = [
-                (&["co-occupancy", "7"], true, true, true),
-                (&["release", "7"], true, true, false),
-                (&["renewer", "stop", "--issue", "7"], true, false, false),
-                (&["renewer", "release", "7"], true, false, false),
-                (&["renewer", "sanitize-exec", "--check"], true, false, false),
-                (&["renewer", "claim", "7", "--pid", "1", "--token", "t"], true, false, false),
-                (&["renewer", "check", "7", "--token", "t"], true, false, false),
+            // (argv tail, uses the issue-mode gate, fails open on a mode error)
+            let table: [(&[&str], bool, bool); 9] = [
+                (&["co-occupancy", "7"], true, true),
+                (&["release", "7"], true, false),
+                (&["renewer", "stop", "--issue", "7"], false, false),
+                (&["renewer", "release", "7"], false, false),
+                (&["renewer", "sanitize-exec", "--check"], false, false),
+                (&["renewer", "claim", "7", "--pid", "1", "--token", "t"], false, false),
+                (&["renewer", "check", "7", "--token", "t"], false, false),
                 // A forced ensure always reaches the publish script.
-                (&["ensure", "7", "--watch-pid", "1", "--force"], true, true, true),
-                // The role-keyed PR leases are not an issue lease.
-                (&["pr", "check", "7", "--role", "judge"], false, false, false),
+                (&["ensure", "7", "--watch-pid", "1", "--force"], true, true),
+                // The PR handler applies its own workspace-specific gate.
+                (&["pr", "check", "7", "--role", "judge"], false, false),
             ];
-            for (tail, served, forge, open) in table {
+            for (tail, issue_gate, open) in table {
                 let cli = parse(tail);
-                assert_eq!(cli.is_served(), served, "{tail:?}");
-                assert_eq!(cli.reaches_forge(), forge, "{tail:?}");
+                assert_eq!(cli.needs_issue_mode_gate(), issue_gate, "{tail:?}");
                 assert_eq!(cli.fails_open_on_mode_error(), open, "{tail:?}");
             }
         });

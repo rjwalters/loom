@@ -425,6 +425,10 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease co-occupancy",
     "lease release",
     "lease renewer",
+    "lease pr claim",
+    "lease pr check",
+    "lease pr fence",
+    "lease pr release",
 ];
 
 /// The identity of the installed-file payload this binary was built against:
