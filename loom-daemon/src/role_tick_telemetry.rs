@@ -1057,9 +1057,9 @@ fn emit_correlated(
     let source = crate::usage_source::UsageSource::for_runtime(usage_runtime_name.as_deref());
     // #14048: the exact native session ids this step's own log names — the
     // strictly-more-precise attribution key for the OpenCode (event-stream
-    // `sessionID`) and Codex (`session id: <uuid>` banner) stores. Empty for a
-    // role tick and for a step whose log was unreadable, which then fall back
-    // to the directory+window key every consumer used before.
+    // `sessionID`) and Codex (`session id: <uuid>` banner) stores. Role ticks
+    // and readable step logs without ids keep the existing directory +
+    // window fallback. An unreadable native step log has no attribution key.
     let session_ids = step_log
         .as_ref()
         .map(|(_, region)| crate::usage_source::native_session_ids(region))
