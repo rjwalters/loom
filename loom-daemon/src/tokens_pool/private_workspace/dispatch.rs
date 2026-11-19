@@ -923,7 +923,7 @@ mod tests {
         let mut order = Vec::new();
         while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
             !tried.contains(&account.id.name)
-                && serves_repository(&account.credential_reference, logical.as_deref())
+                && repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
         }) {
             tried.insert(account.id.name.clone());
             order.push(account.id.name);
