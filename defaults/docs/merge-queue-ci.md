@@ -320,9 +320,13 @@ Every step is a read except step 6, which is an operator action. Do not set
    loom-daemon forge merge-queue preflight --repo 2AMLogic/loom
    loom-daemon forge merge-queue mode        # must still print direct
    ```
-   `NO_MERGE_QUEUE_RULE` is expected before step 6 and is the only failure
-   allowed. The daemon on the host must include the `merge-group-ci` and
-   `forge merge-queue` subcommands. `merge-group-ci` has shipped since
+   `NO_MERGE_QUEUE_RULE` is expected before step 6. `PERMISSION_UNKNOWN` is
+   also expected when the read uses a credential whose repository permissions
+   are not visible (the fleet App token, whose `can_push` reads `null`); no
+   other failure is allowed. Step 6's admin credential should show
+   `can_push: true` and so no `PERMISSION_UNKNOWN` (inferred from the `null`
+   under the App token, not yet run with an admin PAT). The daemon on the host
+   must include the `merge-group-ci` and `forge merge-queue` subcommands. `merge-group-ci` has shipped since
    v0.19.695, `forge merge-queue preflight` since v0.19.761, `group-check`
    since v0.19.879, and the `statusCommand` route since v0.19.1185. Running the
    v0.19.1311 that `merge-group-check.yml` pins as `LOOM_VERSION` keeps the
