@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-18T23:04:37Z (snapshot; compare against live labels)_
+_Generated: 2026-11-19T03:29:41Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -40,8 +40,13 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#14381**: fix: don't carry an exhausted .ranking row over permanently-marked accounts; document carry-forward
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder
 - **#14410**: fix: append --reviews-reconciled on changes-requested; word a repeat lease release as already released
+- **#14411**: fix: carry exhausted weekly-hold row forward over a header-less 2xx probe
 - **#14437**: fix: attribute stranded check runs to their failed run in the merge-group check
 - **#14441**: fix: publish worker images under the repository owner's GHCR namespace
+- **#14452**: fix: record held_back paths and exit 3 when resync withholds a locally-fixed file
+- **#14470**: fix: remove stale by-owner writer credentials once the owner is no longer a cross-owner
+- **#14483**: fix: let recover list and clear dirty leftover worktrees that block a private-clone seat
+- **#14518**: fix(verdict-guard): don't read the verdict writer's own label as an operator send-back
 
 ## Very Important
 
@@ -65,20 +70,15 @@ Human-approved issues (`loom:issue`) ready for implementation — excluding held
 - **#11107**: Hyperparameters: drop the optimizer-only $LOOM_HYPERPARAMS vector tier (precedence becomes env > config > default)
 - **#12167**: telemetry: export peer_coordination verdict and degraded duration on host.health
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out
-- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
-- **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
-- **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
-- **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
-- **#13881**: Champion re-discovers a proposal it just sent to Curator: Priority 3 does not exclude loom:triage, so a loom:hermit/architect/auditor revise verdict walks the whole bound ladder in ~30 min
-- **#14162**: Guide skips Step 4b (pool-pressure check) and reports a tool-policy denial, although the role file routes around that denial
-- **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time
-- **#14464**: Expose park records and operator decisions through loom-tools
-- **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools
+- **#14512**: private_dispatch prepares a Codex seat twice after reserve_seat (#14481)
 
 ## In Progress
 
 Issues currently being built (`loom:building`).
 
+- **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
+- **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
+- **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it
 - **#13820**: Remove the loom-api crate: reads a database the daemon does not write, 3 of 5 endpoints query tables nothing creates
 - **#13827**: Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it
 - **#13875**: Held-PR digest cannot state a ratification hold's reason: Step 1 greps only the merge-risk and critical-file markers (every such row reads "reason unrecorded")
@@ -86,7 +86,6 @@ Issues currently being built (`loom:building`).
 - **#13898**: Installer's managed .gitignore block ignores neither node_modules/ nor pnpm-lock.yaml, which the root package.json stub's documented pnpm entry points produce
 - **#13933**: forge_auth forwards an expired token: a stale per-workspace gh-config-by-owner wins over the refreshed primary one
 - **#13942**: Token pool: captain publishes its account probe; workers apply it (part 2 of #13893)
-- **#13945**: Delete the safehouse peer-claim channel and claims room (#13920 part 1)
 - **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills
 - **#13977**: self-heal's loom-rescue-* stashes accumulate forever, and #13970 adds a recurring generator
 - **#14011**: gh-cached: `gh api -F/--raw-field` writes are classified as reads (retried on timeout, and marked cacheable); two smaller #13930 follow-ups
@@ -109,35 +108,48 @@ Issues currently being built (`loom:building`).
 - **#14301**: ci.yml backend path filter omits defaults/scripts/lib/bounded-run.sh, skipping the Rust tests that read it from disk
 - **#14307**: Champion ratification hold: other_holds_standing() fails open on an unreadable comments read, removing the shared loom:blocked label
 - **#14317**: `.ranking` carry-forward (#14145) is undocumented, and can label an auth-dead account `exhausted`
+- **#14371**: Per-seat session container for Claude steps: launch in the configured session image, one login per container
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder
-- **#14391**: pr-worktree.sh refuses a PR whose branch is checked out in the primary clone, leaving Judge no sanctioned way to review it
 - **#14392**: post-verdict.sh drops --reviews-reconciled on a changes-requested verdict; lease release prints 'released 0' after a successful release
-- **#14407**: Telemetry: work-role loom.role_attempt spans say exit_unobserved with no runtime although the run succeeded
 - **#14414**: adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort=
 - **#14415**: Stranded check runs under a terminal-failed workflow run still read as pending outside `forge wait-checks`
-- **#14417**: Two more unattributed loom-daemon self-spawn sites after #14362 (workspace-resync waiver checks, validate-phase curation-complete)
 - **#14419**: Release cannot publish container images since the transfer: pushes to ghcr.io/rjwalters are denied, so no session image exists after 0.19.1311
-- **#14421**: No regression test for the configured-session-image preference in the recreate paths or the shell wiring
-- **#14431**: loom-tools forge reads: live verification against a real forge (PR #14430)
-- **#14433**: accounts session recover --publish cannot authenticate: the seat's credential helper has no token outside a job
 - **#14434**: resync-installed.sh restamps loom_version even when a file is blocked and the run exits 1
-- **#14440**: OpenCode id-keyed selector: dedupe runs before the usage-free drop, and the empty-id fast path lost its guard
 - **#14443**: Model-limit kill on the legacy issue-sweep path does not step down a rung
 - **#14450**: Remove a by-owner credential directory once its owner is no longer a cross-owner (follow-up to #14435)
-- **#14451**: Private-clone seats ignore accounts.session.image and extraMounts, so a derived image and PDK mounts cannot be pinned for them
-- **#14454**: Plumb a per-role/runtime serviceTier key into LOOM_SERVICE_TIER (daemon side of #14141)
-- **#14457**: A step's usage span can be lost when its trace journal is retired between the span close and the capture thread
+- **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time
 - **#14458**: A dirty leftover worktree with no unpublished commits blocks a private-clone seat for every repo, and recover cannot clear it
+- **#14464**: Expose park records and operator decisions through loom-tools
+- **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools
+- **#14474**: Expose worktree operations through the shared Rust CLI
+- **#14484**: capability_list_matches_the_clap_tree only validates top-level heads, not subcommand names
+- **#14485**: Docs: the renamed QueueDisposition token is still documented as `peer_claim` (post-#13945)
+- **#14487**: Expose checkout-local claim commands through loom-tools
+- **#14488**: Run the attended issue lease publisher, renewer and fence with loom-tools
+- **#14497**: Codex seats: trusted-seat selection for guarded roles, machine-level accounts disable, state-change release of the sandbox hold
+- **#14516**: Verdict staleness trusts an old rejection when a prepared Doctor commit is pushed later
+- **#14519**: loom-tools: admit the shared non-queue forge actions
+- **#14520**: loom-tools: serve the remaining merge-queue actions
+- **#14523**: config_dir_for candidate 1 returns a registered GH_CONFIG_DIR without checking it still exists
+- **#14534**: recover --publish: CLI discovers the daemon's workspace root without an exported variable (AC1 of #14433)
+- **#14538**: Tidy three leftovers from the loom-tools top-level-reads slice (#14429)
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#12631**: fix: release a Champion CI wait as requeued so it holds flat *(held)*
 - **#12637**: refactor: split status_render inline tests into per-module files *(held)*
-- **#12639**: test: create registered roots before registering their gh config dir *(held)*
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
-- **#14459**: test: guard configured session image preference in recreate paths
+- **#14136**: fix: ignore pnpm artifacts in the managed gitignore block of loom-workspace stub repos
+- **#14468**: fix: report an explicit codex model_reasoning_effort config as the launched effort
+- **#14472**: feat: step a legacy issue sweep down a rung when its child dies on a model limit
+- **#14494**: feat: serve the checkout-local claim commands from loom-tools
+- **#14509**: test(tools): check advertised capability verb paths
+- **#14515**: feat: serve the issue lease verbs from loom-tools
+- **#14527**: fix: skip registered GitHub config directories missing hosts.yml
+- **#14528**: feat: serve every merge-queue verb from loom-tools
+- **#14532**: fix: verify WORK_LOG records against the target repo before Guide writes and Judge fast-paths
+- **#14536**: test: pin the loom-tools park/decision write ordering, routing and nested filing
 
 ## Approved (Awaiting Merge)
 
@@ -173,10 +185,13 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#14381**: fix: don't carry an exhausted .ranking row over permanently-marked accounts; document carry-forward — closes #14317
 - **#14384**: fix: require native ownership before handing a fresh worktree to a Builder — closes #14376
 - **#14410**: fix: append --reviews-reconciled on changes-requested; word a repeat lease release as already released — closes #14392
+- **#14411**: fix: carry exhausted weekly-hold row forward over a header-less 2xx probe — closes #14195
 - **#14437**: fix: attribute stranded check runs to their failed run in the merge-group check — closes #14415
 - **#14441**: fix: publish worker images under the repository owner's GHCR namespace — closes #14419
-- **#14447**: fix: mirror an observed step end onto its attempt and phase spans — closes #14407
 - **#14452**: fix: record held_back paths and exit 3 when resync withholds a locally-fixed file — closes #14434
+- **#14470**: fix: remove stale by-owner writer credentials once the owner is no longer a cross-owner — closes #14450
+- **#14483**: fix: let recover list and clear dirty leftover worktrees that block a private-clone seat — closes #14458
+- **#14518**: fix(verdict-guard): don't read the verdict writer's own label as an operator send-back — closes #14516
 
 ## Proposed
 
@@ -210,7 +225,6 @@ Issues carrying `loom:curated`.
 - **#12418**: Verify epic #10698 acceptance: completed-vs-not-planned dispositions and live fleet receipts *(curated)* *(held)*
 - **#12604**: Split status_render.rs: break up ~970-line print_status_human and move inline tests out *(curated)*
 - **#12626**: docs: /repo:release Phase 1.5 CHANGELOG completeness gate has no seam for generated-notes policy *(curated)* *(held)*
-- **#12638**: Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR) *(curated)*
 - **#12703**: Add a per-repo setting to turn off Champion's out-of-band acceptance-criteria hold (#6883) *(curated)* *(held)*
 - **#12713**: Part-of merges re-queue the issue to Builders: landed-route marker is read as a Curator 'kept' decision *(curated)* *(held)*
 - **#12909**: ci_telemetry: 2amlogic owner discovery times out every cycle since Oct 17 (no loom-ui CI facts; 478 consecutive failures) *(curated)* *(held)*
@@ -226,15 +240,16 @@ Issues carrying `loom:curated`.
 - **#13640**: ci_telemetry: owner-kind probe users/2amlogic hangs 120s every cycle in the daemon (0.3s by hand) and a timeout never fails over — 2AMLogic CI dropped 20+ days *(curated)* *(held)*
 - **#13668**: Replay strict resync waiver on recent fasterhenry resync PRs (follow-up to #13665) *(curated)* *(held)*
 - **#13720**: worktree.issue_state_rest reads spike every 4 h (synchronized cache expiry?) *(curated)* *(held)*
+- **#13744**: Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283) *(curated)*
+- **#13746**: Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse *(curated)*
+- **#13760**: Guide WORK_LOG backfill wrote another repo's history; docs-only fast path approved it *(curated)*
 - **#13827**: Remove stale file-size ratchet comments: 242 files cite a gate #12099 deleted, and new code still obeys it *(curated)*
 - **#13865**: [ci-daily] Supply Chain *(curated)* *(held)*
 - **#13875**: Held-PR digest cannot state a ratification hold's reason: Step 1 greps only the merge-risk and critical-file markers (every such row reads "reason unrecorded") *(curated)*
-- **#13881**: Champion re-discovers a proposal it just sent to Curator: Priority 3 does not exclude loom:triage, so a loom:hermit/architect/auditor revise verdict walks the whole bound ladder in ~30 min *(curated)*
 - **#13896**: Doctor conflict-resolution should structurally validate touched workflow files; a vanished check should not satisfy a green rollup *(curated)*
 - **#13898**: Installer's managed .gitignore block ignores neither node_modules/ nor pnpm-lock.yaml, which the root package.json stub's documented pnpm entry points produce *(curated)*
 - **#13933**: forge_auth forwards an expired token: a stale per-workspace gh-config-by-owner wins over the refreshed primary one *(curated)*
 - **#13942**: Token pool: captain publishes its account probe; workers apply it (part 2 of #13893) *(curated)*
-- **#13945**: Delete the safehouse peer-claim channel and claims room (#13920 part 1) *(curated)*
 - **#13957**: Shrink always-read core of judge.md (173 KB) into on-demand sub-skills *(curated)*
 - **#13966**: Z.ai weekly-limit 429 is bad-marked for 60 s: exhausted keys are relaunched all day and the role never falls through to Claude *(curated)* *(held)*
 - **#13977**: self-heal's loom-rescue-* stashes accumulate forever, and #13970 adds a recurring generator *(curated)*
@@ -242,7 +257,7 @@ Issues carrying `loom:curated`.
 - **#14056**: loom-clean's claim-lock pass uses bare pid liveness, so a recycled-pid lock is now never cleared *(curated)*
 - **#14066**: test flake: nextest discovery (lib binary --list) stalls past the 10-minute Run tests cap on Rust Unit Tests (3/5) — recurrence of #11121 *(curated)*
 - **#14075**: docs: add a CI check that docs/README.md indexes every docs/ directory and top-level doc *(curated)*
-- **#14092**: [ci-daily] Full Suite (clean, unpartitioned) *(curated)*
+- **#14092**: [ci-daily] Full Suite (clean, unpartitioned) *(curated)* *(held)*
 - **#14101**: merge-pr.sh --release-hold strips the hold then cannot merge where loom/merge-authorization is required *(curated)*
 - **#14105**: Private-clone Codex sessions still need the interactive hook-trust prompt: extend sealed registration, or state why the hook is needed in a container *(curated)*
 - **#14110**: Contained roles: select only private-clone accounts registering the repository; clear refusal, status and docs *(curated)*
@@ -269,28 +284,32 @@ Issues carrying `loom:curated`.
 - **#14369**: [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered) *(curated)* *(held)*
 - **#14371**: Per-seat session container for Claude steps: launch in the configured session image, one login per container *(curated)*
 - **#14376**: Refuse a peer-owned claim before handing a new worktree to a Builder *(curated)*
-- **#14391**: pr-worktree.sh refuses a PR whose branch is checked out in the primary clone, leaving Judge no sanctioned way to review it *(curated)*
 - **#14392**: post-verdict.sh drops --reviews-reconciled on a changes-requested verdict; lease release prints 'released 0' after a successful release *(curated)*
-- **#14407**: Telemetry: work-role loom.role_attempt spans say exit_unobserved with no runtime although the run succeeded *(curated)*
 - **#14414**: adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort= *(curated)*
 - **#14415**: Stranded check runs under a terminal-failed workflow run still read as pending outside `forge wait-checks` *(curated)*
-- **#14417**: Two more unattributed loom-daemon self-spawn sites after #14362 (workspace-resync waiver checks, validate-phase curation-complete) *(curated)*
 - **#14419**: Release cannot publish container images since the transfer: pushes to ghcr.io/rjwalters are denied, so no session image exists after 0.19.1311 *(curated)*
-- **#14421**: No regression test for the configured-session-image preference in the recreate paths or the shell wiring *(curated)*
-- **#14431**: loom-tools forge reads: live verification against a real forge (PR #14430) *(curated)*
-- **#14433**: accounts session recover --publish cannot authenticate: the seat's credential helper has no token outside a job *(curated)*
+- **#14433**: accounts session recover --publish cannot authenticate: the seat's credential helper has no token outside a job *(curated)* *(held)*
 - **#14434**: resync-installed.sh restamps loom_version even when a file is blocked and the run exits 1 *(curated)*
-- **#14440**: OpenCode id-keyed selector: dedupe runs before the usage-free drop, and the empty-id fast path lost its guard *(curated)*
 - **#14443**: Model-limit kill on the legacy issue-sweep path does not step down a rung *(curated)*
 - **#14450**: Remove a by-owner credential directory once its owner is no longer a cross-owner (follow-up to #14435) *(curated)*
-- **#14451**: Private-clone seats ignore accounts.session.image and extraMounts, so a derived image and PDK mounts cannot be pinned for them *(curated)*
-- **#14454**: Plumb a per-role/runtime serviceTier key into LOOM_SERVICE_TIER (daemon side of #14141) *(curated)*
 - **#14455**: Codex Curator steps are dispatched to stopped, unprovisioned seats and end SANDBOX_UNAVAILABLE every time *(curated)*
 - **#14456**: Confirm loom.runtime.usage rows for step-dispatched work roles in SigNoz after #14423 rolls *(curated)* *(held)*
-- **#14457**: A step's usage span can be lost when its trace journal is retired between the span close and the capture thread *(curated)*
 - **#14458**: A dirty leftover worktree with no unpublished commits blocks a private-clone seat for every repo, and recover cannot clear it *(curated)*
 - **#14464**: Expose park records and operator decisions through loom-tools *(curated)*
 - **#14465**: Serve hold diagnostics, curation labels and blocker notifications from loom-tools *(curated)*
+- **#14474**: Expose worktree operations through the shared Rust CLI *(curated)*
+- **#14484**: capability_list_matches_the_clap_tree only validates top-level heads, not subcommand names *(curated)*
+- **#14485**: Docs: the renamed QueueDisposition token is still documented as `peer_claim` (post-#13945) *(curated)*
+- **#14487**: Expose checkout-local claim commands through loom-tools *(curated)*
+- **#14488**: Run the attended issue lease publisher, renewer and fence with loom-tools *(curated)*
+- **#14497**: Codex seats: trusted-seat selection for guarded roles, machine-level accounts disable, state-change release of the sandbox hold *(curated)*
+- **#14512**: private_dispatch prepares a Codex seat twice after reserve_seat (#14481) *(curated)*
+- **#14516**: Verdict staleness trusts an old rejection when a prepared Doctor commit is pushed later *(curated)*
+- **#14519**: loom-tools: admit the shared non-queue forge actions *(curated)*
+- **#14520**: loom-tools: serve the remaining merge-queue actions *(curated)*
+- **#14523**: config_dir_for candidate 1 returns a registered GH_CONFIG_DIR without checking it still exists *(curated)*
+- **#14534**: recover --publish: CLI discovers the daemon's workspace root without an exported variable (AC1 of #14433) *(curated)*
+- **#14538**: Tidy three leftovers from the loom-tools top-level-reads slice (#14429) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -311,14 +330,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 30 |
+| Operator merge-risk holds | 35 |
 | Very important | 0 |
 | Important | 4 |
-| Ready (`loom:issue`, net of holds/building/merge-pending) | 12 |
-| In Progress (`loom:building`) | 49 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 34 |
-| Curated | 109 |
+| Ready (`loom:issue`, net of holds/building/merge-pending) | 4 |
+| In Progress (`loom:building`) | 57 |
+| PRs awaiting review | 12 |
+| Approved PRs awaiting merge | 37 |
+| Curated | 113 |
 | Architect / Hermit proposals | 2 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
