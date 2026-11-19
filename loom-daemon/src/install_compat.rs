@@ -421,6 +421,24 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    // #14429: top-level reads and config inspection. The write forms inside
+    // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
+    // (#14396) exactly as a `forge` write verb does.
+    "labels",
+    "pr-queue",
+    "premise-check",
+    "duplicate-scan",
+    "check-points-marker",
+    "label-duplicates",
+    "forge-probe",
+    "forge-inventory",
+    "affected-files",
+    "check-stale-blocked",
+    "skip-labels",
+    "roles",
+    "guards",
+    "install-compat",
+    "hooks-home",
 ];
 
 /// The identity of the installed-file payload this binary was built against:
