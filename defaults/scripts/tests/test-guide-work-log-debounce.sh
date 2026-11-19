@@ -277,7 +277,12 @@ JSON
     assert_eq "$(run_threshold_gate 0 1007200)" "SUPPRESS" "an empty delta still skips an update"
     assert_eq "$(run_threshold_gate 1 1001800 "" 0)" "WRITE" "a missing merge anchor still allows a real delta"
 
-    for invalid_threshold in 0 -1 5.5 '"12"' true null 1e100; do
+    for exact_threshold in 12.0 1e2 9223372036854775807 9.223372036854775807e18; do
+        printf '{"guide":{"docsMaintenance":{"workLogMinEntries":%s}}}\n' "$exact_threshold" > "$SANDBOX/.loom/config.json"
+        assert_eq "$(run_threshold_gate 6 1000300)" "SUPPRESS" "integral repo threshold $exact_threshold retains its exact value"
+    done
+
+    for invalid_threshold in 0 -1 5.5 12.0000000000000001 9223372036854775808 '"12"' true null 1e100; do
         printf '{"guide":{"docsMaintenance":{"workLogMinEntries":%s}}}\n' "$invalid_threshold" > "$SANDBOX/.loom/config.json"
         assert_eq "$(run_threshold_gate 4 1000300)" "SUPPRESS" "invalid repo threshold $invalid_threshold uses the default"
         assert_eq "$(run_threshold_gate 5 1000300)" "WRITE" "invalid repo threshold $invalid_threshold leaves the default inclusive"

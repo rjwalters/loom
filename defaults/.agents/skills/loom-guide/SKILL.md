@@ -1928,12 +1928,31 @@ update_work_log() {
   [ -n "$debounce_secs" ] || debounce_secs=1800
   min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-}"
   if [ -z "$min_entries" ]; then
-    min_entries="$(jq -rs '
-      select(length == 1)
-      | .[0].guide.docsMaintenance.workLogMinEntries
-      | select(type == "number")
-      | select(. > 0 and floor == .)
-      | floor
+    min_entries="$(jq -Rrs '
+      . as $config
+      | fromjson
+      | select(.guide.docsMaintenance.workLogMinEntries | type == "number")
+      # Preserve JSON string tokens while quoting raw numeric lexemes. jq 1.6
+      # otherwise rounds numbers before we can check for a fraction.
+      | $config
+      | gsub("(?<quoted>\"(?:[^\"\\\\]|\\\\.)*\")|(?<number>-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)";
+          if .number then (.number | tojson) else .quoted end)
+      | fromjson
+      | .guide.docsMaintenance.workLogMinEntries
+      | strings
+      | capture("^(?<whole>[0-9]+)(?:\\.(?<fraction>[0-9]+))?(?:[eE](?<exponent>[+-]?[0-9]+))?$")
+      | (.fraction // "") as $fraction
+      | (.whole + $fraction | sub("^0+"; "")) as $digits
+      | select($digits != "")
+      | ((.exponent // "0" | sub("^\\+"; "") | tonumber) - ($fraction | length)) as $shift
+      | (($digits | length) + $shift) as $width
+      # Bash compares signed integers. Bound the decimal width before padding.
+      | select($width > 0 and $width <= 19)
+      | if $shift >= 0 then
+          $digits + ("0" * $shift // "")
+        else
+          select($digits[$width:] | test("^0+$")) | $digits[:$width]
+        end
     ' .loom/config.json 2>/dev/null)" || min_entries=""
     if ! [ "$min_entries" -gt 0 ] 2>/dev/null; then
       min_entries=5
