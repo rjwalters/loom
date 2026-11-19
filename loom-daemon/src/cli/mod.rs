@@ -22,6 +22,7 @@ pub use root::{
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
+pub(crate) mod accounts_session_claude;
 mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
