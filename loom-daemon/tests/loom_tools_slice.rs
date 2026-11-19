@@ -455,7 +455,7 @@ fn capabilities_list_the_served_forge_verbs() {
         .iter()
         .filter_map(|c| c.as_str())
         .collect();
-    for read in [
+    for command in [
         "forge check-claim",
         "forge wait-checks",
         "forge merge-queue status",
@@ -469,7 +469,7 @@ fn capabilities_list_the_served_forge_verbs() {
         "forge merge-queue authorize-check",
         "forge issue",
     ] {
-        assert!(cmds.contains(&read), "{read} missing from {cmds:?}");
+        assert!(cmds.contains(&command), "{command} missing from {cmds:?}");
     }
     // #14519: the shared non-queue writes are served.
     for write in [
