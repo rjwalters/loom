@@ -1325,10 +1325,12 @@ fn extra_mount_targets_shadowing_protected_paths_are_refused() {
         ("/opt/pdk", "/home/u/GitHub"),             // an ancestor of it (path parity)
         ("/opt/pdk", "/home/loom/.codex-profile"),  // the profile
         ("/opt/pdk", "/home/loom/.codex-profile/hooks.json"), // a control mount
-        ("/opt/pdk", "/opt/loom/private-control"),  // the sealed bundle
+        ("/opt/pdk", "/home/loom/.claude"),
+        ("/opt/pdk", "/home/loom/.claude/projects"),
+        ("/opt/pdk", "/opt/loom/private-control"), // the sealed bundle
         ("/opt/pdk", "/opt/loom/private-control/hooks"), // inside the bundle
         ("/opt/pdk", "/home/u/loom-daemon/.loom/gh-config"), // a credential path
-        ("/opt/pdk", "/"),                          // the container root
+        ("/opt/pdk", "/"),                         // the container root
     ]
     .iter()
     .map(|(host, container)| extra_mount(host, container))
