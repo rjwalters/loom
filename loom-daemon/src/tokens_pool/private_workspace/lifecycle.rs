@@ -501,11 +501,23 @@ pub fn session_recover(
         .map(|target| forge_auth::ExecAuth::resolve(workspace, &target.repository))
         .collect();
     if action == RecoverAction::Publish {
-        if let Some((target, _)) = targets
+        if let Some((target, auth)) = targets
             .iter()
             .zip(&auths)
             .find(|(_, auth)| auth.github_token_missing())
         {
+            // An owner whose only published credential is provably expired
+            // reaches the same bail (`config_dir_for` skips a matched-but-
+            // expired directory), but the message must not tell the operator
+            // to publish an App config that is already published (#14435).
+            if auth.expired() {
+                bail!(
+                    "private workspace forge credential for {} is expired and no fresher \
+                     one is published; the credential refresh has not renewed it; the \
+                     unpublished work is retained",
+                    target.repository
+                );
+            }
             bail!(
                 "no GitHub write credential for {}: provide the repository owner's published \
                  App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \

@@ -1163,6 +1163,62 @@ fn session_recover_publish_without_a_github_credential_is_refused_before_exec() 
     assert!(!call.iter().any(|a| a.contains("ghs_TESTONLY_14433")));
 }
 
+/// #14469: when the only published credential for a GitHub clone's owner is
+/// provably expired, the publish preflight refuses with the expired message
+/// (#14435) — not with advice to publish an App config that is already
+/// published — and still before any docker exec.
+#[test]
+#[serial]
+fn session_recover_publish_with_only_an_expired_credential_names_the_expiry() {
+    use crate::env_test_support::EnvGuard;
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mut config = env.config.clone();
+    let github = identify("https://github.com/acme/widget").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: github.url.clone(),
+        base: "main".into(),
+        slug: github.slug.clone(),
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    // The workspace fallback holds the owner's published App config, but its
+    // token sidecar expired in 2020 and nothing fresher exists.
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+        env.workspace.path(),
+        "acme",
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+    std::fs::write(
+        dir.join("identity.json"),
+        r#"{"appId":"1","slug":null,"installationId":"2","owner":"acme","role":"writer","expiresAt":"2020-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let guard = EnvGuard::set("GH_HOST", "github.com")
+        .and_set("GH_TOKEN", None)
+        .and_set("GITHUB_TOKEN", None)
+        .and_set("LOOM_MACHINE_CHECKOUT", None);
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, Some(7), &[])
+            .unwrap_err();
+    let text = message(&error);
+    assert!(text.contains("expired and no fresher one is published"), "{text}");
+    assert!(text.contains("credential refresh has not renewed it"), "{text}");
+    assert!(!text.contains("provide the repository owner's published"), "{text}");
+    assert_eq!(
+        env.engine()
+            .calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "recover"))
+            .count(),
+        0,
+        "refused before any exec"
+    );
+    drop(guard);
+}
+
 #[test]
 #[serial]
 fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
