@@ -558,6 +558,33 @@ jobs:
       # job-level timeout.
       - name: Compile tests (no run)
         run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --no-run
+      # Discovery on its own named step (#14066). The #11121 cap bounds the run
+      # step, but a discovery stall (the per-binary `--list` pass hanging before
+      # nextest prints `Starting N tests`) and a real test failure both just
+      # turned the leg red; this step makes a stall name itself. Healthy
+      # discovery is ~1s, so 3 minutes is generous. Same selection as the run
+      # step below, so it lists exactly the binaries that step will list.
+      - name: Discover tests (nextest list, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        id: discover
+        timeout-minutes: 3
+        run: cargo nextest list --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      # Evidence for the next stall, captured before the runner tears down. Job
+      # log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
+      # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
+      # means install got past `write_stub`.
+      - name: Diagnose discovery stall
+        if: failure() && steps.discover.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::group::cargo-nextest / loom_daemon-* process state"
+          ps -eo pid,ppid,stat,wchan:32,etime,cmd | grep -E 'cargo-nextest|loom_daemon-' | grep -v grep || echo "(no matching processes)"
+          echo "::endgroup::"
+          echo "::group::df -h /tmp"
+          df -h /tmp || true
+          echo "::endgroup::"
+          echo "::group::loom-live-gh-guard temp dirs"
+          ls -la /tmp | grep loom-live-gh-guard || echo "(no loom-live-gh-guard-* dir in /tmp)"
+          echo "::endgroup::"
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         # Includes merge_group_ci::workflow_identity_tests: native regression
         # coverage for this repo's cache/release identity guards (#14158).
@@ -674,7 +701,7 @@ jobs:
           import glob, sys, yaml
           PARSE_ONLY = 'defaults/optional/github-workflows/*.y*ml'
           INSTALLED = 'defaults/.github/ISSUE_TEMPLATE/*.y*ml'
-          FORBIDDEN = ('github.com/rjwalters/loom', '{' * 2)
+          FORBIDDEN = ('github.com/rjwalters/loom', 'github.com/2amlogic/loom', '{' * 2)
           bad = 0
           for pattern in (PARSE_ONLY, INSTALLED):
               files = sorted(glob.glob(pattern))
@@ -706,6 +733,19 @@ jobs:
       - name: Check AGENTS.md is in sync with its source
         if: ${{ !cancelled() }}
         run: bash scripts/check-agents-md-sync.sh
+
+      # component: Agent Skills Sync Check
+      # Cheap daemon-run check; always runs. defaults/.agents/skills/loom-<name>/SKILL.md
+      # mirrors are generated from defaults/roles/<name>.md by
+      # `loom-daemon generate-agent-skills` (runtime-adapters.md §5: the
+      # cross-vendor instruction surface Codex / Kimi Code / Mistral Vibe /
+      # Grok read natively). Before this gate, a corrected role prompt could
+      # land with both mirrors stale and a fully green CI (#14248, live in
+      # PR #14106), leaving every non-Claude runtime reading superseded
+      # text — enforced only by author discipline.
+      - name: Check .agents/skills mirrors are in sync with role prompts (#14248)
+        if: ${{ !cancelled() }}
+        run: ./target/debug/loom-daemon generate-agent-skills --check
 
       # component: Config Host-Path Guard
       # Cheap structural check; always runs. #6504: a per-host absolute path
@@ -2333,7 +2373,7 @@ jobs:
     # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
     # or merge_group token holds `packages: write` (#10846). The cache is
     # WRITTEN only by `worker-buildcache` below, a separate job gated at job
-    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # level to a push to main in 2AMLogic/loom (mirrors rust-cache's
     # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
     # same-repo PR must not be able to seed the cache main builds from. The
     # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
