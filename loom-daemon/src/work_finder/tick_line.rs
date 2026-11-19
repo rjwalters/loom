@@ -2,8 +2,10 @@
 //! size-frozen `work_finder.rs`.
 
 use super::TickReport;
+use crate::eager_reclaim::EagerReclaimReport;
 use crate::step_dispatch::gather_budget::millis;
 use chrono::{DateTime, SecondsFormat, Utc};
+use std::future::Future;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -23,11 +25,39 @@ pub(super) struct PreSpanPhases {
     /// Wall time awaiting [`crate::eager_reclaim::tick`] (free-space probe, plus
     /// a whole reclaim pass when one was due).
     pub(super) reclaim: Duration,
-    /// Whether that await ran a reclaim pass rather than just the probe.
+    /// Whether the report confirms that a reclaim pass ran.
     pub(super) reclaim_ran: bool,
     /// Wall time of the CPU-idle fallback sample; zero when a published idle
     /// record made it unnecessary.
     pub(super) cpu_fallback: Duration,
+}
+
+pub(super) async fn sample_pre_span(
+    reclaim_pass: impl Future<Output = Option<EagerReclaimReport>>,
+    filtered_idle: impl FnOnce() -> Option<f64>,
+    raw_idle: impl Future<Output = Option<f64>>,
+) -> (Option<f64>, PreSpanPhases) {
+    let reclaim_started = Instant::now();
+    let reclaim_ran = reclaim_pass
+        .await
+        .is_some_and(|report| report.skipped.is_none());
+    let reclaim = reclaim_started.elapsed();
+    let (idle, cpu_fallback) = match filtered_idle() {
+        Some(idle) => (Some(idle), Duration::ZERO),
+        None => {
+            let started = Instant::now();
+            let idle = raw_idle.await;
+            (idle, started.elapsed())
+        }
+    };
+    (
+        idle,
+        PreSpanPhases {
+            reclaim,
+            reclaim_ran,
+            cpu_fallback,
+        },
+    )
 }
 
 impl TickTiming<'_> {
@@ -192,6 +222,73 @@ mod tests {
         assert!(line.starts_with("work_finder: tick — cap 12 "), "{line}");
         assert!(line.contains("1 dispatched"), "{line}");
         assert!(!worth_logging(&TickReport::default()));
+    }
+
+    fn reclaim_report(skipped: Option<&str>) -> EagerReclaimReport {
+        EagerReclaimReport {
+            repo_root: "/fixture".into(),
+            skipped: skipped.map(str::to_owned),
+            floor_gb: 64,
+            free_gb_before: Some(32),
+            free_gb_after: Some(32),
+            tiers_run: u8::from(skipped.is_none()),
+            worktree_reap_ran: false,
+            worktrees_removed: 0,
+            deep_clean: None,
+            docker: None,
+            scratch: None,
+            target_orphans: None,
+            at: Utc::now(),
+            git_tmp: None,
+            idle_targets: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_phase_distinguishes_skips_from_a_completed_pass() {
+        let wait = Duration::from_millis(5);
+        for (report, ran) in [
+            (None, false),
+            (Some(reclaim_report(Some("disabled"))), false),
+            (Some(reclaim_report(Some("cooldown"))), false),
+            (Some(reclaim_report(None)), true),
+        ] {
+            let (_, phases) = sample_pre_span(
+                async {
+                    tokio::time::sleep(wait).await;
+                    report
+                },
+                || Some(0.5),
+                async { panic!("filtered idle was available") },
+            )
+            .await;
+            assert_eq!(phases.reclaim_ran, ran);
+            assert!(phases.reclaim >= wait);
+        }
+    }
+
+    #[tokio::test]
+    async fn cpu_phase_measures_only_the_raw_fallback() {
+        let wait = Duration::from_millis(5);
+        let (idle, phases) = sample_pre_span(
+            async { None },
+            || {
+                std::thread::sleep(wait);
+                Some(0.5)
+            },
+            async { panic!("filtered idle was available") },
+        )
+        .await;
+        assert_eq!(idle, Some(0.5));
+        assert_eq!(phases.cpu_fallback, Duration::ZERO);
+
+        let (idle, phases) = sample_pre_span(async { None }, || None, async {
+            tokio::time::sleep(wait).await;
+            Some(0.25)
+        })
+        .await;
+        assert_eq!(idle, Some(0.25));
+        assert!(phases.cpu_fallback >= wait);
     }
 
     #[test]
