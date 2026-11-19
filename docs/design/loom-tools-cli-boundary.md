@@ -752,7 +752,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
-| Worktree operations, checkout claims and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). |
+| Worktree operations and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). Checkout-local claims are available through `loom-tools claim` (#14487, §13.8). |
 
 ### 13.4 Gitea decision
 
@@ -843,6 +843,27 @@ unchanged — an added key would be the only reason to bump), and the
 `bin/loom_tools.rs` unit test still fails when the list and the clap tree
 disagree. The Gitea stance is §13.4's: these commands' forge reads (their
 `gh` calls) keep whatever the facade and the shell adapter already do.
+
+### 13.8 Local claim commands (#14487)
+
+Part of #14475. `loom-tools claim <verb>` serves `claim`, `extend`, `check`,
+`release`, `list` and `cleanup` through the same `script_helpers::claim::run`
+that `loom-daemon claim` (and the `loom-claim` shim from
+`scripts/install/provision-daemon.sh`) calls; the argument shape is the same
+optional verb plus trailing positionals. The claim is the
+directory `.loom/claims/issue-<N>.lock` with its `claim.json`, found by walking up
+from the current directory to the checkout root.
+
+**Mode:** none of the six verbs reaches the forge, so none passes through
+`mode_gate()`: they behave the same under `fleet`, `local-daemon`, `session` and
+with `mode` unset, offline, with no daemon binary. Exit codes are the
+handler's: 0 success, 1 existing claim or general error, 2 bad input (or no
+Loom checkout), 3 claim not found, 4 owner mismatch. A refused `claim`, `extend`
+or `release` leaves the owner's `claim.json` unchanged.
+
+`install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
+split into reads and writes, so no sub-verbs are listed). Forge claim checks
+(§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 

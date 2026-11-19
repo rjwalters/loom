@@ -44,6 +44,7 @@ use loom_daemon::cli::{
     StaleBlockedArgs,
 };
 use loom_daemon::install_compat;
+use loom_daemon::script_helpers;
 use loom_daemon::tools_mode;
 
 #[derive(Parser)]
@@ -181,6 +182,23 @@ enum ToolsCommands {
     /// user-scope hooks from (2am#4501): the same line and exit codes as
     /// `loom-daemon hooks-home` (#14429).
     HooksHome(HooksHomeArgs),
+    /// Atomic file-based issue claiming in this checkout (`claim`, `extend`,
+    /// `release`, `check`, `list`, `cleanup`): the same arguments, stdout and
+    /// exit codes as `loom-daemon claim` (#14487), so an attended builder can
+    /// claim with no daemon binary installed. Filesystem only: no forge call
+    /// and no mode gate.
+    ///
+    /// Exit codes: `0` success, `1` already claimed / general error, `2`
+    /// invalid arguments, `3` claim not found, `4` agent-ID mismatch.
+    Claim {
+        /// One of: `claim`, `extend`, `release`, `check`, `list`, `cleanup`.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
+        /// Positional command arguments (issue number, agent id, ttl).
+        #[arg(value_name = "ARGS", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -314,6 +332,12 @@ fn run() -> Result<()> {
         ToolsCommands::Guards(cmd) => cmd.run(),
         ToolsCommands::InstallCompat(cmd) => cmd.run(),
         ToolsCommands::HooksHome(args) => args.run(),
+        // Filesystem only (`.loom/claims/`), so no mode gate: it works with
+        // `mode` unset, offline. Same handler `Commands::Claim` calls.
+        ToolsCommands::Claim { command, args } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
+        }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }
