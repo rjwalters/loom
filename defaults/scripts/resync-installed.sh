@@ -451,13 +451,18 @@
 #       invoked from a linked worktree without --allow-worktree or --output, the
 #       --output directory already exists or its staging worktree could not be
 #       created, one or more files could not be synced — see the PARTIAL
-#       summary block, #4669 — or one or more files were BLOCKED by the
-#       local-divergence protection above and --force was not given, #7864).
+#       summary block, #4669).
 #   2 - --dry-run only: drift detected (one or more files WOULD be updated,
 #       created, or removed as a retired payload file, see RETIRED PAYLOAD
 #       FILES above; or one or more files WOULD be blocked by the
 #       local-divergence protection, #7864).
 #       Lets callers (e.g. the #3770 warning) use --dry-run as a cheap check.
+#   3 - Applied, but one or more files were HELD BACK by the local-divergence
+#       protection (#7864) and --force was not given (#14434). Everything else
+#       synced; install-metadata.json records the held paths under
+#       `held_back` (cleared by the next run that holds nothing back). Distinct
+#       from 1 so a caller can tell "review these files" from a real error.
+#       Exit 1 still wins when a file also FAILED to sync.
 #
 # See also: check-main-freshness.sh (#3770) — the advisory that suggests this.
 
@@ -3218,6 +3223,20 @@ restamp_metadata() {
     # requires_daemon) still apply; and in every case a result that is
     # semantically identical to the current file is not written, so a no-op
     # run leaves the file byte-identical and git sees no diff.
+    # #14434: record the paths the local-divergence protection held back (and
+    # clear the key when there are none) so the stamp no longer claims a version
+    # whose bytes a held-back file does not match. The stamp still advances --
+    # the local-fix guard's lineage rung relies on that -- so this is an
+    # annotation, not a replacement for the restamp. It is written even on a
+    # "noop" run: a clean rerun must be able to clear it.
+    local held_json="[]" held_nl
+    if [[ "${#BLOCKED_RELS[@]}" -gt 0 ]]; then
+        held_nl="$(printf '%s\n' "${BLOCKED_RELS[@]}")"
+        if command -v jq >/dev/null 2>&1; then
+            held_json="$(printf '%s' "$held_nl" | jq -R . | jq -s -c . 2>/dev/null || echo '[]')"
+        fi
+    fi
+    local held_lines="${held_nl:-}"
     local prev_version prev_commit noop=0
     prev_version="$(sed -n 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" 2>/dev/null | head -1)"
     prev_commit="$(sed -n 's/.*"loom_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" 2>/dev/null | head -1)"
@@ -3236,8 +3255,8 @@ restamp_metadata() {
     tmp="${meta}.tmp.$$"
 
     if command -v jq >/dev/null 2>&1; then
-        if jq --arg v "$version" --arg c "$commit" --arg r "$today" --arg src "$remote" --arg q "$req" --arg n "$noop" \
-              '(if $n == "1" then . else .loom_version=$v | .loom_commit=$c | .last_resync=$r | .loom_source_remote=$src end) | del(.loom_source) | if $q == "" then del(.requires_daemon) else .requires_daemon=$q end' \
+        if jq --arg v "$version" --arg c "$commit" --arg r "$today" --arg src "$remote" --arg q "$req" --arg n "$noop" --argjson h "$held_json" \
+              '(if $n == "1" then . else .loom_version=$v | .loom_commit=$c | .last_resync=$r | .loom_source_remote=$src end) | del(.loom_source) | if $q == "" then del(.requires_daemon) else .requires_daemon=$q end | if ($h | length) == 0 then del(.held_back) else .held_back=$h end' \
               "$meta" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
             if jq -n -e --slurpfile a "$meta" --slurpfile b "$tmp" '$a == $b' >/dev/null 2>&1; then
                 rm -f "$tmp"
@@ -3253,7 +3272,7 @@ restamp_metadata() {
 
     if command -v python3 >/dev/null 2>&1; then
         local py_rc=0
-        META="$meta" VERSION="$version" COMMIT="$commit" TODAY="$today" REMOTE="$remote" REQ="$req" NOOP="$noop" \
+        META="$meta" VERSION="$version" COMMIT="$commit" TODAY="$today" REMOTE="$remote" REQ="$req" NOOP="$noop" HELD="$held_lines" \
            python3 - "$tmp" <<'PY' 2>/dev/null || py_rc=$?
 import json, os, sys
 with open(os.environ["META"]) as f:
@@ -3268,6 +3287,10 @@ data.pop("loom_source", None)
 data.pop("requires_daemon", None)
 if os.environ["REQ"]:
     data["requires_daemon"] = os.environ["REQ"]
+held = [l for l in os.environ.get("HELD", "").split("\n") if l]
+data.pop("held_back", None)
+if held:
+    data["held_back"] = held
 if data == orig:
     sys.exit(10)
 with open(sys.argv[1], "w") as f:
@@ -4109,13 +4132,15 @@ if [[ "$N_FAILED" -gt 0 ]]; then
     exit 1
 fi
 
-# #7864: same non-zero exit as N_FAILED above, once it's confirmed clean —
-# a blocked file must never fall through into the success summary below.
+# #7864: a blocked file must never fall through into the success summary below.
+# #14434: it exits 3, not 1 -- the run applied everything else (and stamped
+# install-metadata.json with `held_back`), so a caller must be able to tell
+# "review these files" from a real error (1, the N_FAILED path above).
 if [[ "$N_BLOCKED" -gt 0 ]]; then
     if [[ -n "$OUTPUT_DIR" && "$STAGING_WORKTREE_CREATED" -eq 1 ]]; then
         printf '%b\n' "${YELLOW}The staging worktree at $OUTPUT_DIR was left in place (not removed) so you can inspect it.${NC}"
     fi
-    exit 1
+    exit 3
 fi
 
 # (the #5980 crash-detection marker was already cleared, right after N_FAILED

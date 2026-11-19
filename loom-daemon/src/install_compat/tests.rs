@@ -30,6 +30,7 @@ fn meta(loom_version: Option<&str>, requires_daemon: Option<&str>) -> InstallMet
     InstallMeta {
         loom_version: loom_version.map(str::to_string),
         requires_daemon: requires_daemon.map(str::to_string),
+        ..InstallMeta::default()
     }
 }
 
@@ -124,6 +125,23 @@ fn classify_resync_owed() {
         Compat::ResyncOwed
     );
     assert_eq!(classify(&InstallMeta::default(), &daemon()), Compat::ResyncOwed);
+}
+
+#[test]
+fn held_back_paths_make_an_otherwise_compatible_install_owe_a_resync() {
+    // #14434: the stamp advanced past a file the resync withheld.
+    let m = InstallMeta::parse(
+        r#"{"loom_version":"0.19.870","requires_daemon":"0.19.772","held_back":[".loom/scripts/x.sh"]}"#,
+    )
+    .unwrap();
+    assert_eq!(m.held_back, vec![".loom/scripts/x.sh".to_string()]);
+    assert_eq!(classify(&m, &daemon()), Compat::ResyncOwed);
+    // Absent or empty `held_back` leaves the classification alone.
+    let clean = InstallMeta::parse(
+        r#"{"loom_version":"0.19.870","requires_daemon":"0.19.772","held_back":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(classify(&clean, &daemon()), Compat::Compatible);
 }
 
 #[test]

@@ -3202,6 +3202,14 @@ git merge --ff-only origin/main                 # bring defaults/ current
 ./.loom/scripts/land-resync-commit.sh           # commit + land it (never rebases/bypass-pushes, #6646)
 ```
 
+**Exit codes (#14434):** `0` synced / in sync; `1` error (or a file failed to sync);
+`2` `--dry-run` found drift; `3` synced, but the local-divergence protection (#7864)
+**held back** one or more files that look like a local fix. On exit `3` everything
+else is applied and `.loom/install-metadata.json` records the withheld paths under
+`held_back` (the version stamp still advances; the daemon's install classifier treats
+a non-empty `held_back` as a resync owed, never as current). Review each file, then
+re-run with `--force`; the next run that holds nothing back clears `held_back`.
+
 The last step is what actually commits and pushes the refreshed surfaces onto
 the primary clone's default branch — see "Landing a resync commit on the
 primary clone (#6646)" below for exactly what it will and will not do on its

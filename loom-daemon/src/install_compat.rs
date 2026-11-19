@@ -142,6 +142,11 @@ pub struct InstallMeta {
     /// The oldest daemon these installed files work with.
     #[serde(default)]
     pub requires_daemon: Option<String>,
+    /// Installed paths the last resync withheld because they looked like a
+    /// local fix (#14434). Non-empty means `loom_version` names a release
+    /// whose bytes these files do not match: the install is not current.
+    #[serde(default)]
+    pub held_back: Vec<String>,
 }
 
 impl InstallMeta {
@@ -225,7 +230,9 @@ pub enum Compat {
 ///    too old, whether or not `requires_daemon` was recorded. The migration
 ///    rule ("no `requires_daemon` means compatible but owed a resync") only
 ///    holds while the daemon still supports that version.
-/// 3. Any claim missing or unparseable means a resync is owed.
+/// 3. Any claim missing or unparseable means a resync is owed, and so does a
+///    non-empty `held_back` (#14434): the stamp advanced past a file the
+///    resync withheld.
 ///
 /// `Compatible` and `ResyncOwed` say nothing about the resync's direction.
 /// A present but unparseable `requires_daemon` lands in `ResyncOwed`, and a
@@ -253,7 +260,7 @@ pub fn classify(installed: &InstallMeta, daemon: &DaemonCompat) -> Compat {
             return Compat::InstalledTooOld;
         }
     }
-    if requires.is_none() || version.is_none() {
+    if requires.is_none() || version.is_none() || !installed.held_back.is_empty() {
         return Compat::ResyncOwed;
     }
     Compat::Compatible

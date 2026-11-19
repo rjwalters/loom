@@ -192,6 +192,7 @@ fn recorded(report: &WorkspaceReport) -> InstallMeta {
     InstallMeta {
         loom_version: report.installed.clone(),
         requires_daemon: report.requires_daemon.clone(),
+        ..InstallMeta::default()
     }
 }
 

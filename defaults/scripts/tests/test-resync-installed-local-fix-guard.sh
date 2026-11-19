@@ -84,10 +84,10 @@ git -C "$REPO" add .loom/hooks/guard.sh >/dev/null 2>&1
 git -C "$REPO" commit -qm "fix(guard): resolve_var() now substitutes a mid-token embedded \$VAR reference" >/dev/null 2>&1
 OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]]; then
-    pass "(#7864) a resync that would revert a direct fix exits 1"
+if [[ $RC -eq 3 ]]; then
+    pass "(#7864, #14434) a resync that would revert a direct fix exits 3 (held back)"
 else
-    fail "(#7864) expected exit 1 when a direct fix would be reverted (got $RC)"
+    fail "(#7864, #14434) expected exit 3 when a direct fix would be reverted (got $RC)"
 fi
 if grep -q "BLOCKED" <<<"$OUT" && grep -q "hooks/guard.sh" <<<"$OUT"; then
     pass "(#7864) the blocked file is named in the summary"
@@ -295,7 +295,7 @@ for INSTALL_CASE in normal skip-ci custom-fix; do
     OUT="$(cd "$REPO8" && bash "$SCRIPT" 2>&1)"
     RC=$?
     if [[ "$INSTALL_CASE" == custom-fix ]]; then
-        if [[ $RC -eq 1 ]] && [[ "$(cat "$REPO8/.loom/hooks/guard.sh")" == $'OLD\nINSTALLER-CONTENT' ]]; then
+        if [[ $RC -eq 3 ]] && [[ "$(cat "$REPO8/.loom/hooks/guard.sh")" == $'OLD\nINSTALLER-CONTENT' ]]; then
             pass "custom installer fix message remains protected"
         else
             fail "custom installer fix was not protected: $OUT"
@@ -323,7 +323,7 @@ for SUBJECT in \
     RC=$?
     if [[ "$SUBJECT" == *'with a local fix'* || "$SUBJECT" == *'and also revert'* \
         || "$SUBJECT" == *'plus my hand fix'* ]]; then
-        if [[ $RC -eq 1 ]] && [[ "$(cat "$REPO9/.loom/hooks/guard.sh")" == OLD ]]; then
+        if [[ $RC -eq 3 ]] && [[ "$(cat "$REPO9/.loom/hooks/guard.sh")" == OLD ]]; then
             pass "non-routine suffixed subject retains its local content: $SUBJECT"
         else
             fail "non-routine suffixed subject lost protection: $SUBJECT: $OUT"
@@ -371,7 +371,7 @@ git -C "$REPO10" commit -qm "fix(guard): a direct local fix" >/dev/null 2>&1
 printf 'a\nB\n' > "$REPO10/defaults/hooks/guard.sh"
 OUT="$(cd "$REPO10" && PATH="$WORKDIR/comm-bin:$PATH" LC_ALL=en_US.UTF-8 bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" && ! grep -q "TEST_COMM_BAD_LOCALE" <<<"$OUT"; then
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" && ! grep -q "TEST_COMM_BAD_LOCALE" <<<"$OUT"; then
     pass "(#8165) comm runs under LC_ALL=C even when the caller's LC_ALL is not C"
 else
     fail "(#8165) comm did not run under LC_ALL=C with a non-C ambient locale (rc=$RC); out=$OUT"
@@ -420,7 +420,7 @@ else
         printf 'a\nB\n' > "$REPO10B/defaults/hooks/guard.sh"
         OUT="$(cd "$REPO10B" && LC_ALL="$LOC" bash "$SCRIPT" 2>&1)"
         RC=$?
-        if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+        if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
             && [[ "$(cat "$REPO10B/.loom/hooks/guard.sh")" == $'a\nB\nLOCAL-FIX' ]]; then
             pass "(#8165) LC_ALL=$LOC: a real removal is still blocked"
         else
@@ -570,7 +570,7 @@ git -C "$REPO11H" commit -qm "fix(guard): hand-applied hotfix that upstream has 
 bump_upstream "$REPO11H"
 OUT="$(cd "$REPO11H" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && [[ "$(cat "$REPO11H/.loom/hooks/guard.sh")" == $'line-one\nline-two\nline-three\nLOCAL-HOTFIX' ]]; then
     pass "(#8676) a hand-edited installed file is still protected"
 else
@@ -641,7 +641,7 @@ git -C "$REPO11F2" commit -qm "fix(guard): hand-applied hotfix upstream never to
 bump_upstream "$REPO11F2"
 OUT="$(cd "$REPO11F2" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && [[ "$(cat "$REPO11F2/.loom/hooks/guard.sh")" == $'line-one\nline-two\nline-three\nLOCAL-HOTFIX' ]]; then
     pass "(#9178) a post-install hand edit is still protected when no content proof is available"
 else
@@ -671,7 +671,7 @@ else
 fi
 OUT="$(cd "$REPO11F3" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && [[ "$(cat "$REPO11F3/.loom/hooks/guard.sh")" == "OLD" ]]; then
     pass "(#9178) an extended routine subject on the install commit keeps #8098's protection"
 else
@@ -730,7 +730,7 @@ git -C "$REPO11H2" add .loom/install-metadata.json >/dev/null 2>&1
 git -C "$REPO11H2" commit -qm "chore: re-stamp install metadata" >/dev/null 2>&1
 OUT="$(cd "$REPO11H2" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && [[ "$(cat "$REPO11H2/.loom/hooks/guard.sh")" == $'line-one\nline-two\nline-three\nLOCAL-HOTFIX' ]]; then
     pass "(#8676) a hand edit stays protected even when the recorded version drifted"
 else
@@ -850,7 +850,7 @@ git -C "$REPO13H" commit -qm "$UPDATE_TOOLS_SUBJECT" >/dev/null 2>&1
 bump_upstream "$REPO13H"
 OUT="$(cd "$REPO13H" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && [[ "$(cat "$REPO13H/.loom/hooks/guard.sh")" == $'line-one\nline-two\nline-three\nLOCAL-HOTFIX' ]]; then
     pass "(#12618) a hand-edited file under the update-tools subject keeps its protection"
 else
@@ -922,7 +922,7 @@ echo "Test group 13d: a hand-edited installed copy of a symlinked source is stil
 REPO13SH="$(make_symlink_source_fixture repo-symlink-source-handedit handedit)"
 OUT="$(cd "$REPO13SH" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
     && grep -q "LOCAL-HOTFIX" "$REPO13SH/.loom/roles/guard.md"; then
     pass "(#12618) a hand-edited symlinked-source file keeps its protection"
 else
@@ -993,7 +993,7 @@ for SUBJECT12 in 'chore(loom): resync installed Loom to v1 and also revert the g
     bump_upstream "$REPO12"
     OUT="$(cd "$REPO12" && bash "$SCRIPT" 2>&1)"
     RC=$?
-    if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" \
+    if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" \
         && [[ "$(cat "$REPO12/.loom/hooks/guard.sh")" == $'line-one\nline-two\nline-three\nline-four' ]]; then
         pass "(#8920) '$SUBJECT12' is not routine lineage -- still blocked"
     else
@@ -1007,7 +1007,7 @@ REPO12B="$(make_fixture)"
 git -C "$REPO12B" commit --amend -qm 'chore(loom): resync installed Loom to v1.2.3 and also revert the guard fix' >/dev/null 2>&1
 OUT="$(cd "$REPO12B" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" && [[ "$(cat "$REPO12B/.loom/hooks/guard.sh")" == "OLD" ]]; then
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" && [[ "$(cat "$REPO12B/.loom/hooks/guard.sh")" == "OLD" ]]; then
     pass "(#8920) an extended daemon subject on the install commit is not cleared by the install-baseline rung"
 else
     fail "(#8920) the install-baseline rung cleared an extended daemon subject (rc=$RC); out=$OUT"
@@ -1023,7 +1023,7 @@ git -C "$REPO12C" commit -qm "fix(guard): hand-applied hotfix upstream never too
 bump_upstream "$REPO12C"
 OUT="$(cd "$REPO12C" && bash "$SCRIPT" 2>&1)"
 RC=$?
-if [[ $RC -eq 1 ]] && grep -q "BLOCKED" <<<"$OUT" && grep -q "hand-applied hotfix upstream never took" <<<"$OUT" \
+if [[ $RC -eq 3 ]] && grep -q "BLOCKED" <<<"$OUT" && grep -q "hand-applied hotfix upstream never took" <<<"$OUT" \
     && grep -q "LOCAL-HOTFIX" "$REPO12C/.loom/hooks/guard.sh"; then
     pass "(#8920) a hand edit after a daemon resync is protected, and the block names its commit"
 else

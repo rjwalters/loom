@@ -236,6 +236,7 @@ fn an_unorderable_version_rolls_a_fleet_host_only_when_requires_daemon_says_so()
         let m = InstallMeta {
             loom_version: Some("0.20.0-rc1".into()),
             requires_daemon: requires.map(str::to_string),
+            ..InstallMeta::default()
         };
         let g = crate::init::payload::resync_gate(&m, &d);
         let behind = crate::workspace_hold::behind_compatible(&m, &d);
