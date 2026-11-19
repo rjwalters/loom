@@ -1811,6 +1811,44 @@ out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
 assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
     "a dropped pin still reports model=none (+ requested_model) alongside the tier"
 
+# Compare config arguments in order, one per line, with the record from the
+# same mock launch. A substring inside an instruction is not an effort key.
+assert_effort_launch() {
+    local description="$1" expected_record="$2" expected_config="$3"
+    shift 3
+    local output config
+    output="$(run_mock LOOM_ROLE= LOOM_ACCOUNT_NAME= LOOM_MODEL= LOOM_CODEX_MODEL= \
+        LOOM_EFFORT= LOOM_SERVICE_TIER= -- -p x "$@" 2>&1)"
+    config="$(awk '/^(-c|--config)$/ { print; getline; print; next }
+                   /^(-c|--config)=/ { print }' "$MOCK_ARGV_FILE")"
+    assert_eq "$expected_config" "$config" "$description forwards the expected config arguments"
+    assert_eq "$expected_record" "$(grep '^# LOOM_TERMINAL_RESULT ' <<< "$output")" \
+        "$description emits the expected terminal record"
+}
+
+quoted_data='--config=developer_instructions="model_reasoning_effort=low"'
+plain_data='-c=developer_instructions=model_reasoning_effort=low'
+medium='model_reasoning_effort=medium'
+high_record="$(_tr4 unknown SUCCESS 0 none high none)"
+medium_record="$(_tr4 unknown SUCCESS 0 none medium none)"
+for data in "$quoted_data" "$plain_data"; do
+    assert_effort_launch "inline $data with --effort" "$high_record" \
+        "$(printf '%s\n' "$data" -c model_reasoning_effort=high)" --effort high "$data"
+done
+assert_effort_launch "explicit effort before inline data" "$medium_record" \
+    "$(printf '%s\n' "-c=$medium" "$quoted_data")" --effort high "-c=$medium" "$quoted_data"
+assert_effort_launch "last explicit effort after inline data" "$medium_record" \
+    "$(printf '%s\n' -c model_reasoning_effort=low "$plain_data" "--config=$medium")" \
+    --effort high -c model_reasoning_effort=low "$plain_data" "--config=$medium"
+assert_effort_launch "inline data without an effort source" "$(_tr unknown SUCCESS 0 none)" \
+    "$plain_data" "$plain_data"
+mixed_data='--config=developer_instructions=model_reasoning_effort=low,service_tier=priority'
+assert_effort_launch "instruction mentioning effort and tier" "$(_tr unknown SUCCESS 0 none)" \
+    "$mixed_data" "$mixed_data"
+assert_effort_launch "separate-value instruction" "$high_record" \
+    "$(printf '%s\n' --config "${quoted_data#--config=}" -c model_reasoning_effort=high)" \
+    --effort high --config "${quoted_data#--config=}"
+
 # ============================================================
 # Summary
 # ============================================================

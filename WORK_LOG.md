@@ -16,6 +16,33 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14562**: feat: record work-finder tick phase timings
+- **Issue #14414** (closed): adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort=
+- **PR #14468**: fix: report an explicit codex model_reasoning_effort config as the launched effort
+- **Issue #14557** (closed): Fix the WORK_PLAN stamp regression suite on macOS
+- **PR #14558**: test: use the shipped Guide splice in the plan stamp fixture
+- **Issue #13746** (closed): Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
+- **PR #14551**: fix: classify writer rate-limit refusals in lease pr claim and hold the route until reset
+- **Issue #14369** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
+- **Issue #14092** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **Issue #14484** (closed): capability_list_matches_the_clap_tree only validates top-level heads, not subcommand names
+- **PR #14509**: test(tools): check advertised capability verb paths
+- **Issue #14541** (closed): loom_tools_slice: one allowed-target daemon re-run bypasses the shim cache isolation and leaks a host-global write-scope verdict
+- **PR #14552**: test: compare park-apply stdout from the isolated runs, drop unisolated daemon re-run
+- **Issue #14318** (closed): Private-job record: choose how a merged one-shot sweep's recovery-required stamp should be read
+- **Issue #14520** (closed): loom-tools: serve the remaining merge-queue actions
+- **PR #14528**: feat: serve every merge-queue verb from loom-tools
+- **PR #14550**: fix: prevent fleet park and decision writes from using local gh
+- **Issue #14507** (closed): Classify pr-worktree.sh under both forge operations and retire its bypass
+- **PR #14549**: chore: classify PR worktree reads and checkouts in the forge inventory
+- **Issue #14523** (closed): config_dir_for candidate 1 returns a registered GH_CONFIG_DIR without checking it still exists
+- **PR #14527**: fix: skip registered GitHub config directories missing hosts.yml
+- **Issue #14488** (closed): Run the attended issue lease publisher, renewer and fence with loom-tools
+- **PR #14515**: feat: serve the issue lease verbs from loom-tools
+- **Issue #14485** (closed): Docs: the renamed QueueDisposition token is still documented as `peer_claim` (post-#13945)
+- **PR #14543**: docs: update the retired peer-claim vocabulary
+- **Issue #14538** (closed): Tidy three leftovers from the loom-tools top-level-reads slice (#14429)
+- **PR #14544**: refactor: drop dead loom-tools leftovers and fold is_read into the main impl
 - **PR #14537**: test: cover the tools fleet-mode no-route arms in route_read and host_has_read_pool
 - **Issue #14529** (closed): Cover the tools fleet-mode no-route arm in route_read and host_has_read_pool (#14489 follow-up)
 - **PR #14536**: test: pin the loom-tools park/decision write ordering, routing and nested filing
