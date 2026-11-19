@@ -508,7 +508,7 @@ file_phase_pair() {
     # Model the just-filed issue including the dashboard footer appended by
     # create-issue.sh. The second create sees that stored issue.
     jq -n --arg title "$first_title" --rawfile body "$WORK/$size-first.md" \
-        '[{number: 9999, title: $title, body: ($body + "\n[loom dashboard](https://dashboard.2amlogic.com/github.com/example/repo/issues/9999)\n<!-- loom:dashboard-link -->")} ]' \
+        '[{number: 9999, title: $title, body: ($body + "\n[loom dashboard](https://dashboard.example.com/github.com/example/repo/issues/9999)\n<!-- loom:dashboard-link -->")} ]' \
         > "$WORK/$size-open.json"
     STUB_ISSUE_LIST="$WORK/$size-open.json" run_create --title "$second_title" --body-file "$WORK/$size-second.md"
     assert_eq "$RC" "0" "($size) distinct sibling files at the default thresholds"
