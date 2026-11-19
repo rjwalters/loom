@@ -335,6 +335,8 @@ pub(crate) struct CodexPoolState {
     /// release — see the module doc for why class-scoped holds and
     /// session-managed re-auth holds are not counted as blocking.
     pub spawnable: usize,
+    /// Enabled profiles excluded from this role's draw by hook readiness.
+    pub untrusted: Vec<String>,
     /// Enabled session-managed accounts whose `loom-codex-session-<name>`
     /// container the published session snapshot shows as down — stopped,
     /// restarting or missing (#10454, reason `SessionDown`). Never counted
@@ -362,10 +364,11 @@ pub(crate) struct CodexPoolState {
 /// per-account read this replaced re-parsed the file for every enabled
 /// account and left a window in which an account observed early and one
 /// observed late could disagree about the same tick's state.
-pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
+pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> CodexPoolState {
     let mut state = CodexPoolState {
         enabled: 0,
         spawnable: 0,
+        untrusted: Vec::new(),
         session_down: 0,
         session_held: 0,
         earliest_clear: None,
@@ -408,6 +411,12 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
                 usize::from(crate::tokens_pool::session_lifecycle::liveness::is_held(account));
             continue;
         }
+        if require_hook
+            && !crate::runtime_preference::codex_guard::ready(root, &account.credential_reference)
+        {
+            state.untrusted.push(account.id.name.clone());
+            continue;
+        }
         let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
@@ -436,6 +445,12 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
 /// both name `SessionDown` (#10454) the same way.
 pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
     use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+    if !state.untrusted.is_empty() {
+        return format!(
+            "guard hook not ready on Codex profile(s) {}; no eligible seat is spawnable",
+            state.untrusted.join(", ")
+        );
+    }
     if state.session_down == 0 {
         return "every enabled account is cooling down or needs re-auth".to_string();
     }
@@ -525,7 +540,11 @@ fn codex_gate(
     }
     let now = chrono::Utc::now();
     let now_epoch = u64::try_from(now.timestamp()).unwrap_or(0);
-    let state = codex_pool_state(root, now_epoch);
+    let state = codex_pool_state(
+        root,
+        now_epoch,
+        admitted.execution.is_none() && crate::runtime_preference::codex_guard::guarded(role),
+    );
     if state.spawnable > 0 {
         return None;
     }
@@ -547,6 +566,9 @@ fn codex_gate(
         ),
         None if state.enabled == 0 => {
             (PoolHold::Unprovisioned, "no enabled codex account is provisioned".to_string())
+        }
+        None if state.untrusted.len() == state.enabled => {
+            (PoolHold::Unprovisioned, codex_exhausted_reason(&state))
         }
         None => (PoolHold::SelfHealing, codex_exhausted_reason(&state)),
     };

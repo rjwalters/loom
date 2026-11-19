@@ -305,7 +305,15 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = match dispatch::Selection::prepare(root, "codex", model, kind, issue, owner) {
+    let selection = match dispatch::Selection::prepare_for_role(
+        root,
+        "codex",
+        model,
+        kind,
+        issue,
+        owner,
+        Some(role),
+    ) {
         Ok(Some(selection)) => selection,
         Ok(None) => {
             return Err(rejection.with_containment_failure(

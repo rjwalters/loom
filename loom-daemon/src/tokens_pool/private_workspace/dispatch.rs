@@ -66,6 +66,19 @@ impl Selection {
         issue: Option<u64>,
         owner: &str,
     ) -> Result<Option<Self>> {
+        let role = std::env::var("LOOM_ROLE").ok();
+        Self::prepare_for_role(root, runtime, model, kind, issue, owner, role.as_deref())
+    }
+
+    pub(crate) fn prepare_for_role(
+        root: &Path,
+        runtime: &str,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+        role: Option<&str>,
+    ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
             adapter::check_environment()?;
@@ -94,9 +107,7 @@ impl Selection {
             export::check_failover(root, issue, "unavailable")?;
             return Ok(None);
         }
-        use super::super::account_registry::{
-            account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
-        };
+        use super::super::account_registry::{account_inventory, AccountBinding, AccountProvider};
         let inventory = account_inventory(root, AccountProvider::Codex)?;
         let explicit = std::env::var("LOOM_CODEX_PROFILE")
             .ok()
@@ -135,9 +146,10 @@ impl Selection {
             // Codex role tick in every other workspace that drew one of them
             // failed with "private workspace repository differs".
             let logical = logical_repository(root);
-            let account = select_codex_account_where(root, model, |account| {
-                serves_repository(&account.credential_reference, logical.as_deref())
-            })?;
+            let account =
+                crate::runtime_preference::codex_guard::select(root, model, role, |account| {
+                    serves_repository(&account.credential_reference, logical.as_deref())
+                })?;
             let AccountBinding::CodexHome { directory } = account.binding else {
                 unreachable!()
             };
@@ -205,6 +217,39 @@ impl Selection {
             handed_off: std::cell::Cell::new(false),
         });
         Ok(Some(selection))
+    }
+
+    /// Bind a guarded step to its eligible seat before the forge claim. The
+    /// caller has checked that this is a pooled Codex launch (no explicit pin).
+    pub(crate) fn guarded_step(
+        root: &Path,
+        role: &str,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+    ) -> Result<Self> {
+        let owner = format!("step-{role}-{}", uuid::Uuid::new_v4());
+        if let Some(selected) =
+            Self::prepare_for_role(root, "codex", model, kind, issue, &owner, Some(role))?
+        {
+            if selected.prepared.is_some() {
+                selected.contain(root)?;
+            }
+            return Ok(selected);
+        }
+        // No private clone was prepared. Only a shared profile can run here.
+        let selected =
+            crate::runtime_preference::codex_guard::select(root, model, Some(role), |a| {
+                !crate::tokens_pool::codex_hooks::is_private_clone(&a.credential_reference)
+            })?;
+        let crate::tokens_pool::AccountBinding::CodexHome { directory } = selected.binding else {
+            unreachable!()
+        };
+        Ok(Self {
+            name: selected.id.name,
+            profile: directory,
+            prepared: None,
+        })
     }
 
     pub fn rebind(&self, _root: &Path, owner: &str) -> Result<()> {

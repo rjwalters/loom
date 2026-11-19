@@ -29,7 +29,7 @@ fn the_count_follows_the_snapshot_state() {
     pool(profiles.path(), workspace.path());
     let now = epoch_now();
     let count = || {
-        let state = codex_pool_state(workspace.path(), now);
+        let state = codex_pool_state(workspace.path(), now, false);
         (state.enabled, state.spawnable, state.session_down, state.session_held)
     };
     {
@@ -66,7 +66,7 @@ fn an_unavailable_or_absent_snapshot_leaves_every_account_spawnable() {
         .unwrap();
     for (what, liveness) in [("unavailable", unavailable()), ("no fresh snapshot", None)] {
         let _live = set(liveness);
-        let state = codex_pool_state(workspace.path(), epoch_now());
+        let state = codex_pool_state(workspace.path(), epoch_now(), false);
         assert_eq!(
             (state.spawnable, state.session_down, state.session_held),
             (4, 0, 0),
@@ -98,7 +98,7 @@ fn the_gate_starts_no_docker_process_even_with_docker_wedged() {
     let _seam = set_selector_docker(&docker.to_string_lossy(), false);
 
     let started = std::time::Instant::now();
-    let state = codex_pool_state(workspace.path(), epoch_now());
+    let state = codex_pool_state(workspace.path(), epoch_now(), false);
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!((state.spawnable, state.session_down), (4, 0), "fail open: {state:?}");
     assert!(!calls.exists(), "the gate ran docker: {:?}", fs::read_to_string(&calls));
@@ -120,7 +120,7 @@ fn a_held_account_is_reported_as_held_with_no_start_hint() {
         session_hold::write_hold(&profiles.path().join(name), session_hold::now_unix_ms()).unwrap();
     };
     let _down = set(running(&[]));
-    let read = || codex_pool_state(workspace.path(), epoch_now());
+    let read = || codex_pool_state(workspace.path(), epoch_now(), false);
 
     let reason = codex_exhausted_reason(&read());
     assert!(reason.contains("2/2 session") && reason.contains("session start"), "{reason}");

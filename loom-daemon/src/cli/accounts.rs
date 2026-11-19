@@ -3,7 +3,7 @@
 //! `crate::tokens_pool::account_lifecycle`.
 
 use crate::tokens_pool::account_scope::{
-    resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
+    resolve_accounts_registry, resolve_shared_registry, shadowed_shared_accounts, AccountsRegistry,
 };
 use anyhow::{anyhow, Result};
 
@@ -130,7 +130,11 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         Ok(())
     }
 
-    let registry = resolve_registry(workspace)?;
+    let registry = match &action {
+        AccountsAction::Disable { shared: true, .. }
+        | AccountsAction::Enable { shared: true, .. } => resolve_shared_registry()?,
+        _ => resolve_registry(workspace)?,
+    };
     announce_registry(&registry);
     let workspace = registry.workspace.clone();
     let service = AccountLifecycle::new(workspace.clone(), ProcessCodexRunner)?;
@@ -193,6 +197,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             provider,
             name,
             json,
+            ..
         } => {
             require_codex(&provider)?;
             print_status(&service.disable(&name)?, json)
@@ -201,6 +206,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
             provider,
             name,
             json,
+            ..
         } => {
             require_codex(&provider)?;
             print_status(&service.enable(&name)?, json)
