@@ -206,8 +206,9 @@ assert_eq 5 "$LAST_RC" "--release-hold + required context not reported -> HOLD, 
 assert_not_merged "--release-hold, required context unreported"
 assert_eq "" "$(hold_writes)" "unreported required context: loom:blocked kept and no audit comment posted"
 assert_contains "$LAST_OUT" "was NOT released" "exit-5 text says the hold was not released"
-assert_contains "$LAST_OUT" "fleet Champion" "exit-5 text names the next actor (the fleet Champion)"
-assert_contains "$LAST_OUT" "Do not retry --release-hold" "exit-5 text says not to retry"
+assert_contains "$LAST_OUT" "clear the hold" "exit-5 text names the release path (clear-the-hold comment)"
+assert_contains "$LAST_OUT" "loom:auto-merge-ok" "exit-5 text names the override path (loom:auto-merge-ok)"
+assert_contains "$LAST_OUT" "re-run --release-hold" "exit-5 text says to re-run once required checks pass"
 
 HOLD_REQUIRED=clean run_hold
 assert_eq 0 "$LAST_RC" "--release-hold + required context green -> releases and merges"
