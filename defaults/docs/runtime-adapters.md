@@ -374,9 +374,15 @@ fails closed on anything else, so an older daemon reading a v4 record records no
 account-health mutation for that step: roll the daemon before the scripts, or accept
 that gap.
 
-Not covered here: reading a `serviceTier` key out of the role config and exporting
-`LOOM_SERVICE_TIER` per role/runtime (like `roleEfforts`) is daemon-side plumbing
-that this env-var contract leaves to a follow-up.
+Scheduled role ticks (#14454) and named sweep steps (#14504) use
+`autonomous.roleRunner.serviceTier` and `autonomous.roleRunner.roleServiceTiers`.
+For a fresh or resumed step, the daemon selects the first configured value from
+`<role>@<runtime>` using the admitted runtime, the bare `<role>`, and the global
+`serviceTier`. It exports that value as `LOOM_SERVICE_TIER`. If no tier matches,
+the child inherits the daemon's environment, including an absent value.
+Whole-issue and PR-set sweeps invoke `/loom:sweep` and inherit the environment
+because they span multiple roles. Claude and Codex use the adapter mappings
+above. Native harnesses use their own provider settings.
 
 ### 3. Error classification
 
