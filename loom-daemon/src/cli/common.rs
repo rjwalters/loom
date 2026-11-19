@@ -130,35 +130,37 @@ pub(crate) async fn query_daemon_bounded(
         .map_err(|_| anyhow!("round-trip timed out after {}s", timeout.as_secs()))?
 }
 
-/// Bound on each step of [`primary_workspace_root_from_daemon`].
+/// Total budget for the root request, from connect through the complete reply.
 const PRIMARY_ROOT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ask the running daemon for its primary workspace root (#14534).
 ///
-/// Blocking on purpose: the caller is `ExecAuth::resolve`, a synchronous
-/// function reached from CLI code already inside the `#[tokio::main]` runtime,
-/// where a nested `block_on` would panic. Connect, write and read are each
-/// bounded, so a wedged daemon costs a couple of seconds, not a hang. Every
-/// failure (no socket, no daemon, a bad frame, a relative path) is `None`: the
-/// lookup is a fallback, and the caller's own diagnostic covers its absence.
+/// The resolver is synchronous and can already be inside a Tokio runtime.
+/// Drive the socket on a separate thread so the caller can use the same IPC
+/// client from either context. An unavailable root leaves other routes open.
 pub(crate) fn primary_workspace_root_from_daemon() -> Option<PathBuf> {
     let socket_path = resolve_socket_path().ok()?;
     primary_workspace_root_at(&socket_path, PRIMARY_ROOT_LOOKUP_TIMEOUT)
 }
 
 fn primary_workspace_root_at(socket_path: &Path, timeout: Duration) -> Option<PathBuf> {
-    use std::io::{BufRead, BufReader as StdBufReader, Write};
-    let stream = std::os::unix::net::UnixStream::connect(socket_path).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
-    let mut writer = stream.try_clone().ok()?;
-    let mut frame = serde_json::to_string(&Request::GetPrimaryWorkspaceRoot).ok()?;
-    frame.push('\n');
-    writer.write_all(frame.as_bytes()).ok()?;
-    writer.flush().ok()?;
-    let mut line = String::new();
-    StdBufReader::new(stream).read_line(&mut line).ok()?;
-    match serde_json::from_str::<Response>(&line).ok()? {
+    let response = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                runtime.block_on(async {
+                    let query = query_daemon(socket_path, &Request::GetPrimaryWorkspaceRoot);
+                    tokio::time::timeout(timeout, query).await.ok()?.ok()
+                })
+            })
+            .ok()?
+            .join()
+            .ok()?
+    })?;
+    match response {
         Response::PrimaryWorkspaceRoot { path } => {
             let path = PathBuf::from(path);
             path.is_absolute().then_some(path)
@@ -269,11 +271,13 @@ pub fn resolve_loom_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader as StdBufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
 
-    /// A one-shot fake daemon: reads one frame, asserts it is the root
-    /// request, answers `reply` (when `Some`), then exits.
-    fn fake_daemon(socket: &Path, reply: Option<&'static str>) -> std::thread::JoinHandle<()> {
+    /// Read one root request and let the test control when the reply arrives.
+    fn fake_daemon(
+        socket: &Path,
+        reply: impl FnOnce(StdUnixStream) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -285,14 +289,7 @@ mod tests {
                 serde_json::from_str::<Request>(&line).unwrap(),
                 Request::GetPrimaryWorkspaceRoot
             ));
-            if let Some(reply) = reply {
-                let mut stream = stream;
-                stream.write_all(reply.as_bytes()).unwrap();
-                stream.write_all(b"\n").unwrap();
-            } else {
-                // Wedged: hold the connection open and say nothing.
-                std::thread::sleep(Duration::from_millis(600));
-            }
+            reply(stream);
         })
     }
 
@@ -304,7 +301,7 @@ mod tests {
             path: "/srv/loom/primary".into(),
         })
         .unwrap();
-        let daemon = fake_daemon(&socket, Some(Box::leak(reply.into_boxed_str())));
+        let daemon = fake_daemon(&socket, move |mut stream| writeln!(stream, "{reply}").unwrap());
         assert_eq!(
             primary_workspace_root_at(&socket, Duration::from_secs(2)),
             Some(PathBuf::from("/srv/loom/primary"))
@@ -324,7 +321,8 @@ mod tests {
         .enumerate()
         {
             let socket = dir.path().join(format!("d{i}.sock"));
-            let daemon = fake_daemon(&socket, Some(reply));
+            let daemon =
+                fake_daemon(&socket, move |mut stream| writeln!(stream, "{reply}").unwrap());
             assert_eq!(primary_workspace_root_at(&socket, Duration::from_secs(2)), None, "{reply}");
             daemon.join().unwrap();
         }
@@ -338,10 +336,32 @@ mod tests {
             None
         );
         let socket = dir.path().join("wedged.sock");
-        let daemon = fake_daemon(&socket, None);
+        let daemon = fake_daemon(&socket, |_stream| std::thread::sleep(Duration::from_millis(600)));
         let started = std::time::Instant::now();
         assert_eq!(primary_workspace_root_at(&socket, Duration::from_millis(150)), None);
         assert!(started.elapsed() < Duration::from_millis(550), "lookup must honour its bound");
+        daemon.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_root_lookup_times_out_even_while_the_reply_keeps_arriving() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let daemon = fake_daemon(&socket, |mut stream| {
+            // Each piece arrives within the idle timeout. A client that restarts
+            // its timer on every read would accept the eventual valid reply.
+            for _ in 0..12 {
+                if stream.write_all(b" ").is_err() {
+                    return; // The client cancelled the exchange at its deadline.
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            let _ = writeln!(
+                stream,
+                r#"{{"type":"PrimaryWorkspaceRoot","payload":{{"path":"/late"}}}}"#
+            );
+        });
+        assert_eq!(primary_workspace_root_at(&socket, Duration::from_millis(200)), None);
         daemon.join().unwrap();
     }
 
