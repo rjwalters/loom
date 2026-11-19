@@ -331,6 +331,48 @@ fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root
     assert_eq!(fs::read_to_string(&observed).unwrap(), "__unset__");
 }
 
+/// Issue #14454: a resolved service tier reaches the role child as
+/// `LOOM_SERVICE_TIER`; with none configured the child sees the daemon's own
+/// (operator-exported) value untouched.
+#[test]
+#[serial(loom_config_env)]
+fn test_invoke_exports_resolved_service_tier_and_leaves_inherited_value_when_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let run = |config: &str| -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_config(&root, config);
+        let observed = root.join("observed-tier");
+        let script = write_fake_script(
+            &root,
+            "fake-spawn.sh",
+            &format!(
+                "printf '%s' \"${{LOOM_SERVICE_TIER:-__unset__}}\" > '{}'",
+                observed.display()
+            ),
+        );
+        let ws = crate::write_scope_test_support::WritableRoot::register(&root);
+        let mut runner = ScriptRoleInvocationRunner::new(root.clone())
+            .with_gh_bin(ws.gh.clone())
+            .with_spawn_bin(script);
+        assert_eq!(runner.invoke("judge", "/loom:judge"), RoleTickOutcome::Success);
+        fs::read_to_string(&observed).unwrap()
+    };
+
+    std::env::remove_var("LOOM_SERVICE_TIER");
+    assert_eq!(run(r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#), "flex");
+    assert_eq!(
+        run(r#"{"autonomous": {"roleRunner": {"serviceTier": "flex",
+            "roleServiceTiers": {"judge": "priority"}}}}"#),
+        "priority"
+    );
+    assert_eq!(run("{}"), "__unset__");
+    std::env::set_var("LOOM_SERVICE_TIER", "operator");
+    assert_eq!(run("{}"), "operator");
+    assert_eq!(run(r#"{"autonomous": {"roleRunner": {"serviceTier": "flex"}}}"#), "flex");
+    std::env::remove_var("LOOM_SERVICE_TIER");
+}
+
 /// Issue #4501: a role spawn pins the model explicitly — a role child must
 /// never inherit the account's interactive CLI default (`fable` on the host
 /// that filed the issue, where every child instantly died on "You've reached
