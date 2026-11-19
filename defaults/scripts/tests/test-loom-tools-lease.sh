@@ -234,7 +234,7 @@ no_renewers() { [[ "$(renewers)" -eq 0 ]]; }
 has_patch() { [[ "$(patches)" -ge 1 ]]; }
 deferred_publishers() { pgrep -f "loom-tools lease ensure $ISSUE --deferred .*--watch-pid $SESSION_PID( |$)"; }
 no_deferred_publishers() { ! deferred_publishers > /dev/null; }
-session() { sleep 600 < /dev/null > /dev/null 2>&1 & SESSION_PID=$!; disown "$SESSION_PID" 2> /dev/null || true; }
+session() { sleep 600 > /dev/null 2>&1 & SESSION_PID=$!; disown "$SESSION_PID" 2> /dev/null || true; }
 wait_for() { # <seconds> <command...>
     local n=$(($1 * 4)); shift
     while ((n-- > 0)); do "$@" && return 0; sleep 0.25; done
