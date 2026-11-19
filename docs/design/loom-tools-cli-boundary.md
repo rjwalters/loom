@@ -32,6 +32,7 @@ re-reading the source it names. Counts are from the pinned tree below.
 12. [Not traced, and open questions](#12-not-traced-and-open-questions)
 13. [Phase 3a: forge reads (#14395)](#13-phase-3a-forge-reads-14395)
 14. [Phase 3b: park records and operator decisions (#14464)](#14-phase-3b-park-records-and-operator-decisions-14464)
+15. [Phase 3c: issue leases (#14488)](#15-phase-3c-issue-leases-14488)
 
 ## 1. Pinned inputs
 
@@ -752,7 +753,8 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree, claim and lease commands | #14397 |
+| Worktree and claim commands | #14397 |
+| Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | served since #14488, §15; `lease pr` (role-keyed PR leases) stays in `loom-daemon` for #14398 |
 
 ### 13.4 Gitea decision
 
@@ -826,3 +828,81 @@ facade's decline already do, identical from both roots.
 render|parse|apply|released|decision|retract` and `operator-decision
 validate|apply|resolve`. The unit test in `bin/loom_tools.rs` still fails if the
 list and the clap tree disagree.
+
+## 15. Phase 3c: issue leases (#14488)
+
+Part of #14475. An attended worker on a tools-only checkout can publish its
+`loom:building` lease, keep it renewed for the life of its session, ask whether
+a worktree is shared, hand the lease back, and run the builder's pre-push fence,
+with no `loom-daemon` installed. Role-keyed PR leases (`lease pr`) are not an
+issue lease and stay in `loom-daemon` (#14398); new nested `forge` actions are
+#14461.
+
+### 15.1 Mechanism
+
+`loom-tools lease <verb>` wraps the one `LeaseCommand` clap tree
+(`cli/lease_cli.rs`, `cli/lease_ensure.rs`) and runs the in-process handlers
+`loom-daemon lease` runs. Nothing was copied. `LeaseCli::is_served` and
+`LeaseCli::reaches_forge` are exhaustive `match`es with no wildcard arm, so a
+new verb does not compile until its author says whether it is served and whether
+it can reach the forge. `lease pr` exits **64** before any handler runs.
+
+The whole process chain stays on the binary that was selected:
+
+| Step | How it stays on that binary |
+| --- | --- |
+| `lease ensure` -> `sweep-lease-publish.sh`, `sweep-lease-renew.sh start` | `pin_running_binary` gives both scripts `LOOM_DAEMON_BIN=<current_exe>` unless the caller already exported one |
+| the scripts' `forge may-write`, `forge trusted-comments`, `forge token`, `forge check-branch`, `lease renewer ...` | read `${LOOM_DAEMON_BIN:-loom-daemon}`; `loom-tools` serves each of those verbs |
+| the re-exec through `lease renewer sanitize-exec` and the detached renewal loop | inherit the exported variable |
+| the deferred retry (`lease ensure --deferred`) | `deferred::launch_process` starts `current_exe()` |
+| `renewer stop` and `release` | `is_renewer_argv` recognises `loom-tools lease renewer` as well as `loom-daemon lease renewer`, so the ownership check does not refuse the process it started |
+| `sweep-lease-fence.sh`, or any of the three scripts run on their own | `loom_select_lease_bin` (`lib/locate-daemon-bin.sh`), below |
+
+`loom_select_lease_bin` exports `LOOM_DAEMON_BIN` once at the top of each of the
+three scripts: (1) a value the caller already exported wins; (2) with a
+`loom-daemon` on PATH and `LOOM_MODE` not `session`, nothing changes, so fleet
+hosts resolve exactly what they did before (making `loom-tools` preferred is
+the wrapper switch-over, #14398); (3) otherwise a `loom-tools` that answers
+`lease renewer --help`, found as `loom_locate_tools_bin` finds it. With neither
+binary the scripts keep their existing fail-open (publish, renew) and
+fail-closed (fence, exit 6) answers.
+
+### 15.2 Per-verb outcome by mode
+
+| Verb | `fleet` | `local-daemon` / `session` | Mode gate | A mode error |
+| --- | --- | --- | --- | --- |
+| `ensure` | reads and posts on the exported gateway / reader pool | reads and posts on the person's own credential; inherited fleet variables are dropped before any child sees them | yes, unless the environment settles it (no agent session, or already dispatched: the message prints and nothing starts) | printed, exit **0** (it "always exits 0"; a lease is evidence, never a precondition) |
+| `co-occupancy` | reads the lease comments | same, own credential | yes | printed, exit **0** (its exit 1 means "refuse the shared worktree" to `worktree.sh`, so a mode error must not alias it) |
+| `release` | reads, stops this host's renewers, posts the yield (write-scoped, #9548) | same, own credential | yes | exit **1** (it already exits 1 when the comments are unreadable) |
+| `renewer claim\|check\|release\|stop\|sanitize-exec` | local files and the process table only | same | no | n/a |
+
+A session-mode `ensure` is the same code as the fleet one: the route only
+changes which credential the `gh` calls the scripts and handlers run on, and
+`write_scope` vets every write the same way on either route.
+
+### 15.3 Consumers
+
+| Consumer | Call | Binary |
+| --- | --- | --- |
+| `worktree.sh` (Builder claim) | `lease ensure`, `lease co-occupancy` through `_WT_DAEMON_BIN` | unchanged: whichever `worktree.sh` resolved (#14397 owns its resolution) |
+| Builder pre-push / PR-open | `sweep-lease-fence.sh check` | `loom_select_lease_bin` |
+| `/loom:sweep` | `sweep-lease-publish.sh`, `sweep-lease-renew.sh start\|stop\|release`, `sweep-lease-fence.sh` | `loom_select_lease_bin`; unchanged on a host with a `loom-daemon` |
+
+### 15.4 Served commands and tests
+
+`install_compat::TOOLS_COMMANDS` gains `lease ensure`, `lease co-occupancy`,
+`lease release` and `lease renewer`; the unit test in `bin/loom_tools.rs` fails
+if the list and the clap tree disagree, and `loom_tools_slice.rs` pins that
+`lease pr` is absent and refused.
+
+`defaults/scripts/tests/test-loom-tools-lease.sh` (run by
+`loom-daemon/tests/loom_tools_lease.rs` against the built binary) puts only
+`loom-tools` and a stateful stub forge on PATH and runs the real publish,
+deferred retry, renew, release, co-occupancy and fence paths: one owner and one
+renewer for a repeated `ensure`; a live peer's record kept and never posted
+over; renewal and the deferred publisher stopping when the watched process
+ends; `release` idempotent and refusing a live peer; the fence's branch probe
+answered by `loom-tools` against a local origin. The existing
+`test-sweep-lease-{publish,renew,renew-lifecycle,renew-fd-hygiene,fence,
+fence-race,convergence}.sh` and `test-worktree-lease-co-occupancy.sh` suites
+run unchanged.

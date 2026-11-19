@@ -796,3 +796,54 @@ fn capabilities_list_park_record_and_operator_decision() {
         assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
     }
 }
+
+/// #14488: `capabilities --json` lists the served issue-lease verbs and not the
+/// role-keyed PR leases, and `lease pr` is refused with 64 before any handler.
+#[test]
+fn capabilities_list_the_issue_lease_verbs_and_not_the_pr_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = base(TOOLS, tmp.path(), tmp.path());
+    c.args(["capabilities", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&run(c, None).stdout).unwrap();
+    let cmds: Vec<&str> = v["tools_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    for want in [
+        "lease ensure",
+        "lease co-occupancy",
+        "lease release",
+        "lease renewer",
+    ] {
+        assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
+    }
+    assert!(!cmds.iter().any(|c| c.starts_with("lease pr")), "{cmds:?}");
+
+    let mut c = base(TOOLS, tmp.path(), tmp.path());
+    c.args(["lease", "pr", "check", "7", "--role", "judge"]);
+    let out = run(c, None);
+    assert_eq!(out.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("loom-daemon lease pr"));
+}
+
+/// #14488: the offline `lease renewer` probe the scripts use to select a binary
+/// answers identically from both binaries, with `mode` unset.
+#[test]
+fn lease_renewer_probe_matches_loom_daemon_with_mode_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    for argv in [
+        &["lease", "renewer", "--help"][..],
+        &["lease", "renewer", "sanitize-exec", "--check"],
+    ] {
+        let run_one = |bin: &str| {
+            let mut c = base(bin, tmp.path(), tmp.path());
+            c.env_remove("LOOM_MODE").args(argv);
+            run(c, None)
+        };
+        let (t, d) = (run_one(TOOLS), run_one(DAEMON));
+        assert_eq!(t.status.code(), d.status.code(), "{argv:?}");
+        assert_eq!(t.status.code(), Some(0), "{argv:?}");
+    }
+}

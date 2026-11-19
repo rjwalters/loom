@@ -421,6 +421,10 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    "lease ensure",
+    "lease co-occupancy",
+    "lease release",
+    "lease renewer",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

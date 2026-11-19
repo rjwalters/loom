@@ -23,10 +23,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use loom_daemon::cli::{
     config_get_dispatch, handle_checkpoint_command, handle_forge_read_command,
-    handle_operator_decision_command, handle_park_record_command, handle_resolve_model_command,
-    handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
-    ForgeReadCli, InstallBinaryCommand, OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
+    handle_lease_command, handle_operator_decision_command, handle_park_record_command,
+    handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
+    CheckpointAction, ConfigArgs, ForgeReadCli, InstallBinaryCommand, LeaseCli,
+    OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
+    ResyncPayloadArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::tools_mode::{self, Route};
@@ -34,7 +35,7 @@ use loom_daemon::tools_mode::{self, Route};
 #[derive(Parser)]
 #[command(
     name = "loom-tools",
-    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision)"
+    about = "Loom agent tools (strip-ansi, checkpoint, config get, capabilities, install, resolve-model, resolve-role-model, forge reads, park-record, operator-decision, lease)"
 )]
 #[command(version = loom_daemon::self_update::BUILD_IDENTITY)]
 struct ToolsCli {
@@ -92,6 +93,11 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
+    /// The issue lease verbs (`ensure`, `co-occupancy`, `release`, `renewer`):
+    /// the same arguments, stdout and exit codes as `loom-daemon lease`
+    /// (#14488), publishing, renewing and fencing on the person's own
+    /// credential. `lease pr` stays in `loom-daemon` (exit 64).
+    Lease(LeaseCli),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -194,6 +200,29 @@ fn run() -> Result<()> {
                 use_this_binary_for_nested_filing();
             }
             handle_operator_decision_command(cli)
+        }
+        ToolsCommands::Lease(cli) => {
+            // Classified by effect, from the parsed invocation: the renewer
+            // actions, and an `ensure` the environment settles by itself, never
+            // resolve `mode`.
+            if cli.reaches_forge() {
+                if let Err(err) = mode_gate() {
+                    // `ensure` always exits 0 and `co-occupancy` fails open with
+                    // 0 (its exit 1 means "refuse the shared worktree"): a mode
+                    // error must not alias either, so it is reported and the
+                    // verb ends as it does on any other unreadable forge.
+                    if cli.fails_open_on_mode_error() {
+                        eprintln!(
+                            "lease {}: {err:#} -- failing open (a lease is evidence, never a \
+                             precondition)",
+                            cli.verb()
+                        );
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+            handle_lease_command(cli)
         }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
@@ -389,6 +418,34 @@ mod tests {
                 panic!()
             };
             assert!(!c.reaches_forge());
+        });
+    }
+
+    /// #14488: `loom-tools lease` keeps the daemon's argv, and the mode gate is
+    /// chosen from the parsed invocation's effects.
+    #[test]
+    fn lease_keeps_the_daemon_argv_and_classifies_by_effect() {
+        on_main_sized_stack(|| {
+            // (argv tail, served, reaches the forge)
+            let table: [(&[&str], bool, bool); 6] = [
+                (&["ensure", "7", "--watch-pid", "1", "--force"], true, true),
+                (&["co-occupancy", "7"], true, true),
+                (&["release", "7"], true, true),
+                (&["renewer", "stop", "--issue", "7"], true, false),
+                (&["renewer", "sanitize-exec", "--check"], true, false),
+                (&["pr", "check", "7", "--role", "judge"], false, false),
+            ];
+            for (tail, served, forge) in table {
+                let mut argv = vec!["loom-tools", "lease"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::Lease(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert_eq!(c.is_served(), served, "{argv:?}");
+                assert_eq!(c.reaches_forge(), forge, "{argv:?}");
+            }
         });
     }
 
