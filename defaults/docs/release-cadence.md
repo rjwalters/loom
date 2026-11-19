@@ -61,6 +61,13 @@ direction (2026-10-09) is **at most one release a day**.
   Anyone with `workflow_dispatch` (write) access can force; it is the operator
   path. A forced bump starts a new window. `force: false` runs the normal gate,
   which is useful for checking what the next run would do.
+- **Minor releases.** Bumps are patch steps. A minor release (`X.Y.Z` →
+  `X.(Y+1).0`) is a forced dispatch with `level: minor`; the push and
+  schedule paths never take it. The fleet publisher refuses any minor step it
+  does not list, so the release is first named in 2am's `github-write`
+  (`src/publish/target.js` `LOOM_MINOR_RELEASES`, the widening that
+  2am#4617 Q26 requires), and that Worker deployed. 0.20.0, the multi-runtime
+  release, was the first.
 - **Fleet floors wait for the daily release.** A `loom_min_version` floor can
   only name a published release, so a fix the fleet needs now waits for the
   next eligible bump unless it is forced. To ship it now: dispatch `force` with
