@@ -22,6 +22,7 @@ use super::gather_budget::{
 use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
+use crate::forge_bucket_book::{self, BucketKey};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
@@ -185,6 +186,8 @@ struct RegistrySpawner {
     parts: StepSpawnTimings,
     /// Mirror mode only (`forge.mirror.discovery = worklist`, #12318).
     recheck: Option<crate::discovery::recheck::Shared>,
+    /// Evidence captured before applying the per-route draw gate.
+    writer_holds_before_draw: HashMap<BucketKey, i64>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -305,10 +308,26 @@ impl RegistrySpawner {
                     .downcast_ref::<StepRefusal>()
                     .and_then(|r| r.writer_limit.as_deref())
                 {
-                    if limited.arm_hold(Utc::now().timestamp()) {
-                        // #14559: name the armed key, so an armed-but-not-found
-                        // hold (the tick's warning for it) is greppable against
-                        // what was actually armed.
+                    let now = Utc::now().timestamp();
+                    if let Some(key) = limited.hold_key() {
+                        let before = self.writer_holds_before_draw.get(&key).copied();
+                        if let Some(reset) =
+                            forge_bucket_book::note_missed_writer_hold(&key, before, now)
+                        {
+                            let until = chrono::DateTime::from_timestamp(reset, 0).map_or_else(
+                                || reset.to_string(),
+                                |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            );
+                            log::warn!(
+                                "work_finder: writer hold armed (account {} owner {} installation {}) \
+                                 until {until} but a draw was refused by that writer (#14559)",
+                                key.account, key.owner, key.installation,
+                            );
+                        }
+                    }
+                    if limited.arm_hold(now) {
+                        // #14559: name the armed key so a later missed-hold
+                        // warning can be correlated with this arm.
                         log::warn!(
                             "work_finder: writer {} route held until {} (account {} owner {} \
                              installation {}) (#13746)",
@@ -557,6 +576,11 @@ impl StepDriver {
         crate::observability::ops::hold_age::observe(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
+        let now_ts = now.timestamp();
+        let writer_holds_before_draw: HashMap<_, _> =
+            forge_bucket_book::writer_holds_snapshot(now_ts)
+                .into_iter()
+                .collect();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();
         for (pos, result) in listed {
             let Some(job) = jobs.get_mut(pos).and_then(Option::take) else {
@@ -666,40 +690,9 @@ impl StepDriver {
                 // #13746: the workspace's writer route, when a confirmed
                 // exhaustion hold stands for it — its candidates wait before
                 // the draw until the reset.
-                writer_hold: {
-                    let now_ts = now.timestamp();
-                    let hold = crate::writer_limit::hold_note(Some(root), &repo, now_ts)
-                        .and_then(|until| tick::WriterHold::from_reset(until, now_ts));
-                    // #14559: a hold that was armed but this route's resolution
-                    // cannot find (a key the tick misses while it stands) is
-                    // exactly how dispatch silently degrades to draw-and-refuse
-                    // — make it greppable.
-                    if hold.is_none() {
-                        let owner = crate::writer_limit::owner_of(&repo);
-                        if let Some((key, until)) =
-                            crate::forge_bucket_book::writer_holds_snapshot(now_ts)
-                                .into_iter()
-                                .find(|(k, _)| {
-                                    k.owner == owner
-                                        && k.resource == crate::forge_bucket_book::Resource::Core
-                                })
-                        {
-                            let until = chrono::DateTime::from_timestamp(until, 0).map_or_else(
-                                || until.to_string(),
-                                |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            );
-                            log::warn!(
-                                "work_finder: {repo}: writer hold armed (account {} owner {} \
-                                 installation {}) until {until} but this tick's route resolved \
-                                 to no hold — writes draw and refuse (#14559)",
-                                key.account,
-                                key.owner,
-                                key.installation
-                            );
-                        }
-                    }
-                    hold
-                },
+                writer_hold: crate::writer_limit::WriterLimited::claim_route_key(root, &repo)
+                    .and_then(|key| writer_holds_before_draw.get(&key).copied())
+                    .and_then(|until| tick::WriterHold::from_reset(until, now_ts)),
             });
         }
         let filter_ms = millis(filter_started.elapsed());
@@ -750,6 +743,7 @@ impl StepDriver {
             concurrency: input.spawn_concurrency.max(1),
             parts: StepSpawnTimings::default(),
             recheck: input.discovery.is_worklist().then(|| self.recheck.clone()),
+            writer_holds_before_draw,
         };
         self.recheck.begin_tick();
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);

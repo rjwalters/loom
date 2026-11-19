@@ -191,7 +191,21 @@ impl WriterLimited {
     #[must_use]
     pub fn route_key(cwd: Option<&Path>, target: &str) -> Option<BucketKey> {
         let dir = writer_dir_for(cwd, target)?;
-        let id = forge_bucket_book::dir_identity(&dir, &forge_bucket_book::classify_dir(&dir))?;
+        Self::route_key_for_dir(&dir, target)
+    }
+
+    /// The next step-lease child gets the per-root override from
+    /// [`crate::credential_preflight::apply_gh_config_for_root`] or
+    /// inherits `GH_CONFIG_DIR`. The facade's owner-slug fallback does
+    /// not apply to that child environment.
+    pub(crate) fn claim_route_key(root: &Path, target: &str) -> Option<BucketKey> {
+        let dir = crate::credential_preflight::gh_config_dir_for_root(root)
+            .or_else(ambient_writer_dir)?;
+        Self::route_key_for_dir(&dir, target)
+    }
+
+    fn route_key_for_dir(dir: &Path, target: &str) -> Option<BucketKey> {
+        let id = forge_bucket_book::dir_identity(dir, &forge_bucket_book::classify_dir(dir))?;
         if id.account == "app-unknown" {
             return None;
         }
@@ -358,7 +372,11 @@ pub fn owner_of(nwo: &str) -> String {
 /// ambient `GH_CONFIG_DIR` (a claim child inherits the daemon's). Pure.
 fn writer_dir_for(cwd: Option<&Path>, target: &str) -> Option<PathBuf> {
     crate::credential_preflight::gh_config_dir_for_call(cwd, Some(target))
-        .or_else(|| std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from))
+        .or_else(ambient_writer_dir)
+}
+
+fn ambient_writer_dir() -> Option<PathBuf> {
+    std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from)
 }
 
 /// `HTTP <status>` in gh's failure line.
@@ -604,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn arming_validates_reset_identity_and_past_resets() {
         let now = 1_760_000_000;
         let mut l = WriterLimited::classify(WriterStage::LeasePost, None, PRIMARY_403).unwrap();
@@ -627,6 +646,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn the_hold_store_keys_by_installation_witness() {
         let now = 1_760_000_000;
         let base = BucketKey::new("app-4486636", "acme", Resource::Core);
@@ -712,10 +732,10 @@ mod tests {
 
     /// A writer credential directory with a published sidecar naming `owner`
     /// (the shape every publication writes, `forge_identity::sidecar`).
-    fn writer_dir_with_sidecar(dir: &Path, owner: &str) {
+    fn writer_dir_with_sidecar(dir: &Path, owner: &str, app_id: &str) {
         std::fs::create_dir_all(dir).unwrap();
         let side = crate::forge_identity::Sidecar {
-            app_id: "4486636".to_string(),
+            app_id: app_id.to_string(),
             slug: None,
             installation_id: "151241341".to_string(),
             owner: Some(owner.to_string()),
@@ -725,15 +745,16 @@ mod tests {
         std::fs::write(dir.join("identity.json"), serde_json::to_vec(&side).unwrap()).unwrap();
     }
 
-    /// The `GH_CONFIG_DIR` the spawn (`sweep_registry/step_spawn/lease.rs`)
-    /// puts on the claim child, read back off the built `Command`.
+    /// Use the same child env setup as the step-lease launcher, then read
+    /// the effective env in a harmless subprocess.
     fn spawned_child_dir(root: &Path) -> Option<PathBuf> {
-        let mut cmd = std::process::Command::new("true");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", r#"printf %s "${GH_CONFIG_DIR-}""#]);
         crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
-        cmd.get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new("GH_CONFIG_DIR"))
-            .and_then(|(_, v)| v)
-            .map(PathBuf::from)
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        (!output.stdout.is_empty())
+            .then(|| PathBuf::from(String::from_utf8(output.stdout).unwrap()))
     }
 
     /// #14559 item 2, measured: for a registered (cross-owner) root, the
@@ -757,7 +778,7 @@ mod tests {
             .join(".loom")
             .join("gh-config-by-owner")
             .join("acme");
-        writer_dir_with_sidecar(&owner_dir, "acme");
+        writer_dir_with_sidecar(&owner_dir, "acme", "1057101");
         // What `register_plan` does for an established cross-owner owner.
         register_root_gh_config_dir(&root, &owner_dir);
         register_owner_gh_config_dir("acme", &owner_dir);
@@ -766,6 +787,10 @@ mod tests {
         let route_dir = gh_config_dir_for_call(Some(&root), Some("acme/widgets"));
         assert_eq!(child_dir, route_dir, "the two resolvers must agree");
         assert_eq!(child_dir.as_deref(), Some(owner_dir.as_path()));
+        assert_eq!(
+            WriterLimited::claim_route_key(&root, "acme/widgets"),
+            WriterLimited::route_key(Some(&root), "acme/widgets"),
+        );
 
         // End to end: arm the way the child's handoff arms, find the way the
         // tick resolves the route.
@@ -781,44 +806,93 @@ mod tests {
         clear_owner_root_registry();
     }
 
-    /// #14559 item 2, measured: the workspace-root owner's own repos are
-    /// deliberately absent from the registry, so the child stays on the
-    /// process-global `GH_CONFIG_DIR` (startup's `set_var`) and the tick's
-    /// resolution falls back to that same env — the same directory again.
+    /// A slug-only refresh can register a different App for the same owner.
+    /// It changes the facade fallback but leaves the next claim child on the
+    /// inherited writer. The hold must follow the latter.
     #[test]
     #[serial_test::serial]
-    fn an_unregistered_root_resolves_the_route_through_the_same_process_env() {
-        use crate::credential_preflight::{clear_owner_root_registry, gh_config_dir_for_call};
+    fn a_slug_only_registration_keeps_the_claim_hold_on_the_actual_child_writer() {
+        use crate::credential_preflight::{
+            clear_owner_root_registry, gh_config_dir_for_call, gh_config_dir_for_root,
+            register_owner_gh_config_dir,
+        };
         let _env = crate::env_test_support::EnvGuard::save(&["GH_CONFIG_DIR"]);
         clear_owner_root_registry();
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("widgets-checkout");
         std::fs::create_dir_all(&root).unwrap();
-        let owner_dir = dir
-            .path()
-            .join(".loom")
-            .join("gh-config-by-owner")
-            .join("acme");
-        writer_dir_with_sidecar(&owner_dir, "acme");
-        std::env::set_var("GH_CONFIG_DIR", &owner_dir);
+        let ambient = dir.path().join(".loom/gh-config");
+        let slug = dir.path().join(".loom/gh-config-by-owner/acme");
+        writer_dir_with_sidecar(&ambient, "acme", "1057101");
+        writer_dir_with_sidecar(&slug, "acme", "1057102");
+        std::env::set_var("GH_CONFIG_DIR", &ambient);
+        register_owner_gh_config_dir("acme", &slug);
 
-        // The spawn leaves the child's env untouched (no registration).
-        assert_eq!(spawned_child_dir(&root), None);
-        // Both registry arms miss; the tick falls back to the env too.
-        assert_eq!(gh_config_dir_for_call(Some(&root), Some("acme/widgets")), None);
-
-        let child_dir = writer_dir_for(Some(&root), "acme/widgets");
-        assert_eq!(child_dir.as_deref(), Some(owner_dir.as_path()));
-        let l = WriterLimited::classify(WriterStage::LeasePost, None, PRIMARY_403)
+        let repo = "acme/widgets";
+        assert_eq!(gh_config_dir_for_root(&root), None);
+        assert_eq!(gh_config_dir_for_call(Some(&root), Some(repo)), Some(slug));
+        let child_dir = spawned_child_dir(&root);
+        assert_eq!(child_dir.as_deref(), Some(ambient.as_path()));
+        let limited = WriterLimited::classify(WriterStage::LeasePost, None, PRIMARY_403)
             .unwrap()
-            .with_identity(child_dir.as_deref(), "acme/widgets");
-        let mut parsed = parse_handoff(&l.handoff_line()).unwrap();
+            .with_identity(child_dir.as_deref(), repo);
+        let mut parsed = parse_handoff(&limited.handoff_line()).unwrap();
         let now = Utc::now().timestamp();
         parsed.reset_epoch = Some(now + 600);
         assert!(parsed.arm_hold(now));
-        assert_eq!(hold_note(Some(&root), "acme/widgets", now), Some(now + 600));
+
+        let actual = parsed.hold_key().unwrap();
+        let next = WriterLimited::claim_route_key(&root, repo).unwrap();
+        let facade = WriterLimited::route_key(Some(&root), repo).unwrap();
+        assert_eq!(actual.account, "app-1057101");
+        assert_eq!(facade.account, "app-1057102");
+        assert_eq!(next, actual);
+        let before_draw: std::collections::HashMap<_, _> =
+            forge_bucket_book::writer_holds_snapshot(now)
+                .into_iter()
+                .collect();
+        assert_eq!(before_draw.get(&next), Some(&(now + 600)));
+        assert!(!before_draw.contains_key(&facade), "same-owner sibling is healthy");
+        assert!(WriterLimited::claim_route_key(&root, "other/widgets").is_none());
         forge_bucket_book::clear_writer_holds_for_test();
         clear_owner_root_registry();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_genuine_writer_hold_miss_is_reported_once_per_episode() {
+        use forge_bucket_book::{arm_writer_hold, note_missed_writer_hold, writer_holds_snapshot};
+
+        let writer = BucketKey::new("app-1057101", "acme", Resource::Core);
+        let sibling = BucketKey::new("app-1057102", "acme", Resource::Core);
+        let now = 1_760_000_000;
+        assert!(arm_writer_hold(writer.clone(), now + 600, now));
+        // The first refusal of a route can arm it, but that arm is too late
+        // to prove the draw had missed an existing hold.
+        assert_eq!(note_missed_writer_hold(&writer, None, now), None);
+        let before_draw: std::collections::HashMap<_, _> =
+            writer_holds_snapshot(now).into_iter().collect();
+        assert_eq!(
+            note_missed_writer_hold(&sibling, before_draw.get(&sibling).copied(), now),
+            None
+        );
+        assert_eq!(
+            note_missed_writer_hold(&writer, before_draw.get(&writer).copied(), now),
+            Some(now + 600)
+        );
+        assert_eq!(
+            note_missed_writer_hold(&writer, before_draw.get(&writer).copied(), now + 10),
+            None
+        );
+        assert!(arm_writer_hold(writer.clone(), now + 700, now + 11));
+        assert_eq!(note_missed_writer_hold(&writer, Some(now + 700), now + 12), None);
+        assert_eq!(note_missed_writer_hold(&writer, Some(now + 700), now + 700), None);
+        assert!(arm_writer_hold(writer.clone(), now + 1_000, now + 701));
+        assert_eq!(
+            note_missed_writer_hold(&writer, Some(now + 1_000), now + 702),
+            Some(now + 1_000)
+        );
+        forge_bucket_book::clear_writer_holds_for_test();
     }
 
     /// #14559 item 2, measured: the one transient window — a root not yet
@@ -840,7 +914,7 @@ mod tests {
             .join(".loom")
             .join("gh-config-by-owner")
             .join("acme");
-        writer_dir_with_sidecar(&acme_dir, "acme");
+        writer_dir_with_sidecar(&acme_dir, "acme", "1057101");
         std::env::set_var("GH_CONFIG_DIR", &acme_dir);
 
         let l = WriterLimited::classify(WriterStage::LeasePost, None, PRIMARY_403)
@@ -881,8 +955,8 @@ mod tests {
             .join(".loom")
             .join("gh-config-by-owner")
             .join("acme");
-        writer_dir_with_sidecar(&dir_a, "acme");
-        writer_dir_with_sidecar(&dir_b, "acme");
+        writer_dir_with_sidecar(&dir_a, "acme", "1057101");
+        writer_dir_with_sidecar(&dir_b, "acme", "1057101");
         // The child inherited dir_b at spawn; the tick now resolves dir_a.
         std::env::set_var("GH_CONFIG_DIR", &dir_b);
         register_root_gh_config_dir(&root, &dir_a);
