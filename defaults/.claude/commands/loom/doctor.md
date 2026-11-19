@@ -110,6 +110,8 @@ fi
 
 Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge.
 
+**Detached `pr-<N>` is read-only for Doctor (#14403).** If `pr-worktree.sh` exits `0` but reports a **detached** `pr-<N>` (the PR's branch is checked out in the primary clone), do not edit or commit there: a plain `git push` cannot land from a detached HEAD, and a commit on it has no surviving ref once the worktree is removed. Stop, release the PR lease and `loom:treating`, and route or park the PR instead (same review-only rule as `judge.md`).
+
 ### Expected worktree state after setup (#4823)
 
 For a `feature/issue-<N>` branch, `worktree.sh <N>` fetches `origin/feature/issue-<N>`
