@@ -540,7 +540,9 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
         Option<&'static str>,
         &'static [&'static str],
     );
-    let legacy_rows: [LegacyRow; 11] = [
+    const UNRELATED_CONFIG: &str =
+        r#"--config=developer_instructions="model_reasoning_effort=low""#;
+    let legacy_rows: [LegacyRow; 14] = [
         ("claude", true, "", Some("sonnet"), "", Some("high"), &[]),
         ("codex", true, "", Some("gpt-5.1"), "", Some("high"), &[]),
         // Nothing on argv and nothing in the env tier: absent, never the
@@ -601,6 +603,31 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             "",
             Some("low"),
             &["-c", "model_reasoning_effort=low"],
+        ),
+        // An unrelated inline value suppresses the launcher's fallback but
+        // supplies no effort of its own. A genuine assignment still wins.
+        ("codex", true, "", Some("gpt-5.1"), "", None, &[UNRELATED_CONFIG]),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &["-c", "model_reasoning_effort=medium", UNRELATED_CONFIG],
+        ),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &[
+                UNRELATED_CONFIG,
+                "--config",
+                "model_reasoning_effort=medium",
+            ],
         ),
         (
             "codex",
