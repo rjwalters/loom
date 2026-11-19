@@ -12,9 +12,10 @@
 //! runner's runtime admission and pool gate for that role
 //! (`runtime_admission::resolve_and_admit` then
 //! `role_runner::runtime_preflight::check`, preference walk included), and
-//! the role's model and effort (`roleModels` / `roleEfforts`, the role draw's
-//! model when one picked the tap, #7894's reconciliation, #5028's mismatch
-//! refusal). Only a Builder step keeps the per-issue experiment arm
+//! the role's model, effort and service tier (`roleModels` / `roleEfforts` /
+//! `roleServiceTiers`, the role draw's model when one picked the tap, #7894's
+//! reconciliation, #5028's mismatch refusal). Only a Builder step keeps the
+//! per-issue experiment arm
 //! (`model_dispatch.rs`). A binding whose only unmet requirement is
 //! repository isolation is admitted on private-clone containment (#8787),
 //! as a role run is. A refused gate refuses the step before any claim.
@@ -1088,8 +1089,8 @@ fn with_model_fallback(
 /// in, so a timed-out step's leases are reaped (#11931); the daemon's lease
 /// host id (`LOOM_LEASE_HOST_ID`), so its pre-taken lease is the session's own
 /// wherever the session runs; its pick journal
-/// (#11877's capture); and, for a Curator, the curation provenance the role
-/// runner gives its Curator (`role_runner/launch/curation.rs`).
+/// (#11877's capture), the service tier for its admitted runtime, and the
+/// curation provenance the role runner gives Curator children.
 pub(crate) fn apply_step_env(
     cmd: &mut Command,
     root: &Path,
@@ -1112,6 +1113,17 @@ pub(crate) fn apply_step_env(
         crate::host_identity::lease_host_identity(),
     );
     crate::observability::pick_journal::attach_step(cmd, sweep_id);
+    // The admitted runtime can differ from the configured preference. Leave
+    // an inherited tier in place when there is no matching configuration.
+    if let Some((tier, _)) = runtime.and_then(|runtime| {
+        crate::role_runner::resolve_role_runner_service_tier_for_runtime(
+            root,
+            role.role_name(),
+            Some(runtime),
+        )
+    }) {
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     if role == StepRole::Curator {
         cmd.env("LOOM_CURATION_MODEL", model.filter(|m| !m.is_empty()).unwrap_or("unknown"))
             .env("LOOM_CURATION_RUNTIME", runtime.unwrap_or("unknown"));
