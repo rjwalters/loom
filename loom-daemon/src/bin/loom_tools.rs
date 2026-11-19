@@ -108,7 +108,8 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
-    /// Claim, check, fence and release role-keyed pull-request leases.
+    /// Publish and renew issue leases, or claim, check, fence and release
+    /// role-keyed pull-request leases.
     Lease(LeaseCli),
     /// Query the label registry (#10013): the same subcommands, stdout and
     /// exit codes as `loom-daemon labels` (#14429). `undeclared` and
@@ -288,7 +289,29 @@ fn run() -> Result<()> {
             }
             handle_operator_decision_command(cli)
         }
-        ToolsCommands::Lease(cli) => handle_lease_command(cli),
+        ToolsCommands::Lease(cli) => {
+            // Classified by effect, from the parsed invocation: the renewer
+            // actions, and an `ensure` the environment settles by itself, never
+            // resolve `mode`. PR leases resolve it for their own workspace.
+            if cli.needs_issue_mode_gate() {
+                if let Err(err) = mode_gate() {
+                    // `ensure` always exits 0 and `co-occupancy` fails open with
+                    // 0 (its exit 1 means "refuse the shared worktree"): a mode
+                    // error must not alias either, so it is reported and the
+                    // verb ends as it does on any other unreadable forge.
+                    if cli.fails_open_on_mode_error() {
+                        eprintln!(
+                            "lease {}: {err:#} -- failing open (a lease is evidence, never a \
+                             precondition)",
+                            cli.verb()
+                        );
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+            handle_lease_command(cli)
+        }
         // #14429, design §13.7: the same classified-by-effect gate the forge
         // and park-record families use, and the same exit-64 refusals for
         // the write forms (#14396).
@@ -532,6 +555,33 @@ mod tests {
                 panic!()
             };
             assert!(!c.reaches_forge());
+        });
+    }
+
+    /// #14488: `loom-tools lease` keeps the daemon's argv, and the mode gate is
+    /// chosen from the parsed invocation's effects.
+    #[test]
+    fn lease_keeps_the_daemon_argv_and_classifies_by_effect() {
+        on_main_sized_stack(|| {
+            // (argv tail, uses the issue-mode gate)
+            let table: [(&[&str], bool); 6] = [
+                (&["ensure", "7", "--watch-pid", "1", "--force"], true),
+                (&["co-occupancy", "7"], true),
+                (&["release", "7"], true),
+                (&["renewer", "stop", "--issue", "7"], false),
+                (&["renewer", "sanitize-exec", "--check"], false),
+                (&["pr", "check", "7", "--role", "judge"], false),
+            ];
+            for (tail, issue_gate) in table {
+                let mut argv = vec!["loom-tools", "lease"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::Lease(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert_eq!(c.needs_issue_mode_gate(), issue_gate, "{argv:?}");
+            }
         });
     }
 
