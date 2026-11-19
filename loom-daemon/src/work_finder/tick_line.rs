@@ -15,6 +15,21 @@ pub(super) struct TickTiming<'a> {
     pub(super) began: Instant,
 }
 
+/// The awaited pre-span steps that can hold the span's start back, so a long
+/// `pre_span_ms` can be attributed to one of them (#14560). Everything else in
+/// `pre_span_ms` is synchronous local work.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct PreSpanPhases {
+    /// Wall time awaiting [`crate::eager_reclaim::tick`] (free-space probe, plus
+    /// a whole reclaim pass when one was due).
+    pub(super) reclaim: Duration,
+    /// Whether that await ran a reclaim pass rather than just the probe.
+    pub(super) reclaim_ran: bool,
+    /// Wall time of the CPU-idle fallback sample; zero when a published idle
+    /// record made it unnecessary.
+    pub(super) cpu_fallback: Duration,
+}
+
 impl TickTiming<'_> {
     pub(super) fn start_line(
         &self,
@@ -44,16 +59,21 @@ impl TickTiming<'_> {
         span_started: Instant,
         span_completed: Instant,
         published: Instant,
+        phases: PreSpanPhases,
     ) -> String {
         format!(
             "work_finder: tick {} complete host_id={:?} process_instance_id={} span_started_at={} \
-             completed_at={} pre_span_ms={} span_ms={} publish_ms={}",
+             completed_at={} pre_span_ms={} reclaim_ms={} reclaim_ran={} cpu_fallback_ms={} \
+             span_ms={} publish_ms={}",
             self.number,
             self.host_id,
             self.process_id,
             started_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
             completed_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
             millis(span_started.saturating_duration_since(self.began)),
+            millis(phases.reclaim),
+            phases.reclaim_ran,
+            millis(phases.cpu_fallback),
             millis(span_completed.saturating_duration_since(span_started)),
             millis(published.saturating_duration_since(span_completed)),
         )
@@ -206,13 +226,19 @@ mod tests {
             span_started,
             span_completed,
             published,
+            PreSpanPhases {
+                reclaim: Duration::from_secs(530),
+                reclaim_ran: true,
+                cpu_fallback: Duration::from_millis(250),
+            },
         );
         assert_eq!(
             completion,
             "work_finder: tick 42 complete host_id=\"host-fixture\" \
              process_instance_id=00000000-0000-0000-0000-000000000000 \
              span_started_at=2026-11-19T05:00:12.000000123Z \
-             completed_at=2026-11-19T05:01:51.000000123Z pre_span_ms=541000 span_ms=99000 publish_ms=7"
+             completed_at=2026-11-19T05:01:51.000000123Z pre_span_ms=541000 reclaim_ms=530000 \
+             reclaim_ran=true cpu_fallback_ms=250 span_ms=99000 publish_ms=7"
         );
     }
 

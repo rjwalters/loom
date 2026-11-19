@@ -1970,7 +1970,9 @@ pub fn spawn_multi_work_finder_task(
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`,
             // due while free space is below the floor (#12406). Hygiene, not
             // admission: it never changes the cap.
-            crate::eager_reclaim::tick(&fallback_root).await;
+            let reclaim_started = Instant::now();
+            let reclaim_ran = crate::eager_reclaim::tick(&fallback_root).await.is_some();
+            let reclaim = reclaim_started.elapsed();
             // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
@@ -1978,6 +1980,7 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrent`; it no longer gates admission.
             // With no published record (observability off, so no sampler tick)
             // fall back to the memoized raw sample, as before #12114.
+            let cpu_started = Instant::now();
             let idle = match crate::host_status::filtered_cpu_idle_fraction() {
                 Some(idle) => Some(idle),
                 None => {
@@ -1986,6 +1989,11 @@ pub fn spawn_multi_work_finder_task(
                             .await;
                     crate::cpu_headroom::cached_cpu_idle_fraction()
                 }
+            };
+            let phases = tick_line::PreSpanPhases {
+                reclaim,
+                reclaim_ran,
+                cpu_fallback: cpu_started.elapsed(),
             };
             // The cap, for the published summary and the tick span
             // (`ops::dispatch_facts`).
@@ -2181,6 +2189,7 @@ pub fn spawn_multi_work_finder_task(
                     span_started,
                     span_completed,
                     published,
+                    phases,
                 )
             );
 
