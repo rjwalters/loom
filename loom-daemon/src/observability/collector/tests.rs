@@ -1011,6 +1011,10 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         ci_telemetry: None,
         fleet_sync: None,
         resync_pins: Vec::new(),
+        // `HealthInputs` gained this field in #14223 after this fixture was
+        // added — `None` (not collected) is fine here since this fixture is
+        // not about the `owner_drift` axis.
+        owner_drift: None,
     }
 }
 
