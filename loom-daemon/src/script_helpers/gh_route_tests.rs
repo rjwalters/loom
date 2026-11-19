@@ -192,7 +192,16 @@ fn a_mutation_labelled_read_is_refused_and_sends_nothing() {
     for argv in [
         &["issue", "edit", "7", "--add-label", "x"][..],
         &["api", "-X", "POST", "repos/o/r/issues/7/labels"][..],
+        &["api", "repos/o/r/issues/7/comments", "-fbody=fixture"][..],
+        &["api", "-Fbody=fixture", "repos/o/r/issues/7/comments"][..],
+        &[
+            "api",
+            "repos/o/r/issues/7/comments",
+            "--raw-field=body=fixture",
+        ][..],
+        &["api", "--input=fixture.json", "repos/o/r/issues/7/comments"][..],
         &["api", "graphql", "-f", "query=mutation{updateIssue}"][..],
+        &["api", "/graphql", "-fquery=mutation{updateIssue}"][..],
     ] {
         let out = crate::script_helpers::gh_read("t.probe", argv, tmp.path(), false);
         assert!(
@@ -325,6 +334,7 @@ fn a_json_query_and_a_repo_flag_target_their_owner() {
         ],
         root,
         false,
+        None,
     )
     .expect("a correctly labelled call builds");
     assert_eq!(inv.target().slug().as_deref(), Some("acme/widgets"));

@@ -73,7 +73,8 @@ fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit
         format!("i={n}"),
     ];
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = crate::script_helpers::gh_read("verdict.body_edits", &argv, root, false);
+    let out =
+        crate::script_helpers::gh_route::gh_read_for_repo("verdict.body_edits", &argv, root, repo);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     let nodes = doc
         .pointer("/data/repository/issueOrPullRequest/userContentEdits/nodes")?
@@ -94,6 +95,17 @@ fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn body_edits_use_the_named_repositorys_reader() {
+    let response = serde_json::json!({
+        "data": {"repository": {"issueOrPullRequest": {"userContentEdits": {"nodes": []}}}}
+    });
+    crate::gh_invocation::test_routing::assert_pooled_query("target/widget", &response, |root| {
+        read_body_edits("target/widget", 7, root).is_some_and(|edits| edits.is_empty())
+    });
 }
 
 /// The issues an approval is checked against for a stale read (#12614): those

@@ -329,7 +329,7 @@ fn graphql_listing_and_object(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, serde_json::Value)> {
     let (owner, name) = repo.split_once('/')?;
-    let out = crate::script_helpers::gh_read(
+    let out = crate::script_helpers::gh_route::gh_read_for_repo(
         "premise.graphql_comments",
         &[
             "api",
@@ -345,9 +345,7 @@ fn graphql_listing_and_object(
             &format!("number={number}"),
         ],
         repo_root,
-        // The cache wrapper is a REST-read optimisation; this is the path
-        // taken precisely when REST is unavailable.
-        false,
+        repo,
     );
     parse_graphql_comments(&out.ok_output()?.stdout)
 }

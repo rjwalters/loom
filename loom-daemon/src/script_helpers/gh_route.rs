@@ -94,95 +94,17 @@ pub fn argv_access(args: &[&str]) -> ArgvAccess {
 /// a `graphql` endpoint is classified by its document (`query`/`{` reads,
 /// `mutation` writes; an invisible document stays [`ArgvAccess::Opaque`]).
 fn api_access(rest: &[&str]) -> ArgvAccess {
-    let mut method: Option<String> = None;
-    let mut fields = false;
-    let mut endpoint: Option<&str> = None;
-    let mut query_doc: Option<&str> = None;
-    let value_flags = [
-        "-X",
-        "--method",
-        "-H",
-        "--header",
-        "-f",
-        "-F",
-        "--field",
-        "--raw-field",
-        "--input",
-        "--hostname",
-        "-t",
-        "--template",
-        "-q",
-        "--jq",
-        "--cache",
-    ];
-    let mut i = 0;
-    while i < rest.len() {
-        let a = rest[i];
-        if let Some(v) = a.strip_prefix("--method=") {
-            method = Some(v.to_ascii_uppercase());
-            i += 1;
-            continue;
-        }
-        if let Some(v) = a.strip_prefix("-X") {
-            if !v.is_empty() {
-                method = Some(v.to_ascii_uppercase());
-                i += 1;
-                continue;
-            }
-        }
-        if let Some(v) = a.strip_prefix("--field=") {
-            fields = true;
-            if let Some(doc) = v.strip_prefix("query=") {
-                query_doc = Some(doc);
-            }
-            i += 1;
-            continue;
-        }
-        if value_flags.contains(&a) {
-            if matches!(a, "-f" | "-F" | "--field" | "--raw-field" | "--input") {
-                fields = true;
-                if let Some(v) = rest.get(i + 1) {
-                    if let Some(doc) = v.strip_prefix("query=") {
-                        query_doc = Some(doc);
-                    }
-                }
-            }
-            // A value flag consumes the next token; `-X POST` lands here too.
-            if let Some(v) = rest.get(i + 1) {
-                if a == "-X" || a == "--method" {
-                    method = Some(v.to_ascii_uppercase());
-                }
-            }
-            i += 2;
-            continue;
-        }
-        // `--flag=value` self-contained; unknown flags and bare endpoints.
-        if a.starts_with('-') {
-            if a.contains('=') {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if endpoint.is_none() {
-            endpoint = Some(a);
-        }
-        i += 1;
-    }
-    if endpoint == Some("graphql") {
-        return match query_doc.map(str::trim_start) {
+    let request = crate::gh_invocation::route::api_request(rest);
+    if request.graphql {
+        return match request.query.map(str::trim_start) {
             Some(doc) if doc.starts_with("mutation") => ArgvAccess::Write,
             Some(doc) if doc.starts_with("query") || doc.starts_with('{') => ArgvAccess::Read,
             _ => ArgvAccess::Opaque,
         };
     }
-    match method.as_deref() {
-        Some("GET" | "HEAD") => ArgvAccess::Read,
-        Some(_) => ArgvAccess::Write,
-        // `gh api` defaults to GET, or POST once fields are supplied.
-        None if fields => ArgvAccess::Write,
-        None => ArgvAccess::Read,
+    match request.method {
+        "GET" | "HEAD" => ArgvAccess::Read,
+        _ => ArgvAccess::Write,
     }
 }
 
@@ -283,6 +205,7 @@ fn guarded(
     args: &[&str],
     repo_root: &Path,
     use_cache: bool,
+    read_repo: Option<&str>,
 ) -> Result<GhInvocation, CmdOutcome> {
     match (intent, argv_access(args)) {
         (AccessIntent::Write, ArgvAccess::Read) => {
@@ -293,7 +216,12 @@ fn guarded(
         }
         _ => {}
     }
-    let mut inv = GhInvocation::new(Operation::new(op), intent, target_of(args), DEFAULT_TIMEOUT)
+    let target = match read_repo {
+        Some(repo) => GhTarget::repo(repo)
+            .map_err(|detail| CmdOutcome::Unavailable(Unavailable::Spawn(detail)))?,
+        None => target_of(args),
+    };
+    let mut inv = GhInvocation::new(Operation::new(op), intent, target, DEFAULT_TIMEOUT)
         .current_dir(repo_root)
         .args(args);
     if use_cache {
@@ -303,6 +231,9 @@ fn guarded(
     }
     if intent == AccessIntent::Read {
         inv = inv.reader_only();
+        if let Some(repo) = read_repo {
+            inv = inv.reader_repo(repo);
+        }
     }
     Ok(match forge_op_for(op) {
         Some(fop) => inv.forge_op(fop),
@@ -316,7 +247,21 @@ fn guarded(
 /// [`Query::Unavailable`] / a non-zero exit stays [`CmdOutcome::Ran`],
 /// exactly as the raw helper classified them.
 pub fn gh_read(op: &'static str, args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
-    match guarded(op, AccessIntent::Read, args, repo_root, use_cache) {
+    match guarded(op, AccessIntent::Read, args, repo_root, use_cache, None) {
+        Ok(inv) => inv.run(),
+        Err(out) => out,
+    }
+}
+
+/// Read about a known repository when its argv does not name the repo in a
+/// routable form, for example a GraphQL request with separate variables.
+pub(crate) fn gh_read_for_repo(
+    op: &'static str,
+    args: &[&str],
+    repo_root: &Path,
+    repo: &str,
+) -> CmdOutcome {
+    match guarded(op, AccessIntent::Read, args, repo_root, false, Some(repo)) {
         Ok(inv) => inv.run(),
         Err(out) => out,
     }
@@ -340,7 +285,7 @@ where
 
 /// A write: the writer credential, through the facade's write sequencing.
 pub fn gh_write(op: &'static str, args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
-    match guarded(op, AccessIntent::Write, args, repo_root, use_cache) {
+    match guarded(op, AccessIntent::Write, args, repo_root, use_cache, None) {
         Ok(inv) => inv.run(),
         Err(out) => out,
     }
@@ -398,7 +343,7 @@ pub(crate) fn test_read_invocation(
     args: &[&str],
     repo_root: &Path,
 ) -> GhInvocation {
-    match guarded(op, AccessIntent::Read, args, repo_root, false) {
+    match guarded(op, AccessIntent::Read, args, repo_root, false, None) {
         Ok(inv) => inv,
         Err(out) => panic!("a correctly labelled read does not refuse: {out:?}"),
     }
@@ -411,7 +356,7 @@ pub(crate) fn test_write_invocation(
     args: &[&str],
     repo_root: &Path,
 ) -> GhInvocation {
-    match guarded(op, AccessIntent::Write, args, repo_root, false) {
+    match guarded(op, AccessIntent::Write, args, repo_root, false, None) {
         Ok(inv) => inv,
         Err(out) => panic!("a correctly labelled write does not refuse: {out:?}"),
     }

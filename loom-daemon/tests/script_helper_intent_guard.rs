@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 const RETIRED: &[&str] = &["run_gh(", "gh_query(", "fn run_gh(", "fn gh_query("];
 
 /// The typed entry points whose declarations this lint checks.
-const ENTRY_POINTS: &[&str] = &["gh_read_json", "gh_read", "gh_write"];
+const ENTRY_POINTS: &[&str] = &["gh_read_for_repo", "gh_read_json", "gh_read", "gh_write"];
 
 /// Porcelain verbs that fetch state.
 const READ_VERBS: &[&str] = &["view", "list", "diff", "checks", "status", "download"];
@@ -476,6 +476,7 @@ fn a_mutation_declared_read_fails() {
         r#"gh_read("t.probe", &["issue", "edit", "7", "--add-label", "x"], root, false)"#,
         r#"gh_read("t.probe", &["api", "-X", "DELETE", "repos/o/r"], root, false)"#,
         r#"gh_read("t.probe", &["api", "-X", "POST", "repos/o/r", "-f", "labels[]=x"], root, false)"#,
+        r#"gh_read_for_repo("t.probe", &["api", "graphql", "-f", "query=mutation{updateIssue}"], root, "o/r")"#,
     ] {
         let src = format!("fn f(root: &Path) {{ {argv} }}\n");
         let problems = lint(&file("new/mislabel.rs", &src));
@@ -493,6 +494,7 @@ fn calls(root: &Path) {
     gh_read("t.listing", &["api", "repos/o/r/issues/7/comments", "--paginate"], root, false);
     gh_read("t.labels", &["issue", "view", "7", "--json", "labels"], root, true);
     gh_read_json("t.rows", &["pr", "list", "--state", "open"], root, false, |v: &Vec<u8>| false);
+    gh_read_for_repo("t.graphql", &["api", "graphql", "-f", "query={ viewer { login } }"], root, "o/r");
     gh_write("t.comment", &["issue", "comment", "7", "--body", "b"], root, false);
     gh_write("t.label", &["api", "-X", "POST", "repos/o/r/issues/7/labels", "-f", "labels[]=x"], root, false);
     gh_write("t.withdraw", &["api", "-X", "DELETE", "repos/o/r/issues/comments/9"], root, false);
