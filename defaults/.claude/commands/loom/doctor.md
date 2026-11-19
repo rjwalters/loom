@@ -110,7 +110,9 @@ fi
 
 Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge.
 
-**Detached `pr-<N>` is read-only for Doctor (#14403).** If `pr-worktree.sh` exits `0` but reports a **detached** `pr-<N>` (the PR's branch is checked out in the primary clone), do not edit or commit there: a plain `git push` cannot land from a detached HEAD, and a commit on it has no surviving ref once the worktree is removed. Stop, release the PR lease and `loom:treating`, and route or park the PR instead (same review-only rule as `judge.md`).
+**Detached `pr-<N>` is read-only for Doctor (#14403).** If `pr-worktree.sh` exits `0` but leaves `pr-<N>` **detached** (the PR's branch is checked out in the primary clone), do not edit or commit there: a plain `git push` cannot land from a detached HEAD, and a commit on it has no surviving ref once the worktree is removed. Stop, release the PR lease and `loom:treating`, and route or park the PR instead (same review-only rule as `judge.md`).
+
+Detect it with a command, not by reading the helper's output (a caller may have suppressed it): after `pr-worktree.sh` returns, `git -C .loom/worktrees/pr-<N> symbolic-ref -q --short HEAD` exits non-zero when `pr-<N>` is detached. A detached HEAD equals the PR head sha, so "Verify the pin" does not catch it.
 
 ### Expected worktree state after setup (#4823)
 
@@ -600,7 +602,9 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       cd ".loom/worktrees/issue-$ISSUE_NUM"
       gh pr checkout "$UNLABELED_PR"
     else
-      ./.loom/scripts/pr-worktree.sh "$UNLABELED_PR" >/dev/null
+      # Keep the helper's output visible: it reports a detached pr-<N> (see
+      # "Detached `pr-<N>` is read-only for Doctor" above).
+      ./.loom/scripts/pr-worktree.sh "$UNLABELED_PR"
       cd ".loom/worktrees/pr-$UNLABELED_PR"
     fi
 
