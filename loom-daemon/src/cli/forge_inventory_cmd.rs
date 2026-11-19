@@ -27,7 +27,7 @@ use crate::forge_inventory::{
 };
 
 #[derive(clap::Subcommand)]
-pub(crate) enum ForgeInventoryCommand {
+pub enum ForgeInventoryCommand {
     /// Coverage validator: reject a manifest that cannot support a claim.
     Validate(ValidateArgs),
     /// Change gate: reject a new unclassified direct forge call.
@@ -43,7 +43,7 @@ pub(crate) enum ForgeInventoryCommand {
 }
 
 impl ForgeInventoryCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         match self {
             ForgeInventoryCommand::Validate(a) => a.run(),
             ForgeInventoryCommand::Gate(a) => a.run(),
@@ -80,7 +80,7 @@ fn parse_profile(s: &str) -> Result<Profile> {
 // ============================================================================
 
 #[derive(clap::Args)]
-pub(crate) struct ValidateArgs {
+pub struct ValidateArgs {
     /// Validate a manifest directory instead of the embedded one.
     #[arg(long, value_name = "DIR")]
     manifest_dir: Option<PathBuf>,
@@ -161,7 +161,7 @@ impl ValidateArgs {
 // ============================================================================
 
 #[derive(clap::Args)]
-pub(crate) struct GateArgs {
+pub struct GateArgs {
     /// Repo root to scan.
     #[arg(long, value_name = "DIR", default_value = ".")]
     root: PathBuf,
@@ -324,7 +324,7 @@ impl GateArgs {
 // ============================================================================
 
 #[derive(clap::Args)]
-pub(crate) struct ReportArgs {
+pub struct ReportArgs {
     #[arg(long, value_name = "DIR")]
     manifest_dir: Option<PathBuf>,
     #[arg(long)]
@@ -356,7 +356,7 @@ impl ReportArgs {
 // ============================================================================
 
 #[derive(clap::Args)]
-pub(crate) struct ProbeArgs {
+pub struct ProbeArgs {
     #[arg(long, value_name = "DIR")]
     manifest_dir: Option<PathBuf>,
     /// Repeatable. Default: every required profile.
@@ -406,7 +406,7 @@ impl ProbeArgs {
 // ============================================================================
 
 #[derive(clap::Args)]
-pub(crate) struct ObservedArgs {
+pub struct ObservedArgs {
     #[arg(long, value_name = "DIR")]
     manifest_dir: Option<PathBuf>,
     /// Read this sink directory instead of the host's
@@ -435,4 +435,38 @@ impl ObservedArgs {
         }
         Ok(())
     }
+}
+
+impl ForgeInventoryCommand {
+    /// Whether the parsed invocation is served by `loom-tools`: every verb,
+    /// except `gate --update`, which rewrites the change-gate baseline
+    /// instead of judging it — a write, and #14396's (#14429). The
+    /// exhaustive `match` keeps a new verb from compiling until its author
+    /// has said which side it is on.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        match self {
+            Self::Validate(_) | Self::Report(_) | Self::ProbeManifest(_) | Self::Observed(_) => {
+                true
+            }
+            Self::Gate(args) => !args.update,
+        }
+    }
+}
+
+/// Run the verb through the one shared handler. Refuses (exit
+/// [`super::forge_read::EX_WRITE_VERB_NOT_MIGRATED`]) a form that writes.
+///
+/// # Errors
+/// Whatever [`ForgeInventoryCommand::run`] returns; the verbs report their
+/// own failure classes on stderr and exit with the family contract's codes.
+pub fn handle_forge_inventory_read_command(cmd: ForgeInventoryCommand) -> Result<()> {
+    if !cmd.is_read() {
+        eprintln!(
+            "loom-tools forge-inventory: `gate --update` rewrites the baseline and is not \
+             served by loom-tools yet (#14396); use `loom-daemon forge-inventory gate --update`."
+        );
+        std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+    }
+    cmd.run()
 }

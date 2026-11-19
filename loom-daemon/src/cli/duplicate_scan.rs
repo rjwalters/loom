@@ -182,7 +182,7 @@ impl Pool {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct DuplicateScanArgs {
+pub struct DuplicateScanArgs {
     /// Which candidate pool stdin holds. Fixes the row prefix, the
     /// degenerate-message label, and whether a match is a verdict (exit 1)
     /// or context (exit 0).
@@ -589,7 +589,7 @@ impl DuplicateScanArgs {
         }
     }
 
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let candidates = match self.closed_window_days {
             Some(days) => self.closed_window_pool(days),
             None => read_pool_from_stdin(),
