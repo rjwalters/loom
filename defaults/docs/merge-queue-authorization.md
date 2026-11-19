@@ -234,10 +234,9 @@ directory **refuses** the route before any grant, status or enqueue (a bare
 for repositories that never configured a broker. A trusted root with an
 unreadable or malformed config tier refuses too (a dead tier would otherwise
 read as "no command"), and so does a target whose earlier route observations
-show a command route but which resolves none now: the direct writer is never
-the silent fallback for a known broker target (delete the route log after
-removing a broker on purpose). Global config precedence is unchanged — this
-selects the root the existing resolution reads.
+show a command route but which resolves none now. That refusal identifies the
+earlier broker route record. The selected root supplies the existing config
+tiers in their original precedence order.
 
 Every invocation appends one bounded observation to
 `.loom/logs/merge-queue-route.jsonl` (deduplicated against its recent tail, and
@@ -258,7 +257,9 @@ A target is *broker-required* when the machine-level defaults tier
 (`~/.local/share/loom/config/defaults.json`, outside every checkout) lists it in
 `forge.mergeQueue.brokerRequiredRepos` (`["owner/repo", …]`). With no resolvable
 `forge.mergeQueue.statusCommand` the route is then refused — never the direct
-writer — even on a fresh host with no route history. The route log is a
-secondary signal only. Each probe and post attempt appends a bounded record with
+writer — even on a fresh host with no route history. The diagnostic names the
+machine policy key that requires the broker. The route log supplies a separate
+fallback signal when the machine policy has no entry for the target. Each
+probe and post attempt appends a bounded record with
 the exact PR/head and a typed `outcome` (`probe_ok`, `probe_refused`,
 `post_ok`, `post_failed`), including refusals that make no mutation.

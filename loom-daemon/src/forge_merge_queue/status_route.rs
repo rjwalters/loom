@@ -245,16 +245,17 @@ pub fn resolve_with(
                          granted, posted or enqueued (#14632)"
                     ));
                     refusal = Some(Refusal::TierUnavailable);
-                } else if matches!(command, Ok(None))
-                    && broker_required(&[&root, invocation_root], target)
-                {
-                    command = Err(format!(
-                        "{target} was routed through {CONFIG_KEY} on an earlier handoff but \
-                         no command resolves from its trusted root now; refusing rather than \
-                         using the direct writer. If the broker was removed on purpose, delete \
-                         {ROUTE_LOG_RELATIVE_PATH} (#14632)"
-                    ));
-                    refusal = Some(Refusal::BrokerMissing);
+                } else if matches!(command, Ok(None)) {
+                    if let Some(source) =
+                        broker_requirement_source(&[&root, invocation_root], target)
+                    {
+                        command = Err(format!(
+                            "{target} requires a status broker according to {source}, but no \
+                             {CONFIG_KEY} command resolves from its trusted root; refusing the \
+                             direct writer (#14632)"
+                        ));
+                        refusal = Some(Refusal::BrokerMissing);
+                    }
                 }
             }
             ResolvedRoute {
@@ -288,15 +289,16 @@ pub fn resolve_with(
                             }),
                         )
                     }
-                    Ok(None) if broker_required(&[invocation_root], target) => (
-                        Err(format!(
-                        "{target} was routed through {CONFIG_KEY} on an earlier handoff but no \
-                         trusted root resolves now; refusing rather than using the direct \
-                         writer (#14632)"
-                    )),
-                        Some(Refusal::BrokerMissing),
-                    ),
-                    Ok(None) => (Ok(None), None),
+                    Ok(None) => match broker_requirement_source(&[invocation_root], target) {
+                        Some(source) => (
+                            Err(format!(
+                                "{target} requires a status broker according to {source}, but \
+                                 no trusted root resolves now; refusing the direct writer (#14632)"
+                            )),
+                            Some(Refusal::BrokerMissing),
+                        ),
+                        None => (Ok(None), None),
+                    },
                     Err(e) => (Err(e), Some(Refusal::Malformed)),
                 };
             ResolvedRoute {
@@ -581,12 +583,15 @@ fn policy_file_requires_broker(path: &Path, target: &str) -> bool {
         })
 }
 
-/// Whether `target` needs a broker: declared by host policy
-/// ([`BROKER_REQUIRED_KEY`]), or — as a secondary signal — an earlier record
-/// in any of `roots`' route logs shows it routed through a command.
-fn broker_required(roots: &[&Path], target: &str) -> bool {
-    policy_requires_broker(target)
-        || roots.iter().any(|root| {
+/// The source of a broker requirement. Machine policy takes precedence over
+/// a previous command route recorded under one of these roots.
+fn broker_requirement_source(roots: &[&Path], target: &str) -> Option<String> {
+    if policy_requires_broker(target) {
+        return Some(format!("machine policy {BROKER_REQUIRED_KEY}"));
+    }
+    roots
+        .iter()
+        .any(|root| {
             tail_records(&root.join(ROUTE_LOG_RELATIVE_PATH))
                 .iter()
                 .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
@@ -597,6 +602,7 @@ fn broker_required(roots: &[&Path], target: &str) -> bool {
                             .is_some_and(|t| t.eq_ignore_ascii_case(target))
                 })
         })
+        .then(|| "an earlier broker route record".to_string())
 }
 
 /// Two records are equivalent when every field except `at` matches.
@@ -892,6 +898,10 @@ mod tests {
         let second = resolve(dir.path(), "o/r", &reg);
         assert_eq!(second.refusal, Some(Refusal::BrokerMissing));
         assert_eq!(second.route(), "refused");
+        assert!(second
+            .command
+            .unwrap_err()
+            .contains("an earlier broker route record"));
     }
 
     #[test]

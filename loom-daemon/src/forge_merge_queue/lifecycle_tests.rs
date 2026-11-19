@@ -1324,3 +1324,118 @@ fn a_retry_spent_drop_says_so() {
     let _ = reconcile_pr(&c, PR);
     assert_eq!(gh.count("already had its one infra retry"), 1);
 }
+
+#[cfg(unix)]
+#[test]
+fn fresh_host_broker_policy_refuses_before_any_handoff_write() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    use super::gh_lifecycle::GhLifecycleForge;
+    use super::status_route::{BROKER_REQUIRED_KEY, ROUTE_LOG_RELATIVE_PATH};
+    use crate::test_git_helpers::run as git;
+
+    const CHILD: &str = "LOOM_TEST_REQUIRED_BROKER_HANDOFF_CHILD";
+    const TARGET: &str = "review/policy-required";
+    // Run the normal constructor with its real defaults loader. The child
+    // alone sees the synthetic policy, even when other tests run in parallel.
+    if std::env::var_os(CHILD).is_none() {
+        let config = tempfile::tempdir().unwrap();
+        let defaults = config.path().join("defaults.json");
+        std::fs::write(
+            &defaults,
+            serde_json::json!({"forge": {"mergeQueue": {"brokerRequiredRepos": [TARGET]}}})
+                .to_string(),
+        )
+        .unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::fresh_host_broker_policy_refuses_before_any_handoff_write");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, "1")
+            .env("LOOM_CONFIG_DEFAULTS_FILE", &defaults)
+            .env_remove("GH_HOST")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("required-broker-handoffs-checked"),
+            "{stdout}\n{stderr}"
+        );
+        return;
+    }
+
+    let checkout = || {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{TARGET}.git"),
+            ],
+        );
+        std::fs::create_dir(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom/config.json"), "{}").unwrap();
+        dir
+    };
+    let registered = checkout();
+    let roots = [registered.path().to_path_buf()];
+    for (registry, root_class) in [
+        (Some(roots.as_slice()), "registered-other"),
+        (None, "unverified"),
+    ] {
+        let invocation = checkout();
+        let log = invocation.path().join(ROUTE_LOG_RELATIVE_PATH);
+        assert!(!log.exists());
+        assert!(!registered.path().join(ROUTE_LOG_RELATIVE_PATH).exists());
+        let writer = invocation.path().join("writer-gh");
+        std::fs::write(&writer, "#!/bin/sh\n: > \"$0.called\"\nexit 91\n").unwrap();
+        std::fs::set_permissions(&writer, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let statuses = GhLifecycleForge::new_with_registry(
+            writer.to_str().unwrap(),
+            invocation.path(),
+            TARGET,
+            registry,
+        )
+        .unwrap();
+        let gh = Gh::new();
+        let events = MemoryEventSink::default();
+        let ctx = Ctx {
+            statuses: &statuses,
+            ..ctx(&gh, &events, MergeMode::Queue, t0())
+        };
+
+        let error = handoff(&ctx, PR, SHA1, &required_ok).unwrap_err();
+        assert_eq!(gh.comments.borrow().len(), 1, "no grant or rollback");
+        assert!(!writer.with_extension("called").exists(), "no writer call");
+        assert!(gh.queued.borrow().is_none(), "no queue entry");
+        assert!(events.all().is_empty(), "no queue event");
+        let HandoffFailure::Authz(HandoffError::WriterCannotPostStatuses(detail)) = error else {
+            panic!("expected a pre-grant broker refusal, got {error:?}");
+        };
+        assert!(detail.contains(BROKER_REQUIRED_KEY), "{detail}");
+        assert!(!detail.contains("earlier handoff") && !detail.contains("delete"), "{detail}");
+
+        let text = std::fs::read_to_string(log).unwrap();
+        assert!(!text.contains(invocation.path().to_str().unwrap()));
+        assert!(!text.contains(registered.path().to_str().unwrap()));
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2, "one route record and one attempt");
+        let attempt = &records[1];
+        assert_eq!(attempt["pr"], PR);
+        assert_eq!(attempt["head_sha"], SHA1);
+        assert_eq!(attempt["root_class"], root_class);
+        assert_eq!(attempt["route"], "refused");
+        assert_eq!(attempt["refusal"], "broker-missing");
+        assert_eq!(attempt["operation"], "probe_status");
+        assert_eq!(attempt["outcome"], "probe_refused");
+    }
+    println!("required-broker-handoffs-checked");
+}
