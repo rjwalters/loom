@@ -694,6 +694,7 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     let dir = tempdir().unwrap();
     std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
     emit_step_capture(&StepCapture {
+        runtime: None,
         root: dir.path().to_path_buf(),
         role: StepRole::ChampionMerge,
         item: 8,
@@ -730,6 +731,7 @@ fn a_step_with_no_outcome_line_records_none_on_its_record() {
     let dir = tempdir().unwrap();
     std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
     emit_step_capture(&StepCapture {
+        runtime: None,
         root: dir.path().to_path_buf(),
         role: StepRole::Judge,
         item: 9,
