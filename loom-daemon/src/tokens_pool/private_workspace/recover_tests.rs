@@ -2001,6 +2001,209 @@ fn without_the_configuration_a_private_start_is_unchanged() {
     assert!(!text.contains("extra_mounts") && !text.contains("session_image"), "{text}");
 }
 
+/// Give a disposable workspace the same Codex provider manifest as a launch.
+fn install_codex_dispatch_manifest(root: &Path) {
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/runtimes/codex.json");
+    let dest = root.join(".loom/runtimes/codex.json");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(shipped, dest).unwrap();
+}
+
+#[test]
+#[serial]
+fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
+    use crate::tokens_pool::health::{self, TerminalClassification};
+    use crate::tokens_pool::session_lifecycle::liveness::test_support::set_selector_docker;
+
+    let _environment = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let root = env.workspace.path();
+    install_codex_dispatch_manifest(root);
+    crate::test_git_helpers::run(root, &["init", "-q"]);
+    crate::test_git_helpers::run(root, &["remote", "add", "origin", &env.config.repository]);
+    super::super::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    health::record_terminal(root, &env.account.id, TerminalClassification::TokenExpired, "fixture")
+        .unwrap();
+
+    let registry = crate::tokens_pool::paths::per_repo_accounts_file(root);
+    let profile = env.dir.join("workspace.json");
+    let mut unrelated = env.config.clone();
+    unrelated.repository = "https://forge.example/unrelated/repo".into();
+    let changed_profile = serde_json::to_vec(&unrelated).unwrap();
+    for (file, changed) in [
+        (registry.as_path(), b"invalid fixture registry".as_slice()),
+        (profile.as_path(), changed_profile.as_slice()),
+    ] {
+        let original = std::fs::read(file).unwrap();
+        let replacement = root.join("replacement-data");
+        std::fs::write(&replacement, changed).unwrap();
+        let fake_docker = root.join("selection-snapshot");
+        // Liveness is observed only after the selector collected its
+        // inventory and evaluated its repository predicate.
+        crate::exec_test_support::write_executable(
+            &fake_docker,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = ps ] || exit 88\ncp '{}' '{}'\n",
+                replacement.display(),
+                file.display(),
+            ),
+        );
+        let _liveness = set_selector_docker(fake_docker.to_str().unwrap(), false);
+
+        let result =
+            dispatch::Selection::prepare_idle(root, None, JobKind::Sweep, None, "fixture", false);
+        assert_eq!(std::fs::read(file).unwrap(), changed, "snapshot must have run");
+        let error = result.err().expect("the matching account is not healthy");
+        assert!(error.is::<health::NoHealthyAccountError>(), "{error:#}");
+        assert_eq!(error.to_string(), dispatch::NO_IDLE_SEAT);
+        std::fs::write(file, original).unwrap();
+    }
+    assert!(env.engine().calls.is_empty(), "health filtering made no target calls");
+}
+
+#[test]
+#[serial]
+fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
+    use crate::sweep_registry::{
+        private_dispatch, DispatchModel, SweepRegistry, SweepRegistryConfig,
+    };
+    use crate::types::SweepKind;
+
+    let _environment = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let _defaults = crate::env_test_support::EnvGuard::set("LOOM_CONFIG_DEFAULTS_FILE", "");
+    // The write-scope fixture uses a synthetic GitHub origin and gh; do
+    // not give private preparation a matching forge credential host.
+    let _forge_host = crate::env_test_support::EnvGuard::set("GH_HOST", "fixture.invalid");
+    let mut env = setup();
+    let root = env.workspace.path();
+    let scope = crate::write_scope_test_support::WritableRoot::register(root);
+    env.config.repository = format!("https://github.com/{}.git", scope.repo);
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    super::super::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    env.seed_container(CONTAINER_ID, true);
+    env.seed_volume();
+    install_codex_dispatch_manifest(root);
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults");
+    std::fs::copy(shipped.join("runtimes/claude.json"), root.join(".loom/runtimes/claude.json"))
+        .unwrap();
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let mut config = SweepRegistryConfig::new(root.to_owned());
+    config.gh_bin = Some(scope.gh.clone());
+    config.journal_path = Some(root.join("test-sweeps-journal.json"));
+    let registry = SweepRegistry::shared(config);
+    let roles = root.join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    for runtime in ["codex", "claude"] {
+        crate::exec_test_support::write_executable(
+            &root.join(format!(".loom/scripts/spawn-{runtime}.sh")),
+            "#!/bin/sh\nexit 0\n",
+        );
+    }
+    let controls = tempfile::tempdir().unwrap();
+    let trusted = super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
+    for name in bundle::PROFILE_CONTROLS {
+        std::fs::copy(trusted.join(name), env.config.profile.join(name)).unwrap();
+    }
+
+    for (issue, runtime, capabilities, contained, preference_walk) in [
+        (17_u32, "codex", &[][..], false, true),
+        (18, "codex", &["worktreeIsolation"][..], true, true),
+        (19, "claude", &[][..], false, true),
+        (20, "codex", &[][..], false, false),
+    ] {
+        let runtimes = if preference_walk {
+            json!({"preference": [runtime]})
+        } else {
+            json!({"default": runtime})
+        };
+        save(&root.join(".loom/config.json"), &json!({"runtimes": runtimes})).unwrap();
+        save(&roles.join("builder.json"), &json!({"runtimeRequirements": capabilities})).unwrap();
+        env.with(|engine| engine.calls.clear());
+        let launch = private_dispatch::prepare(
+            &registry,
+            &SweepKind::Issue(issue),
+            None,
+            DispatchModel::Request(Some("fixture-model")),
+        )
+        .unwrap()
+        .unwrap();
+        let admitted = launch.admission.admitted.as_ref().unwrap();
+        assert_eq!(admitted.runtime, runtime);
+        assert_eq!(admitted.preference.is_some(), preference_walk);
+        if let Some(preference) = &admitted.preference {
+            assert_eq!(preference.tap, runtime);
+            assert_eq!(preference.tier, 0);
+        }
+        assert_eq!(admitted.execution.is_some(), contained);
+        assert_eq!(launch.model.as_deref(), Some("fixture-model"));
+        let prepare_count = env
+            .engine()
+            .calls
+            .iter()
+            .filter(|args| {
+                args.first().is_some_and(|arg| arg == "exec")
+                    && args
+                        .windows(2)
+                        .any(|pair| pair[0] == "private-workspace" && pair[1] == "prepare")
+            })
+            .count();
+        if runtime == "codex" {
+            assert_eq!(prepare_count, 1, "legacy sweep #{issue} prepares its target once");
+            let selection = launch
+                .selection
+                .as_ref()
+                .expect("the launch owns the prepared seat");
+            assert_eq!(selection.name, "alice");
+            let lease = selection
+                .lease()
+                .expect("the original lease reaches launch");
+            assert_eq!(lease.dir, env.dir);
+            let job = lease::read(&lease.dir).unwrap().unwrap();
+            assert_eq!(job.container_id, CONTAINER_ID);
+            assert_eq!(job.issue, Some(u64::from(issue)));
+            assert!(matches!(job.kind, JobKind::Sweep));
+            assert_eq!(job.base_revision, "a".repeat(40));
+            assert!(lease::Lease::acquire(&env.dir)
+                .err()
+                .unwrap()
+                .is::<AccountBusy>());
+        } else {
+            assert_eq!(prepare_count, 0, "non-Codex fallback performs no target work");
+            assert!(launch.selection.is_none());
+        }
+    }
+}
+
 #[test]
 #[serial]
 fn concurrent_judge_draws_share_one_idle_seat() {
@@ -2086,9 +2289,15 @@ fn concurrent_judge_draws_share_one_idle_seat() {
         else {
             panic!("expected the role draw");
         };
-        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), preparer.take())
+        // The launch consumes the held reservation as `private_dispatch`
+        // does for a host-admitted Codex candidate (#14512): it is handed
+        // over whole, so nothing is re-prepared.
+        let held = crate::sweep_registry::private_dispatch::take_held(&mut preparer, false)
+            .unwrap()
+            .map(|(selection, _)| selection);
+        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), held)
     };
-    let assert_falls_through = |case: &str| {
+    let assert_falls_through_with = |case: &str, reason: &str| {
         let (runtime, record, selection) = draw(case.to_owned());
         assert_eq!(runtime, "claude", "{case}: {record:?}");
         assert!(selection.is_none(), "{case}");
@@ -2096,10 +2305,11 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             record
                 .passed_over
                 .iter()
-                .any(|reason| reason == "codex: not-admitted(no idle seat)"),
-            "{record:?}"
+                .any(|passed| passed == &format!("codex: not-admitted({reason})")),
+            "{case}: {record:?}"
         );
     };
+    let assert_falls_through = |case: &str| assert_falls_through_with(case, "no idle seat");
 
     assert_falls_through("hook trust unproven");
     let controls = tempfile::tempdir().unwrap();
@@ -2117,7 +2327,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             "https://forge.example/other/repo",
         ],
     );
-    assert_falls_through("repository unregistered");
+    // No inventoried account serves the resolved repository: a routing miss,
+    // reported apart from contention (#14512).
+    assert_falls_through_with("repository unregistered", "no seat serves this repository");
     crate::test_git_helpers::run(root, &["remote", "set-url", "origin", &env.config.repository]);
 
     env.seed_container(CONTAINER_ID, false);

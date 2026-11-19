@@ -1285,6 +1285,7 @@ fn extra_mounts_with_clean_data_paths_are_accepted() {
         &mounts,
         Some(Path::new("/home/u")),
         &[],
+        &[],
         &[PathBuf::from("/home/u/GitHub/loom")],
         &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
     )
@@ -1300,10 +1301,11 @@ fn extra_mount_sources_pass_the_workspace_denials() {
         &[],
         &[],
         &[],
+        &[],
     )
     .unwrap_err()
     .to_string();
-    assert!(err.contains("home directory"), "{err}");
+    assert!(err.contains("protected host path /home/u/.ssh"), "{err}");
     // So is anything overlapping a firewalled repository.
     let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
         &[extra_mount("/srv/notebook", "/data/notebook")],
@@ -1311,10 +1313,98 @@ fn extra_mount_sources_pass_the_workspace_denials() {
         &[PathBuf::from("/srv/notebook")],
         &[],
         &[],
+        &[],
     )
     .unwrap_err()
     .to_string();
     assert!(err.contains("firewall: true"), "{err}");
+}
+
+#[test]
+#[serial]
+fn extra_mount_sources_in_account_roots_are_refused_in_both_modes() {
+    use crate::env_test_support::EnvGuard;
+    use crate::tokens_pool::claude_seat::SEAT_ROOT_ENV;
+    use crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV;
+    use crate::tokens_pool::session_mount_gate::{check_extra_mounts, check_private_extra_mounts};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let profiles = tmp.path().join("profiles");
+    let tokens = tmp.path().join("pool/tokens");
+    let seats = tmp.path().join("seats");
+    let _profiles = ProfileRootEnv::set(&profiles);
+    let _tokens = EnvGuard::set(SHARED_TOKENS_DIR_ENV, &tokens);
+    let _seats = EnvGuard::set(SEAT_ROOT_ENV, &seats);
+    let local_pool = workspace.join(".loom/tokens");
+    for (source, shield) in [
+        (profiles.join("another-account"), &profiles),
+        (tokens.clone(), &tokens),
+        (tokens.join("nested"), &tokens),
+        (tmp.path().join("pool"), &tokens),
+        (seats.join("another-seat/home"), &seats),
+        (local_pool.clone(), &local_pool),
+    ] {
+        let mounts = [ExtraMount {
+            host: source,
+            container: PathBuf::from("/data"),
+        }];
+        for result in [
+            check_extra_mounts(&mounts, &workspace, &[], &[]),
+            check_private_extra_mounts(&mounts, &workspace, &[]),
+        ] {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(&format!("protected host path {}", shield.display())), "{err}");
+        }
+    }
+}
+
+#[test]
+fn extra_mount_sources_overlapping_home_credentials_are_refused() {
+    use crate::tokens_pool::session_mount_gate::check_extra_mount_denials;
+
+    let home = Path::new("/home/u");
+    for (source, shield) in [
+        (".ssh", ".ssh"),
+        (".aws/config", ".aws"),
+        (".config/gh", ".config/gh"),
+        (".config", ".config/gh"),
+    ] {
+        let source = home.join(source);
+        let mount = ExtraMount {
+            host: source.clone(),
+            container: "/data".into(),
+        };
+        let err = check_extra_mount_denials(&[mount], Some(home), &[], &[], &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("protected host path {}", home.join(shield).display())),
+            "{err}"
+        );
+        assert!(check_mount_denials(&[source], Some(home), &[]).is_ok());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn extra_mount_sources_resolve_aliases_without_a_home() {
+    use crate::tokens_pool::session_mount_gate::check_extra_mount_denials;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shield = tmp.path().join("accounts");
+    std::fs::create_dir(&shield).unwrap();
+    let alias = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&shield, &alias).unwrap();
+    let mounts = [ExtraMount {
+        host: alias.join("../alias/new-seat"),
+        container: "/data".into(),
+    }];
+    let err =
+        check_extra_mount_denials(&mounts, None, &[], std::slice::from_ref(&shield), &[], &[])
+            .unwrap_err()
+            .to_string();
+    assert!(err.contains(&format!("protected host path {}", shield.display())), "{err}");
 }
 
 #[test]
@@ -1340,6 +1430,7 @@ fn extra_mount_targets_shadowing_protected_paths_are_refused() {
             std::slice::from_ref(&mount),
             Some(Path::new("/home/u")),
             &[],
+            &[],
             &[PathBuf::from("/home/u/GitHub/loom")],
             &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
         )
@@ -1355,6 +1446,7 @@ fn extra_mount_targets_shadowing_protected_paths_are_refused() {
 
 #[test]
 fn extra_mount_targets_under_the_workspace_label_are_refused() {
+    let _profiles = ProfileRootEnv::set("");
     // Issue #14420: the "parent of repositories" shape. The label is
     // `/home/u/GitHub`, only `/home/u/GitHub/loom` is registered, so a target
     // under the label but outside every root would read as workspace mount
@@ -1404,6 +1496,7 @@ fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
         &[],
         &[],
         &[],
+        &[],
     )
     .unwrap_err()
     .to_string();
@@ -1416,6 +1509,7 @@ fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
     let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
         &overlapping,
         None,
+        &[],
         &[],
         &[],
         &[],
