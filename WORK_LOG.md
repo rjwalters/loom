@@ -16,6 +16,33 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14086**: feat: add workflow-lint subcommand and Doctor pre-push workflow gate
+- **PR #14295**: ci: gate docs/README.md index against the docs/ tree
+- **PR #14319**: ci: cover all of defaults/ in the backend PR path filter
+- **PR #14368**: docs: correct merge-queue dormancy reason and cutover step 3 failures
+- **PR #14645**: fix: keep a guard-refused Champion step's release reason in its verdict
+- **PR #14655**: docs: explain merge-group CI audit step parity
+- **PR #14661**: docs: index the merge queue pilot directory
+- **PR #14666**: fix(telemetry): key Codex role-tick usage on session ids and name each miss
+- **PR #14667**: test: pin the captain tier off in test-filing-lock and surface filer failures
+- **PR #14669**: fix: carry discovery and decode completeness into Codex by-id usage misses
+- **PR #14670**: fix(telemetry): project hold transition rollup fields
+- **PR #14672**: docs(sweep): replace $ARGUMENTS placeholder in sibling reference files with carried-over invocation arguments
+- **Issue #13155** (closed): [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1)
+- **Issue #13896** (closed): Doctor conflict-resolution should structurally validate touched workflow files; a vanished check should not satisfy a green rollup
+- **Issue #14075** (closed): docs: add a CI check that docs/README.md indexes every docs/ directory and top-level doc
+- **Issue #14244** (closed): Live-verify telemetry-hold-transitions against the real reader (14-day window vs the 5 known self-releases)
+- **Issue #14247** (closed): docs: stale 'user-owned' reason in ci.yml comments, and cutover step 3 understates expected eligibility failures
+- **Issue #14301** (closed): ci.yml backend path filter omits defaults/scripts/lib/bounded-run.sh, skipping the Rust tests that read it from disk
+- **Issue #14355** (closed): Version-bump publish returns 403 wrong_repository after org transfer
+- **Issue #14556** (closed): [ci-daily] Compatibility Floor (SUPPORTS_INSTALLED)
+- **Issue #14569** (closed): telemetry-hold-transitions fails on the real reader: rows refused as 'no body string', and the 14-day window exceeds the store memory limit
+- **Issue #14639** (closed): Targeted Champion pin or facts guard refuses on 0.19.1316 across two repos
+- **Issue #14654** (closed): Document step-parity limits of the merge-group CI audit
+- **Issue #14658** (closed): Main Lint fails because the docs index omits merge-queue-pilot
+- **Issue #14659** (closed): sweep: sibling reference files render $ARGUMENTS as empty when loaded as skills
+- **Issue #14664** (closed): Telemetry: on 0.20.0 most Codex runs still have no usage row (15 no_attributable_usage; Guide and Hermit 0 of 10)
+- **Issue #14668** (closed): Codex by-id usage lookup: two read failures still report confirmed absence (session_not_found / no_usage_tokens)
 - **PR #14638**: fix: classify launcher preflight rejections with a typed boundary
 - **PR #14646**: fix(tests): derive the config-restart fixture's release from the running version
 - **PR #14644**: chore: remove stale quickstart worktree.sh copies
