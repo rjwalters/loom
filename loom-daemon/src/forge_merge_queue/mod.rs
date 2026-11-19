@@ -59,6 +59,7 @@ pub mod ops;
 pub mod preflight;
 pub mod removal;
 pub mod status_command;
+pub mod status_route;
 
 use std::path::PathBuf;
 

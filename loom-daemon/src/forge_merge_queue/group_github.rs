@@ -351,7 +351,7 @@ impl GhLifecycleForge {
             Err(e) => return Err(e.clone()),
             Ok(Some(cmd)) => {
                 return cmd.post(
-                    self.root(),
+                    self.command_root(),
                     &StatusPost {
                         repo: &self.nwo(),
                         sha: commit,
@@ -410,7 +410,7 @@ impl StatusApi for GhLifecycleForge {
             Err(e) => return Err(e.clone()),
             Ok(Some(cmd)) => {
                 return cmd
-                    .probe(self.root(), &self.nwo(), REQUIRED_CHECK_CONTEXT)
+                    .probe(self.command_root(), &self.nwo(), REQUIRED_CHECK_CONTEXT)
                     .map_err(|e| format!("the status command refused its dry-run probe: {e}"));
             }
             Ok(None) => {}
@@ -418,7 +418,7 @@ impl StatusApi for GhLifecycleForge {
         // Unreadable or no App writer: unknown, so leave it to the post.
         match crate::merge_group_ci::eligibility::writer_statuses(
             self.gh(),
-            self.root(),
+            self.command_root(),
             self.owner(),
         ) {
             Some(level) if level != "write" => Err(format!(
