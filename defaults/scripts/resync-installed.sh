@@ -25,6 +25,15 @@
 # "Could not locate a defaults/ source tree to sync from": install or update
 # loom-daemon, or point .loom/loom-source-path at a local Loom source clone.
 #
+# An explicit `--source <dir>` (#14677) overrides that whole resolution order:
+# the defaults/ tree is read from <dir>, checked FIRST and EXCLUSIVELY — an
+# unusable <dir> is a hard error naming the path, never a fallthrough to the
+# automatic rungs or the daemon payload. That is the sanctioned form for an
+# agent working from a managed worktree in a CONSUMER repo, where the sidecar
+# lives only in the primary checkout and is gitignored besides, so it cannot
+# be written from the worktree (#4178); combined with --output it stages a
+# complete resync without reading or writing .loom/loom-source-path at all.
+#
 # It is idempotent (a no-op when already in sync), reports per-file
 # updated/created/removed/unchanged/skipped, only ever touches files that
 # either exist in the source tree or are explicitly declared retired (see
@@ -357,7 +366,9 @@
 #      install-metadata.json, .loom/CLAUDE.md, package.json, .gitattributes,
 #      .gitignore) is instead resolved under <dir>. defaults/ itself (the
 #      SOURCE of the sync) is still read from the primary checkout — that is
-#      a read, never a write, so it carries none of the #4563 hazard.
+#      a read, never a write, so it carries none of the #4563 hazard — unless
+#      an explicit `--source <dir>` (#14677) points it somewhere else, which
+#      is likewise read-only.
 #   3. On success the run prints the exact `cd <dir> && git add -- <paths>
 #      && git commit ... && git push` sequence to turn the staged tree into a
 #      resync commit (and PR) from a location that was never live-mid-sweep,
@@ -426,6 +437,18 @@
 #   ./.loom/scripts/resync-installed.sh --output <dir> --base <ref>
 #                                                  # ... based on <ref> instead of the
 #                                                  # invoking checkout's HEAD (#9550)
+#   ./.loom/scripts/resync-installed.sh --output <dir> --source <loom-checkout>
+#                                                  # ... taking the defaults/ SOURCE
+#                                                  # tree from <loom-checkout>
+#                                                  # explicitly (#14677) — the
+#                                                  # sanctioned form from a linked
+#                                                  # worktree in a CONSUMER repo,
+#                                                  # where the sidecar lives only
+#                                                  # in the (gitignored, guard-
+#                                                  # protected) primary checkout.
+#                                                  # Usable with or without --output;
+#                                                  # an unusable <loom-checkout> is
+#                                                  # a hard error naming the path
 #   ./.loom/scripts/resync-installed.sh --force    # also apply an update that would remove
 #                                                  # a locally-diverged installed file's own
 #                                                  # line(s) (see LOCAL-DIVERGENCE PROTECTION, #7864)
@@ -499,6 +522,13 @@ OUTPUT_DIR="${LOOM_RESYNC_OUTPUT:-}"
 # #9550: the commit the --output staging worktree is based on. Empty means the
 # default: the INVOKING checkout's HEAD (see OUTPUT-DIR STAGING MODE above).
 BASE_REF="${LOOM_RESYNC_BASE:-}"
+# #14677: explicit defaults/ SOURCE checkout, checked first and exclusively in
+# resolve_defaults() below. Empty means "resolve automatically". Deliberately
+# NOT mirrored by a LOOM_RESYNC_SOURCE env var — a silent environment override
+# of which tree thousands of files are copied FROM is exactly the kind of
+# ambient state this script refuses (contrast --output/--base, which only
+# steer where the output lands and what it is based on).
+SOURCE_OVERRIDE=""
 
 err()  { printf '%b\n' "${RED}ERROR: $*${NC}" >&2; }
 warn() { printf '%b\n' "${YELLOW}WARN: $*${NC}" >&2; }
@@ -549,6 +579,22 @@ while [[ $# -gt 0 ]]; do
             fi
             shift
             ;;
+        --source)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                err "--source requires a directory argument (try --help)"
+                exit 1
+            fi
+            SOURCE_OVERRIDE="$2"
+            shift 2
+            ;;
+        --source=*)
+            SOURCE_OVERRIDE="${1#--source=}"
+            if [[ -z "$SOURCE_OVERRIDE" ]]; then
+                err "--source requires a directory argument (try --help)"
+                exit 1
+            fi
+            shift
+            ;;
         --help|-h)
             # Print the whole leading comment block (line 2 through the last
             # consecutive `#` line). Derived, not a hard-coded line range — the
@@ -573,6 +619,15 @@ if [[ -n "$OUTPUT_DIR" ]]; then
     case "$OUTPUT_DIR" in
         /*) ;;
         *)  OUTPUT_DIR="$PWD/$OUTPUT_DIR" ;;
+    esac
+fi
+
+# #14677: --source likewise, so a relative `--source ../loom-clone` keeps
+# pointing at the same tree after the script moves on to other directories.
+if [[ -n "$SOURCE_OVERRIDE" ]]; then
+    case "$SOURCE_OVERRIDE" in
+        /*) ;;
+        *)  SOURCE_OVERRIDE="$PWD/$SOURCE_OVERRIDE" ;;
     esac
 fi
 
@@ -794,6 +849,9 @@ fi
 #
 # Mirrors the resolution order lib/repo-root.sh's find_loom_tools() used before
 # epic #4081 Phase 4 (#4557) retired it with the Python package:
+#   0. Explicit --source <dir> (#14677): the caller-named checkout — checked
+#      FIRST and EXCLUSIVELY; an unusable one is a hard error naming the path,
+#      never a fallthrough to the rungs below
 #   1. Loom source repo (dogfood): $REPO_ROOT/defaults/
 #   2. Recorded loom-source-path (target repo install)
 #   3. install-metadata.json "loom_source"
@@ -834,6 +892,19 @@ is_usable_defaults_root() {
 DEFAULTS_DIR=""
 SOURCE_ROOT=""
 resolve_defaults() {
+    # #14677: an explicit --source is the FIRST rung and, when given, the ONLY
+    # one: the caller named exactly where the defaults/ tree lives, so an
+    # unusable value is a loud refusal (rc 2, turned into the named-path error
+    # at the call site) — never a fallthrough to the dogfood/sidecar/metadata
+    # rungs or the daemon-payload fallback, which would silently sync the
+    # consumer from somewhere the caller did not point at.
+    if [[ -n "$SOURCE_OVERRIDE" ]]; then
+        if is_usable_defaults_root "$SOURCE_OVERRIDE"; then
+            DEFAULTS_DIR="$SOURCE_OVERRIDE/defaults"
+            return 0
+        fi
+        return 2
+    fi
     if is_usable_defaults_root "$REPO_ROOT"; then
         DEFAULTS_DIR="$REPO_ROOT/defaults"
         return 0
@@ -858,10 +929,19 @@ resolve_defaults() {
 }
 
 # requires-daemon: resync-payload optional   #8961 no source tree: resync from the daemon's embedded payload; an absent/older binary (no such verb) or a refusal (exit 1) keeps the failure below.
-if ! resolve_defaults; then
+resolve_defaults
+_RD_RC=$?
+if [[ "$_RD_RC" -eq 2 ]]; then
+    err "--source is not a usable Loom source checkout: $SOURCE_OVERRIDE"
+    err "A usable source root carries a populated defaults/hooks or defaults/scripts directory (#6780)."
+    err "Point --source at a clone of the Loom source repo, or drop --source to use the automatic resolution order."
+    exit 1
+fi
+if [[ "$_RD_RC" -ne 0 ]]; then
     _rp="${LOOM_DAEMON_BIN:-$(command -v loom-daemon || echo "${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon")}"; _rpa=(--workspace "$REPO_ROOT"); [[ "$DRY_RUN" -eq 1 ]] && _rpa+=(--dry-run); _rpw="found no loom-daemon that has it (looked at $_rp: missing or too old)"; _rpfix=" Install or update loom-daemon, or set .loom/loom-source-path to a local clone of the Loom source repo."
     if [[ -z "$OUTPUT_DIR" ]] && "$_rp" resync-payload --help >/dev/null 2>&1; then "$_rp" resync-payload "${_rpa[@]}"; _rprc=$?; [[ "$_rprc" -eq 1 ]] || exit "$_rprc"; _rpw="$_rp refused or failed (see above; it also exits 1 when it applied everything but could not refresh a labels block with malformed markers)"; _rpfix=" Its own output above names the cause and the fix."; fi
     err "Could not locate a defaults/ source tree to sync from: no \$REPO_ROOT/defaults, no usable path in the gitignored .loom/loom-source-path sidecar (missing on a fresh clone), no loom_source in .loom/install-metadata.json."
+    err "From a linked worktree in a consumer repo, name the source explicitly instead: --source <loom-checkout> (#14677)."
     err "Fallback \`loom-daemon resync-payload\` (the daemon's embedded payload, #8961): $_rpw.$_rpfix"; exit 1
 fi
 SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
@@ -880,7 +960,8 @@ SOURCE_ROOT="$(dirname "$DEFAULTS_DIR")"
 # the `.loom/docs/*.md -> ../../defaults/docs/*.md` symlinks in the first place.
 #
 # In every CONSUMER repo defaults/ is resolved through the sidecar/metadata
-# rungs above, so SOURCE_ROOT is some other directory entirely, this stays 0,
+# rungs above (or an explicit foreign --source, #14677 — same story: SOURCE_ROOT
+# is then some other directory entirely), this stays 0,
 # and the install stays what it has always been: real file copies, never
 # symlinks. Nothing below may make a consumer's install depend on a path
 # outside its own repository.
