@@ -2102,6 +2102,12 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
     let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults");
     std::fs::copy(shipped.join("runtimes/claude.json"), root.join(".loom/runtimes/claude.json"))
         .unwrap();
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
     let mut config = SweepRegistryConfig::new(root.to_owned());
     config.gh_bin = Some(scope.gh.clone());
     config.journal_path = Some(root.join("test-sweeps-journal.json"));
@@ -2120,12 +2126,18 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
         std::fs::copy(trusted.join(name), env.config.profile.join(name)).unwrap();
     }
 
-    for (issue, runtime, capabilities, contained) in [
-        (17_u32, "codex", &[][..], false),
-        (18, "codex", &["worktreeIsolation"][..], true),
-        (19, "claude", &[][..], false),
+    for (issue, runtime, capabilities, contained, preference_walk) in [
+        (17_u32, "codex", &[][..], false, true),
+        (18, "codex", &["worktreeIsolation"][..], true, true),
+        (19, "claude", &[][..], false, true),
+        (20, "codex", &[][..], false, false),
     ] {
-        save(&root.join(".loom/config.json"), &json!({"runtimes":{"default": runtime}})).unwrap();
+        let runtimes = if preference_walk {
+            json!({"preference": [runtime]})
+        } else {
+            json!({"default": runtime})
+        };
+        save(&root.join(".loom/config.json"), &json!({"runtimes": runtimes})).unwrap();
         save(&roles.join("builder.json"), &json!({"runtimeRequirements": capabilities})).unwrap();
         env.with(|engine| engine.calls.clear());
         let launch = private_dispatch::prepare(
@@ -2138,6 +2150,11 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
         .unwrap();
         let admitted = launch.admission.admitted.as_ref().unwrap();
         assert_eq!(admitted.runtime, runtime);
+        assert_eq!(admitted.preference.is_some(), preference_walk);
+        if let Some(preference) = &admitted.preference {
+            assert_eq!(preference.tap, runtime);
+            assert_eq!(preference.tier, 0);
+        }
         assert_eq!(admitted.execution.is_some(), contained);
         assert_eq!(launch.model.as_deref(), Some("fixture-model"));
         let prepare_count = env
@@ -2152,7 +2169,7 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
             })
             .count();
         if runtime == "codex" {
-            assert_eq!(prepare_count, 1, "the legacy sweep prepares its target once");
+            assert_eq!(prepare_count, 1, "legacy sweep #{issue} prepares its target once");
             let selection = launch
                 .selection
                 .as_ref()
