@@ -207,16 +207,50 @@ fn selector_read(
     Some(SessionLiveness(Arc::new(snapshot)))
 }
 
+/// Whether `account` runs in a session container: adopted by `accounts session
+/// start` ([`is_session_managed`]) or a private-clone seat.
+fn is_container_seat(account: &AccountDescriptor) -> bool {
+    is_session_managed(&account.credential_reference)
+        || super::super::codex_hooks::is_private_clone(&account.credential_reference)
+}
+
+/// `true` iff `account` is an enabled bare-metal Codex profile on a host whose
+/// other enabled seats run in session containers (#14455).
+///
+/// Such a host provisions its seats as containers; a profile that was never
+/// `accounts session start`ed there has no container to be running and no
+/// session-managed state to prove, so a dispatch on it runs on the host's own
+/// sandbox, which on these hosts refuses every command (`SANDBOX_UNAVAILABLE`,
+/// #9979). A host with no container seat at all is a bare-metal host and is
+/// never gated here, so a plain `CODEX_HOME` setup is unaffected.
+#[must_use]
+pub fn is_unprovisioned_bare_seat(
+    account: &AccountDescriptor,
+    inventory: &[AccountDescriptor],
+) -> bool {
+    account.enabled
+        && !is_container_seat(account)
+        && inventory
+            .iter()
+            .any(|other| other.enabled && is_container_seat(other))
+}
+
 /// The accounts in `inventory` the selector should try first: everything
-/// except session-managed accounts whose container is down. `None` when there
-/// is nothing to prefer — cannot observe, no account down, or no account
-/// live — so the caller selects from the full inventory exactly as before.
+/// except session-managed accounts whose container is down and, on a host that
+/// runs container seats, enabled bare-metal profiles that were never
+/// provisioned as one ([`is_unprovisioned_bare_seat`], #14455). `None` when
+/// there is nothing to prefer — cannot observe and no bare seat to pass over,
+/// no account excluded, or no account left — so the caller selects from the
+/// full inventory exactly as before.
 #[must_use]
 pub fn live_preferred(inventory: &[AccountDescriptor]) -> Option<Vec<AccountDescriptor>> {
-    let liveness = for_selector(inventory)?;
+    let liveness = for_selector(inventory);
     let live: Vec<AccountDescriptor> = inventory
         .iter()
-        .filter(|account| !is_session_down(account, Some(&liveness)))
+        .filter(|account| {
+            !is_session_down(account, liveness.as_ref())
+                && !is_unprovisioned_bare_seat(account, inventory)
+        })
         .cloned()
         .collect();
     let any_live_enabled = live.iter().any(|account| account.enabled);

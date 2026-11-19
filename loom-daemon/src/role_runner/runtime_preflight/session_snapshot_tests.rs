@@ -18,8 +18,7 @@ fn pool(profiles: &Path, workspace: &Path) {
 }
 
 /// Stopped, restarting and missing containers are not spawnable; a running
-/// one with stale mounts is; the bare-metal account never depends on any of
-/// it.
+/// one with stale mounts is; the bare-metal account is never counted (#14455).
 #[test]
 #[serial]
 fn the_count_follows_the_snapshot_state() {
@@ -35,7 +34,7 @@ fn the_count_follows_the_snapshot_state() {
     {
         // agent-3 has no container at all: missing.
         let _live = set(states(&[("agent-1", Stopped), ("agent-2", Restarting)]));
-        assert_eq!(count(), (4, 1, 3, 0), "only the bare-metal account is spawnable");
+        assert_eq!(count(), (4, 0, 3, 0), "the bare-metal account is not admitted (#14455)");
     }
     {
         let _live = set(states(&[
@@ -43,11 +42,11 @@ fn the_count_follows_the_snapshot_state() {
             ("agent-2", StaleMounts),
             ("agent-3", StaleMounts),
         ]));
-        assert_eq!(count(), (4, 4, 0, 0), "stale mounts is not down");
+        assert_eq!(count(), (4, 3, 0, 0), "stale mounts is not down");
     }
     {
         let _live = set(running(&["agent-1", "agent-2", "agent-3"]));
-        assert_eq!(count(), (4, 4, 0, 0));
+        assert_eq!(count(), (4, 3, 0, 0));
     }
 }
 
@@ -69,7 +68,7 @@ fn an_unavailable_or_absent_snapshot_leaves_every_account_spawnable() {
         let state = codex_pool_state(workspace.path(), epoch_now());
         assert_eq!(
             (state.spawnable, state.session_down, state.session_held),
-            (4, 0, 0),
+            (3, 0, 0),
             "{what}: {state:?}"
         );
     }
@@ -100,7 +99,7 @@ fn the_gate_starts_no_docker_process_even_with_docker_wedged() {
     let started = std::time::Instant::now();
     let state = codex_pool_state(workspace.path(), epoch_now());
     assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
-    assert_eq!((state.spawnable, state.session_down), (4, 0), "fail open: {state:?}");
+    assert_eq!((state.spawnable, state.session_down), (3, 0), "fail open: {state:?}");
     assert!(!calls.exists(), "the gate ran docker: {:?}", fs::read_to_string(&calls));
 }
 

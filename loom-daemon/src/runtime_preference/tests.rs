@@ -1467,6 +1467,9 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
 #[path = "session_down_tests.rs"]
 mod session_down;
 
+#[path = "seat_readiness_tests.rs"]
+mod seat_readiness;
+
 /// #13916: a containment refusal names its obligation in both the dispatch
 /// diagnostic (uncapped) and the preference marker (capped, one line), not
 /// just the bare unmet capability.

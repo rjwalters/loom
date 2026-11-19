@@ -32,6 +32,42 @@ fn account(profiles: &Path, name: &str, session_managed: bool) -> AccountDescrip
     }
 }
 
+/// #14455: a bare-metal profile is unprovisioned only beside container seats.
+/// A bare-metal host, a private-clone seat, a disabled profile and a disabled
+/// container seat's neighbours are each judged on their own state.
+#[test]
+fn a_bare_seat_is_unprovisioned_only_beside_an_enabled_container_seat() {
+    let profiles = tempfile::tempdir().unwrap();
+    let bare = account(profiles.path(), "bare", false);
+    let other_bare = account(profiles.path(), "other-bare", false);
+    let seat = account(profiles.path(), "seat", true);
+    let private = account(profiles.path(), "private", false);
+    let hold = profiles.path().join(".private-sessions").join("private");
+    fs::create_dir_all(&hold).unwrap();
+    fs::write(hold.join("workspace.json"), "{}").unwrap();
+
+    let bare_host = [bare.clone(), other_bare.clone()];
+    assert!(!is_unprovisioned_bare_seat(&bare, &bare_host), "a bare-metal host is not gated");
+
+    let mixed = [bare.clone(), other_bare, seat.clone()];
+    assert!(is_unprovisioned_bare_seat(&bare, &mixed));
+    assert!(!is_unprovisioned_bare_seat(&seat, &mixed), "a container seat is provisioned");
+
+    let with_private = [bare.clone(), private.clone()];
+    assert!(is_unprovisioned_bare_seat(&bare, &with_private), "a private clone is a seat");
+    assert!(!is_unprovisioned_bare_seat(&private, &with_private));
+
+    let mut disabled_seat = seat;
+    disabled_seat.enabled = false;
+    assert!(
+        !is_unprovisioned_bare_seat(&bare, &[bare.clone(), disabled_seat]),
+        "a disabled seat does not make the host a container host"
+    );
+    let mut disabled_bare = bare;
+    disabled_bare.enabled = false;
+    assert!(!is_unprovisioned_bare_seat(&disabled_bare, &mixed), "disabled is out already");
+}
+
 /// The mapping from the shared snapshot's states: stopped, restarting and
 /// missing are down; running is not, and neither is a running container with
 /// stale mounts (it still serves the roots it does mount). An unavailable
@@ -159,12 +195,19 @@ fn live_preferred_follows_the_snapshot_state_and_ignores_the_hold() {
         .into_iter()
         .map(|a| a.id.name)
         .collect();
-    assert_eq!(names, ["stale", "bare-metal"]);
+    // #14455: the bare-metal profile beside container seats is not preferred.
+    assert_eq!(names, ["stale"]);
     drop(live);
-    // A hold alone marks nothing down: with no snapshot there is nothing to
-    // prefer, exactly as for any other unobservable container.
+    // A hold alone marks nothing down: with no snapshot no container is
+    // passed over, exactly as for any other unobservable container; only the
+    // unprovisioned bare-metal profile still is.
     let _blind = set(unavailable());
-    assert_eq!(live_preferred(&inventory), None);
+    let names: Vec<_> = live_preferred(&inventory)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id.name)
+        .collect();
+    assert_eq!(names, ["looping", "stale", "held"]);
 }
 
 /// The out-of-process selector (`tokens select`): one bounded snapshot from

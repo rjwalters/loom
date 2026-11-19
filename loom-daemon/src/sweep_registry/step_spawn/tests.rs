@@ -5,8 +5,8 @@
 
 use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
-    StepEnd, StepOutcomeClass, StepOutcomeLine,
+    release_class_of_line, sandbox_unavailable_in, step_failure, step_outcome_projection,
+    tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -521,6 +521,52 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
         "the earlier run's anchor reads to the end of the log"
     );
     assert!(read_outcome_line(&log, "step-judge-4-3").is_none());
+}
+
+/// #14455: the step's own Codex terminal record, after its own header, says
+/// whether the sandbox ran nothing — never agent prose, never another run's.
+#[test]
+fn a_sandbox_unavailable_terminal_record_is_read_from_this_steps_own_region() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let record = |category: &str| {
+        format!(
+            "# LOOM_TERMINAL_RESULT v=2 provider=codex account=agent-4 category={category} \
+             exit_code=0 model=none\n"
+        )
+    };
+    let header =
+        |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=curator ====\n");
+    std::fs::write(
+        &log,
+        format!(
+            "{}{}{}{}",
+            header("step-curator-4-1"),
+            record("SANDBOX_UNAVAILABLE"),
+            header("step-curator-4-2"),
+            record("SUCCESS")
+        ),
+    )
+    .unwrap();
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-2"));
+    std::fs::write(
+        &log,
+        format!("{}{}", header("step-curator-4-1"), record("SANDBOX_UNAVAILABLE")),
+    )
+    .unwrap();
+    assert!(sandbox_unavailable_in(&log, "step-curator-4-1"));
+    // Prose about a sandbox with no record is no verdict, and neither is an
+    // unreadable log.
+    std::fs::write(
+        &log,
+        format!(
+            "{}bwrap: No permissions to create a new namespace\n",
+            header("step-curator-4-1")
+        ),
+    )
+    .unwrap();
+    assert!(!sandbox_unavailable_in(&log, "step-curator-4-1"));
+    assert!(!sandbox_unavailable_in(&dir.path().join("none.log"), "step-curator-4-1"));
 }
 
 #[test]

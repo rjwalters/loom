@@ -54,6 +54,11 @@ pub struct EndedStep {
     /// (#13966): the launch died on an empty api-key seat, so the ledger
     /// records a refusal (`provider_exhausted`), never a run or a cooldown.
     pub provider_exhausted: bool,
+    /// The step's own Codex terminal record said the runtime's sandbox
+    /// refused every tool call (`SANDBOX_UNAVAILABLE`, #14455): nothing ran,
+    /// so the ledger records `failed` / `sandbox_unavailable` and charges the
+    /// item nothing.
+    pub sandbox_unavailable: bool,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;

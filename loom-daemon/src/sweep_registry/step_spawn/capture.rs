@@ -198,6 +198,22 @@ pub(crate) fn release_class_fallback(
         .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
 }
 
+/// Whether the step `sweep_id`'s own Codex terminal record in `log` says its
+/// runtime sandbox refused every tool call (`SANDBOX_UNAVAILABLE`, #14455).
+/// The record is the adapter's, read from the step's own region of the log
+/// (anchored on its sweep id, as the provider-health bridge anchors), never
+/// agent prose. An unreadable log is `false`.
+#[must_use]
+pub(crate) fn sandbox_unavailable_in(log: &Path, sweep_id: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return false;
+    };
+    crate::sweep_registry::parse_terminal_result_after(&text, &format!("sweep_id={sweep_id}"))
+        .is_some_and(|result| {
+            result.category == crate::tokens_pool::TerminalClassification::SandboxUnavailable
+        })
+}
+
 /// Steps whose exit-time provider feedback classified the launch's failure
 /// `Exhausted` (#13966), keyed by sweep id with the instant it was noted.
 /// Process-global rather than a [`SweepRegistry`] field for the same reason
@@ -467,7 +483,20 @@ impl SweepRegistry {
         let info = self.entries.get(sweep_id);
         let log_path =
             info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
-        let line = read_outcome_line(&log_path, sweep_id);
+        let sandbox_unavailable = sandbox_unavailable_in(&log_path, sweep_id);
+        // #14455: a step whose sandbox ran nothing is a `failed` /
+        // `sandbox_unavailable` step, not `none`: it cannot have produced the
+        // verdict a line it wrote claims, so the adapter's record wins.
+        let line = if sandbox_unavailable {
+            Some(StepOutcomeLine {
+                role: role.role_name().to_string(),
+                target: item,
+                class: StepOutcomeClass::Failed,
+                reason: crate::step_dispatch::outcome_ledger::SANDBOX_UNAVAILABLE.to_string(),
+            })
+        } else {
+            read_outcome_line(&log_path, sweep_id)
+        };
         // #13966: the exit-time provider feedback (run by the reaper just
         // before this) said the seat was exhausted — the launch died on an
         // empty credential, so the release says so instead of `failed`, and
@@ -541,6 +570,7 @@ impl SweepRegistry {
                     ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
+                    sandbox_unavailable,
                 },
             );
         }

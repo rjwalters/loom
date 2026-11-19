@@ -97,7 +97,18 @@ pub fn run_of(
             outcome_ledger::PROVIDER_EXHAUSTED,
         )
     } else {
-        outcome_ledger::classify(line, post)
+        let outcome = outcome_ledger::classify(line, post);
+        // #14455: a sandbox that ran nothing cannot have produced a verdict,
+        // so the flag overrides whatever the forge read or the session's own
+        // prose claims, short of a verdict the forge shows.
+        if step.sandbox_unavailable && outcome.class != outcome_ledger::OutcomeClass::Verdict {
+            outcome_ledger::StepOutcome::new(
+                outcome_ledger::OutcomeClass::Failed,
+                outcome_ledger::SANDBOX_UNAVAILABLE,
+            )
+        } else {
+            outcome
+        }
     };
     StepRun {
         item: step.item,
@@ -332,6 +343,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(80),
             timed_out: false,
             provider_exhausted: true,
+            sandbox_unavailable: false,
         };
         // The post-state of a crashed step (claim restored, item unchanged)
         // would classify `failed`; the exhaustion override wins.
@@ -368,6 +380,66 @@ mod tests {
         }
     }
 
+    /// #14455: a Curator step whose Codex sandbox ran nothing records
+    /// `failed` / `sandbox_unavailable` (not `none`, not an unclassified
+    /// failure), and charges the item nothing: no window, no repeat-cap run.
+    #[test]
+    fn a_sandbox_unavailable_step_records_failed_and_charges_nothing() {
+        let step = EndedStep {
+            sweep_id: "step-curator-14455-1".into(),
+            item: 14455,
+            role: StepRole::Curator,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(20),
+            timed_out: false,
+            provider_exhausted: false,
+            sandbox_unavailable: true,
+        };
+        // Exit 0, item unchanged, no outcome line: unflagged this is
+        // `failed` / `unclassified`.
+        let post = post_state(StepRole::Curator, &labels(&["loom:curating"]), false);
+        let unflagged = EndedStep {
+            sandbox_unavailable: false,
+            ..step.clone()
+        };
+        assert_eq!(
+            run_of(&unflagged, None, Some(post)).outcome.reason,
+            outcome_ledger::UNCLASSIFIED
+        );
+
+        let run = run_of(&step, None, Some(post));
+        assert_eq!(run.outcome.class, OutcomeClass::Failed);
+        assert_eq!(run.outcome.reason, outcome_ledger::SANDBOX_UNAVAILABLE);
+        assert!(!outcome_ledger::counts_as_run(&run.outcome));
+        let mut ledger = outcome_ledger::OutcomeLedger::default();
+        let t0 = chrono::Utc::now();
+        for k in 0..6 {
+            let at = t0 + chrono::Duration::minutes(k);
+            let rec = ledger.record(run.item, run.step, &run.outcome, run.ran_for, at);
+            assert_eq!(rec.effect, outcome_ledger::Effect::Uncharged, "run {k}");
+            assert_eq!(rec.cooling_until, None, "run {k} armed a window");
+            assert!(!rec.repeat_capped, "run {k} counted as a run");
+        }
+    }
+
+    /// The flag never hides a verdict the forge shows: a step that moved its
+    /// item did work, whatever its terminal record says.
+    #[test]
+    fn a_sandbox_flag_does_not_override_a_verdict_the_forge_shows() {
+        let step = EndedStep {
+            sweep_id: "step-curator-14455-2".into(),
+            item: 14455,
+            role: StepRole::Curator,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(20),
+            timed_out: false,
+            provider_exhausted: false,
+            sandbox_unavailable: true,
+        };
+        let post = post_state(StepRole::Curator, &labels(&["loom:curated"]), false);
+        assert_eq!(run_of(&step, None, Some(post)).outcome.class, OutcomeClass::Verdict);
+    }
+
     #[test]
     fn a_failed_read_classifies_as_a_failed_probe() {
         let step = EndedStep {
@@ -378,6 +450,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(60),
             timed_out: false,
             provider_exhausted: false,
+            sandbox_unavailable: false,
         };
         let run = run_of(&step, None, None);
         assert_eq!(run.outcome.class, OutcomeClass::Failed);

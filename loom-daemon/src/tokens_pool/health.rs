@@ -104,7 +104,9 @@ pub enum TerminalClassification {
     /// account hold, because the account is not at fault: the sandbox is a
     /// property of the host's session containers. It is also not a success,
     /// so it neither clears a hold nor stamps `last_success`. The runtime-level
-    /// fall-through lives in `runtime_preference::sandbox_hold`.
+    /// fall-through lives in `runtime_preference::sandbox_hold`. A sweep
+    /// step's `SANDBOX_UNAVAILABLE` additionally holds its own seat through
+    /// `sandbox_seat_hold` (#14455), a separate write, not this arm.
     SandboxUnavailable,
     /// The account's Codex session container was not running when the tick
     /// tried to dispatch into it (#10455). Produced by `spawn-codex.sh`. Like
@@ -208,7 +210,7 @@ pub struct AccountHealth {
 }
 
 impl AccountHealth {
-    fn id(&self) -> AccountId {
+    pub(super) fn id(&self) -> AccountId {
         AccountId {
             provider: self.provider,
             name: self.name.clone(),
@@ -356,10 +358,10 @@ pub fn model_class_of(model: &str) -> Option<String> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HealthFile {
+pub(super) struct HealthFile {
     version: u32,
     #[serde(default)]
-    accounts: Vec<AccountHealth>,
+    pub(super) accounts: Vec<AccountHealth>,
     #[serde(default)]
     cursors: HashMap<String, u64>,
 }
@@ -464,7 +466,7 @@ fn write_state(workspace: &Path, state: &HealthFile) -> Result<()> {
     Ok(())
 }
 
-fn with_state<T>(
+pub(super) fn with_state<T>(
     workspace: &Path,
     operation: impl FnOnce(&mut HealthFile) -> Result<T>,
 ) -> Result<T> {
