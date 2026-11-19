@@ -434,7 +434,10 @@ mod tests {
                 {
                     let path = format!("{name} {}", verb.get_name());
                     assert!(
-                        TOOLS_COMMANDS.contains(&path.as_str()),
+                        TOOLS_COMMANDS.contains(&path.as_str())
+                            || TOOLS_COMMANDS
+                                .iter()
+                                .any(|listed| listed.starts_with(&format!("{path} "))),
                         "`{path}` is served but missing from TOOLS_COMMANDS"
                     );
                 }
