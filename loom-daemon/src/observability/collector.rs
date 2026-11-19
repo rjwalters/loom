@@ -1124,9 +1124,19 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
             });
         }
     }
+    // #13942: the fleet-convergence drift signal. Next to the usage series so
+    // "how stale is the probe every host is acting on" is one query, not a
+    // log read across workers. Absent sidecar ⇒ absent field, never zero.
+    let fleet_probe_age_secs =
+        crate::tokens_pool::fleet_probe::read_sidecar(&pool_dir).map(|snapshot| {
+            Utc::now()
+                .signed_duration_since(snapshot.probed_at)
+                .num_seconds()
+        });
     TokenSnapshotRecord {
         captured_at: Utc::now(),
         accounts,
+        fleet_probe_age_secs,
     }
 }
 
