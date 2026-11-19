@@ -27,14 +27,15 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.19.0 is the first release whose installed tree carries every file in
-/// [`DAEMON_INVOKED_INSTALLED_FILES`]. No break has been declared since.
+/// 0.19.175 is the first release whose installed watchdog delegates to
+/// `loom-daemon daemon-watchdog`. The 0.19.174 watchdog still calls the
+/// retired `peer-claims` subcommand.
 ///
 /// It must name a release tag. `ci-daily.yml` (`Compatibility Floor`) runs
 /// that release's installed files against today's daemon every day (#10868).
 /// If that fails, raise this to the oldest release that passes, or restore
 /// what the old files need (`defaults/docs/release-cadence.md`).
-pub const SUPPORTS_INSTALLED: &str = "0.19.0";
+pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
