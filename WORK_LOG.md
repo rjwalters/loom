@@ -16,6 +16,20 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14629**: test(loom-tools): per-verb denied-target evidence for the #14519 forge writes
+- **PR #14628**: feat(guide): configure the work-log batching threshold
+- **PR #14624**: test: name served forge commands accurately
+- **PR #14623**: test: close dead-port fixture windows
+- **PR #14616**: test: never rebind dead_url() ports in TestServer start/silent
+- **PR #14611**: docs: explain Fleet rescue-stash retention in troubleshooting
+- **PR #14531**: feat: serve the shared non-queue forge verbs through loom-tools
+- **Issue #14625** (closed): Make Guide work-log batching threshold configurable per repository
+- **Issue #14621** (closed): loom-tools: a denied write scope has no per-verb proof for the #14519 forge writes
+- **Issue #14618** (closed): Close the two residual dead-port windows left by #14616 (record-before-drop; test bypasses the dead set)
+- **Issue #14610** (closed): Harden TestServer::dead_url() against ephemeral-port reuse (the #14601 flake class)
+- **Issue #14608** (closed): troubleshooting.md: stash-producer enumeration omits loom-rescue-<ts>, and self-heal is the first automated dropper
+- **Issue #14554** (closed): Rename the misleading read variable in the forge capability test
+- **Issue #14519** (closed): loom-tools: admit the shared non-queue forge actions
 - **Issue #14580** (closed): Reuse the claim guard’s issue-lease parser in the worktree co-occupancy guard
 - **PR #14606**: refactor: reuse the claim guard's lease-comment parsers in lease co-occupancy
 - **Issue #14572** (closed): accounts.session.extraMounts host sources are not denied for ~/.loom/tokens, ~/.ssh or a session profile/seat directory
