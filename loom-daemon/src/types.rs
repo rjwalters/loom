@@ -1846,24 +1846,6 @@ pub struct DaemonStatusReport {
     /// pre-#11353 daemon; never read as `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
-    /// The daemon-wide peer-claim view + transport counters (Issue #5921):
-    /// which issues THIS host currently sees claimed, by which host and with
-    /// what remaining TTL, plus how many claims have been advertised /
-    /// received / expired / caused a dispatch skip since process start.
-    /// Before this field, [`crate::peer_claims::PeerClaimView`] had no
-    /// external observability surface at all — a duplicate cross-host
-    /// dispatch (e.g. #5789) could not be distinguished from a broken
-    /// re-advertisement path without attaching a debugger.
-    ///
-    /// `None` when no safehouse peer-claim coordination has been established
-    /// for this daemon (`safehouse.enabled` false, or enabled with no socket
-    /// ever resolving) — the same condition
-    /// [`SweepRegistry::peer_claimed_issues`](crate::sweep_registry::SweepRegistry::peer_claimed_issues)
-    /// already treats as "no view attached", rendered honestly here rather
-    /// than as an empty-but-present view. `#[serde(default)]` keeps pre-#5921
-    /// wire data / older clients compatible.
-    #[serde(default)]
-    pub peer_claims: Option<PeerClaimStatus>,
     /// Per-repo state of the pressure-triggered deep-clean pass (#5919), one
     /// entry per registered workspace the reaper has evaluated this process.
     ///
@@ -2119,118 +2101,6 @@ pub struct SafehouseStatus {
     pub reason: Option<String>,
 }
 
-/// Live peer-claim view + transport counters for `loom-daemon status` /
-/// `loom-daemon peer-claims` (Issue #5921). Rendered from
-/// [`crate::peer_claims::PeerClaimView::to_status`]. See
-/// [`DaemonStatusReport::peer_claims`] for the `None`-vs-empty-view contract.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerClaimStatus {
-    /// This daemon's own host identity — the self-claim-recognition key
-    /// (`crate::sweep_registry::host_identity`).
-    pub self_host: String,
-    /// The configured peer-claim TTL, in seconds
-    /// ([`crate::peer_claims::resolve_peer_claim_ttl`]).
-    pub ttl_secs: u64,
-    /// Every tracked claim (live or not-yet-pruned-expired), sorted by
-    /// `(repo, issue)` for a deterministic render.
-    pub entries: Vec<PeerClaimEntryStatus>,
-    /// How many `Advertise` ads THIS host has published (dispatch-time plus
-    /// every reaper re-advertisement heartbeat, #4431).
-    pub advertised: u64,
-    /// How many peer (non-self) ads this daemon has accepted.
-    pub received: u64,
-    /// How many entries have aged out past the TTL with no re-advertisement.
-    pub expired: u64,
-    /// How many dispatches were backed off because this view showed a live
-    /// peer claim (the #5789 enforcement path) — the proof the mechanism
-    /// actually prevented a duplicate.
-    pub dispatch_skipped: u64,
-    /// How many of this host's claim-ad sends safehoused **refused** (Issue
-    /// #9294). Read beside `advertised`, which counts *attempts*: when the two
-    /// track each other, this host is publishing nothing and every fleet-wide
-    /// brake built on the channel is inert. `#[serde(default)]` keeps pre-#9294
-    /// wire data / older clients compatible (deserializes as `0`).
-    #[serde(default)]
-    pub advertise_rejected: u64,
-    /// Peer-coordination degradation state (Issue #6157) — see
-    /// [`PeerCoordinationHealth`]. `#[serde(default)]` keeps pre-#6157 wire
-    /// data / older clients compatible (deserializes as the all-healthy
-    /// default).
-    #[serde(default)]
-    pub coordination: PeerCoordinationHealth,
-    /// The resolved claims-room identity (`SafehouseConfig::claims_room()`,
-    /// Issue #6242) captured at coordination-start time — the room this host
-    /// actually joined for peer-claim ads (`rooms.claims` /
-    /// `LOOM_SAFEHOUSE_ROOM_CLAIMS`, falling back to the signal room). `None`
-    /// when peer-claim coordination was never established (safehouse
-    /// disabled, or no socket ever resolved), matching this struct's own
-    /// `None`-vs-empty-view contract — never an empty string.
-    /// `#[serde(default)]` keeps pre-#6242 wire data / older clients
-    /// compatible (deserializes as `None`).
-    #[serde(default)]
-    pub claims_room: Option<String>,
-    /// Confirmed cross-host claims on the SAME issue within the trailing
-    /// rolling window (default 24h — Issue #6243, part of the
-    /// repo-sharding effort's collision-frequency verification AC). See
-    /// [`crate::peer_claims::PeerClaimView::same_issue_collision_count`] for
-    /// the windowing and why this is distinct from `Dispatcher::collisions()`
-    /// (that counter is a monotonic, never-pruned, per-process-lifetime
-    /// total — unusable for "were there any cross-host claims on the SAME
-    /// issue in the last 24h"). `#[serde(default)]` keeps pre-#6243 wire
-    /// data / older clients compatible (deserializes as `0`).
-    #[serde(default)]
-    pub same_issue_collisions: u64,
-}
-
-/// Peer-coordination degradation state for `loom-daemon health`'s
-/// `peer_coordination` section (Issue #6157): whether this host's
-/// peer-claim RECEIVE path currently looks broken — advertising its own
-/// claims but not hearing from any peer, the 2026-08-13 incident's exact
-/// signature — and, while degraded, how close recovery is. Rendered from
-/// [`crate::peer_claims::PeerClaimView`]'s internal tracking; see
-/// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] for the
-/// decision rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerCoordinationHealth {
-    /// Whether coordination is currently judged degraded.
-    pub degraded: bool,
-    /// Seconds since coordination was judged degraded; `None` while healthy.
-    pub degraded_for_secs: Option<u64>,
-    /// How many consecutive genuine peer receives have landed since going
-    /// degraded, toward `recovery_threshold`. Always `0` while healthy.
-    pub consecutive_receives_toward_recovery: u64,
-    /// How many consecutive receives recovery requires
-    /// ([`crate::peer_claims::resolve_coordination_recovery_threshold`]).
-    pub recovery_threshold: u64,
-    /// The last verdict sentence
-    /// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] produced —
-    /// Issue #9294. Before this, a degraded verdict surfaced only as a `bool`
-    /// plus two raw counters an operator had to interpret, and the *reason*
-    /// (which distinguishes "peers are idle" from "the homeserver is refusing
-    /// every send") existed only in the reaper's return value, which nothing
-    /// persisted. `None` before the first reaper tick has evaluated. Rendered
-    /// verbatim by `loom-daemon status` whenever `degraded` is true.
-    /// `#[serde(default)]` keeps older clients compatible.
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-/// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue
-/// #5921).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerClaimEntryStatus {
-    /// The cross-host-stable repo identity (`crate::peer_claims::repo_slug`)
-    /// this claim was advertised under.
-    pub repo: String,
-    /// The claimed issue number.
-    pub issue: u32,
-    /// The host holding the claim.
-    pub host: String,
-    /// How long this entry has left before it expires from THIS daemon's
-    /// view. `0` reads as "expired, not yet pruned" rather than absent.
-    pub remaining_ttl_secs: u64,
-}
-
 /// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue
 /// #4429). Rendered from [`crate::rate_limit_breaker::RateLimitSnapshot`]. The
 /// `daemon.rate_limit_breaker.state` event carries the transition data on
@@ -2329,6 +2199,27 @@ pub struct ForgeCallsStatus {
     /// routing table. Empty when none are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_spills: Vec<ReadSpillStatus>,
+    /// Writer route holds armed right now (#13746, #14559): one per
+    /// confirmed-exhaustion bucket the work finder stands down until its
+    /// reset. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_holds: Vec<WriterRouteHoldStatus>,
+}
+
+/// One armed writer route hold of [`ForgeCallsStatus`] (#13746): the bucket
+/// a confirmed writer exhaustion held, until its reset releases the route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriterRouteHoldStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The installation's owner, lowercased.
+    pub owner: String,
+    /// The installation id, or `-` when unknown.
+    pub installation: String,
+    /// The billed resource (`core` is the only one a writer hold arms).
+    pub resource: String,
+    /// When the hold releases.
+    pub until: DateTime<Utc>,
 }
 
 /// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).

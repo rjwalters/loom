@@ -691,6 +691,24 @@ pub trait ContainerRunner: session_image::BundleProbe {
         extra_mounts: &[ExtraMount],
     ) -> Result<()>;
 
+    /// Create and start a Claude seat container (issue #14371): like
+    /// [`Self::create`], but mounting the seat's own `claude_home` at the
+    /// session image's Claude config path instead of a `CODEX_HOME` profile
+    /// (see [`super::claude_seat`]). The default refuses, so a runner with no
+    /// Claude-seat support fails closed rather than creating a Codex-shaped
+    /// container for a Claude account.
+    fn create_claude_seat(
+        &self,
+        _container: &str,
+        _image: &str,
+        _claude_home: &Path,
+        _workspace: &Path,
+        _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        bail!("this container runner cannot create a Claude seat container")
+    }
+
     /// Make sure `image` is available locally (`docker image inspect`, then
     /// `docker pull`), so a caller can fail *before* tearing a container down
     /// rather than after (#11727: the version-skew recreate must not delete a
@@ -924,6 +942,25 @@ impl ContainerRunner for ProcessContainerRunner {
             bail!("docker run {image} failed: {}", stderr.trim());
         }
         Ok(())
+    }
+
+    fn create_claude_seat(
+        &self,
+        container: &str,
+        image: &str,
+        claude_home: &Path,
+        workspace: &Path,
+        daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        super::claude_seat::docker_create_seat(
+            container,
+            image,
+            claude_home,
+            workspace,
+            daemon_root,
+            extra_mounts,
+        )
     }
 
     fn ensure_image(&self, image: &str) -> Result<()> {

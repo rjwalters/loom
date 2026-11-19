@@ -1855,7 +1855,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 10`.
 Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 **delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
 `reason` ∈ `dispatched`, `labeled`, `in_flight`, `quarantined`,
-`workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
+`workspace_commands_missing`, `pr_open`, `backoff`,
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
 `already_landed` (#11429: the issue's work already landed),
 `already_closed` (#11429: the issue is closed as not planned),
@@ -1866,6 +1866,7 @@ emitted), `error`, plus the typed dispatch refusals (#8907):
 `lease_order_lost` (lost the lease-order tie-break), `token_selection_failed`
 (empty or fully bad-marked token pool), `claim_collision` (cross-host collision
 enforcement) and `claim_lock_held` (the local claim lock already existed).
+The `peer_claim` metric reason stopped emitting with #13945.
 These are the same buckets as the `work_finder: tick` log line
 (`loom-daemon health`'s last-tick summary omits `prless_retry`), except that
 the log line and `health` still fold `lease_order_lost` into `backoff` and the
@@ -2309,20 +2310,23 @@ traces.
 Every ready-queue row the work finder ranked on its most recent tick
 (`WorkFinderTickSummary::queue`, #8852) gets its own `loom.dispatch.disposition`
 span whenever its disposition changes (including first sight), on a periodic
-refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s), or once as a
-terminal record when it leaves a successfully-listed repo's queue. Unlike
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 150 seconds of
+source time), or once as a terminal record when it leaves a successfully-listed
+repo's queue. Unlike
 `loom.dispatch.admission`, this covers every candidate the tick evaluated —
 including one filtered out before `dispatch()` was ever attempted
 (`workspace_halted`, `parked`, `host_constraint`,
 …) — so a per-issue "why" is answerable for the entire `QueueDisposition`
 vocabulary, not just the subset that reached an admission attempt.
 
-Sampled from the collector's periodic pass (the same cadence as
-`queue.snapshot`), never from the tick loop
-itself, so a disposition that lasts less than one collector interval can be
-missed — only the last-tick state per interval is exported. Parented to the
-tick's own `loom.dispatch.tick` span when the sampled summary is that exact
-tick; otherwise a root of its own. Attributes:
+The collector checks for a newer completed tick every 30 seconds using
+cached identities. The five-minute host snapshot pass resolves repo identities
+and counts unresolved rows. Only the latest eligible summary at a poll can
+enter the tracker, so short-lived dispositions can be missed. The span start
+and end equal the source tick completion time. The envelope records the
+separate collector emission time. A span is parented to the exact source
+`loom.dispatch.tick` span when its context is available. Otherwise it has
+its own root. Attributes:
 
 | Attribute | Value |
 |---|---|
@@ -2714,7 +2718,7 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | Field | Meaning |
 |---|---|
 | `eligibility` | `eligible` (schedulable, held only by a capacity-style limit) or `blocked` (held by something specific to the item/repo/history). |
-| `reason` | the dispatcher's `QueueDisposition` token — `deferred_capacity`, `deferred_build_backoff`, `deferred_file_overlap`, `open_pr`, `parked`, `workspace_halted`, `quarantined`, `peer_claim`, `host_constraint`, … |
+| `reason` | the dispatcher's `QueueDisposition` token — `deferred_capacity`, `deferred_build_backoff`, `deferred_file_overlap`, `open_pr`, `parked`, `workspace_halted`, `quarantined`, `lease_held`, `host_constraint`, … |
 | `state` | the coarse `ready` / `blocked` state the eligibility is derived from. |
 | `block_start` | when the item entered its current eligibility class on this host, as first observed (the tick of the first same-class sample). An observation floor — a class shorter than one collector interval can be missed, and a daemon restart re-anchors it (same tradeoff as `ops::disposition`). This is the dwell split point. |
 | `transition` | `changed` (class flip / first sight; `block_start` re-anchored) or `refresh` (same class, window elapsed; `block_start` preserved). |

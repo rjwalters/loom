@@ -1133,10 +1133,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -1819,10 +1819,10 @@ impl SweepRegistry {
                     // it is released here rather than left to wedge dispatch.
                     let _ = self.release_lock_owned(issue, &watchdog_lock_id);
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         None,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -2027,10 +2027,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,

@@ -83,6 +83,7 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("observability/ops/ratelimit.rs", ASKER),
     ("tokens_pool/private_workspace/forge_auth.rs", LOCAL_TOKEN),
     ("write_scope/probe.rs", ASKER),
+    ("writer_limit.rs", ASKER),
 ];
 
 /// Names that must not appear in non-test source at all.

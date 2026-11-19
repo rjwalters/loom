@@ -102,7 +102,7 @@ fn run_probe(bin: &Path, args: &[String], socket_path: &Path, timeout: Duration)
 
     // #14100: attribute the probe's pid (start line only; the child is
     // short-lived and awaited below). `output_with_timeout` exposes no pid, so
-    // use the observed runner, as `watchdog_peer_claims` does.
+    // use the observed runner.
     let argv = crate::fleet_sync::git_spawn_log::argv_of(&cmd);
     match crate::proc_exec::run_bounded_observed(cmd, timeout, |pid| {
         log::info!("{}", crate::self_spawn_log::start_line("watchdog_ipc_probe", pid, &argv));

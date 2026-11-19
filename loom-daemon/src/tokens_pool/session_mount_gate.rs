@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+use super::claude_seat::CONTAINER_CLAUDE_HOME;
 use super::private_workspace::bundle::CONTROL_ROOT;
 use super::session_image::ExtraMount;
 use super::session_lifecycle::{
@@ -94,7 +95,8 @@ pub fn create_roots(workspace: &Path) -> Result<Vec<PathBuf>> {
 /// * **Container target** — never shadows, and is never shadowed-by-or-
 ///   nested-in, the workspace mounts (path parity), the `CODEX_HOME`
 ///   profile (whose three control files are read-only mount points), the
-///   sealed control bundle ([`CONTROL_ROOT`]), or a credential path.
+///   Claude seat home ([`CONTAINER_CLAUDE_HOME`]), the sealed control
+///   bundle ([`CONTROL_ROOT`]), or a credential path.
 /// * **Among themselves** — no two extra mounts overlap: Docker mounts
 ///   them in argv order, so a nested pair would make one of the two
 ///   silently not what the operator asked for.
@@ -117,6 +119,7 @@ pub fn check_extra_mount_denials(
         .map(|root| normalize(root))
         .collect();
     forbidden.push(PathBuf::from(CONTAINER_CODEX_HOME));
+    forbidden.push(PathBuf::from(CONTAINER_CLAUDE_HOME));
     forbidden.push(PathBuf::from(CONTROL_ROOT));
     let mut destinations: Vec<PathBuf> = Vec::with_capacity(mounts.len());
     for mount in mounts {

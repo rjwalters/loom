@@ -20,6 +20,7 @@ use clap::Args;
 use super::forge_action::{handle_forge_command, ForgeAction};
 use super::forge_merge_queue_cmd::MergeQueueAction;
 use super::forge_parent_cmd::ParentAction;
+use crate::forge_merge_queue::mode::{resolve_merge_mode, MergeModeError, ResolvedMergeMode};
 
 /// Exit status for a `forge` verb `loom-tools` does not serve (BSD
 /// `EX_USAGE`). Not `1`: `check-claim`, `check-open-pr` and friends use `1` as
@@ -50,6 +51,11 @@ impl ForgeReadCli {
     /// touch nothing but stdin, argv, local git objects or local files.
     #[must_use]
     pub fn reaches_forge(&self) -> bool {
+        // #14520: a merge-queue verb is classified by what it does in the
+        // resolved `champion.mergeMode`, not by its name.
+        if let ForgeAction::MergeQueue { action } = &self.action {
+            return action.0.reaches_forge(&current_merge_mode());
+        }
         !matches!(
             self.action,
             // Reads local git objects only (its own doc comment).
@@ -68,6 +74,15 @@ impl ForgeReadCli {
     pub fn verb(&self) -> &'static str {
         self.action.verb()
     }
+}
+
+/// `champion.mergeMode` for the current checkout, resolved exactly as
+/// `forge_merge_queue::Env::current` does (without detecting the forge).
+fn current_merge_mode() -> Result<ResolvedMergeMode, MergeModeError> {
+    let root = crate::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    resolve_merge_mode(&root)
 }
 
 /// Run the verb through the one shared handler. Refuses (exit
@@ -132,13 +147,23 @@ impl ForgeAction {
             | Self::Calls(_)
             | Self::Identities { .. }
             | Self::DashboardLink { .. } => true,
-            // Only the three verbs that never write.
-            Self::MergeQueue { action } => matches!(
-                action.0,
+            // #14520: every queue verb. The mutating ones keep their own
+            // vetting: `write_target` (enqueue, dequeue, handoff, revoke) and
+            // the in-handler `may_write_from` (reconcile's queue branch,
+            // group-check; `step` runs reconcile first) run on this path too.
+            Self::MergeQueue { action } => match action.0 {
                 MergeQueueAction::Mode
-                    | MergeQueueAction::Preflight { .. }
-                    | MergeQueueAction::Status { .. }
-            ),
+                | MergeQueueAction::Preflight { .. }
+                | MergeQueueAction::Status { .. }
+                | MergeQueueAction::Enqueue { .. }
+                | MergeQueueAction::Dequeue { .. }
+                | MergeQueueAction::Reconcile { .. }
+                | MergeQueueAction::Handoff { .. }
+                | MergeQueueAction::Step { .. }
+                | MergeQueueAction::Revoke { .. }
+                | MergeQueueAction::GroupCheck { .. }
+                | MergeQueueAction::AuthorizeCheck { .. } => true,
+            },
             Self::Parent { action } => {
                 matches!(action, ParentAction::Body { .. } | ParentAction::SplitState { .. })
             }
