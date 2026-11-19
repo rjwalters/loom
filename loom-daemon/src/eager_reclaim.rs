@@ -119,7 +119,7 @@ pub use idle_schedule::{
     idle_pass_due, reset_idle_state_for_test, run_idle_targets_if_due, scheduled_idle_pass_with,
     scheduled_pressure_tier,
 };
-pub use level_trigger::{pass_due, spawn_tick, tick, TickReading};
+pub use level_trigger::{pass_due, tick, TickReading};
 
 #[cfg(test)]
 mod level_tests;
@@ -642,8 +642,8 @@ pub fn reset_state_for_test() {
 ///
 /// **Blocking** — it shells to `df`/`git`/`docker` and may probe the forge over
 /// REST, so callers must be on the blocking pool, exactly like the reaper's own
-/// `spawn_blocking(move || reap_repo(..))`. The work-finder tick launches it
-/// detached through [`spawn_tick`] (#14560) rather than awaiting it.
+/// `spawn_blocking(move || reap_repo(..))`. The dispatch loop `await`s it
+/// through [`tick`].
 pub fn run_for(repo_root: &Path) -> EagerReclaimReport {
     let config = read_eager_reclaim_config(repo_root);
     let reaper_config = crate::worktree_reaper::read_worktree_reaper_config(repo_root);
