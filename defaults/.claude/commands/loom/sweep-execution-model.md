@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Execution model — dispatch, parallelism, model selection
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.
@@ -108,6 +111,8 @@ Every role subagent dispatched by this skill (`loom-curator`, `loom-builder`, `l
 2. **Workspace override** — `.loom/config.json` → the `terminals[]` entry whose `roleConfig.roleFile` matches the role (e.g., `builder.md`) → its optional `roleConfig.model` field.
 3. **Role default** — `.loom/roles/<role>.json` → `suggestedModel` (ships as an alias: `sonnet`, `opus`, or `haiku`).
 4. **Session default** — if none of the above resolves (or resolves to an empty string), **omit the `model` parameter entirely** so the subagent inherits the parent session's model. Never pass `model: ""`.
+
+**Deterministic chain lookup (#13956).** Tiers 2–3 are also available as one command — `./.loom/scripts/resolve-role-model.sh <role> [--json]` — which resolves the same chain (explicit > `roleConfig.model` > `suggestedModel` > inherit) and, with `--json`, reports the tier that supplied it. Any session spawning a `loom-<role>` subagent OUTSIDE this skill (a bare attended spawn — `Task(subagent_type="loom-judge")` not dispatched by the sweep) should run it before the spawn and pass the result via the Task `model` parameter, by form: with `--json`, pass the record's `task_model` field (the alias-only form of `model`; `--task-alias` is a no-op under `--json`, which always exits 0) and treat **`task_model: null` ⇒ omit the parameter** (inherit); with the bare form, degrade a pinned ID with `--task-alias` as below and treat **exit 3 ⇒ omit the parameter** (inherit). The policy overrides in this section (escalation, No-Fable-Judge) continue to govern the dispatches THIS skill makes — the helper is the mechanical chain lookup, not a policy engine.
 
 **Logical-tier resolution before dispatch (issue #3982).** Every rung, tier, and arm in this skill names a *logical tier* by its CLI alias (`sonnet`, `opus`, `fable`) — but the bare `opus` alias still resolves to a **previous-generation** model on the wire (`claude-opus-4-8`), while `sonnet`/`fable` resolve to the current generation. So the shipped ladder `sonnet → sonnet@xhigh → opus → fable` would silently step *down* a generation at the `opus` rung. To fix this **without** scattering a pinned ID across the skill, resolve the chosen model through the single indirection point **immediately before** you pass it to the Task tool's `model` parameter (or to a spawned child's `--model`):
 
@@ -365,12 +370,6 @@ The three states:
 **N arms and a budget cap (#9122).** `sweep.modelExperimentArms` (2+ weighted **Claude-only** arms, not just A/B) and `sweep.modelExperimentBudgetFraction` / `LOOM_MODEL_EXPERIMENT_BUDGET_FRACTION` (default `1.0` — fraction of issues getting *any* forced arm) are read by `assign-arm`/`banner` themselves; a bad value warns and falls back to A/B, never failing the sweep. **Your only handling:** `assign-arm` printing `none -` means sampled **out** — treat as `observe` (null `arm`, no forcing, **normal tier-3 resolution**). Everything else: `.loom/docs/model-cost-experiment.md`.
 
 **Forced-arm precedence.** The forced arm slots into the Builder model-resolution chain **above tier 3** but **below tier 1 / tier 2 operator pins**: an explicit dispatch param (tier 1) or a `roleConfig.model` workspace pin (tier 2) still wins — a pinned canary is intentionally opted out of the experiment. The forced arm only ever replaces what tier 3 would have resolved for the Builder.
-
-**Usage record (every mode, #9303).** Immediately after **each** `sweep-checkpoint.sh write` — `off` included (telemetry, not the experiment) — journal that subagent's per-model tokens + USD into the issue's story trace (always exits 0):
-
-```bash
-loom-daemon usage-record --issue N --role <role> --attempt <k> --agent-id <agent-id> --task-id "$RUN_ID" || true
-```
 
 **Durable stats store (`observe`/`experiment` only).** Also append one JSONL record per role phase to `.loom/stats/sweep-model-stats.jsonl` (gitignored; outlives the checkpoint):
 

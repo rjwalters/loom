@@ -9,8 +9,9 @@
 //! Every failure mode (missing keychain entry, expired token, network trouble)
 //! degrades to an `{"error": "..."}` object rather than raising.
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -49,22 +50,47 @@ fn read_keychain_token() -> Option<String> {
         .map(str::to_string)
 }
 
+/// Build the `curl` [`Command`] for the usage query (everything except stdio
+/// wiring). It deliberately takes **no token**: the `Authorization` header is
+/// written to curl's stdin (`-H @-`), never placed in argv, which every
+/// process of the user can read through `ps` and `/proc/<pid>/cmdline` for
+/// the life of the request (same rule as `tokens_pool::check`, #5982). Split
+/// out so the regression test can inspect argv without spawning a process.
+fn build_usage_curl_command() -> Command {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-f",
+        "-H",
+        "@-",
+        "-H",
+        &format!("anthropic-beta: {ANTHROPIC_BETA}"),
+        "-H",
+        &format!("User-Agent: {USER_AGENT}"),
+        USAGE_API_URL,
+    ]);
+    cmd
+}
+
+/// The header lines `call_usage_api` writes to curl's stdin for `-H @-`.
+fn usage_auth_header_lines(token: &str) -> String {
+    format!("Authorization: Bearer {token}\n")
+}
+
 /// Call the Anthropic OAuth usage API via `curl`. `None` on any failure.
 fn call_usage_api(token: &str) -> Option<Value> {
-    let output = Command::new("curl")
-        .args([
-            "-s",
-            "-f",
-            "-H",
-            &format!("Authorization: Bearer {token}"),
-            "-H",
-            &format!("anthropic-beta: {ANTHROPIC_BETA}"),
-            "-H",
-            &format!("User-Agent: {USER_AGENT}"),
-            USAGE_API_URL,
-        ])
-        .output()
+    let mut child = build_usage_curl_command()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // Dropping `stdin` at the end of this block closes the pipe, so curl
+        // sees EOF on the header stream.
+        let _ = stdin.write_all(usage_auth_header_lines(token).as_bytes());
+    }
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -258,6 +284,24 @@ pub const fn api_timeout_hint() -> Duration {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn usage_token_never_reaches_curl_argv() {
+        let token = "stub-oauth-token-must-not-appear-in-argv";
+        let cmd = build_usage_curl_command();
+        let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
+            .collect();
+        let joined = argv.join(" ");
+        assert!(!joined.contains(token), "token leaked into curl argv: {joined}");
+        assert!(!joined.contains("Authorization"), "auth header in curl argv: {joined}");
+        assert!(!joined.contains("Bearer"), "bearer in curl argv: {joined}");
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-H" && w[1] == "@-"),
+            "curl must read the auth header from stdin: {argv:?}"
+        );
+        assert_eq!(usage_auth_header_lines(token), format!("Authorization: Bearer {token}\n"));
+    }
 
     #[test]
     fn transform_maps_api_shape_and_rounds() {

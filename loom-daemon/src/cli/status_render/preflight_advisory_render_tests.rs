@@ -6,9 +6,9 @@
 //! touching the trip/clear decision logic itself.
 use super::{build_status_json_value, render_preflight_advisory_line};
 use crate::cli::status::sample_report::sample_report;
+use crate::self_update::SelfUpdateStatus;
+use crate::types::DaemonStatusReport;
 use chrono::Utc;
-use loom_daemon::self_update::SelfUpdateStatus;
-use loom_daemon::types::DaemonStatusReport;
 
 fn no_update() -> SelfUpdateStatus {
     SelfUpdateStatus {

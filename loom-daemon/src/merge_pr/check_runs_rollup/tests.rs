@@ -161,3 +161,22 @@ fn total_count_must_be_an_unsigned_integer_literal() {
     let raw = r#"{"total_count":18446744073709551615,"check_runs":[]}"#;
     assert_eq!(ok(raw).2, "18446744073709551615");
 }
+
+#[test]
+fn stuck_in_progress_with_conclusion_and_completed_at_is_settled() {
+    let raw = r#"{"total_count":3,"check_runs":[
+        {"name":"Stuck","status":"in_progress","conclusion":"success","completed_at":"2026-11-10T03:25:28Z"},
+        {"name":"StuckFail","status":"in_progress","conclusion":"failure","completed_at":"2026-11-10T03:25:28Z"},
+        {"name":"Done","status":"completed","conclusion":"success","completed_at":"2026-11-10T03:25:28Z"}]}"#;
+    assert_eq!(ok(raw), t("StuckFail", "", "3"));
+}
+
+#[test]
+fn half_written_rows_stay_pending() {
+    let raw = r#"{"total_count":4,"check_runs":[
+        {"name":"NoCompletedAt","status":"in_progress","conclusion":"success","completed_at":null},
+        {"name":"NoConclusion","status":"in_progress","conclusion":null,"completed_at":"2026-11-10T03:25:28Z"},
+        {"name":"NumConclusion","status":"in_progress","conclusion":1,"completed_at":"2026-11-10T03:25:28Z"},
+        {"name":"NoStatus","conclusion":null}]}"#;
+    assert_eq!(ok(raw), t("", "NoCompletedAt\nNoConclusion\nNoStatus\nNumConclusion", "4"));
+}

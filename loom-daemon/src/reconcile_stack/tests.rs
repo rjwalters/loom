@@ -37,10 +37,10 @@ fn plan_error_display_names_the_failing_prerequisite() {
 
 #[test]
 fn sh_quote_survives_a_quote_in_a_branch_name() {
-    assert_eq!(sh_quote("plain"), "'plain'");
+    assert_eq!(shell_quote("plain"), "'plain'");
     // Not a realistic branch name, but the output is `eval`ed: a value that
     // escapes its quoting is arbitrary shell execution, not a cosmetic bug.
-    assert_eq!(sh_quote("it's"), r#"'it'\''s'"#);
+    assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
 }
 
 /// The shell contract: the destination is the pinned COMMIT, and the branch

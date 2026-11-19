@@ -32,7 +32,6 @@ pub const HOST_EXPORT_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.host_export.queue_depth",
     "loom.host_export.dropped_total",
     "loom.host_export.last_flush_ok_at",
-    "loom.host_export.fact_id_missing_total",
     // #11530: `opaque_host_id(host)`, the `host-XXXXXXXX` form `loom:lease`
     // comments publish, derived in the OTLP mapping (no wire field).
     "host.lease_id",
@@ -73,12 +72,6 @@ pub struct HostExportRecord {
     pub host: String,
     /// One entry per active exporter, sorted by name.
     pub exporters: Vec<ExporterExport>,
-    /// `eta.stage_outcome` exits this process emitted without a
-    /// `loom.fact_id` (#11401): each carried `loom.fact_id_missing_reason`.
-    /// Cumulative per process lifetime, like `dropped_total`. Absent on
-    /// records from before #11401.
-    #[serde(default)]
-    pub fact_id_missing_total: u64,
 }
 
 /// One queue's depth and lifetime loss facts, as the collector reads them.
@@ -122,7 +115,6 @@ impl HostExportRecord {
             captured_at: now,
             host: host.to_string(),
             exporters,
-            fact_id_missing_total: super::stage_outcome::fact_id_missing_total(),
         }
     }
 

@@ -96,17 +96,50 @@ const UNKNOWN_TOKEN_NAME = "unknown";
  * Serialized with serde's `tag = "type", content = "value"` shape:
  *   `{"type": "Issue", "value": 42}`
  *   `{"type": "PrSet", "value": [10, 20]}`
+ *   `{"type": "Step", "value": {"item": 42, "role": "judge"}}`
  *
  * `Issue` drives the full Curator -> Builder -> Judge -> Doctor -> Merge
  * lifecycle for one issue. `PrSet` (Mode C, issue #5342) drives Judge/Doctor
  * -> Judge/Merge for an existing set of open PRs without re-running
  * Curator/Builder (`/loom:sweep --prs <n1> <n2> ...`).
  */
-export type SweepKind = { type: "Issue"; value: number } | { type: "PrSet"; value: number[] };
+export type SweepKind =
+  | { type: "Issue"; value: number }
+  | { type: "PrSet"; value: number[] }
+  | { type: "Step"; value: { item: number; role: StepRole } };
+
+/**
+ * `StepRole` mirrors `loom-daemon/src/step_role.rs` (issue #11898): the role a
+ * step (`/loom:<role> <item>`) runs, with Champion split by its claim. `item`
+ * is a PR for `judge`, `doctor` and `champion_merge`, else an issue. Steps are
+ * spawned by the daemon's step engine; `dispatch_sweep` never creates one.
+ */
+export type StepRole =
+  | "curator"
+  | "champion_promote"
+  | "builder"
+  | "judge"
+  | "doctor"
+  | "champion_merge";
+
+/** One-line rendering of a sweep's kind, exhaustive over `SweepKind`. */
+export function formatSweepKind(kind: SweepKind): string {
+  switch (kind.type) {
+    case "Issue":
+      return `Issue #${kind.value}`;
+    case "PrSet":
+      return `PR-set [${kind.value.join(", ")}]`;
+    case "Step":
+      return `Step ${kind.value.role} #${kind.value.item}`;
+    default: {
+      const unknownKind: never = kind;
+      return `unknown kind ${JSON.stringify(unknownKind)}`;
+    }
+  }
+}
 
 /**
  * `SweepState` mirrors the Rust enum's serde-tagged shape:
- *   `{"state": "Pending"}`
  *   `{"state": "Running"}`
  *   `{"state": "Exited", "details": {"code": 0 | null, "at": "..."}}`
  *   `{"state": "Crashed", "details": {"at": "..."}}`
@@ -116,7 +149,6 @@ export type SweepKind = { type: "Issue"; value: number } | { type: "PrSet"; valu
  * are accepted).
  */
 export type SweepState =
-  | { state: "Pending" }
   | { state: "Running" }
   | { state: "Exited"; details?: { code?: number | null; at?: string } }
   | { state: "Crashed"; details?: { at?: string } };
@@ -161,12 +193,6 @@ export interface SweepInfo {
    * Absent/undefined on pre-#3929 entries.
    */
   repo?: string;
-  /**
-   * True when the work finder admitted this sweep through the host's
-   * overflow slot (#9244): a starred issue run as the host's single sweep
-   * over the concurrency cap. Inert since #11508; absent means false.
-   */
-  overflow?: boolean;
 }
 
 interface DispatchResponse {
@@ -437,7 +463,7 @@ function extractError(response: DaemonResponse): string | null {
 }
 
 function isStateTag(s: string): s is SweepState["state"] {
-  return s === "Pending" || s === "Running" || s === "Exited" || s === "Crashed";
+  return s === "Running" || s === "Exited" || s === "Crashed";
 }
 
 /**
@@ -897,7 +923,7 @@ export const sweepTools: Tool[] = [
       properties: {
         state_filter: {
           type: "string",
-          enum: ["Pending", "Running", "Exited", "Crashed"],
+          enum: ["Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
         },
@@ -1223,10 +1249,7 @@ export function formatDispatchTokenLine(tokenName: string): string {
 }
 
 function formatSweepLine(info: SweepInfo): string {
-  const kind =
-    info.kind.type === "Issue"
-      ? `Issue #${info.kind.value}`
-      : `PR-set [${info.kind.value.join(", ")}]`;
+  const kind = formatSweepKind(info.kind);
   const stateLabel = info.state.state;
   const parts = [
     `* ${info.sweep_id}`,
@@ -1247,8 +1270,6 @@ function formatSweepLine(info: SweepInfo): string {
   // repos' identically-numbered issues are distinguishable in the listing.
   if (info.repo) parts.push(`  Repo:       ${info.repo}`);
   if (info.idempotency_key) parts.push(`  Idem. key:  ${info.idempotency_key}`);
-  // Issue #9244: the host's single over-limit starred sweep.
-  if (info.overflow) parts.push("  Overflow:   yes (starred, over the concurrency cap)");
   return parts.join("\n");
 }
 
@@ -1319,7 +1340,7 @@ export async function handleSweepTool(
         args.depends_on > 0
           ? (args.depends_on as number)
           : undefined;
-      // #4317 / #11284: defensive extraction of force + runtime/model_profile.
+      // #4317: defensive extraction of force.
       const dispatchOptions = extractDispatchOptions(args);
 
       const result = await dispatchSweep({
@@ -1467,6 +1488,8 @@ export async function handleSweepTool(
       ];
 
       if (recentEvents > 0) {
+        // Only an issue sweep has per-issue topics; a PR set and a step
+        // report on the global ones.
         const topicPrefix =
           info.kind.type === "Issue" ? `sweep.issue.${info.kind.value}` : "sweep";
         const stream = await streamEvents({

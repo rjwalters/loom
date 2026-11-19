@@ -251,99 +251,12 @@ async fn test_reject_various_shell_chars() {
     cleanup_all_loom_sessions();
 }
 
-/// Security Test 10: Reject symlink in working directory
-#[tokio::test]
-#[serial]
-async fn test_reject_symlink_working_directory() {
-    setup();
-
-    let daemon = TestDaemon::start().await.expect("Failed to start daemon");
-    let mut client = TestClient::connect(daemon.socket_path())
-        .await
-        .expect("Failed to connect");
-
-    // Create temp directory with symlink to sensitive location
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let symlink_path = temp_dir.path().join("symlink-escape");
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        // Create symlink pointing to /etc
-        symlink("/etc", &symlink_path).expect("Failed to create symlink");
-
-        // Attempt to create terminal with symlink as working directory
-        let _result = client
-            .create_terminal(
-                "test-symlink",
-                Some(symlink_path.to_str().expect("Invalid path").to_string()),
-            )
-            .await;
-
-        // SECURITY: Fixed (CWE-59 protection)
-        // Daemon validates symlinks in find_git_root() and rejects them
-        // Note: This test uses symlink as working_dir, not as .git directory
-        // The daemon may still accept symlinks as working directories,
-        // but will reject symlinks at the .git directory level
-        // Test documents current behavior
-    }
-
-    // Cleanup
-    cleanup_all_loom_sessions();
-}
-
-/// Security Test 11: Reject directory traversal in working directory
-#[tokio::test]
-#[serial]
-async fn test_reject_directory_traversal() {
-    setup();
-
-    let daemon = TestDaemon::start().await.expect("Failed to start daemon");
-    let mut client = TestClient::connect(daemon.socket_path())
-        .await
-        .expect("Failed to connect");
-
-    // Attempt directory traversal with various patterns
-    let traversal_attempts = vec![
-        "/tmp/../../../etc/passwd",
-        "../../../etc/shadow",
-        "/tmp/./../../etc",
-        "../../..",
-        "/tmp/../",
-    ];
-
-    for malicious_path in traversal_attempts {
-        let result = client
-            .create_terminal("test-traversal", Some(malicious_path.to_string()))
-            .await;
-
-        // SECURITY: Partially mitigated (CWE-59 protection for .git symlinks)
-        // Directory traversal via `..` paths is a separate concern from symlinks
-        // The symlink fix prevents .git directory symlink attacks specifically
-        // Path canonicalization for working directories could be added in future
-        if result.is_ok() {
-            // Document that traversal succeeded
-            let terminals = client.list_terminals().await.expect("Failed to list");
-            if let Some(term) = terminals
-                .iter()
-                .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("test-traversal"))
-            {
-                if let Some(wd) = term.get("working_dir").and_then(|v| v.as_str()) {
-                    // Warn if we escaped to sensitive directories
-                    if wd.contains("/etc") || wd.contains("/root") {
-                        eprintln!("Note: Path traversal resolved to sensitive directory");
-                        eprintln!("    Input: {malicious_path}");
-                        eprintln!("    Resolved to: {wd}");
-                    }
-                }
-            }
-        }
-        // Test documents current behavior - some paths may succeed
-    }
-
-    // Cleanup
-    cleanup_all_loom_sessions();
-}
+// Working-directory validation is deliberately not tested here (#12722). The
+// daemon does not reject symlinked, `..`-containing or system-directory working
+// directories; `create_terminal` accepts them and tmux session isolation is the
+// chosen control. CWE-59 protection lives at the `.git` symlink level in
+// `find_git_root()`. Tests named `test_reject_*` for these inputs asserted
+// nothing and were removed rather than left green-by-construction.
 
 /// Security Test 12: Verify terminal isolation between clients
 #[tokio::test]
@@ -430,19 +343,17 @@ async fn test_reject_malicious_json() {
         tokio::time::timeout(tokio::time::Duration::from_secs(2), reader.read_line(&mut response))
             .await;
 
-    // Should either timeout or return error, but daemon should still be alive
-    if let Ok(Ok(_)) = read_result {
-        // SECURITY GAP: Daemon may not properly reject malformed JSON
-        if !response.contains("error")
-            && !response.contains("Error")
-            && !response.contains("invalid")
-        {
-            eprintln!("⚠️  SECURITY GAP: Daemon did not return error for deeply nested JSON");
-            eprintln!("    Response: {}", response.trim());
-            eprintln!("    TODO: Add proper JSON depth/size validation");
-        }
-        // Test documents current behavior - may accept malformed JSON
-    }
+    // The daemon must answer the unparseable request with an error response
+    // (serde_json's recursion limit rejects the nesting), not silently accept it.
+    let read_len = read_result
+        .expect("Daemon did not respond to deeply nested JSON within 2s")
+        .expect("Failed to read response");
+    assert!(read_len > 0, "Daemon closed the connection without an error response");
+    assert!(
+        response.to_lowercase().contains("error"),
+        "Deeply nested JSON should yield an error response, got: {}",
+        response.trim()
+    );
 
     // Verify daemon is still responsive by connecting a new client
     let mut health_client = TestClient::connect(daemon.socket_path())
@@ -457,43 +368,7 @@ async fn test_reject_malicious_json() {
     cleanup_all_loom_sessions();
 }
 
-/// Security Test 14: Reject working directory outside allowed paths
-#[tokio::test]
-#[serial]
-async fn test_reject_sensitive_working_directories() {
-    setup();
-
-    let daemon = TestDaemon::start().await.expect("Failed to start daemon");
-    let mut client = TestClient::connect(daemon.socket_path())
-        .await
-        .expect("Failed to connect");
-
-    // Attempt to create terminals in sensitive system directories
-    let sensitive_paths = vec![
-        "/etc",
-        "/root",
-        "/var/root",
-        "/System",
-        "/bin",
-        "/sbin",
-        "/usr/bin",
-        "/private/etc",
-    ];
-
-    for sensitive_path in sensitive_paths {
-        let result = client
-            .create_terminal("test-sensitive", Some(sensitive_path.to_string()))
-            .await;
-
-        // Should either reject outright OR succeed but with restricted permissions
-        // Most importantly, should not allow arbitrary code execution in system dirs
-        if result.is_ok() {
-            // If it succeeds, document that we allow it but monitor for abuse
-            eprintln!("Warning: Terminal created in sensitive directory: {sensitive_path}");
-            // This is acceptable if tmux isolation is properly configured
-        }
-    }
-
-    // Cleanup
-    cleanup_all_loom_sessions();
-}
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

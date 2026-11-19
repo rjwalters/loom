@@ -62,17 +62,8 @@ loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-link"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 YELLOW='\033[0;33m'  # retired() below
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
 
 # An assertion that CANNOT survive the port to Rust, retired under the
 # three-part test in defaults/docs/verification-recipes.md §6. Printed, not
@@ -106,6 +97,7 @@ assert_not_symlink() {
     fi
 }
 
+# Local assert_grep kept: whole-line fixed-string (-xF) match; shared assert_grep is -E (#13258).
 assert_grep() {
     local pattern="$1" file="$2" msg="$3"
     if [[ -f "$file" ]] && grep -qxF "$pattern" "$file"; then

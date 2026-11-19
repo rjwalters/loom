@@ -1101,3 +1101,8 @@ fn a_role_ticks_passthrough_listing_is_journaled() {
     assert_eq!(rows[0]["stage"], "loom:triage");
     assert_eq!(rows[0]["labels"][0], "loom:triage");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -2,9 +2,8 @@
 # test-resync-installed-dogfood-symlink.sh - NEW-FILE dogfood symlink install
 # for the docs surface in resync-installed.sh (#8841)
 #
-# Split out as its own file rather than grown into test-resync-installed.sh
-# (frozen by the file-size ratchet, .loom/docs/file-size-policy.md) — same
-# pattern as test-resync-installed-local-fix-guard.sh and
+# Split out as its own file rather than grown into test-resync-installed.sh —
+# same pattern as test-resync-installed-local-fix-guard.sh and
 # test-resync-installed-agent-skills-guard.sh.
 #
 # What regressed (#8841): in the Loom source repo every `.loom/docs/*.md` is a
@@ -36,25 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # NOTE: the template deliberately avoids the substring "symlink". Every fixture
 # path is echoed back in the script's own progress output, so a WORKDIR named

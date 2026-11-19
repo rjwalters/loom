@@ -360,6 +360,10 @@ pub struct Finding {
     /// The demand is `running + 1` because no version names one
     /// ([`demand_is_guessed`]).
     pub guessed: bool,
+    /// The installed `loom_version` of a copy that is behind this daemon but
+    /// compatible with it, so not held (#14015). Only ever set on a
+    /// [`Verdict::Clear`] finding.
+    pub behind: Option<String>,
 }
 
 impl Finding {
@@ -381,6 +385,17 @@ impl Finding {
             detail: String::new(),
             demand: None,
             guessed: false,
+            behind: None,
+        }
+    }
+
+    /// Clear, but running older installed files than this daemon: the copy
+    /// is behind and compatible (#11052), and `installed` is its version.
+    #[must_use]
+    pub fn clear_behind(installed: Option<String>) -> Self {
+        Self {
+            behind: installed,
+            ..Self::clear()
         }
     }
 
@@ -392,6 +407,7 @@ impl Finding {
             detail,
             demand: None,
             guessed: false,
+            behind: None,
         }
     }
 
@@ -404,6 +420,7 @@ impl Finding {
             detail,
             demand: demanded(requires_daemon, running),
             guessed: demand_is_guessed(requires_daemon),
+            behind: None,
         }
     }
 }
@@ -522,6 +539,33 @@ impl Entry {
     }
 }
 
+/// A repo whose installed Loom files are older than this daemon but
+/// compatible with it, so dispatch is not held (#14015). A fix that spans the
+/// daemon binary and `defaults/scripts` is not in those files yet.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstalledBehind {
+    /// The installed `loom_version`.
+    pub installed: String,
+    /// The version this daemon runs.
+    pub running: String,
+}
+
+/// What [`Holds`] last saw of one workspace's behind-but-compatible copies:
+/// default branch, then checkout.
+#[derive(Debug, Clone)]
+struct BehindEntry {
+    repo: Option<String>,
+    copies: [Option<String>; 2],
+    running: String,
+}
+
+impl BehindEntry {
+    /// The default branch's version, else the checkout's.
+    fn installed(&self) -> Option<&String> {
+        self.copies.iter().flatten().next()
+    }
+}
+
 /// A workspace whose roll demand is a guess (`running + 1`): a version
 /// cannot be ordered and `requires_daemon` does not name one either.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -569,6 +613,11 @@ pub struct Holds {
     all_judged: bool,
     /// Set when the roll's last hold cleared, until taken.
     roll_cleared: Option<RollCleared>,
+    /// Workspaces with an installed copy behind this daemon but compatible
+    /// (#14015), by normalized root.
+    behind: HashMap<PathBuf, BehindEntry>,
+    /// The installed version each root's behind state was last reported at.
+    behind_reported: HashMap<PathBuf, String>,
 }
 
 impl Holds {
@@ -584,6 +633,11 @@ impl Holds {
     ) -> Vec<Transition> {
         let mut previous = std::mem::take(&mut self.entries);
         let mut transitions = Vec::new();
+        let observed: std::collections::HashSet<PathBuf> = observations
+            .iter()
+            .map(|seen| normalize(&seen.root))
+            .collect();
+        self.behind.retain(|root, _| observed.contains(root));
         for seen in observations {
             let before = previous.remove(&normalize(&seen.root));
             self.fold(seen, before, running, now, alert_after, &mut transitions);
@@ -667,6 +721,30 @@ impl Holds {
                 seen: now,
             }),
         };
+        // Behind but compatible (#14015): a copy not judged this pass keeps
+        // what it was last found to be.
+        let [old_behind_default, old_behind_checkout] = self
+            .behind
+            .remove(&root)
+            .map_or([None, None], |old| old.copies);
+        let behind = |finding: &Finding, old: Option<String>| match finding.verdict {
+            Verdict::Unknown => old,
+            _ => finding.behind.clone(),
+        };
+        let copies = [
+            behind(&seen.default_branch, old_behind_default),
+            behind(&seen.checkout, old_behind_checkout),
+        ];
+        if copies.iter().any(Option::is_some) {
+            self.behind.insert(
+                root.clone(),
+                BehindEntry {
+                    repo: seen.repo.clone(),
+                    copies,
+                    running: running.to_string(),
+                },
+            );
+        }
         let mut entry = Entry {
             repo: seen.repo.clone(),
             copies: [
@@ -770,6 +848,52 @@ impl Holds {
         found
     }
 
+    /// Every workspace running installed files behind this daemon but
+    /// compatible with it, by normalized root (#14015). A root with a standing
+    /// hold on either copy is left out: the marker is set per copy, so one copy
+    /// can be behind-but-compatible while the other is held, and "dispatch is
+    /// not held" would be false for that repo (#14334). So is a `maintain-only`
+    /// root: that hold lives in the registry, not in `entries` ([`hold_for`]
+    /// composes it), and dispatch into it is refused (#14409).
+    #[must_use]
+    pub fn installed_behind(&self) -> HashMap<PathBuf, InstalledBehind> {
+        self.behind
+            .iter()
+            .filter(|(root, _)| self.entries.get(*root).is_none_or(|e| e.hold().is_none()))
+            .filter(|(root, _)| maintain_only::maintain_only_for(root).is_none())
+            .filter_map(|(root, entry)| {
+                Some((
+                    root.clone(),
+                    InstalledBehind {
+                        installed: entry.installed()?.clone(),
+                        running: entry.running.clone(),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The workspaces that became behind-but-compatible, or changed which
+    /// release they are behind at, since the last call: each is reported once
+    /// while it stands, and again only after it has left and come back.
+    pub fn newly_behind(&mut self) -> Vec<(PathBuf, Option<String>, InstalledBehind)> {
+        let current = self.installed_behind();
+        let mut found: Vec<_> = current
+            .iter()
+            .filter(|(root, now)| self.behind_reported.get(*root) != Some(&now.installed))
+            .map(|(root, now)| {
+                let repo = self.behind.get(root).and_then(|e| e.repo.clone());
+                (root.clone(), repo, now.clone())
+            })
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        self.behind_reported = current
+            .into_iter()
+            .map(|(root, now)| (root, now.installed))
+            .collect();
+        found
+    }
+
     /// Every standing hold, by normalized root.
     #[must_use]
     pub fn holds(&self) -> HashMap<PathBuf, WorkspaceHold> {
@@ -819,6 +943,11 @@ fn published() -> &'static RwLock<HashMap<PathBuf, WorkspaceHold>> {
     PUBLISHED.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+fn behind_cell() -> &'static RwLock<HashMap<PathBuf, InstalledBehind>> {
+    static BEHIND: OnceLock<RwLock<HashMap<PathBuf, InstalledBehind>>> = OnceLock::new();
+    BEHIND.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 fn demand_cell() -> &'static Mutex<Option<RepoAheadDemand>> {
     static DEMAND: OnceLock<Mutex<Option<RepoAheadDemand>>> = OnceLock::new();
     DEMAND.get_or_init(|| Mutex::new(None))
@@ -860,6 +989,23 @@ pub fn resync_hold_for(root: &Path) -> Option<WorkspaceHold> {
     holds
         .get(root)
         .or_else(|| holds.get(&normalize(root)))
+        .cloned()
+}
+
+/// How `root`'s installed Loom files stand against this daemon, when they are
+/// older but compatible, so dispatch is not held (#14015). `None` when they
+/// are not behind, and until a pass has run. What `status` shows per repo.
+#[must_use]
+pub fn installed_behind_for(root: &Path) -> Option<InstalledBehind> {
+    let behind = behind_cell()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if behind.is_empty() {
+        return None;
+    }
+    behind
+        .get(root)
+        .or_else(|| behind.get(&normalize(root)))
         .cloned()
 }
 
@@ -936,9 +1082,26 @@ fn publish(
     let standing = holds.holds();
     let demand = holds.demand();
     let cleared = holds.take_roll_cleared();
+    let behind = holds.installed_behind();
+    let newly_behind = holds.newly_behind();
     drop(holds);
     if let Ok(mut cell) = published().write() {
         cell.clone_from(&standing);
+    }
+    if let Ok(mut cell) = behind_cell().write() {
+        *cell = behind;
+    }
+    for (root, repo, b) in &newly_behind {
+        log::info!(
+            "workspace_hold: {}: installed Loom {} is older than daemon {} but compatible with it; \
+             dispatch is not held and runs the installed files as they are until the workspace \
+             resync lands. A fix spanning the daemon binary and defaults/scripts needs \
+             SUPPORTS_INSTALLED raised in its release to hold such a repo. Logged once while it \
+             stands",
+            repo.clone().unwrap_or_else(|| root.display().to_string()),
+            b.installed,
+            b.running
+        );
     }
     if let Ok(mut cell) = demand_cell().lock() {
         *cell = demand;
@@ -1071,6 +1234,17 @@ pub fn guard(root: &Path) -> Result<(), WorkspaceHeldDispatchError> {
     }
 }
 
+/// Severity for a log line about a standing hold. `maintain-only` is a
+/// configured policy refusal, not a fault (#11928), so it is informational;
+/// the W3/W4 holds stay warnings.
+#[must_use]
+pub fn hold_log_level(kind: HoldKind) -> log::Level {
+    match kind {
+        HoldKind::MaintainOnly => log::Level::Info,
+        HoldKind::InstallIncompatible | HoldKind::DaemonTooOld => log::Level::Warn,
+    }
+}
+
 /// Drop held roots from a role runner's tick, logging each hold once when it
 /// starts and once when it ends. `logged` carries the roots currently known
 /// held across ticks.
@@ -1092,7 +1266,8 @@ pub fn filter_held(
             continue;
         };
         if !logged.contains(&root) {
-            log::warn!(
+            log::log!(
+                hold_log_level(hold.kind),
                 "role_runner: workspace {} is held ({}): {}; no role tick starts there until it \
                  clears (running roles are not touched)",
                 root.display(),

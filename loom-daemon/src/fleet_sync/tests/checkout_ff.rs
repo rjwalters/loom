@@ -20,32 +20,10 @@ use super::git::{classify_refusal, Refusal};
 use super::host::{hold_for_move, hold_for_self_update};
 use super::*;
 use crate::fleet_sync::FleetSyncStatus;
+use crate::test_git_helpers::{git_out as git_in, run as git};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
-}
-
-fn git_in(dir: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = git_in(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -198,6 +176,8 @@ struct Knobs {
     breaker: Rc<Cell<bool>>,
     budget: Option<Duration>,
     elapsed: Box<dyn Fn() -> Duration>,
+    /// The forge's answer to "is this sha a merged PR's head" (#13588).
+    merged: Option<bool>,
 }
 
 impl Default for Knobs {
@@ -213,6 +193,7 @@ impl Default for Knobs {
             breaker: Rc::new(Cell::new(false)),
             budget: None,
             elapsed: Box::new(|| Duration::ZERO),
+            merged: None,
         }
     }
 }
@@ -230,6 +211,7 @@ fn pass_over(roots: &[PathBuf], knobs: &Knobs, memory: &mut Memory) -> CheckoutP
         budget: knobs.budget,
         elapsed: &*knobs.elapsed,
         clock: &t0,
+        pr_merged: &|_, _| knobs.merged,
     };
     run(&env, roots, memory)
 }
@@ -417,6 +399,58 @@ fn an_ignored_untracked_file_in_the_way_is_not_overwritten() {
         fs::read_to_string(fx.host.join("local.cfg")).unwrap(),
         "mine, ignored, never committed\n"
     );
+}
+
+#[test]
+fn an_ignored_file_identical_to_the_incoming_blob_is_replaced() {
+    // #13580: nothing can be lost, so this is not a hold.
+    let fx = Fixture::new();
+    write(&fx.host.join(".git/info/exclude"), ".loom-local/\n");
+    write(&fx.host.join("a/.loom-local/f.json"), "{}\n");
+    write(&fx.host.join("empty.txt"), "");
+    let tip = {
+        write(&fx.seed.join("empty.txt"), "");
+        fx.push("a/.loom-local/f.json", "{}\n")
+    };
+    let found = pass(&fx, &Knobs::default());
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert!(git(&fx.host, &["status", "--porcelain"]).is_empty());
+}
+
+#[test]
+fn an_untracked_file_identical_to_the_incoming_blob_is_replaced() {
+    let fx = Fixture::new();
+    write(&fx.host.join("notes.txt"), "from upstream\n");
+    let tip = fx.push("notes.txt", "from upstream\n");
+    let found = pass(&fx, &Knobs::default());
+    assert_eq!(only(&found).state, CheckoutState::FastForwarded, "{found:?}");
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn one_differing_byte_keeps_the_hold_and_removes_nothing() {
+    let fx = Fixture::new();
+    write(&fx.host.join("same.txt"), "same\n");
+    write(&fx.host.join("diff.txt"), "mine\n");
+    write(&fx.seed.join("same.txt"), "same\n");
+    fx.push("diff.txt", "theirs\n");
+    let report = assert_skipped(&fx, &Knobs::default(), CheckoutState::WouldOverwrite);
+    assert!(report.detail.as_deref().unwrap().contains("diff.txt"), "{report:?}");
+    assert_eq!(fs::read_to_string(fx.host.join("same.txt")).unwrap(), "same\n");
+    assert_eq!(fs::read_to_string(fx.host.join("diff.txt")).unwrap(), "mine\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_way_keeps_the_hold() {
+    let fx = Fixture::new();
+    std::os::unix::fs::symlink("README.md", fx.host.join("link.txt")).unwrap();
+    fx.push("link.txt", "one\n");
+    assert_skipped(&fx, &Knobs::default(), CheckoutState::WouldOverwrite);
+    assert!(fs::symlink_metadata(fx.host.join("link.txt"))
+        .unwrap()
+        .is_symlink());
 }
 
 #[test]
@@ -1087,7 +1121,10 @@ fn a_refused_merge_is_read_as_a_file_in_the_way_or_as_a_failure() {
                      merge.\nAborting";
     assert_eq!(
         classify_refusal(untracked),
-        Refusal::WouldOverwrite("notes.txt, docs/x.md".to_string())
+        Refusal::WouldOverwrite(
+            "notes.txt, docs/x.md".to_string(),
+            vec!["notes.txt".to_string(), "docs/x.md".to_string()]
+        )
     );
     let other = "fatal: Not possible to fast-forward, aborting.";
     assert!(matches!(classify_refusal(other), Refusal::Other(e) if e.contains("fast-forward")));
@@ -1125,4 +1162,60 @@ fn a_maintain_only_workspace_is_still_fast_forwarded() {
     assert!(hold_for(&fx.host).is_some(), "while dispatch stays refused");
 
     set_maintain_only_for_test(&fx.host, None);
+}
+
+#[path = "checkout_ff_freshness.rs"]
+mod freshness_tests;
+
+// ------------------------------------------------------------------------
+// The daemon root as an extra, unregistered root (#12727)
+// ------------------------------------------------------------------------
+
+#[test]
+fn the_daemon_root_is_added_to_the_registered_roots() {
+    let fx = Fixture::new();
+    let other = PathBuf::from("/nonexistent/registered");
+    let roots = with_daemon_root(vec![other.clone()], &fx.host);
+    assert_eq!(roots, vec![other, fx.host.clone()]);
+}
+
+#[test]
+fn a_daemon_root_that_is_also_registered_is_visited_once() {
+    let fx = Fixture::new();
+    let roots = with_daemon_root(vec![fx.host.clone()], &fx.host);
+    assert_eq!(roots, vec![fx.host.clone()]);
+    // Reached through a different spelling of the same path.
+    let spelled = fx.host.join("..").join("host");
+    assert_eq!(with_daemon_root(vec![fx.host.clone()], &spelled), vec![fx.host.clone()]);
+}
+
+#[test]
+fn an_absent_or_non_git_daemon_root_adds_nothing() {
+    let tmp = TempDir::new().unwrap();
+    assert!(with_daemon_root(Vec::new(), &tmp.path().join("missing")).is_empty());
+    assert!(with_daemon_root(Vec::new(), tmp.path()).is_empty());
+}
+
+#[test]
+fn a_stale_daemon_root_is_fast_forwarded() {
+    let fx = Fixture::new();
+    let tip = fx.push("README.md", "two\n");
+    let roots = with_daemon_root(Vec::new(), &fx.host);
+    pass_over(&roots, &Knobs::default(), &mut Memory::default());
+    assert_eq!(fx.head(), tip);
+}
+
+#[test]
+fn a_daemon_root_with_divergent_dirt_is_left_alone() {
+    let fx = Fixture::new();
+    fx.push("README.md", "two\n");
+    write(&fx.host.join("README.md"), "my local edit\n");
+    let before = snapshot(&fx.host);
+    let roots = with_daemon_root(Vec::new(), &fx.host);
+    pass_over(&roots, &Knobs::default(), &mut Memory::default());
+    assert_eq!(
+        snapshot(&fx.host),
+        before,
+        "divergent dirt must not be reset, stashed or merged over"
+    );
 }

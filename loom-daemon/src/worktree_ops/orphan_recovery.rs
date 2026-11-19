@@ -1,21 +1,19 @@
 //! `loom-daemon recover-orphans`: native port of `loom-recover-orphans`
 //! (`orphan_recovery.py`).
 //!
-//! Detects two kinds of orphaned state and (with `--recover`) fixes them:
+//! Detects orphaned `loom:building` claims and (with `--recover`) fixes them:
 //!
 //! - `untracked_building`: an issue carries `loom:building` but no live
-//!   sweep is tracking it.
-//! - `stale_heartbeat`: a `.loom/spawn-loop-state.json::running` entry's
-//!   heartbeat is stale and its recorded PID is dead.
+//!   sweep is tracking it. (PR-side `loom:reviewing`/`loom:treating` claims
+//!   are detected inline too — see `check_stale_pr_claims`.)
 //!
 //! Liveness evidence is gathered from every available source and unioned
 //! (never intersected) — see [`gather_liveness_evidence`]. The fail-safe
 //! invariant from issue #3651 is preserved exactly: **absent evidence means
 //! treat every claim as ALIVE**, never as orphaned. Every source
-//! [`gather_liveness_evidence`] gathers (`spawn-loop-state.json`,
-//! `.loom/locks`, the sweep journal) is HOST-scoped — it can only prove a
-//! claim dead *on this host*, and is structurally blind to a still-running
-//! peer-host sweep.
+//! [`gather_liveness_evidence`] gathers (`.loom/locks`, the sweep journal)
+//! is HOST-scoped — it can only prove a claim dead *on this host*, and is
+//! structurally blind to a still-running peer-host sweep.
 //!
 //! An **open linked PR is itself liveness evidence** (issue #5511): no
 //! `loom:building` reset happens until the forge's closes-graph has *verified*
@@ -41,10 +39,8 @@ use std::path::{Path, PathBuf};
 use super::claim_file::has_valid_claim;
 use super::gh;
 use super::gh::OpenPrProbe;
-use super::liveness::{active_locked_issues, locks_dir};
-use super::spawn_loop_state::{read_spawn_loop_state, SpawnLoopState};
+use super::liveness::active_locked_issues;
 
-pub const DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 300;
 pub const DEFAULT_LABEL_GRACE_PERIOD_SECS: i64 = 600;
 pub const DEFAULT_STALE_BUILDING_HOURS: f64 = 4.0;
 pub const ORPHAN_COMMENT_DEDUP_SECONDS: i64 = 300;
@@ -62,19 +58,16 @@ pub(crate) const BUILD_ARTIFACT_PATTERNS: &[&str] = &[
     "node_modules",
     "pnpm-lock.yaml",
     ".venv",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    "__pycache__/",
     "target/",
     "Cargo.lock",
     "coverage/",
     ".loom-checkpoint",
     ".loom-in-use",
 ];
-
-fn heartbeat_stale_threshold() -> i64 {
-    std::env::var("LOOM_HEARTBEAT_STALE_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_HEARTBEAT_STALE_THRESHOLD_SECS)
-}
 
 fn label_grace_period() -> i64 {
     std::env::var("LOOM_LABEL_GRACE_PERIOD")
@@ -100,17 +93,15 @@ fn pid_alive(pid: u32) -> bool {
 /// A detected orphan.
 #[derive(Debug, Clone)]
 pub struct OrphanEntry {
-    // "untracked_building" | "stale_heartbeat" | "stale_reviewing_pr" |
+    // "untracked_building" | "stale_reviewing_pr" |
     // "stale_treating_pr" (the last two: Issue #6167, PR-side claim overlays)
     pub kind: &'static str,
     pub issue: Option<u32>,
     /// The PR number, for the PR-side claim kinds (`stale_reviewing_pr` /
     /// `stale_treating_pr`). `None` for every issue-side kind.
     pub pr: Option<u32>,
-    pub pid: Option<u32>,
     pub title: Option<String>,
     pub reason: String,
-    pub age_seconds: Option<i64>,
 }
 
 /// A recovery action taken.
@@ -168,43 +159,18 @@ pub struct LivenessEvidence {
     pub journal_issues: HashSet<u32>,
 }
 
-/// Best-effort daemon-registry query. Mirrors
-/// `orphan_recovery.py::_query_daemon_live_issues`, which is (deliberately)
-/// a permanent no-op stub: the CLI runs as a standalone process with no
-/// socket to a possibly-running daemon, so this is never a contributing
-/// source today. Returns `None` ("not a source"), never an empty set
-/// ("daemon says nothing is live") — those are different claims.
-fn query_daemon_live_issues(_repo_root: &Path) -> Option<HashSet<u32>> {
-    None
-}
-
 /// Gather liveness evidence from every available source and union them.
-/// Mirrors `orphan_recovery.py::gather_liveness_evidence`.
+/// Mirrors `orphan_recovery.py::gather_liveness_evidence` minus its retired
+/// `spawn-loop-state.json` and no-op daemon-registry legs (removed in
+/// #13818 — the state file's writer was deleted in v0.11.0, and the CLI
+/// runs as a standalone process with no socket to a possibly-running
+/// daemon).
 #[must_use]
-pub fn gather_liveness_evidence(
-    spawn_loop_state: &SpawnLoopState,
-    repo_root: &Path,
-) -> LivenessEvidence {
+pub fn gather_liveness_evidence(repo_root: &Path) -> LivenessEvidence {
     let mut live: HashSet<u32> = HashSet::new();
     let mut sources: Vec<&'static str> = Vec::new();
     let mut journal_present = false;
     let mut journal_issues: HashSet<u32> = HashSet::new();
-
-    if spawn_loop_state.present {
-        sources.push("spawn-loop-state.json");
-        live.extend(
-            spawn_loop_state
-                .running
-                .iter()
-                .filter(|t| t.issue != 0)
-                .map(|t| t.issue),
-        );
-    }
-
-    if let Some(daemon_issues) = query_daemon_live_issues(repo_root) {
-        sources.push("loom-daemon");
-        live.extend(daemon_issues);
-    }
 
     let locked = active_locked_issues(repo_root);
     if !locked.is_empty() {
@@ -266,7 +232,7 @@ pub fn gather_liveness_evidence(
 /// mirroring the `evidence.available == false` short-circuit in
 /// [`check_untracked_building`] — absent evidence means treat the claim as
 /// ALIVE (#3651).
-fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
+pub(super) fn open_linked_pr_blocks_reset(repo_root: &Path, issue: u32) -> bool {
     match gh::probe_open_linked_pr(repo_root, issue) {
         OpenPrProbe::Open(pr) => {
             eprintln!(
@@ -342,8 +308,8 @@ pub fn check_untracked_building(
     if !evidence.available {
         if verbose {
             eprintln!(
-                "No authoritative liveness source available (no spawn-loop-state.json, no \
-                 reachable loom-daemon registry, no .loom/locks/issue-<N>/ locks) — refusing \
+                "No authoritative liveness source available (no \
+                 .loom/locks/issue-<N>/ locks) — refusing \
                  to flag any loom:building issue as orphaned (fail-safe: absent liveness data \
                  means treat claims as ALIVE, not orphaned). See issue #3651."
             );
@@ -393,7 +359,25 @@ pub fn check_untracked_building(
             };
 
         if threshold_seconds > 0.0 {
-            let label_age = gh::building_label_age_seconds(repo_root, issue_num);
+            let label_age = match gh::building_label_age(repo_root, issue_num) {
+                gh::LabelAge::Known(age) => Some(age),
+                // Unchanged: no claim event read as "past the grace period".
+                gh::LabelAge::NoEvent => None,
+                gh::LabelAge::Unknown => {
+                    // #12389: the label-age read was shed or failed. "No
+                    // answer" must not read as "past the grace period": a
+                    // claim made a minute ago has no PR or lease yet, so the
+                    // later gates would pass it. Skip the issue this pass.
+                    result.watched.push(WatchedEntry {
+                        issue: issue_num,
+                        title: Some(issue_title.clone()),
+                        reason: "label_age_unverifiable",
+                        age_seconds: None,
+                        threshold_seconds,
+                    });
+                    continue;
+                }
+            };
             if let Some(age) = label_age {
                 if (age as f64) < threshold_seconds {
                     result.watched.push(WatchedEntry {
@@ -436,49 +420,8 @@ pub fn check_untracked_building(
             kind: "untracked_building",
             issue: Some(issue_num),
             pr: None,
-            pid: None,
             title: Some(issue_title),
             reason: reason.to_string(),
-            age_seconds: None,
-        });
-    }
-}
-
-/// Flag `.loom/spawn-loop-state.json::running` entries whose heartbeat is
-/// stale and PID is dead. Mirrors `orphan_recovery.py::check_stale_heartbeats`.
-pub fn check_stale_heartbeats(
-    spawn_loop_state: &SpawnLoopState,
-    result: &mut OrphanRecoveryResult,
-    heartbeat_threshold_secs: i64,
-) {
-    for task in &spawn_loop_state.running {
-        let Some(hb) = &task.last_heartbeat else {
-            continue;
-        };
-        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(hb) else {
-            continue;
-        };
-        let age = chrono::Utc::now()
-            .signed_duration_since(dt.with_timezone(&chrono::Utc))
-            .num_seconds();
-        if age <= heartbeat_threshold_secs {
-            continue;
-        }
-        if pid_alive(task.pid) {
-            continue;
-        }
-        result.orphaned.push(OrphanEntry {
-            kind: "stale_heartbeat",
-            issue: if task.issue != 0 {
-                Some(task.issue)
-            } else {
-                None
-            },
-            pr: None,
-            pid: Some(task.pid),
-            title: None,
-            reason: "heartbeat_stale".to_string(),
-            age_seconds: Some(age),
         });
     }
 }
@@ -622,14 +565,24 @@ pub fn recover_issue(
     label_grace_period_secs: i64,
 ) {
     if label_grace_period_secs > 0 {
-        if let Some(age) = gh::building_label_age_seconds(repo_root, issue) {
-            if age < label_grace_period_secs {
+        match gh::building_label_age(repo_root, issue) {
+            gh::LabelAge::Known(age) if age < label_grace_period_secs => {
                 eprintln!(
                     "Skipping recovery for issue #{issue}: loom:building label applied {age}s ago \
                      (grace period: {label_grace_period_secs}s)"
                 );
                 return;
             }
+            gh::LabelAge::Unknown => {
+                // #12389: a shed or failed label-age read is no answer;
+                // never delete a worktree or flip the label on it.
+                eprintln!(
+                    "Skipping recovery for issue #{issue}: the loom:building label age could not \
+                     be read (shed or failed); retrying next pass"
+                );
+                return;
+            }
+            gh::LabelAge::Known(_) | gh::LabelAge::NoEvent => {}
         }
     }
 
@@ -752,10 +705,8 @@ pub fn check_stale_pr_claims(repo_root: &Path, result: &mut OrphanRecoveryResult
             kind,
             issue: None,
             pr: Some(outcome.pr_number),
-            pid: None,
             title: None,
             reason: reason.clone(),
-            age_seconds: None,
         });
 
         if outcome.reclaimed {
@@ -776,11 +727,9 @@ pub fn run_orphan_recovery(repo_root: &Path, recover: bool, verbose: bool) -> Or
         recover_mode: recover,
         ..Default::default()
     };
-    let heartbeat_threshold = heartbeat_stale_threshold();
     let grace_period = label_grace_period();
 
-    let spawn_loop_state = read_spawn_loop_state(repo_root);
-    let evidence = gather_liveness_evidence(&spawn_loop_state, repo_root);
+    let evidence = gather_liveness_evidence(repo_root);
 
     if verbose {
         if evidence.available {
@@ -800,7 +749,6 @@ pub fn run_orphan_recovery(repo_root: &Path, recover: bool, verbose: bool) -> Or
     }
 
     check_untracked_building(&evidence, &mut result, repo_root, grace_period, verbose);
-    check_stale_heartbeats(&spawn_loop_state, &mut result, heartbeat_threshold);
     // Issue #6167: PR-side `loom:reviewing`/`loom:treating` claims are
     // detected (and, when `recover`, reclaimed) inline here rather than via
     // the issue-only recovery loop below — a PR-side reclaim is a different
@@ -877,13 +825,6 @@ pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
                     orphan.issue.unwrap_or(0),
                     orphan.title.as_deref().unwrap_or("no title")
                 )),
-                "stale_heartbeat" => lines.push(format!(
-                    "  [{}] issue #{} (pid {}): heartbeat stale ({})",
-                    orphan.kind,
-                    orphan.issue.unwrap_or(0),
-                    orphan.pid.unwrap_or(0),
-                    format_duration(orphan.age_seconds.unwrap_or(0))
-                )),
                 "stale_reviewing_pr" | "stale_treating_pr" => lines.push(format!(
                     "  [{}] PR #{}: {} -- dead claimant, no verdict",
                     orphan.kind,
@@ -942,14 +883,8 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
             if let Some(pr) = o.pr {
                 m.insert("pr".to_string(), pr.into());
             }
-            if let Some(p) = o.pid {
-                m.insert("pid".to_string(), p.into());
-            }
             if let Some(t) = &o.title {
                 m.insert("title".to_string(), t.clone().into());
-            }
-            if let Some(a) = o.age_seconds {
-                m.insert("age_seconds".to_string(), a.into());
             }
             serde_json::Value::Object(m)
         })
@@ -1004,13 +939,6 @@ pub fn format_result_json(result: &OrphanRecoveryResult) -> String {
     serde_json::to_string_pretty(&obj).unwrap_or_default()
 }
 
-/// Path to the spawn-loop claim-lock directory (re-exported for the CLI's
-/// help text / diagnostics).
-#[must_use]
-pub fn locks_dir_for(repo_root: &Path) -> PathBuf {
-    locks_dir(repo_root)
-}
-
 /// The one-line stderr diagnostic printed for the CLI's exit code `2`
 /// ("orphaned claims found in dry-run mode") — issue #6392. Exit `2` here is
 /// a *report*, not a failure: the assessment ran cleanly and simply found
@@ -1058,15 +986,12 @@ pub fn format_dry_run_orphans_found_stderr(orphaned_count: usize) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::liveness::locks_dir;
     use crate::write_scope_test_support::WritableRoot;
     use serial_test::serial;
     use tempfile::tempdir;
     use {super::*, crate::comment_trust::records::with_fleet_author};
     // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
-
-    fn absent_state() -> SpawnLoopState {
-        SpawnLoopState::default()
-    }
 
     /// Point the machine-level sweep journal at a path scoped to this test's
     /// tempdir (guaranteed not to exist), so `gather_liveness_evidence`
@@ -1085,9 +1010,8 @@ mod tests {
     #[serial]
     fn no_evidence_sources_means_unavailable() {
         let dir = tempdir().unwrap();
-        let evidence = with_isolated_journal_path(dir.path(), || {
-            gather_liveness_evidence(&absent_state(), dir.path())
-        });
+        let evidence =
+            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(dir.path()));
         assert!(!evidence.available, "fail-safe: no sources present must mean unavailable");
         assert!(evidence.live_issues.is_empty());
     }
@@ -1097,26 +1021,11 @@ mod tests {
     fn locks_dir_contributes_evidence() {
         let dir = tempdir().unwrap();
         std::fs::create_dir_all(locks_dir(dir.path()).join("issue-7")).unwrap();
-        let evidence = with_isolated_journal_path(dir.path(), || {
-            gather_liveness_evidence(&absent_state(), dir.path())
-        });
+        let evidence =
+            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(dir.path()));
         assert!(evidence.available);
         assert!(evidence.live_issues.contains(&7));
         assert!(evidence.sources.contains(&".loom/locks"));
-    }
-
-    #[test]
-    #[serial]
-    fn spawn_loop_state_present_contributes_evidence_even_if_empty() {
-        let dir = tempdir().unwrap();
-        let state = SpawnLoopState {
-            running: Vec::new(),
-            present: true,
-        };
-        let evidence =
-            with_isolated_journal_path(dir.path(), || gather_liveness_evidence(&state, dir.path()));
-        assert!(evidence.available);
-        assert!(evidence.sources.contains(&"spawn-loop-state.json"));
     }
 
     #[test]
@@ -1130,40 +1039,6 @@ mod tests {
         check_untracked_building(&evidence, &mut result, dir.path(), 600, false);
         assert!(result.orphaned.is_empty());
         assert!(result.watched.is_empty());
-    }
-
-    #[test]
-    fn stale_heartbeat_with_dead_pid_is_orphaned() {
-        let mut result = OrphanRecoveryResult::default();
-        let state = SpawnLoopState {
-            present: true,
-            running: vec![super::super::spawn_loop_state::SpawnLoopTask {
-                issue: 42,
-                pid: 0, // pid 0 is never alive per sweep_registry::is_pid_alive
-                last_heartbeat: Some(
-                    (chrono::Utc::now() - chrono::Duration::seconds(600)).to_rfc3339(),
-                ),
-            }],
-        };
-        check_stale_heartbeats(&state, &mut result, 300);
-        assert_eq!(result.orphaned.len(), 1);
-        assert_eq!(result.orphaned[0].kind, "stale_heartbeat");
-        assert_eq!(result.orphaned[0].issue, Some(42));
-    }
-
-    #[test]
-    fn fresh_heartbeat_is_not_orphaned() {
-        let mut result = OrphanRecoveryResult::default();
-        let state = SpawnLoopState {
-            present: true,
-            running: vec![super::super::spawn_loop_state::SpawnLoopTask {
-                issue: 42,
-                pid: 0,
-                last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
-            }],
-        };
-        check_stale_heartbeats(&state, &mut result, 300);
-        assert!(result.orphaned.is_empty());
     }
 
     #[test]
@@ -1246,7 +1121,7 @@ mod tests {
         let mut result = OrphanRecoveryResult::default();
         let evidence = LivenessEvidence {
             available: true,
-            sources: vec!["spawn-loop-state.json"],
+            sources: vec![".loom/locks"],
             ..Default::default()
         };
         check_untracked_building(&evidence, &mut result, dir.path(), 600, false);

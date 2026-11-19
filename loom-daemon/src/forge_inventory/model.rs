@@ -517,13 +517,6 @@ pub struct Inventory {
 }
 
 impl Inventory {
-    /// Rows in `profile`, active only.
-    pub fn in_profile(&self, profile: Profile) -> impl Iterator<Item = &Operation> {
-        self.operations
-            .iter()
-            .filter(move |o| o.profile == profile && o.is_active())
-    }
-
     /// Look one row up by its stable ID.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&Operation> {

@@ -428,13 +428,25 @@ pub fn verdict_line(verdict: Verdict, marker: &SequenceMarker) -> String {
 /// a deadline; `per_page=100` cuts a long thread's walk to a third of the
 /// requests the default 30-per-page walk cost.
 pub fn fetch_trusted_bodies(bin: &str, root: &Path, nwo: &str, pr: u32) -> Option<Vec<String>> {
+    fetch_trusted_bodies_as("sequence.trusted_bodies", bin, root, nwo, pr)
+}
+
+/// [`fetch_trusted_bodies`], counted under the caller's own facade op name
+/// `op` (which must map to `comment.list` in `gh_call::forge_op_for`), so a
+/// pass that reuses this read is not booked as the merge-sequence pass.
+pub fn fetch_trusted_bodies_as(
+    op: &'static str,
+    bin: &str,
+    root: &Path,
+    nwo: &str,
+    pr: u32,
+) -> Option<Vec<String>> {
     let path = format!("repos/{nwo}/issues/{pr}/comments?per_page=100");
-    let stdout =
-        gh_call::ok_stdout(gh_call::read("sequence.trusted_bodies", Path::new(bin), root).args([
-            "api",
-            &path,
-            "--paginate",
-        ]))?;
+    let stdout = gh_call::ok_stdout(gh_call::read(op, Path::new(bin), root).args([
+        "api",
+        &path,
+        "--paginate",
+    ]))?;
     crate::comment_trust::TrustPolicy::for_root(root).trusted_bodies(&stdout)
 }
 

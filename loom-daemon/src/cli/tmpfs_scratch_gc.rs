@@ -1,5 +1,5 @@
 //! `loom-daemon tmpfs-scratch-gc` handler (Issue #8512) — CLI front-end for
-//! [`loom_daemon::tmpfs_reclaim`]. Purely file-based; does not require a
+//! [`crate::tmpfs_reclaim`]. Purely file-based; does not require a
 //! running daemon (mirrors `TargetDirGc`).
 //!
 //! The handler resolves the **same** settings the daemon's own reaper pass
@@ -15,7 +15,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde_json::json;
 
-use loom_daemon::tmpfs_reclaim::{self, TmpfsReclaimReport};
+use crate::tmpfs_reclaim::{self, TmpfsReclaimReport};
 
 pub(crate) fn handle_tmpfs_scratch_gc_command(
     staleness_secs: Option<u64>,

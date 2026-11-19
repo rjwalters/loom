@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr retarget-children` (#9372): the gate in front of
 //! `merge-pr.sh`'s post-merge remote-branch delete. See
-//! [`loom_daemon::merge_pr::retarget_children`] for the failure it closes.
+//! [`crate::merge_pr::retarget_children`] for the failure it closes.
 //!
 //! # Exit codes
 //!
@@ -17,7 +17,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::retarget_children::{prepare_delete, GhForge, Level, Verdict};
+use crate::merge_pr::retarget_children::{prepare_delete, GhForge, Level, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct RetargetChildrenArgs {
@@ -33,11 +33,23 @@ pub(crate) struct RetargetChildrenArgs {
     /// Empty means unknown, which keeps the branch if any child exists.
     #[arg(long, value_name = "BRANCH", default_value = "")]
     base: String,
+
+    /// Directory holding `reconcile-stack.sh`, used to rebase children of a
+    /// parent on a non-`feature/issue-<N>` branch before retargeting (#13332).
+    #[arg(long, value_name = "DIR", default_value = "")]
+    script_dir: String,
 }
 
 impl RetargetChildrenArgs {
     pub(crate) fn run(self) -> Result<()> {
-        let report = prepare_delete(&GhForge, &self.repo, &self.parent_branch, &self.base);
+        let report = prepare_delete(
+            &GhForge {
+                script_dir: self.script_dir,
+            },
+            &self.repo,
+            &self.parent_branch,
+            &self.base,
+        );
         for (level, msg) in &report.lines {
             let tag = match level {
                 Level::Info => "INFO",

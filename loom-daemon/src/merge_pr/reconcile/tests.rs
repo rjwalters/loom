@@ -335,3 +335,28 @@ fn the_defer_comment_names_the_child_the_parent_and_the_manual_command() {
         "the retired shell's comment=\"…\" had no trailing newline"
     );
 }
+
+// ---------------------------------------------------------------------------
+// route_with_lease — #12759 AC7: loom:building defers only while a lease is live.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn building_child_with_no_live_lease_reconciles() {
+    let d = child_route(Some("7"), b"loom:building\n");
+    assert_eq!(d.route, Route::Defer);
+    assert_eq!(route_with_lease(d, &LeaseState::NoneFresh).route, Route::Reconcile);
+}
+
+#[test]
+fn building_child_with_held_or_unreadable_lease_still_defers() {
+    for state in [LeaseState::Held, LeaseState::Unknown] {
+        let d = child_route(Some("7"), b"loom:building\n");
+        assert_eq!(route_with_lease(d, &state).route, Route::Defer);
+    }
+}
+
+#[test]
+fn lease_never_turns_a_reconcile_into_a_defer() {
+    let d = child_route(Some("7"), b"loom:pr\n");
+    assert_eq!(route_with_lease(d, &LeaseState::Held).route, Route::Reconcile);
+}

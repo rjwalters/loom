@@ -119,7 +119,7 @@ fn a_lock_owned_by_a_dead_pid_is_broken_once() {
         owner_pid: 0x7fff_fffe,
         token: "someone-elses".to_string(),
         script: "worktree.sh".to_string(),
-        acquired_at: iso_now(),
+        acquired_at: crate::script_helpers::now_iso(),
     };
     std::fs::write(lock_path(d.path()).join("owner.json"), serde_json::to_string(&dead).unwrap())
         .unwrap();
@@ -152,8 +152,9 @@ fn an_unsignalable_pid_is_treated_as_alive() {
     // `kill(pid, 0)` failing with EPERM means the process EXISTS and is not
     // ours. Reading that as "dead" would break a live lock owned by another
     // user — the unsafe direction.
-    assert!(pid_alive(1), "pid 1 exists and is typically not signalable by us");
-    assert!(!pid_alive(0x7fff_fffe), "a genuinely absent pid is dead");
+    use crate::sweep_registry::is_pid_alive;
+    assert!(is_pid_alive(1), "pid 1 exists and is typically not signalable by us");
+    assert!(!is_pid_alive(0x7fff_fffe), "a genuinely absent pid is dead");
 }
 
 #[test]

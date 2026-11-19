@@ -1,8 +1,7 @@
 //! Prompt-cache prefix stability for scheduled role ticks (#8066) — the
 //! property that a role tick's resolved prompt carries no per-invocation
 //! volatile content, so the injected prefix stays shareable across sessions.
-//! Split out of `role_runner/tests.rs` so the over-threshold parent shrinks
-//! rather than grows (`.loom/docs/file-size-policy.md`).
+//! Split out of `role_runner/tests.rs`.
 
 use super::*;
 
@@ -50,6 +49,9 @@ fn test_role_tick_prompt_carries_no_volatile_content() {
                 spec.name,
                 resolve_architect_max_proposals(&config)
             )
+        } else if spec.name == "champion" {
+            // #11909: Champion's interval run is non-item only.
+            "/loom:champion --non-item".to_string()
         } else {
             format!("/loom:{}", spec.name)
         };

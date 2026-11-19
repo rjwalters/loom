@@ -7,7 +7,7 @@
 //! 72 h soft-hold expiry, and nothing told the operator that one human action
 //! on the head was what held them.
 //!
-//! This module supplies three pure pieces and one write:
+//! This module supplies two pure pieces and one write:
 //!
 //! - [`stall_cause`]: a PR is a **stalled head** when it has been quiet (its
 //!   `updatedAt` has not moved) for [`stall_hours`] AND it is either on a
@@ -19,9 +19,6 @@
 //!   rebased afterwards, as it already needs to be. Hard holds (no `source=`,
 //!   the human-authored shape) never release here, and consolidation
 //!   reservations (`cons-` plans, ADR-0023 §1) keep their own 72 h contract.
-//! - [`stalled_for_ordering`]: stalled no-verdict PRs sort LAST among the
-//!   placeable members of a component, so a released follower is not
-//!   re-planned straight back behind the head on the next tick.
 //! - [`escalate`]: one "operator needed" comment per stalled chain, on the
 //!   head PR, naming the action it needs and the approved PRs it holds. The
 //!   dedupe marker ([`escalation_marker`], a `sequence-stall:` key) is read
@@ -31,7 +28,6 @@
 //!   trusted comment carrying that legacy marker still counts as posted
 //!   ([`LEGACY_MARKER_PREFIX`]), so the rename re-posts nothing.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -77,13 +73,6 @@ pub fn stall_hours() -> f64 {
         .unwrap_or(DEFAULT_STALL_HOURS)
 }
 
-/// The PR's priority level (`loom:important` / `loom:very-important`,
-/// #11103), from its own labels.
-#[must_use]
-pub fn level(pr: &SequencePr) -> crate::priority_pick::Level {
-    crate::priority_pick::Level::of(&pr.labels)
-}
-
 /// Why a chain head is stalled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StallCause {
@@ -116,20 +105,6 @@ pub fn stall_cause(pr: &SequencePr, now: DateTime<Utc>, bound_hours: f64) -> Opt
         return Some(StallCause::HumanHold((*label).to_string()));
     }
     (!pr.has(APPROVED_LABEL)).then_some(StallCause::NoVerdict)
-}
-
-/// The members a component orders LAST among the placeable: stalled PRs
-/// without a verdict. (Human-held PRs are already ineligible for ordering.)
-#[must_use]
-pub fn stalled_for_ordering(
-    open: &[SequencePr],
-    now: DateTime<Utc>,
-    bound_hours: f64,
-) -> BTreeSet<u32> {
-    open.iter()
-        .filter(|p| stall_cause(p, now, bound_hours) == Some(StallCause::NoVerdict))
-        .map(|p| p.number)
-        .collect()
 }
 
 /// [`super::hold_action`], plus the stalled-head release: a soft hold that

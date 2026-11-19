@@ -19,9 +19,11 @@
 #
 # (the same HTML-comment marker convention as `<!-- loom:standdown claim=... -->`
 # and `<!-- loom:fallback-evaluated sha=... -->`), so the verdict records which
-# tree it covers. This script compares that recorded SHA against the PR's
-# CURRENT head SHA and reports FRESH / STALE, optionally performing the
-# clear+re-queue transition itself.
+# tree it covers. `approved` / `changes-requested` are the canonical spellings
+# writers emit; readers also tolerate `approve` / `request-changes`. This
+# script compares that recorded SHA against the PR's CURRENT head SHA and
+# reports FRESH / STALE, optionally performing the clear+re-queue transition
+# itself.
 #
 # Decision, in priority order (first match wins):
 #   1. NOT_OPEN     — the PR is no longer open (merged, or closed unmerged).
@@ -65,6 +67,12 @@
 #                     either because the newest matching marker's SHA equals the
 #                     current head SHA, or because the head moved but the two
 #                     commits' TREES are byte-identical (#9576 — see below).
+#  4b. FRESH (operator send-back, #13586) — `loom:changes-requested` only: the
+#                     marker is older than the head, but the latest `labeled`
+#                     timeline event for the label is by a trusted actor, newer
+#                     than the marker, with no commit / force-push after it. A
+#                     human's direct label writes no marker of its own. Any
+#                     unreadable or untrusted evidence falls through to 5.
 #   5. STALE        — the newest matching marker's SHA differs from the current
 #                     head SHA AND the trees differ (or the comparison could not
 #                     be made). The verdict describes a tree that no longer
@@ -176,7 +184,7 @@
 # mutation inline here in `gh api graphql` plus two comment bodies; review
 # rejected it (PR #8990) as exactly the new portable shell
 # `.loom/docs/shell-language-policy.md` forbids — new executable logic is a
-# loom-daemon subcommand — and the shell-budget ratchet refused the PR outright.
+# loom-daemon subcommand.
 # Do NOT reintroduce an inline mutation "as a fallback for hosts without
 # loom-daemon": that duplication is the thing that was rejected. A host that
 # cannot resolve the binary gets AUTO_MERGE_DISARMED=0 and a named failure in
@@ -500,8 +508,15 @@ COMMENTS_JSON="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<<"$C
 # body is filtered out via `select` rather than raising a per-item jq error.
 # A short (abbreviated) SHA is accepted defensively but never emitted by the
 # roles, which always stamp the full `headRefOid`.
-MARKER_TEST="<!-- loom:verdict-sha sha=[0-9a-f]{7,40} verdict=$VERDICT_TOKEN -->"
-MARKER_CAPTURE="<!-- loom:verdict-sha sha=(?<sha>[0-9a-f]{7,40}) verdict=$VERDICT_TOKEN -->"
+# Readers are lenient about the verdict spelling (a hand-posted or in-session
+# marker may say `approve` / `request-changes`); writers stay canonical.
+case "$VERDICT_TOKEN" in
+  approved) VERDICT_ALT='approved|approve' ;;
+  changes-requested) VERDICT_ALT='changes-requested|request-changes' ;;
+  *) VERDICT_ALT="$VERDICT_TOKEN" ;;
+esac
+MARKER_TEST="<!-- loom:verdict-sha sha=[0-9a-f]{7,40} verdict=($VERDICT_ALT) -->"
+MARKER_CAPTURE="<!-- loom:verdict-sha sha=(?<sha>[0-9a-f]{7,40}) verdict=($VERDICT_ALT) -->"
 MARKER_LINES="$(jq -r --arg t "$MARKER_TEST" --arg c "$MARKER_CAPTURE" '
   .[]
   | select(.body != null and (.body | test($t)))
@@ -512,10 +527,8 @@ MARKER_LINES="$(jq -r --arg t "$MARKER_TEST" --arg c "$MARKER_CAPTURE" '
 # Newest marker wins (the lines are oldest-first). The `-n "$MARKER_LINES"`
 # guard this used to carry was redundant — `tail -n 1` of the empty string is an
 # empty line and `cut -f2` of an empty line is empty, so MARKER_SHA comes out ""
-# either way, which is the value the UNVERIFIABLE branch below keys on. Dropping
-# it pays for the three lines the #8900 disarm delegation adds above, per option
-# 2 of the shell-budget gate's own remedies ("remove portable shell elsewhere in
-# the same change to pay for it"); cases (g)/(h)/(i) cover the no-marker path.
+# either way, which is the value the UNVERIFIABLE branch below keys on.
+# Cases (g)/(h)/(i) cover the no-marker path.
 MARKER_SHA="$(tail -n 1 <<<"$MARKER_LINES" | cut -f2)"
 
 # #9258: an APPROVAL with no trusted marker is STALE, not UNVERIFIABLE — never
@@ -594,9 +607,62 @@ FRESH_REASON=""
 if [[ -n "$MARKER_SHA" && "${HEAD_SHA:0:${#MARKER_SHA}}" == "$MARKER_SHA" ]]; then
   FRESH_REASON="verdict $VERDICT_LABEL was rendered against the current head SHA"
 elif [[ -n "$MARKER_SHA" ]]; then
-  EQUIV_KIND="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent "$PR" "$MARKER_SHA" "$HEAD_SHA" 2>"$GH_STDERR" | sed -n 's/^EQUIVALENCE_KIND=//p')"
+  # #13150: name the repo when one is known (LOOM_REPO, else the vetted write repo) so the
+  # answer does not depend on cwd. A daemon predating `--repo` (#13146) rejects the flag with
+  # nothing on stdout; retry once without it so that degrades to the old cwd resolution, not STALE.
+  EQUIV_REPO="${LOOM_REPO:-$WRITE_REPO}"
+  EQUIV_KIND=""
+  if [[ -n "$EQUIV_REPO" ]]; then
+    EQUIV_KIND="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent --repo "$EQUIV_REPO" "$PR" "$MARKER_SHA" "$HEAD_SHA" 2>"$GH_STDERR" | sed -n 's/^EQUIVALENCE_KIND=//p')"
+  fi
+  if [[ -z "$EQUIV_KIND" ]] && { [[ -z "$EQUIV_REPO" ]] || grep -q -- '--repo' "$GH_STDERR" 2>/dev/null; }; then
+    EQUIV_KIND="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge verdict-equivalent "$PR" "$MARKER_SHA" "$HEAD_SHA" 2>"$GH_STDERR" | sed -n 's/^EQUIVALENCE_KIND=//p')"
+  fi
   EQUIV_WHY="$(sed -n 's/.* Why: //p' "$GH_STDERR" | head -n 1)"; if [[ -n "$EQUIV_KIND" ]]; then
     FRESH_REASON="verdict $VERDICT_LABEL was rendered against $MARKER_SHA and head is now $HEAD_SHA, but the change this PR makes is unchanged across the move (equivalence kind: $EQUIV_KIND) — so the verdict still describes it (#9576, #9416). CI still re-runs against $HEAD_SHA; only the review carries over."
+  fi
+fi
+
+# --- Step 4b: a trusted actor's own send-back at THIS head (#13586) ----------
+# A human applying `loom:changes-requested` directly writes no marker, so the
+# newest marker names an OLDER verdict's SHA and step 4 reads the operator's
+# send-back as stale. The evidence that it was applied at the current head is
+# the timeline: the latest `labeled loom:changes-requested` event, by a trusted
+# actor, newer than the marker comment, with no commit / force-push after it.
+# `loom:changes-requested` only: an approval keeps the strict marker rule.
+# Fail closed: an unreadable timeline, an untrusted or unverifiable actor, or any
+# missing field leaves FRESH_REASON empty, so the marker-vs-head result stands.
+# Plain `gh` (no cache), like the comment read above.
+if [[ -z "$FRESH_REASON" && -n "$MARKER_SHA" && "$VERDICT_TOKEN" == changes-requested ]]; then
+  MARKER_AT="$(tail -n 1 <<<"$MARKER_LINES" | cut -f1)"
+  TIMELINE_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/timeline" --paginate 2>/dev/null)" || TIMELINE_JSON=""
+  # Chronological array; take the latest matching `labeled` event, then check no
+  # head-moving event follows it (by position, not by commit date, which can
+  # predate the push).
+  LABEL_EVT="$(jq -rs --arg l "$VERDICT_LABEL" '
+    [.[] | if type == "array" then .[] else . end] as $t
+    | ([range(0; $t | length) | select($t[.].event == "labeled" and $t[.].label.name == $l)] | last) as $i
+    | if $i == null then empty
+      else [$t[$i].actor.login // "", $t[$i].created_at // "",
+            ([$t[($i + 1):][] | select(.event == "committed" or .event == "head_ref_force_pushed")] | length | tostring)] | @tsv
+      end
+  ' <<<"$TIMELINE_JSON" 2>/dev/null || true)"
+  if [[ -n "$LABEL_EVT" ]]; then
+    IFS=$'\t' read -r LABEL_ACTOR LABEL_AT LABEL_MOVED <<<"$LABEL_EVT"
+    if [[ -n "$LABEL_ACTOR" && -n "$LABEL_AT" && "$LABEL_MOVED" == 0 && -n "$MARKER_AT" && "$LABEL_AT" > "$MARKER_AT" ]]; then
+      # Trust is the daemon's predicate (#9548), fed a one-item listing. A
+      # timeline event carries no author_association, so a repo insider is
+      # proved by write+ permission on the repo.
+      ASSOC="NONE"
+      PERM="$(gh api "repos/{owner}/{repo}/collaborators/$LABEL_ACTOR/permission" --jq '.permission' 2>/dev/null || true)"
+      case "$PERM" in admin|maintain|write) ASSOC="COLLABORATOR" ;; esac
+      # requires-daemon: forge optional   Without `trusted-comments` the actor counts as untrusted and the marker comparison stands (STALE) — the fail-safe answer.
+      TRUSTED_ACTOR="$(jq -nc --arg u "$LABEL_ACTOR" --arg a "$ASSOC" '[{user:{login:$u},author_association:$a}]' \
+        | "${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments 2>/dev/null | jq -r 'length' 2>/dev/null || true)"
+      if [[ "$TRUSTED_ACTOR" == 1 ]]; then
+        FRESH_REASON="verdict $VERDICT_LABEL was applied by trusted actor $LABEL_ACTOR at $LABEL_AT after the newest marker (for $MARKER_SHA), and the head has not moved since — so it describes the current head $HEAD_SHA (#13586)"
+      fi
+    fi
   fi
 fi
 
@@ -624,8 +690,7 @@ if [[ "$CLEAR" -eq 1 ]]; then
   # The binary is probed through ${LOOM_DAEMON_BIN:-loom-daemon}, the first two
   # tiers of lib/locate-daemon-bin.sh's own precedence (explicit override, then
   # $PATH). The full resolver is NOT sourced here on purpose: it would add more
-  # portable shell to this `contract`-category script than the whole delegation
-  # does, which the shell-budget ratchet refuses.
+  # shell to this script than the whole delegation does.
   #
   # stderr is deliberately NOT redirected — a failed disarm must reach the
   # caller's stderr, not a temp file nobody reads. An unresolvable binary or a

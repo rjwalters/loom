@@ -163,6 +163,25 @@ fn shipped_safe_codex_roles_are_admitted() {
     );
 }
 
+/// Issue #13749: the ratification lane invokes `ratification-ee` /
+/// `ratification-market`; both must be admitted as Judge aliases (not new
+/// canonical roles, so no `runtimes.roles` key), while other unknown names
+/// still reject.
+#[test]
+fn ratification_reviewer_sessions_are_judge_aliases() {
+    let _env = ClearedLoomRuntimeEnv::new();
+    let d = fixture();
+    for name in ["ratification-ee", "ratification-market"] {
+        assert_eq!(canonical_role(name), Some("judge"), "{name}");
+        let admitted = resolve_and_admit(d.path(), name, None).unwrap();
+        assert_eq!(admitted.role, "judge", "{name}");
+        assert_eq!(admitted.runtime, "claude", "{name}");
+        assert!(!KNOWN_ROLE_KEYS.contains(&name), "{name} must not be a role key");
+    }
+    assert_eq!(canonical_role("ratification-other"), None);
+    assert!(resolve_and_admit(d.path(), "ratification-other", None).is_err());
+}
+
 /// Issue #8561: `defaults/runtimes/kimi.json` declares every capability
 /// `"no"` (no on-disk copy is written by [`fixture`], so this exercises
 /// the compiled-in [`BUNDLED_RUNTIME_MANIFESTS`] fallback). Curator
@@ -760,6 +779,7 @@ fn rejection_serialization_is_structured_backward_compatible_and_secret_free() {
         source: RuntimeSource::RoleConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     };
     let json = serde_json::to_string(&rejection).unwrap();
     assert!(json.contains("\"role\":\"builder\""));
@@ -897,4 +917,51 @@ fn native_adapter_fails_closed_naming_both_attempts_when_replacement_is_gone() {
         "{}",
         rejected.reason
     );
+}
+
+// #9851: `.cargo/config.toml` `[env]` forces every runtime pin
+// `resolve_binding` reads to "" so an agent session's inherited pin cannot
+// reroute unit tests. Ties that list to the role set here so a new role is
+// not silently left out.
+#[test]
+fn cargo_env_clears_every_role_runtime_pin() {
+    let aliases = [
+        "curator",
+        "issue-curator",
+        "judge",
+        "code-review-specialist",
+        "builder",
+        "development-worker",
+        "doctor",
+        "pr-fixer",
+        "champion",
+        "auditor",
+        "guide",
+        "architect",
+        "hermit",
+        "driver",
+        "loom",
+        "sweep-lifecycle",
+        "sweep",
+    ];
+    for alias in aliases {
+        let canonical = canonical_role(alias).unwrap();
+        assert!(KNOWN_ROLE_KEYS.contains(&canonical), "{canonical} missing from KNOWN_ROLE_KEYS");
+    }
+    let cfg_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.cargo/config.toml");
+    let cfg = fs::read_to_string(&cfg_path).unwrap();
+    let forced = |var: &str| {
+        cfg.lines()
+            .any(|l| l.trim() == format!(r#"{var} = {{ value = "", force = true }}"#))
+    };
+    assert!(
+        forced("LOOM_RUNTIME"),
+        "LOOM_RUNTIME not forced empty in {}",
+        cfg_path.display()
+    );
+    for role in KNOWN_ROLE_KEYS {
+        assert_eq!(canonical_role(role), Some(*role));
+        let var = role_env_var(role);
+        assert!(forced(&var), "{var} not forced empty in {}", cfg_path.display());
+    }
 }

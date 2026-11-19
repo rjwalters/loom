@@ -48,7 +48,6 @@ pub enum ErrorDomain {
     Internal,
 }
 
-#[allow(dead_code)]
 impl ErrorDomain {
     /// Returns true if errors in this domain are typically recoverable with retry
     #[must_use]
@@ -57,18 +56,6 @@ impl ErrorDomain {
             self,
             ErrorDomain::Tmux | ErrorDomain::Ipc | ErrorDomain::Git | ErrorDomain::Filesystem
         )
-    }
-
-    /// Returns the default retry delay for this domain in milliseconds
-    #[must_use]
-    pub fn default_retry_delay_ms(self) -> u64 {
-        match self {
-            ErrorDomain::Tmux => 2000,
-            ErrorDomain::Ipc | ErrorDomain::Filesystem => 1000,
-            ErrorDomain::Git | ErrorDomain::Terminal => 500,
-            ErrorDomain::Activity => 100,
-            ErrorDomain::Configuration | ErrorDomain::Internal => 0,
-        }
     }
 }
 
@@ -89,64 +76,34 @@ impl fmt::Display for ErrorDomain {
 
 /// Error codes provide fine-grained error identification within a domain.
 ///
-/// Format: `DOMAIN_SPECIFIC_ERROR` (e.g., `TMUX_NO_SERVER`, `GIT_DIRTY_WORKTREE`)
+/// Format: `DOMAIN_SPECIFIC_ERROR` (e.g., `TMUX_NO_SERVER`, `ACTIVITY_DB_LOCKED`)
 /// These codes are stable and can be used for programmatic error handling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorCode(pub String);
 
-#[allow(dead_code)]
 impl ErrorCode {
     // Tmux error codes
     pub const TMUX_NO_SERVER: &'static str = "TMUX_NO_SERVER";
     pub const TMUX_SESSION_NOT_FOUND: &'static str = "TMUX_SESSION_NOT_FOUND";
-    pub const TMUX_SESSION_EXISTS: &'static str = "TMUX_SESSION_EXISTS";
-    pub const TMUX_PIPE_FAILED: &'static str = "TMUX_PIPE_FAILED";
-    pub const TMUX_COMMAND_FAILED: &'static str = "TMUX_COMMAND_FAILED";
 
     // IPC error codes
-    pub const IPC_CONNECTION_FAILED: &'static str = "IPC_CONNECTION_FAILED";
-    pub const IPC_TIMEOUT: &'static str = "IPC_TIMEOUT";
     pub const IPC_PROTOCOL_ERROR: &'static str = "IPC_PROTOCOL_ERROR";
-    pub const IPC_SERIALIZATION_FAILED: &'static str = "IPC_SERIALIZATION_FAILED";
-
-    // Git error codes
-    pub const GIT_WORKTREE_EXISTS: &'static str = "GIT_WORKTREE_EXISTS";
-    pub const GIT_WORKTREE_NOT_FOUND: &'static str = "GIT_WORKTREE_NOT_FOUND";
-    pub const GIT_DIRTY_STATE: &'static str = "GIT_DIRTY_STATE";
-    pub const GIT_MERGE_CONFLICT: &'static str = "GIT_MERGE_CONFLICT";
-    pub const GIT_COMMAND_FAILED: &'static str = "GIT_COMMAND_FAILED";
-    pub const GIT_NOT_REPOSITORY: &'static str = "GIT_NOT_REPOSITORY";
-
-    // Filesystem error codes
-    pub const FS_NOT_FOUND: &'static str = "FS_NOT_FOUND";
-    pub const FS_PERMISSION_DENIED: &'static str = "FS_PERMISSION_DENIED";
-    pub const FS_ALREADY_EXISTS: &'static str = "FS_ALREADY_EXISTS";
-    pub const FS_IO_ERROR: &'static str = "FS_IO_ERROR";
 
     // Configuration error codes
-    pub const CONFIG_INVALID_JSON: &'static str = "CONFIG_INVALID_JSON";
-    pub const CONFIG_MISSING_FIELD: &'static str = "CONFIG_MISSING_FIELD";
-    pub const CONFIG_INVALID_VALUE: &'static str = "CONFIG_INVALID_VALUE";
-    pub const CONFIG_FILE_NOT_FOUND: &'static str = "CONFIG_FILE_NOT_FOUND";
     pub const CONFIG_WORKSPACE_AMBIGUOUS: &'static str = "CONFIG_WORKSPACE_AMBIGUOUS";
     pub const CONFIG_WORKSPACE_UNREGISTERED: &'static str = "CONFIG_WORKSPACE_UNREGISTERED";
 
     // Activity database error codes
     pub const ACTIVITY_DB_LOCKED: &'static str = "ACTIVITY_DB_LOCKED";
-    pub const ACTIVITY_DB_CORRUPTED: &'static str = "ACTIVITY_DB_CORRUPTED";
     pub const ACTIVITY_QUERY_FAILED: &'static str = "ACTIVITY_QUERY_FAILED";
-    pub const ACTIVITY_SCHEMA_ERROR: &'static str = "ACTIVITY_SCHEMA_ERROR";
 
     // Terminal error codes
     pub const TERMINAL_NOT_FOUND: &'static str = "TERMINAL_NOT_FOUND";
     pub const TERMINAL_INVALID_ID: &'static str = "TERMINAL_INVALID_ID";
-    pub const TERMINAL_ALREADY_EXISTS: &'static str = "TERMINAL_ALREADY_EXISTS";
-    pub const TERMINAL_STATE_ERROR: &'static str = "TERMINAL_STATE_ERROR";
 
     // Internal error codes
     pub const INTERNAL_MUTEX_POISONED: &'static str = "INTERNAL_MUTEX_POISONED";
     pub const INTERNAL_UNEXPECTED_STATE: &'static str = "INTERNAL_UNEXPECTED_STATE";
-    pub const INTERNAL_ASSERTION_FAILED: &'static str = "INTERNAL_ASSERTION_FAILED";
 
     /// Creates a new error code
     #[must_use]
@@ -194,7 +151,6 @@ pub struct DaemonError {
     pub recovery_hint: Option<String>,
 }
 
-#[allow(dead_code)]
 impl DaemonError {
     /// Creates a new daemon error with required fields
     #[must_use]
@@ -250,62 +206,6 @@ impl DaemonError {
         .with_recovery_hint("The tmux server may need to be started. Try running `tmux -L loom new-session` or restart the Loom daemon.")
     }
 
-    /// Creates a "tmux session not found" error
-    #[must_use]
-    pub fn tmux_session_not_found(session_name: &str) -> Self {
-        Self::new(
-            ErrorDomain::Tmux,
-            ErrorCode::TMUX_SESSION_NOT_FOUND,
-            format!("tmux session '{session_name}' not found"),
-        )
-        .with_details(serde_json::json!({ "session_name": session_name }))
-        .with_recovery_hint(
-            "The terminal session may have been killed. Try restarting the terminal.",
-        )
-    }
-
-    /// Creates a "tmux pipe failed" error
-    #[must_use]
-    pub fn tmux_pipe_failed(session_name: &str, details: &str) -> Self {
-        Self::new(
-            ErrorDomain::Tmux,
-            ErrorCode::TMUX_PIPE_FAILED,
-            format!("Failed to set up output capture for session '{session_name}'"),
-        )
-        .with_details(serde_json::json!({
-            "session_name": session_name,
-            "stderr": details
-        }))
-    }
-
-    // Terminal errors
-    /// Creates a "terminal not found" error
-    #[must_use]
-    pub fn terminal_not_found(terminal_id: &str) -> Self {
-        Self::new(
-            ErrorDomain::Terminal,
-            ErrorCode::TERMINAL_NOT_FOUND,
-            format!("Terminal '{terminal_id}' not found"),
-        )
-        .recoverable(false)
-        .with_details(serde_json::json!({ "terminal_id": terminal_id }))
-    }
-
-    /// Creates an "invalid terminal ID" error
-    #[must_use]
-    pub fn terminal_invalid_id(terminal_id: &str, reason: &str) -> Self {
-        Self::new(
-            ErrorDomain::Terminal,
-            ErrorCode::TERMINAL_INVALID_ID,
-            format!("Invalid terminal ID '{terminal_id}': {reason}"),
-        )
-        .recoverable(false)
-        .with_details(serde_json::json!({
-            "terminal_id": terminal_id,
-            "reason": reason
-        }))
-    }
-
     // Activity database errors
     /// Creates a "database lock failed" error
     #[must_use]
@@ -330,32 +230,6 @@ impl DaemonError {
             "operation": operation,
             "error": error
         }))
-    }
-
-    // Git errors
-    /// Creates a "not a git repository" error
-    #[must_use]
-    pub fn git_not_repository(path: &str) -> Self {
-        Self::new(
-            ErrorDomain::Git,
-            ErrorCode::GIT_NOT_REPOSITORY,
-            format!("'{path}' is not a git repository"),
-        )
-        .recoverable(false)
-        .with_details(serde_json::json!({ "path": path }))
-    }
-
-    // Filesystem errors
-    /// Creates a "file not found" error
-    #[must_use]
-    pub fn fs_not_found(path: &str) -> Self {
-        Self::new(
-            ErrorDomain::Filesystem,
-            ErrorCode::FS_NOT_FOUND,
-            format!("File or directory not found: {path}"),
-        )
-        .recoverable(false)
-        .with_details(serde_json::json!({ "path": path }))
     }
 
     // IPC errors
@@ -524,7 +398,6 @@ impl From<anyhow::Error> for DaemonError {
 }
 
 /// Result type alias for daemon operations
-#[allow(dead_code)]
 pub type DaemonResult<T> = Result<T, DaemonError>;
 
 #[cfg(test)]
@@ -543,14 +416,6 @@ mod tests {
         let parsed: DaemonError = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.domain, ErrorDomain::Tmux);
         assert_eq!(parsed.code.0, ErrorCode::TMUX_NO_SERVER);
-    }
-
-    #[test]
-    fn test_error_with_details() {
-        let error = DaemonError::terminal_not_found("terminal-1");
-        assert!(error.details.is_some());
-        let details = error.details.unwrap();
-        assert_eq!(details["terminal_id"], "terminal-1");
     }
 
     #[test]

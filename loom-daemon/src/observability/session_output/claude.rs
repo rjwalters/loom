@@ -131,16 +131,6 @@ pub struct Pass {
 }
 
 impl Cursor {
-    /// A cursor whose first reported line is the one starting at byte
-    /// `floor` (#10116). The retained-tail rule still applies from there.
-    #[must_use]
-    pub fn starting_at(floor: u64) -> Self {
-        Cursor {
-            floor,
-            ..Cursor::default()
-        }
-    }
-
     /// Bytes of the file consumed so far.
     #[must_use]
     pub fn offset(&self) -> u64 {

@@ -15,6 +15,14 @@ fn rec(head: &str, labels: &str) -> NoVerdict {
     NoVerdict {
         head: head.into(),
         labels: labels.into(),
+        refused: None,
+    }
+}
+
+fn refused(head: &str, labels: &str, token: &str) -> NoVerdict {
+    NoVerdict {
+        refused: Some(token.into()),
+        ..rec(head, labels)
     }
 }
 
@@ -212,4 +220,68 @@ fn reaped_timeout_records_count_toward_the_window() {
     // The reason can never break the marker.
     assert!(reaped_fields(HEAD, &labels, "time out -->").ends_with(" reaped=timeout"));
     assert!(reaped_fields(HEAD, &labels, "  ").ends_with(" reaped=unknown"));
+}
+
+/// #11972: only the pass's own `ci-pending` is a pending-CI skip; no reason,
+/// or an unknown one, keeps the default.
+#[test]
+fn only_ci_pending_is_a_pending_ci_skip() {
+    assert!(skipped_for_pending_ci(Some(SKIP_CI_PENDING)));
+    assert!(skipped_for_pending_ci(Some(" ci-pending\n")));
+    assert!(!skipped_for_pending_ci(None));
+    assert!(!skipped_for_pending_ci(Some("")));
+    assert!(!skipped_for_pending_ci(Some("timeout")));
+}
+
+#[test]
+fn a_gate_refused_record_round_trips_and_sanitises_its_token() {
+    let fields = refused_fields(HEAD, &["loom:review-requested"], "stale-read");
+    let body = format!("{RELEASED_JUDGE_PREFIX}host=h sweep=s{fields} -->\nx");
+    assert_eq!(parse(&body), Some(refused(HEAD, "review-requested", "stale-read")));
+    assert_eq!(refusal_token(Some("gate-refused:Stale Read!-->")), Some("taleead--".into()));
+    assert_eq!(refusal_token(Some("gate-refused:")), Some("unknown".into()));
+    assert_eq!(refusal_token(Some("ci-pending")), None);
+    assert_eq!(refusal_token(None), None);
+}
+
+#[test]
+fn a_gate_refused_pass_only_cools_down_briefly_and_never_escalates() {
+    let r = |m: i64| (t(0) + Duration::minutes(m), refused(HEAD, "review-requested", "stale-read"));
+    let held = |records: &[(DateTime<Utc>, NoVerdict)], m: i64| {
+        hold(records, HEAD, "review-requested", t(0) + Duration::minutes(m))
+    };
+    let cool = Duration::minutes(REFUSED_COOLDOWN_MINUTES);
+    assert_eq!(held(&[r(0)], 5), Some((t(0) + cool, Some("stale-read".into()))));
+    assert_eq!(held(&[r(0)], REFUSED_COOLDOWN_MINUTES), None);
+    // Three refused records never reach the window hold.
+    let three = [r(0), r(20), r(40)];
+    assert_eq!(held(&three, 41).map(|h| h.0), Some(t(0) + Duration::minutes(40) + cool));
+    assert_eq!(held(&three, 56), None);
+}
+
+#[test]
+fn refused_and_ordinary_records_mix_by_the_later_end() {
+    let ord = (t(0), rec(HEAD, "review-requested"));
+    let refd = (t(0) + Duration::minutes(10), refused(HEAD, "review-requested", "verdict-gate"));
+    let at = |m: i64| t(0) + Duration::minutes(m);
+    // The ordinary 1 h hold outlasts the cool-down: no reason is named.
+    assert_eq!(
+        hold(&[ord.clone(), refd.clone()], HEAD, "review-requested", at(12)),
+        Some((t(1), None))
+    );
+    // The refused record does not count: one ordinary record still holds 1 h.
+    let many = [ord, refd.clone(), refd.clone(), refd];
+    assert_eq!(hold_until(&many, HEAD, "review-requested", at(12)), Some(t(1)));
+}
+
+/// #13758: a finished run GitHub left at `in_progress` is not pending.
+#[test]
+fn stuck_in_progress_run_with_conclusion_is_not_pending() {
+    let page = serde_json::json!({"total_count": 2, "check_runs": [
+        {"status": "in_progress", "conclusion": "success",
+         "completed_at": "2026-11-10T03:25:28Z", "started_at": "a"},
+        {"status": "in_progress", "conclusion": "success",
+         "completed_at": null, "started_at": "b"},
+    ]});
+    assert_eq!(pending_check_runs(&page), vec!["b".to_string()]);
 }

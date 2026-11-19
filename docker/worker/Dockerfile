@@ -91,6 +91,8 @@ ARG DEBIAN_FRONTEND=noninteractive
 # and the `cli.github.com` repo are not rewritten — the retries cover them. An
 # arm64 base uses `ports.ubuntu.com`, which has nothing to rewrite, so a set
 # APT_MIRROR there only warns.
+# USN-8944-1: reject pre-revocation CA bundles and invalidate cached apt layers.
+ARG CA_CERTIFICATES_MIN_VERSION=20260816ubuntu0.24.04.1
 ARG APT_MIRROR=
 RUN printf '%s\n' \
         'Acquire::Retries "5";' \
@@ -122,6 +124,7 @@ RUN apt-get update -qq \
         openssh-client \
         unzip \
         less \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge "${CA_CERTIFICATES_MIN_VERSION}" \
     && mkdir -p -m 755 /etc/apt/keyrings \
     && curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \

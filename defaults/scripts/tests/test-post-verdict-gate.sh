@@ -40,6 +40,8 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export LOOM_VERDICT_LOCK_DIR="$STUB_DIR/locks"
+# #12714: the review start is the dispatch epoch in the sweep id, not the agent's word.
+export LOOM_SWEEP_ID="step-judge-1-$(date +%s)"
 
 # --- Stateful stub gh: one PR (owner/repo), comments.json + labels.txt -------
 cat > "$STUB_DIR/gh" <<'STUB'
@@ -58,6 +60,9 @@ done
 if [[ "${1:-}" == "api" ]]; then
   # the #10485 final head compare reads exactly pulls/<N> (not /reviews, /comments)
   if [[ "$method" == GET && "$path" =~ ^repos/owner/repo/pulls/[0-9]+$ ]]; then cat "$D/cur-sha"; exit 0; fi
+  # #13927: a wedged formal-reviews read — the reconciliation gate's fetch
+  # never writes and never exits on its own.
+  [[ -f "$D/rev-hang" && "$path" == *"/reviews"* ]] && sleep 30
   case "$method $path" in
     "GET repos/owner/repo/issues/"*/comments)
       cat "$D/comments.json"; exit 0 ;;
@@ -68,6 +73,12 @@ if [[ "${1:-}" == "api" ]]; then
       [[ -f "$D/labels-post-fail" || -f "$D/labels-write-fail" ]] && { echo "HTTP 403" >&2; exit 1; }
       for l in "${adds[@]}"; do grep -qxF "$l" "$D/labels.txt" || echo "$l" >> "$D/labels.txt"; done
       echo '[]'; exit 0 ;;
+    "GET repos/owner/repo/issues/"[0-9]*)
+      # #12614: the PR / linked-issue objects the stale-read check re-reads.
+      n="${path##*/}"
+      [[ -f "$D/issue-$n-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
+      [[ -f "$D/issue-$n.json" ]] && { cat "$D/issue-$n.json"; exit 0; }
+      echo '{"body":""}'; exit 0 ;;
     "DELETE repos/owner/repo/issues/comments/"*)
       jq --argjson id "${path##*/}" 'map(select(.id != $id))' "$D/comments.json" > "$D/c.tmp" && mv "$D/c.tmp" "$D/comments.json"; exit 0 ;;
     "DELETE repos/owner/repo/issues/"*/labels/*)
@@ -77,6 +88,13 @@ if [[ "${1:-}" == "api" ]]; then
       grep -vxF "$l" "$D/labels.txt" > "$D/labels.tmp"; mv "$D/labels.tmp" "$D/labels.txt"; exit 0 ;;
   esac
   # The #7647 review gate's reads: a clean, empty review state.
+  if [[ "${2:-}" == "graphql" && "$*" == *userContentEdits* ]]; then
+    # #12714: the linked issue's body-edit history.
+    if [[ -f "$D/edits-read-fail" ]]; then echo "HTTP 502" >&2; exit 1; fi
+    if [[ -f "$D/edits.json" ]]; then cat "$D/edits.json"; else
+      echo '{"data":{"repository":{"issueOrPullRequest":{"userContentEdits":{"nodes":[]}}}}}'; fi
+    exit 0
+  fi
   if [[ "${2:-}" == "graphql" ]]; then
     printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}\n'
   fi
@@ -115,9 +133,23 @@ STUB
 chmod +x "$STUB_DIR/gh"
 export PATH="$STUB_DIR:$PATH"
 
-# The comment itself goes over the gh ladder (pinned by test-post-verdict.sh);
-# the gate and label verbs are the real binary's, through LOOM_DAEMON_BIN.
-printf '#!/usr/bin/env bash\nexit 127\n' > "$STUB_DIR/self-daemon"
+# The comment goes through the daemon chokepoint (#9865: the only comment
+# path); this self-daemon lands it on the stub gh as `issue comment`. The gate
+# and label verbs are the real binary's, through LOOM_DAEMON_BIN.
+cat > "$STUB_DIR/self-daemon" <<'SELF'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "forge comment" ]]; then
+  _n="$3"; shift 3; _repo=""; _body=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --repo) _repo="$2"; shift 2 ;; --body) _body="$2"; shift 2 ;; *) shift ;; esac
+  done
+  exec gh issue comment "$_n" --repo "$_repo" --body "$_body"
+fi
+# #12475: the reconciliation gate reads comment verdicts through the trust
+# filter on this binary; the stub gh lists none, so echo the (empty) stdin.
+if [[ "${1:-} ${2:-}" == "forge trusted-comments" ]]; then cat; exit 0; fi
+exit 127
+SELF
 chmod +x "$STUB_DIR/self-daemon"
 export LOOM_DAEMON_SELF_BIN="$STUB_DIR/self-daemon"
 # #10485: approvals also pass the exact-head CI gate. Its reader is not under
@@ -127,6 +159,8 @@ REAL_DAEMON="${LOOM_DAEMON_BIN:-loom-daemon}"
 cat > "$STUB_DIR/daemon" <<WRAP
 #!/usr/bin/env bash
 [[ "\${1:-} \${2:-}" == "forge wait-checks" ]] && { echo "LOOM-CHECKS-GREEN \$(cat "$STUB_DIR/cur-sha")"; exit 0; }
+# #13055: approvals are gated on a live Judge lease; the caller holds it here.
+[[ "\${1:-} \${2:-} \${3:-}" == "lease pr check" ]] && { echo "PR_LEASE_STATE=held-self"; exit 0; }
 exec "$REAL_DAEMON" "\$@"
 WRAP
 chmod +x "$STUB_DIR/daemon"
@@ -271,6 +305,7 @@ cat > "$STUB_DIR/old-daemon" <<OLD
 case "\${1:-} \${2:-}" in
   "--version "*) echo "loom-daemon 0.19.870 (pre-10581)"; exit 0 ;;
   "forge wait-checks") echo "LOOM-CHECKS-GREEN \$(cat "$STUB_DIR/cur-sha")"; exit 0 ;;
+  "lease pr") echo "PR_LEASE_STATE=held-self"; exit 0 ;;  # #13055: the caller holds the Judge lease
   "forge verdict-"*) printf "error: unrecognized subcommand '%s'\n\nUsage: loom-daemon forge <COMMAND>\n" "\$2" >&2; exit 2 ;;
 esac
 exec "$REAL_DAEMON" "\$@"
@@ -376,6 +411,118 @@ state "[]" loom:review-requested loom:reviewing
 pv 10902 approved "$HEAD" --body "@reviewer this looks good because the tests cover the fix"
 check "@mention prose still posts" 0 "$RC"
 check "@mention prose: comment posted" 10902 "$POSTED"
+
+echo "== #12614: an approval against a stale read of the spec is refused =="
+NOW_T="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PAST_T="$(date -u -d '@'"$(($(date +%s) - 3600))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$(($(date +%s) - 3600))" +%Y-%m-%dT%H:%M:%SZ)"
+OP_COMMENT="$(jq -n --arg t "$NOW_T" '[{id: 4242, body: "rescoped: review against the new body", created_at: $t, html_url: "https://example/c/4242", user: {login: "the-operator", type: "User"}, author_association: "OWNER"}]')"
+echo '{"body":"Closes #50"}' > "$STUB_DIR/issue-12614.json"
+echo '{"body":"the design as reviewed"}' > "$STUB_DIR/issue-50.json"
+OLD_HASH="$(printf %s 'the design as reviewed' | sha256sum | cut -d' ' -f1)"
+
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T"
+check "operator comment after start: exit 7" 7 "$RC"
+contains "names the comment id and author" "$OUT" "comment 4242 by the-operator"
+check "operator comment: nothing posted" "" "$POSTED"
+
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 changes-requested "$HEAD" --body "Changes requested: see the spec." --review-started "$PAST_T"
+check "changes-requested is never refused by it" 0 "$RC"
+
+# #13134: --acknowledged-comment is forwarded and excuses only the listed id.
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 4242
+check "acknowledged comment id: exit 0" 0 "$RC"
+check "acknowledged comment id: posted" 12614 "$POSTED"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 9999
+check "acknowledging a different id still refuses: exit 7" 7 "$RC"
+contains "refusal names the remedy flag" "$OUT" "--acknowledged-comment"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --acknowledged-comment 4242 --issue-body-sha "50=$(printf %s 'stale body' | sha256sum | cut -d' ' -f1)"
+check "acknowledged id never excuses a body-hash mismatch: exit 7" 7 "$RC"
+
+# #12714: the start comes from the dispatch, so omitting or lying about the flag cannot hide a comment.
+DISPATCH_T="$(($(date +%s) - 3600))"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+LOOM_SWEEP_ID="step-judge-1-$DISPATCH_T" pv 12614 approved "$HEAD" --body "Approved: covered by the new tests."
+check "no --review-started, dispatch before the comment: exit 7" 7 "$RC"
+contains "no flag: names the comment" "$OUT" "comment 4242 by the-operator"
+state "$OP_COMMENT" loom:review-requested loom:reviewing
+LOOM_SWEEP_ID="step-judge-1-$DISPATCH_T" pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+check "a late --review-started cannot hide the comment: exit 7" 7 "$RC"
+state "[]" loom:review-requested loom:reviewing
+OUT="$(env -u LOOM_SWEEP_ID "$POST_VERDICT" 12614 approved "$HEAD" --body "Approved: covered by the new tests." 2>&1)"; RC=$?
+check "no resolvable start: exit 7" 7 "$RC"
+contains "no resolvable start: says so" "$OUT" "no review start time"
+
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
+check "issue body unchanged: exit 0" 0 "$RC"
+check "issue body unchanged: posted" 12614 "$POSTED"
+
+# #13600: a hash of the raw `gh --jq .body` output (trailing newline kept) is accepted.
+NL_HASH="$(printf '%s\n' 'the design as reviewed' | sha256sum | cut -d' ' -f1)"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$NL_HASH"
+check "trailing-newline body hash: exit 0" 0 "$RC"
+check "trailing-newline body hash: posted" 12614 "$POSTED"
+
+# #13992: a body that itself ends in a newline makes `gh api --jq .body |
+# sha256sum` hash TWO trailing newlines; that form is accepted too.
+echo '{"body":"the design as reviewed\n"}' > "$STUB_DIR/issue-50.json"
+NL2_HASH="$(printf '%s\n\n' 'the design as reviewed' | sha256sum | cut -d' ' -f1)"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$NL2_HASH"
+check "double-newline body hash (body itself ends in newline): exit 0" 0 "$RC"
+check "double-newline body hash: posted" 12614 "$POSTED"
+
+echo '{"body":"rescoped to a daemon-only design"}' > "$STUB_DIR/issue-50.json"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
+check "issue body rescoped: exit 7" 7 "$RC"
+contains "names the issue" "$OUT" "issue #50's body changed"
+contains "refusal says what was hashed" "$OUT" "trailing newlines trimmed"
+contains "refusal shows the recipe" "$OUT" "sha256sum"
+check "issue body rescoped: nothing posted" "" "$POSTED"
+
+echo '{"body":"the design as reviewed"}' > "$STUB_DIR/issue-50.json"
+cat > "$STUB_DIR/edits.json" <<EDITS
+{"data":{"repository":{"issueOrPullRequest":{"userContentEdits":{"nodes":[{"editedAt":"$NOW_T","editor":{"login":"the-operator","__typename":"User"}}]}}}}}
+EDITS
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T"
+check "human body edit after start (PR body links Closes #50): exit 7" 7 "$RC"
+contains "names the edit" "$OUT" "issue #50's body was edited by the-operator"
+rm -f "$STUB_DIR/edits.json"
+
+touch "$STUB_DIR/issue-50-read-fail"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"
+check "unreadable PR/issue state fails closed: exit 7" 7 "$RC"
+rm -f "$STUB_DIR/issue-50-read-fail"
+
+echo "== a hung review read refuses with distinct timeout wording (#13927) =="
+# The gate's formal-reviews fetch wedges (never returns). The approval must be
+# refused promptly with wording that names the TIMEOUT — distinct from a
+# generic UNKNOWN — and --reviews-reconciled must not be offered as a way past
+# it (nothing was read, so there is nothing to disposition).
+state "[]" loom:review-requested loom:reviewing
+printf %s "$HEAD" > "$STUB_DIR/cur-sha"
+touch "$STUB_DIR/rev-hang"
+set +e
+OUT="$(LOOM_FORGE_REVIEW_READ_TIMEOUT=1 "$POST_VERDICT" 10578 approved "$HEAD" --body "Approved: covered by the new tests." 2>&1)"
+RC=$?
+set -e
+rm -f "$STUB_DIR/rev-hang"
+POSTED="$(cat "$STUB_DIR/posted.log" 2>/dev/null || true)"
+LABELS="$(tr '\n' ' ' < "$STUB_DIR/labels.txt")"
+check "exit 3" 3 "$RC"
+contains "refusal names the timeout" "$OUT" "TIMED OUT"
+contains "refusal says it is not dispositionable" "$OUT" "--reviews-reconciled cannot disposition"
+check "nothing posted" "" "$POSTED"
+contains "claim labels kept" "$LABELS" "loom:review-requested"
 
 echo ""
 echo "test-post-verdict-gate: $PASSED passed, $FAILED failed"

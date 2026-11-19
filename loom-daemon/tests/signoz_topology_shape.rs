@@ -426,10 +426,12 @@ fn gateway_keep_keys(context: &str) -> BTreeSet<String> {
 /// drops it before SigNoz sees it: `transform/privacy` is an allowlist, so the
 /// assertion is that none of the topology keys has been *added* to it. The
 /// resource allowlist is additionally asserted to be exactly the five service
-/// identity keys plus the two host-scoped daemon-provenance keys
-/// (`loom.daemon.revision`, `loom.fleet.config_sha`, #11197) — neither is a
-/// topology peer key, so "one service identity" stays a property of the
-/// pipeline and not only of today's exporter.
+/// identity keys, the two host-scoped daemon-provenance keys
+/// (`loom.daemon.revision`, `loom.fleet.config_sha`, #11197), and the six
+/// host-shape keys (`host.cpu.count`, `loom.host.mem_total_bytes`,
+/// `host.arch`, `host.type`, `cloud.provider`, `cloud.region`, #12874) —
+/// none is a topology peer key, so "one service identity" stays a property of
+/// the pipeline and not only of today's exporter.
 #[test]
 fn the_gateway_allowlist_admits_no_topology_peer_attribute() {
     for context in ["span", "spanevent", "resource"] {
@@ -450,10 +452,16 @@ fn the_gateway_allowlist_admits_no_topology_peer_attribute() {
     assert_eq!(
         gateway_keep_keys("resource"),
         BTreeSet::from([
+            "cloud.provider".to_string(),
+            "cloud.region".to_string(),
+            "host.arch".to_string(),
+            "host.cpu.count".to_string(),
             "host.id".to_string(),
             "host.name".to_string(),
+            "host.type".to_string(),
             "loom.daemon.revision".to_string(),
             "loom.fleet.config_sha".to_string(),
+            "loom.host.mem_total_bytes".to_string(),
             "service.instance.id".to_string(),
             "service.name".to_string(),
             "service.version".to_string(),
@@ -496,3 +504,8 @@ fn the_rendered_ingester_aggregates_every_span_and_declares_no_topology_connecto
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

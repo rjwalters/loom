@@ -50,6 +50,16 @@
 //! head nor labels); one stuck longer is. Every page of the head's check
 //! runs counts, up to [`MAX_CHECK_RUN_PAGES`] (#11903).
 //!
+//! A pass that stood down *because* CI was pending says so on its release
+//! (`--skip-reason` [`SKIP_CI_PENDING`], #11972), and is not recorded if CI
+//! finished between its check and its release: re-reading CI at release time
+//! once found a green head 12 s after the pass skipped, recorded
+//! `verdict=none` and held the PR from Judge for an hour. Its release still
+//! reads CI, for the age bound alone: if everything still pending is past
+//! [`PENDING_EXEMPT_HOURS`] or has no start stamp (stuck, not settling, the
+//! CI the PR planner serves, #12003) the pass is recorded as before. A
+//! release without a skip reason (an older prompt) is unchanged.
+//!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
 //!
@@ -77,6 +87,15 @@ pub const MAX_PER_WINDOW: usize = 3;
 /// The hold after the first and the second no-verdict record, in hours.
 const COOLDOWN_HOURS: [i64; MAX_PER_WINDOW - 1] = [1, 4];
 
+/// The hold after a gate-refused pass (#13135), in minutes: a tight
+/// re-dispatch loop is still stopped, but the long escalating hold is not
+/// armed for a tooling artifact.
+pub const REFUSED_COOLDOWN_MINUTES: i64 = 15;
+
+/// The prefix of a `lease pr release --skip-reason` that says the pass
+/// reached a verdict but a gate refused it (`gate-refused:<token>`, #13135).
+pub const SKIP_GATE_REFUSED: &str = "gate-refused:";
+
 /// How long a pending check run exempts a no-verdict pass from the record
 /// (`lease pr release`): CI that is merely running should not hold the PR,
 /// but a run stuck queued forever (no runner) must not exempt every pass,
@@ -92,6 +111,37 @@ pub fn pending_exempts(started: &[String], now: DateTime<Utc>) -> bool {
     started.iter().any(|s| {
         DateTime::parse_from_rfc3339(s.trim())
             .is_ok_and(|t| now - t.with_timezone(&Utc) < Duration::hours(PENDING_EXEMPT_HOURS))
+    })
+}
+
+/// The `lease pr release --skip-reason` of a Judge pass that stood down
+/// because the head's CI was still pending (#11972).
+pub const SKIP_CI_PENDING: &str = "ci-pending";
+
+/// Whether a release's own skip reason says the pass stood down for pending
+/// CI ([`SKIP_CI_PENDING`]), which also exempts it once CI has concluded (but
+/// never on stuck CI; module docs). No reason, or one this binary does not
+/// know, keeps the default.
+#[must_use]
+pub fn skipped_for_pending_ci(reason: Option<&str>) -> bool {
+    reason.map(str::trim) == Some(SKIP_CI_PENDING)
+}
+
+/// The refusal token of a release's skip reason (`gate-refused:<token>`),
+/// reduced to `[a-z0-9-]` so it can never break the marker; `unknown` when
+/// nothing is left. `None` for any other (or no) reason.
+#[must_use]
+pub fn refusal_token(reason: Option<&str>) -> Option<String> {
+    let token: String = reason?
+        .trim()
+        .strip_prefix(SKIP_GATE_REFUSED)?
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .collect();
+    Some(if token.is_empty() {
+        "unknown".into()
+    } else {
+        token
     })
 }
 
@@ -111,7 +161,7 @@ pub fn pending_check_runs(page: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|r| r.get("status").and_then(Value::as_str) != Some("completed"))
+        .filter(|r| !crate::merge_pr::check_runs_rollup::is_settled(r))
         .map(|r| stamp(r, "started_at"))
         .collect()
 }
@@ -153,6 +203,95 @@ pub fn check_runs_listed(page: &Value) -> usize {
 pub fn more_check_runs(page: &Value, read: usize) -> bool {
     let total = page.get("total_count").and_then(Value::as_u64).unwrap_or(0);
     check_runs_listed(page) == CI_PAGE && (read as u64) < total
+}
+
+/// A head's CI as the release reads it (#11972).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiState {
+    /// Something still pending started inside the exemption window
+    /// ([`pending_exempts`]).
+    Young,
+    /// Something is still pending, but every pending run or status is past
+    /// the window or has no start stamp: CI that is stuck, not settling.
+    Stuck,
+    /// Nothing pending was read: CI concluded (or could not be read).
+    Settled,
+}
+
+impl CiState {
+    /// Whether a Judge pass that ended without a verdict at this CI is
+    /// exempt from the no-verdict record. By default only young pending CI
+    /// exempts. A pass that said it stood down for pending CI
+    /// (`--skip-reason ci-pending`) is also exempt once CI has settled since
+    /// (the race #11972 fixes), but never on stuck CI: `forge wait-checks`
+    /// has no age cap, so stuck CI would exempt every pass, and the PR
+    /// planner serves exactly those PRs (#12003); recording them keeps the
+    /// loop bounded.
+    #[must_use]
+    pub fn exempts(self, skipped_for_pending_ci: bool) -> bool {
+        match self {
+            Self::Young => true,
+            Self::Settled => skipped_for_pending_ci,
+            Self::Stuck => false,
+        }
+    }
+}
+
+/// Which read of [`ci_state`] a `get` call is, so each can carry its own
+/// forge-call-stats op.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiRead {
+    /// One page of `commits/{sha}/check-runs`.
+    CheckRuns,
+    /// The legacy `commits/{sha}/status`.
+    CommitStatus,
+}
+
+/// `sha`'s [`CiState`], read through `get(kind, path)` with `path` relative
+/// to `repos/{o}/{r}/`: every page of its check runs, up to
+/// [`MAX_CHECK_RUN_PAGES`], then its legacy commit statuses (#11903). Stops at
+/// the first read that is [`CiState::Young`], so the usual cost is one call;
+/// an unreadable read contributes nothing.
+pub fn ci_state(
+    sha: &str,
+    now: DateTime<Utc>,
+    mut get: impl FnMut(CiRead, &str) -> Option<Value>,
+) -> CiState {
+    let base = format!("commits/{sha}/check-runs?per_page={CI_PAGE}");
+    let mut stuck = false;
+    let mut read = 0;
+    for page in 1..=MAX_CHECK_RUN_PAGES {
+        let path = if page == 1 {
+            base.clone()
+        } else {
+            format!("{base}&page={page}")
+        };
+        let Some(v) = get(CiRead::CheckRuns, &path) else {
+            break;
+        };
+        let pending = pending_check_runs(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+        read += check_runs_listed(&v);
+        if !more_check_runs(&v, read) {
+            break;
+        }
+    }
+    let status = format!("commits/{sha}/status?per_page={CI_PAGE}");
+    if let Some(v) = get(CiRead::CommitStatus, &status) {
+        let pending = pending_statuses(&v);
+        if pending_exempts(&pending, now) {
+            return CiState::Young;
+        }
+        stuck |= !pending.is_empty();
+    }
+    if stuck {
+        CiState::Stuck
+    } else {
+        CiState::Settled
+    }
 }
 
 /// The label whose presence means "still waiting for a Judge".
@@ -212,6 +351,13 @@ pub fn released_fields<S: AsRef<str>>(head: &str, labels: &[S]) -> String {
     format!(" head={head} verdict=none labels={}", label_digest(labels))
 }
 
+/// The fields a gate-refused release appends (#13135): the no-verdict record
+/// plus `refused=<token>` (`token` from [`refusal_token`]).
+#[must_use]
+pub fn refused_fields<S: AsRef<str>>(head: &str, labels: &[S], token: &str) -> String {
+    format!("{} refused={token}", released_fields(head, labels))
+}
+
 /// The fields the daemon's reap of a terminated Judge appends (#11931): the
 /// no-verdict record plus `reaped=<reason>`. `reason` is reduced to
 /// `[a-z0-9]` so it can never break the marker.
@@ -234,6 +380,9 @@ pub fn reaped_fields<S: AsRef<str>>(head: &str, labels: &[S], reason: &str) -> S
 pub struct NoVerdict {
     pub head: String,
     pub labels: String,
+    /// The gate that refused the pass's verdict (`refused=<token>`, #13135);
+    /// such a record only cools the PR down briefly.
+    pub refused: Option<String>,
 }
 
 /// Parse a comment body's first line as a no-verdict Judge release record.
@@ -260,6 +409,7 @@ pub fn parse(body: &str) -> Option<NoVerdict> {
     Some(NoVerdict {
         head: head.to_ascii_lowercase(),
         labels: field("labels")?.to_string(),
+        refused: field("refused").map(str::to_string),
     })
 }
 
@@ -272,20 +422,53 @@ pub fn hold_until(
     digest: &str,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    hold(records, head, digest, now).map(|(until, _)| until)
+}
+
+/// [`hold_until`] plus the refusal token of the record that set the hold,
+/// when it is a gate-refusal cool-down (#13135). Gate-refused records are
+/// ignored for the count and only hold for [`REFUSED_COOLDOWN_MINUTES`]
+/// after the newest one; when both kinds hold, the later end wins (ties go
+/// to the ordinary hold).
+#[must_use]
+pub fn hold(
+    records: &[(DateTime<Utc>, NoVerdict)],
+    head: &str,
+    digest: &str,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, Option<String>)> {
     let window = Duration::hours(WINDOW_HOURS);
     let head = head.to_ascii_lowercase();
-    let mut at: Vec<DateTime<Utc>> = records
-        .iter()
-        .filter(|(when, r)| r.head == head && r.labels == digest && now - *when < window)
-        .map(|(when, _)| *when)
-        .collect();
+    let mut at: Vec<DateTime<Utc>> = Vec::new();
+    let mut newest_refused: Option<(DateTime<Utc>, &str)> = None;
+    for (when, r) in records {
+        if r.head != head || r.labels != digest || now - *when >= window {
+            continue;
+        }
+        match &r.refused {
+            None => at.push(*when),
+            Some(token) => {
+                if newest_refused.is_none_or(|(w, _)| *when > w) {
+                    newest_refused = Some((*when, token));
+                }
+            }
+        }
+    }
     at.sort_unstable_by(|a, b| b.cmp(a));
-    let until = match at.len() {
-        0 => return None,
-        n if n >= MAX_PER_WINDOW => at[MAX_PER_WINDOW - 1] + window,
-        n => at[0] + Duration::hours(COOLDOWN_HOURS[n - 1]),
+    let ordinary = match at.len() {
+        0 => None,
+        n if n >= MAX_PER_WINDOW => Some(at[MAX_PER_WINDOW - 1] + window),
+        n => Some(at[0] + Duration::hours(COOLDOWN_HOURS[n - 1])),
     };
-    (until > now).then_some(until)
+    let refused = newest_refused
+        .map(|(w, t)| (w + Duration::minutes(REFUSED_COOLDOWN_MINUTES), t.to_string()));
+    let best = match (ordinary, refused) {
+        (Some(o), Some((r, t))) if r > o => (r, Some(t)),
+        (Some(o), _) => (o, None),
+        (None, Some((r, t))) => (r, Some(t)),
+        (None, None) => return None,
+    };
+    (best.0 > now).then_some(best)
 }
 
 /// [`hold_until`] over trusted REST comment objects (`body`, `updated_at`).

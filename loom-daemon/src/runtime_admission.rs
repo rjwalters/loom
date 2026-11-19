@@ -130,6 +130,13 @@ pub struct ExecutionProvenance {
     pub control: String,
     pub protocol: String,
     pub base_revision: String,
+    /// Canonical `host/owner/name` of the clone this admission is bound to
+    /// (#10796). Empty in a record written before multi-repository seats.
+    #[serde(default)]
+    pub repository: String,
+    /// Where that clone lives inside the session container.
+    #[serde(default)]
+    pub clone: String,
 }
 
 impl ExecutionProvenance {
@@ -144,7 +151,7 @@ impl ExecutionProvenance {
             .join(",");
         format!(
             "mode={} satisfied={} native={} policy={} account={} container={} control={} \
-             protocol={} base={}",
+             protocol={} base={} repository={} clone={}",
             self.mode,
             self.satisfied.join(","),
             native,
@@ -153,7 +160,9 @@ impl ExecutionProvenance {
             self.container,
             self.control,
             self.protocol,
-            self.base_revision
+            self.base_revision,
+            self.repository,
+            self.clone
         )
     }
 }
@@ -170,6 +179,17 @@ pub struct RuntimeRejection {
     pub source: RuntimeSource,
     pub unmet_capabilities: Vec<String>,
     pub reason: String,
+    /// One-line rendering of a preference-path exhaustion (#14026): every
+    /// skipped candidate and its full, uncapped reason on ONE line, built by
+    /// [`crate::runtime_preference::Resolution::exhausted_summary_line`] at
+    /// the construction site that holds the structured walk. `reason` stays
+    /// the multi-line operator diagnostic; this is what the daemon log's
+    /// refusal line renders. `None` for every other rejection, whose `reason`
+    /// is already one line. (`Box<str>`, not `String`: this rejection rides
+    /// as the `Err` of many admission functions, and clippy's
+    /// `result_large_err` bounds its size.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_summary_line: Option<Box<str>>,
 }
 
 impl fmt::Display for RuntimeRejection {
@@ -210,11 +230,47 @@ impl RuntimeRejection {
     /// unmet for this launch, and the caller must keep failing closed.
     #[must_use]
     pub fn with_containment_failure(mut self, obligation: &str) -> Self {
-        self.reason = format!(
-            "{}; verified private-clone containment could not satisfy it: {obligation}",
-            self.reason
-        );
+        let clause =
+            format!("; verified private-clone containment could not satisfy it: {obligation}");
+        self.reason.push_str(&clause);
+        // Keep the one-line refusal rendering coherent with `reason`
+        // (#14026). A containment obligation can only be appended to a
+        // static-path rejection today (`containment_eligible` needs named
+        // unmet capabilities, the preference path carries none), so the line
+        // is normally `None` here — appending is what keeps the invariant
+        // if that ever changes.
+        self.exhausted_summary_line = self
+            .exhausted_summary_line
+            .map(|line| format!("{line}{clause}").into_boxed_str());
         self
+    }
+
+    /// The text a daemon-log refusal line renders (#14026): the one-line
+    /// candidate summary for a preference-path exhaustion, the static path's
+    /// own single-line `reason` otherwise. Single-line by construction in
+    /// both arms, so a `log::` call prefixing this line never splits it.
+    #[must_use]
+    pub fn refusal_line(&self) -> &str {
+        self.exhausted_summary_line
+            .as_deref()
+            .unwrap_or(&self.reason)
+    }
+
+    /// The whole daemon-log refusal line (#14026): `Display`'s
+    /// `role=`/`runtime=`/`source=` framing with [`Self::refusal_line`] as
+    /// the detail, so a `log::` call interpolating this string never splits
+    /// across lines. `Display` itself keeps rendering the multi-line
+    /// operator `reason` — that is the CLI/IPC diagnostic shape; every
+    /// `log::` call site renders this instead.
+    #[must_use]
+    pub fn refusal_log_line(&self) -> String {
+        format!(
+            "runtime admission rejected role={} runtime={} source={}: {}",
+            self.role,
+            self.runtime,
+            self.source,
+            self.refusal_line()
+        )
     }
 
     /// Operator-facing, multi-line diagnostic naming the role/lifecycle, the
@@ -255,6 +311,12 @@ struct RoleManifest {
 struct RuntimeManifest {
     runtime: String,
     capabilities: BTreeMap<String, serde_json::Value>,
+}
+
+/// The per-role runtime pin variable for a canonical role, e.g.
+/// `sweep-lifecycle` -> `LOOM_RUNTIME_SWEEP_LIFECYCLE`.
+fn role_env_var(canonical: &str) -> String {
+    format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase())
 }
 
 fn nonempty(value: Option<&str>) -> Option<String> {
@@ -359,10 +421,17 @@ pub fn suggested_worker_type_mismatch_warning(admission: &ResolvedRuntime) -> Op
     ))
 }
 
+/// Every `Some` output must also appear in `KNOWN_ROLE_KEYS`, which drives
+/// the `.cargo/config.toml` `LOOM_RUNTIME_<ROLE>` hermeticity list (#9851).
 pub fn canonical_role(role: &str) -> Option<&'static str> {
     match role.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "curator" | "issue-curator" => Some("curator"),
-        "judge" | "code-review-specialist" => Some("judge"),
+        // The ratification lane's two read-only reviewer sessions (#13749) are
+        // Judge-shaped, so they ride the Judge binding rather than adding
+        // canonical roles (and `KNOWN_ROLE_KEYS` / manifest entries).
+        "judge" | "code-review-specialist" | "ratification-ee" | "ratification-market" => {
+            Some("judge")
+        }
         "builder" | "development-worker" => Some("builder"),
         "doctor" | "pr-fixer" => Some("doctor"),
         "champion" => Some("champion"),
@@ -474,6 +543,10 @@ fn config_runtime(root: &Path, role: &str) -> Result<(Option<String>, Option<Str
 /// diagnostic above. Aliases (`issue-curator`, `pr-fixer`, `sweep`, …) are also
 /// accepted by [`canonical_role`]; only the canonical spellings are listed so
 /// the message stays short and points at the documented shape.
+///
+/// Also the role list `.cargo/config.toml` `[env]` forces empty as
+/// `LOOM_RUNTIME_<ROLE>` (#9851); `tests::cargo_env_clears_every_role_runtime_pin`
+/// fails if a role here (or a new [`canonical_role`] output) is missing there.
 const KNOWN_ROLE_KEYS: &[&str] = &[
     "architect",
     "auditor",
@@ -580,6 +653,7 @@ pub fn resolve_binding(
         source: RuntimeSource::Explicit,
         unmet_capabilities: vec![],
         reason: "unknown role".into(),
+        exhausted_summary_line: None,
     })?;
     let (role_config, default_config) =
         config_runtime(root, canonical).map_err(|reason| RuntimeRejection {
@@ -588,9 +662,9 @@ pub fn resolve_binding(
             source: RuntimeSource::RoleConfig,
             unmet_capabilities: vec![],
             reason,
+            exhausted_summary_line: None,
         })?;
-    let env_name = format!("LOOM_RUNTIME_{}", canonical.replace('-', "_").to_ascii_uppercase());
-    let role_env = std::env::var(env_name).ok();
+    let role_env = std::env::var(role_env_var(canonical)).ok();
     let global_env = std::env::var("LOOM_RUNTIME").ok();
     Ok(choose_runtime(
         explicit,
@@ -676,6 +750,7 @@ fn resolve_and_admit_with(
             source: RuntimeSource::Explicit,
             unmet_capabilities: vec![],
             reason: format!("unknown role {role:?}"),
+            exhausted_summary_line: None,
         });
     };
     let lookup_role = if canonical == "sweep-lifecycle" {
@@ -694,6 +769,7 @@ fn resolve_and_admit_with(
         source: source.clone(),
         unmet_capabilities,
         reason,
+        exhausted_summary_line: None,
     };
     let adapter = if crate::worker_spawn::is_native(&runtime) {
         // Native adapters are compiled into the deciding executable, not shell files.

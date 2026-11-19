@@ -173,7 +173,7 @@ pub const ARCHITECT_MAX_PROPOSALS_ENV: &str = "LOOM_ARCHITECT_MAX_PROPOSALS";
 /// `LOOM_WORK_FINDER_MAX_CONCURRENT`, and it exists because that knob bounds
 /// **sweep dispatch only**: role-runner agents are spawned by this module's own
 /// interval / idle loops, never routed through
-/// [`crate::work_finder`]'s `min(disk, ram, maxConcurrent)` admission, so
+/// [`crate::work_finder`]'s `maxConcurrent` admission, so
 /// before #6102 nothing bounded them at all. See
 /// [`resolve_max_concurrent`].
 pub const ROLE_RUNNER_MAX_CONCURRENT_ENV: &str = "LOOM_ROLE_RUNNER_MAX_CONCURRENT";
@@ -193,7 +193,7 @@ pub const DEFAULT_ARCHITECT_MAX_PROPOSALS: u64 = 5;
 /// session) before killing it. Generous — a role tick can involve several
 /// forge round-trips (list/enrich/label issues, review PRs) — but bounded so
 /// a wedged session can't block that role's loop forever.
-const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
+pub(crate) const DEFAULT_ROLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Load-per-core (issue #6637) at or above which a ceiling-hit tick is
 /// classified as [`RoleTickOutcome::LoadSkipped`] instead of
@@ -878,6 +878,21 @@ pub trait RoleInvocationRunner {
     fn trace_context(&self) -> Option<crate::observability::lifecycle::RoleTrace> {
         None
     }
+
+    /// Why the most recent invocation failed before it launched, so no
+    /// `role_attempt` span (and no [`trace_context`](Self::trace_context))
+    /// carries the class (#12028).
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        None
+    }
+
+    /// What the most recent [`invoke`](Self::invoke) wrote to the session's
+    /// output (its role log, from just before launch), or `None` when that is
+    /// unavailable. Defaulted so a test double is unaffected. The ratification
+    /// lane (#13502) posts a bounded tail of it as the verdict text.
+    fn last_output(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The concrete [`RoleInvocationRunner`]: shells out to
@@ -915,9 +930,12 @@ pub struct ScriptRoleInvocationRunner {
     /// [`invoke`]: RoleInvocationRunner::invoke
     resolved_launch: Option<crate::role_tick_telemetry::ResolvedLaunch>,
     trace_context: Option<crate::observability::lifecycle::RoleTrace>,
+    unlaunched_failure: Option<crate::observability::lifecycle::RoleFailure>,
     /// Set by [`roll_resume`] when this runner relaunches a session a daemon
     /// roll paused (#10832), instead of starting a fresh tick.
     roll_resume: Option<roll_resume::RoleRollResume>,
+    /// Output the most recent invocation appended to its role log (#13502).
+    last_output: Option<String>,
 }
 
 impl ScriptRoleInvocationRunner {
@@ -933,7 +951,9 @@ impl ScriptRoleInvocationRunner {
             gh_bin: None,
             resolved_launch: None,
             trace_context: None,
+            unlaunched_failure: None,
             roll_resume: None,
+            last_output: None,
         }
     }
 
@@ -1291,8 +1311,23 @@ pub struct RoleRunnerConfig {
     /// trimmed; blank keys and blank/non-string values are dropped **per
     /// entry**, so an entry never emits `--effort ""`. Absent / malformed /
     /// non-object soft-fails to an empty map (every role falls through to the
-    /// global tier). Resolved by [`resolve_role_runner_effort`].
+    /// global tier). Since #14017 a key may be runtime-qualified
+    /// (`"<role>@<runtime>"`), which beats the bare role key for that runtime
+    /// only; a malformed qualified key is dropped with a warning. Resolved by
+    /// [`resolve_role_runner_effort_for_runtime`].
     pub role_efforts: BTreeMap<String, String>,
+    /// `autonomous.roleRunner.serviceTier` — the runtime-neutral service tier
+    /// (speed setting, #14141) every role child is launched with, exported to
+    /// the spawn scripts as `LOOM_SERVICE_TIER` (#14454). `None` (absent, blank
+    /// or non-string) means **unset**: nothing is exported and an operator's own
+    /// inherited `LOOM_SERVICE_TIER` is left alone. Resolved by
+    /// [`resolve_role_runner_service_tier_for_runtime`].
+    pub service_tier: Option<String>,
+    /// `autonomous.roleRunner.roleServiceTiers` — per-role service-tier
+    /// overrides, keyed exactly like [`role_efforts`](Self::role_efforts)
+    /// (`"<role>"` or runtime-qualified `"<role>@<runtime>"`, #14017) and parsed
+    /// with the same per-entry soft-fail contract.
+    pub role_service_tiers: BTreeMap<String, String>,
     /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
     /// cap on how many proposal issues one architect dispatch may file
     /// (#5656). `None` (key absent, zero, or non-integer) falls through to
@@ -1320,10 +1355,8 @@ pub struct RoleRunnerConfig {
     /// fleet host where the roots disagree, the effective ceiling for a given
     /// tick is that root's own — the tighter root simply refuses sooner.
     pub max_concurrent: Option<usize>,
-    /// `autonomous.roleRunner.championMode` (#11859) — `"all"` (absent) or
-    /// `"non-item"`: whether an interval Champion tick works every queue or
-    /// only the non-item ones. Per root, config only; see
-    /// [`champion_mode`] and [`resolve_role_prompt`].
+    /// `autonomous.roleRunner.championMode` (#11859), retired by #11909:
+    /// parsed only to warn. Champion always runs non-item ([`champion_mode`]).
     pub champion_mode: Option<champion_mode::ChampionMode>,
 }
 
@@ -1461,6 +1494,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
     // them (`role_runner/model_resolution.rs`), with the identical
     // trim/blank-is-unset/per-entry-soft-fail contract `roleModels` uses above.
     let (effort, role_efforts) = model_resolution::parse_effort_config(block);
+    // `serviceTier` / `roleServiceTiers` (#14454) — same contract, same module.
+    let (service_tier, role_service_tiers) = model_resolution::parse_service_tier_config(block);
 
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
@@ -1475,6 +1510,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         role_models,
         effort,
         role_efforts,
+        service_tier,
+        role_service_tiers,
         // `architectMaxProposals` (#5656): a zero / negative / non-integer
         // value soft-fails to `None` — a cap of 0 would mean "dispatch
         // architect, forbid it from filing anything", which is a pure waste of
@@ -1632,6 +1669,66 @@ fn missing_defaults_warning_line(repo_root: &Path, missing: &[&'static str]) -> 
         default_roles_snapshot_id(),
         missing.join(", ")
     ))
+}
+
+/// Whether `repo_root`'s `autonomous.roleRunner.roles` allowlist is set by one
+/// of the repo's **own** tier files (host-local, per-repo fleet, project or
+/// legacy `.loom/config.json`) rather than by the machine-level private/shared
+/// defaults file.
+///
+/// The distinction decides the level of the [`missing_defaults_warning_line`]
+/// diagnostic. #6163's case — and [`missing_defaults`]' own reason to exist —
+/// is a *repo-pinned* list that went stale when a new default role shipped:
+/// somebody can and should update that file, so it is a WARN. A machine-tier
+/// allowlist is a fleet policy applied to every workspace on the host (on a
+/// fleet worker: auditor and architect switched off by operator ruling); the
+/// role is absent on purpose and there is no per-repo file to update. On a
+/// 107-workspace host the once-per-workspace-per-boot line then showed as a
+/// steady 30 WARN/h for the ~3.5 h the reporter loop takes to reach every
+/// workspace, tripping the fleet's log-rate probe on every roll — so that
+/// case is INFO (see [`missing_defaults_log_level`]; #13496).
+#[must_use]
+fn roles_allowlist_is_repo_pinned(repo_root: &Path) -> bool {
+    use crate::config_resolver::{
+        FLEET_REPO_CONFIG_REL, LEGACY_CONFIG_REL, LOCAL_CONFIG_REL, PROJECT_CONFIG_REL,
+    };
+    crate::config_resolver::source_of(repo_root, "autonomous.roleRunner.roles").is_some_and(
+        |path| {
+            [
+                LOCAL_CONFIG_REL,
+                FLEET_REPO_CONFIG_REL,
+                PROJECT_CONFIG_REL,
+                LEGACY_CONFIG_REL,
+            ]
+            .iter()
+            .any(|rel| path == repo_root.join(rel))
+        },
+    )
+}
+
+/// The level and text of the missing-defaults diagnostic for `repo_root`
+/// (pure, so the choice is unit-testable): the [`missing_defaults_warning_line`]
+/// at WARN when the allowlist is the repo's own pin, the same line at INFO
+/// with a machine-tier suffix when it is the private/shared defaults' —
+/// see [`roles_allowlist_is_repo_pinned`] for why the two differ.
+#[must_use]
+fn missing_defaults_log_level(
+    repo_root: &Path,
+    missing: &[&'static str],
+    repo_pinned: bool,
+) -> Option<(log::Level, String)> {
+    let line = missing_defaults_warning_line(repo_root, missing)?;
+    Some(if repo_pinned {
+        (log::Level::Warn, line)
+    } else {
+        (
+            log::Level::Info,
+            format!(
+                "{line} (allowlist set by the machine tier, not by this repo's own config — a \
+                 fleet policy, not a stale pin)"
+            ),
+        )
+    })
 }
 
 /// Whether `spec`'s multi-workspace loop is the one designated to emit the
@@ -1840,7 +1937,7 @@ pub fn resolve_on_idle_roles(config: &RoleRunnerConfig) -> Vec<RoleSpec> {
             );
         }
     }
-    out
+    champion_mode::without_step_roles(out, Some("onIdle"))
 }
 
 /// Age since `role`'s last completed tick at `root`, per
@@ -2170,7 +2267,7 @@ pub fn default_max_concurrent() -> usize {
 /// agents are spawned by this module's interval loops and the work-finder's
 /// idle-edge path *without* passing through
 /// [`crate::work_finder`]'s admission checks, so they were admitted entirely
-/// outside `min(disk, ram, maxConcurrent)` — an operator lowering that knob
+/// outside the `maxConcurrent` cap — an operator lowering that knob
 /// after a load-induced crash got less protection than the knob's own
 /// documentation implied (#6102). This is the distinct ceiling for the other
 /// half of the host's agent load; the two together, not `maxConcurrent`
@@ -2197,8 +2294,8 @@ pub fn resolve_max_concurrent_for(repo_root: &Path) -> usize {
 /// The prompt string actually passed to `claude -p` for one dispatch of
 /// `spec`.
 ///
-/// Every role but `architect` (and `champion` under
-/// `championMode: "non-item"`, which appends `--non-item`, #11859) resolves
+/// Every role but `architect` (and `champion`, which always appends
+/// `--non-item` since #11909) resolves
 /// to its static [`RoleSpec::prompt`] verbatim (byte-for-byte the pre-#5656
 /// behavior). `architect` additionally
 /// carries the resolved per-invocation proposal cap as a slash-command
@@ -2219,8 +2316,8 @@ pub fn resolve_role_prompt(spec: &RoleSpec, config: &RoleRunnerConfig) -> String
             resolve_architect_max_proposals(config)
         );
     }
-    // #11859: `championMode: "non-item"` dispatches `/loom:champion --non-item`.
-    if let Some(arg) = champion_mode::prompt_arg(spec.name, config.champion_mode) {
+    // #11909: Champion's item work is steps; its interval run is non-item.
+    if let Some(arg) = champion_mode::prompt_arg(spec.name) {
         return format!("{} {arg}", spec.prompt);
     }
     spec.prompt.to_string()
@@ -2609,9 +2706,6 @@ pub fn plan_idle_runs(
     let ceiling = resolve_max_concurrent(config);
     let mut out = Vec::new();
     for spec in resolve_on_idle_roles(config) {
-        if matches!(idle_gate::gate(root, spec.name), Some(idle_gate::IdleGateDecision::Deny(_))) {
-            continue;
-        }
         if !trigger.debounce_ok(root, spec.name, now) {
             log::debug!(
                 "role_runner: idle edge for {} — {} within {}s debounce, skipping",
@@ -2884,11 +2978,13 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
 ) -> RoleTickOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
-    // #11819: a Curator on a repo with `curator.backlogTarget` carries the
-    // daemon-computed backlog level; every other dispatch is unchanged.
-    let outcome =
-        backlog::invoke_with_backlog(runner, root, role, prompt, backlog::count_open_issues);
+    let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
+    // Ratification reviewer lane (#13345): a no-op unless `ratificationLane`
+    // is enabled for this root. Runs on the champion tick's blocking thread.
+    if role == "champion" {
+        ratification_lane::tick_for_root(root, runner);
+    }
     outcome
 }
 
@@ -3048,8 +3144,12 @@ fn decide_root_tick_detailed(
             }
             (false, Some(prev)) if *prev == missing => {}
             (false, _) => {
-                if let Some(line) = missing_defaults_warning_line(root, &missing) {
-                    log::warn!("{line}");
+                // WARN only when the allowlist is this repo's own pin; a
+                // machine-tier allowlist is a fleet policy and logs at INFO
+                // (see `roles_allowlist_is_repo_pinned`).
+                let pinned = roles_allowlist_is_repo_pinned(root);
+                if let Some((level, line)) = missing_defaults_log_level(root, &missing, pinned) {
+                    log::log!(level, "{line}");
                 }
                 missing_defaults_logged.insert(root.to_path_buf(), missing);
             }
@@ -3092,128 +3192,6 @@ fn decide_root_tick_detailed(
     concurrent_dispatch::admit_root_tick(root, name, prompt, in_progress, &config)
 }
 
-/// Spawn the role-runner loop for a single role on a single workspace on the
-/// shared daemon runtime. Intended for tests; production uses
-/// [`spawn_multi_role_task`] (the multi-workspace entry point wired into
-/// `main.rs`).
-///
-/// Mirrors [`crate::work_finder::spawn_work_finder_task`] /
-/// [`crate::main_health_gate`]: the **first tick is skipped** so several
-/// role loops starting at daemon boot don't burst several `claude` sessions
-/// at once — see the module docs.
-pub fn spawn_role_task<R>(
-    mut runner: R,
-    spec: RoleSpec,
-    interval: Duration,
-    drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    root: PathBuf,
-    in_progress: InProgressGuard,
-) -> tokio::task::JoinHandle<()>
-where
-    R: RoleInvocationRunner + Send + 'static,
-{
-    log::info!("role_runner: starting {} loop (interval={}s)", spec.name, interval.as_secs());
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        ticker.tick().await; // skip immediate first tick (see module docs)
-        loop {
-            ticker.tick().await;
-            // Scheduled drain (#4090): role ticks have no sweep-registry entry to
-            // await, so a drain cannot wait for an in-flight tick — but it MUST
-            // stop new ticks from *starting* (e.g. a Champion mid-merge). Skip
-            // the whole tick while draining.
-            if drain.load(std::sync::atomic::Ordering::Relaxed) {
-                log::debug!(
-                    "role_runner: {} tick skipped — drain in progress (no new role dispatch)",
-                    spec.name
-                );
-                continue;
-            }
-            // Shared GitHub rate limit exhausted (#4429): a role session
-            // spawned now would burn a token slot just to fail its own gh
-            // calls against the same wall — skip until the window resets.
-            if crate::rate_limit_breaker::global_skip_pass("role_runner") {
-                log::debug!(
-                    "role_runner: {} tick skipped — rate-limit cooldown (#4429)",
-                    spec.name
-                );
-                continue;
-            }
-            let name = spec.name;
-            // #5656: identical to `spec.prompt` for every role but `architect`
-            // (whose per-invocation proposal cap is re-read each tick, so a
-            // config edit hot-applies like every other role-runner knob).
-            let tick_config = read_role_runner_config(&root);
-            let prompt = resolve_role_prompt(&spec, &tick_config);
-            // Shared in-progress guard (#4364): skip this interval tick if an
-            // idle-triggered (or overlapping) run for the same (root, role) is
-            // already active. Held for the whole invocation; cleared on drop.
-            //
-            // #6102: the same call now also enforces the concurrent role-agent
-            // ceiling, re-resolved each tick so a config edit hot-applies like
-            // every other role-runner knob.
-            let _run_guard = match RoleRunGuard::admit(
-                in_progress.clone(),
-                root.clone(),
-                name,
-                resolve_max_concurrent(&tick_config),
-            ) {
-                RoleAdmission::Admitted(g) => g,
-                RoleAdmission::InProgress => {
-                    log::debug!(
-                        "role_runner: {} tick for {} skipped — a run is already in progress \
-                         (#4364)",
-                        name,
-                        root.display()
-                    );
-                    continue;
-                }
-                RoleAdmission::CeilingReached { active, ceiling } => {
-                    log::warn!(
-                        "role_runner: {} tick for {} not admitted — {active} role agent(s) \
-                         already in flight at the ceiling of {ceiling} \
-                         (autonomous.roleRunner.maxConcurrent / \
-                         {ROLE_RUNNER_MAX_CONCURRENT_ENV}, #6102); retrying next tick",
-                        name,
-                        root.display()
-                    );
-                    continue;
-                }
-                // Unreachable: `admit` applies no role budget (#9391) and no
-                // demand reservation (#9392).
-                RoleAdmission::RoleBudgetReached { .. } | RoleAdmission::ReservationHeld { .. } => {
-                    continue
-                }
-            };
-            let tick_start = Instant::now();
-            let probe_root = root.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                // Cross-host collision detection (#4623) — detection only; the
-                // invocation itself is unchanged.
-                let outcome =
-                    invoke_with_collision_probe(&mut runner, &probe_root, name, &prompt, interval);
-                (outcome, runner)
-            })
-            .await;
-            let elapsed = tick_start.elapsed();
-            match joined {
-                Ok((outcome, r)) => {
-                    runner = r;
-                    log_outcome(spec.name, &outcome, elapsed);
-                }
-                Err(e) => {
-                    log::error!(
-                        "role_runner: {} invocation task panicked ({e}); stopping this role's loop",
-                        spec.name
-                    );
-                    return;
-                }
-            }
-        }
-    })
-}
-
 /// Spawn the **multi-workspace** role-runner loop for one role (mirrors
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`])
 /// on the shared daemon runtime.
@@ -3251,6 +3229,35 @@ pub fn spawn_multi_role_task(
     in_progress: InProgressGuard,
     pool_exhausted_observer: Option<std::sync::Arc<dyn PoolExhaustedObserver>>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_multi_role_task_with(
+        spec,
+        fallback_root,
+        interval,
+        drain,
+        in_progress,
+        pool_exhausted_observer,
+        concurrent_dispatch::script_runner_factory(),
+    )
+}
+
+/// The runner seam behind [`spawn_multi_role_task`] (#13832): the identical
+/// production loop with the invocation runner factory injected, so tests
+/// drive the loop the daemon actually runs instead of a second hand-maintained
+/// copy of it (the removed single-workspace test double, which had drifted
+/// from this loop's admission and outcome paths). The public entry point passes
+/// [`concurrent_dispatch::script_runner_factory`]; tests pass a scripted
+/// fake. Everything else — the drain gate, the rate-limit cooldown, the
+/// registry re-read, missing-root and hold filtering, admission, concurrent
+/// dispatch, reaping and outcome logging — is the production path unchanged.
+pub(crate) fn spawn_multi_role_task_with(
+    spec: RoleSpec,
+    fallback_root: PathBuf,
+    interval: Duration,
+    drain: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    in_progress: InProgressGuard,
+    pool_exhausted_observer: Option<std::sync::Arc<dyn PoolExhaustedObserver>>,
+    runner_factory: concurrent_dispatch::RunnerFactory,
+) -> tokio::task::JoinHandle<()> {
     log::info!(
         "role_runner: starting {} multi-workspace loop (interval={}s)",
         spec.name,
@@ -3270,7 +3277,7 @@ pub fn spawn_multi_role_task(
         let mut dispatcher = concurrent_dispatch::RoleDispatcher::new(
             spec,
             interval,
-            concurrent_dispatch::script_runner_factory(),
+            runner_factory,
             concurrent_dispatch::forge_queue_probe(),
             pool_exhausted_observer,
         );
@@ -3381,72 +3388,8 @@ fn tick_is_implausibly_fast(outcome: &RoleTickOutcome, elapsed: Duration) -> boo
     matches!(outcome, RoleTickOutcome::Success) && elapsed < IMPLAUSIBLY_FAST_TICK
 }
 
-/// Log a single-workspace invocation outcome, including elapsed tick
-/// duration. Never escalates to `error!` — a role-invocation failure is never
-/// fatal to the daemon. See [`tick_is_implausibly_fast`] for the `WARN`
-/// escalation on a suspiciously-fast `Success`.
-fn log_outcome(role: &str, outcome: &RoleTickOutcome, elapsed: Duration) {
-    match outcome {
-        RoleTickOutcome::Success if tick_is_implausibly_fast(outcome, elapsed) => {
-            log::warn!(
-                "role_runner: {role} tick completed in {elapsed:.1?} — implausibly fast for a \
-                 real session (threshold {IMPLAUSIBLY_FAST_TICK:.0?}); this may be a no-op that \
-                 exited 0 without doing real work (e.g. a slash-command prompt that did not \
-                 resolve)"
-            );
-        }
-        RoleTickOutcome::Success => {
-            log::info!("role_runner: {role} tick completed in {elapsed:.1?}");
-        }
-        RoleTickOutcome::Failure(reason) => {
-            log::warn!(
-                "role_runner: {role} tick failed after {elapsed:.1?} (logged and skipped, never \
-                 fatal): {reason}"
-            );
-        }
-        RoleTickOutcome::RuntimeRejected(rejection) => {
-            log::warn!("role_runner: {role} runtime admission rejected: {rejection}");
-        }
-        RoleTickOutcome::NoTokenPool => {
-            log::warn!(
-                "role_runner: {role} tick skipped after {elapsed:.1?} — no token pool available \
-                 (neither a per-repo .loom/tokens/ pool nor a provisioned shared pool at \
-                 ~/.loom/tokens; run `loom-daemon tokens bootstrap` for a per-repo pool, or \
-                 `loom-daemon tokens bootstrap --shared` for the machine-level pool — see \
-                 .loom/docs/token-pool.md, #4642)"
-            );
-        }
-        RoleTickOutcome::PoolExhausted { next_clear_at, .. } => {
-            log::warn!(
-                "role_runner: {role} tick skipped after {elapsed:.1?} — {}; next check ~{} (#7607)",
-                outcome.pool_hold_phrase(),
-                next_clear_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-            );
-        }
-        RoleTickOutcome::ModelRuntimeMismatch(mismatch) => {
-            log::warn!(
-                "role_runner: {role} tick skipped after {elapsed:.1?} — {} (#5028)",
-                mismatch.detail()
-            );
-        }
-        RoleTickOutcome::LoadSkipped {
-            load_per_core,
-            detail,
-        } => {
-            log::warn!(
-                "role_runner: {role} tick skipped after {elapsed:.1?}: skipped: host saturated \
-                 (load/core {load_per_core:.2}) at the tick ceiling — not counted as a failure \
-                 (#6637): {detail}"
-            );
-        }
-        RoleTickOutcome::QueueEmpty => {
-            log::debug!("role_runner: {role} tick skipped — its work queue is empty (#9391)");
-        }
-    }
-}
-
-/// Root-aware variant of [`log_outcome`] for the **fire-and-forget idle path**
-/// ([`observe_and_fire_idle`], #4364). Unlike the repeating multi-workspace
+/// Log an invocation outcome with root context for the **fire-and-forget
+/// idle path** ([`observe_and_fire_idle`], #4364). Unlike the repeating multi-workspace
 /// interval loop — which uses [`log_outcome_for_root_deduped`] to suppress a
 /// persistently-failing root's per-tick WARN noise (#4349) — an idle-triggered
 /// run fires exactly once on a busy→idle *edge* and is dispatched as a detached
@@ -3477,8 +3420,9 @@ fn log_outcome_for_root(role: &str, root: &Path, outcome: &RoleTickOutcome, elap
             root.display()
         ),
         RoleTickOutcome::RuntimeRejected(rejection) => log::warn!(
-            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {rejection}",
-            root.display()
+            "role_runner: {role} runtime admission rejected for {} after {elapsed:.1?}: {}",
+            root.display(),
+            rejection.refusal_log_line()
         ),
         RoleTickOutcome::NoTokenPool => log::warn!(
             "role_runner: {role} tick for {} skipped after {elapsed:.1?} — no token pool \
@@ -3665,7 +3609,7 @@ fn classify_root_tick_log(
     }
 }
 
-/// Root-aware, **state-change-deduped** variant of [`log_outcome`] for the
+/// Root-aware, **state-change-deduped** outcome logger for the
 /// multi-workspace loop (#4349). `failing` tracks, per root, whether the
 /// *previous* tick for that root ended in [`RoleTickOutcome::Failure`] (or
 /// [`RoleTickOutcome::RuntimeRejected`]); `no_token_pool` tracks, per root and
@@ -3706,7 +3650,7 @@ fn log_outcome_for_root_deduped(
     );
     let reason = match outcome {
         RoleTickOutcome::Failure(reason) => reason.as_str(),
-        RoleTickOutcome::RuntimeRejected(rejection) => rejection.reason.as_str(),
+        RoleTickOutcome::RuntimeRejected(rejection) => rejection.refusal_line(),
         RoleTickOutcome::Success | RoleTickOutcome::NoTokenPool => "",
         RoleTickOutcome::PoolExhausted { .. } => "",
         RoleTickOutcome::ModelRuntimeMismatch(_) => "",
@@ -3860,10 +3804,6 @@ fn log_outcome_for_root_deduped(
     model_mismatch.insert(root.to_path_buf(), action.is_model_mismatch());
 }
 
-// The Curator's backlog level at dispatch (#11819) — see
-// `role_runner/backlog.rs`.
-pub mod backlog;
-
 // Concurrent per-(repository, role) dispatch, per-role budgets and queue
 // gating (#9391) — see `role_runner/concurrent_dispatch.rs`.
 pub mod concurrent_dispatch;
@@ -3871,10 +3811,6 @@ pub mod concurrent_dispatch;
 // Demand-weighted width and Champion-first reservation (#9392) — see
 // `role_runner/demand.rs`.
 pub mod demand;
-
-// Pipeline-empty gate for hermit/architect idle generation (#10817) — see
-// `role_runner/idle_gate.rs`.
-pub mod idle_gate;
 
 // Event-driven curator/auditor/guide triggers (#10816) — see
 // `role_runner/triggers.rs`.
@@ -3896,11 +3832,13 @@ pub use roster::spawn_roster_heartbeat_task;
 
 // Model resolution + runtime reconciliation (#4501/#5001/#7894) —
 // see `role_runner/model_resolution.rs`.
-mod model_resolution;
+pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
-    is_cli_default_model_sentinel, resolve_role_runner_effort, resolve_role_runner_model,
-    ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL, UNSET_EFFORT_SOURCE,
+    is_cli_default_model_sentinel, resolve_role_runner_effort,
+    resolve_role_runner_effort_for_runtime, resolve_role_runner_model,
+    resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL,
+    CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE, UNSET_EFFORT_SOURCE,
 };
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for
@@ -3912,18 +3850,19 @@ pub use in_progress_global::{
 };
 
 mod skip_counters;
-pub use skip_counters::{
-    load_skipped_count, model_runtime_mismatch_skip_count, no_token_pool_skip_count,
-    pool_exhausted_skip_count,
-};
 use skip_counters::{
     LOAD_SKIPPED_COUNT, MODEL_RUNTIME_MISMATCH_SKIP_COUNT, NO_TOKEN_POOL_SKIP_COUNT,
     POOL_EXHAUSTED_SKIP_COUNT,
 };
 
-// `autonomous.roleRunner.championMode` (#11859) — Champion's non-item-only
-// interval mode; see `role_runner/champion_mode.rs`.
+// Champion non-item only, item roles off the interval (#11909); see
+// `role_runner/champion_mode.rs`.
 pub mod champion_mode;
+
+// Ratification reviewer lane selection layer (#13187); see
+// `role_runner/ratification_lane.rs`.
+pub mod ratification_dispatch;
+pub mod ratification_lane;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

@@ -11,7 +11,7 @@
 //!    still hold the numbers, and this is the path that gets them out — a
 //!    human-readable table, or `--json` to feed a reconciliation job.
 //! 2. **Verification.** It is the same
-//!    [`loom_daemon::opencode_usage::tokens_by_model`] the sweep and role-tick
+//!    [`crate::opencode_usage::tokens_by_model`] the sweep and role-tick
 //!    journals call, so running it against a worktree after an OpenCode sweep
 //!    shows exactly what that sweep's `tokens_by_model` will carry.
 //!
@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
-use loom_daemon::opencode_usage::{self, OpencodeSessionUsage};
+use crate::opencode_usage::{self, OpencodeSessionUsage};
 
 /// `loom-daemon opencode-usage` arguments.
 #[derive(clap::Args)]
@@ -140,7 +140,7 @@ impl OpencodeUsageArgs {
             return Ok(None);
         }
         let now = Utc::now();
-        let since = loom_daemon::sweep_outcome_summary::parse_since(&self.since, now)?;
+        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
         let until = match &self.until {
             Some(raw) => DateTime::parse_from_rfc3339(raw)
                 .with_context(|| format!("--until {raw:?} is not RFC3339"))?
@@ -164,7 +164,7 @@ impl OpencodeUsageArgs {
             roots.len() == 1,
             "--issue names one workspace root's worktree; pass exactly one --directory with it"
         );
-        Ok(loom_daemon::usage_source::sweep_directories(&roots[0], issue))
+        Ok(crate::usage_source::sweep_directories(&roots[0], issue))
     }
 }
 

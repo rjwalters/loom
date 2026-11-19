@@ -146,6 +146,7 @@ fn pr_with_signals(
         most_recent_claim_activity_at: None,
         most_recent_judge_activity_at: judge.map(|m| now - Duration::minutes(m)),
         most_recent_head_push_at: push.map(|m| now - Duration::minutes(m)),
+        most_recent_pr_lease_at: None,
         head_ref_name: None,
     }
 }
@@ -332,4 +333,71 @@ fn extra_liveness_reads_name_the_explicit_repo() {
     let ambient = paths(None);
     assert!(ambient.contains("repos/{owner}/{repo}/issues/7/comments"), "{ambient}");
     assert!(ambient.contains("repos/{owner}/{repo}/issues/7/timeline"), "{ambient}");
+}
+
+// ------------------------------------------------------------------
+// Issue #13727: a live, renewed `loom:pr-lease` is liveness for a silent
+// Judge; a stale/released one is not.
+// ------------------------------------------------------------------
+
+fn lease_row(
+    at: DateTime<Utc>,
+    first_line: &str,
+) -> crate::sweep_registry::step_lease_owner::RoleLeaseRow {
+    crate::sweep_registry::step_lease_owner::RoleLeaseRow {
+        id: 1,
+        updated_at: at,
+        body: format!("{first_line}\nprose"),
+    }
+}
+
+const JUDGE_LEASE: &str = "<!-- loom:pr-lease role=judge host=h sweep=s -->";
+
+#[test]
+fn renewed_judge_lease_keeps_a_silent_aged_claim() {
+    let now = Utc::now();
+    let ttl = Duration::minutes(15);
+    let rows = vec![lease_row(now - Duration::minutes(2), JUDGE_LEASE)];
+    let mut pr = pr_with_signals(now, 90, None, None);
+    pr.most_recent_pr_lease_at = live_pr_lease_at(&rows, "judge", now, ttl);
+    assert_eq!(pr_liveness(&pr).1, LivenessSignal::PrLease);
+    assert_eq!(decide_pr(&pr, None, None, &|_| true, 45.0, now), PrReconcileAction::Keep);
+}
+
+#[test]
+fn stale_judge_lease_is_reclaimed() {
+    let now = Utc::now();
+    let ttl = Duration::minutes(15);
+    // Watched PID gone: the renewer stopped 20 minutes ago.
+    let rows = vec![lease_row(now - Duration::minutes(20), JUDGE_LEASE)];
+    let mut pr = pr_with_signals(now, 90, None, None);
+    pr.most_recent_pr_lease_at = live_pr_lease_at(&rows, "judge", now, ttl);
+    assert_eq!(pr.most_recent_pr_lease_at, None);
+    assert!(matches!(
+        decide_pr(&pr, None, None, &|_| true, 45.0, now),
+        PrReconcileAction::Reclaim(PrReclaimReason::Aged { .. })
+    ));
+}
+
+#[test]
+fn released_yielded_or_other_role_lease_is_not_liveness() {
+    let now = Utc::now();
+    let ttl = Duration::minutes(15);
+    let fresh = now - Duration::minutes(1);
+    let released = vec![
+        lease_row(now - Duration::minutes(5), JUDGE_LEASE),
+        lease_row(fresh, "<!-- loom:pr-lease-released role=judge host=h sweep=s -->"),
+    ];
+    assert_eq!(live_pr_lease_at(&released, "judge", now, ttl), None);
+    let yielded = vec![lease_row(
+        fresh,
+        "<!-- loom:pr-lease-yield role=judge host=h sweep=s earliest_host=a earliest_sweep=b -->",
+    )];
+    assert_eq!(live_pr_lease_at(&yielded, "judge", now, ttl), None);
+    let doctor = vec![lease_row(
+        fresh,
+        "<!-- loom:pr-lease role=doctor host=h sweep=s -->",
+    )];
+    assert_eq!(live_pr_lease_at(&doctor, "judge", now, ttl), None);
+    assert_eq!(live_pr_lease_at(&doctor, "doctor", now, ttl), Some(fresh));
 }

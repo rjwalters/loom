@@ -190,6 +190,8 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
     // `304`s. It is Hygiene-class: a shed walk is a skipped pass, retried on
     // the next one, and so is an incomplete one (past its page cap, or moved
     // mid-walk), since a missing issue must not read as absent.
+    // #12310: the intake walk is discovery.
+    let _discovery = crate::gh_invocation::purpose::discovery();
     let listed = crate::forge_listing::list_open_issues_cached_all_as(
         "intake.list_open",
         gh_bin,
@@ -200,7 +202,9 @@ pub fn run_once(gh_bin: &Path, root: &Path, now: DateTime<Utc>, cap: usize) -> u
         Ok(listed) => listed,
         Err(e)
             if e.downcast_ref::<crate::forge_etag_store::ReadShed>()
-                .is_some() =>
+                .is_some()
+                || e.downcast_ref::<crate::forge_etag_store::TickDeadlineReached>()
+                    .is_some() =>
         {
             log::debug!(
                 "intake_reconcile: open-issue listing deferred in {} ({e}); skipped this pass",

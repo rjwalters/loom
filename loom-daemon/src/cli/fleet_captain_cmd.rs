@@ -3,7 +3,7 @@
 //!
 //! # Why a CLI surface exists at all
 //!
-//! [`loom_daemon::fleet_captain`] is the mechanism, but its callers are not
+//! [`crate::fleet_captain`] is the mechanism, but its callers are not
 //! all in-process. The motivating consumer is a **schedule wrapper**: a
 //! launchd/systemd timer, or a shell script installed on every fleet host,
 //! that must run its periodic check on exactly one of them. Before this, each
@@ -55,21 +55,21 @@
 //!
 //! # `evaluate()` is a gate CHECK, not an arm — `run()` is both (#8901)
 //!
-//! [`loom_daemon::fleet_captain::arm_singleton_job`] maintains a
+//! [`crate::fleet_captain::arm_singleton_job`] maintains a
 //! **process-lifetime** armed registry, sampled into
 //! `HostHealthRecord::armed_singleton_jobs`. A CLI invocation is its own
 //! process that exits immediately, so recording an arm THERE would be
 //! written and lost in the same breath — [`evaluate`] therefore stays a pure
-//! read ([`loom_daemon::fleet_captain::resolve_gate_for_root`], no registry
+//! read ([`crate::fleet_captain::resolve_gate_for_root`], no registry
 //! write of any kind), and the `evaluating_does_not_touch_the_armed_registry`
 //! test below pins that.
 //!
 //! [`FleetCaptainArgs::run`] is the layer above it that closes the gap: on
 //! the **armed** path it also calls
-//! [`loom_daemon::fleet_captain::record_shell_arm`], the durable,
+//! [`crate::fleet_captain::record_shell_arm`], the durable,
 //! cross-process registry under `.loom/state/fleet-captain/armed.json` that
 //! `sample_host_health` merges into `armed_singleton_jobs` alongside the
-//! in-daemon one — see [`loom_daemon::fleet_captain`]'s module doc, "Two arm
+//! in-daemon one — see [`crate::fleet_captain`]'s module doc, "Two arm
 //! registries" / "Staleness policy", for why this is durable (survives past
 //! this process's exit) rather than process-lifetime, and how a stale entry
 //! stops being reported without any action from the wrapper.
@@ -85,7 +85,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use chrono::Utc;
 
-use loom_daemon::fleet_captain::{resolve_gate_for_root, CaptainGate};
+use crate::fleet_captain::{resolve_gate_for_root, CaptainGate};
 
 /// A captain is declared, but it is not this host.
 pub(crate) const EX_NOT_CAPTAIN: i32 = 3;
@@ -151,7 +151,7 @@ pub(crate) fn evaluate(root: &Path, host_id: &str, job_name: &str) -> (i32, Stri
 }
 
 /// [`evaluate`], plus — on the **armed** path only — a durable shell-arm
-/// record via [`loom_daemon::fleet_captain::record_shell_arm`] (#8901).
+/// record via [`crate::fleet_captain::record_shell_arm`] (#8901).
 /// Factored out of [`FleetCaptainArgs::run`] so the recording behavior is
 /// testable without `std::process::exit`. A record-write failure is logged
 /// to the returned message but never changes the exit code: the gate outcome
@@ -167,10 +167,10 @@ pub(crate) fn evaluate(root: &Path, host_id: &str, job_name: &str) -> (i32, Stri
 pub(crate) fn evaluate_and_record(root: &Path, host_id: &str, job_name: &str) -> (i32, String) {
     let (code, mut message) = evaluate(root, host_id, job_name);
     let outcome = if code == 0 {
-        loom_daemon::fleet_captain::record_shell_arm(root, job_name, Utc::now())
+        crate::fleet_captain::record_shell_arm(root, job_name, Utc::now())
             .map_err(|e| format!("durable arm record failed: {e}"))
     } else {
-        loom_daemon::fleet_captain::forget_shell_arm(root, job_name)
+        crate::fleet_captain::forget_shell_arm(root, job_name)
             .map_err(|e| format!("clearing the stale durable arm failed: {e}"))
     };
     if let Err(e) = outcome {
@@ -193,7 +193,7 @@ impl FleetCaptainArgs {
         };
 
         if self.disarm {
-            if let Err(e) = loom_daemon::fleet_captain::forget_shell_arm(&root, &self.job_name) {
+            if let Err(e) = crate::fleet_captain::forget_shell_arm(&root, &self.job_name) {
                 eprintln!("fleet-captain: failed to disarm '{}': {e}", self.job_name);
                 std::process::exit(EX_USAGE);
             }
@@ -205,7 +205,7 @@ impl FleetCaptainArgs {
 
         let host_id = self
             .host_id
-            .unwrap_or_else(loom_daemon::sweep_registry::host_identity);
+            .unwrap_or_else(crate::sweep_registry::host_identity);
 
         // Durable, cross-process arm on the ARMED path (#8901) — see the
         // module doc's "`evaluate()` is a gate CHECK, not an arm" section.
@@ -221,14 +221,14 @@ impl FleetCaptainArgs {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::config_resolver::PRIVATE_DEFAULTS_ENV;
+    use crate::config_resolver::PRIVATE_DEFAULTS_ENV;
     use serial_test::serial;
     use std::ffi::OsString;
     use tempfile::tempdir;
 
     /// Write `contents` as the tracked `.loom/config.json` under `root`.
     fn write_config(root: &Path, contents: &str) {
-        let path = root.join(loom_daemon::config_resolver::LEGACY_CONFIG_REL);
+        let path = root.join(crate::config_resolver::LEGACY_CONFIG_REL);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, contents).unwrap();
     }
@@ -376,13 +376,13 @@ mod tests {
         let (code, _) = evaluate(dir.path(), "loom-worker-1", &job);
         assert_eq!(code, 0);
         assert!(
-            !loom_daemon::fleet_captain::armed_singleton_job_names().contains(&job),
+            !crate::fleet_captain::armed_singleton_job_names().contains(&job),
             "a CLI gate check must not record an arm"
         );
         // #8901: `evaluate()` must not touch the DURABLE registry either —
         // only `evaluate_and_record` (called from `run()`) does that.
         assert!(
-            loom_daemon::fleet_captain::shell_armed_job_names(
+            crate::fleet_captain::shell_armed_job_names(
                 dir.path(),
                 chrono::Utc::now(),
                 std::time::Duration::from_secs(3600),
@@ -403,7 +403,7 @@ mod tests {
         // Refused: no durable arm recorded.
         let (code, _) = evaluate_and_record(dir.path(), "loom-worker-2", &job);
         assert_eq!(code, EX_NOT_CAPTAIN);
-        assert!(loom_daemon::fleet_captain::shell_armed_job_names(
+        assert!(crate::fleet_captain::shell_armed_job_names(
             dir.path(),
             chrono::Utc::now(),
             std::time::Duration::from_secs(3600),
@@ -415,14 +415,14 @@ mod tests {
         // too — see `fleet_captain::tests::shell_arm_written_by_one_call_is_read_back_by_another`).
         let (code, _) = evaluate_and_record(dir.path(), "loom-worker-1", &job);
         assert_eq!(code, 0);
-        assert!(loom_daemon::fleet_captain::shell_armed_job_names(
+        assert!(crate::fleet_captain::shell_armed_job_names(
             dir.path(),
             chrono::Utc::now(),
             std::time::Duration::from_secs(3600),
         )
         .contains(&job));
 
-        loom_daemon::fleet_captain::forget_shell_arm(dir.path(), &job).unwrap();
+        crate::fleet_captain::forget_shell_arm(dir.path(), &job).unwrap();
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let job = format!("handoff-test-{}", std::process::id());
         let armed = |root: &Path| {
-            loom_daemon::fleet_captain::shell_armed_job_names(
+            crate::fleet_captain::shell_armed_job_names(
                 root,
                 chrono::Utc::now(),
                 std::time::Duration::from_secs(6 * 3600),

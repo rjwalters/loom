@@ -351,7 +351,7 @@ pub fn classify_queue_activity(
 #[must_use]
 pub fn resolve_detection_enabled(repo_root: &Path) -> bool {
     if let Ok(v) = std::env::var(ROLE_COLLISION_DETECT_ENV) {
-        return is_truthy(&v);
+        return crate::env_flag::parse_truthy(&v);
     }
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
     if let Some(explicit) = crate::config_resolver::get_path(&effective, "autonomous.roleRunner")
@@ -391,10 +391,6 @@ pub fn resolve_window(repo_root: &Path, role_interval: Duration) -> Duration {
     };
     let window = secs.map_or(role_interval, Duration::from_secs);
     window.clamp(MIN_WINDOW, MAX_WINDOW)
-}
-
-fn is_truthy(v: &str) -> bool {
-    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
 // ============================================================================
@@ -1319,9 +1315,8 @@ JSON
     ///
     /// - `LOOM_GH_BIN` — every writer is `#[serial(loom_config_env)]`, and per
     ///   the #8465 / #8480 invariants it must stay that way;
-    /// - `LOOM_REPO` — every *other* writer in the crate (`gh_repo_env`,
-    ///   `peer_claims`, `claim_reconciliation`, `quarantine_reconciliation`,
-    ///   and the `sweep_registry` test modules) is on the crate-default,
+    /// - `LOOM_REPO` — every *other* writer in the crate (`claim_reconciliation`, `quarantine_reconciliation`, and the
+    ///   `sweep_registry` test modules) is on the crate-default,
     ///   unnamed key.
     ///
     /// `serial_test` only mutually excludes tests that share the *same* key, so
@@ -1339,9 +1334,15 @@ JSON
     ///
     /// # Lock order
     ///
-    /// `loom_config_env` outside, default inside. This is the crate's only
-    /// nested acquisition, so no cycle exists; any future test that needs both
-    /// MUST nest in this same order.
+    /// `loom_config_env` outside, default inside. Many other tests nest this
+    /// key pair, and every one nests in this same order. No cycle
+    /// exists because **no** site in the crate nests the pair in the reverse
+    /// order (a bare-`#[serial]` test calling a `#[serial(loom_config_env)]`
+    /// body); any future test that needs both MUST nest in this same order.
+    /// The invariant that makes this true — a function carrying
+    /// `loom_config_env` is always itself a `#[test]` — is enforced by
+    /// `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`
+    /// (#14404).
     #[serial]
     fn rest_queue_source_parses_the_live_listing_shape_body() {
         // Exercises the real production path (gh api --include -> forge_listing

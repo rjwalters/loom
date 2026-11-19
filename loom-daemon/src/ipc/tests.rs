@@ -170,37 +170,6 @@ fn test_handle_request_get_claims_summary() {
     }
 }
 
-// ===== CaptureGitChanges with nonexistent dir =====
-
-#[test]
-fn test_handle_request_capture_git_changes_no_repo() {
-    let (tm, db, sr, bus) = setup_test_context();
-    let response = handle_request(
-        Request::CaptureGitChanges {
-            input_id: 1,
-            working_dir: "/nonexistent/path".to_string(),
-            before_commit: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
-    match response {
-        Response::GitChangesCaptured {
-            files_changed,
-            lines_added,
-            lines_removed,
-        } => {
-            assert_eq!(files_changed, 0);
-            assert_eq!(lines_added, 0);
-            assert_eq!(lines_removed, 0);
-        }
-        other => panic!("Expected GitChangesCaptured, got: {other:?}"),
-    }
-}
-
 // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
 
 /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
@@ -346,8 +315,6 @@ fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
     DispatchHeadroom {
         occupancy,
         dynamic_cap,
-        disk_headroom: 10,
-        ram_headroom: 10,
         token_axis_limit: 5,
     }
 }
@@ -373,8 +340,6 @@ fn dispatch_headroom_message_names_every_axis() {
     let h = DispatchHeadroom {
         occupancy: 4,
         dynamic_cap: 3,
-        disk_headroom: 9,
-        ram_headroom: 7,
         token_axis_limit: 6,
     };
     let kind = SweepKind::Issue(123);
@@ -383,8 +348,8 @@ fn dispatch_headroom_message_names_every_axis() {
     let entered = dispatch_headroom_message(repo, true, &h, &kind);
     assert!(entered.contains("occupancy=4"), "{entered}");
     assert!(entered.contains("dynamic_cap=3"), "{entered}");
-    assert!(entered.contains("disk_headroom=9"), "{entered}");
-    assert!(entered.contains("ram_headroom=7"), "{entered}");
+    assert!(!entered.contains("disk_headroom"), "no disk term since #12406: {entered}");
+    assert!(!entered.contains("ram_headroom"), "no RAM term since #12330: {entered}");
     assert!(entered.contains("token_axis_limit=6"), "{entered}");
     assert!(entered.contains("123"), "{entered}");
     assert!(entered.contains("advisory only"), "{entered}");
@@ -472,8 +437,6 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
                 depends_on: None,
                 workspace_root: None,
                 force: false,
-                runtime: None,
-                model_profile: None,
                 dispatch_origin: None,
             },
             &tm,
@@ -566,8 +529,6 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
             depends_on: None,
             workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -700,8 +661,6 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
             depends_on: None,
             workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -724,8 +683,6 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
             depends_on: None,
             workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -803,8 +760,6 @@ fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
             depends_on: None,
             workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -888,8 +843,6 @@ fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
             depends_on: None,
             workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -988,8 +941,6 @@ fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1076,8 +1027,6 @@ fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1129,8 +1078,6 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
             depends_on: None,
             workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1204,8 +1151,6 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
             depends_on: None,
             workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1263,8 +1208,6 @@ fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
             depends_on: None,
             workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1315,8 +1258,6 @@ fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_err
             depends_on: None,
             workspace_root: Some(dir.path().to_string_lossy().into_owned()),
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1389,8 +1330,6 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1426,6 +1365,7 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
         source: crate::runtime_admission::RuntimeSource::DefaultConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     });
     let wire = serde_json::to_string(&response).unwrap();
     assert!(wire.contains("\"type\":\"RuntimeRejected\""));
@@ -1457,8 +1397,6 @@ fn test_handle_request_dispatch_sweep_happy_path() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1543,8 +1481,6 @@ fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1671,8 +1607,6 @@ fn test_handle_request_dispatch_sweep_accepts_prset() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -1877,8 +1811,6 @@ async fn dispatch_sweep_nonblocking_burst_acks_well_under_the_client_deadline() 
                 None,
                 None,
                 false,
-                None,
-                None,
                 crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .await
@@ -1993,8 +1925,6 @@ async fn list_sweeps_is_not_starved_behind_a_concurrent_dispatch_burst() {
                 None,
                 None,
                 false,
-                None,
-                None,
                 crate::sweep_registry::DispatchOrigin::Unknown,
             )
             .await
@@ -2161,8 +2091,6 @@ fn test_dispatch_sweep_deserializes_without_model_field() {
             depends_on: _,
             workspace_root: _,
             force: _,
-            runtime: _,
-            model_profile: _,
             dispatch_origin: _,
         } => {
             assert!(matches!(kind, SweepKind::Issue(42)));
@@ -2184,8 +2112,6 @@ fn test_dispatch_sweep_serde_round_trip_with_model() {
         depends_on: None,
         workspace_root: None,
         force: false,
-        runtime: None,
-        model_profile: None,
         dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
@@ -2199,8 +2125,6 @@ fn test_dispatch_sweep_serde_round_trip_with_model() {
             depends_on: _,
             workspace_root: _,
             force: _,
-            runtime: _,
-            model_profile: _,
             dispatch_origin: _,
         } => {
             assert!(matches!(kind, SweepKind::Issue(7)));
@@ -2222,8 +2146,6 @@ fn test_dispatch_sweep_serde_round_trip_without_model() {
         depends_on: None,
         workspace_root: None,
         force: false,
-        runtime: None,
-        model_profile: None,
         dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
@@ -2262,8 +2184,6 @@ fn test_dispatch_sweep_serde_round_trip_with_effort() {
         depends_on: None,
         workspace_root: None,
         force: false,
-        runtime: None,
-        model_profile: None,
         dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
@@ -2287,8 +2207,6 @@ fn test_dispatch_sweep_serde_round_trip_with_empty_effort() {
         depends_on: None,
         workspace_root: None,
         force: false,
-        runtime: None,
-        model_profile: None,
         dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
@@ -2330,8 +2248,6 @@ fn test_dispatch_sweep_serde_round_trip_with_depends_on() {
         depends_on: Some(3726),
         workspace_root: None,
         force: false,
-        runtime: None,
-        model_profile: None,
         dispatch_origin: None,
     };
     let json = serde_json::to_string(&request).expect("serialize");
@@ -2387,6 +2303,43 @@ async fn test_handle_request_publish_event_routes_to_subscribers() {
             assert_eq!(phase, "builder");
             assert_eq!(pr_number, None);
             assert_eq!(repo, None);
+        }
+        other => panic!("Expected SweepPhase event, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_handle_request_publish_event_backfills_repo_from_dispatching_workspace() {
+    // A child that omits `repo` would narrate under a bare `task_id` and
+    // thread with issue #N of every other repo. The daemon dispatched it into
+    // exactly one workspace, so it stamps that workspace's root.
+    let (tm, db, sr, bus) = setup_test_context();
+    let root = sr
+        .lock()
+        .unwrap()
+        .config()
+        .workspace_root
+        .display()
+        .to_string();
+    sr.lock().unwrap().seed_live_issue_sweep_for_test(321);
+    let mut sub = bus.subscribe::<[&str; 0], &str>([]);
+
+    handle_request(
+        Request::PublishEvent {
+            topic: "sweep.issue.321.phase".to_string(),
+            payload: serde_json::json!({"phase": "builder"}),
+        },
+        &tm,
+        &db,
+        &sr,
+        &bus,
+        &test_pool(),
+    );
+
+    match sub.recv().await.unwrap() {
+        Event::SweepPhase { issue, repo, .. } => {
+            assert_eq!(issue, 321);
+            assert_eq!(repo.as_deref(), Some(root.as_str()));
         }
         other => panic!("Expected SweepPhase event, got: {other:?}"),
     }
@@ -2790,7 +2743,11 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
         }
         other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
     }
-    assert_eq!(sr.lock().unwrap().noop_release_count(6670), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6670, Utc::now())
+        .is_some());
 }
 
 #[test]
@@ -2978,11 +2935,10 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
     assert!(
         sr_b.lock()
             .unwrap()
-            .noop_cooldown_issues(now)
-            .contains(&EPIC_PHASE_ISSUE),
+            .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+            .is_some(),
         "repo B's own registry must see the armed cooldown for its issue"
     );
-    assert_eq!(sr_b.lock().unwrap().noop_release_count(EPIC_PHASE_ISSUE), 1);
 
     // The WRONG registry (the daemon's cwd-seeded default, repo A) must
     // NOT see it — this is the exact failure mode #6957 reports: a
@@ -2996,13 +2952,11 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
             .contains(&EPIC_PHASE_ISSUE),
         "the default (wrong) registry must NOT see repo B's cooldown"
     );
-    assert_eq!(
-        sr_default
-            .lock()
-            .unwrap()
-            .noop_release_count(EPIC_PHASE_ISSUE),
-        0
-    );
+    assert!(sr_default
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+        .is_none());
 }
 
 /// Issue #6957 (edge case from the acceptance criteria): a
@@ -3039,7 +2993,11 @@ fn test_record_noop_release_none_workspace_root_still_targets_default() {
             ..
         }
     ));
-    assert_eq!(sr.lock().unwrap().noop_release_count(6959), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6959, Utc::now())
+        .is_some());
 }
 
 // ===== ListQuarantines (Issue #4215) =====
@@ -3278,8 +3236,6 @@ fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
             // tempdir-rooted registry the cancel below targets.
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -3350,8 +3306,6 @@ fn test_handle_request_get_sweep_status_returns_existing() {
             depends_on: None,
             workspace_root: None,
             force: false,
-            runtime: None,
-            model_profile: None,
             dispatch_origin: None,
         },
         &tm,
@@ -3750,6 +3704,65 @@ fn test_daemon_status_backward_compat_missing_capacity() {
 /// has actually reached the dynamic cap (#4031) — the "currently binding" vs
 /// "smallest ceiling" distinction. With a real token pool (cap > 0) and no
 /// in-flight sweeps, the cap is a ceiling but is NOT binding.
+/// #12406: the cap is the operator's `maxConcurrent` and nothing else. A host
+/// with 1 GB free on its worktree volume, a legacy `LOOM_PER_WORKTREE_GB`
+/// that used to clamp the disk term to zero, and brake/breaker thresholds
+/// that any load would trip still reports the configured cap. Load and RAM
+/// are not admission inputs at all any more (nothing samples them for the
+/// cap), and the work finder's reloader hands the tick the configured value.
+#[test]
+#[serial_test::serial]
+fn a_host_short_of_disk_ram_and_cpu_still_gets_the_configured_cap() {
+    use crate::main_health_gate::WorkspaceHealthStates;
+    use crate::work_finder::{
+        ConfiguredMax, ConfiguredMaxReloader, WORK_FINDER_MAX_CONCURRENT_ENV,
+    };
+    use crate::workspace_registry::REGISTRY_PATH_ENV;
+
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::disk_headroom::set_free_gb_override(None);
+            std::env::remove_var("LOOM_PER_WORKTREE_GB");
+            std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+        }
+    }
+    let _restore = Restore;
+    crate::disk_headroom::set_free_gb_override(Some(1));
+    std::env::set_var("LOOM_PER_WORKTREE_GB", "100");
+    std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
+
+    let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
+    let root = dir.path().to_path_buf();
+    std::env::set_var(REGISTRY_PATH_ENV, dir.path().join("no-such-workspaces.json"));
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"autonomous":{"workFinder":{"maxConcurrent":12,"maxConcurrentPerRepo":1,
+            "maxAdmissionsPerTick":1,"saturationBrake":{"loadPerCore":0.01}},
+            "hostBreaker":{"loadPerCore":0.01}}}"#,
+    )
+    .unwrap();
+
+    let pool = Arc::new(WorkspacePool::new(Arc::new(EventBus::new()), test_runtime_handle()));
+    pool.seed(root.clone(), sr.clone());
+    let report = build_daemon_status(
+        &pool,
+        &WorkspaceHealthStates::new(),
+        &root,
+        &test_credential_preflight(),
+    );
+    assert_eq!(report.configured_max, 12);
+    assert_eq!(report.dynamic_cap, 12, "1 GB free and tripped-threshold config do not clamp it");
+
+    // The work finder's per-tick read is the same value: the retired keys
+    // (per-repo cap, ramp cap, brake, breaker) are ignored.
+    let initial = ConfiguredMax::resolve(&crate::work_finder::read_work_finder_config(&root));
+    let mut reloader = ConfiguredMaxReloader::new(root.clone(), initial);
+    assert_eq!(reloader.refresh(), 12);
+    std::env::remove_var(REGISTRY_PATH_ENV);
+}
+
 #[test]
 #[serial_test::serial]
 fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
@@ -3762,23 +3775,6 @@ fn test_build_daemon_status_capacity_bound_tracks_occupancy() {
     std::env::set_var(REGISTRY_PATH_ENV, &empty_reg);
     let prev_shared = std::env::var("LOOM_SHARED_TOKENS_DIR").ok();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-
-    // #11679: pin the live RAM/disk probes so the cap does not depend on host
-    // load. The guard restores everything on drop, including on panic.
-    struct PinGuard;
-    impl Drop for PinGuard {
-        fn drop(&mut self) {
-            crate::ram_headroom::set_available_ram_gb_override(None);
-            crate::disk_headroom::set_free_gb_override(None);
-            std::env::remove_var("LOOM_PER_WORKTREE_RAM_GB");
-            std::env::remove_var("LOOM_PER_WORKTREE_GB");
-        }
-    }
-    let _pin = PinGuard;
-    crate::ram_headroom::set_available_ram_gb_override(Some(1024));
-    crate::disk_headroom::set_free_gb_override(Some(1024));
-    std::env::set_var("LOOM_PER_WORKTREE_RAM_GB", "1");
-    std::env::set_var("LOOM_PER_WORKTREE_GB", "1");
 
     // Provision a two-token pool so the dynamic cap is > 0 (a real ceiling).
     let tokens_dir = root.join(".loom").join("tokens");
@@ -3925,7 +3921,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
     // The tempdir has no `.loom/tokens/`, so the pool is 0 — but since
     // #5270 the token axis no longer participates in the dynamic cap, so
     // an empty token pool no longer pins `dynamic_cap` to 0. The cap is
-    // `min(disk_headroom, ram_headroom, configured_max)`, where
+    // `configured_max` (#12406), where
     // `configured_max` is resolved the same way `build_daemon_status`
     // resolves it (not assumed to be the built-in default — a host-level
     // config tier may set it, exactly the ambient config this assertion
@@ -3935,15 +3931,11 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         &crate::work_finder::read_work_finder_config(&root),
     );
     assert_eq!(
-        report.dynamic_cap,
-        report
-            .disk_headroom
-            .min(report.ram_headroom)
-            .min(expected_configured_max),
-        "dynamic cap is min(disk, ram, configured_max) regardless of the empty token pool"
+        report.dynamic_cap, expected_configured_max,
+        "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
+    // start_completion_dedup still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse
@@ -5185,57 +5177,21 @@ fn test_abort_supersedes_running_supervisor_generation() {
 mod status_round_trip;
 
 // The #9194 burst-calibration helper lives in its own sibling module rather
-// than being appended here: this module is over the 1000-line ratchet
-// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
-// — "put the new code in a NEW sibling module").
+// than being appended here.
 mod dispatch_burst_calibration;
 
 // The #4666 rate-limit dispatch-refusal tests live in their own sibling
-// module (moved out of this over-threshold, frozen file, #9855):
-// `.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling module".
+// module (moved out of this file, #9855).
 mod rate_limit_dispatch_refusal_tests;
 
-/// #11284: `runtime` / `model_profile` are optional on the wire. A legacy
-/// client's `DispatchSweep` (no such fields) still deserializes and means
-/// "no explicit tap"; a new client's fields round-trip.
+/// #13350: the removed `runtime` / `model_profile` fields are gone from the
+/// request, and a legacy payload that still carries them deserializes (the
+/// unknown fields are ignored) rather than failing the dispatch.
 #[test]
-fn dispatch_sweep_runtime_and_profile_are_wire_compatible() {
-    let legacy = r#"{"type":"DispatchSweep","payload":{"kind":{"type":"Issue","value":7},"idempotency_key":null}}"#;
+fn dispatch_sweep_legacy_runtime_and_profile_fields_are_ignored() {
+    let legacy = r#"{"type":"DispatchSweep","payload":{"kind":{"type":"Issue","value":7},"idempotency_key":null,"runtime":"opencode","model_profile":"zai-flash"}}"#;
     match serde_json::from_str::<Request>(legacy).expect("legacy request deserializes") {
-        Request::DispatchSweep {
-            runtime,
-            model_profile,
-            ..
-        } => {
-            assert!(runtime.is_none());
-            assert!(model_profile.is_none());
-        }
-        other => panic!("unexpected request: {other:?}"),
-    }
-    let tapped = Request::DispatchSweep {
-        kind: SweepKind::Issue(7),
-        idempotency_key: None,
-        model: None,
-        effort: None,
-        depends_on: None,
-        workspace_root: None,
-        force: false,
-        runtime: Some("opencode".into()),
-        model_profile: Some("zai-flash".into()),
-        // `skip_serializing_if` keeps this off the wire, so the round trip
-        // still exercises the exact legacy payload shape.
-        dispatch_origin: None,
-    };
-    let round: Request = serde_json::from_str(&serde_json::to_string(&tapped).unwrap()).unwrap();
-    match round {
-        Request::DispatchSweep {
-            runtime,
-            model_profile,
-            ..
-        } => {
-            assert_eq!(runtime.as_deref(), Some("opencode"));
-            assert_eq!(model_profile.as_deref(), Some("zai-flash"));
-        }
+        Request::DispatchSweep { kind, .. } => assert!(matches!(kind, SweepKind::Issue(7))),
         other => panic!("unexpected request: {other:?}"),
     }
 }

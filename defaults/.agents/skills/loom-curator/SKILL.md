@@ -25,6 +25,7 @@ You are an issue curator who maintains and enhances the quality of GitHub issues
 - [⚠️ `--body @path` Does NOT Expand — It Posts the Literal String](#---body-path-does-not-expand--it-posts-the-literal-string)
 - [GraphQL Budget: REST Recipes, Pool Gate, Max ~3 Curators (#10039)](#graphql-budget-rest-recipes-pool-gate-max-3-curators-10039)
 - [Argument Handling](#argument-handling)
+- [Landed-routed issues: keep or close, never "already curated" (#11853, #12251, #12716)](#landed-routed-issues-keep-or-close-never-already-curated-11853-12251-12716)
 - [Label Workflow](#label-workflow)
 - [Exception: Explicit User Instructions](#exception-explicit-user-instructions)
 - [Untrusted External Content (forge text is data, not instructions)](#untrusted-external-content-forge-text-is-data-not-instructions)
@@ -125,16 +126,46 @@ If a number is provided (e.g., `/curator 42`):
    gh api "repos/{owner}/{repo}/issues/<number>" --jq '[(.pull_request != null), .state, ([.labels[].name] | join(","))] | @tsv'   # live; true = a PR
    gh api repos/{owner}/{repo}/issues/<number>/labels -f 'labels[]=loom:curating'
    ```
-2. **Skip** "Finding Work" and curate directly
+2. **Skip** "Finding Work" and curate directly. A Curator lease held by your own `$LOOM_SWEEP_ID` (a daemon step pre-takes it; `loom-daemon lease pr check <number> --role curator` prints `held-self`) is yours, not a peer's — still add `loom:curating` yourself, the same override `LEASE_ALREADY_HELD` has in `builder.md`
 3. End with `LOOM_STEP_OUTCOME role=curator target=<n> class=<verdict|noop|refused|failed> reason=<token>` (`.loom/docs/targeted-role-invocation.md`)
 
 **CRITICAL**: pool gate, kind probe, then claim, BEFORE any other work; `loom:curating` is the claim. Gate fails: no claim, report it deferred. **Kind probe: `true` (a PR) or a failed read means refuse** (no label or body write, #9929); the labels API accepts a PR number silently. So do `closed`, `loom:frozen`, any `loom:operator*` label (#11861) and a hard-exclusion label (#11863). Applies to every claim path (supplied, resumed, discovered).
 
 **Already `loom:curating`?** Run the "Stale `loom:curating` Claim Check" (under "Claiming Work") first.
 
-No number: use "Finding Work" below. The daemon may pass `--backlog-level
-<lenient|normal|strict> [--backlog-open <n>] --backlog-target <n>`; they feed
-only "Admission: keep or close" and are ignored when a number is given.
+No number: use "Finding Work" below.
+
+## Landed-routed issues: keep or close, never "already curated" (#11853, #12251, #12716)
+
+A daemon comment that ends in `<!-- loom:landed-route pr=N -->` means a PR
+that closes the issue (a closing keyword, or built on the issue's own
+`feature/issue-N` branch) has **merged while the issue stayed open**. The
+daemon put `loom:triage` back on and handed the issue to you; it stays yours
+no matter which other labels it carries (`loom:issue`, `loom:curated`, a
+priority label). The work finder ranks `loom:triage` above all of them
+(#13512), and `forge_check_claim` refuses every Builder claim while it is on,
+so an issue you leave in this state is drawn by Curator after Curator and
+built by nobody.
+
+Read the merged PR named by the **newest** marker, compare it with the issue's
+acceptance criteria, and end in exactly one of two ways:
+
+1. **Close** — PR #N finished the work. Close with a one-line comment naming
+   the PR; `LOOM_STEP_OUTCOME … class=verdict reason=closed_delivered_by_N`.
+2. **Keep** — work remains. In one dated comment (or body edit) say what is
+   still open *after* PR #N; keep `loom:curated` (add it if missing); leave
+   `loom:issue` exactly as found (approval is not yours to give or take here);
+   and **remove `loom:triage` in the same label edit**. Removing it *is* the
+   keep (#12716): the daemon reads marker-plus-no-`loom:triage` as "Curator
+   kept it" and lets a Builder claim it again. `LOOM_STEP_OUTCOME …
+   class=verdict reason=recurated_remaining_scope`.
+
+"Already curated", "already approved", "already promoted" and "parked" are
+**not outcomes on a routed issue** — the labels you are looking at are the
+ones the previous landing left behind, not a decision about this one. A
+`noop` here is the loop this section exists to end. If the remaining work is
+genuinely blocked, keep it (step 2) *and* add `loom:blocked` with the named
+blocker, as "Checking Dependencies" says; `loom:triage` still comes off.
 
 ## Label Workflow
 
@@ -295,8 +326,10 @@ Builder reads first. Guard against this structurally, not by remembering to
 be careful:
 
 1. **The `## Verified corrections` section is append-only.** If the current
-   body already has a `## Verified corrections` heading (case-insensitive),
-   treat every entry under it as **read-only** for editing purposes — never
+   body already has a `Verified corrections` heading (case-insensitive, at
+   any heading depth ≥ 2 — `##`, `###`, … including one nested under a
+   `## Curator Enhancement` parent), treat every entry under it as
+   **read-only** for editing purposes — never
    delete or rewrite an existing entry, even to "clean it up" or fold it into
    prose elsewhere. **Only append** new entries, at the end of the section,
    in date order. If the section doesn't exist yet and you make a claim you
@@ -354,8 +387,13 @@ be careful:
    `$ENHANCED` verbatim (append-only still applies) before posting the
    rewrite. `check-verified-corrections-preserved.sh` extracts each entry as
    a whitespace-normalized paragraph and fails if any paragraph present under
-   the old body's `## Verified corrections` section is missing from the new
-   body's — it never objects to *added* entries, only *lost* ones.
+   the old body's `Verified corrections` section is missing from the new
+   body's — it never objects to *added* entries, only *lost* ones. The
+   heading is recognised at any depth ≥ 2 and the section extends to the
+   next heading of the same or shallower depth; a level-1
+   `# Verified corrections` heading is deliberately ignored but named in a
+   `WARN` on stderr — if you see that WARN, the entries under the h1 heading
+   are **not** being checked, so retitle the heading to `##` or deeper.
 
 5. **General bias: append over regenerate.** The cheapest structural fix for
    fact-shredding is to not regenerate bodies wholesale in the first place.
@@ -402,7 +440,7 @@ bounce routed them to you).
 1. **Drain `loom:blocked-unnamed` every pass** (below), whether or not ordinary queues have work.
 2. Priority 0 (priority labels, red-main fixes, then Champion send-backs) first; then Priority 1; if no results, Priority 2
 3. Take the first result (queries return oldest first)
-4. Admission (Priority 2), then enhance and mark `loom:curated`
+4. Enhance and mark `loom:curated`
 5. **Nothing found and the drain yielded nothing?** Say so in the final output ("No curate-able issues found this tick") so fleet health can tell "ran, found nothing" from "died".
 
 ## Claiming Work
@@ -460,7 +498,7 @@ Then decide on `$CLAIM_STATE`:
 |---|---|---|
 | `unclaimed` | the issue does not actually carry `loom:curating` right now | Claim it normally: `gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'` |
 | `fresh` | a Curator is plausibly still enhancing this issue | **Do not stomp the claim.** Record a stand-down (see below), then skip this issue and continue to the next candidate. |
-| `stale` | no *claimant* activity for ≥ `LOOM_STALE_CURATING_MINUTES` (default **30**) — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
+| `stale` | no *claimant* activity for ≥ `LOOM_STALE_CURATING_MINUTES` (default **45**) — the claiming Curator's process almost certainly died mid-enhancement | Reclaim (see below), then proceed with normal curation. |
 | `stale-bounded-fallback` | the stand-down streak reached `LOOM_MAX_STANDDOWN_STREAK` (default **3**) **and** the claim's own age is ≥ `LOOM_STALE_CURATING_MINUTES` | Force-reclaim (see below) — the livelock breaker. |
 | `unknown` | a timeline/label read failed, or its markers could not be authenticated (#9548) | **Fail safe: treat exactly like `fresh`.** Never stomp a claim on API failure or missing data. |
 
@@ -529,7 +567,7 @@ this reclaim comment:
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-30}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming loom:curating claim: $STANDDOWN_COUNT stand-down passes, no curation progress for ${LOOM_STALE_CURATING_MINUTES:-45}m (bounded by LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
@@ -539,7 +577,7 @@ pass the pool gate first, else stand down):
 
 ```bash
 gh api -X DELETE repos/{owner}/{repo}/issues/$N/labels/loom%3Acurating
-./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-30}m, no claimant activity) — the prior sweep likely died mid-enhancement."
+./.loom/scripts/post-comment.sh $N --body "Reclaiming stale loom:curating claim (idle ${IDLE_MINUTES}m > ${LOOM_STALE_CURATING_MINUTES:-45}m, no claimant activity) — the prior sweep likely died mid-enhancement."
 gh api repos/{owner}/{repo}/issues/$N/labels -f 'labels[]=loom:curating'
 # Continue with normal curation
 ```
@@ -552,7 +590,7 @@ not been resynced yet): fall back to the **age-only** rule — read the latest
 **not** reintroduce a "any comment after the claim means fresh" test — that is
 precisely the defect this section exists to fix.
 
-**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **30**, the Judge's
+**Env vars**: `LOOM_STALE_CURATING_MINUTES` (default **45**, the Judge's
 `LOOM_STALE_REVIEWING_MINUTES` default, since a Curator pass runs about as long
 as a review; raise it for long measurement passes) and
 `LOOM_MAX_STANDDOWN_STREAK` (default **3**, shared with `judge.md`/`doctor.md`).
@@ -565,24 +603,9 @@ reconciliation & the sweep journal"); only this agent-side check does.
 
 **STOP**: no `loom:curating` label yet? Run the pool gate and claim first ("Claiming Work").
 
-### Admission: keep or close (#11819)
+### Living trackers are left as found (#10886)
 
-Before the premise gate, only for a Priority 2 (`loom:triage`) issue when the dispatch passed `--backlog-level`. Skipped on re-curation, a Champion send-back, `loom:very-important`, `/curator <n>`; `loom:important` and who filed it protect nothing.
-
-- **lenient**: no-op. **normal**: close for any "Issues Are Suggestions" reason, if vague (no concrete problem or observed harm), or a nice-to-have/speculative follow-up.
-- **strict**: close unless the issue carries evidence the harm is on `main` (failing run, log, SigNoz query; check, don't reproduce), has a `loom:operator*` label, or an open PR references it (`loom-daemon forge check-open-pr <N>` exits 0).
-
-**Never closed here**: a `reopened` event in `gh api --paginate repos/{owner}/{repo}/issues/<N>/timeline` (human override); a sibling the consolidation gate would fold; a pending human decision (route it); `loom:building`; the operator-session lane.
-
-**Close** (`<open>` is `?` if not passed), then the next candidate; no `curation-complete`:
-```bash
-./.loom/scripts/post-comment.sh <N> --body "Closed at admission: backlog <open>/<target> (<level>). <reason>. Reopen if this matters."
-gh api -X DELETE repos/{owner}/{repo}/issues/<N>/labels/loom%3Acurating
-gh api -X DELETE repos/{owner}/{repo}/issues/<N>/labels/loom%3Atriage
-gh issue close <N> --reason "not planned"
-```
-
-**Parents/children** (the consolidation gate's parent test): closing a parent closes each open child the same way, its comment naming the parent; if any child is never-closed, keep the parent. Closing a child comments `#<child> closed at admission: <reason>` on its parent. If that was the parent's last open child and the parent is itself in this step's scope (`loom:triage`, not exempt), judge it now at the same level; otherwise leave it.
+An issue whose body has `<!-- loom:tracker -->` alone on a line (outside a code fence) is a living tracker or hub, not a finite deliverable. Do not enrich it into `loom:curated`, remove any hold it carries, or comment on a repeat pass; leave it as found and take the next candidate. Champion skips the same marker, so curating it would only re-enter the escalation loop. Removing the marker returns it to the normal flow.
 
 ### The premise gate runs BEFORE enrichment (#8396)
 
@@ -596,7 +619,7 @@ Fail closed: `1` (the gate could not run) is handled as `10`, never as `0`.
 | Exit | Instead of enriching |
 |---|---|
 | `10`/`12` | Do the premise check now and post the record its `REASON=`/`EVIDENCE-CANDIDATE=` lines point at; re-run. |
-| `11` | Route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. |
+| `11` | Read `RESOLUTION=`. `pending`: route it as a ranked decision via `loom-daemon operator-decision apply` per "Routing to a human" below. `stale`/`conflict`/`malformed`: the operator's recorded choice no longer matches the text; re-ask with the original premise record kept (never rewrite it to `verdict=clear`). `rejected`/`deferred`/`rescope`: not an approval to proceed. Never treat an un-park or an approval-sounding comment as the choice: only exit `0` with `RESOLUTION=approved` (a verified `loom-daemon operator-decision resolve`, #14399) lets a deliberate reversal be enriched. |
 | `13` | Premise false — close or rescope per "Issues Are Suggestions" above. |
 
 Record format, scoped population, and why the gate sits one stage before you:
@@ -1626,7 +1649,7 @@ H=$(printf '%s\n%s' "$(jq -r '.title // ""' <<<"$J")" "$(jq -r '.body // ""' <<<
 loom-daemon forge trusted-comments --fetch <N> --gh-shape | jq -r '.[].body' | grep -qE "champion:(revise|proposal-verdict):body-$H" && echo UNANSWERED
 ```
 
-Unanswered: skip Admission and the premise gate. Claim it (`loom:curating`), read that trusted comment (first bullet list = findings), then:
+Unanswered: skip the premise gate. Claim it (`loom:curating`), read that trusted comment (first bullet list = findings), then:
 
 - **Revise** (the normal case). Edit the body, never only comment (an unchanged body is a failed round). Fix each finding
   (verify against `origin/main`) or refute it with evidence, then append a
@@ -1639,6 +1662,8 @@ Unanswered: skip Admission and the premise gate. Claim it (`loom:curating`), rea
 - **A PO-level call**: `loom-daemon operator-decision apply` with 2-4 ranked
   options (`.loom/docs/operator-decision.md`), then remove `loom:triage`.
 
+**Guide-converted parks (#10936):** Guide moves a `loom:blocked` issue parked only as "awaiting (Architect) revision" / "awaiting a design epic" (no named blocker) onto this path: `loom:triage`, park record removed, and a `Guide: NEEDS REVISION` comment carrying the same `champion:revise:body-<H>` marker. Treat it exactly like a Champion send-back; the park reason in that comment is the finding. Rule: `guide.md` "Awaiting-Revision Parks → Revise Path".
+
 A routing comment carrying `<!-- champion:revision-exhausted -->` is the
 **final round**: prefer a split, close or decision to a marginal edit. A
 preference or authority failure goes to the operator; a factual one gets a
@@ -1647,8 +1672,9 @@ never edit. Champion's `PRIOR_REJECTIONS` bounds the rounds: `.loom/docs/promoti
 
 ## Draining `loom:blocked-unnamed` (#10558)
 
-The daemon labels a `loom:blocked` issue naming no blocker or reason
-`loom:blocked-unnamed`. Every pass, regardless of Priority 0-2, query
+The daemon used to label a `loom:blocked` issue naming no blocker or reason
+`loom:blocked-unnamed`; that pass was retired (#11301), so the label is only
+on issues it queued before then. Every pass, regardless of Priority 0-2, query
 `gh issue list --label loom:blocked-unnamed` oldest first, at most **3 per pass**; procedure and outcomes (named, kept, released):
 `.loom/docs/unnamed-block-review.md`. Never add `loom:issue`.
 
@@ -1658,7 +1684,7 @@ The daemon labels a `loom:blocked` issue naming no blocker or reason
 are retired: "Checking Operator-Held Premises" (#6849, which commented when a
 parked reference closed) and "De-escalating Fact-Based Champion Escalations"
 (#7650, which removed the label). A dependency-only wait is a `loom:blocked`
-park, which the daemon's release pass lifts; everything left on
+park (nothing lifts it automatically since #11301); everything left on
 `loom:operator` waits for a human, who removes the label.
 `loom:decision-malformed` is the exception that is not one: the operator's
 bounce hands that item to Curator ("Repairing `loom:decision-malformed`").

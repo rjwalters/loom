@@ -361,7 +361,9 @@ pub fn reclaim_skip_reason(
     window: Duration,
 ) -> Option<String> {
     match decision {
-        WorktreeDecision::Remove | WorktreeDecision::RemoveWithQuarantine => {
+        WorktreeDecision::Remove
+        | WorktreeDecision::RemoveWithQuarantine
+        | WorktreeDecision::RemoveWithBackup => {
             return Some(
                 "eligible for full removal (handled by the directory reap pass)".to_string(),
             )
@@ -624,7 +626,10 @@ pub fn removal_veto_in(
         // `Duration::ZERO` short-circuits `probe_worktree_activity` to `Idle`,
         // i.e. "inflight claims only" — see the doc comment above.
         WorktreeDecision::Remove => Duration::ZERO,
-        WorktreeDecision::RemoveWithQuarantine => window,
+        // #12458: an OPEN item's worktree is about to be snapshotted and
+        // removed; a write inside the window is a live worker the idle gate
+        // missed, so it gets the same mtime veto as the quarantine route.
+        WorktreeDecision::RemoveWithQuarantine | WorktreeDecision::RemoveWithBackup => window,
         _ => return decision,
     };
     let holders = live_holders_in(store, worktree_path, now, window, stale);

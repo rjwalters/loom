@@ -34,7 +34,7 @@
 //! # Why this is Rust and not more lines in that script
 //!
 //! `check-dependabot-labels.sh` is `contract`-category shell. Epic #7810's
-//! `shell-budget` gate ratchets that pool down, never up, and
+//! retires that pool, and
 //! `.loom/docs/shell-language-policy.md` sends new executable logic to a
 //! `loom-daemon` subcommand — the same move [`crate::guard_wiring`] made for
 //! #9108.
@@ -316,7 +316,7 @@ pub fn ok_message(checked: &[String]) -> String {
 /// Printed after the violations.
 pub fn failure_trailer(count: usize) -> String {
     format!(
-        "\ncheck-renovate-labels: {count} problem(s). Every Renovate `labels` array must include `{REQUIRED_LABEL}` (#9418; Dependabot-side equivalent: check-dependabot-labels.sh, #7577)."
+        "\ncheck-renovate-labels: {count} problem(s). Every Renovate `labels` array must include `{REQUIRED_LABEL}` (#9418)."
     )
 }
 

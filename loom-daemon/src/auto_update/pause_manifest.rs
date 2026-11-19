@@ -295,8 +295,6 @@ pub struct ManifestItem {
     #[serde(default)]
     pub log_path: Option<String>,
     #[serde(default)]
-    pub overflow: bool,
-    #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
     pub timeout_remaining_secs: Option<u64>,
@@ -304,6 +302,10 @@ pub struct ManifestItem {
     pub holds_issue_creation_mutex: bool,
     #[serde(default)]
     pub stopped_at: Option<DateTime<Utc>>,
+    /// The step role of a `SweepKind::Step` item (#11898); its item number is
+    /// `issue` for an issue step, `pr` for a PR step. Absent for a sweep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<crate::step_role::StepRole>,
 }
 
 impl ManifestItem {

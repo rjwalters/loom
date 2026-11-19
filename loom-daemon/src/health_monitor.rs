@@ -68,6 +68,16 @@ enum TmuxUnresponsiveKind {
     Unresponsive,
 }
 
+/// Log level for the `NeverStarted` condition: `WARN` on the first
+/// occurrence, `DEBUG` while it persists (#13438).
+fn never_started_warn_level(already_logged: bool) -> log::Level {
+    if already_logged {
+        log::Level::Debug
+    } else {
+        log::Level::Warn
+    }
+}
+
 /// Decide how to classify a generic tmux connection failure (any stderr
 /// that doesn't match the explicit "no server running" or "no sessions"
 /// arms) so the check loop can pick the right log level/behavior.
@@ -112,6 +122,10 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
         // being alive" (missing socket). Reset once the server is observed
         // alive again, so the next idle transition logs exactly once.
         let mut idle_logged = false;
+        // Whether the "never started" WARN has already been logged. Headless
+        // step-dispatch workers never create a tmux session, so the condition
+        // persists for the whole process; warn once, then drop to debug.
+        let mut never_started_logged = false;
 
         loop {
             thread::sleep(Duration::from_secs(interval_secs));
@@ -131,6 +145,7 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                     let session_count = sessions.len() as u64;
                     ever_seen_alive = true;
                     idle_logged = false;
+                    never_started_logged = false;
                     health_state_clone
                         .server_alive
                         .store(true, Ordering::Relaxed);
@@ -187,6 +202,7 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                         // has been observed alive.
                         ever_seen_alive = true;
                         idle_logged = false;
+                        never_started_logged = false;
                         health_state_clone
                             .server_alive
                             .store(true, Ordering::Relaxed);
@@ -197,9 +213,17 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                     } else {
                         match classify_tmux_unresponsive(ever_seen_alive, &stderr) {
                             TmuxUnresponsiveKind::NeverStarted => {
-                                log::warn!(
+                                let msg = format!(
                                     "tmux server not responding (not yet started this run, likely a fresh boot with no sessions created yet): {stderr}"
                                 );
+                                if never_started_warn_level(never_started_logged)
+                                    == log::Level::Warn
+                                {
+                                    log::warn!("{msg}");
+                                    never_started_logged = true;
+                                } else {
+                                    log::debug!("{msg}");
+                                }
                             }
                             TmuxUnresponsiveKind::IdleAfterAlive => {
                                 // Normal tmux behavior: the server process
@@ -278,6 +302,12 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn never_started_warns_once_then_debug() {
+        assert_eq!(never_started_warn_level(false), log::Level::Warn);
+        assert_eq!(never_started_warn_level(true), log::Level::Debug);
+    }
 
     // ===== TmuxHealthState::default tests =====
 

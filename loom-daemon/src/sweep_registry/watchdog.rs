@@ -464,7 +464,7 @@ pub struct StaleSweepFinding {
     pub sweep_id: SweepId,
     /// PID of the (confirmed alive) sweep process.
     pub pid: u32,
-    /// How long the sweep has been `Running`/`Pending`.
+    /// How long the sweep has been `Running`.
     pub elapsed: Duration,
     /// How long the sweep's log file has gone un-appended, when readable.
     pub log_idle: Option<Duration>,
@@ -818,8 +818,8 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
     let now = Utc::now();
     entries
         .filter(|(id, info)| {
-            matches!(info.state, SweepState::Running | SweepState::Pending)
-                && matches!(info.kind, SweepKind::Issue(_))
+            matches!(info.state, SweepState::Running)
+                // The kind is matched exhaustively below (#11898).
                 // The complement of the other two watchdogs' eligibility
                 // gate: ONLY sweeps this daemon instance did not itself
                 // spawn are candidates here, so nothing is ever
@@ -828,8 +828,12 @@ pub(crate) fn scan_stale_sweep_findings<'a>(
                 && !is_own_child(id)
         })
         .filter_map(|(id, info)| {
-            let SweepKind::Issue(issue) = info.kind else {
-                return None;
+            let issue = match info.kind {
+                SweepKind::Issue(issue) => issue,
+                // A step's liveness is its claim (`stale_after_minutes`, the
+                // lease); a dead one is restored by the reaper (#11898). This
+                // backstop's remedy is an issue-sweep recovery, so not here.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
             };
             if !is_pid_alive(info.pid) {
                 // Already dead: the ordinary reaper's dead-pid path
@@ -934,7 +938,7 @@ impl SweepRegistry {
         }
     }
 
-    /// Issue numbers of `Running`/`Pending` Issue sweeps that count toward the
+    /// Issue numbers of `Running` Issue sweeps that count toward the
     /// work-finder's admission budget (Issue #4003).
     ///
     /// A sweep counts while it is inside its [`startup_proof_grace`]
@@ -961,10 +965,13 @@ impl SweepRegistry {
         let candidates: Vec<(SweepId, u32, PathBuf, Duration)> = self
             .entries
             .iter()
-            .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter(|(_, info)| matches!(info.state, SweepState::Running))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                // A step holds its item's slot like a sweep holds its issue's
+                // (#11898): both draw from the same `maxConcurrent`.
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -981,7 +988,7 @@ impl SweepRegistry {
     }
 
     /// For status/observability only (Issue #4003): for each currently live
-    /// (`Running`/`Pending`) Issue sweep that has not yet proven startup,
+    /// (`Running`) Issue sweep that has not yet proven startup,
     /// return `(issue, time_since_dispatch)`. Empty once a sweep proves
     /// progress (checked against the same `watchdog_progressed` latch
     /// [`has_proven_start`](Self::has_proven_start) maintains, so this can
@@ -993,10 +1000,11 @@ impl SweepRegistry {
         let now = Utc::now();
         self.entries
             .iter()
-            .filter(|(_, info)| matches!(info.state, SweepState::Running | SweepState::Pending))
+            .filter(|(_, info)| matches!(info.state, SweepState::Running))
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => n,
+                    SweepKind::PrSet(_) => return None,
                 };
                 if self.watchdog_progressed.contains(id)
                     || self.sweep_made_progress(issue, &info.log_path)
@@ -1031,14 +1039,16 @@ impl SweepRegistry {
             .entries
             .iter()
             .filter(|(id, info)| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
+                matches!(info.state, SweepState::Running)
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
             .filter_map(|(id, info)| {
-                let SweepKind::Issue(issue) = info.kind else {
-                    return None;
+                let issue = match info.kind {
+                    SweepKind::Issue(issue) => issue,
+                    // The restart re-dispatches `/loom:sweep N`; a hung step is
+                    // left to its claim's staleness and the reaper (#11898).
+                    SweepKind::Step { .. } | SweepKind::PrSet(_) => return None,
                 };
                 let elapsed = (now - info.started_at).to_std().unwrap_or(Duration::ZERO);
                 Some((id.clone(), issue, info.log_path.clone(), elapsed))
@@ -1073,6 +1083,8 @@ impl SweepRegistry {
                              the MCP-init hang).",
                             elapsed.as_secs()
                         );
+                        // The give-up comment is posted for this sweep (#13171).
+                        let _sweep = crate::gh_invocation::telemetry::enter_sweep(&sweep_id, None);
                         self.post_watchdog_gaveup_comment(issue, elapsed);
                     }
                 }
@@ -1121,10 +1133,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -1455,6 +1467,8 @@ impl SweepRegistry {
     /// fixtures that never publish/read lease comments keep exercising the
     /// pre-#7612 recovery path byte-for-byte unchanged.
     pub(crate) fn midbuild_lease_veto(&self, issue: u32, dead_sweep_id: &str) -> Option<String> {
+        // The lease read is made for the dead sweep (#13171).
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(dead_sweep_id, None);
         if self.config.skip_label_flip {
             return None;
         }
@@ -1490,13 +1504,13 @@ impl SweepRegistry {
         }
     }
 
-    /// Whether an active (Running/Pending) sweep already exists for `issue` —
+    /// Whether an active (Running) sweep already exists for `issue` —
     /// used to avoid racing a re-dispatch the work-finder may have already
     /// issued after the reaper restored `loom:issue` (Issue #3895).
     pub(crate) fn issue_has_active_sweep(&self, issue: u32) -> bool {
         self.entries.values().any(|i| {
-            matches!(i.kind, SweepKind::Issue(n) if n == issue)
-                && matches!(i.state, SweepState::Running | SweepState::Pending)
+            // A live issue step on it is as good as a sweep (#11898).
+            i.kind.issue_number() == Some(issue) && matches!(i.state, SweepState::Running)
         })
     }
 
@@ -1556,14 +1570,11 @@ impl SweepRegistry {
         let candidates: Vec<(SweepId, u32)> = self
             .entries
             .iter()
-            .filter(|(_, info)| {
-                info.state.is_terminal()
-                    && matches!(info.kind, SweepKind::Issue(_))
-                    && info.pr_number.is_none()
-            })
+            .filter(|(_, info)| info.state.is_terminal() && info.pr_number.is_none())
             .filter_map(|(id, info)| match info.kind {
                 SweepKind::Issue(issue) => Some((id.clone(), issue)),
-                SweepKind::PrSet(_) => None,
+                // A step's recovery is its claim restore, not a re-dispatch.
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 
@@ -1808,10 +1819,10 @@ impl SweepRegistry {
                     // it is released here rather than left to wedge dispatch.
                     let _ = self.release_lock_owned(issue, &watchdog_lock_id);
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         None,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -1905,14 +1916,15 @@ impl SweepRegistry {
             .entries
             .iter()
             .filter(|(id, info)| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-                    && matches!(info.kind, SweepKind::Issue(_))
+                matches!(info.state, SweepState::Running)
                     // Only sweeps we spawned (own the Child handle) are cancelable.
                     && self.children.contains_key(*id)
             })
             .filter_map(|(id, i)| match i.kind {
                 SweepKind::Issue(n) => Some((id.clone(), n, i.pid, i.log_path.clone())),
-                SweepKind::PrSet(_) => None,
+                // A review-stalled step is one Judge/Doctor session: its claim
+                // goes stale and the reaper restores it (#11898).
+                SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
             })
             .collect();
 
@@ -2015,10 +2027,10 @@ impl SweepRegistry {
                         continue;
                     }
 
-                    match self.dispatch_from(
+                    match self.dispatch_with_model(
                         &SweepKind::Issue(issue),
                         idempotency_key,
-                        model.as_deref(),
+                        DispatchModel::Retry(model.as_deref()),
                         effort.as_deref(),
                         depends_on,
                         DispatchOrigin::Watchdog,
@@ -2182,7 +2194,7 @@ impl SweepRegistry {
     /// `loom:issue`, exactly like every other watchdog's cancel path) and post
     /// a forge comment explaining why. Unlike the other three watchdogs there
     /// is no bounded retry/give-up pair: the cancel itself transitions the
-    /// entry out of `Running`/`Pending`, so it can never match
+    /// entry out of `Running`, so it can never match
     /// `stale_sweep_findings` again — a single reap per issue is inherent to
     /// the state machine, not a separate latch.
     ///

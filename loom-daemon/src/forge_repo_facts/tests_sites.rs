@@ -75,6 +75,8 @@ fn decide(path: &Path, pr_status: &dyn Fn(u32) -> PrStatus) -> WorktreeDecision 
         pr_status,
         branch_reachable_from_remotes: &|_| true,
         uncommitted: &|_| false,
+        unsaved_work: &|_: &Path| false,
+        idle_for: &|_: &Path, _: i64| false,
         now: Utc::now(),
     };
     let opts = CleanOptions {

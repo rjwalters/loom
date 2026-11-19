@@ -1,6 +1,6 @@
 //! `loom-daemon codex-hooks verify` — the readiness check behind
 //! `provision-codex-hooks.sh verify` (issue #9390). See
-//! `loom_daemon::tokens_pool::codex_hooks` for what "ready" means.
+//! `crate::tokens_pool::codex_hooks` for what "ready" means.
 //!
 //! # Contract (inherited from the shell verb)
 //!
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::tokens_pool::codex_hooks::{pooled_profiles, seal, Check, Registration};
+use crate::tokens_pool::codex_hooks::{pooled_profiles, seal, Check, Registration};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum CodexHooksCommand {
@@ -163,7 +163,7 @@ impl VerifyArgs {
         let Some(root) = self
             .profile_root
             .clone()
-            .or_else(loom_daemon::tokens_pool::paths::codex_profile_root)
+            .or_else(crate::tokens_pool::paths::codex_profile_root)
         else {
             error("No Codex profile root is configured. Pass --profile-root.");
             return 78;

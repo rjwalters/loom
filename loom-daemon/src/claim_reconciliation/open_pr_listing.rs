@@ -5,8 +5,16 @@
 //! conditional-request mechanism. They now read the ETag-cached REST listing
 //! ([`crate::forge_pull_listing`]): an unchanged workspace answers every pass
 //! with a free `304`, and a changed one bills one REST core point per changed
-//! page. Each pass lists for itself, so it still sees the preceding passes'
-//! writes (a write changes the listing's ETag, so the next read is a `200`).
+//! page. In mirror mode (the worklist as the discovery chain) the rows are
+//! the tick's discovery snapshot instead and nothing is listed (#12307);
+//! direct mode keeps the REST listing above.
+//!
+//! The listing only *selects candidates*. A snapshot is at most one tick old,
+//! so it may lag the preceding passes' writes; that is safe because every
+//! write decision re-reads the PR it acts on, live and as a `ReadClass::Gate`
+//! read: `pull_state_cached_as` (`claim_reconciliation.pr_mergeable`, with the
+//! head sha it computed `mergeable` for), `pull_files_cached_as`
+//! (`.pr_files`), and the lease, verdict and activity comments (#12315).
 //!
 //! A sibling module rather than inline in `claim_reconciliation.rs`, which is
 //! frozen by the file-size ratchet (`.loom/docs/file-size-policy.md`). Calls
@@ -31,8 +39,30 @@ pub use crate::forge_pull_listing::RestPull;
 pub(crate) const MAX_PAGES: usize = 10;
 
 /// Every open PR of `root`'s repository (`LOOM_REPO` wins), newest first.
+/// With the mirror's worklist as the discovery chain the rows come from the
+/// tick's snapshot and nothing is listed (#12307); a repo the snapshot has
+/// not read, or whose open-PR facts it could not read, is an error like a
+/// failed listing.
 pub(super) fn list_open_prs(gh_bin: &Path, root: &Path) -> Result<Vec<RestPull>> {
-    list_open_pulls_cached_as("claim_reconciliation.pr_list", gh_bin, Some(root), None, MAX_PAGES)
+    use crate::discovery::published::{absent_error, lookup, Lookup};
+    match lookup(root) {
+        Lookup::Repo(repo) => repo
+            .pulls
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("discovery: no open-PR facts for {}", repo.slug)),
+        Lookup::Absent => Err(absent_error(root)),
+        Lookup::NotMirror => {
+            // #12310: the open-PR listing is discovery.
+            let _discovery = crate::gh_invocation::purpose::discovery();
+            list_open_pulls_cached_as(
+                "claim_reconciliation.pr_list",
+                gh_bin,
+                Some(root),
+                None,
+                MAX_PAGES,
+            )
+        }
+    }
 }
 
 /// The open PRs carrying `label`, newest first, capped at

@@ -556,3 +556,8 @@ fn quiet_suppresses_every_owned_line_on_both_outcomes() {
         }
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

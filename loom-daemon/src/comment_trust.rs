@@ -30,7 +30,10 @@
 //!    ([`crate::fleet_store::admins`], user accounts only). It is **unioned**
 //!    with rule 4: neither can remove the other. Fails closed: an unreadable
 //!    roster widens nothing and is reported by
-//!    [`TrustPolicy::sources_consulted`] (#10303).
+//!    [`TrustPolicy::sources_consulted`] (#10303);
+//! 6. a fleet-trusted App from the optional `apps` list in the same file
+//!    (`name[bot]` spelled, same account-kind rule as rule 4). Unioned, only
+//!    ever adds trust, same fail-closed behavior (#13545).
 //!
 //! # The GraphQL shape cannot name an App
 //!
@@ -188,6 +191,8 @@ pub struct TrustPolicy {
     allowlist: Vec<String>,
     /// Fleet admin roster logins (rule 5), empty when unavailable.
     admins: Vec<String>,
+    /// Fleet-trusted App logins from the same file (rule 6).
+    apps: Vec<String>,
     /// How the roster resolved (`None`: not consulted, e.g. explicit rules).
     admins_state: Option<String>,
 }
@@ -201,6 +206,7 @@ impl TrustPolicy {
             self_login,
             allowlist,
             admins: Vec::new(),
+            apps: Vec::new(),
             admins_state: None,
         }
     }
@@ -209,6 +215,7 @@ impl TrustPolicy {
     #[must_use]
     pub fn with_admins(mut self, admins: crate::fleet_store::admins::Admins) -> Self {
         self.admins = admins.logins;
+        self.apps = admins.apps;
         self.admins_state = Some(admins.state);
         self
     }
@@ -219,10 +226,37 @@ impl TrustPolicy {
     pub fn sources_consulted(&self) -> String {
         format!(
             "author_association (OWNER/MEMBER/COLLABORATOR), fleet Apps, self identity, \
-             forge.trustedCommenters ({} entries), fleet admin roster {ADMINS_PATH} ({})",
+             forge.trustedCommenters ({} entries), fleet admin roster {ADMINS_PATH} ({}), fleet trusted Apps list \
+             ({} entries, `apps` in the same file)",
             self.allowlist.len(),
             self.admins_state.as_deref().unwrap_or("not consulted"),
+            self.apps.len(),
         )
+    }
+
+    /// A short digest of the rules (#13142): the first 16 hex of the sha256 of
+    /// the fleet logins, self identity, allowlist and admin roster. A change to
+    /// who is trusted changes it, so a verdict that depended on trust can be
+    /// re-reached once.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let sorted = |v: &[String]| {
+            let mut v = v.to_vec();
+            v.sort();
+            v
+        };
+        let mut canon = serde_json::json!({
+            "fleet": self.fleet.names(),
+            "self": self.self_login,
+            "allow": sorted(&self.allowlist),
+            "admins": sorted(&self.admins),
+        });
+        // Only when non-empty, so a fleet without the list keeps its digest.
+        if !self.apps.is_empty() {
+            canon["apps"] = serde_json::json!(sorted(&self.apps));
+        }
+        hex::encode(Sha256::digest(canon.to_string().as_bytes()))[..16].to_string()
     }
 
     /// The rules for the workspace at `root`: its fleet roster, its writer
@@ -241,9 +275,16 @@ impl TrustPolicy {
             self_login,
             allowlist: allowlist_from_config(&effective),
             admins: Vec::new(),
+            apps: Vec::new(),
             admins_state: None,
         }
         .with_admins(crate::fleet_store::admins::resolve(root))
+    }
+
+    /// This workspace's own (writer App) login, when one resolved.
+    #[must_use]
+    pub fn self_login(&self) -> Option<&str> {
+        self.self_login.as_deref()
     }
 
     /// Replace the self identity (an explicit `--self-login`).
@@ -255,11 +296,73 @@ impl TrustPolicy {
         self
     }
 
+    /// Whether `login` is this workspace's own self identity (its writer
+    /// App), by the same name-and-kind rule the trust check uses. `false`
+    /// when no self identity resolved: an unknown self is nobody (#12105).
+    #[must_use]
+    pub fn is_self(&self, login: &str) -> bool {
+        let author = Author::new(Some(login), None);
+        let Some(norm) = author
+            .login
+            .as_deref()
+            .map(normalise_login)
+            .filter(|n| !n.is_empty())
+        else {
+            return false;
+        };
+        self.self_login
+            .as_deref()
+            .is_some_and(|me| names(me, author.app, &norm))
+    }
+
     /// Whether `author` is believed.
     #[must_use]
     pub fn trusts(&self, author: &Author) -> bool {
-        let allow: Vec<String> = self.allowlist.iter().chain(&self.admins).cloned().collect();
+        let allow: Vec<String> = self
+            .allowlist
+            .iter()
+            .chain(&self.admins)
+            .chain(&self.apps)
+            .cloned()
+            .collect();
         trusted_by(author, |norm| self.fleet.contains(norm), self.self_login.as_deref(), &allow)
+    }
+
+    /// Whether `author` is an *operator*: a human user account with authority
+    /// over this repository (#14399). Narrower than [`Self::trusts`] on
+    /// purpose: that rule also admits fleet Apps, this daemon's own identity,
+    /// and the `forge.trustedCommenters` allowlist (which may name automation),
+    /// and none of those can attest a human's choice. An operator is a
+    /// non-App account whose forge-reported `author_association` is
+    /// `OWNER`/`MEMBER`/`COLLABORATOR`, or who is on the fleet admin roster.
+    /// A missing login or (for a non-admin) a missing association is
+    /// unverifiable, so not an operator.
+    #[must_use]
+    pub fn is_operator(&self, author: &Author) -> bool {
+        if author.app {
+            return false;
+        }
+        let Some(login) = author.login.as_deref() else {
+            return false;
+        };
+        let norm = normalise_login(login);
+        if norm.is_empty() {
+            return false;
+        }
+        if author.association.as_deref().is_some_and(|a| {
+            TRUSTED_ASSOCIATIONS
+                .iter()
+                .any(|t| a.trim().eq_ignore_ascii_case(t))
+        }) {
+            return true;
+        }
+        self.admins.iter().any(|entry| names(entry, false, &norm))
+    }
+
+    /// [`Self::is_operator`] for a comment/issue object in either shape.
+    #[must_use]
+    pub fn is_operator_json(&self, v: &Value) -> bool {
+        self.is_operator(&Author::from_json(v))
     }
 
     /// Whether the comment/review object `v` (either shape) is believed.

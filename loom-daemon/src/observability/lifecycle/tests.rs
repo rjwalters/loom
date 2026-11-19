@@ -23,6 +23,7 @@ fn completion_markers_preserve_each_repair_attempt_without_invented_duration() {
             Some("glm-5.3-flash"),
             Some(42),
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     assert!(journal.has_checkpoint_observations().unwrap());
@@ -41,9 +42,13 @@ fn completion_markers_preserve_each_repair_attempt_without_invented_duration() {
         .filter(|s| s.name == SpanName::RoleAttempt && s.attributes["loom.role"] == "judge")
         .collect();
     assert_eq!(judges.len(), 2);
-    assert_eq!(judges[0].attributes["loom.judge_verdict"], "rejected");
+    // #12362: the checkpoint phase is not the verdict; `loom.result` still
+    // says how the phase ended, and no verdict is invented from it.
+    assert!(!judges[0].attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(judges[0].attributes["loom.result"], "rejected");
     assert_eq!(judges[0].status, SpanStatus::Error);
-    assert_eq!(judges[1].attributes["loom.judge_verdict"], "approved");
+    assert!(!judges[1].attributes.contains_key("loom.judge_verdict"));
+    assert_eq!(judges[1].attributes["loom.result"], "success");
     assert_eq!(judges[1].status, SpanStatus::Ok);
     assert_ne!(judges[0].context.span_id, judges[1].context.span_id);
     for span in &spans {
@@ -84,6 +89,7 @@ fn checkpoint_completes_existing_started_attempt_without_double_counting() {
         None,
         Some(42),
         "checkpoint_write_observed",
+        "o/r",
     );
     let mut spans = Vec::new();
     assert_eq!(
@@ -202,11 +208,8 @@ fn role_invocation_ids_derive_from_role_and_start_instant() {
     assert_eq!(judge, role_execution_id("judge", at), "recomputable");
     let curator = role_execution_id("curator", at);
     let ws = std::path::Path::new("/nonexistent/loom");
-    let (a, b) = (
-        TraceStore::root_context(ws, &judge, None),
-        TraceStore::root_context(ws, &curator, None),
-    );
-    assert_eq!(a, TraceStore::root_context(ws, &judge, None));
+    let (a, b) = (TraceStore::root_context(ws, &judge), TraceStore::root_context(ws, &curator));
+    assert_eq!(a, TraceStore::root_context(ws, &judge));
     assert_ne!(a.trace_id, b.trace_id);
     assert_ne!(a.span_id, b.span_id);
 }
@@ -294,6 +297,154 @@ fn host_and_admission_attributes_survive_the_span_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
+// #12113: role-span host attributes read the `host_status` latest record
+// ---------------------------------------------------------------------------
+
+use crate::host_status::TEST_SLOT as HOST_STATUS_SLOT;
+
+fn host_record(raw: &[(&str, f64)]) -> crate::telemetry::kinds::host_status::HostStatusRecord {
+    crate::telemetry::kinds::host_status::HostStatusRecord {
+        captured_at: Utc::now(),
+        interval_secs: 5,
+        raw: raw.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        filtered: Default::default(),
+        volumes: Vec::new(),
+    }
+}
+
+/// The four keys `host_status` supplies.
+const HOST_STATUS_KEYS: [&str; 4] = [
+    "loom.host.mem_available_bytes",
+    "loom.host.swap_used_bytes",
+    "loom.host.pressure",
+    "loom.host.load_per_core",
+];
+
+#[test]
+fn host_attributes_read_the_latest_host_status_record() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 123_456.0),
+        ("swap_used_bytes", 789.0),
+        ("mem_pressure_grade", 1.0),
+        ("cpu_load_per_core", 0.5),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        attrs
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("123456")
+    );
+    assert_eq!(attrs.get("loom.host.swap_used_bytes").map(String::as_str), Some("789"));
+    assert_eq!(attrs.get("loom.host.pressure").map(String::as_str), Some("some"));
+    assert_eq!(attrs.get("loom.host.load_per_core").map(String::as_str), Some("0.500"));
+}
+
+#[test]
+fn host_attributes_omit_signals_the_record_lacks() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // No record yet (first span before the first tick): all four are absent.
+    crate::host_status::clear_latest();
+    let none = host_attributes();
+    for key in HOST_STATUS_KEYS {
+        assert!(!none.contains_key(key), "{key} must be absent, not zero, with no record");
+    }
+    // A record with only some signals, and an unknown pressure grade.
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 42.0),
+        ("mem_pressure_grade", 7.0),
+    ]));
+    let partial = host_attributes();
+    crate::host_status::clear_latest();
+    assert_eq!(
+        partial
+            .get("loom.host.mem_available_bytes")
+            .map(String::as_str),
+        Some("42")
+    );
+    for key in [
+        "loom.host.swap_used_bytes",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+    ] {
+        assert!(!partial.contains_key(key), "{key} must be absent, not zero");
+    }
+}
+
+#[test]
+fn host_attributes_key_set_is_pinned() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::host_status::publish(&host_record(&[
+        ("mem_available_bytes", 1.0),
+        ("swap_used_bytes", 1.0),
+        ("mem_pressure_grade", 0.0),
+        ("cpu_load_per_core", 1.0),
+    ]));
+    let attrs = host_attributes();
+    crate::host_status::clear_latest();
+    let allowed = [
+        "loom.host.mem_total_bytes",
+        "loom.host.mem_available_bytes",
+        "loom.host.mem_compressed_bytes",
+        "loom.host.swap_total_bytes",
+        "loom.host.swap_used_bytes",
+        "loom.host.swap_in_bytes_total",
+        "loom.host.swap_out_bytes_total",
+        "loom.host.oom_kill_total",
+        "loom.host.pressure",
+        "loom.host.load_per_core",
+        "loom.host.logical_cpus",
+        "loom.host.loadavg_1m",
+    ];
+    for key in attrs.keys() {
+        assert!(allowed.contains(&key.as_str()), "unexpected host attribute {key}");
+    }
+    for key in HOST_STATUS_KEYS {
+        assert!(attrs.contains_key(key), "{key} missing");
+    }
+}
+
+#[test]
+fn host_attributes_carry_the_cpu_count() {
+    let attrs = host_attributes();
+    let cpus: u64 = attrs["loom.host.logical_cpus"].parse().unwrap();
+    assert!(cpus >= 1);
+    // The load average is absent when unmeasurable, never zero-filled.
+    if let Some(load) = attrs.get("loom.host.loadavg_1m") {
+        assert!(load.parse::<f64>().unwrap() >= 0.0);
+    }
+}
+
+#[test]
+fn spawn_budget_attributes_require_integers_of_at_least_one() {
+    let ok = spawn_budget_from(Some("6"), Some(" 3 "));
+    assert_eq!(ok["loom.host.cpu_budget_cores"], "6");
+    assert_eq!(ok["loom.host.sweeps_in_flight"], "3");
+    for bad in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("abc"),
+        Some("-2"),
+        Some("1.5"),
+    ] {
+        let attrs = spawn_budget_from(bad, bad);
+        assert!(attrs.is_empty(), "{bad:?} must leave both keys absent");
+    }
+    let half = spawn_budget_from(Some("4"), None);
+    assert!(half.contains_key("loom.host.cpu_budget_cores"));
+    assert!(!half.contains_key("loom.host.sweeps_in_flight"));
+}
+
+// ---------------------------------------------------------------------------
 // #9420: loom.attempt.worked — the dwell-conditioning flag
 // ---------------------------------------------------------------------------
 
@@ -355,6 +506,7 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
             None,
             None,
             source,
+            "o/r",
         );
         let mut spans = Vec::new();
         journal
@@ -401,6 +553,7 @@ fn only_an_observed_start_makes_a_checkpoint_completion_count_as_worked() {
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     let mut spans = Vec::new();
     journal
@@ -450,7 +603,18 @@ fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
                 )
                 .unwrap();
         }
-        checkpoint_observation(&journal, &root, None, 18, "builder-done", None, None, None, source);
+        checkpoint_observation(
+            &journal,
+            &root,
+            None,
+            18,
+            "builder-done",
+            None,
+            None,
+            None,
+            source,
+            "o/r",
+        );
         let mut spans = Vec::new();
         journal
             .drain(|s| {
@@ -481,9 +645,10 @@ fn checkpoint_spans_carry_their_executions_repo_and_sweep_id() {
         }
     }
     for span in observed("bare-root", TraceAttributes::new(), false, SYNTHETIC_TIMING_SOURCES[0]) {
-        for key in scope.keys() {
-            assert!(!span.attributes.contains_key(key), "{key} must stay absent, never guessed");
-        }
+        // #13562: the repo falls back to the workspace's own spelling; the
+        // sweep id has no such source and stays absent, never guessed.
+        assert_eq!(span.attributes["loom.repo"], "o/r");
+        assert!(!span.attributes.contains_key("loom.sweep_id"), "sweep id must stay absent");
     }
 }
 
@@ -629,6 +794,7 @@ mod role_tick_spans {
                 source: crate::runtime_admission::RuntimeSource::RoleConfig,
                 unmet_capabilities: vec!["isolation".into()],
                 reason: "unmet".into(),
+                exhausted_summary_line: None,
             }),
             RoleTickOutcome::ModelRuntimeMismatch(crate::role_runner::ModelRuntimeMismatch {
                 role: "doctor".into(),
@@ -754,9 +920,17 @@ fn a_begun_phase_completes_with_its_real_duration() {
         .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
         .unwrap();
     for role in ["curator", "builder", "judge", "doctor"] {
-        let begun =
-            checkpoint_begin_observation(&journal, &root, None, 9935, role, Some(1), Some("opus"))
-                .unwrap();
+        let begun = checkpoint_begin_observation(
+            &journal,
+            &root,
+            None,
+            9935,
+            role,
+            Some(1),
+            Some("opus"),
+            "o/r",
+        )
+        .unwrap();
         assert_eq!(begun.record.attributes["loom.timing_source"], CHECKPOINT_BEGIN_SOURCE);
         assert!(!begun.record.attributes.contains_key(ATTEMPT_WORKED));
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -775,6 +949,7 @@ fn a_begun_phase_completes_with_its_real_duration() {
             None,
             Some(7),
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     let spans = drained_spans(&journal);
@@ -802,8 +977,17 @@ fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     )
     .unwrap();
     let span = begin(root_dir, "sweep-9935", SpanName::Sweep, TraceAttributes::new()).unwrap();
-    checkpoint_begin_observation(&span.journal, span.context(), None, 9935, "builder", None, None)
-        .unwrap();
+    checkpoint_begin_observation(
+        &span.journal,
+        span.context(),
+        None,
+        9935,
+        "builder",
+        None,
+        None,
+        "o/r",
+    )
+    .unwrap();
     assert_eq!(span.journal.active().unwrap().len(), 3, "root, phase, attempt all open");
     finish_execution(root_dir, "sweep-9935", "failure", TraceAttributes::new()).unwrap();
     let spans = drained_spans(&span.journal);
@@ -816,6 +1000,92 @@ fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     assert!(!attempt.attributes.contains_key(ATTEMPT_WORKED));
 }
 
+/// #14407: a step-dispatched attempt on a non-Claude runtime. The step's end
+/// was observed, so the swept phase and attempt mirror its result and carry the
+/// launch's runtime and engine; a close that observed nothing stays unobserved.
+#[test]
+fn a_swept_step_attempt_mirrors_the_observed_step_end_and_runtime() {
+    let open = |execution: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+        )
+        .unwrap();
+        let span = begin(dir.path(), execution, SpanName::Sweep, TraceAttributes::new()).unwrap();
+        checkpoint_begin_observation(
+            &span.journal,
+            span.context(),
+            None,
+            14407,
+            "builder",
+            None,
+            None,
+            "o/r",
+        )
+        .unwrap();
+        (dir, span)
+    };
+    let observed = StepEndObserved {
+        result: "success".into(),
+        runtime: Some("codex".into()),
+    };
+
+    let (dir, span) = open("step-observed");
+    finish_execution_observing(
+        dir.path(),
+        "step-observed",
+        "success",
+        TraceAttributes::new(),
+        Some(&observed),
+    )
+    .unwrap();
+    let spans = drained_spans(&span.journal);
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "success", "{name:?}");
+        assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+    }
+
+    // A failed step end is mirrored as a failure, and an unknown runtime
+    // (no engine) is carried as-is without inventing an engine.
+    let (dir, span) = open("step-failed");
+    let failed = StepEndObserved {
+        result: "failure".into(),
+        runtime: Some("opencode".into()),
+    };
+    finish_execution_observing(
+        dir.path(),
+        "step-failed",
+        "failure",
+        TraceAttributes::new(),
+        Some(&failed),
+    )
+    .unwrap();
+    let spans = drained_spans(&span.journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "failure");
+    assert_eq!(attempt.attributes["loom.runtime"], "opencode");
+    assert!(!attempt.attributes.contains_key("loom.engine"));
+
+    // Nothing observed (kill, orphan recovery, host loss): no result, no runtime.
+    let (dir, span) = open("step-unobserved");
+    finish_execution(dir.path(), "step-unobserved", "success", TraceAttributes::new()).unwrap();
+    let spans = drained_spans(&span.journal);
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+        assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+    }
+}
+
 /// Parallel builders share one orchestrator journal: each issue's checkpoint
 /// completes its own begun attempt. A re-dispatch supersedes the earlier begin
 /// with `worked` absent, and a done with no begin stays synthetic.
@@ -825,10 +1095,13 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     let journal = Journal::for_context(&dir.path().join("root.json"));
     let root = TraceContext::root(true);
     let first_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None).unwrap();
-    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None, "o/r")
+            .unwrap();
+    let b = checkpoint_begin_observation(&journal, &root, None, 2, "builder", None, None, "o/r")
+        .unwrap();
     let second_a =
-        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None).unwrap();
+        checkpoint_begin_observation(&journal, &root, None, 1, "builder", Some(2), None, "o/r")
+            .unwrap();
     for issue in [1, 2] {
         checkpoint_observation(
             &journal,
@@ -840,6 +1113,7 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
             None,
             None,
             "checkpoint_write_observed",
+            "o/r",
         );
     }
     // No begin for issue 3: the synthetic zero-duration completion is unchanged.
@@ -853,6 +1127,7 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
         None,
         None,
         "checkpoint_write_observed",
+        "o/r",
     );
     let spans = drained_spans(&journal);
     let attempt = |context: &TraceContext| spans.iter().find(|s| s.context == *context).unwrap();
@@ -872,7 +1147,10 @@ fn begun_attempts_are_matched_per_issue_and_superseded_on_redispatch() {
     assert_eq!(synthetic.started_at, synthetic.ended_at);
     assert_eq!(synthetic.attributes["loom.timing_source"], "checkpoint_write_observed");
     assert_eq!(synthetic.attributes[ATTEMPT_WORKED], "false");
-    assert!(checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None).is_none());
+    assert!(
+        checkpoint_begin_observation(&journal, &root, None, 1, "sweep", None, None, "o/r")
+            .is_none()
+    );
 }
 
 /// #9510: the value `insert_nonempty_bounded` would stamp for `value`.
@@ -927,6 +1205,7 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         source: crate::runtime_admission::RuntimeSource::RoleConfig,
         unmet_capabilities: vec!["isolation-\u{9694}\u{79BB}".to_owned(); 40],
         reason: "unmet".into(),
+        exhausted_summary_line: None,
     });
     for (outcome, key) in [
         (mismatch, "loom.model"),
@@ -951,4 +1230,435 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         assert!(!value.is_empty() && value.len() <= 256, "{key}: {} bytes", value.len());
         assert_eq!(exported["loom.runtime"], "codex");
     }
+}
+
+/// #11982: the sweep root names its issue and base SHA even when the repo's
+/// GitHub identity did not resolve, and gains the issue branch's head SHA at close.
+#[test]
+fn sweep_root_carries_issue_and_commit_facts_without_a_resolved_identity() {
+    let (dir, base, head) = git_facts::tests::repo_with_branch();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let mut command = Command::new("true");
+    TraceStore::new(root_dir)
+        .load_or_create(root_dir, "sweep-11982")
+        .unwrap();
+    prepare_execution(&mut command, root_dir, "sweep-11982", &StepKeys::issue(Some(42)));
+    let journal = Journal::for_context(&TraceStore::new(root_dir).path(root_dir, "sweep-11982"));
+    let open = journal.active().unwrap();
+    let attrs = &open[0].record.attributes;
+    assert_eq!(attrs["loom.issue"], "42");
+    assert_eq!(attrs["loom.base_sha"], base);
+    assert!(!attrs.contains_key("loom.head_sha"), "no PR head at dispatch");
+    finish_execution(root_dir, "sweep-11982", "success", TraceAttributes::new()).unwrap();
+    let spans = drained_spans(&journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes["loom.issue"], "42");
+    assert_eq!(sweep.attributes["loom.base_sha"], base);
+    assert_eq!(sweep.attributes["loom.head_sha"], head);
+    // Survives the export allowlist, so an external join can read it.
+    let exported = sweep.clone().bounded();
+    for key in [
+        "loom.issue",
+        "loom.base_sha",
+        "loom.head_sha",
+        "loom.sweep_id",
+        "loom.repo",
+    ] {
+        assert!(exported.attributes.contains_key(key), "{key} dropped at export");
+    }
+}
+
+/// Collects the spans a backfill pass exports (#12253).
+#[derive(Default)]
+struct SpanSink(std::sync::Mutex<Vec<crate::telemetry::trace::SpanRecord>>);
+
+impl super::super::queue::QueueSink for SpanSink {
+    fn offer(&self, _: TelemetryEnvelope) {}
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        if let TelemetryRecord::Span(span) = envelope.record {
+            self.0.lock().unwrap().push(span);
+        }
+        Ok(())
+    }
+}
+
+/// #12253: orphan recovery leaves a step's `loom.sweep` span open while the
+/// step still runs (its lock names it and its process lives), even when the
+/// journal's owner and supervisor pids are gone; once the step is gone it
+/// closes it as before.
+#[cfg(unix)]
+#[test]
+fn recovery_leaves_a_running_steps_sweep_span_to_the_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let sweep_id = "step-builder-60-1";
+    let span =
+        begin(root, sweep_id, SpanName::Sweep, attributes(&[("loom.sweep_id", sweep_id)])).unwrap();
+    let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    span.journal.set_owner(span.context(), dead).unwrap();
+    span.journal.set_supervisor(span.context(), dead).unwrap();
+    assert_eq!(step_sweep_id(&span.journal.active().unwrap()), Some(sweep_id));
+
+    // The step's lock names it and its leader (this process) lives.
+    let lock = root.join(".loom/locks/issue-60");
+    std::fs::create_dir_all(&lock).unwrap();
+    let owner = crate::sweep_registry::LockOwner::new(60, std::process::id(), sweep_id);
+    std::fs::write(lock.join("owner.json"), serde_json::to_string(&owner).unwrap()).unwrap();
+    let sink = SpanSink::default();
+    backfill(root, &sink);
+    assert_eq!(span.journal.active().unwrap().len(), 1, "a running step keeps its span");
+    assert!(sink.0.lock().unwrap().is_empty());
+
+    // The step is gone: its lock is released.
+    std::fs::remove_dir_all(&lock).unwrap();
+    backfill(root, &sink);
+    let spans = sink.0.lock().unwrap();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].attributes["loom.result"], "process_lost");
+}
+
+#[test]
+fn only_a_steps_sweep_id_marks_a_step_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    journal
+        .start(
+            TraceContext::root(true),
+            None,
+            SpanName::Sweep,
+            Utc::now(),
+            attributes(&[("loom.sweep_id", "sweep-issue-7-1")]),
+        )
+        .unwrap();
+    assert_eq!(step_sweep_id(&journal.active().unwrap()), None);
+    assert!(!running_step(dir.path(), &journal));
+}
+
+// ---------------------------------------------------------------------------
+// #12884: the open-time load sample survives the close on the drained span
+// ---------------------------------------------------------------------------
+
+fn publish_load(load_per_core: f64) {
+    crate::host_status::publish(&host_record(&[("cpu_load_per_core", load_per_core)]));
+}
+
+/// Asserts a drained, export-bounded span carries `open` under the start key
+/// and `close` under the plain (close-time) key, and that the raw load average
+/// keeps a start copy whenever the host measures one.
+fn assert_start_and_close_load(
+    span: &crate::telemetry::trace::SpanRecord,
+    open: &str,
+    close: &str,
+) {
+    let exported = span.clone().bounded();
+    let attrs = &exported.attributes;
+    let name = span.name;
+    assert_eq!(
+        attrs
+            .get("loom.host.start.load_per_core")
+            .map(String::as_str),
+        Some(open),
+        "{name:?}: start key must keep the open-time sample"
+    );
+    assert_eq!(
+        attrs.get("loom.host.load_per_core").map(String::as_str),
+        Some(close),
+        "{name:?}: plain key is the close-time sample"
+    );
+    assert_eq!(
+        attrs.contains_key("loom.host.start.loadavg_1m"),
+        attrs.contains_key("loom.host.loadavg_1m"),
+        "{name:?}: the load average keeps a start copy exactly when it is measured"
+    );
+}
+
+#[test]
+fn drained_sweep_and_phase_spans_keep_the_open_load_beside_the_close_load() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let store = TraceStore::new(root_dir);
+    let saved = store.load_or_create(root_dir, "sweep-12884").unwrap();
+    let journal = Journal::for_context(&store.path(root_dir, "sweep-12884"));
+    publish_load(0.5);
+    prepare_execution(&mut Command::new("true"), root_dir, "sweep-12884", &StepKeys::default());
+    checkpoint_begin_observation(
+        &journal,
+        &saved.context,
+        None,
+        12884,
+        "builder",
+        None,
+        None,
+        "o/r",
+    )
+    .unwrap();
+    publish_load(3.25);
+    finish_execution(root_dir, "sweep-12884", "success", TraceAttributes::new()).unwrap();
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    for name in [SpanName::Sweep, SpanName::Phase, SpanName::RoleAttempt] {
+        let span = spans.iter().find(|s| s.name == name).unwrap();
+        assert_start_and_close_load(span, "0.500", "3.250");
+    }
+}
+
+#[test]
+fn a_checkpoint_completion_keeps_the_begin_load_and_a_synthetic_one_its_only_sample() {
+    let _slot = HOST_STATUS_SLOT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    publish_load(0.5);
+    checkpoint_begin_observation(&journal, &root, None, 1, "builder", None, None, "o/r").unwrap();
+    publish_load(3.25);
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        1,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+        "o/r",
+    );
+    // No begin for issue 2: the synthetic phase opens and closes on one sample.
+    checkpoint_observation(
+        &journal,
+        &root,
+        None,
+        2,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+        "o/r",
+    );
+    crate::host_status::clear_latest();
+    let spans = drained_spans(&journal);
+    assert_eq!(spans.len(), 4);
+    for span in &spans {
+        let close = "3.250";
+        let open = if span.attributes["loom.issue"] == "1" {
+            "0.500"
+        } else {
+            close
+        };
+        assert_start_and_close_load(span, open, close);
+    }
+}
+
+/// #13439: stale-journal handling in `backfill`.
+mod stale_journals {
+    use super::*;
+
+    fn traced_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom/logs/trace-context")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn age(path: &Path, secs: u64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn dir(root: &Path) -> PathBuf {
+        root.join(".loom/logs/trace-context")
+    }
+
+    #[test]
+    fn an_old_zero_byte_journal_is_retired() {
+        let root = traced_root();
+        let path = dir(root.path()).join("old.jsonl");
+        std::fs::write(&path, "").unwrap();
+        age(&path, 2 * 3600);
+        backfill(root.path(), &SpanSink::default());
+        assert!(!path.exists());
+        assert!(!dir(root.path()).join("old.drain-lock").exists());
+    }
+
+    #[test]
+    fn a_fresh_zero_byte_journal_is_untouched() {
+        let root = traced_root();
+        let path = dir(root.path()).join("new.jsonl");
+        std::fs::write(&path, "").unwrap();
+        backfill(root.path(), &SpanSink::default());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn retire_stale_keeps_undrained_and_young_journals() {
+        let root = traced_root();
+        let path = dir(root.path()).join("j.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let journal = Journal::from_path(path.clone());
+        let day = std::time::Duration::from_secs(24 * 3600);
+        let hour = std::time::Duration::from_secs(3600);
+        age(&path, 48 * 3600);
+        // No cursor: spans not drained, never quarantined.
+        assert!(!journal.retire_stale(hour, day).unwrap());
+        std::fs::write(path.with_extension("cursor"), "3").unwrap();
+        // Young.
+        age(&path, 60);
+        assert!(!journal.retire_stale(hour, day).unwrap());
+        // Old and drained: moved with sidecars; same-named stale file survives.
+        age(&path, 48 * 3600);
+        let stale = dir(root.path()).join("stale");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("j.jsonl"), "keep").unwrap();
+        assert!(journal.retire_stale(hour, day).unwrap());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_to_string(stale.join("j.jsonl")).unwrap(), "keep");
+        assert_eq!(std::fs::read_dir(&stale).unwrap().count(), 3);
+    }
+}
+
+/// #13169: a step root names its PR, role and PR head from the moment it
+/// opens, so a step that never closes still carries its keys.
+#[test]
+fn a_step_root_carries_its_item_keys_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path();
+    std::fs::create_dir_all(root_dir.join(".loom")).unwrap();
+    std::fs::write(
+        root_dir.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let store = TraceStore::new(root_dir);
+    store.load_or_create(root_dir, "step-judge-77-1").unwrap();
+    let head = "b".repeat(40);
+    let keys = StepKeys {
+        issue: None,
+        pr_number: Some(77),
+        role: Some("judge"),
+        head_sha: Some(head.clone()),
+    };
+    prepare_execution(&mut Command::new("true"), root_dir, "step-judge-77-1", &keys);
+    let journal = Journal::for_context(&store.path(root_dir, "step-judge-77-1"));
+    let open = journal.active().unwrap();
+    let attrs = &open[0].record.attributes;
+    assert_eq!(attrs["loom.pr_number"], "77");
+    assert_eq!(attrs["loom.role"], "judge");
+    assert_eq!(attrs["loom.head_sha"], head);
+    assert!(!attrs.contains_key("loom.issue"), "an unlinked PR names no issue");
+}
+
+/// #13562: every role's attempt names its repo even when the root span carries
+/// no scope (or is gone), and its issue or PR only where the step has one.
+#[test]
+fn role_attempts_carry_a_repo_whatever_the_root_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let bare = TraceContext::root(true);
+    journal
+        .start(bare.clone(), None, SpanName::Sweep, Utc::now(), TraceAttributes::new())
+        .unwrap();
+    for (role, issue, pr) in [
+        ("curator", 7, None),
+        ("builder", 7, None),
+        ("judge", 8, Some(70)),
+        ("doctor", 9, Some(90)),
+    ] {
+        let begun =
+            checkpoint_begin_observation(&journal, &bare, None, issue, role, None, None, "o/r")
+                .unwrap();
+        assert_eq!(begun.record.attributes["loom.repo"], "o/r", "{role} begin");
+        assert_eq!(begun.record.attributes["loom.issue"], issue.to_string());
+        checkpoint_observation(
+            &journal,
+            &bare,
+            None,
+            issue,
+            &format!("{role}-done"),
+            None,
+            None,
+            pr,
+            "checkpoint_write_observed",
+            "o/r",
+        );
+    }
+    // A synthetic completion on a root that is no longer open.
+    let gone = TraceContext::root(true);
+    checkpoint_observation(
+        &journal,
+        &gone,
+        None,
+        5,
+        "builder-done",
+        None,
+        None,
+        None,
+        "checkpoint_write_observed",
+        "o/r",
+    );
+    let spans = drained_spans(&journal);
+    let attempts: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == SpanName::RoleAttempt)
+        .collect();
+    assert_eq!(attempts.len(), 5);
+    for span in &attempts {
+        assert_eq!(span.attributes["loom.repo"], "o/r");
+        assert!(span.attributes.contains_key("loom.issue"));
+    }
+    let role_pr = |role: &str| {
+        attempts
+            .iter()
+            .find(|s| s.attributes["loom.role"] == role)
+            .and_then(|s| s.attributes.get("loom.pr_number").cloned())
+    };
+    assert_eq!(role_pr("judge").as_deref(), Some("70"));
+    assert_eq!(role_pr("doctor").as_deref(), Some("90"));
+    assert_eq!(role_pr("curator"), None, "no PR means no loom.pr_number, not an empty one");
+}
+
+/// A step root's own scope wins over the fallback, and supplies its PR.
+#[test]
+fn a_step_roots_scope_wins_over_the_workspace_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::for_context(&dir.path().join("root.json"));
+    let root = TraceContext::root(true);
+    let scope = attributes(&[("loom.repo", "Org/Repo"), ("loom.pr_number", "31")]);
+    journal
+        .start(root.clone(), None, SpanName::Sweep, Utc::now(), scope)
+        .unwrap();
+    let begun =
+        checkpoint_begin_observation(&journal, &root, None, 4, "judge", None, None, "o/r").unwrap();
+    assert_eq!(begun.record.attributes["loom.repo"], "Org/Repo");
+    assert_eq!(begun.record.attributes["loom.pr_number"], "31");
 }

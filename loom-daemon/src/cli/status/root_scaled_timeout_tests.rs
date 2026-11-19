@@ -2,7 +2,7 @@
 //! floored by the registered workspace-root count, not just by host load.
 //!
 //! These mirror
-//! `loom_daemon::status_budget::tests::the_status_build_stays_within_budget_at_the_documented_root_ceiling`
+//! `crate::status_budget::tests::the_status_build_stays_within_budget_at_the_documented_root_ceiling`
 //! (#8163's daemon-side regression guard) from the *client* side: a synthetic
 //! registry at the documented root ceiling must not leave `status` waiting on
 //! the old fixed `5s`/30s-capped budget for an `O(roots)`
@@ -13,8 +13,8 @@ use super::{
     DEFAULT_STATUS_TIMEOUT, MAX_SCALED_STATUS_TIMEOUT,
 };
 use crate::cli::common::DAEMON_IPC_TIMEOUT_ENV;
-use loom_daemon::status_budget::{self, DOCUMENTED_MAX_ROOTS, MAX_ROOT_SCALED_PROBE_TIMEOUT};
-use loom_daemon::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
+use crate::status_budget::{self, DOCUMENTED_MAX_ROOTS, MAX_ROOT_SCALED_PROBE_TIMEOUT};
+use crate::workspace_registry::{WorkspaceRegistry, REGISTRY_PATH_ENV};
 use serial_test::serial;
 use std::time::Duration;
 

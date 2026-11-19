@@ -20,9 +20,18 @@ fn tick(result: RoleTickResult) -> RoleTickTelemetry {
         effort: Some("high".to_string()),
         detail: None,
         gated_pool: None,
+        failure_class: None,
         preference_tier: None,
         preference_tap: None,
         role_draw: None,
+        prompt: None,
+        step_sweep_id: None,
+        stage: None,
+        step_log: None,
+        extras: super::TickExtras::default(),
+        step_item: None,
+        deferred_by: None,
+        shard_owner: None,
     }
 }
 
@@ -49,18 +58,47 @@ fn role_head(role: &str) -> String {
     )
 }
 
+/// RFC 3339 timestamp for `at(secs)`.
+fn ts(secs: i64) -> String {
+    at(secs).to_rfc3339()
+}
+
 fn usage_line(model: &str, input: i64, output: i64) -> String {
+    usage_line_at(10, model, input, output)
+}
+
+fn usage_line_at(secs: i64, model: &str, input: i64, output: i64) -> String {
     format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"model\":\"{model}\",\
-         \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\n"
+        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"{model}\",\
+         \"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\n",
+        ts(secs)
     )
 }
 
+/// Re-stamp a fixture transcript (stamped `at(10)`) to 10s ago, for tests that
+/// run through `emit_for_tick`, whose window is real wall-clock time.
+fn restamp_now(transcript: &str) -> String {
+    transcript.replace(&ts(10), &(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339())
+}
+
 fn bash_line(command: &str) -> String {
+    bash_line_at(10, "toolu_x", command)
+}
+
+fn bash_line_at(secs: i64, id: &str, command: &str) -> String {
     let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
     format!(
-        "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\
-         \"name\":\"Bash\",\"input\":{{\"command\":\"{escaped}\"}}}}]}}}}\n"
+        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\
+         \"id\":\"{id}\",\"name\":\"Bash\",\"input\":{{\"command\":\"{escaped}\"}}}}]}}}}\n",
+        ts(secs)
+    )
+}
+
+fn result_line_at(secs: i64, id: &str, is_error: bool, text: &str) -> String {
+    format!(
+        "{{\"type\":\"user\",\"timestamp\":\"{}\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\
+         \"tool_use_id\":\"{id}\",\"is_error\":{is_error},\"content\":\"{text}\"}}]}}}}\n",
+        ts(secs)
     )
 }
 
@@ -96,12 +134,12 @@ fn attributed_transcripts_filters_by_role_and_window() {
 
     // The window is anchored on "now" because the fixtures' mtimes are now.
     let now = Utc::now();
-    let found = attributed_transcripts(&projects, &root, "judge", now, now);
+    let found = attributed_transcripts(&projects, &root, "judge", None, now, now);
     assert_eq!(found, vec![mine.clone()]);
 
     // A window far in the past excludes everything, even the right role —
     // the mtime half of the key is load-bearing.
-    let stale = attributed_transcripts(&projects, &root, "judge", at(0), at(1));
+    let stale = attributed_transcripts(&projects, &root, "judge", None, at(0), at(1));
     assert!(stale.is_empty(), "out-of-window transcript must not attribute");
 }
 
@@ -127,9 +165,11 @@ fn tally_command_classifies_each_forge_action() {
     tally_command("gh pr edit 7 --remove-label loom:review-requested", &mut a);
     assert_eq!(a.issues_labeled, 2);
 
+    // A merge command alone is an attempt, not a merge: `prs_merged` is only
+    // counted from a confirmed `tool_result` (see the scan tests).
     tally_command("./.loom/scripts/merge-pr.sh 99", &mut a);
-    tally_command("gh pr merge 100 --squash", &mut a);
-    assert_eq!(a.prs_merged, 2);
+    assert_eq!(a.prs_merged, 0);
+    assert!(is_merge_command("gh pr merge 100 --squash"));
 
     tally_command("gh issue comment 42 --body-file /tmp/x", &mut a);
     tally_command("gh pr comment 7 --body hi", &mut a);
@@ -174,7 +214,8 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
     text.push_str(&bash_line("gh pr comment 9 --body ok"));
     fs::write(&path, text).unwrap();
 
-    let scan = scan_transcripts(&[path]).expect("a readable transcript yields a scan");
+    let scan =
+        scan_transcripts(&[path], at(0), at(42)).expect("a readable transcript yields a scan");
     let actions = scan
         .actions
         .expect("a read transcript always yields measured actions");
@@ -197,9 +238,9 @@ fn scan_transcripts_folds_tokens_and_actions_in_one_pass() {
 
 #[test]
 fn scan_transcripts_returns_none_when_nothing_is_readable() {
-    assert_eq!(scan_transcripts(&[]), None);
+    assert_eq!(scan_transcripts(&[], at(0), at(42)), None);
     let dir = tempdir().unwrap();
-    assert_eq!(scan_transcripts(&[dir.path().join("absent.jsonl")]), None);
+    assert_eq!(scan_transcripts(&[dir.path().join("absent.jsonl")], at(0), at(42)), None);
 }
 
 #[test]
@@ -208,13 +249,71 @@ fn scan_transcripts_distinguishes_observed_zero_from_unobserved() {
     let path = dir.path().join("quiet.jsonl");
     // A real session that did nothing forge-mutating and reported no usage.
     fs::write(&path, role_head("guide")).unwrap();
-    let scan = scan_transcripts(&[path]).expect("a readable transcript is an observation");
+    let scan =
+        scan_transcripts(&[path], at(0), at(42)).expect("a readable transcript is an observation");
     assert_eq!(
         scan.actions,
         Some(RoleTickActions::default()),
         "a transcript WAS read, so a zero count is an observation, not an absence"
     );
     assert!(scan.tokens_by_model.is_empty());
+}
+
+#[test]
+fn scan_transcripts_counts_each_record_once_across_adjacent_ticks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("growing.jsonl");
+    // Tick 1 window is [0, 42); tick 2 is [42, 84). The same file is in both.
+    let mut text = role_head("judge");
+    text.push_str(&usage_line_at(5, "claude-sonnet-5", 100, 10));
+    text.push_str(&bash_line_at(6, "t1", "gh pr comment 9 --body a"));
+    text.push_str(&usage_line_at(50, "claude-sonnet-5", 7, 3));
+    text.push_str(&bash_line_at(51, "t2", "gh pr comment 9 --body b"));
+    text.push_str(&bash_line_at(52, "t3", "gh issue edit 1 --add-label x"));
+    fs::write(&path, text).unwrap();
+
+    let one = scan_transcripts(std::slice::from_ref(&path), at(0), at(42)).unwrap();
+    let two = scan_transcripts(&[path], at(42), at(84)).unwrap();
+    let a1 = one.actions.clone().unwrap();
+    let a2 = two.actions.clone().unwrap();
+    assert_eq!((a1.comments_posted, a1.issues_labeled), (1, 0));
+    assert_eq!((a2.comments_posted, a2.issues_labeled), (1, 1));
+    let sum = |s: &TranscriptScan| s.tokens_by_model.iter().map(|r| r.input).sum::<i64>();
+    assert_eq!((sum(&one), sum(&two)), (100, 7));
+}
+
+#[test]
+fn scan_transcripts_window_is_start_inclusive_end_exclusive_and_drops_untimestamped() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("edge.jsonl");
+    let mut text = role_head("judge");
+    text.push_str(&bash_line_at(0, "a", "gh pr comment 1 --body s")); // included
+    text.push_str(&bash_line_at(42, "b", "gh pr comment 1 --body e")); // excluded
+                                                                       // No timestamp at all.
+    text.push_str(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"c\",\
+         \"input\":{\"command\":\"gh pr comment 1 --body n\"}}]}}\n",
+    );
+    fs::write(&path, text).unwrap();
+    let scan = scan_transcripts(&[path], at(0), at(42)).unwrap();
+    assert_eq!(scan.actions.unwrap().comments_posted, 1);
+}
+
+#[test]
+fn scan_transcripts_counts_only_confirmed_merges() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("merge.jsonl");
+    let mut text = role_head("champion");
+    text.push_str(&bash_line_at(1, "ok", "./.loom/scripts/merge-pr.sh 5"));
+    text.push_str(&result_line_at(2, "ok", false, "PR #5 merged successfully"));
+    text.push_str(&bash_line_at(3, "fail", "./.loom/scripts/merge-pr.sh 6"));
+    text.push_str(&result_line_at(4, "fail", true, "Exit code 1\\nrefused: checks red"));
+    text.push_str(&bash_line_at(5, "dry", "./.loom/scripts/merge-pr.sh 7 --dry-run"));
+    text.push_str(&result_line_at(6, "dry", false, "[dry-run] Would merge PR #7"));
+    text.push_str(&bash_line_at(7, "none", "./.loom/scripts/merge-pr.sh 8"));
+    fs::write(&path, text).unwrap();
+    let scan = scan_transcripts(&[path], at(0), at(42)).unwrap();
+    assert_eq!(scan.actions.unwrap().prs_merged, 1);
 }
 
 // ------------------------------------------------------------------------
@@ -445,12 +544,12 @@ fn a_successful_tick_writes_a_self_sufficient_journal_record() {
     transcript.push_str(&usage_line("claude-sonnet-5", 900, 120));
     transcript.push_str(&bash_line("gh issue edit 42 --add-label loom:pr"));
     transcript.push_str(&bash_line("gh pr comment 42 --body approved"));
-    let journal = stage_tick_env(dir.path(), &root, "judge", &transcript);
+    let journal = stage_tick_env(dir.path(), &root, "judge", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
         "judge",
-        Utc::now(),
+        Utc::now() - chrono::Duration::seconds(60),
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
     );
@@ -492,12 +591,12 @@ fn a_pool_exhausted_skip_writes_a_record_without_borrowing_tokens() {
 
     let mut transcript = role_head("champion");
     transcript.push_str(&usage_line("claude-sonnet-5", 5_000, 500));
-    let journal = stage_tick_env(dir.path(), &root, "champion", &transcript);
+    let journal = stage_tick_env(dir.path(), &root, "champion", &restamp_now(&transcript));
 
     emit_for_tick(
         &root,
         "champion",
-        Utc::now(),
+        Utc::now() - chrono::Duration::seconds(60),
         &RoleTickOutcome::PoolExhausted {
             total: 4,
             next_clear_at: at(9_000),
@@ -637,15 +736,16 @@ fn an_opencode_tick_sources_tokens_by_model_from_the_session_db() {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE session (
-                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 id TEXT, model TEXT, tokens_input INTEGER, tokens_output INTEGER,
                  tokens_reasoning INTEGER, tokens_cache_read INTEGER,
                  tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
              );",
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO session VALUES (?1, 500, 40, 0, 10, 2, ?2, ?3)",
+            "INSERT INTO session VALUES (?1, ?2, 500, 40, 0, 10, 2, ?3, ?4)",
             rusqlite::params![
+                "ses_none",
                 serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"}).to_string(),
                 root.to_string_lossy().into_owned(),
                 Utc::now().timestamp_millis(),
@@ -732,6 +832,7 @@ fn classify_maps_every_outcome_variant_to_its_own_result() {
                 source: crate::runtime_admission::RuntimeSource::RoleConfig,
                 unmet_capabilities: vec!["subagents".to_string()],
                 reason: "not admitted".to_string(),
+                exhausted_summary_line: None,
             }),
             RoleTickResult::RuntimeRejected,
         ),
@@ -881,4 +982,495 @@ fn a_tick_record_is_exported_without_a_local_path() {
     assert_eq!(exported.len(), 1, "{:?}", captured.records);
     assert_eq!(exported[0].result, RoleTickResult::SkippedQueueEmpty);
     assert_eq!(exported[0].repo, crate::observability::pick_decision::REPO_UNRESOLVED);
+}
+
+/// #12028: a failed tick's class is the span's when it launched, else the
+/// site's, else an explicit fallback; no other result carries one.
+#[test]
+fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
+    use crate::observability::lifecycle::{
+        RoleFailure, UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP,
+    };
+    let failed = RoleTickOutcome::Failure("free-form detail".into());
+    let site = RoleFailure::new("resume-refused", None, "m");
+    assert_eq!(
+        failure_class_of(&failed, None, Some(&site), false).as_deref(),
+        Some("resume-refused")
+    );
+    assert_eq!(
+        failure_class_of(&failed, None, None, false).as_deref(),
+        Some(UNCLASSIFIED_PRE_LAUNCH)
+    );
+    assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(&site), false), None);
+}
+
+#[test]
+fn only_a_failure_record_keeps_a_failure_class() {
+    let mut t = tick(RoleTickResult::Failure);
+    t.failure_class = Some("logs-dir-failed".into());
+    let record = build_record(&t, "o/r".into(), RepoVisibility::Private, None);
+    assert_eq!(record.failure_class.as_deref(), Some("logs-dir-failed"));
+    let mut t = tick(RoleTickResult::Success);
+    t.failure_class = Some("logs-dir-failed".into());
+    assert_eq!(
+        build_record(&t, "o/r".into(), RepoVisibility::Private, None).failure_class,
+        None
+    );
+}
+
+// ------------------------------------------------------------------------
+// Step-sourced records (#14048): the step's OWN log is the launch source
+// ------------------------------------------------------------------------
+
+/// Write a step's own per-item log: this dispatch's header plus `body`. The
+/// header's `sweep_id=<id>` token is the anchor every step-side read keys on.
+fn write_step_log(dir: &Path, sweep_id: &str, body: &str) -> PathBuf {
+    let path = dir.join(format!("step-builder-{sweep_id}.log"));
+    fs::write(
+        &path,
+        format!(
+            "\n==== loom-daemon dispatch: {} sweep_id={sweep_id} item=42 step=builder ====\n{body}",
+            Utc::now().to_rfc3339()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// Drive [`emit_for_step`] for one step and return its journal records.
+fn emit_one_step(
+    dir: &Path,
+    root: &Path,
+    role: &str,
+    stage: &str,
+    sweep_id: &str,
+    log_path: &Path,
+) -> Vec<crate::telemetry::RoleTickOutcomeRecord> {
+    let journal = stage_tick_env(dir, root, role, "");
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    emit_for_step(
+        root,
+        role,
+        started,
+        &RoleTickOutcome::Success,
+        Some(ResolvedLaunch::new("zai-org/GLM-5.3", "high")),
+        crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
+            failure: None,
+            sweep_id,
+            step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
+            item: (42, false),
+            stage,
+            log_path,
+        },
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+    records
+}
+
+/// A step's record carries its stage and its launch attribution read from
+/// the STEP'S OWN log — not the per-role log, which this test plants with a
+/// decoy launch record of the same role to prove it is never consulted.
+#[test]
+#[serial_test::serial]
+fn a_steps_record_reads_stage_and_launch_attribution_from_its_own_log() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    // The decoy: a judge ROLE TICK's launch sitting in role-builder.log. A
+    // step that read this log would publish `pi`, not its own `opencode`.
+    write_role_log(&root, "builder", &launch_line("pi", "zai-coding-plan", "zai-flash"));
+    let log = write_step_log(
+        dir.path(),
+        "step-builder-42-1",
+        &launch_line("opencode", "friendli", "glm-flash"),
+    );
+
+    let records = emit_one_step(dir.path(), &root, "builder", "builder", "step-builder-42-1", &log);
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.source.as_deref(), Some(crate::telemetry::ROLE_TICK_SOURCE_STEP));
+    assert_eq!(record.stage.as_deref(), Some("builder"));
+    assert_eq!(record.runtime.as_deref(), Some("opencode"), "the step's own log wins");
+    assert_eq!(record.provider.as_deref(), Some("friendli"));
+    assert_eq!(record.profile.as_deref(), Some("glm-flash"));
+}
+
+/// The stage is FINER than the role (#14048): a Champion merge step reports
+/// `role = champion` (the folded name every role-keyed consumer uses) and
+/// `stage = champion_merge` (the lifecycle stage a per-stage usage query
+/// splits on).
+#[test]
+#[serial_test::serial]
+fn a_champion_merge_steps_stage_is_finer_than_its_role() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let log = write_step_log(dir.path(), "step-champion_merge-7-1", "");
+
+    let records = emit_one_step(
+        dir.path(),
+        &root,
+        "champion",
+        "champion_merge",
+        "step-champion_merge-7-1",
+        &log,
+    );
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].role, "champion");
+    assert_eq!(records[0].stage.as_deref(), Some("champion_merge"));
+    // No launch record in the log, so the launch identity stays absent —
+    // never a guessed `claude` default.
+    assert_eq!(records[0].runtime, None);
+    assert_eq!(records[0].provider, None);
+    assert_eq!(records[0].profile, None);
+}
+
+/// A step whose log cannot be read (deleted, rotated, unreadable) leaves
+/// every launch-sourced field absent — runtime, provider, profile AND
+/// `tokens_by_model` — never zeroed, never guessed.
+#[test]
+#[serial_test::serial]
+fn a_step_with_an_unreadable_log_leaves_every_launch_field_absent() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let missing = dir.path().join("step-builder-42-2.log");
+    // Decoy: a per-role log naming ANOTHER launch must never be adopted.
+    write_role_log(&root, "builder", &launch_line("pi", "zai-coding-plan", "zai-flash"));
+
+    let records =
+        emit_one_step(dir.path(), &root, "builder", "builder", "step-builder-42-2", &missing);
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.stage.as_deref(), Some("builder"), "the stage is registry-known");
+    assert_eq!(record.runtime, None);
+    assert_eq!(record.provider, None);
+    assert_eq!(record.profile, None);
+    assert_eq!(record.tokens_by_model, None, "unknown is not zero");
+}
+
+/// An OpenCode step's tokens are selected by the SESSION IDS its own log
+/// names (#14048) — the case directory+window provably cannot decide: two
+/// sessions in the same workspace directory, created in the same window, of
+/// which only one is this step's.
+#[test]
+#[serial_test::serial]
+fn an_opencode_step_selects_tokens_by_the_session_ids_its_log_names() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+
+    let db_dir = tempdir().unwrap();
+    let db_path = db_dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 id TEXT, model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
+             );",
+        )
+        .unwrap();
+        let now_ms = Utc::now().timestamp_millis();
+        for (id, input) in [("ses_step", 500), ("ses_neighbour", 7)] {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, ?3, 40, 0, 10, 2, ?4, ?5)",
+                rusqlite::params![
+                    id,
+                    serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"})
+                        .to_string(),
+                    input,
+                    root.to_string_lossy().into_owned(),
+                    now_ms,
+                ],
+            )
+            .unwrap();
+        }
+    }
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db_path);
+
+    let body = format!(
+        "{}{}\n",
+        launch_line("opencode", "friendli", "glm-flash"),
+        "{\"type\":\"tool_use\",\"timestamp\":1791767321693,\"sessionID\":\"ses_step\",\
+         \"part\":{\"type\":\"tool\",\"tool\":\"loom_bash\"}}\n"
+    );
+    let log = write_step_log(dir.path(), "step-builder-42-3", &body);
+    let records = emit_one_step(dir.path(), &root, "builder", "builder", "step-builder-42-3", &log);
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.runtime.as_deref(), Some("opencode"));
+    let rows = record
+        .tokens_by_model
+        .as_ref()
+        .expect("the log-named session attributed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].input, 500, "the neighbour session must stay out");
+}
+
+/// A Codex step's tokens are selected by the `session id:` banner its own
+/// log carries (#14048) — same indistinguishable-by-directory+window shape
+/// as the OpenCode test above, against the rollout store.
+#[test]
+#[serial_test::serial]
+fn a_codex_step_selects_tokens_by_the_session_id_its_log_names() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+
+    let codex_home = tempdir().unwrap();
+    let now = (Utc::now() - chrono::Duration::seconds(20)).to_rfc3339();
+    let today = Utc::now().date_naive();
+    let sessions = codex_home
+        .path()
+        .join("sessions")
+        .join(today.format("%Y").to_string())
+        .join(today.format("%m").to_string())
+        .join(today.format("%d").to_string());
+    fs::create_dir_all(&sessions).unwrap();
+    let cwd = root.to_string_lossy().into_owned();
+    for (id, input) in [
+        ("3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01", 300),
+        ("5d1b0e2f-88c3-4e1b-0d2c-3a7b9c5d6f02", 9),
+    ] {
+        let meta = serde_json::json!({
+            "timestamp": now,
+            "type": "session_meta",
+            "payload": {
+                "session_id": id, "id": id, "timestamp": now,
+                "cwd": cwd, "originator": "codex_exec", "cli_version": "0.154.0",
+                "model_provider": "openai",
+            },
+        })
+        .to_string();
+        let turn = serde_json::json!({
+            "timestamp": now,
+            "type": "turn_context",
+            "payload": { "cwd": cwd, "model": "gpt-5.6-sol", "effort": "low", "summary": "auto" },
+        })
+        .to_string();
+        let count = serde_json::json!({
+            "timestamp": now,
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input, "cached_input_tokens": 0,
+                        "output_tokens": 20, "reasoning_output_tokens": 0,
+                        "total_tokens": input + 20,
+                    },
+                    "last_token_usage": {
+                        "input_tokens": input, "cached_input_tokens": 0,
+                        "output_tokens": 20, "reasoning_output_tokens": 0,
+                        "total_tokens": input + 20,
+                    },
+                    "model_context_window": 272_000,
+                },
+                "rate_limits": { "limit_id": "premium" },
+            },
+        })
+        .to_string();
+        let mut file =
+            fs::File::create(sessions.join(format!("rollout-2026-11-18T08-00-00-{id}.jsonl")))
+                .unwrap();
+        use std::io::Write as _;
+        for line in [meta, turn, count.clone(), count] {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+    std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, codex_home.path());
+
+    let body = format!(
+        "{}codex\nsession id: 3f2a9c1e-77b2-4d0a-9c1e-2f6a8b4d5e01\n",
+        crate::launch_record::RUNTIME_RESOLVED_MARKER,
+    );
+    let log = write_step_log(dir.path(), "step-judge-7-1", &body);
+    let records = emit_one_step(dir.path(), &root, "judge", "judge", "step-judge-7-1", &log);
+    std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    // A legacy adapter writes no `# LOOM_LAUNCH` record: the runtime identity
+    // stays absent (the marker resolves only the usage SOURCE, #8594).
+    assert_eq!(record.runtime, None);
+    let rows = record
+        .tokens_by_model
+        .as_ref()
+        .expect("the log-named rollout attributed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "gpt-5.6-sol");
+    assert_eq!(rows[0].input, 300, "the neighbour rollout must stay out");
+}
+
+/// A Claude step's tokens still come from the transcript scan (there is no
+/// launch record and no native store), and the record carries its stage and
+/// resolved model beside them — the Claude row of #14048's per-runtime set.
+#[test]
+#[serial_test::serial]
+fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    // The transcript scan needs a fresh window; the usage line stamps itself
+    // ten seconds after the fixture epoch, so re-stamp it into this step's.
+    // #14406: a step's transcript must name its own item (`/loom:builder 42`).
+    let mut transcript = role_head("builder")
+        .replace("<command-args></command-args>", "<command-args>42</command-args>");
+    transcript.push_str(
+        &"{\"type\":\"assistant\",\"timestamp\":\"REPLACED\",\"message\":{\"model\":\
+         \"claude-sonnet-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":34,\
+         \"cache_read_input_tokens\":40,\"cache_creation\":{\
+         \"ephemeral_5m_input_tokens\":9,\"ephemeral_1h_input_tokens\":4}}}}\n"
+            .replace("REPLACED", &(Utc::now() - chrono::Duration::seconds(10)).to_rfc3339()),
+    );
+    let journal = stage_tick_env(dir.path(), &root, "builder", &transcript);
+    let log = write_step_log(dir.path(), "step-builder-42-4", "");
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    emit_for_step(
+        &root,
+        "builder",
+        started,
+        &RoleTickOutcome::Success,
+        Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
+        crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
+            failure: None,
+            sweep_id: "step-builder-42-4",
+            step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
+            item: (42, false),
+            stage: "builder",
+            log_path: &log,
+        },
+    );
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    clear_tick_env();
+
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.stage.as_deref(), Some("builder"));
+    assert_eq!(record.model.as_deref(), Some("claude-sonnet-5"));
+    // No `# LOOM_LAUNCH` record on a Claude spawn: the identity keys stay
+    // absent, never a `claude` guess.
+    assert_eq!(record.runtime, None);
+    let rows = record
+        .tokens_by_model
+        .as_ref()
+        .expect("transcript attributed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "claude-sonnet-5");
+    assert_eq!(rows[0].input, 120);
+    assert_eq!(rows[0].output, 34);
+    assert_eq!(rows[0].cache_read, 40);
+    assert_eq!(rows[0].cache_write_5m, 9);
+    assert_eq!(rows[0].cache_write_1h, 4);
+}
+
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn opencode_step_close_preserves_launch_runtime_and_writes_newly_available_tokens() {
+    use crate::telemetry::trace::journal::Journal;
+    use crate::telemetry::trace::store::TraceStore;
+    use crate::telemetry::trace::{SpanName, SpanStatus, TraceAttributes};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let db = dir.path().join("opencode.db");
+    let _db = crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _tick_journal = crate::env_test_support::EnvGuard::set(
+        crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV,
+        dir.path().join("ticks.jsonl"),
+    );
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    let emit = |sweep_id, log: &Path| {
+        let store = TraceStore::new(&root);
+        let saved = store.load_or_create(&root, sweep_id).unwrap();
+        let journal = Journal::for_context(&store.path(&root, sweep_id));
+        let run = journal
+            .start(
+                saved.context.child(),
+                Some(&saved.context),
+                SpanName::RuntimeRun,
+                started,
+                TraceAttributes::new(),
+            )
+            .unwrap();
+        journal
+            .finish(&run, Utc::now(), SpanStatus::Ok, TraceAttributes::new())
+            .unwrap();
+        emit_for_step(
+            &root,
+            "builder",
+            started,
+            &RoleTickOutcome::Failure("fixture".to_string()),
+            None,
+            StepTelemetry {
+                runtime: Some("opencode"),
+                trace_context: Some(&saved.context),
+                failure: None,
+                sweep_id,
+                step_outcome: None,
+                item: (42, false),
+                stage: "builder",
+                log_path: log,
+            },
+        );
+        journal
+            .completed()
+            .unwrap()
+            .into_iter()
+            .filter(|span| {
+                matches!(span.name, SpanName::RuntimeUsage | SpanName::RuntimeUsageMissing)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let absent = dir.path().join("absent.log");
+    let header = write_step_log(dir.path(), "header", "");
+    for (id, log, reason) in [
+        ("missing", &absent, "no_step_log"),
+        ("header", &header, "no_session_id"),
+    ] {
+        let spans = emit(id, log);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, SpanName::RuntimeUsageMissing);
+        assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+        assert_eq!(spans[0].attributes["loom.usage.missing_reason"], reason);
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER,
+         tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+         tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+         INSERT INTO session VALUES ('ses_fixture', '{\"id\":\"glm-fixture\",\"providerID\":\"fixture\"}',
+         0, 0, 0, 0, 0, '/unrelated-directory', 1);",
+    )
+    .unwrap();
+    let ids = vec!["ses_fixture".to_string()];
+    assert_eq!(crate::opencode_usage::tokens_by_model_for_ids(&ids, None), None);
+    conn.execute("UPDATE session SET tokens_input = 10 WHERE id = 'ses_fixture'", [])
+        .unwrap();
+    let log = write_step_log(
+        dir.path(),
+        "available",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_fixture\"}\n",
+    );
+    let spans = emit("available", &log);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, SpanName::RuntimeUsage);
+    assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+    assert_eq!(spans[0].attributes["loom.tokens.input"], "10");
 }

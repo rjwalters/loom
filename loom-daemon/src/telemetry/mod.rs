@@ -64,10 +64,9 @@ pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
-pub mod journal_shadow;
 pub mod ops;
 pub mod provenance;
-pub mod queue_snapshot;
+pub mod queue_repo;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
@@ -90,7 +89,6 @@ pub use kinds::{
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
 pub use phase_tap_usage::PhaseTapUsageRow;
-pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -129,6 +127,17 @@ pub enum RepoVisibility {
     Public,
     /// A private repository — the public view exposes only redacted aggregates.
     Private,
+}
+
+impl RepoVisibility {
+    /// The wire string (`"public"` / `"private"`), matching the serde spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
 }
 
 impl Default for RepoVisibility {
@@ -263,7 +272,7 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 /// shared file and had to be edited in lockstep by hand.
 macro_rules! define_telemetry_record {
     ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
-        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        gate: $gate:expr, otlp: $class:ident; )+) => {
         /// Every telemetry record kind, internally tagged on a `kind` discriminant. The
         /// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
         /// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
@@ -272,8 +281,16 @@ macro_rules! define_telemetry_record {
         ///
         /// **Generated** from the one-row-per-kind registry in
         /// [`kinds`](crate::telemetry::kinds) — add a kind there, never here.
+        ///
+        /// `large_enum_variant` is allowed here on purpose: the payloads are
+        /// serde records whose field count is the wire contract, not a sizing
+        /// decision — the honest alternatives (boxing a field, splitting a
+        /// record) would change the wire shape or the reader for every
+        /// consumer to save stack bytes an envelope that is cloned once per
+        /// emit never cared about.
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
         #[serde(tag = "kind")]
+        #[allow(clippy::large_enum_variant)]
         pub enum TelemetryRecord {
             $(
                 $(#[$attr])*
@@ -313,15 +330,6 @@ macro_rules! define_telemetry_record {
             pub fn otlp_class(&self) -> TelemetryKindOtlp {
                 match self {
                     $( Self::$variant(_) => TelemetryKindOtlp::$class, )+
-                }
-            }
-
-            /// Whether the native HTTPS `/ingest` backend accepts this kind.
-            /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
-            #[must_use]
-            pub fn accepted_by_native_ingest(&self) -> bool {
-                match self {
-                    $( Self::$variant(_) => $native, )+
                 }
             }
         }
@@ -454,6 +462,19 @@ pub struct PhaseDuration {
     /// Builder. Same omission contract as `tokens_in`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The reasoning effort this attempt's launch ran at (Issue #14242) —
+    /// the per-phase counterpart of [`SweepOutcomeRecord::effort`], stamped
+    /// from the effort that applied at the phase's launch: a sweep session
+    /// runs its phases at the session-default effort (the in-session Task
+    /// tool exposes no effort parameter, so no phase can run at anything
+    /// else), and a step sweep's single phase is its role's own resolved
+    /// effort. Never re-derived from dispatch-time config at read time.
+    ///
+    /// Omitted — never `default` or empty — when unknown: a record written
+    /// before #14242, or one whose entry could not name an effort at all (the
+    /// same conditions the record-level `effort` is absent under).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl PhaseDuration {
@@ -1075,6 +1096,10 @@ pub enum RoleTickResult {
     SkippedLoad,
     /// Skipped pre-spawn: a queue-gated role's work queue was empty (#9391).
     SkippedQueueEmpty,
+    /// Not reached this tick: a host-level limit (ceiling, role budget,
+    /// demand width, reservation) stopped the round-robin walk before this
+    /// repo's turn, so its next chance is a later tick (#12084).
+    SkippedDeferred,
 }
 
 /// Whether a `repo` string is a local filesystem path (or empty) rather than
@@ -1190,6 +1215,14 @@ pub struct RoleTickOutcomeRecord {
     /// optional field).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_pool: Option<String>,
+    /// Why a [`RoleTickResult::Failure`] tick failed (#12028): the closed-
+    /// vocabulary `loom.failure_class` the tick's `role_attempt` span carries
+    /// when it launched, or the fixed pre-launch class of the site that
+    /// refused it. Never `detail`'s text. Present only on a failure; absent on
+    /// every other result and on every record written before #12028 —
+    /// additive, no `schema_version` bump, exactly as [`Self::gated_pool`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
     /// Which tier of the ordered runtime-preference list this tick launched on
     /// (Issue #8599): `0` is the most-preferred tap — nothing fell through —
     /// and any higher value is a fall-through, so "how much work went to the
@@ -1253,7 +1286,86 @@ pub struct RoleTickOutcomeRecord {
     /// optional unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<RoleTickActions>,
+    /// The checkout this tick's session read its `/loom:<role>` prompt from,
+    /// as it stood at launch (#11989): its commit, the Loom release installed
+    /// in it, how far it is behind `origin/<default>`, and whether HEAD was
+    /// on a branch. Absent for a tick that never resolved a launch and on
+    /// records written before #11989 — additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<crate::role_tick_telemetry::prompt_tree::PromptTree>,
+    /// What ran the tick (#11906): absent for a role-runner tick, `"step"`
+    /// ([`ROLE_TICK_SOURCE_STEP`]) for a step-engine step, so a "role ticks
+    /// still running" query never counts steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_id: Option<String>,
+    /// The step-engine stage a step ran (#14048) — the wire
+    /// [`crate::step_role::StepRole`] name (`builder`, `judge`,
+    /// `champion_promote`, …), which is FINER than `role`: `role` folds
+    /// Champion's two stages (`champion_promote`, `champion_merge`) to
+    /// `champion`, so a consumer splitting per-stage usage cross-host reads
+    /// this key. Present only on a step-sourced record (`source = "step"`);
+    /// absent on every role tick and on records written before #14048 —
+    /// additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// The issue a step worked (#13563); set only on a step whose item is an
+    /// issue, so its token totals attribute to that issue. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// The PR a step worked (#13563); set only on a step whose item is a PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
+    /// Which host limit deferred this repo's tick (#12084): `ceiling`,
+    /// `role_budget`, `demand_width` or `reservation`. Present exactly on
+    /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
+    /// bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_by: Option<String>,
+    /// Which shard owns this repo's role ticks (#12084), `<index>/<count>`
+    /// (zero-based index), as [`crate::role_shard`] resolved it. Present only
+    /// on a [`RoleTickResult::SkippedDeferred`] record of a sharded host;
+    /// absent when unsharded, never a guessed `0/1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_owner: Option<String>,
+    /// A launched Judge tick won a PR claim or wrote a verdict (#12362).
+    /// Omitted for any other role and for a tick that never launched; `false`
+    /// is an observation (an idle tick), never a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found_work: Option<bool>,
+    /// Why a Judge tick found no work: the session's own `LOOM_STEP_OUTCOME`
+    /// reason (advisory), else the daemon-observed `no_claim_no_verdict`.
+    /// Set exactly when `found_work` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noop_reason: Option<String>,
+    /// The verdicts a Judge tick wrote, one per PR (#12362), from the
+    /// `forge verdict-labels` write. Omitted when it wrote none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdicts: Option<Vec<JudgeVerdictRecord>>,
+    /// The step's `LOOM_STEP_OUTCOME` class (#12362), on a step-sourced record:
+    /// `result` keeps its `tick_outcome` mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_class: Option<String>,
+    /// The step's `LOOM_STEP_OUTCOME` reason (#12362); see `step_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_reason: Option<String>,
 }
+
+/// One verdict a Judge tick wrote ([`RoleTickOutcomeRecord::verdicts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeVerdictRecord {
+    pub pr_number: u32,
+    /// The head the verdict was written against, when the writer passed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// `approved` or `changes_requested`.
+    pub verdict: String,
+}
+
+/// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).
+pub const ROLE_TICK_SOURCE_STEP: &str = "step";
 
 /// One account's slice of a `tokens.snapshot` — the per-account usage /
 /// limit-window state matching what `loom-daemon tokens check --ranking` knows.
@@ -1394,69 +1506,6 @@ pub struct HostProtectionSummary {
     pub watchdog_provisioned: Option<bool>,
 }
 
-/// `host.health`'s saturation admission-brake summary (Issue #8478) — a narrow
-/// wire projection of [`crate::admission_brake::BrakeSnapshot`], carrying the
-/// facts a *fleet-level* consumer needs to tell "this host is quiet" apart from
-/// "this host's dispatch has been suppressed for hours by load Loom does not
-/// own".
-///
-/// # Why the existing fields were not enough
-///
-/// `dispatch_halted`/`halt_reason` (#4975) already report the host-distress
-/// **breaker**, and #8478 extends them to cover a sustained-starving brake too
-/// — that is what makes such a host render as degraded in the existing fleet
-/// view with no consumer change. But a boolean plus a prose reason cannot answer
-/// the question the 12-hour incident actually raised: *how long*. That duration
-/// existed only in the host-local `status --json` payload
-/// ([`crate::types::AdmissionBrakeStatus::starving_since`], #5715); nothing
-/// pushed it off-host, so a fleet check could not distinguish a brake that
-/// engaged this minute from one wedged since yesterday.
-///
-/// # Every field is a fact, never a verdict
-///
-/// `starving_secs` is computed at capture time against the emitting host's own
-/// clock so a consumer never has to subtract a remote timestamp from its own
-/// (clock skew across a fleet would otherwise make short streaks negative).
-/// `starvation_warn_secs` is that host's own resolved threshold, so
-/// "longer than N minutes" is evaluated against what *this* host considers
-/// alarming rather than a hardcoded fleet constant.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AdmissionBrakeSummary {
-    /// Whether new sweep admissions are currently held. In-flight sweeps are
-    /// never affected — the brake has no path to running work.
-    pub held: bool,
-    /// When the current starvation streak began (held with **zero** sweeps in
-    /// flight, continuously). `None` whenever the host is not starving,
-    /// including a brake held while sweeps genuinely drain (healthy
-    /// backpressure never starves, however long it holds).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub starving_since: Option<DateTime<Utc>>,
-    /// Seconds the current starvation streak has run, as measured on the
-    /// emitting host at capture time. `None` when not starving.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub starving_secs: Option<i64>,
-    /// This host's resolved starvation **warn** threshold in seconds — the
-    /// duration past which it logs `STARVING` locally.
-    pub starvation_warn_secs: i64,
-    /// Cumulative starvation-escape-hatch grants this daemon process's
-    /// lifetime. `0` on a healthy host forever; nonzero means the brake has
-    /// had to force at least one admission through a still-saturated host.
-    pub escape_hatch_grants: u32,
-    /// `true` once this host has been starving for at least its own
-    /// `starvation_warn_secs` — i.e. dispatch is suppressed and **nothing Loom
-    /// admitted** is producing the load. This is the single field a fleet-level
-    /// check should alert on; the rest are for the diagnosis that follows.
-    pub dispatch_suppressed_by_foreign_load: bool,
-    /// Which processes the CPU actually belongs to, as
-    /// [`crate::foreign_load::attribution_clause`] renders it. Sampled **only**
-    /// while `dispatch_suppressed_by_foreign_load` is true, so an ordinary
-    /// healthy host never pays for a `ps` shellout, and `None` whenever the
-    /// probe could not answer (no `ps`, a timeout, unparseable output) — an
-    /// absent attribution must never be read as "no foreign load".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_cpu_consumers: Option<String>,
-}
-
 /// `host.health` — host CPU/disk headroom plus the emitting binary's identity
 /// (version + build commit + build time) and uptime.
 /// Host-level: it references no repository, so it carries no visibility tag.
@@ -1510,7 +1559,7 @@ pub struct HostHealthRecord {
     /// `worktree_root_free_gb` as a percentage instead of a bare absolute
     /// number that is not comparable across a heterogeneous fleet (Issue
     /// #5356). Sourced from the same `df -Pk` sample as the free-space
-    /// reading (`crate::disk_headroom::worktree_root_disk_gb`).
+    /// reading (`crate::disk_headroom::worktree_root_disk_bytes`).
     ///
     /// Follows the exact "unknown != zero" contract `worktree_root_free_gb`
     /// already established: **omitted**, never a fabricated `0`, when the
@@ -1539,25 +1588,6 @@ pub struct HostHealthRecord {
     /// `applyUpdate` doc comment for the exact caveat it applies.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_sweep_ids: Vec<String>,
-    /// Whether this host's own dispatch is currently halted for a
-    /// non-idle reason — i.e. the host-distress breaker
-    /// ([`crate::host_breaker`], Issue #4235) has tripped `Open` or is still
-    /// `CoolDown`ing (see [`crate::host_breaker::BreakerPhase::suppresses_dispatch`]).
-    /// `false` when the breaker is `Closed`, disabled, or has never been
-    /// registered (no work-finder loop running on this host) — a repo that
-    /// never enables autonomy sees no behavior change (Issue #4975).
-    ///
-    /// `#[serde(default)]` so a record from a pre-#4975 daemon still decodes
-    /// (as `false`, i.e. "not known to be halted") rather than failing.
-    #[serde(default)]
-    pub dispatch_halted: bool,
-    /// Human-readable reason for the current halt — the breaker's own
-    /// transition message (e.g. `"load-per-core 4.24 ≥ 2.50 sustained for 3
-    /// consecutive tick(s)"`), sourced straight from
-    /// [`crate::host_breaker::BreakerSnapshot::reason`]. Always `None` while
-    /// `dispatch_halted` is `false`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub halt_reason: Option<String>,
     /// This host's managed-repository roster (Issue #4976): every workspace
     /// root the daemon's [`crate::workspace_pool::WorkspacePool`] has a
     /// provisioned registry for, resolved to its forge `owner/repo` slug and
@@ -1597,18 +1627,6 @@ pub struct HostHealthRecord {
     /// (as `None`) rather than failing the whole envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protection: Option<HostProtectionSummary>,
-    /// This host's saturation admission-brake state (Issue #8478) — see
-    /// [`AdmissionBrakeSummary`]. `None` when no brake has been registered on
-    /// this host at all (no work-finder loop running), which is distinct from
-    /// `Some(..)` with `held: false` (a brake exists and is admitting). Both
-    /// must degrade gracefully on the consuming side: absent means "not
-    /// reported", never "not suppressed".
-    ///
-    /// `#[serde(default)]` so a record from a pre-#8478 daemon still decodes
-    /// (as `None`) rather than failing the whole envelope — the same
-    /// backward-compatibility contract `protection` established.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admission_brake: Option<AdmissionBrakeSummary>,
     /// Whether this host is the fleet-wide singleton-job captain (Issue
     /// #8848) — see [`crate::fleet_captain`]. Three-valued, not a bare
     /// `bool`: `None` when this repo declares no `fleet.captain` at all
@@ -1650,8 +1668,8 @@ pub struct HostHealthRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
     /// Record kinds this host's started exporters carry (Issue #10196),
-    /// sorted wire `kind` tags -- the export-coverage half of the replay
-    /// contract (`telemetry-replay.md`). Derived from the kind registry via
+    /// sorted wire `kind` tags -- the export-coverage half of the former replay
+    /// contract. Derived from the kind registry via
     /// [`exported_kinds_for`], so it can never drift from routing.
     ///
     /// Empty means "unknown / no exporter started / pre-#10196
@@ -1659,7 +1677,7 @@ pub struct HostHealthRecord {
     /// list as proof of silence. `#[serde(default)]` so an older record decodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exported_kinds: Vec<String>,
-    /// Exporter names that actually started in this process (`"https"`, `"otlp"`;
+    /// Exporter names that actually started in this process (`"otlp"`;
     /// [`crate::observability::ExporterKind::name`]), sorted. Same
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1680,6 +1698,48 @@ pub struct HostHealthRecord {
     /// backward-compatibility contract `protection` established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryPressureSummary>,
+    /// Live `loom-agent-*` cgroup scopes on this host (Issue #12166), read
+    /// from the cgroup tree rather than the sweep registry, so residue that
+    /// outlived its registry entry stays visible. Capped at
+    /// [`crate::agent_scopes::MAX_AGENT_SCOPES`]; the true count is
+    /// `agent_scopes_total`. Empty means "unmeasured or none" (non-Linux, no
+    /// systemd agents slice), never "proved idle".
+    ///
+    /// `#[serde(default)]` so a pre-#12166 record still decodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_scopes: Vec<AgentScopeSummary>,
+    /// Total live agent scopes (uncapped). `None` when the agents slice could
+    /// not be read at all, distinct from `Some(0)` (read, none live).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_scopes_total: Option<u32>,
+}
+
+/// One live `loom-agent-*` scope as seen in the cgroup tree (Issue #12166).
+/// Each measurement is optional: unmeasurable is absent, never zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentScopeSummary {
+    /// Scope unit name (carries the sweep id).
+    pub scope: String,
+    /// Seconds since the scope's cgroup was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_sec: Option<u64>,
+    /// Whether an agent runtime/launcher process is among the scope's procs.
+    pub agent_alive: bool,
+    /// Pid of the longest-running process left in the scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pid: Option<u32>,
+    /// `comm` of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_comm: Option<String>,
+    /// Age in seconds of that process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_sec: Option<u64>,
+    /// Cumulative CPU time of the scope (`cpu.stat` `usage_usec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usec: Option<u64>,
+    /// Seconds since the newest transcript write for the scope's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_age_sec: Option<u64>,
 }
 
 /// Memory/pressure readings at one host.health sampling moment: physical
@@ -1779,32 +1839,6 @@ pub struct ManagedRepoEntry {
     /// older daemons, which sent a `priority` tier instead (#9244).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
-    /// This host's `loom:blocked` release-pass tallies for the repo since the
-    /// daemon started (#10763). Absent before the pass's first tick for the
-    /// repo on this host and on older daemons.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stale_blocked_release: Option<StaleBlockedReleaseCounters>,
-}
-
-/// One repo's `loom:blocked` release-pass tallies on one host (#10763),
-/// carried on [`ManagedRepoEntry`] so a fleet where the pass never acts is
-/// diagnosable without host logs: `ticks` counts every per-repo tick by
-/// outcome (`ran`, `not_due`, `skipped_shard`, `denied_scope`, `not_served`,
-/// `rate_limited`, `skipped_off`, `dry_run`, `archived`, `enumerate_error`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StaleBlockedReleaseCounters {
-    /// Artifacts released (applied writes only).
-    #[serde(default)]
-    pub released: u64,
-    /// Artifacts re-parked (applied writes only).
-    #[serde(default)]
-    pub reparked: u64,
-    /// The most recent tick's outcome key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_outcome: Option<String>,
-    /// Ticks per outcome key.
-    #[serde(default)]
-    pub ticks: std::collections::BTreeMap<String, u64>,
 }
 
 /// One entry of a [`SessionSummaryRecord`]'s tool-call histogram: how many

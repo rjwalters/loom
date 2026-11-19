@@ -6,11 +6,7 @@
 //!
 //! - [`journal_execution`] journals one usage span per model with
 //!   `loom.usage.scope=execution` under the tick's own root, in the tick's
-//!   trace journal — every tick with known usage;
-//! - [`attempt_usage`] adds `scope=attempt` children under the tick's story
-//!   span **only when the tick stitched exactly one target**. With several
-//!   targets (e.g. a Champion pass merging five PRs) there is no honest way to
-//!   split the tokens between them, so the usage stays in the tick trace only.
+//!   trace journal — every tick with known usage.
 
 use std::path::Path;
 
@@ -19,6 +15,7 @@ use chrono::{DateTime, Utc};
 use crate::observability::lifecycle::RoleTrace;
 use crate::observability::llm_billing::LlmBilling;
 use crate::observability::runtime_usage::cost::Pricing;
+use crate::observability::runtime_usage::missing::{self, UsageMissing};
 use crate::observability::runtime_usage::spans::{append_new, model_usage_spans, UsageScope};
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::trace::journal::Journal;
@@ -58,6 +55,48 @@ pub fn journal_execution(
     }
 }
 
+/// Journal a `loom.runtime.usage_missing` span under the tick's root (#14566):
+/// the run's usage was unreadable, and `reason` says why. Best-effort.
+pub fn journal_missing(
+    root: &Path,
+    trace: &RoleTrace,
+    role: &str,
+    ended_at: DateTime<Utc>,
+    runtime: Option<&str>,
+    reason: UsageMissing,
+) {
+    let span = missing_span(trace, role, ended_at, runtime, reason);
+    let store = TraceStore::new(root);
+    let journal = Journal::for_context(&store.path(root, &trace.execution));
+    if let Err(error) = append_new(&journal, vec![span]) {
+        log::warn!("role_tick_telemetry: {role} usage_missing not journalled (#14566): {error}");
+    }
+}
+
+/// The tick's `loom.runtime.usage_missing` span. Pure.
+#[must_use]
+pub fn missing_span(
+    trace: &RoleTrace,
+    role: &str,
+    ended_at: DateTime<Utc>,
+    runtime: Option<&str>,
+    reason: UsageMissing,
+) -> SpanRecord {
+    let mut common = TraceAttributes::new();
+    common.insert("loom.role".into(), role.to_string());
+    common.insert("loom.sweep_id".into(), trace.execution.clone());
+    if let Some(runtime) = runtime {
+        common.insert("loom.runtime".into(), runtime.to_string());
+    }
+    missing::span(
+        &trace.context,
+        (trace.started_at, ended_at),
+        reason,
+        UsageScope::Execution,
+        &common,
+    )
+}
+
 /// The tick's execution-scoped usage spans, children of its root. Pure.
 #[must_use]
 pub fn execution_usage(
@@ -83,45 +122,6 @@ pub fn execution_usage(
         (trace.started_at, ended_at),
         rows,
         UsageScope::Execution,
-        &common,
-        pricing,
-    )
-}
-
-/// Attempt-scoped usage under the tick's one story span, or nothing when the
-/// tick stitched zero or several targets, or its usage is unknown. Pure.
-#[must_use]
-pub fn attempt_usage(
-    story_spans: &[SpanRecord],
-    rows: Option<&[ModelUsageTotals]>,
-    pricing: &Pricing<'_>,
-) -> Vec<SpanRecord> {
-    let ([story], Some(rows)) = (story_spans, rows) else {
-        return Vec::new();
-    };
-    let common: TraceAttributes = [
-        "loom.role",
-        "loom.issue",
-        "loom.pr_number",
-        "loom.sweep_id",
-        "loom.runtime",
-        crate::observability::llm_billing::BILLING_KEY,
-        crate::observability::llm_billing::CREDENTIAL_KIND_KEY,
-        crate::observability::llm_billing::PROFILE_KEY,
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        story
-            .attributes
-            .get(key)
-            .map(|value| (key.to_string(), value.clone()))
-    })
-    .collect();
-    model_usage_spans(
-        &story.context,
-        (story.started_at, story.ended_at),
-        rows,
-        UsageScope::Attempt,
         &common,
         pricing,
     )

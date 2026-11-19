@@ -276,25 +276,22 @@ fn a_download_runs_under_the_reader() {
 }
 
 #[test]
-fn a_download_outside_the_readers_installation_falls_back_and_withdraws_for_the_repo() {
+fn a_download_outside_the_readers_installation_is_the_readers_answer_not_a_writer_retry() {
     let stub = Stub::new(NOT_COVERED, OK);
     let (result, rows, withdrawn) = download(&stub, true);
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(stub.calls(), vec![true, false]);
-    assert_eq!(roles(&rows), vec!["reader", "writer-fallback"]);
-    assert_eq!(
-        *withdrawn.lock().unwrap(),
-        vec![(APP.to_string(), REPO.to_string(), Failure::Coverage)]
-    );
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(stub.calls(), vec![true], "writer stub NOT invoked");
+    assert_eq!(roles(&rows), vec!["reader"]);
+    assert!(withdrawn.lock().unwrap().is_empty());
 }
 
 #[test]
-fn a_rate_limited_reader_download_falls_back_and_withdraws_the_reader() {
+fn a_rate_limited_reader_download_withdraws_the_reader_and_never_runs_on_the_writer() {
     let stub = Stub::new(RATE_LIMITED, OK);
     let (result, rows, withdrawn) = download(&stub, true);
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(stub.calls(), vec![true, false]);
-    assert_eq!(roles(&rows), vec!["reader", "writer-fallback"]);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(stub.calls(), vec![true], "writer stub NOT invoked");
+    assert_eq!(roles(&rows), vec!["reader"]);
     assert_eq!(
         *withdrawn.lock().unwrap(),
         vec![(
@@ -346,4 +343,24 @@ fn a_download_without_a_reader_is_the_pre_reader_invocation() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(stub.calls(), vec![false]);
     assert_eq!(roles(&rows), vec!["writer"]);
+}
+
+/// #13640 / #12394: a reader whose `gh` produces no HTTP response on the
+/// owner-kind probe yields a transport error, and the writer is never run.
+#[test]
+fn a_failed_owner_kind_probe_on_the_reader_never_runs_the_writer() {
+    let stub = Stub::new("exit 1", "echo 'HTTP/2.0 200 OK'; echo; echo '{}'");
+    let withdrawn: Withdrawals = Arc::default();
+    let reader = stub.reader.clone();
+    let api = GhCliApi::with_reader_seams(
+        stub.gh.clone(),
+        Box::new(move |route| (route == "acme/*").then(|| (reader.clone(), APP.to_string()))),
+        Box::new(|_, _, _, _| {}),
+    );
+    drop(withdrawn);
+    let err = api.get("users/acme", None).unwrap_err();
+    assert!(matches!(err, ApiError::Transport(_)), "{err:?}");
+    let log = std::fs::read_to_string(&stub.log).unwrap();
+    assert_eq!(log.lines().count(), 1, "only the reader ran: {log}");
+    assert_eq!(log.trim(), stub.reader.display().to_string());
 }

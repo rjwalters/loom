@@ -100,13 +100,15 @@ pub(super) fn validate_runtime_labels(obj: &Map<String, Value>) -> Result<()> {
 /// of a legacy adapter that keeps a usage store of its own (Codex, #8594) from
 /// the log marker every runtime writes — and deliberately yields `None` for
 /// Claude, keeping the pre-#8507 transcript reader and a byte-identical
-/// payload. Runs on the blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`]
+/// payload. `pr` is the merged PR, which a step-dispatched merge needs to find
+/// its Judge/Doctor/`champion --pr` work (#14018). Runs on the blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`]
 /// as every other token lookup, so a pathological store can never delay a
 /// completion past the lookup budget.
 pub(super) async fn fetch_tokens_by_model(
     runtime: Option<&str>,
     workspace_root: &str,
     issue: u32,
+    pr: u32,
     window: (DateTime<Utc>, DateTime<Utc>),
 ) -> Option<Vec<ModelUsageTotals>> {
     if !transcript_tokens_enabled() {
@@ -115,6 +117,12 @@ pub(super) async fn fetch_tokens_by_model(
     let root = PathBuf::from(workspace_root);
     let runtime = runtime.map(str::to_owned);
     let scan = tokio::task::spawn_blocking(move || {
+        // #14018: a step-dispatched merge is read from its step logs — the
+        // published `runtime` names one step's launch, but the PR's steps can
+        // have run on different runtimes, so no single-source reader fits.
+        if crate::usage_source::has_merge_step_logs(&root, issue, pr) {
+            return crate::usage_source::merge_step_tokens_by_model(&root, issue, pr, Some(window));
+        }
         let runtime = crate::usage_source::sweep_usage_runtime(runtime.as_deref(), &root, issue);
         crate::usage_source::sweep_tokens_by_model(runtime.as_deref(), &root, issue, Some(window))
     });
@@ -160,6 +168,54 @@ pub(crate) fn sample_completion_meta() -> CompletionMeta {
         provider: Some("friendli".to_owned()),
         profile: Some("glm-coding".to_owned()),
     }
+}
+
+/// Which trigger path built a completion, and whether it is only being recorded
+/// (a fresh host's first reconciliation pass, #4649), for [`emit_narration_record`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Narration {
+    trigger: crate::observability::ops::feed::Trigger,
+    seeded: bool,
+}
+
+impl Narration {
+    pub(super) fn new(trigger: crate::observability::ops::feed::Trigger, seeded: bool) -> Self {
+        Self { trigger, seeded }
+    }
+}
+
+/// Emit one `completion.narrated` record (#13287) for a completion just built,
+/// so a token regression is visible from the store: `tokens_present` and
+/// `tokens_by_model_rows` are read off the payload's own meta. A no-op without
+/// an ops sink, and skipped when the build provenance is not valid.
+pub(super) fn emit_narration_record(meta: &CompletionMeta, issue: u32, pr: u32, n: Narration) {
+    use crate::observability::ops::feed::Trigger;
+    if !crate::observability::ops::records_exported() {
+        return;
+    }
+    let loom = crate::telemetry::provenance::Provenance::current();
+    if !loom.is_valid() {
+        return;
+    }
+    let trigger = match n.trigger {
+        Trigger::SweepExit => "sweep_exit",
+        Trigger::Step => "champion_merge_step",
+        Trigger::Reconcile => "reconcile",
+    };
+    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::CompletionNarrated(
+        crate::telemetry::kinds::completion_narrated::CompletionNarratedRecord {
+            repo: meta.repo_slug.clone(),
+            issue,
+            pr,
+            trigger: trigger.to_owned(),
+            outcome: if n.seeded { "seeded" } else { "narrated" }.to_owned(),
+            tokens_present: meta.tokens.is_some(),
+            tokens_by_model_rows: u32::try_from(meta.tokens_by_model.as_ref().map_or(0, Vec::len))
+                .unwrap_or(u32::MAX),
+            narrated_at: Utc::now(),
+            loom,
+        },
+    ));
 }
 
 #[cfg(test)]

@@ -18,6 +18,9 @@
 //! payload that only `touch`es a marker inside that same temp dir. Nothing
 //! touches the network, a forge, `gh`, or any path outside the fixture.
 
+mod common;
+
+use common::git;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,16 +45,6 @@ fn git_out(dir: &Path, args: &[&str]) -> std::process::Output {
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
         .expect("git must spawn")
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = git_out(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A bare origin reachable by **path** (the high-severity case: local mirrors,
@@ -318,3 +311,8 @@ fn refuses_on_a_real_path_origin_without_executing_the_payload() {
         "plan() must refuse BEFORE any git process could exec the payload"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

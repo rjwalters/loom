@@ -447,7 +447,6 @@ fn effort_row(conn: &Connection, issue: u32) -> std::collections::BTreeMap<Strin
         .prepare(statement)
         .unwrap()
         .column_names()
-        .into_iter()
         .map(str::to_owned)
         .collect();
     let rows = query_with(conn, statement, &[(":issue", &issue.to_string())]);
@@ -611,3 +610,8 @@ fn sf1_coverage_row_reports_the_attributable_share_without_dividing_by_zero() {
         assert_eq!(rows[0], expected, "window [{since}, {until})");
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

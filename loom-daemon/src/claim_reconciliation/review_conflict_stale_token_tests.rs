@@ -14,7 +14,7 @@ fn both_flag_writes_land_each_on_its_own_retry() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, log) = refusing_gh(dir.path(), false);
     let refreshed = counting_refresh(true);
-    flag(&gh, dir.path(), 8909, SHA).unwrap();
+    flag(&gh, dir.path(), 8909, SHA, &[REVIEW_REQUESTED]).unwrap();
     set_test_refresh(None);
     assert_eq!(calls(&log, "pr comment 8909"), 2, "the comment: refused, then landed");
     assert_eq!(calls(&log, "pr edit 8909"), 2, "the relabel: refused, then landed");
@@ -36,7 +36,7 @@ fn a_comment_refused_twice_aborts_before_the_relabel() {
     let dir = tempfile::tempdir().unwrap();
     let (gh, log) = refusing_gh(dir.path(), true);
     let refreshed = counting_refresh(true);
-    let err = flag(&gh, dir.path(), 8909, SHA).unwrap_err();
+    let err = flag(&gh, dir.path(), 8909, SHA, &[REVIEW_REQUESTED]).unwrap_err();
     set_test_refresh(None);
     assert!(err.to_string().contains(REFUSED), "{err}");
     assert_eq!((calls(&log, "pr comment 8909"), calls(&log, "pr edit 8909")), (2, 0));

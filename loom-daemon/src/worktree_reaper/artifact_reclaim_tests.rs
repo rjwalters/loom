@@ -63,6 +63,18 @@ fn worktree(root: &Path, name: &str) -> PathBuf {
     fs::write(wt.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
     fs::write(wt.join("Cargo.lock"), "lock\n").unwrap();
     fs::write(wt.join(".loom-managed"), "").unwrap();
+    // The fixed-name path asks git whether anything under a directory is tracked.
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
     wt.canonicalize().unwrap()
 }
 
@@ -81,7 +93,18 @@ fn source_listing(wt: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         for entry in fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if dir == wt && ["target", "node_modules"].contains(&name.as_str()) {
+            if dir == wt
+                && [
+                    "target",
+                    "node_modules",
+                    ".venv",
+                    ".pytest_cache",
+                    ".ruff_cache",
+                    ".mypy_cache",
+                    "__pycache__",
+                ]
+                .contains(&name.as_str())
+            {
                 continue;
             }
             let meta = fs::symlink_metadata(&path).unwrap();
@@ -436,11 +459,20 @@ fn a_gc_rewritten_reflog_no_longer_pins_an_idle_worktrees_target() {
         let tmp = tempfile::tempdir().unwrap();
         let wt = worktree(tmp.path(), "issue-9243");
         fill(&wt.join("target"), MB);
+        // A real (relocated) git dir, so the tracked-files check can answer.
         let gitdir = tmp.path().join("gitdir/worktrees/issue-9243");
+        fs::create_dir_all(gitdir.parent().unwrap()).unwrap();
+        fs::rename(wt.join(".git"), &gitdir).unwrap();
         fs::create_dir_all(gitdir.join("logs")).unwrap();
         fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/issue-9243\n").unwrap();
-        fs::write(gitdir.join("index"), "idx").unwrap();
         fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+        let read_tree = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["read-tree", "--empty"])
+            .output()
+            .unwrap();
+        assert!(read_tree.status.success());
         fs::write(gitdir.join("logs/HEAD"), reflog_entry(10 * 3600)).unwrap();
         backdate(tmp.path(), 2 * 3600);
         // The gc rewrite (or a real commit): fresh mtime on logs/HEAD.
@@ -587,4 +619,99 @@ fn log_report_handles_every_shape() {
     assert_eq!(full.bytes_freed(), 10);
     assert_eq!(full.bytes_kept(), 6);
     assert!(full.detail().contains("bytes_freed=10"));
+}
+
+#[test]
+#[serial]
+fn python_caches_and_venv_are_reclaimed_from_an_idle_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = worktree(tmp.path(), "issue-31");
+    let names = [
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        "__pycache__",
+        ".venv",
+    ];
+    for n in names {
+        fill(&wt.join(n), 1024);
+    }
+    let before = source_listing(&wt);
+
+    let report = run(tmp.path(), &open_issue);
+
+    for n in names {
+        assert!(!wt.join(n).exists(), "{n} should be reclaimed");
+    }
+    assert_eq!(source_listing(&wt), before);
+    assert!(report.kept.is_empty(), "{:?}", report.kept);
+}
+
+#[test]
+#[serial]
+fn a_tracked_artifact_directory_is_kept_with_a_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = worktree(tmp.path(), "issue-32");
+    fill(&wt.join(".venv"), 1024);
+    fill(&wt.join(".pytest_cache"), 1024);
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&wt)
+        .args(["add", "-f", ".venv/debug/deps/blob"])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+
+    let report = run(tmp.path(), &open_issue);
+
+    assert!(wt.join(".venv/debug/deps/blob").is_file(), "tracked dir untouched");
+    assert!(!wt.join(".pytest_cache").exists(), "untracked sibling reclaimed");
+    let kept: Vec<_> = report
+        .kept
+        .iter()
+        .filter(|(a, _)| a.name == ".venv")
+        .collect();
+    assert_eq!(kept.len(), 1, "{:?}", report.kept);
+    assert!(kept[0].1.contains("tracks files"), "{}", kept[0].1);
+}
+
+#[test]
+#[serial]
+fn a_symlinked_python_cache_is_kept_and_never_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = worktree(tmp.path(), "issue-33");
+    let shared = tmp.path().join("shared-cache");
+    fill(&shared, 1024);
+    std::os::unix::fs::symlink(&shared, wt.join(".mypy_cache")).unwrap();
+
+    let report = run(tmp.path(), &open_issue);
+
+    assert!(shared.join("debug/deps/blob").is_file());
+    assert!(report.removed.is_empty());
+    assert_eq!(report.kept.len(), 1);
+    assert!(report.kept[0].1.contains("symlink"), "{}", report.kept[0].1);
+}
+
+#[test]
+#[serial]
+fn an_open_handle_keeps_a_python_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wt = worktree(tmp.path(), "issue-34");
+    fill(&wt.join(".ruff_cache"), 1024);
+    let probes = ArtifactProbes {
+        open_handles: &held_open,
+        executing_within: &no_executables,
+        volume: &one_volume,
+        euid: current_euid(),
+    };
+    let report = reclaim_kept(
+        tmp.path(),
+        &issue_class(&open_issue),
+        false,
+        Duration::ZERO,
+        &probes,
+        &never_stop,
+    );
+    assert!(wt.join(".ruff_cache").is_dir());
+    assert!(report.kept[0].1.contains("holds a file open"), "{}", report.kept[0].1);
 }

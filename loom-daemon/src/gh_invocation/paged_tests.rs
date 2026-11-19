@@ -5,21 +5,14 @@
 
 use super::*;
 use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::test_support::stub;
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 fn os(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
-}
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
 }
 
 fn inv(args: &[&str], program: &Path) -> GhInvocation {

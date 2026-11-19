@@ -437,3 +437,19 @@ fn clean_section_honors_dry_run_then_removes() {
         assert!(!old.exists());
     }
 }
+
+#[test]
+fn vanished_cwd_read_is_not_unknown_but_other_errors_are() {
+    use std::io::{Error, ErrorKind};
+    // An existing /proc dir stand-in: the exit race is NotFound on the cwd link
+    // even though the pid directory still lists (#13442).
+    let here = Path::new(".");
+    assert!(cwd_read_means_vanished(&Error::from(ErrorKind::NotFound), here));
+    // Any other failure on a live pid must keep failing closed.
+    assert!(!cwd_read_means_vanished(&Error::from(ErrorKind::PermissionDenied), here));
+    // A pid directory that is gone entirely is still a vanished process.
+    assert!(cwd_read_means_vanished(
+        &Error::from(ErrorKind::PermissionDenied),
+        Path::new("/nonexistent-pid-dir-13442")
+    ));
+}

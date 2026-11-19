@@ -83,6 +83,18 @@ pub const DEFAULT_QUARANTINE_MAX_RELEASE_ATTEMPTS: u32 = 20;
 /// hand — only the former is safe to auto-release at startup.
 pub const QUARANTINE_COMMENT_MARKER: &str = "Auto-quarantined by loom-daemon (#3939)";
 
+/// The park comment's account of the fleet captain's no-progress hold
+/// (#14047), which is separate from the park: an operator's `quarantine
+/// clear` lifts it, a TTL expiry does not. Leading space, no trailing one.
+pub(super) fn no_progress_hold_note(issue: u32) -> String {
+    format!(
+        " On a fleet, the captain's separate no-progress backoff (30 min, 2 h, 6 h, then 24 h \
+         after consecutive failed steps) can still refuse this issue as `cooldown` after the \
+         park ends: `loom-daemon quarantine clear {issue}` lifts it too, but waiting out the TTL \
+         does not."
+    )
+}
+
 /// Resolved insta-crash-quarantine parameters (Issue #3939), set on the registry
 /// at construction so [`SweepRegistry::reap_once`] can enforce them without a
 /// per-tick config read. Defaults mirror the shipped constants (enabled — it is a
@@ -413,6 +425,17 @@ impl SweepRegistry {
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
         // operator command look like it did nothing.
+        // #13919: and the captain's count and park order, which is what
+        // refuses the item fleet-wide while a captain-ordered park stands.
+        // Sent whether or not this host holds the park: the operator may run
+        // the clear on any host.
+        // #14047: an operator's clear also lifts the captain's no-progress
+        // hold (`Cleared`); a TTL expiry does not (below).
+        crate::fleet_dispatch::worker::park_ended(
+            &self.config.workspace_root,
+            issue,
+            crate::fleet_dispatch::proto::ParkEndCause::Cleared,
+        );
         self.clear_dispatch_backoff(issue);
         // #6670: same reasoning for the no-op re-dispatch cooldown — an
         // operator clearing a quarantine wants the issue dispatchable NOW,
@@ -949,6 +972,16 @@ impl SweepRegistry {
             // The generation marker is deliberately KEPT (vibesql#6639): it is
             // the probation that re-quarantines on the first further crash.
             self.insta_crash_counts.remove(&issue);
+            // #13919: the park is over, so the captain's hold for it ends too;
+            // otherwise the item is refused fleet-wide past the TTL its park
+            // comment names. The captain's no-progress hold stands (#14047):
+            // the ladder is the fleet's backoff for an item that keeps
+            // failing, and an automatic release must not defeat it.
+            crate::fleet_dispatch::worker::park_ended(
+                &self.config.workspace_root,
+                issue,
+                crate::fleet_dispatch::proto::ParkEndCause::Expired,
+            );
 
             // Issue #4206 (refined by #5725): before restoring the forge
             // label, check whether a human re-applied `loom:blocked` well
@@ -1050,13 +1083,14 @@ impl SweepRegistry {
              is paused so it stops occupying a global concurrency slot and starving other work. \
              Once the underlying cause is fixed, clear the quarantine with `loom-daemon \
              quarantine clear {issue}`, or simply wait for the {ttl}s TTL — both paths release the \
-             in-memory pause AND restore `loom:issue` (#4110).{escalation} Note: manually flipping \
+             in-memory pause AND restore `loom:issue` (#4110).{hold_note}{escalation} Note: manually flipping \
              `loom:blocked` -> `loom:issue` on the forge does NOT release the daemon's in-memory \
              quarantine on its own — the work finder skips it until the CLI clear or the TTL \
              fires.",
             marker = QUARANTINE_COMMENT_MARKER,
             secs = self.quarantine_config.insta_crash_secs,
             ttl = self.effective_quarantine_ttl(issue).as_secs(),
+            hold_note = no_progress_hold_note(issue),
             escalation = self.quarantine_escalation_note(issue),
         );
         // The forge writes are shared with the #11854 fast-fail park.
@@ -1324,7 +1358,6 @@ mod tests {
 
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_some());
         assert!(registry.clear_quarantine(35));
-        assert_eq!(registry.noop_release_count(35), 0);
         assert!(registry.noop_cooldown_remaining(35, Utc::now()).is_none());
     }
 

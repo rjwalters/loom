@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Single source of the CLI version string: the help footer below and the
+# --version output, which .loom/bin/loom's version arm delegates to (#13899).
+LOOM_CLI_VERSION="v0.1.0"
+
 # Find repository root
 find_repo_root() {
     local dir="$PWD"
@@ -75,7 +79,6 @@ ${YELLOW}COMMANDS:${NC}
     ${GREEN}stop${NC}      Graceful shutdown (or --force to kill immediately)
     ${GREEN}attach${NC}    Open live tmux session for an agent
     ${GREEN}send${NC}      Send command to agent session
-    ${GREEN}scale${NC}     Dynamic agent scaling
     ${GREEN}logs${NC}      Tail agent output
     ${GREEN}help${NC}      Show this help message
 
@@ -90,7 +93,7 @@ ${YELLOW}QUICK START:${NC}
     ./.loom/bin/loom health
 
     ${GRAY}# View an agent's terminal${NC}
-    ./.loom/bin/loom attach shepherd-1
+    ./.loom/bin/loom attach builder-1
 
     ${GRAY}# Send a command to an agent${NC}
     ./.loom/bin/loom send builder-1 "/loom:sweep 123"
@@ -113,7 +116,6 @@ ${YELLOW}EXAMPLES:${NC}
     ./.loom/bin/loom stop                   Graceful shutdown
     ./.loom/bin/loom stop --force           Force kill all sessions
     ./.loom/bin/loom stop builder-1         Stop single agent
-    ./.loom/bin/loom scale builder 3        Scale builder pool to 3
     ./.loom/bin/loom logs terminal-1        Tail agent output
     ./.loom/bin/loom logs --all             Tail all agent logs
 
@@ -153,7 +155,7 @@ ${YELLOW}RELATED COMMANDS:${NC}
     /builder, /judge, etc.    Assume specialized agent roles
     mcp__loom__dispatch_sweep Multi-issue dispatch via loom-daemon (Tier 2)
 
-${GRAY}Loom CLI v0.1.0${NC}
+${GRAY}Loom CLI ${LOOM_CLI_VERSION}${NC}
 EOF
 }
 
@@ -233,14 +235,6 @@ show_command_help() {
                 exit 1
             fi
             ;;
-        scale)
-            if [[ -n "$CLI_DIR" && -f "$CLI_DIR/loom-scale.sh" ]]; then
-                exec "$CLI_DIR/loom-scale.sh" --help
-            else
-                echo -e "${RED}Error: scale command not installed${NC}"
-                exit 1
-            fi
-            ;;
         logs)
             if [[ -n "$CLI_DIR" && -f "$CLI_DIR/loom-logs.sh" ]]; then
                 exec "$CLI_DIR/loom-logs.sh" --help
@@ -263,7 +257,7 @@ show_command_help() {
         *)
             echo -e "${RED}Error: Unknown command '$command'${NC}"
             echo ""
-            echo "Available commands: start, status, health, stop, attach, send, scale, logs, help"
+            echo "Available commands: start, status, health, stop, attach, send, logs, help"
             exit 1
             ;;
     esac
@@ -274,6 +268,9 @@ main() {
     case "${1:-}" in
         ""|--help|-h)
             show_main_help
+            ;;
+        --version|-v)
+            echo "Loom CLI ${LOOM_CLI_VERSION}"
             ;;
         *)
             show_command_help "$1"

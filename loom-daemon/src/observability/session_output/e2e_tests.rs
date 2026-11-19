@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 
-use super::claude;
+use super::{claude, Scratch};
 use crate::observability::exporter::Exporter;
 use crate::observability::otlp::OtlpExporter;
 use crate::telemetry::kinds::session_output::{
@@ -56,27 +56,6 @@ fn endpoint() -> Option<String> {
     std::env::var(ENDPOINT_ENV)
         .ok()
         .filter(|e| !e.trim().is_empty())
-}
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("loom-so-e2e-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 /// A transcript whose head attributes it to `issue`, as the real discovery

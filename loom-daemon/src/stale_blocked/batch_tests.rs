@@ -26,8 +26,6 @@ pub(super) struct Fake {
     pub(super) archived: Option<Result<bool, String>>,
     pub(super) archived_calls: usize,
     pub(super) rows: Vec<RestIssue>,
-    /// What the `loom:blocked-unnamed` listing returns (#10558).
-    pub(super) unnamed: Vec<RestIssue>,
     pub(super) list_fails: bool,
     pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
     pub(super) states: HashMap<Key, RefState>,
@@ -66,10 +64,6 @@ impl StaleBlockedForge for Fake {
             return Err(anyhow!("HTTP 502"));
         }
         Ok(self.rows.clone())
-    }
-
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
-        Ok(self.unnamed.clone())
     }
 
     fn comments(&mut self, number: u32) -> Result<Vec<extract::Comment>> {
@@ -141,6 +135,7 @@ pub(super) fn row(number: u32, body: &str, comments: u32, pr: bool, labels: &[&s
         comments,
         open_sub_issues: None,
         labels_at: None,
+        draft: false,
     }
 }
 
@@ -153,6 +148,7 @@ pub(super) fn state(s: &str) -> RefState {
         state: s.to_string(),
         labels: Vec::new(),
         is_pr: false,
+        closed_at: None,
     }
 }
 
@@ -162,6 +158,7 @@ pub(super) fn comment(login: &str, body: &str) -> extract::Comment {
             login: login.to_string(),
         },
         body: body.to_string(),
+        ..extract::Comment::default()
     }
 }
 
@@ -391,6 +388,7 @@ fn verdicts_match_the_existing_fixtures() {
             state: "MERGED".to_string(),
             labels: vec!["loom:blocked".to_string()],
             is_pr: true,
+            closed_at: None,
         },
     );
     // Undocumented (T2a), and a bot-only reference (T2f) over REST's `[bot]`.
@@ -640,4 +638,158 @@ fn a_body_record_with_a_reason_and_no_blocker_is_held_with_reason() {
         }
     );
     assert_eq!(verdict_of(find(&out, 2)), Verdict::Undocumented);
+}
+
+// --- #13889: permanent-block marker and post-resolution hold comments ---------
+
+fn trusted(body: &str, at: &str) -> extract::Comment {
+    extract::Comment {
+        created_at: Some(at.to_string()),
+        trusted: true,
+        ..comment("an-operator", body)
+    }
+}
+
+fn closed_at(s: &str, at: &str) -> RefState {
+    RefState {
+        closed_at: Some(at.to_string()),
+        ..state(s)
+    }
+}
+
+fn blocked_by_closed_seven(fake: &mut Fake, comments: Vec<extract::Comment>) {
+    fake.rows
+        .push(row(301, "Blocked by #7", 1, false, &["loom:blocked"]));
+    fake.comments.insert(301, comments);
+    fake.states
+        .insert((None, 7), closed_at("CLOSED", "2026-11-01T00:00:00Z"));
+}
+
+#[test]
+fn trusted_permanent_block_comment_holds_a_stale_issue() {
+    let mut fake = Fake::default();
+    blocked_by_closed_seven(
+        &mut fake,
+        vec![trusted(
+            "keep it\n<!-- loom:permanent-block -->",
+            "2026-10-01T00:00:00Z",
+        )],
+    );
+    let (out, _) = run(&mut fake);
+    assert!(
+        matches!(verdict_of(&out[0]), Verdict::Superseded { block, .. } if block == crate::stale_blocked::PERMANENT_BLOCK)
+    );
+}
+
+#[test]
+fn untrusted_or_quoted_permanent_block_marker_does_not_count() {
+    let mut fake = Fake::default();
+    let untrusted = extract::Comment {
+        trusted: false,
+        ..comment("a-stranger", "<!-- loom:permanent-block -->")
+    };
+    blocked_by_closed_seven(&mut fake, vec![untrusted]);
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Stale(_)));
+
+    let mut fake = Fake::default();
+    blocked_by_closed_seven(
+        &mut fake,
+        vec![trusted(
+            "the `<!-- loom:permanent-block -->` marker means…",
+            "2026-10-01T00:00:00Z",
+        )],
+    );
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Stale(_)));
+}
+
+#[test]
+fn untrusted_body_marker_does_not_count() {
+    let mut fake = Fake::default();
+    fake.rows
+        .push(issue(302, "Blocked by #7\n<!-- loom:permanent-block -->"));
+    fake.states.insert((None, 7), state("CLOSED"));
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Stale(_)), "Fake trusts nobody");
+}
+
+#[test]
+fn hold_comment_after_the_blocker_closed_is_held() {
+    let mut fake = Fake::default();
+    blocked_by_closed_seven(
+        &mut fake,
+        vec![trusted(
+            "<!-- loom:operator-decision -->\nkeep blocked",
+            "2026-11-05T00:00:00Z",
+        )],
+    );
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Superseded { .. }));
+}
+
+#[test]
+fn hold_comment_before_the_blocker_closed_is_still_stale() {
+    let mut fake = Fake::default();
+    blocked_by_closed_seven(
+        &mut fake,
+        vec![trusted(
+            "<!-- loom:operator-decision -->",
+            "2026-10-20T00:00:00Z",
+        )],
+    );
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Stale(_)));
+}
+
+#[test]
+fn hold_comment_with_a_missing_closed_at_fails_closed_to_held() {
+    let mut fake = Fake::default();
+    blocked_by_closed_seven(
+        &mut fake,
+        vec![trusted(
+            "<!-- loom:hold-restored -->",
+            "2026-10-20T00:00:00Z",
+        )],
+    );
+    fake.states.insert((None, 7), state("CLOSED"));
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Superseded { .. }));
+}
+
+#[test]
+fn ticked_checklist_dependency_is_read_for_its_close_time_only_when_a_hold_exists() {
+    let body = "## Dependencies\n\n- [x] #658: the thing\n";
+    let mut fake = Fake::default();
+    fake.rows.push(row(303, body, 1, false, &["loom:blocked"]));
+    fake.comments.insert(
+        303,
+        vec![trusted(
+            "<!-- loom:operator-decision -->",
+            "2026-11-05T00:00:00Z",
+        )],
+    );
+    fake.states
+        .insert((None, 658), closed_at("CLOSED", "2026-11-01T00:00:00Z"));
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Superseded { .. }));
+    assert_eq!(fake.state_calls, vec![(None, 658)]);
+
+    // No hold comment: no extra read, same verdict as before.
+    let mut fake = Fake::default();
+    fake.rows.push(issue(304, body));
+    let (out, _) = run(&mut fake);
+    assert!(matches!(verdict_of(&out[0]), Verdict::Stale(_)));
+    assert!(fake.state_calls.is_empty());
+}
+
+#[test]
+fn unreadable_comment_listing_is_never_stale() {
+    let mut fake = Fake::default();
+    fake.rows
+        .push(row(305, "Blocked by #7", 1, false, &["loom:blocked"]));
+    fake.states.insert((None, 7), state("CLOSED"));
+    // No comments fixture: the Fake's read errors, as an unreadable listing does.
+    let (out, _) = run(&mut fake);
+    assert!(out[0].evidence.is_err());
 }

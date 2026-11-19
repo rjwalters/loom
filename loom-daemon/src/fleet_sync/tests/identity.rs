@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::fleet_state::{Enforcement, StatePass};
 use crate::fleet_store::test_support::{sample_files, snapshot_of};
+use crate::fleet_sync::AutoApply;
 use crate::fleet_sync::{
     render_line, workspace_resync, ConfigPass, FleetSyncStatus, FloorPass, RosterPass,
 };
@@ -110,6 +111,7 @@ fn status_text_flags_a_host_not_in_the_store() {
         at: Utc::now(),
         interval_secs: 300,
         auto_apply: true,
+        auto_apply_writes: AutoApply::ALL,
         config: ConfigPass {
             error: Some(format!("host `{GENERATED}` is not in the store")),
             host_not_in_store: true,

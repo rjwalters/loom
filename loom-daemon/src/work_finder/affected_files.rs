@@ -111,8 +111,8 @@ pub fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> Vec<String> {
 }
 
 /// Per-tick overlap state: each listed candidate's surface and, per
-/// workspace, the surface already occupied. Lives inside
-/// [`super::RepoCap`], whose admission hooks it rides on.
+/// workspace, the surface already occupied. The multi-workspace tick holds
+/// one per tick.
 #[derive(Debug, Clone, Default)]
 pub struct OverlapGate {
     surfaces: HashMap<(usize, u32), BTreeSet<String>>,
@@ -149,6 +149,35 @@ impl OverlapGate {
             (Some(own), Some(taken)) => overlap(own, taken),
             _ => Vec::new(),
         }
+    }
+
+    /// Record a listed item's `## Affected Files` surface; `in_flight` marks
+    /// an item this dispatcher already holds, and a listed `loom:building`
+    /// item occupies its surface regardless. Reads only the listing's own
+    /// body and labels.
+    pub fn note_surface(&mut self, idx: usize, item: &super::WorkItem, in_flight: bool) {
+        let occupying = in_flight || item.labels.iter().any(|l| l == super::BUILDING_LABEL);
+        self.note(idx, item.number, item.body.as_deref(), occupying);
+    }
+
+    /// Defer `cand` when it shares files with its repo's occupied surface,
+    /// resolving its queue row as `deferred_file_overlap`. `true` means
+    /// the caller skips it. A scheduling signal only: no label, hold, or
+    /// stacking edge.
+    pub fn defer(&self, cand: &PriorityCandidate, report: &mut super::TickReport) -> bool {
+        let shared = self.overlapping(cand);
+        if shared.is_empty() {
+            return false;
+        }
+        let detail =
+            super::ready_queue::short_detail(&format!("file overlap: {}", shared.join(", ")));
+        super::ready_queue::resolve(
+            &mut report.queue,
+            cand,
+            crate::types::QueueDisposition::DeferredFileOverlap,
+            Some(detail),
+        );
+        true
     }
 
     /// `cand` was admitted: its surface now occupies its repo.

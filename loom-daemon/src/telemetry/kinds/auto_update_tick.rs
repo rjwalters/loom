@@ -38,8 +38,9 @@ pub const AUTO_UPDATE_LOG_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.auto_update.in_flight",
     "loom.auto_update.drain_armed",
     "loom.auto_update.drain_pending",
-    "loom.auto_update.drain_refusals",
     "loom.auto_update.drain_target",
+    "loom.auto_update.target_source",
+    "loom.auto_update.config_restart_paths",
     "loom.auto_update.consecutive_failures",
     "loom.auto_update.duration_ms",
     "loom.auto_update.version",
@@ -57,8 +58,12 @@ pub enum TickDecisionKind {
     /// A newer target exists, but a gate held the roll this tick (settle
     /// window, backoff, terminal failure, in-flight sweeps, roll window).
     Defer,
-    /// The artifact resolved from a repo other than the one this binary was
-    /// built from (#8513): no progress is possible until that is fixed.
+    /// A WARN-level "nothing to roll onto" tick: the artifact resolved from
+    /// a repo other than the one this binary was built from (#8513), or a
+    /// below-floor host with no release resolved (#11029, #14224). No
+    /// progress is possible either way until that is fixed. Tell the two
+    /// causes apart with `floor_not_rolling` (`no_release`, set only for the
+    /// below-floor cause) or the `reason` text — the kind alone does not.
     StaleRepo,
     /// A release artifact fetch ran.
     Fetch,
@@ -66,6 +71,9 @@ pub enum TickDecisionKind {
     Rebuild,
     /// A roll or drain is already armed; the tick leaves it to finish.
     DrainWait,
+    /// Restart-required config changed since boot and the tick armed a
+    /// same-binary restart for it (#12425).
+    ConfigRestart,
     /// The tick panicked. The loop recorded it and keeps running.
     Panic,
 }
@@ -81,7 +89,66 @@ impl TickDecisionKind {
             Self::Fetch => "fetch",
             Self::Rebuild => "rebuild",
             Self::DrainWait => "drain_wait",
+            Self::ConfigRestart => "config_restart",
             Self::Panic => "panic",
+        }
+    }
+}
+
+/// Why a host below the fleet floor is not rolling on this tick (#11042).
+/// A closed set, so dashboards and `status` can name the cause without
+/// parsing the tick's free-text note. Absent while the host is at or above
+/// the floor, has no fleet store, or is rolling to the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FloorNotRolling {
+    /// No published release meets the floor (the #10712 stall).
+    Unsatisfiable,
+    /// No release resolved this tick, or its version cannot be compared.
+    NoRelease,
+    /// No launchd/systemd supervisor would relaunch the daemon, so the roll
+    /// cannot start. The release is fetched once per target, then not again.
+    Unsupervised,
+    /// The last fetch for this target failed; the loop is backing off.
+    Backoff,
+    /// The last fetch for this target failed terminally.
+    Terminal,
+    /// The release is installed but the pause-and-roll refused to start for
+    /// another reason (a live pause manifest, a roll-attempt backoff, no
+    /// state directory). The daemon log names it.
+    RollRefused,
+}
+
+impl FloorNotRolling {
+    /// The wire spelling (`unsupervised`, `backoff`, …).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsatisfiable => "unsatisfiable",
+            Self::NoRelease => "no_release",
+            Self::Unsupervised => "unsupervised",
+            Self::Backoff => "backoff",
+            Self::Terminal => "terminal",
+            Self::RollRefused => "roll_refused",
+        }
+    }
+
+    /// One line for `status`: what holds the roll and what clears it.
+    #[must_use]
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Unsatisfiable => "no published release meets the floor",
+            Self::NoRelease => "no comparable release resolved this tick",
+            Self::Unsupervised => {
+                "no supervisor (LOOM_DAEMON_SUPERVISOR unset) would relaunch the daemon; the \
+                 release is installed once and not re-downloaded — restart manually to run it"
+            }
+            Self::Backoff => "the last fetch failed; backing off before the next attempt",
+            Self::Terminal => "the last fetch failed terminally; waiting for a new release",
+            Self::RollRefused => {
+                "the release is installed but the roll refused to start (see \
+                                  the daemon log)"
+            }
         }
     }
 }
@@ -95,8 +162,6 @@ pub struct DrainSnapshot {
     /// is an operator drain. (Before #10831: it had survived a deadline
     /// refusal.)
     pub pending: bool,
-    /// Always `0` since #10831: a roll no longer refuses deadlines.
-    pub refusals: u32,
     /// The artifact identity it rolls to, when the auto-updater armed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
@@ -176,10 +241,27 @@ pub struct AutoUpdateTickRecord {
     /// needs a daemon no release provides) when the floor has no stall.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub floor_stall: Option<String>,
+    /// #11042: why a host below the fleet floor did not roll on this tick.
+    /// Absent when it is not below the floor or is rolling to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor_not_rolling: Option<FloorNotRolling>,
     /// #10880: the held-roll alert, when this tick left a release roll held.
     /// Raises the record to ERROR when floor-driven, else WARN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_held: Option<RollHeld>,
+    /// #12420: the host's update state at the end of the tick (`H0`–`H5`,
+    /// `H7`, `unknown`). Absent from a record written before the projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_state: Option<String>,
+    /// #12420: who would choose the roll target (`floor`, `repo-ahead`,
+    /// `autoUpdate`, `none`); #12425: `config_restart` on a tick that armed
+    /// a same-binary restart for restart-required config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_source: Option<String>,
+    /// #12425: how many restart-required paths asked for the restart. A
+    /// count, never the paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_restart_paths: Option<u64>,
     /// Consecutive retryable failures for the tracked target.
     pub consecutive_failures: u32,
     /// Wall time the tick took, milliseconds.
@@ -193,5 +275,20 @@ impl AutoUpdateTickRecord {
     #[must_use]
     pub fn has_provenance(&self) -> bool {
         self.loom.is_valid()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DrainSnapshot;
+
+    /// #13492: records written before `refusals` was dropped still parse.
+    #[test]
+    fn a_stored_drain_snapshot_with_refusals_still_deserializes() {
+        let old = r#"{"armed":true,"pending":false,"refusals":3,"target":"artifact:1"}"#;
+        let d: DrainSnapshot = serde_json::from_str(old).unwrap();
+        assert!(d.armed && !d.pending);
+        assert_eq!(d.target.as_deref(), Some("artifact:1"));
+        assert!(!serde_json::to_string(&d).unwrap().contains("refusals"));
     }
 }

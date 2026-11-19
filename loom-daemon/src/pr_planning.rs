@@ -8,12 +8,16 @@ use serde_json::{json, Value};
 use crate::comment_trust::TrustPolicy;
 use crate::provenance::origin::WorkOrigin;
 
+mod ci_gate;
+#[cfg(test)]
+mod ci_gate_tests;
 mod listing;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod workflow_shaped_tests;
-pub use listing::{fetch_queue, has_judge_fallback, has_judge_work};
+pub use ci_gate::{cached_answer as ci_pending_cached, ci_pending};
+pub use listing::{ci_pending_at_sha, fetch_queue, has_judge_fallback, has_judge_work};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PrRole {
@@ -31,6 +35,15 @@ impl PrRole {
             Self::Doctor => "doctor",
             Self::Champion => "champion",
         }
+    }
+
+    /// The role spelled as [`Self::as_str`] spells it; `None` for a role
+    /// without a PR queue.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Judge, Self::Doctor, Self::Champion]
+            .into_iter()
+            .find(|r| r.as_str() == name)
     }
 }
 
@@ -88,8 +101,8 @@ fn fallback(row: &Value) -> bool {
 pub fn workflow_shaped(row: &Value) -> bool {
     let issue_branch = row["head"]["ref"]
         .as_str()
-        .and_then(|r| r.strip_prefix("feature/issue-"))
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        .and_then(crate::worktree_ops::naming::issue_digits_from_branch)
+        .is_some();
     let (head, base) = (&row["head"]["repo"], &row["base"]["repo"]);
     let same_repo = match (head["id"].as_u64(), base["id"].as_u64()) {
         (Some(h), Some(b)) => h == b,

@@ -75,37 +75,30 @@ You can still register per-repo if needed (e.g. Claude Desktop), but set
 | `LOOM_WORKSPACE` | Path to the Loom workspace (bypasses CWD discovery) | CWD-based repo-root discovery; **no** `~/GitHub/loom` fallback |
 | `LOOM_SOCKET_PATH` | Path to daemon socket | `~/.loom/loom-daemon.sock` |
 
-## Available Tools (30 total)
+## Available Tools (22 total)
 
-The MCP server provides 30 tools organized by function.
+The MCP server provides 22 tools organized by function. The count is the
+server's advertised `tools/list` surface — `daemon_status` was missing from the
+sections below (and so from the total) before #13821 re-counted them.
 
-### UI/Engine Control (6 tools)
+### UI/Engine Control (2 tools)
 
 | Tool | Description |
 |------|-------------|
-| `trigger_start` | Start engine with confirmation dialog |
-| `trigger_force_start` | Start engine without confirmation |
-| `trigger_force_factory_reset` | Reset workspace without confirmation |
 | `get_heartbeat` | Check if Loom app is running |
-| `stop_engine` | Stop all terminals |
-| `get_ui_state` | Get comprehensive UI state (workspace, config, terminals) |
+| `get_ui_state` | Get comprehensive UI state (workspace, config, engine liveness) |
 
-### Terminal Management (13 tools)
+### Terminal Management (8 tools)
 
 | Tool | Description |
 |------|-------------|
 | `list_terminals` | List all active terminal sessions |
 | `get_terminal_output` | Get recent output from a terminal |
-| `get_selected_terminal` | Get info about selected terminal |
 | `send_terminal_input` | Send input to a terminal |
 | `create_terminal` | Create a new terminal session |
 | `delete_terminal` | Delete a terminal session |
 | `restart_terminal` | Restart a terminal preserving config |
 | `configure_terminal` | Update terminal settings |
-| `set_primary_terminal` | Set primary terminal in UI |
-| `start_autonomous_mode` | Start autonomous mode |
-| `stop_autonomous_mode` | Stop autonomous mode |
-| `launch_interval` | Trigger interval prompt manually |
 | `get_agent_metrics` | Get agent performance metrics |
 
 ### Sweep Dispatch (8 tools)
@@ -116,13 +109,19 @@ These tools front the Rust `loom-daemon` (Tier 2) over its Unix-socket IPC and b
 | Tool | Description |
 |------|-------------|
 | `dispatch_sweep` | Dispatch a `/loom:sweep <N>` for an issue (multi-account token rotation) |
-| `list_sweeps` | Enumerate running sweeps in the daemon registry |
+| `list_sweeps` | Enumerate running sweeps in the daemon registry: issue sweeps, PR sets, and steps (`{"type":"Step","value":{"item":N,"role":"judge"}}`, one role session on one item, spawned by the daemon's step engine, #11898) |
 | `get_sweep_status` | Inspect a running sweep's state |
 | `tail_sweep_log` | Tail a per-sweep log file |
 | `cancel_sweep` | Cancel a running sweep (SIGTERM → grace → SIGKILL) |
 | `publish_event` | Publish a sweep-lifecycle event on the event bus |
 | `subscribe_to_events` | Stream topic-filtered events to a subscriber |
 | `tail_event_bus` | Tail the event bus without subscribing to a topic |
+
+### Daemon Status (1 tool)
+
+| Tool | Description |
+|------|-------------|
+| `daemon_status` | Daemon build, in-flight sweeps, and telemetry-export state (relay any TELEMETRY WARNING to the user, #9950) |
 
 ### Durable Watches (3 tools)
 
@@ -153,14 +152,15 @@ The following tools were removed to reduce complexity. Use the alternatives list
 | `read_console_log` | `tail -n 20 ~/.loom/console.log` |
 | `read_state_file` | Use `get_ui_state` (provides state + context) |
 | `read_config_file` | Use `get_ui_state` (provides config + context) |
-| `trigger_factory_reset` | Use `trigger_force_factory_reset` |
+| `trigger_factory_reset`, `trigger_start`, `trigger_force_start`, `trigger_force_factory_reset`, `stop_engine` | Removed (no daemon-era equivalent; file IPC had no consumer) |
 | `trigger_restart_terminal` | Use `restart_terminal` |
-| `trigger_run_now` | Use `launch_interval` |
+| `trigger_run_now`, `start_autonomous_mode`, `stop_autonomous_mode`, `launch_interval` | Removed (use `dispatch_sweep` / the daemon) |
 | `get_random_file` | Use `.loom/scripts/random-file.sh` |
 | `check_tmux_server_health` | tmux debugging - use bash directly |
 | `get_tmux_server_info` | tmux debugging - use bash directly |
 | `toggle_tmux_verbose_logging` | tmux debugging - send SIGUSR2 manually |
 | `clear_terminal_history` | Use `restart_terminal` instead |
+| `set_primary_terminal`, `get_selected_terminal` | Removed (no daemon-era equivalent; the `~/.loom/state.json` they shared was written only by `set_primary_terminal` itself, and the desktop app that owned the "primary terminal" concept went away in #3353). Use `list_terminals` and address a terminal by id |
 
 ## Example Usage
 
@@ -175,9 +175,6 @@ await mcp__loom__configure_terminal({
   terminal_id: "terminal-1",
   role_config: { targetInterval: 300000 }
 });
-
-// Trigger autonomous work
-await mcp__loom__launch_interval({ terminal_id: "terminal-1" });
 ```
 
 ## Development
@@ -241,7 +238,7 @@ mcp-loom/
 │   ├── index.ts           # Main server entry point
 │   ├── types.ts           # Shared TypeScript types
 │   ├── shared/
-│   │   ├── config.ts      # Workspace/state file utilities
+│   │   ├── config.ts      # Workspace resolution + config file utilities
 │   │   ├── config.test.ts
 │   │   ├── config-resolver.ts       # Tiered config merge (TS port of config_resolver.rs)
 │   │   ├── config-resolver.test.ts
@@ -249,7 +246,6 @@ mcp-loom/
 │   │   ├── daemon.ts      # Socket-based daemon communication
 │   │   └── formatting.ts  # Log/output formatting
 │   └── tools/
-│       ├── logs.ts        # Log tools (empty - use bash)
 │       ├── ui.ts          # UI/Engine tools
 │       ├── ui.test.ts
 │       ├── terminals.ts   # Terminal management tools

@@ -22,7 +22,7 @@
 //! Before this module ~a dozen modules composed a body and POSTed it to
 //! `repos/{n}/issues/{n}/comments` ad hoc. Appending per site would be a
 //! dozen chances to forget; the same reasoning that puts `loom:verdict-sha`
-//! in `post-verdict.sh` and `loom:provenance` in `create-pr.sh` puts the
+//! in `post-verdict.sh` puts the
 //! footer here: a caller cannot post through this module *without* the
 //! footer, so omission is structurally impossible instead of a matter of
 //! remembering. The footer is idempotent on [`FOOTER_MARKER`], so a body
@@ -355,6 +355,28 @@ pub struct CommentArgs {
     pub patch_created: Option<String>,
 }
 
+/// Refuse an inline `--body` that is a lone `@`-token (`@path`, `@-`) before
+/// anything is posted (#14286). `--body` takes the literal text — it never
+/// expands `@path` the way `curl -d` does — so such a body would publish the
+/// literal string. Only this one rule is applied: the verdict-body length
+/// floor and the `-`/empty rules would break legitimate short comments
+/// (`LGTM`). The `--body-file` path never reaches here.
+///
+/// # Errors
+///
+/// When `text` is a lone `@`-token.
+fn reject_lone_at_body(text: &str) -> anyhow::Result<()> {
+    if crate::verdict_body::is_lone_at_token(text) {
+        anyhow::bail!(
+            "refusing to post: --body {:?} is a lone '@' token, which posts the \
+             literal string and reads nothing — use --body-file <path> (or \
+             --body-file - for stdin)",
+            text.trim()
+        );
+    }
+    Ok(())
+}
+
 /// The `loom-daemon forge comment` verb (#9772): the same chokepoint the
 /// daemon's internal sites use, exposed so shell callers and agents
 /// (#9774's `post-comment.sh`) post through it instead of around it.
@@ -371,7 +393,10 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         anyhow::anyhow!("a NUMBER is required (or --patch-created <URL|owner/repo#N>)")
     })?;
     let body = match (&args.body, &args.body_file) {
-        (Some(text), None) => text.clone(),
+        (Some(text), None) => {
+            reject_lone_at_body(text)?;
+            text.clone()
+        }
         (None, Some(path)) => {
             if path.as_os_str() == "-" {
                 let mut buffer = String::new();
@@ -411,6 +436,9 @@ pub fn cli_entrypoint(args: CommentArgs) -> anyhow::Result<()> {
         &body,
     )
     .map_err(anyhow::Error::msg)?;
+    // #12027: journal the markers the comment opens with (a no-op outside a
+    // journaled role run; best-effort, never the exit code or output).
+    crate::observability::pick_journal::record_marker(number, args.is_pr, &body);
     // The response is the new comment's JSON; `html_url` is the friendliest
     // one-line confirmation. A shape change must never fail the POST, so a
     // parse miss just echoes the raw response.
@@ -482,9 +510,11 @@ fn gh_api_get(gh_bin: &str, path: &str) -> Result<String, String> {
         GhTarget::None,
         std::time::Duration::from_secs(60),
     )
-    // W4-C: reads back an object this process just created, then patches
-    // it: the writer that created it answers (a reader may lag).
-    .writer_identity()
+    // Reads back an object this process just created, then patches it. A
+    // reader serves it (#12394, #12584: the writer is never used for reads);
+    // the gateway revalidates every cached answer, and a reader that cannot
+    // see the new object yet fails this best-effort footer edit, which is
+    // all it decides.
     .program(gh_bin)
     .arg("api")
     .arg(path)

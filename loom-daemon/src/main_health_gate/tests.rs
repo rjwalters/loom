@@ -1,5 +1,6 @@
 use super::*;
 use crate::build_slot::test_support::{with_isolated_slot, BuildSlotEnvGuard};
+use crate::test_git_helpers::run as git;
 use serial_test::serial;
 use std::collections::VecDeque;
 
@@ -116,31 +117,6 @@ fn test_remained_healthy_logs_at_info_via_root_renderer() {
     assert!(msg.contains("/repo/alpha"), "line must name the workspace: {msg}");
     assert!(msg.contains("726s"), "line must carry the elapsed seconds: {msg}");
     assert!(msg.contains("dispatch unaffected"), "unexpected wording: {msg}");
-}
-
-/// AC4 — the single-workspace renderer (no production caller, but kept for
-/// API/test parity) must also carry the upgraded severity. It omits the
-/// workspace name (there is no root in scope) but still logs at INFO with
-/// the elapsed time.
-#[test]
-fn test_remained_healthy_logs_at_info_via_plain_renderer() {
-    let state = MainHealthState::new();
-    let outcome = GateOutcome::Green {
-        elapsed: Duration::from_secs(42),
-    };
-
-    let records = capture::capture_logs(|| {
-        apply_and_log(&state, &outcome, log_transition);
-    });
-
-    let green: Vec<_> = records
-        .iter()
-        .filter(|(_, msg)| msg.contains("GREEN in"))
-        .collect();
-    assert_eq!(green.len(), 1, "exactly one green line expected, got {records:?}");
-    let (level, msg) = green[0];
-    assert_eq!(*level, log::Level::Info, "green path must log at INFO, not debug");
-    assert!(msg.contains("42s"), "line must carry the elapsed seconds: {msg}");
 }
 
 /// A green run that *exits a halt* must stay `Recovered` (its own distinct,
@@ -1408,20 +1384,6 @@ fn test_parse_gh_run_list_real_data_fixture() {
 // ===================================================================
 // Workspace preparation — sync to origin/main before a gate run (#3885)
 // ===================================================================
-
-/// Run `git <args>` in `dir`, asserting success. Test-only helper for
-/// building throwaway repos.
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
-    assert!(status.success(), "git {args:?} failed in {}", dir.display());
-}
 
 /// Create an `origin` bare repo with an initial `main` commit and a working
 /// clone checked out on `main`. Returns `(origin_dir, clone_dir)` — both

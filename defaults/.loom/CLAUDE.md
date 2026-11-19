@@ -61,7 +61,7 @@ Spawn and manage a background pool of autonomous agents (tmux sessions) from
 ./.loom/bin/loom stop     # Graceful shutdown of the pool
 ```
 
-Full command reference (including `attach`/`logs`/`health`/`scale`) and the
+Full command reference (including `attach`/`logs`/`health`) and the
 legacy-wrapper/session-safety notes: [`.loom/docs/agent-pool-cli.md`](.loom/docs/agent-pool-cli.md).
 
 > For single-issue lifecycle orchestration prefer `/loom:sweep <issue>` (Tier 1),
@@ -233,6 +233,21 @@ Curator → Builder → Judge → Doctor (if needed) → Merge
 `loom:review-requested` is only the Builder stage. **`/loom:sweep` runs all
 stages automatically** — prefer it to avoid skipping any.
 
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
+
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
@@ -251,9 +266,9 @@ readily as a dispatched one; only Curator may be skipped.
    all-clear (`--help` has it). A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
-   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (the process doing the work, never a subagent's inherited `$PPID`).
    Step 3's `worktree.sh` does this itself; a lane NOT using it MUST call `lease ensure`
-   directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453)
+   directly — a leaseless claim is invisible to other lanes and gets reclaimed (#9453); `lease release 42` hands it back (#12103)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 &&
@@ -268,8 +283,11 @@ pr comment` — **not** `gh pr review --approve`; GitHub's API blocks self-revie
 ### Curator Workflow
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
-`--label` values, no negation), enhance with technical detail, then
-`gh issue edit 42 --add-label "loom:curated"`.
+`--label` values, no negation), enhance with technical detail,
+then write the standalone `<!-- loom:points=3 -->`
+marker and run `loom-daemon curation-complete --repo OWNER/REPO --issue 42 --model M
+--runtime R --completion-id $(uuidgen) --workspace-root ROOT` (it applies `loom:curated`;
+never a bare `--add-label`, #11787; recipe: `.loom/roles/curator-estimate.md`).
 
 ## Configuration
 

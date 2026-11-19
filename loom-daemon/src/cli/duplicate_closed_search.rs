@@ -212,41 +212,43 @@ fn repo_slug(cwd: &Path) -> Option<String> {
     std::env::var("LOOM_REPO")
         .ok()
         .filter(|r| !r.trim().is_empty())
-        .or_else(|| loom_daemon::credential_preflight::nwo_from_git_remote(cwd))
+        .or_else(|| crate::credential_preflight::nwo_from_git_remote(cwd))
 }
 
 /// Run the one search request for `path`, recorded under the inventoried
 /// `issue.search` operation.
 ///
-/// Pinned to the writer credential: the facade's reader-then-writer shape
-/// would answer a refused reader with a second search on the writer, and the
-/// contract here is one request.
+/// Reader-only (#12394, #12584): the query is scoped to `slug`
+/// (`repo:<slug>`), so a reader for that repo serves it; the search argv
+/// names no repository the facade could derive, so the route is named
+/// explicitly. With no reader to serve it the search is shed (no request),
+/// never retried on the writer: the contract here is still one request.
 fn run_search(cwd: &Path, slug: &str, path: &str) -> Result<String, String> {
-    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     let outcome = GhInvocation::new(
         Operation::new("duplicate_scan.closed_search"),
         AccessIntent::Read,
         GhTarget::None,
         SEARCH_TIMEOUT,
     )
-    .forge_op(loom_daemon::forge_call_stats::ops::ISSUE_SEARCH)
+    .forge_op(crate::forge_call_stats::ops::ISSUE_SEARCH)
     .identity_scope(None, Some(slug))
-    .writer_identity()
+    .reader_repo(slug)
     .current_dir(cwd)
     .args(["api", path])
     .run();
     match outcome {
-        loom_daemon::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
+        crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         }
-        loom_daemon::cmd_out::CmdOutcome::Ran(out) => {
+        crate::cmd_out::CmdOutcome::Ran(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // One line is enough to name a 403/429; the rest of a forge error
             // body is noise in a warning.
             let first = stderr.lines().next().unwrap_or_default().trim();
             Err(format!("the forge refused the search: {first}"))
         }
-        loom_daemon::cmd_out::CmdOutcome::Unavailable(why) => {
+        crate::cmd_out::CmdOutcome::Unavailable(why) => {
             Err(format!("the search did not complete: {why}"))
         }
     }
@@ -282,8 +284,7 @@ pub(crate) fn fetch(
         // Decided before anything touches git or the forge.
         return ClosedSearch::NoKeywords;
     }
-    let github = loom_daemon::forge_cmd::detect_forge(Some(cwd))
-        == loom_daemon::forge_cmd::ForgeType::GitHub;
+    let github = crate::forge_cmd::detect_forge(Some(cwd)) == crate::forge_cmd::ForgeType::GitHub;
     let slug = repo_slug(cwd);
     let since = closed_since(now, days);
     select(&terms, github, slug.as_deref(), &since, |slug, path| {

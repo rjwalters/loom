@@ -45,6 +45,7 @@ impl HoldFeed {
             let tap = Tap {
                 runtime: admitted.runtime.clone(),
                 model_profile: stamp.model_profile.clone(),
+                model: None,
             };
             let role = crate::runtime_admission::canonical_role(role).unwrap_or(role);
             Some((root.to_path_buf(), Key::new(root, role, &tap), tap))

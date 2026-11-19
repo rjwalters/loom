@@ -40,6 +40,7 @@ fn pass_at(fx: &Fixture, knobs: &Knobs, memory: &mut Memory, now: DateTime<Utc>)
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &clock,
+        pr_merged: &|_, _| knobs.merged,
     };
     run(&env, std::slice::from_ref(&fx.host), memory)
 }
@@ -215,6 +216,46 @@ fn a_stale_loom_only_merge_is_aborted_and_repaired() {
     assert!(kinds(&found).contains(&"abort"));
 }
 
+/// A neighbour runner's `git` that has exited but not been reaped is a
+/// zombie: it runs nothing and holds no working directory, but
+/// `kill(pid, 0)` still finds it, so `live_git`'s fail-closed rule counted
+/// it as working in the fixture and the repair was declined. That was the
+/// loaded-runner flake in this module (#14059, #14052).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreaped_git_elsewhere_does_not_hold_the_repair() {
+    fn zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| {
+                s.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+    let fx = loom_fixture();
+    merge_in_progress(&fx);
+    let mut ghost = Command::new("git")
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a foreign git that exits at once");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !zombie(ghost.id()) {
+        assert!(std::time::Instant::now() < deadline, "the foreign git never exited");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let found = heal(&fx, late());
+
+    let _ = ghost.wait();
+    assert!(healed(only(&found).state), "{found:?}");
+    assert!(!fx.host.join(".git/MERGE_HEAD").exists());
+}
+
 #[test]
 fn a_stale_loom_only_rebase_is_aborted_and_repaired() {
     let fx = loom_fixture();
@@ -291,6 +332,63 @@ fn a_non_loom_dirty_file_is_not_touched_even_beside_loom_ones() {
     assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
 }
 
+/// The committed `opencode.json` (#13970), as the squad installer leaves it.
+const OPENCODE_COMMITTED: &str = "{\n  \"mcp\": {\n    \"squad\": {}\n  }\n}\n";
+
+#[test]
+fn an_opencode_schema_only_dirty_config_is_repaired() {
+    let fx = loom_fixture();
+    fx.push("opencode.json", OPENCODE_COMMITTED);
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    // What OpenCode adds: exactly one `$schema` entry, nothing else.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {}\n  }\n}\n",
+    );
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, Utc::now());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    let status = git(&fx.host, &["status", "--porcelain"]);
+    assert!(!status.contains("opencode.json"), "{status}");
+}
+
+#[test]
+fn an_opencode_config_with_any_other_change_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push("opencode.json", OPENCODE_COMMITTED);
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    // The schema entry plus one edited value: not the tool's one-liner.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {\"other\": true}\n  }\n}\n",
+    );
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
+}
+
+#[test]
+fn an_opencode_json_absent_from_head_is_not_touched() {
+    let fx = loom_fixture();
+    // Staged, so it is dirty, but `HEAD` has no `opencode.json` to compare
+    // against: fail closed to the operator.
+    write(
+        &fx.host.join("opencode.json"),
+        "{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"mcp\": \
+         {\n    \"squad\": {}\n  }\n}\n",
+    );
+    git(&fx.host, &["add", "opencode.json"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Dirty);
+}
+
 #[test]
 fn dirt_on_a_checkout_that_is_not_behind_is_left_to_the_operator() {
     let fx = loom_fixture();
@@ -318,6 +416,21 @@ fn a_recent_operation_is_not_touched() {
     let fx = loom_fixture();
     merge_in_progress(&fx);
     assert_eq!(assert_untouched(&fx, Utc::now()), CheckoutState::MidOperation);
+}
+
+/// A pass that declines a repair says why in its result (#14059): the
+/// self-heal tests print the pass, so a repeat flake names the cause of the
+/// skip and not only the state the checkout was left in.
+#[test]
+fn a_declined_repair_says_why_in_the_pass_result() {
+    let fx = loom_fixture();
+    merge_in_progress(&fx);
+
+    let found = pass_at(&fx, &Knobs::default(), &mut Memory::default(), Utc::now());
+
+    assert_eq!(only(&found).state, CheckoutState::MidOperation);
+    let why = found.self_heal_left.join("; ");
+    assert!(why.contains("the operation in progress is recent"), "{why}");
 }
 
 #[test]
@@ -525,4 +638,554 @@ fn a_hold_that_cannot_be_repaired_is_escalated_once() {
     ] {
         assert!(ask.line.contains(needle), "{needle} in {}", ask.line);
     }
+}
+
+// ----------------------------------------------------------------------------
+// #11989: surfaces `installed_files` does not list, and a detached HEAD
+// ----------------------------------------------------------------------------
+
+/// Far enough ahead that a detached HEAD has sat past
+/// `managed::detached_after()`'s six-hour default.
+fn much_later() -> DateTime<Utc> {
+    Utc::now() + chrono::Duration::hours(7)
+}
+
+/// A local resync-shaped commit writing surfaces a release added after the
+/// last full install: none of them is in `installed_files`.
+fn commit_unlisted_surfaces(fx: &Fixture) {
+    for path in [
+        ".agents/skills/loom-builder/SKILL.md",
+        ".loom/scripts/tests/check-ci-suite-manifest.sh",
+        ".loom/docs/blame-issue.md",
+    ] {
+        write(
+            &fx.host.join(path),
+            &format!("{}\nresynced locally\n", crate::agent_skills::MARKER),
+        );
+    }
+    git(&fx.host, &["add", "-A"]);
+    git(
+        &fx.host,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "chore: resync installed Loom surfaces",
+        ],
+    );
+}
+
+#[test]
+fn a_stranded_resync_commit_on_surfaces_installed_files_misses_is_repaired() {
+    let fx = loom_fixture();
+    commit_unlisted_surfaces(&fx);
+    let stranded = fx.head();
+    let tip = fx.push(".loom/scripts/spawn.sh", "resynced\n");
+
+    let found = heal(&fx, Utc::now());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert!(rescue_refs(&fx)[0].ends_with(&stranded));
+}
+
+#[test]
+fn a_surface_path_pinned_in_resync_ignore_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push(
+        ".loom/resync-ignore",
+        "# deliberate\nscripts/tests/check-ci-suite-manifest.sh\n",
+    );
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    commit_unlisted_surfaces(&fx);
+    fx.push("README.md", "two\n");
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn a_non_loom_skill_or_command_is_not_counted_as_a_surface() {
+    let fx = loom_fixture();
+    write(&fx.host.join(".agents/skills/custom/SKILL.md"), "mine\n");
+    write(&fx.host.join(".claude/commands/repo/x.md"), "mine\n");
+    git(&fx.host, &["add", "-A"]);
+    git(
+        &fx.host,
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "chore: resync installed Loom surfaces",
+        ],
+    );
+    fx.push("README.md", "two\n");
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+/// The host's checkout detached at its current HEAD, with origin one commit
+/// ahead and the clone already holding it.
+fn detached_behind(fx: &Fixture) -> String {
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    tip
+}
+
+#[test]
+fn a_detached_head_left_behind_for_hours_is_put_back_on_the_branch() {
+    let fx = loom_fixture();
+    let tip = detached_behind(&fx);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    assert_eq!(
+        git(&fx.host, &["rev-parse", "--abbrev-ref", "main@{upstream}"]),
+        "origin/main",
+        "the branch tracks origin again"
+    );
+    // Everything on that HEAD is on origin, so #13588's rule puts it back
+    // before the Loom-owned repair is asked.
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
+}
+
+#[test]
+fn a_detached_head_with_loom_only_commits_is_put_back_and_rescued() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    commit_unlisted_surfaces(&fx);
+    let stranded = fx.head();
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    let refs = rescue_refs(&fx);
+    assert!(refs.iter().any(|r| r.ends_with(&stranded)), "{refs:?}");
+}
+
+#[test]
+fn a_recently_detached_head_is_not_touched() {
+    let fx = loom_fixture();
+    detached_behind(&fx);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_with_a_non_loom_commit_is_not_touched() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    fx.commit_locally("src/feature.rs");
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_checkout_on_another_branch_with_its_own_commit_is_not_this_repair() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "pr6597"]);
+    fx.commit_locally("src/feature.rs");
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+/// Commit `files` on the host's branch, ahead of an origin that has moved on.
+fn commit_files_behind_origin(fx: &Fixture, files: &[(&str, &str)]) -> String {
+    for (path, body) in files {
+        write(&fx.host.join(path), body);
+    }
+    git(&fx.host, &["add", "-A"]);
+    git(&fx.host, &["commit", "--quiet", "-m", "local"]);
+    let local = fx.head();
+    fx.push("README.md", "two\n");
+    local
+}
+
+#[test]
+fn a_repo_local_file_in_a_managed_directory_is_not_loom_owned() {
+    for path in [
+        ".loom/roles/custom-role.md",
+        ".loom/scripts/my-local-helper.sh",
+        ".claude/commands/loom/mine.md",
+    ] {
+        let fx = loom_fixture();
+        commit_files_behind_origin(&fx, &[(path, "mine\n")]);
+        assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged, "{path}");
+    }
+}
+
+#[test]
+fn a_skill_without_the_generation_marker_is_not_loom_owned() {
+    let fx = loom_fixture();
+    // A shipped name, but detached from generation: the resync skips it.
+    commit_files_behind_origin(
+        &fx,
+        &[(".agents/skills/loom-builder/SKILL.md", "consumer's own\n")],
+    );
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn a_skill_pinned_in_the_agents_skills_form_is_not_touched() {
+    let fx = loom_fixture();
+    fx.push(".loom/resync-ignore", "agents-skills/loom-builder/SKILL.md\n");
+    git(&fx.host, &["pull", "--quiet", "--ff-only", "origin", "main"]);
+    let marked = format!("{}\nlocal\n", crate::agent_skills::MARKER);
+    commit_files_behind_origin(&fx, &[(".agents/skills/loom-builder/SKILL.md", &marked)]);
+    assert_eq!(assert_untouched(&fx, late()), CheckoutState::Diverged);
+}
+
+#[test]
+fn another_named_branch_with_loom_only_commits_is_not_reset() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "loom/my-work"]);
+    commit_files_behind_origin(&fx, &[(".loom/scripts/tests/check-ci-suite-manifest.sh", "x\n")]);
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_detached_head_pinned_to_keep_is_not_put_back() {
+    let fx = loom_fixture();
+    detached_behind(&fx);
+    git(&fx.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+// ----------------------------------------------------------------------------
+// A checkout stranded off the default branch (#13588)
+// ----------------------------------------------------------------------------
+
+fn knobs_merged(merged: Option<bool>) -> Knobs {
+    Knobs {
+        merged,
+        ..Knobs::default()
+    }
+}
+
+#[test]
+fn a_branch_whose_commits_are_all_on_origin_is_put_back_and_fast_forwarded() {
+    let fx = loom_fixture();
+    let old = fx.head();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+    let refs = rescue_refs(&fx);
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    assert!(refs[0].ends_with(&old), "the rescue ref is at the old HEAD: {refs:?}");
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
+}
+
+#[test]
+fn a_branch_whose_commits_are_a_merged_prs_is_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally("src/feature.rs");
+    let tip = fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = pass_at(&fx, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(fx.head(), tip);
+    assert_eq!(rescue_refs(&fx).len(), 1);
+    // The branch and its commit are still there.
+    assert!(git(&fx.host, &["branch", "--list", "feature/issue-756"]).contains("feature"));
+}
+
+#[test]
+fn a_failed_or_negative_merged_pr_lookup_keeps_the_hold() {
+    for answer in [None, Some(false)] {
+        let fx = loom_fixture();
+        git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+        fx.commit_locally("src/feature.rs");
+        fx.push("README.md", "two\n");
+        git(&fx.host, &["fetch", "--quiet", "origin"]);
+        let knobs = knobs_merged(answer);
+        assert_eq!(
+            assert_untouched_with(&fx, &knobs, much_later()),
+            CheckoutState::WrongBranch,
+            "lookup answer {answer:?}"
+        );
+    }
+}
+
+#[test]
+fn a_head_detached_at_a_commit_on_origin_is_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "--detach", "origin/main"]);
+
+    let found = heal(&fx, much_later());
+
+    assert!(healed(only(&found).state), "{found:?}");
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "main");
+}
+
+#[test]
+fn a_stranded_checkout_with_a_tracked_change_stays_held() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    write(&fx.host.join("README.md"), "edited\n");
+    assert_eq!(assert_untouched(&fx, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_stranded_checkout_is_not_moved_when_nothing_may_be_written() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let knobs = Knobs {
+        write: false,
+        ..Knobs::default()
+    };
+    assert_eq!(assert_untouched_with(&fx, &knobs, much_later()), CheckoutState::WrongBranch);
+    let held = Knobs {
+        held: Some("paused"),
+        ..Knobs::default()
+    };
+    assert_eq!(assert_untouched_with(&fx, &held, much_later()), CheckoutState::WrongBranch);
+}
+
+#[test]
+fn a_standing_wrong_branch_hold_is_said_again_each_interval() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally("src/feature.rs");
+    let mut memory = Memory::default();
+    let knobs = Knobs::default();
+    let t0 = Utc::now();
+    let at = |mins: i64| t0 + chrono::Duration::minutes(mins);
+    let still = |pass: &CheckoutPass| kinds(pass).iter().filter(|k| **k == "still-held").count();
+
+    assert_eq!(
+        still(&pass_at(&fx, &knobs, &mut memory, at(0))),
+        0,
+        "the first sight is the transition"
+    );
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(30))), 0);
+    let hourly = pass_at(&fx, &knobs, &mut memory, at(61));
+    assert_eq!(still(&hourly), 1, "{:?}", kinds(&hourly));
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(90))), 0);
+    assert_eq!(still(&pass_at(&fx, &knobs, &mut memory, at(125))), 1);
+}
+
+// ----------------------------------------------------------------------------
+// #13835: the forge lookup runs last, and a rescue ref is reused
+// ----------------------------------------------------------------------------
+
+/// A pass whose `pr_merged` stub counts its calls. Returns the count and the
+/// pass, so a test can assert both the lookup's cost and the outcome.
+fn lookups_in_a_pass(fx: &Fixture, knobs: &Knobs, now: DateTime<Utc>) -> (usize, CheckoutPass) {
+    let calls = Rc::new(Cell::new(0_usize));
+    let seen = Rc::clone(&calls);
+    let answer = knobs.merged;
+    let count = move |_: &Path, _: &str| {
+        seen.set(seen.get() + 1);
+        answer
+    };
+    let clock = move || now;
+    let env = Env {
+        write: knobs.write,
+        held: &|| knobs.held,
+        gate_in_flight: &*knobs.gate,
+        hold: &|_| (!knobs.updating).then(MoveHold::free),
+        network: knobs.network,
+        backing_off: &|_| false,
+        confirmed: &|_, _| None,
+        breaker_open: &|| false,
+        budget: None,
+        elapsed: &|| Duration::ZERO,
+        clock: &clock,
+        pr_merged: &count,
+    };
+    let pass = run(&env, std::slice::from_ref(&fx.host), &mut Memory::default());
+    (calls.get(), pass)
+}
+
+/// A checkout off `main` carrying one commit of its own, with origin moved on:
+/// the only shape in which the `pr_merged` lookup is reached at all.
+fn stranded_with_its_own_commit(fx: &Fixture) {
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally("src/feature.rs");
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+}
+
+#[test]
+fn the_merged_pr_lookup_is_the_last_question_asked() {
+    // The one case that must still pay for it: everything local agrees.
+    let fx = loom_fixture();
+    stranded_with_its_own_commit(&fx);
+    let (asked, found) = lookups_in_a_pass(&fx, &knobs_merged(Some(true)), much_later());
+    assert_eq!(
+        asked,
+        1,
+        "the lookup settles it: {:?} {:?}",
+        kinds(&found),
+        found.self_heal_left
+    );
+    assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
+}
+
+#[test]
+fn a_local_refusal_costs_no_forge_lookup() {
+    // "HEAD moved recently": `late()` is two hours on, inside the six-hour wait.
+    let recent = loom_fixture();
+    stranded_with_its_own_commit(&recent);
+    let (asked, found) = lookups_in_a_pass(&recent, &knobs_merged(Some(true)), late());
+    assert_eq!(asked, 0, "HEAD moved recently: {:?}", kinds(&found));
+    assert_eq!(only(&found).state, CheckoutState::WrongBranch);
+
+    // `loom.checkoutFf.detached=keep` on a detached HEAD.
+    let pinned = loom_fixture();
+    git(&pinned.host, &["checkout", "--quiet", "--detach", "HEAD"]);
+    pinned.commit_locally("src/feature.rs");
+    pinned.push("README.md", "two\n");
+    git(&pinned.host, &["fetch", "--quiet", "origin"]);
+    git(&pinned.host, &["config", "--local", "loom.checkoutFf.detached", "keep"]);
+    let (asked, found) = lookups_in_a_pass(&pinned, &knobs_merged(Some(true)), much_later());
+    assert_eq!(asked, 0, "detached on purpose: {:?}", kinds(&found));
+    assert_eq!(only(&found).state, CheckoutState::WrongBranch);
+
+    // A live `git` in the repository.
+    let busy = loom_fixture();
+    stranded_with_its_own_commit(&busy);
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(&busy.host)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let (asked, found) = lookups_in_a_pass(&busy, &knobs_merged(Some(true)), much_later());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(asked, 0, "a git process is running: {:?}", kinds(&found));
+}
+
+/// Check `main` out in a second worktree, so the `git checkout main` inside
+/// `rehome` fails the same way on every pass.
+fn hold_the_branch_elsewhere(fx: &Fixture) {
+    let side = fx.host.parent().unwrap().join("side");
+    git(&fx.host, &["worktree", "add", "--quiet", side.to_str().unwrap(), "main"]);
+}
+
+#[test]
+fn a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    let stranded = fx.head();
+    hold_the_branch_elsewhere(&fx);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    // Two passes an hour apart: a timestamp-named ref would differ between them.
+    let first = heal(&fx, much_later());
+    let second = heal(&fx, much_later() + chrono::Duration::hours(1));
+
+    // `rehome` declines with a reason when `stranded` doubts the checkout
+    // (#14231); the reason travels in the pass result's `self_heal_left`.
+    for pass in [&first, &second] {
+        assert!(
+            kinds(pass).contains(&"repair-failed"),
+            "{:?}: {:?}",
+            kinds(pass),
+            pass.self_heal_left
+        );
+        assert!(!kinds(pass).contains(&"rehomed"), "{:?}", kinds(pass));
+    }
+    assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "feature/issue-756");
+    let refs = rescue_refs(&fx);
+    assert_eq!(refs.len(), 1, "one rescue ref for one stranded HEAD: {refs:?}");
+    assert!(refs[0].ends_with(&stranded), "{refs:?}");
+    // Only the pass that made it reports making one.
+    assert!(kinds(&first).contains(&"rescue-ref"), "{:?}", kinds(&first));
+    assert!(!kinds(&second).contains(&"rescue-ref"), "{:?}", kinds(&second));
+}
+
+#[test]
+fn a_checkout_left_off_its_branch_says_why_it_was_not_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    // `late()` is inside the six-hour wait: `stranded` answers "HEAD moved recently".
+    let found = heal(&fx, late());
+
+    assert_eq!(only(&found).state, CheckoutState::WrongBranch, "{:?}", kinds(&found));
+    assert!(
+        found
+            .self_heal_left
+            .iter()
+            .any(|why| why.contains("HEAD moved recently")),
+        "{:?}",
+        found.self_heal_left
+    );
+}
+
+#[test]
+fn a_rescue_ref_at_another_sha_is_not_reused() {
+    let fx = loom_fixture();
+    let elsewhere = fx.head();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.commit_locally(".loom/scripts/tests/check-ci-suite-manifest.sh");
+    let stranded = fx.head();
+    git(
+        &fx.host,
+        &[
+            "update-ref",
+            "refs/loom/rescue/20991231T235959Z",
+            &elsewhere,
+        ],
+    );
+    hold_the_branch_elsewhere(&fx);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    let found = pass_at(&fx, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+
+    assert!(kinds(&found).contains(&"repair-failed"), "{:?}", kinds(&found));
+    let refs = rescue_refs(&fx);
+    assert_eq!(refs.len(), 2, "the other ref is at another commit: {refs:?}");
+    assert!(refs.iter().any(|r| r.ends_with(&stranded)), "{refs:?}");
+    assert!(refs.iter().any(|r| r.ends_with(&elsewhere)), "{refs:?}");
+}
+
+#[test]
+fn a_rehome_that_carried_nothing_does_not_say_it_carried_zero_commits() {
+    let carried_none = loom_fixture();
+    git(&carried_none.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    carried_none.push("README.md", "two\n");
+    git(&carried_none.host, &["fetch", "--quiet", "origin"]);
+    let found = heal(&carried_none, much_later());
+    let line = &only_repair(&found, "rehomed").line;
+    assert!(!line.contains("commit(s)"), "{line}");
+    assert!(line.contains("put back on `main` from `feature/issue-756`"), "{line}");
+
+    // One carried commit still names itself.
+    let carried_one = loom_fixture();
+    stranded_with_its_own_commit(&carried_one);
+    let found =
+        pass_at(&carried_one, &knobs_merged(Some(true)), &mut Memory::default(), much_later());
+    let line = &only_repair(&found, "rehomed").line;
+    assert!(line.contains("(1 commit(s) only on a merged PR)"), "{line}");
+}
+
+/// The pass's single transition of `kind`.
+fn only_repair<'a>(pass: &'a CheckoutPass, kind: &str) -> &'a Transition {
+    let found: Vec<_> = pass.transitions.iter().filter(|t| t.kind == kind).collect();
+    assert_eq!(found.len(), 1, "one {kind}: {:?}", kinds(pass));
+    found[0]
 }

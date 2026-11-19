@@ -555,6 +555,7 @@ fn ported_extract_refs_diverges_from_the_retired_shell_only_in_known_ways() {
                         login: login.clone(),
                     },
                     body: body.clone(),
+                    ..Comment::default()
                 })
                 .collect(),
         };
@@ -838,3 +839,8 @@ fn nbsp_is_a_separator_for_neither_implementation() {
             .join("\n")
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

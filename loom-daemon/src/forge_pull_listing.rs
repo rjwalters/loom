@@ -115,6 +115,17 @@ pub fn build_pulls_url(repo: Option<&str>, page: usize) -> String {
     )
 }
 
+/// The Gitea form of [`build_pulls_url`] (#12312): paged by `limit` (Gitea's
+/// default cap is 50), newest first.
+#[must_use]
+pub(crate) fn build_gitea_pulls_url(repo: Option<&str>, page: usize) -> String {
+    let repo_path = repo.unwrap_or("{owner}/{repo}");
+    format!(
+        "repos/{repo_path}/pulls?state=open&sort=recentupdate&limit={}&page={page}",
+        store::Shape::GiteaPulls.page_size()
+    )
+}
+
 /// `GET pulls?state=open` — the `pr.list-open` inventory row (#10382).
 const PR_LIST_OPEN: ForgeOp = ops::PR_LIST_OPEN;
 
@@ -146,6 +157,29 @@ pub fn list_open_pulls_cached_as(
     max_pages: usize,
 ) -> Result<Vec<RestPull>> {
     list_open_pulls_cached_within(caller, gh_bin, cwd, repo_override, max_pages, None)
+}
+
+/// [`list_open_pulls_cached_as`] on `forge` (#12312): Gitea's `/pulls`
+/// dialect and its 50-row pages; GitHub is [`list_open_pulls_cached_as`].
+///
+/// # Errors
+/// As [`list_open_pulls_cached_as`].
+pub fn list_open_pulls_on(
+    forge: crate::forge_cmd::ForgeType,
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    max_pages: usize,
+) -> Result<Vec<RestPull>> {
+    if forge == crate::forge_cmd::ForgeType::GitHub {
+        return list_open_pulls_cached_as(caller, gh_bin, cwd, repo_override, max_pages);
+    }
+    let refresh = crate::credential_preflight::force_refresh_owner_credential;
+    let site = store::ConditionalRead::new(caller, PR_LIST_OPEN).shaped(store::Shape::GiteaPulls);
+    // The same PR ceiling as GitHub's 100-row pages.
+    let max_pages = max_pages * (PER_PAGE / site.shape.page_size());
+    list_open_pulls_at(site, gh_bin, cwd, repo_override, max_pages, &refresh)
 }
 
 /// [`list_open_pulls_cached_as`] with every page read bounded by `timeout`
@@ -195,7 +229,10 @@ fn list_open_pulls_at(
 ) -> Result<Vec<RestPull>> {
     let target = resolve(cwd, repo_override);
     let read = |page: usize| -> Result<Vec<RestPull>> {
-        let url = build_pulls_url(target.repo.as_deref(), page);
+        let url = match site.shape {
+            store::Shape::GitHub => build_pulls_url(target.repo.as_deref(), page),
+            _ => build_gitea_pulls_url(target.repo.as_deref(), page),
+        };
         let get = || conditional_get(site, gh_bin, cwd, &target, &url, Kind::Listing);
         let body = retry_404_once(cwd, &url, refresh, get)?;
         parse_rest_pulls(&body).with_context(|| format!("parse REST pulls JSON from {url}"))
@@ -204,7 +241,7 @@ fn list_open_pulls_at(
     let mut pages: Vec<Vec<RestPull>> = Vec::new();
     for page in 1..=max_pages {
         let rows = read(page)?;
-        let full = rows.len() >= PER_PAGE;
+        let full = rows.len() >= site.shape.page_size();
         pages.push(rows);
         if !full {
             for (i, earlier) in pages[..pages.len() - 1].iter().enumerate() {
@@ -226,7 +263,7 @@ fn list_open_pulls_at(
     }
     Err(anyhow!(
         "forge_pull_listing: more than {} open PRs; the listing is incomplete",
-        max_pages * PER_PAGE
+        max_pages * site.shape.page_size()
     ))
 }
 

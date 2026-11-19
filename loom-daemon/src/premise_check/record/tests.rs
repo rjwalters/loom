@@ -243,3 +243,92 @@ fn cited_paths_strips_line_suffixes() {
     assert!(paths.contains("src/watchdog.rs"), "{paths:?}");
     assert!(paths.contains("docs/adr/0009-shepherd.md"), "{paths:?}");
 }
+
+// ---- hermit.reversalNeedsOperator (#13620) ---------------------------------
+
+fn reversal_clear(protected_line: &str) -> Record {
+    let chunk = format!(
+        "{}premise-evidence: src/watchdog.rs:1 — kept for later\n{protected_line}",
+        marker("exists=yes deliberate=yes reversal=yes verdict=clear")
+    );
+    parse(&chunk).expect("parses")
+}
+
+#[test]
+fn policy_defaults_to_always_and_fails_closed_on_junk() {
+    assert_eq!(ReversalPolicy::default(), ReversalPolicy::Always);
+    assert_eq!(ReversalPolicy::from_config(None), ReversalPolicy::Always);
+    assert_eq!(ReversalPolicy::from_config(Some("always")), ReversalPolicy::Always);
+    assert_eq!(ReversalPolicy::from_config(Some("junk")), ReversalPolicy::Always);
+    assert_eq!(ReversalPolicy::from_config(Some("Protected-Only")), ReversalPolicy::Always);
+    assert_eq!(
+        ReversalPolicy::from_config(Some("protected-only")),
+        ReversalPolicy::ProtectedOnly
+    );
+}
+
+#[test]
+fn always_policy_still_rejects_protected_none() {
+    let root = fixture_root();
+    let rec = reversal_clear("premise-protected: none\n");
+    assert!(matches!(
+        check_with(&rec, root.path(), ReversalPolicy::Always),
+        Outcome::Malformed(_)
+    ));
+    assert!(matches!(check(&rec, root.path()), Outcome::Malformed(_)));
+}
+
+#[test]
+fn protected_only_clears_with_protected_none() {
+    let root = fixture_root();
+    for line in [
+        "premise-protected: none\n",
+        "premise-protected: None — no callers\n",
+    ] {
+        let rec = reversal_clear(line);
+        assert_eq!(
+            check_with(&rec, root.path(), ReversalPolicy::ProtectedOnly),
+            Outcome::Proceed,
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn protected_only_without_the_line_is_still_malformed() {
+    let root = fixture_root();
+    let rec = reversal_clear("");
+    match check_with(&rec, root.path(), ReversalPolicy::ProtectedOnly) {
+        Outcome::Malformed(why) => assert!(why.contains("operator-decision"), "{why}"),
+        other => panic!("expected Malformed, got {other:?}"),
+    }
+}
+
+#[test]
+fn protected_only_each_class_still_routes_to_the_operator() {
+    let root = fixture_root();
+    for class in [
+        "attested-evidence (tier record)",
+        "provenance (vendoring attestation)",
+        "public-api of a published package",
+        "infra-state (tofu moved block)",
+        "product-direction (roadmap feature)",
+    ] {
+        let line = format!("premise-protected: {class}\n");
+        let rec = reversal_clear(&line);
+        match check_with(&rec, root.path(), ReversalPolicy::ProtectedOnly) {
+            Outcome::Malformed(why) => assert!(why.contains("protected class"), "{class}: {why}"),
+            other => panic!("{class}: expected Malformed, got {other:?}"),
+        }
+        let chunk = format!(
+            "{}premise-evidence: src/watchdog.rs:1 — x\n{line}",
+            marker("exists=yes deliberate=yes reversal=yes verdict=operator-decision")
+        );
+        let routed = parse(&chunk).unwrap();
+        assert_eq!(
+            check_with(&routed, root.path(), ReversalPolicy::ProtectedOnly),
+            Outcome::RouteOperator,
+            "{class}"
+        );
+    }
+}

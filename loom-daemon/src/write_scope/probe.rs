@@ -26,7 +26,10 @@
 //! answer is then cached here for [`ttl`]. So a repository removed from the
 //! installation can keep a cached WRITE for up to about two hours with the
 //! defaults (snapshot TTL + probe TTL), not one. The write itself is still
-//! refused by the forge; what lags is this pre-check.
+//! refused by the forge; what lags is this pre-check. A repository the
+//! snapshot does not list is the exception (#13152): the snapshot is
+//! revalidated on such a miss (at most once a minute) and a cached
+//! [`NOT_IN_INSTALLATION`] lives for only a minute, like an `Unknown`.
 //!
 //! A forced per-owner re-mint cuts both short (#9247): the stale-token write
 //! retry forgets the credential's snapshot and expires every answer cached
@@ -55,11 +58,17 @@
 //! has no key at all: it is never looked up, never stored, and never upgraded
 //! by the stale-WRITE grace, so "no Gitea credential" always refuses.
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The `Insufficient` detail for a repository outside the App installation.
+/// Shared by the probes and by the refusal-class mapping, so the class is
+/// derived from the typed verdict rather than parsed from a sentence.
+pub(crate) const NOT_IN_INSTALLATION: &str = "not in this App installation";
 
 /// What the probe established.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +133,15 @@ impl GhProbe {
         Self { gh, config_dir }
     }
 
-    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
-    /// explicit `config_dir` is the credential under test, so it overrides
-    /// the facade's working-directory lookup; `None` inherits the process's.
-    fn api(&self, args: &[&str]) -> Result<String, String> {
+    /// One probe read. A read-for-write: it must run on the credential of the
+    /// write it gates (#12606), so it is pinned to that writer
+    /// (`writer_identity`, the asker-dependent exception
+    /// `tests/writer_read_guard.rs` lists for this file) and is never
+    /// reader-only. A reader would answer for its own installation and refuse
+    /// every repository it does not cover.
+    pub(crate) fn invocation(&self, args: &[&str]) -> crate::gh_invocation::GhInvocation {
         use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-        let inv = GhInvocation::new(
+        GhInvocation::new(
             Operation::new("write_scope.probe"),
             AccessIntent::Read,
             GhTarget::None,
@@ -140,8 +152,14 @@ impl GhProbe {
         // Asker-dependent: the probe measures THIS credential's write scope.
         .writer_identity()
         .arg("api")
-        .args(args);
-        match inv.run() {
+        .args(args)
+    }
+
+    /// Counted through the `gh` facade as `write_scope.probe` (#10089). The
+    /// explicit `config_dir` is the credential under test, so it overrides
+    /// the facade's working-directory lookup; `None` inherits the process's.
+    fn api(&self, args: &[&str]) -> Result<String, String> {
+        match self.invocation(args).run() {
             crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => {
                 Ok(String::from_utf8_lossy(&o.stdout).into_owned())
             }
@@ -182,13 +200,19 @@ pub(crate) fn classify_repo_permissions(json: &str) -> Option<Permission> {
     Some(Permission::Insufficient(format!("repository role `{role}`")))
 }
 
+use crate::forge_repo_facts::installation;
+
 impl PermissionProbe for GhProbe {
     fn permission(&self, repo: &str) -> Permission {
         // W8: the writer's own installation snapshot answers the installation
         // leg; leg 1 runs only for a user token or when it cannot answer.
-        let cred =
-            crate::forge_repo_facts::installation::Credential::writer(self.config_dir.clone());
-        let snapshot = crate::forge_repo_facts::installation::lookup(&self.gh, &cred, repo);
+        let cred = installation::Credential::writer(self.config_dir.clone());
+        let mut snapshot = installation::lookup(&self.gh, &cred, repo);
+        if matches!(snapshot, installation::Answer::Listed(None))
+            && remint_writer_token(repo, &cred)
+        {
+            snapshot = installation::lookup(&self.gh, &cred, repo);
+        }
         if let Some(p) = super::probe_snapshot::from_snapshot(&snapshot, || self.repo_leg(repo)) {
             return p;
         }
@@ -198,6 +222,53 @@ impl PermissionProbe for GhProbe {
     fn cache_scope(&self) -> CacheScope {
         CacheScope::GitHub
     }
+}
+
+/// A writer token's repository set is fixed when it is minted (#9247), so a
+/// repo created after the mint is absent from its `installation/repositories`
+/// listing no matter how often the snapshot is refreshed (#13306: a 16-repo
+/// view of a 119-repo installation). When a miss refresh still lists the repo
+/// absent, force one re-mint for the owner (debounced) and drop the stale
+/// snapshot so the caller re-reads under the new token. `true` when a fresh
+/// token is published and the lookup should be repeated.
+fn remint_writer_token(repo: &str, cred: &installation::Credential) -> bool {
+    static DEBOUNCE: std::sync::OnceLock<crate::stale_token_retry::Debounce> =
+        std::sync::OnceLock::new();
+    let owner = crate::credential_preflight::owner_of_nwo(repo);
+    if !DEBOUNCE
+        .get_or_init(Default::default)
+        .admit(owner, std::time::Instant::now())
+    {
+        return false;
+    }
+    if force_remint(repo).is_none() {
+        return false;
+    }
+    log::warn!(
+        "write_scope: {repo} absent from the writer installation listing after a miss refresh; \
+         re-minted the {owner} installation token (#13306)"
+    );
+    installation::forget(cred);
+    true
+}
+
+#[cfg(not(test))]
+fn force_remint(repo: &str) -> Option<PathBuf> {
+    crate::credential_preflight::force_refresh_owner_credential_for_repo(repo)
+}
+
+#[cfg(test)]
+fn force_remint(repo: &str) -> Option<PathBuf> {
+    TEST_REMINT.with(|slot| slot.borrow().as_ref().and_then(|f| f(repo)))
+}
+
+#[cfg(test)]
+pub(super) type TestRemint = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_REMINT: std::cell::RefCell<Option<TestRemint>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl GhProbe {
@@ -227,7 +298,7 @@ impl GhProbe {
             (_, Ok(list)) if list.lines().any(|l| l.trim().eq_ignore_ascii_case(repo)) => {
                 Permission::Write
             }
-            (_, Ok(_)) => Permission::Insufficient("not in this App installation".into()),
+            (_, Ok(_)) => Permission::Insufficient(NOT_IN_INSTALLATION.into()),
             (Ok(Some(p)), Err(_)) => p,
             (Ok(None), Err(e)) => Permission::Unknown(format!("unparseable permissions ({e})")),
             (Err(e), Err(_)) => Permission::Unknown(e),
@@ -463,12 +534,6 @@ struct DiskEntry {
     cred: String,
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 pub(crate) fn cache_dir() -> PathBuf {
     match std::env::var("LOOM_WRITE_SCOPE_CACHE_DIR") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -625,11 +690,11 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
             credential_tag(self.key_dir.as_deref(), &self.inner.cache_scope()).unwrap_or_default();
         let now = SystemTime::now();
         let fresh = |at: SystemTime, p: &Permission| {
-            let limit = if matches!(p, Permission::Unknown(_)) {
-                UNKNOWN_TTL
-            } else {
-                ttl()
-            };
+            // A snapshot miss is short-lived too (#13152): a repo added to a
+            // selected-repositories install later must be picked up quickly.
+            let short = matches!(p, Permission::Unknown(_))
+                || matches!(p, Permission::Insufficient(d) if d == NOT_IN_INSTALLATION);
+            let limit = if short { UNKNOWN_TTL } else { ttl() };
             now.duration_since(at).is_ok_and(|age| age < limit)
         };
         let mem = memory().lock().ok().and_then(|m| m.get(&key).cloned());
@@ -658,6 +723,12 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
             }
         }
         let p = self.inner.permission(repo);
+        // #12074: an Unknown because the work-finder tick's read deadline
+        // passed says nothing about the credential; caching it would make
+        // passes outside the tick read Deny for a minute.
+        if matches!(p, Permission::Unknown(_)) && crate::gh_invocation::read_deadline::passed() {
+            return with_grace(p, last_write, now);
+        }
         match &p {
             Permission::Write => last_write = Some(now),
             Permission::Insufficient(_) => last_write = None,
@@ -685,7 +756,7 @@ impl<P: PermissionProbe> PermissionProbe for Cached<P> {
                 &DiskEntry {
                     write,
                     detail,
-                    at: now_secs(),
+                    at: now_epoch_secs(),
                     cred,
                 },
             );
@@ -703,7 +774,7 @@ fn write_entry(path: &Path, entry: &DiskEntry) {
     let Ok(body) = serde_json::to_string(entry) else {
         return;
     };
-    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_secs()));
+    let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_epoch_secs()));
     let Ok(mut f) = crate::forge_etag_store::create_private_file(&tmp) else {
         return;
     };

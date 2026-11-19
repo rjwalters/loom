@@ -4,29 +4,16 @@
 
 use super::*;
 use crate::activity::{AgentInput, InputContext, InputType};
+use crate::test_git_helpers::run as git;
 use crate::types::{AgentStatus, TerminalInfo};
 use chrono::Utc;
 use serde_json::json;
 use serial_test::serial;
-use std::process::Command;
 use tempfile::{tempdir, TempDir};
 
 fn isolate_env() {
     std::env::set_var("LOOM_CONFIG_DEFAULTS_FILE", "");
     std::env::remove_var("LOOM_FORGE_TYPE");
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A git repo with `origin` = `remote` (if any) and `.loom/config.json`
@@ -52,7 +39,7 @@ fn gitea_repo() -> TempDir {
     )
 }
 
-fn terminal(working_dir: Option<&Path>, worktree: Option<&Path>) -> TerminalInfo {
+fn terminal(working_dir: Option<&Path>) -> TerminalInfo {
     TerminalInfo {
         id: "t".into(),
         name: "t".into(),
@@ -60,7 +47,6 @@ fn terminal(working_dir: Option<&Path>, worktree: Option<&Path>) -> TerminalInfo
         working_dir: working_dir.map(|p| p.display().to_string()),
         created_at: 0,
         role: None,
-        worktree_path: worktree.map(|p| p.display().to_string()),
         agent_pid: None,
         agent_status: AgentStatus::default(),
         last_interval_run: None,
@@ -114,7 +100,7 @@ fn ingest(host: Option<&str>, output: &str) -> (Vec<Row>, i64) {
 fn gitea_repo_creation_urls_reach_activity_records_with_input_id() {
     isolate_env();
     let r = gitea_repo();
-    let host = host_for_terminal(Some(&terminal(Some(r.path()), None)));
+    let host = host_for_terminal(Some(&terminal(Some(r.path()))));
     assert_eq!(host.as_deref(), Some("gitea.example.com"));
 
     let (rows, input_id) = ingest(host.as_deref(), OUTPUT);
@@ -181,10 +167,6 @@ fn worktree_resolves_to_canonical_repo_configuration() {
     assert!(!wt.join(".loom/config.json").exists());
     let res = resolve_forge_host(Some(&wt));
     assert_eq!(res.host(), Some("gitea.example.com"));
-    // worktree_path wins over working_dir, as for commit correlation.
-    let other = repo(Some("git@github.com:o/r.git"), None);
-    let t = terminal(Some(other.path()), Some(&wt));
-    assert_eq!(host_for_terminal(Some(&t)).as_deref(), Some("gitea.example.com"));
 }
 
 #[test]
@@ -197,9 +179,9 @@ fn two_terminal_contexts_do_not_cross_contaminate() {
         Some("https://ci@git.internal.test:3000/o/r.git"),
         Some(&json!({"forge": {"type": "gitea"}})),
     );
-    let t1 = terminal(Some(gitea.path()), None);
-    let t2 = terminal(Some(github.path()), None);
-    let t3 = terminal(Some(other_gitea.path()), None);
+    let t1 = terminal(Some(gitea.path()));
+    let t2 = terminal(Some(github.path()));
+    let t3 = terminal(Some(other_gitea.path()));
     // Interleave twice so the second round is served from the cache.
     for _ in 0..2 {
         assert_eq!(host_for_terminal(Some(&t1)).as_deref(), Some("gitea.example.com"));
@@ -215,10 +197,7 @@ fn missing_context_falls_back_to_github() {
     isolate_env();
     assert_eq!(resolve_forge_host(None), ForgeHostResolution::NoContext);
     assert_eq!(host_for_terminal(None).as_deref(), Some(DEFAULT_FORGE_HOST));
-    assert_eq!(
-        host_for_terminal(Some(&terminal(None, None))).as_deref(),
-        Some(DEFAULT_FORGE_HOST)
-    );
+    assert_eq!(host_for_terminal(Some(&terminal(None))).as_deref(), Some(DEFAULT_FORGE_HOST));
     // A workspace that is not a git repository resolves like GitHub too.
     let plain = tempdir().unwrap();
     assert_eq!(resolve_forge_host(Some(plain.path())).host(), Some(DEFAULT_FORGE_HOST));

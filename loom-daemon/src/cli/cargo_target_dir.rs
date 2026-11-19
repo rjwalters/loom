@@ -1,7 +1,7 @@
 //! `loom-daemon cargo-target-dir` — the creation-time half of the per-worktree
 //! target-dir scheme (issue #8458), behind a CLI so `worktree.sh` and
-//! `spawn-claude.sh` can use it without growing the shell budget's portable
-//! pool (epic #7810, `.loom/docs/shell-language-policy.md`).
+//! `spawn-claude.sh` can use it without new portable shell (epic #7810,
+//! `.loom/docs/shell-language-policy.md`).
 //!
 //! Seven verbs, deliberately narrow. Two write (the creation half):
 //!
@@ -47,7 +47,7 @@
 //!
 //! `merge-pr.sh` removes worktrees with its own `git worktree remove --force`
 //! rather than through `worktree.sh remove`, so it could not inherit the Rust
-//! reclaim that [`loom_daemon::worktree_ops::clean`], `worktree-remove` and the
+//! reclaim that [`crate::worktree_ops::clean`], `worktree-remove` and the
 //! reaper already share; it carried the last bash copy of the resolve/reclaim
 //! *call sequence* instead. These two verbs are that sequence, split exactly
 //! where the removal has to happen: `cargo metadata` needs the manifest that is
@@ -59,18 +59,18 @@
 //! And one that is a guard (issue #11582):
 //!
 //! * `guard --for-command <text> [--cwd <dir>]` — the `loom:cargo-target-dir`
-//!   `PreToolUse` rule [`loom_daemon::cargo_target_guard`]: exit 1 with a
+//!   `PreToolUse` rule [`crate::cargo_target_guard`]: exit 1 with a
 //!   `BLOCKED [cargo-target-dir]` denial for a cargo build into a target dir
-//!   nothing owns, exit 0 otherwise — printing an `ASK [cargo-shared-target]`
-//!   line when a worktree build would fall through to a shared
-//!   `build.target-dir` (#10646).
+//!   nothing owns, or a `BLOCKED [cargo-shared-target]` denial when a worktree
+//!   build would fall through to a shared `build.target-dir` (#10646,
+//!   #11625); exit 0 otherwise.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_ops::cargo_target::{self, per_worktree, provision};
-use loom_daemon::worktree_root::worktree_root;
+use crate::worktree_ops::cargo_target::{self, per_worktree, provision};
+use crate::worktree_root::worktree_root;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum CargoTargetDirCommand {
@@ -109,8 +109,8 @@ pub(crate) enum CargoTargetDirCommand {
     /// (`BLOCKED [cargo-target-dir]: …`) and exits 1. Silent exit 0
     /// otherwise, including with `guards.cargoTargetDir=false` — except that a
     /// build with no explicit target dir, in a Loom-managed worktree, whose
-    /// cargo config resolves `build.target-dir` outside it prints an
-    /// `ASK [cargo-shared-target]: …` line (exit 0; #10646,
+    /// cargo config resolves `build.target-dir` outside it prints a
+    /// `BLOCKED [cargo-shared-target]: …` denial and exits 1 (#10646, #11625,
     /// `guards.cargoSharedTarget`).
     Guard(GuardArgs),
 }
@@ -337,7 +337,7 @@ impl ReclaimArgs {
 impl GuardArgs {
     fn run(self) -> Result<()> {
         let cwd = repo_root_or_cwd(self.cwd);
-        use loom_daemon::cargo_target_guard::{self as guard, Verdict};
+        use crate::cargo_target_guard::{self as guard, Verdict};
         match guard::check_process(&self.for_command, &cwd) {
             Some(Verdict::Deny(denial)) => {
                 guard::publish(&denial);
@@ -345,9 +345,13 @@ impl GuardArgs {
                 // The exit code is the verdict the hook branches on.
                 std::process::exit(1);
             }
-            // #10646: exit 0 with the `ASK [cargo-shared-target]` prefix, so a
-            // hook older than the ask still reads it as an allow.
-            Some(Verdict::Ask(ask)) => println!("{}", guard::shared::ask_reason(&ask)),
+            // #11625: a deny, so the model reads the prefix to use. A hook
+            // matching only the old `ASK [cargo-shared-target]` text sees no
+            // match and allows.
+            Some(Verdict::Ask(ask)) => {
+                println!("{}", guard::shared::ask_reason(&ask));
+                std::process::exit(1);
+            }
             None => {}
         }
         Ok(())

@@ -101,6 +101,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+
+use crate::fs_util::human_size;
 use serde::Deserialize;
 
 // ============================================================================
@@ -345,19 +347,6 @@ impl DockerImageRecord {
     #[must_use]
     pub fn size_human(&self) -> String {
         human_size(self.size_bytes)
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    let b = bytes as f64;
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", b / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1}M", b / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1}K", b / 1024.0)
-    } else {
-        format!("{bytes}B")
     }
 }
 

@@ -15,6 +15,7 @@
 //!   under a `MINIMAL_PATH` with stubbed `launchctl`/`systemctl`/`cargo`/
 //!   `gh`/`crontab` in front of it.
 
+pub use crate::fs_util::is_executable;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -75,12 +76,6 @@ pub fn have(name: &str) -> bool {
 #[must_use]
 pub fn uname_s() -> String {
     uname_flag("-s")
-}
-
-/// `uname -m`, or `unknown`.
-#[must_use]
-pub fn uname_m() -> String {
-    uname_flag("-m")
 }
 
 fn uname_flag(flag: &str) -> String {
@@ -214,27 +209,17 @@ pub fn version_output(bin: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// `[[ -x "$path" ]]` — exists, is not a directory, and has an execute bit.
-#[must_use]
-pub fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
 /// `kill -0 <pid> 2>/dev/null` — is this pid alive and signalable by us?
+///
+/// A one-line delegate onto the crate's shared shell-parity probe (Issue
+/// #13862) rather than a private `kill(pid, 0)` copy that could drift. The
+/// name keeps the shell rule visible at every call site: `EPERM` reads as
+/// *not* running — the deliberate opposite of
+/// [`crate::sweep_registry::is_pid_alive`], whose callers authorize
+/// destruction and must fail safe.
 #[must_use]
 pub fn pid_alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
+    crate::sweep_registry::pid_signalable(pid)
 }
 
 /// Run a command, returning `(exit code, stdout, stderr)` with stderr captured.

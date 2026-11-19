@@ -5,25 +5,11 @@
 //! real linked worktree, so a mocked layer would test the wrong thing.
 
 use super::*;
+use crate::test_git_helpers::run as git;
 use crate::worktree_state::MANAGED_SENTINEL;
-use std::process::Command;
 
 /// A transcript line no outcome record may ever contain.
 const TRANSCRIPT_CANARY_TEXT: &str = "FAKE-TRANSCRIPT-BODY-not-a-real-secret-0000";
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 /// A main checkout with a `.loom/config.json` and one managed linked worktree
 /// at `<main>/.loom/worktrees/issue-1`, branched from `main`.

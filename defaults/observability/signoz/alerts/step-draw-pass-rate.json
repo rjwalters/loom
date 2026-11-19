@@ -1,0 +1,34 @@
+{
+  "alert": "Loom step draws mostly passing",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "30m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.end_timestamp_ms}}) AS end_ms,\n  draws AS (\n    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,\n           count() AS attempts,\n           countIf(attributes_string['loom.dispatch.admission_result'] = 'refused'\n                   AND attributes_string['loom.dispatch.reason'] IN\n                       ('pool_exhausted', 'no_token_pool', 'token_selection_failed',\n                        'claimed', 'claim_lost')) AS passes\n    FROM signoz_traces.signoz_index_v3\n    WHERE name = 'loom.dispatch.step'\n      AND timestamp >= fromUnixTimestamp64Milli(toInt64({{.start_timestamp_ms}}))\n      AND timestamp < fromUnixTimestamp64Milli(toInt64({{.end_timestamp_ms}}))\n    GROUP BY host\n  )\nSELECT toDateTime(intDiv(end_ms, 1000)) AS ts,\n       host,\n       toFloat64(passes) / attempts AS value\nFROM draws\nWHERE host != ''\n  AND attempts >= 10\nORDER BY host",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0.8
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "step_draw_pass_rate"
+  },
+  "annotations": {
+    "summary": "Loom step draws mostly passing",
+    "description": "On host {{$labels.host}}, {{$value}} of the loom.dispatch.step attempts in 30 min (at least 10) were refused by the pool gate (pool_exhausted, no_token_pool, token_selection_failed) or the claim (claimed, claim_lost). Above 0.8 the redraw budget (8 per slot, 32 per tick) is spent on items that cannot run: an exhausted role pool the draw does not yet exclude, or peers contending for the same items. Break the attempts down by loom.dispatch.reason and loom.role. Issue rjwalters/loom#11909."
+  },
+  "disabled": false
+}

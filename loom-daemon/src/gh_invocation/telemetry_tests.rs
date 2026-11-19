@@ -255,9 +255,7 @@ fn ambient_parsing_rejects_garbage_and_never_reads_third_party_traceparent() {
 
 #[test]
 fn every_span_attribute_survives_export_bounding() {
-    // A write inside a caller scope, so the #10752 keys (`github.caller`,
-    // `github.number`, `github.repo`) are set too.
-    let _scope = super::super::caller_scope::enter("stale_blocked_release");
+    // A write, so the #10752 keys (`github.number`, `github.repo`) are set too.
     let inv = GhInvocation::new(
         Operation::new("api.rest"),
         AccessIntent::Write,
@@ -288,6 +286,9 @@ fn every_span_attribute_survives_export_bounding() {
     let bounded = span.clone().bounded();
     for key in SPAN_ATTRIBUTE_KEYS {
         assert_eq!(bounded.attributes.get(*key), span.attributes.get(*key), "{key}");
+        if OPTIONAL_SPAN_ATTRIBUTE_KEYS.contains(key) {
+            continue;
+        }
         assert!(span.attributes.contains_key(*key), "record() never sets {key}");
     }
 }
@@ -317,8 +318,8 @@ fn spans_carry_github_api_kind() {
 }
 
 /// #10343: every span carries the nine billing keys; a `--include` 304 (gh
-/// exits non-zero on it) is billed `not_modified` while `github.outcome`
-/// keeps its process truth.
+/// exits non-zero on it) is billed `not_modified`; `github.exit_code` keeps
+/// the process truth while `github.outcome` is `not_modified` (#10755).
 #[test]
 fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
     let inv = read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
@@ -326,7 +327,8 @@ fn a_304_span_is_billed_not_modified_with_process_truth_unchanged() {
         "printf 'HTTP/2.0 304 Not Modified\\r\\nX-Ratelimit-Resource: core\\r\\n\\r\\n'; exit 1";
     let (_, spans, _) = run(inv, body);
     let span = &spans[0];
-    assert_eq!(attr(span, "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(attr(span, "github.outcome"), Some("not_modified"));
+    assert_eq!(attr(span, "github.exit_code"), Some("1"));
     assert_eq!(attr(span, "github.billing"), Some("not_modified"));
     assert_eq!(attr(span, "github.http.status"), Some("304"));
     assert_eq!(attr(span, "github.http.not_modified"), Some("true"));
@@ -423,4 +425,208 @@ fn a_front_read_carries_the_agents_command_and_its_own_route() {
     assert_eq!(attr(&spans[0], "github.command"), Some("pr view"));
     assert_eq!(attr(&spans[0], "github.route"), Some("/repos/{owner}/{repo}/pulls/{n}"));
     assert_eq!(attr(&spans[0], "http.request.method"), Some("GET"));
+}
+
+// #12256: the tick's forge calls parent to its span.
+#[test]
+fn a_thread_parent_is_the_ambient_parent_until_its_guard_drops() {
+    set_test_ambient(None, None);
+    assert_eq!(ParentContext::ambient(), ParentContext::Missing);
+    let tick = TraceContext::derived("loom.dispatch.tick", &["2026-10-15T00:00:00Z"]);
+    {
+        let _g = enter_parent(Some(tick.clone()));
+        assert_eq!(ParentContext::ambient(), ParentContext::Parent(tick.clone()));
+        let inv = GhInvocation::new(
+            Operation::new("issue.list"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(5),
+        );
+        let span = InvocationSpan::open(&inv);
+        assert_eq!(span.parent_span_id.as_ref(), Some(&tick.span_id));
+        assert_eq!(span.context.trace_id, tick.trace_id);
+        // Another thread does not see it.
+        std::thread::spawn(|| assert_eq!(thread_parent(), None))
+            .join()
+            .unwrap();
+    }
+    assert_eq!(ParentContext::ambient(), ParentContext::Missing);
+}
+
+fn sweep_span_attrs() -> SpanRecord {
+    let (_, mut spans, _) = run(read_op(), "true");
+    spans.remove(0)
+}
+
+#[test]
+fn a_thread_sweep_stamps_sweep_id_and_role_until_its_guard_drops() {
+    set_test_ambient(None, None);
+    {
+        let _g = enter_sweep("step-builder-1-2", Some("builder"));
+        let rec = sweep_span_attrs();
+        assert_eq!(attr(&rec, "loom.sweep_id"), Some("step-builder-1-2"));
+        assert_eq!(attr(&rec, "loom.role"), Some("builder"));
+        std::thread::spawn(|| assert_eq!(ambient_sweep(), (None, None)))
+            .join()
+            .unwrap();
+    }
+    let rec = sweep_span_attrs();
+    assert_eq!(attr(&rec, "loom.sweep_id"), None);
+    assert_eq!(attr(&rec, "loom.role"), None);
+}
+
+#[test]
+fn env_sourced_sweep_identity_omits_absent_and_blank_values() {
+    let s = |v: &str| Some(v.to_string());
+    assert_eq!(sweep_identity(s("sw-1"), s("judge")), (s("sw-1"), s("judge")));
+    assert_eq!(sweep_identity(s("sw-1"), None), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s("sw-1"), s("  ")), (s("sw-1"), None));
+    assert_eq!(sweep_identity(s(""), s("judge")), (None, None));
+    assert_eq!(sweep_identity(None, s("judge")), (None, None));
+}
+
+fn api_op(intent: AccessIntent) -> GhInvocation {
+    GhInvocation::new(
+        Operation::new("api.rest"),
+        intent,
+        GhTarget::repo("acme/widgets").unwrap(),
+        Duration::from_secs(10),
+    )
+    .parent(ParentContext::Missing)
+    .args(["api", "repos/acme/widgets/issues"])
+}
+
+/// #12310: every span carries `loom.forge.purpose`: a write is `write`, a
+/// read `gate` unless its site marked it discovery (or gave it a deferrable
+/// class), and the request header goes out on the discovery `gh api` read
+/// alone.
+#[test]
+fn purpose_is_on_every_span_and_the_header_only_on_discovery() {
+    let echo = "echo \"$@\"";
+    let cases = [
+        (api_op(AccessIntent::Read), "gate", false),
+        (api_op(AccessIntent::Read).discovery(), "discovery", true),
+        (
+            api_op(AccessIntent::Read).read_class(crate::gh_invocation::ReadClass::Hygiene),
+            "hygiene",
+            false,
+        ),
+        (
+            api_op(AccessIntent::Read).read_class(crate::gh_invocation::ReadClass::Observability),
+            "observability",
+            false,
+        ),
+        // A write is a write whatever else is set on it.
+        (api_op(AccessIntent::Write).discovery(), "write", false),
+    ];
+    for (inv, purpose, header) in cases {
+        let (result, spans, _) = run(inv, echo);
+        assert_eq!(attr(&spans[0], "loom.forge.purpose"), Some(purpose));
+        let argv = stdout_of(result);
+        assert_eq!(argv.contains("loom.forge.purpose: discovery"), header, "{purpose}: {argv}");
+    }
+    // A scope marks the calls built inside it, and only those.
+    let scoped = {
+        let _scope = crate::gh_invocation::purpose::discovery();
+        api_op(AccessIntent::Read)
+    };
+    let (_, spans, _) = run(scoped, "echo ok");
+    assert_eq!(attr(&spans[0], "loom.forge.purpose"), Some("discovery"));
+    let (_, spans, _) = run(api_op(AccessIntent::Read), "echo ok");
+    assert_eq!(attr(&spans[0], "loom.forge.purpose"), Some("gate"));
+    // Porcelain cannot take `-H`: tagged, but argv untouched.
+    let porcelain = op(GhTarget::repo("acme/widgets").unwrap(), Duration::from_secs(10))
+        .args(["issue", "list"])
+        .discovery();
+    let (result, spans, _) = run(porcelain, "echo \"$@\"");
+    assert_eq!(attr(&spans[0], "loom.forge.purpose"), Some("discovery"));
+    assert_eq!(stdout_of(result).trim(), "issue list");
+}
+
+/// #12310: the gateway's quota-reserve `429` on a discovery read is counted
+/// as its own outcome, names `reserve` as the fallback reason, ends the
+/// tick's discovery (the next discovery read is not sent) and never reaches
+/// the rate-limit breaker.
+#[test]
+fn a_reserve_refusal_is_its_own_outcome_and_leaves_the_breaker_alone() {
+    use crate::observability::ops::forge_calls;
+    use crate::rate_limit_breaker::{
+        global_observe_failure, with_test_global, RateLimitBreakerConfig, SharedRateLimitBreaker,
+    };
+    let refusal = "echo 'gh: loom-gateway-reserve: discovery refused (HTTP 429)' >&2; exit 1";
+    let breaker =
+        std::sync::Arc::new(SharedRateLimitBreaker::new(RateLimitBreakerConfig::default()));
+    crate::gh_invocation::purpose::reopen_discovery();
+    let _ = forge_calls::drain_points();
+    with_test_global(breaker.clone(), || {
+        let (_, spans, _) = run(api_op(AccessIntent::Read).discovery(), refusal);
+        assert_eq!(attr(&spans[0], "loom.discovery.fallback_reason"), Some("reserve"));
+        let text = "gh: loom-gateway-reserve: discovery refused (HTTP 429)";
+        assert!(global_observe_failure(text, "test").is_none());
+    });
+    assert!(!breaker.is_suppressed(chrono::Utc::now()), "the breaker is untouched");
+    let points = forge_calls::drain_points();
+    let point = points
+        .iter()
+        .find(|p| p.labels.get("outcome").map(String::as_str) == Some("reserve_refused"))
+        .expect("a reserve_refused series");
+    assert_eq!(point.labels.get("purpose").map(String::as_str), Some("discovery"));
+    assert!(crate::gh_invocation::purpose::discovery_ended());
+    // The tick's remaining discovery is deferred, a gate read still goes out.
+    let tmp = tempfile::tempdir().unwrap();
+    let program = stub(tmp.path(), "echo sent");
+    let shed = api_op(AccessIntent::Read)
+        .discovery()
+        .program(&program)
+        .execute();
+    assert!(matches!(shed, Ok(GhCompletion::DeadlineReached)), "{shed:?}");
+    let (gate, _, _) = run(api_op(AccessIntent::Read), "echo sent");
+    assert_eq!(stdout_of(gate).trim(), "sent");
+    crate::gh_invocation::purpose::reopen_discovery();
+}
+
+/// #10755: a 304 is the normal answer to a conditional read — an OK span, no
+/// failure line — while a real HTTP error still fails loudly.
+#[test]
+fn a_304_is_an_ok_span_with_no_failure_record_but_a_404_is_an_error() {
+    let inv = || read_op().args(["api", "--include", "repos/acme/widgets/issues"]);
+    let (_, spans, records) = run(inv(), "printf 'HTTP/2.0 304 Not Modified\\r\\n\\r\\n'; exit 1");
+    assert_eq!(attr(&spans[0], "github.outcome"), Some("not_modified"));
+    assert_eq!(spans[0].status, SpanStatus::Ok);
+    assert!(records.is_empty(), "{records:?}");
+
+    let (_, spans, records) = run(inv(), "printf 'HTTP/2.0 404 Not Found\\r\\n\\r\\n'; exit 1");
+    assert_eq!(attr(&spans[0], "github.outcome"), Some("exit_nonzero"));
+    assert_eq!(spans[0].status, SpanStatus::Error);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].outcome, Outcome::ExitNonzero);
+
+    // No status evidence: never guessed into a success.
+    let (_, spans, records) = run(read_op().args(["issue", "list"]), "exit 1");
+    assert_eq!(spans[0].status, SpanStatus::Error);
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn a_graphql_write_span_carries_the_explicit_pr_number() {
+    let graphql = |named: bool| {
+        let inv = GhInvocation::new(
+            Operation::new("merge_queue.enqueue"),
+            AccessIntent::Write,
+            GhTarget::repo("acme/widgets").unwrap(),
+            Duration::from_secs(10),
+        )
+        .parent(ParentContext::Missing)
+        .args(["api", "graphql", "-f", "pullRequestId=PR_kwDOabc"]);
+        if named {
+            inv.number(4242)
+        } else {
+            inv
+        }
+    };
+    let (_, spans, _) = run(graphql(true), "echo ok");
+    assert_eq!(attr(&spans[0], "github.number"), Some("4242"));
+    // Without the explicit number, argv names none: the attribute is absent.
+    let (_, spans, _) = run(graphql(false), "echo ok");
+    assert_eq!(attr(&spans[0], "github.number"), None);
 }

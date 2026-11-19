@@ -335,9 +335,7 @@ _emit_loom_ownership_set() {
 # `.loom/manifest.json` (SHA-256 per installed file, consumed by
 # `verify-install.sh verify` to detect drift). They share a word, nothing else.
 #
-# Extracted from install-loom.sh (#8270) because install-loom.sh is over the
-# file-size ratchet's threshold and may not grow (.loom/docs/file-size-policy.md);
-# this is the "new code lands in a sibling, dispatch arm stays behind" path.
+# Extracted from install-loom.sh (#8270) to keep that file from growing.
 #
 # Must be called with the CWD set to the installed tree (the install worktree).
 # Uses install-loom.sh's info/success/warning/error reporters, which are in

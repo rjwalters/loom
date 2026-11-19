@@ -13,16 +13,16 @@
 //!   bug would surface as a broken session rather than as a missed check.
 //! - `stop-hook --consumer-canary` → the same protocol behind the opt-in
 //!   consumer gate and outcome log (#8372); see
-//!   [`loom_daemon::worktree_state::consumer_canary`].
+//!   [`crate::worktree_state::consumer_canary`].
 //!
-//! The logic lives in [`loom_daemon::worktree_state`]; this module is argument
+//! The logic lives in [`crate::worktree_state`]; this module is argument
 //! parsing and exit codes only.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_state::{self, consumer_canary, stop_hook};
+use crate::worktree_state::{self, consumer_canary, stop_hook};
 
 /// The base ref every Loom issue worktree branches from. Overridable for a
 /// repo whose default branch is not `main`, and for tests.
@@ -84,7 +84,7 @@ impl ReportArgs {
                     Some(root) => root,
                     None => std::env::current_dir()?,
                 };
-                loom_daemon::worktree_root::worktree_root(&root).join(format!("issue-{issue}"))
+                crate::worktree_root::worktree_root(&root).join(format!("issue-{issue}"))
             }
             (None, None) => std::env::current_dir()?,
         };

@@ -11,8 +11,7 @@
 //! that; only a test that drives both entry points with the same inputs can.
 //!
 //! These live in `tests/` rather than inline because
-//! `script_helpers/sweep_experiment.rs` is over the file-size ratchet's
-//! threshold and may not grow (`.loom/docs/file-size-policy.md`).
+//! `script_helpers/sweep_experiment.rs` is a large non-test module.
 
 use loom_daemon::activity::resource_usage::ModelPricing;
 use loom_daemon::script_helpers::sweep_experiment::model_pricing;
@@ -77,3 +76,8 @@ fn fable_is_priced_as_fable_not_as_opus() {
     assert!((fable.0 - 2.0 * opus.0).abs() < f64::EPSILON);
     assert!((fable.1 - 2.0 * opus.1).abs() < f64::EPSILON);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

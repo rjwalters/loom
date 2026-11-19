@@ -1,9 +1,7 @@
 //! Unit tests for [`super`] — `tokens_pool::bad_tokens`.
 //!
-//! Extracted verbatim from `bad_tokens.rs` (issue #8058) for the reason
-//! `scripts/check-file-size-budget.sh` names: an over-threshold file that needs
-//! to grow puts the new lines in a sibling instead, and a test module is the
-//! cleanest thing to move. `bad_tokens.rs` declares it with
+//! Extracted verbatim from `bad_tokens.rs` (issue #8058) so that file need not
+//! grow; a test module is the cleanest thing to move. `bad_tokens.rs` declares it with
 //! `#[cfg(test)] #[path = "bad_tokens_tests.rs"] mod tests;`, so `super::*`
 //! below still resolves to `bad_tokens` exactly as before.
 
@@ -346,8 +344,10 @@ fn wired_cleanup_prunes_over_age_exhaustion_entry() {
 fn cleanup_holds_auth_entries_past_the_requested_max_age() {
     let tmp = make_pool();
     let dir = pool_dir(tmp.path());
-    // Older than the routine 24h policy, far younger than the 30d floor.
-    let old = (Utc::now() - chrono::Duration::seconds(3 * 24 * 3600))
+    // Older than the routine 8-day policy (#13893 raised it from 24h so the
+    // on-disk clock can never expire a live weekly hold), far younger than
+    // the 30d auth floor.
+    let old = (Utc::now() - chrono::Duration::seconds(9 * 24 * 3600))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
     fs::write(
@@ -1196,4 +1196,439 @@ fn ambiguous_entry_ignores_a_ranking_row_that_predates_the_mark() {
         is_bad(tmp.path(), "agent-1"),
         "a stale pre-mark .ranking row must not release the entry"
     );
+}
+
+// -----------------------------------------------------------------
+// #13893: a still-`exhausted` re-probe holds the entry until the
+// recorded 7d reset instant instead of cycling the 6h fixed cooldown.
+// -----------------------------------------------------------------
+
+/// Compile-time proof the fixtures below really do sit outside the fixed
+/// cooldown — otherwise the "held PAST the cooldown" assertions would pass
+/// vacuously.
+const _: () = assert!(7 * 3600 > DEFAULT_EXHAUSTION_COOLDOWN_SECS);
+
+/// AC 1 regression pin (#13893): a fresh re-probe that is NOT `exhausted`
+/// with 5h utilization under the load gate releases the entry before the 6h
+/// cooldown — even when the row also carries a future `limit_reset` (for a
+/// non-`exhausted` status that field is the 5h window's reset, not a 7d
+/// one, so it must not be turned into a hold). This held before #13893 via
+/// `ambiguous_exhaustion_has_reset` → `Some(true)` and must keep holding
+/// after the evidence reader was extended.
+#[test]
+#[serial]
+fn ambiguous_entry_still_releases_when_reprobe_is_not_exhausted_with_low_5h() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked = (Utc::now() - chrono::Duration::seconds(3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: rate-limited (daemon insta-crash, issue #123)\n"),
+    )
+    .unwrap();
+    // Re-probed AFTER the mark: recovered on both windows, and the row
+    // still carries a (future, 5h-window) reset instant.
+    let reset = (Utc::now() + chrono::Duration::seconds(3 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|available|0.05|{reset}\n")).unwrap();
+
+    assert!(
+        !is_bad(tmp.path(), "agent-1"),
+        "a non-exhausted re-probe with 5h under the gate must still release early"
+    );
+    assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+}
+
+/// #13893 core: a fresh `exhausted` row whose `limit_reset` is a credible
+/// future instant holds the entry PAST the 6h fixed cooldown, until that
+/// instant — the 6h expiry → retry → insta-crash → re-mark churn in the
+/// issue's evidence is exactly what this prevents. The countdown reports
+/// time to the reset instant, not to the (long past) fixed cooldown.
+#[test]
+#[serial]
+fn exhausted_reprobe_holds_entry_until_limit_reset_past_the_fixed_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Marked 7h ago — the 6h default cooldown has already expired, so any
+    // blocking below can only come from the #13893 hold.
+    let marked = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    // Re-probed AFTER the mark: still `exhausted`, 5h util low (a
+    // weekly-blocked account's 5h usage is near zero regardless), and the
+    // probe recorded the 7d reset 5 days out.
+    let reset = (Utc::now() + chrono::Duration::seconds(5 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+
+    let entry = blocking_entry(tmp.path(), "agent-1").expect("held past the fixed cooldown");
+    assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    assert_eq!(entry.timestamp, marked, "the held entry is the original mark");
+    let remaining = entry
+        .cooldown_remaining_secs
+        .expect("the hold reports a countdown");
+    // #7748 convention: loose lower bound to tolerate a wall-clock jump
+    // between the fixture's `Utc::now()` and the internal one.
+    assert!(
+        ((5 * 24 * 3600) - 3600..=(5 * 24 * 3600)).contains(&remaining),
+        "expected ~5d to the recorded reset instant, got {remaining}s"
+    );
+}
+
+/// #13893, AC 2 for the writer's own empty-util row shape: a fresh
+/// `exhausted` row that knows its 7d reset but not its 5h utilization —
+/// `check::ranking_line`'s `(None, Some(r))` arm writes
+/// `name|exhausted||limit_reset` — must hold past the fixed cooldown exactly
+/// like a row with a utilization. The codex probe emits this shape in the
+/// steady state of a weekly-blocked account whose 5h window has already
+/// rolled over; gating the hold on `util_5h` would send exactly those rows
+/// back to the 6h re-mark churn.
+#[test]
+#[serial]
+fn exhausted_reprobe_without_5h_util_still_holds_until_limit_reset() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Marked 7h ago — past the 6h default cooldown, so any blocking below
+    // can only come from the #13893 hold.
+    let marked = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    // Re-probed AFTER the mark: still `exhausted`, 5h utilization unknown
+    // (empty third field — `name|status||limit_reset`), 7d reset 5 days out.
+    let reset = (Utc::now() + chrono::Duration::seconds(5 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted||{reset}\n")).unwrap();
+
+    let entry = blocking_entry(tmp.path(), "agent-1")
+        .expect("an exhausted row with unknown 5h util must hold past the fixed cooldown");
+    assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    let remaining = entry
+        .cooldown_remaining_secs
+        .expect("the hold reports a countdown");
+    assert!(
+        ((5 * 24 * 3600) - 3600..=(5 * 24 * 3600)).contains(&remaining),
+        "expected ~5d to the recorded reset instant, got {remaining}s"
+    );
+}
+
+/// #13893: even while the entry is still inside its fixed cooldown, a fresh
+/// `exhausted` row's countdown switches to the recorded reset instant — here
+/// the instant (2h out) is EARLIER than the remaining cooldown (~5h50m), and
+/// the earlier truth is what the operator is shown.
+#[test]
+#[serial]
+fn exhausted_reprobe_countdown_reports_time_to_reset_even_inside_the_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked = (Utc::now() - chrono::Duration::seconds(600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    let reset = (Utc::now() + chrono::Duration::seconds(2 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+
+    let entry = blocking_entry(tmp.path(), "agent-1").expect("held to the reset instant");
+    let remaining = entry.cooldown_remaining_secs.expect("countdown");
+    // ~2h to the reset instant, NOT ~5h50m to the fixed cooldown.
+    assert!(
+        ((2 * 3600) - 600..=(2 * 3600)).contains(&remaining),
+        "expected ~2h to the recorded reset instant, got {remaining}s"
+    );
+}
+
+/// AC 3 (#13893): once the recorded 7d reset instant is in the past — but
+/// still strictly after the mark, so it is fresh evidence for THIS mark's
+/// window — the next read releases the entry.
+#[test]
+#[serial]
+fn exhausted_reprobe_releases_once_limit_reset_has_passed() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked = (Utc::now() - chrono::Duration::seconds(2 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    // The recorded reset passed 10 minutes ago: the 7d window the probe
+    // described has rolled over.
+    let reset = (Utc::now() - chrono::Duration::seconds(600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+
+    assert!(!is_bad(tmp.path(), "agent-1"), "a passed reset instant must release the entry");
+    assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+}
+
+// -----------------------------------------------------------------
+// #14145: a failed probe round mid-hold must not readmit the account.
+// The write-side guarantee lives in `check::write_ranking_atomic`
+// (an evidence-free `error`/`blocked` round carries the previous
+// `exhausted` row forward instead of overwriting it); these tests pin
+// the end-to-end behaviour through that real writer.
+// -----------------------------------------------------------------
+
+/// #14145, the issue body's steps 1–3: an account held under #13893 with a
+/// 7d reset days out and a 10h-old mark; one probe cycle fails (transport
+/// `error`); the next read must STILL hold the account to the recorded
+/// reset — not release it at the 6h fixed cooldown. Before the fix the
+/// failed round overwrote `name|exhausted||<reset>` with a bare
+/// `name|error`, the reader found no util and no reset, and the 10h-old
+/// entry released.
+#[test]
+#[serial]
+fn failed_probe_round_mid_hold_does_not_readmit_the_account() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Step 1: held, mark 10h old — past the 6h default cooldown, so any
+    // blocking below can only come from the weekly hold.
+    let marked = (Utc::now() - chrono::Duration::seconds(10 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    let reset = (Utc::now() + chrono::Duration::seconds(4 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    // The steady-state hold row (mtime after the backdated mark — fresh).
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted||{reset}\n")).unwrap();
+    // Sanity: held before the failed round.
+    assert!(
+        blocking_entry(tmp.path(), "agent-1").is_some(),
+        "precondition: the hold is active"
+    );
+
+    // Step 2: one probe cycle fails — the round's report carries an
+    // evidence-free `error` row; run it through the REAL writer the
+    // daemon's periodic refresh uses.
+    let ranking_path = dir.join(".ranking");
+    let report = crate::tokens_pool::check::ProbeReport {
+        ranked_at: "x".into(),
+        accounts: vec![crate::tokens_pool::check::AccountResult::new(
+            "agent-1", "error",
+        )],
+    };
+    crate::tokens_pool::check::write_ranking_atomic(&report, &ranking_path).unwrap();
+
+    // The row on disk is still the exhausted hold row, not `error`.
+    assert_eq!(
+        fs::read_to_string(&ranking_path).unwrap(),
+        format!("agent-1|exhausted||{reset}\n"),
+        "a failed round must not overwrite the hold row"
+    );
+    // Step 3: the next read holds the account to the recorded reset.
+    let entry = blocking_entry(tmp.path(), "agent-1")
+        .expect("a failed probe round must not readmit an account under a weekly hold");
+    assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    assert_eq!(entry.timestamp, marked, "the held entry is the original mark");
+    let remaining = entry
+        .cooldown_remaining_secs
+        .expect("the hold reports a countdown");
+    // ~4d to the recorded reset instant (NOT the ~0 remaining the 6h fixed
+    // cooldown would report for a 10h-old mark). #7748 convention: loose
+    // lower bound for a wall-clock jump between fixture and reader.
+    assert!(
+        ((4 * 24 * 3600) - 3600..=(4 * 24 * 3600)).contains(&remaining),
+        "expected ~4d to the recorded reset instant, got {remaining}s"
+    );
+}
+
+/// #14145 guard, #13893 AC 4 unchanged: with no previous `exhausted` row at
+/// all (no hold evidence ever recorded), a failed round writes its `error`
+/// row as before and the entry still clears at the 6h fixed cooldown — the
+/// carry-forward never manufactures a hold out of nothing.
+#[test]
+#[serial]
+fn no_evidence_at_all_still_yields_the_fixed_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Marked 7h ago — past the 6h default cooldown; no `.ranking` exists.
+    let marked = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 exhausted: hit your limit\n"))
+        .unwrap();
+    assert!(
+        !is_bad(tmp.path(), "agent-1"),
+        "precondition: with no evidence at all the 7h-old mark is already past the 6h cooldown"
+    );
+
+    // A failed round writes the bare error row (nothing to preserve).
+    let ranking_path = dir.join(".ranking");
+    let report = crate::tokens_pool::check::ProbeReport {
+        ranked_at: "x".into(),
+        accounts: vec![crate::tokens_pool::check::AccountResult::new(
+            "agent-1", "error",
+        )],
+    };
+    crate::tokens_pool::check::write_ranking_atomic(&report, &ranking_path).unwrap();
+    assert_eq!(fs::read_to_string(&ranking_path).unwrap(), "agent-1|error\n");
+
+    assert!(
+        !is_bad(tmp.path(), "agent-1"),
+        "no-evidence-at-all must still clear at the 6h fixed cooldown (#13893 AC 4); \
+         a landed error row must not resurrect or extend anything"
+    );
+    assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+}
+
+/// AC 4 (#13893): without a credible reset instant the fixed 6h behaviour is
+/// unchanged. Three shapes: an unparseable `limit_reset`, one at the mark
+/// instant itself, and one before the mark (a pre-mark instant describes the
+/// previous window — the same trap `session_window_has_reset` documents).
+#[test]
+#[serial]
+fn exhausted_reprobe_without_a_credible_reset_keeps_the_fixed_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked_at = Utc::now() - chrono::Duration::seconds(3600);
+    let marked = marked_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+
+    for reset in [
+        "not-a-date".to_string(),
+        marked.clone(), // at the mark
+        (marked_at - chrono::Duration::seconds(3600)) // before the mark
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+    ] {
+        fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+        let entry = blocking_entry(tmp.path(), "agent-1")
+            .unwrap_or_else(|| panic!("reset `{reset}`: entry must still block on the fixed TTL"));
+        let remaining = entry
+            .cooldown_remaining_secs
+            .unwrap_or_else(|| panic!("reset `{reset}`: fixed-TTL entry has a countdown"));
+        assert!(
+            (3 * 3600..=5 * 3600).contains(&remaining),
+            "reset `{reset}`: expected ~5h of the fixed TTL, got {remaining}s"
+        );
+    }
+}
+
+/// AC 6 (#13893): a `limit_reset` more than the 8-day horizon past now is
+/// garbage — a 7d window cannot end later — so the entry falls back to the
+/// fixed cooldown instead of being frozen out until a corrupt instant.
+#[test]
+#[serial]
+fn garbage_limit_reset_beyond_the_weekly_horizon_falls_back_to_fixed_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked = (Utc::now() - chrono::Duration::seconds(3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    // 9 days out — past MAX_WEEKLY_RESET_HORIZON_SECS (8d).
+    let reset = (Utc::now() + chrono::Duration::seconds(9 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+
+    let entry = blocking_entry(tmp.path(), "agent-1").expect("still blocked on the fixed TTL");
+    let remaining = entry.cooldown_remaining_secs.expect("fixed-TTL countdown");
+    assert!(
+        (3 * 3600..=5 * 3600).contains(&remaining),
+        "expected ~5h of the fixed TTL (not the ~9d garbage instant), got {remaining}s"
+    );
+}
+
+/// #13893: an explicitly configured [`EXHAUSTION_COOLDOWN_ENV`] caps the
+/// extended hold — the operator asked for that cooldown and gets it. With
+/// the env at 1h and a fresh `exhausted` row whose reset is 2h out, the
+/// entry clears at the env cap (~50 min from now), NOT at the reset instant
+/// (~2h); the default (no env) would report the reset instant instead.
+#[test]
+#[serial]
+fn operator_env_cooldown_caps_the_extended_weekly_hold() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let marked = (Utc::now() - chrono::Duration::seconds(600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: used 100% of your weekly limit\n"),
+    )
+    .unwrap();
+    let reset = (Utc::now() + chrono::Duration::seconds(2 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted|0.02|{reset}\n")).unwrap();
+
+    std::env::set_var(EXHAUSTION_COOLDOWN_ENV, "3600"); // 1h cap
+    let entry = blocking_entry(tmp.path(), "agent-1").expect("held, but only to the env cap");
+    let remaining = entry.cooldown_remaining_secs.expect("countdown");
+    std::env::remove_var(EXHAUSTION_COOLDOWN_ENV);
+
+    // mark_at + 3600 − now ≈ 3600 − 600 = ~50 min, not the ~2h reset instant.
+    assert!(
+        (2400..=3000).contains(&remaining),
+        "expected ~50m (the env cap), got {remaining}s"
+    );
+}
+
+/// #13893 retention pin: the on-disk clock must never expire a line whose
+/// read-side hold can still be live — pruning one earlier would silently
+/// readmit a still-exhausted account mid-hold. A weekly entry aged past the
+/// pre-#13893 24h policy but inside the 8-day retention survives the routine
+/// cleanup; one past the retention is still reclaimed.
+#[test]
+fn cleanup_retention_covers_the_extended_weekly_hold() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    let mid_hold = (Utc::now() - chrono::Duration::seconds(3 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let ancient = (Utc::now() - chrono::Duration::seconds(9 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!(
+            "{mid_hold} agent-hold exhausted: used 100% of your weekly limit\n\
+             {ancient} agent-old exhausted: used 100% of your weekly limit\n"
+        ),
+    )
+    .unwrap();
+
+    let outcome = cleanup_bad_tokens_in_dir(&dir, DEFAULT_CLEANUP_MAX_AGE_SECS).unwrap();
+    assert_eq!(outcome.kept, 1, "a mid-hold weekly entry must survive cleanup");
+    assert_eq!(outcome.removed, 1);
+    let text = fs::read_to_string(dir.join(".bad_tokens")).unwrap();
+    assert!(text.contains("agent-hold"), "mid-hold entry was pruned: {text}");
+    assert!(!text.contains("agent-old"));
 }

@@ -25,14 +25,21 @@
 //! and only calls [`DurableQueue::ack`] on success — a failed export leaves
 //! the batch queued for the next retry rather than losing it.
 //!
-//! This whole-file rewrite on every mutation is `O(queue length)` per push/ack,
-//! not an append-only journal — deliberately simple for Phase 1's expected
-//! queue sizes (hundreds to a few thousand envelopes, per
-//! `queueCapacity`'s default). A future phase can switch to an append+compact
-//! journal (mirroring [`crate::sweep_outcomes`]'s rotation) if profiling ever
-//! shows this matters.
+//! **Append + compact journal (#11137).** An enqueue appends only the new
+//! envelope's line (`O(1)` in queue length) and, on the durable paths, fsyncs
+//! the file (the directory only when the file was just created). A
+//! drop-oldest eviction changes in-memory state only; its line stays in the
+//! file as a stale prefix. `ack`, `ack_snapshot` and a size-triggered
+//! compaction (the file holding more than `2 x capacity` lines) rewrite the
+//! file via temp + rename, so the amortised write cost per enqueue stays
+//! `O(1)`. The first line is a `{"loom_queue_header":{"capacity":N}}` record
+//! of the capacity the file was written under: on reopen the last `N` lines
+//! are the live queue, and only a drop below that live set because the
+//! configured capacity shrank counts as [`REASON_CAPACITY_SHRINK`] — stale
+//! prefix lines were already counted as `queue_overflow` when evicted.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -45,16 +52,6 @@ pub const QUEUE_PATH_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_PATH";
 
 /// Default filename under `<workspace_root>/.loom/logs/`.
 pub const QUEUE_FILENAME: &str = "observability-queue.jsonl";
-
-/// Per-exporter queue filename under `<workspace_root>/.loom/logs/` when more
-/// than one exporter is configured (Issue #8756) — `observability-queue.<name>
-/// .jsonl` for the exporter named `name` ("https", "otlp"). A **sole**
-/// exporter keeps [`QUEUE_FILENAME`] unchanged so a pre-fan-out backlog stays
-/// discoverable without migration.
-#[must_use]
-pub fn named_queue_filename(name: &str) -> String {
-    format!("observability-queue.{name}.jsonl")
-}
 
 /// Resolve the default queue path: [`QUEUE_PATH_ENV`] override (non-empty),
 /// else `<workspace_root>/.loom/logs/observability-queue.jsonl`.
@@ -71,11 +68,48 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
         .join(QUEUE_FILENAME)
 }
 
+/// Key of the first-line header recording the capacity a queue file was
+/// written under (#11137). A line carrying it never parses as an envelope, so
+/// older readers skip it as a corrupt line.
+const HEADER_KEY: &str = "loom_queue_header";
+
+/// Minimum gap between overflow log lines.
+const OVERFLOW_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `kind=count` pairs for `items`, most frequent first (spans by name), capped
+/// at the top eight.
+fn kind_histogram(items: &VecDeque<TelemetryEnvelope>) -> String {
+    use crate::telemetry::TelemetryRecord;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in items {
+        let key = match &item.record {
+            TelemetryRecord::Span(span) => format!("trace.span:{}", span.name.as_str()),
+            other => other.kind().to_string(),
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut pairs: Vec<_> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
+        .iter()
+        .take(8)
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
+    /// Envelope lines currently in the file, stale (evicted) prefix included.
+    file_lines: usize,
+    /// True once the file exists with a header, so appends need not write one.
+    file_ready: bool,
     /// Bulk-backfill offers refused at the backfill limit (#11115).
     deferred_total: u64,
     head_sequence: u128,
+    /// When the last overflow line (with its per-kind histogram) was logged
+    /// (#13538), so a burst logs once rather than once per dropped record.
+    last_overflow_log: Option<std::time::Instant>,
 }
 
 /// Outcome of a bounded bulk-backfill offer (#11115).
@@ -147,10 +181,13 @@ impl DurableQueue {
     pub fn open(path: PathBuf, capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let ledger = LossLedger::open(loss_ledger_path(&path));
-        let mut items = load_existing(&path);
+        let loaded = load_existing(&path);
+        let mut items = loaded.items;
         // A capacity that shrank since the file was last written (e.g. a
         // config edit between restarts) must not resurrect more than the
-        // new bound allows.
+        // new bound allows. Stale prefix lines are not live records and were
+        // already counted when evicted, so only the excess of the live set
+        // over the new capacity is a shrink loss.
         let mut shrunk = 0u64;
         while items.len() > capacity {
             items.pop_front();
@@ -158,12 +195,26 @@ impl DurableQueue {
         }
         if shrunk > 0 {
             ledger.record(REASON_CAPACITY_SHRINK, shrunk);
-            // Persist the trimmed queue too: the file still holds the
-            // pre-trim lines, so without this rewrite every reopen would
-            // re-trim (and re-count) the same front until a push/ack
-            // happened to rewrite it.
-            if let Err(error) = persist_to(&path, &items) {
-                log::warn!("observability: failed to persist trimmed queue: {error}");
+        }
+        // Rewrite when the file does not already describe exactly this queue
+        // under this capacity (stale prefix, changed capacity, legacy file
+        // without a header, a corrupt/torn line): otherwise every reopen would
+        // re-trim the same front, and an append could glue onto a torn line.
+        let mut file_lines = loaded.lines;
+        let mut file_ready = loaded.header_capacity.is_some();
+        let needs_rewrite = loaded.exists
+            && (loaded.header_capacity != Some(capacity)
+                || loaded.lines != items.len()
+                || loaded.corrupt);
+        if needs_rewrite {
+            match persist_to(&path, &items, capacity, false) {
+                Ok(()) => {
+                    file_lines = items.len();
+                    file_ready = true;
+                }
+                Err(error) => {
+                    log::warn!("observability: failed to persist trimmed queue: {error}");
+                }
             }
         }
         DurableQueue {
@@ -172,8 +223,11 @@ impl DurableQueue {
             ledger,
             state: Mutex::new(QueueState {
                 items,
+                file_lines,
+                file_ready,
                 deferred_total: 0,
                 head_sequence: 0,
+                last_overflow_log: None,
             }),
         }
     }
@@ -210,12 +264,21 @@ impl DurableQueue {
             state.items.pop_front();
             state.head_sequence += 1;
             self.ledger.record(REASON_QUEUE_OVERFLOW, 1);
-            log::warn!(
-                "observability: queue at capacity ({}); dropped oldest record \
-                 (queue_overflow, dropped_total={})",
-                self.capacity,
-                self.ledger.total()
-            );
+            // One line per burst, naming what fills the queue (#13538): the
+            // ledger counts every drop, so per-record lines add only noise.
+            let quiet = state
+                .last_overflow_log
+                .is_some_and(|at| at.elapsed() < OVERFLOW_LOG_INTERVAL);
+            if !quiet {
+                state.last_overflow_log = Some(std::time::Instant::now());
+                log::warn!(
+                    "observability: queue at capacity ({}); dropped oldest record \
+                     (queue_overflow, dropped_total={}); queued by kind: {}",
+                    self.capacity,
+                    self.ledger.total(),
+                    kind_histogram(&state.items)
+                );
+            }
         }
     }
 
@@ -229,15 +292,39 @@ impl DurableQueue {
         durable: bool,
     ) -> std::io::Result<()> {
         state.items.push_back(envelope);
-        persist_to(&self.path, &state.items)?;
-        if durable {
-            std::fs::File::open(&self.path)?.sync_all()?;
-            let parent = self
-                .path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
+        let compact = state.file_lines >= 2 * self.capacity;
+        if compact || !state.file_ready {
+            // Compaction (or first write): one temp + rename that also
+            // replaces the file, so the directory entry is synced too.
+            persist_to(&self.path, &state.items, self.capacity, durable)?;
+            state.file_lines = state.items.len();
+            state.file_ready = true;
+            return Ok(());
+        }
+        let line = state
+            .items
+            .back()
+            .and_then(|item| serde_json::to_string(item).ok());
+        if let Some(mut line) = line {
+            line.push('\n');
+            let appended = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .and_then(|mut file| {
+                    write_counted(&mut file, line.as_bytes())?;
+                    state.file_lines += 1;
+                    if durable {
+                        file.sync_all()?;
+                    }
+                    Ok(())
+                });
+            if appended.is_err() {
+                // A failed append may leave a torn line or a missing record;
+                // distrust the file so the next enqueue rewrites it from memory.
+                state.file_ready = false;
+            }
+            return appended;
         }
         Ok(())
     }
@@ -361,7 +448,23 @@ impl DurableQueue {
             .min(state.items.len() as u128) as usize;
         state.items.drain(..count);
         state.head_sequence += count as u128;
-        self.persist(&state.items);
+        self.persist(&mut state);
+    }
+
+    /// Drop every queued envelope `keep` rejects, wherever it sits, and
+    /// persist. Returns how many were removed. For a single-writer caller
+    /// (the one-shot watchdog, #12831) that has no sender or snapshot in
+    /// flight: it shifts the head sequence like an ack would.
+    pub fn retain(&self, mut keep: impl FnMut(&TelemetryEnvelope) -> bool) -> usize {
+        let mut state = self.lock();
+        let before = state.items.len();
+        state.items.retain(|e| keep(e));
+        let removed = before - state.items.len();
+        if removed > 0 {
+            state.head_sequence += removed as u128;
+            self.persist(&mut state);
+        }
+        removed
     }
 
     /// Remove the front `n` envelopes (clamped to the current length) after a
@@ -371,7 +474,7 @@ impl DurableQueue {
         let n = n.min(state.items.len());
         state.items.drain(0..n);
         state.head_sequence += n as u128;
-        self.persist(&state.items);
+        self.persist(&mut state);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -380,12 +483,21 @@ impl DurableQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn persist(&self, items: &VecDeque<TelemetryEnvelope>) {
-        if let Err(error) = persist_to(&self.path, items) {
-            log::warn!(
-                "observability: failed to persist queue to {}: {error}",
-                self.path.display()
-            );
+    /// Compact the file to exactly the in-memory queue (ack paths).
+    fn persist(&self, state: &mut QueueState) {
+        match persist_to(&self.path, &state.items, self.capacity, false) {
+            Ok(()) => {
+                state.file_lines = state.items.len();
+                state.file_ready = true;
+            }
+            Err(error) => {
+                // The file may still hold acked lines; force a rewrite next enqueue.
+                state.file_ready = false;
+                log::warn!(
+                    "observability: failed to persist queue to {}: {error}",
+                    self.path.display()
+                );
+            }
         }
     }
 }
@@ -414,6 +526,13 @@ pub trait QueueSink: Send + Sync {
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.offer_durable(envelope).map(|()| Admission::Admitted)
     }
+
+    /// How many more backfill offers the sink would admit right now (#13688),
+    /// or `None` for a sink with no capacity notion. The export pass uses it
+    /// to split one pass's admission between its fast and bulk lanes.
+    fn backfill_headroom(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl QueueSink for DurableQueue {
@@ -427,6 +546,10 @@ impl QueueSink for DurableQueue {
 
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.push_bounded(envelope)
+    }
+
+    fn backfill_headroom(&self) -> Option<usize> {
+        Some(backfill_limit(self.capacity).saturating_sub(self.lock().items.len()))
     }
 }
 
@@ -470,6 +593,14 @@ impl QueueSink for FanoutQueue {
         Ok(())
     }
 
+    /// The tightest member queue's headroom (an offer needs room in all).
+    fn backfill_headroom(&self) -> Option<usize> {
+        self.queues
+            .iter()
+            .filter_map(|queue| queue.backfill_headroom())
+            .min()
+    }
+
     /// All-or-defer across unequal queues (#11115). Every queue's lock is
     /// taken first, in config order, and held through the checks and the
     /// pushes, so no producer can fill a queue between its check and its push
@@ -511,33 +642,104 @@ impl QueueSink for FanoutQueue {
     }
 }
 
-fn load_existing(path: &Path) -> VecDeque<TelemetryEnvelope> {
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return VecDeque::new();
-    };
-    contents
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+/// What [`load_existing`] found in a queue file.
+struct Loaded {
+    /// The live queue: the last `header capacity` envelope lines (all of them
+    /// for a legacy headerless file).
+    items: VecDeque<TelemetryEnvelope>,
+    /// Envelope lines in the file, stale prefix included.
+    lines: usize,
+    header_capacity: Option<usize>,
+    /// A non-blank line that was neither an envelope nor the header.
+    corrupt: bool,
+    exists: bool,
 }
 
-/// Atomically rewrite `path` to contain exactly `items`, one JSON object per
-/// line — a temp-file-then-rename, mirroring
-/// [`crate::idle_exit::write_marker`].
-fn persist_to(path: &Path, items: &VecDeque<TelemetryEnvelope>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn load_existing(path: &Path) -> Loaded {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Loaded {
+            items: VecDeque::new(),
+            lines: 0,
+            header_capacity: None,
+            corrupt: false,
+            exists: false,
+        };
+    };
+    let mut items = VecDeque::new();
+    let mut header_capacity = None;
+    let mut corrupt = false;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(item) = serde_json::from_str::<TelemetryEnvelope>(line) {
+            items.push_back(item);
+        } else if let Some(capacity) = parse_header(line) {
+            header_capacity = Some(capacity);
+        } else {
+            corrupt = true;
+        }
     }
+    let lines = items.len();
+    if let Some(capacity) = header_capacity {
+        while items.len() > capacity {
+            items.pop_front();
+        }
+    }
+    Loaded {
+        items,
+        lines,
+        header_capacity,
+        corrupt,
+        exists: true,
+    }
+}
+
+fn parse_header(line: &str) -> Option<usize> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let capacity = value.get(HEADER_KEY)?.get("capacity")?.as_u64()?;
+    usize::try_from(capacity).ok()
+}
+
+/// Write `bytes`, counting them under test so the regression test can assert
+/// the per-enqueue write cost without relying on wall time.
+fn write_counted(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::BYTES_WRITTEN.with(|total| total.set(total.get() + bytes.len()));
+    file.write_all(bytes)
+}
+
+/// Atomically rewrite `path` to a header plus exactly `items`, one JSON object
+/// per line — a temp-file-then-rename, mirroring
+/// [`crate::idle_exit::write_marker`]. When `durable`, the temp file is synced
+/// before the rename and the directory after it.
+fn persist_to(
+    path: &Path,
+    items: &VecDeque<TelemetryEnvelope>,
+    capacity: usize,
+    durable: bool,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
-    let mut buffer = String::new();
+    let mut buffer = format!("{{\"{HEADER_KEY}\":{{\"capacity\":{capacity}}}}}\n");
     for item in items {
         if let Ok(line) = serde_json::to_string(item) {
             buffer.push_str(&line);
             buffer.push('\n');
         }
     }
-    std::fs::write(&temporary, buffer)?;
-    std::fs::rename(temporary, path)
+    let mut file = std::fs::File::create(&temporary)?;
+    write_counted(&mut file, buffer.as_bytes())?;
+    if durable {
+        file.sync_all()?;
+    }
+    drop(file);
+    std::fs::rename(temporary, path)?;
+    if durable {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -556,6 +758,8 @@ mod tests {
         /// used to slip in. Thread-local so parallel tests never see it.
         static BOUNDED_ADMIT_PROBE: Cell<Option<fn(&DurableQueue)>> = const { Cell::new(None) };
         static BOUNDED_ADMIT_PROBE_CALLS: Cell<usize> = const { Cell::new(0) };
+        /// Bytes written to queue files by this thread (#11137 regression seam).
+        pub(super) static BYTES_WRITTEN: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn run_bounded_admit_probe(queue: &DurableQueue) {
@@ -593,6 +797,39 @@ mod tests {
                 other => panic!("unexpected record {other:?}"),
             })
             .collect()
+    }
+
+    /// #12094: `fleet.state`, `pr.resolved`, `eta.stage_outcome` and
+    /// `pass.summary` left the registry. An older daemon's spool can still hold
+    /// them; they are skipped on load (never a decode error that loses the
+    /// neighbouring records) and rewritten away on the next open.
+    #[test]
+    fn a_retired_kind_in_an_old_spool_is_skipped_not_fatal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let valid = |n| serde_json::to_string(&envelope(n)).unwrap();
+        let mut retired = serde_json::to_value(envelope(2)).unwrap();
+        for kind in [
+            "fleet.state",
+            "pr.resolved",
+            "eta.stage_outcome",
+            "pass.summary",
+        ] {
+            retired["record"] = serde_json::json!({ "kind": kind, "repo": "o/r" });
+            assert!(
+                serde_json::from_value::<TelemetryEnvelope>(retired.clone()).is_err(),
+                "{kind} must no longer decode as a registered kind"
+            );
+        }
+        let retired_line = serde_json::to_string(&retired).unwrap();
+        std::fs::write(&path, format!("{}\n{retired_line}\n{}\n", valid(1), valid(3))).unwrap();
+
+        let queue = DurableQueue::open(path.clone(), 8);
+        assert_eq!(issues(&queue), vec![1, 3]);
+        queue.push(envelope(4));
+        assert_eq!(issues(&queue), vec![1, 3, 4]);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("eta.stage_outcome"), "{rewritten}");
     }
 
     #[test]
@@ -803,6 +1040,13 @@ mod tests {
     }
 
     #[test]
+    fn kind_histogram_names_what_fills_the_queue() {
+        let items: VecDeque<TelemetryEnvelope> = (1..=3).map(envelope).collect();
+        assert_eq!(kind_histogram(&items), "sweep.started=3");
+        assert_eq!(kind_histogram(&VecDeque::new()), "");
+    }
+
+    #[test]
     fn bounded_capacity_drops_oldest_and_counts_it() {
         let dir = tempdir().unwrap();
         let queue = DurableQueue::open(dir.path().join("q.jsonl"), 2);
@@ -905,6 +1149,63 @@ mod tests {
     }
 
     #[test]
+    fn durable_enqueue_write_cost_is_o_of_k_not_k_times_capacity() {
+        let dir = tempdir().unwrap();
+        let capacity = 200;
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), capacity);
+        let line_len = serde_json::to_string(&envelope(1)).unwrap().len() + 1;
+        let records = 2_000; // K >> C
+        BYTES_WRITTEN.with(|total| total.set(0));
+        for i in 0..records {
+            queue.push_durable(envelope(i as u32)).unwrap();
+        }
+        let written = BYTES_WRITTEN.with(Cell::get);
+        assert!(
+            written < 3 * records * line_len,
+            "wrote {written} bytes for {records} offers of {line_len}-byte lines \
+             (capacity {capacity}); expected O(K), not O(K x C)"
+        );
+        assert_eq!(queue.len(), capacity);
+    }
+
+    #[test]
+    fn reopen_after_evictions_does_not_recount_stale_prefix() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 4);
+            for i in 1..=7 {
+                queue.push(envelope(i));
+            }
+            assert_eq!(queue.dropped_total(), 3);
+        }
+        let reopened = DurableQueue::open(path.clone(), 4);
+        assert_eq!(reopened.dropped_total(), 3, "stale prefix must not count as capacity_shrink");
+        assert_eq!(issues(&reopened), vec![4, 5, 6, 7]);
+        let again = DurableQueue::open(path, 4);
+        assert_eq!(again.dropped_total(), 3);
+        assert_eq!(issues(&again), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn acked_records_are_not_resurrected_after_crash_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        {
+            let queue = DurableQueue::open(path.clone(), 10);
+            for i in 1..=5 {
+                queue.push(envelope(i));
+            }
+            queue.ack(2);
+            queue.push(envelope(6));
+            // Dropped without a clean shutdown.
+        }
+        let reopened = DurableQueue::open(path, 10);
+        assert_eq!(issues(&reopened), vec![3, 4, 5, 6]);
+        assert_eq!(reopened.dropped_total(), 0);
+    }
+
+    #[test]
     #[serial]
     fn default_queue_path_env_override_wins() {
         std::env::set_var(QUEUE_PATH_ENV, "/tmp/custom-observability-queue.jsonl");
@@ -981,5 +1282,46 @@ mod tests {
         let fanout = FanoutQueue::new(Vec::new());
         QueueSink::offer(&fanout, envelope(1)); // must not panic
         assert!(fanout.queues().is_empty());
+    }
+
+    #[test]
+    fn torn_append_is_healed_by_the_next_enqueue() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 8);
+        queue.push(envelope(1));
+        queue.push(envelope(2));
+        // Simulate a failed append that left a partial line with no newline,
+        // and the bookkeeping the failure path performs.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"partial").unwrap();
+        queue.lock().file_ready = false;
+        queue.push_durable(envelope(3)).unwrap();
+        drop(queue);
+        let reopened = DurableQueue::open(path, 8);
+        assert_eq!(issues(&reopened), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn failed_append_distrusts_the_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 8);
+        queue.push(envelope(1));
+        assert!(queue.lock().file_ready);
+        // Replace the file with a directory so the append open fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(queue.push_durable(envelope(2)).is_err());
+        assert!(!queue.lock().file_ready, "a failed append must force a rewrite");
+        std::fs::remove_dir(&path).unwrap();
+        queue.push_durable(envelope(3)).unwrap();
+        drop(queue);
+        let reopened = DurableQueue::open(path, 8);
+        assert_eq!(issues(&reopened), vec![1, 2, 3]);
     }
 }

@@ -29,9 +29,9 @@
 //! The issue body arrives on stdin, never in argv: it is forge-controlled
 //! text, and an argument vector is the wrong place for it.
 
+use crate::merge_pr::closed_building::{plan, render};
+use crate::merge_pr::partial_reset::IssueView;
 use anyhow::Result;
-use loom_daemon::merge_pr::closed_building::{plan, render};
-use loom_daemon::merge_pr::partial_reset::IssueView;
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]

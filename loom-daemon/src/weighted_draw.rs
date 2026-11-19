@@ -42,15 +42,21 @@ pub struct DrawStep<K> {
 ///
 /// Candidates are taken in the order given (the caller's declaration order),
 /// which is part of what makes a draw replayable from its record.
+///
+/// The total saturates at `u64::MAX` rather than overflowing (#11782): a
+/// typo'd weight near `u64::MAX` must neither panic a debug build nor wrap the
+/// total to `0` in release and silently skip the stage.
 pub fn draw<K: Clone>(candidates: &[(K, u64)], rng: &mut PickRng) -> Option<DrawStep<K>> {
-    let total: u64 = candidates.iter().map(|(_, w)| *w).sum();
+    let total = candidates
+        .iter()
+        .fold(0u64, |acc, (_, w)| acc.saturating_add(*w));
     if total == 0 {
         return None;
     }
     let roll = rng.below(total);
     let mut acc = 0u64;
     for (key, weight) in candidates {
-        acc += *weight;
+        acc = acc.saturating_add(*weight);
         if roll < acc {
             return Some(DrawStep {
                 total,
@@ -97,6 +103,16 @@ mod tests {
         assert!(draw::<&str>(&[], &mut rng).is_none());
         assert!(draw(&[("a", 0), ("b", 0)], &mut rng).is_none());
         assert!(draw_order(&[("a", 0)], &mut rng).is_empty());
+    }
+
+    #[test]
+    fn weights_summing_past_u64_max_saturate_instead_of_overflowing() {
+        let table = [("big", u64::MAX), ("small", 1)];
+        let mut rng = PickRng::from_seed(3);
+        let step = draw(&table, &mut rng).unwrap();
+        assert_eq!(step.total, u64::MAX);
+        assert!(step.roll < u64::MAX);
+        assert_eq!(draw_order(&table, &mut PickRng::from_seed(3)).len(), 2);
     }
 
     #[test]

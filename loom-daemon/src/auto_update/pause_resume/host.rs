@@ -135,8 +135,10 @@ fn pause_dir(item: &ManifestItem) -> PathBuf {
 /// The sweep-registry resume spec of a sweep item. `None` for anything else.
 pub(crate) fn sweep_spec(item: &ManifestItem, launch: &RollResumeLaunch) -> Option<RollResumeSpec> {
     let handle = item.resume_handle.as_ref()?;
+    // A PR step (no `issue`) is not resumed: requeued instead (#11898).
     Some(RollResumeSpec {
         issue: item.issue?,
+        step: item.step,
         old_sweep_id: item.id.clone(),
         launch: launch.clone(),
         model: handle.model.clone(),
@@ -317,6 +319,9 @@ pub(crate) mod sweeps {
         forge: bool,
     ) -> Result<(), String> {
         let mut sr = locked(registry);
+        if let Some(role) = item.step {
+            return requeue_step(&mut sr, item, role, forge);
+        }
         let Some(issue) = item.issue else {
             let released = sr.release_roll_prset(&item.id);
             log::info!("pause_resume: {}: released PR lock(s) {released:?}", item.id);
@@ -338,8 +343,47 @@ pub(crate) mod sweeps {
         Ok(())
     }
 
+    /// A step's requeue (#11898): its claim goes back to its role's ready
+    /// stage, and its lock (`issue-<N>` or `pr-<N>`) is released.
+    fn requeue_step(
+        sr: &mut SweepRegistry,
+        item: &ManifestItem,
+        role: crate::step_role::StepRole,
+        forge: bool,
+    ) -> Result<(), String> {
+        let Some(number) = item.issue.or(item.pr) else {
+            return Ok(());
+        };
+        let ours = if role.acts_on_pr() {
+            sr.roll_pr_step_claim_still_ours(number, role, &item.id)
+        } else {
+            sr.roll_claim_still_ours(number, &item.id)
+        };
+        if forge {
+            match ours {
+                Ok(()) => {
+                    sr.restore_step_claim(number, role, &item.id)
+                        .map_err(|e| format!("{e:#}"))?;
+                }
+                Err(why) => log::warn!(
+                    "pause_resume: {}: #{number} is no longer this {role} step's claim ({why}); \
+                     nothing is written to the forge for it",
+                    item.id
+                ),
+            }
+        }
+        if role.acts_on_pr() {
+            let released = sr.release_roll_prset(&item.id);
+            log::info!("pause_resume: {}: released PR lock(s) {released:?}", item.id);
+        } else {
+            sr.release_roll_item(number, &[&item.id]);
+        }
+        Ok(())
+    }
+
     pub(crate) fn recover(registry: &Arc<Mutex<SweepRegistry>>, item: &ManifestItem) {
-        let Some(issue) = item.issue else {
+        // Restart recovery rebuilds issue sweeps; a step is not one (#11898).
+        let (Some(issue), None) = (item.issue, item.step) else {
             return;
         };
         let only = HashSet::from([issue]);

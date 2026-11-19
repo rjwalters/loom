@@ -221,3 +221,8 @@ fn branch_checked_out_in_another_worktree_is_refused() {
     );
     assert!(show_ref.status.success(), "the branch must survive");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

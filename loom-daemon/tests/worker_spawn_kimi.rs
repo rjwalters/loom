@@ -2,28 +2,15 @@
 //! model-profile binding (config-alias and Moonshot-API-key routes) and the
 //! honest fail-closed manifest, driven through the real `spawn-worker` path.
 //!
-//! A sibling of `worker_spawn.rs` rather than a section of it: that file sits
-//! at the 1000-line file-size ratchet, and these tests would carry it over.
-//! `fixture` / `worker` / `config` / `profile_check` below are therefore
-//! deliberate copies of that file's helpers, the same pattern
-//! `worker_spawn_api_keys.rs` already uses.
-use std::{path::PathBuf, process::Command, sync::OnceLock};
+//! A sibling of `worker_spawn.rs` rather than a section of it: these tests
+//! get their own file. `worker` / `config` / `profile_check` below are therefore deliberate copies
+//! of that file's helpers, the same pattern `worker_spawn_api_keys.rs` already
+//! uses; `fixture` comes from the shared `support/worker_cli.rs`.
+use std::process::Command;
 
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
 
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
@@ -334,3 +321,8 @@ fn bundled_kimi_example_profiles_load() {
         );
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -2,6 +2,9 @@
 //! re-provision path. Each test drives the real `loom-daemon` binary against a
 //! temp HOME / marker, never the machine-level Loom dir.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -37,6 +40,7 @@ impl Host {
             .env_remove("LOOM_MACHINE_CHECKOUT")
             .env_remove("LOOM_WORKSPACE")
             .env_remove("LOOM_DAEMON_SUPERVISOR");
+        common::deny_real_gh(&mut c);
         c
     }
     fn run(&self, args: &[&str]) -> Output {
@@ -88,6 +92,30 @@ fn disable_writes_marker_stops_daemon_and_clears_desired() {
     assert!(text(&s).contains("disabled by operator: cost freeze ("), "{}", text(&s));
     // Idempotent.
     h.disable();
+}
+
+#[test]
+fn disable_discards_the_record_a_running_stop_writes() {
+    // #9957: stopping a live daemon records an operator stop; `host disable`
+    // discards that record after the stop, not before it.
+    let h = Host::new();
+    std::fs::write(h.desired(), "started_at=x\n").unwrap();
+    let record = h.p().join("autonomy-desired.stopped");
+    let stop = h.p().join("recording-stop.sh");
+    std::fs::write(&stop, format!("#!/bin/sh\ntouch {}\n", record.display())).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&stop, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let o = h
+        .cmd(&["host", "disable", "--reason", "cost freeze"])
+        .env("LOOM_HOST_STOP_SCRIPT", &stop)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(h.disabled().exists());
+    assert!(!record.exists(), "the stop's operator-stop record is discarded");
 }
 
 #[test]
@@ -243,3 +271,8 @@ fn installer_refuses() {
     assert_refused(&o);
     assert!(!target.join(".loom").exists(), "installer must have no side effects");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -10,9 +10,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::supersede::ArmedRoll;
+use super::update_observation::HostUpdateObservation;
 use super::{ArtifactResolution, UpdateCheck};
 use crate::telemetry::kinds::auto_update_tick::{
-    AutoUpdateTickRecord, DrainSnapshot, RollHeld, TickDecisionKind,
+    AutoUpdateTickRecord, DrainSnapshot, FloorNotRolling, RollHeld, TickDecisionKind,
 };
 use crate::telemetry::provenance::Provenance;
 use crate::telemetry::TelemetryRecord;
@@ -43,9 +44,28 @@ pub struct TickSummary {
     /// started, changed, or its reminder came due). Not on the tick record:
     /// `floor_stall` there is the standing condition.
     pub floor_alerted: bool,
+    /// #11042: why a host below the fleet floor did not roll on this tick.
+    pub floor_not_rolling: Option<FloorNotRolling>,
     /// #10880: the held-roll alert this tick raised (ERROR below the floor,
     /// WARN otherwise). Set on every tick the roll stays held.
     pub roll_held: Option<RollHeld>,
+    /// #12425: the tick armed a same-binary restart for restart-required
+    /// config.
+    pub config_restart: Option<ConfigRestartFacts>,
+    /// #12420: the host's update state at the end of the tick and who would
+    /// choose its target. Set by the loop after the tick, from its published
+    /// status; `None` for a summary built without one.
+    pub observed: Option<HostUpdateObservation>,
+}
+
+/// What a `config_restart` tick reports: the trigger and how many paths
+/// asked for it. Never the paths' values, nor the paths themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigRestartFacts {
+    /// The roll's `target_source`.
+    pub source: &'static str,
+    /// How many restart-required paths are in the demand.
+    pub paths: usize,
 }
 
 impl TickSummary {
@@ -64,15 +84,16 @@ impl TickSummary {
                 armed: true,
                 // #10831: no roll is retained across a deadline any more, so
                 // `pending` now reports a roll that can no longer be
-                // superseded and `refusals` is always 0 (fields kept so the
-                // record's shape is unchanged).
+                // superseded.
                 pending: roll.committed,
-                refusals: 0,
                 target: roll.target.clone(),
             }),
             floor_stall: None,
             floor_alerted: false,
+            floor_not_rolling: None,
             roll_held: None,
+            config_restart: None,
+            observed: None,
         }
     }
 
@@ -125,7 +146,24 @@ pub fn record(
         in_flight: summary.in_flight.map(|n| n as u64),
         drain: summary.drain.clone(),
         floor_stall: summary.floor_stall.clone(),
+        floor_not_rolling: summary.floor_not_rolling,
         roll_held: summary.roll_held.clone(),
+        config_restart_paths: summary.config_restart.map(|c| c.paths as u64),
+        host_state: summary
+            .observed
+            .as_ref()
+            .map(|o| o.state.as_str().to_string()),
+        // A `config_restart` tick names its own trigger; any other tick
+        // reports who would choose the roll target.
+        target_source: summary
+            .config_restart
+            .map(|c| c.source.to_string())
+            .or_else(|| {
+                summary
+                    .observed
+                    .as_ref()
+                    .map(|o| o.target_source.as_str().to_string())
+            }),
         consecutive_failures,
         duration_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
         loom,

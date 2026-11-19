@@ -231,10 +231,20 @@
 #     the lease's own updated_at. See defaults/docs/lease-record.md.
 #
 #   sweep-lease-renew.sh stop <PID>
-#     Best-effort kill of a loop PID returned by `start`. NOT required for
-#     correctness (the loop already self-terminates once its watched PID
-#     dies, OR once its own renewal target's yield record appears -- see
-#     `start` below) -- this only speeds up teardown for anyone who wants it.
+#   sweep-lease-renew.sh stop --issue <N> [--host H] [--sweep-id S]
+#   sweep-lease-renew.sh stop-issue <N> [--host H] [--sweep-id S]
+#     Best-effort teardown of a renewer. <PID> must be a loop PID returned by
+#     `start`: `loom-daemon lease renewer stop` (#11086) signals it ONLY after
+#     verifying its command line is a lease renewer's and its start identity
+#     is stable; any other pid (an issue number passed by mistake, an unrelated
+#     process, a non-number) is refused, non-zero, with nothing signalled. An
+#     issue-scoped stop ends every recorded renewer of that issue (any sweep
+#     unless --sweep-id) and never a peer issue's -- prefer it when you hold
+#     the issue number rather than the pid. Fails CLOSED: a loom-daemon
+#     predating `lease renewer stop` (or none) refuses; there is no fallback
+#     kill. NOT required for correctness (the loop already self-terminates once
+#     its watched PID dies, OR once its own renewal target's yield record
+#     appears -- see `start` below) -- this only speeds up teardown.
 #
 # ## Scope
 #
@@ -248,6 +258,7 @@
 #   .loom/scripts/sweep-lease-renew.sh start 6180
 #   .loom/scripts/sweep-lease-renew.sh renew-once 6180
 #   .loom/scripts/sweep-lease-renew.sh stop 12345
+#   .loom/scripts/sweep-lease-renew.sh stop --issue 6180
 
 # requires-daemon: lease optional   `lease renewer` (#10229): any exit but 3 (stop) / 4 (skip) from a binary predating it renews exactly as before.
 
@@ -280,6 +291,12 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # of failing closed for the sweep's entire lease lifetime.
 # shellcheck source=./lib/forge-helpers.sh
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
+# #14488: one binary for the whole lease chain (see loom_select_lease_bin).
+# Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
+if [[ -r "$SCRIPT_DIR/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "$SCRIPT_DIR/lib/locate-daemon-bin.sh" && loom_select_lease_bin "$PWD" || true
+fi
 
 # lease_gh <read|write> <gh args...> (#10229): run one forge call on this host's
 # GitHub App installation -- `loom-daemon forge token` picks a reader App for the
@@ -396,9 +413,29 @@ lease_publish_raw_hostname() {
     esac
 }
 
+# `LOOM_LEASE_HOST_ID` is first, as in `host_identity::lease_host_identity`:
+# a dispatcher exports its own lease host id to the session it spawns, so a
+# session whose hostname differs (a Codex session container) still names the
+# host its lease was published under, not its container. Every value is
+# trimmed and a whitespace-only one counts as unset, matching Rust's
+# `non_blank` (#13998) -- " " must fall through to the next link, and
+# "worker-4 " must hash to the same opaque id as `worker-4`, or what this
+# loop renews and what the other sides publish would disagree on a hand-set
+# variable.
+trim() {
+    local s="${1-}"
+    s="${s#"${s%%[![:space:]]*}"}" # ltrim
+    s="${s%"${s##*[![:space:]]}"}" # rtrim
+    printf '%s' "$s"
+}
+
 resolve_host() {
-    local h="${LOOM_HOST_ID:-${HOSTNAME:-}}"
-    [[ -n "$h" ]] || h="$(hostname 2> /dev/null || true)"
+    local v h
+    for v in "${LOOM_LEASE_HOST_ID-}" "${LOOM_HOST_ID-}" "${HOSTNAME-}"; do
+        h="$(trim "$v")"
+        [[ -n "$h" ]] && { printf '%s' "$h"; return 0; }
+    done
+    h="$(trim "$(hostname 2> /dev/null || true)")"
     printf '%s' "${h:-unknown-host}"
 }
 
@@ -465,10 +502,8 @@ parse_lease_yield_marker_line() {
 # and `defaults/scripts/sweep-run-registry.sh` and MUST stay byte-identical in
 # both: `defaults/scripts/tests/test-sweep-lease-renew.sh` case (q) diffs the
 # two copies and fails the suite on any drift. It is deliberately NOT extracted
-# into `defaults/scripts/lib/`: ADR-0018 / `scripts/shell-allowlist.txt` admits
-# no category for a NEW shared shell library (`contract` is BASELINE-ONLY, and
-# a library is not bootstrap/hook-entry/vendored/stub/test), so a new lib file
-# would fail `scripts/check-shell-allowlist.sh`. The machine-checked
+# into `defaults/scripts/lib/`: ADR-0018 rules out a NEW shared shell library
+# (.loom/docs/shell-language-policy.md). The machine-checked
 # byte-identity is the substitute for `source`. Edit one copy, then run
 # `diff` — or just let case (q) tell you.
 #
@@ -1110,13 +1145,12 @@ cmd_start() {
     echo "$loop_pid"
 }
 
+# Teardown is `loom-daemon lease renewer stop` (#11086): it verifies the target
+# is a renewer before signalling. This stays a thin delegate and fails CLOSED --
+# a missing/older daemon (or a missing argument) exits non-zero, nothing signalled.
 cmd_stop() {
-    local pid="${1:-}"
-    [[ "$pid" =~ ^[0-9]+$ ]] || {
-        echo "ERROR: stop requires a PID argument" >&2
-        exit 1
-    }
-    kill "$pid" 2> /dev/null || true
+    "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer stop "$@" && return 0
+    local rc=$?; echo "sweep-lease-renew: stop refused or unavailable (exit ${rc}); nothing was signalled -- usage: stop <PID> | stop --issue N" >&2; exit "$rc"
 }
 
 main() {
@@ -1126,6 +1160,7 @@ main() {
         start) cmd_start "$@" ;;
         renew-once) cmd_renew_once "$@" ;;
         stop) cmd_stop "$@" ;;
+        stop-issue) cmd_stop --issue "$@" ;;
         release) exec "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer release "$@" ;;
         -h | --help | "") usage ;;
         *)

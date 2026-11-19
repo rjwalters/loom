@@ -86,7 +86,8 @@
 //!   `2>/dev/null` did.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+
+use super::wip::{git_status_code, git_stdout_nl as git_stdout, BLUE, GREEN, NC, RED, YELLOW};
 
 /// Everything the guard needs, once assembled by the shell wrapper.
 pub struct Options {
@@ -264,39 +265,6 @@ fn resolve_dir_or_literal(path: &Path) -> PathBuf {
 // git
 // ---------------------------------------------------------------------------
 
-/// `$(git -C "$dir" … 2>/dev/null)` — trimmed stdout on success, `None` when
-/// git exits non-zero or could not run.
-fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches(['\n', '\r'])
-            .to_string(),
-    )
-}
-
-/// `git -C "$dir" … >/dev/null 2>&1; echo $?` — a git that cannot even be
-/// spawned answers 127, matching bash's own report for that failure.
-fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(127, |s| s.code().unwrap_or(127))
-}
-
 // ---------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------
@@ -308,12 +276,6 @@ fn git_status_code(dir: &Path, args: &[&str]) -> i32 {
 struct Reporter {
     quiet: bool,
 }
-
-const RED: &str = "\x1b[0;31m";
-const GREEN: &str = "\x1b[0;32m";
-const YELLOW: &str = "\x1b[1;33m";
-const BLUE: &str = "\x1b[0;34m";
-const NC: &str = "\x1b[0m";
 
 impl Reporter {
     /// `print_error` — stderr, but only when not `--quiet` (see the struct

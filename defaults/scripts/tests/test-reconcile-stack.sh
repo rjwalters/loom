@@ -50,30 +50,15 @@ RECONCILE="$SCRIPTS_DIR/reconcile-stack.sh"
 # shellcheck source=lib/require-daemon-bin.sh
 source "$TEST_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin "$SCRIPTS_DIR" "reconcile-stack"
-# #9548: this suite's subject vets its write target (`forge may-write`)
-# first; that decision is not what this suite tests (test-write-scope.sh does),
-# and without this the outcome would depend on the host's loom-daemon.
-WS_STUB_DIR="$(mktemp -d)"
-# shellcheck source=lib/write-scope-stub.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/write-scope-stub.sh"
-write_scope_allow_all "$WS_STUB_DIR"
+# #9548: a real run vets its write target (`loom_write_repo`) before it pushes
+# or retargets. Each sandbox clone is registered as owner/repo
+# (write-scope-fixture.sh), so the real gate admits it; see setup_sandbox for
+# how the clone stays offline with a GitHub origin.
+# shellcheck source=lib/write-scope-fixture.sh
+source "$TEST_DIR/lib/write-scope-fixture.sh"
 
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
-
-assert_not_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if ! [[ "$haystack" == *"$needle"* ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Unexpected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
 
 # Per-scenario sandbox globals.
 SANDBOX=""
@@ -83,7 +68,15 @@ GH_STUB_DIR=""
 GH_EDIT_LOG=""
 GIT_STUB_DIR=""
 
-git_q() { git -c advice.detachedHead=false -c protocol.file.allow=always "$@"; }
+# The sandbox clone's raw `origin` is this GitHub URL (what the write-scope
+# gate reads); its TRANSPORT goes to the bare $REMOTE. See setup_sandbox.
+ORIGIN_URL="https://github.com/owner/repo.git"
+# git_q passes that transport rewrite too ($LOOM_TEST_ORIGIN_TRANSPORT
+# overrides the bare remote, for a fetch that must fail).
+git_q() {
+    git -c advice.detachedHead=false -c protocol.file.allow=always \
+        -c "url.${LOOM_TEST_ORIGIN_TRANSPORT:-${REMOTE:-/nonexistent}}.insteadOf=$ORIGIN_URL" "$@"
+}
 
 # Build a fresh sandbox:
 #   remote.git  — bare "origin"
@@ -151,6 +144,18 @@ setup_sandbox() {
         exit 2
     fi
 
+    # #9548: register the clone as owner/repo, which repoints its raw origin
+    # to $ORIGIN_URL: both write-scope deciders read that raw URL (the daemon
+    # from `git config`, the shell fallback from `git remote get-url`). NOT
+    # `url.<bare>.insteadOf` in the clone's config: `git remote get-url`
+    # applies it, so the shell fallback would read the bare path while the
+    # daemon reads the raw URL. Instead the stub git below (and git_q) pass the
+    # rewrite with `-c` only to the transport commands (fetch, push,
+    # ls-remote, pull), which therefore still reach the bare remote, offline.
+    # Registered after the gh stub path is known: the fixture's LOOM_GH_BIN
+    # answers the permission probe and hands every other call to it.
+    WRITE_SCOPE_INNER_GH="$SANDBOX/bin/gh" write_scope_register "$MAIN" owner/repo
+
     # Stub gh on PATH: resolve the child head branch and record `pr edit`.
     GH_STUB_DIR="$SANDBOX/bin"
     mkdir -p "$GH_STUB_DIR"
@@ -160,7 +165,14 @@ setup_sandbox() {
 #!/usr/bin/env bash
 if [[ "\$1" == "pr" && "\$2" == "view" ]]; then
   # gh pr view <n> --json headRefName --jq '.headRefName'
-  echo "$CHILD_BR"
+  # A scenario reconciling several children writes "<pr> <branch>" lines to
+  # \$PR_BRANCH_MAP; any PR not listed (every single-child scenario) resolves
+  # to the default $CHILD_BR.
+  _b=""
+  if [[ -f "$SANDBOX/pr-branches" ]]; then
+    _b="\$(awk -v p="\$3" '\$1 == p { print \$2 }' "$SANDBOX/pr-branches")"
+  fi
+  echo "\${_b:-$CHILD_BR}"
   exit 0
 fi
 if [[ "\$1" == "pr" && "\$2" == "edit" ]]; then
@@ -172,8 +184,9 @@ exit 3
 STUB
     chmod +x "$GH_STUB_DIR/gh"
 
-    # Stub `git` that transparently delegates to the REAL git for everything
-    # except a --force-with-lease push made while LOOM_TEST_FAKE_REJECT=1: in
+    # Stub `git` that transparently delegates to the REAL git (adding the
+    # origin transport rewrite to fetch/push/ls-remote/pull, see above) for
+    # everything except a --force-with-lease push made while LOOM_TEST_FAKE_REJECT=1: in
     # that one case it runs the real push (so the remote genuinely updates,
     # exactly like the LFS-hook race in #6695), then discards the real exit
     # code and prints a synthetic rejection instead — modeling a push that
@@ -198,6 +211,10 @@ while [[ \$_i -lt \${#_args[@]} ]]; do
         *)     _sub="\${_args[\$_i]}"; break ;;
     esac
 done
+_rw=()
+case "\$_sub" in
+    fetch|push|ls-remote|pull) _rw=(-c "url.\${LOOM_TEST_ORIGIN_TRANSPORT:-$REMOTE}.insteadOf=$ORIGIN_URL") ;;
+esac
 if [[ "\$_sub" == "push" && -n "\${LOOM_TEST_PUSH_RACE_SCRIPT:-}" && ! -f "$SANDBOX/.race-fired" ]]; then
     # #9487: fire a one-shot race hook at the instant of the push — AFTER the
     # script captured its lease pin. The hook lands a conflicting commit on the
@@ -207,10 +224,10 @@ if [[ "\$_sub" == "push" && -n "\${LOOM_TEST_PUSH_RACE_SCRIPT:-}" && ! -f "$SAND
     # that agreement and clobbers; the pinned one must still reject.
     : > "$SANDBOX/.race-fired"
     "\$LOOM_TEST_PUSH_RACE_SCRIPT"
-    exec "\$REAL_GIT" "\$@"
+    exec "\$REAL_GIT" "\${_rw[@]}" "\$@"
 fi
 if [[ "\$_sub" == "push" && "\${LOOM_TEST_FAKE_REJECT:-0}" == "1" ]]; then
-    "\$REAL_GIT" "\$@"
+    "\$REAL_GIT" "\${_rw[@]}" "\$@"
     rc=\$?
     if [[ \$rc -eq 0 ]]; then
         echo "To $REMOTE" >&2
@@ -221,7 +238,7 @@ if [[ "\$_sub" == "push" && "\${LOOM_TEST_FAKE_REJECT:-0}" == "1" ]]; then
     fi
     exit "\$rc"
 fi
-exec "\$REAL_GIT" "\$@"
+exec "\$REAL_GIT" \${_rw[@]+"\${_rw[@]}"} "\$@"
 STUB
     chmod +x "$GIT_STUB_DIR/git"
 }
@@ -253,6 +270,7 @@ run_reconcile() {
         LOOM_TEST_FAKE_REJECT="${LOOM_TEST_FAKE_REJECT:-0}" \
         LOOM_TEST_PUSH_RACE_SCRIPT="${LOOM_TEST_PUSH_RACE_SCRIPT:-}" \
         LOOM_VERSION_CHECK_SCRIPT="${LOOM_VERSION_CHECK_SCRIPT:-}" \
+        LOOM_TEST_ORIGIN_TRANSPORT="${LOOM_TEST_ORIGIN_TRANSPORT:-}" \
         GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="protocol.file.allow" GIT_CONFIG_VALUE_0="always" \
         bash "$RECONCILE" "$CHILD_PR" "$PARENT_BR" "$@" 2>&1
     )" || RUN_RC=$?
@@ -471,7 +489,7 @@ set -e
 REAL_GIT="$(command -v git)"
 "\$REAL_GIT" -c protocol.file.allow=always -C "$CONFLICT_CLONE_D2" push -q origin "$CHILD_BR"
 # …and the sibling's fetch advances the SHARED remote-tracking ref in \$MAIN.
-"\$REAL_GIT" -c protocol.file.allow=always -C "$MAIN" fetch -q origin "$CHILD_BR"
+"\$REAL_GIT" -c protocol.file.allow=always -c "url.$REMOTE.insteadOf=$ORIGIN_URL" -C "$MAIN" fetch -q origin "$CHILD_BR"
 RACE
 chmod +x "$RACE_SCRIPT"
 
@@ -679,9 +697,9 @@ setup_sandbox
 git_q -C "$MAIN" checkout -q main
 git_q -C "$MAIN" reset -q --hard HEAD~1
 CHILD_BEFORE_K="$(git_q -C "$MAIN" rev-parse "$CHILD_BR")"
-git_q -C "$MAIN" remote set-url origin "$SANDBOX/not-a-repository"
-
-run_reconcile "$MAIN"
+# Origin's transport, not its URL: the URL must stay the registered one, or the
+# write-scope gate (not the fetch) would be what refuses.
+LOOM_TEST_ORIGIN_TRANSPORT="$SANDBOX/not-a-repository" run_reconcile "$MAIN"
 
 assert_eq "1" "$RUN_RC" "K: a fetch failure is a precondition failure (exit 1), not a silent degrade"
 assert_contains "$RUN_OUT" "FETCH" "K: the diagnostics name the failing prerequisite"
@@ -715,6 +733,112 @@ for M_MODE in merge auto-unknown; do
       "M ($M_MODE): the child PR base is still retargeted to the default branch"
     teardown_sandbox
 done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scenarios N/O: a real-git 3-deep stack whose branch names do NOT follow
+# feature/issue-<N> (#13388, AC4 of #13332). merge-pr retargets a child of a
+# non-feature/issue-N parent by rebasing it with reconcile-stack.sh first, so
+# the contract under test is: after each bottom-up squash-merge, reconciling
+# the next child leaves it carrying exactly its own commit and file.
+#
+#   main <- chore/a <- feat/b <- feat/c     (one own commit + one own file each)
+
+# Replace setup_sandbox's two-branch fixture with the 3-deep stack, then squash
+# the bottom (chore/a, PR 101) into main and delete it on the remote.
+setup_stack_sandbox() {
+    setup_sandbox
+    git_q -C "$MAIN" checkout -q main
+    git_q -C "$MAIN" reset -q --hard HEAD~1
+    git_q -C "$MAIN" push -q --force origin main
+    git_q -C "$MAIN" branch -D "$PARENT_BR" "$CHILD_BR" >/dev/null 2>&1
+    git_q -C "$REMOTE" branch -D "$PARENT_BR" "$CHILD_BR" >/dev/null 2>&1 || true
+    git_q -C "$MAIN" update-ref -d "refs/remotes/origin/$PARENT_BR"
+    git_q -C "$MAIN" update-ref -d "refs/remotes/origin/$CHILD_BR"
+
+    local prev=main br
+    for br in chore/a feat/b feat/c; do
+        git_q -C "$MAIN" checkout -q -b "$br" "$prev"
+        echo "${br#*/}" > "$MAIN/${br#*/}.txt"
+        git_q -C "$MAIN" add "${br#*/}.txt"
+        git_q -C "$MAIN" commit -q -m "${br#*/}-own"
+        git_q -C "$MAIN" push -q -u origin "$br"
+        prev="$br"
+    done
+    printf '102 feat/b\n103 feat/c\n' > "$SANDBOX/pr-branches"
+    squash_into_main chore/a "a-squash (#101)"
+}
+
+# Squash-merge origin/<branch> into main (what the forge does), push it, and
+# delete the branch on the remote only — the clone keeps its local branch and a
+# stale remote-tracking ref, as after delete-branch-on-merge.
+squash_into_main() {
+    local br="$1" msg="$2"
+    git_q -C "$MAIN" fetch -q origin
+    git_q -C "$MAIN" checkout -q main
+    git_q -C "$MAIN" reset -q --hard origin/main
+    git_q -C "$MAIN" merge -q --squash "origin/$br" >/dev/null
+    git_q -C "$MAIN" commit -q -m "$msg"
+    git_q -C "$MAIN" push -q origin main
+    git_q -C "$REMOTE" branch -D "$br" >/dev/null 2>&1
+}
+
+# Reconcile PR $1 (branch $2) whose parent was $3.
+reconcile_stack_child() {
+    CHILD_PR="$1" CHILD_BR="$2" PARENT_BR="$3" run_reconcile "$MAIN"
+}
+
+echo ""
+echo "Scenario N: 3-deep non-feature/issue-N stack, squash-merged bottom-up"
+setup_stack_sandbox
+
+reconcile_stack_child 102 feat/b chore/a
+assert_eq "0" "$RUN_RC" "N: reconcile of B (parent chore/a) exits 0"
+git_q -C "$MAIN" fetch -q origin
+assert_eq "b-own" "$(git_q -C "$MAIN" log --format=%s origin/main..origin/feat/b)" \
+  "N: B carries only its own commit above main (parent's chore/a commit stripped)"
+assert_eq "b.txt" "$(git_q -C "$MAIN" diff --name-only origin/main origin/feat/b)" \
+  "N: B's diff against main is exactly its own file"
+assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit 102 --repo owner/repo --base main" \
+  "N: PR 102 (B) retargeted to main"
+assert_not_contains "$(cat "$GH_EDIT_LOG")" "pr edit 103" \
+  "N: PR 103 (C) is not touched while reconciling B"
+assert_eq "0" "$(git_q -C "$MAIN" merge-base --is-ancestor origin/main origin/feat/b && echo 0 || echo 1)" \
+  "N: B sits on top of main"
+
+squash_into_main feat/b "b-squash (#102)"
+
+reconcile_stack_child 103 feat/c feat/b
+assert_eq "0" "$RUN_RC" "N: reconcile of C (parent feat/b) exits 0"
+git_q -C "$MAIN" fetch -q origin
+assert_eq "c-own" "$(git_q -C "$MAIN" log --format=%s origin/main..origin/feat/c)" \
+  "N: C carries only its own commit above main (A and B content stripped)"
+assert_eq "c.txt" "$(git_q -C "$MAIN" diff --name-only origin/main origin/feat/c)" \
+  "N: C's diff against main is exactly its own file"
+assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit 103 --repo owner/repo --base main" \
+  "N: PR 103 (C) retargeted to main"
+
+# C merges cleanly, and main ends up with all three files exactly once.
+squash_into_main feat/c "c-squash (#103)"
+assert_eq "a.txt b.txt base.txt c.txt" "$(git_q -C "$MAIN" ls-tree --name-only origin/main | tr '\n' ' ' | sed 's/ $//')" \
+  "N: main holds every stacked change after the bottom-up merges"
+
+teardown_sandbox
+
+echo ""
+echo "Scenario O: LOOM_BRANCH_UPDATE_STRATEGY=merge retargets but keeps the parent's commit (documented limitation)"
+setup_stack_sandbox
+B_REMOTE_BEFORE="$(git_q -C "$MAIN" ls-remote origin refs/heads/feat/b | cut -f1)"
+LOOM_BRANCH_UPDATE_STRATEGY=merge reconcile_stack_child 102 feat/b chore/a
+assert_eq "0" "$RUN_RC" "O: reconcile of B under the merge strategy exits 0"
+assert_contains "$RUN_OUT" "#10771" "O: the output names the merge-only policy (rebase + force-push skipped)"
+assert_eq "$B_REMOTE_BEFORE" "$(git_q -C "$MAIN" ls-remote origin refs/heads/feat/b | cut -f1)" \
+  "O: nothing was pushed to B"
+git_q -C "$MAIN" fetch -q origin
+assert_contains "$(git_q -C "$MAIN" log --format=%s origin/main..origin/feat/b)" "a-own" \
+  "O: B still carries the parent's original commit (the squash left it behind)"
+assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit 102 --repo owner/repo --base main" \
+  "O: the retarget is still performed and logged"
+teardown_sandbox
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Source guards: fail loudly if a refactor drops either fix.

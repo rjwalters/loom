@@ -1,7 +1,7 @@
 //! Is llm-monitor's `ranking.json` going stale? (#11295)
 //!
 //! loom-daemon posts `llm-monitor.stale` on loom-ui when it is
-//! ([`crate::loom_ui_alerts::watches`]). A host with no `ranking.json` at all
+//! ([`crate::alerts::watches`]). A host with no `ranking.json` at all
 //! does not run llm-monitor, and has nothing to say.
 //!
 //! llm-monitor's quota step-change alert (`evaluateStepChangeAlerts`) is not in

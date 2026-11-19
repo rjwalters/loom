@@ -13,7 +13,7 @@
 //! pass-through. The daemon's terminal-record parser
 //! (`sweep_registry::parse_terminal_result_after`) then calls [`category_of`], which
 //! replaces the record's category with the announced one. The adapter script
-//! needs no line per category, so the shell budget does not grow with them
+//! needs no line per category, so it does not grow with them
 //! (#10455; `SESSION_DOWN` was first, #10364's mount-drift refusal is next).
 //!
 //! **Adding a category** is daemon-only: add the `TerminalClassification`
@@ -42,6 +42,22 @@ pub const REFUSAL_MARKER: &str = "# LOOM_SESSION_REFUSAL ";
 
 /// The exit code every `session-exec` refusal uses.
 pub const REFUSAL_EXIT_CODE: i32 = 78;
+
+/// A managed seat was still busy when its session adapter tried to enter.
+pub(crate) const SEAT_BUSY_REASON: &str = "seat_busy";
+
+pub(super) fn announce_seat_busy() {
+    let Some((role, target)) = std::env::var(crate::roll_pause::ITEM_ENV)
+        .ok()
+        .and_then(|id| crate::step_role::StepRole::parse_sweep_id(&id))
+    else {
+        return;
+    };
+    eprintln!(
+        "LOOM_STEP_OUTCOME role={} target={target} class=refused reason={SEAT_BUSY_REASON}",
+        role.role_name()
+    );
+}
 
 /// The categories a refusal may announce, with their wire spelling (the same
 /// spelling `TerminalClassification::from_str` reads).

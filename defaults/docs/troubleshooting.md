@@ -8,7 +8,7 @@
 - [Stuck Agent Detection](#stuck-agent-detection)
 - [Sweep Dispatch Troubleshooting](#sweep-dispatch-troubleshooting)
 - [Overnight / long-running orchestration](#overnight--long-running-orchestration)
-- [Worker disk full: dispatch halted `disk_full` (#10973)](#worker-disk-full-dispatch-halted-disk_full-10973)
+- [Worker disk full (#10973)](#worker-disk-full-10973)
 <!-- toc:end -->
 
 ## Common Issues
@@ -18,7 +18,7 @@
 `loom-daemon-stop.sh` is "stopped for now"; the watchdog, a supervised relaunch, the
 auto-update roll or `loom update` can bring a daemon back. For a durable opt-out run
 `loom-daemon host disable --reason "<why>"` (writes `~/.loom/autonomy-disabled`, stops
-the daemon and removes its jobs). Every start/re-provision path then refuses with the
+the daemon; the watchdog job stays loaded and refuses on the marker). Every start/re-provision path then refuses with the
 reason, who and when; `loom-daemon status` shows `disabled by operator: <reason>
 (<when>)`. Undo with `loom-daemon host enable` (it does not start anything). Agents must
 not start or repair a daemon on such a host. See `daemon-reference.md`.
@@ -427,7 +427,7 @@ of:
 
 1. Its mtime is older than the retention window (below).
 2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
-   lock, no `.loom/spawn-loop-state.json` entry).
+   lock).
 3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
    sweep (even one not currently running) keeps its log regardless of age.
 
@@ -445,6 +445,17 @@ LOOM_LOGS_RETENTION_DAYS=14 loom-clean --dry-run
 A non-positive or unparseable value at either tier is treated as absent (falls
 through to the next tier), never as "disable retention" — a config typo can
 never silently turn this pass into a no-op.
+
+**Step logs are excluded by default (#14177).** Per-step logs
+`step-<role>-<item>.log` (the durable `LOOM_STEP_OUTCOME` history) carry no
+`issue-` in their name and are never removed by this pass unless
+`LOOM_STEP_LOG_REQUIRE_ARCHIVE=1` is set. With the gate on, a step log is
+deleted — together with its `<log>.archived` sidecar, written by the off-host
+preserver only after a checksum-confirmed store put — only when it is past the
+retention window, its item has no live sweep and no sweep checkpoint, and its
+last dispatch attempt wrote a terminal outcome line. See
+*Daily-rolling `daemon.log`* → "Step-log archive gate" in
+[`daemon-reference.md`](daemon-reference.md).
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
@@ -639,9 +650,7 @@ failed, cancelled or watchdog-cancelled); a manual spawn's, or one kept at run
 end, is collected by the orphan sweep about 10 minutes after its owner
 exits. Agents must use it (or
 their worktree's `target/`) and never create one under `/tmp`, `~`, `~/.cache`
-or `.loom/target-*`; see `cargo-target-isolation.md`. The disk-headroom
-estimate per worktree (`LOOM_PER_WORKTREE_GB`) defaults to 8 GB, measured
-from full builds of this workspace.
+or `.loom/target-*`; see `cargo-target-isolation.md`.
 
 ### Building into a private target dir you can actually delete afterwards (#8460)
 
@@ -814,6 +823,9 @@ the **destination** (the marker / `LOOM_WORKTREE_CARGO_TARGET_DIR`) by different
 rules. A genuinely session-global `CARGO_TARGET_DIR` — an operator redirecting
 *all* builds — is still honored for the main workspace, unchanged. Both are
 pinned by `tests/hooks/test-post-worktree-target-dir.sh`.
+
+When no main-workspace binary exists the hook prints a skip line and exits; it
+never runs `cargo build` (#11329), so a new worktree creates no release build.
 
 **Two attribution rules are relaxed for these directories, and only for these.**
 `<root>/wt/<the worktree's own directory name>` is checked *structurally*, so
@@ -997,7 +1009,7 @@ user-provisioned paths) have no issue state to consult and are unaffected.
 
 **What the #5919 post-mortem could and could not establish.** The ledger exists
 because this incident was *not* attributable from the evidence that existed at
-the time. Against `~/.loom/daemon.log` (+ rotations `.1`–`.5`, covering
+the time. Against `~/.loom/daemon.log` (+ day files `daemon.log.YYYY-MM-DD`, covering
 2026-08-01 → 2026-08-11) for the incident window — issue #5919 filed
 `2026-08-10T21:01:18Z`, PR #5942 opened `23:31:21Z`:
 
@@ -1136,68 +1148,6 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
-### Every merge re-stales every open PR in a consumer repo (#9589)
-
-**Symptom**: in a repo other than loom itself, each merge makes every other
-open PR's green required check (a lint job, a ratchet) stale:
-`Merge blocked: … this required check has no entry in the input-scope table
-and no declaration in .loom/stale-check-inputs.json`. Each PR then needs a
-re-date push and a fresh CI run before it can merge.
-
-**Cause**: loom's freshness guard only knows its own checks' inputs, and an
-unknown check is stale on any base move. **Fix**: commit
-`.loom/stale-check-inputs.json` on the default branch, declaring what each
-required check reads. See [stale-check-inputs](stale-check-inputs.md). If the
-refusal persists, look for a `Warning: … ignoring .loom/stale-check-inputs.json`
-line, which means the declaration was rejected and names why.
-
-### Every merge blocked by the freshness guard on a private free-plan repo (#8844)
-
-**Symptom**: on a **private** repository owned by a GitHub Free account or
-org, every `merge-pr.sh` run stops at the #8248 required-check freshness
-guard, whatever the PR looks like:
-
-```
-Error: Merge blocked: PR #N's required-check freshness guard (#8248) could not run —
-'loom-daemon merge-pr stale-checks' exited 2 without the LOOM-STALE-CHECKS-CLEAN signal.
-[...]
-
-What it reported: Merge blocked: PR #N's required-check freshness guard (#8248) could not
-determine whether the green required checks predate the base tip — ruleset lookup failed:
-gh: Upgrade to GitHub Pro or make this repository public to enable this feature. (HTTP 403)
-```
-
-`merge-pr.sh` wraps the subcommand's own refusal under `What it reported:`
-(#8873); a host whose script predates that fix prints only the outer "could
-not run" paragraph, and you have to re-run the `gh api` call below to see
-which failure it was.
-
-No flag helps: `--allow-unapproved` overrides a missing review and
-`--redate-stale-checks` re-dates a stale check; neither is this condition.
-
-**Root cause**: rulesets and branch protection are paid features for private
-repositories. `GET /repos/{owner}/{repo}/rules/branches/{branch}` answers 403
-with that message, and the guard — correctly fail-closed on any lookup it
-cannot complete — refused every merge.
-
-**Fixed in `loom-daemon merge-pr stale-checks`**: that ONE message is now read
-as "this repository's plan has no rulesets, so nothing can be a *required*
-check", the lookup yields no required contexts, and the guard returns its
-`LOOM-STALE-CHECKS-CLEAN` sentinel while printing a `Warning:` on stderr
-naming the gated source. The match is on the message, never on the status
-code — a token missing a scope, SSO enforcement and a rate-limit refusal are
-all 403s too, and there required checks may genuinely exist. Every one of
-those still exits 2 and still refuses the merge.
-
-**If you still see a block here**, read the forge error quoted under `What it
-reported:`: it is a different failure (network, auth scope, rate limit, 404,
-5xx), and the refusal names it rather than telling you to rebuild a binary
-that ran fine (#8873 — the build/install remedy is offered only when the
-subcommand printed nothing at all, i.e. it is missing or too old). Fix the
-lookup — `gh api "repos/{owner}/{repo}/rules/branches/main"` reproduces it in
-one call — rather than reaching for a `LOOM_DAEMON_BIN` shim. And if the host's
-binary predates the fix, roll it (next section).
-
 ### `merge-pr.sh` refuses after a `git pull` — roll the daemon (#8285)
 
 **Symptom**: merges on ONE host stop dead, immediately after pulling `main`,
@@ -1246,8 +1196,8 @@ loom-daemon --version
 ./.loom/scripts/merge-pr.sh <PR> --dry-run
 ```
 
-**If no artifact carries the floor yet** — releases are cut at fleet-rollable
-boundaries, not on every `VERSION` bump (see
+**If no artifact carries the floor yet** — only a green `main` commit is released and
+not every `VERSION` bump gets a tag (see
 [`release-cadence.md`](release-cadence.md)), so `main` routinely runs ahead of
 the newest published release — you have two options, both of which keep the
 fail-closed guarantee:
@@ -1265,20 +1215,17 @@ Do **not** work around it by reverting the pull or by hand-editing the refusal
 out. The guard is the only thing standing between a stale binary and a silently
 mis-closed issue.
 
-**Preventing the next one**: `scripts/check-daemon-subcommand-versions.sh`
-fails CI when a shell script gains a NEW `loom-daemon <subcommand>` dependency
-without declaring its floor:
+**Preventing the next one**: declare the floor when a shell script gains a NEW
+`loom-daemon <subcommand>` dependency:
 
 ```
 # requires-daemon: <subcommand> >= <version>   <which PR added it>
 # requires-daemon: <subcommand> optional       <how it degrades>
 ```
 
-It is a one-way ratchet over `scripts/daemon-subcommand-baseline.txt` — every
-dependency that predates the convention is grandfathered, so the gate fires
-only at the moment someone moves the floor. Run
-`scripts/check-daemon-subcommand-versions.sh --help` for the full convention,
-and `--list` to see every daemon dependency in the tree.
+In the Loom source tree, `scripts/check-daemon-subcommand-versions.sh --help`
+documents the convention and `--list` shows every daemon dependency (the
+`install-compat check` CI step reads that list).
 
 #### The same refusal, from any stub (#8385)
 
@@ -1298,9 +1245,8 @@ found, exactly like the `tokens select --model` capability probe next to it.
 The behaviour is identical whether the stub delegates its exec to
 `loom_exec_script_helper` (`lib/script-helper.sh`, which execs through
 `loom_daemon_exec_checked`) or calls `loom_daemon_version_preflight <sub>
-"$BIN"` itself one line above its own `exec` (which is what a Shape-A `stub`
-in `scripts/shell-allowlist.txt` must do to keep that category — the cap
-requires the last code line to *be* the `exec`).
+"$BIN"` itself one line above its own `exec` (the Shape-A stub pattern, whose
+last code line *is* the `exec`).
 
 Two properties are worth knowing when you meet one:
 
@@ -1354,9 +1300,7 @@ Out-of-band rolling is also where this already belongs: the daemon's own
 auto-update loop and `loom-daemon-watchdog.sh` converge the host from *outside*
 any merge. A version-floor refusal is a **symptom** of that loop being behind
 (on 2026-09-18 it was deferring behind the build-stampede guard, #8252) — fix
-it there, not by restarting the daemon from inside its own child. The secondary
-argument, that `merge-pr.sh` is frozen at its file-size-ratchet ceiling, only
-reinforces a conclusion the process model already forces.
+it there, not by restarting the daemon from inside its own child.
 
 ### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
 
@@ -1469,9 +1413,8 @@ with `git commit --allow-empty -m test && git log -1 --format='%an <%ae>'`
 ```
 
 Label sync is a manual/install-time step, not something CI re-applies when
-`.github/labels.yml` changes. (In an installed repo the script is
-`.loom/scripts/sync-labels.sh`, as above; `./scripts/install/sync-labels.sh` is
-the installer-side copy and exists only in a Loom source checkout.) If a label is
+`.github/labels.yml` changes. (The installer's Step 4 calls the same
+`.loom/scripts/sync-labels.sh`.) If a label is
 defined in `labels.yml` but missing from the live repo, applying it fails with
 `failed to update 1 issue` (the standard `gh` error for "label does not exist").
 Run the sync script — or create the one label directly — to reconcile:
@@ -2073,13 +2016,12 @@ as "which branch happened to be checked out at quarantine time," not as
 
 ### Finding outstanding quarantine stashes (#5185)
 
-**Symptom**: none — that is the problem. A quarantine is loud at the moment it
-happens (a `main-clean.quarantine` line on stderr and in
-`.loom/logs/main-quarantine.log`) and silent forever afterwards. Nothing drops
-the rescue stash, nothing reminds anyone it exists, so entries pile up: 29 on
-one host, oldest 7 days; five in a consumer repo inside 24 hours, none
-reconciled. They were noticed only because an unrelated hygiene command
-happened to count stashes.
+**Symptom**: a quarantine is loud at the moment it happens (a
+`main-clean.quarantine` line on stderr and in `.loom/logs/main-quarantine.log`).
+Its `loom-quarantine:` stash then waits for operator reconciliation. Entries
+piled up before this report existed: 29 on one host, oldest 7 days, and five
+in a consumer repo inside 24 hours with none reconciled. An unrelated hygiene
+command happened to count them.
 
 **List them**:
 
@@ -2094,10 +2036,15 @@ discoverable without knowing one happened. The report is read-only — it never
 pops, drops, or reorders anything — and exits 0 whether or not anything is
 outstanding.
 
-It covers every Loom producer that pushes to the stash stack, not just
-`check-main-clean.sh --quarantine`'s `loom-quarantine:` entries (the Auditor's
-`auditor-tmp-drift-stash-<epoch>` shelf is the other one), and flags any entry
+The report lists `loom-quarantine:` entries from `check-main-clean.sh --quarantine`
+and the Auditor's `auditor-tmp-drift-stash-<epoch>` entries. It flags entries
 that captured **nothing** — those are pure noise and safe to drop.
+
+Fleet checkout self-heal also creates `loom-rescue-<ts>` stashes. These are
+outside `--list-quarantined` and the `Quarantined work` section of `loom status`.
+The daemon automatically prunes them once they are older than the
+`LOOM_RESCUE_REF_RETAIN_DAYS` window (14 days by default). See the
+[Rescue refs note under Self-heal](daemon-reference.md#self-heal-of-a-loom-only-blockage-11425).
 
 **Reconciling an entry**:
 
@@ -2462,14 +2409,10 @@ coordination problems, not a general-purpose external-mutex library):
   scheduled" half of the pattern above, which is exactly why a resource nobody
   else ever tries to (re-)claim can stay stale-held indefinitely under this
   model alone.
-- `PeerClaimView` (`loom-daemon/src/peer_claims.rs`) is the scheduled-reaper
-  half: it expires a peer's soft claim once local receipt time exceeds a fixed
-  TTL since the *last* observed heartbeat ad (`is_claimed_at` /
-  `claimed_issues_at`), and a periodic re-advertisement
-  (`sweep_registry::readvertise_peer_claims`) refreshes that clock well inside
-  the TTL for a still-live holder — see the module doc comment's "TTL is
-  measured against LOCAL receipt, never the advertiser's clock" section for why
-  wall-clock skew across hosts rules out comparing timestamps directly.
+- The scheduled-reaper half is now the forge lease record
+  ([`lease-record.md`](lease-record.md)): a lease expires by its own
+  forge-assigned `updated_at`, and a still-live holder renews it. (The safehouse
+  peer-claim soft claim that once played this role was retired in #13945.)
 
 **Prior art establishing this as Loom's actual mitigation pattern** (both
 resolved without a kill-time hook, because none is available):
@@ -3160,6 +3103,24 @@ git push -u origin HEAD   # open a PR from here
 cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
 ```
 
+**Which file to trust while a resync PR is open (#13592).** The re-stamp of
+`.loom/install-metadata.json` (`loom_version`, `loom_commit`, `last_resync`)
+lands wherever the files land, so `--output` stamps only the staging worktree and
+the PR branch: the primary checkout's metadata keeps naming the version whose
+files it actually carries until the PR merges and you pull. A *bare* run from the
+primary checkout (or `--allow-worktree`) writes the files **and** the stamp into
+that checkout's working tree; if you then move the changes onto a PR branch and
+reset the primary, a **gitignored** metadata file (some consumers ignore it) is
+not reset and keeps reporting the target version while the tracked `.loom/` files
+on the default branch are still the old ones. So while a resync PR is open:
+treat the **default branch's tracked `.loom/` files** (e.g. `git show
+origin/<default>:.loom/install-metadata.json`, or a vendored script's content) as
+the source of truth for "which Loom is installed", not a working-tree
+`install-metadata.json`, and prefer `--output` over a bare run so the primary's
+metadata is never touched. A daemon resync (`fleet_sync/workspace_resync.rs`)
+already works in a throwaway worktree. A mid-resync interruption is recorded by
+`resync_pending` in the metadata, never by bumping `loom_version`.
+
 Or skip the hand-rolled add entirely and let
 `./.loom/scripts/land-resync-commit.sh` stage and commit for you — it stages an
 explicit allowlist of resync-surface pathspecs (never `-A`), refuses to land if
@@ -3447,23 +3408,20 @@ legitimately changed for some other reason, `git diff <old-sha> <new-sha>`
 being empty confirms the content is identical (the #6646 incident's actual
 outcome) even though the identity changed.
 
-## Worker disk full: dispatch halted `disk_full` (#10973)
+## Worker disk full (#10973)
 
-**Symptom.** `host.health` shows `dispatch_halted: true` with a `halt_reason`
-starting `disk_full: <n> GB free`, `loom-daemon status` reports the host
-breaker `open` with the same reason, and `dispatch_sweep` is refused. On the
-2026-10-08 incident a worker's worktree volume reached 0 GB and, because that
-host was the ETA authority, fleet ETAs went `stale_inputs` for hours (ETA has since been removed from Loom, #11098).
+**Symptom.** A worker's worktree volume runs out of space. Builds and clones
+fail, and sweeps on that host error out. On the 2026-10-08 incident a worker's
+worktree volume reached 0 GB.
 
-**What the daemon does by itself.** Each work-finder tick samples free GB on
-the worktree-root volume. Two consecutive readings below the floor
-(`LOOM_DISK_FULL_HALT_GB`, default 3; `0` disables) halt new dispatch. The
-eager reclaim pass (#7512) gets the first low tick to free space, so a pass
-that frees space never halts. The halt clears only at `LOOM_DISK_FULL_RESUME_GB`
-(default twice the floor). An unmeasurable probe (`df` failure) never halts and
-clears an existing halt. Running sweeps drain; nothing is killed. Grep the
-daemon log for `disk_full_halt:` (edges) and `eager_reclaim:` (what each
-reclaim step freed).
+**What the daemon does by itself.** The daemon does not halt dispatch on low
+disk; the old disk-full halt and the host-distress breaker were removed by
+#12406. Admission is capped only by `autonomous.workFinder.maxConcurrent`.
+When free space on the worktree-root volume falls below the floor
+(`autonomous.worktreeReaper.diskWarnFreeGb`), the eager reclaim pass (#7512)
+runs and frees Loom-managed space. Grep the daemon log for `eager_reclaim:`
+(what each reclaim step freed). If a host keeps filling, lower its
+`maxConcurrent` in fleet config.
 
 **Alerts.** SigNoz pages before this point (`signoz/alerts/`): `host-disk-low`
 (warning: under 30 GB or 10%, or full within 6 h at the last hour's rate) and
@@ -3480,4 +3438,12 @@ heartbeats but its work finder has not ticked for 2x its own interval.
    manual run is the way past it.
 4. Reclaim only touches Loom-managed paths. Space held by anything else (logs,
    caches, another tenant) must be freed by hand.
-5. The halt lifts within a tick or two of free space reaching the resume level.
+   **The uv cache** (`~/.cache/uv`, 28 GB on one busy host, #12460) is such a
+   path: the daemon never prunes it, because uv is a host tool provisioned from
+   the worker spec (`infra/aws/loom-worker/` in 2AMLogic/2am), not by Loom.
+   uv has no size cap, so the bound is a periodic `uv cache prune --ci` (drops
+   pre-built wheels, keeps source-built ones; add it to the worker spec's
+   housekeeping, not to a sweep) or `UV_CACHE_DIR` pointed at a volume that can
+   fill harmlessly. `uv cache prune` alone removes only unreferenced entries.
+5. If the host keeps filling, lower its `autonomous.workFinder.maxConcurrent`
+   in fleet config.

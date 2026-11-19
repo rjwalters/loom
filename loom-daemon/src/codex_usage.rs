@@ -72,9 +72,12 @@
 //! (`session_meta.session_id`, which is also the rollout filename's own uuid),
 //! so [`sessions`] reports it on every row and [`SessionFilter::ids`] accepts
 //! an explicit id set — the strictly-more-precise attribution #8507's design
-//! note asked for. It is offered rather than required: nothing in the daemon
-//! captures a launch's Codex session ids today, so directory+window remains
-//! the default, and an id set narrows it when a caller has one.
+//! note asked for. It is offered rather than required: directory+window
+//! remains the default, and an id set narrows it when a caller has one (a
+//! step's log names its own, #14048). Ids NARROW rather than replace: the
+//! directory and window constraints still apply to an id-matched rollout
+//! (`SessionFilter::matches`); only an ids-only filter (empty `directories`)
+//! drops the directory constraint.
 //!
 //! # Mapping to [`ModelUsageTotals`]
 //!
@@ -142,7 +145,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
@@ -535,12 +538,64 @@ impl Counters {
 /// by hand.
 ///
 /// `None` when the path is not an authorized rollout or cannot be opened.
-fn read_rollout(codex_home: &Path, path: &Path) -> Option<Vec<String>> {
+///
+/// `max_bytes` is a ceiling on what is held in memory: at most
+/// `max_bytes + 1` bytes are read, and a file larger than `max_bytes` yields
+/// `None`, so a rollout that grew past a caller's size check between its
+/// `stat` and this read is still never loaded whole. `u64::MAX` is no ceiling
+/// (the usage path, which streams one file at a time).
+fn read_rollout(codex_home: &Path, path: &Path, max_bytes: u64) -> Option<Vec<String>> {
     if !is_rollout_path(codex_home, path) {
         return None;
     }
-    let reader = BufReader::new(File::open(path).ok()?);
-    Some(reader.lines().map_while(Result::ok).collect())
+    let mut reader = BufReader::new(File::open(path).ok()?.take(max_bytes.saturating_add(1)));
+    let lines: Vec<String> = reader.by_ref().lines().map_while(Result::ok).collect();
+    if max_bytes != u64::MAX && reader.into_inner().limit() == 0 {
+        // `max_bytes + 1` bytes were read: the file is over the ceiling.
+        return None;
+    }
+    Some(lines)
+}
+
+/// One authorized rollout path, paired with the home whose
+/// [`is_rollout_path`] gate it passed. Only [`rollout_paths`] constructs one,
+/// so [`RolloutPath::read_capped`] can only ever open a discovered rollout.
+#[derive(Debug, Clone)]
+pub struct RolloutPath {
+    home: PathBuf,
+    path: PathBuf,
+}
+
+impl RolloutPath {
+    /// The rollout file's path, for `stat` and ledger keys.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read this rollout's lines through [`read_rollout`]'s guard, holding at
+    /// most `max_bytes` of it: `None` when it is unreadable or larger than
+    /// `max_bytes`.
+    #[must_use]
+    pub fn read_capped(&self, max_bytes: u64) -> Option<Vec<String>> {
+        read_rollout(&self.home, &self.path, max_bytes)
+    }
+}
+
+/// Every rollout across every [`codex_homes`] store that could hold a session
+/// inside `window`, **unread**, for consumers that need the raw lines (the
+/// `session.summary` adapter, [`crate::activity::codex_summary`]). The caller
+/// stats each one and decides whether to read it, so an unchanged or
+/// oversized rollout is never opened.
+#[must_use]
+pub fn rollout_paths(
+    home: Option<&Path>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Vec<RolloutPath> {
+    discover_home_rollouts(home, window)
+        .into_iter()
+        .map(|(home, path)| RolloutPath { home, path })
+        .collect()
 }
 
 /// Fold one rollout's lines into per-model rows.
@@ -695,7 +750,7 @@ pub fn sessions(
 ) -> Vec<CodexSessionUsage> {
     let mut all: Vec<CodexSessionUsage> = discover_home_rollouts(home, window)
         .into_iter()
-        .filter_map(|(root, path)| read_rollout(&root, &path))
+        .filter_map(|(root, path)| read_rollout(&root, &path, u64::MAX))
         .flat_map(|lines| fold_rollout(&lines, filter, window))
         .collect();
     all.sort_by(|a, b| {

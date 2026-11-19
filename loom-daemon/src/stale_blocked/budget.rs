@@ -6,8 +6,10 @@
 //! one epic #10332 is keeping clear. So the run checks before it spends:
 //!
 //! - **Before gathering**: after the candidate listing (a free `304` when
-//!   nothing moved), the free `/rate_limit` + GraphQL `rateLimit` probe
-//!   ([`crate::rate_limit_breaker::forge::probe_budget_ctx`]) is compared with
+//!   nothing moved), the budget
+//!   ([`crate::rate_limit_breaker::forge::probe_budget_ctx`] — cached and
+//!   header-refreshed, one free `/rate_limit` only on a cold start, #12204)
+//!   is compared with
 //!   the run's projected cost ([`project`]). If the run would take either
 //!   bucket below its floor, nothing is gathered: every artifact is reported
 //!   *not evaluated*, and the advisory still exits 0 ([`refusal`]).
@@ -132,20 +134,78 @@ pub fn project(selected: &[(Artifact, RestIssue)]) -> Projection {
     }
 }
 
+/// Which rate-limit bucket a floor stop is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bucket {
+    Core,
+    Graphql,
+}
+
+impl Bucket {
+    /// The bucket's name as the refusal text renders it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Graphql => "graphql",
+        }
+    }
+}
+
+/// A budget-floor stop, typed (#12036). Its `Display` is the exact refusal
+/// text the run has always reported; the numbers are the readings that
+/// decided it, so no consumer has to parse the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloorStop {
+    pub bucket: Bucket,
+    pub remaining: u64,
+    pub floor: u64,
+    /// The run's projected cost, for a pre-run refusal.
+    pub projected: Option<u64>,
+    /// The stop happened between reads rather than before the run.
+    pub mid_run: bool,
+}
+
+impl std::fmt::Display for FloorStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (name, remaining, min) = (self.bucket.as_str(), self.remaining, self.floor);
+        match (self.mid_run, self.projected) {
+            (false, Some(cost)) => write!(
+                f,
+                "budget floor: {name} remaining {remaining}, projected {cost}, floor {min} — \
+                 not evaluated this run (advisory; exit 0)"
+            ),
+            _ => write!(
+                f,
+                "budget floor reached mid-run: {name} remaining {remaining} < floor {min} — not \
+                 evaluated (advisory; exit 0)"
+            ),
+        }
+    }
+}
+
+/// Why the run must not start, typed; see [`refusal`].
+#[must_use]
+pub fn refusal_stop(budget: &Budget, projected: Projection, floor: Floor) -> Option<FloorStop> {
+    let check = |bucket: Bucket, remaining: u64, cost: u64, min: u64| {
+        (cost > 0 && remaining.saturating_sub(cost) < min).then_some(FloorStop {
+            bucket,
+            remaining,
+            floor: min,
+            projected: Some(cost),
+            mid_run: false,
+        })
+    };
+    check(Bucket::Graphql, budget.graphql_remaining, projected.graphql, floor.graphql)
+        .or_else(|| check(Bucket::Core, budget.core_remaining, projected.core, floor.core))
+}
+
 /// Why the run must not start, or `None` when it fits above both floors. A
 /// bucket the run does not draw on (projected `0`) is never a reason.
 #[must_use]
 pub fn refusal(budget: &Budget, projected: Projection, floor: Floor) -> Option<String> {
-    let check = |name: &str, remaining: u64, cost: u64, min: u64| {
-        (cost > 0 && remaining.saturating_sub(cost) < min).then(|| {
-            format!(
-                "budget floor: {name} remaining {remaining}, projected {cost}, floor {min} — \
-                 not evaluated this run (advisory; exit 0)"
-            )
-        })
-    };
-    check("graphql", budget.graphql_remaining, projected.graphql, floor.graphql)
-        .or_else(|| check("core", budget.core_remaining, projected.core, floor.core))
+    refusal_stop(budget, projected, floor).map(|s| s.to_string())
 }
 
 /// Mid-run floor checks over the [`Meter`]'s latest readings. The first stop
@@ -171,7 +231,7 @@ impl Guard {
     /// # Errors
     /// The latest core reading is below the floor; the reason to report.
     pub fn core(&mut self, meter: &Meter) -> Result<(), String> {
-        self.check("core", meter.core_remaining, self.floor.core)
+        self.core_stop(meter).map_err(|s| s.to_string())
     }
 
     /// May another GraphQL query be made?
@@ -179,18 +239,37 @@ impl Guard {
     /// # Errors
     /// The latest GraphQL reading is below the floor; the reason to report.
     pub fn graphql(&mut self, meter: &Meter) -> Result<(), String> {
-        self.check("graphql", meter.graphql_remaining, self.floor.graphql)
+        self.graphql_stop(meter).map_err(|s| s.to_string())
     }
 
-    fn check(&mut self, name: &str, remaining: Option<u64>, min: u64) -> Result<(), String> {
+    /// [`Self::core`], with the typed stop.
+    ///
+    /// # Errors
+    /// The latest core reading is below the floor.
+    pub fn core_stop(&mut self, meter: &Meter) -> Result<(), FloorStop> {
+        self.check(Bucket::Core, meter.core_remaining, self.floor.core)
+    }
+
+    /// [`Self::graphql`], with the typed stop.
+    ///
+    /// # Errors
+    /// The latest GraphQL reading is below the floor.
+    pub fn graphql_stop(&mut self, meter: &Meter) -> Result<(), FloorStop> {
+        self.check(Bucket::Graphql, meter.graphql_remaining, self.floor.graphql)
+    }
+
+    fn check(&mut self, bucket: Bucket, remaining: Option<u64>, min: u64) -> Result<(), FloorStop> {
         match remaining {
             Some(r) if r < min => {
-                let why = format!(
-                    "budget floor reached mid-run: {name} remaining {r} < floor {min} — not \
-                     evaluated (advisory; exit 0)"
-                );
-                self.stopped.get_or_insert_with(|| why.clone());
-                Err(why)
+                let stop = FloorStop {
+                    bucket,
+                    remaining: r,
+                    floor: min,
+                    projected: None,
+                    mid_run: true,
+                };
+                self.stopped.get_or_insert_with(|| stop.to_string());
+                Err(stop)
             }
             _ => Ok(()),
         }
@@ -211,6 +290,10 @@ pub struct ForgeCost {
     /// The probe's reading before gathering; `None` when it did not answer
     /// (or nothing needed gathering).
     pub budget_before: Option<Budget>,
+    /// The release pass's phase-1 probe reading, kept rather than dropped
+    /// (#12036). Telemetry only; not part of the `--json` object.
+    #[serde(skip)]
+    pub budget_at_start: Option<Budget>,
     pub projected: Projection,
     pub floor: Floor,
     /// Why nothing was gathered (pre-run floor, or the breaker).

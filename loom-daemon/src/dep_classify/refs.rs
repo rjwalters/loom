@@ -77,20 +77,64 @@ fn bare_ref_re() -> &'static Regex {
 /// collation the scripts run with, and `BTreeSet` gives both properties at once.
 #[must_use]
 pub fn parse_dependency_refs(body: &str, default_repo: &str) -> Vec<String> {
-    let mut out: BTreeSet<String> = BTreeSet::new();
+    dependency_lines(body, default_repo)
+        .into_iter()
+        .flat_map(|(_, refs)| refs)
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
+}
 
+/// The dependency-declaring lines of `body` (original text), each with the
+/// normalised refs it yields, in body order.
+///
+/// This is [`parse_dependency_refs`] before the set is flattened, so the cycle
+/// report can quote the line that produced an edge. Double-quoted and
+/// backticked spans are masked first ([`mask_quoted_spans`]): a phrase or
+/// reference inside them describes some other issue rather than declaring a
+/// dependency of this one (#13303).
+#[must_use]
+pub fn dependency_lines(body: &str, default_repo: &str) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
     for line in body.lines() {
-        if !line_re().is_match(line) {
+        let masked = mask_quoted_spans(line);
+        if !line_re().is_match(&masked) {
             continue;
         }
-        for m in ref_re().find_iter(line) {
-            if let Some(normalised) = normalise(m.as_str(), default_repo) {
-                out.insert(normalised);
+        let refs: Vec<String> = ref_re()
+            .find_iter(&masked)
+            .filter_map(|m| normalise(m.as_str(), default_repo))
+            .collect();
+        out.push((line.to_string(), refs));
+    }
+    out
+}
+
+/// Replace every closed `"…"` and `` `…` `` span in `line` with spaces.
+///
+/// Only a span with a closing delimiter is masked: an unmatched opening quote
+/// leaves the rest of the line intact, so a stray `"` can never hide a real
+/// `Blocked by #3`. Apostrophes are not delimiters.
+fn mask_quoted_spans(line: &str) -> String {
+    let mut chars: Vec<char> = line.chars().collect();
+    for delim in ['"', '`'] {
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] != delim {
+                i += 1;
+                continue;
             }
+            let Some(rel) = chars[i + 1..].iter().position(|&c| c == delim) else {
+                break;
+            };
+            let close = i + 1 + rel;
+            for c in &mut chars[i..=close] {
+                *c = ' ';
+            }
+            i = close + 1;
         }
     }
-
-    out.into_iter().collect()
+    chars.into_iter().collect()
 }
 
 /// Every blocker `body` **names**, normalised to `owner/repo#N`, sorted and

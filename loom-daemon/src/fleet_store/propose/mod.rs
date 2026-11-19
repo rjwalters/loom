@@ -40,8 +40,6 @@ mod state_edit;
 mod weight_edit;
 mod yaml_edit;
 
-use std::path::Path;
-
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose;
 use base64::Engine as _;
@@ -73,7 +71,7 @@ pub struct Proposal {
     pub branch: String,
     /// PR title.
     pub title: String,
-    /// PR body, including the hidden provenance marker.
+    /// PR body.
     pub body: String,
     /// The files it changes. Never empty — a proposal with nothing to change
     /// is not opened at all (the caller reports "nothing to propose" before
@@ -224,39 +222,6 @@ pub fn drop_unchanged(files: Vec<FileChange>) -> Vec<FileChange> {
 #[must_use]
 pub fn branch_name(kind: &str, stamp: &str) -> String {
     format!("loom/fleet-propose/{kind}-{stamp}")
-}
-
-/// Build the hidden provenance marker for a store PR (#9027 v1, see
-/// [`crate::provenance`]). Unlike [`crate::provenance::marker::collect`],
-/// this never inspects a local git checkout of the *store* — there isn't
-/// one; every store write goes through the forge API — so `base` is simply
-/// the commit this proposal branched from, which [`submit`] already
-/// requires as an argument, rather than something derived from `git
-/// merge-base` against a checkout that does not exist.
-#[must_use]
-pub fn provenance_marker(daemon_workspace: &Path, base_commit: &str) -> String {
-    use crate::provenance::{marker, NONE, UNKNOWN};
-    let host = crate::sweep_registry::host_identity();
-    marker::Marker {
-        build: crate::self_update::BUILD_STAMP.to_string(),
-        prompts: marker::prompts_field(daemon_workspace),
-        sweep: std::env::var("LOOM_SWEEP_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| NONE.to_string()),
-        story: NONE.to_string(),
-        trace: UNKNOWN.to_string(),
-        host: if host == crate::sweep_registry::UNKNOWN_HOST {
-            UNKNOWN.to_string()
-        } else {
-            host
-        },
-        base: base_commit.to_string(),
-        run: marker::run_field(|k| std::env::var(k).ok()),
-        installs: None,
-        origin: Some(crate::provenance::origin::WorkOrigin::from_env()),
-    }
-    .render()
 }
 
 #[cfg(test)]

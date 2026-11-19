@@ -14,16 +14,18 @@
 //!   [`OutputContract::Captured`] (a passthrough stream cannot be retried);
 //! - the target is an explicit `owner/repo` ([`GhTarget::Repo`]), or (W4-C)
 //!   the facade derived one for an untargeted read ([`super::cwd_route`]);
-//! - the caller did not pick a credential itself
-//!   ([`GhInvocation::gh_config_dir`], [`GhInvocation::without_token_env`])
-//!   and does not route its own reads ([`GhInvocation::identity_role`]);
+//! - the caller does not route its own reads (a reader credential it chose,
+//!   [`GhInvocation::gh_config_dir`] with [`GhInvocation::identity_role`]
+//!   `Reader`). Any other credential a caller hands a read is set aside
+//!   first (#12584, [`GhInvocation::route_site_credential`]), so it does not
+//!   keep the read off the readers;
 //! - the caller did not pin the writer ([`GhInvocation::writer_identity`]),
 //!   which a read whose answer depends on **who** asks (a permission or
 //!   write-scope probe, `viewer`, `/user`) must do;
 //! - a fresh reader exists for the repo
 //!   ([`crate::forge_identity::route_read`]). With no readers configured
-//!   this is always [`RouteDecision::NoPool`], so such a host behaves
-//!   byte-for-byte as before.
+//!   this is always [`RouteDecision::NoPool`]: such a host has no reader to
+//!   be out of budget, so its reads run on the only credential it has.
 //!
 //! The request carries its [`super::affinity_key`] (W4-B), so a repo in
 //! `forge.readPool.routing.splitRepos` spreads its reads across the pool
@@ -32,19 +34,15 @@
 //!
 //! The reader attempt runs with every token env var removed: `gh` prefers an
 //! env `GH_TOKEN` / `GITHUB_TOKEN` over `GH_CONFIG_DIR`, so an ambient
-//! personal token would otherwise serve the "reader" read. A credential
-//! failure falls back to the writer through the shared
-//! [`crate::forge_identity::reader_then_writer`] shape.
-//!
-//! Since W4-C [`GhInvocation::execute`] runs the class-aware chain in
-//! [`v2`] instead; `LOOM_READ_ROUTING=legacy` keeps the
-//! [`GhInvocation::execute_routed`] path below exactly.
+//! personal token would otherwise serve the "reader" read. A read **never**
+//! falls back to the writer (#12394): [`GhInvocation::execute`] runs the
+//! reader-only chain in [`v2`], which sheds a read no reader can serve.
 
 use super::{AccessIntent, GhCompletion, GhInvocation, OutputContract};
 use crate::forge_bucket_book::Resource;
 use crate::forge_gateway::outage::Fault;
-use crate::forge_identity::{self, Failure, IdentityRole, ReadClass, RouteDecision, RouteRequest};
-use crate::proc_exec::{Completion, ExecError};
+use crate::forge_identity::{self, Failure, IdentityRole, RouteDecision, RouteRequest};
+use crate::proc_exec::Completion;
 
 /// One read's [`RouteRequest`] → where it goes
 /// ([`forge_identity::route_read`] in production).
@@ -71,80 +69,17 @@ impl GhInvocation {
             None
         }
     }
-
-    /// [`GhInvocation::execute`]'s routing step, with the reader lookup and
-    /// the withdrawal injected (production passes
-    /// [`forge_identity::route_read`] / [`forge_identity::withdraw_after`]).
-    /// [`RouteDecision::NoPool`] and [`RouteDecision::Exhausted`] both run on
-    /// the writer here: every read is [`ReadClass::Gate`] until W4-C.
-    pub(super) fn execute_routed(
-        self,
-        lookup: ReaderLookup<'_>,
-        withdraw: Withdraw<'_>,
-    ) -> Result<GhCompletion, ExecError> {
-        let Some(slug) = self.reader_slug() else {
-            return self.execute_direct();
-        };
-        let host = super::accounting::resolved_identity(&self).origin;
-        // W4-A: the pool this call spends, so a reader withdrawn from this
-        // owner's `core` still serves its `graphql` reads (and vice versa).
-        let resource = Resource::of_pool(super::accounting::static_pool(&self.args));
-        let affinity = super::affinity_key(&self.args);
-        let request = RouteRequest {
-            owner_repo: &slug,
-            host: host.as_deref(),
-            resource,
-            affinity_key: Some(&affinity),
-            class: ReadClass::Gate,
-        };
-        let Some((dir, app_id)) = lookup(&request).into_credential() else {
-            return self.execute_direct();
-        };
-        let outage = std::cell::Cell::new(false);
-        forge_identity::reader_then_writer(
-            Some(dir.as_path()),
-            |reader_dir, role| {
-                let inv = self.clone().identity_role(role);
-                match reader_dir {
-                    Some(d) => inv
-                        .identity_bucket(&forge_identity::reader_bucket(&app_id, &slug))
-                        .gh_config_dir(Some(d))
-                        .without_token_env(),
-                    None => inv,
-                }
-                .execute_direct()
-            },
-            succeeded,
-            |result| {
-                // 2am#4367 P4: a gateway outage falls back to the writer
-                // (legacy routing has no reader spill) and withdraws the
-                // gateway for the default window, not as a credential.
-                if app_id == crate::forge_gateway::GATEWAY_APP_ID {
-                    let fault = gateway_fault(result);
-                    if fault.reruns() {
-                        outage.set(true);
-                        if fault == Fault::Withdraw {
-                            withdraw_gateway_outage(self.operation.as_str());
-                        }
-                        return Some(Failure::Credential);
-                    }
-                }
-                failure_of(result, resource)
-            },
-            |failure, _| {
-                if outage.get() {
-                    return;
-                }
-                let why = format!("{} via the gh choke point", self.operation.as_str());
-                withdraw(&app_id, &slug, failure, &why);
-            },
-        )
-    }
 }
 
 /// What a failed gateway attempt calls for
 /// ([`crate::forge_gateway::outage::fault`]); a timeout reruns.
 pub(super) fn gateway_fault(result: &GhCompletion) -> Fault {
+    crate::forge_gateway::outage::escalate(classify_gateway_fault(result))
+}
+
+/// [`gateway_fault`] for one attempt alone, before the consecutive-rerun
+/// escalation (#12074).
+fn classify_gateway_fault(result: &GhCompletion) -> Fault {
     let out = match result {
         GhCompletion::Captured(Completion::TimedOut { .. }) => return Fault::Rerun,
         GhCompletion::Captured(Completion::Exited(out)) if !out.status.success() => out,
@@ -207,11 +142,8 @@ pub(super) fn role_of(inv: &GhInvocation) -> IdentityRole {
 
 #[path = "reader_route_v2.rs"]
 mod v2;
-pub use v2::{ShedPolicy, READ_SHED_ENV, SHED_MARKER};
-
-#[cfg(test)]
-#[path = "reader_route_tests.rs"]
-mod tests;
+pub(crate) use v2::ShedWhy;
+pub use v2::{host_has_read_pool, SHED_MARKER};
 
 #[cfg(test)]
 #[path = "reader_route_v2_tests.rs"]
@@ -220,3 +152,7 @@ mod v2_tests;
 #[cfg(test)]
 #[path = "reader_route_gateway_tests.rs"]
 mod gateway_tests;
+
+#[cfg(test)]
+#[path = "reader_only_tests.rs"]
+mod reader_only_tests;

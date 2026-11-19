@@ -4,14 +4,14 @@
 //! Brand-new logic, native from the start per the shell-language policy; the
 //! vendored `resync-installed.sh` is not modified and never reads the sidecar,
 //! so pin protection is identical with or without a daemon that knows this
-//! command. Logic lives in [`loom_daemon::resync_pin`]; see
+//! command. Logic lives in [`crate::resync_pin`]; see
 //! `defaults/docs/repo-owned-files.md` §"Recording a pin's fork point".
 
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 
-use loom_daemon::resync_pin::{self, AddOptions, BaseOutcome};
+use crate::resync_pin::{self, AddOptions, BaseOutcome};
 
 #[derive(clap::Subcommand)]
 pub(crate) enum ResyncPinCommand {

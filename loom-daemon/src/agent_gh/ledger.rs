@@ -55,8 +55,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use super::classify::is_slug;
 use crate::forge_call_stats::{self, CallAttribution, CallIdentity, Outcome, Pool};
+use crate::forge_slug::valid_slug;
 use crate::gh_invocation::accounting::{self, CredAttr};
 
 /// The role label of a session with no `LOOM_ROLE`.
@@ -153,7 +153,7 @@ fn repo_in_api_path(words: &[String]) -> Option<String> {
         let rest = a.trim_start_matches('/').strip_prefix("repos/")?;
         let mut parts = rest.split(['/', '?']);
         let slug = format!("{}/{}", parts.next()?, parts.next()?);
-        is_slug(&slug).then_some(slug)
+        valid_slug(&slug).then_some(slug)
     })
 }
 
@@ -175,6 +175,9 @@ pub struct Row {
     pub identity: CallIdentity,
     pub pool: Pool,
     pub attribution: CallAttribution,
+    /// The `owner/repo` the row is booked under (#13170: the write span's
+    /// `github.repo`), when one was resolved.
+    pub repo: Option<String>,
 }
 
 /// The row for one passthrough, or `None` for a call that is not booked.
@@ -201,12 +204,12 @@ pub fn plan(
     // a repo this row cannot: it is left unattributed, never guessed from
     // the checkout.
     let (repo, origin) = if let Some(flag) = repo_flag(&words) {
-        match Some(flag).filter(|r| is_slug(r)) {
+        match Some(flag).filter(|r| valid_slug(r)) {
             Some(repo) => (Some(repo), "target"),
             None => (None, "none"),
         }
     } else if let Some(repo) =
-        repo_in_api_path(&words).or_else(|| session.gh_repo.clone().filter(|r| is_slug(r)))
+        repo_in_api_path(&words).or_else(|| session.gh_repo.clone().filter(|r| valid_slug(r)))
     {
         (Some(repo), "target")
     } else if let Some(repo) = remote() {
@@ -222,6 +225,7 @@ pub fn plan(
     if let Some(repo) = &repo {
         identity = identity.with_repo(repo);
     }
+    let booked_repo = repo.clone();
     let attribution = CallAttribution {
         ro: Some(origin.to_string()),
         ca: forge_call_stats::sanitize(&cred.account),
@@ -246,15 +250,39 @@ pub fn plan(
         identity,
         pool,
         attribution,
+        repo: booked_repo,
     })
 }
 
-/// Book the passthrough of `args` (see the module docs). Never fails, never
-/// panics into the caller.
-pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::FrontRoute) {
-    let _ = std::panic::catch_unwind(|| {
+/// Book the passthrough of `args` (see the module docs), run under `profile`
+/// — a gateway profile or a reader App's directory — or, when `None`, the
+/// session's own credential. `read` is the front's classification. Never
+/// fails, never panics into the caller.
+pub fn book(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    profile: Option<&Path>,
+    read: bool,
+) -> Option<String> {
+    book_as(args, cwd, profile, read, Outcome::Ok)
+}
+
+/// Book a read the front shed instead of exec'ing it on the writer (#12394):
+/// the same row as [`book`], `o=shed`.
+pub fn book_shed(args: &[OsString], cwd: Option<&Path>) {
+    let _ = book_as(args, cwd, None, true, Outcome::Shed);
+}
+
+fn book_as(
+    args: &[OsString],
+    cwd: Option<&Path>,
+    profile: Option<&Path>,
+    read: bool,
+    outcome: Outcome,
+) -> Option<String> {
+    std::panic::catch_unwind(|| {
         if std::env::var_os(crate::gh_invocation::BOOKED_ENV).is_some_and(|v| v == "1") {
-            return;
+            return None;
         }
         let var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
         let session = Session {
@@ -262,14 +290,15 @@ pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::Fr
             host: var("GH_HOST"),
             gh_repo: var("GH_REPO"),
         };
-        // A gateway-routed read runs under its profile with every env token
-        // removed (2am#4367 P4); anything else under the session's own.
-        let dir = route.gateway.clone().or_else(|| {
+        // A gateway- or reader-routed read runs under that directory with
+        // every env token removed (2am#4367 P4, #12245); anything else under
+        // the session's own.
+        let dir = profile.map(Path::to_path_buf).or_else(|| {
             std::env::var_os("GH_CONFIG_DIR")
                 .filter(|d| !d.is_empty())
                 .map(std::path::PathBuf::from)
         });
-        let env_token = route.gateway.is_none()
+        let env_token = profile.is_none()
             && ["GH_TOKEN", "GITHUB_TOKEN"]
                 .iter()
                 .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
@@ -277,17 +306,21 @@ pub fn book(args: &[OsString], cwd: Option<&Path>, route: &super::read_route::Fr
         let remote = || cwd.and_then(|dir| bounded_remote("git", dir, REMOTE_BUDGET));
         if let Some(mut row) = plan(args, &session, &cred, remote) {
             row.attribution.rt =
-                Some(crate::forge_gateway::route_label(cred.kind, route.read).to_string());
+                Some(crate::forge_gateway::route_label(cred.kind, read).to_string());
             forge_call_stats::record_attributed(
                 row.caller,
                 &row.identity,
                 row.pool,
-                Outcome::Ok,
+                outcome,
                 None,
                 &row.attribution,
             );
+            return row.repo;
         }
-    });
+        None
+    })
+    .ok()
+    .flatten()
 }
 
 #[cfg(test)]

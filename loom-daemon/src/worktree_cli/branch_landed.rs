@@ -76,8 +76,12 @@
 //!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
 //!   reasons.
 
+use crate::fs_util::is_executable;
+use crate::git_merge_tree::merge_tree_in_version;
 use std::path::Path;
 use std::process::Command;
+
+use super::wip::{git_ok, git_stdout};
 
 /// What the ladder concluded. Mirrors the shell's stdout token exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -503,17 +507,6 @@ fn on_path(program: &str) -> bool {
     })
 }
 
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
-}
-
 /// Accept a local branch, a remote branch, a bare ref name, or any rev —
 /// the shell's `_branch_landed_resolve_branch` order exactly.
 fn resolve_branch(repo: &Path, branch: &str) -> Option<String> {
@@ -577,31 +570,13 @@ fn commit(repo: &Path, rev: &str) -> Option<String> {
 /// `LOOM_BRANCH_LANDED_GIT_VERSION` overrides detection, the same seam the
 /// shell exposes so a test can simulate a pre-2.38 host.
 fn supports_merge_tree() -> bool {
-    let version = std::env::var("LOOM_BRANCH_LANDED_GIT_VERSION")
+    match std::env::var("LOOM_BRANCH_LANDED_GIT_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
-        .or_else(|| {
-            let out = Command::new("git").arg("--version").output().ok()?;
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .nth(2)
-                .map(str::to_string)
-        });
-    version.as_deref().is_some_and(merge_tree_in_version)
-}
-
-/// The version predicate on its own, so it can be pinned without a `git` or an
-/// environment variable.
-fn merge_tree_in_version(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let Some(Ok(major)) = parts.next().map(str::parse::<u32>) else {
-        return false;
-    };
-    let minor = parts
-        .next()
-        .and_then(|m| m.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 2 || (major == 2 && minor >= 38)
+    {
+        Some(version) => merge_tree_in_version(&version),
+        None => crate::git_merge_tree::supports_merge_tree(None),
+    }
 }
 
 enum MergeTree {
@@ -637,28 +612,6 @@ fn merge_tree_write_tree(repo: &Path, default_sha: &str, tip: &str) -> MergeTree
         Some(1) => MergeTree::Conflict,
         _ => MergeTree::NoAnswer,
     }
-}
-
-fn git_ok(repo: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 #[cfg(test)]

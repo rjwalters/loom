@@ -82,3 +82,8 @@ fn isolate_daemon_state_strips_the_inherited_supervisor() {
         .map(|(_, v)| v);
     assert_eq!(supervisor, Some(None), "LOOM_DAEMON_SUPERVISOR must be removed");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

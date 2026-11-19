@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::sparse;
+use crate::worktree_cli::sparse;
 
 /// Which retired block this invocation is. Kebab-case on the command line.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

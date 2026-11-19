@@ -743,3 +743,8 @@ fn the_throughput_question_reports_both_grains_portably() {
          derivation is what makes the week number exact without the %V/%G modifiers (#9433)"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

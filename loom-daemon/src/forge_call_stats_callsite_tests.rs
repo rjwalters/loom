@@ -149,11 +149,39 @@ fn observed_vs_inventory_diff_covers_both_directions() {
         .with_provider("github")
         .with_origin("github.com")
         .with_repo("acme/app");
-    record_with_identity("diff_listing", &gh_row, Pool::Core, Outcome::Ok, None);
-    record_with_identity("diff_listing", &gh_row, Pool::Core, Outcome::NotModified, None);
+    record_attributed(
+        "diff_listing",
+        &gh_row,
+        Pool::Core,
+        Outcome::Ok,
+        None,
+        &CallAttribution::default(),
+    );
+    record_attributed(
+        "diff_listing",
+        &gh_row,
+        Pool::Core,
+        Outcome::NotModified,
+        None,
+        &CallAttribution::default(),
+    );
     let stray = CallIdentity::operation("made.up-operation");
-    record_with_identity("diff_typo_site", &stray, Pool::Core, Outcome::Ok, None);
-    record("diff_unmapped_site", Pool::Graphql, Outcome::Ok, None);
+    record_attributed(
+        "diff_typo_site",
+        &stray,
+        Pool::Core,
+        Outcome::Ok,
+        None,
+        &CallAttribution::default(),
+    );
+    record_attributed(
+        "diff_unmapped_site",
+        &CallIdentity::default(),
+        Pool::Graphql,
+        Outcome::Ok,
+        None,
+        &CallAttribution::default(),
+    );
     let seen = observed_operations(Utc::now()).expect("sink opted in");
     set_test_sink_dir(None);
 

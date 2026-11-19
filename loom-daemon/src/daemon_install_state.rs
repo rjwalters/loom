@@ -372,17 +372,9 @@ impl EnvOverrides {
 }
 
 // ============================================================================
-// Path resolution — mirrors `main.rs::resolve_loom_dir` / `daemon_heartbeat`
-// deliberately (both are tiny; kept in sync by inspection rather than shared,
-// same rationale `daemon_heartbeat.rs` documents for its own copy).
+// Path resolution — via the shared [`crate::autonomy_marker::resolve_loom_dir`]
+// (#13833): the parent of `LOOM_SOCKET_PATH` when set, else `~/.loom`.
 // ============================================================================
-
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
-}
 
 /// Resolve the autonomy-desired marker path: `LOOM_AUTONOMY_MARKER` env
 /// override first (matching `loom-daemon-start.sh`'s `INTENT_MARKER`), else
@@ -1024,7 +1016,8 @@ pub(crate) fn classify_with_process_age_fn(
 }
 
 /// Production entry point: resolves the loom dir + marker path from env
-/// (mirroring `main.rs::resolve_loom_dir` / `loom-daemon-watchdog.sh`) and
+/// (via the shared [`crate::autonomy_marker::resolve_loom_dir`], matching
+/// `loom-daemon-watchdog.sh`) and
 /// classifies. Returns `None` only when no loom dir can be resolved at all
 /// (no `LOOM_SOCKET_PATH` and no home directory) — the caller should fall
 /// back to the pre-#4069 generic message in that case. This function never
@@ -1032,7 +1025,7 @@ pub(crate) fn classify_with_process_age_fn(
 /// read plus at most two read-only subprocess calls (`launchctl`, `kill -0`).
 #[must_use]
 pub fn probe() -> Option<InstallStateReport> {
-    let loom_dir = resolve_loom_dir()?;
+    let loom_dir = crate::autonomy_marker::resolve_loom_dir()?;
     let marker_path = resolve_marker_path(&loom_dir);
     Some(classify(&loom_dir, &marker_path, &EnvOverrides::from_env()))
 }
@@ -1386,7 +1379,7 @@ pub fn classify_protection(
 /// whatever this reports).
 #[must_use]
 pub fn probe_protection() -> Option<ProtectionReport> {
-    let loom_dir = resolve_loom_dir()?;
+    let loom_dir = crate::autonomy_marker::resolve_loom_dir()?;
     let marker_path = resolve_marker_path(&loom_dir);
     let env = ProtectionEnv::from_env();
     let domain_override = env.launchd_domain_override.clone();
@@ -2870,9 +2863,19 @@ mod tests {
             ),
         );
 
-        let provisioned = with_path_prefix(stub_dir.path(), || {
-            launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("custom/1"))
-        });
+        // The probe is bounded by the production `PROBE_TIMEOUT`; on a starved
+        // host the stub can miss it, which degrades to `None` (unknown). Ask
+        // again until the probe answers, with a generous bound. Only the
+        // answer is asserted, never how long it took.
+        let give_up = Instant::now() + Duration::from_secs(90);
+        let provisioned = loop {
+            let answer = with_path_prefix(stub_dir.path(), || {
+                launchctl_job_provisioned(DEFAULT_LAUNCHD_LABEL, Some("custom/1"))
+            });
+            if answer.is_some() || Instant::now() >= give_up {
+                break answer;
+            }
+        };
 
         assert_eq!(
             provisioned,

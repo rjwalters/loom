@@ -524,22 +524,6 @@ fn dead_daemon_exits_two_and_marks_other_sections_unknown() {
 // Observability section (#4830)
 // ===================================================================
 
-/// An inputs fixture whose daemon has confirmed a host-identity mismatch —
-/// the live 2026-07-31 shape (the Studio's key bound to `robb-pro`).
-fn mismatched_inputs(age_secs: i64) -> HealthInputs {
-    let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = Some(crate::types::ObservabilityHostIdMismatch {
-        daemon_host_id: "robb-studio".to_string(),
-        ingest_host_id: "robb-pro".to_string(),
-        first_seen_at: now() - chrono::Duration::seconds(age_secs),
-    });
-    inputs
-}
-
 #[test]
 fn no_observability_section_when_the_host_ids_agree() {
     // AC: "no behavior change when they match" — a healthy daemon's report
@@ -556,11 +540,7 @@ fn no_observability_section_for_a_disabled_or_keyless_exporter() {
     // `None` on the wire — indistinguishable, by design, from "enabled and
     // correctly bound".
     let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = None;
+    inputs.status.as_mut().unwrap().observability_export = None;
     assert!(assess_observability(&inputs).is_none());
 }
 
@@ -569,23 +549,6 @@ fn no_observability_section_when_the_daemon_is_unreachable() {
     let mut inputs = healthy_inputs();
     inputs.status = None;
     assert!(assess_observability(&inputs).is_none());
-}
-
-#[test]
-fn a_host_id_mismatch_is_a_degraded_observability_note() {
-    let report = assess(&mismatched_inputs(3600));
-    let section = report.section("observability").expect("section present");
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.contains("robb-pro") && section.summary.contains("robb-studio"),
-        "the note must name BOTH identities: {}",
-        section.summary
-    );
-    assert_eq!(section.detail["daemon_host_id"], "robb-studio");
-    assert_eq!(section.detail["ingest_host_id"], "robb-pro");
-    assert_eq!(section.detail["first_seen_age_secs"], 3600);
-    assert_eq!(report.overall, Verdict::Degraded);
-    assert_eq!(report.exit_code(), EXIT_DEGRADED);
 }
 
 // ===================================================================
@@ -599,170 +562,6 @@ fn dispatch_reports_last_tick_reason_summary() {
     assert!(section
         .summary
         .contains("12 seen, 2 dispatched, 10 in-flight-skip"));
-}
-
-/// #5177 AC4 (re-scoped #5270): `disk_binds_cap` is the strict-minimum
-/// test against `configured_max` (never merely tied), and ties WITH ram
-/// resolve to disk (matching `calibrate::binding_term`'s tie-break order).
-/// The token axis no longer participates in the cap at all.
-#[test]
-fn disk_binds_cap_only_when_smallest_or_tied_with_ram() {
-    // disk 2 < ram (unbounded) and < configured 12 → disk binds.
-    assert!(disk_binds_cap(2, usize::MAX, 12));
-    // disk ties configured_max → operator's own ceiling, not a disk fault.
-    assert!(!disk_binds_cap(12, usize::MAX, 12));
-    // disk larger than configured_max → the ceiling binds, not disk.
-    assert!(!disk_binds_cap(5, usize::MAX, 1));
-    // disk larger than ram → ram binds, not disk (see ram_binds_cap below).
-    assert!(!disk_binds_cap(5, 2, 12));
-    // disk ties ram (both smaller than configured_max) → disk wins the tie.
-    assert!(disk_binds_cap(3, 3, 12));
-    // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
-    // trip it — a 0/0/0 tie is "unconfigured", not "throttling".
-    assert!(!disk_binds_cap(0, 0, 0));
-}
-
-/// #5270: `ram_binds_cap` is the RAM-headroom mirror of the disk test
-/// above — RAM must be the UNIQUE smallest term (a tie resolves to disk).
-#[test]
-fn ram_binds_cap_only_when_uniquely_smallest() {
-    // ram 2 < disk (unbounded) and < configured 12 → ram binds.
-    assert!(ram_binds_cap(usize::MAX, 2, 12));
-    // ram ties configured_max → operator's own ceiling, not a ram fault.
-    assert!(!ram_binds_cap(usize::MAX, 12, 12));
-    // ram larger than configured_max → the ceiling binds, not ram.
-    assert!(!ram_binds_cap(usize::MAX, 5, 1));
-    // ram larger than disk → disk binds, not ram.
-    assert!(!ram_binds_cap(2, 5, 12));
-    // ram ties disk → disk wins the tie (not flagged as ram).
-    assert!(!ram_binds_cap(3, 3, 12));
-    // the healthy default fixture (disk 0, ram 0, configured 0) must NOT
-    // trip it.
-    assert!(!ram_binds_cap(0, 0, 0));
-}
-
-/// #5177 AC4: when disk headroom is the binding cap term, the dispatch
-/// section is Degraded and names disk as the cause — not a silent green
-/// daemon dispatching at a fraction of its token/config capacity.
-#[test]
-fn disk_bound_cap_produces_degraded_verdict_naming_disk() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.capacity.token_axis_limit = 6;
-        status.configured_max = 12;
-        status.disk_headroom = 2; // strictly the smallest term
-        status.ram_headroom = 40; // ample RAM — must not also fire
-        status.dynamic_cap = 2;
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.to_lowercase().contains("disk"),
-        "summary must name disk: {}",
-        section.summary
-    );
-}
-
-/// #5270: the RAM-headroom mirror of the disk test above — a critically-low
-/// available-memory host must be named as degraded the same way a
-/// critically-low-disk host already is.
-#[test]
-fn ram_bound_cap_produces_degraded_verdict_naming_ram() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.configured_max = 12;
-        status.disk_headroom = 40; // ample disk — must not also fire
-        status.ram_headroom = 1; // strictly the smallest term
-        status.dynamic_cap = 1;
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.to_lowercase().contains("ram"),
-        "summary must name ram: {}",
-        section.summary
-    );
-}
-
-/// #5270: a host where the CPU saturation admission brake is HOLDING new
-/// admissions must be named as degraded, even when the numeric disk/ram/
-/// ceiling terms are all comfortably ample — the brake is a point-in-time
-/// gate outside the `min(...)` formula (see `crate::admission_brake`).
-#[test]
-fn cpu_brake_held_produces_degraded_verdict_naming_cpu() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.configured_max = 12;
-        status.disk_headroom = 40;
-        status.ram_headroom = 40;
-        status.dynamic_cap = 12;
-        status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
-            enabled: true,
-            held: true,
-            load_per_core: Some(1.10),
-            load_per_core_threshold: 0.95,
-            held_since: None,
-            held_ticks: 3,
-            starving_since: None,
-            starving_ticks: 0,
-            escape_hatch_grants: 0,
-        });
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.to_lowercase().contains("cpu"),
-        "summary must name cpu: {}",
-        section.summary
-    );
-    assert!(section.summary.contains("1.10"), "{}", section.summary);
-}
-
-/// #5270: a brake that exists but is NOT holding must not itself degrade
-/// the section (mirrors the existing disk/ram negative test below).
-#[test]
-fn cpu_brake_not_holding_is_not_flagged() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.configured_max = 12;
-        status.disk_headroom = 40;
-        status.ram_headroom = 40;
-        status.dynamic_cap = 12;
-        status.admission_brake = Some(crate::types::AdmissionBrakeStatus {
-            enabled: true,
-            held: false,
-            load_per_core: Some(0.10),
-            load_per_core_threshold: 0.95,
-            held_since: None,
-            held_ticks: 0,
-            starving_since: None,
-            starving_ticks: 0,
-            escape_hatch_grants: 0,
-        });
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Green);
-}
-
-/// #5177 AC4 (negative): a cap bound by the operator's configured ceiling
-/// (disk/ram headroom ample) stays green — neither is the culprit there.
-#[test]
-fn config_bound_cap_is_not_flagged_as_disk() {
-    let mut inputs = healthy_inputs();
-    {
-        let status = inputs.status.as_mut().unwrap();
-        status.capacity.token_axis_limit = 6;
-        status.configured_max = 4; // operator's own ceiling binds
-        status.disk_headroom = 50; // plenty of disk
-        status.ram_headroom = 50; // plenty of ram
-        status.dynamic_cap = 4;
-    }
-    let section = assess_dispatch(&inputs);
-    assert_eq!(section.verdict, Verdict::Green);
 }
 
 /// Inputs with no tick reported, a daemon well past the warm-up grace
@@ -948,6 +747,29 @@ fn warming_up_outranks_build_skew() {
             grace_secs: 120
         }
     );
+}
+
+/// #12073: a host inside its startup-jitter window (delay 400 s, up 300 s)
+/// has not ticked because its first tick waits the jitter. It is warming
+/// up, with the grace window extended by the delay, not a dead work finder.
+#[test]
+fn a_host_inside_its_startup_jitter_is_warming_up_not_dead() {
+    let mut inputs = missing_tick_inputs();
+    inputs.status.as_mut().unwrap().startup_jitter_delay_secs = Some(400);
+    let mut report = install_report(InstallState::AliveButUnresponsive);
+    report.process_age_secs = Some(300);
+    inputs.install_state = Some(report);
+    assert_eq!(
+        classify_missing_tick(&inputs, inputs.status.as_ref().unwrap()),
+        MissingTick::WarmingUp {
+            age_secs: 300,
+            grace_secs: 520
+        }
+    );
+    assert_ne!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
+    // Past delay + 2 x interval with no tick, it is a fault again.
+    inputs.install_state.as_mut().unwrap().process_age_secs = Some(600);
+    assert_eq!(assess_dispatch(&inputs).verdict, Verdict::Degraded);
 }
 
 // -------------------------------------------------------------------
@@ -1166,6 +988,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1175,6 +998,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1199,6 +1023,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1208,6 +1033,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1270,6 +1096,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1279,6 +1106,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -1708,6 +1536,7 @@ fn role_liveness_repo_with_intervals(
     crate::types::RepoStatus {
         root: PathBuf::from(root),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1717,6 +1546,7 @@ fn role_liveness_repo_with_intervals(
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -2473,164 +2303,6 @@ fn an_empty_fleet_is_green_not_unknown() {
 }
 
 // ===================================================================
-// Peer-coordination section (Issue #6157)
-// ===================================================================
-
-#[test]
-fn peer_coordination_is_green_when_safehouse_not_configured() {
-    // `healthy_inputs()` carries no `safehouse`/`peer_claims` at all —
-    // the common single-host / non-fleet case.
-    let section = assess_peer_coordination(&healthy_inputs());
-    assert_eq!(section.verdict, Verdict::Green);
-    assert!(section.summary.contains("not configured"));
-}
-
-#[test]
-fn peer_coordination_is_green_when_receiving_normally() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 1800,
-        expired: 12,
-        dispatch_skipped: 4,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth::default(),
-        claims_room: Some("!claims:example.org".to_string()),
-        same_issue_collisions: 0,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Green);
-    assert!(section.summary.contains("1800 received"));
-    assert!(section.summary.contains("2510 advertised"));
-    // Issue #6242: the resolved claims room is visible in the summary
-    // so two hosts' `health` output makes a mismatch a one-line diff.
-    assert!(section.summary.contains("!claims:example.org"));
-    assert_eq!(section.detail["claims_room"], serde_json::json!("!claims:example.org"));
-    // Issue #6243: the counter is always present in the JSON detail (the
-    // machine-readable surface the 24h observation reads) …
-    assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(0));
-    // … but a ZERO count must NOT appear in the human summary, so the
-    // pre-#6243 wording is byte-for-byte unchanged for a healthy fleet.
-    assert!(!section.summary.contains("#6243"));
-}
-
-/// Issue #6243: a NON-zero same-issue cross-host claim count is surfaced
-/// in the human-readable summary too — an operator running the 24h
-/// verification must not have to reach for `--json` to see the fleet is
-/// colliding. The verdict itself is deliberately unchanged (still Green):
-/// this section's verdict answers #6157's mesh-liveness question, and
-/// building a collision-rate verdict is #6242's scope.
-#[test]
-fn peer_coordination_surfaces_a_nonzero_same_issue_collision_count() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 1800,
-        expired: 12,
-        dispatch_skipped: 4,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth::default(),
-        claims_room: Some("!claims:example.org".to_string()),
-        same_issue_collisions: 3,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Green, "the counter must not change the verdict");
-    assert!(
-        section
-            .summary
-            .contains("3 same-issue cross-host claim(s) in 24h"),
-        "summary must name the non-zero count, got: {}",
-        section.summary
-    );
-    assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(3));
-}
-
-/// The 2026-08-13 incident's exact signature: `received=0` while
-/// `advertised>0` for hours, on every host — must report DEGRADED, not
-/// silently Green.
-#[test]
-fn peer_coordination_is_degraded_when_coordination_reports_degraded() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 0,
-        expired: 0,
-        dispatch_skipped: 0,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth {
-            degraded: true,
-            degraded_for_secs: Some(9000),
-            consecutive_receives_toward_recovery: 0,
-            recovery_threshold: 3,
-            reason: None,
-        },
-        claims_room: None,
-        same_issue_collisions: 0,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(section.summary.contains("DEGRADED"));
-    assert!(section.summary.contains("0 received"));
-    // Issue #6242: a host with no resolvable room (edge case — safehouse
-    // enabled but no `rooms`/legacy `room` configured at all) renders
-    // "none", not a missing field or an empty string.
-    assert!(section.summary.contains("room: none"));
-    assert_eq!(section.detail["claims_room"], serde_json::json!(null));
-    assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
-}
-
-#[test]
-fn peer_coordination_is_degraded_when_safehouse_socket_unreachable() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "unreachable".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: None,
-        reason: None,
-    });
-    // No `peer_claims` yet (the coordination task never got established)
-    // — the socket-unreachable check must fire regardless.
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(section.summary.contains("unreachable"));
-}
-
-#[test]
-fn peer_coordination_unknown_without_status() {
-    let mut inputs = healthy_inputs();
-    inputs.status = None;
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Unknown);
-}
-
-// ===================================================================
 // --since parsing / formatting
 // ===================================================================
 
@@ -3028,14 +2700,13 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 mod section_inventory;
 
 // Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
-// module so this file, already over `.loom/docs/file-size-policy.md`'s
-// threshold, does not grow to hold it.
+// module.
+mod auto_update_freshness;
 mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
 
-// Export-liveness coverage (#5083, #5337, #9015) — moved out of this file for
-// the same reason as the two modules above: it is over
-// `.loom/docs/file-size-policy.md`'s threshold and may not grow.
+// Export-liveness coverage (#5083, #5337, #9015) — its own child module, like
+// the two modules above.
 mod observability_export;

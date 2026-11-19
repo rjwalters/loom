@@ -15,8 +15,8 @@
 use std::sync::{Mutex, OnceLock};
 
 use super::FleetSyncStatus;
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 
 /// Rule for a malformed `loom_min_version`.
 pub const RULE_FLOOR: &str = "fleet.floor-malformed";

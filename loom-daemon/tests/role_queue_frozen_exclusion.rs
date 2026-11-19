@@ -303,3 +303,8 @@ fn frozen_is_a_hold_and_a_park_in_the_registry() {
     assert_eq!(frozen["hold"], true, "loom:frozen must stay a hold (#11870)");
     assert_eq!(frozen["park"], true, "loom:frozen must stay a park (#11870)");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

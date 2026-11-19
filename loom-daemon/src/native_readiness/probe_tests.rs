@@ -19,6 +19,10 @@ fn state(parent: &Path) -> IsolatedState {
     IsolatedState::create(parent).unwrap()
 }
 
+/// Deadline for the tests whose child hangs on purpose. Well under the
+/// child's `sleep 30`, well over what a loaded host needs to start a shell.
+const TIMEOUT_SECS: u64 = 8;
+
 fn probe(bin: PathBuf, seconds: u64, network: NetworkMode) -> Probe {
     Probe::new(bin, Duration::from_secs(seconds), network, &[]).unwrap()
 }
@@ -208,7 +212,10 @@ fn a_timeout_reports_the_stage_and_byte_counts_but_no_child_output() {
     let secret = "sk-live-CANARY-3f9a2b";
     let cli = fake_cli(tmp.path(), "hang", &format!("printf '%s\\n' 'token={secret}'\nsleep 30"));
     let state = state(tmp.path());
-    let probe = probe(cli, 1, NetworkMode::Allowed);
+    // The deadline is the subject, so the child hangs on purpose; it is long
+    // enough that a loaded host still starts the child and sees its first
+    // output before the deadline fires.
+    let probe = probe(cli, TIMEOUT_SECS, NetworkMode::Allowed);
     let (observation, plugin_loaded) = probe.readiness(&state);
     let Observation::Failed {
         classification,
@@ -255,7 +262,7 @@ fn a_timed_out_probe_leaves_no_descendant_running() {
         ),
     );
     let state = state(tmp.path());
-    let probe = probe(cli, 1, NetworkMode::Allowed);
+    let probe = probe(cli, TIMEOUT_SECS, NetworkMode::Allowed);
     let (observation, plugin_loaded) = probe.readiness(&state);
     assert!(matches!(
         observation,

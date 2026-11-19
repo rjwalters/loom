@@ -1,4 +1,4 @@
-//! `fleet/state.yml` → this host's desired run state.
+//! `fleet.json` `state` → this host's desired run state.
 //!
 //! ```yaml
 //! fleet:                    # the default for every host
@@ -11,9 +11,8 @@
 //!     state: paused         # a host entry overrides the fleet default
 //! ```
 //!
-//! When the store has the compiled `fleet.json` (#10705), the same document is
-//! its `state` section ([`resolve_snapshot`]); `fleet/state.yml` is read only
-//! when `fleet.json` is absent.
+//! The document is the compiled `fleet.json`'s (#10705) `state` section
+//! ([`resolve_snapshot`]); a legacy `fleet/state.yml` is no longer read.
 //!
 //! `running` dispatches normally, `paused` keeps the daemon up without new
 //! dispatch, `stopped` means the daemon is meant to be down. This module reads
@@ -81,25 +80,18 @@ pub struct HostState {
     pub reason: Option<String>,
 }
 
-/// Resolve `host`'s desired state from the text of `fleet/state.yml`.
-pub fn resolve(text: &str, host: &str) -> Result<HostState> {
-    let doc = super::yaml::parse(text).map_err(|e| anyhow!("{}: {e:#}", super::STATE_PATH))?;
-    resolve_value(&doc, host, super::STATE_PATH)
-}
-
 /// Resolve `host`'s desired state from a store snapshot: `fleet.json`'s
-/// `state` when the store has it, else `fleet/state.yml`. `Ok(None)` when it
-/// has neither. A present but invalid `fleet.json` is an error and never falls
-/// back to `fleet/state.yml`.
+/// `state`. `Ok(None)` when the store has no `fleet.json`; a legacy
+/// `fleet/state.yml` is not read. A present but invalid `fleet.json` is an
+/// error.
 pub fn resolve_snapshot(snapshot: &Snapshot, host: &str) -> Result<Option<HostState>> {
-    if let Some(doc) = super::compiled::from_snapshot(snapshot)? {
-        let source = format!("{} `state`", super::FLEET_JSON_PATH);
-        return resolve_value(doc.state(), host, &source).map(Some);
+    match super::compiled::from_snapshot(snapshot)? {
+        Some(doc) => {
+            let source = format!("{} `state`", super::FLEET_JSON_PATH);
+            resolve_value(doc.state(), host, &source).map(Some)
+        }
+        None => Ok(None),
     }
-    let Some(text) = snapshot.text(super::STATE_PATH)? else {
-        return Ok(None);
-    };
-    resolve(&text, host).map(Some)
 }
 
 /// The message for a snapshot with no run state at all
@@ -107,9 +99,11 @@ pub fn resolve_snapshot(snapshot: &Snapshot, host: &str) -> Result<Option<HostSt
 #[must_use]
 pub fn missing_message(snapshot: &Snapshot) -> String {
     format!(
-        "the store has neither {} nor {} (commit {})",
+        "the store has no {} (the only supported run-state source; a legacy {} is no longer \
+         read; publish a compiled {}) (commit {})",
         super::FLEET_JSON_PATH,
         super::STATE_PATH,
+        super::FLEET_JSON_PATH,
         snapshot.short_commit()
     )
 }

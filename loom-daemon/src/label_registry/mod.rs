@@ -9,8 +9,8 @@
 //! `SKIP_LABELS`, `HARD_EXCLUSION_LABELS`, `CHAMPION_PATH_LABELS`) are
 //! [`LabelSet`]s derived from registry properties via [`embedded_set`].
 //!
-//! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels`, merge_pr
-//! `BLOCKING` and queue_blocked `HOLD_LABELS` are derived too; `tests.rs`
+//! Slice 2b: `OPERATOR_GATE_LABELS`, pr_latency `hold_labels` and merge_pr
+//! `BLOCKING` are derived too; `tests.rs`
 //! pins each to its literal.
 //!
 //! The `propagate` rule table (#10012) is gone (#11510): its only consumer,
@@ -27,8 +27,8 @@
 //! never rendered into `labels.yml`, so the additive `sync-labels.sh` cannot
 //! re-create a retired label.
 //!
-//! Fields documented as inert (`stale_after_minutes`, `lifecycle`) have no
-//! consumer yet.
+//! `lifecycle` is inert: no consumer yet. `stale_after_minutes` is live for
+//! the five claim labels (#11898): see [`crate::claim_liveness`].
 
 use std::collections::HashSet;
 
@@ -171,7 +171,8 @@ pub struct Label {
     /// 1-based position in the order labels that contradict `loom:pr` are
     /// reported; `None` = does not contradict.
     pub contradicts_approval: Option<u32>,
-    /// Inert (no consumer yet).
+    /// The claim-liveness window of a claim label (#11898,
+    /// [`crate::claim_liveness`]); `None` for every other label.
     pub stale_after_minutes: Option<u32>,
     pub requires_base: Option<String>,
     pub remove_with: Vec<String>,

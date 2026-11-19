@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
-use loom_daemon::{
+use crate::{
     comment_trust::TrustPolicy,
     pr_planning::{self, PrRole},
 };
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
-pub(crate) struct PrQueueArgs {
+pub struct PrQueueArgs {
     #[arg(long, value_enum)]
     role: PrRole,
     #[arg(long, default_value = ".")]
@@ -17,7 +17,14 @@ pub(crate) struct PrQueueArgs {
 }
 
 impl PrQueueArgs {
-    pub(crate) fn run(mut self) -> Result<()> {
+    /// Whether the invocation reads the forge (`gh`), and so must pass the
+    /// tools mode gate (design §10.3): `--input` runs offline instead (#14429).
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.input.is_none()
+    }
+
+    pub fn run(mut self) -> Result<()> {
         self.repo_root =
             std::fs::canonicalize(&self.repo_root).context("resolve repository root")?;
         let rows = if let Some(input) = self.input {
@@ -31,11 +38,8 @@ impl PrQueueArgs {
         } else {
             let gh =
                 std::env::var_os("LOOM_GH_BIN").map_or_else(|| PathBuf::from("gh"), PathBuf::from);
-            let rows = pr_planning::fetch_queue(&self.repo_root, &gh, self.role)?;
-            // #10432: the serving queue, journaled for this role tick's
-            // `pick.decision` (a no-op outside a role tick).
-            loom_daemon::observability::pick_journal::record_pr_queue(self.role.as_str(), &rows);
-            rows
+            // A pure read: the daemon journals the serving queue at dispatch (#12119).
+            pr_planning::fetch_queue(&self.repo_root, &gh, self.role)?
         };
         let rows: Vec<_> = rows
             .into_iter()

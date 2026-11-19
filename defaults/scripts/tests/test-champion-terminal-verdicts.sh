@@ -21,8 +21,11 @@
 #
 # WHAT THIS SUITE DOES
 #
-#   1. BEHAVIOUR -- champion.md's Priority 2 query and Priority 3 loop are
-#      EXTRACTED and EXECUTED against a stubbed `gh`.
+#   1. BEHAVIOUR -- champion.md's Priority 2 query, Priority 3 loop and Priority 4 query are
+#      EXTRACTED and EXECUTED against a stubbed `gh`. Priority 3 also pins the
+#      revise-sent-back exclusion (#13906): a proposal Champion sent back to
+#      Curator (loom:triage swapped in) leaves the queue until Curator returns
+#      it curated.
 #   2. BEHAVIOUR -- curator.md's send-back queue is extracted and executed, and
 #      its unanswered-marker check is executed against the hash Champion's OWN
 #      idempotency block computes for the same issue (so the two formulas
@@ -59,32 +62,7 @@ LABELS_YML="$REPO_ROOT/.github/labels.yml"
 # The registry is source-tree only; consumer repos carry the generated yml.
 REGISTRY_JSON="$REPO_ROOT/defaults/labels.json"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
-assert_eq() {
-    if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3"; echo "    Expected: '$1'"; echo "    Actual:   '$2'"; fi
-}
-assert_contains() {
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else fail "$3"; echo "    Expected to contain: '$2'"; fi
-}
-assert_not_contains() {
-    if [[ "$1" != *"$2"* ]]; then pass "$3"; else fail "$3"; echo "    Expected NOT to contain: '$2'"; fi
-}
-assert_doc_contains() {
-    if grep -qF -- "$2" "$1"; then pass "$3"; else fail "$3 (missing literal in $1: $2)"; fi
-}
-assert_doc_lacks() {
-    if grep -qF -- "$2" "$1"; then fail "$3 (found literal in $1: $2)"; else pass "$3"; fi
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # One section (read from stdin), from a heading containing $1 to the next
 # heading of the same or shallower level; fenced code is skipped when looking
@@ -139,15 +117,27 @@ cat >"$FIXTURE_DIR/issues.json" <<'EOF'
  {"number":6,"title":"auditor report","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:auditor"}]},
  {"number":7,"title":"being evaluated","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:evaluating"}]},
  {"number":8,"title":"blocked verdict","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:blocked"}]},
- {"number":9,"title":"escalated","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:operator"}]}
+ {"number":9,"title":"escalated","createdAt":"2026-09-30T00:00:00Z","labels":[{"name":"loom:curated"},{"name":"loom:operator"}]},
+ {"number":10,"title":"revise sent back to Curator","createdAt":"2026-09-29T00:00:00Z","labels":[{"name":"loom:hermit"},{"name":"loom:triage"}]},
+ {"number":11,"title":"fresh hermit proposal","createdAt":"2026-09-28T00:00:00Z","labels":[{"name":"loom:hermit"}]},
+ {"number":12,"title":"architect revise sent back","createdAt":"2026-09-27T00:00:00Z","labels":[{"name":"loom:architect"},{"name":"loom:triage"}]}
 ]
 EOF
 
 # `gh issue list --label X ... --jq EXPR`: filter the fixture by label, then
 # apply the caller's OWN --jq expression. `--search` is the forge's shortlist
 # and is ignored here: the jq filter is what this suite pins.
+# `gh api --paginate ".../issues?labels=A,B&..."` (Champion's REST discovery,
+# #12242): the fixture rows carrying every label, in REST shape (`created_at`),
+# as one page; the caller's own `| jq` does the rest.
 cat >"$FIXTURE_DIR/bin/gh" <<'STUB'
 #!/usr/bin/env bash
+if [ "$1" = api ]; then
+  url=""; for a in "$@"; do case "$a" in repos/*) url="$a" ;; esac; done
+  labels=$(printf '%s' "$url" | sed -n 's/.*[?&]labels=\([^&]*\).*/\1/p')
+  jq -c --arg l "$labels" '($l | split(",")) as $want | [.[] | select([.labels[].name] as $have | all($want[]; . as $w | $have | index($w))) | . + {created_at: .createdAt} | del(.createdAt)]' "$LOOM_TEST_ISSUES"
+  exit 0
+fi
 label=""; expr="."; limit=30
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -173,7 +163,7 @@ numbers_of() { grep -oE '^#[0-9]+' | tr '\n' ' ' | sed 's/ $//'; }
 echo ""
 echo "Test 1: Champion discovery hands only unheld, unclaimed proposals to evaluation"
 section_body "Priority 2: Quality Issues Ready to Promote" <"$CHAMPION_MD" \
-    | bash_block_with '--label="loom:curated"' >"$FIXTURE_DIR/p2.sh"
+    | bash_block_with 'labels=loom:curated&' >"$FIXTURE_DIR/p2.sh"
 section_body "Priority 3:" <"$CHAMPION_MD" \
     | bash_block_with 'for P in architect hermit auditor' >"$FIXTURE_DIR/p3.sh"
 if [[ ! -s "$FIXTURE_DIR/p2.sh" || ! -s "$FIXTURE_DIR/p3.sh" ]]; then
@@ -181,11 +171,18 @@ if [[ ! -s "$FIXTURE_DIR/p2.sh" || ! -s "$FIXTURE_DIR/p3.sh" ]]; then
 else
     assert_eq "#1" "$(run_query p2.sh | numbers_of)" \
         "Priority 2 returns only the evaluable curated issue (skips issue, evaluating, blocked, operator)"
-    assert_eq "#4 #6" "$(run_query p3.sh | numbers_of)" \
-        "Priority 3 returns the architect and auditor proposals and skips the blocked hermit one"
+    assert_eq "#4 #11 #6" "$(run_query p3.sh | numbers_of)" \
+        "Priority 3 loops architect, hermit, auditor: the fresh hermit proposal is listed; the blocked hermit one and the revise-sent-back triage ones (hermit #10, architect #12) are skipped (#13906, #13902)"
     assert_not_contains "$(cat "$FIXTURE_DIR/p2.sh" "$FIXTURE_DIR/p3.sh")" "needs-revision" \
         "neither query names the retired loom:needs-revision"
 fi
+# #13906: the loom:triage exclusion ships in every copy of the Priority 3
+# block. `defaults/roles/champion.md` is a symlink to the commands copy the
+# extraction above ran; the .agents skill copy is generator output whose
+# byte-sync CI checks, pinned here so a hand-edited copy cannot drift.
+assert_contains "$(cat "$REPO_ROOT/defaults/.agents/skills/loom-champion/SKILL.md")" \
+    'IN("loom:evaluating","loom:issue","loom:building","loom:curated","loom:triage")' \
+    "the generated loom-champion skill copy carries the same loom:triage exclusion (#13906)"
 
 echo ""
 echo "Test 1b: Champion discovery orders proposals by level, then oldest first (#11103)"
@@ -201,6 +198,45 @@ EOF
 if [[ -s "$FIXTURE_DIR/p2.sh" ]]; then
     assert_eq "#34 #33 #32 #35 #31" "$(run_query p2.sh "$FIXTURE_DIR/levels.json" | numbers_of)" \
         "very-important, then important (oldest first), then the rest oldest first; a retired star carries no level"
+fi
+
+echo ""
+echo "Test 1c: every curated proposal and epic has exactly one owner in non-item mode (#11922)"
+# `--non-item` runs Priority 3 and 4 but never Priority 2. Under step dispatch
+# a curated architect/hermit/auditor proposal is a `--issue` Champion step, so
+# Priority 3 must skip it (else two owners). A curated EPIC is never a step
+# (the classifier routes `loom:epic` before `loom:curated`), so Priority 4 must
+# keep it (else no owner in non-item mode).
+cat >"$FIXTURE_DIR/curated-proposals.json" <<'EOF2'
+[
+ {"number":40,"title":"plain architect","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:architect"}]},
+ {"number":41,"title":"curated architect","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:architect"},{"name":"loom:curated"}]},
+ {"number":42,"title":"curated hermit","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:hermit"},{"name":"loom:curated"}]},
+ {"number":43,"title":"curated auditor","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:auditor"},{"name":"loom:curated"}]},
+ {"number":44,"title":"plain epic","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:epic"}]},
+ {"number":45,"title":"curated epic","createdAt":"2026-10-01T00:00:00Z","labels":[{"name":"loom:epic"},{"name":"loom:curated"}]}
+]
+EOF2
+section_body "Priority 4: Epic Proposals" <"$CHAMPION_MD" \
+    | bash_block_with 'labels=loom:epic&' >"$FIXTURE_DIR/p4.sh"
+NONITEM_RUNS="$(awk '/^## `--non-item`/{on=1;next} on&&/^## /{exit} on' "$TARGETED_MD")"
+if [[ ! -s "$FIXTURE_DIR/p3.sh" || ! -s "$FIXTURE_DIR/p4.sh" ]]; then
+    fail "could not extract champion.md's Priority 3 loop and Priority 4 query"
+else
+    assert_eq "#40" "$(run_query p3.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 3 skips curated architect, hermit and auditor proposals"
+    assert_eq "#44 #45" "$(run_query p4.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "Priority 4 keeps a curated epic"
+    # The non-item pass's queues, from champion-targeted.md's own table.
+    assert_contains "$NONITEM_RUNS" "| Priority 4: epic proposals |" "--non-item runs Priority 4"
+    assert_contains "$NONITEM_RUNS" "and Priority 2 (the curated query)" "--non-item skips Priority 2"
+    NONITEM_SEEN=" $( { run_query p3.sh "$FIXTURE_DIR/curated-proposals.json"; run_query p4.sh "$FIXTURE_DIR/curated-proposals.json"; } | numbers_of) "
+    for n in 41 42 43; do
+        assert_not_contains "$NONITEM_SEEN" " #$n " "--non-item never evaluates curated proposal #$n (its --issue step owns it)"
+    done
+    assert_contains "$NONITEM_SEEN" " #45 " "--non-item still evaluates the curated epic #45 (no --issue step owns it)"
+    assert_eq "#41 #42 #43 #45" "$(run_query p2.sh "$FIXTURE_DIR/curated-proposals.json" | numbers_of)" \
+        "batch Priority 2 still sees every curated proposal and epic"
 fi
 
 # ---------------------------------------------------------------------------
@@ -229,8 +265,6 @@ fi
 WORKFLOW="$(section_body "Priority 2: Triage queue" <"$CURATOR_MD")"
 assert_contains "$WORKFLOW" "then Champion send-backs) first" \
     "Curator's workflow takes send-backs before Priority 1"
-assert_contains "$(section_body "Admission: keep or close" <"$CURATOR_MD")" "a Champion send-back" \
-    "a send-back skips the admission keep-or-close"
 
 # ---------------------------------------------------------------------------
 echo ""
@@ -379,7 +413,7 @@ else
         OUT="$(run_guard "$F4")"
         assert_eq "0" "$(result_of "$OUT" PRIOR_REJECTIONS)" "an outsider's NEEDS REVISION text is not counted in PRIOR_REJECTIONS"
         assert_eq "no" "$(result_of "$OUT" UNREVISED)" "an outsider's verdict marker does not send the proposal to Step 4 (UNREVISED=no)"
-        assert_eq "" "$(run_check "$F4")" "an outsider's revise marker does not make a send-back unanswered (Admission still runs)"
+        assert_eq "" "$(run_check "$F4")" "an outsider's revise marker does not make a send-back unanswered"
         MIXED="$(jq -c '.[0] |= (.authorAssociation = "NONE") | .[3] |= (.authorAssociation = "NONE")' <<<"$COMMENTS")"
         F5="$FIXTURE_DIR/fix/mixed"
         make_fixture "$F5" "$TITLE" "$BODY" "$MIXED" "$(to_rest <<<"$MIXED")"

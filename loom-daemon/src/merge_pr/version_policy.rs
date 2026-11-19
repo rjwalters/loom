@@ -45,6 +45,7 @@
 //! behind in `$TMPDIR`. Here the extracted checker is a [`tempfile::TempPath`],
 //! removed on drop however the evaluation ends. No output changes.
 
+use crate::fs_util::is_executable;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -221,13 +222,7 @@ pub fn classify(
 /// and nothing is inherited, so no child can write into the caller's
 /// protocol stream.
 fn git(repo: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::git_utils::git_run(repo, args).ok()?;
     out.status.success().then_some(out.stdout)
 }
 
@@ -240,12 +235,6 @@ fn git_str(repo: &Path, args: &[&str]) -> Option<String> {
 /// guard interpolated the checker's output that way.
 fn strip_trailing_newlines(s: &str) -> String {
     s.trim_end_matches('\n').to_string()
-}
-
-fn is_executable_file(p: &Path) -> bool {
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 /// Write the PR head's checker to a private executable temp file. `None`
@@ -311,7 +300,7 @@ fn run_checker(checker: &Path, repo: &Path, base_sha: &str, head_sha: &str) -> (
 pub fn evaluate(inputs: &Inputs<'_>) -> Report {
     let repo = inputs.repo_root;
     let local_checker = repo.join(CHECKER_REL);
-    if !is_executable_file(&local_checker)
+    if !is_executable(&local_checker)
         || inputs.default_branch.is_empty()
         || inputs.head_sha.is_empty()
         || inputs.branch.is_empty()

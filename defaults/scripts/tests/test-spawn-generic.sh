@@ -37,6 +37,7 @@ AIDER_MANIFEST="$DEFAULTS_DIR/runtimes/aider.json"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 
+# Local assert_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -51,6 +52,7 @@ assert_contains() {
     fi
 }
 
+# Local assert_not_contains kept: takes (needle, haystack, msg); shared helper is (haystack, needle, msg).
 assert_not_contains() {
     local needle="$1" haystack="$2" msg="$3"
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -307,7 +309,7 @@ echo "Testing LOOM_RUNTIME=aider dispatch through spawn-worker.sh..."
 STAGE="$TMPROOT/stage"
 mkdir -p "$STAGE/lib"
 cp "$SCRIPTS_DIR/spawn-worker.sh" "$STAGE/spawn-worker.sh"
-cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools}.sh "$STAGE/lib/"
+cp "$SCRIPTS_DIR/lib/"{config-resolver,locate-daemon-bin,loom-tools,repo-root}.sh "$STAGE/lib/"
 cp "$SPAWN_GENERIC" "$STAGE/spawn-generic.sh"
 cp "$SPAWN_AIDER" "$STAGE/spawn-aider.sh"
 cp "$SCRIPTS_DIR/spawn-generic-launch.sh" "$STAGE/spawn-generic-launch.sh"

@@ -4,8 +4,12 @@
 //! trusted authors in every fleet repo, so an admin whose org membership is
 //! private (`CONTRIBUTOR` to the fleet's App) is still believed (#10303).
 //!
-//! File contract: `{"admins": ["turian", "rjwalters"]}`. Entries are user
-//! accounts; an App-spelled entry (`x[bot]`, `app/x`) is ignored.
+//! File contract: `{"admins": ["turian", "rjwalters"], "apps": ["x[bot]"]}`.
+//! `admins` entries are user accounts; an App-spelled entry (`x[bot]`,
+//! `app/x`) is ignored there. The optional `apps` key is the fleet-level
+//! trusted-Apps list (#13545): only App-spelled entries are kept, so a bare
+//! slug (a user) is ignored. A missing or non-array `apps` is an empty list
+//! and never invalidates a valid `admins`; it can only add trust.
 //!
 //! **Fails closed.** Store unset, fetch failure, missing file, malformed JSON
 //! or a wrong type all yield an empty roster, never an error that widens
@@ -38,6 +42,9 @@ pub const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 pub struct Admins {
     /// The admin user logins (empty when unavailable).
     pub logins: Vec<String>,
+    /// The fleet-trusted App logins, `name[bot]` spelled (empty when
+    /// unavailable or absent).
+    pub apps: Vec<String>,
     /// Human description for the sources-consulted line.
     pub state: String,
 }
@@ -48,6 +55,7 @@ impl Admins {
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             logins: Vec::new(),
+            apps: Vec::new(),
             state: format!("unavailable: {}", reason.into()),
         }
     }
@@ -73,6 +81,26 @@ pub fn parse(text: &str) -> Result<Vec<String>, String> {
         .filter(|s| !s.is_empty() && !crate::comment_trust::is_app_login(s))
         .map(str::to_string)
         .collect())
+}
+
+/// Parse the optional `apps` key of `fleet/admins.json` (#13545). Anything
+/// other than an array yields an empty list; non-App-spelled entries are dropped.
+#[must_use]
+pub fn parse_apps(text: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    v.get("apps")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| crate::comment_trust::is_app_login(s))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A process-wide TTL cache of resolved rosters, keyed by store.
@@ -137,15 +165,20 @@ pub fn from_loaded(loaded: &fetch::Loaded, now: chrono::DateTime<chrono::Utc>) -
         Err(e) => return Admins::unavailable(format!("{e:#}")),
     };
     match parse(&text) {
-        Ok(logins) => Admins {
-            state: format!(
-                "loaded {} from {} @ {}",
-                logins.len(),
-                m.repo,
-                loaded.snapshot.short_commit()
-            ),
-            logins,
-        },
+        Ok(logins) => {
+            let apps = parse_apps(&text);
+            Admins {
+                state: format!(
+                    "loaded {} from {} @ {} ({} fleet apps)",
+                    logins.len(),
+                    m.repo,
+                    loaded.snapshot.short_commit(),
+                    apps.len()
+                ),
+                logins,
+                apps,
+            }
+        }
         Err(e) => Admins::unavailable(format!("{ADMINS_PATH}: {e}")),
     }
 }

@@ -20,11 +20,9 @@
 //! ## Why this lives in `loom-daemon` rather than in `worktree.sh`
 //!
 //! `defaults/scripts/worktree.sh` — the one call site every builder runs
-//! immediately after claiming — is a shell-budget `contract` file, i.e. part of
-//! the **portable** pool epic #7810 exists to retire. `check_against_rev`
-//! refuses portable growth *unconditionally*: unlike floor growth, it has no
-//! `Shell-Budget-Growth:` override (see `shell_budget.rs`, "Portable growth is
-//! NOT overridable, deliberately"). So the ADR-0018 shape is not merely
+//! immediately after claiming — is a `contract` file, i.e. part of
+//! the **portable** pool epic #7810 exists to retire, and new portable shell
+//! is not admitted. So the ADR-0018 shape is not merely
 //! preferred here, it is the only admissible one — the behavior goes into this
 //! subcommand and `worktree.sh` keeps a two-line reach into it.
 //!
@@ -64,22 +62,6 @@
 //! ([`session_sweep_id`]) so a session's second call re-attaches to its own
 //! lease instead of being declined by it.
 //!
-//! ## Live output for the same claim (#10116)
-//!
-//! The same blind spot hides the agent's output: the daemon's `session.output`
-//! producer only follows runs it dispatched. So after the lease, `run` also
-//! asks `observability::session_output::attended` to start a tailer for this
-//! agent's own transcript when the agent is a subagent, or a top-level
-//! session running a `/loom:<role>` command that names this issue (an inline
-//! claim by an operator's main agent is refused, with the reason on stderr,
-//! #10129). That call is a few
-//! local file reads and a detached spawn, a silent no-op unless live output
-//! and an OTLP exporter are
-//! configured, and skipped outright for a daemon-dispatched child, whose
-//! output the daemon already publishes. Like the lease, it never fails or
-//! delays the claim. Because `worktree.sh` discards this stderr, the outcome
-//! line is also kept in `.loom/logs/live-output-attended/last-start.log`
-//! (#10125).
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -134,6 +116,12 @@ pub(crate) enum LeaseCommand {
     /// See `cli::lease_co_occupancy`.
     CoOccupancy(super::lease_co_occupancy::LeaseCoOccupancyArgs),
 
+    /// Hand back this host's lease on `<issue>`: stop its renewer(s) and post
+    /// a `loom:lease-yield` so `forge check-claim` stops counting it (#12103).
+    /// Idempotent; refuses (exit 1) a live lease held by another host. See
+    /// `cli::lease_release`.
+    Release(super::lease_release::LeaseReleaseArgs),
+
     /// Single-owner bookkeeping and the per-cycle completion gate for
     /// `sweep-lease-renew.sh`'s renewal loops (#10229). See
     /// `cli::lease_renewer`.
@@ -151,6 +139,7 @@ impl LeaseCommand {
         match self {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
+            LeaseCommand::Release(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
             LeaseCommand::Pr(action) => action.run(),
         }
@@ -223,10 +212,13 @@ pub(crate) struct SessionEnv {
     /// Whether `LOOM_SWEEP_RUN_ID` is set: an in-session `/loom:sweep` run
     /// already names its own stable lease identity, which publish then uses.
     pub(crate) run_id_set: bool,
+    /// The issue's trusted lease + lease-yield comments, when they were read
+    /// (#13252). `None` = unread, so no reuse is attempted.
+    pub(crate) lease_rows: Option<Vec<super::lease_co_occupancy::LeaseRow>>,
 }
 
 impl SessionEnv {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 
@@ -244,8 +236,49 @@ impl SessionEnv {
             dispatched_issue: non_empty(DISPATCHED_MARKER),
             session_present: SESSION_MARKERS.iter().any(|k| non_empty(k).is_some()),
             run_id_set: non_empty("LOOM_SWEEP_RUN_ID").is_some(),
+            lease_rows: None,
         }
     }
+
+    /// Read the issue's lease comments so [`reusable_lease`] can see a lease
+    /// the orchestrator already published (#13252). Fails open: an unreadable
+    /// issue leaves `lease_rows` unset and publish decides as before.
+    fn with_lease_rows(mut self, args: &LeaseEnsureArgs) -> Self {
+        use super::lease_co_occupancy::read_rows;
+        let gh_bin = PathBuf::from(std::env::var("LOOM_GH_BIN").unwrap_or_else(|_| "gh".into()));
+        let root = PathBuf::from(&args.workspace);
+        let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+        self.lease_rows =
+            read_rows(&gh_bin, &root, args.issue, std::time::Duration::from_secs(10), &policy);
+        self
+    }
+}
+
+/// Lease-liveness TTL for the reuse check, resolved down the daemon's tier
+/// chain (`LOOM_LEASE_TTL_MINUTES`, hyperparameters, 15 min default) so
+/// `lease ensure` agrees with the other lease paths on what counts as live.
+fn reuse_ttl() -> chrono::Duration {
+    let minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
+    chrono::Duration::seconds((minutes * 60.0) as i64)
+}
+
+/// A live lease this host already holds on the issue under a sweep id other
+/// than `own_id` — i.e. one an in-session orchestrator published (#13252).
+/// Exactly one such pair and no live foreign pair, else `None`: with a peer
+/// present, publish's own refusal must decide. Pure.
+pub(crate) fn reusable_lease(
+    rows: &[super::lease_co_occupancy::LeaseRow],
+    now: chrono::DateTime<chrono::Utc>,
+    ttl: chrono::Duration,
+    mine: &[String],
+    own_id: Option<&str>,
+) -> Option<(String, String)> {
+    let live = super::lease_co_occupancy::live_pairs(rows, now, ttl);
+    let (own, foreign): (Vec<_>, Vec<_>) = live.into_iter().partition(|(h, _)| mine.contains(h));
+    if !foreign.is_empty() || own.iter().any(|(_, s)| Some(s.as_str()) == own_id) {
+        return None;
+    }
+    (own.len() == 1).then(|| own.into_iter().next()).flatten()
 }
 
 /// The lease identity an attended session publishes under (#10570): stable for
@@ -283,6 +316,9 @@ pub(crate) enum Outcome {
     PublishDeclined(Option<i32>),
     /// Publish succeeded but printed an identity line this cannot use.
     PublishUnparseable(String),
+    /// This host's live lease from the orchestrator was reused (#13252): no
+    /// second lease comment, no second renewer.
+    ReusedExisting { host: String, sweep_id: String },
     /// Published (or already held) and the renewal loop is running.
     Renewing {
         host: String,
@@ -311,6 +347,11 @@ impl Outcome {
             Self::AlreadyDispatched => format!(
                 "issue #{issue} is daemon-dispatched ({DISPATCHED_MARKER} names it) — publish + \
                  renewal are already running for it; nothing to do"
+            ),
+            Self::ReusedExisting { host, sweep_id } => format!(
+                "issue #{issue} already carries this host's live lease (host={host} \
+                 sweep={sweep_id}) — reusing it: no second lease published, no second renewer \
+                 started (its owner keeps it fresh)"
             ),
             Self::NoAgentSession => format!(
                 "no agent session in the environment (none of {}) — not publishing a lease for \
@@ -363,14 +404,16 @@ impl LeaseEnsureArgs {
             deferred::run(&self);
             return Ok(());
         }
-        let outcome = self.ensure(&SessionEnv::from_process());
+        let env = SessionEnv::from_process();
+        let env = if env.run_id_set || env.dispatched_issue.is_some() {
+            env
+        } else {
+            env.with_lease_rows(&self)
+        };
+        let outcome = self.ensure(&env);
         let line = outcome.describe(self.issue);
         eprintln!("lease ensure: {line}");
         deferred::record(&self.workspace, self.issue, &line);
-        if let Outcome::Renewing { sweep_id, .. } = &outcome {
-            // #11563: an in-session sweep is an operator-origin sweep.start.
-            super::presence::on_lease_published(&self.workspace, self.issue, sweep_id);
-        }
         // #10570: a declined publish used to be final, so a claim made while a
         // released sweep's lease was still inside its TTL never got a lease of
         // its own and was reclaimed once that leftover aged out.
@@ -379,40 +422,12 @@ impl LeaseEnsureArgs {
             eprintln!("lease ensure: {line}");
             deferred::record(&self.workspace, self.issue, &line);
         }
-        self.attend_live_output(&outcome);
         Ok(())
     }
 
-    /// Start this claim's attended live-output tailer (#10116). Independent
-    /// of whether the lease itself published: a declined publish (another
-    /// lease, a forge outage) says nothing about whether this agent's output
-    /// should be visible.
-    fn attend_live_output(&self, outcome: &Outcome) {
-        use loom_daemon::observability::session_output::attended;
-        // A daemon child is covered by the daemon's own producer, and with no
-        // agent session there is no transcript to follow.
-        if matches!(outcome, Outcome::AlreadyDispatched | Outcome::NoAgentSession) {
-            return;
-        }
-        let Ok(issue) = u32::try_from(self.issue) else {
-            return;
-        };
-        let request = attended::StartRequest {
-            watch_pid: Some(self.watch_pid),
-            // `0` means "unbounded" for the lease loop; a tailer is always capped.
-            max_age_secs: if self.max_age == 0 {
-                attended::DEFAULT_MAX_AGE_SECS
-            } else {
-                self.max_age
-            },
-            ..super::attend_hook::request(issue, PathBuf::from(&self.workspace))
-        };
-        let live = attended::start(&request, &attended::AttendEnv::from_process());
-        eprintln!("lease ensure: live output: {}", live.describe(issue));
-    }
-
-    /// The whole decision, with the environment injected so it is testable.
-    pub(crate) fn ensure(&self, env: &SessionEnv) -> Outcome {
+    /// The two outcomes settled from the environment alone, before any script
+    /// runs or the forge is touched. Neither starts a publisher or a renewer.
+    fn settled_early(&self, env: &SessionEnv) -> Option<Outcome> {
         // #8193 finding 2: when `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` already
         // names THIS issue, the daemon published the lease
         // (`SweepRegistry::dispatch` -> `write_lease_comment`, #6179) and
@@ -424,14 +439,30 @@ impl LeaseEnsureArgs {
             .as_deref()
             .is_some_and(|d| d == self.issue.to_string())
         {
-            return Outcome::AlreadyDispatched;
+            return Some(Outcome::AlreadyDispatched);
         }
 
         if !env.session_present && !self.force {
-            return Outcome::NoAgentSession;
+            return Some(Outcome::NoAgentSession);
+        }
+        None
+    }
+
+    /// Whether this run can reach the forge, and so must pass `loom-tools`'s
+    /// mode gate first (#14488). The no-session and already-dispatched answers
+    /// are printed by [`Self::ensure`] without touching it, so a plain shell
+    /// (`worktree.sh` calls this unconditionally) gets them with `mode` unset.
+    pub(crate) fn reaches_forge(&self, env: &SessionEnv) -> bool {
+        self.deferred || self.settled_early(env).is_none()
+    }
+
+    /// The whole decision, with the environment injected so it is testable.
+    pub(crate) fn ensure(&self, env: &SessionEnv) -> Outcome {
+        if let Some(outcome) = self.settled_early(env) {
+            return outcome;
         }
 
-        let root = match loom_daemon::repo_root::resolve_repo_root(&self.workspace) {
+        let root = match crate::repo_root::resolve_repo_root(&self.workspace) {
             Ok(r) => r,
             Err(e) => return Outcome::NoRepoRoot(e.to_string()),
         };
@@ -439,6 +470,17 @@ impl LeaseEnsureArgs {
         let renew_script = root.join(".loom/scripts/sweep-lease-renew.sh");
         if !publish_script.is_file() || !renew_script.is_file() {
             return Outcome::ScriptsMissing(root);
+        }
+
+        if let Some(rows) = env.lease_rows.as_deref().filter(|_| !env.run_id_set) {
+            let ttl = reuse_ttl();
+            let own_id = session_sweep_id(self.watch_pid);
+            let mine = super::lease_release::my_host_ids();
+            if let Some((host, sweep_id)) =
+                reusable_lease(rows, chrono::Utc::now(), ttl, &mine, own_id.as_deref())
+            {
+                return Outcome::ReusedExisting { host, sweep_id };
+            }
         }
 
         match self.publish(&publish_script, &root, env) {
@@ -463,6 +505,7 @@ impl LeaseEnsureArgs {
     ) -> Result<(String, String), Outcome> {
         let mut command = Command::new(publish_script);
         command.arg("publish").arg(self.issue.to_string());
+        pin_running_binary(&mut command);
         // An in-session sweep's `LOOM_SWEEP_RUN_ID` wins inside the script.
         if let Some(id) = (!env.run_id_set)
             .then(|| session_sweep_id(self.watch_pid))
@@ -510,7 +553,9 @@ impl LeaseEnsureArgs {
         sweep_id: &str,
     ) -> Outcome {
         mark_inherited_fds_cloexec();
-        let result = Command::new(renew_script)
+        let mut command = Command::new(renew_script);
+        pin_running_binary(&mut command);
+        let result = command
             .arg("start")
             .arg(self.issue.to_string())
             .arg("--watch-pid")
@@ -539,6 +584,22 @@ impl LeaseEnsureArgs {
             Ok(o) => Outcome::RenewalFailed(o.status.code()),
             Err(_) => Outcome::RenewalFailed(None),
         }
+    }
+}
+
+/// Keep the publish/renew script chain on the binary that is running it
+/// (#14488). The scripts call `${LOOM_DAEMON_BIN:-loom-daemon}` for
+/// `forge may-write`, `forge trusted-comments` and `lease renewer`, so when
+/// `loom-tools lease ensure` runs on a host with no `loom-daemon` they would
+/// otherwise reach for a binary that is not there, and lose the write-scope
+/// vetting that only the binary can do. A value the caller already exported
+/// is theirs to choose and is left alone.
+fn pin_running_binary(command: &mut Command) {
+    if std::env::var_os("LOOM_DAEMON_BIN").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Ok(me) = std::env::current_exe() {
+        command.env("LOOM_DAEMON_BIN", me);
     }
 }
 

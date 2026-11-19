@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use super::out;
+use crate::repo_root::main_checkout_from_gitdir_file;
 
 /// `find_repo_root()` — walk up from `$PWD` looking for a `.loom` directory,
 /// following a linked worktree's `.git` **file** to its main checkout.
@@ -28,24 +29,9 @@ pub fn find_repo_root() -> Option<PathBuf> {
         }
         let dot_git = dir.join(".git");
         if dot_git.is_file() {
-            if let Ok(text) = std::fs::read_to_string(&dot_git) {
-                // `sed 's/^gitdir: //'` is per-line and unanchored at the end;
-                // `$( )` then strips the trailing newline. A single-line
-                // `.git` file — the only shape git writes — reduces to this.
-                let gitdir = text
-                    .lines()
-                    .map(|l| l.strip_prefix("gitdir: ").unwrap_or(l))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let main_repo = PathBuf::from(&gitdir)
-                    .parent()
-                    .and_then(Path::parent)
-                    .and_then(Path::parent)
-                    .map(Path::to_path_buf);
-                if let Some(main_repo) = main_repo {
-                    if main_repo.join(".loom").is_dir() {
-                        return Some(main_repo);
-                    }
+            if let Some(main_repo) = main_checkout_from_gitdir_file(&dot_git) {
+                if main_repo.join(".loom").is_dir() {
+                    return Some(main_repo);
                 }
             }
         }
@@ -54,7 +40,10 @@ pub fn find_repo_root() -> Option<PathBuf> {
     None
 }
 
-fn logical_cwd() -> Option<PathBuf> {
+/// bash's `$PWD` when it names the directory we are actually in, else the
+/// resolved physical path: the operator's logical path is what every message
+/// and state file should name. Shared with `daemon_update::paths`.
+pub(crate) fn logical_cwd() -> Option<PathBuf> {
     let physical = std::env::current_dir().ok()?;
     if let Some(pwd) = std::env::var_os("PWD") {
         let logical = PathBuf::from(pwd);

@@ -50,7 +50,7 @@ impl Workspace {
         )?;
         let mut git = Command::new("git");
         git.args(["init", "--quiet"]).current_dir(&root);
-        let init = loom_daemon::proc_exec::run_bounded(git, Duration::from_secs(10))?;
+        let init = crate::proc_exec::run_bounded(git, Duration::from_secs(10))?;
         ensure!(init.succeeded(), "cannot initialize isolated canary repository");
         Ok(Self {
             root,

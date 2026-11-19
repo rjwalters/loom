@@ -13,7 +13,7 @@
 //! - **Dry run by default.** Without `--apply` the command only reads: no
 //!   add, remove or delete reaches the forge.
 //! - **Write scope** (#9548): `--apply` is gated by
-//!   `loom_daemon::write_scope::may_write_from` before the first forge call
+//!   `crate::write_scope::may_write_from` before the first forge call
 //!   (read or write) for that repo; a refused repo exits 2 untouched.
 //! - **Open items only.** Loom never cleans labels off closed items (#2838).
 //! - **Add before remove.** Each item gains `replaced_by` before it loses the
@@ -47,9 +47,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use loom_daemon::cmd_out::{CmdOutcome, Unavailable};
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::label_registry::RetiredLabel;
+use crate::cmd_out::{CmdOutcome, Unavailable};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::label_registry::RetiredLabel;
 use serde::Serialize;
 
 /// Items the issues listing returns per page (GitHub's maximum).
@@ -90,6 +90,10 @@ pub(crate) trait MigrateForge {
     /// Page `page` (1-based, [`PER_PAGE`] per page) of the OPEN issues and
     /// PRs carrying `label`.
     fn open_page(&self, label: &str, page: u32) -> Result<Vec<Item>, ForgeError>;
+    /// Labels on one item, read directly (not through the list endpoint,
+    /// which can lag a removal just made). [`ForgeError::NotFound`] means
+    /// the item is gone.
+    fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError>;
     fn add_label(&self, number: u64, label: &str) -> Result<(), ForgeError>;
     /// Remove `label` from one item. [`ForgeError::NotFound`] means it was
     /// not there.
@@ -511,8 +515,27 @@ fn relabel_item(
 }
 
 /// Re-read open usage after the relabels; delete only on a definite "none".
+/// The listed items that really still carry `label`. The list endpoint can
+/// lag a removal this run just made, so each listed item is confirmed with a
+/// direct read; a read failure is an error (fail closed: the label is kept).
+fn still_carrying(
+    forge: &dyn MigrateForge,
+    label: &str,
+    listed: Vec<Item>,
+) -> Result<Vec<Item>, ForgeError> {
+    let mut real = Vec::new();
+    for it in listed {
+        match forge.item_labels(it.number) {
+            Ok(labels) if labels.iter().any(|l| l == label) => real.push(it),
+            Ok(_) | Err(ForgeError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(real)
+}
+
 fn prune(forge: &dyn MigrateForge, name: &str, r: &mut Report) -> Result<(), Stop> {
-    let why = match list_open(forge, name) {
+    let why = match list_open(forge, name).and_then(|open| still_carrying(forge, name, open)) {
         Err(e) => {
             stop_on_limit(r, &e)?;
             format!("usage re-check failed: {e}")
@@ -664,7 +687,7 @@ pub(crate) fn enc(s: &str) -> String {
 /// Classify a failed gh call's text.
 pub(crate) fn classify(why: String) -> ForgeError {
     let lower = why.to_ascii_lowercase();
-    if loom_daemon::rate_limit_breaker::indicates_rate_limit(&why) || lower.contains("http 429") {
+    if crate::rate_limit_breaker::indicates_rate_limit(&why) || lower.contains("http 429") {
         ForgeError::RateLimited(why)
     } else if lower.contains("http 404") {
         ForgeError::NotFound(why)
@@ -732,6 +755,17 @@ impl MigrateForge for GhMigrateForge {
         parse_items(&String::from_utf8_lossy(&out))
     }
 
+    fn item_labels(&self, number: u64) -> Result<Vec<String>, ForgeError> {
+        let path = format!("repos/{}/issues/{number}/labels?per_page=100", self.repo);
+        let out = self.gh(AccessIntent::Read, &["api", &path, "--jq", ".[].name"])?;
+        Ok(String::from_utf8_lossy(&out)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     fn add_label(&self, number: u64, label: &str) -> Result<(), ForgeError> {
         let path = format!("repos/{}/issues/{number}/labels", self.repo);
         let field = format!("labels[]={label}");
@@ -764,7 +798,7 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
             GhTarget::repo(&repo).map_err(|_| "--repo must be OWNER/NAME".to_string())?;
             Ok((vec![Target { repo, root: cwd }], Vec::new()))
         }
-        Scope::Here(root) => match loom_daemon::release_resolve::host::repo_slug(&root) {
+        Scope::Here(root) => match crate::release_resolve::host::repo_slug(&root) {
             Some(repo) => Ok((vec![Target { repo, root }], Vec::new())),
             None => Err(format!(
                 "{} has no GitHub origin; pass --repo OWNER/NAME or --all-workspaces",
@@ -772,13 +806,13 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
             )),
         },
         Scope::AllWorkspaces => {
-            let reg = loom_daemon::workspace_registry::WorkspaceRegistry::load_default()
+            let reg = crate::workspace_registry::WorkspaceRegistry::load_default()
                 .map_err(|e| format!("cannot read the workspace registry: {e}"))?;
             let roots = reg
                 .workspaces
                 .into_iter()
                 .map(|w| {
-                    let slug = loom_daemon::release_resolve::host::repo_slug(&w.root);
+                    let slug = crate::release_resolve::host::repo_slug(&w.root);
                     (w.root, slug)
                 })
                 .collect();
@@ -788,9 +822,9 @@ pub(crate) fn resolve_targets(scope: Scope) -> Result<(Vec<Target>, Vec<PathBuf>
 }
 
 pub(crate) fn write_gate(t: &Target) -> Result<(), String> {
-    match loom_daemon::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
-        loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
-        loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
+    match crate::write_scope::may_write_from(Path::new(&t.root), Some(&t.repo)) {
+        crate::write_scope::Verdict::Allow(_) => Ok(()),
+        crate::write_scope::Verdict::Deny(why) => Err(why),
     }
 }
 

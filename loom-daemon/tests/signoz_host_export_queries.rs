@@ -11,14 +11,14 @@
 //! placeholders, and the replay substitutes a fixture roster between the markers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::process::{Command, Stdio};
 
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 const SQL: &str = include_str!("../../defaults/observability/signoz/host-export-queries.sql");
 const ALERT: &str =
@@ -26,6 +26,13 @@ const ALERT: &str =
 const TEMPLATE: &str =
     include_str!("../../defaults/observability/signoz/alerts/queue-starvation.json");
 const FIXTURE: &str = include_str!("fixtures/signoz_host_export/fixture.sql");
+
+const LIFECYCLE_FIXTURE: &str = include_str!("fixtures/signoz_host_export/lifecycle.sql");
+const LIFECYCLE_ROSTER: &str =
+    "('l-running','always'), ('l-stopped','always'), ('l-crashed','always'), \
+('l-restart-running','always'), ('l-restart-silent','always'), ('l-exit-restart','always'), \
+('l-nostart','always'), ('l-othertopic','always'), ('l-never','always'), \
+('w-asleep','when_awake'), ('w-gone','when_awake')";
 
 const BEGIN: &str = "/* loom:roster:begin */";
 const END: &str = "/* loom:roster:end */";
@@ -58,6 +65,38 @@ fn with_roster(text: &str, roster: &str) -> String {
 }
 
 // ---------------------------------------------------------------- static ----
+
+const LIFECYCLE_BEGIN: &str = "/* loom:lifecycle-roster:begin */";
+const LIFECYCLE_END: &str = "/* loom:lifecycle-roster:end */";
+
+fn lifecycle_roster_of(text: &str) -> &str {
+    assert_eq!(text.matches(LIFECYCLE_BEGIN).count(), 1, "one lifecycle begin marker");
+    assert_eq!(text.matches(LIFECYCLE_END).count(), 1, "one lifecycle end marker");
+    let (_, rest) = text.split_once(LIFECYCLE_BEGIN).unwrap();
+    rest.split_once(LIFECYCLE_END).unwrap().0
+}
+
+#[test]
+fn lifecycle_query_shares_query_3_roster_and_thresholds() {
+    let squash = |t: &str| t.split_whitespace().collect::<String>();
+    assert_eq!(
+        squash(lifecycle_roster_of(SQL)),
+        squash(roster_of(SQL)),
+        "query 5's roster must be the same rows as query 3's"
+    );
+    let q5 = sql_query(5);
+    assert!(q5.contains("900") && q5.contains("86400"), "query 3's thresholds");
+    for s in [
+        "'running'",
+        "'stopped'",
+        "'silent'",
+        "daemon.start",
+        "daemon.exit",
+        "host.export",
+    ] {
+        assert!(q5.contains(s), "query 5 mentions {s}");
+    }
+}
 
 #[test]
 fn alert_shares_the_template_schema() {
@@ -126,39 +165,6 @@ fn sql_status_header_no_longer_claims_unexecuted() {
 
 // ---------------------------------------------------------------- replay ----
 
-fn clickhouse(script: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            "--format=JSONEachRow",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 fn rows(out: &str) -> Vec<serde_json::Value> {
     out.lines()
         .filter(|l| !l.trim().is_empty())
@@ -184,10 +190,13 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
         return;
     }
     // Queries 1 and 2: increment, no-increase, reset, no-baseline, baseline.
-    let q1: BTreeMap<String, f64> = rows(&clickhouse(&format!("{FIXTURE}\n{}", sql_query(1))))
-        .iter()
-        .map(|r| (r["host"].as_str().unwrap().to_owned(), r["dropped_in_window"].as_f64().unwrap()))
-        .collect();
+    let q1: BTreeMap<String, f64> =
+        rows(&clickhouse_local::clickhouse_json(&format!("{FIXTURE}\n{}", sql_query(1))))
+            .iter()
+            .map(|r| {
+                (r["host"].as_str().unwrap().to_owned(), r["dropped_in_window"].as_f64().unwrap())
+            })
+            .collect();
     let want: BTreeMap<String, f64> = [
         ("q1-inc", 3.0),
         ("q1-reset", 6.0),  // 10 -> 14 is +4, then a reset to 2 contributes 2
@@ -199,10 +208,11 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
     .collect();
     assert_eq!(q1, want, "q1-flat (no increase) must be absent");
 
-    let q2: BTreeSet<String> = rows(&clickhouse(&format!("{FIXTURE}\n{}", sql_query(2))))
-        .iter()
-        .map(|r| r["host"].as_str().unwrap().to_owned())
-        .collect();
+    let q2: BTreeSet<String> =
+        rows(&clickhouse_local::clickhouse_json(&format!("{FIXTURE}\n{}", sql_query(2))))
+            .iter()
+            .map(|r| r["host"].as_str().unwrap().to_owned())
+            .collect();
     let want2: BTreeSet<String> = ["w-gone", "w-never", "off-roster"]
         .into_iter()
         .map(str::to_owned)
@@ -210,7 +220,7 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
     assert_eq!(q2, want2);
 
     // Query 3 over the fixture roster.
-    let q3 = rows(&clickhouse(&format!(
+    let q3 = rows(&clickhouse_local::clickhouse_json(&format!(
         "{FIXTURE}\n{}",
         with_roster(&sql_query(3), FIXTURE_ROSTER)
     )));
@@ -244,11 +254,12 @@ fn replayed_queries_find_silent_roster_hosts_and_drop_steps() {
     let q = with_roster(&alert_query(), FIXTURE_ROSTER)
         .replace("{{.start_timestamp_nano}}", &(start * 1_000_000_000).to_string())
         .replace("{{.end_timestamp_nano}}", &(end * 1_000_000_000).to_string());
-    let fired: BTreeSet<String> = rows(&clickhouse(&format!("{FIXTURE}\n{q};")))
-        .iter()
-        .filter(|r| r["value"].as_f64().unwrap() > target)
-        .map(|r| r["host"].as_str().unwrap().to_owned())
-        .collect();
+    let fired: BTreeSet<String> =
+        rows(&clickhouse_local::clickhouse_json(&format!("{FIXTURE}\n{q};")))
+            .iter()
+            .filter(|r| r["value"].as_f64().unwrap() > target)
+            .map(|r| r["host"].as_str().unwrap().to_owned())
+            .collect();
     let want_alert: BTreeSet<String> = expect.keys().cloned().collect();
     assert_eq!(fired, want_alert);
 }
@@ -266,7 +277,7 @@ fn replayed_exporter_loss_keeps_reset_steps_and_unknown_coverage() {
         v.as_f64()
             .unwrap_or_else(|| v.as_str().unwrap().parse::<f64>().unwrap())
     };
-    let output = rows(&clickhouse(&format!("{fixture}\n{query}")));
+    let output = rows(&clickhouse_local::clickhouse_json(&format!("{fixture}\n{query}")));
     let losses: BTreeMap<(String, String, String), (f64, f64)> = output
         .iter()
         .map(|r| {
@@ -319,4 +330,80 @@ fn replayed_exporter_loss_keeps_reset_steps_and_unknown_coverage() {
             assert_eq!(number(&row["conflicting_samples"]), 1.0);
         }
     }
+}
+
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_lifecycle_query_reads_running_stopped_and_silent() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    let query = {
+        let q = sql_query(5);
+        let (head, rest) = q.split_once(LIFECYCLE_BEGIN).unwrap();
+        let (_, tail) = rest.split_once(LIFECYCLE_END).unwrap();
+        format!("{head}{LIFECYCLE_BEGIN} {LIFECYCLE_ROSTER} {LIFECYCLE_END}{tail}")
+    };
+    let states: BTreeMap<String, String> =
+        rows(&clickhouse_local::clickhouse_json(&format!("{LIFECYCLE_FIXTURE}\n{query}")))
+            .iter()
+            .map(|r| {
+                (r["host"].as_str().unwrap().to_owned(), r["state"].as_str().unwrap().to_owned())
+            })
+            .collect();
+    let want: BTreeMap<String, String> = [
+        ("l-running", "running"),
+        ("l-stopped", "stopped"),
+        ("l-crashed", "silent"),
+        ("l-restart-running", "running"),
+        ("l-restart-silent", "silent"),
+        ("l-exit-restart", "running"),
+        ("l-nostart", "running"),
+        ("l-othertopic", "silent"),
+        ("l-never", "silent"),
+        ("w-asleep", "running"),
+        ("w-gone", "silent"),
+    ]
+    .into_iter()
+    .map(|(h, s)| (h.to_owned(), s.to_owned()))
+    .collect();
+    assert_eq!(states, want);
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
+
+// ------------------------------------------------- hold-transition replay ----
+
+/// `loom-daemon telemetry-hold-transitions` (#14094): the statement the CLI
+/// builds, executed verbatim — not a copy retyped here — against the CI DDL
+/// (`timestamp UInt64` ns) with the same bound user-text params the reader
+/// sends. Catches a type inversion (a `DateTime64` conversion applied to the
+/// UInt64 column) offline, with no live reader.
+#[test]
+#[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
+fn replayed_hold_transitions_statement_reads_the_window_with_bound_params() {
+    if !hub_image::available(CLICKHOUSE_IMAGE) {
+        return;
+    }
+    let (sql, params) = loom_daemon::cli::hold_transitions_query(
+        1_000_000_000,
+        5_000_000_000,
+        &["o/one".to_string()],
+        Some("merge-risk-self-release"),
+        10,
+    );
+    let mut args = vec!["--format=JSONEachRow".to_string()];
+    for (name, value) in &params {
+        args.push(format!("--param_{name}={value}"));
+    }
+    let fixture = include_str!("fixtures/signoz_host_export/hold_transitions.sql");
+    let out = rows(&clickhouse_local::clickhouse_with(&format!("{fixture}\n{sql};"), &args));
+    let bodies: Vec<&str> = out.iter().map(|r| r["body"].as_str().unwrap()).collect();
+    // Kept: the inclusive since-edge row and the in-window match, oldest
+    // first. Dropped: wrong repo, wrong reason_code, wrong kind, and the
+    // exclusive until-edge row.
+    assert_eq!(bodies, vec![r#"{"pr":10}"#, r#"{"pr":42}"#]);
 }

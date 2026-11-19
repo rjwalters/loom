@@ -6,7 +6,7 @@
 //! (the probe stays writer-only). So a fresh installation snapshot decides
 //! alone, with no per-repo read: listed is WRITE, absent is `Insufficient`.
 //! A user token has no installation listing, and leg 1 (`permissions`)
-//! decides.
+//! decides — save an all-`false` role, which is `Unknown` (see below).
 //!
 //! When the snapshot cannot be had, leg 1 decides what it can:
 //!
@@ -19,10 +19,13 @@
 //!   closed on (the probe cache's stale-WRITE grace still applies).
 //!
 //! **Age.** The snapshot answers for up to its own TTL and the probe cache
-//! then keeps the answer for the probe's: the two stack (about two hours
-//! with the defaults), see [`super::probe`].
+//! then keeps a WRITE for the probe's. A repo the snapshot does not list is
+//! different (#13152): the snapshot is revalidated once on such a miss
+//! (rate-limited to one per minute), and the probe cache keeps the resulting
+//! `NOT_IN_INSTALLATION` for only a minute, so a newly created or newly
+//! added repo is answered within about a minute, see [`super::probe`].
 
-use super::probe::{names_a_lesser_role, Permission};
+use super::probe::{names_a_lesser_role, Permission, NO_REPOSITORY_ROLE};
 use crate::forge_repo_facts::installation::Answer;
 
 /// Leg 1's outcome: `Ok(Some)` classified, `Ok(None)` unparseable, `Err`
@@ -40,9 +43,19 @@ pub(crate) fn from_snapshot(
         Answer::Disabled => None,
         Answer::Listed(Some(_)) => Some(Permission::Write),
         Answer::Listed(None) => {
-            Some(Permission::Insufficient("not in this App installation".into()))
+            Some(Permission::Insufficient(super::probe::NOT_IN_INSTALLATION.into()))
         }
+        // A user token: leg 1 decides, except an all-`false` role, which is
+        // what an App installation token is served (#11957: a snapshot
+        // misclassed as not-an-installation turned every repo into a cached
+        // refusal for a TTL). A real user is told at least `pull` on any
+        // repository it can see, so `none` is no verdict either way.
         Answer::PerRepo => Some(match repo_leg() {
+            Ok(Some(Permission::Insufficient(why))) if why == NO_REPOSITORY_ROLE => {
+                Permission::Unknown(
+                    "repository role `none` (no verdict: an App token is served the same)".into(),
+                )
+            }
             Ok(Some(p)) => p,
             Ok(None) => Permission::Unknown("unparseable permissions".into()),
             Err(e) => Permission::Unknown(e),

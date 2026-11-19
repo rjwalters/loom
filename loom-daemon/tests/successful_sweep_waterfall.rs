@@ -229,7 +229,9 @@ fn every_span_in_a_successful_sweep_resolves_to_its_issue_and_pr() {
     let roles: Vec<_> = observed.iter().map(|s| attribute(s, "loom.role")).collect();
     assert_eq!(roles, ["curator", "builder", "judge", "merge"], "{observed:?}");
     let judge = observed[2];
-    assert_eq!(attribute(judge, "loom.judge_verdict"), "approved");
+    // The checkpoint write no longer invents a verdict: the real Judge write
+    // records it, so the sweep-checkpoint span must not carry one.
+    assert_eq!(attribute(judge, "loom.judge_verdict"), "<absent>");
     assert_eq!(
         attribute(judge, "loom.timing_source"),
         "checkpoint_write_observed",
@@ -256,3 +258,8 @@ fn operator_supplied_task_text_never_reaches_an_exported_span() {
     .unwrap();
     assert!(written.contains(TASK_SENTINEL), "{written}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

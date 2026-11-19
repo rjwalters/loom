@@ -28,32 +28,6 @@ VPR="$SCRIPTS_DIR/verify-proposal-refs.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if [[ "$haystack" == *"$needle"* ]]; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected to contain: '$needle'"
-        echo "    Actual: '$haystack'"
-    fi
-}
-
-assert_doc_contains() {
-    local file="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -qF -- "$needle" "$file"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg (missing literal in $file: $needle)"
-    fi
-}
-
 if [[ ! -x "$VPR" ]]; then
     echo -e "${RED}FATAL${NC}: $VPR not found or not executable" >&2
     exit 2
@@ -132,6 +106,86 @@ RC=$?
 assert_eq "1" "$RC" "missing file exits 1"
 assert_contains "$OUT" "MISSING FILE" "missing-file miss is labeled"
 assert_contains "$OUT" "src/does-not-exist.py" "the specific missing path is named"
+
+echo
+echo "=== Fixture 2b: existing directory citations are not MISSING FILE (#10191) ==="
+mkdir -p "$FIXTURE_REPO/tools/probes"
+(
+    cd "$FIXTURE_REPO" || exit 1
+    printf 'x\n' > tools/probes/p.py
+    git add tools
+    git commit -qm "add tools/probes" >/dev/null
+    git update-ref refs/remotes/origin/main refs/heads/main
+)
+DIR_BODY="$BODY_DIR/dir.md"
+cat > "$DIR_BODY" <<'EOF'
+Scope: tools/probes and `src/foo.py:3`.
+EOF
+OUT="$(run_vpr "$DIR_BODY")"
+RC=$?
+assert_eq "0" "$RC" "an existing directory citation exits 0"
+assert_contains "$OUT" "all references check out" "an existing directory is not reported as a miss"
+
+DIR_MISSING_BODY="$BODY_DIR/dir-missing.md"
+cat > "$DIR_MISSING_BODY" <<'EOF'
+Scope: tools/nonexistent-dir and tools/probes.
+EOF
+OUT="$(run_vpr "$DIR_MISSING_BODY")"
+RC=$?
+assert_eq "1" "$RC" "a nonexistent directory citation still exits 1"
+assert_contains "$OUT" "tools/nonexistent-dir" "the nonexistent directory is named as a miss"
+
+echo
+echo "=== Fixture 2c: trailing-punctuation shapes on directory citations (#13901) ==="
+# PATH_RE includes '.' in its class, so a prose `rtl-sketch/...` extracts
+# whole and the dot-stripper leaves `rtl-sketch/` -- but `git ls-tree` emits
+# tree entries with NO trailing slash, so the membership test false-missed an
+# existing directory (#13901, third input of the #10191/#11338 class). The
+# general shape is anything the extractor can leave on the end of a directory
+# path that ls-tree does not emit; the sibling fixtures below assert the
+# OBSERVED outcome of each shape against the extractor first: `dir/*`,
+# `dir/**` and `dir/` leave the `*`/trailing slash unconsumed (`*` is not in
+# the class and a trailing `/` has no component after it), so they yield
+# `dir` -- or nothing for a one-component `model/` -- and cannot false-miss;
+# only `dir/...` yields the slash-suffixed candidate.
+(
+    cd "$FIXTURE_REPO" || exit 1
+    mkdir -p rtl-sketch
+    printf 'x\n' > rtl-sketch/top.v
+    git add rtl-sketch
+    git commit -qm "add rtl-sketch" >/dev/null
+    git update-ref refs/remotes/origin/main refs/heads/main
+)
+# The reporter's exact reproducer line (2AMLogic/gf180-parasynth #784): every
+# one-component `dir/` extracts nothing; `rtl-sketch/...` extracts whole.
+ELLIPSIS_BODY="$BODY_DIR/ellipsis.md"
+cat > "$ELLIPSIS_BODY" <<'EOF'
+(`model/ spec/ tools/ fpga/ pnr/ rtl-sketch/...`) — the two repairs widen
+EOF
+OUT="$(run_vpr "$ELLIPSIS_BODY")"
+RC=$?
+assert_eq "0" "$RC" "an existing dir cited with a prose ellipsis (rtl-sketch/...) exits 0"
+assert_contains "$OUT" "all references check out" "an ellipsis-suffixed directory citation is not a miss"
+
+GLOB_BODY="$BODY_DIR/glob.md"
+cat > "$GLOB_BODY" <<'EOF'
+Scope: `tools/probes/*`, `tools/probes/**`, `tools/probes/`, and the
+sentence-final `tools/probes.` plus `src/foo.py:3.` — every other trailing
+shape of an existing-path citation.
+EOF
+OUT="$(run_vpr "$GLOB_BODY")"
+RC=$?
+assert_eq "0" "$RC" "glob, bare-slash and sentence-final dir citations produce no false miss"
+
+NODIR_BODY="$BODY_DIR/nodir.md"
+cat > "$NODIR_BODY" <<'EOF'
+See `spec/nodir/...` for the directory the proposal plans to create.
+EOF
+OUT="$(run_vpr "$NODIR_BODY")"
+RC=$?
+assert_eq "1" "$RC" "a nonexistent dir cited with a prose ellipsis still exits 1"
+assert_contains "$OUT" "MISSING FILE" "the nonexistent-ellipsis miss is labeled"
+assert_contains "$OUT" "spec/nodir" "the nonexistent directory is named as a miss"
 
 echo
 echo "=== Fixture 3: bad line range ==="

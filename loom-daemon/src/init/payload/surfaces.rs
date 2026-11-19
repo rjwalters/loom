@@ -68,6 +68,12 @@ pub(crate) enum Rule {
     /// staged, so nothing is copied; a directory the repo never had is not
     /// created. A file in it the payload does not ship is the repo's own.
     CopyTreeIfDir,
+    /// `.claude/settings.json` (#13793): the missing project-level Loom hook
+    /// entries are added additively by [`super::super::hook_wiring`], for the
+    /// hook scripts staged under `.loom/hooks/`. Only when the file exists
+    /// and is a usable JSON object; anything else is skipped and reported.
+    /// The repo's own file, so never recorded as Loom-owned.
+    HookWiring,
 }
 
 /// One surface the daemon resync refreshes beyond the installer's payload
@@ -129,6 +135,10 @@ pub(crate) const EXTRA_SURFACES: &[Surface] = &[
         path: ".loom/AGENTS.md",
         rule: Rule::DatedGuide,
     },
+    Surface {
+        path: ".claude/settings.json",
+        rule: Rule::HookWiring,
+    },
 ];
 
 /// What `resync-installed.sh` or the installer does that NO daemon resync
@@ -163,13 +173,6 @@ pub(crate) const INSTALL_TIME_ONLY: &[(&str, &str)] = &[
          cannot be committed",
     ),
     (
-        ".claude/settings.json",
-        "the repo's own hook wiring: no resync writes it. The upstream wiring table lives in \
-         scripts/install/provision-hooks.sh, which is not in the payload, so only \
-         resync-installed.sh can warn about a hook wired upstream and not here (#11033); a \
-         daemon-dispatched launch injects the roll-pause wiring itself (#11049)",
-    ),
-    (
         "forge labels",
         "the drift check against .github/labels.yml is a forge read and a report, not an \
          installed file; it stays with sync-labels.sh",
@@ -195,6 +198,12 @@ pub(crate) fn export_pathspecs() -> Vec<&'static str> {
     specs
 }
 
+/// Is `root` one of the payload trees (the installer's `.loom` files and
+/// Loom's slash commands), as opposed to an extra surface?
+pub(crate) fn is_payload_tree(root: &str) -> bool {
+    PAYLOAD_TREES.iter().any(|tree| within(root, tree))
+}
+
 /// `path` is `root` or lies under it.
 fn within(path: &str, root: &str) -> bool {
     path == root
@@ -203,18 +212,14 @@ fn within(path: &str, root: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Is `path` one of the extra surfaces (as opposed to the installer's)?
-pub(super) fn is_extra(path: &str) -> bool {
-    EXTRA_SURFACES.iter().any(|s| within(path, s.path))
-}
-
 /// May a resync record `path` in `installed_files`? That list is deletion
 /// evidence (a later release, or an uninstall, may remove what it names), so
 /// a file the repo owns and Loom only merges a block into is never listed.
 pub(super) fn records_ownership(path: &str) -> bool {
-    !EXTRA_SURFACES
-        .iter()
-        .any(|s| matches!(s.rule, Rule::GitignoreBlock | Rule::LabelsBlock) && s.path == path)
+    !EXTRA_SURFACES.iter().any(|s| {
+        matches!(s.rule, Rule::GitignoreBlock | Rule::LabelsBlock | Rule::HookWiring)
+            && s.path == path
+    })
 }
 
 /// The names `path` can be pinned under in `.loom/resync-ignore`: itself, and
@@ -259,6 +264,10 @@ pub(crate) enum SkipReason {
     /// or END, END before BEGIN, a lone or near-miss marker. Not guessed at;
     /// the run is reported failed so someone fixes the markers.
     MalformedMarkers(String),
+    /// A directory above it is a symlink the resync cannot write through:
+    /// it points outside the repo, dangles, loops, or resolves onto another
+    /// root (#11426). The reason names the link and where it points.
+    BehindSymlink(String),
 }
 
 /// Run every extra step over `stage`, which already holds the workspace's
@@ -296,6 +305,7 @@ pub(super) fn stage_extras(
         let present = is_regular_file(&dst);
         let wrote = match surface.rule {
             Rule::MarkerGatedSkills | Rule::CopyTreeIfDir => false,
+            Rule::HookWiring => stage_hook_wiring(stage, &dst, surface.path, skipped)?,
             Rule::CopyIfPresent => present && copy_file(&defaults.join(surface.path), &dst)?,
             Rule::CopyOrBackfill => copy_file(&defaults.join(surface.path), &dst)?,
             Rule::GitignoreBlock => {
@@ -344,6 +354,38 @@ impl Skipped {
         Self {
             path: path.to_string(),
             why: SkipReason::Unusable(why.to_string()),
+        }
+    }
+}
+
+/// [`Rule::HookWiring`]: wire every hook script staged under `.loom/hooks/`.
+fn stage_hook_wiring(
+    stage: &Path,
+    dst: &Path,
+    rel: &str,
+    skipped: &mut Vec<Skipped>,
+) -> Result<bool, String> {
+    use super::super::hook_wiring::{wire, Wired};
+    if !is_regular_file(dst) {
+        return Ok(false);
+    }
+    let text = match fs::read_to_string(dst) {
+        Ok(t) => t,
+        Err(e) => {
+            skipped.push(Skipped::unusable(rel, &e.to_string()));
+            return Ok(false);
+        }
+    };
+    let hooks = stage.join(".loom/hooks");
+    match wire(&text, |name| is_regular_file(&hooks.join(name))) {
+        Wired::Unchanged => Ok(false),
+        Wired::Unusable(why) => {
+            skipped.push(Skipped::unusable(rel, &why));
+            Ok(false)
+        }
+        Wired::Changed(new) => {
+            fs::write(dst, new).map_err(|e| format!("write {}: {e}", dst.display()))?;
+            Ok(true)
         }
     }
 }
@@ -406,6 +448,17 @@ pub(crate) fn log_skipped_once(repo: &Path, skipped: &[Skipped]) {
                  is until the BEGIN/END markers are fixed by hand",
                 repo.display(),
                 skip.path
+            ),
+            SkipReason::BehindSymlink(why) => log::warn!(
+                "resync: {}: {} is NOT resynced: {why}. Loom's files there stay at their \
+                 current release{}",
+                repo.display(),
+                skip.path,
+                if is_payload_tree(&skip.path) {
+                    ", and the install stamp is held at it until the link is fixed"
+                } else {
+                    ""
+                }
             ),
         }
     }

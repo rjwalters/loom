@@ -1,21 +1,14 @@
 //! Allowlisted observed outcome metadata. No prompts, errors, account contents,
 //! token-price estimates, or provider billing guesses enter this mapping.
 use super::{
-    any_string, any_value, kv, kv_int, kv_string, AnyValue, ArrayValue, KeyValue, KeyValueList,
-    RepoVisibility,
+    any_string, any_value, kv, kv_bool, kv_int, kv_string, AnyValue, ArrayValue, KeyValue,
+    KeyValueList,
 };
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 use crate::telemetry::{
     PhaseDuration, PhaseTapUsageRow, RoleTickResult, SweepOutcomeRecord, SweepStartFacts,
 };
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
-
-pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
-}
 
 /// The wire string for a role-tick result (Issue #8056) — the serde
 /// `rename_all = "snake_case"` spelling, restated here so the OTLP attribute
@@ -30,6 +23,7 @@ pub(super) fn role_tick_result_str(result: RoleTickResult) -> &'static str {
         RoleTickResult::SkippedModelRuntimeMismatch => "skipped_model_runtime_mismatch",
         RoleTickResult::SkippedLoad => "skipped_load",
         RoleTickResult::SkippedQueueEmpty => "skipped_queue_empty",
+        RoleTickResult::SkippedDeferred => "skipped_deferred",
     }
 }
 
@@ -95,6 +89,22 @@ pub(super) fn start_facts(facts: &SweepStartFacts) -> Vec<KeyValue> {
         }
     }
     attrs
+}
+
+/// `loom.tokens.{input,output,cache_read,cache_write}` (#13563): the sums of
+/// the same rows [`usage`] emits, so they equal `burn.rs`'s fold by
+/// construction. Empty when there are no rows.
+pub(super) fn token_totals(rows: Option<&[ModelUsageTotals]>) -> Vec<KeyValue> {
+    let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
+        return Vec::new();
+    };
+    let sum = |f: fn(&ModelUsageTotals) -> i64| rows.iter().map(f).sum::<i64>();
+    vec![
+        kv_int("loom.tokens.input", sum(|r| r.input)),
+        kv_int("loom.tokens.output", sum(|r| r.output)),
+        kv_int("loom.tokens.cache_read", sum(|r| r.cache_read)),
+        kv_int("loom.tokens.cache_write", sum(|r| r.cache_write_5m + r.cache_write_1h)),
+    ]
 }
 
 pub(super) fn usage(rows: Option<&[ModelUsageTotals]>) -> Option<KeyValue> {
@@ -170,6 +180,13 @@ pub(super) fn phase_durations(entries: &[PhaseDuration]) -> Option<KeyValue> {
                 ];
                 if let Some(attempt) = entry.attempt {
                     values.push(kv_int("attempt", i64::from(attempt)));
+                }
+                // #14242: the effort this phase's launch ran at; absent, never
+                // `default`, when no effort could be named.
+                if let Some(effort) = entry.effort.as_deref().map(str::trim) {
+                    if !effort.is_empty() {
+                        values.push(kv_string("effort", effort.to_string()));
+                    }
                 }
                 for (key, value) in [
                     ("tokens_in", entry.tokens_in),
@@ -404,12 +421,7 @@ pub(super) fn outcome(record: &SweepOutcomeRecord) -> Vec<KeyValue> {
     // 2AMLogic/2am#4393: the weighted agent draw's pick (#11726).
     if let Some(draw) = &record.role_draw {
         attrs.push(kv_string("loom.role_draw.pick", draw.pick.clone()));
-        attrs.push(kv(
-            "loom.role_draw.model_pinned",
-            AnyValue {
-                value: Some(any_value::Value::BoolValue(draw.model_pinned)),
-            },
-        ));
+        attrs.push(kv_bool("loom.role_draw.model_pinned", draw.model_pinned));
     }
     if let Some(numbers) = &record.pr_numbers {
         if !numbers.is_empty() && numbers.len() <= MAX_GROUPS {

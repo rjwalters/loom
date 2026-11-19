@@ -183,7 +183,8 @@ struct UserJson {
     kind: String,
 }
 
-/// `owner`'s kind: declared, cached, or probed via `GET /users/{login}`.
+/// `owner`'s kind: declared, cached, or probed via `GET /users/{login}` (with
+/// one `GET /orgs/{login}` retry when that probe fails in transport).
 /// Never guessed — any failure is returned for the caller to skip the owner.
 pub fn resolve_kind(
     api: &dyn GithubApi,
@@ -206,7 +207,24 @@ pub fn resolve_kind(
         });
     }
     *requests += 1;
-    let response = api.get(&path, None)?;
+    let response = match api.get(&path, None) {
+        Ok(response) => response,
+        // #13640: a transport failure (timeout, `gh` could not run) on the
+        // `users/` probe gets one more read on the `orgs/` route, same reader
+        // routing — never the writer (#12394). An HTTP answer (404, 401, rate
+        // limit) is a verdict, not a transport fault, and is not second-guessed.
+        Err(ApiError::Transport(first)) => {
+            let org_path = format!("orgs/{}", owner.login);
+            *requests += 1;
+            api.get(&org_path, None).map_err(|second| match second {
+                ApiError::Transport(second) => ApiError::Transport(format!(
+                    "{first}; fallback {org_path} also failed: {second}"
+                )),
+                other => other,
+            })?
+        }
+        Err(other) => return Err(other),
+    };
     let parsed: UserJson = serde_json::from_str(&response.body).map_err(|e| ApiError::Parse {
         path: path.clone(),
         detail: e.to_string(),
@@ -285,14 +303,18 @@ pub fn discover(
         }
         let cached = cache.get(&path).cloned();
         *requests += 1;
-        let mut response = api.get(&path, cached.as_ref().map(|c| c.etag.as_str()))?;
+        // Every page is routed for `login` (#12584): page 2+ links name the
+        // owner by numeric id, which picks no reader on their own.
+        let route = super::api::owner_listing_route(login);
+        let mut response =
+            api.get_in(Some(&route), &path, cached.as_ref().map(|c| c.etag.as_str()))?;
         let page = match (response.status, cached) {
             (304, Some(page)) => page,
             (304, None) => {
                 // Unreachable in practice (a 304 only answers our ETag);
                 // re-fetch unconditionally rather than trust an empty body.
                 *requests += 1;
-                response = api.get(&path, None)?;
+                response = api.get_in(Some(&route), &path, None)?;
                 cached_page(&response)
             }
             _ => cached_page(&response),

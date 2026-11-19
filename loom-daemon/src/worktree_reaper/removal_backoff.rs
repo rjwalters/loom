@@ -69,6 +69,10 @@ pub(crate) fn skip_reason(decision: &WorktreeDecision) -> Option<String> {
         // ever consulted for it (quarantine, then treat like `Remove`) — this
         // arm exists only so the match stays exhaustive; it is never reached.
         WorktreeDecision::RemoveWithQuarantine => None,
+        // #12458: same shape — the reap loop pushes the remote backup first
+        // and only then treats it like `Remove`; a failed backup becomes a
+        // skip with its own wording before this is consulted.
+        WorktreeDecision::RemoveWithBackup => None,
     }
 }
 
@@ -715,6 +719,7 @@ mod tests {
                 crate::worktree_ops::clean::WorktreeDecision::SkipIssueNotClosed("OPEN".to_string())
             },
             &|_path, _num| None,
+            &|_path, _num| Err("no backup route in this test".to_string()),
             &|_path, _num| {
                 remove_was_called.set(true);
                 true
@@ -761,6 +766,7 @@ mod tests {
             &crate::worktree_ops::naming::issue_from_worktree,
             &|_path, _num| crate::worktree_ops::clean::WorktreeDecision::RemoveWithQuarantine,
             &|_path, _num| None,
+            &|_path, _num| Err("no backup route in this test".to_string()),
             &|_path, _num| true,
             &|_num| None,
         );
@@ -810,6 +816,7 @@ mod tests {
                 &crate::worktree_ops::naming::issue_from_worktree,
                 &move |_path, _num| decision.clone(),
                 &|_path, _num| None,
+                &|_path, _num| Err("no backup route in this test".to_string()),
                 &|_path, _num| true,
                 &|_num| None,
             );

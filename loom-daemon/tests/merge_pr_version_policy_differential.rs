@@ -21,9 +21,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+mod exec_support;
+use exec_support::write_executable;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -57,12 +59,6 @@ fn git_ok(dir: &Path, args: &[&str]) -> String {
 
 const CHECKER_REL: &str = "defaults/scripts/check-defaults-version-bump.sh";
 
-fn write_exec(path: &Path, body: &str) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// An origin on `main` carrying the real checker, `defaults/scripts/foo.md`
 /// and `VERSION=1.0.0`, plus a clone playing `$REPO_ROOT`.
 struct Fixture {
@@ -80,7 +76,7 @@ impl Fixture {
         git_ok(&origin, &["init", "-q"]);
         git_ok(&origin, &["checkout", "-q", "-b", "main"]);
         let checker = fs::read_to_string(repo_root().join(CHECKER_REL)).unwrap();
-        write_exec(&origin.join(CHECKER_REL), &checker);
+        write_executable(&origin.join(CHECKER_REL), &checker);
         fs::write(origin.join("defaults/scripts/foo.md"), "hello\n").unwrap();
         fs::write(origin.join("VERSION"), "1.0.0\n").unwrap();
         git_ok(&origin, &["add", "-A"]);
@@ -292,7 +288,7 @@ fn checker_fault_is_a_warned_skip_including_multi_line_and_empty_output() {
         "#!/bin/sh\necho one\necho two >&2\necho\necho three\nexit 3\n",
         "#!/bin/sh\necho usage\n\n\nexit 64\n",
     ] {
-        write_exec(&checker, body);
+        write_executable(&checker, body);
         let (rc, out) = agree(body, &case(&f.local, "feature/bump", &head));
         assert_eq!(rc, 0, "{body}");
         assert!(out.lines().all(|l| l.starts_with("WARNING\t")), "{out}");
@@ -312,7 +308,7 @@ fn the_pr_head_oracle_and_its_fallback_agree() {
             .filter(|l| *l != "  \"VERSION\"")
             .map(|l| format!("{l}\n"))
             .collect();
-        write_exec(&p, &body);
+        write_executable(&p, &body);
         fs::write(d.join("VERSION"), "9.9.9\n").unwrap();
     });
     let (rc, out) = agree("shrink", &case(&f.local, "feature/shrink", &head));
@@ -321,7 +317,7 @@ fn the_pr_head_oracle_and_its_fallback_agree() {
 
     // Touching scripts/version.sh is not a bypass.
     let head = f.pr("feature/touch", |d| {
-        write_exec(&d.join("scripts/version.sh"), "#!/usr/bin/env bash\n");
+        write_executable(&d.join("scripts/version.sh"), "#!/usr/bin/env bash\n");
         fs::write(d.join("VERSION"), "1.0.1\n").unwrap();
     });
     assert_eq!(agree("touch", &case(&f.local, "feature/touch", &head)).0, 1);
@@ -339,6 +335,11 @@ fn the_pr_head_oracle_and_its_fallback_agree() {
     let head = f.pr("feature/plain", |d| {
         fs::write(d.join("defaults/scripts/foo.md"), "changed\n").unwrap();
     });
-    f.advance_main(|d| write_exec(&d.join("scripts/version.sh"), "#!/usr/bin/env bash\n"));
+    f.advance_main(|d| write_executable(&d.join("scripts/version.sh"), "#!/usr/bin/env bash\n"));
     assert_eq!(agree("drift", &case(&f.local, "feature/plain", &head)), (0, String::new()));
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

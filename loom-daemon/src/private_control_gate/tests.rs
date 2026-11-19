@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use super::*;
 
@@ -18,24 +17,7 @@ fn src(version: &str, entries: &[(&str, &str)]) -> String {
 
 const BASE: &[(&str, &str)] = &[("LOOM_GUARD_SQL", "1"), ("LOOM_RM_SCOPE", "repo")];
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 fn write(dir: &Path, text: &str) {
     let p = dir.join(DEFAULT_SOURCE_PATH);
@@ -46,6 +28,7 @@ fn write(dir: &Path, text: &str) {
 fn repo(initial: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     git(d.path(), &["init", "-q", "-b", "main"]);
+    configure(d.path());
     write(d.path(), initial);
     git(d.path(), &["add", "-A"]);
     git(d.path(), &["commit", "-q", "-m", "base"]);

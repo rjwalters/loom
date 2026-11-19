@@ -1,5 +1,6 @@
 //! A Curator completion's pre-build estimate. Historical issues are never inferred.
 pub mod completion;
+pub mod observe;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

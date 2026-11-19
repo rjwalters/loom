@@ -12,6 +12,7 @@ See issue [#3347](https://github.com/rjwalters/loom/issues/3347) for the origina
 - [Configuration](#configuration)
 - [In-session pre-PR gate (`loom-daemon preflight`)](#in-session-pre-pr-gate-loom-daemon-preflight)
 - [Examples](#examples)
+- [Keeping the local gate equal to CI (#13904)](#keeping-the-local-gate-equal-to-ci-13904)
 - [Failure semantics](#failure-semantics)
 - [Why a receipt?](#why-a-receipt)
 <!-- toc:end -->
@@ -251,7 +252,8 @@ failures independently confirmed pre-existing and host-environmental — an
 accurate report), then CI failed **five** gates: the markdown-token ratchet, the
 role-prompt-prefix ratchet, `check-dangling-links.sh`, `check-docs-defaults-parity.sh`,
 and the install-surface link check — a ratchet violation plus one missing
-`.loom/docs/` symlink. Every one reproduces locally in about a second. The cost
+`.loom/docs/` symlink. (#12106 later removed both ratchets and the parity
+check from CI.) Every one reproduces locally in about a second. The cost
 of not being able to learn that without pushing was one full
 Builder → CI → Judge → Doctor lap.
 
@@ -278,14 +280,10 @@ and does not call this script:
 
 - each gate is its own named step under `if: ${{ !cancelled() }}`, so one red
   gate never hides another and the step name says which one failed; and
-- each step sits inside a `# component:` marker that `loom-daemon`'s
-  required-check freshness guard pins per component
-  ([`stale_checks/inputs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/stale_checks/inputs.rs)
-  `REQUIRED_CHECKS`), whose pin test fails if a component's steps run a script
-  missing from that component's spec.
+- each step sits inside a `# component:` marker naming its gate group.
 
 Having CI invoke the aggregate instead would collapse fifteen named steps into
-one opaque one and break that pin test. Reading the workflow costs CI nothing
+one opaque one. Reading the workflow costs CI nothing
 and changes nothing about it.
 
 #### Ordering, and why it is unconditional
@@ -349,12 +347,21 @@ belonged to `Install Surface Checks`, outside the mirrored job. This section is
 the audit that says what the gate does and does not predict.
 
 **Audited at** `9ca463f06afa2864aa58f3adbeb8e1a4d743a2ad` (`main`, workflow
-`.github/workflows/ci.yml`). Re-audit when the jobs below change. The set of
-required status contexts is `REQUIRED_CONTEXTS` in
-[`stale_checks/inputs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/stale_checks/inputs.rs):
+`.github/workflows/ci.yml`). Re-audit when the jobs below change. Since
+#12106, `Structural Checks`, `Daemon Checks`, `Install Surface Checks` and
+`Repo Hygiene Checks` are one `Lint` job (which `check-structural.sh` now
+mirrors), and the one required context is `CI Result`; the rows below predate
+that merge. The set of required status contexts at the audit, from the `main`
+ruleset (`gh api repos/{owner}/{repo}/rules/branches/main`), was:
 `Structural Checks`, `Shell Syntax (macos-latest)`, `Daemon Checks`, `CI Result`.
 `Install Surface Checks` is **not** itself required; it reaches `main`'s merge
 gate only through `CI Result`.
+
+Since #12106 CI no longer runs the shell budget, the shell allowlist, the
+markdown-token / role-prompt / CLAUDE.md budgets, the pipefail and
+daemon-subcommand ratchets, doc TOC / anchor / docs-parity checks or the
+agent-skills sync; the rows below that time those were measured before it. Do
+not run them as CI gates.
 
 **A local green does not imply any CI context passed.** It means the rows
 marked "mirrored" below passed on this host, nothing more.
@@ -371,7 +378,7 @@ is claimed.
 |---|---|---|---|---|---|---|---|
 | `Structural Checks` | `bash scripts/check-structural.sh` (derived: 34 invocations, 33 run) | Stage 0, both tiers, before cargo | every `bash <script>.sh [args]` step in the job, in order, including `--self-test` steps | the `check-defaults-version-bump.sh --forbid-bump` step (SKIP: needs `${{ }}` PR SHAs); every non-`bash` step (conflict-marker `git grep`, `jq`/YAML parse of `config.json` and workflow templates, inline `run:` bodies); `actions/checkout` environment | bash, git, standard Unix tools | 33 passed, 1 skipped in 617s (loaded) | Reproduces the derived subset; **partial**, not job equivalence |
 | `Shell Syntax (macos-latest)` | `bash scripts/check-structural.sh --job "Shell Syntax (macos-latest)"` lists 5 commands; **but** stage 0 already runs the same scripts via `Structural Checks` | Stage 0 | the five `bash <script>.sh` steps, on whatever `bash` is first on `PATH` | the bash 3.2 assertion step (inline); the macOS runner image; any bash version other than the host's `PATH` bash | stock macOS `/bin/bash` 3.2.57 | syntax scan 23s, allowlist self-test 16s, pipefail ratchet 26s, subcommand ratchet 25s + 3s self-test (all loaded, under `/bin/bash` 3.2.57) | Syntax component reproduced under 3.2 (below); the runner itself is **not** reproduced |
-| `Daemon Checks` | `loom-daemon shell-budget --check`; `bash scripts/check-gitignore-convergence.sh . <daemon>`; `loom-daemon check-guard-wiring --repo-root .`; `loom-daemon secret-scan --range <base>..<head>` | **Not wired.** Needs a built daemon, so post-build if ever wired | all four component gates, each run by hand | `--job "Daemon Checks"` derives only the gitignore line, with a **relative** `target/debug/loom-daemon` path that does not exist under an isolated `CARGO_TARGET_DIR`; the other three are daemon subcommands the parser does not match | a debug `loom-daemon` | shell-budget 39s, other three about 1s each (daemon build itself 947s, loaded) | Locally reproducible, **not mirrored** |
+| `Daemon Checks` | `bash scripts/check-gitignore-convergence.sh . <daemon>`; `loom-daemon check-guard-wiring --repo-root .`; `loom-daemon secret-scan --range <base>..<head>` | **Not wired.** Needs a built daemon, so post-build if ever wired | all three component gates, each run by hand | `--job "Daemon Checks"` derives only the gitignore line, with a **relative** `target/debug/loom-daemon` path that does not exist under an isolated `CARGO_TARGET_DIR`; the other two are daemon subcommands the parser does not match | a debug `loom-daemon` | about 1s each (daemon build itself 947s, loaded) | Locally reproducible, **not mirrored** |
 | `Install Surface Checks` | `loom-daemon generate-agent-skills --check`; then the fixture recipe below | **Not wired.** Post-build | skills sync: reproduced. Fresh-install link check: reproduced by the recipe, not by `--job` | `--job "Install Surface Checks"` derives `bash .loom/scripts/verify-install.sh check-links` with **no** fixture and **no** `cd`: run from the repo root it checks this repo's own `.loom/`, not a fresh install, and so is a false assurance. The adjacent-release compatibility contract needs published releases and network | debug daemon, git, network for `install-compat` | `generate-agent-skills --check` under 1s; fixture `init` 77-131s, `check-links` 13-20s (loaded). `install-compat check` **not measured** (network/release assets) | Skills sync and link check reproducible; compatibility contract **not reproducible offline** |
 | `CI Result` | none | none | n/a | the aggregate of 25 `needs:` jobs (every job above plus Rust unit tests, OTLP, repo-hygiene, image jobs, installer suites, and others) | the GitHub Actions context | not measured | **Not reproducible**; it is a verdict over other jobs and cannot be run |
 
@@ -387,8 +394,9 @@ fixtures to test the *parser*; it never initializes the current complete
 
 #### Installed-tree link independence: verdict
 
-**Verdict: independent.** The source-tree checks
-(`scripts/check-dangling-links.sh`, `scripts/check-docs-defaults-parity.sh`) do
+**Verdict: independent.** (`check-docs-defaults-parity.sh` was retired with
+its CI step in #12106; the table records the audit as run.) The source-tree checks
+(`scripts/check-dangling-links.sh`, `scripts/check-docs-defaults-parity.sh`) did
 not subsume `loom-daemon init` followed by `verify-install.sh check-links` on a
 fresh fixture. A controlled fixture passes both source checks and fails the
 installed-tree check.
@@ -461,9 +469,9 @@ git -C "$FIXTURE" -c user.email=x@example.com -c user.name=x commit -q --allow-e
 Stock macOS ships `/bin/bash` 3.2.57, and `check-shell-syntax.sh` resolves
 `bash -n` through `PATH`, not its own shebang. With a directory holding a
 `bash` symlink to `/bin/bash` placed first on `PATH`, `bash defaults/scripts/check-shell-syntax.sh --quiet --dir .`
-and `bash scripts/check-shell-allowlist.sh --self-test` both exited 0 under 3.2.57
-on this host, and the two ratchets also passed under `/bin/bash`. That
-reproduces the syntax and ratchet *components* of the CI job under a real bash
+exited 0 under 3.2.57 on this host. (The allowlist and the two ratchets this
+audit also ran were retired from CI in #12106.) That
+reproduces the syntax *component* of the CI job under a real bash
 3.2; it does not reproduce the macOS runner image, its awk, or the job's inline
 bash-version assertion. On a host whose `PATH` bash is 4.x or 5.x (Homebrew),
 stage 0's derived run of these same scripts exercises that newer bash only.
@@ -597,6 +605,9 @@ gate reds on a **dispatch worker** while the same commit is green in CI:
   gate deliberately does **not** sanitize the environment wholesale: it needs
   the real `PATH`/`HOME`/credential environment to run at all, and an `env -i`
   wrapper would hide exactly the host-shaped reds this section is about.
+  Since #9851 the Rust step is also hermetic to `LOOM_RUNTIME*` through
+  `.cargo/config.toml` `[env]`, which forces `LOOM_RUNTIME` and every
+  `LOOM_RUNTIME_<ROLE>` empty for cargo-run test binaries.
 
 **The gate runs at a mild throttle relative to sweeps (#4020, revises #3985).**
 `build-gate.sh` now defaults to `nice 5` — a mild positive niceness, a real but
@@ -1011,6 +1022,91 @@ disk the cap saves.
 Not covered: a cargo workspace that is not at the repo root (for example
 `src-tauri/`). Its `[profile]` table is not read, so the cap applies over it.
 Set `cargo.debuginfo: "full"` for such a repo if its profile must win.
+
+## Keeping the local gate equal to CI (#13904)
+
+A common `command` is a hand mirror of the repo's CI workflow: the same
+interpreter pin, dependency pins and command sequence, restated as a
+`package.json` script (the `pnpm check:ci` Node example above). Nothing
+compares the two copies, so the mirror is a load-bearing correctness surface
+that drifts silently — bump a pin or add a test directory in the workflow and
+the script keeps running yesterday's gate: the local gate reports green having
+run less than CI, which is the exact divergence the gate exists to catch.
+
+**If your gate mirrors CI, add a parity check that parses both files and fails
+naming both values and both file locations**, and run it as part of the gate
+itself so drift fails pre-flight instead of surfacing in CI:
+
+```json
+{
+  "buildGate": {
+    "command": "bash scripts/check-gate-parity.sh && pnpm check:ci"
+  }
+}
+```
+
+One minimal example. It reads the facts it asserts from the workflow — the
+source of truth; never restate the pins inside the checker, or you have created
+a third copy to drift. It handles a matrix workflow by requiring the mirror's
+interpreter pin to be one of the matrix's values, and needs only `grep`, `sed`,
+`tr` and `jq` (swap the `jq` extraction for whatever your repo has if `jq` is
+absent; a `yq`/YAML parser is the upgrade path if your `run:` blocks outgrow
+line-grep):
+
+```bash
+#!/usr/bin/env bash
+# scripts/check-gate-parity.sh — the local gate equals CI, or this fails.
+# Every failure names the drifted fact, both values, and both file locations.
+set -euo pipefail
+
+wf=.github/workflows/ci.yml                        # source of truth
+gate=$(jq -r '.scripts["check:ci"] // empty' package.json)  # the mirror
+
+drift() { # drift <what> <workflow value> <gate value>
+  printf 'parity: %s drifted\n  %s: %s\n  package.json scripts["check:ci"]: %s\n' \
+    "$1" "$wf" "$2" "$3" >&2
+  exit 1
+}
+
+# A grep that finds nothing exits 1, which under `set -e` would end the script
+# with no message. Every extraction is therefore `|| true`: a missing fact
+# reaches its check as an empty value and is reported as "<none found>".
+
+# Interpreter pin (single or matrix): the mirror's pin must be one of the
+# workflow's python-version values. A pin missing on either side is drift.
+ci_pys=$({ grep 'python-version:' "$wf" || true; } | { grep -oE '[0-9]+(\.[0-9]+)+' || true; } | sort -u)
+gate_py=$(sed -nE 's/.*--python ([0-9.]+).*/\1/p' <<<"$gate")
+ci_pys_flat=${ci_pys//$'\n'/ }
+if [[ -z "$gate_py" ]] || ! grep -qxF -- "$gate_py" <<<"$ci_pys"; then
+  drift "python pin" "${ci_pys_flat:-<none found>}" "${gate_py:-<none found>}"
+fi
+
+# Dependency pins: every pinned spec in the workflow must appear in the mirror
+# as a whole word. A substring test would pass pkg==1.2.3 against pkg==1.2.30
+# or mypkg==1.2.3, so split the mirror into words and compare whole lines.
+gate_words=$(tr -s '[:space:]\042\047;' '\n' <<<"$gate")
+while IFS= read -r dep; do
+  grep -qxF -- "$dep" <<<"$gate_words" || drift "dependency pin" "$dep" "absent from gate script"
+done < <({ grep -oE '[A-Za-z0-9._-]+==[0-9][A-Za-z0-9.*+!]*' "$wf" || true; } | sort -u)
+
+# Command/target list: the pytest invocation must be identical in both
+# (quote-stripped, so sh -c quoting in the mirror does not mask a match).
+# A pytest invocation missing on either side is drift.
+ci_t=$({ grep -oE 'pytest -q [^&|]+' "$wf" || true; } | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+gate_t=$({ grep -oE 'pytest -q [^&|]+' <<<"$gate" || true; } | head -1 | sed 's/[[:space:]]*$//' | tr -d "\042\047")
+[[ -n "$ci_t" && "$ci_t" == "$gate_t" ]] \
+  || drift "pytest targets" "${ci_t:-<none found>}" "${gate_t:-<none found>}"
+```
+
+The dependency check runs one way, workflow to mirror: a pin that exists only
+in the mirror is not flagged. Add the reverse loop if your mirror must not
+install anything CI does not.
+
+The shape generalizes: one assertion per mirrored fact, each naming the fact
+and both sides' values and locations on failure. The whole check is a handful
+of `grep`/`jq` invocations — cheap enough for the fast tier (`fastCommand`),
+which is where you want it: drift caught at pre-flight costs seconds, drift
+caught in CI costs a review cycle.
 
 ## Failure semantics
 

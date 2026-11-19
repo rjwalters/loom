@@ -179,3 +179,13 @@ fn a_truncated_tree_is_refused() {
     let err = sync(&Truncated, dir.path(), &location(), t0()).unwrap_err();
     assert!(err.to_string().contains("truncated"));
 }
+
+#[cfg(unix)]
+#[test]
+fn write_atomic_keeps_the_file_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("nested").join("manifest.json");
+    write_atomic(&p, b"{}").unwrap();
+    assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+}

@@ -125,6 +125,14 @@ fn read_config_worktree_root(repo_root: &Path) -> Option<String> {
 pub fn worktree_root_readable(repo_root: &Path) -> PathBuf {
     let resolved = worktree_root(repo_root);
     let default = repo_root.join(".loom").join("worktrees");
+    if resolved != default && unusable(&resolved) {
+        log::warn!(
+            "worktree root target is missing or not writable on this host: '{}'; \
+             falling back to default",
+            resolved.display()
+        );
+        return default;
+    }
     if resolved != default && unreadable(&resolved) {
         log::warn!(
             "worktree root target exists but is unreadable (readdir failed, e.g. macOS TCC \
@@ -134,6 +142,30 @@ pub fn worktree_root_readable(repo_root: &Path) -> PathBuf {
         return default;
     }
     resolved
+}
+
+/// `_loom_root_unusable <target>` (#13639): the target exists but is not
+/// writable, or it does not exist and its nearest existing ancestor is not a
+/// writable directory. Never creates anything.
+fn unusable(target: &Path) -> bool {
+    let mut p = target;
+    while !p.exists() {
+        match p.parent() {
+            Some(parent) if parent != p => p = parent,
+            _ => return true,
+        }
+    }
+    !(p.is_dir() && access_wx(p))
+}
+
+/// Real access(2) check (honours uid/ACLs/read-only mounts); creates nothing.
+fn access_wx(dir: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(dir.as_os_str().as_bytes())
+        // SAFETY: valid NUL-terminated path; access(2) has no side effects.
+        .map(|c| unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0)
+        .unwrap_or(false)
 }
 
 /// `_loom_root_unreadable <dir>`: the path exists as a directory (so `stat`
@@ -213,6 +245,27 @@ mod tests {
     }
 
     use std::fs;
+
+    /// Guard for the config-tier tests below: they hold BOTH the unkeyed
+    /// default lock and `loom_config_env`. `serial_test` keeps the two as
+    /// independent locks (the default group is key `""`), and its macro
+    /// cannot name the default key in a multi-key list, so a test nests: the
+    /// `#[serial(loom_config_env)]` test calls a `#[serial] fn *_body()`.
+    /// That order is load-bearing and crate-mandatory — `loom_config_env`
+    /// outside, default inside; see `role_collision.rs`'s lock-order doc
+    /// (rest_queue_source_parses_the_live_listing_shape_body). Nesting fixes
+    /// the order structurally; this guard still fails loudly if either lock
+    /// is ever dropped (#14214).
+    fn assert_holds_default_and_config_env_locks() {
+        assert!(
+            serial_test::is_locked_serially(None),
+            "test must hold the default #[serial] lock: it mutates LOOM_WORKTREE_ROOT"
+        );
+        assert!(
+            serial_test::is_locked_serially(Some("loom_config_env")),
+            "test must hold the loom_config_env lock: it mutates PRIVATE_DEFAULTS_ENV"
+        );
+    }
 
     #[test]
     #[serial]
@@ -412,13 +465,26 @@ mod tests {
     // now that `read_config_worktree_root` goes through
     // `config_resolver::resolve_effective_config`. Every test that touches
     // `LOOM_CONFIG_DEFAULTS_FILE` is serialized on the keyed
-    // `loom_config_env` lock (not the crate-wide unkeyed `#[serial]` lock —
-    // see the CI-cost note on issue #4058) and pins the env var to `""` so a
-    // private defaults file on the host can never leak in.
+    // `loom_config_env` lock (see the CI-cost note on issue #4058) and pins
+    // the env var to `""` so a private defaults file on the host can never
+    // leak in. Because `with_env` also removes/restores LOOM_WORKTREE_ROOT,
+    // which the default-group tests set, each of these tests additionally
+    // holds the unkeyed default lock so the two groups cannot interleave on
+    // that var (#14214): it nests a `#[serial] fn *_body()` inside the
+    // `#[serial(loom_config_env)]` test — `loom_config_env` outside, default
+    // inside, the order role_collision's lock-order doc mandates (enforced by
+    // `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock`,
+    // #14404). Only these four short tests join the default queue.
 
     #[test]
     #[serial(loom_config_env)]
     fn project_tier_only_worktree_root_is_honored_like_legacy() {
+        project_tier_only_worktree_root_is_honored_like_legacy_body();
+    }
+
+    #[serial]
+    fn project_tier_only_worktree_root_is_honored_like_legacy_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -434,6 +500,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn project_tier_overrides_legacy_tier_on_overlap() {
+        project_tier_overrides_legacy_tier_on_overlap_body();
+    }
+
+    #[serial]
+    fn project_tier_overrides_legacy_tier_on_overlap_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -454,6 +526,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn local_tier_overrides_both_legacy_and_project() {
+        local_tier_overrides_both_legacy_and_project_body();
+    }
+
+    #[serial]
+    fn local_tier_overrides_both_legacy_and_project_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -471,6 +549,12 @@ mod tests {
     #[test]
     #[serial(loom_config_env)]
     fn explicit_null_in_project_tier_clears_legacy_worktree_root() {
+        explicit_null_in_project_tier_clears_legacy_worktree_root_body();
+    }
+
+    #[serial]
+    fn explicit_null_in_project_tier_clears_legacy_worktree_root_body() {
+        assert_holds_default_and_config_env_locks();
         std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().join("my-repo");
@@ -486,5 +570,31 @@ mod tests {
         // Cleared key -> falls through to the default, exactly like an
         // absent key.
         assert_eq!(got, repo_root.join(".loom").join("worktrees"));
+    }
+
+    // #13639: a committed host-specific root (e.g. /Volumes/Stripe) that is
+    // missing under an unwritable ancestor falls back to the default; a
+    // missing leaf under a writable parent is kept.
+    #[test]
+    #[serial]
+    fn readable_falls_back_when_root_missing_under_unwritable_ancestor() {
+        let repo = Path::new("/tmp/loom-13639-repo/reporoot");
+        let default = repo.join(".loom").join("worktrees");
+        let got =
+            with_env(Some("/nonexistent-loom-vol-13639/Stripe"), || worktree_root_readable(repo));
+        // Skip the assertion's premise only if running as root (can write anywhere).
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(got, default);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn readable_keeps_missing_leaf_under_writable_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("not-yet-created");
+        let repo = Path::new("/tmp/loom-13639-repo/reporoot");
+        let got = with_env(Some(base.to_str().unwrap()), || worktree_root_readable(repo));
+        assert_eq!(got, base.join("reporoot"));
     }
 }

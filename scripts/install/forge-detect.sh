@@ -119,18 +119,14 @@ _probe_gitea_api() {
   local api_base="$1"
   local token="$2"
 
-  local auth_header=""
-  if [[ -n "$token" ]]; then
-    auth_header="Authorization: token $token"
-  fi
-
-  # Try the Gitea version endpoint — lightweight and always available
-  local response=""
-  if [[ -n "$auth_header" ]]; then
-    response=$(curl -s -m 5 -H "$auth_header" "${api_base}/version" 2>/dev/null || echo "")
-  else
-    response=$(curl -s -m 5 "${api_base}/version" 2>/dev/null || echo "")
-  fi
+  # Try the Gitea version endpoint — lightweight and always available.
+  # The token rides a curl config on a /dev/fd pipe, never curl's argv, which
+  # every process of the user can read (ps, /proc/*/cmdline); printf is a
+  # builtin, so it is in no argv here either. With no token the config is
+  # empty and the request is anonymous. The value is cut to the token
+  # alphabet so it cannot break out of the quoted config string.
+  local response
+  response=$(curl -s -m 5 --config <([[ -n "$token" ]] && printf 'header = "Authorization: token %s"\n' "${token//[^A-Za-z0-9_.-]/}") "${api_base}/version" 2>/dev/null || echo "")
 
   # Gitea returns {"version":"X.Y.Z"} from this endpoint
   if echo "$response" | grep -q '"version"'; then
@@ -163,15 +159,13 @@ gitea_api() {
     -w "\n%{http_code}"
   )
 
-  if [[ -n "$FORGE_TOKEN" ]]; then
-    curl_args+=(-H "Authorization: token $FORGE_TOKEN")
-  fi
-
   if [[ -n "$body" ]]; then
     curl_args+=(-d "$body")
   fi
 
-  curl "${curl_args[@]}" "$url"
+  # The token rides a curl config on a /dev/fd pipe, never argv (see
+  # _probe_gitea_api). With no FORGE_TOKEN the config is empty.
+  curl "${curl_args[@]}" --config <([[ -n "$FORGE_TOKEN" ]] && printf 'header = "Authorization: token %s"\n' "${FORGE_TOKEN//[^A-Za-z0-9_.-]/}") "$url"
 }
 
 # Detect which merge strategy the target repository actually allows (#7844).

@@ -36,20 +36,6 @@ GUARD="$SCRIPTS_DIR/verdict-staleness-guard.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 
-assert_not_contains() {
-  local haystack="$1" needle="$2" msg="$3"
-  TESTS_RUN=$((TESTS_RUN + 1))
-  if [[ "$haystack" != *"$needle"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $msg"
-  else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $msg"
-    echo "    Unexpected substring: '$needle'"
-    echo "    In: '$haystack'"
-  fi
-}
-
 
 if [[ ! -x "$POST_VERDICT" ]]; then
   echo -e "${RED}FATAL${NC}: $POST_VERDICT not found or not executable" >&2
@@ -80,10 +66,17 @@ STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 if [[ "$1" == "api" ]]; then
   # #10581 round 2: scenario files fail a label DELETE / a label read.
   [[ " $* " == *" -X DELETE "* && -f "$LOOM_TEST_STUB_DIR/delete-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
+  # #14169: a wedged withdrawal — the file holds the sleep seconds (default 15).
+  [[ " $* " == *" -X DELETE "* && -f "$LOOM_TEST_STUB_DIR/delete-hang" ]] && { sleep "$(cat "$LOOM_TEST_STUB_DIR/delete-hang" 2>/dev/null || echo 15)"; exit 0; }
   [[ "$*" == *"/labels?"* && -f "$LOOM_TEST_STUB_DIR/labels-read-fail" ]] && { echo "HTTP 502" >&2; exit 1; }
   # #10485: the final head compare reads `repos/O/R/pulls/N --jq .head.sha`.
   if [[ "$2" =~ ^repos/[^/]+/[^/]+/pulls/[0-9]+$ ]]; then
     [[ -f "$LOOM_TEST_STUB_DIR/final-head-fail" ]] && exit 1
+    # #14169: a wedged read — the file holds the sleep seconds (default 15);
+    # after the sleep it answers normally (so budget 0 can let it finish).
+    if [[ -f "$LOOM_TEST_STUB_DIR/final-head-hang" ]]; then
+      sleep "$(cat "$LOOM_TEST_STUB_DIR/final-head-hang" 2>/dev/null || echo 15)"
+    fi
     if [[ -f "$LOOM_TEST_STUB_DIR/final-head" ]]; then cat "$LOOM_TEST_STUB_DIR/final-head"; else cat "$LOOM_TEST_STUB_DIR/cur-sha"; fi
     exit 0
   fi
@@ -207,9 +200,26 @@ if [[ "${1:-} ${2:-}" == "forge verdict-body-check" ]]; then
 fi
 if [[ "${1:-}" == forge && "${2:-}" == verdict-* && "${3:-}" == --help ]]; then
   [[ -f "$D/old-daemon" ]] && { echo "error: unrecognized subcommand '$2'" >&2; exit 2; }
+  # #12362: verdict-labels advertises --sha unless the mock is a pre-#12362 daemon.
+  [[ "$2" == verdict-labels && ! -f "$D/no-sha-daemon" ]] && echo "      --sha <SHA>  the head the verdict was written against"
+  exit 0
+fi
+# #13055: `lease pr check` answers from lease-state ("<rc> <line>"); default held-self.
+if [[ "${1:-} ${2:-} ${3:-}" == "lease pr check" ]]; then
+  printf '%s\n' "$*" >> "$D/lease-calls.log"
+  [[ -f "$D/lease-state" ]] || { echo "PR_LEASE_STATE=held-self"; exit 0; }
+  read -r rc line < "$D/lease-state"; [[ -n "$line" ]] && echo "$line"; exit "$rc"
+fi
+# #13264: `lease pr release` is logged; lease-release-rc makes it fail.
+if [[ "${1:-} ${2:-} ${3:-}" == "lease pr release" ]]; then
+  printf '%s\n' "$*" >> "$D/lease-release.log"
+  [[ -f "$D/lease-release-rc" ]] && { echo "release failed" >&2; exit "$(cat "$D/lease-release-rc")"; }
   exit 0
 fi
 if [[ "${1:-}" == --version ]]; then echo "loom-daemon 0.19.870 (mock)"; exit 0; fi
+# #12475: the reconciliation gate reads comment verdicts through the trust
+# filter; this suite posts none, so the filter just echoes its (empty) stdin.
+if [[ "${1:-} ${2:-}" == "forge trusted-comments" ]]; then cat; exit 0; fi
 if [[ "${1:-} ${2:-}" == "forge verdict-gate" ]]; then
   printf '%s\n' "$*" >> "$D/daemon-calls.log"
   [[ -f "$D/gate-answer" ]] || { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
@@ -233,7 +243,16 @@ if [[ "${1:-} ${2:-}" == "forge verdict-labels" ]]; then
   [[ -f "$D/labels-fail" ]] && { echo "forge verdict-labels: did not hold: missing loom:pr.  Repair: gh pr edit $3 --add-label loom:pr" >&2; exit 1; }
   echo "LOOM-VERDICT-LABELS OK"; exit 0
 fi
-echo "mock loom-daemon: forge comment not under test here" >&2
+# #9865: comments post only through the daemon; the mock lands them on the
+# suite's stub gh (as `gh issue comment`) so the call-log assertions still hold.
+if [[ "${1:-} ${2:-}" == "forge comment" ]]; then
+  _n="$3"; shift 3; _repo=""; _body=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --repo) _repo="$2"; shift 2 ;; --body) _body="$2"; shift 2 ;; *) shift ;; esac
+  done
+  exec gh issue comment "$_n" --repo "$_repo" --body "$_body"
+fi
+echo "mock loom-daemon: unexpected invocation: $*" >&2
 exit 127
 MOCK
 chmod +x "$STUB_DIR/loom-daemon"
@@ -249,9 +268,9 @@ cd "$STUB_DIR/checkout"
 reset_state() {
   rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR/last-pr.txt" "$STUB_DIR/last-body.txt" \
     "$STUB_DIR"/ci-stdout "$STUB_DIR"/ci-stderr "$STUB_DIR"/ci-garbage "$STUB_DIR"/ci-absent "$STUB_DIR"/ci-empty "$STUB_DIR"/ci-required \
-    "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR/wait-checks-calls.log" \
+    "$STUB_DIR"/final-head "$STUB_DIR"/final-head-fail "$STUB_DIR"/final-head-hang "$STUB_DIR"/delete-hang "$STUB_DIR/wait-checks-calls.log" \
     "$STUB_DIR/gate-answer" "$STUB_DIR/reconcile-answer" "$STUB_DIR"/reconcile-answer.* "$STUB_DIR/labels-fail" "$STUB_DIR/lock-fail" "$STUB_DIR/daemon-calls.log" \
-    "$STUB_DIR/old-daemon" "$STUB_DIR/body-answer" "$STUB_DIR/body-check-missing" "$STUB_DIR/body-check-input.txt" "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail" "$STUB_DIR/pr-edit.log" "$STUB_DIR/pr-edit-fail"
+    "$STUB_DIR/lease-state" "$STUB_DIR/lease-calls.log" "$STUB_DIR/old-daemon" "$STUB_DIR/body-answer" "$STUB_DIR/body-check-missing" "$STUB_DIR/body-check-input.txt" "$STUB_DIR/delete-fail" "$STUB_DIR/labels-read-fail" "$STUB_DIR/pr-edit.log" "$STUB_DIR/pr-edit-fail"
 }
 
 run_pv() {
@@ -320,6 +339,22 @@ assert_eq "" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "no comment at
 reset_state
 run_pv abc approved abc1234 --body "x"
 assert_eq "2" "$EXIT_CODE" "non-numeric PR number -> exit 2"
+
+# T8a: aliases normalise to the canonical verdict tokens (#12692).
+reset_state
+run_pv 110 approve abc1234 --body "x"
+assert_eq "0" "$EXIT_CODE" "alias 'approve' -> exits 0"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->" "'approve' posts verdict=approved"
+reset_state
+run_pv 111 request-changes abc1234 --body "x"
+assert_eq "0" "$EXIT_CODE" "alias 'request-changes' -> exits 0"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=abc1234 verdict=changes-requested -->" "'request-changes' posts verdict=changes-requested"
+reset_state
+run_pv 112 bogus abc1234 --body "x"
+assert_eq "2" "$EXIT_CODE" "unknown verdict 'bogus' still -> exit 2"
+reset_state
+run_pv 113 Approve abc1234 --body "x"
+assert_eq "2" "$EXIT_CODE" "aliases are case-sensitive: 'Approve' -> exit 2"
 
 # T8: invalid verdict token -> rejected (only approved/changes-requested are
 # valid, matching verdict-staleness-guard.sh's verdict_token_for_label()).
@@ -463,7 +498,15 @@ else
   for token in approved changes-requested; do
     reset_state
     run_pv 200 "$token" 0123456789abcdef0123456789abcdef01234567 --body "cross-check"
-    GUARD_REGEX="${GUARD_MARKER_TEMPLATE//\$VERDICT_TOKEN/$token}"
+    # The guard's reader accepts aliases ($VERDICT_ALT); mirror its mapping so
+    # the canonical writer output is checked against the alias-tolerant reader.
+    case "$token" in
+      approved) token_alt='approved|approve' ;;
+      changes-requested) token_alt='changes-requested|request-changes' ;;
+      *) token_alt="$token" ;;
+    esac
+    GUARD_REGEX="${GUARD_MARKER_TEMPLATE//\$VERDICT_ALT/$token_alt}"
+    GUARD_REGEX="${GUARD_REGEX//\$VERDICT_TOKEN/$token}"
     # -E (POSIX extended), not -P: the guard's own regex uses only portable
     # ERE syntax ([0-9a-f]{7,40}), and BSD grep (macOS) has no -P at all.
     if printf '%s' "$LAST_BODY" | grep -Eq -- "$GUARD_REGEX"; then
@@ -583,6 +626,46 @@ run_pv 310 approved "$CI_SHA_FULL" --body "ok"
 assert_eq "5" "$EXIT_CODE" "final head read failure -> exit 5"
 no_comment "final head read failure"
 
+# a HUNG final head read is bounded (#14169): the unbounded read wedged this
+# script for 11 minutes; the read now times out into the same exit-5 refusal.
+reset_state
+echo 15 > "$STUB_DIR/final-head-hang"
+HANG_T0=$SECONDS
+set +e
+printf '%s' "$CI_SHA_FULL" > "$STUB_DIR/cur-sha"
+OUTPUT=$(LOOM_FORGE_REVIEW_READ_TIMEOUT=1 "$POST_VERDICT" 320 approved "$CI_SHA_FULL" --body "ok" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_eq "5" "$EXIT_CODE" "hung final-head read -> exit 5 within the budget"
+assert_contains "$OUTPUT" "final head read" "the timeout line names the timed-out read"
+assert_contains "$OUTPUT" "#14169" "the timeout line cites the issue"
+if (( SECONDS - HANG_T0 < 10 )); then pass "hung read bounded: returned well before the stub's 15s sleep"; else fail "hung read bounded: returned well before the stub's 15s sleep"; fi
+no_comment "hung final-head read"
+
+# ... bounded the same way on the portable (no timeout(1)) fallback — the
+# macOS shape (LOOM_FORCE_PORTABLE_TIMEOUT=1).
+reset_state
+echo 15 > "$STUB_DIR/final-head-hang"
+set +e
+printf '%s' "$CI_SHA_FULL" > "$STUB_DIR/cur-sha"
+OUTPUT=$(LOOM_FORGE_REVIEW_READ_TIMEOUT=1 LOOM_FORCE_PORTABLE_TIMEOUT=1 "$POST_VERDICT" 321 approved "$CI_SHA_FULL" --body "ok" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_eq "5" "$EXIT_CODE" "portable fallback: hung final-head read -> exit 5"
+no_comment "portable fallback (hung final-head read)"
+
+# budget 0 restores the unbounded read (the documented disable): a slow-but-
+# finishing read succeeds instead of timing out.
+reset_state
+echo 2 > "$STUB_DIR/final-head-hang"
+set +e
+printf '%s' "$CI_SHA_FULL" > "$STUB_DIR/cur-sha"
+OUTPUT=$(LOOM_FORGE_REVIEW_READ_TIMEOUT=0 "$POST_VERDICT" 322 approved "$CI_SHA_FULL" --body "ok" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_eq "0" "$EXIT_CODE" "budget 0 disables the bound: slow read succeeds -> posted"
+assert_eq "322" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "budget 0: approval posted"
+
 # status read failure: older daemon (no wait-checks), garbage output, no binary
 reset_state
 touch "$STUB_DIR/ci-absent"
@@ -631,6 +714,20 @@ assert_contains "$CALLS" "forge verdict-gate 300 --repo owner/repo --verdict app
 assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved" "label transition runs after the post"
 assert_contains "$CALLS" "forge verdict-lock acquire 300 --repo owner/repo" "the per-PR lock is taken before the gate"
 assert_contains "$CALLS" "forge verdict-lock release 300 --repo owner/repo" "the per-PR lock is released at exit"
+
+# #12362: the head reaches verdict-labels (journaled there for telemetry) and
+# nothing else about the call, its stdout or its exit code changes.
+assert_contains "$CALLS" "forge verdict-labels 300 --repo owner/repo --verdict approved --sha abc1234" "verdict-labels gets the head via --sha (main path)"
+
+# A daemon that predates --sha is never handed it (clap would reject the call
+# and stall the verdict): the labels still apply, exit 0.
+reset_state
+touch "$STUB_DIR/no-sha-daemon"
+run_pv 308 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "pre-#12362 daemon: verdict still lands"
+assert_eq "0" "$(grep -c -- '--sha' <<<"$(grep 'forge verdict-labels 308' "$STUB_DIR/daemon-calls.log")")" "pre-#12362 daemon: no --sha on verdict-labels"
+assert_eq "1" "$(grep -c 'forge verdict-labels 308 --repo owner/repo --verdict approved' "$STUB_DIR/daemon-calls.log")" "pre-#12362 daemon: label transition still runs"
+rm -f "$STUB_DIR/no-sha-daemon"
 
 # Lock timeout: exit 9 (fail closed), the gate never runs, nothing is posted.
 reset_state
@@ -711,6 +808,8 @@ assert_contains "$(cat "$STUB_DIR/last-body.txt" 2>/dev/null || true)" "verdict=
 CALLS="$(cat "$STUB_DIR/daemon-calls.log")"
 assert_eq "yes" "$([[ "${CALLS%%forge verdict-labels*}" == *"forge verdict-reconcile"* ]] && echo yes || echo no)" "reconcile precedes verdict-labels"
 
+assert_contains "$CALLS" "forge verdict-labels 321 --repo owner/repo --verdict changes-requested --sha abc1234" "superseded path hands the head to its changes-requested flip"
+
 # A changes-requested that prevails re-asserts its own labels.
 reset_state
 echo "0 LOOM-VERDICT-RECONCILE PREVAILS 1 concurrent approved verdict(s) landed" > "$STUB_DIR/reconcile-answer"
@@ -771,6 +870,24 @@ assert_not_contains "$OUTPUT" "loom:pr was withdrawn" "a failed DELETE is never 
 assert_contains "$OUTPUT" "could NOT be withdrawn" "the failed withdrawal is announced"
 assert_contains "$OUTPUT" "gh pr edit 328 --repo owner/repo --remove-label loom:pr" "the manual removal command is printed"
 
+# a HUNG withdrawal DELETE is bounded too (#14169): it times out into the same
+# NOT-withdrawn announcement, never a claimed withdrawal.
+reset_state
+echo "0 LOOM-VERDICT-RECONCILE STABLE" > "$STUB_DIR/reconcile-answer.1"
+echo "1 LOOM-VERDICT-RECONCILE UNREAD x" > "$STUB_DIR/reconcile-answer.2"
+echo 15 > "$STUB_DIR/delete-hang"
+DEL_T0=$SECONDS
+set +e
+printf '%s' "abc1234" > "$STUB_DIR/cur-sha"
+OUTPUT=$(LOOM_FORGE_REVIEW_READ_TIMEOUT=1 "$POST_VERDICT" 328 approved abc1234 --body "ok" 2>&1)
+EXIT_CODE=$?
+set -e
+assert_eq "8" "$EXIT_CODE" "hung withdrawal DELETE -> exit 8"
+assert_not_contains "$OUTPUT" "loom:pr was withdrawn" "a timed-out DELETE is never reported as a withdrawal"
+assert_contains "$OUTPUT" "could NOT be withdrawn" "the timed-out withdrawal falls to the NOT-withdrawn announcement"
+assert_contains "$OUTPUT" "#14169" "the timeout line names the timed-out DELETE"
+if (( SECONDS - DEL_T0 < 10 )); then pass "hung DELETE bounded: returned well before the stub's 15s sleep"; else fail "hung DELETE bounded: returned well before the stub's 15s sleep"; fi
+
 # --- T17: a daemon without the #10581 verbs (capability probe, round 2) -----
 
 # An approval posts on the legacy path (round 4, so a script roll ahead of the
@@ -819,6 +936,52 @@ run_pv 332 changes-requested abc1234 --body "please fix"
 assert_eq "8" "$EXIT_CODE" "legacy path label failure -> exit 8"
 assert_eq "332" "$(cat "$STUB_DIR/last-pr.txt" 2>/dev/null || true)" "the comment itself was posted"
 assert_contains "$OUTPUT" "Repair: gh pr edit 332 --repo owner/repo --add-label loom:changes-requested" "repair command is printed"
+
+# --- Judge lease gate (#13055) ------------------------------------------------
+for case_ in "0 PR_LEASE_STATE=free" "4 PR_LEASE_STATE=held-peer" "5 PR_LEASE_STATE=unknown" "5 garbage-no-state-line" "0 "; do
+  reset_state
+  echo "$case_" > "$STUB_DIR/lease-state"
+  run_pv 340 approved abc1234 --body "ok"
+  assert_eq "10" "$EXIT_CODE" "lease '$case_' -> approval refused with exit 10"
+  no_comment "lease '$case_'"
+  assert_contains "$OUTPUT" "does not hold a live Judge lease" "lease '$case_': stderr names the refusal"
+done
+reset_state
+echo "0 PR_LEASE_STATE=free" > "$STUB_DIR/lease-state"
+run_pv 341 changes-requested abc1234 --body "please fix"
+assert_eq "0" "$EXIT_CODE" "changes-requested is not gated on the lease"
+reset_state
+echo "0 PR_LEASE_STATE=held-self" > "$STUB_DIR/lease-state"
+run_pv 342 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "held-self -> approval posted"
+assert_contains "$(cat "$STUB_DIR/lease-calls.log")" "lease pr check 342 --role judge --watch-pid" "check asked for this PR and role"
+reset_state
+echo "2 error: unrecognized subcommand 'pr'" > "$STUB_DIR/lease-state"
+run_pv 343 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "binary without lease pr (exit 2) -> approval proceeds"
+assert_contains "$OUTPUT" "not gating the approval" "older binary: loud warning"
+
+# --- Judge lease release after a posted verdict (#13264) ---------------------
+for v in approved changes-requested; do
+  reset_state
+  rm -f "$STUB_DIR/lease-release.log" "$STUB_DIR/lease-release-rc"
+  run_pv 344 "$v" abc1234 --body "ok"
+  assert_eq "0" "$EXIT_CODE" "$v: posted"
+  assert_contains "$(cat "$STUB_DIR/lease-release.log" 2>/dev/null || true)" "lease pr release 344 --role judge --watch-pid" "$v: lease released after the verdict"
+done
+reset_state
+rm -f "$STUB_DIR/lease-release.log"
+echo 2 > "$STUB_DIR/lease-release-rc"
+run_pv 345 approved abc1234 --body "ok"
+assert_eq "0" "$EXIT_CODE" "release failure (exit 2) never fails the verdict"
+assert_contains "$OUTPUT" "releasing the Judge lease failed" "release failure warns"
+rm -f "$STUB_DIR/lease-release-rc"
+reset_state
+echo "0 PR_LEASE_STATE=free" > "$STUB_DIR/lease-state"
+rm -f "$STUB_DIR/lease-release.log"
+run_pv 346 approved abc1234 --body "ok"
+assert_contains "$OUTPUT" "gate-refused:lease" "exit-10 message names the skip reason"
+assert_eq "" "$(cat "$STUB_DIR/lease-release.log" 2>/dev/null || true)" "refused approval: script does not release"
 
 # --- Summary ---
 echo ""

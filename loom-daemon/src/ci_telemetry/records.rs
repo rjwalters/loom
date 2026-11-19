@@ -157,6 +157,12 @@ impl RunJson {
         self.status.as_deref() == Some("completed")
     }
 
+    /// Waiting for a runner (#11993). An absent `status` is not counted.
+    #[must_use]
+    pub fn is_queued(&self) -> bool {
+        self.status.as_deref() == Some("queued")
+    }
+
     #[must_use]
     pub fn workflow(&self) -> String {
         self.name.clone().unwrap_or_else(|| "unnamed".to_string())
@@ -168,7 +174,7 @@ impl RunJson {
     /// 1. `pull_requests[].number` — the true PR number, present only when
     ///    GitHub associates a PR with the run (typically `event ==
     ///    "pull_request"`).
-    /// 2. [`crate::claim_reconciliation::parse_issue_from_branch`] on
+    /// 2. [`crate::worktree_ops::naming::issue_from_branch`] on
     ///    `head_branch` — a `feature/issue-N` branch's **issue** number, used
     ///    as a fallback for `push`-triggered runs where no PR association is
     ///    reported. This is a different number space than (1) (issue vs. PR),
@@ -184,7 +190,7 @@ impl RunJson {
         }
         self.head_branch
             .as_deref()
-            .and_then(crate::claim_reconciliation::parse_issue_from_branch)
+            .and_then(crate::worktree_ops::naming::issue_from_branch)
     }
 
     /// Why this run attempt happened (#9337). Evaluated in order:
@@ -768,7 +774,7 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         status: span_status(run.conclusion.as_deref()),
         attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
-            ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+            ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
             ("loom.ci.workflow", Some(workflow)),
             ("loom.ci.event", Some(run.event.clone())),
@@ -788,13 +794,6 @@ pub fn run_envelopes(repo: &RepoJson, run: &RunJson, host_id: &str) -> Vec<Telem
         envelope(host_id, TelemetryRecord::CiDuration(duration_record), None),
         envelope(host_id, TelemetryRecord::Span(span), Some(ctx)),
     ]
-}
-
-pub(super) fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
 }
 
 /// The envelopes of one completed job's unit: `ci.job`, `ci.duration`
@@ -886,7 +885,7 @@ pub fn job_envelopes_with_reason(
         status: span_status(job.conclusion.as_deref()),
         attributes: span_attributes(vec![
             ("loom.repo", Some(repo.full_name.clone())),
-            ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+            ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
             ("loom.ci.run_id", Some(run.id.to_string())),
             ("loom.ci.job_id", Some(job.id.to_string())),
             ("loom.ci.workflow", Some(workflow)),
@@ -959,7 +958,7 @@ fn step_envelopes(
                 status: span_status(step.conclusion.as_deref()),
                 attributes: span_attributes(vec![
                     ("loom.repo", Some(repo.full_name.clone())),
-                    ("loom.repo.visibility", Some(visibility_str(repo.visibility()).to_string())),
+                    ("loom.repo.visibility", Some(repo.visibility().as_str().to_string())),
                     ("loom.ci.run_id", Some(run.id.to_string())),
                     ("loom.ci.job_id", Some(job.id.to_string())),
                     ("loom.ci.workflow", Some(run.workflow())),

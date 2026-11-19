@@ -310,7 +310,7 @@ fn read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly() {
         home.join(SESSIONS_DIR).join("auth.json"),
     ] {
         assert!(path.is_file(), "fixture must exist: {}", path.display());
-        assert_eq!(read_rollout(&home, &path), None, "{}", path.display());
+        assert_eq!(read_rollout(&home, &path, u64::MAX), None, "{}", path.display());
     }
 }
 
@@ -587,6 +587,42 @@ fn an_explicit_session_id_set_is_a_strictly_narrower_key_than_directory_alone() 
             .session_id
             .as_deref(),
         Some("wanted")
+    );
+}
+
+/// An id set NARROWS the directory+window key, it does not replace it: an
+/// id-matched rollout whose `cwd` is outside `directories`, or whose start is
+/// outside the window, is not attributed. `usage_source::role_tick_tokens_by_model`
+/// documents this asymmetry with the OpenCode arm (#14278); only an ids-only
+/// filter drops the directory constraint.
+#[test]
+fn ids_are_anded_with_the_directory_and_window_not_a_replacement_for_them() {
+    let lines =
+        rollout("/elsewhere", "2026-09-21T02:06:31Z", "wanted", "gpt-5", &[(100, 0, 10, 0)]);
+    let anded = SessionFilter {
+        directories: vec![PathBuf::from("/w")],
+        ids: vec!["wanted".to_string()],
+    };
+    assert!(
+        fold_rollout(&lines, &anded, None).is_empty(),
+        "the id names the rollout but its cwd is outside the directory set"
+    );
+    let ids_only = SessionFilter {
+        directories: Vec::new(),
+        ids: vec!["wanted".to_string()],
+    };
+    assert_eq!(fold_rollout(&lines, &ids_only, None).len(), 1);
+
+    let in_dir = rollout("/w", "2026-09-21T02:06:31Z", "wanted", "gpt-5", &[(100, 0, 10, 0)]);
+    let created = instant("2026-09-21T02:06:31Z");
+    assert!(
+        fold_rollout(
+            &in_dir,
+            &anded,
+            Some((created + Duration::seconds(1), created + Duration::hours(1)))
+        )
+        .is_empty(),
+        "the window still applies to an id-matched rollout"
     );
 }
 

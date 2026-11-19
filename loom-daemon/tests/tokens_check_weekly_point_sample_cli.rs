@@ -180,3 +180,8 @@ fn an_unwritable_activity_db_does_not_break_the_check() {
         "the .ranking write must be unaffected by the sampling failure"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

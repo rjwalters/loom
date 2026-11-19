@@ -2,7 +2,6 @@
 //! version gate, and the profile files themselves.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -194,6 +193,9 @@ pub struct Refresher {
     at: Option<Instant>,
     published: BTreeSet<String>,
     logged: HashSet<String>,
+    /// The `gh` (path, version) the last successful pass published with, so a
+    /// replaced `gh` is reported on the next refresh (#12147).
+    gh_seen: Option<(PathBuf, GhVersion)>,
 }
 
 impl Refresher {
@@ -201,6 +203,12 @@ impl Refresher {
         if self.logged.insert(key.clone()) {
             f(&key);
         }
+    }
+
+    /// The `gh` the last successful pass published with.
+    #[must_use]
+    pub fn gh_seen(&self) -> Option<&(PathBuf, GhVersion)> {
+        self.gh_seen.as_ref()
     }
 
     /// One pass for the workspace at `ws` against its live config.
@@ -315,6 +323,17 @@ impl Refresher {
             log::warn!("forge_gateway: could not write {GH_MARKER} in {}", base.display());
         }
         let set: BTreeSet<String> = owners.iter().cloned().collect();
+        // The version is re-probed on every due pass; what used to hide an
+        // upgraded `gh` was this line logging only when the owner set moved.
+        let gh_now = (gh_path.to_path_buf(), version);
+        let gh_changed = self.gh_seen.as_ref().is_some_and(|prev| *prev != gh_now);
+        if gh_changed {
+            log::info!(
+                "forge_gateway: gh changed to {} (gh {version}) — 2am#4367",
+                gh_path.display()
+            );
+        }
+        self.gh_seen = Some(gh_now);
         if set != self.published {
             log::info!(
                 "forge_gateway: gateway read profiles live for [{}] via {} (gh {version}) — 2am#4367",
@@ -371,33 +390,14 @@ fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Write `bytes` to `path` atomically, created 0600 (never readable by
 /// others, not even for an instant).
 pub(super) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    // A leftover from a crashed run may carry any mode: never reuse it.
-    let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let written = opts
-        .open(&tmp)
-        .and_then(|mut f| {
-            // The umask cannot widen 0600, but make the mode explicit anyway
-            // before a byte of the key is written.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            f.write_all(bytes)
-        })
-        .and_then(|()| std::fs::rename(&tmp, path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written
+    crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )
 }
 
 /// The gateway profile's `config.yml`: `version: 1` skips gh's account

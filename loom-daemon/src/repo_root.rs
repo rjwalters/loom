@@ -142,6 +142,33 @@ pub fn resolve_repo_root(workspace: &str) -> anyhow::Result<PathBuf> {
     })
 }
 
+/// Follow a linked worktree's `.git` **file** (`gitdir: <main>/.git/worktrees/<name>`)
+/// back to its main checkout: the pointer's third ancestor.
+///
+/// This is the bash-parity parse shared by `daemon_start::paths` and
+/// `daemon_update::paths` (#13421): `sed 's/^gitdir: //'` is per-line and
+/// unanchored at the end, and `$( )` then strips the trailing newline, so a
+/// single-line `.git` file — the only shape git writes — reduces to this. It
+/// is deliberately **not** [`resolve_git_root`]: that one canonicalizes and
+/// walks to the `.git` component, while the lifecycle scripts keep the
+/// logical path.
+///
+/// `None` when `git_file` is unreadable or the pointer has too few ancestors.
+/// The caller still decides whether the result holds a `.loom/` directory.
+pub(crate) fn main_checkout_from_gitdir_file(git_file: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(git_file).ok()?;
+    let gitdir = text
+        .lines()
+        .map(|l| l.strip_prefix("gitdir: ").unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    PathBuf::from(&gitdir)
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
 /// Resolve the main repo root for a candidate directory, following a linked
 /// worktree's `.git` `gitdir:` pointer file when present. Mirrors
 /// `loom_tools.common.repo._resolve_git_root`.
@@ -185,6 +212,18 @@ mod tests {
     fn make_repo(root: &Path) {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join(".loom")).unwrap();
+    }
+
+    #[test]
+    fn gitdir_file_resolves_to_main_checkout() {
+        let dir = tempdir().unwrap();
+        let main = dir.path().join("main");
+        let git_file = dir.path().join("wt").join(".git");
+        std::fs::create_dir_all(git_file.parent().unwrap()).unwrap();
+        std::fs::write(&git_file, format!("gitdir: {}/.git/worktrees/issue-1\n", main.display()))
+            .unwrap();
+        assert_eq!(main_checkout_from_gitdir_file(&git_file), Some(main));
+        assert_eq!(main_checkout_from_gitdir_file(&dir.path().join("missing")), None);
     }
 
     #[test]

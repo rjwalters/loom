@@ -37,6 +37,7 @@ Present it grouped like this (keep descriptions terse, one line each):
 | Command | What it does |
 |---------|--------------|
 | `/loom:sweep <issue>` | Run one issue through the full lifecycle (Curator → Builder → Judge → Doctor → Merge). Also `--prs` for a PR set. |
+| `/loom:accelerate [--dry-run] [--yes] [--max-parallel N]` | Session-only `/loom:sweep all` + `all --prs` loop sized to this machine, to push one repo faster alongside the fleet. No daemon. |
 | `/loom:loom` | Operate the Layer 2 `loom-daemon` — dispatch, monitor, and cancel sweeps via MCP tools. |
 | `/loom:watch [--until HH:MM]` | Watch the fleet on a tick loop: health probe, bounded remediation, end-of-window summary. `--dry-run` for one read-only tick. |
 
@@ -76,12 +77,12 @@ After printing the overview, do a lightweight accuracy check against what is act
 
 1. List the installed command files: `ls .claude/commands/loom/*.md` (read-only). If that path is missing, try `ls defaults/.claude/commands/loom/*.md` (the loom source repo's canonical copy).
 2. Reduce each result to its base name without `.md`.
-3. **Exclude** the known reference sub-docs and deprecated stubs:
+3. **Exclude** the known reference sub-docs:
    - anything ending in `-patterns` or `-reference` (e.g. `architect-patterns`, `loom-reference`)
    - the builder sub-docs: `builder-pr`, `builder-worktree`, `builder-complexity`
    - the champion helper docs: `champion-common`, `champion-epic`, `champion-issue-promo`, `champion-pr-merge` (any `champion-*` other than `champion` itself)
    - `sweep-*` sub-docs, plus `cargo-target-isolation`, `comment-body-literal-path`, `probe-protocol`
-   - the deprecated stubs: `loom-iteration`, `loom-parent`
+   - reference sub-docs are marked: their file starts with `disable-model-invocation: true` frontmatter, which keeps them out of the model-facing skill listing (#13960) while `/loom:<name>` and Read-by-path keep working
 4. Compare the surviving set against the curated command names above.
    - If an installed primary command is **missing** from the curated list, warn: `Note: /loom:<name> is installed here but not described above — this help text may be out of date (please report).`
    - If a curated command is **not** installed here, note it as possibly-not-installed rather than dropping it silently: `Note: /loom:<name> is described above but not found in this install.`
@@ -95,7 +96,7 @@ Keep warnings brief.
 
 The user asked about one command. Resolve `<command>` to a file at `.claude/commands/loom/<name>.md` (fall back to `defaults/.claude/commands/loom/<name>.md`).
 
-**If the name resolves to a reference sub-doc or deprecated stub** (matches the exclude rules above — `*-patterns`, `*-reference`, `builder-pr/-worktree/-complexity`, a `champion-*` helper, `loom-iteration`, `loom-parent`): explain that it is an internal reference file, not a user-invocable command, and point at its parent command (e.g. `builder-pr` → `/loom:builder`). Do not summarize it as if it were a command.
+**If the name resolves to a reference sub-doc** (matches the exclude rules above — `*-patterns`, `*-reference`, `builder-pr/-worktree/-complexity`, a `champion-*` helper): explain that it is an internal reference file, not a user-invocable command, and point at its parent command (e.g. `builder-pr` → `/loom:builder`). Do not summarize it as if it were a command.
 
 **If the file does not exist**: say so plainly, list the closest matches from the curated command names, and suggest `/loom:help` (no args) for the full list. Do not guess or fabricate behavior.
 

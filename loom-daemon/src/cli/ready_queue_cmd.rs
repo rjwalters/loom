@@ -10,7 +10,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use loom_daemon::types::{
+use crate::types::{
     DaemonStatusReport, DispatchPlanContext, PlanState, ReadyQueueRow, WorkFinderTickSummary,
 };
 
@@ -30,7 +30,7 @@ pub(crate) fn stale_after_secs(report: &DaemonStatusReport) -> i64 {
     let interval = report
         .work_finder_interval_secs
         .filter(|s| *s > 0)
-        .unwrap_or(loom_daemon::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS);
+        .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS);
     let secs = interval
         .saturating_mul(STALE_AFTER_INTERVALS)
         .max(STALE_FLOOR_SECS);
@@ -39,7 +39,7 @@ pub(crate) fn stale_after_secs(report: &DaemonStatusReport) -> i64 {
 
 /// Handle `loom-daemon queue [--json]`. Exits 1 only when the daemon is
 /// unreachable; an empty queue is a normal answer.
-pub(crate) async fn handle_queue_command(json: bool) -> Result<()> {
+pub async fn handle_queue_command(json: bool) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     let timeout_info = resolve_status_timeout(None);
     let report = match query_daemon_status(&socket_path, &timeout_info).await {
@@ -187,12 +187,7 @@ pub(crate) fn render_queue(report: &DaemonStatusReport, now: DateTime<Utc>) -> S
 fn render_plan(plan: &DispatchPlanContext) -> String {
     let s = &plan.slots;
     let opt = |v: Option<usize>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
-    let mut line = format!(
-        "Plan: {} free of {} slot(s), {} admission(s)/tick",
-        opt(s.free),
-        s.max_concurrent,
-        opt(s.max_admissions_per_tick)
-    );
+    let mut line = format!("Plan: {} free of {} slot(s)", opt(s.free), s.max_concurrent);
     if let Some(secs) = plan.tick_interval_secs {
         line.push_str(&format!(", every {secs}s"));
     }
@@ -200,9 +195,6 @@ fn render_plan(plan: &DispatchPlanContext) -> String {
         (plan.shard.configured, plan.shard.host_shard, plan.shard.shard_count)
     {
         line.push_str(&format!(", shard {host}/{count}"));
-    }
-    if s.saturation_held {
-        line.push_str(", SATURATION-HELD");
     }
     line.push('\n');
     line
@@ -236,7 +228,7 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
     // The priority level (#11510), when it is not the default.
-    if row.level != loom_daemon::priority_pick::Level::Default {
+    if row.level != crate::priority_pick::Level::Default {
         flags.push(row.level.as_str().to_string());
     }
     if row.main_red_fix {
@@ -266,7 +258,7 @@ fn render_row(row: &ReadyQueueRow) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::types::{PlanGate, PlanKey, PlanSlots, QueueDisposition, RowPlan};
+    use crate::types::{PlanGate, PlanKey, PlanSlots, QueueDisposition, RowPlan};
 
     fn report_with(queue: Vec<ReadyQueueRow>, at: DateTime<Utc>) -> DaemonStatusReport {
         DaemonStatusReport {
@@ -290,9 +282,9 @@ mod tests {
             workspace_weight: 100,
             urgent: false,
             level: if rank == 1 {
-                loom_daemon::priority_pick::Level::VeryImportant
+                crate::priority_pick::Level::VeryImportant
             } else {
-                loom_daemon::priority_pick::Level::Default
+                crate::priority_pick::Level::Default
             },
             main_red_fix: false,
             created_at: None,
@@ -409,7 +401,7 @@ mod tests {
         let mut r = report_with(
             vec![
                 row(1, 10, QueueDisposition::Dispatched),
-                row(2, 11, QueueDisposition::DeferredRampCap),
+                row(2, 11, QueueDisposition::DeferredCapacity),
             ],
             now,
         );
@@ -430,7 +422,7 @@ mod tests {
         tick.queue[1].plan = RowPlan {
             position: Some(2),
             plan_state: PlanState::Next,
-            gate: Some(PlanGate::Ramp),
+            gate: Some(PlanGate::Capacity),
             ..RowPlan::default()
         };
         // Row keys alone are enough to name the ordering.
@@ -442,7 +434,6 @@ mod tests {
                 max_concurrent: 2,
                 occupancy: Some(2),
                 free: Some(0),
-                max_admissions_per_tick: Some(1),
                 ..PlanSlots::default()
             },
             tick_interval_secs: Some(60),
@@ -453,15 +444,12 @@ mod tests {
         assert_eq!(j["ordering"], serde_json::json!(["level", "created_at"]));
         assert_eq!(j["plan"]["slots"]["max_concurrent"], 2);
         assert_eq!(j["queue"][1]["plan_state"], "next");
-        assert_eq!(j["queue"][1]["gate"], "ramp");
+        assert_eq!(j["queue"][1]["gate"], "capacity");
         assert_eq!(j["queue"][1]["position"], 2);
         let text = render_queue(&r, now);
         assert!(text.contains("Order: level, then created_at"), "{text}");
-        assert!(
-            text.contains("Plan: 0 free of 2 slot(s), 1 admission(s)/tick, every 60s"),
-            "{text}"
-        );
-        assert!(text.contains("#2 next/ramp"), "{text}");
+        assert!(text.contains("Plan: 0 free of 2 slot(s), every 60s"), "{text}");
+        assert!(text.contains("#2 next/capacity"), "{text}");
         assert!(text.contains("#1 running"), "{text}");
     }
 }

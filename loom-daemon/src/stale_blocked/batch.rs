@@ -50,6 +50,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
+use super::unreadable::Unreadable;
 use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
@@ -88,6 +89,9 @@ pub struct RefState {
     /// without merging reads exactly like a closed issue, and only the second
     /// is a resolved blocker.
     pub is_pr: bool,
+    /// When it closed/merged (RFC 3339; the forge's `closed_at`), if it did
+    /// and the forge said so (#13889).
+    pub closed_at: Option<String>,
 }
 
 /// One PR declared to close an issue, as the batched query reports it.
@@ -101,7 +105,7 @@ pub struct ClosingRef {
 /// [`GhStaleBlockedForge`]; tests use a counting fake.
 pub trait StaleBlockedForge {
     /// Whether the repository is archived (#10562): one REST `repos/{slug}`
-    /// read through [`probe_archived`], the same probe the release pass uses.
+    /// read through [`probe_archived`], the same probe the role runner uses.
     ///
     /// # Errors
     /// The read failed, or the answer carried no `archived` flag.
@@ -112,13 +116,6 @@ pub trait StaleBlockedForge {
     /// # Errors
     /// The listing did not answer completely.
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>>;
-
-    /// Every open item labelled `loom:blocked-unnamed` (#10558), which may no
-    /// longer carry `loom:blocked`.
-    ///
-    /// # Errors
-    /// The listing did not answer completely.
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>>;
 
     /// Every comment on an issue or PR, oldest first.
     ///
@@ -146,12 +143,20 @@ pub trait StaleBlockedForge {
     /// The whole batch did not answer.
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>>;
 
-    /// The live budget from the free `/rate_limit` + GraphQL `rateLimit`
-    /// probe; `None` when it did not answer.
+    /// The budget from the process-wide cache / response-header readings,
+    /// else one free `/rate_limit` probe (#12204: never a standalone GraphQL
+    /// `rateLimit` query); `None` when nothing answered.
     fn budget(&mut self) -> Option<Budget>;
 
     /// Whether the rate-limit breaker is suppressing forge calls.
     fn breaker_open(&mut self) -> bool;
+
+    /// Whether the forge's trust rules believe an author with this login and
+    /// `author_association` (#13889: a body marker is read only from a
+    /// trusted author). Default: nobody — fail safe.
+    fn trusts_author(&mut self, _login: Option<&str>, _association: Option<&str>) -> bool {
+        false
+    }
 
     /// What the reads above have spent so far.
     fn meter(&self) -> Meter;
@@ -164,6 +169,12 @@ pub struct Gathered {
     pub number: i64,
     pub title: String,
     pub evidence: Result<Evidence, String>,
+    /// The typed cause when `evidence` is an `Err` (#12036).
+    pub cause: Option<Unreadable>,
+    /// The listing row's label names (#13331: the notifier's unpark gate).
+    pub labels: Vec<String>,
+    /// The listing row's body (#13331: park records are read from it).
+    pub body: String,
 }
 
 /// Which artifacts to examine.
@@ -201,8 +212,10 @@ struct Pending {
     unparsed_unchecked: usize,
     declared: Vec<crate::park_record::BlockerRef>,
     held: Option<super::Held>,
+    permanent_block: bool,
+    hold: Option<super::HoldComment>,
     closing: Vec<ClosingRef>,
-    failed: Option<String>,
+    failed: Option<Unreadable>,
 }
 
 /// A blocker reference: `(repo, number)`, `None` meaning the invoking repo.
@@ -286,8 +299,8 @@ pub fn gather_filtered(
             .filter(|r| r.is_pull_request == want_pr)
             // Champion's digest is not a parked artifact (#9397).
             .filter(|r| !super::digest::excluded(kind, r))
-            // #11743: a frozen artifact is not read as work by any pass —
-            // not the release pass, the unnamed queue or the notifier.
+            // #11743: a frozen artifact is not read as work by any pass,
+            // the notifier included.
             .filter(|r| !crate::work_finder::is_frozen(&r.labels))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
@@ -296,12 +309,15 @@ pub fn gather_filtered(
     // Nothing to gather, nothing to probe.
     if !selected.is_empty() {
         cost.projected = budget::project(&selected);
-        let refused = if forge.breaker_open() {
-            Some("rate-limit breaker is suppressing forge calls — not evaluated this run".into())
+        let refused: Option<Unreadable> = if forge.breaker_open() {
+            Some(Unreadable::read_failed(
+                "rate-limit breaker is suppressing forge calls — not evaluated this run",
+            ))
         } else {
             cost.budget_before = forge.budget();
             cost.budget_before
-                .and_then(|b| budget::refusal(&b, cost.projected, opts.floor))
+                .and_then(|b| budget::refusal_stop(&b, cost.projected, opts.floor))
+                .map(Unreadable::from)
         };
         if let Some(why) = refused {
             let items = selected
@@ -310,10 +326,13 @@ pub fn gather_filtered(
                     kind,
                     number: i64::from(row.number),
                     title: row.title.unwrap_or_default(),
-                    evidence: Err(why.clone()),
+                    evidence: Err(why.to_string()),
+                    cause: Some(why.clone()),
+                    labels: row.labels.clone(),
+                    body: row.body.clone().unwrap_or_default(),
                 })
                 .collect();
-            cost.budget_refused = Some(why);
+            cost.budget_refused = Some(why.to_string());
             cost.meter = forge.meter();
             return Gathering {
                 items,
@@ -367,6 +386,8 @@ fn read_text(
         unparsed_unchecked: 0,
         declared: Vec::new(),
         held: None,
+        permanent_block: false,
+        hold: None,
         closing: Vec::new(),
         failed: None,
         row,
@@ -374,23 +395,32 @@ fn read_text(
     let comments = if p.row.comments == 0 {
         Vec::new()
     } else {
-        if let Err(why) = guard.core(&forge.meter()) {
-            p.failed = Some(why);
+        if let Err(stop) = guard.core_stop(&forge.meter()) {
+            p.failed = Some(stop.into());
             return (p, None);
         }
         match forge.comments(p.row.number) {
             Ok(c) => c,
             Err(e) => {
-                p.failed = Some(format!(
+                p.failed = Some(Unreadable::read_failed(format!(
                     "comment read for {} #{} failed — cannot assess a park from a failed read \
                      (fail safe: never guess 'no refs' on missing data): {e}",
                     kind.label(),
                     p.row.number
-                ));
+                )));
                 return (p, None);
             }
         }
     };
+    // #13889: a trusted permanent-block marker (comment, or the body when its
+    // author is trusted) and the newest trusted hold comment. An unreadable
+    // listing never gets here — it is `failed` above, i.e. unevaluated.
+    p.permanent_block = comments
+        .iter()
+        .any(|c| c.trusted && super::hold::has_permanent_block(&c.body))
+        || (super::hold::has_permanent_block(&body)
+            && forge.trusts_author(p.row.author.as_deref(), p.row.author_association.as_deref()));
+    p.hold = super::hold::newest_hold(&comments);
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
     // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
@@ -415,7 +445,6 @@ fn read_text(
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
         reason: r.reason.unwrap_or_default().trim().to_string(),
-        at: r.at,
     });
     if kind == Artifact::Issue {
         p.named = named::parse_entries(&p.body);
@@ -434,19 +463,21 @@ fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending], guar
         .map(|p| p.row.number)
         .collect();
     let mut answers: HashMap<u32, Vec<ClosingRef>> = HashMap::new();
-    let mut batch_errors: HashMap<u32, String> = HashMap::new();
+    let mut batch_errors: HashMap<u32, Unreadable> = HashMap::new();
     for chunk in issues.chunks(CLOSING_BATCH) {
         // Re-checked between batches, from the previous batch's own
         // `rateLimit.remaining`.
-        let answer = match guard.graphql(&forge.meter()) {
-            Ok(()) => forge.closing_refs_batch(chunk),
-            Err(why) => Err(anyhow!(why)),
+        let answer = match guard.graphql_stop(&forge.meter()) {
+            Ok(()) => forge
+                .closing_refs_batch(chunk)
+                .map_err(|e| Unreadable::read_failed(e.to_string())),
+            Err(stop) => Err(Unreadable::from(stop)),
         };
         match answer {
             Ok(map) => answers.extend(map),
-            Err(e) => {
+            Err(cause) => {
                 for n in chunk {
-                    batch_errors.insert(*n, e.to_string());
+                    batch_errors.insert(*n, cause.clone());
                 }
             }
         }
@@ -459,13 +490,14 @@ fn read_closing(forge: &mut dyn StaleBlockedForge, pending: &mut [Pending], guar
         match answers.remove(&n) {
             Some(refs) => p.closing = refs,
             None => {
-                let why = batch_errors
-                    .remove(&n)
-                    .unwrap_or_else(|| "no complete answer for this issue".to_string());
-                p.failed = Some(format!(
+                let why = batch_errors.remove(&n).unwrap_or_else(|| {
+                    Unreadable::read_failed("no complete answer for this issue")
+                });
+                let text = format!(
                     "closing-PR read for issue #{n} failed — never guess 'no closing PRs' on a \
                      failed read: {why}"
-                ));
+                );
+                p.failed = Some(why.with_text(text));
             }
         }
     }
@@ -488,7 +520,7 @@ fn read_states(
     forge: &mut dyn StaleBlockedForge,
     pending: &[Pending],
     guard: &mut Guard,
-) -> HashMap<RefKey, Result<RefState, String>> {
+) -> HashMap<RefKey, Result<RefState, Unreadable>> {
     let mut keys: BTreeSet<RefKey> = BTreeSet::new();
     for p in pending.iter().filter(|p| p.failed.is_none()) {
         keys.extend(p.prose.iter().map(|n| (None, *n)));
@@ -510,14 +542,14 @@ fn read_states(
     }
     keys.into_iter()
         .map(|key| {
-            if let Err(why) = guard.core(&forge.meter()) {
-                return (key, Err(why));
+            if let Err(stop) = guard.core_stop(&forge.meter()) {
+                return (key, Err(stop.into()));
             }
             let state = match forge.ref_state(key.0.as_deref(), key.1) {
                 Ok(Some(s)) if !s.state.is_empty() => Ok(s),
-                Ok(Some(_)) => Err("the forge returned no state".to_string()),
-                Ok(None) => Err("not found (HTTP 404)".to_string()),
-                Err(e) => Err(e.to_string()),
+                Ok(Some(_)) => Err("the forge returned no state".to_string().into()),
+                Ok(None) => Err("not found (HTTP 404)".to_string().into()),
+                Err(e) => Err(e.to_string().into()),
             };
             (key, state)
         })
@@ -528,32 +560,43 @@ fn read_states(
 fn assemble(
     forge: &mut dyn StaleBlockedForge,
     p: Pending,
-    states: &HashMap<RefKey, Result<RefState, String>>,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
 ) -> Gathered {
-    let evidence = match p.failed.clone() {
+    let outcome = match p.failed.clone() {
         Some(why) => Err(why),
         None => evidence_for(forge, &p, states, guard),
+    };
+    let (evidence, cause) = match outcome {
+        Ok(ev) => (Ok(ev), None),
+        Err(why) => (Err(why.to_string()), Some(why)),
     };
     Gathered {
         kind: p.kind,
         number: i64::from(p.row.number),
         title: p.row.title.clone().unwrap_or_default(),
         evidence,
+        cause,
+        labels: p.row.labels.clone(),
+        body: p.body.clone(),
     }
 }
 
 fn evidence_for(
     forge: &mut dyn StaleBlockedForge,
     p: &Pending,
-    states: &HashMap<RefKey, Result<RefState, String>>,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
-) -> Result<Evidence, String> {
-    let lookup = |key: RefKey, what: String| -> Result<RefState, String> {
+) -> Result<Evidence, Unreadable> {
+    let lookup = |key: RefKey, what: String| -> Result<RefState, Unreadable> {
         match states.get(&key) {
             Some(Ok(s)) => Ok(s.clone()),
-            Some(Err(why)) => Err(format!("could not read state for {what}: {why}")),
-            None => Err(format!("could not read state for {what}: never requested")),
+            Some(Err(why)) => Err(why
+                .clone()
+                .with_text(format!("could not read state for {what}: {why}"))),
+            None => Err(Unreadable::read_failed(format!(
+                "could not read state for {what}: never requested"
+            ))),
         }
     };
     let prose = p
@@ -578,7 +621,7 @@ fn evidence_for(
                         state: s.state,
                     })
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, Unreadable>>()?;
     let named = p
         .named
         .iter()
@@ -593,7 +636,7 @@ fn evidence_for(
                 ..d.clone()
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, Unreadable>>()?;
     let closing = if all_resolved(&p.closing) {
         p.closing
             .iter()
@@ -606,7 +649,7 @@ fn evidence_for(
                     ..recheck::Pr::default()
                 })
             })
-            .collect::<Result<Vec<_>, String>>()?
+            .collect::<Result<Vec<_>, Unreadable>>()?
     } else {
         p.closing
             .iter()
@@ -626,12 +669,71 @@ fn evidence_for(
         remote,
         self_block: None,
         held: p.held.clone(),
+        permanent_block: p.permanent_block,
+        hold: p.hold.clone(),
+        resolved_at: None,
     };
+    // `classify` fails closed to "held" while `resolved_at` is unset, so ask
+    // whether the artifact would be stale *without* the hold before reading.
+    if evidence.hold.is_some() {
+        let without_hold = Evidence {
+            hold: None,
+            permanent_block: false,
+            ..evidence.clone()
+        };
+        if matches!(classify(&without_hold), Verdict::Stale(_)) {
+            evidence.resolved_at = resolution_time(forge, p, states, guard);
+        }
+    }
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
-        guard.core(&forge.meter())?;
+        guard.core_stop(&forge.meter())?;
         evidence.self_block = self_block(forge, &p.row)?;
     }
     Ok(evidence)
+}
+
+/// When the last resolved cited blocker closed (#13889), or `None` when any
+/// resolved one has no readable time — the caller fails closed to "held".
+///
+/// A ticked `## Dependencies` box is not in `states` (only unchecked entries
+/// are read run-wide), so it is read here, and only for an artifact that
+/// already has a hold comment and would otherwise be reported stale.
+fn resolution_time(
+    forge: &mut dyn StaleBlockedForge,
+    p: &Pending,
+    states: &HashMap<RefKey, Result<RefState, Unreadable>>,
+    guard: &mut Guard,
+) -> Option<String> {
+    use chrono::DateTime;
+    let mut keys: Vec<RefKey> = p.prose.iter().map(|n| (None, *n)).collect();
+    keys.extend(
+        p.declared
+            .iter()
+            .filter_map(|b| Some((Some(b.repo.clone()?), i64::try_from(b.number).ok()?))),
+    );
+    keys.extend(p.named.iter().map(|d| (d.repo.clone(), d.number)));
+    keys.sort();
+    keys.dedup();
+    let mut latest: Option<(DateTime<chrono::FixedOffset>, String)> = None;
+    for key in keys {
+        let state = match states.get(&key) {
+            Some(Ok(s)) => s.clone(),
+            Some(Err(_)) => return None,
+            None => {
+                guard.core_stop(&forge.meter()).ok()?;
+                forge.ref_state(key.0.as_deref(), key.1).ok()??
+            }
+        };
+        if !super::resolved(&state.state) {
+            continue;
+        }
+        let raw = state.closed_at?;
+        let at = DateTime::parse_from_rfc3339(raw.trim()).ok()?;
+        if latest.as_ref().is_none_or(|(l, _)| at > *l) {
+            latest = Some((at, raw));
+        }
+    }
+    latest.map(|(_, raw)| raw)
 }
 
 /// A parked PR's own superseding block. Labels come from the listing row; the
@@ -674,6 +776,8 @@ pub struct GhStaleBlockedForge {
     slug: String,
     /// What this run's evidence reads have spent.
     meter: Meter,
+    /// Who is believed (#13889), resolved on first use.
+    trust: Option<crate::comment_trust::TrustPolicy>,
 }
 
 impl GhStaleBlockedForge {
@@ -693,7 +797,14 @@ impl GhStaleBlockedForge {
             repo,
             slug,
             meter: Meter::default(),
+            trust: None,
         }
+    }
+
+    fn trust(&mut self) -> &crate::comment_trust::TrustPolicy {
+        let root = &self.root;
+        self.trust
+            .get_or_insert_with(|| crate::comment_trust::TrustPolicy::for_root(root))
     }
 
     /// A conditional GET through the shared ETag store. `repo` overrides the
@@ -728,23 +839,14 @@ impl StaleBlockedForge for GhStaleBlockedForge {
     }
 
     fn list_blocked(&mut self) -> Result<Vec<RestIssue>> {
+        // #12310: the blocked-issue listing is discovery.
+        let _discovery = crate::gh_invocation::purpose::discovery();
         crate::forge_listing::list_issues_cached_all_as(
             CALLER,
             &self.gh_bin,
             Some(&self.root),
             self.repo.as_deref(),
             "loom:blocked",
-            "open",
-        )
-    }
-
-    fn list_unnamed(&mut self) -> Result<Vec<RestIssue>> {
-        crate::forge_listing::list_issues_cached_all_as(
-            CALLER,
-            &self.gh_bin,
-            Some(&self.root),
-            self.repo.as_deref(),
-            super::unnamed::UNNAMED_LABEL,
             "open",
         )
     }
@@ -759,7 +861,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
             let body = self
                 .get(ops::COMMENT_LIST, None, &url)?
                 .ok_or_else(|| anyhow!("gh api {url} failed: HTTP 404"))?;
-            let rows = parse_comments(&body).map_err(|e| anyhow!("parse {url}: {e}"))?;
+            let rows = parse_comments_with(&body, Some(self.trust()))
+                .map_err(|e| anyhow!("parse {url}: {e}"))?;
             let short = rows.len() < COMMENT_PAGE;
             all.extend(rows);
             if short {
@@ -804,11 +907,20 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         )
         .forge_op(ops::ISSUE_CLOSED_BY_PULL_REQUESTS)
         .identity_scope(None, Some(&self.slug))
+        // Reader-only (#12394, #12584): a GraphQL argv does not spell its
+        // repo for the facade, so the reader route names it.
+        .reader_repo(&self.slug)
         .program(&self.gh_bin)
         .current_dir(&self.root)
         .args(["api", "graphql", "-f", field.as_str()]);
         let out = match inv.execute() {
             Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::DeadlineReached) => {
+                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
+            }
+            Ok(GhCompletion::Shed { .. }) => {
+                return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
+            }
             Ok(_) => {
                 // It may still have been charged.
                 self.meter.graphql(None, None);
@@ -845,6 +957,11 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         crate::rate_limit_breaker::global_skip_pass(CALLER)
     }
 
+    fn trusts_author(&mut self, login: Option<&str>, association: Option<&str>) -> bool {
+        let author = crate::comment_trust::Author::new(login, association);
+        self.trust().trusts(&author)
+    }
+
     fn meter(&self) -> Meter {
         self.meter
     }
@@ -852,9 +969,8 @@ impl StaleBlockedForge for GhStaleBlockedForge {
 
 /// The one archived-repository probe (#10556, #10562): `GET repos/{slug}`
 /// through the shared ETag store, so a warm re-run is a free `304`. Shared by
-/// `check-stale-blocked` ([`GhStaleBlockedForge`]), the release pass
-/// ([`super::release_gh::GhReleaseForge`]) and the role runner's archived-root
-/// gate; each passes its own call site and cache prefix. Returns the read too,
+/// `check-stale-blocked` ([`GhStaleBlockedForge`]) and the role runner's
+/// archived-root gate; each passes its own call site and cache prefix. Returns the read too,
 /// for a caller that meters its spend.
 ///
 /// # Errors
@@ -1003,6 +1119,8 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
         labels: Vec<RawLabel>,
         #[serde(default)]
         pull_request: Option<RawPr>,
+        #[serde(default)]
+        closed_at: Option<String>,
     }
     let raw: Raw = serde_json::from_str(body.trim())?;
     let is_pr = raw.pull_request.is_some();
@@ -1018,6 +1136,7 @@ pub fn parse_ref_state(body: &str) -> Result<RefState> {
         },
         labels: raw.labels.into_iter().map(|l| l.name).collect(),
         is_pr,
+        closed_at: raw.closed_at,
     })
 }
 
@@ -1058,27 +1177,34 @@ pub fn parse_pr_merge_state(body: &str) -> Result<(String, String)> {
 /// # Errors
 /// The body is not a comment array.
 pub fn parse_comments(body: &str) -> Result<Vec<extract::Comment>> {
-    #[derive(Deserialize)]
-    struct RawUser {
-        #[serde(default)]
-        login: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct Raw {
-        #[serde(default)]
-        body: Option<String>,
-        #[serde(default)]
-        user: Option<RawUser>,
-    }
-    let rows: Vec<Raw> = serde_json::from_str(body.trim())?;
+    parse_comments_with(body, None)
+}
+
+/// [`parse_comments`], also stamping each comment's `trusted` flag from
+/// `policy` (#13889). Without a policy nothing is trusted.
+///
+/// # Errors
+/// The body is not a comment array.
+pub fn parse_comments_with(
+    body: &str,
+    policy: Option<&crate::comment_trust::TrustPolicy>,
+) -> Result<Vec<extract::Comment>> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(body.trim())?;
     Ok(rows
         .into_iter()
-        .map(|r| {
-            let login = r.user.and_then(|u| u.login).unwrap_or_default();
-            let login = login.strip_suffix("[bot]").unwrap_or(&login).to_string();
+        .map(|v| {
+            let text = |k: &str| v.get(k).and_then(serde_json::Value::as_str);
+            let login = v
+                .get("user")
+                .and_then(|u| u.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let login = login.strip_suffix("[bot]").unwrap_or(login).to_string();
             extract::Comment {
                 author: extract::Author { login },
-                body: r.body.unwrap_or_default(),
+                body: text("body").unwrap_or_default().to_string(),
+                created_at: text("created_at").map(str::to_string),
+                trusted: policy.is_some_and(|p| p.trusts_json(&v)),
             }
         })
         .collect())

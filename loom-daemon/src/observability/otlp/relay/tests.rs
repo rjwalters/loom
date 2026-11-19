@@ -25,25 +25,9 @@ use tokio::net::{TcpListener, TcpStream};
 const INGEST_KEY: &str = "fixture-ingest-key-7c1d";
 const OPTED_IN: &str = r#"{"observability":{"agentRelay":{"enabled":true}}}"#;
 
-struct EnvGuard(Option<std::ffi::OsString>);
+use crate::env_test_support::EnvGuard;
 
-impl EnvGuard {
-    fn clear() -> Self {
-        let previous = std::env::var_os(ENABLED_ENV);
-        std::env::remove_var(ENABLED_ENV);
-        std::env::remove_var("LOOM_SWEEP_CONTAINERIZED");
-        Self(previous)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.0 {
-            Some(value) => std::env::set_var(ENABLED_ENV, value),
-            None => std::env::remove_var(ENABLED_ENV),
-        }
-    }
-}
+const GUARDED_ENV: &[&str] = &[ENABLED_ENV, "LOOM_SWEEP_CONTAINERIZED"];
 
 fn workspace(config: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -181,7 +165,7 @@ struct Stack {
 impl Stack {
     /// A receiver forwarding to `upstream_url` through a real `OtlpExporter`.
     async fn start(upstream_url: &str, limits: server::Limits, queue: forward::Limits) -> Self {
-        let env = EnvGuard::clear();
+        let env = EnvGuard::clear(GUARDED_ENV);
         let listener = bind_loopback().unwrap();
         let relay = Relay::new(listener.local_addr().unwrap(), "host-fixture", None).unwrap();
         let queue = RelayQueue::new(queue);
@@ -801,7 +785,7 @@ async fn an_unreachable_upstream_drops_with_a_count_and_reports_the_gap_on_recov
 #[tokio::test]
 #[serial]
 async fn the_receiver_starts_only_when_opted_in_and_an_otlp_sink_started() {
-    let _env = EnvGuard::clear();
+    let _env = EnvGuard::clear(GUARDED_ENV);
     let sink = Sink {
         endpoint: "http://127.0.0.1:9".to_string(),
         headers_file: None,

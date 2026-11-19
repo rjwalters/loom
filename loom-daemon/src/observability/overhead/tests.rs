@@ -43,6 +43,18 @@ const ALLOWED_KEYS: &[&str] = &[
     "loom.host.oom_kill_total",
     "loom.host.pressure",
     "loom.host.load_per_core",
+    "loom.host.logical_cpus",
+    "loom.host.loadavg_1m",
+    "loom.host.start.loadavg_1m",
+    "loom.host.start.load_per_core",
+    "loom.host.cpu_budget_cores",
+    "loom.host.sweeps_in_flight",
+    // #14168: a step's outcome line, countable per runtime/model/role from
+    // the `loom.sweep` close.
+    "loom.step.outcome.class",
+    "loom.step.outcome.reason",
+    // #14234: whether the forge post-state agreed with the step's claim.
+    "loom.step.outcome.agrees",
 ];
 
 fn traced_root() -> tempfile::TempDir {

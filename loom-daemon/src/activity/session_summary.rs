@@ -29,8 +29,9 @@ use crate::activity::session_context::SessionContext;
 use crate::activity::transcript_parse::ParsedTranscript;
 use crate::telemetry::{SessionSummaryRecord, ToolCallCount};
 
-/// Runtime label this pass stamps. It reads Claude Code transcripts only;
-/// #8664's per-runtime tails are the future producers for other runtimes.
+/// Runtime label the Claude transcript pass stamps. Codex rollouts
+/// ([`super::codex_summary`]) stamp their own via [`build_session_summary_for`];
+/// #8664's other per-runtime tails are still future producers.
 const RUNTIME: &str = "claude";
 
 /// Derive one transcript's `session.summary` record.
@@ -48,6 +49,18 @@ const RUNTIME: &str = "claude";
 /// filesystem read this pure derivation must not make.
 #[must_use]
 pub fn build_session_summary(
+    path: &Path,
+    parsed: &ParsedTranscript,
+    context: &SessionContext,
+) -> SessionSummaryRecord {
+    build_session_summary_for(RUNTIME, path, parsed, context)
+}
+
+/// [`build_session_summary`] for a named `runtime` (#8664's `loom.runtime`
+/// vocabulary) — one wire shape for every runtime's session record.
+#[must_use]
+pub fn build_session_summary_for(
+    runtime: &str,
     path: &Path,
     parsed: &ParsedTranscript,
     context: &SessionContext,
@@ -110,7 +123,7 @@ pub fn build_session_summary(
         visibility: context.visibility,
         session_id,
         parent_session_id,
-        runtime: RUNTIME.to_string(),
+        runtime: runtime.to_string(),
         role: parsed.role.clone(),
         issue: context.issue,
         pr_number: context.pr_number,

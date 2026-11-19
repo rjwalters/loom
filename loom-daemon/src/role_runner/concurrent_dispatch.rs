@@ -215,6 +215,20 @@ pub enum LimitRefusal {
     },
 }
 
+impl LimitRefusal {
+    /// The stable wire name of the limit (`role_tick.outcome`'s
+    /// `deferred_by`, #12084).
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Ceiling { .. } => "ceiling",
+            Self::RoleBudget { .. } => "role_budget",
+            Self::DemandWidth { .. } => "demand_width",
+            Self::Reservation { .. } => "reservation",
+        }
+    }
+}
+
 /// The per-root decision of one tick.
 #[derive(Debug)]
 pub enum RootTickDecision {
@@ -531,18 +545,27 @@ pub fn forge_queue_probe() -> QueueProbe {
 
 /// The PR role whose queue may serve a Champion hold on its round trip in
 /// `rows` of queue `label` (#11861), when any row has that shape.
+///
+/// A Doctor-shaped row whose body declares a Doctor-cycle-cap park and no
+/// Champion hold record is an ordinary capped PR (#11905): Doctor's queue
+/// never serves it, so it must not cost a cached queue read every tick.
 fn round_trip_role(
     label: &str,
     rows: &[crate::forge_listing::RestIssue],
 ) -> Option<crate::pr_planning::PrRole> {
+    use crate::champion_hold::{body_declares_doctor_cap, body_declares_hold};
     use crate::champion_hold::{doctor_shape, judge_shape};
+    use crate::forge_listing::RestIssue;
     use crate::pr_planning::PrRole;
-    let (role, shape): (PrRole, fn(&[String]) -> bool) = match label {
-        "loom:changes-requested" => (PrRole::Doctor, |l| doctor_shape(l)),
-        "loom:review-requested" => (PrRole::Judge, |l| judge_shape(l)),
+    let (role, shape): (PrRole, fn(&RestIssue) -> bool) = match label {
+        "loom:changes-requested" => (PrRole::Doctor, |r| {
+            let body = r.body.as_deref().unwrap_or("");
+            doctor_shape(&r.labels) && (body_declares_hold(body) || !body_declares_doctor_cap(body))
+        }),
+        "loom:review-requested" => (PrRole::Judge, |r| judge_shape(&r.labels)),
         _ => return None,
     };
-    rows.iter().any(|r| shape(&r.labels)).then_some(role)
+    rows.iter().any(shape).then_some(role)
 }
 
 /// The `gh` binary the gate listings use: `LOOM_GH_BIN` when set, else the
@@ -647,12 +670,36 @@ pub struct RoleDispatcher {
     /// the root that followed it has slid into this index, so the next tick
     /// starts here.
     last_admitted_index: usize,
+    /// Where the cursor is persisted (`role-cursor-<role>.json`), so a daemon
+    /// restart resumes the rotation instead of restarting at the head of the
+    /// registry (#13682). `None` (the `with_decide` default) is memory-only.
+    cursor_path: Option<PathBuf>,
     /// Roots the current tick has not decided yet (deferred by a limit), in
     /// walk order with their registry index.
     pending: VecDeque<(usize, PathBuf)>,
     /// A run returned `QueueEmpty` since the last walk, so the `pending`
     /// roots may be resumed.
     resume_requested: bool,
+}
+
+/// Read the persisted rotation cursor; `None` on a missing, unreadable or
+/// malformed file (#13682).
+fn load_role_cursor(path: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let root = v.get("root")?.as_str()?;
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+/// Write the cursor atomically (temp file, then rename).
+fn write_role_cursor(path: &Path, root: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::json!({ "root": root.to_string_lossy() });
+    std::fs::write(&tmp, body.to_string())?;
+    std::fs::rename(&tmp, path)
 }
 
 impl RoleDispatcher {
@@ -676,6 +723,33 @@ impl RoleDispatcher {
         .with_demand(demand::global(), demand::forge_merge_probe())
         .with_lane_probe(lanes::LaneProbe::forge())
         .with_triggers(triggers::forge_trigger_probe(), triggers::global())
+        .with_cursor_dir(crate::auto_update::state_dir().as_deref())
+    }
+
+    /// Persist the round-robin cursor under `dir` and load any saved one
+    /// (#13682). `None` keeps it memory-only. A missing or corrupt file starts
+    /// at the head of the registry; a saved root that has left the registry
+    /// falls back to `last_admitted_index` (0) in [`Self::rotation_start`].
+    #[must_use]
+    pub fn with_cursor_dir(mut self, dir: Option<&Path>) -> Self {
+        self.cursor_path = dir.map(|d| d.join(format!("role-cursor-{}.json", self.spec.name)));
+        self.last_admitted = self.cursor_path.as_deref().and_then(load_role_cursor);
+        self
+    }
+
+    /// Persist `root` as the cursor. Best effort: a failed write is logged at
+    /// debug and never fails the tick.
+    fn save_cursor(&self, root: &Path) {
+        let Some(path) = &self.cursor_path else {
+            return;
+        };
+        if let Err(e) = write_role_cursor(path, root) {
+            log::debug!(
+                "role_runner: {} could not persist rotation cursor to {}: {e} (#13682)",
+                self.spec.name,
+                path.display()
+            );
+        }
     }
 
     /// Use `probe` and `ledger` for the event triggers (#10816).
@@ -745,6 +819,7 @@ impl RoleDispatcher {
             model_mismatch_roots: HashMap::new(),
             last_admitted: None,
             last_admitted_index: 0,
+            cursor_path: None,
             pending: VecDeque::new(),
             resume_requested: false,
         }
@@ -783,8 +858,26 @@ impl RoleDispatcher {
         let report = self.walk(order, in_progress);
         if let Some(refusal) = report.refusal {
             log::warn!("{}", refusal_summary_line(self.spec.name, refusal, report.deferred));
+            self.emit_deferred(refusal);
         }
         report
+    }
+
+    /// Record each root this tick left in `pending` as deferred (#12084). Only
+    /// the tick calls it: a resume re-walks the same roots and would repeat
+    /// the fact. Off the async loop, because it resolves each repo's slug and
+    /// shard.
+    fn emit_deferred(&self, refusal: LimitRefusal) {
+        let roots: Vec<PathBuf> = self.pending.iter().map(|(_, root)| root.clone()).collect();
+        if roots.is_empty() {
+            return;
+        }
+        let (role, kind) = (self.spec.name, refusal.kind());
+        tokio::task::spawn_blocking(move || {
+            for root in &roots {
+                crate::role_tick_telemetry::deferred::emit_deferred(root, role, kind);
+            }
+        });
     }
 
     /// Curator demand axis (#9000): among roots with a last-known untriaged
@@ -887,6 +980,9 @@ impl RoleDispatcher {
                     lane_plan,
                 } => {
                     self.spawn(root.clone(), prompt, guard, assign, lane_plan);
+                    if self.last_admitted.as_deref() != Some(root.as_path()) {
+                        self.save_cursor(&root);
+                    }
                     self.last_admitted = Some(root.clone());
                     self.last_admitted_index = index;
                     report.spawned.push(root);
@@ -962,6 +1058,7 @@ impl RoleDispatcher {
                 &outcome,
                 runner.resolved_launch(),
                 runner.trace_context(),
+                runner.unlaunched_failure(),
             );
             FinishedRun {
                 root: task_root,

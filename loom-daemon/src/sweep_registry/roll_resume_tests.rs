@@ -69,6 +69,7 @@ fn launch(runtime: &str) -> RollResumeLaunch {
 
 fn spec(issue: u32, launch: RollResumeLaunch) -> RollResumeSpec {
     RollResumeSpec {
+        step: None,
         issue,
         old_sweep_id: OLD.to_string(),
         launch,
@@ -304,20 +305,7 @@ fn a_lock_that_is_gone_or_another_runs_refuses_the_resume() {
     assert_eq!(owner(&reg, 81).sweep_id, "sweep-issue-81-someone-else");
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 /// §9 `worktree-changed`: missing, on another branch, or at another HEAD.
 #[test]
@@ -329,6 +317,7 @@ fn a_worktree_that_moved_refuses_the_resume() {
     let wt = ws.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     git(&wt, &["init", "-q", "-b", "feature/issue-82"]);
+    configure(&wt);
     std::fs::write(wt.join("a"), "1").unwrap();
     git(&wt, &["add", "a"]);
     git(&wt, &["commit", "-q", "-m", "one"]);
@@ -496,4 +485,43 @@ fn restart_recovery_can_be_run_for_one_released_issue() {
         .collect();
     assert_eq!(crashed.len(), 1);
     assert_eq!(crashed[0].kind, SweepKind::Issue(88));
+}
+
+/// #11898: a paused issue step resumes from its saved session as the same
+/// step: tracked as `Step`, its own step log, the claim lock kept, and no
+/// issue-sweep journal record (restart recovery rebuilds sweeps, not steps).
+#[test]
+fn a_paused_issue_step_resumes_as_its_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let (mut reg, _record) = registry(&ws);
+    pause_issue(&reg, &ws, 79, OLD, "claude");
+    let mut spec = spec(79, launch("claude"));
+    spec.step = Some(crate::step_role::StepRole::Curator);
+
+    let resumed = resume(&mut reg, &spec);
+
+    assert!(resumed.sweep_id.starts_with("step-curator-79-"), "{}", resumed.sweep_id);
+    let entry = reg
+        .entries
+        .get(&resumed.sweep_id)
+        .expect("a registry entry");
+    assert_eq!(
+        entry.kind,
+        SweepKind::Step {
+            item: 79,
+            role: crate::step_role::StepRole::Curator
+        }
+    );
+    assert_eq!(entry.log_path, reg.compute_step_log_path(79, spec.step.unwrap()));
+    assert_eq!(owner(&reg, 79).sweep_id, resumed.sweep_id, "the claim is kept");
+    let journal = crate::sweep_journal::load(&ws.join("test-sweeps-journal.json"));
+    assert!(
+        !journal
+            .entries
+            .iter()
+            .any(|e| e.issue == 79 && e.pid == resumed.pid),
+        "a step is not journalled as an issue sweep"
+    );
+    reg.abandon_roll_resume(&resumed.sweep_id);
 }

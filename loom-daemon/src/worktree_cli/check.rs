@@ -24,8 +24,7 @@
 //!
 //! Two consumers, two consequences:
 //!
-//! 1. **`worktree.sh --check`** — a documented verb (`worktree-return.sh` tells
-//!    operators to run it) — reported the primary clone as a worktree and
+//! 1. **`worktree.sh --check`** — a documented verb — reported the primary clone as a worktree and
 //!    exited 0. Its `else` arm, *"Not currently in a worktree (you're in the
 //!    main working directory)"* and its exit 1, were dead code.
 //! 2. **The create path's auto-navigation** printed four spurious lines on

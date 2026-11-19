@@ -50,8 +50,8 @@
 //! `requires-daemon:` block in `merge-pr.sh` for why the `merge-pr` group's
 //! floor stays at the merge-gate version.
 
+use crate::merge_pr::response::{classify, MergeResponseKind};
 use anyhow::Result;
-use loom_daemon::merge_pr::response::{classify, MergeResponseKind};
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]

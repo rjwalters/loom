@@ -261,13 +261,13 @@ fn a_fixed_seed_reproduces_the_exact_order_and_log() {
 }
 
 #[test]
-fn the_draw_log_is_capped_but_counts_every_draw() {
+fn the_draw_log_records_every_draw() {
     let candidates: Vec<PriorityCandidate> = (1..=80).map(|n| cand(0, n, None, &[])).collect();
     let (order, log) = draw_order(candidates, &[], 1, &B);
     let log = log.unwrap();
     assert_eq!(order.len(), 80);
     assert_eq!(log.draws_total, 80);
-    assert_eq!(log.steps.len(), MAX_RECORDED_DRAWS);
+    assert_eq!(log.steps.len(), 80);
 }
 
 #[test]

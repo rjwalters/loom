@@ -17,8 +17,7 @@
 #   7. degrade OPEN when the lock store is unusable (a FILE in the way).
 #   8. LOOM_FILING_LOCK=0 disables serialization entirely.
 #   9. re-entrancy — LOOM_FILING_LOCK_HELD makes a nested acquire a no-op.
-#  10. fleet tier — a live peer hold blocks filing and expires on its TTL.
-#  11. create-issue.sh actually takes the lock (the wiring, not just the lib).
+#  10. create-issue.sh actually takes the lock (the wiring, not just the lib).
 #
 # Style follows test-build-slot.sh: throwaway mktemp dirs, assert harness, no
 # network, no real ~/.loom.
@@ -29,17 +28,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FILING_LOCK_LIB="$SCRIPTS_DIR/lib/filing-lock.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
@@ -256,39 +247,6 @@ DIR="$(new_store)"
 assert_true "$CASE_RC" "LOOM_FILING_LOCK_HELD makes a nested acquire a re-entrant no-op"
 
 echo ""
-echo "=== fleet tier: a mirrored peer hold blocks, then expires ==="
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_WAIT_SECS=1
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=3600
-    # What safehouse::PeerClaimSink writes on an observed peer FilingLock ad.
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    RC=0
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || RC=$?
-    [[ "$RC" -eq 75 ]] || exit 1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "a live peer hold defers local filing (the cross-host tier)"
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=1
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    sleep 1.1
-    # A peer that crashed without sending FilingUnlock must not wedge us.
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || exit 1
-    [[ ! -e "$DIR/peers/host-remote" ]] || exit 1
-    loom_filing_lock_release >/dev/null 2>&1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "an expired peer hold is pruned and never wedges filing"
-
-echo ""
 echo "=== store resolution ==="
 
 assert_eq "$(LOOM_FILING_LOCK_DIR="/tmp/x" loom_filing_lock_store)" "/tmp/x" \
@@ -310,6 +268,79 @@ if grep -q "loom_filing_lock_acquire" "$SCRIPTS_DIR/create-issue.sh" \
 else
     fail "create-issue.sh does not acquire the lock / does not propagate the DEFER exit code"
 fi
+
+echo ""
+echo "=== host identity comes from loom-daemon host-id (#10023) ==="
+
+HID_DIR="$(mktemp -d)"
+printf '#!/usr/bin/env bash\n[[ "${1:-}" == "host-id" ]] && { echo persisted-host-abc; exit 0; }\nexit 0\n' > "$HID_DIR/fake-daemon"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$HID_DIR/failing-daemon"
+chmod +x "$HID_DIR/fake-daemon" "$HID_DIR/failing-daemon"
+GOT="$(env -u LOOM_HOST_ID HOSTNAME=some-distinct-hostname LOOM_DAEMON_BIN="$HID_DIR/fake-daemon" \
+    bash -c 'source "$1"; loom_filing_lock_host' _ "$FILING_LOCK_LIB")"
+[[ "$GOT" == "persisted-host-abc" ]] && pass "owner host equals loom-daemon host-id, not \$HOSTNAME" \
+    || fail "owner host was '$GOT', expected persisted-host-abc"
+GOT="$(env -u LOOM_HOST_ID HOSTNAME=some-distinct-hostname LOOM_DAEMON_BIN="$HID_DIR/failing-daemon" \
+    bash -c 'source "$1"; loom_filing_lock_host' _ "$FILING_LOCK_LIB")"
+[[ "$GOT" == "unknown-host" ]] && pass "a failing host-id yields the unknown-host literal" \
+    || fail "failing host-id produced '$GOT', expected unknown-host"
+rm -rf "$HID_DIR"
+
+echo ""
+echo "=== captain acquire: subcommand stderr reaches the caller (#14422) ==="
+
+CAP_DIR="$(mktemp -d "$TMPROOT/captain.XXXXXX")"
+# Grants: warn line on stderr, holder id on stdout, rc 0.
+printf '#!/usr/bin/env bash\necho "WARN stub-fail-open-line" >&2\necho holder-xyz\nexit 0\n' > "$CAP_DIR/warn-grant"
+# Deferred: the subcommand's EXIT_DEFERRED (75) with its reason on stderr.
+printf '#!/usr/bin/env bash\necho "filing-lock: deferred: stub-held" >&2\nexit 75\n' > "$CAP_DIR/defer"
+# An older binary / crash: an unrelated rc with a message on stderr.
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$CAP_DIR/older"
+chmod +x "$CAP_DIR"/warn-grant "$CAP_DIR"/defer "$CAP_DIR"/older
+
+# Run in a subshell (the helper sets a global) and report "<rc>|<holder>"; the
+# helper's own stderr lands in $2.
+captain_case() {
+    local stub="$1" errfile="$2"
+    (
+        export LOOM_DAEMON_BIN="$stub"
+        rc=0
+        _loom_filing_lock_captain_acquire "t" 5 2>"$errfile" || rc=$?
+        printf '%s|%s' "$rc" "$LOOM_FILING_LOCK_CAPTAIN_HOLDER"
+    )
+}
+
+GOT="$(captain_case "$CAP_DIR/warn-grant" "$CAP_DIR/err.grant")"
+assert_eq "$GOT" "0|holder-xyz" "a grant still captures stdout as the holder id"
+if grep -q "WARN stub-fail-open-line" "$CAP_DIR/err.grant"; then
+    pass "the subcommand's stderr warn line reaches the caller's stderr"
+else
+    fail "the subcommand's stderr warn line was swallowed (got: $(cat "$CAP_DIR/err.grant"))"
+fi
+if grep -q "holder-xyz" "$CAP_DIR/err.grant"; then
+    fail "the holder id leaked onto stderr (stdout/stderr were mixed)"
+else
+    pass "the holder id stays on stdout, off stderr"
+fi
+
+GOT="$(captain_case "$CAP_DIR/defer" "$CAP_DIR/err.defer")"
+assert_eq "$GOT" "$LOOM_FILING_LOCK_DEFER_RC|" "an rc-75 answer still returns LOOM_FILING_LOCK_DEFER_RC with no holder"
+if grep -q "deferred: stub-held" "$CAP_DIR/err.defer"; then
+    pass "the defer reason reaches the caller's stderr"
+else
+    fail "the defer reason was swallowed (got: $(cat "$CAP_DIR/err.defer"))"
+fi
+
+GOT="$(captain_case "$CAP_DIR/older" "$CAP_DIR/err.older")"
+assert_eq "$GOT" "0|" "any other failure still fails open (rc 0, no holder)"
+
+# Release stays quiet (out of scope for #14422): best effort, its output is discarded.
+GOT="$(
+    LOOM_DAEMON_BIN="$CAP_DIR/warn-grant" LOOM_FILING_LOCK_CAPTAIN_HOLDER=holder-xyz \
+        _loom_filing_lock_captain_release 2>&1
+)"
+assert_eq "$GOT" "" "the captain release stays silent"
+rm -rf "$CAP_DIR"
 
 echo ""
 echo "==============================================="

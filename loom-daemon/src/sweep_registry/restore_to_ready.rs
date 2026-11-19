@@ -41,6 +41,7 @@ use super::*;
 
 mod open_pr_veto;
 mod prior_label;
+mod step_restore;
 
 /// What a claim release did (#11743).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,11 @@ pub(crate) enum ClaimRelease {
     /// The issue has this open linked PR (#11852): it keeps `loom:building`
     /// while the PR is open, so no label was touched.
     HeldByOpenPr(u32),
+    /// A step's release wrote nothing (#11898): its claim label was already
+    /// gone (the step finished and moved the item on, or a later role holds
+    /// it), or the item could not be read and a Builder claim is not touched
+    /// blind.
+    Untouched,
 }
 
 impl SweepRegistry {

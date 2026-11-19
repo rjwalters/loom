@@ -38,36 +38,12 @@ pub enum Request {
         id: TerminalId,
         start_byte: Option<usize>,
     },
-    ResizeTerminal {
-        id: TerminalId,
-        cols: u16,
-        rows: u16,
-    },
     CheckSessionHealth {
         id: TerminalId,
-    },
-    ListAvailableSessions,
-    AttachToSession {
-        id: TerminalId,
-        session_name: String,
-    },
-    KillSession {
-        session_name: String,
-    },
-    SetWorktreePath {
-        id: TerminalId,
-        worktree_path: String,
     },
     GetTerminalActivity {
         id: TerminalId,
         limit: usize,
-    },
-    /// Capture git changes for a specific input
-    /// Called after a prompt completes to record code changes
-    CaptureGitChanges {
-        input_id: i64,
-        working_dir: String,
-        before_commit: Option<String>,
     },
     /// Get the current git commit hash for a directory
     GetCurrentCommit {
@@ -195,19 +171,6 @@ pub enum Request {
         /// byte-for-byte compatible) a tripped breaker refuses the dispatch.
         #[serde(default)]
         force: bool,
-        /// Per-dispatch runtime override for the coding phases (#11284).
-        /// Together with `model_profile` it names one explicit tap that the
-        /// sweep's Builder and Doctor phases launch on. An unavailable or
-        /// unadmitted tap is refused with a reason, never passed down the
-        /// preference list. Curator, Judge and the orchestrator keep their
-        /// role policy. `None` (or absent on the wire, `#[serde(default)]`)
-        /// preserves existing behavior byte-for-byte.
-        #[serde(default)]
-        runtime: Option<String>,
-        /// Model profile paired with `runtime` (e.g. `zai-flash`). Requires
-        /// `runtime`; absent preserves the runtime's own default resolution.
-        #[serde(default)]
-        model_profile: Option<String>,
         /// Who is asking (Issue #11444), recorded on the sweep's start facts
         /// and exported as `loom.dispatch_origin`. `loom-daemon dispatch`,
         /// the `dispatch_sweep` MCP tool and Safehouse ChatOps send
@@ -634,21 +597,12 @@ pub enum Response {
     SessionHealth {
         has_session: bool,
     },
-    AvailableSessions {
-        sessions: Vec<String>,
-    },
     TerminalActivity {
         entries: Vec<ActivityEntry>,
     },
     /// Response with current git commit hash
     CurrentCommit {
         commit: Option<String>,
-    },
-    /// Response with git changes captured
-    GitChangesCaptured {
-        files_changed: i32,
-        lines_added: i32,
-        lines_removed: i32,
     },
     // ========================================================================
     // Issue Claim Registry Responses (Issue #1159)
@@ -761,10 +715,15 @@ pub enum Response {
     /// [`Response::DispatchFailureRecorded`]'s shape so the caller can
     /// log/report the resulting window without a second round trip.
     /// `cooldown_secs` is `None` when the mechanism is disabled (the record
-    /// call is then a no-op — `consecutive` is also `0` in that case).
+    /// call is then a no-op — see the `consecutive` field for why it can
+    /// still be non-zero in that case).
     NoopReleaseRecorded {
         issue: u32,
-        /// Consecutive no-op releases now on record for `issue`.
+        /// Consecutive no-op sweeps now on the durable hold streak for
+        /// `issue` — the fingerprint-aware count compared against
+        /// `holdThreshold` (#10156), reported here since #13861 in place of
+        /// the cooldown record's own counter. `0` also when the hold could
+        /// not read the issue (fail-open, #10156).
         consecutive: u32,
         /// Seconds until the next dispatch is allowed, or `None` when the
         /// cooldown mechanism is disabled.
@@ -908,7 +867,6 @@ pub struct TerminalInfo {
     pub created_at: i64,
     // Agent-specific fields
     pub role: Option<String>,
-    pub worktree_path: Option<String>,
     pub agent_pid: Option<u32>,
     #[serde(default)]
     pub agent_status: AgentStatus,
@@ -942,6 +900,14 @@ pub enum AgentStatus {
 /// label and is tracked via a per-PR claim lock (`.loom/locks/pr-<N>/`,
 /// distinct from `Issue`'s `.loom/locks/issue-<N>/`) rather than the
 /// issue-keyed guard chain `Issue` dispatch uses.
+///
+/// `Step` (#11898, design #11894 §4.4) is one role session advancing one item
+/// by one stage: `claude -p "/loom:<role> <item>"`. `item` is the number the
+/// role is invoked on (the PR for a PR step, else the issue). It is additive on
+/// the wire: `{"type":"Step","value":{"item":N,"role":"builder"}}`, and the
+/// `Issue` / `PrSet` shapes are unchanged. Every consumer matches the kind
+/// exhaustively; `step_kind_sites` (in `step_kind_sites_tests.rs`) fails CI on
+/// a new `let`-`else` / `if let` that would drop it silently.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
 pub enum SweepKind {
@@ -949,16 +915,52 @@ pub enum SweepKind {
     Issue(u32),
     /// PR-set sweep: `claude -p "/loom:sweep --prs <n1> <n2> ..."`.
     PrSet(Vec<u32>),
+    /// One step: `claude -p "/loom:<role> <item>"` (#11898).
+    Step {
+        item: u32,
+        role: crate::step_role::StepRole,
+    },
+}
+
+impl SweepKind {
+    /// The single item this sweep holds: the issue of an `Issue` sweep, the
+    /// item of a `Step` (an issue or a PR, see [`StepRole::acts_on_pr`]).
+    /// `None` for a `PrSet`, which holds several.
+    ///
+    /// [`StepRole::acts_on_pr`]: crate::step_role::StepRole::acts_on_pr
+    #[must_use]
+    pub fn item_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(*n),
+            SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The step role, for a `Step`.
+    #[must_use]
+    pub fn role(&self) -> Option<crate::step_role::StepRole> {
+        match self {
+            SweepKind::Step { role, .. } => Some(*role),
+            SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
+        }
+    }
+
+    /// The issue this sweep works on as an issue: an `Issue` sweep's, or an
+    /// issue step's item. `None` for a `PrSet` and for a PR step.
+    #[must_use]
+    pub fn issue_number(&self) -> Option<u32> {
+        match self {
+            SweepKind::Issue(n) => Some(*n),
+            SweepKind::Step { item, role } if !role.acts_on_pr() => Some(*item),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        }
+    }
 }
 
 /// Lifecycle state of a tracked sweep.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "state", content = "details")]
 pub enum SweepState {
-    /// Spawn requested but the child PID has not yet been confirmed alive.
-    /// In Phase A this transient state collapses immediately into `Running`,
-    /// but the variant is reserved for future async-spawn paths.
-    Pending,
     /// Child PID is alive (verified by the most recent reaper tick).
     Running,
     /// Child exited; recorded by the reaper task on a `kill(pid, 0)` failure.
@@ -1034,7 +1036,7 @@ pub struct SweepInfo {
     pub state: SweepState,
     /// Most-recent phase the sweep advertised via its checkpoint, if any.
     /// Set directly on `Crashed` entries (the reaper's crash path and
-    /// `reconstruct_from_checkpoints`). For `Running`/`Pending` entries this
+    /// `reconstruct_from_checkpoints`). For `Running` entries this
     /// field is `None` in the stored registry entry — `SweepRegistry::list`
     /// overlays a live read of the on-disk checkpoint at query time (#4328)
     /// so `ListSweeps`/`loom-daemon status` show the sweep's current phase
@@ -1086,13 +1088,6 @@ pub struct SweepInfo {
     /// compatible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// Whether this sweep was admitted through the host's
-    /// overflow slot (#9244, inert since #11508): an operator-starred issue
-    /// dispatched over the global and/or per-repo concurrency cap as this
-    /// host's single over-limit sweep. `#[serde(default)]` keeps older wire
-    /// data and clients compatible (absent parses as `false`).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub overflow: bool,
 }
 
 fn default_sweep_runtime() -> String {
@@ -1102,6 +1097,42 @@ fn default_sweep_runtime() -> String {
 // ========================================================================
 // Autonomous Daemon Status Types (Issue #3891 — follow-up to #3813 Phase D)
 // ========================================================================
+
+/// Agent-residue reap counters (#10802), reported as `agent_residue` in
+/// `status --json`. Counts reaps since the daemon started; planned (`dryRun`)
+/// reaps are counted apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentResidueStatus {
+    /// `loom-agent-*` scopes stopped.
+    #[serde(default)]
+    pub scope: u64,
+    /// Process trees reaped (recorded identity, or worktree attribution).
+    #[serde(default)]
+    pub tree: u64,
+    /// Failed `loom-agent-*` scopes cleared with `reset-failed`.
+    #[serde(default)]
+    pub failed_scope: u64,
+    /// Reaps that `dryRun` planned and did not perform.
+    #[serde(default)]
+    pub dry_run_planned: u64,
+    /// When the last real reap happened.
+    #[serde(default)]
+    pub last_reap_at: Option<DateTime<Utc>>,
+}
+
+impl AgentResidueStatus {
+    /// All zero (usable in a `static`).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            scope: 0,
+            tree: 0,
+            failed_scope: 0,
+            dry_run_planned: 0,
+            last_reap_at: None,
+        }
+    }
+}
 
 /// The autonomous-mode operability snapshot returned by `Request::DaemonStatus`
 /// and rendered by the `loom-daemon status` CLI subcommand.
@@ -1118,7 +1149,7 @@ fn default_sweep_runtime() -> String {
 /// (and needing an edit every time one is added).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DaemonStatusReport {
-    /// Sweeps in a non-terminal state (`Pending` / `Running`) at snapshot time.
+    /// Sweeps in a non-terminal state (`Running`) at snapshot time.
     /// The full `SweepInfo` is carried so the CLI can render issue numbers,
     /// PIDs, token account, and latest phase without a second round-trip.
     pub in_flight: Vec<SweepInfo>,
@@ -1174,21 +1205,6 @@ pub struct DaemonStatusReport {
     /// daemon binaries compatible (an absent field parses as `None`).
     #[serde(default)]
     pub token_pool_dir: Option<PathBuf>,
-    /// Dynamic-cap input 2: how many worktrees the scratch volume can hold at
-    /// `LOOM_PER_WORKTREE_GB` each. Via [`crate::disk_headroom::disk_headroom_limit`].
-    pub disk_headroom: usize,
-    /// Dynamic-cap input (#5270): how many worktrees the host's
-    /// currently-available RAM can hold at `LOOM_PER_WORKTREE_RAM_GB` each.
-    /// Via [`crate::ram_headroom::ram_headroom_limit`] — the second machine-
-    /// headroom axis alongside [`Self::disk_headroom`], added when the token
-    /// axis was removed from admission entirely (operator direction: "we
-    /// should only ever limit parallelism based on the machine
-    /// disk/RAM/CPU"). `#[serde(default)]` keeps pre-#5270 wire data / older
-    /// clients compatible (an absent field parses as `0`, i.e. "unknown" —
-    /// callers should treat a `0` from a stale client cautiously, the same
-    /// caution any dynamic-cap input warrants).
-    #[serde(default)]
-    pub ram_headroom: usize,
     /// The host's logical CPU count (#3978), via
     /// [`crate::cpu_headroom::logical_cpu_count`]. **Observational only since
     /// #4512** — the CPU headroom *term* it used to feed was removed from the
@@ -1256,18 +1272,19 @@ pub struct DaemonStatusReport {
     /// compatible (an absent field parses as `None`).
     #[serde(default)]
     pub preflight_advisory_changed_at: Option<DateTime<Utc>>,
-    /// Dynamic-cap input 3: **the** per-machine admission knob
-    /// (`autonomous.workFinder.maxConcurrent` / `LOOM_WORK_FINDER_MAX_CONCURRENT`).
-    /// Since #4512 this is the only *policy* term in the cap — the other two
-    /// meter exhaustible resources (accounts, bytes) — so it is what an operator
-    /// tunes for a host, empirically, from the observed idle fraction above.
+    /// Agent-residue reap counters (#10802). `#[serde(default)]` keeps older
+    /// wire data compatible (an absent field parses as all zero).
+    #[serde(default)]
+    pub agent_residue: AgentResidueStatus,
+    /// **The** per-machine admission knob (`autonomous.workFinder.maxConcurrent`
+    /// / `LOOM_WORK_FINDER_MAX_CONCURRENT`). Since #12406 it is the cap and
+    /// nothing else limits it, so it is what an operator tunes for a host,
+    /// empirically, from the host's observed load, RAM and disk.
     pub configured_max: usize,
-    /// The effective dynamic concurrency cap —
-    /// `min(disk_headroom, ram_headroom, configured_max)`
-    /// (`resolve_dynamic_max_concurrent`; the CPU term that sat in this `min`
-    /// from #3978 was removed in #4512, and the token axis was removed
-    /// entirely in #5270 — see [`Self::ram_headroom`]). This is the
-    /// total-occupancy ceiling the work finder recomputes every tick.
+    /// The effective concurrency cap: equal to [`Self::configured_max`] since
+    /// #12406, which removed every automatic term (CPU #4512, tokens #5270,
+    /// RAM #12330, disk #12406; an older payload's `ram_headroom` and
+    /// `disk_headroom` are ignored). Kept under its old name for consumers.
     pub dynamic_cap: usize,
     /// Whether autonomous dispatch is currently halted by the reactive
     /// main-health gate (#3812). `true` means a red `main` has paused new
@@ -1520,6 +1537,28 @@ pub struct DaemonStatusReport {
     /// wire data compatible.
     #[serde(default)]
     pub auto_update_stale_repo: Option<String>,
+    /// #11042: why a host below the fleet floor is not rolling (typed:
+    /// `unsupervised`, `backoff`, `unsatisfiable`, …), or `None` when it is
+    /// not below the floor or is rolling. Absent from an older daemon.
+    #[serde(default)]
+    pub auto_update_floor_not_rolling: Option<crate::auto_update::not_rolling::FloorNotRolling>,
+    /// #12420: the host's update state (H0–H5, H7 or `unknown`) with the
+    /// versions, floor and target it was read from. Read-only; present whether
+    /// or not the update loop runs. Absent from an older daemon.
+    #[serde(default)]
+    pub host_update: Option<crate::auto_update::update_observation::HostUpdateObservation>,
+    /// #11042: what `autonomous.autoUpdate.enabled` resolved to. Since #10954
+    /// `auto_update_enabled` means "the loop runs", which a fleet host's loop
+    /// does for the floor alone; this is the setting beside it. `None` before
+    /// the spawn decision and from an older daemon.
+    #[serde(default)]
+    pub auto_update_config_enabled: Option<bool>,
+    /// #9736: the loop's progress clocks (last successful check, unapplied
+    /// release age, next attempt, blocking reason, thresholds), stamped with the
+    /// daemon's own running version. `None` when the loop has not ticked and
+    /// from an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update_freshness: Option<crate::auto_update::freshness::FreshnessReport>,
     /// Every long-running daemon loop's liveness (Issue #10414): last beat,
     /// staleness window, alive/dead. Empty from a pre-#10414 daemon.
     #[serde(default)]
@@ -1531,32 +1570,11 @@ pub struct DaemonStatusReport {
     /// pre-#10600 daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_containers: Option<crate::session_status::SessionContainersReport>,
-    /// Host-distress circuit-breaker state (Issue #4235). `Some` when a breaker
-    /// has been registered this process (the work-finder loop is running and the
-    /// breaker is enabled); `None` when no breaker is active — which the status
-    /// renderer treats as "breaker inactive", the zero-behavior-change baseline.
-    /// `#[serde(default)]` keeps pre-#4235 wire data / older clients compatible
-    /// (an absent field parses as `None`). Boxed (`clippy::large_enum_variant`):
-    /// `HostBreakerStatus` is the field that tips `Response::DaemonStatus` past
-    /// the second-largest variant, and the indirection is the cheapest fix (one
-    /// heap alloc on an already-rare, human-latency status round-trip).
-    #[serde(default)]
-    pub host_breaker: Option<Box<HostBreakerStatus>>,
-    /// Saturation admission-brake state (Issue #4903). `Some` once a brake has
-    /// been registered this process (the daemon registers one at startup
-    /// alongside the host breaker); `None` when none is active — which the
-    /// status renderer treats as "brake inactive", the zero-behavior-change
-    /// baseline. Answers the question `capacity_bound: false` could not: a host
-    /// that is refusing new work because it is already saturated now says so
-    /// instead of reading as idle. `#[serde(default)]` keeps pre-#4903 wire data
-    /// / older clients compatible (an absent field parses as `None`).
-    #[serde(default)]
-    pub admission_brake: Option<AdmissionBrakeStatus>,
     /// GitHub rate-limit circuit-breaker state (Issue #4429). `Some` once the
     /// breaker is registered at startup; `None` on older daemons.
     /// `#[serde(default)]` keeps pre-#4429 wire data / older clients compatible.
-    /// Boxed for the same `clippy::large_enum_variant` reason as
-    /// [`Self::host_breaker`].
+    /// Boxed (`clippy::large_enum_variant`): one heap alloc on an
+    /// already-rare, human-latency status round-trip.
     #[serde(default)]
     pub rate_limit_breaker: Option<Box<RateLimitBreakerStatus>>,
     /// Per-caller forge call accounting (Issue #9251): 200/304/limited/error
@@ -1787,27 +1805,19 @@ pub struct DaemonStatusReport {
     /// `#[serde(default)]` keeps older wire data compatible.
     #[serde(default)]
     pub work_finder_interval_secs: Option<u64>,
-    /// An observability-exporter host-identity mismatch detected this process
-    /// (Issue #4830): the ingest key installed on this host is bound to a
-    /// *different* `host_id` than the one this daemon reports for itself, so
-    /// every record it pushes is filed under the wrong host.
-    ///
-    /// `None` in the overwhelmingly common case — the ids agree, the exporter
-    /// is disabled/keyless, or no batch has been acked yet this process — and
-    /// for a pre-#4830 wire payload. Published by
-    /// [`crate::observability::HostIdStatus`] and read here via
-    /// [`crate::observability::global_host_id_mismatch`]. `#[serde(default)]`
-    /// keeps older wire data / older clients compatible.
-    #[serde(default)]
-    pub observability_host_id_mismatch: Option<ObservabilityHostIdMismatch>,
+    /// The per-host post-restart delay before this process's first
+    /// fleet-wide gather (#12073, [`crate::startup_jitter`]). `health` adds it
+    /// to the first-tick grace window, so a host still inside its jitter reads
+    /// as warming up. `None` when the gate is unarmed or for an older daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_jitter_delay_secs: Option<u64>,
     /// **Positive** confirmation of whether telemetry is actually reaching the
     /// backend, and under which `host_id` (Issue #5083).
     ///
-    /// [`Self::observability_host_id_mismatch`] above is anomaly-only by
-    /// design (#4830), which left "exporting fine", "observability disabled",
-    /// and "configured but silently never exported" all rendering as the same
-    /// thing: nothing at all. This field is the counterpart that always has an
-    /// answer — see [`ObservabilityExportStatus`].
+    /// Without it "exporting fine", "observability disabled", and
+    /// "configured but silently never exported" all render as the same thing:
+    /// nothing at all. This field always has an answer — see
+    /// [`ObservabilityExportStatus`].
     ///
     /// With the multi-exporter fan-out (#8756) this is the **first configured
     /// exporter's** cell — byte-identical to the pre-fan-out status for every
@@ -1836,34 +1846,6 @@ pub struct DaemonStatusReport {
     /// pre-#11353 daemon; never read as `ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp_export: Option<crate::observability::otlp_health::OtlpExportHealth>,
-    /// State of the forge event-feed consumer (ADR-0021, #8765): whether this
-    /// daemon is polling its operator-provisioned per-host event feed, under
-    /// which `host_id`, how far its cursor has advanced, and — when it is not
-    /// advancing — which class of failure is responsible.
-    ///
-    /// `None` **only** from a pre-ADR-0021 daemon binary that never computed
-    /// one. A daemon of this vintage with no `forgeEvents` block reports
-    /// `Some(ForgeEventsStatus::disabled())`, so silence is never the answer.
-    #[serde(default)]
-    pub forge_events: Option<ForgeEventsStatus>,
-    /// The daemon-wide peer-claim view + transport counters (Issue #5921):
-    /// which issues THIS host currently sees claimed, by which host and with
-    /// what remaining TTL, plus how many claims have been advertised /
-    /// received / expired / caused a dispatch skip since process start.
-    /// Before this field, [`crate::peer_claims::PeerClaimView`] had no
-    /// external observability surface at all — a duplicate cross-host
-    /// dispatch (e.g. #5789) could not be distinguished from a broken
-    /// re-advertisement path without attaching a debugger.
-    ///
-    /// `None` when no safehouse peer-claim coordination has been established
-    /// for this daemon (`safehouse.enabled` false, or enabled with no socket
-    /// ever resolving) — the same condition
-    /// [`SweepRegistry::peer_claimed_issues`](crate::sweep_registry::SweepRegistry::peer_claimed_issues)
-    /// already treats as "no view attached", rendered honestly here rather
-    /// than as an empty-but-present view. `#[serde(default)]` keeps pre-#5921
-    /// wire data / older clients compatible.
-    #[serde(default)]
-    pub peer_claims: Option<PeerClaimStatus>,
     /// Per-repo state of the pressure-triggered deep-clean pass (#5919), one
     /// entry per registered workspace the reaper has evaluated this process.
     ///
@@ -1944,33 +1926,29 @@ pub struct DeepCleanRepoStatus {
     /// What that firing pass reclaimed, e.g. `"target/ (34.1G)"` or
     /// `"nothing"`.
     pub last_reclaimed: Option<String>,
+    /// What `clean.keepBuildArtifacts` left in place on that pass, e.g.
+    /// `"node_modules/ (1.2G)"` (#12694). `None` when nothing was kept.
+    #[serde(default)]
+    pub last_kept: Option<String>,
 }
 
 mod observability_export;
 pub use observability_export::{
     ObservabilityExportScope, ObservabilityExportState, ObservabilityExportStatus,
-    ObservabilityHostIdMismatch, ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
-};
-
-mod forge_events;
-pub use forge_events::{
-    ForgeEventsState, ForgeEventsStatus, ForgeEventsWakeStatus, PollGatingStatus,
-    PollGatingWorkspace,
+    ObservabilityQueuePressure, NEVER_EXPORTED_GRACE_FLOOR_SECS,
 };
 
 mod ready_queue;
 pub use ready_queue::{QueueDisposition, ReadyQueueRow};
 mod dispatch_plan;
 pub use dispatch_plan::{
-    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RepoCapView,
-    RowPlan, PLAN_SCOPE,
+    DispatchPlanContext, PlanGate, PlanKey, PlanShard, PlanSlots, PlanState, PlanStep, RowPlan,
+    PLAN_SCOPE,
 };
 mod fleet_plan;
 pub use fleet_plan::{FleetPlan, FleetPlanItem, FleetPlanObservation, HostPlan, HostPlanRow};
 pub(crate) mod work_finder_tick;
-pub use work_finder_tick::{
-    CapLimiter, CapView, CapacityWait, RepoLimitView, WorkFinderTickSummary,
-};
+pub use work_finder_tick::{CapView, CapacityWait, WorkFinderTickSummary};
 
 /// One role-runner tick outcome for one `(root, role)` pair (Issue #4761).
 ///
@@ -2123,205 +2101,6 @@ pub struct SafehouseStatus {
     pub reason: Option<String>,
 }
 
-/// Live peer-claim view + transport counters for `loom-daemon status` /
-/// `loom-daemon peer-claims` (Issue #5921). Rendered from
-/// [`crate::peer_claims::PeerClaimView::to_status`]. See
-/// [`DaemonStatusReport::peer_claims`] for the `None`-vs-empty-view contract.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerClaimStatus {
-    /// This daemon's own host identity — the self-claim-recognition key
-    /// (`crate::sweep_registry::host_identity`).
-    pub self_host: String,
-    /// The configured peer-claim TTL, in seconds
-    /// ([`crate::peer_claims::resolve_peer_claim_ttl`]).
-    pub ttl_secs: u64,
-    /// Every tracked claim (live or not-yet-pruned-expired), sorted by
-    /// `(repo, issue)` for a deterministic render.
-    pub entries: Vec<PeerClaimEntryStatus>,
-    /// How many `Advertise` ads THIS host has published (dispatch-time plus
-    /// every reaper re-advertisement heartbeat, #4431).
-    pub advertised: u64,
-    /// How many peer (non-self) ads this daemon has accepted.
-    pub received: u64,
-    /// How many entries have aged out past the TTL with no re-advertisement.
-    pub expired: u64,
-    /// How many dispatches were backed off because this view showed a live
-    /// peer claim (the #5789 enforcement path) — the proof the mechanism
-    /// actually prevented a duplicate.
-    pub dispatch_skipped: u64,
-    /// How many of this host's claim-ad sends safehoused **refused** (Issue
-    /// #9294). Read beside `advertised`, which counts *attempts*: when the two
-    /// track each other, this host is publishing nothing and every fleet-wide
-    /// brake built on the channel is inert. `#[serde(default)]` keeps pre-#9294
-    /// wire data / older clients compatible (deserializes as `0`).
-    #[serde(default)]
-    pub advertise_rejected: u64,
-    /// Peer-coordination degradation state (Issue #6157) — see
-    /// [`PeerCoordinationHealth`]. `#[serde(default)]` keeps pre-#6157 wire
-    /// data / older clients compatible (deserializes as the all-healthy
-    /// default).
-    #[serde(default)]
-    pub coordination: PeerCoordinationHealth,
-    /// The resolved claims-room identity (`SafehouseConfig::claims_room()`,
-    /// Issue #6242) captured at coordination-start time — the room this host
-    /// actually joined for peer-claim ads (`rooms.claims` /
-    /// `LOOM_SAFEHOUSE_ROOM_CLAIMS`, falling back to the signal room). `None`
-    /// when peer-claim coordination was never established (safehouse
-    /// disabled, or no socket ever resolved), matching this struct's own
-    /// `None`-vs-empty-view contract — never an empty string.
-    /// `#[serde(default)]` keeps pre-#6242 wire data / older clients
-    /// compatible (deserializes as `None`).
-    #[serde(default)]
-    pub claims_room: Option<String>,
-    /// Confirmed cross-host claims on the SAME issue within the trailing
-    /// rolling window (default 24h — Issue #6243, part of the
-    /// repo-sharding effort's collision-frequency verification AC). See
-    /// [`crate::peer_claims::PeerClaimView::same_issue_collision_count`] for
-    /// the windowing and why this is distinct from `Dispatcher::collisions()`
-    /// (that counter is a monotonic, never-pruned, per-process-lifetime
-    /// total — unusable for "were there any cross-host claims on the SAME
-    /// issue in the last 24h"). `#[serde(default)]` keeps pre-#6243 wire
-    /// data / older clients compatible (deserializes as `0`).
-    #[serde(default)]
-    pub same_issue_collisions: u64,
-}
-
-/// Peer-coordination degradation state for `loom-daemon health`'s
-/// `peer_coordination` section (Issue #6157): whether this host's
-/// peer-claim RECEIVE path currently looks broken — advertising its own
-/// claims but not hearing from any peer, the 2026-08-13 incident's exact
-/// signature — and, while degraded, how close recovery is. Rendered from
-/// [`crate::peer_claims::PeerClaimView`]'s internal tracking; see
-/// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] for the
-/// decision rule.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerCoordinationHealth {
-    /// Whether coordination is currently judged degraded.
-    pub degraded: bool,
-    /// Seconds since coordination was judged degraded; `None` while healthy.
-    pub degraded_for_secs: Option<u64>,
-    /// How many consecutive genuine peer receives have landed since going
-    /// degraded, toward `recovery_threshold`. Always `0` while healthy.
-    pub consecutive_receives_toward_recovery: u64,
-    /// How many consecutive receives recovery requires
-    /// ([`crate::peer_claims::resolve_coordination_recovery_threshold`]).
-    pub recovery_threshold: u64,
-    /// The last verdict sentence
-    /// [`crate::peer_claims::PeerClaimView::evaluate_coordination`] produced —
-    /// Issue #9294. Before this, a degraded verdict surfaced only as a `bool`
-    /// plus two raw counters an operator had to interpret, and the *reason*
-    /// (which distinguishes "peers are idle" from "the homeserver is refusing
-    /// every send") existed only in the reaper's return value, which nothing
-    /// persisted. `None` before the first reaper tick has evaluated. Rendered
-    /// verbatim by `loom-daemon status` whenever `degraded` is true.
-    /// `#[serde(default)]` keeps older clients compatible.
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-/// One live peer claim entry within [`PeerClaimStatus::entries`] (Issue
-/// #5921).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PeerClaimEntryStatus {
-    /// The cross-host-stable repo identity (`crate::peer_claims::repo_slug`)
-    /// this claim was advertised under.
-    pub repo: String,
-    /// The claimed issue number.
-    pub issue: u32,
-    /// The host holding the claim.
-    pub host: String,
-    /// How long this entry has left before it expires from THIS daemon's
-    /// view. `0` reads as "expired, not yet pruned" rather than absent.
-    pub remaining_ttl_secs: u64,
-}
-
-/// Host-distress circuit-breaker snapshot for `loom-daemon status` (Issue
-/// #4235). Rendered from [`crate::host_breaker::BreakerSnapshot`]. The
-/// `daemon.host_breaker.state` event carries the same transition data on every
-/// phase change; this is the point-in-time status view.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HostBreakerStatus {
-    /// Whether the breaker is enabled (default ON — a safety backstop).
-    pub enabled: bool,
-    /// The current phase: `"closed"`, `"open"`, or `"cooldown"`.
-    pub phase: String,
-    /// Whether the breaker is currently suppressing new dispatch (Open or
-    /// CoolDown).
-    pub suppressed: bool,
-    /// Human-readable reason for the current non-Closed state; `None` while
-    /// Closed.
-    #[serde(default)]
-    pub reason: Option<String>,
-    /// When the breaker last tripped to Open; `None` while Closed.
-    #[serde(default)]
-    pub tripped_at: Option<DateTime<Utc>>,
-    /// When the current cool-down completes and normal dispatch resumes; `None`
-    /// outside CoolDown.
-    #[serde(default)]
-    pub releases_at: Option<DateTime<Utc>>,
-    /// The most recent load-per-core sample observed; `None` when no
-    /// load-average source is available.
-    #[serde(default)]
-    pub last_load_per_core: Option<f64>,
-    /// The configured load-per-core trip threshold.
-    pub load_per_core_threshold: f64,
-    /// The configured number of consecutive over-threshold ticks needed to trip.
-    pub sustain_ticks: u32,
-    /// The configured cool-down window, in seconds.
-    pub cooldown_secs: u64,
-}
-
-/// Saturation admission-brake snapshot for `loom-daemon status` (Issue #4903).
-/// Rendered from [`crate::admission_brake::BrakeSnapshot`].
-///
-/// Distinct from [`HostBreakerStatus`] on purpose: the brake is the
-/// **point-in-time** guard that holds new admissions while the host is already
-/// saturated and releases the moment it recovers, whereas the breaker is the
-/// stateful trip that remembers sustained distress across a cool-down. A host
-/// holding admissions must *say so* — before this field, a worker at 12×
-/// overcommit reported `capacity_bound: false` and read as idle.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub struct AdmissionBrakeStatus {
-    /// Whether the brake is enabled (default ON — a safety backstop).
-    pub enabled: bool,
-    /// Whether **new** sweep admissions are currently held. In-flight sweeps are
-    /// never affected by this flag: the brake has no path to running work.
-    pub held: bool,
-    /// The most recent load-per-core sample observed; `None` when no
-    /// load-average source is available (which fails safe to *not* holding).
-    #[serde(default)]
-    pub load_per_core: Option<f64>,
-    /// The configured load-per-core hold threshold.
-    pub load_per_core_threshold: f64,
-    /// When the current hold streak began; `None` while not holding.
-    #[serde(default)]
-    pub held_since: Option<DateTime<Utc>>,
-    /// How many consecutive ticks the current streak has held; `0` when not
-    /// holding.
-    #[serde(default)]
-    pub held_ticks: u32,
-    /// When the current **starvation** streak began — held with **zero**
-    /// sweeps in flight, continuously, since this timestamp (Issue #5715).
-    /// `None` when not currently starving, including whenever sweeps are
-    /// genuinely in flight (healthy backpressure never starves, however long
-    /// it holds). `#[serde(default)]` keeps a pre-#5715 wire payload
-    /// compatible.
-    #[serde(default)]
-    pub starving_since: Option<DateTime<Utc>>,
-    /// How many consecutive ticks the current starvation streak has held;
-    /// `0` when not starving. `#[serde(default)]` keeps a pre-#5715 wire
-    /// payload compatible.
-    #[serde(default)]
-    pub starving_ticks: u32,
-    /// Cumulative starvation-escape-hatch grants this daemon process's
-    /// lifetime (Issue #5715) — `0` on a healthy host forever; any nonzero
-    /// count means the brake has had to force at least one admission through
-    /// despite the host still reading saturated. `#[serde(default)]` keeps a
-    /// pre-#5715 wire payload compatible.
-    #[serde(default)]
-    pub escape_hatch_grants: u32,
-}
-
 /// GitHub rate-limit circuit-breaker snapshot for `loom-daemon status` (Issue
 /// #4429). Rendered from [`crate::rate_limit_breaker::RateLimitSnapshot`]. The
 /// `daemon.rate_limit_breaker.state` event carries the transition data on
@@ -2420,6 +2199,27 @@ pub struct ForgeCallsStatus {
     /// routing table. Empty when none are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_spills: Vec<ReadSpillStatus>,
+    /// Writer route holds armed right now (#13746, #14559): one per
+    /// confirmed-exhaustion bucket the work finder stands down until its
+    /// reset. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_holds: Vec<WriterRouteHoldStatus>,
+}
+
+/// One armed writer route hold of [`ForgeCallsStatus`] (#13746): the bucket
+/// a confirmed writer exhaustion held, until its reset releases the route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriterRouteHoldStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The installation's owner, lowercased.
+    pub owner: String,
+    /// The installation id, or `-` when unknown.
+    pub installation: String,
+    /// The billed resource (`core` is the only one a writer hold arms).
+    pub resource: String,
+    /// When the hold releases.
+    pub until: DateTime<Utc>,
 }
 
 /// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).
@@ -2659,7 +2459,7 @@ pub struct StaleSweepFinding {
     pub sweep_id: String,
     /// PID of the (confirmed alive at snapshot time) sweep process.
     pub pid: u32,
-    /// How long the sweep has been `Running`/`Pending`, in seconds.
+    /// How long the sweep has been `Running`, in seconds.
     pub elapsed_secs: u64,
     /// How long the sweep's log file has gone un-appended, in seconds, when
     /// its mtime was readable. `None` when the log is missing/unreadable.
@@ -2743,6 +2543,11 @@ pub struct RepoStatus {
     /// a normal workspace, and from a daemon that predates the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_only: Option<crate::workspace_registry::MaintainOnly>,
+    /// The installed Loom files are older than this daemon but compatible
+    /// with it, so dispatch is not held (#14015). `None` when they are not
+    /// behind, for the Loom source repo, and from a daemon that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_behind: Option<crate::workspace_hold::InstalledBehind>,
     /// This repo's cross-repo draw weight (#11742): higher = drawn more,
     /// default [`crate::workspace_registry::DEFAULT_WORKSPACE_WEIGHT`].
     /// Surfaced so `loom-daemon status` shows how the autonomous loops share
@@ -2750,7 +2555,7 @@ pub struct RepoStatus {
     /// field parses as the default weight).
     #[serde(default = "crate::workspace_registry::default_weight")]
     pub weight: u32,
-    /// Count of non-terminal (`Pending` / `Running`) sweeps live in this repo's
+    /// Count of non-terminal (`Running`) sweeps live in this repo's
     /// own [`crate::sweep_registry::SweepRegistry`] at snapshot time.
     pub in_flight_count: usize,
     /// Whether this repo's dispatch is currently halted by the per-repo reactive
@@ -2802,6 +2607,12 @@ pub struct RepoStatus {
     /// absent field parses as `false`, i.e. "not known to be missing").
     #[serde(default)]
     pub root_missing: bool,
+    /// This root's sweep-registry mutex stayed held past the status build's
+    /// bounded wait (#13443), so its registry-derived fields (in-flight count,
+    /// quarantines) are empty rather than known. Omitted when `false`;
+    /// `#[serde(default)]` keeps older wire data parsing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lock_busy: bool,
     /// Whether this repo's most recent gate tick DEFERRED for host load (#4259)
     /// — a bounded, load-aware scheduling decision distinct from both
     /// `health_gate_halted` (verified-red) and `health_gate_not_evaluated`
@@ -3042,8 +2853,8 @@ pub struct CapacityReport {
     pub exhausted_accounts: usize,
     /// The health-adjusted token-axis limit: `healthy_accounts` when a ranking
     /// exists, else the raw token-pool size. The token axis no longer feeds the
-    /// dynamic concurrency cap (`min(disk headroom, ram headroom,
-    /// configured_max)`, removed in #5270) — this field is informational only,
+    /// concurrency cap (removed from it in #5270; the cap is the configured
+    /// `maxConcurrent` since #12406) — this field is informational only,
     /// reported here because it still drives spawn-time account *selection*
     /// (prefer healthier accounts) elsewhere in the daemon.
     pub token_axis_limit: usize,
@@ -3332,6 +3143,31 @@ pub enum Event {
         sweep_id: SweepId,
         outcome: SweepOutcome,
     },
+    /// `step.item.{N}.ended` — a step session's outcome, as the step ledger
+    /// classified it (Issue #12152). Published once per ended step by the
+    /// step tick's settle pass (`step_dispatch::step_end::settle`), after
+    /// [`crate::sweep_registry::SweepRegistry::record_step_outcome`].
+    ///
+    /// A step never emits `sweep.issue.{N}.exited` (it is not an issue
+    /// sweep), so this is the step's terminal event on the bus. The narration
+    /// sink reads it to narrate a public-feed `completion` for a Champion
+    /// merge step whose PR merged; nothing else in the event makes a write.
+    /// `item` is the number the step ran on: the PR for a PR step
+    /// (`StepRole::acts_on_pr`), else the issue. `class` and `reason` are the
+    /// ledger's (`outcome_ledger::classify`): `class` is one of `verdict`,
+    /// `noop`, `refused`, `failed`.
+    StepEnded {
+        item: u32,
+        role: crate::step_role::StepRole,
+        class: String,
+        reason: String,
+        /// How long the session ran, in seconds.
+        ran_for_sec: i64,
+        /// Owning managed-workspace root (Issue #3929's pattern). Stamped by
+        /// `SweepRegistry::emit_event` -> [`Self::set_repo_if_absent`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo: Option<String>,
+    },
     /// `epic.issue.{N}.{action}` — the epic supervisor (#3842) fired one of its
     /// four action-class transitions for epic `{N}`. Published by the epic
     /// supervisor loop; authorized by #3873 (epic #3842 Phase 4).
@@ -3479,6 +3315,7 @@ impl Event {
     /// | `SweepGlobalDispatch {..}` | `sweep.global.dispatch` |
     /// | `SweepGlobalRuntimeRejected {..}` | `sweep.global.runtime_rejected` |
     /// | `SweepGlobalCompleted {..}` | `sweep.global.completed` |
+    /// | `StepEnded {item, ..}` | `step.item.{item}.ended` |
     /// | `EpicAction {epic, action, ..}` | `epic.issue.{epic}.{action}` |
     /// | `CapacityAdvisory {..}` | `daemon.capacity.advisory` |
     /// | `PreflightAdvisory {..}` | `daemon.preflight.advisory` |
@@ -3505,6 +3342,7 @@ impl Event {
             Self::SweepGlobalDispatch { .. } => "sweep.global.dispatch".to_string(),
             Self::SweepGlobalRuntimeRejected { .. } => "sweep.global.runtime_rejected".to_string(),
             Self::SweepGlobalCompleted { .. } => "sweep.global.completed".to_string(),
+            Self::StepEnded { item, .. } => format!("step.item.{item}.ended"),
             Self::EpicAction { epic, action, .. } => {
                 format!("epic.issue.{epic}.{}", action.as_str())
             }
@@ -3537,7 +3375,8 @@ impl Event {
             | Self::SweepCrashed { repo, .. }
             | Self::SweepResumeDispatched { repo, .. }
             | Self::SweepGlobalDispatch { repo, .. }
-            | Self::SweepGlobalRuntimeRejected { repo, .. } => repo,
+            | Self::SweepGlobalRuntimeRejected { repo, .. }
+            | Self::StepEnded { repo, .. } => repo,
             _ => return,
         };
         if slot.is_none() {

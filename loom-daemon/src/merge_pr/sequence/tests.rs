@@ -363,9 +363,9 @@ fn every_hold_releasing_writer_emits_a_tombstone_parse_live_reads() {
         source: Some("pass".into()),
     };
     let writers = [
-        release_comment_body(&m, HoldAction::Release),
-        release_comment_body(&m, HoldAction::ReleaseDissolved),
-        release_comment_body(&m, HoldAction::Expire),
+        release_comment_body(&m, HoldAction::Release, None),
+        release_comment_body(&m, HoldAction::ReleaseDissolved, None),
+        release_comment_body(&m, HoldAction::Expire, None),
         REPLAN_NOTE_BODY.to_string(),
         reservation_release_body(&m, "cons-ab12cd34"),
     ];

@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::discovered_worktree::{decide, render};
+use crate::merge_pr::discovered_worktree::{decide, render};
 
 #[derive(clap::Args)]
 pub(crate) struct DiscoveredWorktreeArgs {

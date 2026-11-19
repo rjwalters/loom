@@ -1,6 +1,7 @@
 use super::probe::{classify_repo_permissions, Permission, PermissionProbe};
 use super::target::{gh_target, parse_remote_config, parse_remote_url};
 use super::*;
+use crate::test_git_helpers::run as git;
 use std::cell::Cell;
 
 // ---- gh's base-repo resolution --------------------------------------------
@@ -196,17 +197,6 @@ fn repo_permissions_classify_user_roles() {
 
 // ---- a real checkout -------------------------------------------------------
 
-fn git(dir: &Path, args: &[&str]) {
-    let ok = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
-}
-
 #[test]
 fn a_fork_checkout_with_an_upstream_remote_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -244,6 +234,7 @@ fn a_fork_checkout_with_an_upstream_remote_is_refused() {
 #[serial_test::serial(write_scope_cache)]
 fn the_cache_answers_repeat_questions_without_a_second_probe() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     // SAFETY-free: the variable is read only by this module's cache.
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
     probe::clear_memory();
@@ -266,6 +257,76 @@ fn the_cache_answers_repeat_questions_without_a_second_probe() {
     std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
 }
 
+/// #13152: a snapshot miss is cached for a minute only, so a repo added to
+/// the installation later is re-probed soon.
+#[test]
+#[serial_test::serial(write_scope_cache)]
+fn a_not_in_installation_answer_is_cached_for_a_minute_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
+    std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("c"));
+    probe::clear_memory();
+    let kd = dir.path().join("cred-m");
+    let cached = probe::Cached {
+        inner: FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into())),
+        key_dir: Some(kd.clone()),
+    };
+    let key = probe::cache_key(Some(&kd), &cached.cache_scope(), "acme/new").unwrap();
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert!(matches!(cached.permission("acme/new"), Permission::Insufficient(_)));
+    assert_eq!(cached.inner.calls.get(), 1, "a fresh miss is reused");
+    // Two minutes on (memory dropped, disk entry aged): re-probed.
+    probe::clear_memory();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 120;
+    let body = serde_json::json!({
+        "write": false, "detail": probe::NOT_IN_INSTALLATION, "at": at
+    });
+    std::fs::write(probe::cache_dir().join(format!("{key}.json")), body.to_string()).unwrap();
+    let _ = cached.permission("acme/new");
+    assert_eq!(cached.inner.calls.get(), 2, "a miss older than a minute is re-probed");
+    std::env::remove_var("LOOM_WRITE_SCOPE_CACHE_DIR");
+}
+
+/// #13306: a writer token minted before a repo joined the installation lists
+/// the installation without it. The probe re-mints once and re-reads, so the
+/// repo is answered WRITE; a repo that stays absent after the re-mint is
+/// still refused, and a failed re-mint stays fail-closed.
+#[test]
+fn a_repo_absent_from_a_stale_writer_listing_is_admitted_after_a_remint() {
+    use crate::forge_repo_facts::installation::tests::{page, Listing};
+    use crate::forge_repo_facts::test_support::Env;
+    let env = Env::new(&[]);
+    let fake = Listing::new(env.tmp.path());
+    fake.set("page1", &page(1, &[(1, "remintco/old", false)]));
+    let probe = probe::GhProbe::new(fake.gh.clone(), Some(env.tmp.path().join("cfg-writer")));
+    let dir = fake.dir.clone();
+    let minted = std::rc::Rc::new(Cell::new(0));
+    let seen = minted.clone();
+    probe::TEST_REMINT.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_repo: &str| {
+            seen.set(seen.get() + 1);
+            std::fs::write(
+                dir.join("page1"),
+                page(2, &[(1, "remintco/old", false), (2, "remintco/new", true)]),
+            )
+            .unwrap();
+            Some(std::path::PathBuf::new())
+        }));
+    });
+    assert_eq!(probe.permission("remintco/new"), Permission::Write);
+    assert_eq!(minted.get(), 1, "one forced mint");
+    assert_eq!(fake.listing_calls(), 2, "{:?}", fake.calls());
+    // A repo the fresh token also lacks stays refused; the owner's debounce
+    // window keeps this from minting again.
+    assert!(matches!(probe.permission("remintco/gone"), Permission::Insufficient(_)));
+    assert_eq!(minted.get(), 1, "debounced per owner");
+    probe::TEST_REMINT.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// The library-test fixture is admitted by the real decision, and only
 /// because its credential reports WRITE: the same registered checkout with a
 /// `pull` answer is refused. Neither answer is cached across the two, since
@@ -286,6 +347,164 @@ fn a_registered_fixture_is_admitted_only_with_write() {
         matches!(&v, Verdict::Deny(w) if w.contains("cannot write") && w.contains("pull")),
         "{v:?}"
     );
+}
+
+// ---- the per-owner writer route (#13929) -----------------------------------
+
+use crate::credential_preflight::GithubAppOutcome;
+
+/// A workspace whose config gives `covered` per-owner `writers[]` Apps, plus
+/// a managed checkout of a repo owned by `checkout_owner` and a fake `gh`
+/// that answers WRITE only when the probe carries an established
+/// `GH_CONFIG_DIR` — the ambient credential it starts with must read as
+/// `pull`, so a pass proves the probe really switched to the minted
+/// credential. Returns `(checkout, gh, repo, gh_bin_dir)`; the caller mints
+/// with its own stub and holds the bin dir for the test's duration.
+fn writer_route_fixture(
+    dir: &Path,
+    checkout_owner: &str,
+    covered: &[&str],
+) -> (PathBuf, PathBuf, String, tempfile::TempDir) {
+    use crate::test_git_helpers::run as git;
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(ws.join(".loom")).unwrap();
+    let writers: Vec<_> = covered
+        .iter()
+        .map(|owner| {
+            serde_json::json!({"appId": "99", "privateKeyPath": "/tmp/key.pem", "owners": [owner]})
+        })
+        .collect();
+    let config = serde_json::json!({"forge": {"identities": {"writers": writers}}});
+    std::fs::write(ws.join(".loom/config.json"), config.to_string()).unwrap();
+
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let repo = format!("{checkout_owner}/w{}", &id[..12]);
+    let checkout = dir.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    git(&checkout, &["init", "-q"]);
+    git(
+        &checkout,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{repo}.git"),
+        ],
+    );
+    std::fs::create_dir_all(checkout.join(".loom")).unwrap();
+
+    // WRITE (push) only under the published per-owner credential; any other
+    // `GH_CONFIG_DIR` (including the ambient host one a test process can
+    // inherit) and an unset one answer `pull`, so an un-established probe
+    // must refuse.
+    let bin = tempfile::tempdir().unwrap();
+    let gh = bin.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = api ] && [ \"$2\" = 'repos/{repo}' ]; then\n\
+         case \"${{GH_CONFIG_DIR:-}}\" in\n\
+         *gh-config-by-owner/{checkout_owner}) echo '{{\"push\":true}}';;\n\
+         *) echo '{{\"pull\":true}}';;\n\
+         esac\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = api ] && [ \"$2\" = installation/repositories ]; then\n\
+         echo 'fake gh: not an App installation token' >&2\n\
+         exit 1\n\
+         fi\n\
+         echo \"fake gh: unexpected call: $*\" >&2\n\
+         exit 1\n"
+    );
+    std::fs::write(&gh, &script).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    // The gh script must outlive the returned PathBuf; the tempdir is
+    // released when the caller's `bin` binding drops at test end.
+    (checkout, gh, repo, bin)
+}
+
+fn mint_ok(
+    calls: &Cell<u32>,
+) -> impl Fn(&crate::forge_identity::Identity, &str) -> GithubAppOutcome + '_ {
+    move |_identity, _repo| {
+        calls.set(calls.get() + 1);
+        GithubAppOutcome::Minted {
+            token: "ghs_test_token".into(),
+            installation_id: "1".into(),
+            app_id: "99".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+}
+
+/// An owner a `forge.identities.writers[]` entry covers, whose writer can
+/// mint, is probed under that writer: the mint ran, the credential was
+/// published and registered, and the decision is Allow — today it is a false
+/// `pull` refusal, because a CLI process has nothing registered (#13929).
+#[test]
+#[serial_test::serial]
+fn may_write_probes_under_a_per_owner_writer_that_can_mint() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (checkout, gh, repo, _bin) =
+        writer_route_fixture(dir.path(), "loom-fixture", &["loom-fixture"]);
+    let ws = dir.path().join("ws");
+    let mints = Cell::new(0);
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint_ok(&mints));
+    assert_eq!(mints.get(), 1, "one mint for the covered owner");
+    assert_eq!(v, Verdict::Allow(repo.clone()), "{v:?}");
+    assert_eq!(
+        crate::credential_preflight::gh_config_dir_for_owner_slug(&repo),
+        Some(ws.join(".loom/gh-config-by-owner/loom-fixture")),
+        "the minted credential is registered for the owner"
+    );
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
+/// An owner no `writers[]` entry covers is never minted for: no mint runs,
+/// and the decision is today's ambient answer — here a `pull` refusal
+/// (fail closed, unchanged) (#13929).
+#[test]
+#[serial_test::serial]
+fn may_write_without_a_covering_writer_entry_stays_the_ambient_refusal() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    // The fixture's owner is `loom-fixture`; the config covers only `acme`.
+    let (checkout, gh, repo, _bin) = writer_route_fixture(dir.path(), "loom-fixture", &["acme"]);
+    let ws = dir.path().join("ws");
+    let mints = Cell::new(0);
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint_ok(&mints));
+    assert_eq!(mints.get(), 0, "no mint for an uncovered owner");
+    assert!(matches!(&v, Verdict::Deny(w) if w.contains("pull")), "{v:?}");
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
+/// A covered owner whose mint fails keeps the fail-closed refusal (exit 1
+/// upstream), and the refusal names the mint failure instead of leaving the
+/// ambient credential's answer as the whole story (#13929).
+#[test]
+#[serial_test::serial]
+fn a_failed_mint_on_the_writer_covered_path_names_it_in_the_refusal() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (checkout, gh, repo, _bin) =
+        writer_route_fixture(dir.path(), "loom-fixture", &["loom-fixture"]);
+    let ws = dir.path().join("ws");
+    let mint = |_identity: &crate::forge_identity::Identity, _repo: &str| {
+        GithubAppOutcome::Error("private key unreadable".into())
+    };
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint);
+    match &v {
+        Verdict::Deny(w) => {
+            assert!(w.contains("could not mint"), "{v:?}");
+            assert!(w.contains("private key unreadable"), "{v:?}");
+            assert!(w.contains("loom-fixture"), "{v:?}");
+        }
+        other => panic!("expected a Deny, got {other:?}"),
+    }
+    crate::credential_preflight::clear_owner_root_registry();
 }
 
 /// Write a disk-cache entry as if the probe had recorded it `age` ago. It is
@@ -324,6 +543,7 @@ pub(super) fn seed_disk_for(
 #[serial_test::serial(write_scope_cache)]
 fn an_unanswerable_reprobe_keeps_a_recent_write_but_not_an_old_one() {
     let dir = tempfile::tempdir().unwrap();
+    std::env::remove_var("LOOM_WRITE_SCOPE_TTL_SECS");
     std::env::set_var("LOOM_WRITE_SCOPE_CACHE_DIR", dir.path().join("g"));
     probe::clear_memory();
     let hour = std::time::Duration::from_secs(3600);
@@ -365,24 +585,6 @@ enum Scope {
     /// An operator-run verb with an explicit, configured target, never run by
     /// an autonomous path. Not write-scoped yet; listed so the gap is visible.
     OperatorOnly(&'static str),
-    /// An **autonomous** daemon write to the configured fleet store
-    /// (`fleet.repo`), which is not a managed workspace repo, so
-    /// `write_scope`'s managed + root-credential rule cannot vet it (it would
-    /// refuse every store that is not some workspace's origin). Scoped instead
-    /// by construction, and each part is asserted: the target comes from config
-    /// via `fleet_store::resolve_location`, never gh base-repo resolution; the
-    /// write goes only through the store's `WriteTransport` (the writer App,
-    /// `GhTransport::write_raw`), never a `gh` child of its own; the file
-    /// refuses the store's reviewed branch (`refuse_reviewed_branch`); and the
-    /// named caller reaches the named call only under its captain `gate`
-    /// (e.g. `RefreshGate::Captain`), so only the declared captain (or the
-    /// single refresher it stands for) writes.
-    FleetStore {
-        caller: &'static str,
-        call: &'static str,
-        gate: &'static str,
-        why: &'static str,
-    },
     /// Matches the pattern but is not a forge write.
     NotAWrite(&'static str),
 }
@@ -394,7 +596,7 @@ enum Scope {
 /// managed-repo + WRITE check.
 #[test]
 fn daemon_write_paths_are_scoped() {
-    use Scope::{FleetStore, Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
+    use Scope::{Gated, NotAWrite, OperatorOnly, OriginResolved, ShellVetted, Via};
     const PASS: &str = "claim_reconciliation/pass_loop.rs";
     const DISPATCH: &str = "sweep_registry/private_dispatch.rs";
     let reviewed: &[(&str, Scope)] = &[
@@ -418,6 +620,18 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("claim_reconciliation/pass_loop/building_heal.rs", Via(PASS, "heal pass")),
         (
+            "claim_reconciliation/ci_gate_recovery.rs",
+            Via(PASS, "CI-gate recovery pass: audit comment + label swap"),
+        ),
+        (
+            "claim_reconciliation/orphan_stack.rs",
+            Via(
+                PASS,
+                "orphan-stack pass (#12760): base retarget PATCH, conflict label, flag \
+                 comment; its scratch-worktree push (orphan_stack_git.rs) rides the same gate",
+            ),
+        ),
+        (
             "forge_disable_auto_merge.rs",
             Via(PASS, "verdict pass; shell guard vets its own call"),
         ),
@@ -432,6 +646,22 @@ fn daemon_write_paths_are_scoped() {
                 "the resync claim ref of a workspace repo the pass vetted with repo_writable (#10718)",
             ),
         ),
+        (
+            "fleet_sync/workspace_resync/w2.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "the resync PR of a workspace repo the pass vetted with repo_writable (#12572)",
+            ),
+        ),
+        ("fleet_sync/workspace_resync/waiver_gh.rs", Gated),
+        (
+            "fleet_sync/workspace_resync/supersede.rs",
+            Via(
+                "fleet_sync/workspace_resync/host.rs",
+                "closes the older daemon resync PRs (title + branch + version trailer) of a \
+                 workspace repo the pass vetted with repo_writable before w2::attempt (#13488)",
+            ),
+        ),
         ("worktree_ops/gh.rs", Gated),
         (
             "parent_link.rs",
@@ -443,6 +673,7 @@ fn daemon_write_paths_are_scoped() {
         (DISPATCH, Gated),
         ("work_finder/pool_preflight.rs", Gated),
         ("intake_reconcile.rs", Gated),
+        ("epic_supervisor.rs", Gated),
         ("intake_reconcile/singleton.rs", Gated),
         (
             "intake_reconcile/demote.rs",
@@ -452,13 +683,20 @@ fn daemon_write_paths_are_scoped() {
                  singleton's run_repo behind may_write (gate_repo_with)",
             ),
         ),
-        ("stale_blocked/release_gh.rs", Gated),
         ("work_finder/main_red_autofile.rs", Gated),
         // #11853: label swap + routing comment, each behind gate_repo_with.
         ("work_finder/landed_prefilter.rs", Gated),
         (
             "sweep_registry/guards.rs",
             Via(DISPATCH, "claim flip + lease of a dispatched sweep"),
+        ),
+        (
+            "sweep_registry/lease_step.rs",
+            Via(DISPATCH, "the lease record of a dispatched sweep or step (moved from guards.rs, #11898)"),
+        ),
+        (
+            "sweep_registry/step_spawn/builder_rollback.rs",
+            Via(DISPATCH, "yields the lease + restores the label of a refused dispatched Builder step (#12822)"),
         ),
         (
             "sweep_registry/dispatch/claim_release.rs",
@@ -470,8 +708,20 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("sweep_registry/restore_to_ready.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         (
+            "sweep_registry/restore_to_ready/step_restore.rs",
+            Via(DISPATCH, "releases the claim of a dispatched step sweep via run_claim_release_edit"),
+        ),
+        (
             "sweep_registry/roll_requeue.rs",
             Via(DISPATCH, "requeues dispatched sweeps a roll could not pause (#10831)"),
+        ),
+        (
+            "sweep_registry/step_cap_notice.rs",
+            Via(DISPATCH, "repeat-cap notice on an item whose Builder step was dispatched (#12500)"),
+        ),
+        (
+            "sweep_registry/step_outcome_notice.rs",
+            Via(DISPATCH, "noop/failed reason comment on an item whose Builder step was dispatched (#13054)"),
         ),
         ("sweep_registry/fast_fail_park.rs", Via(DISPATCH, "acts on dispatched sweeps")),
         ("sweep_registry/quarantine.rs", Via(DISPATCH, "acts on dispatched sweeps")),
@@ -495,9 +745,18 @@ fn daemon_write_paths_are_scoped() {
             "script_helpers/validate_phase.rs",
             Via(DISPATCH, "runs inside a dispatched sweep"),
         ),
+        (
+            "script_helpers/validate_phase_curator.rs",
+            Via(DISPATCH, "curator recovery split out of validate_phase.rs; runs inside a dispatched sweep"),
+        ),
         ("forge_rerun.rs", Gated),
-        ("merge_pr/redate.rs", ShellVetted("merge-pr.sh")),
-        ("merge_pr/redate/sync_handoff.rs", ShellVetted("merge-pr.sh")),
+        (
+            "forge_create_issue.rs",
+            Via(
+                "cli/forge_action.rs",
+                "the `forge create-issue` verb is vetted via may_write_from before create()",
+            ),
+        ),
         (
             "forge_cmd.rs",
             Via("cli/forge_action.rs", "every writing forge verb is vetted first"),
@@ -511,8 +770,7 @@ fn daemon_write_paths_are_scoped() {
             Via(
                 "cli/forge_action.rs",
                 "enqueue/dequeue mutations (#10255) run only from `forge merge-queue \
-                 enqueue|dequeue`, vetted via write_target before dispatch; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 enqueue|dequeue`, vetted via write_target before dispatch; opt-in via champion.mergeMode=queue",
             ),
         ),
         (
@@ -527,8 +785,8 @@ fn daemon_write_paths_are_scoped() {
                  path's `revoke_for_root` run only from claim_reconciliation/pass_loop.rs \
                  after gate_root_with, and forge_disable_auto_merge.rs's call follows its \
                  shell-vetted guard. Both are no-ops (no forge call) in direct mode; an \
-                 unresolved mode/repo reports `NOT confirmed` rather than writing; dormant \
-                 behind QUEUE_EXECUTION_ENABLED=false",
+                 unresolved mode/repo reports `NOT confirmed` rather than writing; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         (
@@ -540,9 +798,13 @@ fn daemon_write_paths_are_scoped() {
                  whose callers are exactly the gh_lifecycle.rs ones above: `forge \
                  merge-queue revoke` (vetted via write_target) and `revoke_for_root` (behind \
                  gate_root_with / the shell-vetted disable-auto-merge guard). It returns \
-                 before any forge call in direct mode, refuses a non-sha target, and only \
-                 ever writes `failure` (withdraws authority); dormant behind \
-                 QUEUE_EXECUTION_ENABLED=false",
+                 before any forge call in direct mode, refuses a non-sha target, and writes \
+                 `failure` (withdraws authority) on revoke. The one `success` write (#12496) \
+                 is the PR-head status `authorize_and_enqueue` posts from `forge merge-queue \
+                 handoff` (vetted via write_target), only after the dormant/direct execution \
+                 gate and `evaluate` allowed it, pinned to the grant's approved sha, and rolled \
+                 back to `failure` if the enqueue does not follow; opt-in via \
+                 champion.mergeMode=queue",
             ),
         ),
         ("cli/forge_action.rs", Gated),
@@ -564,6 +826,7 @@ fn daemon_write_paths_are_scoped() {
         ("cli/curation_complete.rs", Gated),
         ("cli/labels_undeclared.rs", Gated),
         ("cli/pr_lease.rs", Gated),
+        ("cli/lease_release.rs", Gated),
         (
             "fleet/drain_reset.rs",
             OperatorOnly("`fleet drain`: the operator's own worker, by name (the claim resetter, split out of fleet/drain.rs by #10089)"),
@@ -573,25 +836,12 @@ fn daemon_write_paths_are_scoped() {
             OperatorOnly("`fleet-config propose`: a PR against the configured store"),
         ),
         (
-            "observability/captain_gauges/store.rs",
-            FleetStore {
-                caller: "observability/captain_gauges.rs",
-                call: "publish_heartbeat(root, loc",
-                gate: "Role::Captain { captain } => {",
-                why: "the armed captain publishes its fleet-gauge heartbeat (W12)",
-            },
-        ),
-        (
             "cli/merge_pr_consolidate.rs",
             OperatorOnly("`merge-pr consolidate-prepare|abort|reconcile`: run by hand against an explicit candidate PR; #9839 is the automated caller"),
         ),
         (
             "merge_pr/consolidate/reconcile.rs",
             OperatorOnly("library half of `consolidate-reconcile`, reached only via the CLI verb above"),
-        ),
-        (
-            "watchdog/peer_coord.rs",
-            NotAWrite("follow-up on the issue this watchdog filed"),
         ),
         (
             "forge_probe.rs",
@@ -606,6 +856,10 @@ fn daemon_write_paths_are_scoped() {
             NotAWrite("action names; writes go through dep_classify"),
         ),
         ("role_tick_telemetry.rs", NotAWrite("classifies commands, runs none")),
+        (
+            "stack_parent.rs",
+            NotAWrite("reads the forge and runs local git; only its test names git's `-X theirs`"),
+        ),
         (
             "gh_invocation/accounting.rs",
             NotAWrite("classifies an invocation's argv for call accounting, runs none"),
@@ -634,7 +888,6 @@ fn daemon_write_paths_are_scoped() {
             "gh_invocation/own_writes.rs",
             NotAWrite("names the label flags to parse a write argv for the numbers it pins, runs none"),
         ),
-        ("role_tick_telemetry/targets.rs", NotAWrite("classifies commands, runs none")),
         (
             "agent_gh/read_route.rs",
             NotAWrite(
@@ -643,10 +896,24 @@ fn daemon_write_paths_are_scoped() {
             ),
         ),
         (
+            "agent_gh/write_span.rs",
+            NotAWrite(
+                "classifies the agent's own gh write argv for a span and re-runs it unchanged \
+                 as a child, in place of the exec it replaces: same argv, same credential, no \
+                 target chosen and no write added by the daemon (#13170)",
+            ),
+        ),
+        (
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),
-        ("terminal.rs", NotAWrite("tmux flags")),
+        (
+            "cli/forge_read.rs",
+            NotAWrite(
+                "the `verb()` diagnostic table names the `comment` verb as a string; \
+                 the file routes to handle_forge_command and makes no forge call",
+            ),
+        ),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
             "merge_group_ci/eligibility.rs",
@@ -661,6 +928,14 @@ fn daemon_write_paths_are_scoped() {
         (
             "observability/otlp/relay/server.rs",
             NotAWrite("HTTP method check in the loopback relay receiver"),
+        ),
+        (
+            "fleet_dispatch/server.rs",
+            NotAWrite("HTTP method check in the captain's claim-arbiter listener"),
+        ),
+        (
+            "host_loss/imds.rs",
+            NotAWrite("IMDSv2 token `PUT` to the link-local metadata endpoint, not the forge"),
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -744,50 +1019,6 @@ fn daemon_write_paths_are_scoped() {
                     "{file} relies on {resolver} resolving origin before any gh repo view"
                 );
             }
-            FleetStore {
-                caller,
-                call,
-                gate,
-                why,
-            } => {
-                let text = std::fs::read_to_string(src.join(file)).unwrap_or_default();
-                assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
-                // The guard is the first statement of `publish`, not merely defined.
-                let guarded = text.find("fn publish(").is_some_and(|f| {
-                    let sig = &text[f..];
-                    sig.find(") -> Result<")
-                        .and_then(|b| sig[b..].find(" {\n").map(|o| &sig[b + o + 3..]))
-                        .is_some_and(|body| {
-                            body.trim_start()
-                                .starts_with("refuse_reviewed_branch(loc, base_ref)?;")
-                        })
-                });
-                assert!(
-                    text.contains("fleet_store::resolve_location(")
-                        && text.contains("WriteTransport")
-                        && guarded
-                        && !text.contains("Command::new"),
-                    "{file} ({why}) must take its target from fleet_store::resolve_location, \
-                     write only through WriteTransport and refuse the reviewed branch"
-                );
-                let caller_text = std::fs::read_to_string(src.join(caller)).unwrap_or_default();
-                let gated_at = caller_text.find(gate);
-                let at = caller_text.find(call);
-                assert!(
-                    gated_at.is_some() && at.is_some() && gated_at < at,
-                    "{file} ({why}): {caller} must reach `{call}` only under {gate}"
-                );
-                let name = call.split('(').next().unwrap_or(call);
-                let callers: Vec<&str> = sources
-                    .iter()
-                    .filter(|(_, t)| {
-                        t.replace(&format!("fn {name}("), "")
-                            .contains(&format!("{name}("))
-                    })
-                    .map(|(rel, _)| rel.as_str())
-                    .collect();
-                assert_eq!(callers, [*caller], "{file} ({why}): only {caller} may call `{name}`");
-            }
             OperatorOnly(why) | NotAWrite(why) => {
                 assert!(matches(file), "stale entry: {file} ({why})");
             }
@@ -854,4 +1085,157 @@ fn shell_write_paths_are_vetted() {
          (lib/forge-helpers.sh) and name it on the write, or be listed here with a reason \
          (#9548): {offenders:?}"
     );
+}
+
+// ---- write_scope.refused telemetry (#12168) --------------------------------
+
+fn classified(
+    t: Option<GhTarget>,
+    explicit: bool,
+    origin: Option<&str>,
+    managed: &[&str],
+    probe: &FakeProbe,
+) -> Decision {
+    let m = |r: &str| managed.iter().any(|x| x.eq_ignore_ascii_case(r));
+    decide_classified(
+        &Inputs {
+            target: t,
+            explicit,
+            origin,
+            managed: &m,
+        },
+        probe,
+    )
+}
+
+fn refusals_from_gate(decision: &Decision, times: usize) -> Vec<WriteScopeRefusedRecord> {
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    let (_, captured) = crate::observability::ops::capture::capture(|| {
+        for _ in 0..times {
+            gate("write-scope-telemetry".into(), root, decision, "claim reconciliation");
+        }
+    });
+    captured
+        .records
+        .into_iter()
+        .filter_map(|r| match r {
+            crate::telemetry::TelemetryRecord::WriteScopeRefused(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn every_deny_branch_has_its_refusal_class() {
+    let w = FakeProbe::new(Permission::Write);
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let cases = [
+        (classified(None, false, None, &[], &w), RefusalClass::NoTarget, None),
+        (
+            classified(target("a/b"), false, Some("c/d"), &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), false, None, &["a/b"], &w),
+            RefusalClass::TargetMismatch,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &[], &w),
+            RefusalClass::UnmanagedRepo,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ni),
+            RefusalClass::NotInInstallation,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &ro),
+            RefusalClass::InsufficientPermission,
+            Some("a/b"),
+        ),
+        (
+            classified(target("a/b"), true, None, &["a/b"], &unk),
+            RefusalClass::Unverifiable,
+            Some("a/b"),
+        ),
+    ];
+    for (decision, class, repo) in cases {
+        assert!(!decision.verdict.is_allowed());
+        assert_eq!(decision.class, Some(class));
+        assert_eq!(decision.repo.as_deref(), repo);
+    }
+    let ok = classified(target("a/b"), true, None, &["a/b"], &w);
+    assert!(ok.verdict.is_allowed());
+    assert_eq!(ok.class, None);
+}
+
+/// #13978: only the `NotInInstallation` refusal names the interim `gh issue
+/// create` route; every other class keeps its text, and the verdict is unchanged.
+#[test]
+fn only_the_not_in_installation_refusal_names_the_gh_issue_create_route() {
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let why = |d: Decision| match d.verdict {
+        Verdict::Deny(w) => w,
+        v => panic!("expected a deny, got {v:?}"),
+    };
+
+    let w = why(classified(target("a/b"), true, None, &["a/b"], &ni));
+    assert!(w.contains("gh issue create -R a/b"), "{w}");
+    assert!(w.contains("gh-issue-create-rest-fallback.md"), "{w}");
+    assert!(w.contains(probe::NOT_IN_INSTALLATION), "{w}");
+
+    for (name, probe) in [("insufficient", &ro), ("unverifiable", &unk)] {
+        let w = why(classified(target("a/b"), true, None, &["a/b"], probe));
+        assert!(!w.contains("gh issue create"), "{name}: {w}");
+    }
+    let w = why(classified(target("a/b"), true, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "unmanaged: {w}");
+    let w = why(classified(None, false, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "no target: {w}");
+}
+
+#[test]
+fn a_deny_through_the_gate_emits_one_record_each_time_while_the_warn_dedupes() {
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &unk);
+    let records = refusals_from_gate(&d, 3);
+    assert_eq!(records.len(), 3, "the count is not deduplicated");
+    for r in &records {
+        assert_eq!(r.reason, RefusalClass::Unverifiable);
+        assert_eq!(r.repo.as_deref(), Some("acme/widgets"));
+        assert_eq!(r.call_site, "claim reconciliation");
+        assert!(!r.credential.is_empty());
+    }
+}
+
+#[test]
+fn an_allow_through_the_gate_emits_nothing() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(target("acme/widgets"), true, None, &["acme/widgets"], &w);
+    assert!(refusals_from_gate(&d, 2).is_empty());
+}
+
+#[test]
+fn a_deny_with_no_known_repo_omits_it_and_without_a_sink_does_not_panic() {
+    let w = FakeProbe::new(Permission::Write);
+    let d = classified(None, false, None, &[], &w);
+    let records = refusals_from_gate(&d, 1);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].repo, None);
+    assert_eq!(records[0].reason, RefusalClass::NoTarget);
+    // Outside a capture and with no global sink, the gate still just refuses.
+    let root = Path::new("/nonexistent/write-scope-telemetry");
+    assert!(!crate::observability::ops::capture::without_global_sink(|| gate(
+        "k2".into(),
+        root,
+        &d,
+        "x"
+    )));
 }

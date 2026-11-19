@@ -487,6 +487,134 @@ outcomes="$(python3 -c 'import json,sys; print(",".join(json.loads(l)["x-loom-ca
 assert_eq "miss,hit,bypass" "$outcomes" "records carry x-loom-cache: miss, then hit, then bypass"
 reset_cache
 
+# --- 11. run_gh timeout + bounded read retry (#13930) ----------------------
+# The real `gh` call inside the wrapper is bounded by LOOM_GH_TIMEOUT_S
+# (default 120). On expiry: a READ is retried once (~2s backoff), a MUTATION
+# never (a timed-out write may have landed); final expiry exits 124
+# (timeout(1) parity) with a distinguishable stderr diagnostic, no partial
+# stdout, and nothing cached. LOOM_GH_TIMEOUT_S=0 restores the unbounded
+# behavior; a non-numeric/negative value falls back to the default.
+echo ""
+echo "Testing the #13930 gh timeout bound + bounded read retry..."
+
+# Resolver edge cases, exercised directly against the wrapper module.
+python3 - "$GH_CACHED" <<'PY'
+import importlib.util, os, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("gh_cached", sys.argv[1])
+spec = importlib.util.spec_from_loader("gh_cached", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+cases = [("", 120.0), ("0", None), ("7", 7.0), ("2.5", 2.5),
+         ("banana", 120.0), ("-3", 120.0), (" 5 ", 5.0)]
+bad = []
+for raw, want in cases:
+    if raw:
+        os.environ["LOOM_GH_TIMEOUT_S"] = raw
+    else:
+        os.environ.pop("LOOM_GH_TIMEOUT_S", None)
+    got = mod.resolve_gh_timeout_s()
+    if got != want:
+        bad.append(f"LOOM_GH_TIMEOUT_S={raw!r}: got {got!r}, want {want!r}")
+if bad:
+    print("; ".join(bad))
+    sys.exit(1)
+PY
+assert_eq "0" "$?" "LOOM_GH_TIMEOUT_S resolver: default 120, 0=None (unbounded), numeric honored, non-numeric/negative -> default"
+
+# A stub `gh` that always stalls past the bound.
+SLOW_DIR="$TMP_ROOT/slowbin"
+mkdir -p "$SLOW_DIR"
+cat > "$SLOW_DIR/gh" <<'SLOW'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_STUB_CALL_LOG"
+sleep 5
+echo "never-reached"
+SLOW
+chmod +x "$SLOW_DIR/gh"
+
+ghc_slow() {
+    PATH="$SLOW_DIR:$PATH" \
+    GH_CACHE_DIR="$CACHE_DIR" \
+    LOOM_ETAG_LIST_DISABLE=1 \
+    LOOM_GH_TIMEOUT_S=1 \
+      "$GH_CACHED" "$@"
+}
+
+# A stalled READ: two attempts (one retry), exit 124, diagnostic, no stdout.
+reset_cache
+ghc_slow pr list --label "loom:review-requested" --state open --limit 500 \
+    >"$TMP_ROOT/timeout-read.out" 2>"$TMP_ROOT/timeout-read.err"
+slow_read_rc=$?
+assert_eq "124" "$slow_read_rc" "a stalled read expires with exit 124 (timeout(1) parity), never an unbounded hang"
+assert_eq "2" "$(call_count)" "a stalled READ is retried exactly once (2 attempts total)"
+case "$(cat "$TMP_ROOT/timeout-read.err")" in
+  *"gh-cached: gh timed out after 1s (attempts=2): gh pr list"*) diag="yes" ;;
+  *) diag="no: $(cat "$TMP_ROOT/timeout-read.err")" ;;
+esac
+assert_eq "yes" "$diag" "…surfacing the distinguishable stderr diagnostic naming the subcommand"
+assert_eq "" "$(cat "$TMP_ROOT/timeout-read.out")" "…and returning no partial stdout"
+assert_eq "0" "$(find "$CACHE_DIR" -name '*.json' ! -name '_stats.json' 2>/dev/null | wc -l | tr -d ' ')" "a timed-out read is never cached"
+
+# A stalled MUTATION: exactly one attempt (no double-post risk), still 124.
+reset_cache
+ghc_slow issue comment 99 --body "x" >/dev/null 2>"$TMP_ROOT/timeout-write.err"
+slow_write_rc=$?
+assert_eq "124" "$slow_write_rc" "a stalled mutation also expires (124)"
+assert_eq "1" "$(call_count)" "a stalled MUTATION gets exactly ONE attempt (never retried)"
+case "$(cat "$TMP_ROOT/timeout-write.err")" in
+  *"gh-cached: gh timed out after 1s (attempts=1): gh issue comment"*) wdiag="yes" ;;
+  *) wdiag="no: $(cat "$TMP_ROOT/timeout-write.err")" ;;
+esac
+assert_eq "yes" "$wdiag" "…with the attempts=1 diagnostic"
+
+# A read that stalls ONCE then succeeds: the retry returns the good output.
+FLAKY_DIR="$TMP_ROOT/flakybin"
+mkdir -p "$FLAKY_DIR"
+cat > "$FLAKY_DIR/gh" <<'FLAKY'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_STUB_CALL_LOG"
+if [[ -f "$GH_STUB_STATE/stall-once" ]]; then
+  rm -f "$GH_STUB_STATE/stall-once"
+  sleep 5
+fi
+echo '{"labels":["retried-ok"]}'
+FLAKY
+chmod +x "$FLAKY_DIR/gh"
+reset_cache
+touch "$GH_STUB_STATE/stall-once"
+flaky_out="$(PATH="$FLAKY_DIR:$PATH" GH_CACHE_DIR="$CACHE_DIR" LOOM_ETAG_LIST_DISABLE=1 \
+    LOOM_ETAG_VIEW_DISABLE=1 LOOM_GH_TIMEOUT_S=1 "$GH_CACHED" pr view 4242 --json labels)"
+flaky_rc=$?
+assert_eq "0" "$flaky_rc" "a read that stalls once then succeeds completes on the retry"
+assert_eq '{"labels":["retried-ok"]}' "$flaky_out" "…returning the successful output, not an error"
+assert_eq "2" "$(call_count)" "…after exactly one bounded retry"
+
+# A hung ETag daemon subprocess falls through to plain gh (same bound).
+SLOW_DAEMON_DIR="$TMP_ROOT/slowdaemon"
+mkdir -p "$SLOW_DAEMON_DIR"
+cat > "$SLOW_DAEMON_DIR/loom-daemon-slowmock" <<'SD'
+#!/usr/bin/env bash
+sleep 5
+SD
+chmod +x "$SLOW_DAEMON_DIR/loom-daemon-slowmock"
+reset_cache
+slowd_out="$(PATH="$STUB_DIR:$PATH" GH_CACHE_DIR="$CACHE_DIR" \
+    LOOM_DAEMON_BIN="$SLOW_DAEMON_DIR/loom-daemon-slowmock" LOOM_GH_TIMEOUT_S=1 \
+    "$GH_CACHED" issue list --label "loom:issue" --state open --json number,title)"
+slowd_rc=$?
+assert_eq "0" "$slowd_rc" "a hung ETag daemon expires under the same bound and degrades, not hangs"
+assert_eq "$(cat "$STATE_DIR/issue-list.json")" "$slowd_out" "…served by the plain-gh fallback (the stub), byte-identical"
+assert_eq "1" "$(call_count)" "…with exactly one real gh call after the daemon fell through"
+
+# LOOM_GH_TIMEOUT_S=0 restores the unbounded pre-#13930 behavior.
+reset_cache
+unbounded_out="$(PATH="$SLOW_DIR:$PATH" GH_CACHE_DIR="$CACHE_DIR" LOOM_ETAG_LIST_DISABLE=1 \
+    LOOM_GH_TIMEOUT_S=0 "$GH_CACHED" repo view --json name)"
+unbounded_rc=$?
+assert_eq "0" "$unbounded_rc" "LOOM_GH_TIMEOUT_S=0: the slow call is NOT killed"
+assert_eq "never-reached" "$unbounded_out" "…and returns the stub's own stdout after sleeping (unbounded restored)"
+
 # --- Sweep-support script call sites (#9953) --------------------------------
 # Static contract: observation scripts route reads through $GH_READ and keep
 # the probe/fallback; arbitration scripts stay on literal plain `gh`.
@@ -512,7 +640,7 @@ BROKEN_DIR="$(mktemp -d)"; printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKEN_DIR
 broken_out="$(SCRIPT_DIR="$BROKEN_DIR" bash -c 'set -euo pipefail; GH_READ="gh"; _ghc="$SCRIPT_DIR/gh-cached"; if [[ -x "$_ghc" ]] && "$_ghc" --version >/dev/null 2>&1; then GH_READ="$_ghc"; fi; echo "$GH_READ"')"
 assert_eq "gh" "$broken_out" "broken wrapper -> GH_READ falls back to plain gh (set -euo pipefail safe)"
 rm -rf "$BROKEN_DIR"
-# Each routed script resolves the probe on ONE code line (shell budget, #7810).
+# Each routed script resolves the probe on ONE code line.
 for sc in check-duplicate blame-issue sync-labels; do
     grep -qE '^GH_READ="gh"; _ghc=.*"\$_ghc" --version >/dev/null 2>&1; then GH_READ="\$_ghc"; fi$' "$S_DIR/$sc.sh"
     assert_eq "0" "$?" "$sc.sh resolves \$GH_READ on a single probe line"

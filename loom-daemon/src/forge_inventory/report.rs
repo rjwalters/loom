@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::forge_inventory::model::{Coverage, Inventory, Operation, Profile, Support};
+use crate::forge_inventory::model::{Coverage, Inventory, Operation, Support};
 
 /// One row of the report.
 #[derive(Debug, Clone, Serialize)]
@@ -264,10 +264,4 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         format!("{}…", &s[..n.saturating_sub(1)])
     }
-}
-
-/// Rows in one profile, for `report --profile`.
-#[must_use]
-pub fn filter_profile(inv: &Inventory, profile: Profile) -> Vec<&Operation> {
-    inv.in_profile(profile).collect()
 }

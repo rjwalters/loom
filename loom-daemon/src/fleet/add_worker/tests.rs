@@ -1,5 +1,6 @@
 use super::super::PlanEntry;
 use super::*;
+use crate::exec_test_support::write_executable;
 
 pub(super) fn base_config() -> AddWorkerConfig {
     AddWorkerConfig {
@@ -590,7 +591,7 @@ fn verify_rendered_script_is_valid_shell() {
 }
 
 #[test]
-fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
+fn daemon_watchdog_step_heals_only_from_the_workspace_root() {
     // #5343: the step must cd into the SAME workspace root `daemon-unit`
     // pinned as WorkingDirectory=, then re-run the already-cloned
     // loom-daemon-start.sh (never a second hand-rolled watchdog
@@ -601,8 +602,8 @@ fn daemon_watchdog_step_reruns_loom_daemon_start_from_the_workspace_root() {
         "daemon-watchdog must cd into the primary workspace root:\n{script}"
     );
     assert!(
-        script.contains("$HOME/.local/share/loom/defaults/scripts/cli/loom-daemon-start.sh"),
-        "daemon-watchdog must re-run the already-cloned loom-daemon-start.sh:\n{script}"
+        script.contains("/defaults/scripts/cli/loom-daemon-start.sh\" --heal-watchdog-only"),
+        "daemon-watchdog must run loom-daemon-start.sh --heal-watchdog-only (2am#4484):\n{script}"
     );
 }
 
@@ -848,15 +849,6 @@ pub(super) fn which_bash() -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(path))
     }
-}
-
-/// Write an executable shell-script stub at `path` (mode 0755).
-pub(super) fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, contents).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
 }
 
 #[test]
@@ -1296,13 +1288,13 @@ fn run_idle_guard(
     let daemon_exit = if status_exit_ok { 0 } else { 1 };
     write_executable(
             &stub_bin.join("loom-daemon"),
-            &format!(
+            format!(
                 "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then cat <<'JSON'\n{status_json}\nJSON\nexit {daemon_exit}\nfi\nexit 1\n"
             ),
         );
     write_executable(
         &stub_bin.join("sudo"),
-        &format!("#!/bin/sh\necho \"$@\" >> \"{}/sudo-calls\"\nexit 0\n", dir.path().display()),
+        format!("#!/bin/sh\necho \"$@\" >> \"{}/sudo-calls\"\nexit 0\n", dir.path().display()),
     );
 
     let out = Command::new(bash)
@@ -1466,9 +1458,12 @@ fn worker_record_roundtrips_idle_shutdown_fields_through_the_registry() {
 }
 
 #[test]
-fn daemon_unit_pins_workingdirectory_with_4292_marker() {
-    // AC 4: the #4292 token-pool cwd workaround must be marked with its
-    // tracking issue so it is removed when #4292 lands.
+fn daemon_unit_pins_workingdirectory_to_primary_workspace() {
+    // The fleet unit sets no LOOM_WORKSPACE, so the daemon's cwd seeds its
+    // primary workspace — pin it to the first registered clone, as the
+    // canonical loom-daemon-start unit does. #13819: the pin is NOT the
+    // token-pool cwd workaround of #4292 (closed 2026-07-29), so neither that
+    // marker nor its temporary-pending framing may come back.
     let config = base_config();
     let plan = build_plan(&config, &Secrets::default());
     let step = plan
@@ -1482,7 +1477,15 @@ fn daemon_unit_pins_workingdirectory_with_4292_marker() {
     assert!(step
         .apply
         .contains("WorkingDirectory=%h/loom-workspaces/anvil"));
-    assert!(step.apply.contains("#4292"), "workaround must be marked with #4292");
+    assert!(
+        !step.apply.contains("#4292"),
+        "the WorkingDirectory pin is not the (closed) #4292 workaround; \
+         the rendered unit must not name it"
+    );
+    assert!(
+        !step.apply.contains("WORKAROUND"),
+        "the WorkingDirectory pin is permanent, not a marked workaround"
+    );
     assert!(step.apply.contains("\nRestart=always\n"));
     assert!(step.apply.contains("enable-linger"));
 }

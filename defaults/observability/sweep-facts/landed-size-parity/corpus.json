@@ -1,0 +1,729 @@
+{
+ "_doc": "Synthetic landed-size parity corpus (#12548). Every value is invented; no real repo, record body or credential. Each case is one sweep.outcome row: `row` is the envelope, `payload` the record body. expect=match: the SQL reference and the client port must agree on (landing?, LSI); expect=diverge: they must DIFFER on the declared `diverges` axis (a documented current difference \u2014 if upstream fixes it the check fails and the case must be updated).",
+ "cases": [
+  {
+   "id": "full-three",
+   "note": "all three components present",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 1,
+    "sweep_id": "s-full-three",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 120,
+    "hw_lines_deleted": 30,
+    "hw_files": 4,
+    "tokens_in": 2000000,
+    "tokens_out": 1000000
+   },
+   "expect": "match"
+  },
+  {
+   "id": "no-components",
+   "note": "landed with no component: NULL landed_size/LSI/class (absent, never 0)",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 2,
+    "sweep_id": "s-no-components",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100
+   },
+   "expect": "match"
+  },
+  {
+   "id": "only-files",
+   "note": "hw_files alone",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 3,
+    "sweep_id": "s-only-files",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 7
+   },
+   "expect": "match"
+  },
+  {
+   "id": "one-sided-lines-added",
+   "note": "hw_lines_added without hw_lines_deleted: lines component absent",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 4,
+    "sweep_id": "s-one-sided-lines-added",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 50,
+    "hw_files": 2
+   },
+   "expect": "match"
+  },
+  {
+   "id": "one-sided-lines-deleted",
+   "note": "hw_lines_deleted without hw_lines_added: lines component absent",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 5,
+    "sweep_id": "s-one-sided-lines-deleted",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_deleted": 50,
+    "hw_files": 2
+   },
+   "expect": "match"
+  },
+  {
+   "id": "one-sided-tokens",
+   "note": "tokens_in without tokens_out: tokens component absent",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 6,
+    "sweep_id": "s-one-sided-tokens",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 1000000
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tokens-measured",
+   "note": "explicit measured verdict is clean",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 7,
+    "sweep_id": "s-tokens-measured",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000,
+    "tokens_status": "measured"
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tokens-suspect",
+   "note": "suspect verdict: tokens component excluded",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 8,
+    "sweep_id": "s-tokens-suspect",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000,
+    "tokens_status": "suspect"
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tokens-unattributable",
+   "note": "unattributable verdict: tokens component excluded",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 9,
+    "sweep_id": "s-tokens-unattributable",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000,
+    "tokens_status": "unattributable"
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tokens-not-spawned",
+   "note": "not_spawned verdict: tokens component excluded",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 10,
+    "sweep_id": "s-tokens-not-spawned",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000,
+    "tokens_status": "not_spawned"
+   },
+   "expect": "match"
+  },
+  {
+   "id": "model-without-factor",
+   "note": "model with no fitted factor: tokens absent, never normalized by 1.0",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 11,
+    "sweep_id": "s-model-without-factor",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "gpt-unfitted"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000
+   },
+   "expect": "match"
+  },
+  {
+   "id": "model-absent",
+   "note": "no models_used: tokens absent",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 12,
+    "sweep_id": "s-model-absent",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000
+   },
+   "expect": "match"
+  },
+  {
+   "id": "model-unattributed",
+   "note": "the literal <unattributed> models_used[0] has its own factor",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 13,
+    "sweep_id": "s-model-unattributed",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "<unattributed>"
+    ],
+    "hw_files": 2,
+    "tokens_in": 30000000,
+    "tokens_out": 0
+   },
+   "expect": "match"
+  },
+  {
+   "id": "model-first-entry",
+   "note": "only models_used[0] keys the factor lookup",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 14,
+    "sweep_id": "s-model-first-entry",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-sonnet-5-5",
+     "claude-opus-5"
+    ],
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000
+   },
+   "expect": "match"
+  },
+  {
+   "id": "negative-landed-size",
+   "note": "below-baseline landing: landed_size < 0 yet LSI > 0, class 1",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 15,
+    "sweep_id": "s-negative-landed-size",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 1,
+    "hw_lines_deleted": 0,
+    "hw_files": 1,
+    "tokens_in": 1000,
+    "tokens_out": 0
+   },
+   "expect": "match"
+  },
+  {
+   "id": "zero-values",
+   "note": "explicit zeros are readings (ln(1+0)=0), not absences",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 16,
+    "sweep_id": "s-zero-values",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 0,
+    "hw_lines_deleted": 0,
+    "hw_files": 0,
+    "tokens_in": 0,
+    "tokens_out": 0
+   },
+   "expect": "match"
+  },
+  {
+   "id": "large-landing",
+   "note": "top class path",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 17,
+    "sweep_id": "s-large-landing",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 900000,
+    "hw_lines_deleted": 100000,
+    "hw_files": 900,
+    "tokens_in": 900000000,
+    "tokens_out": 0
+   },
+   "expect": "match"
+  },
+  {
+   "id": "repeat-attempt-first",
+   "note": "issue landed twice (first landing sweep)",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 18,
+    "sweep_id": "s-repeat-1",
+    "emitted_at": "2026-10-05T09:00:00Z",
+    "host_id": "host-a",
+    "export_id": 1801
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 10,
+    "hw_lines_deleted": 2,
+    "hw_files": 1
+   },
+   "expect": "match"
+  },
+  {
+   "id": "repeat-attempt-second",
+   "note": "issue landed twice (second sweep): each landing scores once, first-per-issue keeps only the first",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 18,
+    "sweep_id": "s-repeat-2",
+    "emitted_at": "2026-10-05T11:00:00Z",
+    "host_id": "host-a",
+    "export_id": 1802
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 101,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 400,
+    "hw_lines_deleted": 80,
+    "hw_files": 9
+   },
+   "expect": "match"
+  },
+  {
+   "id": "same-issue-other-repo",
+   "note": "same issue number in another repo is a different issue",
+   "row": {
+    "repo": "acme/gadgets",
+    "issue": 18,
+    "sweep_id": "s-gadgets-18",
+    "emitted_at": "2026-10-05T10:30:00Z",
+    "host_id": "host-a",
+    "export_id": 1803
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 30,
+    "hw_lines_deleted": 5,
+    "hw_files": 2
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tie-same-ms-a",
+   "note": "two landing sweeps for one issue at the same instant (lower export id)",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 19,
+    "sweep_id": "s-tie-a",
+    "emitted_at": "2026-10-05T12:00:00Z",
+    "host_id": "host-a",
+    "export_id": 1901
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2
+   },
+   "expect": "match"
+  },
+  {
+   "id": "tie-same-ms-b",
+   "note": "... (higher export id): the client keeps the first-processed row, which is the higher id under the documented newest-first/id-desc walk; SQL needs an explicit tie-break",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 19,
+    "sweep_id": "s-tie-b",
+    "emitted_at": "2026-10-05T12:00:00Z",
+    "host_id": "host-a",
+    "export_id": 1902
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 102,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 5
+   },
+   "expect": "match"
+  },
+  {
+   "id": "legacy-fallback-landing",
+   "note": "pre-#9441 row: disposition absent, result success, pr_number present is a landing",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 20,
+    "sweep_id": "s-legacy-fallback-landing",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 3
+   },
+   "expect": "match"
+  },
+  {
+   "id": "legacy-no-pr",
+   "note": "disposition absent, result success, no pr_number: not a landing",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 21,
+    "sweep_id": "s-legacy-no-pr",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "result": "success",
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 3
+   },
+   "expect": "match"
+  },
+  {
+   "id": "legacy-failed",
+   "note": "disposition absent, result failure: not a landing",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 22,
+    "sweep_id": "s-legacy-failed",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "result": "failure",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 3
+   },
+   "expect": "match"
+  },
+  {
+   "id": "non-landed-disposition",
+   "note": "a non-landed disposition with a pr_number is not a landing",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 23,
+    "sweep_id": "s-non-landed-disposition",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "noop_already_done",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 3
+   },
+   "expect": "match"
+  },
+  {
+   "id": "landed-without-pr-number",
+   "note": "DIVERGENCE: disposition landed with no pr_number: SQL predicate admits it, the client (isLandingOutcome + parsed.prNumber) drops it",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 24,
+    "sweep_id": "s-landed-without-pr-number",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 3
+   },
+   "expect": "diverge",
+   "diverges": "population"
+  },
+  {
+   "id": "negative-reading",
+   "note": "DIVERGENCE: a negative hw_lines_deleted: SQL sums it, the client treats negatives as counter resets (absent), making lines one-sided",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 25,
+    "sweep_id": "s-negative-reading",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_lines_added": 10,
+    "hw_lines_deleted": -3,
+    "hw_files": 2
+   },
+   "expect": "diverge",
+   "diverges": "lsi"
+  },
+  {
+   "id": "model-field-fallback",
+   "note": "DIVERGENCE: no models_used but a dispatched `model` field: the client falls back to it, SQL does not",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 26,
+    "sweep_id": "s-model-field-fallback",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "model": "claude-opus-5-5",
+    "hw_files": 2,
+    "tokens_in": 900000,
+    "tokens_out": 900000
+   },
+   "expect": "diverge",
+   "diverges": "lsi"
+  },
+  {
+   "id": "record-carried-lsi",
+   "note": "DIVERGENCE: a record carrying its own lsi: the client prefers it, SQL ignores it",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 27,
+    "sweep_id": "s-record-carried-lsi",
+    "emitted_at": "2026-10-05T10:00:00Z",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2,
+    "lsi": 5.0
+   },
+   "expect": "diverge",
+   "diverges": "lsi"
+  },
+  {
+   "id": "bad-timestamp",
+   "note": "DIVERGENCE: unparseable emitted_at: the client drops the row, SQL keeps it (the string is just data)",
+   "row": {
+    "repo": "acme/widgets",
+    "issue": 28,
+    "sweep_id": "s-bad-timestamp",
+    "emitted_at": "not-a-timestamp",
+    "host_id": "host-a",
+    "export_id": null
+   },
+   "payload": {
+    "disposition": "landed",
+    "result": "success",
+    "pr_number": 100,
+    "models_used": [
+     "claude-opus-5-5"
+    ],
+    "hw_files": 2
+   },
+   "expect": "diverge",
+   "diverges": "population"
+  }
+ ]
+}

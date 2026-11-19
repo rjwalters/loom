@@ -119,14 +119,6 @@ pub trait GithubApi: Send + Sync {
     /// refuses to emit unless told otherwise.
     fn get_document(&self, path: &str) -> Result<ApiResponse, ApiError>;
 
-    /// One GraphQL `query` (Issue #9088): a PR's closing-issue references
-    /// have no REST endpoint. The default refuses, so a client that never
-    /// needs it (every test fake predating story stitching) is unchanged and
-    /// a caller treats the refusal as "could not resolve", never as an answer.
-    fn graphql(&self, _query: &str) -> Result<ApiResponse, ApiError> {
-        Err(ApiError::Transport("this GitHub client does not support GraphQL".to_string()))
-    }
-
     /// Download one run artifact by **name**, unpacked into `dest` (Issue
     /// #9089 — the suite-timings record `run-ci-suites.sh` uploads).
     ///
@@ -245,9 +237,11 @@ pub fn parse_raw(raw: &str) -> Option<ApiResponse> {
 }
 
 /// `owner/repo` from a `repos/<owner>/<repo>/…` API path (leading `/`
-/// allowed), for picking the repo's reader. Anything else (`graphql`,
-/// `orgs/…`, a `repositories/<id>/…` page link) is `None` and runs on the
-/// writer unless the caller names the repo ([`GithubApi::get_in`]).
+/// allowed), for picking the repo's reader. Anything else (`orgs/…`,
+/// a `repositories/<id>/…` page link) is `None`: an owner listing
+/// is routed for its owner ([`owner_of_listing_path`]), and a read with no
+/// route at all is the facade's to route or shed (#12584) unless the caller
+/// names the repo ([`GithubApi::get_in`]).
 pub(super) fn repo_of_path(path: &str) -> Option<String> {
     let mut parts = path.trim_start_matches('/').split('/');
     if parts.next()? != "repos" {
@@ -257,6 +251,40 @@ pub(super) fn repo_of_path(path: &str) -> Option<String> {
     let repo = parts.next().filter(|s| !s.is_empty())?;
     let repo = repo.split(['?', '#']).next().filter(|s| !s.is_empty())?;
     Some(format!("{owner}/{repo}"))
+}
+
+/// The suffix of an owner-listing reader route ([`owner_listing_route`]).
+const OWNER_ROUTE_SUFFIX: &str = "/*";
+
+/// The reader route for a read of `owner`'s repository listing (#12584):
+/// `<owner>/*`, which picks a reader serving `owner` without naming one of
+/// its repositories. A route only: it is never an accounting row's repo.
+#[must_use]
+pub(crate) fn owner_listing_route(owner: &str) -> String {
+    format!("{owner}{OWNER_ROUTE_SUFFIX}")
+}
+
+/// The owner of an owner-scoped listing path (`orgs/<o>/…`, `users/<o>…`):
+/// the discovery listing and the owner-kind probe. Their answers are the
+/// same for any credential that sees the owner's repositories, so a reader
+/// for the owner serves them (#12584) instead of the writer.
+pub(super) fn owner_of_listing_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').split(['/', '?', '#']);
+    match parts.next()? {
+        "orgs" | "users" => parts.next().filter(|o| !o.is_empty()).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// `(reader route, accounting repo)` for a read the caller says belongs to
+/// `nwo` (or not): an [`owner_listing_route`] steers the reader only; a
+/// read with no repo of its own is routed for the owner its path lists.
+fn route_and_repo(nwo: Option<String>, path: &str) -> (Option<String>, Option<String>) {
+    match nwo {
+        Some(route) if route.ends_with(OWNER_ROUTE_SUFFIX) => (Some(route), None),
+        Some(repo) => (Some(repo.clone()), Some(repo)),
+        None => (owner_of_listing_path(path).map(|o| owner_listing_route(&o)), None),
+    }
 }
 
 /// The inventoried forge operation one poller request serves (#9831).
@@ -271,9 +299,6 @@ fn ci_operation(path: &str) -> ForgeOp {
     let route = path.split(['?', '#']).next().unwrap_or_default();
     let segs: Vec<&str> = route.split('/').collect();
     match segs.as_slice() {
-        // The poller's only GraphQL query is `story.rs`'s batched
-        // closing-issue-references lookup.
-        ["graphql"] => ops::PR_CLOSING_ISSUE_REFERENCES,
         ["orgs" | "users", _, "repos"] => ops::REPO_LIST_FOR_OWNER,
         // The run listing and the jobs of one run: the run-state reads the
         // `ci.workflow-runs-for-sha` row covers (its callers list names this
@@ -361,6 +386,7 @@ pub(crate) fn api_failure(
                 reset: reset_epoch.and_then(crate::forge_identity::epoch_time),
                 secondary,
                 retry_after: retry_after_secs.map(Duration::from_secs),
+                remaining: None,
             })
         }
         Err(ApiError::Http { status: 401, .. }) => Some(Failure::Credential),
@@ -377,8 +403,8 @@ impl GhCliApi {
     /// #9537: a `repos/<owner>/<repo>/…` path is a repo-scoped read, so it
     /// runs under that repo's reader App when one is usable (readers carry
     /// `actions: read`). A rate limit or an auth/coverage refusal withdraws
-    /// the reader (until the reported reset, when there is one) and the same
-    /// call is retried once on the writer's credential.
+    /// the reader (until the reported reset, when there is one); the read is
+    /// never retried on the writer (#12394).
     fn run(&self, path: &str, extra: &[&str]) -> Result<ApiResponse, ApiError> {
         self.run_for(repo_of_path(path), path, extra)
     }
@@ -392,9 +418,10 @@ impl GhCliApi {
         path: &str,
         extra: &[&str],
     ) -> Result<ApiResponse, ApiError> {
-        let reader = nwo.as_deref().and_then(|r| (self.reader_for)(r));
-        // The shared reader → writer retry (#9872, `reader_then_writer`).
-        let attempt = crate::forge_identity::reader_then_writer(
+        let (route, nwo) = route_and_repo(nwo, path);
+        let reader = route.as_deref().and_then(|r| (self.reader_for)(r));
+        // One reader attempt (#12394: a read never falls through to the writer).
+        let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
             |dir, role| {
                 Ok::<_, std::convert::Infallible>(self.run_once(
@@ -408,11 +435,11 @@ impl GhCliApi {
             Result::is_ok,
             api_failure,
             |failure, _| {
-                let (Some((_, app_id)), Some(nwo)) = (&reader, nwo.as_deref()) else {
+                let (Some((_, app_id)), Some(route)) = (&reader, route.as_deref()) else {
                     return;
                 };
                 let why = format!("ci_telemetry {path}");
-                (self.withdraw)(app_id, nwo, failure, &why);
+                (self.withdraw)(app_id, route, failure, &why);
             },
         );
         match attempt {
@@ -555,11 +582,6 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
         }
     }
 
-    fn graphql(&self, query: &str) -> Result<ApiResponse, ApiError> {
-        let field = format!("query={query}");
-        self.run("graphql", &["-f", field.as_str()])
-    }
-
     /// One `gh run download` subprocess (#9089). `gh` handles the redirect to
     /// blob storage and the unzip; a non-zero exit is a transport failure
     /// naming `gh`'s own stderr, which [`indicates_credential_failure`] and
@@ -582,7 +604,7 @@ terminal escapes will be refused by gh rather than captured (upgrade gh to captu
         dest: &std::path::Path,
     ) -> Result<(), ApiError> {
         let reader = (self.reader_for)(repo);
-        let attempt = crate::forge_identity::reader_then_writer(
+        let attempt = crate::forge_identity::read_via_reader(
             reader.as_ref().map(|(dir, _)| dir.as_path()),
             |dir, role| {
                 let role = reader.as_ref().map(|_| role);
@@ -686,7 +708,6 @@ mod repo_of_path_tests {
     #[test]
     fn poller_routes_map_to_their_inventoried_operation() {
         let cases = [
-            ("graphql", ops::PR_CLOSING_ISSUE_REFERENCES),
             ("orgs/acme/repos?per_page=100&type=all", ops::REPO_LIST_FOR_OWNER),
             ("users/me/repos?per_page=100", ops::REPO_LIST_FOR_OWNER),
             (
@@ -718,7 +739,6 @@ mod repo_of_path_tests {
         );
         assert_eq!(repo_of_path("/repos/o/r").as_deref(), Some("o/r"));
         assert_eq!(repo_of_path("repos/o/r?x=1").as_deref(), Some("o/r"));
-        assert_eq!(repo_of_path("graphql"), None);
         assert_eq!(repo_of_path("orgs/o/installations"), None);
         assert_eq!(repo_of_path("repos/o"), None);
     }

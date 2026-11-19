@@ -1,0 +1,292 @@
+//! A step's `loom.sweep` span: closed by the step's end, not by recovery
+//! (Issue #12253).
+//!
+//! A step is spawned through the sweep spawn path, so `prepare_child` opens a
+//! `loom.sweep` root for it under the step's sweep id. An issue sweep's root
+//! is closed by its terminal outcome (`outcome_journal`'s
+//! `lifecycle::finish_execution`), but a step never reaches that path: its end
+//! is [`SweepRegistry::end_step`], which emitted `role_tick.outcome` and
+//! nothing else. The root therefore stayed open until orphan recovery, after
+//! the next daemon restart, found both the step and the old daemon gone and
+//! closed it as `process_lost` / `supervisor-lost`, with a duration that ran
+//! to the restart instead of the session's end.
+//!
+//! Two halves fix that:
+//!
+//! - [`sweep_close`] is the close a step's end records: the same
+//!   `loom.result` its `role_tick.outcome` reports (`success` / `failure`),
+//!   the step's role, the PR a Builder step opened (`loom.pr_number`, #13169;
+//!   a PR step's number is already on its open root), its story points when the item is sized
+//!   (`loom.story_points`, #12957), and on a failure a [`StepFailure`] class
+//!   from the closed vocabulary below. [`SweepRegistry::end_step`] journals it at the moment
+//!   it sees the end. A step a roll stopped closes as `interrupted_by_roll`,
+//!   as a role tick does.
+//! - [`step_still_running`] is what orphan recovery asks before it closes a
+//!   step's span: whether the step's claim lock still names this step and its
+//!   leader or its process group is alive. A leader can exit while its group
+//!   (a wrapper retry) keeps running the session, which the journal's owner
+//!   pid alone cannot see.
+//!
+//! | `loom.failure_class` | Observed |
+//! |---|---|
+//! | `timeout-ceiling` | the reaper killed the step at its role timeout |
+//! | `cancelled` | an operator or the daemon cancelled the step |
+//! | `step-outcome-failed` | the session's `LOOM_STEP_OUTCOME` said `class=failed` |
+//! | `exit-<code>` | the step exited non-zero |
+//! | `no-pr` | a Builder step exited 0 with `class=noop`: no PR (#12500) |
+//! | `no-outcome-line` | a Builder step exited 0, opened no PR (or none was readable) and wrote no outcome line (#12500) |
+//! | `no-outcome-line-pr-opened` | as `no-outcome-line`, but the step opened a PR (#13521) |
+//! | `exit-unobserved` | the step exited, its status is unknown, and it wrote no outcome line |
+//! | `provider-exhausted` | the step's api-key seat was exhausted; the launch died on the provider's refusal (#13966) |
+
+use std::path::Path;
+
+use super::capture::{StepEnd, StepOutcomeClass, StepOutcomeLine};
+use crate::observability::lifecycle::{self, roll_interruption, RoleFailure};
+use crate::role_runner::RoleTickOutcome;
+use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOutcome};
+use crate::step_role::StepRole;
+use crate::sweep_registry::reaper::pid_identity;
+use crate::sweep_registry::{LockOwner, SweepRegistry};
+use crate::telemetry::trace::{TraceAttributes, TraceContext};
+
+/// Why a step failed, on its `loom.sweep` close. A step whose provider
+/// feedback said its api-key seat was exhausted (`provider_exhausted`,
+/// #13966) carries that class instead of its exit shape — the launch never
+/// had a working credential — unless it was cancelled, where the operator's
+/// own act stays the story.
+#[must_use]
+pub(crate) fn step_failure(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    pr_number: Option<u32>,
+    provider_exhausted: bool,
+) -> RoleFailure {
+    let failed_line = line.filter(|l| l.class == StepOutcomeClass::Failed);
+    match end {
+        StepEnd::Cancelled => RoleFailure::new("cancelled", None, "step was cancelled"),
+        // Ahead of the timeout arm, as `capture::step_failure` has it: a step
+        // that hit the limit and then hung to its ceiling is one exhaustion
+        // on both vocabularies, not `timed-out` here and exhausted there.
+        _ if provider_exhausted => RoleFailure::new(
+            "provider-exhausted",
+            match end {
+                StepEnd::Exited(code) => code,
+                StepEnd::TimedOut | StepEnd::Cancelled => None,
+            },
+            "step ended on provider exhaustion (its api-key seat is marked to the reset)",
+        ),
+        StepEnd::TimedOut => RoleFailure::new(
+            "timeout-ceiling",
+            None,
+            "step ran past its role timeout and was terminated",
+        ),
+        StepEnd::Exited(code) if failed_line.is_some() => RoleFailure::new(
+            "step-outcome-failed",
+            code,
+            "step session reported LOOM_STEP_OUTCOME class=failed",
+        ),
+        StepEnd::Exited(Some(code)) if code != 0 => RoleFailure::new(
+            format!("exit-{code}"),
+            Some(code),
+            &format!("step exited with code {code}"),
+        ),
+        StepEnd::Exited(None) if line.is_none() => RoleFailure::new(
+            "exit-unobserved",
+            None,
+            "step exited with no observed status and no outcome line",
+        ),
+        // A clean exit that tick_outcome still fails (#12500): a Builder step
+        // that opened no PR, or wrote no outcome line.
+        // #13521: with a PR known it is delivered work, so it has its own class.
+        StepEnd::Exited(code) if line.is_none() && pr_number.is_some() => RoleFailure::new(
+            "no-outcome-line-pr-opened",
+            code,
+            "step opened a PR but exited without writing a LOOM_STEP_OUTCOME line",
+        ),
+        StepEnd::Exited(code) if line.is_none() => RoleFailure::new(
+            "no-outcome-line",
+            code,
+            "step exited without writing a LOOM_STEP_OUTCOME line",
+        ),
+        StepEnd::Exited(code) => RoleFailure::new(
+            "no-pr",
+            code,
+            "builder step exited without opening a PR (LOOM_STEP_OUTCOME class=noop)",
+        ),
+    }
+}
+
+/// The `loom.result` and close attributes of a step's `loom.sweep` span.
+/// `outcome` is the tick outcome the step's `role_tick.outcome` reports
+/// ([`super::capture::tick_outcome`]), so the two agree. `runtime` is the
+/// registry's runtime for the step (#14168, the same fact
+/// `SweepInfo.runtime` records), absent for a legacy entry. `story_points`
+/// are the step's spawn-time points (#12957), absent when unsized.
+/// `pr_number` is the PR a Builder step opened, absent when it opened none.
+/// `provider_exhausted` reclasses the close (#13966). The step's own word on
+/// its work rides `loom.step.outcome.class` / `.reason` (#14168): `none`
+/// with no reason when the step wrote no parseable outcome line, so "no
+/// outcome" is countable per runtime, model and role from the span alone.
+/// `post` is the forge post-state the step's claim release noted before the
+/// close, absent when none was (#14234): with a line and a post-state the
+/// close adds `loom.step.outcome.agrees`, whether the ledger's class for the
+/// two ([`crate::step_dispatch::outcome_ledger::classify`]) is the class the
+/// step claimed. Pure.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_close(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    outcome: &RoleTickOutcome,
+    role: StepRole,
+    runtime: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    story_points: Option<u32>,
+    pr_number: Option<u32>,
+    provider_exhausted: bool,
+    post: Option<PostState>,
+) -> (String, TraceAttributes) {
+    let (result, _) = crate::role_tick_telemetry::classify(outcome);
+    let result = crate::role_tick_telemetry::result_label(result);
+    let mut close = lifecycle::attributes(&[("loom.role", role.role_name())]);
+    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+        close.insert(
+            crate::observability::lifecycle::role_runtime::RUNTIME.into(),
+            runtime.to_owned(),
+        );
+    }
+    let (outcome_class, outcome_reason) =
+        line.map_or(("none", ""), |l| (l.class.as_str(), l.reason.as_str()));
+    close.insert("loom.step.outcome.class".into(), outcome_class.to_owned());
+    if !outcome_reason.is_empty() {
+        close.insert("loom.step.outcome.reason".into(), outcome_reason.to_owned());
+    }
+    if let (Some(l), Some(post)) = (line, post.filter(|_| !provider_exhausted)) {
+        close.insert("loom.step.outcome.agrees".into(), outcome_agrees(l, post).to_string());
+    }
+    for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            close.insert(key.into(), value.to_owned());
+        }
+    }
+    if let Some(pr) = pr_number {
+        close.insert("loom.pr_number".into(), pr.to_string());
+    }
+    if let Some(points) = story_points {
+        close.insert(
+            crate::observability::ops::dispatch_step::STORY_POINTS.into(),
+            points.to_string(),
+        );
+    }
+    if matches!(outcome, RoleTickOutcome::Failure(_)) {
+        close.extend(step_failure(end, line, pr_number, provider_exhausted).attributes());
+    } else if let StepEnd::Exited(Some(code)) = end {
+        close.insert(lifecycle::EXIT_CODE.into(), code.to_string());
+    }
+    (result, close)
+}
+
+/// Whether the class the ledger derives from `post` is the class the step's
+/// own line claimed (#14234). The ledger's rule is reused, not restated: a
+/// `verdict` claim the forge does not show classifies `failed`, which is a
+/// disagreement. Pure.
+fn outcome_agrees(line: &StepOutcomeLine, post: PostState) -> bool {
+    let claimed = StepOutcome::new(ledger_class(line.class), &line.reason);
+    outcome_ledger::classify(Some(&claimed), Some(post)).class == claimed.class
+}
+
+fn ledger_class(class: StepOutcomeClass) -> OutcomeClass {
+    match class {
+        StepOutcomeClass::Verdict => OutcomeClass::Verdict,
+        StepOutcomeClass::Noop => OutcomeClass::Noop,
+        StepOutcomeClass::Refused => OutcomeClass::Refused,
+        StepOutcomeClass::Failed => OutcomeClass::Failed,
+    }
+}
+
+impl SweepRegistry {
+    /// Close a finished step's `loom.sweep` span with its real outcome, at
+    /// the moment its end is seen. A step a roll stopped (`pid`, the leader
+    /// H4 noted) closes as `interrupted_by_roll` instead. A no-op when
+    /// tracing is off. Return the root context for the asynchronous usage capture.
+    pub(crate) fn close_step_span(
+        &self,
+        sweep_id: &str,
+        pid: Option<u32>,
+        result: String,
+        mut close: TraceAttributes,
+    ) -> Option<TraceContext> {
+        let result = match pid.and_then(roll_interruption::take_stopped) {
+            Some(roll) => {
+                roll.apply(&mut close);
+                roll_interruption::RESULT.to_owned()
+            }
+            None => result,
+        };
+        // #14407: this close saw the step end, so the step's phase and attempt
+        // spans mirror it (result + launch runtime) instead of reading
+        // `exit_unobserved`. Not when a roll stopped the step, or when the step
+        // exited with no observed status and no outcome line: those exits were
+        // not observed, and keep the unobserved label.
+        let observed = (result != roll_interruption::RESULT
+            && close.get(lifecycle::FAILURE_CLASS).map(String::as_str) != Some("exit-unobserved"))
+        .then(|| lifecycle::StepEndObserved {
+            result: result.clone(),
+            // The registry's word for the launch; `unknown` is no runtime.
+            runtime: close
+                .get(lifecycle::role_runtime::RUNTIME)
+                .filter(|r| r.as_str() != "unknown")
+                .cloned(),
+        });
+        lifecycle::finish_execution_observing(
+            &self.config.workspace_root,
+            sweep_id,
+            &result,
+            close,
+            observed.as_ref(),
+        )
+    }
+}
+
+/// Whether the step `sweep_id` in the workspace at `root` is still running:
+/// its claim lock (`issue-<N>`, or `pr-<N>` for a PR step) still names it,
+/// and its leader, or the process group it leads, is alive. `false` for
+/// anything that is not a step's sweep id. Orphan recovery leaves a running
+/// step's span to the step's own end ([`SweepRegistry::end_step`]).
+#[must_use]
+pub fn step_still_running(root: &Path, sweep_id: &str) -> bool {
+    let Some((role, item)) = StepRole::parse_sweep_id(sweep_id) else {
+        return false;
+    };
+    let ns = if role.acts_on_pr() { "pr" } else { "issue" };
+    let owner_path = root
+        .join(".loom/locks")
+        .join(format!("{ns}-{item}"))
+        .join("owner.json");
+    let Some(owner) = std::fs::read_to_string(owner_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<LockOwner>(&s).ok())
+    else {
+        return false;
+    };
+    if owner.sweep_id != sweep_id {
+        return false;
+    }
+    pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at)
+        || owner.pgid.is_some_and(group_alive)
+}
+
+/// A dead leader's recorded group still has members, and is not ours or a
+/// recycled number (the reaper's own checks, without its signal-path logs).
+fn group_alive(pgid: u32) -> bool {
+    pgid > 1
+        && Some(pgid) != crate::sweep_registry::current_process_group()
+        && !pid_identity::pgid_number_was_recycled(pgid)
+        && crate::sweep_registry::reaper::group_has_members(pgid)
+}
+
+#[cfg(test)]
+#[path = "span_tests.rs"]
+mod tests;

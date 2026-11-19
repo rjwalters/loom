@@ -1709,26 +1709,19 @@ emit_decision() {
 # LOOM: Prefer merge-pr.sh over gh pr merge
 # =============================================================================
 
-# Match against a MASKED copy of $COMMAND (issue #5109, extended by #5155,
-# #5172, #6464, and #6866) so a mention of the phrase inside a cat-heredoc
-# commit-message body, a --search/--body/-m/etc quoted value (including the
-# `gh api -f field=value` shape), a quoted POSITIONAL argument to a known
-# non-executing command (grep/rg/check-duplicate.sh/jq), a heredoc assigned
-# to a shell variable and only referenced later via that variable, or a `for
-# VAR in "..." "...";  do` item list only referenced later via that loop
-# variable, doesn't false-positive as a real invocation. See the masking
-# functions' doc comments above for exactly what is (and is NOT) neutralized.
-#
-# mask_for_loop_list_items runs BEFORE mask_command_positional_args and
-# mask_data_flag_values here (mirroring mask_var_assigned_heredoc_bodies's
-# position) even though it internally calls those same two functions on a
-# scratch buffer to decide confinement -- that internal use is independent of
-# this outer composition order, and running it here (right after the other
-# DEFINITION-site masks, before the REFERENCE-site masks) keeps this pipeline
-# consistent: definition-site literals are neutralized first, so a later
-# reference-site pass can never be confused by a still-live definition.
+# GH_PR_MERGE_SCAN_TEXT: the shell-masked copy of $COMMAND (#5109, #5155, #5172,
+# #6464, #6866) the cargo-target-dir and secret-scan checks below still scan.
 GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_for_loop_list_items "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")")")
-if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
+
+# The merge check itself (#12236, slice 1 of #11113) asks the shared command
+# lexer what $COMMAND would EXECUTE: a heredoc body or quoted argument is data,
+# a live/chained/`bash -c`/`eval`/`$( )` merge is not. Exit 0 = live merge, 1 =
+# not; any other answer (no binary, a daemon predating the verb) falls back to
+# the shell-masked copy above, this check's behaviour before the lexer.
+# requires-daemon: command-analysis optional   #12236 — `gh-pr-merge`; with no usable answer the shell-masked copy is scanned.
+GPM_RC=0
+"${LOOM_DAEMON_SELF_BIN:-loom-daemon}" command-analysis gh-pr-merge --command "$COMMAND" >/dev/null 2>&1 || GPM_RC=$?
+if [[ "$GPM_RC" -eq 0 ]] || { [[ "$GPM_RC" -ne 1 ]] && echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; }; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the
     # loom-checkout copy under defaults/scripts/ (via $LOOM_HOME) when the repo
@@ -1829,9 +1822,10 @@ fi
 # allowed roots, guards.cargoTargetDir / LOOM_GUARD_CARGO_TARGET_DIR and the
 # deny span all live in `loom-daemon cargo-target-dir guard`
 # (loom-daemon/src/cargo_target_guard.rs). Fork-free prefilter: only a command
-# that mentions cargo or CARGO_TARGET_DIR reaches it. The same verb ASKs (exit
-# 0, ASK [cargo-shared-target]) when a worktree build with no explicit target
-# dir falls through to a shared build.target-dir (#10646).
+# that mentions cargo or CARGO_TARGET_DIR reaches it. The same verb denies (exit
+# 1, BLOCKED [cargo-shared-target]) when a worktree build with no explicit
+# target dir falls through to a shared build.target-dir (#10646; deny, not ask,
+# #11625: an ask is unanswerable headless and its reason never reaches the model).
 # =============================================================================
 
 # requires-daemon: cargo-target-dir optional   #11582 — `guard`; a daemon without the verb exits 2, which this block treats as allow (rule inert).
@@ -1840,9 +1834,8 @@ if [[ "$GH_PR_MERGE_SCAN_TEXT" == *cargo* || "$GH_PR_MERGE_SCAN_TEXT" == *CARGO_
     CTD_OUT=$("${LOOM_DAEMON_SELF_BIN:-loom-daemon}" cargo-target-dir guard --cwd "${CWD:-.}" --for-command "$GH_PR_MERGE_SCAN_TEXT" 2>/dev/null) || CTD_RC=$?
     if [[ "$CTD_RC" -eq 1 && "$CTD_OUT" == "BLOCKED [cargo-target-dir]"* ]]; then
         deny "$CTD_OUT" "loom:cargo-target-dir"
-    elif [[ "$CTD_RC" -eq 0 && "$CTD_OUT" == "ASK [cargo-shared-target]"* ]]; then
-        log_guard_decision "ask" "ask" "loom:cargo-shared-target" || true
-        ask "$CTD_OUT"
+    elif [[ "$CTD_RC" -eq 1 && "$CTD_OUT" == "BLOCKED [cargo-shared-target]"* ]]; then
+        deny "$CTD_OUT" "loom:cargo-shared-target"
     fi
 fi
 

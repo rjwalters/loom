@@ -3,7 +3,7 @@
 //! # Problem
 //!
 //! Every daemon-issued `gh` call (`claim_reconciliation`, `main_health_gate`,
-//! `metrics_collector`, the work finder, …) is a plain `Command::new("gh")`
+//! the work finder, …) is a plain `Command::new("gh")`
 //! with no `env_clear` — so it authenticates however `gh` itself resolves
 //! credentials in the daemon's process environment: `GH_TOKEN` /
 //! `GITHUB_TOKEN`, falling back to `gh`'s own credential store (the macOS
@@ -1379,6 +1379,40 @@ pub fn apply_gh_config_for_owner_slug(cmd: &mut Command, owner_repo: &str) {
     }
 }
 
+/// The per-owner `GH_CONFIG_DIR` a `gh` call run from `cwd` against
+/// `target` (`owner/repo`) carries when its site chose none: the one
+/// registered for `cwd` (#5401), else the one registered for `target`'s
+/// owner (#5431), else `None` (this process's own credential).
+///
+/// This is the single rule for "which writer does this call use". The `gh`
+/// facade applies it to every invocation
+/// (`GhInvocation::env_plan`), and the #9548 write-scope gate probes the
+/// credential it names (`write_scope::may_write_from`), so the gate always
+/// vets the credential the write will carry (#12606). Before #12606 the
+/// gate probed the process credential (the workspace-root owner's writer)
+/// while the write itself ran under the item owner's, so every cross-owner
+/// write through `GhForge` was refused as "not in this App installation".
+#[must_use]
+pub fn gh_config_dir_for_call(cwd: Option<&Path>, target: Option<&str>) -> Option<PathBuf> {
+    cwd.and_then(gh_config_dir_for_root)
+        .or_else(|| target.and_then(gh_config_dir_for_owner_slug))
+}
+
+/// The owner a registered per-owner `GH_CONFIG_DIR` belongs to (#5431's
+/// owner-keyed registry, reversed), for telemetry: names whose writer
+/// installation a credential is without exposing anything secret. `None` for
+/// a directory no owner registered (the process's own credential, or a
+/// root-only registration).
+#[must_use]
+pub fn owner_for_gh_config_dir(dir: &Path) -> Option<String> {
+    owner_slug_config_registry()
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(_, d)| d.as_path() == dir)
+        .map(|(owner, _)| owner.clone())
+}
+
 /// One distinct non-root owner among the managed repos, with a representative
 /// `owner/repo` to mint from and every managed checkout root under that owner
 /// to register (#5401). Produced by [`plan_cross_owner_credentials`].
@@ -1485,6 +1519,13 @@ pub fn register_primary_workspace_root(root: &Path) {
     PRIMARY_WORKSPACE_ROOT.get_or_init(|| root.to_path_buf());
 }
 
+/// The daemon's primary workspace root, when [`register_primary_workspace_root`]
+/// has run in this process (`None` in a CLI process).
+#[must_use]
+pub fn primary_workspace_root() -> Option<PathBuf> {
+    PRIMARY_WORKSPACE_ROOT.get().cloned()
+}
+
 /// Process-global registry of every per-owner credential the periodic refresh
 /// tick should keep fresh (#6171): owner -> (representative `owner/repo` to
 /// mint from, its `GH_CONFIG_DIR`). Distinct from
@@ -1552,27 +1593,44 @@ pub fn force_refresh_owner_credential_with(
     let Some(owner_repo) = nwo_from_git_remote(repo_root) else {
         return false;
     };
-    let owner = owner_of(&owner_repo).to_string();
-    let source = credential_source_for_owner(&owner_repo);
-    match minter.mint_forced(&owner_repo) {
+    match force_mint_owner_credential(workspace_root, &owner_repo, minter) {
+        Some(owner_dir) => {
+            register_root_gh_config_dir(repo_root, &owner_dir);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The mint + publish + register core shared by [`force_refresh_owner_credential_with`]
+/// and [`force_refresh_owner_credential_for_repo`]: force-mints for
+/// `owner_repo`'s owner and publishes into the owner's `gh` config dir,
+/// returning that dir on success.
+fn force_mint_owner_credential(
+    workspace_root: &Path,
+    owner_repo: &str,
+    minter: &dyn GithubAppMinter,
+) -> Option<PathBuf> {
+    let owner = owner_of(owner_repo).to_string();
+    let source = credential_source_for_owner(owner_repo);
+    match minter.mint_forced(owner_repo) {
         ref outcome @ GithubAppOutcome::Minted {
             ref installation_id,
             ref app_id,
             ..
         } => {
             let owner_dir = github_app_gh_config_dir_for_owner(workspace_root, &owner);
-            match publish_outcome(&owner_dir, outcome, &owner_repo) {
+            match publish_outcome(&owner_dir, outcome, owner_repo) {
                 Ok(()) => {
-                    register_root_gh_config_dir(repo_root, &owner_dir);
                     register_owner_gh_config_dir(&owner, &owner_dir);
-                    register_owner_refresh_source(&owner_repo, &owner_dir);
+                    register_owner_refresh_source(owner_repo, &owner_dir);
                     record_forge_credential_success(&source);
                     log::info!(
                         "credential_preflight: forced per-owner github-app refresh for {owner} \
-                         ({owner_repo}) after a registered-workspace scan failure — retrying (app \
-                         {app_id} installation {installation_id}) — #6171"
+                         ({owner_repo}) — retrying (app {app_id} installation {installation_id}) \
+                         — #6171"
                     );
-                    true
+                    Some(owner_dir)
                 }
                 Err(e) => {
                     log::warn!(
@@ -1580,20 +1638,34 @@ pub fn force_refresh_owner_credential_with(
                          could not publish it to {} ({e}) — #6171",
                         owner_dir.display()
                     );
-                    false
+                    None
                 }
             }
         }
-        GithubAppOutcome::NotConfigured => false,
+        GithubAppOutcome::NotConfigured => None,
         GithubAppOutcome::Error(reason) => {
             record_forge_credential_failure(&source, &reason);
             log::warn!(
                 "credential_preflight: forced per-owner github-app refresh for {owner_repo} \
                  failed ({reason}) — #6171"
             );
-            false
+            None
         }
     }
+}
+
+/// Force-mint a fresh installation token for `owner_repo`'s owner and publish
+/// it, with no checkout root involved (#13306): the write-scope probe knows
+/// only the repo's slug. Returns the owner's `gh` config dir on success.
+#[must_use]
+pub fn force_refresh_owner_credential_for_repo(owner_repo: &str) -> Option<PathBuf> {
+    let workspace_root = PRIMARY_WORKSPACE_ROOT.get()?;
+    let script_path = resolve_github_app_script(workspace_root)?;
+    let minter = RealGithubAppMinter {
+        script_path,
+        cwd: workspace_root.clone(),
+    };
+    force_mint_owner_credential(workspace_root, owner_repo, &minter)
 }
 
 /// Production entry point for the #6171 404-recovery path: resolves the real
@@ -1618,6 +1690,7 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
     force_refresh_owner_credential_with(workspace_root, repo_root, &minter)
 }
 
+pub mod cross_owner;
 pub mod loom_ui;
 pub mod pool;
 pub use pool::attach as attach_pool;
@@ -2082,6 +2155,35 @@ mod tests {
             "unregistered root must not set GH_CONFIG_DIR on the child"
         );
 
+        clear_owner_root_registry();
+    }
+
+    /// #12606: the one "which writer does this call carry" rule, shared by
+    /// the `gh` facade and the write-scope gate: the cwd's registration, else
+    /// the target owner's, else the process's own.
+    #[test]
+    #[serial_test::serial]
+    fn gh_config_dir_for_call_prefers_the_root_then_the_target_owner() {
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("checkout-b");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_cfg = dir.path().join("root-cfg");
+        let owner_cfg = dir.path().join("gh-config-by-owner/xowner-12606");
+        register_owner_gh_config_dir("xowner-12606", &owner_cfg);
+        assert_eq!(
+            gh_config_dir_for_call(Some(&root), Some("xowner-12606/r")),
+            Some(owner_cfg.clone())
+        );
+        assert_eq!(gh_config_dir_for_call(Some(&root), Some("other/r")), None);
+        assert_eq!(gh_config_dir_for_call(None, None), None);
+        register_root_gh_config_dir(&root, &root_cfg);
+        assert_eq!(
+            gh_config_dir_for_call(Some(&root), Some("xowner-12606/r")),
+            Some(root_cfg.clone())
+        );
+        assert_eq!(owner_for_gh_config_dir(&owner_cfg).as_deref(), Some("xowner-12606"));
+        assert_eq!(owner_for_gh_config_dir(&root_cfg), None);
         clear_owner_root_registry();
     }
 

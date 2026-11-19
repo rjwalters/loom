@@ -42,26 +42,44 @@ fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir.join(".loom")).unwrap();
 }
 
-/// A long-lived system binary to stand in for a service executable. Copying a
-/// real one (rather than compiling a fixture) keeps the test fast and makes the
-/// spawned process indistinguishable, to the detector, from a real service.
-fn host_sleep_binary() -> PathBuf {
-    for candidate in ["/bin/sleep", "/usr/bin/sleep"] {
+/// A long-lived system binary to stand in for a service executable, and the
+/// arguments that keep it alive. Copying a real one (rather than compiling a
+/// fixture) keeps the test fast and makes the spawned process
+/// indistinguishable, to the detector, from a real service.
+fn host_stand_in() -> (PathBuf, &'static [&'static str]) {
+    // The stand-in image and its arguments. On Linux it is a copy of the host
+    // shell run as `-c 'read _'`, blocked reading a stdin pipe the returned
+    // `Child` holds open. Not `sleep`: on Ubuntu 26.04 (`ubuntu-latest` since
+    // 2026-11-14) `sleep` is uutils' multicall coreutils, and a copy run under
+    // another file name exits at once with status 1, even with argv[0] set to
+    // "sleep" (#13924). `read` is a shell builtin, so the process stays the
+    // copied shell (no fork, no exec) and `/proc/<pid>/exe` names the copy.
+    // macOS keeps the `sleep` copy its `ps -o comm` detection path was built
+    // and verified against.
+    #[cfg(target_os = "linux")]
+    let (candidates, args): (&[&str], &'static [&'static str]) =
+        (&["/bin/sh", "/usr/bin/sh"], &["-c", "read _"]);
+    #[cfg(not(target_os = "linux"))]
+    let (candidates, args): (&[&str], &'static [&'static str]) =
+        (&["/bin/sleep", "/usr/bin/sleep"], &["300"]);
+    for candidate in candidates {
         let path = PathBuf::from(candidate);
         if path.is_file() {
-            return path;
+            return (path, args);
         }
     }
-    panic!("no `sleep` binary found — this test needs one to stand in for a service");
+    panic!("no stand-in binary found — this test needs one to play a service");
 }
 
-/// Copy `sleep` into `<repo>/target/release/<name>` and run it, so a live
-/// process's executable image lives inside the directory `--deep` deletes.
+/// Copy the stand-in binary into `<repo>/target/release/<name>` and run it, so
+/// a live process's executable image lives inside the directory `--deep`
+/// deletes.
 fn spawn_service_from_target(repo: &Path, name: &str) -> (Child, PathBuf) {
     let release = repo.join("target").join("release");
     std::fs::create_dir_all(&release).unwrap();
     let program = release.join(name);
-    std::fs::copy(host_sleep_binary(), &program).unwrap();
+    let (source, args) = host_stand_in();
+    std::fs::copy(source, &program).unwrap();
     // Re-sign the relocated copy on macOS: a plain `fs::copy` of a system binary
     // carries over the original embedded code signature (bound to the source
     // path's identity), so Gatekeeper SIGKILLs the exec'd copy asynchronously —
@@ -91,15 +109,20 @@ fn spawn_service_from_target(repo: &Path, name: &str) -> (Child, PathBuf) {
     // exec the file. A harness race, not a property of the code under test.
     for _ in 0..100 {
         match Command::new(&program)
-            .arg("300")
-            .stdin(Stdio::null())
+            .args(args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
         {
-            Ok(child) => {
+            Ok(mut child) => {
                 // Let the kernel publish the exec'd image (/proc/<pid>/exe).
                 std::thread::sleep(std::time::Duration::from_millis(250));
+                // A stand-in that already exited would fail every detection
+                // assertion for a reason unrelated to the detector.
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("the stand-in service exited before the test ran: {status}");
+                }
                 return (child, program);
             }
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
@@ -202,3 +225,8 @@ fn deep_clean_safe_still_reclaims_when_nothing_is_running_from_target() {
         "the reclaim must still be reported; stdout:\n{stdout}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

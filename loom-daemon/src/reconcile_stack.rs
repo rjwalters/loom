@@ -66,6 +66,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use crate::cmd_out::{run_command, CmdOutcome};
+use crate::shell_quote::shell_quote;
 
 #[cfg(test)]
 mod tests;
@@ -221,7 +222,10 @@ fn short(dir: &Path, rev: &str) -> String {
 /// rebase uses, and the local branch of the same name is never consulted. A
 /// failure at either step is a refusal — reusing stale local state on a failed
 /// fetch is the silent-data-loss path, not a graceful degradation.
-fn fetch_and_pin_target(
+///
+/// Also the destination of the orphaned-stacked-child pass
+/// (`claim_reconciliation::orphan_stack`, #12760).
+pub(crate) fn fetch_and_pin_target(
     repo_dir: &Path,
     remote: &str,
     branch: &str,
@@ -503,11 +507,6 @@ pub fn rebase(plan: &Plan) -> Result<(), String> {
         .to_string())
 }
 
-/// Single-quote a value for `eval` in POSIX shell.
-fn sh_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 /// The plan as `eval`-able shell assignments — the script's stdout contract.
 #[must_use]
 pub fn render_shell(plan: &Plan) -> String {
@@ -524,11 +523,11 @@ pub fn render_shell(plan: &Plan) -> String {
          LOOM_RS_CHILD_WORKTREE={}\n\
          LOOM_RS_PARENT_REF={}\n\
          LOOM_RS_PARENT_PIN_REF={}\n",
-        sh_quote(&plan.target_commit),
-        sh_quote(&plan.target_ref),
-        sh_quote(&plan.git_dir.display().to_string()),
-        sh_quote(&worktree),
-        sh_quote(&plan.parent_ref),
-        sh_quote(&pin),
+        shell_quote(&plan.target_commit),
+        shell_quote(&plan.target_ref),
+        shell_quote(&plan.git_dir.display().to_string()),
+        shell_quote(&worktree),
+        shell_quote(&plan.parent_ref),
+        shell_quote(&pin),
     )
 }

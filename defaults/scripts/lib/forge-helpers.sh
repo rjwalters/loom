@@ -46,6 +46,18 @@ _LOOM_FORGE_HELPERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/config-resolver.sh"
 # shellcheck source=./locate-daemon-bin.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/locate-daemon-bin.sh"
+# shellcheck source=./bounded-run.sh
+# bounded_run (#13927): the formal-review reads at the bottom of this file
+# run `gh` under a hard wall-clock budget, because on a loaded multi-sweep
+# host a fraction of `gh` invocations block indefinitely rather than erroring
+# and an unbounded read inside a command substitution wedges the whole verdict
+# chain (see lib/bounded-run.sh's header for the signal-deferral mechanics).
+# A missing lib is an install defect that must not break the dozens of
+# unrelated scripts sourcing this file: the review reads then degrade to the
+# unbounded pre-#13927 behaviour via _forge_review_read_run's guard.
+if [[ -f "$_LOOM_FORGE_HELPERS_LIB_DIR/bounded-run.sh" ]]; then
+  source "$_LOOM_FORGE_HELPERS_LIB_DIR/bounded-run.sh"
+fi
 
 # --- Forge Detection ---
 
@@ -228,6 +240,16 @@ _gitea_validate_basic_auth() {
 
 # --- Gitea API Helper ---
 
+# _gitea_auth_cfg -> curl config line carrying the Gitea credential (values
+# escaped for a double-quoted config string; backslash/quote escaped, CR/LF
+# stripped). Used with `curl --config <(_gitea_auth_cfg)` so credentials never
+# reach curl's argv (#10463).
+_gitea_auth_cfg() {
+  local t="${_GITEA_TOKEN//[$'\r\n']/}" u="${_GITEA_USERNAME//[$'\r\n']/}"
+  t="${t//\\/\\\\}"; t="${t//\"/\\\"}"; u="${u//\\/\\\\}"; u="${u//\"/\\\"}"
+  if [[ -n "$u" ]]; then printf 'user = "%s:%s"\n' "$u" "$t"; else printf 'header = "Authorization: token %s"\n' "$t"; fi
+}
+
 # Make a Gitea API request using curl.
 # Usage: gitea_api METHOD path [curl-args...]
 # Returns: response body on stdout, exit code 0 on 2xx, 1 on error
@@ -259,26 +281,14 @@ gitea_api() {
   local http_code
   local response
 
-  if [[ -n "$_GITEA_USERNAME" ]]; then
-    # HTTP Basic Auth (username + password). curl handles base64 encoding
-    # of "user:pass" internally; we never echo the password to the log.
-    response=$(curl -s -w "\n%{http_code}" \
-      -X "$method" \
-      -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/json" \
-      "$@" \
-      "$url" 2>/dev/null)
-  else
-    # Token auth (existing behavior, unchanged).
-    response=$(curl -s -w "\n%{http_code}" \
-      -X "$method" \
-      -H "Authorization: token $_GITEA_TOKEN" \
-      -H "Content-Type: application/json" \
-      -H "Accept: application/json" \
-      "$@" \
-      "$url" 2>/dev/null)
-  fi
+  # Basic Auth (username set) or token auth; credential rides a curl config, not argv.
+  response=$(curl -s -w "\n%{http_code}" \
+    -X "$method" \
+    --config <(_gitea_auth_cfg) \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    "$@" \
+    "$url" 2>/dev/null)
 
   http_code=$(echo "$response" | tail -1)
   local body
@@ -306,10 +316,7 @@ forge_split_nwo() {
 
 # --- Forge-Dispatched Operations ---
 
-# forge_detect_merge_method() (#7754) lives in the sibling module below --
-# forge-helpers.sh is already over the file-size ratchet's threshold and
-# frozen at its current size (scripts/file-size-baseline.txt), so new
-# functionality is split out rather than added here.
+# forge_detect_merge_method() (#7754) lives in the sibling module below.
 # shellcheck source=./forge-merge-method.sh
 source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
 
@@ -403,7 +410,6 @@ forge_update_branch() {
 # Returns JSON with .state, .merged, .head.ref, .title, .mergeable
 # On failure stderr carries the forge's own error (#9192) -- silence it at the
 # call site (`2>/dev/null`) if unwanted; the helper no longer discards it.
-# (Compacted to offset forge_fetch_error_cause on the shell-budget ratchet.)
 forge_get_pr() {
   local nwo="$1" pr_number="$2" gh_cmd="${3:-gh}"
   if [[ "$FORGE_TYPE" == "gitea" ]]; then forge_split_nwo "$nwo"; gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number"; else "$gh_cmd" api "repos/$nwo/pulls/$pr_number"; fi; }
@@ -526,9 +532,7 @@ forge_check_auto_delete() {
 #
 # jq (a hard dependency of this lib already) rather than a bash character loop:
 # `@uri` is exactly the RFC 3986 encoder and handles multi-byte input without
-# locale juggling. Written as a one-liner because `defaults/scripts/lib/` is
-# inside the portable pool `loom-daemon shell-budget --check` ratchets, where
-# comments are free and code lines are not.
+# locale juggling.
 url_encode_path_segment() { printf '%s' "${1:-}" | jq -sRr 'split("/") | map(@uri) | join("/")'; }
 
 # Delete a remote branch.
@@ -537,9 +541,7 @@ url_encode_path_segment() { printf '%s' "${1:-}" | jq -sRr 'split("/") | map(@ur
 # Gitea: DELETE /repos/{owner}/{repo}/branches/{branch}
 forge_delete_branch() {
   # Declaration and assignment are separate statements sharing one physical
-  # line: the encode call is net-new code in the portable pool
-  # `loom-daemon shell-budget --check` ratchets, and packing it against the
-  # `local` is what pays for it there.
+  # line.
   local nwo="$1" branch; branch="$(url_encode_path_segment "$2")"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
@@ -1097,7 +1099,6 @@ _forge_nwo_from_remote() {
 # `loom-daemon forge may-write` (loom-daemon/src/write_scope.rs: managed repo +
 # the credential has WRITE). See .loom/docs/comment-trust.md.
 # requires-daemon: forge optional   With no binary, or one predating `may-write` (any exit but 0/1, or 0 without OWNER/REPO on stdout), the fallback allows a write only when the checkout's ONLY remote is origin, only to origin, and GH_REPO is unset or origin: it cannot check permission, but it cannot reach any repository but the one this Loom checkout was cloned from.
-# Five dense body lines on purpose: this file is frozen by the file-size ratchet.
 loom_write_repo() {
   local want="${1:-}" out rc=0 err origin; err="$(mktemp)"; origin="$(_forge_nwo_from_remote)" || origin=""
   if [[ -n "$want" ]]; then out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge may-write --repo "$want" 2>"$err")" || rc=$?; else out="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge may-write 2>"$err")" || rc=$?; fi
@@ -1402,43 +1403,25 @@ forge_gh_repo_safe() {
   return "$rc"
 }
 
-# Post a comment on an issue OR a pull request via `gh issue comment`, falling
-# back to the REST comments endpoint on a GraphQL rate-limit rejection. The
-# REST endpoint (`repos/{nwo}/issues/{n}/comments`) is shared by issues and
-# PRs on GitHub (a PR IS an issue for labels/comments/state), so one function
-# safely serves both `gh issue comment` and `gh pr comment` call sites.
-# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY
-# Returns 0 on success (either path), 1 on failure (message on stderr).
+# Post a comment on an issue OR a pull request through the daemon's comment
+# chokepoint (`loom-daemon forge comment`, #9818), which owns the posting
+# semantics and the dashboard footer (#9774). There is no gh fallback (#9865):
+# a comment posted without the daemon would ship unfootered, which is exactly
+# what #9774 exists to prevent, so a missing binary is a loud failure.
+# Usage: forge_gh_comment_rl_safe NWO NUMBER BODY [IS_PR]
+# Returns 0 on success, 1 on failure (daemon stderr or the minimum-version
+# message on stderr).
 forge_gh_comment_rl_safe() {
   local nwo="$1" number="$2" body="$3" is_pr="${4:-0}"
-  local out; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
-  # #9774: the daemon's comment chokepoint (forge comment, #9818) is the
-  # poster whenever a binary resolves — one posting path, dashboard footer
-  # included. The gh paths below are the binary-absent fallback (an
-  # unfootered comment on a host with no loom-daemon at all; the fleet
-  # premise is that every host has one).
+  nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
   local self_bin="${LOOM_DAEMON_SELF_BIN:-$(loom_resolve_self_daemon_bin "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" 2>/dev/null || true)}"
-  if [[ -n "$self_bin" ]]; then
-    local daemon_args=(forge comment "$number" --repo "$nwo" --body "$body")
-    [[ "$is_pr" == "1" ]] && daemon_args+=(--pr)
-    if "$self_bin" "${daemon_args[@]}" >/dev/null 2>&1; then
-      return 0
-    fi
-    # The daemon could not post (absent verb, stale binary, forge refusal):
-    # fall through to the gh ladder rather than swallowing the comment.
-  fi
-  if out=$(forge_gh_perm_safe issue comment "$number" --repo "$nwo" --body "$body" 2>&1); then
-    return 0
-  fi
-  if is_rate_limit_error "$out"; then
-    if gh api "repos/$nwo/issues/$number/comments" -f "body=$body" >/dev/null 2>&1; then
-      return 0
-    fi
-    echo "gh issue comment rate-limited on #$number, and the REST fallback also failed: $out" >&2
+  if [[ -z "$self_bin" ]]; then
+    echo "comment posting requires loom-daemon >= 0.19.598 (#9865)" >&2
     return 1
   fi
-  echo "$out" >&2
-  return 1
+  local daemon_args=(forge comment "$number" --repo "$nwo" --body "$body")
+  [[ "$is_pr" == "1" ]] && daemon_args+=(--pr)
+  "$self_bin" "${daemon_args[@]}" >/dev/null || return 1
 }
 
 # Reopen a closed issue via `gh issue reopen`, falling back to a REST PATCH
@@ -1572,10 +1555,9 @@ forge_gh_remove_label_rl_safe() {
 # "not created" are indistinguishable from here, so a caller must LOOK before
 # retrying rather than blind-retry into a real duplicate.
 #
-# Implemented as two MODIFIED lines, no added ones, on purpose: this file is
-# frozen by scripts/check-file-size-budget.sh, and a "never silent" guarantee
-# belongs at the point of failure, not in a sibling module the one caller
-# would have to remember to route through.
+# Implemented as two MODIFIED lines, no added ones, on purpose: a "never
+# silent" guarantee belongs at the point of failure, not in a sibling module
+# the one caller would have to remember to route through.
 forge_gh_create_issue_rl_safe() {
   local nwo="$1" title="$2" body="$3"; nwo="$(loom_write_repo "$nwo")" || return 1  # #9548
   shift 3
@@ -1674,6 +1656,31 @@ forge_gh_create_issue_rl_safe() {
 #
 # Old bodies-only behaviour is one jq away for any caller that genuinely wants
 # it: `forge_get_pr_reviews "$nwo" "$n" | jq -r 'select(.body != "") | .body'`.
+#
+# Wall-clock bound (#13927): every GitHub-branch read below runs `gh` under
+# bounded_run with this budget. Override: LOOM_FORGE_REVIEW_READ_TIMEOUT
+# (seconds). 0 restores the unbounded pre-#13927 behaviour. A timed-out read
+# exits 124 (bounded_run normalizes to GNU timeout's code); callers treat any
+# non-zero as fail-closed, and 124 specifically means "timed out", never
+# "no reviews".
+_LOOM_FORGE_REVIEW_READ_TIMEOUT="${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}"
+
+# Run ONE review-read gh invocation under that budget (#13927). Preserves the
+# `$gh_cmd` pass-through: tests stub it with a path, and `timeout`/bounded_run
+# exec a path fine. Degrades to the plain unbounded call when the budget is 0
+# or bounded-run.sh is absent (see the sourcing note at the top of this file).
+# The override is RE-RESOLVED per call so `LOOM_FORGE_REVIEW_READ_TIMEOUT=1
+# <script>` (tests, one-off loaded-host runs) is honored, not just a value
+# present when this file was sourced.
+_forge_review_read_run() {
+  _LOOM_FORGE_REVIEW_READ_TIMEOUT="${LOOM_FORGE_REVIEW_READ_TIMEOUT:-60}"
+  if [[ "$_LOOM_FORGE_REVIEW_READ_TIMEOUT" == "0" ]] \
+    || ! declare -F bounded_run > /dev/null 2>&1; then
+    "$@"
+    return $?
+  fi
+  bounded_run "$_LOOM_FORGE_REVIEW_READ_TIMEOUT" "$@"
+}
 
 # jq filter shared by both forges' review reads. Emits one compact JSON record
 # per review. Gitea spells two states differently (REQUEST_CHANGES / COMMENT);
@@ -1715,7 +1722,8 @@ _FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
 #   {"id":…,"state":"APPROVED|CHANGES_REQUESTED|COMMENTED|DISMISSED|PENDING|…",
 #    "commit_id":"…","submitted_at":"…","author":"…","body":"…"}
 # Exit: 0 on a complete read (including a genuinely empty review list),
-#       non-zero on ANY read/pagination failure (fail closed).
+#       non-zero on ANY read/pagination failure (fail closed),
+#       124 when the read exceeded LOOM_FORGE_REVIEW_READ_TIMEOUT (#13927).
 #
 # Both forges: GET /repos/{nwo}/pulls/{n}/reviews
 # Always plain `gh` (never a cache wrapper): this read gates a verdict, and the
@@ -1732,7 +1740,7 @@ forge_get_pr_reviews() {
     return $?
   fi
 
-  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
+  _forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
     --jq "$_FORGE_REVIEW_RECORD_JQ"
 }
 
@@ -1740,7 +1748,8 @@ forge_get_pr_reviews() {
 #
 # Usage: forge_get_pr_review_comments NWO PR_NUMBER [GH_CMD]
 # Output: one JSON object per line (see _FORGE_REVIEW_COMMENT_RECORD_JQ).
-# Exit: 0 on a complete read, non-zero on ANY failure (fail closed).
+# Exit: 0 on a complete read, non-zero on ANY failure (fail closed);
+#       124 when the GitHub-branch read timed out (#13927).
 #
 # GitHub: GET /repos/{nwo}/pulls/{n}/comments — a DIFFERENT endpoint from
 #   /issues/{n}/comments (general PR conversation). Both exist; reading only the
@@ -1767,7 +1776,7 @@ forge_get_pr_review_comments() {
     return 0
   fi
 
-  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/comments?per_page=100" --paginate \
+  _forge_review_read_run "$gh_cmd" api "repos/$nwo/pulls/$pr_number/comments?per_page=100" --paginate \
     --jq "$_FORGE_REVIEW_COMMENT_RECORD_JQ"
 }
 
@@ -1779,7 +1788,9 @@ forge_get_pr_review_comments() {
 #    "path":"…","author":"…","body":"…"}
 # Exit: 0 on a complete read, 2 when the forge has no supported
 #       thread-resolution interface (caller must fall back and fail closed on
-#       the unknown resolution state — NOT treat it as resolved), 1 on failure.
+#       the unknown resolution state — NOT treat it as resolved), 1 on failure
+#       (including a per-page timeout, #13927: a bounded_run 124 is folded
+#       into 1 here — callers already fall back on any non-zero).
 #
 # Resolution state is GraphQL-only on GitHub (REST exposes no `isResolved`), so
 # this is the one read here that cannot use the REST pool. `gh api graphql` dies
@@ -1819,10 +1830,10 @@ forge_get_pr_review_threads() {
     fi
 
     if [[ -z "$cursor" ]]; then
-      response=$("$gh_cmd" api graphql -f query="$query" \
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
         -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number") || return 1
     else
-      response=$("$gh_cmd" api graphql -f query="$query" \
+      response=$(_forge_review_read_run "$gh_cmd" api graphql -f query="$query" \
         -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number" \
         -F cursor="$cursor") || return 1
     fi
@@ -1987,19 +1998,11 @@ forge_get_required_status_check_contexts() {
 
     local url="${_GITEA_BASE_URL}/api/v1/repos/${FORGE_OWNER}/${FORGE_REPO}/branch_protections/${branch}"
     local response
-    if [[ -n "$_GITEA_USERNAME" ]]; then
-      response=$(curl -s -w "\n%{http_code}" \
-        -X GET \
-        -u "${_GITEA_USERNAME}:${_GITEA_TOKEN}" \
-        -H "Accept: application/json" \
-        "$url" 2>/dev/null) || return 1
-    else
-      response=$(curl -s -w "\n%{http_code}" \
-        -X GET \
-        -H "Authorization: token $_GITEA_TOKEN" \
-        -H "Accept: application/json" \
-        "$url" 2>/dev/null) || return 1
-    fi
+    response=$(curl -s -w "\n%{http_code}" \
+      -X GET \
+      --config <(_gitea_auth_cfg) \
+      -H "Accept: application/json" \
+      "$url" 2>/dev/null) || return 1
 
     local http_code body
     http_code=$(echo "$response" | tail -1)
@@ -2038,10 +2041,7 @@ forge_get_required_status_check_contexts() {
   forge_split_nwo "$nwo"
 
   # Both queries are written as single lines rather than backslash-continued
-  # blocks: `defaults/scripts/lib/` is `contract` in scripts/shell-allowlist.txt,
-  # i.e. inside the portable pool `loom-daemon shell-budget --check` ratchets,
-  # and a continuation line is a code line there. Comments are free, so the
-  # explanation lives here instead of in the invocation.
+  # blocks, so the explanation lives here instead of in the invocation.
   #
   # `--jq` yielding nothing is not an error in either query: `.[]?` over an
   # empty rules array and a `null` branchProtectionRule both mean "this source

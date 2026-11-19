@@ -136,3 +136,15 @@ mod role_invocation_close {
         assert_eq!(pr, None, "an earlier tick's note never describes this one");
     }
 }
+
+#[test]
+fn an_explicit_builder_or_curator_prompt_names_its_issue() {
+    assert_eq!(explicit_issue("builder", "/loom:builder 11982"), Some(11982));
+    assert_eq!(explicit_issue("curator", "/loom:curator #7 extra"), Some(7));
+    assert_eq!(explicit_issue("curator", "/loom:curator"), None);
+    assert_eq!(explicit_issue("judge", "/loom:judge 179"), None);
+    note_prompt("builder", "/loom:builder 9");
+    assert_eq!(take_issue(), Some(9));
+    assert_eq!(take_issue(), None);
+    assert_eq!(take(), None);
+}

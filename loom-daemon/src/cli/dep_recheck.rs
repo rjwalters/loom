@@ -3,14 +3,14 @@
 //! Backs `dep-recheck-fingerprint.sh`, which is now a thin stub that `exec`s
 //! into this. Its subcommands, flags, stdout keys and exit codes are contract:
 //! `curator.md` invokes the stub by path and `eval`s its `KEY=VALUE` output.
-//! What each answers is documented on [`loom_daemon::dep_recheck`].
+//! What each answers is documented on [`crate::dep_recheck`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
 //! reason `RestartArgs` and `DepClassifyCommand` do (#6969): `main.rs` is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen.
 
+use crate::dep_recheck::cli;
 use anyhow::Result;
-use loom_daemon::dep_recheck::cli;
 use std::io::Read as _;
 use std::path::PathBuf;
 

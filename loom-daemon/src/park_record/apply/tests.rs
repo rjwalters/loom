@@ -16,6 +16,8 @@ struct Fake {
     blockers: HashMap<(Option<String>, u64), &'static str>,
     calls: Vec<String>,
     fail_body: bool,
+    fail_label: bool,
+    fail_view: bool,
 }
 
 impl Fake {
@@ -47,6 +49,9 @@ impl Fake {
 impl ParkForge for Fake {
     fn view(&mut self, number: u64) -> Result<IssueState, String> {
         self.calls.push(format!("view {number}"));
+        if self.fail_view {
+            return Err("boom".into());
+        }
         Ok(self.state.clone())
     }
     fn state(&mut self, repo: Option<&str>, number: u64) -> Result<String, String> {
@@ -68,6 +73,9 @@ impl ParkForge for Fake {
     fn add_labels(&mut self, number: u64, labels: &[String]) -> Result<(), String> {
         self.calls
             .push(format!("add_labels {number} {}", labels.join(",")));
+        if self.fail_label {
+            return Err("'loom:blocked' not found".into());
+        }
         self.state.labels.extend(labels.iter().cloned());
         Ok(())
     }
@@ -88,6 +96,9 @@ fn req(blocked_by: &[u64], reason: Option<&str>) -> ApplyRequest {
         at: AT.to_string(),
         remove_labels: vec!["loom:building".to_string()],
         dry_run: false,
+        is_pr: false,
+        transient: None,
+        jitter: 0.0,
     }
 }
 
@@ -151,6 +162,17 @@ fn a_failed_body_write_applies_no_label() {
     assert_eq!(code, exit::FORGE);
     assert_eq!(f.mutations(), vec!["set_body 10"]);
     assert!(err.contains("no label applied"), "{err}");
+}
+
+#[test]
+fn a_failed_label_add_exits_nonzero_after_the_body_with_a_sync_labels_hint() {
+    let mut f = Fake::new("b", &["loom:building"]).blocker(11, "open");
+    f.fail_label = true;
+    let (code, _, err) = run(&mut f, &req(&[11], None));
+    assert_eq!(code, exit::FORGE);
+    assert_eq!(f.mutations(), vec!["set_body 10", "add_labels 10 loom:blocked"]);
+    assert!(f.state.body.contains("loom:park"), "body already written: {}", f.state.body);
+    assert!(err.contains("sync-labels.sh"), "{err}");
 }
 
 #[test]
@@ -349,4 +371,399 @@ fn a_leftover_daemon_hold_record_does_not_swallow_an_operator_park() {
         .filter_map(|r| r.reason)
         .collect();
     assert_eq!(reasons, vec!["insta-crash quarantine", "operator"]);
+}
+
+mod hold_journal {
+    use super::*;
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+
+    fn champion(reason: &str) -> ApplyRequest {
+        ApplyRequest {
+            by: Some("champion".to_string()),
+            is_pr: true,
+            remove_labels: Vec::new(),
+            ..req(&[], Some(reason))
+        }
+    }
+
+    fn holds(f: &mut Fake, r: &ApplyRequest) -> Vec<JournalEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("j.jsonl");
+        set_test_journal(Some(path.clone()));
+        run(f, r);
+        set_test_journal(None);
+        parse(&std::fs::read_to_string(&path).unwrap_or_default())
+            .into_iter()
+            .filter(|e| matches!(e, JournalEntry::Hold { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn a_new_champion_hold_journals_one_add_and_a_reapply_none() {
+        let r = champion("champion merge-risk hold");
+        let mut f = Fake::new("body", &["loom:pr"]);
+        let first = holds(&mut f, &r);
+        assert!(
+            matches!(
+                first.as_slice(),
+                [JournalEntry::Hold { number: 10, transition, reason_code, confirmed: true, .. }]
+                    if transition == "add" && reason_code == "merge-risk-hold"
+            ),
+            "{first:?}"
+        );
+        assert!(holds(&mut f, &r).is_empty(), "label already on: no new transition");
+    }
+
+    #[test]
+    fn the_critical_file_hold_has_its_own_reason_code() {
+        let mut f = Fake::new("body", &[]);
+        let e = holds(&mut f, &champion("champion critical-file hold"));
+        assert!(
+            matches!(
+                e.as_slice(),
+                [JournalEntry::Hold { reason_code, .. }] if reason_code == "critical-file-hold"
+            ),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn a_champion_issue_park_journals_no_hold() {
+        let mut f = Fake::new("body", &[]);
+        let issue = ApplyRequest {
+            is_pr: false,
+            ..champion("champion park")
+        };
+        assert!(holds(&mut f, &issue).is_empty());
+    }
+
+    #[test]
+    fn another_role_or_a_dry_run_journals_nothing() {
+        let mut f = Fake::new("body", &[]);
+        assert!(holds(&mut f, &req(&[], Some("operator"))).is_empty());
+        let dry = ApplyRequest {
+            dry_run: true,
+            ..champion("champion merge-risk hold")
+        };
+        assert!(holds(&mut f, &dry).is_empty());
+    }
+}
+
+mod transient {
+    use super::*;
+    use crate::park_record::{transient_delay_secs, transient_due, Transient, TRANSIENT_CAP_SECS};
+
+    fn treq(at: &str) -> ApplyRequest {
+        ApplyRequest {
+            transient: Some("capacity:batch".to_string()),
+            by: Some("builder".to_string()),
+            at: at.to_string(),
+            ..req(&[], None)
+        }
+    }
+
+    fn last(body: &str) -> Transient {
+        parse(body)
+            .into_iter()
+            .filter_map(|r| r.transient)
+            .next_back()
+            .unwrap()
+    }
+
+    #[test]
+    fn schedule_doubles_from_30_minutes_and_caps_at_24_hours() {
+        let got: Vec<i64> = (1..=8).map(|a| transient_delay_secs(a, 0.0) / 60).collect();
+        assert_eq!(got, vec![30, 60, 120, 240, 480, 960, 1440, 1440]);
+        assert_eq!(transient_delay_secs(40, 1.0), TRANSIENT_CAP_SECS);
+    }
+
+    #[test]
+    fn jitter_stays_within_ten_percent() {
+        assert_eq!(transient_delay_secs(1, 1.0), 1980);
+        assert_eq!(transient_delay_secs(1, -1.0), 1620);
+        assert_eq!(transient_delay_secs(1, 50.0), 1980, "out-of-range jitter is clamped");
+    }
+
+    #[test]
+    fn apply_writes_attempt_and_until_then_increments_after_expiry() {
+        let mut f = Fake::new("Body.", &["loom:building"]);
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        assert_eq!(apply(&mut f, &treq("2026-11-05T12:00:00Z"), &mut o, &mut e), exit::OK);
+        let t = last(&f.state.body);
+        assert_eq!((t.attempt, t.until.as_deref()), (1, Some("2026-11-05T12:30:00Z")));
+        // Re-run while unexpired: body unchanged (idempotent).
+        let before = f.state.body.clone();
+        apply(&mut f, &treq("2026-11-05T12:10:00Z"), &mut o, &mut e);
+        assert_eq!(f.state.body, before);
+        // Re-park after expiry: attempt 2, one hour out.
+        apply(&mut f, &treq("2026-11-05T13:00:00Z"), &mut o, &mut e);
+        let t = last(&f.state.body);
+        assert_eq!((t.attempt, t.until.as_deref()), (2, Some("2026-11-05T14:00:00Z")));
+    }
+
+    #[test]
+    fn another_cause_starts_at_attempt_one() {
+        let body =
+            compose_transient_body("", "capacity:batch", None, "2026-11-05T12:00:00Z", None, 0.0)
+                .unwrap();
+        let body =
+            compose_transient_body(&body, "quota:api", None, "2026-11-05T12:00:00Z", None, 0.0)
+                .unwrap();
+        assert_eq!(last(&body).attempt, 1);
+    }
+
+    fn body_with_attempt5() -> String {
+        render(&ParkRecord {
+            blocker: None,
+            by: None,
+            at: Some("2026-11-05T00:00:00Z".into()),
+            reason: None,
+            transient: Some(Transient {
+                cause: "capacity:batch".into(),
+                attempt: 5,
+                until: Some("2026-11-05T12:00:00Z".into()),
+            }),
+        })
+    }
+
+    #[test]
+    fn stale_chain_resets_attempt() {
+        let out = compose_transient_body(
+            &body_with_attempt5(),
+            "capacity:batch",
+            None,
+            "2026-11-07T00:00:00Z",
+            None,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(last(&out).attempt, 1);
+    }
+
+    #[test]
+    fn live_chain_and_boundary_increment_attempt() {
+        for at in ["2026-11-05T12:00:01Z", "2026-11-06T12:00:00Z"] {
+            let out = compose_transient_body(
+                &body_with_attempt5(),
+                "capacity:batch",
+                None,
+                at,
+                None,
+                0.0,
+            )
+            .unwrap();
+            assert_eq!(last(&out).attempt, 6, "{at}");
+        }
+    }
+
+    #[test]
+    fn missing_until_keeps_incrementing() {
+        let b = body_with_attempt5().replace(" until=2026-11-05T12:00:00Z", "");
+        let out =
+            compose_transient_body(&b, "capacity:batch", None, "2026-12-25T00:00:00Z", None, 0.0)
+                .unwrap();
+        assert_eq!(last(&out).attempt, 6);
+    }
+
+    #[test]
+    fn transient_excludes_blockers_and_needs_a_cause() {
+        let both = ApplyRequest {
+            blocked_by: vec![BlockerRef::local(5)],
+            ..treq(AT)
+        };
+        assert!(precheck(&both).is_some());
+        let empty = ApplyRequest {
+            transient: Some(" ".into()),
+            ..treq(AT)
+        };
+        assert!(precheck(&empty).is_some());
+        assert!(precheck(&treq(AT)).is_none(), "a transient park needs no --reason");
+    }
+
+    #[test]
+    fn due_when_until_passed_missing_or_garbled() {
+        let t = |u: Option<&str>| Transient {
+            cause: "c".into(),
+            attempt: 1,
+            until: u.map(Into::into),
+        };
+        let now = "2026-11-05T12:00:00Z";
+        assert!(transient_due(&t(Some("2026-11-05T11:59:59Z")), now));
+        assert!(!transient_due(&t(Some("2026-11-05T12:00:01Z")), now));
+        assert!(transient_due(&t(None), now));
+        assert!(transient_due(&t(Some("garbage")), now));
+    }
+
+    #[test]
+    fn legacy_parks_parse_without_transient_and_round_trip() {
+        let legacy = "<!-- loom:park Blocked by: #7 by=doctor at=2026-09-19T12:09:00Z -->";
+        assert!(parse(legacy).iter().all(|r| r.transient.is_none()));
+        let body = compose_transient_body("", "capacity:batch", None, AT, None, 0.0).unwrap();
+        assert_eq!(render(&parse(&body)[0]), body.trim());
+    }
+}
+
+// --- retract (#13895) -------------------------------------------------------
+
+use crate::park_record::apply::{compose_retract_body, precheck_retract, retract, RetractRequest};
+
+fn rreq(target: u64, reason: Option<&str>) -> RetractRequest {
+    RetractRequest {
+        number: 10,
+        repo: Some("me/here".to_string()),
+        blocked_by: BlockerRef::local(target),
+        reason: reason.unwrap_or("ruling: not a gate").to_string(),
+        by: Some("guide".to_string()),
+        at: AT.to_string(),
+        dry_run: false,
+    }
+}
+
+fn rrun(f: &mut Fake, r: &RetractRequest) -> (i32, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = retract(f, r, &mut out, &mut err);
+    (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn retract_demotes_the_marker_and_appends_one_audit_line() {
+    let mut f = Fake::new(
+        "Do it.\n\n<!-- loom:park Blocked by: #11 by=builder at=2026-10-01T00:00:00Z -->\n",
+        &["loom:blocked"],
+    );
+    let (code, out, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK, "{err}");
+    assert_eq!(f.mutations(), vec!["set_body 10"], "labels untouched");
+    assert!(out.contains("APPLIED=true"), "{out}");
+    let body = &f.state.body;
+    assert_eq!(park_record_blockers(body), Vec::<BlockerRef>::new(), "{body}");
+    assert!(body.contains("<!-- loom:park Blocked by: #11 by=builder"), "verbatim: {body}");
+    let ws = super::super::withdrawn(body);
+    assert_eq!(ws.len(), 1, "{body}");
+    assert_eq!(ws[0].blocker, BlockerRef::local(11));
+    assert_eq!(ws[0].by.as_deref(), Some("guide"));
+    assert_eq!(ws[0].at.as_deref(), Some(AT));
+    assert_eq!(ws[0].reason.as_deref(), Some("ruling: not a gate"));
+    // The label stays: retract edits the body only.
+    assert_eq!(f.state.labels, vec!["loom:blocked".to_string()]);
+}
+
+#[test]
+fn retract_keeps_the_live_blocker_and_never_splits_a_multi_ref_marker() {
+    let mut f = Fake::new(
+        "<!-- loom:park Blocked by: #11 by=builder -->\n\
+         <!-- loom:park Blocked by: #12 by=curator -->\n",
+        &["loom:blocked"],
+    );
+    let (code, _, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert_eq!(park_record_blockers(&f.state.body), vec![BlockerRef::local(12)]);
+
+    let mut f = Fake::new("<!-- loom:park Blocked by: #11, #12 -->\n", &["loom:blocked"]);
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::REFUSED);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(err.contains("#12"), "{err}");
+    assert_eq!(
+        park_record_blockers(&f.state.body),
+        vec![BlockerRef::local(11), BlockerRef::local(12)]
+    );
+}
+
+#[test]
+fn retract_is_a_noop_without_a_live_marker_or_on_a_rerun() {
+    let mut f = Fake::new("nothing declared\n", &["loom:blocked"]);
+    let (code, out, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(out.contains("BODY_CHANGED=false"), "{out}");
+
+    // Re-running after a successful retract changes nothing.
+    let mut f =
+        Fake::new("Do it.\n\n<!-- loom:park Blocked by: #11 by=builder -->\n", &["loom:blocked"]);
+    assert_eq!(rrun(&mut f, &rreq(11, None)).0, exit::OK);
+    let once = f.state.body.clone();
+    f.calls.clear();
+    let (code, out, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert_eq!(f.state.body, once);
+    assert!(out.contains("BODY_CHANGED=false"), "{out}");
+}
+
+#[test]
+fn a_blank_reason_is_refused_before_any_forge_call() {
+    let mut f = Fake::new("b", &[]);
+    for reason in [Some(""), Some("   ")] {
+        let (code, _, err) = rrun(&mut f, &rreq(11, reason));
+        assert_eq!(code, exit::REFUSED, "{reason:?}");
+        assert!(err.contains("--reason is required"), "{err}");
+        assert!(f.calls.is_empty(), "{:?}", f.calls);
+    }
+    assert!(precheck_retract(&rreq(11, None)).is_none(), "a real reason passes");
+}
+
+#[test]
+fn retract_dry_run_prints_the_body_and_writes_nothing() {
+    let mut f = Fake::new("b\n\n<!-- loom:park Blocked by: #11 -->\n", &["loom:blocked"]);
+    let mut req = rreq(11, None);
+    req.dry_run = true;
+    let (code, out, _) = rrun(&mut f, &req);
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(out.contains("DRY_RUN=true"), "{out}");
+    assert!(out.contains("BODY<<EOF"), "{out}");
+    assert!(out.contains("Park withdrawn: #11"), "{out}");
+}
+
+#[test]
+fn retract_reports_forge_failures() {
+    let mut f = Fake::new("b", &[]);
+    f.fail_view = true;
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::FORGE, "unreadable artifact");
+    assert!(err.contains("could not read #10"), "{err}");
+    assert!(f.mutations().is_empty());
+
+    let mut f = Fake::new("b\n\n<!-- loom:park Blocked by: #11 -->\n", &[]);
+    f.fail_body = true;
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::FORGE);
+    assert!(err.contains("body write to #10 failed"), "{err}");
+}
+
+#[test]
+fn compose_retract_body_shapes() {
+    // A body that is only the marker: no head, no stray blank line.
+    let b = compose_retract_body(
+        "<!-- loom:park Blocked by: #11 by=builder -->\n",
+        &BlockerRef::local(11),
+        Some("guide"),
+        AT,
+        "why",
+    )
+    .unwrap()
+    .unwrap();
+    let marker = "<!-- loom:park Blocked by: #11 by=builder -->";
+    assert_eq!(
+        b,
+        format!("`{marker}`\n\nPark withdrawn: #11 — by=guide at={AT} reason=\"why\"\n")
+    );
+
+    // No live marker: the None of idempotence.
+    assert_eq!(
+        compose_retract_body("b", &BlockerRef::local(11), None, AT, "why").unwrap(),
+        None
+    );
+
+    // Multi-ref: the refusal message names the other refs.
+    let e = compose_retract_body(
+        "<!-- loom:park Blocked by: #11, #12 -->",
+        &BlockerRef::local(11),
+        None,
+        AT,
+        "why",
+    )
+    .unwrap_err();
+    assert!(e.contains("#12"), "{e}");
 }

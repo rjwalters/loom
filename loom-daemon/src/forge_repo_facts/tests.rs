@@ -79,6 +79,39 @@ const CASES: &[Case] = &[
         ambiguous_honour: true,
         ambiguous_ignore: true,
     },
+    // #12630: `gh repo set-default` run in a single-remote checkout pins that
+    // remote to itself. gh can only answer with that remote, so the pin is no
+    // ambiguity (an untargeted read there routes to a reader, never shed).
+    Case {
+        name: "set-default = base on the sole remote",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "base")],
+        env: &[],
+        honour: "acme/app",
+        ignore: "acme/app",
+        ambiguous_honour: false,
+        ambiguous_ignore: false,
+    },
+    Case {
+        name: "set-default = the sole remote's own owner/repo",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "acme/app")],
+        env: &[],
+        honour: "acme/app",
+        ignore: "acme/app",
+        ambiguous_honour: false,
+        ambiguous_ignore: false,
+    },
+    Case {
+        name: "set-default on the sole remote naming another repo",
+        remotes: &[ORIGIN],
+        config: &[("remote.origin.gh-resolved", "pinned/tool")],
+        env: &[],
+        honour: "pinned/tool",
+        ignore: "pinned/tool",
+        ambiguous_honour: true,
+        ambiguous_ignore: true,
+    },
     Case {
         name: "set-default = an explicit owner/repo",
         remotes: &[ORIGIN, ("upstream", "https://github.com/up/app.git")],
@@ -409,6 +442,33 @@ fn a_failed_verify_backs_off_then_retries_once() {
     forge.set("mode", "ok");
     assert!(matches!(canonical_with(&forge.gh, &root, GhRepoEnv::Ignore), Lookup::Fact(_)));
     assert_eq!(forge.repo_reads(), 2, "one retry after it");
+}
+
+/// A failing read says why (stderr's first line), and 404 stays `Gone`.
+#[test]
+#[serial_test::serial(loom_config_env)]
+fn a_failed_verify_carries_its_cause_and_404_stays_gone() {
+    let env = Env::new(&[]);
+    let root = env.repo("r", &[ORIGIN]);
+    let forge = Forge::new(env.tmp.path(), "acme/app");
+    let b = base(&root, GhRepoEnv::Ignore);
+
+    forge.set("mode", "fail");
+    std::env::set_var("LOOM_GH_BIN", &forge.gh);
+    let failed = super::record::verify(&forge.gh, &root, &b, None, "test.verify");
+    forge.set("mode", "404");
+    advance_test_clock(SUSPECT_BACKOFF_SECS + 1);
+    let gone = super::record::verify(&forge.gh, &root, &b, None, "test.verify");
+    std::env::remove_var("LOOM_GH_BIN");
+
+    match failed {
+        Err(super::record::VerifyFailure::Failed(cause)) => {
+            assert!(cause.contains("boom"), "{cause}");
+            assert!(!cause.contains('\n'));
+        }
+        other => panic!("expected Failed with a cause, got {other:?}"),
+    }
+    assert_eq!(gone.unwrap_err(), super::record::VerifyFailure::Gone);
 }
 
 /// The cross-check runs the command each rule replaced: the placeholder with

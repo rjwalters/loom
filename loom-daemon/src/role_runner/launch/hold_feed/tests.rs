@@ -1,7 +1,8 @@
 //! #11453 end to end: deterministic launch failures trip the **tap**, never
 //! the role.
 //!
-//! Drives the real tick loop ([`spawn_role_task`]) over the real
+//! Drives the production multi-workspace tick loop through its runner seam
+//! ([`crate::role_runner::spawn_multi_role_task_with`], #13832) over the real
 //! [`ScriptRoleInvocationRunner`]: runtime preflight, the ordered preference
 //! walk, admission, the spawn, the toolless verdict (#8448) and this module's
 //! feed. The workspace's Doctor prefers `opencode:zai-flash` over `claude`,
@@ -12,13 +13,13 @@
 //! The #6201 tests in `role_runner/tests.rs` are deliberately untouched: they
 //! drive a `FakeRunner` that bypasses the walk and the launch path, so the
 //! hold cannot reach them. This is their sibling for the path that does.
+use crate::exec_test_support::write_executable;
 use crate::role_runner::{
-    new_in_progress_guard, spawn_role_task, RoleInvocationRunner, RoleSpec, RoleTickOutcome,
-    ScriptRoleInvocationRunner,
+    new_in_progress_guard, spawn_multi_role_task_with, RoleInvocationRunner, RoleSpec,
+    RoleTickOutcome, ScriptRoleInvocationRunner,
 };
 use crate::runtime_preference::launch_failure_hold;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,9 +78,55 @@ impl Drop for Env {
     }
 }
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+/// The production loop's process-global redirects, held for the guard's
+/// lifetime (#13832): an empty workspace registry (so `effective_roots`
+/// reduces to the single `fallback_root` — this workspace), a scratch
+/// auto-update state dir (the rotation cursor), and `LOOM_GH_BIN` pointed
+/// at the fixture's fake `gh`, so the doctor queue gate's probe fails fast
+/// and dispatches fail-open instead of reaching the real forge. Callers
+/// must be `#[serial]` with the other tests that set these.
+struct LoopIsolation {
+    _scratch: tempfile::TempDir,
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl LoopIsolation {
+    fn new(gh_bin: &Path) -> Self {
+        let scratch = tempfile::tempdir().unwrap();
+        let keys: [(&'static str, std::path::PathBuf); 3] = [
+            (
+                crate::workspace_registry::REGISTRY_PATH_ENV,
+                scratch.path().join("workspaces.json"),
+            ),
+            (crate::auto_update::AUTO_UPDATE_STATE_DIR_ENV, scratch.path().join("state")),
+            // The queue gate resolves its `gh` through `LOOM_GH_BIN`
+            // (`concurrent_dispatch::gate_gh_bin`).
+            ("LOOM_GH_BIN", gh_bin.to_path_buf()),
+        ];
+        let prior = keys
+            .iter()
+            .map(|(key, value)| {
+                let prior = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (*key, prior)
+            })
+            .collect();
+        Self {
+            _scratch: scratch,
+            prior,
+        }
+    }
+}
+
+impl Drop for LoopIsolation {
+    fn drop(&mut self) {
+        for (key, value) in self.prior.drain(..) {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
 }
 
 /// The bundled role/runtime manifests, an enabled `zai` seat,
@@ -107,7 +154,7 @@ fn doctor_workspace_with(root: &Path, opencode_output: &str) {
     let launches = root.join("launches");
     write_executable(
         &scripts.join("spawn-worker.sh"),
-        &format!(
+        format!(
             "#!/bin/sh\necho \"$LOOM_RUNTIME\" >> '{}'\n\
              if [ \"$LOOM_RUNTIME\" = opencode ]; then printf '%s\\n' '{opencode_output}'; fi\n\
              exit 0\n",
@@ -121,7 +168,14 @@ fn doctor_workspace_with(root: &Path, opencode_output: &str) {
     let list = serde_json::json!([{"runtime": "opencode", "modelProfile": "zai-flash"}, "claude"]);
     fs::write(
         root.join(".loom/config.json"),
-        serde_json::json!({"runtimes": {"rolePreference": {"doctor": list}}}).to_string(),
+        serde_json::json!({
+            "runtimes": {"rolePreference": {"doctor": list}},
+            // The production loop's per-root gate: without this, every
+            // doctor tick skips as "disabled" and the drive below would
+            // never launch anything (#4377).
+            "autonomous": {"roleRunner": {"enabled": true}}
+        })
+        .to_string(),
     )
     .unwrap();
 }
@@ -137,6 +191,9 @@ struct Recording {
     inner: ScriptRoleInvocationRunner,
     calls: Arc<AtomicUsize>,
     ticks: Ticks,
+    /// The role-draw attempt counter right after each tick (#11782).
+    attempts: Arc<Mutex<Vec<u32>>>,
+    root: std::path::PathBuf,
     limit: usize,
 }
 
@@ -156,6 +213,10 @@ impl RoleInvocationRunner for Recording {
             .lock()
             .unwrap()
             .push((outcome.clone(), tap, marker));
+        self.attempts
+            .lock()
+            .unwrap()
+            .push(crate::runtime_preference::role_draw::attempts::current(&self.root, role));
         self.calls.fetch_add(1, Ordering::SeqCst);
         outcome
     }
@@ -163,25 +224,36 @@ impl RoleInvocationRunner for Recording {
 
 async fn drive_four_ticks(
     opencode_output: &str,
-) -> (tempfile::TempDir, Vec<(RoleTickOutcome, Option<String>, String)>) {
+) -> (tempfile::TempDir, Vec<(RoleTickOutcome, Option<String>, String)>, Vec<u32>) {
     let _env = Env::new();
     let workspace = tempfile::tempdir().unwrap();
     doctor_workspace_with(workspace.path(), opencode_output);
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let _loop = LoopIsolation::new(&ws.gh);
     // A registered root is a git checkout, which refuses an in-tree token
     // pool (#9135): Claude's account lives in the shared pool, as it does on
     // a real host.
     let _claude = crate::write_scope_test_support::SharedTokenPool::one_account();
     let calls = Arc::new(AtomicUsize::new(0));
     let ticks: Ticks = Arc::default();
-    let runner = Recording {
-        inner: ScriptRoleInvocationRunner::new(workspace.path().to_path_buf())
-            .with_timeout(Duration::from_secs(60))
-            .with_load_per_core_override(0.0)
-            .with_gh_bin(ws.gh.clone()),
-        calls: calls.clone(),
-        ticks: ticks.clone(),
-        limit: 4,
+    let attempts: Arc<Mutex<Vec<u32>>> = Arc::default();
+    crate::runtime_preference::role_draw::attempts::reset_for_tests();
+    let factory: crate::role_runner::concurrent_dispatch::RunnerFactory = {
+        let (root, gh_bin) = (workspace.path().to_path_buf(), ws.gh.clone());
+        let (calls, ticks, attempts) = (calls.clone(), ticks.clone(), attempts.clone());
+        Arc::new(move |task_root| {
+            Box::new(Recording {
+                inner: ScriptRoleInvocationRunner::new(task_root.clone())
+                    .with_timeout(Duration::from_secs(60))
+                    .with_load_per_core_override(0.0)
+                    .with_gh_bin(gh_bin.clone()),
+                calls: calls.clone(),
+                ticks: ticks.clone(),
+                attempts: attempts.clone(),
+                root: root.clone(),
+                limit: 4,
+            })
+        })
     };
     let spec = RoleSpec {
         name: "doctor",
@@ -189,13 +261,14 @@ async fn drive_four_ticks(
         default_interval_secs: 1,
         interval_default: true,
     };
-    let handle = spawn_role_task(
-        runner,
+    let handle = spawn_multi_role_task_with(
         spec,
+        workspace.path().to_path_buf(),
         Duration::from_millis(20),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        workspace.path().to_path_buf(),
         new_in_progress_guard(),
+        None,
+        factory,
     );
     let deadline = Instant::now() + Duration::from_secs(60);
     while calls.load(Ordering::SeqCst) < 4 {
@@ -210,13 +283,14 @@ async fn drive_four_ticks(
     handle.abort();
 
     let ticks = ticks.lock().unwrap().clone();
-    (workspace, ticks)
+    let attempts = attempts.lock().unwrap().clone();
+    (workspace, ticks, attempts)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn deterministic_launch_failures_trip_the_tap_not_the_role() {
-    let (workspace, ticks) = drive_four_ticks(TOOLLESS_STREAM).await;
+    let (workspace, ticks, _) = drive_four_ticks(TOOLLESS_STREAM).await;
     // N = 2 toolless launches on the preferred tap...
     for (outcome, tap, _) in &ticks[..2] {
         assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
@@ -250,7 +324,11 @@ const HOOK_DENIED_STREAM: &str = "exec\n/bin/bash -lc 'cat SKILL.md' in /w\n exi
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn a_hook_denied_run_falls_back_to_the_next_runtime() {
-    let (workspace, ticks) = drive_four_ticks(HOOK_DENIED_STREAM).await;
+    let (workspace, ticks, attempts) = drive_four_ticks(HOOK_DENIED_STREAM).await;
+    // #11782: the two hook-denied exits (child exit 0) reach
+    // `attempts::record_failure` through `HoldFeed::failure` — attempt 2, then
+    // 3 — and the first success on the fallback resets to attempt 1.
+    assert_eq!(attempts, [2, 3, 1, 1], "{ticks:?}");
     for (outcome, tap, _) in &ticks[..2] {
         assert_eq!(tap.as_deref(), Some("opencode:zai-flash"), "{ticks:?}");
         let RoleTickOutcome::Failure(detail) = outcome else {

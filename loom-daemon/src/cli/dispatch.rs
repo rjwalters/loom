@@ -5,8 +5,8 @@ use serde::Deserialize;
 use std::path::Path;
 use std::path::PathBuf;
 
-use loom_daemon::sweep_registry;
-use loom_daemon::types::{Request, Response, SweepKind};
+use crate::sweep_registry;
+use crate::types::{Request, Response, SweepKind};
 
 use super::common::{query_daemon_bounded, resolve_dispatch_ack_timeout, resolve_socket_path};
 
@@ -15,7 +15,6 @@ use super::common::{query_daemon_bounded, resolve_dispatch_ack_timeout, resolve_
 /// (`--workspace`/`--model`/`--effort`/`--depends-on`) is unit-testable without
 /// a socket. Mirrors the field mapping the `mcp__loom__dispatch_sweep` tool uses
 /// so both operator surfaces enqueue byte-for-byte-equivalent requests.
-#[cfg(test)]
 fn build_dispatch_request(
     issue: u32,
     workspace: Option<String>,
@@ -23,22 +22,6 @@ fn build_dispatch_request(
     effort: Option<String>,
     depends_on: Option<u32>,
     force: bool,
-) -> Request {
-    build_dispatch_request_with_tap(issue, workspace, model, effort, depends_on, force, None, None)
-}
-
-/// [`build_dispatch_request`] plus the optional per-dispatch `runtime` /
-/// `modelProfile` tap for the Builder and Doctor phases (#11284).
-#[allow(clippy::too_many_arguments)]
-fn build_dispatch_request_with_tap(
-    issue: u32,
-    workspace: Option<String>,
-    model: Option<String>,
-    effort: Option<String>,
-    depends_on: Option<u32>,
-    force: bool,
-    runtime: Option<String>,
-    model_profile: Option<String>,
 ) -> Request {
     Request::DispatchSweep {
         kind: SweepKind::Issue(issue),
@@ -52,11 +35,9 @@ fn build_dispatch_request_with_tap(
         // Host-distress circuit-breaker override (#4235): default false, so a
         // tripped breaker refuses the dispatch unless the operator passes --force.
         force,
-        runtime,
-        model_profile,
         // #11444: a human ran `loom-daemon dispatch`. The daemon records an
         // absent origin as `unknown`, so the CLI must say so explicitly.
-        dispatch_origin: Some(loom_daemon::telemetry::DispatchOrigin::Operator),
+        dispatch_origin: Some(crate::telemetry::DispatchOrigin::Operator),
     }
 }
 
@@ -84,17 +65,17 @@ fn build_dispatch_request_with_tap(
 pub(crate) fn resolve_cli_dispatch_workspace(
     explicit: Option<String>,
     cwd: &Path,
-    registry: &loom_daemon::workspace_registry::WorkspaceRegistry,
+    registry: &crate::workspace_registry::WorkspaceRegistry,
 ) -> Option<String> {
     explicit.or_else(|| {
-        loom_daemon::workspace_registry::resolve_client_workspace_default(cwd, registry)
+        crate::workspace_registry::resolve_client_workspace_default(cwd, registry)
             .map(|root| root.to_string_lossy().into_owned())
     })
 }
 
 /// The `gh issue view --json labels,body` response shape this pre-check
 /// needs — a subset of the full listing schema, deserialized directly rather
-/// than through [`loom_daemon::forge_listing`] since this is a one-off
+/// than through [`crate::forge_listing`] since this is a one-off
 /// single-issue fetch, not a cached multi-issue listing.
 #[derive(Debug, Deserialize)]
 struct GhIssueLabel {
@@ -119,7 +100,7 @@ struct GhIssueLabelsAndBody {
 /// not run this time" and proceeds, exactly as it would with
 /// `--ignore-host-constraint`.
 fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, Option<String>)> {
-    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // #10089: through the facade (counted, bounded, and run under `root`'s
     // owner credential).
     let op = Operation::new("dispatch.host_check");
@@ -145,7 +126,7 @@ fn fetch_issue_for_host_check(root: &Path, issue: u32) -> Option<(Vec<String>, O
 /// Pure and side-effect-free — takes the already-fetched labels/body rather
 /// than calling `gh` itself, so it is unit-testable without a subprocess.
 /// Mirrors [`crate::work_finder`]'s AC1/AC2 skip decision exactly (same
-/// [`loom_daemon::host_affinity::host_constraint`] call), but renders an
+/// [`crate::host_affinity::host_constraint`] call), but renders an
 /// operator-facing refusal message instead of a silent tick-log skip, since
 /// this is an explicit command the operator is waiting on.
 fn host_constraint_refusal(
@@ -154,7 +135,7 @@ fn host_constraint_refusal(
     body: Option<&str>,
     current_host_id: &str,
 ) -> Option<String> {
-    let constraint = loom_daemon::host_affinity::host_constraint(labels, body);
+    let constraint = crate::host_affinity::host_constraint(labels, body);
     if constraint.matches(current_host_id) {
         return None;
     }
@@ -163,21 +144,6 @@ fn host_constraint_refusal(
          Re-run with --ignore-host-constraint to dispatch anyway.",
         constraint.describe(),
     ))
-}
-
-/// Per-dispatch runtime tap flags for `loom-daemon dispatch` (#11284), kept here
-/// (flattened into `Commands::Dispatch`) so `main.rs` does not grow.
-#[derive(clap::Args, Debug, Clone, Default)]
-pub(crate) struct DispatchTapArgs {
-    /// Run the sweep's Builder and Doctor phases on this runtime (#11284),
-    /// e.g. `opencode`. An unavailable or unadmitted runtime is refused,
-    /// never silently replaced. Curator/Judge keep their role policy.
-    #[arg(long, value_name = "RUNTIME")]
-    pub(crate) runtime: Option<String>,
-
-    /// Model profile for `--runtime` (e.g. `zai-flash`). Requires `--runtime`.
-    #[arg(long, value_name = "PROFILE", requires = "runtime")]
-    pub(crate) model_profile: Option<String>,
 }
 
 /// Handle the `dispatch` subcommand (Issue #3952). Connects to the running
@@ -196,15 +162,12 @@ pub(crate) struct DispatchTapArgs {
 /// [`fetch_issue_for_host_check`]) and refuses the dispatch with a clear
 /// message when it declares a `loom:host:<id>` / `<!--
 /// loom:requires-host=<id> -->` constraint that does not name this host
-/// ([`loom_daemon::sweep_registry::host_identity`]) — the explicit-operator
+/// ([`crate::sweep_registry::host_identity`]) — the explicit-operator
 /// AC3 fix, mirroring the work-finder's own AC1/AC2 autonomous skip. This
 /// happens entirely client-side, before the socket round-trip: the CLI
 /// process and the daemon it talks to over a Unix socket always share one
 /// host identity, so there is no protocol change to make here.
-#[allow(clippy::too_many_arguments)] // one flag per independent CLI override
-                                     // (`--force`, `--ignore-host-constraint`, `--runtime`,
-                                     // `--model-profile`)
-pub(crate) async fn handle_dispatch_command(
+pub async fn handle_dispatch_command(
     issue: u32,
     workspace: Option<String>,
     model: Option<String>,
@@ -212,20 +175,9 @@ pub(crate) async fn handle_dispatch_command(
     depends_on: Option<u32>,
     force: bool,
     ignore_host_constraint: bool,
-    runtime: Option<String>,
-    model_profile: Option<String>,
 ) -> Result<()> {
-    // Fail fast, client-side, on a malformed runtime/modelProfile (#11284).
-    if let Err(message) = loom_daemon::runtime_preference::explicit_tap::parse_explicit_tap(
-        runtime.as_deref(),
-        model_profile.as_deref(),
-    ) {
-        eprintln!("loom-daemon dispatch: {message}");
-        std::process::exit(2);
-    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let registry =
-        loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
 
     if !ignore_host_constraint {
@@ -249,16 +201,7 @@ pub(crate) async fn handle_dispatch_command(
     }
 
     let socket_path = resolve_socket_path()?;
-    let request = build_dispatch_request_with_tap(
-        issue,
-        workspace,
-        model,
-        effort,
-        depends_on,
-        force,
-        runtime,
-        model_profile,
-    );
+    let request = build_dispatch_request(issue, workspace, model, effort, depends_on, force);
     let ack_timeout = resolve_dispatch_ack_timeout();
 
     match query_daemon_bounded(&socket_path, &request, ack_timeout).await {
@@ -301,7 +244,7 @@ pub(crate) async fn handle_dispatch_command(
         // daemon error (mirroring check-runtime-capabilities.sh's exit codes).
         Ok(Response::RuntimeRejected(rejection)) => {
             eprintln!("{}", rejection.diagnostic());
-            std::process::exit(loom_daemon::runtime_admission::EX_CONFIG);
+            std::process::exit(crate::runtime_admission::EX_CONFIG);
         }
         Ok(other) => {
             eprintln!("Unexpected response from daemon: {other:?}");
@@ -326,45 +269,16 @@ mod dispatch_tests {
     //! plumbing into the `DispatchSweep` IPC request, a successful round-trip
     //! against a fake daemon, and the bounded-timeout path against a
     //! deliberately-unresponsive socket (the #3945 wedge must never hang).
-    use super::{
-        build_dispatch_request, build_dispatch_request_with_tap, host_constraint_refusal,
-        resolve_cli_dispatch_workspace,
-    };
+    use super::{build_dispatch_request, host_constraint_refusal, resolve_cli_dispatch_workspace};
     use crate::cli::common::{
         query_daemon_bounded, resolve_dispatch_ack_timeout, DAEMON_IPC_TIMEOUT_ENV,
         DISPATCH_ACK_TIMEOUT,
     };
-    use loom_daemon::types::{Request, Response, SweepKind};
+    use crate::types::{Request, Response, SweepKind};
     use serial_test::serial;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
-
-    /// #11284: `--runtime` / `--model-profile` reach the request.
-    #[test]
-    fn build_dispatch_request_plumbs_runtime_and_profile() {
-        let request = build_dispatch_request_with_tap(
-            7,
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some("opencode".into()),
-            Some("zai-flash".into()),
-        );
-        match request {
-            Request::DispatchSweep {
-                runtime,
-                model_profile,
-                ..
-            } => {
-                assert_eq!(runtime.as_deref(), Some("opencode"));
-                assert_eq!(model_profile.as_deref(), Some("zai-flash"));
-            }
-            other => panic!("expected DispatchSweep, got {other:?}"),
-        }
-    }
 
     /// `build_dispatch_request` maps every flag into the right `DispatchSweep`
     /// field — the core plumbing acceptance criterion.
@@ -387,15 +301,13 @@ mod dispatch_tests {
                 depends_on,
                 workspace_root,
                 force,
-                runtime: _,
-                model_profile: _,
                 dispatch_origin,
             } => {
                 assert_eq!(kind, SweepKind::Issue(3952));
                 assert_eq!(idempotency_key, None);
                 assert_eq!(
                     dispatch_origin,
-                    Some(loom_daemon::telemetry::DispatchOrigin::Operator),
+                    Some(crate::telemetry::DispatchOrigin::Operator),
                     "the operator CLI must name its origin (#11444)"
                 );
                 assert_eq!(model.as_deref(), Some("sonnet"));
@@ -439,7 +351,7 @@ mod dispatch_tests {
     /// An explicit `--workspace` always wins, regardless of cwd/registry state.
     #[test]
     fn resolve_cli_dispatch_workspace_explicit_always_wins() {
-        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let registry = crate::workspace_registry::WorkspaceRegistry::default();
         let resolved = resolve_cli_dispatch_workspace(
             Some("/explicit/repo".to_string()),
             std::path::Path::new("/somewhere/else"),
@@ -457,7 +369,7 @@ mod dispatch_tests {
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
 
-        let mut registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let mut registry = crate::workspace_registry::WorkspaceRegistry::default();
         registry.add(&repo, None).unwrap();
 
         let canonical_repo = std::fs::canonicalize(&repo).unwrap();
@@ -470,7 +382,7 @@ mod dispatch_tests {
     #[test]
     fn resolve_cli_dispatch_workspace_none_when_cwd_unregistered() {
         let dir = tempfile::tempdir().unwrap();
-        let registry = loom_daemon::workspace_registry::WorkspaceRegistry::default();
+        let registry = crate::workspace_registry::WorkspaceRegistry::default();
         let resolved = resolve_cli_dispatch_workspace(None, dir.path(), &registry);
         assert_eq!(resolved, None);
     }
@@ -613,14 +525,14 @@ mod dispatch_tests {
             let (reader, mut writer) = stream.into_split();
             let mut lines = BufReader::new(reader).lines();
             let _ = lines.next_line().await.expect("read").expect("line");
-            let response =
-                Response::RuntimeRejected(loom_daemon::runtime_admission::RuntimeRejection {
-                    role: "sweep-lifecycle".to_string(),
-                    runtime: "codex".to_string(),
-                    source: loom_daemon::runtime_admission::RuntimeSource::DefaultConfig,
-                    unmet_capabilities: vec!["worktreeIsolation".to_string()],
-                    reason: "unmet capabilities: worktreeIsolation".to_string(),
-                });
+            let response = Response::RuntimeRejected(crate::runtime_admission::RuntimeRejection {
+                role: "sweep-lifecycle".to_string(),
+                runtime: "codex".to_string(),
+                source: crate::runtime_admission::RuntimeSource::DefaultConfig,
+                unmet_capabilities: vec!["worktreeIsolation".to_string()],
+                reason: "unmet capabilities: worktreeIsolation".to_string(),
+                exhausted_summary_line: None,
+            });
             let json = serde_json::to_string(&response).expect("serialize");
             writer.write_all(json.as_bytes()).await.expect("write");
             writer.write_all(b"\n").await.expect("newline");
@@ -651,7 +563,7 @@ mod dispatch_tests {
         }
         // ...and the CLI's refusal exit code stays distinguishable from a
         // generic daemon error (EX_CONFIG, as the shell checker uses).
-        assert_eq!(loom_daemon::runtime_admission::EX_CONFIG, 78);
+        assert_eq!(crate::runtime_admission::EX_CONFIG, 78);
 
         server.await.expect("server task");
     }

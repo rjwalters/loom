@@ -41,17 +41,9 @@ WS_FIXTURE_DIR="$(mktemp -d)"
 write_scope_register "$WS_FIXTURE_DIR" owner/repo
 cd "$WS_FIXTURE_DIR"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$SCRIPT_DIR/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
+# Local assert_grep kept: fixed-string (-F) match; shared assert_grep is -E (#13258).
 assert_grep() {
     local pattern="$1" file="$2" msg="$3"
     if grep -qF "$pattern" "$file"; then pass "$msg"; else fail "$msg (pattern: $pattern)"; fi

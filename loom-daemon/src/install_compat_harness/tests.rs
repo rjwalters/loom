@@ -9,7 +9,7 @@
 //! (the download is a closure too).
 
 use super::*;
-use std::process::Command;
+use crate::test_git_helpers::run as git;
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
@@ -164,16 +164,6 @@ fn lookups_are_capped() {
 }
 
 // ---- end to end through `run`, no forge, no probe ----
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-}
 
 /// A checkout at `version` with release tags `release_tags` and a `defaults/`
 /// holding no shell, so neither direction runs the detector or a daemon.

@@ -27,18 +27,10 @@ pub enum QueueDisposition {
     InFlight,
     /// Waiting: the shared concurrency cap was full.
     DeferredCapacity,
-    /// Waiting: the per-tick admission ramp cap was reached.
-    DeferredRampCap,
-    /// Waiting: the saturation admission brake held new admissions.
-    DeferredSaturation,
     /// Waiting: the build back-off (#9410) held new issue builds because the
     /// host's review + merge debt is high. A verified red-main fix bypasses
     /// it, so this row is never one.
     DeferredBuildBackoff,
-    /// Waiting: its own repo already held `maxConcurrentPerRepo` of the shared
-    /// concurrency budget's slots (#9090). The machine-level cap was NOT full;
-    /// the slot went to another repo's candidate in the same tick.
-    DeferredRepoCap,
     /// Waiting: its `## Affected Files` overlap a same-repo candidate admitted
     /// earlier this tick (or an in-flight one); the row's `detail` names the
     /// shared paths (#9781). A scheduling signal only.
@@ -46,7 +38,7 @@ pub enum QueueDisposition {
     /// Blocked: the work finder is holding dispatch for its whole repo. The
     /// hold has several possible causes (verified-red `main`, a main-health
     /// gate still running, a pre-flight advisory hold, an unusable token pool,
-    /// a scheduled drain, the host-distress breaker); the row's `detail`
+    /// a scheduled drain); the row's `detail`
     /// names which one, as a closed-vocabulary token from
     /// `work_finder::halt_cause` (#9017) — absent on rows recorded by a
     /// cause-less legacy caller.
@@ -73,8 +65,10 @@ pub enum QueueDisposition {
     Declined,
     /// Waiting: a previous dispatch produced no PR; its retry window is open.
     PrlessRetry,
-    /// Held elsewhere: a peer host advertised a live soft claim.
-    PeerClaim,
+    /// Held elsewhere: another host's or sweep's claim holds it — a live lease,
+    /// a captain assignment, or a merge in flight. (Named for the retired
+    /// safehouse peer-claim channel until #13945.)
+    LeaseHeld,
     /// Blocked: it already has an open linked PR.
     OpenPr,
     /// The dispatch attempt failed.
@@ -91,7 +85,9 @@ pub enum QueueDisposition {
     LabelledBlocked,
     /// A disposition this client does not know (forward compatibility). This
     /// includes `deferred_out_of_slice`, retired with the dispatch slice
-    /// (#11682) and never emitted since.
+    /// (#11682), and `deferred_ramp_cap`, `deferred_saturation` and
+    /// `deferred_repo_cap`, retired with those caps (#12406); none is emitted
+    /// any more.
     #[serde(other)]
     Unknown,
 }
@@ -101,14 +97,11 @@ impl QueueDisposition {
     /// ([`Self::LabelledBlocked`] and [`Self::Unknown`] excluded). The queue-depth metrics (Issue #8852, phase 2) emit one
     /// point per entry every tick, zeros included, so an empty queue reads as
     /// `0` rather than as a missing series.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 22] = [
         Self::Dispatched,
         Self::InFlight,
         Self::DeferredCapacity,
-        Self::DeferredRampCap,
-        Self::DeferredSaturation,
         Self::DeferredBuildBackoff,
-        Self::DeferredRepoCap,
         Self::DeferredFileOverlap,
         Self::WorkspaceHalted,
         Self::WorkspaceCommandsMissing,
@@ -122,7 +115,7 @@ impl QueueDisposition {
         Self::NoopCooldown,
         Self::Declined,
         Self::PrlessRetry,
-        Self::PeerClaim,
+        Self::LeaseHeld,
         Self::OpenPr,
         Self::DispatchError,
         Self::AlreadyLanded,
@@ -137,10 +130,7 @@ impl QueueDisposition {
             Self::Dispatched => "dispatched",
             Self::InFlight => "in_flight",
             Self::DeferredCapacity => "deferred_capacity",
-            Self::DeferredRampCap => "deferred_ramp_cap",
-            Self::DeferredSaturation => "deferred_saturation",
             Self::DeferredBuildBackoff => "deferred_build_backoff",
-            Self::DeferredRepoCap => "deferred_repo_cap",
             Self::DeferredFileOverlap => "deferred_file_overlap",
             Self::WorkspaceHalted => "workspace_halted",
             Self::WorkspaceCommandsMissing => "workspace_commands_missing",
@@ -154,7 +144,7 @@ impl QueueDisposition {
             Self::NoopCooldown => "noop_cooldown",
             Self::Declined => "declined",
             Self::PrlessRetry => "prless_retry",
-            Self::PeerClaim => "peer_claim",
+            Self::LeaseHeld => "lease_held",
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
             Self::AlreadyLanded => "already_landed",
@@ -171,12 +161,9 @@ impl QueueDisposition {
     pub fn state(self) -> &'static str {
         match self {
             Self::Dispatched | Self::InFlight => "running",
-            Self::DeferredCapacity
-            | Self::DeferredRampCap
-            | Self::DeferredSaturation
-            | Self::DeferredBuildBackoff
-            | Self::DeferredRepoCap
-            | Self::DeferredFileOverlap => "ready",
+            Self::DeferredCapacity | Self::DeferredBuildBackoff | Self::DeferredFileOverlap => {
+                "ready"
+            }
             _ => "blocked",
         }
     }
@@ -188,13 +175,10 @@ impl QueueDisposition {
             Self::Dispatched => "dispatched this tick",
             Self::InFlight => "sweep already running",
             Self::DeferredCapacity => "waiting: concurrency cap full",
-            Self::DeferredRampCap => "waiting: per-tick admission cap reached",
-            Self::DeferredSaturation => "waiting: host saturated (admission brake)",
             Self::DeferredBuildBackoff => "waiting: build back-off (review/merge debt high)",
-            Self::DeferredRepoCap => "waiting: this repo is at its per-repo cap",
             Self::DeferredFileOverlap => "waiting: affected files overlap in-flight work",
             Self::WorkspaceHalted => {
-                "blocked: repo dispatch held (red main, gate, token pool, drain or breaker)"
+                "blocked: repo dispatch held (red main, gate, token pool or drain)"
             }
             Self::WorkspaceCommandsMissing => "blocked: workspace missing sweep command",
             Self::HostConstraint => "not for this host (host affinity)",
@@ -207,7 +191,7 @@ impl QueueDisposition {
             Self::NoopCooldown => "waiting: no-op release cooldown",
             Self::Declined => "blocked: declined, cooldown active",
             Self::PrlessRetry => "waiting: last run produced no PR",
-            Self::PeerClaim => "held by a peer host",
+            Self::LeaseHeld => "held by another claim (lease or captain order)",
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
             Self::AlreadyLanded => "skipped: work already landed",
@@ -329,7 +313,7 @@ mod tests {
                 "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
                 "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
                 "skipped_quarantined": 0, "skipped_pr_open": 0,
-                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "skipped_backoff": 0,
                 "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
                 "halted": false
             }))
@@ -339,8 +323,11 @@ mod tests {
 
     #[test]
     fn dispositions_serialize_snake_case_and_classify() {
-        let json = serde_json::to_string(&QueueDisposition::DeferredRampCap).unwrap();
-        assert_eq!(json, "\"deferred_ramp_cap\"");
+        let json = serde_json::to_string(&QueueDisposition::DeferredBuildBackoff).unwrap();
+        assert_eq!(json, "\"deferred_build_backoff\"");
+        // A retired disposition (#12406) parses as unknown.
+        let old: QueueDisposition = serde_json::from_str("\"deferred_ramp_cap\"").unwrap();
+        assert_eq!(old, QueueDisposition::Unknown);
         assert_eq!(QueueDisposition::Dispatched.state(), "running");
         assert_eq!(QueueDisposition::DeferredCapacity.state(), "ready");
         assert_eq!(QueueDisposition::OpenPr.state(), "blocked");
@@ -351,7 +338,7 @@ mod tests {
     #[test]
     fn build_backoff_disposition_round_trips_and_old_summaries_parse() {
         let d = QueueDisposition::DeferredBuildBackoff;
-        assert_eq!(QueueDisposition::ALL.len(), 25);
+        assert_eq!(QueueDisposition::ALL.len(), 22);
         assert!(QueueDisposition::ALL.contains(&d));
         let json = serde_json::to_value(d).unwrap();
         assert_eq!(json, serde_json::json!("deferred_build_backoff"));
@@ -366,7 +353,7 @@ mod tests {
                 "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
                 "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
                 "skipped_quarantined": 0, "skipped_pr_open": 0,
-                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "skipped_backoff": 0,
                 "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
                 "halted": false, "saturation_held": true
             }))

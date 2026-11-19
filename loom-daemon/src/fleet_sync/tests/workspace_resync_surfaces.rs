@@ -101,3 +101,58 @@ fn a_release_that_changes_no_surface_makes_no_claim_and_no_commit() {
     assert!(fx.forge.calls.borrow().is_empty(), "no claim was asked for");
     assert!(host.resync_worktrees().is_empty());
 }
+
+/// miniset's layout (#11426): `.claude/commands` and `.claude/skills` are
+/// committed as symlinks into `.agents/`. Loom's commands root is resynced at
+/// the real path the link resolves to, so the role prompts stay current, the
+/// commit stages only real paths (no "beyond a symbolic link"), and the links
+/// themselves are left alone.
+#[test]
+fn a_repo_with_symlinked_claude_commands_and_skills_resyncs_once() {
+    let fx = Fixture::new(Seed {
+        current: false,
+        ..CURRENT
+    });
+    let defaults = skilled_defaults(&fx);
+    fx.push_from_seed("link the claude surfaces into .agents", |seed| {
+        let _ = fs::remove_dir_all(seed.join(".claude/commands"));
+        let _ = fs::remove_dir_all(seed.join(".claude/skills"));
+        write(&seed.join(".agents/commands/keep.md"), "theirs\n");
+        write(&seed.join(".agents/skills/keep.md"), "theirs\n");
+        std::os::unix::fs::symlink("../.agents/commands", seed.join(".claude/commands")).unwrap();
+        std::os::unix::fs::symlink("../.agents/skills", seed.join(".claude/skills")).unwrap();
+    });
+    let commits = fx.origin_commits();
+
+    let host = Host::running(&fx, "host-a", RUNNING, defaults);
+    let pass = host.pass();
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W0, "{report:?}");
+    assert_eq!(fx.origin_commits(), commits + 1, "one resync commit");
+    // The role prompt is written at the real path, in the resync commit.
+    assert_eq!(fx.origin_file(".agents/commands/loom/builder.md"), "cmd");
+    let changed = git(&fx.origin, &["show", "--name-only", "--format=", "refs/heads/main"]);
+    assert!(changed.contains(".agents/commands/loom/builder.md"), "{changed}");
+    assert!(!changed.contains(".claude/commands/"), "{changed}");
+    assert_eq!(fx.origin_file(".agents/commands/keep.md"), "theirs");
+    // The links are still links.
+    let links = git(
+        &fx.origin,
+        &[
+            "ls-tree",
+            "refs/heads/main",
+            "--",
+            ".claude/commands",
+            ".claude/skills",
+        ],
+    );
+    assert_eq!(links.lines().filter(|l| l.starts_with("120000 ")).count(), 2, "{links}");
+    // The stamp is the new release: nothing was held back.
+    let meta = fx.origin_file(INSTALL_METADATA_PATH);
+    assert!(meta.contains(RUNNING) && !meta.contains("resync_held"), "{meta}");
+
+    // The second resync is a no-op.
+    host.advance(INTERVAL);
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert_eq!(fx.origin_commits(), commits + 1);
+}

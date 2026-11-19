@@ -114,8 +114,18 @@ startup" — because that is precisely what a restart would drop.
   whose lookups find no lease on two consecutive cycles stops (#10229). Each
   call runs on the host's GitHub App credential when one is configured; see
   [`lease-record.md`](lease-record.md#renewer-ownership-completion-and-request-budget-issue-10229).
-- **`stop <PID>`** — best-effort kill of a loop PID. Not required for
-  correctness; the loop already self-terminates.
+- **`stop <PID>`** / **`stop --issue <N>`** (alias `stop-issue <N>`) —
+  best-effort teardown, delegated to `loom-daemon lease renewer stop`
+  (#11086). `<PID>` is signalled only after native argv proves it is a
+  lease renewer (a shell — bash/sh/zsh/dash — running `sweep-lease-renew.sh
+  start ...` as a file, never a `-c` string, or `loom-daemon lease renewer
+  ...`) and its start identity is stable; an issue number passed by mistake,
+  an unrelated process (even one whose arguments look like a renewer's) or a
+  non-number is refused (non-zero, nothing signalled; the refusal names only
+  the pid and program basename, never the target's arguments). `--issue N` ends every recorded renewer of that issue in this
+  repo (any sweep unless `--sweep-id`), never a peer issue's. It fails closed:
+  unreadable argv or an old daemon refuses. Linux uses NUL-delimited procfs;
+  macOS uses `KERN_PROCARGS2`, never whitespace-split `ps` output.
 
 ### The loop's four exits (#7825)
 
@@ -139,6 +149,29 @@ than one:
 In every case the lease comment is **left in place** to age out. A
 terminating loop never deletes it — the epic requires positive evidence on
 the reclaim side, and the renew side simply stops broadcasting.
+
+**Handing a lease back (#12103).** `loom-daemon lease release <issue>` stops this
+host's renewer(s) for the issue whatever their sweep id (an attended session
+never knows its own, `session_sweep_id`) and posts a `loom:lease-yield` per live
+lease, so `forge check-claim` stops counting it at once. The comment is kept for
+the audit trail. Idempotent; it exits 1, touching nothing, when a live lease
+belongs to another host. `--watch-pid` on `lease ensure` must be the process
+doing the work, never an inherited `$PPID` in a subagent: that is the parent
+session, which outlives the subagent and keeps the lease live.
+
+`lease release` prints each renewer it stopped (`pid=N sweep=ID`). **A sweep
+child (Builder) must not release the orchestrator's lease**: when
+`/loom:sweep` published the lease in-session, the orchestrator owns it and its
+renewer, and releasing from a child stops that renewer and yields the lease
+while the sweep is still running. Release only a lease this session itself took
+(a hand-claim via `lease ensure`).
+
+**Reuse of an orchestrator's lease (#13252).** A Builder's `worktree.sh N` runs
+`lease ensure`. If this host already holds exactly one live lease on the issue
+under another sweep id (the orchestrator's, which a tool-call subshell does not
+inherit as `LOOM_SWEEP_RUN_ID`) and no other host holds one, `lease ensure`
+reuses it: no second lease comment and no second renewer; it reports `reusing
+it`. A foreign live lease still falls through to publish's refusal.
 
 **Before a loop exists: the deferred publisher (#10570).** When an attended
 `loom-daemon lease ensure` is declined (publish exit 4, a peer lease still in
@@ -204,9 +237,8 @@ runs multi-day sweeps.
 `defaults/scripts/sweep-run-registry.sh`**, between
 `# --- BEGIN shared pid-liveness block` / `# --- END …` delimiters.
 `sweep-run-registry.sh` calls `main "$@"` unguarded at the bottom of the
-file, so sourcing it would also run its CLI dispatch; and ADR-0018 /
-`scripts/shell-allowlist.txt` admits no category for a *new* shared shell
-library (`contract` is baseline-only). Test case `(q)` in
+file, so sourcing it would also run its CLI dispatch; and ADR-0018 rules
+out a *new* shared shell library. Test case `(q)` in
 `defaults/scripts/tests/test-sweep-lease-renew.sh` diffs the two copies and
 fails the suite on any drift — that machine check is what stands in for
 `source`.
@@ -393,6 +425,14 @@ the hard way (#7876):
 - **Keep `> /dev/null 2>&1`.** The loop is disowned but inherits whatever
   stdout it was given; attach a pipe (e.g. `| tail`) and the calling tool call
   blocks until the loop exits — i.e. for the lifetime of the sweep.
+- **Launch it once, in the foreground of a single tool call; never with a
+  trailing `&` or `nohup`** (#13252). `start` already forks its own detached
+  loop and returns the loop pid. A job backgrounded with `&`/`nohup` from a
+  short-lived Bash call belongs to that call's process group, and the harness
+  reaps it when the call returns, so the renewer dies and the lease ages out at
+  the TTL. Recipe: `LEASE_PID=$(sweep-lease-renew.sh start N --watch-pid
+  "$PPID" --host H --sweep-id S 2>/dev/null)` — with stderr redirected, never
+  piped. If a call blocks, stdout/stderr is still attached to a pipe.
 
 ## What this does not do (Phase 1 scope)
 

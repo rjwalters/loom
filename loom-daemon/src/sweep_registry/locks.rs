@@ -1,7 +1,6 @@
 //! Per-issue claim-lock lifecycle (`.loom/locks/issue-<N>/owner.json`) and
 //! startup reconstruction of registry state from disk.
 
-use super::journal_shadow::LockNs;
 use super::*;
 
 /// Typed, matchable error returned by [`SweepRegistry::dispatch`] when the
@@ -187,23 +186,6 @@ pub(crate) struct LockOwner {
     /// default — which is a genuinely unknown level, never a fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) effort: Option<String>,
-    /// Whether this sweep took the host's single overflow slot (#9244,
-    /// inert since #11508), stamped by [`SweepRegistry::mark_overflow`] the
-    /// moment the work finder admits the over-limit dispatch (Issue #9314).
-    ///
-    /// Same schema-evolution contract and the same *reason* as
-    /// [`model`](Self::model)/[`effort`](Self::effort): the fact is known only
-    /// to the dispatching daemon *instance*, so before this field existed a
-    /// restart erased it — [`SweepRegistry::reconstruct`] had nothing to
-    /// restore from and set `overflow: false` on every adopted entry. Safety
-    /// held either way (the `occupancy <= configured` gate bounds the host to
-    /// max+1 regardless), but `status`/`list_sweeps` lost the `[overflow]`
-    /// marker and, once one normal sweep ended, a *second* starred issue could
-    /// take a slot the first over-limit sweep was still occupying. `false` on
-    /// a pre-#9314 `owner.json` and on every ordinary in-cap dispatch — which
-    /// is the honest value for both.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) overflow: bool,
     /// Pause-and-roll identity (Issue #10830), stamped at spawn by
     /// [`resume_handle::DispatchSession::stamp`](super::resume_handle::DispatchSession::stamp):
     /// the item id that arms the pause hook, the systemd scope unit (the H4
@@ -224,7 +206,7 @@ pub(crate) struct LockOwner {
 impl LockOwner {
     /// A provisional owner record: the three fields every lock has from the
     /// moment it is created, with `acquired_at` stamped now and every
-    /// after-the-fact field (`pgid`, `model`, `effort`, `overflow`) unset.
+    /// after-the-fact field (`pgid`, `model`, `effort`) unset.
     ///
     /// Exists so the optional fields stay in ONE place. Each was added
     /// separately (#4980, #8056) and every construction site had to grow a
@@ -242,7 +224,6 @@ impl LockOwner {
             pgid: None,
             model: None,
             effort: None,
-            overflow: false,
             item_id: None,
             scope_unit: None,
             agent_started_at: None,
@@ -313,7 +294,7 @@ pub(crate) fn scan_unregistered_locked_issues(
 impl SweepRegistry {
     /// Cross-check `.loom/locks/issue-<N>/` against this registry's own
     /// in-memory entries and surface any issue whose lock has a **live**
-    /// `owner_pid` but no matching non-terminal (`Pending`/`Running`) registry
+    /// `owner_pid` but no matching non-terminal (`Running`) registry
     /// entry (Issue #4214).
     ///
     /// This is the structural fix for the "vanish window" incident: the
@@ -368,7 +349,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -424,7 +404,6 @@ impl SweepRegistry {
             .with_context(|| format!("read lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -438,37 +417,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
-        Ok(())
-    }
-
-    /// Stamp `overflow: true` onto `issue`'s claim lock (Issue #9314), so
-    /// [`reconstruct`](Self::reconstruct) can restore the flag after a restart.
-    ///
-    /// A read-modify-write over the same `owner.json`
-    /// [`record_child_pid_in_lock`](Self::record_child_pid_in_lock) stamps, so
-    /// the two are order-independent: whichever runs second preserves the
-    /// other's fields. Called only from
-    /// [`mark_overflow`](Self::mark_overflow), which owns the in-memory half.
-    pub(crate) fn stamp_overflow_in_lock(&self, issue: u32) -> Result<()> {
-        let owner_path = self
-            .config
-            .locks_dir()
-            .join(format!("issue-{issue}"))
-            .join("owner.json");
-        let existing = std::fs::read_to_string(&owner_path)
-            .with_context(|| format!("read lock owner {}", owner_path.display()))?;
-        let mut owner: LockOwner =
-            serde_json::from_str(&existing).context("parse lock owner.json")?;
-        if owner.overflow {
-            return Ok(());
-        }
-        let before = serde_json::from_str(&existing).unwrap_or_default();
-        owner.overflow = true;
-        let owner_json = serde_json::to_string_pretty(&owner).context("serialize lock owner")?;
-        std::fs::write(&owner_path, owner_json)
-            .with_context(|| format!("write lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Issue, issue, &before, &owner);
         Ok(())
     }
 
@@ -515,7 +463,6 @@ impl SweepRegistry {
                     serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
                 std::fs::write(lock.join("owner.json"), owner_json)
                     .context("write PR lock owner.json")?;
-                self.shadow_owner_acquired(LockNs::Pr, pr, &owner, true);
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
@@ -542,7 +489,6 @@ impl SweepRegistry {
             .with_context(|| format!("read PR lock owner {}", owner_path.display()))?;
         let mut owner: LockOwner =
             serde_json::from_str(&existing).context("parse PR lock owner.json")?;
-        let before = serde_json::from_str(&existing).unwrap_or_default();
         owner.owner_pid = child_pid;
         if pgid.is_some() {
             owner.pgid = pgid;
@@ -550,7 +496,6 @@ impl SweepRegistry {
         let owner_json = serde_json::to_string_pretty(&owner).context("serialize PR lock owner")?;
         std::fs::write(&owner_path, owner_json)
             .with_context(|| format!("write PR lock owner {}", owner_path.display()))?;
-        self.shadow_owner_updated(LockNs::Pr, pr, &before, &owner);
         Ok(())
     }
 
@@ -596,7 +541,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::Superseded;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Pr, pr, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => {
                 log::warn!("release_pr_lock: failed to remove lock dir {}: {e}", lock.display());
             }
@@ -616,7 +561,6 @@ impl SweepRegistry {
         if lock.exists() {
             std::fs::remove_dir_all(&lock)
                 .with_context(|| format!("failed to remove lock dir {}", lock.display()))?;
-            self.shadow_owner_released(LockNs::Issue, issue, None);
         }
         Ok(())
     }
@@ -665,7 +609,7 @@ impl SweepRegistry {
             return LockReleaseOutcome::HolderAlive;
         }
         match std::fs::remove_dir_all(&lock) {
-            Ok(()) => self.shadow_owner_released(LockNs::Issue, issue, Some(sweep_id)),
+            Ok(()) => {}
             Err(e) => log::warn!("release_lock: failed to remove lock dir {}: {e}", lock.display()),
         }
         LockReleaseOutcome::Released
@@ -805,10 +749,7 @@ impl SweepRegistry {
                 std::fs::write(lock.join("owner.json"), json).context("write lock owner.json")
             });
         match takeover {
-            Ok(()) => {
-                self.shadow_owner_acquired(LockNs::Issue, issue, &owner, false);
-                Some(watchdog_sweep_id)
-            }
+            Ok(()) => Some(watchdog_sweep_id),
             Err(e) => {
                 log::warn!(
                     "midbuild-watchdog: could not take over issue #{issue}'s stale claim lock at \
@@ -855,7 +796,7 @@ impl SweepRegistry {
         )
     }
 
-    /// Whether this registry has a non-terminal (`Pending`/`Running`) entry
+    /// Whether this registry has a non-terminal (`Running`) entry
     /// tracking a sweep for `issue` — shared by [`Self::live_claim_evidence`]
     /// (#5236) and [`Self::unregistered_locked_issues`] (#4214), both of
     /// which need the same "does our own bookkeeping know about this issue"
@@ -863,7 +804,8 @@ impl SweepRegistry {
     #[must_use]
     fn has_tracked_sweep_for(&self, issue: u32) -> bool {
         self.entries.values().any(|info| {
-            !info.state.is_terminal() && matches!(info.kind, SweepKind::Issue(i) if i == issue)
+            // An issue step holds the same `issue-<N>` lock (#11898).
+            !info.state.is_terminal() && info.kind.issue_number() == Some(issue)
         })
     }
 
@@ -949,13 +891,15 @@ impl SweepRegistry {
                     .and_then(|s| serde_json::from_str(&s).ok());
                 let Some(owner) = owner else {
                     // No owner.json — treat as stale, remove.
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, None);
-                    }
+                    let _ = std::fs::remove_dir_all(&path);
                     continue;
                 };
                 let alive =
                     pid_identity::owner_pid_alive_since(owner.owner_pid, &owner.acquired_at);
+                // #11898: an issue step holds this same lock; its owner's
+                // sweep id says so, and it is adopted as the step it is.
+                let step = crate::step_role::StepRole::parse_sweep_id(&owner.sweep_id)
+                    .filter(|(role, item)| *item == issue && !role.acts_on_pr());
                 // #10832: a roll's H4 pause stopped this agent on purpose and
                 // left its lock for H5, which resumes the saved session or
                 // requeues it. Crash recovery must not get there first: keep
@@ -1009,13 +953,24 @@ impl SweepRegistry {
                     if let Some(pgid) = owner.pgid {
                         self.reap_orphaned_group(&owner.sweep_id, Some(issue), pgid);
                     }
-                    daemon_owned_dead.insert(issue);
-                    if std::fs::remove_dir_all(&path).is_ok() {
-                        self.shadow_owner_released(LockNs::Issue, issue, Some(&owner.sweep_id));
+                    // A dead step has no checkpoint to recover; its claim goes
+                    // back per role instead (#11898).
+                    if step.is_none() {
+                        daemon_owned_dead.insert(issue);
+                    }
+                    let _ = std::fs::remove_dir_all(&path);
+                    if let Some((role, item)) = step {
+                        let started_at = Self::lock_started_at(&owner);
+                        self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                     }
                     continue;
                 }
-                let log_path = self.compute_log_path(issue);
+                let (kind, log_path) = match step {
+                    Some((role, item)) => {
+                        (SweepKind::Step { item, role }, self.compute_step_log_path(item, role))
+                    }
+                    None => (SweepKind::Issue(issue), self.compute_log_path(issue)),
+                };
                 let started_at = chrono::DateTime::parse_from_rfc3339(&owner.acquired_at)
                     .map_or_else(|_| Utc::now(), |t| t.with_timezone(&Utc));
                 let repo = Some(self.config.workspace_root.display().to_string());
@@ -1059,7 +1014,7 @@ impl SweepRegistry {
                     owner.sweep_id.clone(),
                     SweepInfo {
                         sweep_id: owner.sweep_id.clone(),
-                        kind: SweepKind::Issue(issue),
+                        kind,
                         pid: owner.owner_pid,
                         pgid,
                         token_name,
@@ -1086,14 +1041,6 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
-                        // Issue #9314: restored from the lock, which
-                        // `mark_overflow` stamps the moment the work finder
-                        // admits an over-limit starred dispatch. Before that
-                        // this was a hardcoded `false`, so a restart silently
-                        // freed the host's single overflow slot while the
-                        // over-limit sweep was still running — and dropped the
-                        // `[overflow]` marker from `status`/`list_sweeps`.
-                        overflow: owner.overflow,
                     },
                 );
                 crate::observability::lifecycle::execution_adopted(
@@ -1103,6 +1050,12 @@ impl SweepRegistry {
                 admitted += 1;
             }
         }
+
+        // #11898: PR steps hold `pr-<N>` locks, which the loop above skips.
+        admitted += self.adopt_pr_steps(only);
+        // #11909: the adopted steps' slots reach `busy_slots` now, not only
+        // at the next spawn.
+        self.publish_step_slots();
 
         // Checkpoints for daemon-owned sweeps whose process is gone -> Crashed
         // entries (so list_sweeps shows them; the next dispatch resumes via the
@@ -1131,8 +1084,8 @@ impl SweepRegistry {
                 }
                 // Skip if we already have a Running entry for this issue.
                 let already_running = self.entries.values().any(|info| {
-                    matches!(info.state, SweepState::Running | SweepState::Pending)
-                        && matches!(info.kind, SweepKind::Issue(n) if n == issue)
+                    matches!(info.state, SweepState::Running)
+                        && info.kind.issue_number() == Some(issue)
                 });
                 if already_running {
                     continue;
@@ -1182,13 +1135,6 @@ impl SweepRegistry {
                         // Owning workspace root, stamped for multi-repo
                         // disambiguation (#3929).
                         repo,
-                        // A checkpoint-only entry is `Crashed`, and
-                        // `overflow_in_flight` only counts non-terminal
-                        // entries — so this can never hold the slot open,
-                        // whatever the departed sweep was (#9314). The lock
-                        // that would have carried the flag was already removed
-                        // as stale by the pass above.
-                        overflow: false,
                     },
                 );
                 admitted += 1;
@@ -1295,16 +1241,6 @@ impl SweepRegistry {
                     effort: None,
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
-                    // The machine journal records no overflow flag, and this
-                    // pass exists precisely for a survivor whose lock did NOT
-                    // survive — so there is nothing to restore from (#9314).
-                    // The residual gap is deliberate and bounded: such a sweep
-                    // is adopted without the marker, which can let ONE later
-                    // starred issue take the slot it still occupies. Fixing it
-                    // means widening the journal schema, which this pass's own
-                    // "read-only, adopt-only" contract keeps out of scope; the
-                    // `occupancy <= configured` gate still bounds the host.
-                    overflow: false,
                 },
             );
             adopted += 1;

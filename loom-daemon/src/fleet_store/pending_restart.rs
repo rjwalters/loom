@@ -52,24 +52,18 @@ pub struct PendingRestart {
     pub rendered_at: DateTime<Utc>,
 }
 
-/// Resolve `<loom_dir>` the same way [`crate::fleet_sync`] does: the parent
+/// Resolve `<loom_dir>` via the shared
+/// [`crate::autonomy_marker::resolve_loom_dir`] (#13833): the parent
 /// of `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir
 /// socket never writes into the operator's real `~/.loom`), else `~/.loom`.
 pub fn loom_dir() -> Option<PathBuf> {
-    resolve_loom_dir()
-}
-
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
+    crate::autonomy_marker::resolve_loom_dir()
 }
 
 /// Path of the host-level marker, or `None` when no loom dir resolves.
 #[must_use]
 pub fn marker_path() -> Option<PathBuf> {
-    resolve_loom_dir().map(|d| d.join(FILENAME))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(FILENAME))
 }
 
 /// Record `paths` against `observed_pid`. Best-effort on the caller's part —
@@ -87,12 +81,6 @@ pub fn record(paths: Vec<String>, observed_pid: u32, rendered_at: DateTime<Utc>)
     let mut body = serde_json::to_vec_pretty(&marker)?;
     body.push(b'\n');
     write_atomic(&path, &body).with_context(|| format!("writing {}", path.display()))?;
-    // J3 shadow record (#11349): after the legacy write, never fails it.
-    crate::config_journal::record_pending_restart(
-        &marker.paths,
-        marker.observed_pid,
-        marker.rendered_at,
-    );
     Ok(())
 }
 
@@ -113,7 +101,6 @@ pub fn probe() -> Option<PendingRestart> {
 pub fn clear() {
     if let Some(path) = marker_path() {
         let _ = std::fs::remove_file(path);
-        crate::config_journal::record_pending_cleared();
     }
 }
 
@@ -158,9 +145,10 @@ mod tests {
     #[serial(loom_socket_path_env)]
     fn record_then_probe_roundtrips() {
         with_loom_dir(|_| {
-            record(vec!["autonomous.hostBreaker.enabled".to_string()], 4242, Utc::now()).unwrap();
+            record(vec!["autonomous.mainHealthGate.enabled".to_string()], 4242, Utc::now())
+                .unwrap();
             let marker = probe().unwrap();
-            assert_eq!(marker.paths, vec!["autonomous.hostBreaker.enabled".to_string()]);
+            assert_eq!(marker.paths, vec!["autonomous.mainHealthGate.enabled".to_string()]);
             assert_eq!(marker.observed_pid, 4242);
         });
     }

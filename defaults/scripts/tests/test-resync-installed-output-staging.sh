@@ -3,8 +3,7 @@
 # staging worktree: which HEAD it is based on (#9550) and what its printed
 # staging recipe is allowed to `git add` (#9141)
 #
-# Split out of test-resync-installed.sh (frozen by the file-size ratchet,
-# .loom/docs/file-size-policy.md) rather than grown in place.
+# Split out of test-resync-installed.sh rather than grown in place.
 #
 #   (1) #9550 -- --output creates a DETACHED staging worktree, and it was
 #       always created at the PRIMARY checkout's HEAD. The documented use case
@@ -31,25 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/test-resync-output.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
@@ -171,6 +152,8 @@ if ! grep -q 'feature-file\.txt' <<<"$ADD_LINE"; then
 else
     fail "(#9141) the allowlist swept in an unrelated path (line='$ADD_LINE')"
 fi
+# #13592: capture the staging worktree's stamp before it is dropped (group 8).
+STAGING1_META_VER="$(sed -n 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAGING1/.loom/install-metadata.json" 2>/dev/null | head -1)"
 drop_staging "$STAGING1"
 
 echo ""
@@ -232,6 +215,29 @@ else
     fail "(#9550) the primary-checkout case regressed; out=$OUT6"
 fi
 drop_staging "$STAGING5"
+
+echo ""
+echo "Test group 8: --output stamps install-metadata.json in the staging worktree ONLY (#13592)"
+# STAGING1 (group 1) was a real resync: guard.sh changed, so the stamp ran.
+# The primary checkout and the invoking worktree must still report the version
+# whose files they actually carry (0.0.0), never the resync's target (9.9.9).
+meta_ver() { sed -n 's/.*"loom_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+if [[ "$STAGING1_META_VER" == "9.9.9" ]]; then
+    pass "(#13592) the staging worktree's metadata carries the target version"
+else
+    fail "(#13592) staging metadata not stamped to 9.9.9: '$STAGING1_META_VER'"
+fi
+if [[ "$(meta_ver "$REPO/.loom/install-metadata.json")" == "0.0.0" ]] \
+    && [[ "$(meta_ver "$WT/.loom/install-metadata.json")" == "0.0.0" ]]; then
+    pass "(#13592) the primary checkout and invoking worktree metadata still match their files"
+else
+    fail "(#13592) --output leaked the target stamp into the primary or invoking worktree"
+fi
+if git -C "$REPO" diff --quiet -- .loom/install-metadata.json; then
+    pass "(#13592) the primary checkout's metadata is byte-identical to HEAD"
+else
+    fail "(#13592) the primary checkout's metadata was modified by an --output run"
+fi
 
 # --- summary -----------------------------------------------------------------
 echo ""

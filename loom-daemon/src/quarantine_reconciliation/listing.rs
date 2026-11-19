@@ -6,7 +6,9 @@
 //! exhausts while REST sits idle, so both legs now go over REST:
 //!
 //! 1. The `loom:blocked` set comes from [`crate::forge_listing`]'s ETag-cached
-//!    issues listing (an unchanged set is a free `304`).
+//!    issues listing (an unchanged set is a free `304`), or, with the mirror's
+//!    worklist as the discovery chain, from the tick's snapshot (#12307); the startup pass runs before any tick, so
+//!    it takes that snapshot on demand (#12314).
 //! 2. Comments (and the timeline) are read per issue only on a
 //!    [`QUARANTINE_SCAN`] miss, keyed on the issue's `updatedAt` (a new comment
 //!    or label event bumps it), so an unchanged set costs no comment fetch.
@@ -16,6 +18,8 @@ use crate::claim_reconciliation::read_cache::{self, QuarantineScan, QUARANTINE_S
 use anyhow::Result;
 use std::path::Path;
 
+const BLOCKED_LABEL: &str = "loom:blocked";
+
 /// The open `loom:blocked` issues of `root` (pull requests dropped, capped at
 /// [`MAX_ISSUES_PER_WORKSPACE`]) as `(number, updatedAt)`.
 ///
@@ -24,20 +28,45 @@ use std::path::Path;
 /// The REST listing failed; the message carries the `gh` stderr tail so the
 /// rate-limit classifier sees it unchanged.
 pub(super) fn list_blocked(gh_bin: &Path, root: &Path) -> Result<Vec<(u32, Option<String>)>> {
-    let rows = crate::forge_listing::list_issues_cached_as(
-        "quarantine_reconciliation",
-        gh_bin,
-        Some(root),
-        None,
-        "loom:blocked",
-        "open",
-    )?;
-    Ok(rows
-        .into_iter()
+    use crate::discovery::published::{lookup, on_demand, Lookup};
+    let blocked = |repo: &crate::discovery::RepoSnapshot| {
+        repo.rows
+            .iter()
+            .filter(|r| r.labels.iter().any(|l| l == BLOCKED_LABEL))
+            .cloned()
+            .collect()
+    };
+    let rows = match lookup(root) {
+        Lookup::Repo(repo) => blocked(&repo),
+        // #12314: the startup pass runs before the first tick, so it asks the
+        // discovery backend for a snapshot rather than listing itself.
+        Lookup::Absent => {
+            let repo = on_demand(gh_bin, root)?;
+            blocked(&repo)
+        }
+        Lookup::NotMirror => {
+            // #12310: the blocked-issue listing is discovery.
+            let _discovery = crate::gh_invocation::purpose::discovery();
+            crate::forge_listing::list_issues_cached_as(
+                "quarantine_reconciliation",
+                gh_bin,
+                Some(root),
+                None,
+                BLOCKED_LABEL,
+                "open",
+            )?
+        }
+    };
+    Ok(blocked_numbers(rows))
+}
+
+/// `(number, updatedAt)` of the issues among `rows`, capped.
+fn blocked_numbers(rows: Vec<crate::forge_listing::RestIssue>) -> Vec<(u32, Option<String>)> {
+    rows.into_iter()
         .filter(|r| !r.is_pull_request)
         .take(MAX_ISSUES_PER_WORKSPACE as usize)
         .map(|r| (r.number, r.updated_at))
-        .collect())
+        .collect()
 }
 
 /// One uncached read of an issue's scan legs, plus whether every leg answered
@@ -81,5 +110,72 @@ pub(super) fn scan_issue(
         has_quarantine_comment: has,
         last_quarantine_comment_at: last_comment,
         last_blocked_labeled_at: labeled,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::discovery::published::test_support::{repo, set, MirrorRoot};
+
+    fn issue(number: u32, labels: &[&str], pr: bool) -> crate::forge_listing::RestIssue {
+        let mut row = crate::forge_listing::parse_rest_issues(&format!(
+            r#"[{{"number": {number}, "state": "open", "updated_at": "2026-10-01T00:00:00Z", "labels": []}}]"#
+        ))
+        .unwrap()
+        .remove(0);
+        row.labels = labels.iter().map(|l| (*l).to_string()).collect();
+        row.is_pull_request = pr;
+        row
+    }
+
+    /// #12307: mirror mode reads `loom:blocked` issues from the snapshot, with
+    /// no `gh` call; a repo the snapshot has not read is a failed listing.
+    #[test]
+    #[serial_test::serial]
+    fn mirror_mode_reads_the_blocked_set_from_the_snapshot() {
+        let fixture = MirrorRoot::new("acme/widgets");
+        set(Vec::new());
+        crate::discovery::published::test_support::reset_on_demand();
+        // #12314: an unread repo is asked for on demand (the fallback tier's
+        // listing is the fake `gh`, which fails): still a failed listing.
+        assert!(list_blocked(&fixture.gh, fixture.path()).is_err());
+        assert!(!fixture.gh_calls().is_empty(), "the on-demand snapshot never reached a tier");
+        crate::discovery::published::test_support::reset_on_demand();
+        let before = fixture.gh_calls();
+
+        let mut snapshot = repo("acme/widgets");
+        snapshot.rows = vec![
+            issue(1, &["loom:blocked"], false),
+            issue(2, &["loom:issue"], false),
+            issue(3, &["loom:blocked"], true),
+            issue(4, &["loom:blocked", "loom:operator"], false),
+        ];
+        set(vec![snapshot]);
+        let got = list_blocked(&fixture.gh, fixture.path()).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (1, Some("2026-10-01T00:00:00Z".to_string())),
+                (4, Some("2026-10-01T00:00:00Z".to_string()))
+            ]
+        );
+        assert_eq!(fixture.gh_calls(), before, "mirror mode made a listing call");
+
+        // Parity: the snapshot yields what a listing of the same blocked rows
+        // would (`blocked_numbers` is the listing path's own reduction).
+        let listing = vec![
+            issue(1, &["loom:blocked"], false),
+            issue(3, &["loom:blocked"], true),
+            issue(4, &["loom:blocked", "loom:operator"], false),
+        ];
+        assert_eq!(got, blocked_numbers(listing));
+
+        // The decision reads stay live: scanning a candidate still calls `gh`
+        // (comments), though no listing was made.
+        let _ = scan_issue(&fixture.gh, fixture.path(), 1, Some("2026-10-01T00:00:00Z"));
+        assert_ne!(fixture.gh_calls(), before, "the scan made no live read");
+        set(Vec::new());
     }
 }

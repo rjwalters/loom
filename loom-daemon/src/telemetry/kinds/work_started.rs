@@ -25,13 +25,16 @@
 //!   Judge, Doctor or Champion agent issued on a PR (its claim label, verdict
 //!   or merge), from the tick's pick journal. `started_at` is when the agent
 //!   issued that write.
+//! - **A step this host spawned** (`source` [`source::STEP`]): an issue-acting
+//!   Builder or Curator step whose claim was accepted and whose child
+//!   launched. A `sweep.builder` start with `source=step` is the exit from
+//!   `ready_wait` (#12904). PR-acting steps are covered by the role tick.
 //!
 //! **OTLP only.** **Provenance is required.**
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::telemetry::kinds::fleet_state::FleetStage;
 use crate::telemetry::provenance::Provenance;
 
 /// `source` values: what observed the start.
@@ -46,6 +49,9 @@ pub mod source {
     pub const SWEEP_OBSERVED: &str = "sweep_observed";
     /// A role-runner agent's first forge write on the item in its tick.
     pub const ROLE_ACT: &str = "role_act";
+    /// A step's spawn succeeded: its claim was accepted and its child
+    /// launched (Issue #12904). `started_at` is the spawn instant.
+    pub const STEP: &str = "step";
 }
 
 /// `role` values.
@@ -57,6 +63,61 @@ pub mod role {
     /// A sweep's own merge phase (the role name `sweep-checkpoint begin` uses).
     pub const MERGE: &str = "merge";
     pub const CHAMPION: &str = "champion";
+}
+
+/// The stage an item is in, in a work-start fact. Neutral (not tied to any
+/// estimator); the wire strings are the stage names `fleet.state` (retired,
+/// #12094) established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum FleetStage {
+    /// Ready (`loom:issue`), in this host's dispatch plan.
+    #[serde(rename = "ready_wait")]
+    ReadyWait,
+    /// A sweep on this host, from dispatch until its Curator phase completes.
+    #[serde(rename = "sweep.curator")]
+    SweepCurator,
+    /// A sweep on this host, Curator done, Builder not yet done.
+    #[serde(rename = "sweep.builder")]
+    SweepBuilder,
+    /// A PR waiting for, or receiving, a Judge verdict.
+    #[serde(rename = "review_wait")]
+    ReviewWait,
+    /// Doctor rework after `loom:changes-requested`.
+    #[serde(rename = "doctor")]
+    Doctor,
+    /// Approved (`loom:pr`), waiting to merge.
+    #[serde(rename = "merge_wait")]
+    MergeWait,
+    /// Approved, held for a human by an operator hold label.
+    #[serde(rename = "merge_hold")]
+    MergeHold,
+    /// Pre-ready: from the issue's creation (or latest reopen) until
+    /// `loom:curated`, or `loom:issue` for a one-step promotion (#11368).
+    /// Pre-ready stage.
+    #[serde(rename = "triage_wait")]
+    TriageWait,
+    /// Pre-ready: from `loom:curated` until `loom:issue` (#11368). Only ever
+    /// a pre-ready stage.
+    #[serde(rename = "approval_wait")]
+    ApprovalWait,
+}
+
+impl FleetStage {
+    /// The wire name.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FleetStage::ReadyWait => "ready_wait",
+            FleetStage::SweepCurator => "sweep.curator",
+            FleetStage::SweepBuilder => "sweep.builder",
+            FleetStage::ReviewWait => "review_wait",
+            FleetStage::Doctor => "doctor",
+            FleetStage::MergeWait => "merge_wait",
+            FleetStage::MergeHold => "merge_hold",
+            FleetStage::TriageWait => "triage_wait",
+            FleetStage::ApprovalWait => "approval_wait",
+        }
+    }
 }
 
 /// The `dispatch_origin` of a role-runner tick's start. A sweep's start carries
@@ -117,8 +178,7 @@ pub struct WorkStartedRecord {
 
 /// The role a sweep checkpoint marker hands the item to, and that role's
 /// stage. `None` (no marker) is the Curator in `sweep.curator`; `merge-done`
-/// starts no work, and an unknown marker is never guessed at. The stage agrees
-/// with `fleet_state::held_stage` for every known marker (tested).
+/// starts no work, and an unknown marker is never guessed at.
 #[must_use]
 pub fn sweep_role_for_marker(marker: Option<&str>) -> Option<(FleetStage, &'static str)> {
     Some(match marker {
@@ -148,19 +208,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sweep_stage_agrees_with_fleet_state_for_every_marker() {
-        let at = Utc::now();
-        for marker in [
-            None,
-            Some("curator-done"),
-            Some("builder-done"),
-            Some("doctor-done"),
-            Some("judge-rejected"),
-            Some("judge-done"),
+    fn every_known_marker_maps_to_its_stage() {
+        for (marker, want) in [
+            (None, FleetStage::SweepCurator),
+            (Some("curator-done"), FleetStage::SweepBuilder),
+            (Some("builder-done"), FleetStage::ReviewWait),
+            (Some("doctor-done"), FleetStage::ReviewWait),
+            (Some("judge-rejected"), FleetStage::Doctor),
+            (Some("judge-done"), FleetStage::MergeWait),
         ] {
             let (stage, _) = sweep_role_for_marker(marker).unwrap_or_else(|| panic!("{marker:?}"));
-            let (held, ..) = crate::observability::fleet_state::held_stage(marker, Some(at), at);
-            assert_eq!(stage, held, "{marker:?}");
+            assert_eq!(stage, want, "{marker:?}");
         }
         assert_eq!(sweep_role_for_marker(Some("merge-done")), None);
         assert_eq!(sweep_role_for_marker(Some("future-marker")), None);

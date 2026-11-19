@@ -245,7 +245,6 @@ fn a_failing_sink_does_not_suppress_the_other() {
             window: WINDOW,
             host: "h",
             pool_dir: None,
-            outputs: None,
         },
         t0(),
     );
@@ -269,7 +268,6 @@ fn unreachable_status_changes_nothing() {
             window: WINDOW,
             host: "h",
             pool_dir: None,
-            outputs: None,
         },
         t0(),
     );
@@ -281,7 +279,6 @@ fn unreachable_status_changes_nothing() {
             window: WINDOW,
             host: "h",
             pool_dir: None,
-            outputs: None
         },
         t0()
     )
@@ -314,7 +311,6 @@ fn incident_2026_10_04_produces_alerts_naming_auth_401() {
             window: WINDOW,
             host: "joseph-superset",
             pool_dir: Some(dir.path()),
-            outputs: None,
         },
         t0(),
     );
@@ -333,7 +329,6 @@ fn incident_2026_10_04_produces_alerts_naming_auth_401() {
             window: WINDOW,
             host: "h",
             pool_dir: None,
-            outputs: None
         },
         t0() + Cd::minutes(1)
     )
@@ -391,156 +386,3 @@ fn settings_block_and_defaults() {
 }
 
 use std::sync::Arc;
-
-// --- #10916 slice 2a: output watchdog riding the fleet alert path ---
-
-mod output_watch {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::fleet_alert::outputs::{self, OutputWatch};
-    use crate::fleet_outputs::OutputSource;
-
-    /// Every registry row produced fresh, for every roster repo.
-    struct Healthy(DateTime<Utc>);
-    impl OutputSource for Healthy {
-        fn last_seen(&self, _: &str) -> Option<DateTime<Utc>> {
-            Some(self.0)
-        }
-        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
-            ["a/x", "b/y"]
-                .iter()
-                .map(|r| ((*r).to_string(), self.0))
-                .collect()
-        }
-        fn expected_repos(&self, _: &str) -> Option<Vec<String>> {
-            None
-        }
-    }
-
-    /// Nothing observed at all (a host that does not produce).
-    struct Silent;
-    impl OutputSource for Silent {
-        fn last_seen(&self, _: &str) -> Option<DateTime<Utc>> {
-            None
-        }
-        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
-            BTreeMap::new()
-        }
-    }
-
-    /// Everything fresh except one fleet-wide `record_kind`.
-    struct SilentKind(&'static str, DateTime<Utc>);
-    impl OutputSource for SilentKind {
-        fn last_seen(&self, kind: &str) -> Option<DateTime<Utc>> {
-            (kind != self.0).then_some(self.1)
-        }
-        fn last_seen_per_repo(&self, _: &str) -> BTreeMap<String, DateTime<Utc>> {
-            ["a/x", "b/y"]
-                .iter()
-                .map(|r| ((*r).to_string(), self.1))
-                .collect()
-        }
-    }
-
-    /// `ci.run` is a Warning row (a quiet spell is legal): it must reach the
-    /// inbox as a non-critical alert, while critical rows stay critical.
-    #[test]
-    fn warning_row_is_not_escalated_to_critical() {
-        let r = roster();
-        let src = SilentKind("ci.run", t0());
-        let w = OutputWatch {
-            source: &src,
-            roster: &r,
-        };
-        let conds = outputs::conditions(&w, t0());
-        assert_eq!(conds.len(), 1);
-        assert!(conds[0].headline.starts_with("WARNING"));
-        assert!(!conds[0].critical);
-
-        let mut st = AlertState::new(1, Duration::from_secs(3600));
-        let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
-        let out = run_tick(
-            &mut st,
-            &sinks,
-            &TickContext {
-                status: Some(&status(1, 1)),
-                window: WINDOW,
-                host: "h",
-                pool_dir: None,
-                outputs: Some(&w),
-            },
-            t0(),
-        );
-        assert_eq!(out.len(), 1);
-        assert!(outputs::is_output_key(&out[0].key));
-        assert!(!out[0].critical);
-    }
-
-    fn roster() -> Vec<String> {
-        vec!["a/x".into(), "b/y".into()]
-    }
-
-    #[test]
-    fn healthy_fleet_does_not_fire() {
-        let r = roster();
-        let src = Healthy(t0());
-        let w = OutputWatch {
-            source: &src,
-            roster: &r,
-        };
-        assert!(outputs::conditions(&w, t0()).is_empty());
-    }
-
-    #[test]
-    fn silent_fleet_fires_critical_through_the_sinks_after_debounce() {
-        let r = roster();
-        let w = OutputWatch {
-            source: &Silent,
-            roster: &r,
-        };
-        let conds = outputs::conditions(&w, t0());
-        assert!(!conds.is_empty());
-        assert!(conds.iter().all(|c| outputs::is_output_key(&c.key)));
-        assert!(conds.iter().any(|c| c.headline.starts_with("CRITICAL")));
-
-        let mut st = AlertState::new(1, Duration::from_secs(3600));
-        let sinks: Vec<Box<dyn AlertSink>> = Vec::new();
-        let out = run_tick(
-            &mut st,
-            &sinks,
-            &TickContext {
-                status: Some(&status(1, 1)),
-                window: WINDOW,
-                host: "h",
-                pool_dir: None,
-                outputs: Some(&w),
-            },
-            t0(),
-        );
-        assert_eq!(out.len(), conds.len());
-        assert!(out.iter().all(|t| t.kind == Kind::Started));
-        assert!(out.iter().any(|t| t.critical));
-
-        // Output resumes: every alert clears.
-        let src = Healthy(t0());
-        let ok = OutputWatch {
-            source: &src,
-            roster: &r,
-        };
-        let out = run_tick(
-            &mut st,
-            &sinks,
-            &TickContext {
-                status: Some(&status(1, 1)),
-                window: WINDOW,
-                host: "h",
-                pool_dir: None,
-                outputs: Some(&ok),
-            },
-            t0(),
-        );
-        assert!(out.iter().all(|t| t.kind == Kind::Cleared));
-        assert!(!out.is_empty());
-    }
-}

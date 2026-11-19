@@ -27,7 +27,22 @@
 #      pick a single value may still work) — treated as a lower-severity
 #      warning.
 #
-# Deliberately reads LOCAL (+ per-worktree, when `extensions.worktreeConfig`
+#   3. FIXTURE IDENTITY: the EFFECTIVE user.email (all scopes: system, global,
+#      local, worktree) is a known test-fixture address (`ci@loom.test`, any
+#      `@loom.local`, or an address under the reserved test domains `.test`,
+#      `.invalid`, `example.com`). Fleet commits have been authored as
+#      `Loom CI <ci@loom.test>` because such a value leaked into host git
+#      config (#11332). Reported as a warning (exit 1) naming the scope that
+#      supplied the value (`git config --show-origin --get user.email`).
+#
+#   4. MISSING IDENTITY: no explicit author identity at any scope or in the
+#      environment, so git would invent `user@hostname` (#13088: a fleet PR
+#      was authored as `Ubuntu <user@hostname>`). Probed
+#      mechanically with `git -c user.useConfigOnly=true var GIT_AUTHOR_IDENT`,
+#      which fails unless name and email are both explicit; `GIT_AUTHOR_*` env
+#      identities count as explicit. Reported as exit 4 with remediation.
+#
+# Conditions 1 and 2 read LOCAL (+ per-worktree, when `extensions.worktreeConfig`
 # is enabled) scope only — never global/system — so a normal global identity
 # with no repo-local override never false-positives. `git config --get-all`
 # WITHOUT `--local`/`--worktree` also surfaces global/system values, which
@@ -39,11 +54,14 @@
 #
 # Exit codes:
 #   0 - Clean: no corrupted value and at most one local value per field.
-#   1 - WARNING: multiple local values for user.email and/or user.name, but
-#       none match the corruption pattern (ambiguous, not necessarily broken).
+#   1 - WARNING: multiple local values for user.email and/or user.name (none
+#       matching the corruption pattern), and/or the effective user.email is a
+#       fixture address (condition 3). Ambiguous, not necessarily broken.
 #   2 - Usage error or not inside a git repository.
 #   3 - CORRUPTION detected: a value matches the glued-token pattern. This is
 #       the failure mode that ships garbled commit authors (see PR #4303).
+#   4 - MISSING identity (condition 4): no explicit user.name/user.email, so a
+#       commit would be authored under git's `user@hostname` fallback.
 #
 # Remediation (never applied automatically — this script only detects and
 # prints the command; auto-remediation is a judgment call, see #4369):
@@ -52,6 +70,9 @@
 #   Alternative (no global identity, or you want to keep a specific value):
 #     git config --replace-all user.email <value-to-keep>
 #     git config --replace-all user.name  <value-to-keep>
+#   Fixture identity: remove it from the scope named in the warning
+#     git config --global --unset user.email   (or --local/--system), or set a
+#     real identity with `git config --global user.email <you>`.
 
 set -uo pipefail  # no -e: git config "not found" exits are expected control flow
 
@@ -59,6 +80,7 @@ EXIT_OK=0
 EXIT_MULTI_VALUE=1
 EXIT_USAGE=2
 EXIT_CORRUPTED=3
+EXIT_MISSING=4
 
 # Anchored to the specific corruption vector (a GitHub noreply email with
 # extra characters glued directly after ".com", no separator) rather than a
@@ -66,8 +88,12 @@ EXIT_CORRUPTED=3
 # addresses with unusual-but-valid TLDs (e.g. "user@company.comm").
 CORRUPTION_REGEX='users\.noreply\.github\.com[a-zA-Z0-9]+$'
 
+# Known fixture addresses (#11332): ci@loom.test, anything @loom.local, and
+# the reserved test domains (RFC 2606): *.test, *.invalid, example.com.
+FIXTURE_REGEX='(^ci@loom\.test$|@loom\.local$|\.test$|\.invalid$|@([A-Za-z0-9-]+\.)*example\.com$)'
+
 usage() {
-    sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-}" in
@@ -163,8 +189,40 @@ for field in user.email user.name; do
     fi
 done
 
+# Effective-scope fixture identity check (#11332). Read-only: report only.
+effective_email=$(git config --get user.email 2>/dev/null || true)
+if [[ -n "$effective_email" && "$effective_email" =~ $FIXTURE_REGEX ]]; then
+    multi_value=1
+    origin=$(git config --show-origin --get user.email 2>/dev/null || true)
+    echo "WARNING: check-git-identity.sh: effective user.email is a test-fixture address." >&2
+    echo "         Commits made here would be authored as <$effective_email>." >&2
+    echo "" >&2
+    echo "  Supplied by: ${origin:-unknown}" >&2
+    echo "" >&2
+    echo "  Remediation (not applied automatically; use the scope named above):" >&2
+    echo "    git config --global --unset user.email   # or --local / --system" >&2
+    echo "    git config --global user.email <your-real-address>" >&2
+fi
+
+# Missing explicit identity (#13088). useConfigOnly makes git refuse to guess
+# user@hostname, so a non-zero probe means the identity is not explicit.
+missing=0
+if ! git -c user.useConfigOnly=true var GIT_AUTHOR_IDENT >/dev/null 2>&1; then
+    missing=1
+    echo "ERROR: check-git-identity.sh: no explicit git identity (user.name / user.email)." >&2
+    echo "       A commit here would be authored under git's auto-generated" >&2
+    echo "       user@hostname fallback (#13088) and fail DCO / attribution checks." >&2
+    echo "" >&2
+    echo "  Remediation (not applied automatically):" >&2
+    echo "    git config --global user.name  \"<your name>\"" >&2
+    echo "    git config --global user.email <your-address>" >&2
+    echo "    or export GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (and GIT_COMMITTER_*)." >&2
+fi
+
 if [[ "$corrupted" -eq 1 ]]; then
     exit "$EXIT_CORRUPTED"
+elif [[ "$missing" -eq 1 ]]; then
+    exit "$EXIT_MISSING"
 elif [[ "$multi_value" -eq 1 ]]; then
     exit "$EXIT_MULTI_VALUE"
 fi

@@ -16,7 +16,9 @@ import {
   formatDispatchTokenLine,
   formatRuntimeRejection,
   formatStructuredError,
+  formatSweepKind,
   sweepTools,
+  type SweepKind,
   type RuntimeRejection,
 } from "./sweeps.js";
 
@@ -160,19 +162,19 @@ describe("formatStructuredError", () => {
   });
 });
 
-describe("dispatch_sweep per-dispatch tap schema (issue #11284)", () => {
+describe("dispatch_sweep schema", () => {
   const tool = sweepTools.find((t) => t.name === "dispatch_sweep");
   const schema = tool?.inputSchema as {
     properties: Record<string, { type: string }>;
     required: string[];
   };
 
-  it("accepts optional runtime and model_profile strings", () => {
-    expect(schema.properties.runtime?.type).toBe("string");
-    expect(schema.properties.model_profile?.type).toBe("string");
+  it("no longer advertises the removed per-dispatch runtime override", () => {
+    expect(schema.properties.runtime).toBeUndefined();
+    expect(schema.properties.model_profile).toBeUndefined();
   });
 
-  it("keeps them optional so legacy callers are unchanged", () => {
+  it("keeps kind the only required field so legacy callers are unchanged", () => {
     expect(schema.required).toEqual(["kind"]);
   });
 });
@@ -197,9 +199,24 @@ describe("buildDispatchSweepPayload", () => {
       depends_on: null,
       workspace_root: null,
       force: false,
-      runtime: null,
-      model_profile: null,
       dispatch_origin: "operator",
     });
+  });
+});
+
+describe("formatSweepKind (issue #11898)", () => {
+  it("renders every SweepKind variant, including a step", () => {
+    expect(formatSweepKind({ type: "Issue", value: 42 })).toBe("Issue #42");
+    expect(formatSweepKind({ type: "PrSet", value: [10, 20] })).toBe("PR-set [10, 20]");
+    expect(formatSweepKind({ type: "Step", value: { item: 7, role: "judge" } })).toBe(
+      "Step judge #7",
+    );
+  });
+
+  it("parses the daemon's serde shape for a step", () => {
+    const wire = JSON.parse(
+      '{"type":"Step","value":{"item":9,"role":"champion_merge"}}',
+    ) as SweepKind;
+    expect(formatSweepKind(wire)).toBe("Step champion_merge #9");
   });
 });

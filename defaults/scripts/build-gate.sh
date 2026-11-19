@@ -264,7 +264,7 @@ cd "$(git rev-parse --show-toplevel)"
 # STRUCTURAL PHASE — first, and in BOTH tiers (#9140).
 #
 # Until #9140 this gate ran cargo, the doctests and five bash suites and none of
-# the ~30 structural/ratchet gates CI's required `Structural Checks` job
+# the structural gates CI's `Lint` job
 # enforces, so a Builder could report a fully green local gate and still fail CI
 # on checks that are fast, deterministic and need no build at all. PR #9137 is
 # the receipt: an honest 9300/9303 local green, then five CI failures (markdown
@@ -351,10 +351,7 @@ fi
 # The fallback degrades LOUDLY, never silently: a `cargo test` verdict from this
 # gate is a weaker signal than CI's, and whoever triages a red needs to know that
 # BEFORE they spend an investigation on a failure that only reproduces here.
-# Written as one `printf` and one `||` rather than an if/else block of `echo`s
-# purely to stay inside the `shell-budget --check` portable ratchet: this file is
-# `contract` in scripts/shell-allowlist.txt, so its code-line count may shrink
-# but never grow (see .loom/docs/shell-language-policy.md).
+# Written as one `printf` and one `||` rather than an if/else block of `echo`s.
 _rust_unit_cmd=(cargo nextest run --workspace --lib --bins --profile ci --retries "${LOOM_BUILD_GATE_TEST_RETRIES:-1}" --final-status-level flaky)
 command -v cargo-nextest >/dev/null 2>&1 || { _rust_unit_cmd=(cargo test --workspace --lib --bins); printf '[build-gate] WARNING: cargo-nextest is NOT installed -- falling back to cargo test, which shares ONE process\n[build-gate] WARNING: across every test in a binary, so env mutation can race Command::spawn and produce flaky FALSE\n[build-gate] WARNING: REDS that do not reproduce under the runner CI uses (#4385; see .config/nextest.toml, and\n[build-gate] WARNING: #8170 for an investigation spent on exactly such a false red).\n[build-gate] WARNING: Install the runner CI uses for a trustworthy gate:  cargo install cargo-nextest --locked\n' >&2; }
 echo "[build-gate] ${_rust_unit_cmd[*]} (workspace unit tests; host-dependent integration targets are CI-only, #3985)"

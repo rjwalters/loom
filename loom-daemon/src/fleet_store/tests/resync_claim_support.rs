@@ -38,6 +38,14 @@ pub(crate) struct FakeRefForge {
     pub(crate) commits: RefCell<BTreeMap<String, (String, Vec<String>)>>,
     /// Every request, as `"METHOD path"`.
     pub(crate) calls: RefCell<Vec<String>>,
+    /// Pull requests opened through the fake: (head branch, reply body).
+    pub(crate) pulls: RefCell<Vec<(String, Value)>>,
+    /// Labels added to pull requests: (number, label).
+    pub(crate) labels: RefCell<Vec<(u64, String)>>,
+    /// Comments added to pull requests: (number, body).
+    pub(crate) comments: RefCell<Vec<(u64, String)>>,
+    /// Numbers of pull requests closed through the fake.
+    pub(crate) closed: RefCell<Vec<u64>>,
     faults: RefCell<Vec<(String, Fault)>>,
     hook: RefCell<Option<Hook>>,
     next: Cell<u64>,
@@ -111,6 +119,9 @@ impl FakeRefForge {
     }
 
     fn handle(&self, method: &str, path: &str, body: &Value) -> Reply {
+        if let Some(reply) = self.handle_pulls(method, path, body) {
+            return reply;
+        }
         let rest = path.split_once("/git/").map_or("", |(_, r)| r);
         let reply = |status: u16, body: Value| Reply {
             status,
@@ -193,6 +204,61 @@ impl FakeRefForge {
             }
             _ => reply(400, json!({"message": format!("fake forge: unhandled {method} {path}")})),
         }
+    }
+
+    /// The pull-request endpoints the resync's PR route uses.
+    fn handle_pulls(&self, method: &str, path: &str, body: &Value) -> Option<Reply> {
+        let reply = |status: u16, body: Value| Reply {
+            status,
+            etag: None,
+            body: body.to_string(),
+        };
+        if let Some((_, rest)) = path.split_once("/issues/") {
+            if let Some(n) = rest.strip_suffix("/comments") {
+                let text = body.get("body")?.as_str()?.to_string();
+                self.comments.borrow_mut().push((n.parse().ok()?, text));
+                return Some(reply(201, json!({})));
+            }
+            let number: u64 = rest.strip_suffix("/labels")?.parse().ok()?;
+            for label in body.get("labels")?.as_array()? {
+                self.labels
+                    .borrow_mut()
+                    .push((number, label.as_str()?.to_string()));
+            }
+            return Some(reply(200, json!([])));
+        }
+        let (_, rest) = path.split_once("/pulls")?;
+        if method == "PATCH" {
+            let number: u64 = rest.strip_prefix('/')?.parse().ok()?;
+            self.closed.borrow_mut().push(number);
+            self.pulls
+                .borrow_mut()
+                .retain(|(_, v)| v.get("number").and_then(Value::as_u64) != Some(number));
+            return Some(reply(200, json!({"number": number, "state": "closed"})));
+        }
+        if method == "GET" && !rest.contains("head=") {
+            let open: Vec<Value> = self.pulls.borrow().iter().map(|(_, v)| v.clone()).collect();
+            return Some(reply(200, Value::Array(open)));
+        }
+        if method == "GET" {
+            let head = rest.split("head=").nth(1)?.split('&').next()?;
+            let head = head.rsplit(':').next()?;
+            let open: Vec<Value> = self
+                .pulls
+                .borrow()
+                .iter()
+                .filter(|(h, _)| h == head)
+                .map(|(_, v)| v.clone())
+                .collect();
+            return Some(reply(200, Value::Array(open)));
+        }
+        let head = body.get("head").and_then(Value::as_str)?.to_string();
+        let number = self.pulls.borrow().len() as u64 + 1;
+        let pr = json!({"number": number, "html_url": format!("https://forge.test/pull/{number}"),
+                        "title": body.get("title"), "base": body.get("base"),
+                        "body": body.get("body"), "head": {"ref": head}});
+        self.pulls.borrow_mut().push((head, pr.clone()));
+        Some(reply(201, pr))
     }
 
     fn request(&self, method: &str, path: &str, body: &Value) -> Result<Reply> {

@@ -54,6 +54,12 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
             repo,
             ..
         } => Some(dispatch_envelope(repo.as_deref(), *issue)),
+        // A step is not narrated as an issue dispatch (#11898): its item may be
+        // a PR, and one item is advanced by several steps.
+        Event::SweepGlobalDispatch {
+            kind: SweepKind::Step { .. } | SweepKind::PrSet(_),
+            ..
+        } => None,
         Event::SweepPhase {
             issue,
             phase,
@@ -164,27 +170,19 @@ pub fn event_to_envelope(event: &Event) -> Option<Envelope> {
                 meta: None,
             })
         }
-        Event::DaemonIdleExit {
-            trigger,
-            idle_minutes,
-            in_flight_sweeps,
-            active_role_runs,
-            healthy_tokens,
-            total_tokens,
-            message,
-        } => Some(Envelope {
+        // A daemon-wide announcement, so no thread key: it is not about an
+        // issue, and a shared constant id would thread every host's idle exit
+        // together. The old `daemon-idle-exit` id failed `build_send_request`'s
+        // `[A-Za-z0-9_]` check, as did the structured `meta` it carried (`meta`
+        // is valid only on a `completion`), so this line never reached the
+        // room — and the refused send cost the sink a reconnect on its way
+        // out. The trigger is already in `message`.
+        Event::DaemonIdleExit { message, .. } => Some(Envelope {
             to: "*".to_owned(),
             kind: "handoff".to_owned(),
-            task_id: Some("daemon-idle-exit".to_owned()),
+            task_id: None,
             body: message.clone(),
-            meta: Some(serde_json::json!({
-                "trigger": trigger,
-                "idle_minutes": idle_minutes,
-                "in_flight_sweeps": in_flight_sweeps,
-                "active_role_runs": active_role_runs,
-                "healthy_tokens": healthy_tokens,
-                "total_tokens": total_tokens,
-            })),
+            meta: None,
         }),
         // SweepGlobalCompleted (no issue number — SweepExited covers it),
         // SweepGlobalDispatch(PrSet), EpicAction, CapacityAdvisory, TopicLag,

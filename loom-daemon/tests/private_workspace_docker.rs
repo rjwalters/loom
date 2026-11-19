@@ -13,6 +13,8 @@ mod containment;
 mod control;
 #[path = "private_workspace_docker/dispatch.rs"]
 mod dispatch;
+#[path = "private_workspace_docker/recovery.rs"]
+mod recovery;
 
 #[track_caller]
 fn checked(output: Output) -> String {
@@ -147,6 +149,25 @@ impl Fixture {
             kind,
             "--owner",
             "docker-proof",
+            "--",
+            "sh",
+            "-c",
+            command,
+        ])
+    }
+    /// A job bound to an existing branch: preparation resumes that branch's
+    /// local tip (#14030).
+    fn job_on(&self, name: &str, kind: &str, branch: &str, command: &str) -> Command {
+        self.command(&[
+            "session",
+            "job",
+            name,
+            "--kind",
+            kind,
+            "--owner",
+            "docker-proof",
+            "--branch",
+            branch,
             "--",
             "sh",
             "-c",
@@ -326,6 +347,203 @@ WORKDIR /srv
     }
 }
 
+/// Publish a one-file bare repository on the fixture forge at `/srv/<owner>/<name>`.
+fn publish(f: &Fixture, owner: &str, name: &str) -> String {
+    let work = f.root.path().join(format!("publish-{owner}-{name}"));
+    std::fs::create_dir_all(&work).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap(),
+        )
+    };
+    git(&work, &["init", "-b", "main"]);
+    std::fs::write(work.join("file"), owner).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-m", owner]);
+    let bare = f.root.path().join(format!("publish-{owner}-{name}.git"));
+    git(
+        &work,
+        &[
+            "clone",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    git(&bare, &["update-server-info"]);
+    docker(&["exec", &f.server, "mkdir", "-p", &format!("/srv/{owner}")]);
+    docker(&[
+        "cp",
+        bare.to_str().unwrap(),
+        &format!("{}:/srv/{owner}/{name}", f.server),
+    ]);
+    // `docker cp` keeps the host UID; git-http-backend refuses a foreign-owned repository.
+    docker(&[
+        "exec",
+        "--user",
+        "0",
+        &f.server,
+        "chown",
+        "-R",
+        "0:0",
+        &format!("/srv/{owner}"),
+    ]);
+    f.repository
+        .replace("/repo.git", &format!("/{owner}/{name}"))
+}
+
+#[test]
+#[ignore = "requires Docker; explicitly run by CI"]
+fn one_account_container_prepares_two_repositories_without_collision_or_host_mounts() {
+    let f = Fixture::new();
+    let a = &f.names[0];
+    f.start(a);
+    // Same basename, different owners: both must get their own clone.
+    let (one, two) = (publish(&f, "other", "second"), publish(&f, "zed", "second"));
+    let register = |url: &str| -> Value {
+        serde_json::from_str(&f.cli(&[
+            "session",
+            "start",
+            a,
+            "--private-clone",
+            url,
+            "--image",
+            &f.image,
+            "--json",
+        ]))
+        .unwrap()
+    };
+    assert_eq!(
+        register(&one)["config"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Registering is lazy: nothing is cloned until a job selects the repository.
+    assert_eq!(f.exec(a, "ls /workspace/work 2>/dev/null | wc -l").trim(), "0");
+    assert_eq!(
+        register(&two)["config"]["repositories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    checked(
+        f.job(a, "role", "echo unfinished > /workspace/repo/keep")
+            .output()
+            .unwrap(),
+    );
+    let on = |url: &str, command: &str| {
+        checked(
+            f.command(&[
+                "session",
+                "job",
+                a,
+                "--kind",
+                "role",
+                "--owner",
+                "docker-proof",
+                "--repository",
+                url,
+                "--",
+                "sh",
+                "-c",
+                command,
+            ])
+            .output()
+            .unwrap(),
+        )
+    };
+    let first = on(&one, "pwd; cat file; echo mine > mine");
+    let second = on(&two, "pwd; cat file");
+    assert!(
+        first.contains("/workspace/work/other-second-") && first.contains("other"),
+        "{first}"
+    );
+    assert!(
+        second.contains("/workspace/work/zed-second-") && second.contains("zed"),
+        "{second}"
+    );
+    // Separate Git roots; the first clone's work is unchanged by preparing the second.
+    let roots = f.exec(
+        a,
+        "for d in /workspace/repo /workspace/work/*-second-*; do git -C $d rev-parse --show-toplevel; done",
+    );
+    assert_eq!(
+        roots
+            .lines()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "{roots}"
+    );
+    assert_eq!(f.exec(a, "cat /workspace/work/other-second-*/mine").trim(), "mine");
+    assert_eq!(f.exec(a, "cat /workspace/repo/keep").trim(), "unfinished");
+    // An unregistered repository is refused before any clone.
+    let refused = f
+        .command(&[
+            "session",
+            "job",
+            a,
+            "--kind",
+            "role",
+            "--owner",
+            "docker-proof",
+            "--repository",
+            &f.repository.replace("/repo.git", "/nobody/unknown"),
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not registered"));
+    // Actual HostConfig/mounts: no host checkout, no peer volume; credentials stay outside clones.
+    let mounts: Value = serde_json::from_str(&docker(&[
+        "inspect",
+        &format!("loom-codex-session-{a}"),
+        "--format",
+        "{{json .Mounts}}",
+    ]))
+    .unwrap();
+    let host_source = f.root.path().join("source");
+    for mount in mounts.as_array().unwrap() {
+        let source = mount["Source"].as_str().unwrap();
+        assert!(!source.starts_with(host_source.to_str().unwrap()), "{mount}");
+        assert!(
+            !mount["Destination"]
+                .as_str()
+                .unwrap()
+                .starts_with("/workspace/work"),
+            "{mount}"
+        );
+        if mount["Destination"] == "/workspace" {
+            assert_eq!(mount["Name"], format!("loom-codex-workspace-{a}"));
+        }
+    }
+    assert_eq!(
+        f.exec(
+            a,
+            &format!("grep -rl '{}' /workspace/work /workspace/repo || true", auth::PASSWORD)
+        )
+        .trim(),
+        ""
+    );
+}
+
 #[test]
 #[ignore = "requires Docker; explicitly run by CI"]
 fn private_clones_contain_writes_reuse_and_serialize_all_job_kinds() {
@@ -481,10 +699,69 @@ fn private_clones_contain_writes_reuse_and_serialize_all_job_kinds() {
     f.exec(a, "git -C /workspace/repo restore file");
     checked(f.job(a, "sweep", "git -C /workspace/repo switch -c unpublished; echo commit > /workspace/repo/file; git -C /workspace/repo commit -am unpublished").output().unwrap());
     let tip = f.exec(a, "git -C /workspace/repo rev-parse HEAD");
-    let unpublished = f.job(a, "role", "true").output().unwrap();
-    assert!(!unpublished.status.success());
-    assert!(String::from_utf8_lossy(&unpublished.stderr).contains("unpushed"));
+    // Work named by a branch no longer refuses: preparation never moves a
+    // branch, so the account stays usable and the branch keeps its tip (#14030).
+    checked(f.job(a, "role", "true").output().unwrap());
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse unpublished"), tip);
+    // Naming the branch resumes its local tip exactly.
+    checked(f.job_on(a, "role", "unpublished", "true").output().unwrap());
     assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // Work stranded on a detached HEAD — unnamed by any branch — still
+    // refuses, and the refusal names the recover verb as the cure.
+    f.exec(a, "git -C /workspace/repo checkout --detach");
+    f.exec(a, "git -C /workspace/repo branch -D unpublished");
+    let stranded = f.job(a, "role", "true").output().unwrap();
+    assert!(!stranded.status.success());
+    assert!(String::from_utf8_lossy(&stranded.stderr).contains("detached"));
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // `session recover` lists the stranded work without touching it.
+    let report: Value = serde_json::from_str(&f.cli(&["session", "recover", a, "--json"])).unwrap();
+    assert_eq!(report["clones"][0]["detached"].as_array().unwrap().len(), 1);
+    assert_eq!(report["clones"][0]["branches"].as_array().unwrap().len(), 0);
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), tip);
+    // Naming the work makes it publishable; `--publish` pushes it and the
+    // account is unblocked for good.
+    f.exec(a, "git -C /workspace/repo switch -c recovered");
+    let report: Value =
+        serde_json::from_str(&f.cli(&["session", "recover", a, "--publish", "--json"])).unwrap();
+    assert_eq!(report["clones"][0]["published"].as_array().unwrap().len(), 1);
+    assert_eq!(report["clones"][0]["branches"].as_array().unwrap().len(), 0);
+    checked(f.job(a, "role", "true").output().unwrap());
+    // A scoped discard deletes only the branch it was named for. The volume,
+    // the checkout and every other branch are untouched — the discarded tip
+    // is merely unnamed again, so the account correctly stays refused until
+    // the work is named again, and that refusal leaves the stale job record
+    // the next segment builds on.
+    checked(f.job(a, "sweep", "git -C /workspace/repo switch -c disposable; echo gone > /workspace/repo/file; git -C /workspace/repo commit -am disposable; git -C /workspace/repo switch --detach").output().unwrap());
+    let disposable_tip = f.exec(a, "git -C /workspace/repo rev-parse HEAD");
+    let report: Value = serde_json::from_str(&f.cli(&[
+        "session",
+        "recover",
+        a,
+        "--discard",
+        "--branch",
+        "disposable",
+        "--json",
+    ]))
+    .unwrap();
+    assert_eq!(report["clones"][0]["discarded"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.exec(
+            a,
+            "git -C /workspace/repo rev-parse --verify refs/heads/disposable || echo gone"
+        )
+        .trim(),
+        "gone"
+    );
+    assert!(
+        f.exec(a, "git -C /workspace/repo rev-parse --verify refs/heads/recovered")
+            .len()
+            == 41
+    );
+    assert_eq!(f.exec(a, "git -C /workspace/repo rev-parse HEAD"), disposable_tip);
+    let stranded = f.job(a, "role", "true").output().unwrap();
+    assert!(!stranded.status.success());
+    assert!(String::from_utf8_lossy(&stranded.stderr).contains("detached"));
     // An unleased surviving child also blocks stale-record reclamation.
     docker(&[
         "exec",
@@ -526,3 +803,8 @@ fn private_clones_contain_writes_reuse_and_serialize_all_job_kinds() {
     assert!(lease.exists());
     docker(&["rename", &renamed, &original]);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

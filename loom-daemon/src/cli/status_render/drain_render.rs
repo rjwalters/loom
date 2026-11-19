@@ -13,7 +13,7 @@
 //! line instead of printing it, so tests assert on the text directly —
 //! the same shape as the [`super::holds`] sibling.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// The `drain` object for `status --json`.
 ///
@@ -31,7 +31,6 @@ pub fn drain_json(report: &DaemonStatusReport) -> serde_json::Value {
             "started_at": r.started_at,
             "paused_secs": r.paused_secs,
             "budget_secs": r.budget_secs,
-            "refusals": r.refusals,
             "in_flight": r.in_flight,
             "target": r.target,
             "then_exit": r.then_exit,
@@ -81,10 +80,15 @@ pub fn paused_by_day_line(report: &DaemonStatusReport) -> Option<String> {
 /// live roll state (no drain active, or a pre-#8514 daemon).
 #[must_use]
 pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
+    roll_line_at(report, chrono::Utc::now())
+}
+
+/// [`roll_line`] with an injectable clock.
+fn roll_line_at(report: &DaemonStatusReport, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
     // #10832: an H5 resume hold is not a roll waiting on anything; say what
     // it is doing instead.
     if let Some(resume) = report.pause_resume.as_ref().filter(|r| r.holding) {
-        return Some(resume_line(resume));
+        return Some(resume_line(resume, now));
     }
     let roll = report.drain_roll.as_ref()?;
     // #9588: say WHY dispatch is paused before anything else.
@@ -121,21 +125,24 @@ pub fn roll_line(report: &DaemonStatusReport) -> Option<String> {
         format!(" [origin: {}]", roll.origin)
     };
     Some(format!(
-        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight, {} refusal(s){target}{origin}",
+        "       roll {state} {since} — dispatch paused {}{budget}, {} in flight{target}{origin}",
         human_secs(roll.paused_secs),
         roll.in_flight,
-        roll.refusals,
     ))
 }
 
 /// The human line for an H5 resume in progress (#10832).
-fn resume_line(resume: &loom_daemon::auto_update::pause_resume::PauseResumeStatus) -> String {
+fn resume_line(
+    resume: &crate::auto_update::pause_resume::PauseResumeStatus,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
     let requeued: u32 = resume.requeued_by_reason.values().sum();
     format!(
-        "       roll RESUMING (H5 {}, manifest {}, phase {}) — dispatch held while this daemon \
+        "       roll RESUMING (H5 {}{}, manifest {}, phase {}) — dispatch held while this daemon \
          verifies its health and resumes {} paused agent(s): {} resumed, {requeued} requeued so \
          far [{} → {}, running {}{}]",
         resume.step,
+        step_progress(resume, now),
         resume.manifest_id.as_deref().unwrap_or("?"),
         resume.phase.as_deref().unwrap_or("?"),
         resume.items,
@@ -151,11 +158,31 @@ fn resume_line(resume: &loom_daemon::auto_update::pause_resume::PauseResumeStatu
     )
 }
 
-/// The human line for a pause roll's H4 pause (#10831).
-fn pause_line(
-    roll: &loom_daemon::ipc::DrainRollStatus,
-    pause: &loom_daemon::ipc::PauseRollStatus,
+/// `" 31s of a 1m budget"` for the H5 step in progress (#12147), so a slow H5
+/// reads differently from a stuck one. Empty when the step has no start
+/// stamp (older daemon) — the budget alone would say nothing about progress.
+fn step_progress(
+    resume: &crate::auto_update::pause_resume::PauseResumeStatus,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> String {
+    let Some(started) = resume.step_started_at else {
+        return String::new();
+    };
+    let elapsed = u64::try_from((now - started).num_seconds()).unwrap_or(0);
+    let budget = match resume.step.as_str() {
+        "probation" => resume.verify_probation_secs,
+        "resume" | "requeue" => resume.resume_budget_secs,
+        _ => 0,
+    };
+    if budget > 0 {
+        format!(", {} of a {} budget", human_secs(elapsed), human_secs(budget))
+    } else {
+        format!(", {} in step", human_secs(elapsed))
+    }
+}
+
+/// The human line for a pause roll's H4 pause (#10831).
+fn pause_line(roll: &crate::ipc::DrainRollStatus, pause: &crate::ipc::PauseRollStatus) -> String {
     let requeued: u32 = pause.requeued_by_reason.values().sum();
     let reasons = if pause.requeued_by_reason.is_empty() {
         String::new()
@@ -211,7 +238,7 @@ fn human_secs(secs: u64) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::ipc::DrainRollStatus;
+    use crate::ipc::DrainRollStatus;
 
     fn report_with(roll: Option<DrainRollStatus>) -> DaemonStatusReport {
         let mut report = crate::cli::status::sample_report::sample_report();
@@ -247,7 +274,7 @@ mod tests {
     fn a_resume_reports_its_manifest_phase_and_per_reason_counts() {
         let mut report = report_with(None);
         assert_eq!(drain_json(&report)["resume"], serde_json::Value::Null);
-        report.pause_resume = Some(loom_daemon::auto_update::pause_resume::PauseResumeStatus {
+        report.pause_resume = Some(crate::auto_update::pause_resume::PauseResumeStatus {
             manifest_id: Some("rp-1".to_string()),
             phase: Some("resumed".to_string()),
             step: "done".to_string(),
@@ -274,6 +301,28 @@ mod tests {
         let line = roll_line(&report).unwrap();
         assert!(line.contains("RESUMING") && line.contains("probation"), "{line}");
         assert!(line.contains("2 resumed, 1 requeued") && line.contains("ROLLBACK"), "{line}");
+
+        // #12147: the line shows elapsed time in the step and its budget.
+        let started = chrono::DateTime::parse_from_rfc3339("2026-10-14T16:53:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let now = started + chrono::Duration::seconds(75);
+        let resume = report.pause_resume.as_mut().unwrap();
+        resume.step_started_at = Some(started);
+        resume.verify_probation_secs = 120;
+        resume.resume_budget_secs = 300;
+        let line = roll_line_at(&report, now).unwrap();
+        assert!(line.contains("H5 probation, 1m15s of a 2m0s budget"), "{line}");
+        report.pause_resume.as_mut().unwrap().step = "resume".to_string();
+        let line = roll_line_at(&report, now).unwrap();
+        assert!(line.contains("H5 resume, 1m15s of a 5m0s budget"), "{line}");
+        report.pause_resume.as_mut().unwrap().step = "lease".to_string();
+        let line = roll_line_at(&report, now).unwrap();
+        assert!(line.contains("H5 lease, 1m15s in step"), "{line}");
+        // No stamp (older daemon): no invented progress.
+        report.pause_resume.as_mut().unwrap().step_started_at = None;
+        let line = roll_line_at(&report, now).unwrap();
+        assert!(line.contains("(H5 lease, manifest"), "{line}");
     }
 
     /// #10831: a pause roll reports its H4 progress in `--json` and renders a
@@ -282,11 +331,10 @@ mod tests {
     fn a_pause_roll_reports_its_step_budget_and_per_reason_counts() {
         let mut roll = pending_roll();
         roll.roll_pending = false;
-        roll.refusals = 0;
         roll.budget_secs = 120;
         roll.paused_secs = 40;
         roll.origin = "pause-roll".to_string();
-        roll.pause = Some(loom_daemon::ipc::PauseRollStatus {
+        roll.pause = Some(crate::ipc::PauseRollStatus {
             step: 5,
             stopped: true,
             budget_secs: 120,
@@ -299,7 +347,7 @@ mod tests {
         });
         let value = drain_json(&report_with(Some(roll.clone())));
         assert_eq!(value["roll"]["roll_pending"], serde_json::json!(false));
-        assert_eq!(value["roll"]["refusals"], serde_json::json!(0));
+        assert!(value["roll"].get("refusals").is_none());
         assert_eq!(value["roll"]["pause"]["step"], serde_json::json!(5));
         assert_eq!(value["roll"]["pause"]["budget_secs"], serde_json::json!(120));
         assert_eq!(
@@ -320,7 +368,7 @@ mod tests {
         assert_eq!(roll["roll_pending"], serde_json::json!(true));
         assert_eq!(roll["paused_secs"], serde_json::json!(3720));
         assert_eq!(roll["budget_secs"], serde_json::json!(7200));
-        assert_eq!(roll["refusals"], serde_json::json!(2));
+        assert!(roll.get("refusals").is_none());
         assert_eq!(roll["in_flight"], serde_json::json!(3));
         assert_eq!(roll["target"], serde_json::json!("v0.19.24@abcd"));
         assert_eq!(roll["then_exit"], serde_json::json!(false));
@@ -350,7 +398,7 @@ mod tests {
         assert!(line.contains("since 2026-09-22 12:00:00"), "{line}");
         assert!(line.contains("dispatch paused 1h2m of a 2h0m budget"), "{line}");
         assert!(line.contains("3 in flight"), "{line}");
-        assert!(line.contains("2 refusal(s)"), "{line}");
+        assert!(!line.contains("refusal"), "{line}");
         assert!(line.contains("target v0.19.24@abcd"), "{line}");
     }
 
@@ -358,7 +406,6 @@ mod tests {
     fn a_first_attempt_roll_does_not_claim_to_be_pending() {
         let mut roll = pending_roll();
         roll.roll_pending = false;
-        roll.refusals = 0;
         roll.paused_secs = 45;
         roll.target = None;
         let line = roll_line(&report_with(Some(roll))).unwrap();

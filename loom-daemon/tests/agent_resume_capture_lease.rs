@@ -107,3 +107,8 @@ fn a_running_capture_watcher_does_not_hold_the_account_lease() {
     );
     stop(watcher);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

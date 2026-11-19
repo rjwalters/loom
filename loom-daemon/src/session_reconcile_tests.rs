@@ -16,6 +16,8 @@ use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
+use crate::tokens_pool::session_image;
+use crate::tokens_pool::session_image::ExtraMount;
 use crate::tokens_pool::session_lifecycle::{
     check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
     ExecOutput, WORKSPACE_LABEL,
@@ -119,6 +121,7 @@ impl FakeState {
                 started_at: None,
                 image: Some("example/session:pinned".into()),
                 workspace: workspace.map(Path::to_path_buf),
+                extra_mounts: Vec::new(),
             },
         );
     }
@@ -223,6 +226,8 @@ fn inspect_json(name: &str, state: &ContainerState, mounts: &[PathBuf]) -> Value
     })
 }
 
+impl session_image::BundleProbe for Fake {}
+
 impl ContainerRunner for Fake {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
@@ -240,6 +245,7 @@ impl ContainerRunner for Fake {
         _codex_home: &Path,
         workspace: &Path,
         _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         self.log("create");
         self.hold_if_racing_a_stop();
@@ -440,6 +446,7 @@ fn fake_inputs<'a>(
     PassInputs {
         index,
         is_private_clone: private,
+        recover_private: &|_, _, _| Ok(()),
         fallback_workspace: fallback,
         registered: Some(registered),
         denials_for: &|_| Ok(drift::Denials::default()),
@@ -447,6 +454,7 @@ fn fake_inputs<'a>(
         dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
         class: None,
         host_version: None,
+        session_config: None,
     }
 }
 
@@ -485,6 +493,42 @@ fn pass_named(
     reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }
 
+/// [`pass_named`] with the resolved `accounts.session` settings in the
+/// inputs (issue #14019).
+fn pass_named_with_session_config(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+    session_config: &SessionImageConfig,
+) -> Vec<AccountOutcome> {
+    let index = AccountIndex::from_inventories(&[accounts, &[]]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
+    let inputs = PassInputs {
+        host_version: fake.host_version.lock().unwrap().clone(),
+        registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
+        denials_for: &|_| {
+            if *fake.roster_unreadable.lock().unwrap() {
+                bail!("fleet roster (firewall input): unreadable");
+            }
+            Ok(fake.denials())
+        },
+        would_create_accept: &|workspace| {
+            let walls = fake.firewalled.lock().unwrap().clone();
+            fake.create_accepts(workspace, &walls).map(drop)
+        },
+        session_config: Some(session_config),
+        ..inputs
+    };
+    reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
+}
+
 // ---- decision function ------------------------------------------------------
 
 fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerState {
@@ -495,6 +539,7 @@ fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerStat
         started_at: None,
         image: None,
         workspace: workspace.map(PathBuf::from),
+        extra_mounts: Vec::new(),
     }
 }
 
@@ -681,6 +726,52 @@ fn a_removed_host_mounted_container_is_recreated_with_its_last_workspace_and_ima
 
 #[test]
 #[serial]
+fn a_missing_container_is_recreated_on_the_configured_image_not_the_recorded_pin() {
+    // Issue #14421 (regression guard for #14019): the configured
+    // `accounts.session.image` beats the image recorded for the seat.
+    let env = setup(&["alice"], &["alice"]);
+    let container = container_name("alice");
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container, true, false, Some(Path::new("/home/u/GitHub")));
+    let config = SessionImageConfig {
+        image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
+        extra_mounts: Vec::new(),
+    };
+    let mut state = ReconcileState::default();
+    let pass_cfg = |lifecycle: &mut SessionLifecycle<Fake>, state: &mut ReconcileState, now| {
+        pass_named_with_session_config(
+            lifecycle,
+            &env.accounts,
+            &host,
+            Path::new("/srv/checkouts"),
+            state,
+            now,
+            &config,
+        )
+        .into_iter()
+        .map(|o| o.outcome)
+        .collect::<Vec<_>>()
+    };
+    // Observed running first, so the pass records the stale image pin.
+    assert_eq!(pass_cfg(&mut lifecycle, &mut state, 0), vec![Outcome::Running]);
+    // `docker rm -f`
+    lifecycle.runner().containers.lock().unwrap().clear();
+    assert_eq!(
+        pass_cfg(&mut lifecycle, &mut state, 60),
+        vec![Outcome::Recreated {
+            workspace: "/home/u/GitHub".into()
+        }]
+    );
+    let creates = lifecycle.runner().creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0].1, "ghcr.io/example/session-mine@sha256:aa55");
+    assert_ne!(creates[0].1, "example/session:pinned", "not the recorded pin");
+}
+
+#[test]
+#[serial]
 fn a_never_seen_missing_container_uses_the_fallback_workspace() {
     let env = setup(&["alice"], &["alice"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
@@ -697,19 +788,20 @@ fn a_never_seen_missing_container_uses_the_fallback_workspace() {
 
 #[test]
 #[serial]
-fn a_private_clone_account_is_skipped_not_created() {
+fn a_private_clone_account_is_recovered_never_created_host_mounted() {
     let env = setup(&["alice"], &["alice"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
     let mut state = ReconcileState::default();
     let private = |_: &AccountDescriptor| -> anyhow::Result<bool> { Ok(true) };
     assert_eq!(
         pass(&mut lifecycle, &env, &private, &mut state, 0),
-        vec![Outcome::PrivateCloneSkipped]
+        vec![Outcome::PrivateRecovered]
     );
     // Undecidable mode fails closed too.
     let unknown = |_: &AccountDescriptor| -> anyhow::Result<bool> { bail!("bad state") };
+    let mut fresh = ReconcileState::default();
     assert_eq!(
-        pass(&mut lifecycle, &env, &unknown, &mut state, 60),
+        pass(&mut lifecycle, &env, &unknown, &mut fresh, 60),
         vec![Outcome::PrivateCloneSkipped]
     );
     assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
@@ -1140,4 +1232,140 @@ fn an_operator_start_is_never_left_running_and_held() {
     std::fs::create_dir_all(dir.join(session_hold::LAST_START_FILE).join("x")).unwrap();
     let status = lifecycle.start("alice").unwrap();
     assert!(status.running && !status.held, "{status:?}");
+}
+
+/// One pass over alice with a caller-supplied private recovery.
+fn recover_pass(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    env: &Env,
+    recover: &PrivateRecovery<'_>,
+    state: &mut ReconcileState,
+    now: u64,
+) -> Vec<Outcome> {
+    let index = AccountIndex::from_inventories(&[&env.accounts]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let private = |_: &AccountDescriptor| -> anyhow::Result<bool> { Ok(true) };
+    let inputs = PassInputs {
+        recover_private: recover,
+        ..fake_inputs(&fake, &index, &private, Path::new("/srv/checkouts"), &registered)
+    };
+    reconcile_accounts(lifecycle, &env.accounts, &inputs, &mut observe, state, now)
+        .into_iter()
+        .map(|o| o.outcome)
+        .collect()
+}
+
+#[test]
+#[serial]
+fn private_recovery_failure_backs_off_and_never_touches_the_host_path() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let calls = std::cell::Cell::new(0);
+    let failing = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        calls.set(calls.get() + 1);
+        bail!("workspace volume is missing")
+    };
+    let first = recover_pass(&mut lifecycle, &env, &failing, &mut state, 0);
+    assert!(matches!(&first[0], Outcome::Failed { error, .. } if error.contains("volume")));
+    // Inside the backoff window the recovery is not retried.
+    let second = recover_pass(&mut lifecycle, &env, &failing, &mut state, 1);
+    assert!(matches!(second[0], Outcome::BackingOff { .. }));
+    assert_eq!(calls.get(), 1);
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+}
+
+#[test]
+#[serial]
+fn private_recovery_hold_at_the_mutation_boundary_is_reported_held() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    let held = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        Err(anyhow::Error::from(OperatorHeld))
+    };
+    assert_eq!(recover_pass(&mut lifecycle, &env, &held, &mut state, 0), vec![Outcome::Held]);
+}
+
+/// A private session that dies after every recovery is retried on the
+/// exponential backoff, not every pass: the recovery "succeeds", the next pass
+/// finds it down again and counts a failure, and each failure doubles the
+/// wait (120 s, 240 s, 480 s ...). The restart storm is bounded the same way
+/// the host-mounted path's is.
+#[test]
+#[serial]
+fn a_private_session_that_dies_after_each_recovery_is_retried_on_the_backoff() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle.runner().seed(
+        &container_name("alice"),
+        false,
+        false,
+        Some(Path::new(private_workspace::REPO)),
+    );
+    let mut state = ReconcileState::default();
+    let calls = std::cell::Cell::new(0);
+    // Reports success but the fake container stays stopped: it died at once.
+    let dies = |_: &AccountDescriptor, _: Option<&str>, _: &dyn Fn() -> bool| {
+        calls.set(calls.get() + 1);
+        Ok(())
+    };
+    let mut run = |now: u64| recover_pass(&mut lifecycle, &env, &dies, &mut state, now);
+    assert_eq!(run(0), vec![Outcome::PrivateRecovered]);
+    let died = run(60);
+    assert!(matches!(died[0], Outcome::Failed { retry_at: 180, .. }), "{died:?}");
+    assert!(matches!(run(120)[0], Outcome::BackingOff { retry_at: 180 }));
+    assert_eq!(run(180), vec![Outcome::PrivateRecovered]);
+    assert!(matches!(run(240)[0], Outcome::Failed { retry_at: 480, .. }));
+    assert!(matches!(run(300)[0], Outcome::BackingOff { retry_at: 480 }));
+    assert_eq!(run(480), vec![Outcome::PrivateRecovered]);
+    assert!(matches!(run(540)[0], Outcome::Failed { retry_at: 1020, .. }));
+    assert_eq!(calls.get(), 3, "one recovery per backoff window, not per pass");
+    assert_eq!(lifecycle.runner().mutations(), Vec::<String>::new());
+}
+
+/// The image a missing private container is recreated from is the one last
+/// seen on it, never the operator-start record: that record is written only
+/// by host-mounted starts, so for a private account it describes an earlier
+/// host-mounted era. With no sighting at all the hint is `None` (the recovery
+/// then refuses to substitute an image) rather than the host image.
+#[test]
+#[serial]
+fn a_private_recovery_is_handed_the_containers_own_last_image_not_the_operator_start() {
+    let env = setup(&["alice"], &["alice"]);
+    session_hold::record_operator_start(
+        &env.accounts[0].credential_reference,
+        Path::new("/srv/checkouts"),
+        "example/host-session:old",
+        session_hold::now_unix_ms(),
+    )
+    .unwrap();
+    let handed = std::cell::RefCell::new(Vec::<Option<String>>::new());
+    let record = |_: &AccountDescriptor, image: Option<&str>, _: &dyn Fn() -> bool| {
+        handed.borrow_mut().push(image.map(str::to_owned));
+        Ok(())
+    };
+    // Never seen: no image to recreate from.
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        recover_pass(&mut lifecycle, &env, &record, &mut state, 0),
+        vec![Outcome::PrivateRecovered]
+    );
+    // Seen stopped (the fake seeds `example/session:pinned`): that image.
+    lifecycle.runner().seed(
+        &container_name("alice"),
+        false,
+        false,
+        Some(Path::new(private_workspace::REPO)),
+    );
+    let mut state = ReconcileState::default();
+    assert_eq!(
+        recover_pass(&mut lifecycle, &env, &record, &mut state, 0),
+        vec![Outcome::PrivateRecovered]
+    );
+    assert_eq!(handed.borrow().as_slice(), [None, Some("example/session:pinned".to_owned())]);
 }

@@ -33,10 +33,27 @@ pub struct IntentMarker<'a> {
 /// Written under `umask 077`: the marker records paths and a label, and the
 /// shell chose 0600 deliberately.
 pub fn write(loom_dir: &Path, marker_path: &Path, m: &IntentMarker) {
-    let _ = std::fs::create_dir_all(loom_dir);
-    let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let work_finder = std::env::var("LOOM_WORK_FINDER").unwrap_or_default();
     let health_gate = std::env::var("LOOM_MAIN_HEALTH_GATE").unwrap_or_default();
+    write_recording(loom_dir, marker_path, m, &work_finder, &health_gate);
+}
+
+/// [`write`] with the recorded `work_finder` / `health_gate` given rather than
+/// read from this process's env.
+///
+/// The systemd start passes the values the started daemon actually runs with
+/// (#11951): its unit carries no autonomy env, so the start script's own
+/// resolved default says nothing about the daemon, and recording it gave a
+/// later start a stale `work_finder=0` to compare against.
+pub fn write_recording(
+    loom_dir: &Path,
+    marker_path: &Path,
+    m: &IntentMarker,
+    work_finder: &str,
+    health_gate: &str,
+) {
+    let _ = std::fs::create_dir_all(loom_dir);
+    let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     // Read BEFORE the truncating write below: the prior values are the carry.
     let config = crate::config_resolver::resolve_effective_config(m.repo_root);
     let hang_recover = hang_recover_fields(

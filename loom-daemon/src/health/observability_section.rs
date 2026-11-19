@@ -74,32 +74,6 @@ pub fn assess_observability(inputs: &HealthInputs) -> Option<HealthSection> {
         serde_json::to_value(e).unwrap_or(serde_json::Value::Null)
     });
 
-    if let Some(mismatch) = status.observability_host_id_mismatch.as_ref() {
-        let age = inputs
-            .at
-            .signed_duration_since(mismatch.first_seen_at)
-            .num_seconds()
-            .max(0);
-        return Some(HealthSection::new(
-            "observability",
-            Verdict::Degraded,
-            format!(
-                "telemetry is being filed under {} — the ingest key on this host is bound to that \
-                 id, not to {} (first seen {} ago)",
-                mismatch.ingest_host_id,
-                mismatch.daemon_host_id,
-                format_window(u64::try_from(age).unwrap_or(0))
-            ),
-            serde_json::json!({
-                "daemon_host_id": mismatch.daemon_host_id,
-                "ingest_host_id": mismatch.ingest_host_id,
-                "first_seen_at": mismatch.first_seen_at,
-                "first_seen_age_secs": age,
-                "export": export_detail,
-            }),
-        ));
-    }
-
     let export = export?;
     match export.classify(inputs.at) {
         // The #5083 headline: configured, running, and has never once

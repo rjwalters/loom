@@ -85,3 +85,8 @@ fn recover_orphans_json_from_a_bare_loom_dir_fails_loudly() {
         "a zero-orphan payload after a failed resolution is a false all-clear: {stdout}"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

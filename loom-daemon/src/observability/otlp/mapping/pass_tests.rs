@@ -1,4 +1,4 @@
-//! OTLP mapping of `pass.summary` / `pass.verdict` (#10752).
+//! OTLP mapping of `pass.verdict` (#10752).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,52 +8,11 @@ use opentelemetry_proto::tonic::logs::v1::{LogRecord, SeverityNumber};
 
 use super::super::log_record_for;
 use crate::telemetry::kinds::pass::{
-    BlockerState, GithubSpend, PassMode, PassOutcome, PassSummaryRecord, PassVerdictRecord,
-    PASS_LOG_ATTRIBUTE_KEYS,
+    BlockerState, PassMode, PassVerdictRecord, PASS_LOG_ATTRIBUTE_KEYS,
 };
-use crate::telemetry::provenance::Provenance;
 use crate::telemetry::{TelemetryEnvelope, TelemetryRecord};
 
 const QUERIES: &str = include_str!("../../../../../defaults/observability/signoz/pass-queries.sql");
-
-fn summary() -> PassSummaryRecord {
-    let at = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
-    PassSummaryRecord {
-        pass_id: "0123456789abcdef0123456789abcdef".to_string(),
-        mechanism: "stale_blocked_release".to_string(),
-        repo: "rjwalters/loom".to_string(),
-        host: "loom-worker-1".to_string(),
-        mode: PassMode::On,
-        outcome: PassOutcome::Completed,
-        refusal: None,
-        started_at: at,
-        ended_at: at + chrono::Duration::milliseconds(1500),
-        duration_ms: 1500,
-        examined: 46,
-        verdicts: [("failed", 0), ("released", 1), ("skipped", 40)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        skipped: [("no-park-record", 30), ("unstated", 10)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        write_cap_hit: true,
-        github: GithubSpend {
-            calls: 9,
-            writes: 2,
-            not_modified: 5,
-        },
-        verdicts_emitted: 3,
-        verdicts_unchanged: 43,
-        loom: Provenance {
-            version: "0.19.853".to_string(),
-            revision: "2889d5ed585b4da0935543cb916381cc03b19746".to_string(),
-            tree_state: "clean".to_string(),
-            complete: true,
-        },
-    }
-}
 
 fn verdict() -> PassVerdictRecord {
     PassVerdictRecord {
@@ -66,6 +25,8 @@ fn verdict() -> PassVerdictRecord {
         verdict: "released".to_string(),
         reason: Some("no-park-record".to_string()),
         detail: Some("free text stays in the body".to_string()),
+        unevaluated_reason: None,
+        budget: None,
         blockers: vec![
             BlockerState {
                 reference: "#10753".to_string(),
@@ -81,6 +42,7 @@ fn verdict() -> PassVerdictRecord {
         mode: PassMode::On,
         applied: true,
         at: Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 1).unwrap(),
+        step: Default::default(),
     }
 }
 
@@ -112,44 +74,14 @@ fn int(value: Option<&Value>) -> i64 {
 /// Every key either kind exports, beyond the two `log_record_for` adds.
 fn allowed(key: &str) -> bool {
     PASS_LOG_ATTRIBUTE_KEYS.contains(&key)
-        || matches!(key, "loom.repo" | "loom.role" | "loom.kind" | "loom.record_id")
+        || matches!(
+            key,
+            "loom.repo" | "loom.role" | "loom.kind" | "loom.record_id" | "loom.sweep_id"
+        )
 }
 
 #[test]
-fn a_summary_is_one_log_at_its_end_with_its_counts_flattened() {
-    let r = summary();
-    let log = log(TelemetryRecord::PassSummary(r.clone()));
-    assert_eq!(log.event_name, "pass.summary");
-    assert_eq!(log.time_unix_nano, super::super::nanos(r.ended_at));
-    assert_eq!(log.severity_number, SeverityNumber::Info as i32);
-    let a = attrs(&log);
-    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
-    assert_eq!(string(a.get("loom.kind")), "pass.summary");
-    assert_eq!(string(a.get("loom.repo")), "rjwalters/loom");
-    assert_eq!(string(a.get("loom.pass.mechanism")), "stale_blocked_release");
-    assert_eq!(string(a.get("loom.pass.verdicts")), "failed=0,released=1,skipped=40");
-    assert_eq!(string(a.get("loom.pass.skip_reasons")), "no-park-record=30,unstated=10");
-    assert_eq!(int(a.get("loom.pass.skipped")), 40);
-    assert_eq!(int(a.get("loom.pass.github_calls")), 9);
-    assert_eq!(a.get("loom.pass.write_cap_hit"), Some(&Value::BoolValue(true)));
-    // The body is the whole record.
-    let Some(Value::StringValue(body)) = log.body.and_then(|b| b.value) else {
-        panic!("string body")
-    };
-    let back: PassSummaryRecord = serde_json::from_str(&body).unwrap();
-    assert_eq!(back, r);
-}
-
-#[test]
-fn a_refused_pass_or_a_failed_write_is_a_warning() {
-    let mut refused = summary();
-    refused.outcome = PassOutcome::Refused;
-    let log1 = log(TelemetryRecord::PassSummary(refused));
-    assert_eq!(log1.severity_number, SeverityNumber::Warn as i32);
-    let mut failed = summary();
-    failed.verdicts.insert("failed".to_string(), 1);
-    let log2 = log(TelemetryRecord::PassSummary(failed));
-    assert_eq!(log2.severity_number, SeverityNumber::Warn as i32);
+fn a_failed_verdict_is_a_warning() {
     let mut v = verdict();
     v.verdict = "failed".to_string();
     assert_eq!(
@@ -221,10 +153,7 @@ fn sql_keys(sql: &str) -> BTreeSet<(String, String)> {
 #[test]
 fn the_saved_queries_read_each_key_from_the_map_its_type_lands_in() {
     let mut types: BTreeMap<String, &str> = BTreeMap::new();
-    for record in [
-        TelemetryRecord::PassSummary(summary()),
-        TelemetryRecord::PassVerdict(verdict()),
-    ] {
+    for record in [TelemetryRecord::PassVerdict(verdict())] {
         for (key, value) in attrs(&log(record)) {
             let container = match value {
                 Value::StringValue(_) => "string",
@@ -236,7 +165,7 @@ fn the_saved_queries_read_each_key_from_the_map_its_type_lands_in() {
         }
     }
     let keys = sql_keys(QUERIES);
-    assert!(keys.len() > 10, "the parser found the queries' keys: {keys:?}");
+    assert!(keys.len() > 5, "the parser found the queries' keys: {keys:?}");
     for (container, key) in &keys {
         if key.starts_with("github.") {
             assert_eq!(container, "string", "span attributes are strings: {key}");
@@ -253,47 +182,117 @@ fn the_saved_queries_read_each_key_from_the_map_its_type_lands_in() {
     }
 }
 
-/// A dry-run pass reports the verdicts it planned (`report.acted` still counts
-/// them) but removes nothing, so the saved queries must not fold them into the
-/// applied release/re-park totals, and the per-artifact query must say whether
-/// the newest verdict was written. No ClickHouse runs in CI, so this pins the
-/// gating in the SQL against the mode strings the daemon actually exports.
+/// The per-artifact query must say whether the newest verdict was written (a
+/// dry-run verdict is a plan). No ClickHouse runs in CI, so this pins the SQL
+/// against the mode strings the daemon actually exports.
 #[test]
-fn the_saved_queries_keep_dry_run_plans_out_of_applied_totals() {
-    let mut on = summary();
-    on.mode = PassMode::On;
-    let mut dry = summary();
-    dry.mode = PassMode::DryRun;
-    let mode = |r: PassSummaryRecord| {
-        string(attrs(&log(TelemetryRecord::PassSummary(r))).get("loom.pass.mode")).to_string()
+fn the_saved_queries_show_mode_and_applied_beside_the_verdict() {
+    let mode = |m: PassMode| {
+        let mut v = verdict();
+        v.mode = m;
+        string(attrs(&log(TelemetryRecord::PassVerdict(v))).get("loom.pass.mode")).to_string()
     };
-    let (on_mode, dry_mode) = (mode(on), mode(dry));
-    assert_eq!((on_mode.as_str(), dry_mode.as_str()), ("on", "dry_run"));
-
-    let flat: String = QUERIES.split_whitespace().collect::<Vec<_>>().join(" ");
-    for (verdict, alias) in [
-        ("released", "released"),
-        ("reparked", "reparked"),
-        ("failed", "failed"),
-    ] {
-        let applied = format!(
-            "sumIf(JSONExtractUInt(body, 'verdicts', '{verdict}'), \
-             attributes_string['loom.pass.mode'] = '{on_mode}') AS {alias}"
-        );
-        assert!(flat.contains(&applied), "{alias} must count mode {on_mode} only");
-    }
-    for verdict in ["released", "reparked"] {
-        let planned = format!(
-            "sumIf(JSONExtractUInt(body, 'verdicts', '{verdict}'), \
-             attributes_string['loom.pass.mode'] = '{dry_mode}') AS planned_{verdict}"
-        );
-        assert!(flat.contains(&planned), "planned_{verdict} must count mode {dry_mode} only");
-    }
-    assert!(
-        !flat.contains("sum(JSONExtractUInt(body, 'verdicts'"),
-        "an ungated sum over body verdicts mixes dry-run plans into applied totals"
+    assert_eq!(
+        (mode(PassMode::On).as_str(), mode(PassMode::DryRun).as_str()),
+        ("on", "dry_run")
     );
-    // Query 2 shows mode and applied beside the verdict.
+    let flat: String = QUERIES.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(flat.contains("argMax(attributes_string['loom.pass.mode'], timestamp) AS mode"));
     assert!(flat.contains("argMax(attributes_bool['loom.pass.applied'], timestamp) AS applied"));
+}
+
+/// #12027: a role step's verdict maps every fact it carries, each key on the
+/// allow-list; a daemon pass's verdict gains none of them.
+#[test]
+fn a_step_verdict_maps_every_step_fact() {
+    use crate::telemetry::kinds::pass::StepFacts;
+    let mut r = verdict();
+    r.mechanism = "step:champion".to_string();
+    r.role = Some("champion".to_string());
+    r.artifact = "pr".to_string();
+    r.verdict = "refused".to_string();
+    r.reason = Some("ci_failing".to_string());
+    r.step = StepFacts {
+        sweep_id: Some("step-champion_merge-9-1".to_string()),
+        head_sha: Some("abc1234".to_string()),
+        step: Some("champion_pr".to_string()),
+        class: Some("refused".to_string()),
+        reason_set: Some("champion_merge_v1".to_string()),
+        ledger_class: Some("failed".to_string()),
+        ledger_reason: Some("unclassified".to_string()),
+        pre_labels: vec!["loom:pr".to_string()],
+        evaluated_at: Some(r.at),
+        first_refused_at: Some(Utc.with_ymd_and_hms(2026, 10, 7, 11, 0, 0).unwrap()),
+        criterion_key: Some("ci-status".to_string()),
+        reason_key: Some("Lint".to_string()),
+        proposal_label: Some("loom:curated".to_string()),
+        body_hash: Some("0123abcd".to_string()),
+        fact_id: Some("f".repeat(32)),
+        loom: Some(crate::telemetry::provenance::Provenance {
+            version: "0.19.1161".to_string(),
+            revision: "3187e328c".repeat(4) + "abcd",
+            tree_state: "clean".to_string(),
+            complete: true,
+        }),
+    };
+    r.detail = Some("merge_rc7".to_string());
+    let a = attrs(&log(TelemetryRecord::PassVerdict(r.clone())));
+    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
+    for (key, want) in [
+        ("loom.pass.reason_detail", "merge_rc7"),
+        ("loom.pass.verdict", "refused"),
+        ("loom.pass.reason", "ci_failing"),
+        ("loom.pass.head_sha", "abc1234"),
+        ("loom.pass.step", "champion_pr"),
+        ("loom.pass.class", "refused"),
+        ("loom.sweep_id", "step-champion_merge-9-1"),
+        ("loom.pass.reason_set", "champion_merge_v1"),
+        ("loom.pass.ledger_class", "failed"),
+        ("loom.pass.ledger_reason", "unclassified"),
+        ("loom.pass.first_refused_at", "2026-10-07T11:00:00Z"),
+        ("loom.pass.criterion", "ci-status"),
+        ("loom.pass.proposal_label", "loom:curated"),
+        ("loom.pass.body_hash", "0123abcd"),
+        ("loom.pass.version", "0.19.1161"),
+    ] {
+        assert_eq!(string(a.get(key)), want, "{key}");
+    }
+    assert_eq!(string(a.get("loom.pass.fact_id")).len(), 32);
+    assert!(!a.contains_key("loom.pass.reason_key"), "the raw reason key is body-only");
+    let plain = attrs(&log(TelemetryRecord::PassVerdict(verdict())));
+    for key in [
+        "loom.pass.step",
+        "loom.pass.class",
+        "loom.pass.fact_id",
+        "loom.pass.version",
+    ] {
+        assert!(!plain.contains_key(key), "a daemon pass has no {key}");
+    }
+}
+
+#[test]
+fn unevaluated_reason_and_budget_attributes_are_present_when_some_absent_when_none() {
+    use crate::telemetry::kinds::pass::PassBudgetReading;
+    let mut r = verdict();
+    let none = attrs(&log(TelemetryRecord::PassVerdict(r.clone())));
+    for key in [
+        "loom.pass.unevaluated_reason",
+        "loom.pass.budget.bucket",
+        "loom.pass.budget.remaining",
+        "loom.pass.budget.floor",
+    ] {
+        assert!(!none.contains_key(key), "{key}");
+    }
+    r.unevaluated_reason = Some("budget_floor_core".to_string());
+    r.budget = Some(PassBudgetReading {
+        bucket: "core".to_string(),
+        remaining: 920,
+        floor: 1000,
+    });
+    let a = attrs(&log(TelemetryRecord::PassVerdict(r)));
+    assert!(a.keys().all(|k| allowed(k)), "{:?}", a.keys());
+    assert_eq!(string(a.get("loom.pass.unevaluated_reason")), "budget_floor_core");
+    assert_eq!(string(a.get("loom.pass.budget.bucket")), "core");
+    assert_eq!(int(a.get("loom.pass.budget.remaining")), 920);
+    assert_eq!(int(a.get("loom.pass.budget.floor")), 1000);
 }

@@ -448,7 +448,6 @@ fn probe_needle_is_the_body_captured_at() {
         captured_at: Utc::now(),
         host: "h".into(),
         exporters: vec![],
-        fact_id_missing_total: 0,
     };
     let envelope = TelemetryEnvelope::new("h", TelemetryRecord::HostExport(record));
     let needle = probe_needle(&envelope).unwrap();

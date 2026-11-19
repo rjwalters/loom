@@ -19,6 +19,8 @@ fn policy(allow: &[&str]) -> TrustPolicy {
         writer: Some(app("acme-writer")),
         readers: vec![app("acme-reader-1")],
         legacy_logins: vec!["acme-old".into()],
+        writers: Vec::new(),
+        load_failed: false,
     };
     TrustPolicy::new(
         FleetLogins::of(&roster),
@@ -226,6 +228,8 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/tests.rs", "test"),
         ("claim_reconciliation/review_conflict_tests.rs", "test"),
         ("claim_reconciliation/verdict_dedup_tests.rs", "test"),
+        // #10178: fixture only; the pass reads through `forge::fetch_comment_bodies`.
+        ("claim_reconciliation/ci_gate_recovery_tests.rs", "test fixture"),
         ("claim_reconciliation/auto_merge_disarm.rs", "test fixture"),
         ("claim_reconciliation/trusted_comments_tests.rs", "test"),
         // #10235: in-memory `PrComment` fixtures for the liveness predicate; no forge read.
@@ -233,6 +237,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("claim_reconciliation/read_cache_tests.rs", "test"),
         ("claim_reconciliation/read_cache_passes_tests.rs", "test"),
         ("claim_reconciliation/open_pr_listing_tests.rs", "test"),
+        // #12041: fixture only. Feeds a Judge-authored verdict marker to the
+        // base-conflict pass to prove it never clears a flag it did not write;
+        // it reads no forge comments.
+        ("claim_reconciliation/review_conflict_approved_tests.rs", "test fixture"),
         // #9258: WRITES the anchor marker (moved here from claim_reconciliation.rs)
         // and acts on `decide_anchor`; it reads no comment bodies itself.
         ("claim_reconciliation/unanchored_verdict.rs", "writer, never a reader"),
@@ -256,6 +264,25 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         // through `fetch_trusted_comments`; it fetches nothing itself.
         ("verdict_gate.rs", "parses already-filtered bodies"),
         ("verdict_gate/tests.rs", "test"),
+        // #12900: `unreleased_hold_head` takes the PR's trusted bodies only; its
+        // sole caller (`PullMarkers::from_trusted`) passes `TrustedComments::bodies()`.
+        // It fetches nothing itself.
+        ("champion_hold.rs", "parses already-filtered bodies"),
+        // #13517: `--release-hold` eligibility. `evaluate` takes comment bodies on
+        // stdin from `merge-pr.sh`'s `_trusted_pr_comments` (trust-filtered; Gitea
+        // reads as absent, so it refuses). It fetches nothing itself.
+        ("merge_pr/hold_release.rs", "parses already-filtered bodies"),
+        // #13673: the daemon-landing gate. It reads only `forge.trusted_comments(pr)`,
+        // which `gh_lifecycle.rs` filters through `TrustPolicy::for_root`. It
+        // fetches nothing itself.
+        ("forge_merge_queue/clear_gate.rs", "parses already-filtered bodies"),
+        // #13936: `rejection_precedes_claim` parses the records its sole
+        // production caller, `GhHandback::rejected_precedes_claim`
+        // (`cli/forge_verdict_cmd.rs`), read through `fetch_trusted_comments`
+        // (`TrustPolicy::for_root(..).trusted_listing`). It fetches nothing itself.
+        ("doctor_handback.rs", "parses already-filtered records"),
+        // In-memory records for the pure predicate and the `Fake` forge; no forge read.
+        ("doctor_handback/tests.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];
@@ -301,8 +328,48 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
 fn roster(logins: &[&str]) -> crate::fleet_store::admins::Admins {
     crate::fleet_store::admins::Admins {
         logins: logins.iter().map(|s| (*s).to_string()).collect(),
+        apps: Vec::new(),
         state: format!("loaded {}", logins.len()),
     }
+}
+
+fn roster_with_apps(apps: &[&str]) -> crate::fleet_store::admins::Admins {
+    let mut r = roster(&["turian"]);
+    r.apps = apps.iter().map(|s| (*s).to_string()).collect();
+    r
+}
+
+#[test]
+fn fleet_app_is_trusted_but_bare_user_is_not() {
+    let p = policy(&[]).with_admins(roster_with_apps(&["gateway[bot]"]));
+    assert!(p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+    assert!(!p.trusts_json(&rest("gateway", "User", "NONE")));
+    assert!(p.trusts_json(&rest("turian", "User", "NONE")));
+}
+
+#[test]
+fn unavailable_roster_trusts_no_apps() {
+    let p = policy(&[]).with_admins(crate::fleet_store::admins::Admins::unavailable("x"));
+    assert!(!p.trusts_json(&rest("gateway[bot]", "Bot", "NONE")));
+}
+
+#[test]
+fn apps_list_changes_digest_only_when_non_empty() {
+    let base = policy(&[]).with_admins(roster(&["turian"])).digest();
+    let empty = policy(&[]).with_admins(roster_with_apps(&[])).digest();
+    let one = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .digest();
+    let two = policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]", "b[bot]"]))
+        .digest();
+    assert_eq!(base, empty);
+    assert_ne!(base, one);
+    assert_ne!(one, two);
+    assert!(policy(&[])
+        .with_admins(roster_with_apps(&["a[bot]"]))
+        .sources_consulted()
+        .contains("fleet trusted Apps list (1 entries"));
 }
 
 #[test]
@@ -338,4 +405,76 @@ fn unavailable_roster_widens_nothing_and_is_reported() {
     let s = p.sources_consulted();
     assert!(s.contains("unavailable: no file") && s.contains("fleet/admins.json"), "{s}");
     assert!(policy(&[]).sources_consulted().contains("not consulted"));
+}
+
+#[test]
+fn the_actions_bot_stays_untrusted_for_comments_and_markers() {
+    // #13378: the ci-daily tracker exception lives in the promotion author
+    // gate only; the bot's comments and markers are never trusted.
+    let p = policy(&[]);
+    let marker = "<!-- loom:verdict-sha sha=abc1234 verdict=approved -->";
+    for v in [
+        rest("github-actions[bot]", "Bot", "NONE"),
+        graphql("github-actions[bot]", "NONE"),
+        json!({"user": {"login": "github-actions[bot]", "type": "Bot"},
+               "author_association": "NONE", "title": "[ci-daily] x", "body": marker}),
+    ] {
+        assert!(!p.trusts_json(&v), "{v}");
+    }
+}
+
+// ---- #14399: operator authority -------------------------------------------
+
+mod operator_authority {
+    use super::*;
+
+    fn policy() -> TrustPolicy {
+        TrustPolicy::new(
+            FleetLogins::of(&crate::forge_identity::Roster::default()),
+            Some("loom-self[bot]".to_string()),
+            vec!["ci-user".to_string(), "helper[bot]".to_string()],
+        )
+        .with_admins(crate::fleet_store::admins::Admins {
+            logins: vec!["fleet-admin".to_string()],
+            apps: vec!["trusted-app[bot]".to_string()],
+            state: "test".to_string(),
+        })
+    }
+
+    fn author(login: &str, assoc: Option<&str>) -> Author {
+        Author::new(Some(login), assoc)
+    }
+
+    #[test]
+    fn insiders_and_fleet_admins_are_operators() {
+        let p = policy();
+        for a in ["OWNER", "member", "COLLABORATOR"] {
+            assert!(p.is_operator(&author("someone", Some(a))), "{a}");
+        }
+        assert!(p.is_operator(&author("fleet-admin", Some("NONE"))));
+        assert!(p.is_operator(&author("Fleet-Admin", None)));
+    }
+
+    #[test]
+    fn apps_self_allowlist_and_outsiders_are_not() {
+        let p = policy();
+        // Generic trust admits all of these; an operator is narrower.
+        for a in [
+            author("loom-self[bot]", Some("NONE")),
+            author("trusted-app[bot]", Some("NONE")),
+            author("helper[bot]", Some("OWNER")),
+            author("ci-user", Some("CONTRIBUTOR")),
+            author("drive-by", Some("CONTRIBUTOR")),
+            author("drive-by", None),
+        ] {
+            assert!(!p.is_operator(&a), "{a:?}");
+        }
+        assert!(p.trusts(&author("ci-user", Some("CONTRIBUTOR"))), "still a trusted commenter");
+        assert!(!p.is_operator(&Author::default()), "a missing author is nobody");
+        // An App-typed author with an insider association is still an App.
+        let typed = serde_json::json!({
+            "user": {"login": "svc", "type": "Bot"}, "author_association": "OWNER"
+        });
+        assert!(!p.is_operator_json(&typed));
+    }
 }

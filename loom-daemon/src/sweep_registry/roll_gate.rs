@@ -13,9 +13,8 @@
 //! agent is in neither the pause manifest nor the reaper hold, and it is
 //! still running when the daemon exits.
 //!
-//! `SweepState::Pending` does not describe that window. Nothing constructs
-//! it (`types.rs` reserves it for a future async spawn), so a wait on it
-//! waits for nothing.
+//! No `SweepState` describes that window: the registry entry does not exist
+//! yet, so there is no state to wait on.
 //!
 //! # What H4 does instead
 //!
@@ -53,7 +52,8 @@ pub(crate) struct RollGate {
     mid_spawn: Arc<AtomicUsize>,
 }
 
-/// Held by a dispatch from its spawn until its registry entry is recorded.
+/// Held by a dispatch from its gate admission (same lock hold as `admit`,
+/// #9573) until its registry entry is recorded or the attempt is abandoned.
 #[derive(Debug)]
 pub(crate) struct MidSpawn(Arc<AtomicUsize>);
 

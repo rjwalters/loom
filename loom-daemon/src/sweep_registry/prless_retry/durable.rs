@@ -173,9 +173,6 @@ impl SweepRegistry {
                 "could not persist PR-less clear mark for issue #{issue} to {}: {e}",
                 path.display()
             );
-        } else {
-            let ws = &self.config.workspace_root;
-            crate::journal::execution::prless_cleared(&path, ws, issue, at);
         }
     }
 
@@ -192,9 +189,6 @@ impl SweepRegistry {
                 "could not persist PR-less counted mark for sweep {sweep_id} to {}: {e}",
                 path.display()
             );
-        } else {
-            let ws = &self.config.workspace_root;
-            crate::journal::execution::prless_counted(&path, ws, sweep_id, at);
         }
     }
 

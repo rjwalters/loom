@@ -33,49 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/check-stale-blocked.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
-
-assert_contains() { # <haystack> <needle> <msg>
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected to contain: '$2'"
-        echo "    actual: $(printf '%s' "$1" | head -40)"
-    fi
-}
-
-assert_not_contains() { # <haystack> <needle> <msg>
-    if [[ "$1" != *"$2"* ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected NOT to contain: '$2'"
-        echo "    actual: $(printf '%s' "$1" | head -40)"
-    fi
-}
-
-assert_eq() { # <expected> <actual> <msg>
-    if [[ "$1" == "$2" ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected: '$1'"
-        echo "    actual:   '$2'"
-    fi
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 [[ -x "$SCRIPT" ]] || {
     echo -e "${RED}FATAL${NC}: $SCRIPT missing or not executable"
@@ -177,21 +135,20 @@ if [[ "${1:-}" == "api" ]]; then
     esac
   done
 
-  # The free budget probe (#10480): `api rate_limit` (body only) and the
-  # GraphQL `rateLimit` query (`-i`, head + body), both answered from
+  # The free budget probe (#10480): one `api rate_limit` (body only), its
+  # `.resources.core` and `.resources.graphql` both answered from
   # `rate_limit.json` ({"core":N,"graphql":N}) and unhandled without it, so
-  # every case that does not set one sees a probe that did not answer.
+  # every case that does not set one sees a probe that did not answer. Since
+  # #12204 there is no standalone GraphQL `rateLimit` query; one fails loudly.
   RL="$D/rate_limit.json"
   if [[ "$url" == "rate_limit" ]]; then
     [[ -f "$RL" ]] || { echo "stub gh: no rate_limit fixture" >&2; exit 3; }
-    jq -c '{resources: {core: {limit: 5000, used: (5000 - .core), remaining: .core, reset: 4102444800}}}' "$RL"
+    jq -c '{resources: {core: {limit: 5000, used: (5000 - .core), remaining: .core, reset: 4102444800},
+      graphql: {limit: 5000, used: (5000 - .graphql), remaining: .graphql, reset: 4102444800}}}' "$RL"
     exit 0
   fi
   if [[ "$url" == "graphql" && "$query" == *"rateLimit{limit"* ]]; then
-    [[ -f "$RL" ]] || { echo "stub gh: no rate_limit fixture" >&2; exit 3; }
-    http "200 OK" "$(jq -c '{data: {rateLimit: {limit: 5000, used: (5000 - .graphql),
-      remaining: .graphql, resetAt: "2100-01-01T00:00:00Z"}}}' "$RL")"
-    exit 0
+    echo "stub gh: standalone rateLimit query (#12204)" >&2; exit 4
   fi
 
   if [[ "$url" == "graphql" ]]; then

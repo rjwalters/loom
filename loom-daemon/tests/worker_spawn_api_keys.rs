@@ -1,29 +1,16 @@
 //! Native worker seam x API-key account pool (issue #8401): explicit env >
 //! pool > fail-closed 78, driven through the real `spawn-worker` path.
 //!
-//! A sibling of `worker_spawn.rs` rather than a section of it: that file sits
-//! just under the 1000-line file-size ratchet, and these tests would carry it
-//! over. The three helpers below are therefore deliberate copies of that file's
-//! `fixture` / `worker` / `config`. Keep `worker` in step with it — in
+//! A sibling of `worker_spawn.rs` rather than a section of it: these tests
+//! get their own file. The `worker` / `config` helpers below are therefore deliberate copies of
+//! that file's (`fixture` is shared via `support/worker_cli.rs`). Keep `worker` in step with it — in
 //! particular the `FIXTURE_VERSION` line, without which the OpenCode adapter's
 //! pre-exec `--version` probe (#8438) refuses the fixture.
-use std::{path::PathBuf, process::Command, sync::OnceLock};
+use std::process::Command;
 
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
 
 fn worker(root: &std::path::Path, runtime: &str) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
@@ -452,3 +439,8 @@ fn a_credential_pool_on_an_array_form_credential_env_is_rejected_before_launch()
     assert!(stderr.contains("single-string credentialEnv"), "{stderr}");
     assert!(out.stdout.is_empty());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

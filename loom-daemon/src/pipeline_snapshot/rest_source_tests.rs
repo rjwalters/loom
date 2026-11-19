@@ -316,3 +316,68 @@ fn health_mask_fetches_every_read_axis_but_not_building() {
         "the held query lists loom:operator, not loom:operator-only: {calls:#?}"
     );
 }
+
+/// #11905: held approvals (`loom:pr` + `loom:blocked`, any actor's park) are counted beside
+/// `operator_held`, never overlapping it, from the `loom:pr` listing
+/// `approved` already reads (one listing, no extra call).
+#[test]
+#[serial]
+fn champion_held_counts_held_approvals_without_overlapping_operator_held() {
+    let fake = FakeGh::new();
+    fake.rest(
+        "loom:pr",
+        &[
+            row(1, &["loom:pr"], true),
+            row(2, &["loom:pr", "loom:blocked"], true),
+            row(3, &["loom:pr", "loom:blocked"], true),
+            row(4, &["loom:pr", "loom:blocked", "loom:operator"], true),
+            row(5, &["loom:pr", "loom:blocked"], false),
+        ],
+    );
+    fake.rest("loom:operator", &[row(4, &["loom:pr", "loom:blocked", "loom:operator"], true)]);
+    fake.gql(
+        "mergeable",
+        r#"[{"number":4,"mergeable":"MERGEABLE","createdAt":"2026-08-01T00:00:00Z"}]"#,
+    );
+    let snap = fake.source().fetch(fake.root());
+    assert_eq!(snap.approved, Some(5 - 1), "PR rows only");
+    assert_eq!(snap.champion_held, Some(2), "PRs 2 and 3: not the operator-held 4");
+    assert_eq!(snap.operator_held, Some(1));
+    let pr_listings = fake
+        .take_calls()
+        .iter()
+        .filter(|c| c.starts_with("api") && c.contains("labels=loom:pr&"))
+        .count();
+    assert_eq!(pr_listings, 1, "approved and champion_held share one listing");
+
+    // Masked off with the operator metrics: not fetched, not fabricated.
+    let only_approved = PipelineMetrics {
+        operator_held: false,
+        ..PipelineMetrics::ALL
+    };
+    let snap = fake.source().with_metrics(only_approved).fetch(fake.root());
+    assert_eq!(snap.champion_held, None);
+
+    let failed = FakeGh::new();
+    failed.fail("loom:pr");
+    let snap = failed.source().fetch(failed.root());
+    assert_eq!(snap.champion_held, None, "a failed read is never 0 held");
+}
+
+/// #11905 review: the full-page GraphQL fallback filters as the REST path
+/// does: any blocked-hold name (OR), every operator-hold name excluded.
+#[test]
+fn the_champion_held_fallback_matches_the_rest_filter() {
+    let q = super::champion_held_search_query();
+    assert!(q.contains("label:loom:pr "), "{q}");
+    let blocked = q
+        .split(' ')
+        .find(|t| t.starts_with("label:") && t.contains("loom:blocked"))
+        .unwrap_or_default();
+    assert!(blocked.contains("loom:needs-capability"), "{q}");
+    assert!(
+        q.contains("-label:loom:operator ") || q.ends_with("-label:loom:operator"),
+        "{q}"
+    );
+    assert!(q.contains("-label:loom:operator-only"), "{q}");
+}

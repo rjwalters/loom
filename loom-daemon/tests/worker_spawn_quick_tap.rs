@@ -4,8 +4,7 @@
 //!
 //! A sibling of `worker_spawn.rs` rather than a section of it, for the same
 //! reason `worker_spawn_api_keys.rs` and `worker_spawn_preference_marker.rs`
-//! are: that file sits at the 1000-line file-size ratchet and these tests
-//! would carry it over. `worker` and `profile_check` below are deliberate
+//! are: these tests get their own file. `worker` and `profile_check` below are deliberate
 //! copies of its own.
 use std::process::Command;
 
@@ -122,3 +121,8 @@ fn bundled_presets_do_not_change_the_unconfigured_default() {
     assert!(!launched.contains("gpt-oss-120b"), "{launched}");
     assert!(!launched.contains("gemini"), "{launched}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

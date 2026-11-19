@@ -10,7 +10,7 @@
 //! Every commit reachable from `--ref` (default `origin/main`) since `--since`
 //! whose subject is exactly the re-date subject
 //! ([`super::is_redate_commit_subject`]). Each is either **attributed** (it
-//! carries a `Stale-Check:` trailer, see [`super::attribution`]) and counted in
+//! carries a `Stale-Check:` trailer, #9746) and counted in
 //! the check x clause x base path x PR path table, or **untrailered** (written
 //! before #9746, or by a daemon of that vintage, or with a verdict that could
 //! not be recomputed at re-date time).
@@ -21,11 +21,11 @@
 //! the PR merges with its commits intact. This repo merges with merge commits,
 //! so they do (verified 2026-09-30). A repo that SQUASH-merges drops them, and
 //! the report then undercounts — only re-dates on PRs that never merged, or
-//! that squashed, are invisible. The PR's `loom:stale-check-redate` comment is
-//! still the budget's durable record either way.
+//! that squashed, are invisible. (The PR-side re-date comments were the
+//! retired budget's record; nothing writes them since #12063 slice 1.)
 
-use super::attribution::{NONE, TRAILER_BASE_PATH, TRAILER_CHECK, TRAILER_CLAUSE, TRAILER_PR_PATH};
 use super::is_redate_commit_subject;
+use super::{NONE, TRAILER_BASE_PATH, TRAILER_CHECK, TRAILER_CLAUSE, TRAILER_PR_PATH};
 use serde::Serialize;
 use std::collections::BTreeMap;
 

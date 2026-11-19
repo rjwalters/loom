@@ -12,9 +12,9 @@
 //! never at risk of a parse ambiguity.
 //!
 //! Data source: exclusively the already-ingested `resource_usage` /
-//! `agent_inputs` tables (via [`loom_daemon::activity::ActivityDb::get_usage_report`]).
+//! `agent_inputs` tables (via [`crate::activity::ActivityDb::get_usage_report`]).
 //! Nothing here re-parses a transcript or re-derives a price — see
-//! [`loom_daemon::activity::usage_report`]'s module doc (re-exported here as
+//! [`crate::activity::usage_report`]'s module doc (re-exported here as
 //! `UsageReportGroupBy`/`UsageReportRow`).
 
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use chrono::Utc;
 
-use loom_daemon::activity::{ActivityDb, UsageReportGroupBy, UsageReportRow};
+use crate::activity::{ActivityDb, UsageReportGroupBy, UsageReportRow};
 
 /// `loom-daemon usage-report` arguments.
 #[derive(clap::Args)]
@@ -52,7 +52,7 @@ impl UsageReportArgs {
     /// Propagates an invalid `--since`/`--by` value or a database failure.
     pub(crate) fn run(self) -> Result<()> {
         let group_by = UsageReportGroupBy::parse(&self.by)?;
-        let since = loom_daemon::sweep_outcome_summary::parse_since(&self.since, Utc::now())?;
+        let since = crate::sweep_outcome_summary::parse_since(&self.since, Utc::now())?;
         let db_path = self.db.unwrap_or_else(default_activity_db_path);
 
         if !db_path.is_file() {
@@ -188,7 +188,7 @@ mod tests {
     use crate::cli::whole_cli_parse::try_parse_cli;
 
     /// The whole `Cli`, parsed on an 8 MiB thread like the binary's (#10616).
-    fn parse(args: &[&str]) -> crate::Commands {
+    fn parse(args: &[&str]) -> crate::cli::Commands {
         try_parse_cli(args)
             .expect("parse")
             .command
@@ -198,9 +198,9 @@ mod tests {
     #[test]
     fn usage_report_parses_with_defaults() {
         match parse(&["loom-daemon", "usage-report"]) {
-            crate::Commands::Telemetry(super::super::telemetry::TelemetryCommand::UsageReport(
-                a,
-            )) => {
+            crate::cli::Commands::Telemetry(
+                super::super::telemetry::TelemetryCommand::UsageReport(a),
+            ) => {
                 assert_eq!(a.since, "7d");
                 assert_eq!(a.by, "role");
                 assert!(!a.json);
@@ -221,9 +221,9 @@ mod tests {
             "model",
             "--json",
         ]) {
-            crate::Commands::Telemetry(super::super::telemetry::TelemetryCommand::UsageReport(
-                a,
-            )) => {
+            crate::cli::Commands::Telemetry(
+                super::super::telemetry::TelemetryCommand::UsageReport(a),
+            ) => {
                 assert_eq!(a.since, "30d");
                 assert_eq!(a.by, "model");
                 assert!(a.json);

@@ -4,9 +4,8 @@ use serial_test::serial;
 // crate-private there, so name it explicitly rather than re-exporting it.
 use super::artifact_verdict::compare_versions;
 
-// Wrong-repo-resolution coverage (Issue #8513) lives in its own child module
-// so this file, already over `.loom/docs/file-size-policy.md`'s threshold,
-// does not grow to hold it. It reuses the fixtures below via `use super::*`.
+// Wrong-repo-resolution coverage (Issue #8513) lives in its own child module.
+// It reuses the fixtures below via `use super::*`.
 mod stale_repo;
 // The production trigger's test needs these directly since #8514 moved the
 // trigger itself (and with it the parent's `EventBus`/`DrainState` imports) to
@@ -94,6 +93,8 @@ fn test_config_reads_all_fields() {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            overdue_secs: None,
+            converge_deadline_secs: None,
             removed_keys: Vec::new(),
         }
     );
@@ -606,6 +607,30 @@ fn test_backing_off_blocks_rebuild_until_delay_elapses() {
     );
 }
 
+/// #14016: the run loop's `min(interval, backoff)` scheduling reads the time
+/// left through `backoff_remaining` — inside the backoff it reports the
+/// wait, once elapsed (or never set) it reports `None` so the loop keeps its
+/// regular cadence instead of spinning on an already-expired deadline.
+#[test]
+fn test_backoff_remaining_reads_the_gate_clock() {
+    let mut st = AutoUpdateState::new();
+    assert_eq!(st.backoff_remaining(Instant::now()), None);
+    let t0 = Instant::now();
+    st.decide_source(t0, &stale("c1"), true, 0, SETTLE, DEFER);
+    st.record_rebuild(t0, &RebuildOutcome::Retryable("boom".into()), false);
+    // Inside the window: the same clock the gate reads, ~the full delay.
+    let mid = t0 + backoff_delay(1) - Duration::from_secs(30);
+    let left = st.backoff_remaining(mid).expect("backing off");
+    assert!(left <= Duration::from_secs(30) && left >= Duration::from_secs(29), "{left:?}");
+    // Elapsed: None, not zero — an immediate wake would spin past the gates
+    // that hold a tick after the backoff gate lets go.
+    let after = t0 + backoff_delay(1) + Duration::from_secs(1);
+    assert_eq!(st.backoff_remaining(after), None);
+    // And a success clears it outright.
+    st.record_rebuild(t0, &RebuildOutcome::Success, true);
+    assert_eq!(st.backoff_remaining(t0), None);
+}
+
 #[test]
 fn test_terminal_is_sticky_until_commit_changes() {
     let mut st = AutoUpdateState::new();
@@ -1100,17 +1125,18 @@ fn test_global_status_defaults_when_unset() {
 // ===================================================================
 
 /// Issue #8252 — the in-flight/build-stampede gate applies to the rebuild path
-/// only. A sibling file (this one is over the file-size ratchet threshold); it
-/// reuses the fixtures below via `use super::*`.
+/// only. A sibling file; it reuses the fixtures below via
+/// `use super::*`.
 mod in_flight_gate;
-// Supersede-not-stack coverage (#8514) — its own child module so this file,
-// already over `.loom/docs/file-size-policy.md`'s threshold, does not grow to
-// hold it. Reuses the fixtures above via `use super::*`.
+// Supersede-not-stack coverage (#8514) — its own child module. Reuses the
+// fixtures above via `use super::*`.
 mod supersede_tick;
 // Running-version roll basis (#10710).
 mod running_basis;
 // Floor-driven roll targets (#10712).
 mod floor_roll;
+// Restart-required config arms a same-binary restart (#12425).
+mod config_restart;
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -1156,6 +1182,7 @@ fn inputs<'a>(
         check,
         tree_clean,
         in_flight,
+        repo_source: None,
     }
 }
 

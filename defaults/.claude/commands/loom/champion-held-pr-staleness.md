@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Held-PR Base-Staleness Tick (#8552)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Held-PR Census"
@@ -17,7 +20,7 @@ A held PR's approval never goes stale — verdict-staleness keys on the PR's own
 head, which does not move while a human decision is outstanding — and its CI
 stays green on the old base. `main` moves anyway. On 2026-09-20/21 three of six
 PRs coming off operator holds needed a rebase: two mechanical append-collisions
-(`ci.yml`, `ci-excluded.txt`, `shell-allowlist.txt`) and one re-integration
+(`ci.yml`, `ci-excluded.txt`, and a since-retired allowlist) and one re-integration
 (#8426 — `main` restructured the same `merge-pr.sh --auto` block via #8048 and
 #8429 while the PR sat held). All three were discovered *at merge time*: the
 worst moment, right after a human had made and announced a merge decision.
@@ -194,7 +197,7 @@ the other.
   tick reopens it.
 - **Never gate a merge decision on it.** Like the rest of the census, if any
   part of it fails (fetch declined, no git checkout, rate limit), log and
-  continue — criteria #1-6 are unaffected, and the digest still writes with
+  continue — the `judge-approval`, `merge-risk`, `critical-files`, `mergeable`, `recency` and `ci-green` criteria are unaffected, and the digest still writes with
   `overlap unknown` for that PR.
 - **Never state a class more specific than the two above** from file names and
   line counts alone.

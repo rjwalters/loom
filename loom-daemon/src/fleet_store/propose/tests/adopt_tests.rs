@@ -49,10 +49,72 @@ config:
 ";
 
 /// `text` as the store's compiled `fleet.json` would carry it.
+///
+/// `fleet.json` is JSON and the daemon no longer reads YAML, so this is a
+/// deliberately tiny reader for the block subset these fixtures and
+/// `yaml_edit`'s output use: nested mappings, `- ` lists of scalars, `[a, b]`
+/// and `{}` flow forms, scalars, and `#` comments.
 fn compiled(text: &str) -> Value {
-    let mut doc = crate::fleet_store::yaml::parse(text).unwrap();
+    let lines: Vec<(usize, &str)> = text
+        .lines()
+        .map(|l| (l.len() - l.trim_start().len(), l.trim_start()))
+        .filter(|(_, l)| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let mut at = 0;
+    let mut doc = block(&lines, &mut at, 0);
     doc["_generated"] = json!({"schema_version": 1});
     doc
+}
+
+fn scalar_of(raw: &str) -> Value {
+    let raw = raw.trim();
+    if raw == "{}" {
+        return json!({});
+    }
+    if let Some(inner) = raw.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return Value::Array(
+            inner
+                .split(',')
+                .filter(|p| !p.trim().is_empty())
+                .map(scalar_of)
+                .collect(),
+        );
+    }
+    if let Some(q) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return json!(q);
+    }
+    match raw {
+        "true" => json!(true),
+        "false" => json!(false),
+        _ => raw.parse::<i64>().map_or_else(|_| json!(raw), |n| json!(n)),
+    }
+}
+
+/// Parse the lines at `indent` (and deeper) starting at `*at`.
+fn block(lines: &[(usize, &str)], at: &mut usize, indent: usize) -> Value {
+    if lines[*at].1.starts_with("- ") {
+        let mut items = Vec::new();
+        while *at < lines.len() && lines[*at].0 == indent && lines[*at].1.starts_with("- ") {
+            items.push(scalar_of(lines[*at].1[2..].split(" #").next().unwrap()));
+            *at += 1;
+        }
+        return Value::Array(items);
+    }
+    let mut map = serde_json::Map::new();
+    while *at < lines.len() && lines[*at].0 == indent {
+        let (key, rest) = lines[*at].1.split_once(':').expect("key: value");
+        let rest = rest.split(" #").next().unwrap().trim();
+        *at += 1;
+        let value = if rest.is_empty() {
+            let child = lines[*at].0;
+            // A list may sit at the key's own indent or deeper.
+            block(lines, at, child)
+        } else {
+            scalar_of(rest)
+        };
+        map.insert(key.to_string(), value);
+    }
+    Value::Object(map)
 }
 
 /// A snapshot of a store whose `fleet.json` is `FLEET_YML` compiled.

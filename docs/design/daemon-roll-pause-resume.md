@@ -189,11 +189,11 @@ rule (§2) and the requeue rules (§9).
 
 | Kind | Quiesce point | Persisted fields | Resume procedure (H5) | Cross-version safety check | Unresumable rule |
 |---|---|---|---|---|---|
-| **Daemon-dispatched sweep** (Claude Code or Codex; host process or session container) | Pause request, then the **safe point** (§2), then a tree stop (§5). Bounded by the pause budget. | `issue`, `pr`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle` (runtime, session id, session store, account, model, effort, cwd, container), `safe_point`, `checkpoint_phase`, `worktree`, `claim`, `lease_comment_id`, `lease_refreshed_at`, `log_path`, `overflow`, `stopped_at` | Before the work finder's first tick, relaunch through the spawn script in the recorded worktree with `--resume <session_id>` (Codex: `exec resume <session_id>`, inside the recorded container for session-exec items) and the resume prompt (§2). It gets a new registry entry (`Running`, owned `Child`, `resume_of = <old id>`), a new lease renewal loop and a new journal entry. The claim is kept. | The manifest is no older than `roll.max_age_secs`. The issue's freshest lease record is still this host's. The issue is open and not parked (dispatch guards 2.5/2.7). The worktree exists at `worktree.path` on `worktree.branch`, at `worktree.head`. The session store is reachable. For session-exec items, the container is up and its mounts match (`session_exec/host.rs:226-252`). No compatibility check before #10716 (§12, Q5). | Young: reset. Missed the pause budget: requeue. No session id captured: requeue. Any check fails, or the relaunch exits without starting the session: requeue with the matching reason. |
+| **Daemon-dispatched sweep** (Claude Code or Codex; host process or session container) | Pause request, then the **safe point** (§2), then a tree stop (§5). Bounded by the pause budget. | `issue`, `pr`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle` (runtime, session id, session store, account, model, effort, cwd, container), `safe_point`, `checkpoint_phase`, `worktree`, `claim`, `lease_comment_id`, `lease_refreshed_at`, `log_path`, `stopped_at` | Before the work finder's first tick, relaunch through the spawn script in the recorded worktree with `--resume <session_id>` (Codex: `exec resume <session_id>`, inside the recorded container for session-exec items) and the resume prompt (§2). It gets a new registry entry (`Running`, owned `Child`, `resume_of = <old id>`), a new lease renewal loop and a new journal entry. The claim is kept. | The manifest is no older than `roll.max_age_secs`. The issue's freshest lease record is still this host's. The issue is open and not parked (dispatch guards 2.5/2.7). The worktree exists at `worktree.path` on `worktree.branch`, at `worktree.head`. The session store is reachable. For session-exec items, the container is up and its mounts match (`session_exec/host.rs:226-252`). No compatibility check before #10716 (§12, Q5). | Young: reset. Missed the pause budget: requeue. No session id captured: requeue. Any check fails, or the relaunch exits without starting the session: requeue with the matching reason. |
 | **Role run** (`role_runner`: Champion, Curator, Judge, Auditor, Guide, Doctor) | Same as a sweep. New ticks are already skipped while the drain flag is set (`role_runner.rs:3245-3255`). | `role`, `root`, `pid`, `pid_started_at`, `pgid`, `scope_unit`, `agent_started_at`, `resume_handle`, `safe_point`, `timeout_remaining_secs`, `claim` (from the role's claim breadcrumb, if any), `holds_issue_creation_mutex`, `log_path`, `stopped_at` | Relaunch from the session id in `root`, as for a sweep. Seed the role runner's `InProgressGuard` with `(root, role)` so no duplicate run starts. The new run's timeout is `timeout_remaining_secs`: the roll does not count against the run's budget. If the run held the issue-creation mutex, seed the mutex as held by the resumed run (#3707). Role runs have no registry entry today (`ipc.rs:152-154`); this is the first place they are counted across a restart. | The session store is reachable, and the role is still enabled for `root` in the new config. | As for a sweep. A requeued role run releases the claim named in its breadcrumb (§9). With no breadcrumb, the role's own staleness rule (for example `LOOM_STALE_TREATING_MINUTES`) releases it. In both cases the next scheduled tick redoes the work. |
 | **Epic supervisor** | Not an agent. It stops ticking (drain flag, `epic_supervisor.rs:476-480`). | Nothing of its own. Its issue-creation mutex holder is a role run (row above). | Re-derive every epic from the forge (monotone derived state, `epic_supervisor.rs:43-50`). | n/a | n/a. If the mutex holder was requeued, the mutex is free and the next tick's derivation recovers. The machine-wide filing lock (`filing_lock.rs`) is file-based and survives the restart. |
 | **Worktree** (`.loom/worktrees/issue-N`) | None. It is on-disk state and is never paused or touched by the roll. | `path`, `branch`, `head`, `dirty`, carried on the owning item | Reused by the resumed agent. Until H5 completes, the worktree reaper and the orphan-process reaper must treat every worktree named in a live manifest as **owned** (`orphan_process_reaper.rs` fail-safes). | None needed. Git state does not depend on the binary version. | Never deleted by the roll. If its item was reset or requeued, it becomes ordinary stale state under the existing worktree reaper's rules. A later dispatch reuses it under `worktree.sh`'s existing rules. |
-| **Pending dispatch** (spawn in progress: the child is spawned and `finish_issue_dispatch` has not recorded its entry yet. Nothing constructs `SweepState::Pending`, so the count is `sweep_registry::roll_gate`'s, #10974) | Close dispatch, then wait for it to be recorded `Running` or fail (bounded by the existing startup-race window). It is then young, so it is reset. New IPC dispatches are refused while paused (`ipc.rs:706`, `ipc.rs:1913`). | As a sweep | n/a (reset) | n/a | `young-agent-reset` |
+| **Pending dispatch** (spawn in progress: the child is spawned and `finish_issue_dispatch` has not recorded its entry yet. No `SweepState` describes this window, so the count is `sweep_registry::roll_gate`'s, #10974) | Close dispatch, then wait for it to be recorded `Running` or fail (bounded by the existing startup-race window). It is then young, so it is reset. New IPC dispatches are refused while paused (`ipc.rs:706`, `ipc.rs:1913`). | As a sweep | n/a (reset) | n/a | `young-agent-reset` |
 | **In-session sweep / attended builder** (not daemon-owned) | None. It is not the daemon's work, and it has no `LOOM_DAEMON_ITEM_ID`, so the pause hook ignores it. | Not in the manifest. | Nothing to do. Two caveats: during the window, IPC-backed `loom-daemon` CLI calls fail and callers must retry. After the roll, the CLI on `PATH` is the new version. | CLI flag and IPC compatibility. That is the existing release contract, not this design. | None. |
 | **Auto-update state** (settle ceiling, floor alert) | Not work. | Persisted by #10713 in `auto_update_state.json`, not in this manifest. | Loaded by #10713. | #10713's typed load outcome. | n/a |
 
@@ -340,7 +340,6 @@ audit.
       "lease_comment_id": 5822662982,
       "lease_refreshed_at": null,            // set by H4's one-shot refresh
       "log_path": "…/.loom/logs/sweep-issue-10714.log",
-      "overflow": false,
       "role": null, "timeout_remaining_secs": null,      // role_run only
       "holds_issue_creation_mutex": false,               // role_run only
       "stopped_at": null
@@ -945,6 +944,28 @@ Consequences:
   (written by `restart --drain --then-exit` or `fleet drain`) holds a roll,
   and that tick is skipped; `restart --abort-drain` clears the record and
   releases the hold. A `stopped` host exits at boot, before the loop exists.
+
+### Cancelling an armed floor roll: roll the floor back (#12610)
+
+A floor roll that was armed for a release the operator then withdrew is
+cancelled by **rolling `loom_min_version` back** in the fleet store. Two checks
+act on it, both only while the roll has stopped no agent:
+
+- **On sync.** A host whose synced floor is now met by its running version
+  disarms the pending roll at once (the floor change wakes the self-update loop).
+- **Before H4 stops anything.** After the manifest is written and before the
+  first agent is stopped, H4 re-reads the floor *from the store*, not from the
+  last sync. If it is lower than the floor the roll was armed under, or the
+  running version now meets it, the roll disarms: dispatch resumes, the pause
+  requests and manifest are removed, nothing is stopped, the staged binary is
+  left unused, and `daemon.roll.disarmed` is emitted with the reason. An
+  unreadable or unknown floor never disarms.
+
+Once the first agent is stopped the roll is committed and completes onto the
+armed target; `restart --abort-drain` is refused as before. The window is the
+seconds between the fetch decision and H4 step 4, so roll the floor back
+promptly and run `loom-daemon status` on any host that logged `drain_wait` to
+see whether it disarmed. Only floor-driven rolls are withdrawn this way.
 
 ## 14. Host maintenance: pause and stay down (#11812)
 

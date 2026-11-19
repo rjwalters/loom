@@ -177,6 +177,51 @@ fn window_counts_only_lines_inside_the_window() {
     assert_eq!(agg.consumed_per_pool()[&Pool::Core], 1);
 }
 
+/// A sink line spent on credential `ca`/`co`, optionally by an agent session.
+fn cred_line(t: i64, o: Outcome, ca: Option<&str>, co: Option<&str>, agent: bool) -> String {
+    let mut parsed: SinkLine = serde_json::from_str(&line(t, "c", Pool::Graphql, o, None)).unwrap();
+    parsed.at.ca = ca.map(str::to_string);
+    parsed.at.co = co.map(str::to_string);
+    parsed.ag.ag = agent.then(|| "builder".to_string());
+    serde_json::to_string(&parsed).unwrap()
+}
+
+#[test]
+fn own_spend_counts_only_the_named_credential_split_by_daemon_and_agent() {
+    // #12238: the trip's `own` is one credential's calls, not the host's sum.
+    let now = 1_800_000_000;
+    let mut free = cred_line(now - 1, Outcome::Ok, Some("app-1"), Some("acme"), false);
+    free = free.replacen('{', "{\"fr\":true,", 1);
+    let lines = [
+        cred_line(now - 9, Outcome::Ok, Some("app-1"), Some("acme"), false),
+        cred_line(now - 8, Outcome::Error, Some("app-1"), Some("acme"), false),
+        cred_line(now - 7, Outcome::Ok, Some("app-1"), Some("acme"), true),
+        // Free of charge: a 304, a refusal, the rate_limit probe.
+        cred_line(now - 6, Outcome::NotModified, Some("app-1"), Some("acme"), false),
+        cred_line(now - 5, Outcome::RateLimited, Some("app-1"), Some("acme"), false),
+        free,
+        // Another owner's installation of the same App, another App, and a
+        // row naming no credential: none of them is this credential's.
+        cred_line(now - 4, Outcome::Ok, Some("app-1"), Some("other"), false),
+        cred_line(now - 3, Outcome::Ok, Some("app-2"), Some("acme"), false),
+        cred_line(now - 2, Outcome::Ok, None, None, false),
+    ];
+    let agg = aggregate_lines(lines.iter().map(String::as_str), now - WINDOW_SECS);
+    let own = agg.consumed_for("app-1", Some("acme"));
+    assert_eq!(
+        own[&Pool::Graphql],
+        CredentialSpend {
+            daemon: 2,
+            agent: 1
+        }
+    );
+    assert_eq!(own[&Pool::Graphql].total(), 3);
+    assert!(agg.consumed_for("app-1", None).is_empty());
+    assert!(agg.consumed_for("app-3", Some("acme")).is_empty());
+    // The host-wide per-pool view is unchanged.
+    assert_eq!(agg.consumed_per_pool()[&Pool::Graphql], 7);
+}
+
 #[test]
 fn a_newer_line_without_used_keeps_the_last_known_used() {
     // A pre-#9855 binary shares the sink: its lines carry no `usd`. The
@@ -216,8 +261,22 @@ fn sink_round_trips_prunes_old_hours_and_feeds_status() {
         limit: None,
         retry_after_secs: None,
     };
-    record("test_sink_caller", Pool::Core, Outcome::NotModified, Some(&headers));
-    record("test_sink_caller", Pool::Core, Outcome::Ok, None);
+    record_attributed(
+        "test_sink_caller",
+        &CallIdentity::default(),
+        Pool::Core,
+        Outcome::NotModified,
+        Some(&headers),
+        &CallAttribution::default(),
+    );
+    record_attributed(
+        "test_sink_caller",
+        &CallIdentity::default(),
+        Pool::Core,
+        Outcome::Ok,
+        None,
+        &CallAttribution::default(),
+    );
     let report = status_report(Utc::now(), None);
     set_test_sink_dir(None);
 
@@ -488,30 +547,4 @@ fn quota_rate_limit_reading() {
             .as_deref(),
         Some("gitea.example.com")
     );
-}
-
-/// #10210: only a pool read at zero whose reset is still ahead (or, with no
-/// reset, whose reading is fresh) is an exhausted pool.
-#[test]
-fn exhausted_in_keeps_only_live_zero_readings() {
-    let now = 1_000_000;
-    let reading = |remaining, reset_epoch, observed_at| Reading {
-        remaining,
-        used: None,
-        reset_epoch,
-        observed_at,
-    };
-    let mut latest = BTreeMap::new();
-    latest.insert(Pool::Core, reading(0, Some(now + 600), now - 10));
-    latest.insert(Pool::Graphql, reading(0, Some(now - 1), now - 10));
-    latest.insert(Pool::Search, reading(5, Some(now + 600), now - 10));
-    latest.insert(Pool::Other, reading(0, None, now - 10));
-    let exhausted = exhausted_in(&latest, now);
-    assert_eq!(
-        exhausted,
-        vec![(Pool::Core, epoch(now + 600)), (Pool::Other, None)],
-        "graphql already reset; search has budget"
-    );
-    latest.insert(Pool::Other, reading(0, None, now - WINDOW_SECS - 1));
-    assert_eq!(exhausted_in(&latest, now).len(), 1, "a stale unreset reading is no stall");
 }

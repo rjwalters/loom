@@ -15,7 +15,6 @@ This MCP server enables AI agents to:
 - List active terminal sessions with metadata
 - Read terminal output in real-time
 - Send input to terminals (commands, text)
-- Query the currently selected terminal
 - Interact with the Loom daemon via IPC
 
 This server communicates directly with the Loom daemon via Unix socket.
@@ -65,14 +64,19 @@ No active terminals found. Either Loom hasn't been started yet, or all terminals
 ```
 
 **Data Source:**
-- Primary: Daemon IPC (`ListTerminals` request)
-- Fallback: State file (`~/.loom/state.json`) if daemon is not running
+- Daemon IPC (`ListTerminals` request) — the only source. The daemon prunes
+  registry entries whose tmux session has died on every request, so every
+  terminal listed is verified live.
 
 **Error Conditions:**
 
-- **Daemon Not Running**: Falls back to reading state file
-- **State File Missing**: Returns empty list
-- **IPC Error**: Returns empty list with fallback attempt
+- **Daemon Not Running**: Returns a tool error (`isError`) carrying the
+  connection failure. There is deliberately no fallback source since #13821:
+  the `~/.loom/state.json` snapshot this used to fall back to was written only
+  by the desktop app removed in #3353, so an empty list would have been
+  indistinguishable from "the daemon never answered".
+- **IPC Error**: Same — the error propagates rather than degrading to an
+  empty list.
 
 **Example:**
 ```typescript
@@ -145,72 +149,6 @@ mcp__loom__get_terminal_output({
 - Reading agent responses
 
 **Note:** This reads from `/tmp/loom-{terminal_id}.out` files, which are the same files accessed by the log tools.
-
----
-
-### `get_selected_terminal`
-
-Get information about the currently selected (primary) terminal in Loom. Returns the terminal's ID, name, role, and recent output.
-
-**Parameters:**
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `lines` | number | No | 50 | Number of output lines to include |
-
-**Returns:**
-
-Plain text with terminal information and recent output.
-
-**Output Format:**
-```
-=== Currently Selected Terminal ===
-
-ID: terminal-1
-Name: Architect
-Role: claude-code-worker
-Working Dir: /Users/user/GitHub/loom
-Session: loom-terminal-1
-
-=== Output (last 50 lines) ===
-
-claude --dangerously-skip-permissions
-Claude Code v1.2.3
-Ready to assist!
-
-> _
-```
-
-**Empty Case:**
-```
-No terminal is currently selected in Loom.
-```
-
-**Data Source:**
-- Reads `~/.loom/state.json` to find `selectedTerminalId`
-- Reads terminal output from `/tmp/loom-{terminal_id}.out`
-
-**Error Conditions:**
-
-- **No Selection**: Returns message if no terminal is selected
-- **State File Missing**: Returns error message
-- **Terminal Not Found**: Returns error if selected terminal ID not in state
-- **Output Read Error**: Shows terminal info but reports error for output
-
-**Example:**
-```typescript
-// Get selected terminal with default 50 lines of output
-mcp__loom__get_selected_terminal()
-
-// Get selected terminal with 100 lines of output
-mcp__loom__get_selected_terminal({ lines: 100 })
-```
-
-**Use Cases:**
-- Checking which terminal user is viewing
-- Reading output from primary terminal
-- Monitoring user's active context
-- Quick access to main terminal info
 
 ---
 
@@ -287,172 +225,6 @@ mcp__loom__send_terminal_input({
 
 ---
 
-### `start_autonomous_mode`
-
-Start autonomous mode for all configured terminals. This starts the interval prompt timers for all terminals that have a `targetInterval` configured.
-
-**Parameters:**
-
-None
-
-**Returns:**
-
-Status message indicating success or failure with timing information.
-
-**Success Response:**
-```
-=== Start Autonomous Mode ===
-
-✅ Success
-
-Autonomous mode has been started for all configured terminals.
-
-Terminals with targetInterval > 0 will now receive their intervalPrompt when idle.
-
-MCP command 'start_autonomous_mode' processed successfully (waited 200ms, attempt 2/8)
-```
-
-**Error Response:**
-```
-=== Start Autonomous Mode ===
-
-❌ Failed
-
-MCP command 'start_autonomous_mode' written but no acknowledgment received after 8 retries...
-```
-
-**How It Works:**
-- Sends `start_autonomous_mode` command via file-based IPC to `~/.loom/mcp-command.json`
-- Loom application watches for this file and starts interval prompt timers
-- Uses exponential backoff to wait for acknowledgment
-
-**Example:**
-```typescript
-// Start autonomous mode for all terminals
-mcp__loom__start_autonomous_mode()
-```
-
-**Use Cases:**
-- Starting automated agent workflows
-- Enabling interval prompts after workspace setup
-- Resuming autonomous operation after manual intervention
-- Integration testing of autonomous behavior
-
----
-
-### `stop_autonomous_mode`
-
-Stop autonomous mode for all terminals. This pauses all interval prompt timers, preventing automatic prompts from being sent.
-
-**Parameters:**
-
-None
-
-**Returns:**
-
-Status message indicating success or failure with timing information.
-
-**Success Response:**
-```
-=== Stop Autonomous Mode ===
-
-✅ Success
-
-Autonomous mode has been stopped for all terminals.
-
-Terminals will no longer receive automatic interval prompts until autonomous mode is started again.
-
-MCP command 'stop_autonomous_mode' processed successfully (waited 150ms, attempt 1/8)
-```
-
-**Error Response:**
-```
-=== Stop Autonomous Mode ===
-
-❌ Failed
-
-MCP command 'stop_autonomous_mode' written but no acknowledgment received after 8 retries...
-```
-
-**How It Works:**
-- Sends `stop_autonomous_mode` command via file-based IPC
-- Loom application stops all interval prompt timers
-- Terminals remain running but won't receive autonomous prompts
-
-**Example:**
-```typescript
-// Stop autonomous mode
-mcp__loom__stop_autonomous_mode()
-```
-
-**Use Cases:**
-- Pausing automated workflows for manual intervention
-- Debugging autonomous behavior
-- Temporarily disabling prompts while making changes
-- Graceful shutdown of autonomous operations
-
----
-
-### `launch_interval`
-
-Manually trigger the interval prompt for a specific terminal immediately. This sends the terminal's configured `intervalPrompt` without waiting for the next scheduled interval.
-
-**Parameters:**
-
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `terminal_id` | string | **Yes** | - | Terminal ID to trigger (e.g., `terminal-1`) |
-
-**Returns:**
-
-Status message indicating success or failure with timing information.
-
-**Success Response:**
-```
-=== Launch Interval ===
-
-✅ Success
-
-Interval prompt triggered for terminal terminal-2.
-
-The terminal's configured intervalPrompt has been sent.
-
-MCP command 'launch_interval:terminal-2' processed successfully (waited 180ms, attempt 2/8)
-```
-
-**Error Response:**
-```
-=== Launch Interval ===
-
-❌ Failed
-
-MCP command 'launch_interval:terminal-2' acknowledged but execution failed...
-```
-
-**How It Works:**
-- Sends `launch_interval:{terminal_id}` command via file-based IPC
-- Loom application triggers the interval prompt for the specified terminal
-- Works regardless of whether autonomous mode is currently enabled
-
-**Example:**
-```typescript
-// Trigger interval prompt for terminal-2
-mcp__loom__launch_interval({
-  terminal_id: "terminal-2"
-})
-```
-
-**Use Cases:**
-- Testing interval prompts without waiting
-- Manually triggering agent work cycles
-- Debugging autonomous prompt behavior
-- On-demand agent activation
-- Integration testing
-
-**Note:** This is similar to `trigger_run_now` in the UI tools but available in the terminals tools for convenience.
-
----
-
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -466,7 +238,6 @@ mcp__loom__launch_interval({
 | File | Path | Purpose |
 |------|------|---------|
 | Daemon Socket | `/tmp/loom-daemon.sock` | Unix socket for IPC |
-| State File | `~/.loom/state.json` | Terminal state and selection |
 | Terminal Logs | `/tmp/loom-{terminal_id}.out` | Terminal output capture |
 
 ---
@@ -499,14 +270,14 @@ const output = await mcp__loom__get_terminal_output({
 ### Monitoring Agent Activity
 
 ```typescript
-// 1. Get currently selected terminal
-const selected = await mcp__loom__get_selected_terminal();
+// 1. Find the terminal to watch
+const terminals = await mcp__loom__list_terminals();
 // Parse to find terminal ID
 
 // 2. Periodically check output
 setInterval(async () => {
   const output = await mcp__loom__get_terminal_output({
-    terminal_id: selectedId,
+    terminal_id: watchedId,
     lines: 20
   });
 

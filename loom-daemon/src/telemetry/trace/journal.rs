@@ -12,6 +12,7 @@ use std::{
 
 pub const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 32 * 1024;
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 // Test-only counters for the durability barriers this module issues *besides*
 // the per-boundary journal write (Issue #8643). Thread-local, so tests running
@@ -86,17 +87,7 @@ impl Journal {
             options.mode(0o600);
         }
         let file = options.open(&self.path)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(error) if std::time::Instant::now() >= deadline => {
-                    log::warn!("observability: trace journal lock retry budget exhausted; record deferred or omitted");
-                    return Err(error).context("trace journal busy");
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
-            }
-        }
+        Self::try_lock_for(&file, "trace journal busy")?;
         let len = file.metadata()?.len();
         // A parent-directory fsync durably links a *newly created* journal;
         // once the file holds a record that link is already stable, so
@@ -370,8 +361,25 @@ impl Journal {
             options.mode(0o600);
         }
         let lock = options.open(self.path.with_extension("drain-lock"))?;
-        lock.try_lock().context("trace journal drain busy")?;
+        Self::try_lock_for(&lock, "trace journal drain busy")?;
         Ok(lock)
+    }
+
+    /// Poll `try_lock` for a bounded interval so a lock held only briefly (for
+    /// example by a forked child's inherited descriptor until it execs) is
+    /// waited out instead of failing at once (Issue #10302).
+    fn try_lock_for(file: &File, context: &'static str) -> Result<()> {
+        let deadline = std::time::Instant::now() + LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(()),
+                Err(error) if std::time::Instant::now() >= deadline => {
+                    log::warn!("observability: {context}: lock retry budget exhausted; record deferred or omitted");
+                    return Err(error).context(context);
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            }
+        }
     }
 
     /// Called only by the daemon after drain: retire completed executions once
@@ -422,6 +430,74 @@ impl Journal {
         std::fs::remove_file(cursor_path)?;
         std::fs::remove_file(self.path.with_extension("drain-lock"))?;
         File::open(self.path.parent().context("journal has no parent")?)?.sync_all()?;
+        Ok(true)
+    }
+
+    /// Retire a journal nothing will ever finish (#13439), after a successful
+    /// drain. A zero-byte journal untouched for `empty_after` is removed with
+    /// its sidecars; a fully drained journal (cursor at EOF) untouched for
+    /// `quarantine_after` is moved with its sidecars into a `stale/` directory
+    /// beside it, which the backfill scan does not enter. A journal with
+    /// undrained bytes is never touched, so no span is lost. The caller has
+    /// already established that no running step owns the journal.
+    pub fn retire_stale(
+        &self,
+        empty_after: std::time::Duration,
+        quarantine_after: std::time::Duration,
+    ) -> Result<bool> {
+        let _drain_lock = self.drain_lock()?;
+        let file = self.lock()?;
+        let meta = file.metadata()?;
+        let idle = meta
+            .modified()?
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO);
+        let parent = self.path.parent().context("journal has no parent")?;
+        let cursor_path = self.path.with_extension("cursor");
+        let json_path = self.path.with_extension("json");
+        if meta.len() == 0 {
+            if idle < empty_after {
+                return Ok(false);
+            }
+            for sidecar in [&json_path, &cursor_path] {
+                match std::fs::remove_file(sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            std::fs::remove_file(&self.path)?;
+            let _ = std::fs::remove_file(self.path.with_extension("drain-lock"));
+            File::open(parent)?.sync_all()?;
+            return Ok(true);
+        }
+        let cursor = std::fs::read_to_string(&cursor_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if idle < quarantine_after || cursor != Some(meta.len()) {
+            return Ok(false);
+        }
+        let stale = parent.join("stale");
+        std::fs::create_dir_all(&stale)?;
+        let name = self
+            .path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .context("journal has no name")?;
+        let mut tag = String::new();
+        while stale.join(format!("{name}{tag}.jsonl")).exists() {
+            tag = format!("-{}", Utc::now().timestamp_nanos_opt().unwrap_or_default());
+        }
+        std::fs::rename(&self.path, stale.join(format!("{name}{tag}.jsonl")))?;
+        for (sidecar, ext) in [(&json_path, "json"), (&cursor_path, "cursor")] {
+            match std::fs::rename(sidecar, stale.join(format!("{name}{tag}.{ext}"))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let _ = std::fs::remove_file(self.path.with_extension("drain-lock"));
+        File::open(parent)?.sync_all()?;
         Ok(true)
     }
 

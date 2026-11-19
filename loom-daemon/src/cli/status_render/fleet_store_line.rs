@@ -6,7 +6,7 @@
 //!
 //! **Read client-side, not over IPC.** The snapshot this renders
 //! (`<loom_dir>/fleet-sync-status.json`, written by
-//! [`loom_daemon::fleet_sync`] at the end of every pass) is a fact about the
+//! [`crate::fleet_sync`] at the end of every pass) is a fact about the
 //! *host's* config tiers, not about the daemon's in-memory state — the same
 //! class as the `daemon_install_state` probe `cli::status` already performs
 //! locally. Reading it here also keeps it visible in exactly the case an
@@ -17,7 +17,7 @@
 //! snapshot, so both entry points below render nothing at all and `status`
 //! output is byte-identical to a build without this feature.
 
-use loom_daemon::fleet_sync::{self, FleetSyncStatus};
+use crate::fleet_sync::{self, FleetSyncStatus};
 
 /// Print the block, or nothing when this host has no fleet-store snapshot.
 pub fn print(status: Option<&FleetSyncStatus>) {
@@ -57,10 +57,11 @@ mod tests {
             at: chrono::Utc::now(),
             interval_secs: 300,
             auto_apply: false,
+            auto_apply_writes: Default::default(),
             config: fleet_sync::ConfigPass::default(),
             roster: fleet_sync::RosterPass::default(),
-            state: loom_daemon::fleet_state::StatePass::default(),
-            enforced: loom_daemon::fleet_state::Enforcement::Proceed,
+            state: crate::fleet_state::StatePass::default(),
+            enforced: crate::fleet_state::Enforcement::Proceed,
             floor: fleet_sync::FloorPass::default(),
             workspaces: fleet_sync::workspace_resync::WorkspacePass::default(),
             checkouts: Vec::new(),
@@ -83,15 +84,16 @@ mod tests {
             at: chrono::Utc::now(),
             interval_secs: 300,
             auto_apply: false,
+            auto_apply_writes: Default::default(),
             config: fleet_sync::ConfigPass::default(),
             roster: fleet_sync::RosterPass::default(),
-            state: loom_daemon::fleet_state::StatePass {
-                desired: Some(loom_daemon::fleet_store::state::RunState::Paused),
+            state: crate::fleet_state::StatePass {
+                desired: Some(crate::fleet_store::state::RunState::Paused),
                 source: Some("host".to_string()),
                 by: Some("operator".to_string()),
                 ..Default::default()
             },
-            enforced: loom_daemon::fleet_state::Enforcement::Hold,
+            enforced: crate::fleet_state::Enforcement::Hold,
             floor: fleet_sync::FloorPass::default(),
             workspaces: fleet_sync::workspace_resync::WorkspacePass::default(),
             checkouts: Vec::new(),

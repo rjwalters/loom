@@ -142,13 +142,16 @@ pub async fn flush_before_shutdown(budget: Duration) {
 pub async fn intercept(request: &crate::types::Request) {
     if matches!(request, crate::types::Request::Shutdown) {
         log::info!("Shutdown requested; draining telemetry before exit");
-        exit(crate::ipc::EXIT_SHUTDOWN).await;
+        exit(crate::ipc::EXIT_SHUTDOWN, super::daemon_exit::ExitCause::IpcShutdown).await;
     }
 }
 
 /// Signal/IPC shutdown preserves active work; it exports only already-completed
 /// queued spans. SIGKILL cannot run this path and relies on persisted state.
-pub async fn exit(code: i32) -> ! {
+/// The `daemon.exit` record (#11839) is enqueued first so the final drain
+/// carries it.
+pub async fn exit(code: i32, cause: super::daemon_exit::ExitCause) -> ! {
+    super::daemon_exit::emit(cause, code);
     flush_before_shutdown(Duration::from_secs(2)).await;
     std::process::exit(code)
 }
@@ -245,6 +248,47 @@ mod tests {
         );
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert_eq!(DurableQueue::open(path, 5).len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_exit_enqueued_before_the_flush_is_exported_by_it() {
+        use super::super::daemon_exit::{build_record, emit_to, ExitCause};
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+        impl Exporter for Recorder {
+            async fn emit_batch(
+                &self,
+                batch: &[TelemetryEnvelope],
+            ) -> Result<(), super::super::exporter::ExportError> {
+                let mut seen = self.0.lock().unwrap();
+                for envelope in batch {
+                    if let TelemetryRecord::DaemonExit(r) = &envelope.record {
+                        seen.push(r.requested_by.as_str().to_string());
+                    }
+                }
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(DurableQueue::open(dir.path().join("queue.jsonl"), 5));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        // A long interval: the sender only exports because the flush asks it to.
+        let task = spawn_sender(
+            queue.clone(),
+            Recorder(seen.clone()),
+            5,
+            Duration::from_secs(3600),
+            Arc::new(ExportStatus::started("host", "http://localhost", "otlp", 30)),
+        );
+        emit_to(
+            queue.as_ref(),
+            "host",
+            build_record(ExitCause::Signal("SIGTERM"), 143, vec![], None, None),
+        );
+        flush_before_shutdown(Duration::from_secs(2)).await;
+        assert_eq!(*seen.lock().unwrap(), ["unknown"]);
+        assert_eq!(queue.len(), 0);
+        task.abort();
     }
 
     #[tokio::test]

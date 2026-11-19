@@ -608,6 +608,7 @@ fn a_traced_role_ticks_session_summary_and_usage_span_share_one_trace_id() {
         execution: execution.clone(),
         started_at,
         failure: None,
+        judge: None,
     };
     crate::role_tick_telemetry::usage::journal_execution(
         &workspace,
@@ -768,4 +769,168 @@ fn a_sessions_join_key_prefers_its_issue_and_falls_back_to_its_slash_role() {
     assert_eq!(session_key(Some(42), Some("judge")), Some(JoinKey::Issue(42)));
     assert_eq!(session_key(None, Some("judge")), Some(JoinKey::Role("judge")));
     assert_eq!(session_key(None, None), None);
+}
+
+/// #14566: an unreadable sweep journals a `usage_missing` span under its
+/// completed `loom.runtime.run` span, with the reason and no counters; an untraced one
+/// has nowhere to say so and journals nothing.
+#[test]
+fn an_unreadable_sweep_journals_a_usage_missing_span_under_its_run_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root_context, run) = traced_execution(tmp.path(), "sweep-gone");
+    let window = (Utc::now() - Duration::hours(1), Utc::now());
+    let spans = journal_missing(
+        tmp.path(),
+        "sweep-gone",
+        window,
+        Some(missing::UsageMissing::NoAttributableUsage),
+        Some("opencode"),
+        false,
+    )
+    .unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one span: {spans:?}");
+    };
+    assert_eq!(span.name, SpanName::RuntimeUsageMissing);
+    assert_eq!(span.context.trace_id, root_context.trace_id);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&run.context.span_id));
+    assert_eq!(span.attributes["loom.usage.missing_reason"], "no_attributable_usage");
+    assert_eq!(span.attributes["loom.runtime"], "opencode");
+    assert_eq!(span.attributes["loom.sweep_id"], "sweep-gone");
+    // A re-emit adds nothing.
+    assert!(journal_missing(
+        tmp.path(),
+        "sweep-gone",
+        window,
+        Some(missing::UsageMissing::NoAttributableUsage),
+        Some("opencode"),
+        false,
+    )
+    .unwrap()
+    .is_empty());
+
+    assert!(journal_missing(
+        tmp.path(),
+        "never-traced",
+        window,
+        Some(missing::UsageMissing::NoWindow),
+        None,
+        false,
+    )
+    .unwrap()
+    .is_empty());
+}
+
+#[test]
+#[serial_test::serial]
+fn a_sweep_marks_each_unmeasured_run_even_with_aggregate_usage() {
+    let _enabled =
+        crate::env_test_support::EnvGuard::set(crate::observability::ENABLED_ENV, "true");
+    let _endpoint = crate::env_test_support::EnvGuard::set(
+        crate::observability::ENDPOINT_ENV,
+        "http://127.0.0.1:4318",
+    );
+    let _exporter =
+        crate::env_test_support::EnvGuard::set(crate::observability::EXPORTER_ENV, "otlp");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let store = TraceStore::new(root);
+    let start = Utc::now() - Duration::seconds(60);
+    let rows = [row(10, 1, 0, 0, 0)];
+    for (exec, known) in [("sweep-empty", false), ("sweep-mixed", true)] {
+        let saved = store.load_or_create(root, exec).unwrap();
+        let journal = Journal::for_context(&store.path(root, exec));
+        let mut parents = Vec::new();
+        for (role, offset) in [("builder", 0), ("doctor", 20)] {
+            let at = start + Duration::seconds(offset);
+            let attempt = saved.context.child();
+            let active = journal
+                .start(
+                    attempt.clone(),
+                    Some(&saved.context),
+                    SpanName::RoleAttempt,
+                    at,
+                    TraceAttributes::from([("loom.role".into(), role.into())]),
+                )
+                .unwrap();
+            let run = attempt.child();
+            let child = journal
+                .start(
+                    run.clone(),
+                    Some(&attempt),
+                    SpanName::RuntimeRun,
+                    at,
+                    TraceAttributes::from([("loom.runtime".into(), "opencode".into())]),
+                )
+                .unwrap();
+            let end = at + Duration::seconds(10);
+            journal
+                .finish(&child, end, SpanStatus::Ok, TraceAttributes::new())
+                .unwrap();
+            journal
+                .finish(&active, end, SpanStatus::Ok, TraceAttributes::new())
+                .unwrap();
+            parents.push(run.span_id.as_str().to_owned());
+        }
+        if known {
+            record_phase_usage(
+                root,
+                exec,
+                &[PhaseUsage {
+                    role: "builder",
+                    attempt: 1,
+                    window: (start, start + Duration::seconds(10)),
+                    rows: &rows,
+                }],
+                Some("opencode"),
+            );
+        }
+        for _ in 0..2 {
+            finish_sweep(
+                root,
+                exec,
+                Some(start),
+                known.then_some(rows.as_slice()),
+                (!known).then_some(missing::UsageMissing::StoreUnreadable),
+                Some("opencode"),
+            );
+        }
+        let finished = journal.completed().unwrap();
+        let actual: std::collections::BTreeSet<_> = finished
+            .iter()
+            .filter(|span| span.name == SpanName::RuntimeUsageMissing)
+            .map(|span| {
+                assert_eq!(span.attributes["loom.runtime"], "opencode");
+                assert_eq!(
+                    span.attributes["loom.usage.missing_reason"],
+                    if known {
+                        "no_attributable_usage"
+                    } else {
+                        "store_unreadable"
+                    },
+                );
+                span.parent_span_id.as_ref().unwrap().as_str().to_owned()
+            })
+            .collect();
+        let expected = parents.into_iter().skip(usize::from(known)).collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            finished
+                .iter()
+                .filter(|span| span.name == SpanName::RuntimeUsageMissing)
+                .count(),
+            actual.len(),
+            "a repeated close must add no duplicate marker",
+        );
+        if known {
+            let aggregate = finished
+                .iter()
+                .find(|span| {
+                    span.name == SpanName::RuntimeUsage
+                        && span.attributes["loom.usage.scope"] == "execution"
+                })
+                .unwrap();
+            assert_eq!(aggregate.parent_span_id.as_ref(), Some(&saved.context.span_id));
+        }
+    }
 }

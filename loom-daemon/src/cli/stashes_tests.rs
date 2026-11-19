@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
-use loom_daemon::stash_retirement::{list_quarantine_stashes, IssueStateLookup};
+use crate::stash_retirement::{list_quarantine_stashes, IssueStateLookup};
 
 use super::{run_with, RunOptions};
 

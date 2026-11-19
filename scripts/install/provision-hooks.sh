@@ -43,7 +43,11 @@
 #      entry run that copy — the project copy WINS until Phase 6 strips it, so a
 #      transition repo runs each guard exactly ONCE (no double-fire, no
 #      duplicated decision-log lines).
-#   4. Otherwise exec the machine-checkout hook
+#   4. Otherwise exec `$LOOM_HOOKS_HOME/defaults/hooks/<name>` when that is
+#      executable (the running daemon's own release, unpacked from its binary
+#      and exported to every session it spawns: hooks track the daemon by
+#      construction, 2am#4501, see loom-daemon/src/hooks_home.rs),
+#      else the machine-checkout hook
 #      `${LOOM_HOME:-$HOME/.local/share/loom}/defaults/hooks/<name>`, passing the
 #      resolved repo root through `LOOM_PROJECT_ROOT` (so guard-destructive.sh's
 #      dispatcher resolves the consuming repo's canonical Repo-Skills guard from
@@ -182,7 +186,12 @@ PROJECT_HOOKS_WIRED=0
 # `SessionStart` / `gh-front-env.sh` (#10516) is not a guard: it puts the agent
 # `gh` front first on an interactive session's PATH via `$CLAUDE_ENV_FILE`
 # (inherited by Task subagents). Matcher "" covers startup/resume/clear/compact;
-# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out.
+# the hook is fail-open and stdout-silent, and `LOOM_GH_SHIM=0` opts out. It is
+# the one entry wired with a `timeout` (10 s, #13959): a hung binary lookup,
+# version preflight or `gh-shim session-env` call is killed by the client
+# instead of stalling session start for the 30-50 s the unresolved worst case
+# was reported at. The hook is fail-open, so a killed run costs only the PATH
+# line — the same degradation as any other resolution failure.
 #
 # `roll-pause.sh` (#10830) is wired three times, match-all: PreToolUse parks a
 # daemon-dispatched agent's tool calls at a roll's safe point, and PostToolUse /
@@ -213,6 +222,12 @@ _PHOOK_NAMES=(
     guard-uncommitted-work.sh
     guard-uncommitted-work.sh
 )
+# Parallel array (#13959): per-entry `timeout` seconds for the emitted hook
+# object (the client kills a hung hook after this many), or "" to emit no
+# timeout field at all. Only the SessionStart gh front carries one today — see
+# its comment above. Keep indexed with the three arrays above; the Rust-side
+# drift test (loom-daemon/src/init/hook_wiring.rs) compares all four.
+_PHOOK_TIMEOUTS=("" "" "" "" "" "" "" "10" "" "" "" "" "")
 
 # Emit the fail-open, workspace-gated, transition-deferring command wrapper for a
 # single hook script <name>. A single-quoted `bash -c '...'` body with NO
@@ -233,50 +248,22 @@ _PHOOK_WRAPPER_MARKER='ROOT=$(cd "$(git rev-parse --git-common-dir'
 _phook_cmd() {
     local name="$1"
     # shellcheck disable=SC2016  # literal $-expansions are intentional (per-user, at hook time)
-    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
+    printf '%s' "bash -c 'ROOT=\$(cd \"\$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd); [ -n \"\$ROOT\" ] || exit 0; { [ -f \"\$ROOT/.loom-project/project.json\" ] || [ -f \"\$ROOT/.loom/config.json\" ]; } || exit 0; [ -x \"\$ROOT/.loom/hooks/${name}\" ] && [ -f \"\$ROOT/.claude/settings.json\" ] && case \"\$(<\"\$ROOT/.claude/settings.json\")\" in *\".loom/hooks/${name}\"*) exit 0 ;; esac; H=\"\${LOOM_HOOKS_HOME:+\$LOOM_HOOKS_HOME/defaults/hooks/${name}}\"; [ -x \"\$H\" ] || H=\"\${LOOM_HOME:-\$HOME/.local/share/loom}/defaults/hooks/${name}\"; [ -x \"\$H\" ] && LOOM_PROJECT_ROOT=\"\$ROOT\" exec \"\$H\" || exit 0'"
 }
 
-# ── Operator presence (#11563, #11713) ────────────────────────────────────────
-# _phook_presence_mode -> echoes `on`, `off` or `unset`. First match wins:
-#   LOOM_OPERATOR_PRESENCE=0         per-run / per-shell force-off
-#   ~/.loom/operator-presence.optout per-operator local opt-out (beats fleet policy)
-#   operatorPresence.enabled=false   fleet key (machine-level defaults.json, tier 1)
-#   LOOM_OPERATOR_PRESENCE=1 / enabled=true: on (=1 is below the opt-outs; the installer writes it)
-_phook_presence_mode() {
-    [[ "${LOOM_OPERATOR_PRESENCE:-}" == 0 || -e "${LOOM_PRESENCE_OPTOUT_FILE:-$HOME/.loom/operator-presence.optout}" ]] && { echo off; return; }
-    local cfg="${LOOM_CONFIG_DEFAULTS_FILE-$HOME/.local/share/loom/config/defaults.json}" v=""
-    [[ -n "$cfg" && -r "$cfg" ]] && command -v jq >/dev/null 2>&1 \
-        && v="$(jq -r '.operatorPresence.enabled | if type == "boolean" then tostring else empty end' "$cfg" 2>/dev/null)"
-    [[ "$v" == false ]] && { echo off; return; }
-    if [[ "$v" == true || "${LOOM_OPERATOR_PRESENCE:-}" == 1 ]]; then echo on; else echo unset; fi
-}
-
-# _phook_presence_apply <settings_file>: merge (on) or strip (off) the three
-# presence-beat.sh hook entries and the LOOM_OPERATOR_PRESENCE=1 env entry,
-# touching nothing else. Idempotent; a no-op when already in the wanted state.
+# ── Operator presence (#11563, #11713, #12121) ────────────────────────────────
+# Presence is derived by the daemon from session transcripts and lease records
+# (#12121), so there is no hook to wire. This only STRIPS the wiring older
+# installs left behind: the three presence-beat.sh hook entries and the
+# LOOM_OPERATOR_PRESENCE=1 env entry, touching nothing else. Idempotent; a
+# no-op when already converged. (Any other env value, e.g. 0, is left alone.)
 _phook_presence_apply() {
-    local settings="$1" mode pevent rc=0
-    mode="$(_phook_presence_mode)"
-    [[ "$mode" == unset ]] && return 0
-    if [[ "$mode" == on ]]; then
-        for pevent in UserPromptSubmit PostToolUse Stop; do
-            if _phook_merge_one "$settings" "$pevent" "" "defaults/hooks/presence-beat.sh" \
-                "$(_phook_cmd presence-beat.sh)" "" "$_PHOOK_WRAPPER_MARKER"; then
-                _phook_ok "wired $pevent/<all> -> presence-beat.sh (operator presence)"
-            else
-                _phook_warn "failed to wire presence-beat.sh ($pevent) into $settings"
-                rc=1
-            fi
-        done
-        _phook_presence_edit "$settings" '.env = ((.env // {}) + {"LOOM_OPERATOR_PRESENCE": "1"})' || rc=1
-    else
-        _phook_presence_edit "$settings" '
-            (if .hooks then .hooks |= (to_entries | map(.value |= (map(.hooks |= map(select((.command // "") | contains("defaults/hooks/presence-beat.sh") | not))) | map(select((.hooks | length) > 0)))) | map(select((.value | length) > 0)) | from_entries) else . end)
-            | if (.hooks // {}) == {} then del(.hooks) else . end
-            | if (.env.LOOM_OPERATOR_PRESENCE // "") == "1" then del(.env.LOOM_OPERATOR_PRESENCE) else . end
-            | if (.env // {}) == {} then del(.env) else . end' || rc=1
-    fi
-    return "$rc"
+    local settings="$1"
+    _phook_presence_edit "$settings" '
+        (if .hooks then .hooks |= (to_entries | map(.value |= (map(.hooks |= map(select((.command // "") | contains("defaults/hooks/presence-beat.sh") | not))) | map(select((.hooks | length) > 0)))) | map(select((.value | length) > 0)) | from_entries) else . end)
+        | if (.hooks // {}) == {} then del(.hooks) else . end
+        | if (.env.LOOM_OPERATOR_PRESENCE // "") == "1" then del(.env.LOOM_OPERATOR_PRESENCE) else . end
+        | if (.env // {}) == {} then del(.env) else . end'
 }
 
 # _phook_presence_edit <settings_file> <jq filter>: apply the filter only when it
@@ -298,22 +285,17 @@ _phook_presence_edit() {
 
 # provision_operator_presence [claude_dir]
 #
-# Standalone presence-only pass for resync-installed.sh (#11713): applies
-# `_phook_presence_mode` to the user-scope settings without re-running the full
-# guard-hook wiring. Best-effort, never fatal; a no-op when mode is `unset`.
+# Standalone pass for resync-installed.sh: strips the retired presence-beat.sh
+# wiring (#12121) from the user-scope settings without re-running the full
+# guard-hook wiring. Best-effort, never fatal.
 provision_operator_presence() {
-    local claude_dir="${1:-$HOME/.claude}" settings mode
+    local claude_dir="${1:-$HOME/.claude}" settings
     settings="$claude_dir/settings.json"
-    mode="$(_phook_presence_mode)"
-    [[ "$mode" == unset ]] && return 0
-    command -v jq >/dev/null 2>&1 || { _phook_warn "jq not available; cannot apply operator presence."; return 1; }
-    if [[ -s "$settings" ]] && ! jq empty "$settings" >/dev/null 2>&1; then
+    [[ -s "$settings" ]] || return 0
+    command -v jq >/dev/null 2>&1 || { _phook_warn "jq not available; cannot strip operator presence wiring."; return 1; }
+    if ! jq empty "$settings" >/dev/null 2>&1; then
         _phook_warn "$settings is not valid JSON; leaving it untouched."
         return 1
-    fi
-    if [[ ! -s "$settings" ]]; then
-        [[ "$mode" == on ]] || return 0
-        mkdir -p "$claude_dir" 2>/dev/null && printf '{}\n' >"$settings" 2>/dev/null || return 1
     fi
     _phook_presence_apply "$settings"
 }
@@ -390,9 +372,10 @@ provision_loom_hooks() {
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
         local name="${_PHOOK_NAMES[$i]}"
+        local tmo="${_PHOOK_TIMEOUTS[$i]}"
         local cmd
         cmd="$(_phook_cmd "$name")"
-        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" "defaults/hooks/$name" "$cmd" "" "$_PHOOK_WRAPPER_MARKER" "$tmo"; then
             _phook_ok "wired $htype/${matcher:-<all>} -> $name"
         else
             _phook_warn "failed to wire $name into $settings"
@@ -400,8 +383,7 @@ provision_loom_hooks() {
         fi
     done
 
-    # Operator presence heartbeat (#11563/#11713): wired, or removed, per
-    # _phook_presence_mode. Unset leaves any existing wiring untouched.
+    # Operator presence (#12121): the daemon derives it now; strip the old hook.
     _phook_presence_apply "$settings" || soft_fail=1
 
     return "$soft_fail"
@@ -432,8 +414,13 @@ provision_loom_hooks() {
 # name is never touched, only ever left as-is.
 #   $1 settings_file  $2 hook_type  $3 matcher  $4 dedup_marker  $5 command
 #   $6 exclude_marker (optional)  $7 upgrade_marker (optional)
+#   $8 timeout_s (optional, #13959): emitted as the `timeout` field of every
+#     hook object this function appends, and set in place on a duplicate that
+#     <upgrade_marker> identifies as Loom-authored — so an already-provisioned
+#     install converges to the bound without a duplicate entry. Empty = no
+#     field, and never touches a hand-written duplicate's timeout.
 _phook_merge_one() {
-    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}"
+    local f="$1" htype="$2" matcher="$3" marker="$4" cmd="$5" exclude="${6:-}" upgrade="${7:-}" tmo="${8:-}"
     local tmp
     tmp="$(mktemp 2>/dev/null)" || return 1
     if jq \
@@ -442,17 +429,20 @@ _phook_merge_one() {
         --arg marker "$marker" \
         --arg exclude "$exclude" \
         --arg upgrade "$upgrade" \
-        --arg cmd "$cmd" '
+        --arg cmd "$cmd" \
+        --arg tmo "$tmo" '
         def is_dup($c): ($c | contains($marker))
             and (($exclude | length) == 0 or ($c | contains($exclude) | not));
         def is_stale_loom_wrapper($c): ($upgrade | length) > 0
             and ($c != $cmd)
             and ($c | contains($upgrade));
+        def new_entry: {type: "command", command: $cmd}
+            + (if ($tmo | length) > 0 then {timeout: ($tmo | tonumber)} else {} end);
         .hooks = (.hooks // {})
         | .hooks[$ht] = (.hooks[$ht] // [])
         | (.hooks[$ht] | map(.matcher // "") | index($m)) as $idx
         | if $idx == null then
-            .hooks[$ht] += [{matcher: $m, hooks: [{type: "command", command: $cmd}]}]
+            .hooks[$ht] += [{matcher: $m, hooks: [new_entry]}]
           else
             .hooks[$ht][$idx].hooks = (.hooks[$ht][$idx].hooks // [])
             | if (.hooks[$ht][$idx].hooks | map(.command // "") | any(is_dup(.)))
@@ -461,13 +451,25 @@ _phook_merge_one() {
                 # PLACE only if it is a stale Loom-authored wrapper (recognized
                 # by upgrade_marker) that differs from the current command —
                 # never touch anything else (already-current, or hand-written).
+                # With a timeout set (#13959), a Loom-authored duplicate also
+                # converges to it in place (added when missing, corrected when
+                # stale) — the bound reaches already-provisioned installs, and
+                # a hand-written duplicate never gains a field it did not have.
                 .hooks[$ht][$idx].hooks |= map(
-                    if is_dup(.command // "") and is_stale_loom_wrapper(.command // "")
-                    then .command = $cmd
+                    if is_dup(.command // "") then
+                        (if is_stale_loom_wrapper(.command // "")
+                         then .command = $cmd
+                         else . end)
+                        | (if ($tmo | length) > 0
+                               and (($upgrade | length) > 0)
+                               and ((.command // "") | contains($upgrade))
+                               and ((.timeout // 0) != ($tmo | tonumber))
+                           then .timeout = ($tmo | tonumber)
+                           else . end)
                     else .
                     end
                 )
-              else .hooks[$ht][$idx].hooks += [{type: "command", command: $cmd}]
+              else .hooks[$ht][$idx].hooks += [new_entry]
               end
           end
         ' "$f" > "$tmp" 2>/dev/null; then
@@ -562,6 +564,7 @@ ensure_project_hook_wiring() {
         [[ -f "$hooks_dir/$name" ]] || continue
         local htype="${_PHOOK_TYPES[$i]}"
         local matcher="${_PHOOK_MATCHERS[$i]}"
+        local tmo="${_PHOOK_TIMEOUTS[$i]}"
         # shellcheck disable=SC2016  # ${CLAUDE_PROJECT_DIR} is expanded by Claude Code, not bash
         # #6544: quoted so a project path containing a space does not get
         # word-split by `sh` at hook-execution time — ${CLAUDE_PROJECT_DIR} is
@@ -592,7 +595,7 @@ ensure_project_hook_wiring() {
         # deliberate customization.
         # shellcheck disable=SC2016
         local legacy_cmd='${CLAUDE_PROJECT_DIR}/.loom/hooks/'"$name"
-        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd"; then
+        if _phook_merge_one "$settings" "$htype" "$matcher" ".loom/hooks/$name" "$cmd" "defaults/hooks/" "$legacy_cmd" "$tmo"; then
             wired=$((wired + 1))
         else
             _phook_warn "failed to assert project-level entry for $name in $settings"

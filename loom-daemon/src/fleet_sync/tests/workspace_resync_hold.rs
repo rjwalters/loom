@@ -2,7 +2,10 @@
 //! installed files, judged against real git and a synthetic payload.
 
 use super::*;
-use crate::workspace_hold::{HeldCopy, HoldKind, Holds, Observation, Verdict, ALERT_AFTER};
+use crate::fleet_sync::workspace_resync::waiver::Waived;
+use crate::workspace_hold::{
+    Finding, HeldCopy, HoldKind, Holds, InstalledBehind, Observation, Verdict, ALERT_AFTER,
+};
 
 /// A pass by `host`, then what it tells the hold, folded into `holds`.
 fn hold_pass(host: &Host<'_>, floor: Option<&str>, holds: &mut Holds) -> Vec<Observation> {
@@ -32,6 +35,8 @@ fn hold_pass_in(
         spent: &|| false,
         overdue: &|| false,
         heads: &|asks| host.heads.answer(asks),
+        land: &|_, _, _| Landed::Waiting("not exercised".to_string()),
+        waive: &|_, _, _| Waived::Lane("not exercised".to_string()),
     };
     let seen = observations(&env, &pass, &mut host.memory.borrow_mut());
     holds.step(&seen, v(host.version), host.now.get(), ALERT_AFTER);
@@ -315,6 +320,174 @@ fn a_compatible_w3_repo_is_not_held_and_is_still_resynced() {
     assert_ne!(fx.origin_head(), before, "resynced");
 }
 
+/// #14015: a daemon at N+1 over installed files at N is behind but
+/// compatible. It is named once for `status` and the log, it is still not
+/// held, and it is named again only if it leaves that state and returns or
+/// its installed version changes.
+#[test]
+fn a_behind_but_compatible_repo_is_named_once_and_still_not_held() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+    let behind = InstalledBehind {
+        installed: STALE.version.to_string(),
+        running: RUNNING.to_string(),
+    };
+
+    let (check, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert_eq!(only(&check).state, WState::W3);
+    assert_eq!(seen[0].default_branch.behind.as_deref(), Some(STALE.version));
+    assert_eq!(verdicts(&seen), (Verdict::Clear, Verdict::Clear), "still not held");
+    assert!(holds.holds().is_empty(), "dispatch is not held");
+    assert_eq!(holds.demand(), None, "and no roll is asked for");
+    assert_eq!(
+        holds.installed_behind().into_values().collect::<Vec<_>>(),
+        std::slice::from_ref(&behind)
+    );
+    let first = holds.newly_behind();
+    assert_eq!(first.len(), 1, "named once");
+    assert_eq!(first[0].1.as_deref(), Some(REPO));
+    assert_eq!(first[0].2, behind);
+
+    // The same state again does not repeat.
+    hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert!(holds.newly_behind().is_empty(), "not every pass");
+    assert_eq!(holds.installed_behind().len(), 1, "but still shown");
+
+    // Its installed version changes: named again.
+    let mut moved = seen.clone();
+    moved[0].default_branch = Finding::clear_behind(Some("0.19.801".to_string()));
+    holds.step(&moved, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.newly_behind().len(), 1);
+
+    // The resync lands on the default branch. The checkout still carries the
+    // old stamp until the checkout step moves it, so it is still behind.
+    let (_, seen) = hold_pass_in(&host, Mode::Write, floor, &mut holds);
+    assert_eq!(seen[0].default_branch.behind, None);
+    assert_eq!(seen[0].checkout.behind.as_deref(), Some(STALE.version));
+    assert_eq!(holds.installed_behind().len(), 1);
+    let moved_back = holds.newly_behind();
+    assert_eq!(moved_back.len(), 1, "now the checkout's version, which differs from the last");
+    assert_eq!(moved_back[0].2.installed, STALE.version);
+    assert!(holds.newly_behind().is_empty(), "and then not again");
+
+    // Both copies current: nothing is shown.
+    let mut current = seen;
+    current[0].checkout = Finding::clear();
+    holds.step(&current, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert!(holds.installed_behind().is_empty());
+    assert!(holds.newly_behind().is_empty());
+
+    // It leaves the state and comes back: named again.
+    let mut back = current;
+    back[0].default_branch = Finding::clear_behind(Some(STALE.version.to_string()));
+    holds.step(&back, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.newly_behind().len(), 1, "re-entered");
+
+    // A pass that could not judge the copy keeps what it was last found to be.
+    let mut unknown = back;
+    unknown[0].default_branch = Finding::unknown();
+    holds.step(&unknown, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.installed_behind().len(), 1);
+    assert!(holds.newly_behind().is_empty());
+}
+
+/// #14409: a maintain-only root is refused dispatch by the registry mark, not
+/// by a pass hold, so "dispatch is not held" would be false for it. It is not
+/// reported as behind-but-compatible (neither the log nor `status` says so)
+/// while marked, and is named once the mark clears. An unmarked repo in the
+/// same state is still reported.
+#[test]
+fn a_maintain_only_repo_is_not_reported_as_behind_but_not_held() {
+    use crate::workspace_hold::set_maintain_only_for_test;
+    use crate::workspace_registry::{MaintainOnly, MaintainOnlySource};
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    let floor = Some("0.19.850");
+    let mut holds = Holds::default();
+
+    // Regression guard: unmarked, it is behind-but-compatible and named.
+    let (_, seen) = hold_pass_in(&host, Mode::Check, floor, &mut holds);
+    assert_eq!(seen[0].default_branch.behind.as_deref(), Some(STALE.version));
+    assert_eq!(holds.installed_behind().len(), 1, "unmarked is reported");
+    assert_eq!(holds.newly_behind().len(), 1, "and announced");
+
+    // Marked: the same observation is neither shown nor announced.
+    set_maintain_only_for_test(
+        &host.root,
+        Some(MaintainOnly {
+            by: MaintainOnlySource::FleetStore,
+            since: t0(),
+        }),
+    );
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert!(holds.holds().is_empty(), "the registry mark is not a pass hold");
+    assert!(holds.installed_behind().is_empty(), "maintain-only is not 'not held'");
+    assert!(holds.newly_behind().is_empty(), "and is not announced as such");
+
+    // The mark clears while it is still behind: reported again.
+    set_maintain_only_for_test(&host.root, None);
+    holds.step(&seen, v(RUNNING), host.now.get(), ALERT_AFTER);
+    assert_eq!(holds.installed_behind().len(), 1);
+    assert_eq!(holds.newly_behind().len(), 1, "named once the mark is gone");
+}
+
+/// A held repo is not also reported as merely behind: only a clear copy
+/// carries the marker.
+#[test]
+fn a_held_w3_repo_is_not_reported_as_behind() {
+    let fx = Fixture::new(Seed {
+        requires: None,
+        ..STALE
+    });
+    let host = Host::new(&fx, "host-a");
+    let mut holds = Holds::default();
+    let (_, seen) = hold_pass_in(&host, Mode::Check, Some("0.19.850"), &mut holds);
+    assert_eq!(seen[0].default_branch.behind, None);
+    assert!(holds.installed_behind().is_empty());
+}
+
+/// One copy behind-but-compatible and the other held (mid-resync, where the
+/// two stamps disagree): the repo has a standing hold, so it is not also
+/// reported as "behind, not held" (#14334). Either copy may be the held one.
+#[test]
+fn a_repo_with_one_copy_behind_and_the_other_held_is_not_reported_as_behind() {
+    let held = Finding::install_incompatible("no requires_daemon".to_string());
+    let behind = || Finding::clear_behind(Some(STALE.version.to_string()));
+    for (default_branch, checkout, copy) in [
+        (held.clone(), behind(), HeldCopy::DefaultBranch),
+        (behind(), held.clone(), HeldCopy::Checkout),
+    ] {
+        let mut holds = Holds::default();
+        let seen = [Observation {
+            root: PathBuf::from("/work/mixed"),
+            repo: Some(REPO.to_string()),
+            default_branch,
+            checkout,
+        }];
+        let now = chrono::Utc::now();
+        holds.step(&seen, v(RUNNING), now, ALERT_AFTER);
+        let hold = holds
+            .holds()
+            .into_values()
+            .next()
+            .expect("the repo is held");
+        assert_eq!(hold.copy, copy);
+        assert!(holds.installed_behind().is_empty(), "a held repo is not 'not held'");
+        assert!(holds.newly_behind().is_empty(), "and is not announced as such");
+
+        // The hold clears while the other copy is still behind: now it is.
+        let mut cleared = seen.clone();
+        cleared[0].default_branch = behind();
+        cleared[0].checkout = behind();
+        holds.step(&cleared, v(RUNNING), now, ALERT_AFTER);
+        assert!(holds.holds().is_empty());
+        assert_eq!(holds.installed_behind().len(), 1);
+        assert_eq!(holds.newly_behind().len(), 1, "named once the hold is gone");
+    }
+}
+
 /// The same repo with no `requires_daemon` on record: nothing vouches for
 /// its files, so it is held until the resync lands.
 #[test]
@@ -369,6 +542,7 @@ fn a_checkout_hold_clears_when_the_checkout_fast_forwards_in_the_same_pass() {
         budget: None,
         elapsed: &|| Duration::ZERO,
         clock: &|| host.now.get(),
+        pr_merged: &|_, _| None,
     };
     let roots = [host.root.clone()];
     let moved = checkout_ff::run(&env, &roots, &mut checkout_ff::Memory::default());

@@ -68,6 +68,7 @@
 //! `loom.codex_session.mount_drift{account,container,kind}` (`missing`,
 //! `extra`, `denied`: how many paths; only when there is a drift verdict).
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -339,13 +340,6 @@ impl Staleness {
     }
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// What one pass decided: the observations to export (`None`: export
 /// nothing) and the WARN lines.
 #[derive(Debug, Default, PartialEq)]
@@ -443,7 +437,12 @@ fn watch_pass(root: &Path) {
         let mut guard = TRACKER
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        fold(guard.get_or_insert_with(Tracker::default), &accounts, &snapshot, now_secs())
+        fold(
+            guard.get_or_insert_with(Tracker::default),
+            &accounts,
+            &snapshot,
+            now_epoch_secs(),
+        )
     };
     for message in &pass.warn {
         log::warn!("session: {message}");
@@ -477,7 +476,7 @@ pub fn spawn_watch(workspace_root: PathBuf) -> tokio::task::JoinHandle<()> {
             ticker.tick().await;
             let seats = published_seats().is_some_and(|seats| !seats.is_empty());
             let age = session_state::newest().map(|(age, _)| age);
-            if let Some(message) = staleness.check(seats, age, now_secs()) {
+            if let Some(message) = staleness.check(seats, age, now_epoch_secs()) {
                 log::warn!("session: {message}");
             }
             if IN_FLIGHT.swap(true, Ordering::AcqRel) {

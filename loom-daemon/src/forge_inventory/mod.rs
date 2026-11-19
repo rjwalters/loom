@@ -36,13 +36,11 @@
 //! - The CLI verbs and the tests call the *same* functions, so there is one
 //!   mechanism per behaviour — the command is for operators and for
 //!   `gate --update`, the test is the pre-merge gate.
-//! - Registering a new required `Daemon Checks` component means giving it a
-//!   `CheckSpec` in [`crate::merge_pr::stale_checks::inputs`]. This gate's
-//!   `scanned` set is *every tracked `.sh`/`.rs`/workflow file*, so its spec
-//!   would make `Daemon Checks` stale on nearly every base move — directly
-//!   worsening the stale-check remedy exhaustion that already holds PRs
-//!   (#8248/#8508). Registering it needs that consequence designed, not
-//!   inherited; see the follow-up issue the PR names.
+//! - Registering a new required `Daemon Checks` component used to mean a
+//!   freshness `CheckSpec` whose scanned set (every tracked `.sh`/`.rs`/workflow
+//!   file) went stale on nearly every base move (#8248/#8508). That guard was
+//!   deleted by #12063 slice 1, so the hazard is gone; registering it is now
+//!   only a ruleset decision.
 //!
 //! **The test form does not escape that hazard, it only costs less.** The test
 //! runs over the *merged* tree too, so a base move that adds an undeclared,

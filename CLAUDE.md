@@ -5,8 +5,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 **Installation Date**: 2026-04-21
 
 > **Operating core:** keep immediate dispatch instructions here. Put reference
-> details in `.loom/docs/*`, with a one-line pointer here; CI enforces the
-> instruction budget (`scripts/check-claude-md-budget.sh`). Completed migration
+> details in `.loom/docs/*`, with a one-line pointer here. Completed migration
 > history belongs in `docs/migration/` and ADRs.
 
 ## What is Loom?
@@ -166,6 +165,21 @@ phase — creating a PR labeled `loom:review-requested` is only the Builder stag
 the work is not complete until reviewed and merged. **`/loom:sweep` handles all
 stages automatically** — prefer it over manual orchestration to avoid skipping any.
 
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](.loom/docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
+
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools directly may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
@@ -194,8 +208,8 @@ All org CI is captured in SigNoz: [`ci-observability`](.loom/docs/ci-observabili
    all-clear. A hand-claim is not exempt.
 1. Find issue: `gh issue list --label="loom:issue"`
 2. Claim: `gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"`, then
-   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"`.
-   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453)
+   lease it: `loom-daemon lease ensure 42 --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"` (the process doing the work, never a subagent's inherited `$PPID`).
+   Step 3's `worktree.sh` does this itself; a lane not using it MUST call `lease ensure` (#9453); `lease release 42` hands it back (#12103)
 3. Create worktree: `./.loom/scripts/worktree.sh 42 && cd .loom/worktrees/issue-42`
 4. Implement, test, commit
 5. Create PR: `git push -u origin feature/issue-42 && gh pr create --label "loom:review-requested" --body "Closes #42"`
@@ -211,8 +225,11 @@ blocks self-review and Loom agents often create and review the same PR.
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
 `--label` values with no negation syntax, so a negated `--label` always returns
-empty), enhance with technical detail, then `gh issue edit 42 --add-label
-"loom:curated"`.
+empty), enhance with technical detail,
+then write the standalone `<!-- loom:points=3 -->`
+marker and run `loom-daemon curation-complete --repo OWNER/REPO --issue 42 --model M
+--runtime R --completion-id $(uuidgen) --workspace-root ROOT` (it applies `loom:curated`;
+never a bare `--add-label`, #11787; recipe: `.loom/roles/curator-estimate.md`).
 
 ### Overnight / long-running orchestration
 
@@ -235,8 +252,8 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
-- **File size policy** — over-threshold files, agent-facing markdown, and each role's whole prompt prefix are ratcheted (may shrink, not grow), NOT refactor-on-touch: [`.loom/docs/file-size-policy.md`](.loom/docs/file-size-policy.md).
-- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh`; a new script needs a category + reason in `scripts/shell-allowlist.txt` (CI-enforced, `contract` is baseline-only): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
+- **Fail closed** — success must be positively proven; a null, empty, or bare exit-0 result is a failure, not a result: [`.loom/docs/fail-closed.md`](.loom/docs/fail-closed.md).
+- **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh` (a review standard, not a CI gate): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
 - **Branch rulesets & repository settings** — at install, or via `scripts/install/setup-{branch-protection,repository-settings}.sh`.
@@ -275,16 +292,29 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
   atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
+  **Exception — a foreign public repo the App is not installed on** (`forge create-issue` /
+  `create-issue.sh` refuse with `NOT_IN_INSTALLATION`, #9548): file with a raw
+  `gh issue create -R <repo>` (interim) rather than parking for an operator, per
+  [`gh-issue-create-rest-fallback.md`](.loom/docs/gh-issue-create-rest-fallback.md) (#13978).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does
   it once, and CI fails any PR that hand-edits a version-bearing file (#7743).
   `scripts/version.sh` keeps all 5 in sync (`version.sh list` names them; #5517,
   #8147) and is the *release* path;
-  releases are driven by `/repo:release` from [rjwalters/repo](https://github.com/rjwalters/repo). The
-  release workflow triggers on GitHub Release creation, not tag push, and
-  publishes the `ghcr.io/rjwalters/loom-worker:<version>` base image
-  ([`docker/worker/README.md`](docker/worker/README.md)). **Cadence**: releases are cut at fleet-rollable boundaries, not every `VERSION` bump: [`.loom/docs/release-cadence.md`](.loom/docs/release-cadence.md) (#6010).
+  releases are normally automatic: `release.yml` releases a green `main` commit
+  (the tested `head_sha`, via a `workflow_run` on `CI`, #10826) and also fires on
+  a hand-created GitHub Release (`/repo:release` from
+  [rjwalters/repo](https://github.com/rjwalters/repo) stays the hand-cut and
+  rollback path), and publishes the `ghcr.io/rjwalters/loom-worker:<version>` base
+  image ([`docker/worker/README.md`](docker/worker/README.md)). **Cadence**: a
+  `VERSION` bump lands at most once per `RELEASE_MIN_INTERVAL` (default 24 h,
+  #11174; `force` dispatch for a hotfix), and not every `VERSION` gets a tag.
+  Published releases lag unreleased `main`; a signature shows who built an
+  artifact, not that its code was reviewed or is safe to roll to the fleet:
+  [`.loom/docs/release-cadence.md`](.loom/docs/release-cadence.md) (#6010). **Change
+  summaries** are the generated GitHub Release notes; `CHANGELOG.md` is the
+  historical record up to its policy note and is no longer hand-curated per release.
 
 ## Troubleshooting
 

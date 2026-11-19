@@ -70,6 +70,16 @@ pub fn vars(config_dir: &Path) -> Vec<(&'static str, String)> {
                 .unwrap_or_default(),
         ));
     }
+    // 2am#4501: the hooks of this release, which the wired user-scope hook
+    // command prefers over the machine checkout; blank when there is none.
+    for (key, value) in crate::hooks_home::agent_env() {
+        vars.push((
+            key,
+            value
+                .map(|v| v.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+    }
     vars
 }
 

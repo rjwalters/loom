@@ -6,12 +6,8 @@
 //! [`super::run_one_tick`], and this file is the timer, the blocking-thread
 //! hand-off, and the panic log around it.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-use crate::event_bus::EventBus;
-use crate::forge_events::wake::EarlyTicker;
 
 use super::{run_one_tick, WatchProbe};
 
@@ -24,26 +20,10 @@ use super::{run_one_tick, WatchProbe};
 /// A completely empty registry short-circuits to a no-op (no forge calls), so the
 /// default-on loop costs a single file read per tick until an operator registers
 /// a watch.
-///
-/// **In-flight PR watch (#8766).** This is the daemon's only standing "has this
-/// in-flight issue/PR reached terminal state yet" poller, so it is the loop
-/// Phase 2 of ADR-0021 attaches its third consumer to. `event_bus` lets a
-/// `forge.event` prompt of a PR-lifecycle shape (`pull_request`,
-/// `check_run`/`check_suite`) run the *next ordinary tick now* rather than at
-/// the cadence above — and nothing else. The tick body is untouched: it still
-/// resolves terminal state by asking the forge through [`WatchProbe`], so an
-/// early tick cannot report a state the forge did not just confirm, and the
-/// empty-registry short-circuit means an early tick on a host with no watches
-/// costs one file read and zero forge calls. Disarmed — holding no bus
-/// subscription at all — unless `forgeEvents.events.inFlightPrWatch` is on for
-/// `root`; otherwise [`EarlyTicker`] is exactly the
-/// `tokio::time::interval(interval)` this loop used before.
 pub fn spawn_watch_monitor_task<P>(
     probe: P,
     interval: Duration,
     expiry: Duration,
-    event_bus: Arc<EventBus>,
-    root: PathBuf,
 ) -> tokio::task::JoinHandle<()>
 where
     P: WatchProbe + Send + Sync + 'static,
@@ -55,7 +35,7 @@ where
     );
     tokio::spawn(async move {
         let probe = Arc::new(probe);
-        let mut ticker = EarlyTicker::for_in_flight_pr(interval, &event_bus, &root);
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;

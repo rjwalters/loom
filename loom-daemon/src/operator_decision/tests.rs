@@ -276,6 +276,7 @@ struct FakeForge {
     state: IssueState,
     calls: Vec<String>,
     fail_body: bool,
+    fail_label: bool,
 }
 
 impl FakeForge {
@@ -303,6 +304,9 @@ impl Forge for FakeForge {
     fn add_labels(&mut self, issue: u64, labels: &[String]) -> Result<(), String> {
         self.calls
             .push(format!("add_labels {issue} {}", labels.join(",")));
+        if self.fail_label {
+            return Err("'loom:operator' not found".into());
+        }
         self.state.labels.extend(labels.iter().cloned());
         Ok(())
     }
@@ -404,6 +408,23 @@ fn apply_relabel_writes_body_before_labels() {
     assert!(f.state.body.contains("Original prose."));
     assert!(f.state.labels.contains(&DECISION_LABEL.to_string()));
     assert!(!f.state.labels.contains(&MALFORMED_LABEL.to_string()));
+}
+
+#[test]
+fn apply_label_failure_exits_nonzero_after_body_with_sync_labels_hint() {
+    let mut f = FakeForge {
+        state: IssueState {
+            body: "prose".into(),
+            labels: vec![],
+        },
+        fail_label: true,
+        ..FakeForge::default()
+    };
+    let (code, _, err) = run(&mut f, &decision(2), &req(Target::Existing(7)));
+    assert_eq!(code, exit::FORGE);
+    assert_eq!(f.calls[1], "set_body 7");
+    assert!(f.calls[2].starts_with("add_labels 7"), "{:?}", f.calls);
+    assert!(err.contains("sync-labels.sh"), "{err}");
 }
 
 #[test]

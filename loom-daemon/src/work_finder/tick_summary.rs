@@ -6,13 +6,13 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use super::{dispatch_plan, ready_queue, TickReport};
-use crate::types::{QueueDisposition, RepoLimitView, WorkFinderTickSummary};
+use crate::types::WorkFinderTickSummary;
 
 /// Process-global slot holding the most recent completed tick's summary.
 ///
 /// Mirrors the "loop publishes, status reads" discipline
 /// [`crate::auto_update::global_status_snapshot`] and
-/// [`crate::host_breaker::global_snapshot`] already use: the work-finder loop
+/// `crate::host_breaker::global_snapshot` (removed, #12406) already use: the work-finder loop
 /// writes here at the end of every tick, and `build_daemon_status` reads it
 /// back so a cross-process consumer (`loom-daemon health`) can see the last
 /// tick's dispatch/skip breakdown without scraping the daemon log.
@@ -83,7 +83,6 @@ pub fn tick_summary(
         skipped_quarantined: report.skipped_quarantined,
         skipped_workspace_commands_missing: report.skipped_workspace_commands_missing,
         skipped_pr_open: report.skipped_pr_open,
-        skipped_peer_claim: report.skipped_peer_claim,
         skipped_backoff: report.skipped_backoff,
         skipped_pr_open_backoff: report.skipped_pr_open_backoff,
         skipped_noop_cooldown: report.skipped_noop_cooldown,
@@ -97,61 +96,23 @@ pub fn tick_summary(
         skipped_recheck_interval: report.skipped_recheck_interval,
         skipped_host_constraint: report.skipped_host_constraint,
         deferred_capacity: report.deferred_capacity,
-        deferred_ramp_cap: report.deferred_ramp_cap,
-        deferred_saturation: report.deferred_saturation,
         deferred_build_backoff: report.deferred_build_backoff,
         errors: report.errors,
         halted: report.halted,
         held_roots: report.held_roots,
         halt_partial: report.halt_partial,
-        saturation_held: report.saturation_held,
         build_backoff_held: report.build_backoff_held,
         collisions: report.collisions,
         cap: None,
-        repo_limits: repo_limits(report, roots),
     }
 }
 
-/// Each workspace's limits as the tick resolved them (Issue #11606): the
-/// cap and occupancy of `report.repo_cap` and the per-workspace count of
-/// [`Qd::DeferredRepoCap`] rows. Empty when the tick did not shape with a cap
-/// state (a single-workspace tick) or `roots` is unknown. Reads no state the
-/// tick did not already hold.
-fn repo_limits(report: &TickReport, roots: &[PathBuf]) -> Vec<RepoLimitView> {
-    let Some(snapshot) = report.repo_cap.as_ref() else {
-        return Vec::new();
-    };
-    // Occupancy when pass 2 finished; the top-of-tick count if it never ran.
-    let occupancy = if snapshot.occupancy_end.is_empty() {
-        &snapshot.occupancy
-    } else {
-        &snapshot.occupancy_end
-    };
-    roots
-        .iter()
-        .enumerate()
-        .map(|(idx, root)| RepoLimitView {
-            repo: root.display().to_string(),
-            in_flight: occupancy.get(idx).copied().unwrap_or(0),
-            cap: snapshot.cap,
-            deferred_repo_cap: report
-                .queue
-                .iter()
-                .filter(|row| {
-                    row.key.workspace_idx == idx
-                        && row.disposition == Some(QueueDisposition::DeferredRepoCap)
-                })
-                .count(),
-        })
-        .collect()
-}
-
-/// The latest cap terms the work-finder loop observed (Issue #10214), set by
-/// [`super::CapTerms::observed`] and stamped onto the published summary by
-/// [`publish_tick`], so neither frozen tick loop needs a new parameter.
+/// The latest cap the work-finder loop observed (Issue #10214), recorded by
+/// the loop and stamped onto the published summary by [`publish_tick`], so
+/// the frozen tick loop needs no new parameter.
 static LAST_CAP: OnceLock<Mutex<Option<crate::types::CapView>>> = OnceLock::new();
 
-/// Record this tick's cap terms (Issue #10214).
+/// Record this tick's cap (Issue #10214).
 pub fn record_cap(cap: crate::types::CapView) {
     *LAST_CAP
         .get_or_init(|| Mutex::new(None))
@@ -166,6 +127,15 @@ pub fn last_cap() -> Option<crate::types::CapView> {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Export a tick skipped whole by the GitHub rate-limit breaker (#12083) as an
+/// empty `pick.decision` naming why, so the skip is a record, not silence.
+pub fn publish_rate_limit_skip(at: chrono::DateTime<chrono::Utc>) {
+    crate::observability::pick_decision::emit_skipped_work_finder(
+        crate::observability::pick_decision::RATE_LIMIT_HELD,
+        at,
+    );
 }
 
 /// [`publish_tick_summary_at`] stamped with the current wall clock.
@@ -199,13 +169,14 @@ pub(super) fn reset_last_tick_summary() {
 /// each ready-queue row's repo (#8852 — empty for the single-workspace loop);
 /// `plan` is the multi-workspace loop's dispatch-plan context (#9288 — `None`
 /// for the single-workspace loop, which records no rows).
+/// Returns the completion stamp and its monotonic counterpart for the local log.
 pub fn publish_tick(
     report: &TickReport,
     max_concurrent: usize,
     started_at: chrono::DateTime<chrono::Utc>,
     roots: &[PathBuf],
     plan: Option<&dispatch_plan::PlanInputs>,
-) {
+) -> (chrono::DateTime<chrono::Utc>, std::time::Instant) {
     // Captured once and threaded through both the summary and the tick span
     // (Issue #9222): `ops::disposition` matches a later sample's
     // `WorkFinderTickSummary::at` against `dispatch::last_tick_context()` to
@@ -213,20 +184,23 @@ pub fn publish_tick(
     // the two "this tick completed at" instants are bit-identical rather than
     // two separate `Utc::now()` reads a few lines apart.
     let completed_at = chrono::Utc::now();
+    let completed = std::time::Instant::now();
     let mut summary = tick_summary(report, max_concurrent, completed_at, roots, plan);
-    summary.cap = last_cap().filter(|c| c.effective() == max_concurrent);
+    summary.cap = last_cap().filter(|c| c.configured == max_concurrent);
     crate::observability::ops::queue::record_queue(&summary);
+    // #11840: the tick's canonical `loom.dispatch.result`, classified once
+    // here from the report itself (not re-derived from the reduced summary).
+    let dispatch_result = crate::observability::ops::dispatch::tick_result(report);
     // #10212: the ranked candidates and what the tick did with each.
     crate::observability::pick_decision::emit_work_finder(
         &summary,
         started_at,
         completed_at,
-        (report.workspace_draw.as_ref(), &report.vi_demotions),
+        (report.workspace_draw.as_ref(), &report.vi_demotions, report.item_draw.as_ref()),
         roots,
+        dispatch_result,
     );
     store_tick_summary(summary);
-    // #11161: `fleet.state` samples every tick, after the summary is stored.
-    crate::observability::fleet_state::tick_completed();
     crate::observability::ops::dispatch::record_tick(
         report,
         max_concurrent,
@@ -240,4 +214,24 @@ pub fn publish_tick(
     crate::observability::ops::turnaround::record_tick(report, max_concurrent);
     // #11847: busy slots by role (sweep occupancy and role-runner agents).
     crate::observability::ops::busy_slots::record_tick(report, roots);
+    (completed_at, completed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial(work_finder_last_tick)]
+    fn publication_returns_its_completion_and_a_skip_preserves_it() {
+        reset_last_tick_summary();
+        let started_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        let (completed_at, _) = publish_tick(&TickReport::default(), 1, started_at, &[], None);
+        assert_eq!(last_tick_summary().unwrap().at, completed_at);
+
+        publish_rate_limit_skip(completed_at + chrono::Duration::seconds(60));
+        assert_eq!(last_tick_summary().unwrap().at, completed_at);
+        reset_last_tick_summary();
+    }
 }

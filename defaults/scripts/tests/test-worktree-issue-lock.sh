@@ -23,9 +23,8 @@
 #      refuses -- the #8553 incident this suite exists to pin.
 #
 # Needs a BUILT loom-daemon: the check is `loom-daemon worktree-lock
-# check-issue`, reached through worktree.sh's single delegating call (this
-# file is frozen by the file-size ratchet, so the decision logic lives in
-# Rust, not shell). Wired in the "Native Port Suites" CI job, which builds
+# check-issue`, reached through worktree.sh's single delegating call (the
+# decision logic lives in Rust, not shell). Wired in the "Native Port Suites" CI job, which builds
 # the binary, and FAILS rather than skips without one.
 #
 # Usage:
@@ -43,16 +42,7 @@ loom_test_require_daemon_bin "$SCRIPTS_DIR" "worktree-lock"
 
 WORKTREE_SH="$SCRIPTS_DIR/worktree.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # --- Throwaway repo setup ---------------------------------------------------
 TMP=$(mktemp -d /tmp/loom-issue-lock-test.XXXXXX)

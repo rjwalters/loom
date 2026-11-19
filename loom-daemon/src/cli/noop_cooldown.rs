@@ -14,13 +14,13 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
-use super::common::{query_daemon, resolve_socket_path};
-use crate::NoopCooldownAction;
+use super::common::{exit_on_daemon_failure, query_daemon, resolve_socket_path};
+use crate::cli::NoopCooldownAction;
 
 /// Handle the `noop-cooldown` subcommand.
-pub(crate) async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<()> {
+pub async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     match action {
         NoopCooldownAction::Record {
@@ -33,16 +33,16 @@ pub(crate) async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> 
                 reason,
                 workspace_root,
             };
-            match query_daemon(&socket_path, &request).await {
-                Ok(Response::NoopReleaseRecorded {
+            match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+                Response::NoopReleaseRecorded {
                     issue,
-                    consecutive,
+                    consecutive: _,
                     cooldown_secs,
-                }) => {
+                } => {
                     match cooldown_secs {
                         Some(secs) => println!(
-                            "Recorded no-op release for issue #{issue} — {consecutive} \
-                             consecutive, next dispatch allowed in {secs}s (#6670)."
+                            "Recorded no-op release for issue #{issue} — \
+                             next dispatch allowed in {secs}s (#6670)."
                         ),
                         None => println!(
                             "No-op re-dispatch cooldown is disabled — recorded issue #{issue}'s \
@@ -51,19 +51,8 @@ pub(crate) async fn handle_noop_cooldown_command(action: NoopCooldownAction) -> 
                     }
                     Ok(())
                 }
-                Ok(Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
+                other => {
                     eprintln!("Unexpected response from daemon: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                    eprintln!();
-                    eprintln!("Is the daemon running? Start it with:");
-                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                     std::process::exit(1);
                 }
             }

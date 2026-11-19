@@ -8,6 +8,7 @@
 //! default on failure.
 
 use super::authz::{AuthzFacts, Fact};
+use super::group_authz::MemberFacts;
 use super::ops::PrState;
 use crate::claim_reconciliation::{extract_latest_verdict_sha, VerdictKind, VERDICT_HOLD_LABELS};
 
@@ -42,6 +43,21 @@ pub struct RemovalEvent {
     pub reason: Option<String>,
     /// RFC 3339.
     pub created_at: String,
+    /// The merge-group commit GitHub removed (`beforeCommit.oid`), which
+    /// stays readable after the group ref is deleted. `None` when absent.
+    pub before_commit: Option<String>,
+}
+
+/// One check run on a merge-group commit, reduced to what separates an
+/// infrastructure failure from a real one (see [`super::removal::infra_only`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRun {
+    pub name: String,
+    /// GitHub's check-run conclusion, lower case; `None` while not finished.
+    pub conclusion: Option<String>,
+    /// Steps of the backing job that ended `failure` — a test or build step
+    /// that actually ran and failed.
+    pub failed_steps: u32,
 }
 
 /// Forge operations outside the queue API. Implementations must not put a
@@ -72,6 +88,12 @@ pub trait LifecycleForge {
     ///
     /// The timeline could not be read.
     fn removals(&self, pr: u32) -> Result<Vec<RemovalEvent>, String>;
+    /// The check runs on a merge-group commit (#12573).
+    ///
+    /// # Errors
+    ///
+    /// The runs, or the job detail behind a failed one, could not be read.
+    fn group_check_runs(&self, commit: &str) -> Result<Vec<GroupRun>, String>;
 }
 
 fn has(labels: &[String], wanted: &[&str]) -> bool {
@@ -123,4 +145,27 @@ pub fn read_facts(forge: &dyn LifecycleForge, pr: u32) -> Result<AuthzFacts, Str
     }
     let bodies = forge.trusted_comments(pr)?;
     Ok(facts_from(&snap, &bodies))
+}
+
+/// [`read_facts`] for a merge-group member: a merged PR is reported as
+/// [`MemberFacts::Merged`] (with its head) instead of an outage, so the group
+/// check can tell a landed predecessor from an unreadable one. A PR closed
+/// unmerged stays an `Err`.
+///
+/// # Errors
+///
+/// The snapshot or the comment listing could not be read, or the PR is
+/// closed without merging.
+pub fn read_member_facts(forge: &dyn LifecycleForge, pr: u32) -> Result<MemberFacts, String> {
+    let snap = forge.snapshot(pr)?;
+    match snap.state {
+        PrState::Merged => Ok(MemberFacts::Merged {
+            head: snap.head_sha,
+        }),
+        PrState::Open => {
+            let bodies = forge.trusted_comments(pr)?;
+            Ok(MemberFacts::Open(facts_from(&snap, &bodies)))
+        }
+        other => Err(format!("PR #{pr} is {}", other.as_str())),
+    }
 }

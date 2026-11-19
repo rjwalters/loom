@@ -405,6 +405,8 @@ pub fn classify(response: Option<&HttpResponse>, exit_ok: bool, stderr: &str) ->
     let outcome = match status {
         Some(304) => Outcome::NotModified,
         Some(200..=299) if exit_ok => Outcome::Ok,
+        // #12310: a gateway reserve refusal is a `429` that is not a limit.
+        _ if crate::gh_invocation::purpose::is_reserve_refusal(stderr) => Outcome::Error,
         _ if is_secondary_limit(response, stderr) => Outcome::SecondaryLimited,
         _ if crate::rate_limit_breaker::indicates_rate_limit(stderr) => Outcome::RateLimited,
         Some(429) => Outcome::RateLimited,
@@ -427,48 +429,14 @@ pub fn is_secondary_limit(response: Option<&HttpResponse>, stderr: &str) -> bool
         == Some(crate::forge_denial::Denial::SecondaryRateLimit)
 }
 
-/// Record one `gh api --include` call by `caller` (see [`classify`]) with the
-/// #9777 call identity. Plain `gh` spawns are recorded by the `GhInvocation`
-/// facade (#10089); this is for a caller that carries an explicit identity.
-pub fn record_gh_api_with_identity(
-    caller: &'static str,
-    identity: &CallIdentity,
-    response: Option<&HttpResponse>,
-    exit_ok: bool,
-    stderr: &str,
-) {
-    let (pool, outcome) = classify(response, exit_ok, stderr);
-    record_with_identity(caller, identity, pool, outcome, response.map(|r| &r.ratelimit));
-}
-
-/// Record one forge call. Never blocks or fails the caller: a poisoned lock
-/// or an unwritable sink is silently skipped.
-pub fn record(
-    caller: &'static str,
-    pool: Pool,
-    outcome: Outcome,
-    headers: Option<&RateLimitHeaders>,
-) {
-    record_with_identity(caller, &CallIdentity::default(), pool, outcome, headers);
-}
-
-/// [`record`] plus the #9777 call identity. An identity with no operation is
-/// recorded as [`UNKNOWN_OPERATION`] rather than as an absent field, so an
-/// un-migrated call site is *visible* in the accounting instead of silently
-/// indistinguishable from one that has no operation at all.
-pub fn record_with_identity(
-    caller: &'static str,
-    identity: &CallIdentity,
-    pool: Pool,
-    outcome: Outcome,
-    headers: Option<&RateLimitHeaders>,
-) {
-    record_attributed(caller, identity, pool, outcome, headers, &CallAttribution::default());
-}
-
-/// [`record_with_identity`] plus the W1 bucket attribution the `gh` facade
-/// knows ([`CallAttribution`]): which credential, which billed bucket, how
-/// many pages. Same guarantees: never blocks or fails the caller.
+/// Record one forge call with the #9777 call identity and the W1 bucket
+/// attribution the `gh` facade knows ([`CallAttribution`]): which
+/// credential, which billed bucket, how many pages. Never blocks or fails
+/// the caller: a poisoned lock or an unwritable sink is silently skipped.
+/// An identity with no operation is recorded as [`UNKNOWN_OPERATION`]
+/// rather than as an absent field, so an un-migrated call site is *visible*
+/// in the accounting instead of silently indistinguishable from one that
+/// has no operation at all.
 pub fn record_attributed(
     caller: &'static str,
     identity: &CallIdentity,
@@ -661,6 +629,27 @@ struct Aggregate {
     /// key). Only lines that name a bucket, or ran as an owner's writer, land
     /// here.
     latest_by_bucket: BTreeMap<(Pool, String), Reading>,
+    /// Budget-costing calls per `(credential account, credential owner,
+    /// pool)` (#12238), split into daemon and agent-session rows — the trip
+    /// span's `own`, which must count only the credential that tripped. A row
+    /// that names no account (a non-facade call, an older binary) lands
+    /// nowhere: it stays in the trip's unattributed remainder.
+    by_credential: BTreeMap<(String, Option<String>, Pool), CredentialSpend>,
+}
+
+/// One credential's budget-costing calls in the window, by who made them:
+/// the daemon's own rows, or an agent session's `gh` front (`ag`-stamped).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CredentialSpend {
+    pub daemon: u64,
+    pub agent: u64,
+}
+
+impl CredentialSpend {
+    #[must_use]
+    pub fn total(self) -> u64 {
+        self.daemon + self.agent
+    }
 }
 
 /// The owner whose writer a writer-role `line` spent (#10334): the owner its
@@ -681,6 +670,21 @@ impl Aggregate {
     fn add(&mut self, line: &SinkLine) {
         let c = self.counts.entry((line.c.clone(), line.p)).or_default();
         bump(c, line.o);
+        // `ok` + `error` cost budget (as in `consumed_per_pool`); a free
+        // probe (`fr`) is a request GitHub never charges.
+        if matches!(line.o, Outcome::Ok | Outcome::Error) && line.at.fr != Some(true) {
+            if let Some(account) = line.at.ca.clone() {
+                let spend = self
+                    .by_credential
+                    .entry((account, line.at.co.clone(), line.p))
+                    .or_default();
+                if line.ag.ag.is_some() {
+                    spend.agent += 1;
+                } else {
+                    spend.daemon += 1;
+                }
+            }
+        }
         let role = line.ir.as_deref().unwrap_or(UNKNOWN_OPERATION);
         bump(self.roles.entry(role.to_string()).or_default(), line.o);
         if let Some(operation) = line.op.clone() {
@@ -744,6 +748,15 @@ impl Aggregate {
             *spent.entry(*pool).or_default() += c.ok + c.error;
         }
         spent
+    }
+
+    /// [`Self::by_credential`] for one `(account, owner)`, per pool.
+    fn consumed_for(&self, account: &str, owner: Option<&str>) -> BTreeMap<Pool, CredentialSpend> {
+        self.by_credential
+            .iter()
+            .filter(|((a, o, _), _)| a == account && o.as_deref() == owner)
+            .map(|((_, _, pool), spend)| (*pool, *spend))
+            .collect()
     }
 
     fn rows(&self) -> Vec<ForgeCallCounts> {
@@ -1011,6 +1024,7 @@ pub fn status_report(
         buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
         reader_withdrawals: reader_withdrawal_rows(now),
         read_spills: read_spill_rows(now),
+        writer_holds: writer_hold_rows(now_ts),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
@@ -1046,84 +1060,38 @@ fn read_spill_rows(now: DateTime<Utc>) -> Vec<crate::types::ReadSpillStatus> {
         .collect()
 }
 
-/// The rate-limit pools this process last read at **zero remaining** and
-/// that have not reset yet at `now`, each with its reset instant when the
-/// header carried one (#10210, the ETA's `rate_limit_quota` stall).
-///
-/// Read-only and in-process: the newest free `x-ratelimit-*` reading per pool
-/// this daemon already absorbed — no file read, no forge call. A reading
-/// older than [`WINDOW_SECS`] with no reset is too stale to call a stall.
-#[must_use]
-pub fn exhausted_pools(now: DateTime<Utc>) -> Vec<(Pool, Option<DateTime<Utc>>)> {
-    match process_state().lock() {
-        Ok(state) => exhausted_in(&state.latest, now.timestamp()),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// [`exhausted_pools`] over an explicit reading map. Pure.
-fn exhausted_in(latest: &BTreeMap<Pool, Reading>, now: i64) -> Vec<(Pool, Option<DateTime<Utc>>)> {
-    latest
-        .iter()
-        .filter(|(_, r)| r.remaining == 0)
-        .filter(|(_, r)| match r.reset_epoch {
-            Some(reset) => reset > now,
-            None => now - r.observed_at <= WINDOW_SECS,
+/// This process's armed writer route holds (#13746), for `status`.
+fn writer_hold_rows(now_ts: i64) -> Vec<crate::types::WriterRouteHoldStatus> {
+    crate::forge_bucket_book::writer_holds_snapshot(now_ts)
+        .into_iter()
+        .filter_map(|(key, until)| {
+            Some(crate::types::WriterRouteHoldStatus {
+                account: key.account,
+                owner: key.owner,
+                installation: key.installation,
+                resource: key.resource.as_str().to_string(),
+                until: epoch(until)?,
+            })
         })
-        .map(|(pool, r)| (*pool, r.reset_epoch.and_then(epoch)))
         .collect()
 }
 
-/// The newest header budget reading of each pool, per **reader rate-limit
-/// identity bucket** (#10232, #10334), keyed by the public bucket label
-/// ([`crate::forge_identity::reader_bucket`], or
-/// [`crate::forge_identity::writer_bucket`] — `writer@<owner>` — for an
-/// owner's writer and its fallback). Unlike [`status_report`]'s `budget` this
-/// never mixes identities: two readers of the same role, or two owners'
-/// writers, are separate buckets, and an unattributed call is not returned at
-/// all. Never a credential.
+/// This host's budget-costing forge calls per pool over the last window on
+/// **one credential** — the `account` (`app-<id>`, `ambient`, …) and the
+/// `owner` its installation covers (`None` for a credential with no owner)
+/// — split into daemon and agent-session rows (Issues #9855, #12238). The
+/// breaker's trip-time attribution subtracts this from the tripping
+/// credential's `used`; the remainder is other hosts or processes on that
+/// credential. `None` when the sink is disabled — own consumption is
+/// unknown, not zero.
 #[must_use]
-pub fn bucket_readings(now: DateTime<Utc>) -> BTreeMap<String, Vec<ForgeBudgetReading>> {
-    let window = sink_dir().map(|d| read_window(&d, now.timestamp()));
-    let process = process_state()
-        .lock()
-        .map(|s| s.latest_by_bucket.clone())
-        .unwrap_or_default();
-    let mut latest = process;
-    for (key, r) in window.iter().flat_map(|w| w.latest_by_bucket.iter()) {
-        if latest
-            .get(key)
-            .is_none_or(|l| l.observed_at < r.observed_at)
-        {
-            latest.insert(key.clone(), *r);
-        }
-    }
-    let mut out: BTreeMap<String, Vec<ForgeBudgetReading>> = BTreeMap::new();
-    for ((pool, bucket), r) in latest {
-        let Some(observed_at) = epoch(r.observed_at) else {
-            continue;
-        };
-        out.entry(bucket).or_default().push(ForgeBudgetReading {
-            pool: pool.as_str().to_string(),
-            remaining: r.remaining,
-            used: r.used,
-            reset_at: r.reset_epoch.and_then(epoch),
-            observed_at,
-            source: "headers".to_string(),
-        });
-    }
-    out
-}
-
-/// This host's budget-costing forge calls per pool over the last window —
-/// `ok` + `error` outcomes, host-wide from the sink (Issue #9855). The
-/// breaker's trip-time attribution log divides a pool's `used` by this to
-/// estimate the external share. `None` when the sink is disabled — own
-/// consumption is unknown, not zero.
-#[must_use]
-pub fn consumed_in_window(now: DateTime<Utc>) -> Option<BTreeMap<Pool, u64>> {
+pub fn consumed_in_window_for(
+    now: DateTime<Utc>,
+    account: &str,
+    owner: Option<&str>,
+) -> Option<BTreeMap<Pool, CredentialSpend>> {
     let dir = sink_dir()?;
-    Some(read_window(&dir, now.timestamp()).consumed_per_pool())
+    Some(read_window(&dir, now.timestamp()).consumed_for(account, owner))
 }
 
 #[cfg(test)]

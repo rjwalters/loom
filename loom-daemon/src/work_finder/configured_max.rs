@@ -1,11 +1,9 @@
 //! Per-tick hot-reload of the work-finder's operator ceiling, `configured_max`
 //! (issue #9060, closing the gap #6203 documented).
 //!
-//! The dynamic cap is `min(disk headroom, ram headroom, configured_max)`, and
-//! the two headroom terms have always been re-read every tick. Until #9060 the
-//! third term was resolved once at daemon bring-up and threaded into the loop
-//! as a frozen `usize`, so raising a machine's ceiling to use idle capacity
-//! required a daemon restart. [`ConfiguredMaxReloader::refresh`] now re-resolves
+//! The cap is `configured_max` alone (#12406). Until #9060 it was resolved
+//! once at daemon bring-up and threaded into the loop as a frozen `usize`, so
+//! raising a machine's ceiling to use idle capacity required a daemon restart. [`ConfiguredMaxReloader::refresh`] now re-resolves
 //! it every multi-workspace tick from the daemon's primary workspace, so an
 //! edit to `autonomous.workFinder.maxConcurrent` (in `.loom/config.json`, or
 //! host-locally in `.loom-local/local.json`) takes effect on the **next tick**.
@@ -28,6 +26,8 @@
 //! "absent", so a half-written config falls back to env/default for that tick
 //! (exactly the startup behavior), never to a zero ceiling. The next tick with
 //! a well-formed file restores the configured value.
+//!
+//! `intervalSecs` stays restart-required: see `fleet_store::reload` for why.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,20 +39,13 @@ use super::{
 /// A resolved operator ceiling plus enough provenance to explain it in a log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfiguredMax {
-    /// The ceiling fed into `resolve_dynamic_max_concurrent`.
+    /// The cap.
     pub value: usize,
     /// Which layer supplied `value`.
     pub source: ConfigSource,
     /// The config value the env override is hiding, when one is set and
     /// differs from `value`. Always `None` unless `source` is `Env`.
     pub shadowed_config: Option<usize>,
-    /// The **per-repo** cap (#9090, `autonomous.workFinder.maxConcurrentPerRepo`
-    /// / `LOOM_WORK_FINDER_MAX_CONCURRENT_PER_REPO`), or `None` for uncapped —
-    /// the opt-in default. Resolved on the same per-tick hot-reload path as
-    /// `value` deliberately: a fleet retuning how much of one host's budget a
-    /// single repo may hold must not need a daemon restart, exactly as #9060
-    /// concluded for the global ceiling.
-    pub per_repo: Option<usize>,
 }
 
 impl ConfiguredMax {
@@ -68,7 +61,6 @@ impl ConfiguredMax {
             value,
             source,
             shadowed_config,
-            per_repo: super::repo_cap::resolve(config),
         }
     }
 }
@@ -89,32 +81,6 @@ pub fn transition_message(prev: ConfiguredMax, next: ConfiguredMax) -> Option<St
     }
     next.shadowed_config
         .map(|config| shadowed_message(next.value, config))
-}
-
-/// The log line for a `prev → next` **per-repo cap** transition (#9090), or
-/// `None` when it did not change (the common, every-tick case).
-///
-/// Its own message rather than a branch of [`transition_message`]: the two
-/// knobs are independent (one bounds the host, one bounds a single repo's share
-/// of it) and either can change on a tick the other did not.
-#[must_use]
-pub fn per_repo_transition_message(prev: ConfiguredMax, next: ConfiguredMax) -> Option<String> {
-    if prev.per_repo == next.per_repo {
-        return None;
-    }
-    Some(match next.per_repo {
-        Some(cap) => format!(
-            "maxConcurrentPerRepo {} -> {cap} — hot-applied without a daemon restart (#9090); \
-             at most {cap} of this host's {} slots may be held by any one repo, and repos with \
-             a live sweep sort ahead of cold ones",
-            prev.per_repo
-                .map_or_else(|| "uncapped".to_string(), |c| c.to_string()),
-            next.value
-        ),
-        None => "maxConcurrentPerRepo cleared -> uncapped (#9090) — one repo may again hold \
-                 every slot of this host's budget, and track affinity is off"
-            .to_string(),
-    })
 }
 
 fn shadowed_message(env_value: usize, config: usize) -> String {
@@ -145,61 +111,27 @@ impl ConfiguredMaxReloader {
 
     /// Re-read config under the primary workspace, log any transition, and
     /// return this tick's ceiling.
-    ///
-    /// The per-repo cap (#9090) is refreshed by the same read and read back
-    /// with [`Self::per_repo`] — one config read per tick serves both knobs.
-    /// The same read also publishes the workspace draw's weight bonuses
-    /// (`dispatch.weightBonus*`, #11742) for this tick's draw.
     pub fn refresh(&mut self) -> usize {
         let config = read_work_finder_config(&self.root);
-        publish_weight_bonus(&config);
         let next = ConfiguredMax::resolve(&config);
         if let Some(msg) = transition_message(self.current, next) {
-            log::info!("work_finder: {msg}");
-        }
-        if let Some(msg) = per_repo_transition_message(self.current, next) {
             log::info!("work_finder: {msg}");
         }
         self.current = next;
         next.value
     }
-
-    /// This tick's per-repo cap (#9090) — `None` for uncapped. Valid after
-    /// [`Self::refresh`]; before the first refresh it is the startup value.
-    #[must_use]
-    pub fn per_repo(&self) -> Option<usize> {
-        self.current.per_repo
-    }
-}
-
-/// Publish `config`'s weight bonuses (#11742) for the next tick's
-/// [`super::workspace_draw::order`], logging a change once.
-pub fn publish_weight_bonus(config: &WorkFinderConfig) {
-    let next = super::config::resolve_weight_bonus(config);
-    let prev = super::workspace_draw::set_weight_bonus(next);
-    if prev != next {
-        log::info!(
-            "work_finder: dispatch.weightBonus {prev:?} -> {next:?} — hot-applied without a \
-             daemon restart (#11742); the next workspace draw uses the new bonuses"
-        );
-    }
 }
 
 /// The multi-workspace loop's one-time startup line (moved here from
 /// `spawn_multi_work_finder_task`, which is at its file-size ratchet).
-pub fn log_loop_start(interval: Duration, initial: ConfiguredMax, max_admissions_per_tick: usize) {
+pub fn log_loop_start(interval: Duration, initial: ConfiguredMax) {
     log::info!(
-        "work_finder: starting multi-workspace loop (interval={}s, configured_max={} \
-         (source={}, re-read every tick, #9060), max_admissions_per_tick={max_admissions_per_tick}, \
-         max_concurrent_per_repo={} (re-read every tick, #9090), \
-         dynamic cap = min(disk, ram, configured_max) — token axis is selection-only, \
-         not a cap, since #5270; global across workspaces)",
+        "work_finder: starting multi-workspace loop (interval={}s, cap = maxConcurrent = {} \
+         (source={}, re-read every tick, #9060; nothing else limits it, #12406; global \
+         across workspaces)",
         interval.as_secs(),
         initial.value,
         initial.source,
-        initial
-            .per_repo
-            .map_or_else(|| "uncapped".to_string(), |c| c.to_string()),
     );
     if let Some(config) = initial.shadowed_config {
         log::warn!("work_finder: {}", shadowed_message(initial.value, config));
@@ -218,57 +150,7 @@ mod tests {
             value,
             source,
             shadowed_config,
-            per_repo: None,
         }
-    }
-
-    /// `cm` with a #9090 per-repo cap attached.
-    fn cm_per_repo(value: usize, per_repo: Option<usize>) -> ConfiguredMax {
-        ConfiguredMax {
-            per_repo,
-            ..cm(value, ConfigSource::Config, None)
-        }
-    }
-
-    #[test]
-    fn per_repo_cap_transitions_are_announced_independently() {
-        let uncapped = cm_per_repo(6, None);
-        let capped = cm_per_repo(6, Some(2));
-        // The global ceiling did not move, so only the per-repo line fires.
-        assert_eq!(transition_message(uncapped, capped), None);
-        let msg = per_repo_transition_message(uncapped, capped).unwrap();
-        assert!(msg.contains("maxConcurrentPerRepo uncapped -> 2"), "{msg}");
-        // Stable thereafter, and clearing the key is announced too.
-        assert_eq!(per_repo_transition_message(capped, capped), None);
-        let cleared = per_repo_transition_message(capped, uncapped).unwrap();
-        assert!(cleared.contains("uncapped"), "{cleared}");
-    }
-
-    #[test]
-    #[serial]
-    fn reloader_hot_applies_per_repo_cap_edits_between_ticks() {
-        std::env::remove_var(WORK_FINDER_MAX_CONCURRENT_ENV);
-        std::env::remove_var(super::super::repo_cap::WORK_FINDER_MAX_CONCURRENT_PER_REPO_ENV);
-        let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), &max_config(6));
-        let initial = ConfiguredMax::resolve(&read_work_finder_config(dir.path()));
-        let mut reloader = ConfiguredMaxReloader::new(dir.path().to_path_buf(), initial);
-        assert_eq!(reloader.per_repo(), None, "absent key must resolve to uncapped");
-
-        write_config(
-            dir.path(),
-            r#"{"autonomous":{"workFinder":{"maxConcurrent":6,"maxConcurrentPerRepo":2}}}"#,
-        );
-        assert_eq!(reloader.refresh(), 6);
-        assert_eq!(reloader.per_repo(), Some(2));
-
-        // Zero is absent, never a cap of 0 (which would deadlock every repo).
-        write_config(
-            dir.path(),
-            r#"{"autonomous":{"workFinder":{"maxConcurrent":6,"maxConcurrentPerRepo":0}}}"#,
-        );
-        assert_eq!(reloader.refresh(), 6);
-        assert_eq!(reloader.per_repo(), None);
     }
 
     fn write_config(root: &std::path::Path, body: &str) {
@@ -344,39 +226,6 @@ mod tests {
 
         write_config(dir.path(), &max_config(1));
         assert_eq!(reloader.refresh(), 1);
-    }
-
-    /// #11742: the per-tick reload publishes `dispatch.weightBonus*` for the
-    /// next draw, so a config edit hot-applies without a restart. (The
-    /// published value is per thread under `cfg(test)`.)
-    #[test]
-    #[serial]
-    fn reloader_publishes_the_weight_bonus() {
-        use crate::priority_pick::WeightBonus;
-        use crate::work_finder::workspace_draw::weight_bonus;
-        let dir = tempfile::tempdir().unwrap();
-        let initial = ConfiguredMax::resolve(&read_work_finder_config(dir.path()));
-        let mut reloader = ConfiguredMaxReloader::new(dir.path().to_path_buf(), initial);
-        reloader.refresh();
-        assert_eq!(weight_bonus(), WeightBonus::default());
-
-        write_config(
-            dir.path(),
-            r#"{"hyperparameters": {"dispatch": {"weightBonusRedMainFix": 7, "weightBonusImportant": 0}}}"#,
-        );
-        reloader.refresh();
-        assert_eq!(
-            weight_bonus(),
-            WeightBonus {
-                red_main_fix: 7,
-                important: 0,
-                ..WeightBonus::default()
-            }
-        );
-
-        write_config(dir.path(), "{}");
-        reloader.refresh();
-        assert_eq!(weight_bonus(), WeightBonus::default());
     }
 
     #[test]

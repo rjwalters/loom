@@ -41,41 +41,13 @@
 //! way `build-gate.sh` calls `loom-daemon dispatch-backoff record` on a step
 //! timeout (Issue #6192).
 //!
-//! # Fleet-wide visibility (Issue #7477)
+//! # Host-local window
 //!
-//! The window armed here (and [`super::dispatch`]'s sibling dispatch-backoff
-//! window) used to live ONLY in this host's in-process [`NoopCooldownState`]
-//! map — invisible to every other host in the fleet. On a multi-dispatcher
-//! fleet that reintroduced the exact symptom this module was built to fix:
-//! host A dispatches, bails, and arms its own cooldown, but hosts B/C/D never
-//! see that and immediately re-dispatch the same freshly-released candidate,
-//! each bailing in turn — an N-host fleet round-robins the bail loop up to N×
-//! faster than a single-host cooldown was designed to prevent (confirmed via
-//! #7466/#7468's sub-minute `loom:issue`/`loom:building` flapping across four
-//! hosts). [`SweepRegistry::record_noop_release`] now also broadcasts the
-//! armed window over the peer-claim channel
-//! (`SweepRegistry::publish_peer_cooldown_claim`), and
-//! [`SweepRegistry::noop_cooldown_issues`] unions the local map with the
-//! peer-observed view before the work finder reads it. See
-//! `defaults/docs/safehouse.md` → "Fleet-wide no-op cooldown / dispatch
-//! backoff" for the full mechanism.
-//!
-//! Issue #9928 extended that union to the *dispatch-path* guard
-//! ([`SweepRegistry::noop_cooldown_dispatch_block`], step 2.75 of
-//! `begin_issue_dispatch`). #7477 made the work finder's advisory pre-filter
-//! fleet-aware but left the one guard EVERY dispatch route funnels through
-//! reading the host-local window only — so a peer host's direct
-//! `{"Issue": <N>}` re-dispatch (and a work-finder tick that had already
-//! selected the candidate before the peer's ad landed) sailed straight
-//! through a window #7477 had broadcast to it.
-//!
-//! That broadcast is **config-gated**: with no peer-claim publisher attached
-//! (`safehouse.enabled` false on this host) it is a byte-for-byte no-op and the
-//! window is host-local again. That is *one* of the two ways #8912's multi-host
-//! symptom arises — the other being a host whose peer-claim *receive* path is
-//! dead (#9294), which this module cannot observe. The arm path now logs the gated case
-//! rather than degrading silently; see `defaults/docs/safehouse.md` →
-//! "'Fleet-wide' has two preconditions" for the other one and how to check it.
+//! The window armed here lives in this host's in-process [`NoopCooldownState`]
+//! map. It used to be broadcast to peer hosts over the safehouse claims room
+//! (#7477, #9928); that channel was retired in #13945. Cross-host coordination
+//! is the captain's assignment plus the forge lease, and this local ledger is
+//! the fallback path's own (`docs/design/fleet-captain-dispatch.md` §8).
 //!
 //! # One release, one classification (Issue #8912)
 //!
@@ -97,12 +69,12 @@ use super::*;
 
 mod fingerprint;
 mod hold;
-mod peer_expiry;
 
 pub(crate) use fingerprint::ParkKind;
 pub(crate) use hold::NoopCooldownTable;
 pub use hold::{
-    NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER, NOOP_HOLD_FAILED_COMMENT_MARKER,
+    standing_noop_hold_fingerprint, NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER,
+    NOOP_HOLD_FAILED_COMMENT_MARKER, NOOP_HOLD_FP_MARKER_PREFIX, NOOP_HOLD_RELEASED_COMMENT_MARKER,
 };
 
 /// Env var overriding how many consecutive unchanged no-op releases park an
@@ -159,16 +131,8 @@ impl Default for NoopCooldownConfig {
 /// Per-issue no-op-cooldown bookkeeping (Issue #6670).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoopCooldownState {
-    /// When this cooldown window was (most recently) armed.
-    pub(crate) recorded_at: DateTime<Utc>,
     /// The instant at which the next dispatch attempt becomes allowed.
     pub(crate) until: DateTime<Utc>,
-    /// Consecutive no-op releases recorded for this issue without an
-    /// intervening real dispatch (cleared by [`SweepRegistry::clear_noop_cooldown`]
-    /// — including the automatic clear on a successful non-no-op dispatch, see
-    /// [`SweepRegistry::dispatch`]). Observability only; never affects the
-    /// (flat, non-exponential) cooldown duration.
-    pub(crate) consecutive: u32,
     /// Free-form context supplied by the recording caller, logged verbatim.
     pub(crate) reason: Option<String>,
     /// The dispatch this self-report belongs to (Issue #8912): the id of the
@@ -287,16 +251,12 @@ impl SweepRegistry {
             return;
         }
         let now = Utc::now();
-        let consecutive = self
-            .noop_cooldown
-            .get(&issue)
-            .map_or(1, |prev| prev.consecutive.saturating_add(1));
         let until = now
             + chrono::Duration::from_std(self.noop_cooldown_config.cooldown)
                 .unwrap_or_else(|_| chrono::Duration::zero());
         log::info!(
-            "sweep_registry: issue #{issue} no-op-release cooldown armed — {consecutive} \
-             consecutive no-op release(s), next dispatch allowed in {}s (#6670){}",
+            "sweep_registry: issue #{issue} no-op-release cooldown armed — \
+             next dispatch allowed in {}s (#6670){}",
             self.noop_cooldown_config.cooldown.as_secs(),
             reason
                 .as_deref()
@@ -312,9 +272,7 @@ impl SweepRegistry {
         self.noop_cooldown.insert(
             issue,
             NoopCooldownState {
-                recorded_at: now,
                 until,
-                consecutive,
                 reason,
                 released_by_sweep: released_by_sweep.clone(),
             },
@@ -329,43 +287,84 @@ impl SweepRegistry {
         // bound's `loom:blocked` hold, so clear that tally here. See
         // `super::prless_retry`'s module doc (the non-interference section).
         self.clear_prless_retry(issue);
-        // Issue #7477: broadcast the armed window fleet-wide so a peer host
-        // does not immediately re-offer the same candidate this host just
-        // self-reported "no actionable delta" on — see
-        // `SweepRegistry::publish_peer_cooldown_claim`'s doc comment for why
-        // this is one-shot rather than re-advertised.
-        self.publish_peer_cooldown_claim(
-            crate::peer_claims::ClaimKind::NoopCooldownArmed,
-            issue,
-            self.noop_cooldown_config.cooldown,
-        );
-        // Issue #8912: without a peer-claim publisher attached
-        // (`safehouse.enabled` false / no coordination on this host) the
-        // broadcast above is a byte-for-byte no-op and this window is
-        // HOST-LOCAL — a peer host will re-offer the same candidate inside it,
-        // which is exactly the multi-host symptom #8912 reports. Say so at the
-        // moment it matters instead of leaving the degradation invisible: the
-        // fleet-wide half of #7477 is config-gated, and nothing else in the log
-        // distinguishes "armed fleet-wide" from "armed on this host only".
-        if self.peer_claim_publisher.is_none() {
-            log::info!(
-                "sweep_registry: issue #{issue}'s no-op cooldown is HOST-LOCAL only — no \
-                 peer-claim publisher is attached on this host (safehouse peer coordination \
-                 disabled), so a peer host may re-dispatch inside the window (#7477/#8912)"
-            );
-        }
     }
 
-    /// The id of the live (`Running`/`Pending`) sweep this host has running for
+    /// Re-arm the no-op cooldown from the outcome journal after a restart
+    /// (Issue #11481). The window is in-memory only, so a pause-and-roll used
+    /// to release every issue sitting in one at once. The reap that followed
+    /// each self-reported no-op already journalled it as a
+    /// [`crate::telemetry::SweepDisposition::NoopAlreadyDone`] row, so the
+    /// journal's rows from the last cooldown window rebuild the table with no
+    /// new state file.
+    ///
+    /// Only an issue's **latest** row counts: a later landed or failed
+    /// dispatch proves the candidate is live again, exactly as
+    /// [`Self::clear_noop_cooldown`] would have. The remaining time is counted
+    /// from the row's `emitted_at`, so a window never outlives the one that
+    /// was armed. An issue already holding a window keeps it. Returns how many
+    /// windows were re-armed.
+    pub fn replay_noop_cooldown_from_journal(&mut self, now: DateTime<Utc>) -> usize {
+        if !self.noop_cooldown_config.enabled {
+            return 0;
+        }
+        let cooldown = chrono::Duration::from_std(self.noop_cooldown_config.cooldown)
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        let path = self.config.resolve_outcome_telemetry_path();
+        let mut latest: HashMap<u32, (DateTime<Utc>, bool)> = HashMap::new();
+        for envelope in crate::sweep_outcomes::read_all_outcome_telemetry(&path) {
+            let crate::telemetry::TelemetryRecord::SweepOutcome(record) = envelope.record else {
+                continue;
+            };
+            let noop = record.disposition == crate::telemetry::SweepDisposition::NoopAlreadyDone;
+            let at = envelope.emitted_at;
+            match latest.get(&record.issue) {
+                Some((seen, _)) if *seen > at => {}
+                _ => {
+                    latest.insert(record.issue, (at, noop));
+                }
+            }
+        }
+        let mut replayed = 0;
+        for (issue, (at, noop)) in latest {
+            let until = at + cooldown;
+            if !noop || until <= now || self.noop_cooldown.contains_key(&issue) {
+                continue;
+            }
+            self.noop_cooldown.insert(
+                issue,
+                NoopCooldownState {
+                    until,
+                    reason: Some("replayed from the outcome journal after a restart".into()),
+                    released_by_sweep: None,
+                },
+            );
+            replayed += 1;
+            log::info!(
+                "sweep_registry: issue #{issue} no-op cooldown restored from the outcome journal \
+                 (recorded {}), next dispatch allowed in {}s (#11481)",
+                at.to_rfc3339(),
+                (until - now).num_seconds()
+            );
+        }
+        replayed
+    }
+
+    /// The id of the live (`Running`) sweep this host has running for
     /// `issue`, if any (Issue #8912) — the most recently started one when more
     /// than one entry matches (a superseded claim leaves the older entry behind
     /// until its own reap).
-    fn live_issue_sweep_id(&self, issue: u32) -> Option<String> {
+    pub(crate) fn live_issue_sweep_id(&self, issue: u32) -> Option<String> {
         self.entries
             .values()
             .filter(|info| {
-                matches!(info.kind, SweepKind::Issue(n) if n == issue)
-                    && matches!(info.state, SweepState::Running | SweepState::Pending)
+                // A Builder step self-reports its no-op release like the
+                // sweep's Builder does (#11898).
+                matches!(
+                    info.kind,
+                    SweepKind::Issue(n)
+                        | SweepKind::Step { item: n, role: crate::step_role::StepRole::Builder }
+                        if n == issue
+                ) && matches!(info.state, SweepState::Running)
             })
             .max_by_key(|info| info.started_at)
             .map(|info| info.sweep_id.clone())
@@ -468,11 +467,14 @@ impl SweepRegistry {
         true
     }
 
-    /// Clear `issue`'s no-op-cooldown record (Issue #6670) — called on any
-    /// dispatch that actually starts a sweep, so a genuine content change
-    /// before the cooldown elapses is never suppressed (a fresh dispatch is
-    /// itself proof the candidate is live again). Returns `true` when a record
-    /// existed. Mirrors [`Self::clear_dispatch_backoff`].
+    /// Clear `issue`'s no-op-cooldown record (Issue #6670). The only two
+    /// callers are the operator's `quarantine clear`
+    /// ([`Self::clear_quarantine`]) and the reaper's crashed-reap path
+    /// ([`Self::clear_noop_cooldown_unless_reported`] — a reap that made
+    /// checkpoint progress before dying); **no dispatch path clears it**, and
+    /// an expired window is never pruned — the record simply stays until one
+    /// of those fires. Returns `true` when a record existed. Mirrors
+    /// [`Self::clear_dispatch_backoff`].
     pub(crate) fn clear_noop_cooldown(&mut self, issue: u32) -> bool {
         self.noop_cooldown.remove(&issue).is_some()
     }
@@ -494,80 +496,10 @@ impl SweepRegistry {
         remaining.to_std().ok().filter(|d| !d.is_zero())
     }
 
-    /// Remaining no-op cooldown that must **block a dispatch** of `issue` at
-    /// `now` (Issue #9928): the longer of this host's own window
-    /// ([`Self::noop_cooldown_remaining`]) and any live window a **peer** host
-    /// broadcast (#7477), or `None` when neither is live.
-    ///
-    /// # Why the dispatch path needs its own accessor
-    ///
-    /// The two readers of this state had different scopes, and the narrower
-    /// one is the one that actually enforces:
-    ///
-    /// - The work finder's **advisory pre-filter** reads the fleet-unioned
-    ///   [`Self::noop_cooldown_issues`] (local ∪ peer-armed, since #7477). It
-    ///   runs a tick ahead of the dispatch it gates, so a peer ad arriving
-    ///   between selection and dispatch is already too late for it.
-    /// - The **step 2.75 dispatch guard** (#6917) is the seam every dispatch
-    ///   route funnels through — the work finder itself, the IPC/CLI
-    ///   `{"Issue": <N>}` RPC behind `loom-daemon dispatch <N>` /
-    ///   `mcp__loom__dispatch_sweep`, the epic supervisor, all three
-    ///   watchdogs, the reaper's runtime-handoff re-dispatch — and it read the
-    ///   HOST-LOCAL [`Self::noop_cooldown_remaining`].
-    ///
-    /// So a window armed by host A bound A's own dispatches and every peer's
-    /// *pre-filter*, but nothing that reached `begin_issue_dispatch` on a peer
-    /// by another route or a tick too early: hosts B/C/D re-claimed the same
-    /// issue inside the very cooldown A's sweep had just armed, which is the
-    /// fleet round-robin #7477 set out to stop (observed on
-    /// `2AMLogic/gf180-pll#127`: four hosts re-dispatching one tracker issue
-    /// inside ~10 minutes against byte-identical `origin/main`, two of them
-    /// *after* a self-reported no-op release). Reading the union here makes
-    /// the enforcing seam at least as fleet-aware as the advisory one, for
-    /// every route at once.
-    ///
-    /// Takes the **longer** of the two rather than preferring either: both are
-    /// statements that nothing has changed since a real check, and the later
-    /// expiry is the one that still holds. Empty peer view
-    /// (`safehouse.enabled` false, no coordination attached) degrades exactly
-    /// to [`Self::noop_cooldown_remaining`] — the pre-#9928 behaviour.
-    #[must_use]
-    pub fn noop_cooldown_dispatch_block(&self, issue: u32, now: DateTime<Utc>) -> Option<Duration> {
-        if !self.noop_cooldown_config.enabled {
-            return None;
-        }
-        let local = self.noop_cooldown_remaining(issue, now);
-        let fleet = self.fleet_noop_cooldown_remaining(issue);
-        match (local, fleet) {
-            (Some(l), Some(f)) => Some(l.max(f)),
-            (l, f) => l.or(f),
-        }
-    }
-
-    /// Remaining time on a live fleet-wide no-op cooldown a **peer** host
-    /// armed for `issue` (Issue #9928) — the per-issue read behind
-    /// [`Self::noop_cooldown_dispatch_block`], mirroring
-    /// [`Self::fleet_noop_cooldown_issues`]'s disabled-state contract (`None`
-    /// when no peer-claim view is attached).
-    #[must_use]
-    fn fleet_noop_cooldown_remaining(&self, issue: u32) -> Option<Duration> {
-        let view = self.peer_claims.as_ref()?;
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        match view.lock() {
-            Ok(v) => v.noop_cooldown_remaining_at(&repo, issue, Instant::now()),
-            Err(poisoned) => {
-                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
-                None
-            }
-        }
-    }
-
     /// Absolute no-op-cooldown expiry for `issue` at `now` (Issue #9311), or
     /// `None` when it may be dispatched immediately. Mirrors
     /// [`Self::noop_cooldown_remaining`] but returns the instant itself rather
-    /// than the duration until it — this host's own local window only, not
-    /// the fleet-unioned [`Self::noop_cooldown_issues`]: a peer-armed window's
-    /// expiry is not available here.
+    /// than the duration until it.
     #[must_use]
     pub fn noop_cooldown_until(&self, issue: u32, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         if !self.noop_cooldown_config.enabled {
@@ -577,57 +509,20 @@ impl SweepRegistry {
         (state.until > now).then_some(state.until)
     }
 
-    /// Consecutive no-op releases recorded for `issue` (Issue #6670). `0` when
-    /// no release is on record. Test/inspection helper, mirroring
-    /// [`Self::dispatch_failure_count`].
-    #[must_use]
-    pub fn noop_release_count(&self, issue: u32) -> u32 {
-        self.noop_cooldown.get(&issue).map_or(0, |s| s.consecutive)
-    }
-
     /// Every issue whose no-op cooldown is still in effect at `now` (Issue
     /// #6670) — the set the work finder skips *before* the capacity gate,
     /// mirroring [`Self::quarantined_issues`] / [`Self::dispatch_backoff_issues`].
     ///
-    /// Fleet-wide as of Issue #7477: unions this host's own local cooldown
-    /// state with any live cooldown window a **peer** host has broadcast (see
-    /// [`Self::fleet_noop_cooldown_issues`]) — this module's own doc comment
-    /// (top of file) describes the fleet-scope gap this closes: a plain
-    /// per-process `HashMap` let an N-host fleet round-robin a claim/release
-    /// bail loop up to N times faster than the single-host cooldown was
-    /// designed to prevent.
     #[must_use]
     pub fn noop_cooldown_issues(&self, now: DateTime<Utc>) -> HashSet<u32> {
         if !self.noop_cooldown_config.enabled {
             return HashSet::new();
         }
-        let mut set: HashSet<u32> = self
-            .noop_cooldown
+        self.noop_cooldown
             .iter()
             .filter(|(_, s)| s.until > now)
             .map(|(issue, _)| *issue)
-            .collect();
-        set.extend(self.fleet_noop_cooldown_issues());
-        set
-    }
-
-    /// Issues with a live fleet-wide no-op cooldown armed by a **peer** host
-    /// (Issue #7477) — empty when no peer-claim view is attached
-    /// (`safehouse.enabled` false), mirroring
-    /// [`Self::peer_claimed_issues`]'s disabled-state contract.
-    #[must_use]
-    fn fleet_noop_cooldown_issues(&self) -> HashSet<u32> {
-        let Some(view) = &self.peer_claims else {
-            return HashSet::new();
-        };
-        let repo = peer_claims::repo_slug(&self.config.workspace_root);
-        match view.lock() {
-            Ok(v) => v.noop_cooldown_issues_at(&repo, Instant::now()),
-            Err(poisoned) => {
-                log::error!("sweep_registry: peer-claim view mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+            .collect()
     }
 }
 
@@ -650,24 +545,21 @@ mod tests {
     #[test]
     fn record_arms_cooldown_and_is_reflected_in_skip_set() {
         let mut reg = test_registry();
-        assert_eq!(reg.noop_release_count(4242), 0);
         assert!(reg.noop_cooldown_remaining(4242, Utc::now()).is_none());
 
         reg.record_noop_release(4242, Some("no delta since last survey".into()));
 
-        assert_eq!(reg.noop_release_count(4242), 1);
         let remaining = reg.noop_cooldown_remaining(4242, Utc::now());
         assert!(remaining.is_some_and(|d| d.as_secs() > 0));
         assert!(reg.noop_cooldown_issues(Utc::now()).contains(&4242));
     }
 
     #[test]
-    fn repeated_records_accumulate_consecutive_but_stay_flat() {
+    fn repeated_records_refresh_a_flat_window() {
         let mut reg = test_registry();
         reg.record_noop_release(99, None);
         reg.record_noop_release(99, None);
         reg.record_noop_release(99, None);
-        assert_eq!(reg.noop_release_count(99), 3);
         // Flat, non-exponential: the window is always exactly the configured
         // cooldown from the most recent record, never longer.
         let remaining = reg.noop_cooldown_remaining(99, Utc::now()).unwrap();
@@ -702,7 +594,6 @@ mod tests {
             ..NoopCooldownConfig::default()
         });
         reg.record_noop_release(1, None);
-        assert_eq!(reg.noop_release_count(1), 0);
         assert!(reg.noop_cooldown_remaining(1, Utc::now()).is_none());
         assert!(reg.noop_cooldown_issues(Utc::now()).is_empty());
     }
@@ -921,6 +812,101 @@ mod tests {
         assert_eq!(reg.noop_streak_count(89_125), 1);
     }
 
+    // --- Restart replay from the outcome journal (#11481) ------------------
+
+    /// Journal one self-reported no-op for `issue` through the real reap path,
+    /// then back-date its row by `age_secs`. Returns the journal path.
+    fn journal_noop(dir: &Path, issue: u32, age_secs: i64) -> PathBuf {
+        let mut reg = no_progress_test_registry(dir, "OPEN", "", false);
+        let path = dir.join("test-sweep-outcome-telemetry.jsonl");
+        reg.config.outcome_telemetry_path = Some(path.clone());
+        insert_clean_exit_running(&mut reg, issue, 0);
+        reg.record_noop_release(issue, None);
+        reg.reap_once();
+        let stamp = (Utc::now() - chrono::Duration::seconds(age_secs)).to_rfc3339();
+        let rewritten: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["emitted_at"] = serde_json::Value::String(stamp.clone());
+                v.to_string()
+            })
+            .collect();
+        std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+        path
+    }
+
+    fn restarted_registry(dir: &Path, journal: PathBuf) -> SweepRegistry {
+        let mut reg = SweepRegistry::new(SweepRegistryConfig::new(dir.to_path_buf()));
+        reg.config.outcome_telemetry_path = Some(journal);
+        reg
+    }
+
+    #[test]
+    fn restart_replays_a_recent_noop_with_its_remaining_time() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_201, 600);
+        let mut reg = restarted_registry(dir.path(), journal);
+        assert!(reg.noop_cooldown_remaining(89_201, Utc::now()).is_none());
+
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 1);
+
+        let remaining = reg
+            .noop_cooldown_remaining(89_201, Utc::now())
+            .unwrap()
+            .as_secs();
+        assert!(
+            (2900..=3000).contains(&remaining),
+            "10 min into a 60 min window leaves ~50 min, got {remaining}s"
+        );
+    }
+
+    #[test]
+    fn restart_does_not_replay_an_expired_noop() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_202, 3700);
+        let mut reg = restarted_registry(dir.path(), journal);
+
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0);
+        assert!(reg.noop_cooldown_remaining(89_202, Utc::now()).is_none());
+    }
+
+    #[test]
+    fn restart_replay_respects_the_disabled_switch_and_a_missing_journal() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_203, 60);
+        let mut reg = restarted_registry(dir.path(), journal);
+        reg.set_noop_cooldown_config(NoopCooldownConfig {
+            enabled: false,
+            ..NoopCooldownConfig::default()
+        });
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0);
+
+        let mut fresh = restarted_registry(dir.path(), dir.path().join("absent.jsonl"));
+        assert_eq!(fresh.replay_noop_cooldown_from_journal(Utc::now()), 0);
+    }
+
+    #[test]
+    fn restart_replay_keeps_a_live_window_and_skips_a_later_non_noop_row() {
+        let dir = tempdir().unwrap();
+        let journal = journal_noop(dir.path(), 89_204, 600);
+        let mut reg = restarted_registry(dir.path(), journal.clone());
+        reg.record_noop_release(89_204, None);
+        assert_eq!(reg.replay_noop_cooldown_from_journal(Utc::now()), 0, "live window kept");
+
+        // A newer, non-no-op row for the same issue proves it is live again.
+        let line = std::fs::read_to_string(&journal).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        v["emitted_at"] = serde_json::Value::String(Utc::now().to_rfc3339());
+        v["record"]["disposition"] = "landed".into();
+        let mut all = line;
+        all.push_str(&format!("{v}\n"));
+        std::fs::write(&journal, all).unwrap();
+        let mut again = restarted_registry(dir.path(), journal);
+        assert_eq!(again.replay_noop_cooldown_from_journal(Utc::now()), 0);
+    }
+
     // --- Config resolution precedence (env > config > default) -------------
 
     #[test]
@@ -979,204 +965,5 @@ mod tests {
         let cfg = resolve_noop_cooldown_config(dir.path());
         std::env::remove_var(NOOP_COOLDOWN_SECS_ENV);
         assert_eq!(cfg.cooldown.as_secs(), DEFAULT_NOOP_COOLDOWN_SECS);
-    }
-
-    // --- Fleet-wide visibility (Issue #7477) --------------------------------
-
-    /// Arming a LOCAL no-op cooldown must also broadcast it fleet-wide over
-    /// the same peer-claim channel dispatch claims use, so a peer host does
-    /// not immediately re-offer the same candidate this host just
-    /// self-reported "no actionable delta" on. This is the exact fleet-scope
-    /// gap #7477 reports: pre-fix, this state was a plain per-process
-    /// `HashMap`, invisible to any other host.
-    #[test]
-    fn record_noop_release_broadcasts_fleet_wide() {
-        let mut reg = test_registry();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        reg.set_peer_claim_publisher(tx);
-
-        reg.record_noop_release(7466, Some("still nothing to do".into()));
-
-        let ad = rx.try_recv().expect("a cooldown ad must be published");
-        assert_eq!(ad.kind, crate::peer_claims::ClaimKind::NoopCooldownArmed);
-        assert_eq!(ad.issue, 7466);
-        assert_eq!(ad.remaining_secs, Some(reg.noop_cooldown_config().cooldown.as_secs()));
-    }
-
-    /// A disabled mechanism must not broadcast either — mirrors
-    /// `disabled_mechanism_records_nothing`'s local-state contract.
-    #[test]
-    fn disabled_mechanism_does_not_broadcast() {
-        let mut reg = test_registry();
-        reg.set_noop_cooldown_config(NoopCooldownConfig {
-            enabled: false,
-            cooldown: Duration::from_secs(60),
-            ..NoopCooldownConfig::default()
-        });
-        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        reg.set_peer_claim_publisher(tx);
-
-        reg.record_noop_release(1, None);
-
-        assert!(rx.try_recv().is_err(), "a disabled mechanism must publish nothing");
-    }
-
-    /// `noop_cooldown_issues` must union this host's own local cooldown
-    /// state with a live window a PEER host has broadcast — the fleet-scope
-    /// fix. A registry with NO local record for an issue still must not
-    /// offer it while a peer's broadcast window is live.
-    #[test]
-    fn noop_cooldown_issues_reflects_a_peer_armed_window() {
-        let mut reg = test_registry();
-        assert!(!reg.noop_cooldown_issues(Utc::now()).contains(&7466));
-
-        let repo = peer_claims::repo_slug(&reg.config().workspace_root);
-        let view =
-            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-        {
-            let mut v = view.lock().unwrap();
-            v.observe_noop_cooldown_at(
-                &ClaimAd::noop_cooldown_armed(7466, repo, "peer".into(), 1, "ts".into(), 3600),
-                Instant::now(),
-            );
-        }
-        reg.set_peer_claims(view);
-        assert!(
-            reg.noop_cooldown_issues(Utc::now()).contains(&7466),
-            "a peer-armed no-op cooldown must suppress this host's dispatch too"
-        );
-    }
-
-    // --- Fleet-aware dispatch-path read (Issue #9928) -----------------------
-
-    /// Helper: attach a peer-claim view to `reg` carrying a live
-    /// `remaining_secs`-long no-op cooldown a PEER host armed for `issue`.
-    fn attach_peer_armed_cooldown(reg: &mut SweepRegistry, issue: u32, remaining_secs: u64) {
-        let repo = peer_claims::repo_slug(&reg.config().workspace_root);
-        let view =
-            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-        {
-            let mut v = view.lock().unwrap();
-            v.observe_noop_cooldown_at(
-                &ClaimAd::noop_cooldown_armed(
-                    issue,
-                    repo,
-                    "peer".into(),
-                    1,
-                    "ts".into(),
-                    remaining_secs,
-                ),
-                Instant::now(),
-            );
-        }
-        reg.set_peer_claims(view);
-    }
-
-    /// THE #9928 gap at the registry level: with NO local record but a live
-    /// peer-armed window, the host-local `noop_cooldown_remaining` reads
-    /// `None` (so the dispatch guard let a direct `--claim-owned N`
-    /// re-dispatch straight through) while the fleet-unioned
-    /// `noop_cooldown_issues` the work finder reads already said "skip".
-    /// `noop_cooldown_dispatch_block` is the dispatch path's fleet-aware read.
-    #[test]
-    fn dispatch_block_sees_a_peer_armed_window_that_the_local_read_misses() {
-        let mut reg = test_registry();
-        attach_peer_armed_cooldown(&mut reg, 9928, 3600);
-
-        assert!(
-            reg.noop_cooldown_remaining(9928, Utc::now()).is_none(),
-            "the host-local read sees nothing — this is the gap, not the fix"
-        );
-        assert!(
-            reg.noop_cooldown_issues(Utc::now()).contains(&9928),
-            "the work-finder pre-filter has been fleet-aware since #7477"
-        );
-
-        let remaining = reg
-            .noop_cooldown_dispatch_block(9928, Utc::now())
-            .expect("the dispatch path must see a peer-armed window too (#9928)");
-        assert!(remaining.as_secs() > 0);
-    }
-
-    /// With both windows live, the longer one holds — neither reader is
-    /// preferred, and a short local window can never shorten a peer's.
-    #[test]
-    fn dispatch_block_takes_the_longer_of_local_and_peer_windows() {
-        let mut reg = test_registry();
-        reg.set_noop_cooldown_config(NoopCooldownConfig {
-            enabled: true,
-            cooldown: Duration::from_secs(60),
-            ..NoopCooldownConfig::default()
-        });
-        reg.record_noop_release(9929, None);
-        attach_peer_armed_cooldown(&mut reg, 9929, 3600);
-
-        let remaining = reg.noop_cooldown_dispatch_block(9929, Utc::now()).unwrap();
-        assert!(
-            remaining.as_secs() > 60,
-            "the peer's longer window must win; got {}s",
-            remaining.as_secs()
-        );
-    }
-
-    /// No peer view attached (`safehouse.enabled` false) degrades exactly to
-    /// the host-local read — the pre-#9928 behaviour, unchanged.
-    #[test]
-    fn dispatch_block_degrades_to_the_local_window_with_no_peer_view() {
-        let mut reg = test_registry();
-        assert!(reg.noop_cooldown_dispatch_block(42, Utc::now()).is_none());
-        reg.record_noop_release(42, None);
-        // One fixed `now` for both reads — two `Utc::now()` calls differ by
-        // the microseconds between them.
-        let now = Utc::now();
-        assert_eq!(reg.noop_cooldown_dispatch_block(42, now), reg.noop_cooldown_remaining(42, now),);
-    }
-
-    /// An expired peer window never blocks — the `expiry > now` discipline
-    /// every other read in this lane uses.
-    #[test]
-    fn dispatch_block_ignores_an_expired_peer_window() {
-        let mut reg = test_registry();
-        // `remaining_secs: 0` is how a malformed/already-lapsed ad degrades.
-        attach_peer_armed_cooldown(&mut reg, 9930, 0);
-        assert!(reg.noop_cooldown_dispatch_block(9930, Utc::now()).is_none());
-    }
-
-    /// A disabled mechanism must ignore a peer-armed window on the dispatch
-    /// path too — mirrors `disabled_mechanism_ignores_peer_armed_window`.
-    #[test]
-    fn disabled_mechanism_dispatch_block_ignores_peer_armed_window() {
-        let mut reg = test_registry();
-        reg.set_noop_cooldown_config(NoopCooldownConfig {
-            enabled: false,
-            cooldown: Duration::from_secs(60),
-            ..NoopCooldownConfig::default()
-        });
-        attach_peer_armed_cooldown(&mut reg, 9928, 3600);
-        assert!(reg.noop_cooldown_dispatch_block(9928, Utc::now()).is_none());
-    }
-
-    /// A disabled mechanism must ignore even a live peer-armed window —
-    /// mirrors the local-state early return.
-    #[test]
-    fn disabled_mechanism_ignores_peer_armed_window() {
-        let mut reg = test_registry();
-        reg.set_noop_cooldown_config(NoopCooldownConfig {
-            enabled: false,
-            cooldown: Duration::from_secs(60),
-            ..NoopCooldownConfig::default()
-        });
-        let repo = peer_claims::repo_slug(&reg.config().workspace_root);
-        let view =
-            Arc::new(Mutex::new(PeerClaimView::new("self".into(), Duration::from_secs(120))));
-        {
-            let mut v = view.lock().unwrap();
-            v.observe_noop_cooldown_at(
-                &ClaimAd::noop_cooldown_armed(7466, repo, "peer".into(), 1, "ts".into(), 3600),
-                Instant::now(),
-            );
-        }
-        reg.set_peer_claims(view);
-        assert!(!reg.noop_cooldown_issues(Utc::now()).contains(&7466));
     }
 }

@@ -54,46 +54,54 @@
 //!      the pre-port function's `return 1`: ITS OWN caller prints the
 //!      generic "Artifact download failed" line and exits 1.
 
-use anyhow::Result;
-use loom_daemon::release_fetch::{
+use crate::release_fetch::fetch::{DAEMON_BIN, TOOLS_BIN};
+use crate::release_fetch::{
     evidence, fetch_and_verify_with_evidence, FetchInputs, FetchOutcome, SignaturePolicy,
 };
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
-pub(crate) struct ReleaseFetchArgs {
+pub struct ReleaseFetchArgs {
     /// The checkout used to resolve a checked-in cosign key
     /// (`.loom/cosign.pub` / `defaults/cosign.pub`) and as `gh`'s working
     /// directory. Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
-    pub(crate) repo_root: Option<PathBuf>,
+    pub repo_root: Option<PathBuf>,
 
-    /// The release target triple (`loom-daemon-<target>` names the asset).
+    /// The release target triple (`<bin>-<target>` names the asset).
     #[arg(long, value_name = "TRIPLE")]
-    pub(crate) target: String,
+    pub target: String,
+
+    /// Which release binary to fetch (#12940): `loom-daemon` (default) or
+    /// `loom-tools`. Verification (checksum, signature, glibc) is identical.
+    #[arg(long, value_name = "NAME", default_value = DAEMON_BIN,
+          value_parser = [DAEMON_BIN, TOOLS_BIN])]
+    pub bin: String,
 
     /// `owner/repo` to download from.
     #[arg(long, value_name = "OWNER/NAME")]
-    pub(crate) repo: String,
+    pub repo: String,
 
     /// The release tag to fetch.
     #[arg(long, value_name = "TAG")]
-    pub(crate) tag: String,
+    pub tag: String,
 }
 
 impl ReleaseFetchArgs {
     /// Never returns: exits 0/1/2 per the module contract above.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let root = self
             .repo_root
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        let bin_name = format!("loom-daemon-{}", self.target);
+        let bin_name = format!("{}-{}", self.bin, self.target);
         let sha_name = format!("{bin_name}.sha256");
         eprintln!("Downloading {bin_name} + {sha_name} from {}@{}...", self.repo, self.tag);
 
         let inputs = FetchInputs {
             repo_root: &root,
+            binary: &self.bin,
             target: &self.target,
             repo_slug: &self.repo,
             tag: &self.tag,

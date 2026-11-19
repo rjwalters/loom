@@ -1,30 +1,30 @@
-//! Delivery accounting shared by native HTTPS and OTLP senders.
+//! Delivery accounting for the OTLP sender.
 use super::exporter;
 
 /// Live record of whether telemetry is actually *reaching* the backend, written
 /// by [`super::sender::try_flush`] on every attempt and read back by
 /// [`super::global_export_status`] for `loom-daemon status` / `health`.
 ///
-/// The complement to [`super::HostIdStatus`], which is anomaly-only by design (#4830)
-/// and therefore cannot answer "is it working?" — only "is it working *wrong*
-/// in this one specific way?". This cell is always readable and always has an
-/// answer, including the answer #4830 could never give: *configured, running,
-/// and has never successfully exported anything*.
-///
-/// Unlike [`super::HostIdStatus`] this is **not** write-once: it is a rolling record,
-/// so `last_success_at` genuinely means "the last time data landed" and a watch
-/// loop can alert on its age.
+/// This cell is always readable and always has an answer, including
+/// *configured, running, and has never successfully exported anything*. It is
+/// a rolling record, so `last_success_at` genuinely means "the last time data
+/// landed" and a watch loop can alert on its age.
 #[derive(Debug)]
 pub struct ExportStatus {
     inner: std::sync::Mutex<crate::types::ObservabilityExportStatus>,
     /// The exporter's own queue, attached once at startup (#11115) so a
     /// snapshot can report live pressure.
     queue: std::sync::OnceLock<std::sync::Arc<super::queue::DurableQueue>>,
+    /// Wire kind -> last time an envelope of that kind was acked (#12120).
+    /// In memory only: after a restart a kind reads as "not yet exported this
+    /// process", which the health rule measures from process start.
+    kind_last_export:
+        std::sync::Mutex<std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>>,
 }
 
 // Allow expect_used: a poisoned status mutex means another thread panicked
 // while holding it — unrecoverable, matching the crash-on-poison policy
-// `HostIdStatus` above (and `auto_update`/`ipc`) already use.
+// `auto_update` and `ipc` already use.
 #[allow(clippy::expect_used)]
 impl ExportStatus {
     /// A status cell for an exporter that is starting *now* under `host_id`,
@@ -39,7 +39,6 @@ impl ExportStatus {
         let mut initial = crate::types::ObservabilityExportStatus {
             state: crate::types::ObservabilityExportState::Starting,
             host_id: Some(host_id.to_string()),
-            ingest_host_id: None,
             endpoint: Some(endpoint.to_string()),
             exporter: Some(exporter.to_string()),
             started_at: Some(chrono::Utc::now()),
@@ -58,6 +57,7 @@ impl ExportStatus {
         ExportStatus {
             inner: std::sync::Mutex::new(initial),
             queue: std::sync::OnceLock::new(),
+            kind_last_export: Default::default(),
         }
     }
 
@@ -79,6 +79,29 @@ impl ExportStatus {
             .records_exported
             .saturating_add(count.try_into().unwrap_or(u64::MAX));
         guard.consecutive_failures = 0;
+    }
+
+    /// Stamp each of `kinds` (wire tags of acked envelopes) as exported now.
+    pub fn record_kinds<'a>(&self, kinds: impl IntoIterator<Item = &'a str>) {
+        let now = chrono::Utc::now();
+        let mut guard = self
+            .kind_last_export
+            .lock()
+            .expect("observability kind map mutex poisoned");
+        for kind in kinds {
+            guard.insert(kind.to_string(), now);
+        }
+    }
+
+    /// Wire kind -> last acked export time, for kinds seen this process.
+    #[must_use]
+    pub fn kind_last_export(
+        &self,
+    ) -> std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> {
+        self.kind_last_export
+            .lock()
+            .expect("observability kind map mutex poisoned")
+            .clone()
     }
 
     /// Counts use signal units, never envelope counts (one envelope may contain many points).
@@ -125,13 +148,12 @@ impl ExportStatus {
                 endpoint, detail,
             )),
             queue: std::sync::OnceLock::new(),
+            kind_last_export: Default::default(),
         }
     }
 
     /// The current record, with [`crate::types::ObservabilityExportStatus::state`]
-    /// (and the #9015 scope fields) re-derived as of now. `ingest_host_id` is folded in from
-    /// [`super::global_host_id_mismatch`] by [`super::global_export_status`], not here — this
-    /// cell knows nothing about identity.
+    /// (and the #9015 scope fields) re-derived as of now.
     #[must_use]
     pub fn snapshot(&self) -> crate::types::ObservabilityExportStatus {
         let mut snapshot = self

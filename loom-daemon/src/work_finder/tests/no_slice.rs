@@ -102,59 +102,10 @@ fn in_slice_repo_with_only_open_prs_yields_the_tick_to_other_repos() {
         b,
         c,
     ];
-    let report = tick_multi_with_sharding(
-        &mut workspaces,
-        &[1000, 1, 1],
-        10,
-        &[false; 3],
-        usize::MAX,
-        false,
-    );
+    let report = tick_multi(&mut workspaces, &[1000, 1, 1], 10, &[false; 3]);
 
     assert_eq!(report.skipped_pr_open, 2, "the in-slice issues hit the open-PR guard");
     assert_eq!(report.dispatched, 2, "free slots go to other repos this tick");
-    assert_eq!(workspaces[1].1.dispatched, vec![10]);
-    assert_eq!(workspaces[2].1.dispatched, vec![20]);
-    assert_plan_has_no_slice(&report, &shards);
-}
-
-/// Acceptance 1, repo-cap form: the in-slice repo is at
-/// `maxConcurrentPerRepo`, so its candidates defer and the other repos'
-/// candidates take the slots in the same tick.
-#[test]
-fn in_slice_repo_at_its_cap_yields_the_tick_to_other_repos() {
-    let keys = three_repos_one_owned_here();
-    let shards = decisions(&keys);
-    assert!(shards[0].owned && !shards[1].owned && !shards[2].owned);
-
-    let [b, c] = ready_elsewhere();
-    let mut workspaces = vec![
-        (
-            FakeSource::once(vec![issue(1), issue(2)]),
-            // One live sweep: at a per-repo cap of 1.
-            RecordingDispatcher {
-                in_flight: [1000].into_iter().collect(),
-                ..RecordingDispatcher::default()
-            },
-        ),
-        b,
-        c,
-    ];
-    let report = tick_multi_with_repo_cap(
-        &mut workspaces,
-        &[1000, 1, 1],
-        10.into(),
-        &[false; 3],
-        None,
-        usize::MAX,
-        false,
-        Some(1),
-        &[],
-    );
-
-    assert_eq!(report.deferred_repo_cap, 2, "the in-slice repo is at its cap");
-    assert_eq!(report.dispatched, 2, "free slots go to other repos this tick");
-    assert!(workspaces[0].1.dispatched.is_empty());
     assert_eq!(workspaces[1].1.dispatched, vec![10]);
     assert_eq!(workspaces[2].1.dispatched, vec![20]);
     assert_plan_has_no_slice(&report, &shards);
@@ -169,8 +120,7 @@ fn the_ring_neither_defers_nor_reorders_dispatch() {
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(3)]), RecordingDispatcher::default()),
     ];
-    let report =
-        tick_multi_with_sharding(&mut workspaces, &[1, 1, 1], 10, &[false; 3], usize::MAX, false);
+    let report = tick_multi(&mut workspaces, &[1, 1, 1], 10, &[false; 3]);
     assert_eq!(report.dispatched, 3);
     let rows = ready_queue::finish(&report.queue, &[]);
     assert!(rows.iter().all(|r| r.disposition == Qd::Dispatched));

@@ -222,3 +222,13 @@ async fn the_work_finder_pre_filter_names_maintain_only() {
     assert_ne!(causes[1], Some(HaltCause::MaintainOnly));
     set_maintain_only_for_test(held_dir.path(), None);
 }
+
+/// #11928: a maintain-only hold is a policy refusal, logged below `warn`;
+/// the fault-class holds keep `warn`.
+#[test]
+fn maintain_only_logs_below_warn_and_faults_keep_warn() {
+    use crate::workspace_hold::hold_log_level;
+    assert_eq!(hold_log_level(HoldKind::MaintainOnly), log::Level::Info);
+    assert_eq!(hold_log_level(HoldKind::InstallIncompatible), log::Level::Warn);
+    assert_eq!(hold_log_level(HoldKind::DaemonTooOld), log::Level::Warn);
+}

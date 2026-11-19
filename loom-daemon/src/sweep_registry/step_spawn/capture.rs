@@ -1,0 +1,652 @@
+//! A step's end: its outcome line, and the role tick's capture (#11906).
+//!
+//! #11877 made a role tick journal the listings its agent read (the pick
+//! journal) and export its `role_tick.outcome`. Both fired only inside a role
+//! tick, and a step is not one: it runs detached in the sweep registry. So a
+//! step carries a journal of its own from the spawn (`pick_journal::
+//! attach_step`), and its end emits both through the role tick's own emit
+//! (`role_tick_telemetry::emit_for_step`, which drains the journal into the
+//! role's `pick.decision`), on a detached thread: the transcript scan behind
+//! `role_tick.outcome` must not hold the registry lock. The record is marked
+//! `source = "step"` with the step's sweep id, so it never counts as a
+//! role-runner tick.
+//!
+//! The session's own word on its step is its last
+//! `LOOM_STEP_OUTCOME role=… target=… class=… reason=…` line
+//! (`targeted-role-invocation.md`, #11868), read from the step's log after
+//! its own dispatch header. The class rides the record's detail and the end
+//! log line; the outcome ledger (#11900) consumes it from
+//! [`read_outcome_line`]. The line is advisory: the ledger decides with the
+//! forge post-state, which this module does not read: the end queues the
+//! step ([`super::ended`]) and the work finder's step tick reads the
+//! post-state with the lock released (`step_dispatch::step_end`, #11909),
+//! passing `None` when that read fails, never a default (#11962), so a failed
+//! probe classifies as `failed`, not as the session's word.
+
+use super::*;
+use crate::observability::lifecycle::RoleFailure;
+use crate::role_runner::RoleTickOutcome;
+use crate::telemetry::trace::TraceContext;
+
+/// The four outcome classes of a targeted step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcomeClass {
+    Verdict,
+    Noop,
+    Refused,
+    Failed,
+}
+
+impl StepOutcomeClass {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "verdict" => Some(Self::Verdict),
+            "noop" => Some(Self::Noop),
+            "refused" => Some(Self::Refused),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verdict => "verdict",
+            Self::Noop => "noop",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One `LOOM_STEP_OUTCOME` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutcomeLine {
+    pub role: String,
+    pub target: u32,
+    pub class: StepOutcomeClass,
+    /// The reason token, `snake_case`: a `-` on the line is read as `_`
+    /// (#13500), the same fold the Champion outcome word gets, so a Judge
+    /// that writes `reason=ci-pending` (the spelling of its own
+    /// `lease pr release --skip-reason`) is the contract's `ci_pending`.
+    pub reason: String,
+}
+
+const OUTCOME_PREFIX: &str = "LOOM_STEP_OUTCOME ";
+
+/// The bound on a recorded outcome `reason` (#14168): the reason is recorded
+/// as written (its `-` read as `_`), then truncated to this many `char`s on
+/// the span and the record. A later issue may decide a closed vocabulary;
+/// until then the bound is the only guard on it.
+const REASON_MAX_CHARS: usize = 64;
+
+/// `reason` truncated to [`REASON_MAX_CHARS`] `char`s. Pure.
+#[must_use]
+fn bound_reason(reason: &str) -> &str {
+    match reason.char_indices().nth(REASON_MAX_CHARS) {
+        Some((at, _)) => &reason[..at],
+        None => reason,
+    }
+}
+
+/// Parse one outcome line. The prompt's own template
+/// (`class=<verdict|noop|refused|failed>`) is not one. The prefix may sit
+/// anywhere in the line — bare, backticked, or inside a JSON text event
+/// (#14168) — and each field's value is [`token_value`] of its token, so a
+/// wrapper's framing characters (`"}`, a literal `\n` escape, a backtick)
+/// end the value instead of riding in it. Pure.
+#[must_use]
+pub fn parse_outcome_line(line: &str) -> Option<StepOutcomeLine> {
+    let rest = &line[line.find(OUTCOME_PREFIX)? + OUTCOME_PREFIX.len()..];
+    let field = |key: &str| {
+        rest.split_whitespace()
+            .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
+            .map(crate::step_dispatch::outcome_ledger::token_value)
+    };
+    Some(StepOutcomeLine {
+        role: field("role")?.to_string(),
+        target: field("target")?.parse().ok()?,
+        class: StepOutcomeClass::parse(field("class")?)?,
+        reason: bound_reason(&field("reason").unwrap_or("").replace('-', "_")).to_string(),
+    })
+}
+
+/// The last outcome line in `log` written after `sweep_id`'s own dispatch
+/// header (an earlier run's line in the same per-item log is not this
+/// step's). `None` when the session wrote none.
+#[must_use]
+pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> {
+    let text = String::from_utf8_lossy(&std::fs::read(log).ok()?).into_owned();
+    let anchor = format!("sweep_id={sweep_id} ");
+    let start = text.rfind(&anchor)?;
+    text[start..].lines().rev().find_map(parse_outcome_line)
+}
+
+/// The `reason`s held as `ci_wait`: Judge's `ci_pending` (written
+/// `ci-pending` on the line; the parser folds it, #13500), and the Champion
+/// `requeued` outcome word. The captain is fed the outcome line's own reason,
+/// not the telemetry projection, so a Champion `requeued` holds for any gate
+/// (`ci_pending`, `merge_rc<N>`, `pin_missing`): not merged, still approved,
+/// retry shortly. A Champion `skipped` stop is not listed and climbs the
+/// no-progress ladder.
+const CI_WAIT_REASONS: [&str; 2] = ["ci_pending", "requeued"];
+
+/// The captain release outcome for a step that ended `class` / `reason`: the
+/// class, except that a `noop` waiting on CI is `ci_wait` (#12551), which the
+/// captain holds briefly instead of climbing its no-progress ladder.
+fn release_token(class: &'static str, reason: &str) -> &'static str {
+    if class == "noop" && CI_WAIT_REASONS.contains(&reason) {
+        crate::fleet_dispatch::table::CI_WAIT_OUTCOME
+    } else {
+        class
+    }
+}
+
+/// The captain release outcome of a step: `failed` becomes
+/// [`crate::fleet_dispatch::table::FAST_FAIL_OUTCOME`] for a Builder step that
+/// ran under the fast-fail window with a reason that is not environmental
+/// (#13919). The window is the ladder's own
+/// ([`crate::sweep_registry::is_fast_failure`]): the wider of
+/// `FAST_FAIL_WINDOW_SECS` and this host's configured `insta_crash_secs`, so
+/// a failure the local ladder counts is never told to the captain as a plain
+/// `failed`, which would end the fleet's streak. Anything else passes
+/// through. Pure.
+pub(crate) fn fast_fail_release_class(
+    role: StepRole,
+    class: &'static str,
+    reason: Option<&str>,
+    ran_for: std::time::Duration,
+    insta_crash_secs: i64,
+) -> &'static str {
+    let window = std::time::Duration::from_secs(
+        u64::try_from(crate::sweep_registry::FAST_FAIL_WINDOW_SECS.max(insta_crash_secs))
+            .unwrap_or(120),
+    );
+    if role == StepRole::Builder
+        && class == "failed"
+        && ran_for < window
+        && !reason.is_some_and(crate::telemetry::disposition::is_environmental_failure_class)
+    {
+        crate::fleet_dispatch::table::FAST_FAIL_OUTCOME
+    } else {
+        class
+    }
+}
+
+/// The captain release outcome of a step that wrote an outcome line.
+pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
+    release_token(line.class.as_str(), &line.reason)
+}
+
+/// A late account refusal is tied to this launch's exit and outcome line.
+pub(crate) fn seat_busy_exit_reason(
+    role: StepRole,
+    item: u32,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> Option<&'static str> {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    (end == StepEnd::Exited(Some(REFUSAL_EXIT_CODE))
+        && line.is_some_and(|outcome| {
+            outcome.role == role.role_name()
+                && outcome.target == item
+                && outcome.class == StepOutcomeClass::Refused
+                && outcome.reason == SEAT_BUSY_REASON
+        }))
+    .then_some(SEAT_BUSY_REASON)
+}
+
+/// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
+/// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
+/// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
+/// `sweep_id`'s own dispatch header; else `failed`.
+pub(crate) fn release_class_fallback(
+    log: &Path,
+    sweep_id: &str,
+    role: StepRole,
+    item: u32,
+) -> &'static str {
+    let Ok(bytes) = std::fs::read(log) else {
+        return "failed";
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(start) = text.rfind(&format!("sweep_id={sweep_id} ")) else {
+        return "failed";
+    };
+    crate::step_dispatch::outcome_ledger::parse_outcome_line(&text[start..], role, item)
+        .map_or("failed", |o| release_token(o.class.as_str(), &o.reason))
+}
+
+/// Steps whose exit-time provider feedback classified the launch's failure
+/// `Exhausted` (#13966), keyed by sweep id with the instant it was noted.
+/// Process-global rather than a [`SweepRegistry`] field for the same reason
+/// `provider_health_feedback`'s in-run watches are: the bridge runs on the
+/// reaper's death pass, a sibling module, and the consumer is this module's
+/// `end_step`. An entry is taken (removed) by the step's own end; one no
+/// step consumed within an hour ages out, so a sweep that never ends
+/// cleanly cannot pin it forever.
+static STEP_PROVIDER_EXHAUSTIONS: std::sync::Mutex<
+    std::collections::BTreeMap<String, std::time::Instant>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Note that `sweep_id`'s exit-time provider feedback said the api-key seat
+/// its launch ran against was exhausted (#13966). Called by the
+/// provider-health bridge, for step sweeps only.
+pub(crate) fn note_step_provider_exhaustion(sweep_id: &str) {
+    let mut entries = STEP_PROVIDER_EXHAUSTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let now = std::time::Instant::now();
+    entries.retain(|_, noted| now.duration_since(*noted) < std::time::Duration::from_secs(3600));
+    entries.insert(sweep_id.to_string(), now);
+}
+
+/// Whether `sweep_id`'s provider feedback said its seat was exhausted
+/// (#13966). Removes the entry: the answer is read once, by the step's end.
+#[must_use]
+pub(crate) fn take_step_provider_exhaustion(sweep_id: &str) -> bool {
+    STEP_PROVIDER_EXHAUSTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(sweep_id)
+        .is_some()
+}
+
+/// How a step's process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepEnd {
+    /// It exited (the reaper saw it die), with its status when known.
+    Exited(Option<i32>),
+    /// Cancelled (by an operator or a roll).
+    Cancelled,
+    /// Killed by the reaper at its role's timeout (B3).
+    TimedOut,
+}
+
+/// Whether a clean exit of a `role` step with `class` is a non-success: a
+/// Builder step that exits 0 without opening a PR (`noop`) or without
+/// writing any outcome line (#12500). Other roles' exit 0 is a completion.
+fn clean_exit_failure(role: StepRole, class: Option<StepOutcomeClass>) -> Option<CleanExit> {
+    if role != StepRole::Builder {
+        return None;
+    }
+    match class {
+        Some(StepOutcomeClass::Noop) => Some(CleanExit::NoPr),
+        None => Some(CleanExit::NoOutcomeLine),
+        Some(_) => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CleanExit {
+    NoPr,
+    NoOutcomeLine,
+}
+
+/// The role tick outcome a step's end maps to. The session's `failed`
+/// class, a non-zero exit, a timeout and a cancel are failures, and so is a
+/// Builder step that ends without a PR (`noop`, or no outcome line at all,
+/// #12500); anything else completed. Pure.
+#[must_use]
+pub fn tick_outcome(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> RoleTickOutcome {
+    let class = line.map(|l| l.class);
+    let reason = line.map_or("", |l| l.reason.as_str());
+    let clean = clean_exit_failure(role, class);
+    match (end, class) {
+        (StepEnd::TimedOut, _) => RoleTickOutcome::Failure("step timed out".to_string()),
+        (StepEnd::Cancelled, _) => RoleTickOutcome::Failure("step cancelled".to_string()),
+        (_, Some(StepOutcomeClass::Failed)) => {
+            RoleTickOutcome::Failure(format!("step outcome failed: {reason}"))
+        }
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            RoleTickOutcome::Failure(format!("step exited {code}"))
+        }
+        (StepEnd::Exited(None), None) => {
+            RoleTickOutcome::Failure("step exited, status unknown".to_string())
+        }
+        _ => match clean {
+            Some(CleanExit::NoPr) => RoleTickOutcome::Failure(format!("no_pr: {reason}")),
+            Some(CleanExit::NoOutcomeLine) => {
+                RoleTickOutcome::Failure("step exited without an outcome line".to_string())
+            }
+            None => RoleTickOutcome::Success,
+        },
+    }
+}
+
+/// A `step-no-outcome-line` failure of a step that did open a PR (#13521)
+/// becomes `step-no-outcome-line-pr-opened`; any other failure is unchanged.
+/// The tick outcome stays a `Failure`: only the dashboard class splits.
+#[must_use]
+pub(crate) fn no_outcome_line_with_pr(failure: RoleFailure) -> RoleFailure {
+    use crate::observability::lifecycle::step;
+    if failure.class() == step::NO_OUTCOME_LINE.class {
+        step::NO_OUTCOME_LINE_PR_OPENED.failure(failure.exit_code())
+    } else {
+        failure
+    }
+}
+
+/// The closed-vocabulary failure behind a failed [`tick_outcome`] (#12480):
+/// `Some` exactly when `tick_outcome` is a `Failure`, one class per branch.
+/// The exit code rides `exit_code`, never the class. A step whose provider
+/// feedback said its api-key seat was exhausted (`provider_exhausted`,
+/// #13966) carries that class instead of its exit shape — the launch never
+/// had a working credential, which is the story an operator needs — but
+/// only where the end is a failure at all (the invariant above), and never
+/// on a cancel, where the operator's own act stays the story. Pure.
+#[must_use]
+pub fn step_failure(
+    role: StepRole,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    provider_exhausted: bool,
+) -> Option<RoleFailure> {
+    use crate::observability::lifecycle::step;
+    let class = line.map(|l| l.class);
+    let failure = match (end, class) {
+        (StepEnd::TimedOut, _) => Some(step::TIMED_OUT.failure(None)),
+        (StepEnd::Cancelled, _) => Some(step::CANCELLED.failure(None)),
+        (_, Some(StepOutcomeClass::Failed)) => Some(step::OUTCOME_FAILED.failure(None)),
+        (StepEnd::Exited(Some(code)), _) if code != 0 => {
+            Some(step::EXIT_NONZERO.failure(Some(code)))
+        }
+        (StepEnd::Exited(None), None) => Some(step::STATUS_UNKNOWN.failure(None)),
+        (StepEnd::Exited(code), _) => match clean_exit_failure(role, class) {
+            Some(CleanExit::NoPr) => Some(step::NO_PR.failure(code)),
+            Some(CleanExit::NoOutcomeLine) => Some(step::NO_OUTCOME_LINE.failure(code)),
+            None => None,
+        },
+    };
+    if provider_exhausted && failure.is_some() && end != StepEnd::Cancelled {
+        let code = match end {
+            StepEnd::Exited(code) => code,
+            StepEnd::TimedOut | StepEnd::Cancelled => None,
+        };
+        return Some(step::PROVIDER_EXHAUSTED.failure(code));
+    }
+    failure
+}
+
+/// A step's outcome as the span close and the `role_tick.outcome` record
+/// carry it (#12362, #14168): the class and the bounded reason of its
+/// `LOOM_STEP_OUTCOME` line, or `none` with an empty reason when it wrote no
+/// parseable line — "no outcome" is a countable value, not an absence. Pure.
+#[must_use]
+pub(crate) fn step_outcome_projection(line: Option<&StepOutcomeLine>) -> (String, String) {
+    match line {
+        Some(l) => (l.class.as_str().to_string(), l.reason.clone()),
+        None => ("none".to_string(), String::new()),
+    }
+}
+
+/// Everything the end-of-step emit needs, read out of the registry.
+#[derive(Debug, Clone)]
+pub(crate) struct StepCapture {
+    pub(crate) root: PathBuf,
+    pub(crate) role: StepRole,
+    pub(crate) item: u32,
+    pub(crate) sweep_id: SweepId,
+    pub(crate) trace_context: Option<TraceContext>,
+    pub(crate) started_at: DateTime<Utc>,
+    pub(crate) outcome: RoleTickOutcome,
+    /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362), which
+    /// `outcome` collapses.
+    pub(crate) step_outcome: Option<(String, String)>,
+    pub(crate) failure: Option<RoleFailure>,
+    pub(crate) model: String,
+    pub(crate) effort: String,
+    /// The step-engine stage, the wire [`StepRole`] name (#14048) — finer
+    /// than the role name the record's `role` field folds Champion's two
+    /// stages onto.
+    pub(crate) stage: String,
+    /// The step's own per-item log (#14048): the source of its `# LOOM_LAUNCH`
+    /// record, resolved-runtime marker and native session ids. The per-role
+    /// log a role tick reads is wrong for a step.
+    pub(crate) log_path: PathBuf,
+    pub(crate) runtime: Option<String>,
+}
+
+/// Emit the role tick's capture for one finished step: its journal drained
+/// into the role's `pick.decision`, and its `role_tick.outcome`. Blocking.
+pub(crate) fn emit_step_capture(capture: &StepCapture) {
+    crate::observability::pick_journal::adopt(
+        &capture.root,
+        crate::observability::pick_journal::step_path(&capture.sweep_id),
+    );
+    crate::role_tick_telemetry::emit_for_step(
+        &capture.root,
+        capture.role.role_name(),
+        capture.started_at,
+        &capture.outcome,
+        Some(crate::role_tick_telemetry::ResolvedLaunch::new(&capture.model, &capture.effort)),
+        crate::role_tick_telemetry::StepTelemetry {
+            failure: capture.failure.clone(),
+            sweep_id: &capture.sweep_id,
+            trace_context: capture.trace_context.as_ref(),
+            step_outcome: capture.step_outcome.clone(),
+            item: (capture.item, capture.role.acts_on_pr()),
+            stage: &capture.stage,
+            log_path: &capture.log_path,
+            runtime: capture.runtime.as_deref(),
+        },
+    );
+}
+
+impl SweepRegistry {
+    /// Whether a step's death was a model-limit kill with a rung left to step
+    /// down to (#13905, `model_limit_kill`), updating that module's memo. The
+    /// kill is only possible for an exit that is not a clean zero, not a
+    /// timeout or cancel (the operator's or the clock's act, not the
+    /// provider's), and that wrote no verdict line.
+    fn observe_model_limit_kill(
+        &self,
+        sweep_id: &str,
+        item: u32,
+        role: StepRole,
+        log_path: &Path,
+        end: StepEnd,
+        line: Option<&StepOutcomeLine>,
+    ) -> bool {
+        use super::super::model_limit_kill::{observe_step_end, EndKind};
+        let died = matches!(end, StepEnd::Exited(code) if code != Some(0))
+            && !line.is_some_and(|l| l.class == StepOutcomeClass::Verdict);
+        let killed = observe_step_end(
+            &self.config.workspace_root,
+            item,
+            role.role_name(),
+            log_path,
+            if died { EndKind::Died } else { EndKind::Clean },
+        );
+        if killed {
+            log::info!(
+                "sweep_registry: {role} step {sweep_id} on #{item} died on a model limit; \
+                 charged to the provider, not the item (#13905)"
+            );
+        }
+        killed
+    }
+
+    /// A step ended (`release_dead_step`, or found dead at startup with no
+    /// entry): reap the leases it still listed, then emit its capture off the
+    /// lock. Returns its outcome line.
+    pub(crate) fn end_step(
+        &self,
+        sweep_id: &str,
+        item: u32,
+        role: StepRole,
+        started_at: DateTime<Utc>,
+        end: StepEnd,
+    ) -> Option<StepOutcomeLine> {
+        let end = if super::timeout::take_timed_out(sweep_id) {
+            StepEnd::TimedOut
+        } else {
+            end
+        };
+        let info = self.entries.get(sweep_id);
+        let log_path =
+            info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
+        let line = read_outcome_line(&log_path, sweep_id);
+        // #13966: the exit-time provider feedback (run by the reaper just
+        // before this) said the seat was exhausted — the launch died on an
+        // empty credential, so the release says so instead of `failed`, and
+        // the item is charged nothing.
+        let provider_exhausted = take_step_provider_exhaustion(sweep_id)
+            | self.observe_model_limit_kill(sweep_id, item, role, &log_path, end, line.as_ref());
+        log::info!(
+            "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {}{} (#11906)",
+            line.as_ref().map_or("none".to_string(), |l| format!(
+                "{} {}",
+                l.class.as_str(),
+                l.reason
+            )),
+            if provider_exhausted {
+                " (provider exhausted)"
+            } else {
+                ""
+            }
+        );
+        // #12450: a granted step's assignment ends with the step, its outcome
+        // class the release's outcome (no line reads as `failed`). A no-op
+        // for a step the captain never granted. #12541: a Champion step
+        // writes no `LOOM_STEP_OUTCOME` line, only its `CHAMPION-STEP` one,
+        // so its class is that line's fold; before, every Champion release
+        // read `failed`, and the captain's no-progress hold would have held
+        // a triage that did move its PR. #13966: a provider-exhaustion step
+        // releases `provider_exhausted` — not progress, but not the item's
+        // fault — so the captain holds nothing and the next draw (which
+        // falls through to the next runtime) may take it at once. No cancel
+        // carve-out, unlike `step_failure`: a cancelled step never reaches
+        // the provider feedback that sets the flag (`reaper::finish_cancel`
+        // does not run it), so it keeps its own release.
+        let seat_busy = seat_busy_exit_reason(role, item, end, line.as_ref());
+        let release_class = if let Some(reason) = seat_busy {
+            reason
+        } else if provider_exhausted {
+            crate::fleet_dispatch::table::PROVIDER_EXHAUSTED_OUTCOME
+        } else {
+            line.as_ref().map_or_else(
+                || release_class_fallback(&log_path, sweep_id, role, item),
+                release_class_of_line,
+            )
+        };
+        // #13919: an issue-attributable fast failure of a Builder step is told
+        // to the captain apart from a plain `failed`, so it counts the fleet-wide
+        // streak. Same window and carve-outs as the ladder's (`effect_of`,
+        // `is_environmental_failure_class`); a progressing release never is,
+        // and neither is `provider_exhausted`.
+        let ran_for = (Utc::now() - started_at).to_std().unwrap_or_default();
+        let release_class = fast_fail_release_class(
+            role,
+            release_class,
+            line.as_ref().map(|l| l.reason.as_str()),
+            ran_for,
+            self.quarantine_config.insta_crash_secs,
+        );
+        crate::fleet_dispatch::worker::release(sweep_id, release_class);
+        if !self.config.skip_label_flip {
+            let reason = seat_busy.unwrap_or(match end {
+                StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
+                StepEnd::Cancelled => "cancelled",
+                StepEnd::Exited(_) => "exited",
+            });
+            if role == StepRole::Builder {
+                self.yield_finished_builder_lease(item, sweep_id, reason);
+            }
+            self.reap_step_leases(sweep_id, reason);
+        }
+        if !self.config.skip_label_flip {
+            super::ended::push(
+                &self.config.workspace_root,
+                super::ended::EndedStep {
+                    sweep_id: sweep_id.to_string(),
+                    item,
+                    role,
+                    log_path: log_path.clone(),
+                    ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
+                    timed_out: end == StepEnd::TimedOut,
+                    provider_exhausted,
+                },
+            );
+        }
+        // #13169: a Builder step that reported a PR names it on its close.
+        // #13521: so does a clean-exit Builder step that wrote no line, to
+        // tell "PR opened, no line" from "no PR, no line". An unreadable PR
+        // stays unknown, so that case keeps the `no-outcome-line` class.
+        let pr_number = (role == StepRole::Builder
+            && match line.as_ref() {
+                Some(l) => l.class == StepOutcomeClass::Verdict,
+                None => matches!(end, StepEnd::Exited(Some(0))),
+            })
+        .then(|| self.builder_pr(item))
+        .flatten();
+        let mut failure = step_failure(role, end, line.as_ref(), provider_exhausted);
+        if pr_number.is_some() {
+            failure = failure.map(no_outcome_line_with_pr);
+        }
+        let outcome = tick_outcome(role, end, line.as_ref());
+        // #12253: the step's `loom.sweep` span ends here, with the outcome
+        // its `role_tick.outcome` reports, not at the next restart's orphan
+        // recovery. Local journal writes only, so it runs under the lock.
+        // #14234: the post-state the claim release noted, if it ran before
+        // this end. Peeked, not taken: `step_end::settle` still classifies
+        // with it. `Some(None)` (a failed read) is no post-state.
+        let post = super::ended::peek_post(&self.config.workspace_root, sweep_id).flatten();
+        let (result, close) = super::span::sweep_close(
+            end,
+            line.as_ref(),
+            &outcome,
+            role,
+            info.map(|i| i.runtime.as_str()),
+            info.and_then(|i| i.model.as_deref()),
+            info.and_then(|i| i.effort.as_deref()),
+            self.step_points(sweep_id),
+            pr_number,
+            provider_exhausted,
+            post,
+        );
+        let trace_context = self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
+        // Hermetic fixtures (no forge) keep their tests free of the detached
+        // transcript scan; the capture itself is tested directly.
+        if !self.config.skip_label_flip {
+            let capture = StepCapture {
+                root: self.config.workspace_root.clone(),
+                role,
+                item,
+                sweep_id: sweep_id.to_string(),
+                trace_context,
+                started_at,
+                outcome,
+                step_outcome: Some(step_outcome_projection(line.as_ref())),
+                failure,
+                model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
+                effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
+                stage: role.as_str().to_string(),
+                log_path: log_path.clone(),
+                runtime: info.map(|i| i.runtime.clone()),
+            };
+            // #12027: the step's verdict record reads its log at the drain.
+            let staged = crate::observability::step_verdict::StagedStep {
+                sweep_id: sweep_id.to_string(),
+                step: role,
+                item,
+                log: log_path,
+                hold_auth_before: self.step_hold_auth(sweep_id),
+            };
+            let spawned = std::thread::Builder::new()
+                .name("step-capture".to_string())
+                .spawn(move || {
+                    crate::observability::step_verdict::stage_step(staged);
+                    emit_step_capture(&capture);
+                });
+            if let Err(e) = spawned {
+                log::warn!("sweep_registry: {sweep_id}: no capture thread ({e})");
+            }
+        }
+        line
+    }
+}

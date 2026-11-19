@@ -931,3 +931,8 @@ fn the_comparison_can_actually_fail() {
     mutated.stdout.push("extra".into());
     assert_ne!(real, mutated, "an extra stdout line must not compare equal");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

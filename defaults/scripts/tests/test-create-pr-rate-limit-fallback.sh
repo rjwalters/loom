@@ -25,20 +25,6 @@ CREATE_PR="$(cd "$SCRIPT_DIR/.." && pwd)/create-pr.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 
-assert_contains() {
-  local haystack="$1" needle="$2" msg="$3"
-  TESTS_RUN=$((TESTS_RUN + 1))
-  if [[ "$haystack" == *"$needle"* ]]; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $msg"
-  else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $msg"
-    echo "    Looking for: '$needle'"
-    echo "    In output:   '$haystack'"
-  fi
-}
-
 if [[ ! -x "$CREATE_PR" ]]; then
   echo "ERROR: $CREATE_PR is not executable" >&2
   exit 1
@@ -168,7 +154,7 @@ run_create_pr --title "t" --body "b" --head feature/issue-78 --base release --dr
 assert_eq "0" "$EXIT_CODE" "T2: rate-limited --draft create -> exit 0"
 assert_eq "release" "$(payload .base)" "T2: --base is used verbatim"
 assert_eq "true" "$(payload .draft)" "T2: --draft -> draft:true"
-assert_eq "0" "$(calls_matching '^api repos/owner/repo --jq')" "T2: no default-branch lookup when --base is given"
+assert_eq "0" "$(calls_matching '^api repos/owner/repo --jq \.default_branch')" "T2: no default-branch lookup when --base is given"
 assert_eq "0" "$(calls_matching '/labels')" "T2: no labels requested -> no labels POST"
 
 # T3/T4: a NON-rate-limit failure makes no REST call and keeps today's exit 1.

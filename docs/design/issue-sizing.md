@@ -183,8 +183,6 @@ A test file takes its subject's status.
 | `defaults/scripts/tests/test-sweep-experiment.sh` | Its test | live |
 | `defaults/docs/model-cost-experiment.md` | Experiment design (#3725, #9122) | live (observe recording) |
 | `docs/model-selection-retune.md` | Cheap-first retune (#3718) | inert-unless-configured |
-| `defaults/scripts/experiments/README.md` | Cites `sweep.modelExperiment` as flag precedent | dead |
-| `defaults/scripts/experiments/judge-fanout-experiment.sh` | Same | dead |
 | `docs/research/dynamic-workflows-evaluation.md` | Same | dead |
 | `loom-daemon/tests/native_tools.rs` | Fixture config `autonomous.modelExperiment`, a key path nothing reads | dead |
 
@@ -199,7 +197,6 @@ A test file takes its subject's status.
 | `loom-daemon/src/forge_pr_congestion.rs` | `points_from_labels`, a **separate** parser that accepts `points:4` | live |
 | `loom-daemon/src/work_finder/ready_queue_tests.rs` | Ready-queue `story_points` for the disposition exporter | live |
 | `loom-daemon/src/sweep_registry/guards/issue_snapshot_tests.rs` | `points:3` label fixture | live |
-| `loom-daemon/src/observability/captain_gauges/facts_tests.rs` | `points:3` label fixture | live |
 | `loom-daemon/src/label_registry/tests.rs` | `points:1` used as a `replaced_by` fixture | live |
 | `.github/labels.yml` | 6 `points:*` labels marked "(paused)" | live |
 | `defaults/.github/labels.yml` | Same (consumer copy) | live |
@@ -409,7 +406,7 @@ first; P2 and P3 each depend on it.
 | Phase | Scope | Key tests |
 |---|---|---|
 | **P1** Points gate (#11663) | Harden `points_marker.rs` (§5a). Resolve the marker from the body and trusted comments through `comment_trust` (§5b). `curation-complete` validates, projects `points:N`, applies `loom:curated` and journals `points` in `issue.estimate`. Fold `forge_pr_congestion::points_from_labels` into `story_points`. | Rejects `3`, `loom:complexity=3`, `loom:points=x`, `points=21` and conflicting duplicates. Accepts a valid marker in a trusted comment; ignores an untrusted commenter's. Body-vs-comment precedence. Quoted and fenced syntax. Projection replaces a stale `points:*` label. No label or journal entry on failure. |
-| **P2** Curator switch and gate deletion (#11664) | `curator.md`, `curator-estimate.md` and their skill mirrors emit `<!-- loom:points=N -->` and drop the tier section. Un-pause `story-points.md`. Drop `difficulty` from `loom:estimate` (prompt and parser). Update `label-state-machine.md` and the `points:*` label descriptions. **Delete** `require-complexity-marker.sh`, its test, and its allowlist, CI and baseline entries. | A missing `difficulty` is accepted. Prompt-budget and markdown-token-budget gates. Codex mirror sync. Shell budget shrinks. |
+| **P2** Curator switch and gate deletion (#11664) | `curator.md`, `curator-estimate.md` and their skill mirrors emit `<!-- loom:points=N -->` and drop the tier section. Un-pause `story-points.md`. Drop `difficulty` from `loom:estimate` (prompt and parser). Update `label-state-machine.md` and the `points:*` label descriptions. **Delete** `require-complexity-marker.sh`, its test, and its allowlist, CI and baseline entries. | A missing `difficulty` is accepted. Prompt-budget and markdown-token-budget gates. Codex mirror sync. |
 | **P3** Delete the tier consumers (#11665) | Delete `resolve-tier-model.sh`, tier 2.5, `tierModels`/`optimization`, the `--tier` flag, `minComplexity`/`ComplexityTier`, Jev (`jev_tier.rs`, its hook and subcommand), `complexity_signal.rs`'s body fetch and `sweep.outcome.complexity`, and the experiment stratum (§6.4). Observe records carry `story_points` (§6.3). The work-finder carrier and write-back read the label. Update the docs in §3.2–§3.4 and `sweep_md_doc_lint.rs`, re-anchor the dead cross-references (§3.1), and fix the dangling "Points estimate marker" reference in `daemon-reference.md`. Split into a Rust change and a docs change only if the diff is too large to review. | Builder resolution is byte-identical without tier config. A stale `minComplexity` rejects dispatch, naming the key. Arm parity test on the issue-only hash. Observe record carries `story_points`. No Jev call path remains. The inventory grep in §3 matches only historical docs and existing markers. |
 
 **Child issues.** #11663 (P1), #11664 (P2) and #11665 (P3) are kept and

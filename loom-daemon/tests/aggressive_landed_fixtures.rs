@@ -16,6 +16,10 @@
 //! What remains is exactly the rung under test — the offline
 //! `git merge-tree --write-tree` tree-equality comparison.
 
+#[allow(dead_code)]
+mod common;
+
+use common::git;
 use std::path::Path;
 
 use loom_daemon::worktree_ops::aggressive::{
@@ -23,19 +27,6 @@ use loom_daemon::worktree_ops::aggressive::{
     LOOM_MANAGED_SENTINEL,
 };
 use loom_daemon::worktree_ops::landed::Landed;
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "loom@example.com")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "loom@example.com")
-        .status()
-        .expect("git must spawn");
-    assert!(status.success(), "git {args:?} failed in {}", dir.display());
-}
 
 /// A repo with an `origin` remote and a seeded `main`, plus a managed
 /// (detached) worktree at `.loom/worktrees/pr-9999` sitting on `head_rev`.
@@ -46,6 +37,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        common::stub_gh_bin_in_process();
         let origin = tempfile::tempdir().unwrap();
         git(origin.path(), &["init", "-q", "--bare"]);
         let repo = tempfile::tempdir().unwrap();
@@ -254,11 +246,10 @@ fn undeterminable_worktree_is_never_reaped_even_with_force() {
 // ---------------------------------------------------------------------------
 // Decision-tree cases for the three-way answer.
 //
-// These live here rather than in `aggressive.rs`'s own `#[cfg(test)]` block
-// only because that file sits at its file-size-ratchet baseline
-// (scripts/file-size-baseline.txt) and may not grow; the decision function is
-// `pub`, so testing it from here is equivalent. The pre-existing in-file cases
-// were rewritten in place to pass `Landed::{Reachable,Rewritten,NotLanded}`.
+// These live here rather than in `aggressive.rs`'s own `#[cfg(test)]` block;
+// the decision function is `pub`, so testing it from here is equivalent. The
+// pre-existing in-file cases were rewritten in place to pass
+// `Landed::{Reachable,Rewritten,NotLanded}`.
 // ---------------------------------------------------------------------------
 
 /// A canonical managed worktree on `feature/issue-42`, matching the in-file
@@ -325,3 +316,8 @@ fn not_landed_is_still_force_removable() {
     assert_eq!(d, Decision::Remove);
     assert_eq!(r, Reason::ForceOverrideUnreachable);
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

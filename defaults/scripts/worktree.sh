@@ -26,7 +26,6 @@
 #     # land "in between" push and pop (#5217, extended to `main` by #6076).
 #   pnpm worktree --check                              # Check if currently in a worktree
 #   pnpm worktree --json <issue-number>                # Machine-readable output
-#   pnpm worktree --return-to <dir> <issue-number>     # Store return directory
 #   pnpm worktree --help                               # Show help
 
 set -e
@@ -837,7 +836,7 @@ _worktree_base() {
 #
 #   - `worktree.sh --check` reported the primary clone as a worktree and exited
 #     0; its "Not currently in a worktree" arm and its exit 1 were dead code,
-#     while `worktree-return.sh` tells operators to run it.
+#     while the docs told operators to run it.
 #   - every `worktree.sh <N>` from the primary clone printed four spurious
 #     lines ("Currently in a worktree, auto-navigating…", a `Current worktree:`
 #     block naming the primary clone, "Found main workspace: .", "Switched to
@@ -941,7 +940,6 @@ Usage:
   pnpm worktree stash-pop <N|main> [--json]             Restore WIP captured by stash-push
   pnpm worktree --check                                 Check if in a worktree
   pnpm worktree --json <issue-number>                   Machine-readable JSON output
-  pnpm worktree --return-to <dir> <issue-number>        Store return directory
   pnpm worktree --help                                  Show this help
 
 Examples:
@@ -1052,9 +1050,6 @@ Examples:
 
   pnpm worktree --json 42
     Output: {"success": true, "worktreePath": "/path/to/.loom/worktrees/issue-42", ...}
-
-  pnpm worktree --return-to $(pwd) 42
-    Creates worktree and stores current directory for later return
 
 Sparse-Mode Notes:
   - --sparse and --full are mutually exclusive
@@ -1200,7 +1195,6 @@ fi
 
 # Check for --json flag
 JSON_OUTPUT=false
-RETURN_TO_DIR=""
 
 if [[ "$1" == "--json" ]]; then
     JSON_OUTPUT=true
@@ -1229,21 +1223,6 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
     trap '' PIPE
 else
     exec 3>&1
-fi
-
-# Check for --return-to flag
-if [[ "$1" == "--return-to" ]]; then
-    RETURN_TO_DIR="$2"
-    shift 2
-    # Validate return directory exists
-    if [[ ! -d "$RETURN_TO_DIR" ]]; then
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Return directory does not exist", "returnTo": "'"$RETURN_TO_DIR"'"}' >&3
-        else
-            print_error "Return directory does not exist: $RETURN_TO_DIR"
-        fi
-        exit 1
-    fi
 fi
 
 # Main worktree creation logic
@@ -1491,6 +1470,12 @@ if [[ -x "$GIT_IDENTITY_CHECK" ]]; then
             echo '{"success": false, "error": "corrupted-git-identity", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
         fi
         exit 1
+    elif [[ "$GIT_IDENTITY_RC" -eq 4 ]]; then
+        # Missing identity (#13088): warn, don't hard-fail. Workers spawned via
+        # spawn-claude.sh set user.useConfigOnly, so a commit will refuse loudly
+        # and name the fix; a hard-fail here would strand read-only uses too.
+        print_warning "No explicit git identity — commits from this worktree will be refused (user.useConfigOnly)."
+        echo "$GIT_IDENTITY_OUTPUT"
     elif [[ "$GIT_IDENTITY_RC" -eq 1 ]]; then
         print_warning "Stacked local git identity values detected (non-fatal — see details below)."
         echo "$GIT_IDENTITY_OUTPUT"
@@ -1626,25 +1611,6 @@ if [[ -d "$WORKTREE_PATH" ]]; then
     _wt_lease_claim; exit 0
 fi
 
-# --- Pre-creation claim probe (#9453 Phase 1) ----------------------------
-# Reached only on the CREATE path (the reuse arm above already exited),
-# before `git worktree add` below. `loom-daemon forge check-claim
-# --force-claim` aggregates the four claim signals; --force-claim because
-# this script's caller has ALWAYS already claimed by the time it runs
-# (builder.md: claim, then create worktree), so the issue legitimately
-# carries the caller's own `loom:building` label, lease, and possibly
-# branch -- the only legs that still refuse are OPEN_PR ("do not build a
-# duplicate"), TARGET_IS_PR (#9929, the number is a PR), CLOSED (#11863,
-# nothing left to build) and FROZEN (#11743, `loom:frozen`: a human took the
-# issue out of every lane), the legs --force-claim can never override. Only exit 0
-# (blocked; its reason token went to >&3, its explanation to stderr)
-# refuses; a read failure, an old daemon, or any other code fails OPEN,
-# exactly like the #8553/#5783 guards above. A caller refused here adopts
-# the existing PR (create-pr.sh) or stands down -- never a suffix branch.
-# requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
-# shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
-[[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
-
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     # The whole arm — the reuse warning, the #6095/#6100 upstream-tracking
@@ -1687,6 +1653,22 @@ else
         fi
         CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/$BRANCH_NAME")
     else
+        # --- Pre-creation claim probe (#9453 Phase 1; fresh-branch only, #9828) ---
+        # Guards fresh-branch creation ONLY: a caller reusing a local or origin
+        # feature/issue-<N> branch (above) is continuing that open PR -- a Doctor
+        # (#9828) -- so OPEN_PR there is expected, and the reuse resolver already
+        # refuses to shadow a real PR. Here we would branch fresh off BASE_REF, so
+        # an open linked PR (e.g. on another branch name) means a duplicate build.
+        # --force-claim: the caller has already claimed (builder.md), so its own
+        # `loom:building`/lease are expected; OPEN_PR, TARGET_IS_PR (#9929, the
+        # number is a PR), CLOSED (#11863, nothing left to build) and FROZEN
+        # (#11743, `loom:frozen`) are the legs it never overrides. Only exit 0
+        # (blocked; reason token to >&3, explanation to stderr) refuses; a read failure, an old daemon, or any other code fails
+        # OPEN, like the #8553/#5783 guards. A refused caller adopts the existing
+        # PR (create-pr.sh) or stands down -- never a suffix branch.
+        # requires-daemon: forge optional   #9453 — `forge check-claim` at worktree creation; without it (absent or pre-#9453 binary) no pre-create OPEN_PR gate is performed and creation proceeds as before
+        # shellcheck disable=SC2015  # the trailing `|| true` IS the fail-open path: only exit 0 (blocked) refuses
+        [[ -n "$_WT_DAEMON_BIN" ]] && "$_WT_DAEMON_BIN" forge check-claim "$ISSUE_NUMBER" --force-claim >&3 && exit 1 || true
         # Create new branch from the base ref (origin/$DEFAULT_BRANCH by default, or
         # the --base override for a stacked child — #3729).
         [[ "$JSON_OUTPUT" == "true" ]] || print_info "Creating new branch from $BASE_DISPLAY"
@@ -1839,15 +1821,6 @@ if _try_worktree_add; then
     # root captured at L824 (cwd is the main workspace here, not the worktree).
     if [[ -d "$WORKTREE_REPO_ROOT/.githooks" ]]; then
         git -C "$ABS_WORKTREE_PATH" config core.hooksPath .githooks
-    fi
-
-    # Store return-to directory if provided
-    if [[ -n "$RETURN_TO_DIR" ]]; then
-        ABS_RETURN_TO=$(cd "$RETURN_TO_DIR" && pwd)
-        echo "$ABS_RETURN_TO" > "$ABS_WORKTREE_PATH/.loom-return-to"
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Stored return directory: $ABS_RETURN_TO"
-        fi
     fi
 
     # --------------------------------------------------------------------
@@ -2010,7 +1983,7 @@ if _try_worktree_add; then
         # Machine-readable JSON output. Sparse mode sets "sparse": true and the
         # "cone": [...] worktree-sparse returned; full mode keeps "sparse":
         # false with the empty cone $CONE_JSON is initialized to.
-        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
+        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
     else
         # Human-readable output
         print_success "Worktree created successfully!"

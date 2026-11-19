@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # `--body @path` Does NOT Expand — It Posts the Literal String (canonical)
 
 Single canonical copy; role prompts' short pointers refer here.

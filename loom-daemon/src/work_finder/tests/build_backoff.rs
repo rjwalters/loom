@@ -28,19 +28,15 @@ const RED: RedMainLane = RedMainLane {
 fn run(
     multi: &mut [(FakeSource, RecordingDispatcher)],
     max: usize,
-    per_repo: Option<usize>,
     lanes: &[RedMainLane],
     held: &[bool],
 ) -> TickReport {
     tick_multi_with_build_backoff(
         multi,
         &[1; 4][..multi.len()],
-        max.into(),
+        max,
         &[false; 4][..multi.len()],
         None,
-        usize::MAX,
-        false,
-        per_repo,
         lanes,
         held,
     )
@@ -59,7 +55,7 @@ fn engaged_defers_every_plain_candidate_and_leaves_in_flight_alone() {
         (FakeSource::once(items()), busy()),
         (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
     ];
-    let report = run(&mut multi, 10, None, &[], &[true, true]);
+    let report = run(&mut multi, 10, &[], &[true, true]);
 
     assert_eq!(report.dispatched, 0);
     assert!(multi.iter().all(|(_, d)| d.dispatched.is_empty()));
@@ -99,7 +95,7 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
         FakeSource::once(vec![issue(1), vi(5), important(6)]),
         RecordingDispatcher::default(),
     )];
-    let report = run(&mut multi, 10, None, &[], &[true]);
+    let report = run(&mut multi, 10, &[], &[true]);
     assert!(multi[0].1.dispatched.is_empty());
     assert_eq!((report.dispatched, report.deferred_build_backoff), (0, 3));
     let rows = ready_queue::finish(&report.queue, &[]);
@@ -108,7 +104,7 @@ fn a_very_important_candidate_is_held_by_the_backoff_like_any_other() {
 
     // The same candidate in a repo that is not held is dispatched.
     let mut multi = vec![(FakeSource::once(vec![vi(5)]), RecordingDispatcher::default())];
-    let report = run(&mut multi, 10, None, &[], &[false]);
+    let report = run(&mut multi, 10, &[], &[false]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
 }
 
@@ -123,7 +119,7 @@ fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
         FakeSource::once(vec![issue(1), vi(5), important(6), fix(9)]),
         RecordingDispatcher::default(),
     )];
-    let report = run(&mut multi, 10, None, &[RED], &[true]);
+    let report = run(&mut multi, 10, &[RED], &[true]);
     assert_eq!(multi[0].1.dispatched, vec![9]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 3));
     let rows = ready_queue::finish(&report.queue, &[]);
@@ -141,63 +137,10 @@ fn a_verified_red_main_fix_bypasses_the_backoff_but_priority_does_not() {
 
     // Without a verified-red main the marker is inert: the fix waits too.
     let mut multi = vec![(FakeSource::once(vec![fix(9)]), RecordingDispatcher::default())];
-    let report = run(&mut multi, 10, None, &[], &[true]);
+    let report = run(&mut multi, 10, &[], &[true]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (0, 1));
     let rows = ready_queue::finish(&report.queue, &[]);
     assert!(!rows[0].main_red_fix);
-}
-
-#[test]
-fn not_held_is_the_repo_cap_tick_exactly() {
-    let items = || vec![issue(1), vi(2), issue(3), fix(4)];
-    let mut a = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
-    let mut b = vec![(FakeSource::once(items()), RecordingDispatcher::default())];
-    let via_backoff = run(&mut a, 2, Some(1), &[RED], &[false]);
-    let via_repo_cap = tick_multi_with_repo_cap(
-        &mut b,
-        &[1],
-        2.into(),
-        &[false],
-        None,
-        usize::MAX,
-        false,
-        Some(1),
-        &[RED],
-    );
-    // Identical but for the admission records' wall-clock stamps.
-    let unstamped = |mut r: TickReport| {
-        let epoch = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
-        for a in &mut r.admissions {
-            (a.started_at, a.ended_at) = (epoch, epoch);
-        }
-        format!("{r:?}")
-    };
-    // On this verified-red repo the fix #4 sorts first (#11547, ahead of the
-    // very-important #2) and fills the repo's cap of 1; nothing overflows it
-    // (#11508).
-    assert_eq!(via_backoff.admissions.len(), 1);
-    assert_eq!(a[0].1.dispatched, vec![4]);
-    assert_eq!(unstamped(via_backoff.clone()), unstamped(via_repo_cap));
-    assert_eq!(a[0].1.dispatched, b[0].1.dispatched);
-    assert_eq!((via_backoff.deferred_build_backoff, via_backoff.build_backoff_held), (0, false));
-}
-
-#[test]
-fn the_saturation_brake_outranks_the_backoff() {
-    let mut multi = vec![(FakeSource::once(vec![issue(1)]), RecordingDispatcher::default())];
-    let report = tick_multi_with_build_backoff(
-        &mut multi,
-        &[1],
-        10.into(),
-        &[false],
-        None,
-        usize::MAX,
-        true,
-        None,
-        &[],
-        &[true],
-    );
-    assert_eq!((report.deferred_saturation, report.deferred_build_backoff), (1, 0));
 }
 
 // -- #10624: per-repo isolation ----------------------------------------------
@@ -211,7 +154,7 @@ fn a_held_repo_defers_only_its_own_candidates() {
         ),
         (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
     ];
-    let report = run(&mut multi, 10, None, &[], &[true, false]);
+    let report = run(&mut multi, 10, &[], &[true, false]);
     assert!(multi[0].1.dispatched.is_empty(), "nothing bypasses repo A's hold");
     assert_eq!(multi[1].1.dispatched, vec![10, 11], "repo B has no debt of its own");
     assert_eq!((report.dispatched, report.deferred_build_backoff), (2, 3));
@@ -233,7 +176,7 @@ fn an_empty_or_all_false_hold_slice_holds_nothing() {
             (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
             (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
         ];
-        let report = run(&mut multi, 10, None, &[], held);
+        let report = run(&mut multi, 10, &[], held);
         assert_eq!((report.dispatched, report.deferred_build_backoff), (2, 0), "{held:?}");
         assert!(!report.build_backoff_held);
     }
@@ -249,7 +192,7 @@ fn a_short_hold_slice_is_a_caller_bug_in_debug_builds() {
         (FakeSource::once(vec![issue(1)]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(2)]), RecordingDispatcher::default()),
     ];
-    let _ = run(&mut multi, 10, None, &[], &[false]);
+    let _ = run(&mut multi, 10, &[], &[false]);
 }
 
 /// #10624: a held repo with nothing to defer does not tag the tick, so the
@@ -260,7 +203,7 @@ fn a_held_repo_with_no_candidates_does_not_tag_the_tick() {
         (FakeSource::once(vec![]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(10)]), RecordingDispatcher::default()),
     ];
-    let report = run(&mut multi, 10, None, &[], &[true, false]);
+    let report = run(&mut multi, 10, &[], &[true, false]);
     assert_eq!((report.dispatched, report.deferred_build_backoff), (1, 0));
     assert!(report.build_backoff_held, "the repo is still held");
     let summary = tick_summary(&report, 10, chrono::Utc::now(), &[], None);
@@ -272,7 +215,7 @@ fn a_held_repo_with_no_candidates_does_not_tag_the_tick() {
         (FakeSource::once(vec![]), RecordingDispatcher::default()),
         (FakeSource::once(vec![issue(10), issue(11)]), RecordingDispatcher::default()),
     ];
-    let report = run(&mut multi, 0, None, &[], &[true, false]);
+    let report = run(&mut multi, 0, &[], &[true, false]);
     assert_eq!(report.deferred_build_backoff, 0);
     assert!(report.deferred_capacity > 0, "{report:?}");
     assert_eq!(crate::observability::ops::dispatch::tick_result(&report), "capacity_full");

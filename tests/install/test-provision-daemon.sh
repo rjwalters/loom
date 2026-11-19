@@ -19,27 +19,21 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=scripts/install/provision-daemon.sh
 source "$REPO_ROOT/scripts/install/provision-daemon.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-PASS=0
-FAIL=0
-TOTAL=0
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
+# Copy a system binary into a fixture (#9720). On macOS 27+ an unsigned copy
+# of a system binary is killed on exec (exit 137), so on Darwin the copy is
+# ad-hoc re-signed; a codesign failure is tolerated. Plain cp elsewhere. The
+# host OS and the real codesign path are resolved HERE, before any test swaps
+# PATH for a fake uname/codesign.
+_FIXTURE_HOST_OS="$(uname 2>/dev/null || true)"
+_FIXTURE_CODESIGN="$(command -v codesign 2>/dev/null || true)"
+copy_fixture_bin() {
+  cp "$1" "$2" || return 1
+  if [[ "$_FIXTURE_HOST_OS" == Darwin && -n "$_FIXTURE_CODESIGN" ]]; then
+    "$_FIXTURE_CODESIGN" -f -s - "$2" >/dev/null 2>&1 || true
   fi
 }
+
+source "$SCRIPT_DIR/lib/assert.sh"
 
 assert_contains() {
   local desc="$1" haystack="$2" needle="$3"
@@ -194,7 +188,8 @@ chmod +x "$FAKE_FILE_DIR/file"
 # host has installed. Used by test 36 to assert the soft-pass contract.
 NO_FILE_DIR="$WORKDIR/no-file-bin"
 mkdir -p "$NO_FILE_DIR"
-for tool in uname mkdir install cp mv chmod rm ln readlink env bash sh head; do
+# sleep: _pmd_verify_binary_loadable (#8843) polls with `sleep 1`; without it the 10s cap collapses to ~10 instant spins and a slow-starting fresh binary fails with exit 124 (#9720).
+for tool in uname mkdir install cp mv chmod rm ln readlink env bash sh head sleep; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_FILE_DIR/$tool"
 done
@@ -337,7 +332,8 @@ assert_eq "non-Darwin: codesign is never invoked" "0" "$( [[ -e "$CODESIGN_MARKE
 # and never attempt to invoke a missing codesign.
 NO_CODESIGN_DIR="$WORKDIR/no-codesign-bin"
 mkdir -p "$NO_CODESIGN_DIR"
-for tool in uname mkdir install cp mv rm chmod env bash sh; do
+# sleep: _pmd_verify_binary_loadable (#8843) polls with `sleep 1`; without it the 10s cap collapses to ~10 instant spins and a slow-starting fresh binary fails with exit 124 (#9720).
+for tool in uname mkdir install cp mv rm chmod env bash sh sleep; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [[ -n "$tool_path" ]] && ln -sf "$tool_path" "$NO_CODESIGN_DIR/$tool"
 done
@@ -534,13 +530,15 @@ assert_contains "gate rejection names the reason" "$out14" "not a compiled binar
 assert_eq "gate rejection installs nothing" "0" "$( [[ -e "$DEST14/loom-daemon" ]] && echo 1 || echo 0 )"
 
 # ---------- test 15: binary-format gate (#4397) — accepts a REAL compiled
-# executable (a copy of /bin/cat, standing in for a real Mach-O/ELF daemon
-# binary) even without the bypass. Also runs with the pinned file(1) stub
+# executable (a copy of the running bash, standing in for a real Mach-O/ELF
+# daemon binary) even without the bypass. Not `cat`: the gate runs
+# `<bin> --version` and needs rc 0 + output, and BSD `cat` rejects
+# `--version` (#12045). Also runs with the pinned file(1) stub
 # (#6662) — see test 37 for the live-tool assertion.
 # ---------------------------------------------------------------------------
 SRC15="$WORKDIR/src15/loom-daemon"
 mkdir -p "$WORKDIR/src15"
-cp "$(command -v cat)" "$SRC15"
+copy_fixture_bin "$BASH" "$SRC15"
 chmod +x "$SRC15"
 DEST15="$WORKDIR/dest15"
 _out15=$( ( unset LOOM_PROVISION_ALLOW_SCRIPT
@@ -971,7 +969,7 @@ mkdir -p "$WORKDIR/src37"
 SRC37_SCRIPT="$WORKDIR/src37/loom-daemon-script"
 SRC37_BIN="$WORKDIR/src37/loom-daemon-compiled"
 make_fake_bin "$SRC37_SCRIPT" "0.19.7"
-cp "$(command -v cat)" "$SRC37_BIN"
+copy_fixture_bin "$(command -v cat)" "$SRC37_BIN"
 chmod +x "$SRC37_BIN"
 
 if command -v file >/dev/null 2>&1; then

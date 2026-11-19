@@ -607,3 +607,8 @@ fn the_landing_predicate_keeps_the_fallback_and_excludes_non_landings() {
     let cancelled: i64 = prepared.query_row([], |row| row.get(0)).unwrap();
     assert_eq!(cancelled, 0, "a cancelled sweep opens no PR and lands nothing");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

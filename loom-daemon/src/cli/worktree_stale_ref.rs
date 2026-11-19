@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::stale_ref;
+use crate::worktree_cli::stale_ref;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeStaleRefArgs {

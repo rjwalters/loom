@@ -11,7 +11,8 @@
 //! sourced shell library, which external consumers (2AMLogic/miniset's E2B
 //! shim) had to download or vendor. This module ports both, byte-compatibly;
 //! the shell library now delegates here when a daemon binary resolves and
-//! keeps its in-file tables as the no-daemon fallback.
+//! (since #11219) carries no tables of its own: with no capable daemon it
+//! gives a fail-safe degraded answer.
 //!
 //! What is NOT here: `crate::retry_classify`'s wrappers-side predicates
 //! (retry vs give up, rotate, mark dead, backoff). Those keep taking the
@@ -30,8 +31,7 @@
 //!   `include_str!` — the same file the shell suite reads.
 //! * `defaults/scripts/tests/test-classify-error.sh` runs its whole existing
 //!   table through the shell library, which now delegates here when a binary
-//!   resolves, and diffs the in-file shell tables against this subcommand on
-//!   every vector row.
+//!   resolves, and checks the degraded answer when none does.
 //! * `tests/test-claude-wrapper-retry.sh` and the spawn suites run the
 //!   wrapper's predicates end-to-end unchanged.
 //!
@@ -49,9 +49,8 @@
 //!   `regex` crate supports both, and `(?i)` on a negated class like
 //!   `[^a-z]` excludes the upper-case range exactly as `grep -i` does.
 //!
-//! Any divergence between this module and the shell tables is a bug in one of
-//! them; the vectors and the parity section of the shell suite are the
-//! tripwires. Change the two TOGETHER or not at all.
+//! This module is the only copy of the pattern tables (#11219); the vectors
+//! fixture and the shell suite are the tripwires for behavior changes.
 
 #[cfg(test)]
 mod tests;

@@ -9,7 +9,7 @@
 //! `.agents/skills/<name>/SKILL.md`, the cross-vendor skills convention (see
 //! `superset-sh/superset`'s `docs/agent-tooling.md`, whose provisioner this
 //! module's ownership marker mirrors). This is the SECOND single-source
-//! instruction surface alongside `generate-agents-md.sh` (which covers the
+//! instruction surface alongside `scripts/generate-agents-md.sh` (which covers the
 //! top-level repo guide, not the per-role skill files) — see
 //! `runtime-adapters.md` §5.
 //!
@@ -129,6 +129,33 @@ pub fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Strip a leading YAML frontmatter block (`---` … `---`) from a source file,
+/// returning the body that follows it. Returns the input unchanged when there
+/// is no leading block.
+///
+/// Source command files may carry frontmatter for Claude Code's listing
+/// surface — reference sub-documents set `disable-model-invocation: true` so
+/// their description stays out of every session's context (#13960). The
+/// generated `SKILL.md` renders its own frontmatter, so the source's block
+/// must not also be embedded verbatim in the body.
+#[must_use]
+pub fn strip_leading_frontmatter(source: &str) -> &str {
+    let mut lines = source.split('\n');
+    let first = lines.next().unwrap_or("");
+    if first.trim_end_matches('\r') != "---" {
+        return source;
+    }
+    let mut offset = first.len() + 1; // the '\n' the split dropped
+    for line in lines {
+        offset += line.len() + 1; // the '\n' the split dropped
+        match line.trim_end_matches('\r') {
+            "---" | "..." => return source.get(offset..).unwrap_or(""),
+            _ => {}
+        }
+    }
+    source
+}
+
 /// Rewrite flat sibling-skill links for the one-dir-per-skill output layout.
 ///
 /// Every source file lives together in `defaults/.claude/commands/loom/`, so a
@@ -233,9 +260,10 @@ pub fn generate_all(defaults_dir: &Path) -> Result<Vec<GeneratedSkill>, Generate
             })?;
         let json_path = roles_dir.join(format!("{name}.json"));
         let json_text = fs::read_to_string(&json_path).ok();
-        let description = derive_description(&source_content, json_text.as_deref())
+        let body_source = strip_leading_frontmatter(&source_content);
+        let description = derive_description(body_source, json_text.as_deref())
             .ok_or_else(|| GenerateError::MissingDescription { name: name.clone() })?;
-        let body = rewrite_sibling_skill_links(&source_content, &names);
+        let body = rewrite_sibling_skill_links(body_source, &names);
         let content = render_skill_md(name, &description, &body);
         let out_path = out_root.join(format!("loom-{name}")).join("SKILL.md");
         out.push(GeneratedSkill {
@@ -293,6 +321,61 @@ mod tests {
     #[test]
     fn yaml_escape_handles_quotes_and_backslashes() {
         assert_eq!(yaml_escape(r#"a "quoted" \path"#), r#"a \"quoted\" \\path"#);
+    }
+
+    #[test]
+    fn strip_removes_a_leading_frontmatter_block() {
+        let src = "---\ndisable-model-invocation: true\n---\n# Heading\n\nBody.\n";
+        assert_eq!(strip_leading_frontmatter(src), "# Heading\n\nBody.\n");
+    }
+
+    #[test]
+    fn strip_accepts_ellipsis_closer_and_crlf_lines() {
+        assert_eq!(strip_leading_frontmatter("---\nx: 1\n...\nrest\n"), "rest\n");
+        assert_eq!(strip_leading_frontmatter("---\r\nx: 1\r\n---\r\nrest\r\n"), "rest\r\n");
+    }
+
+    #[test]
+    fn strip_leaves_sources_without_a_leading_block_alone() {
+        for src in [
+            "# Heading\n\nBody.\n",
+            "Prose before any heading.\n",
+            // A leading `---` with no closing delimiter is not frontmatter.
+            "---\nnot frontmatter\n",
+            "",
+        ] {
+            assert_eq!(strip_leading_frontmatter(src), src);
+        }
+    }
+
+    #[test]
+    fn generate_all_strips_source_frontmatter_from_the_body() {
+        // #13960: reference sub-doc sources carry
+        // `disable-model-invocation: true` for Claude Code's listing; the
+        // generated cross-vendor SKILL.md must stay byte-identical to the
+        // same source without the block.
+        let tmp = tempfile::tempdir().unwrap();
+        let defaults = tmp.path();
+        write(&defaults.join("roles/probe-protocol.md"), "symlink-placeholder");
+        let plain = "# Terminal Probe Protocol\n\nRespond to probes.\n";
+        write(
+            &defaults.join(".claude/commands/loom/probe-protocol.md"),
+            &format!("---\ndisable-model-invocation: true\n---\n{plain}"),
+        );
+
+        let flagged = generate_all(defaults).unwrap().remove(0);
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let defaults2 = tmp2.path();
+        write(&defaults2.join("roles/probe-protocol.md"), "symlink-placeholder");
+        write(&defaults2.join(".claude/commands/loom/probe-protocol.md"), plain);
+        let unflagged = generate_all(defaults2).unwrap().remove(0);
+
+        assert_eq!(flagged.content, unflagged.content);
+        assert!(!flagged.content[40..].starts_with("---"));
+        assert!(flagged
+            .content
+            .contains("description: \"Respond to probes.\""));
     }
 
     #[test]
@@ -448,5 +531,34 @@ mod tests {
         write(&defaults.join("roles/README.md"), "# index\n");
         let skills = generate_all(defaults).unwrap();
         assert!(skills.is_empty());
+    }
+
+    /// The committed `defaults/.agents/skills/` copies must equal what the
+    /// generator renders from the role docs. When they lag, a fresh install
+    /// (which regenerates) looks "edited in place" to the resync local-fix
+    /// guard. Fails on a stale file and on a missing one.
+    #[test]
+    fn committed_agent_skills_match_generator_output() {
+        let defaults = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("defaults");
+        let skills = generate_all(&defaults).unwrap();
+        assert!(!skills.is_empty(), "generator produced no skills from {}", defaults.display());
+
+        let mut problems = Vec::new();
+        for skill in &skills {
+            match fs::read_to_string(&skill.out_path) {
+                Ok(on_disk) if on_disk == skill.content => {}
+                Ok(_) => problems.push(format!("STALE:   {}", skill.out_path.display())),
+                Err(_) => problems.push(format!("MISSING: {}", skill.out_path.display())),
+            }
+        }
+        assert!(
+            problems.is_empty(),
+            "committed defaults/.agents/skills are out of sync with defaults/roles:\n{}\n\
+             Regenerate with: loom-daemon generate-agent-skills --defaults defaults",
+            problems.join("\n")
+        );
     }
 }

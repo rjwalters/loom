@@ -526,6 +526,7 @@ fn deferrals_are_broken_down_per_repo() {
         updated_at: None,
         held_until: None,
         story_points: None,
+        step: None,
     };
     let queue = vec![
         row(1, 1, Qd::DeferredBuildBackoff),

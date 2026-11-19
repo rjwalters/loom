@@ -2,17 +2,17 @@
 //! hold that file at its file-size ratchet (Issue #11304).
 //!
 //! - [`SweepRegistry::unwind_local_claim`]: undo this dispatch attempt's own
-//!   purely local side effects (peer-claim advertisement, claim lock,
-//!   in-flight idempotency key) — shared by every abandon branch whose unwind
-//!   is exactly those three steps in that order.
+//!   purely local side effects (claim lock, in-flight idempotency key) —
+//!   shared by every abandon branch whose unwind is exactly those two steps in
+//!   that order.
 //! - [`SweepRegistry::release_claim_if_closed_after_flip`]: step 4e, the
 //!   post-claim closed-issue re-verification.
 
 use super::*;
 
 impl SweepRegistry {
-    /// Retract this host's peer-claim advertisement (3a), release the claim
-    /// lock (3) it owns, and — #9572 — release the in-flight idempotency key
+    /// Release the claim lock (3) this attempt owns, and — #9572 — release
+    /// the in-flight idempotency key
     /// claimed at step 3.05 so a later same-key dispatch is not wedged behind
     /// a sweep that never spawned.
     pub(super) fn unwind_local_claim(
@@ -21,7 +21,6 @@ impl SweepRegistry {
         sweep_id: &str,
         idempotency_key: Option<&String>,
     ) {
-        self.publish_peer_claim(peer_claims::ClaimKind::Retract, issue_number);
         let _ = self.release_lock_owned(issue_number, sweep_id);
         if let Some(key) = idempotency_key {
             self.inflight_idempotency.remove(key);
@@ -64,13 +63,16 @@ impl SweepRegistry {
     /// `restore_label_to_ready`, whose independent state probes can fail and
     /// fall back to re-adding `loom:issue` to the known-closed issue. The
     /// caller must not have spawned a child yet.
-    pub(super) fn release_claim_if_closed_after_flip(
-        &mut self,
+    pub(super) fn release_claim_if_closed_after_flip_via<
+        A: super::registry_access::RegistryAccess,
+    >(
+        acc: &mut A,
         issue_number: u32,
         sweep_id: &str,
         idempotency_key: Option<&String>,
     ) -> Result<()> {
-        if self.guard_closed_or_pr(issue_number) != Some(true) {
+        // Lock-free (#9573): the re-probe is a forge read.
+        if acc.unlocked(|r| r.guard_closed_or_pr(issue_number)) != Some(true) {
             return Ok(());
         }
         log::warn!(
@@ -78,11 +80,12 @@ impl SweepRegistry {
              PR) right after the claim flip (#11304) - the pre-flip guard failed open. \
              Releasing the claim instead of spawning a builder."
         );
-        let restore = self.remove_building_claim(issue_number);
+        let restore = acc.unlocked(|r| r.remove_building_claim(issue_number));
+        let sr = acc.reg();
         if restore.is_ok() {
-            self.note_label_flip(issue_number); // #4485 flap detection
+            sr.note_label_flip(issue_number); // #4485 flap detection
         }
-        self.unwind_local_claim(issue_number, sweep_id, idempotency_key);
+        sr.unwind_local_claim(issue_number, sweep_id, idempotency_key);
         match restore {
             Ok(()) => Err(anyhow!(
                 "refusing to dispatch issue #{issue_number}: it was found closed on the forge \

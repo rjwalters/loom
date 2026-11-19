@@ -1,4 +1,7 @@
 //! Owned Rust launch/tool contracts. Real provider canaries are separate evidence.
+#[allow(dead_code)]
+mod common;
+
 use loom_daemon::{
     observability::{lifecycle, queue::DurableQueue},
     telemetry::{
@@ -10,27 +13,16 @@ use serde_json::json;
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
-    sync::OnceLock,
 };
 
-fn fixture() -> &'static PathBuf {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap().keep();
-        let bin = dir.join("harness");
-        assert!(Command::new("rustc")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/worker_cli.rs"))
-            .arg("-o")
-            .arg(&bin)
-            .status()
-            .unwrap()
-            .success());
-        bin
-    })
-}
+#[path = "support/worker_cli.rs"]
+mod worker_cli;
+use worker_cli::fixture;
+
 fn root() -> tempfile::TempDir {
+    common::stub_gh_bin_in_process();
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join(".loom")).unwrap();
     fs::write(dir.path().join(".loom/config.json"), json!({"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}).to_string()).unwrap();
@@ -38,6 +30,7 @@ fn root() -> tempfile::TempDir {
 }
 fn command(root: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_loom-daemon"));
+    common::deny_real_gh(&mut cmd);
     cmd.current_dir(root)
         .env("LOOM_WORKSPACE", root)
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
@@ -77,7 +70,12 @@ fn failed_spawn_completes_and_retires_the_prepared_root() {
     let root = dir.path();
     let execution = "missing-executable";
     let mut cmd = Command::new(root.join("does-not-exist"));
-    loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, None);
+    loom_daemon::observability::tracing::prepare_child(
+        &mut cmd,
+        root,
+        execution,
+        &Default::default(),
+    );
     assert!(TraceStore::new(root).path(root, execution).exists());
     let error = lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -108,49 +106,51 @@ fn issue_sweeps(
     let mut sweeps = Vec::new();
     for execution in executions {
         let mut cmd = Command::new(root.join("does-not-exist"));
-        loom_daemon::observability::tracing::prepare_child(&mut cmd, root, execution, Some(issue));
+        loom_daemon::observability::tracing::prepare_child(
+            &mut cmd,
+            root,
+            execution,
+            &loom_daemon::observability::lifecycle::StepKeys::issue(Some(issue)),
+        );
         lifecycle::spawn_child(&mut cmd, root, execution).unwrap_err();
         sweeps.extend(
             spans(root).into_iter().filter(|s| {
                 s.name == SpanName::Sweep && s.attributes["loom.sweep_id"] == *execution
             }),
         );
-        // The story-parented root still counts as this journal's root (#9038),
-        // so the drained execution retires instead of leaking its context.
+        // The drained execution retires instead of leaking its context.
         assert!(!TraceStore::new(root).path(root, execution).exists());
     }
     sweeps
 }
 
 #[test]
-fn issue_execution_joins_the_story_trace_and_still_retires() {
+fn issue_execution_is_its_own_root_and_still_retires() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:RJWalters/Loom.git");
-    // Stubbed resolver: the D32 v1 key is the repo_id, not the origin's name.
     loom_daemon::telemetry::repo_identity::seed(
         "RJWalters/Loom",
         loom_daemon::telemetry::repo_identity::parse("1073994527 rjwalters/loom"),
     );
-    let story = loom_daemon::telemetry::trace::story_context(1_073_994_527, 9038).unwrap();
-    let sweeps = issue_sweeps(root, &["story-attempt-1", "story-attempt-2"], 9038);
+    let sweeps = issue_sweeps(root, &["issue-attempt-1", "issue-attempt-2"], 9038);
     assert_eq!(sweeps.len(), 2);
     for sweep in &sweeps {
-        assert_eq!(sweep.context.trace_id, story.trace_id);
-        assert_eq!(sweep.parent_span_id.as_ref(), Some(&story.span_id));
+        assert_eq!(sweep.parent_span_id, None);
         assert_eq!(sweep.attributes["loom.issue"], "9038");
         assert_eq!(sweep.attributes["loom.repo"], "rjwalters/loom");
-        assert_eq!(sweep.attributes["loom.story_id"], story.trace_id.as_str());
-        assert_eq!(sweep.attributes["loom.story"], "rjwalters/loom#9038");
-        assert_eq!(sweep.attributes["loom.story.key_version"], "v1");
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
+            assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
+        }
     }
+    assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
     assert_ne!(sweeps[0].context.span_id, sweeps[1].context.span_id);
 }
 
-/// #10637: a story sweep's `loom.repo` is GitHub's spelling of the repo (the
-/// one `loom.dispatch.*` carries), not the origin's, and never lowercased.
+/// #10637: a sweep's `loom.repo` is GitHub's spelling of the repo (the one
+/// `loom.dispatch.*` carries), not the origin's, and never lowercased.
 #[test]
-fn story_sweep_names_its_repo_as_github_spells_it() {
+fn issue_sweep_names_its_repo_as_github_spells_it() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:twoam-fixture/story-case.git");
@@ -161,34 +161,23 @@ fn story_sweep_names_its_repo_as_github_spells_it() {
     let sweeps = issue_sweeps(root, &["case-attempt-1"], 10637);
     assert_eq!(sweeps.len(), 1);
     assert_eq!(sweeps[0].attributes["loom.repo"], "TwoAM-Fixture/Story-Case");
-    assert_eq!(sweeps[0].attributes["loom.story"], "TwoAM-Fixture/Story-Case#10637");
 }
 
 #[test]
-fn unresolvable_repo_id_makes_the_execution_its_own_root() {
+fn unresolvable_repo_identity_still_names_the_issue() {
     let dir = root();
     let root = dir.path();
     git_repo_with_origin(root, "git@github.com:unresolvable-owner/no-repo-id.git");
     loom_daemon::telemetry::repo_identity::seed("unresolvable-owner/no-repo-id", None);
     let sweeps = issue_sweeps(root, &["orphan-attempt-1", "orphan-attempt-2"], 7);
     assert_eq!(sweeps.len(), 2);
-    // Never a name-derived story: no shared trace, no parent, no story attrs.
-    let name_derived = loom_daemon::telemetry::trace::TraceId::derived(&[
-        "loom.story.trace",
-        "unresolvable-owner/no-repo-id",
-        "7",
-    ]);
     for sweep in &sweeps {
         assert_eq!(sweep.parent_span_id, None);
-        assert_ne!(sweep.context.trace_id, name_derived);
-        for key in [
-            "loom.story_id",
-            "loom.story",
-            "loom.story.key_version",
-            "loom.issue",
-        ] {
+        for key in ["loom.story_id", "loom.story", "loom.story.key_version"] {
             assert!(!sweep.attributes.contains_key(key), "{key} must be absent");
         }
+        // #11982: the issue is a plain fact, whatever the identity lookup said.
+        assert_eq!(sweep.attributes["loom.issue"], "7");
     }
     assert_ne!(sweeps[0].context.trace_id, sweeps[1].context.trace_id);
 }
@@ -452,5 +441,281 @@ fn actual_checkpoint_cli_preserves_rapid_judge_doctor_repair_waterfall() {
         for (key, value) in &scope {
             assert_eq!(span.attributes.get(key), Some(value), "{key} on {:?}", span.name);
         }
+    }
+}
+
+/// #14167: with no inherited context (tracing disabled), the scope a child
+/// can stamp is the repo alone — the item stays absent rather than guessed.
+#[test]
+fn a_child_without_an_inherited_context_stamps_only_the_repo() {
+    let dir = root();
+    let root = dir.path();
+    let scope = lifecycle::inherited_scope(root);
+    assert!(scope.contains_key("loom.repo"));
+    assert!(!scope.contains_key("loom.issue"));
+    assert!(!scope.contains_key("loom.pr_number"));
+    assert!(!scope.contains_key("loom.sweep_id"));
+    assert!(!scope.contains_key("loom.role"));
+}
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;
+
+/// #14167: every runtime's `loom.runtime.run` span carries the identity facts
+/// — role, repo, item and sweep id, stamped from the inherited execution
+/// root and the pinned environment — and only the launch facts its runtime
+/// actually resolves: a native harness its profile selection, a legacy
+/// adapter its documented precedence (the handed-over `--model`/`--effort`
+/// argv, then the `LOOM_MODEL` / `LOOM_CODEX_MODEL` / `LOOM_EFFORT` env
+/// tier). A runtime that reports no launched model leaves `loom.model`
+/// ABSENT rather than filling it with a configured value, and no account
+/// name ever reaches a span.
+#[test]
+fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
+    // Native (opencode): identity plus the selection it launched with.
+    {
+        let dir = root();
+        let root = dir.path();
+        // A role-tagged launch is admitted against its role manifest; the
+        // fixture role carries no runtime requirements.
+        let roles = root.join(".loom/roles");
+        fs::create_dir_all(&roles).unwrap();
+        fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        let sweep = lifecycle::begin(
+            root,
+            "identity-sweep",
+            SpanName::Sweep,
+            lifecycle::attributes(&[
+                ("loom.repo", "acme/widget"),
+                ("loom.issue", "18"),
+                ("loom.sweep_id", "identity-sweep"),
+                ("loom.role", "builder"),
+            ]),
+        )
+        .unwrap();
+        let mut cmd = command(root);
+        cmd.args([
+            "spawn-worker",
+            "--",
+            "-p",
+            "hello",
+            "--model",
+            "example/model-v2",
+            "--effort",
+            "high",
+        ])
+        .env("LOOM_RUNTIME", "opencode")
+        .env("LOOM_ROLE", "builder")
+        .env("LOOM_SWEEP_ID", "identity-sweep")
+        .env_remove("LOOM_EFFORT");
+        sweep.command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        lifecycle::finish_execution(root, "identity-sweep", "success", Default::default());
+        let run = spans(root)
+            .into_iter()
+            .find(|s| s.name == SpanName::RuntimeRun)
+            .unwrap();
+        assert_eq!(run.attributes["loom.runtime"], "opencode");
+        assert_eq!(run.attributes["loom.role"], "builder");
+        assert_eq!(run.attributes["loom.repo"], "acme/widget");
+        assert_eq!(run.attributes["loom.issue"], "18");
+        assert_eq!(run.attributes["loom.sweep_id"], "identity-sweep");
+        // The opencode adapter splits `provider/model`; the span names the
+        // model half it launched (the provider rides `loom.provider`).
+        assert_eq!(run.attributes["loom.model"], "model-v2");
+        assert_eq!(run.attributes["loom.provider"], "example");
+        assert_eq!(run.attributes["loom.effort"], "high");
+    }
+    // Legacy claude/codex: the handed-over argv, the env tier, or absence.
+    // `env_effort` is `LOOM_EFFORT`; `expect_effort` is `None` for "absent".
+    type LegacyRow = (
+        &'static str,
+        bool,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        &'static [&'static str],
+    );
+    const UNRELATED_CONFIG: &str =
+        r#"--config=developer_instructions="model_reasoning_effort=low""#;
+    let legacy_rows: [LegacyRow; 14] = [
+        ("claude", true, "", Some("sonnet"), "", Some("high"), &[]),
+        ("codex", true, "", Some("gpt-5.1"), "", Some("high"), &[]),
+        // Nothing on argv and nothing in the env tier: absent, never the
+        // configured value (there is none to fill it with here).
+        ("claude", false, "", None, "", None, &[]),
+        // Codex's static per-seat default is the env tier of last resort.
+        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model"), "", None, &[]),
+        // #14302: the adapter splits `model@effort` on the first `@`; the
+        // span records the base as the model and the suffix as the effort.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "",
+            Some("high"),
+            &[],
+        ),
+        // `LOOM_EFFORT` outranks the suffix, as in the adapter.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "low",
+            Some("low"),
+            &[],
+        ),
+        // An empty suffix is no effort; an empty base is no model.
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@",
+            Some("gpt-5-codex"),
+            "",
+            None,
+            &[],
+        ),
+        ("codex", false, "LOOM_CODEX_MODEL=@high", None, "", None, &[]),
+        // An explicit model arg suppresses the env split (and its suffix).
+        (
+            "codex",
+            true,
+            "LOOM_CODEX_MODEL=seat@low",
+            Some("gpt-5.1"),
+            "",
+            Some("high"),
+            &[],
+        ),
+        // #14414: an explicit `-c model_reasoning_effort=` outranks `--effort`
+        // and `LOOM_EFFORT`, with or without a model arg, and the span records
+        // what the adapter launches rather than the lower-tier value.
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("low"),
+            &["-c", "model_reasoning_effort=low"],
+        ),
+        // An unrelated inline value suppresses the launcher's fallback but
+        // supplies no effort of its own. A genuine assignment still wins.
+        ("codex", true, "", Some("gpt-5.1"), "", None, &[UNRELATED_CONFIG]),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &["-c", "model_reasoning_effort=medium", UNRELATED_CONFIG],
+        ),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &[
+                UNRELATED_CONFIG,
+                "--config",
+                "model_reasoning_effort=medium",
+            ],
+        ),
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "medium",
+            Some("low"),
+            &["-c", "model_reasoning_effort=low"],
+        ),
+    ];
+    for (runtime, model_arg, env_tier, expect_model, env_effort, expect_effort, extra_args) in
+        legacy_rows
+    {
+        let dir = root();
+        let root = dir.path();
+        let scripts = root.join(".loom/scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::copy(fixture(), scripts.join(format!("spawn-{runtime}.sh"))).unwrap();
+        let roles = root.join(".loom/roles");
+        fs::create_dir_all(&roles).unwrap();
+        fs::write(roles.join("builder.json"), r#"{"runtimeRequirements":[]}"#).unwrap();
+        let sweep = lifecycle::begin(
+            root,
+            "legacy-sweep",
+            SpanName::Sweep,
+            lifecycle::attributes(&[
+                ("loom.repo", "acme/widget"),
+                ("loom.issue", "18"),
+                ("loom.sweep_id", "legacy-sweep"),
+            ]),
+        )
+        .unwrap();
+        let mut cmd = command(root);
+        cmd.arg("spawn-worker").arg("--").arg("-p").arg("hello");
+        if model_arg {
+            let model = if runtime == "codex" {
+                "gpt-5.1"
+            } else {
+                "sonnet"
+            };
+            cmd.args(["--model", model, "--effort", "high"]);
+        }
+        cmd.args(extra_args);
+        cmd.env("LOOM_RUNTIME", runtime)
+            .env("LOOM_ROLE", "builder")
+            .env("LOOM_SWEEP_ID", "legacy-sweep")
+            // The account the launch would run on is an env fact; a span must
+            // carry the pool KIND, never this name.
+            .env("LOOM_ACCOUNT_NAME", "SECRET-ACCOUNT-NAME")
+            .env_remove("LOOM_MODEL")
+            .env_remove("LOOM_EFFORT");
+        if !env_effort.is_empty() {
+            cmd.env("LOOM_EFFORT", env_effort);
+        }
+        if runtime == "codex" {
+            // #8787's private-clone containment is pool machinery no fixture
+            // has; the adapter's explicit-credential env bypasses it.
+            cmd.env("LOOM_CODEX_NO_EXEC", "1");
+        }
+        if env_tier == "LOOM_CODEX_MODEL" {
+            cmd.env("LOOM_CODEX_MODEL", "seat-model");
+        } else if let Some(value) = env_tier.strip_prefix("LOOM_CODEX_MODEL=") {
+            cmd.env("LOOM_CODEX_MODEL", value);
+        } else {
+            cmd.env_remove("LOOM_CODEX_MODEL");
+        }
+        sweep.command(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{runtime}: {}", String::from_utf8_lossy(&out.stderr));
+        lifecycle::finish_execution(root, "legacy-sweep", "success", Default::default());
+        let records = spans(root);
+        let run = records
+            .iter()
+            .find(|s| s.name == SpanName::RuntimeRun)
+            .unwrap();
+        assert_eq!(run.attributes["loom.runtime"], runtime, "{runtime}");
+        assert_eq!(run.attributes["loom.role"], "builder", "{runtime}");
+        assert_eq!(run.attributes["loom.repo"], "acme/widget", "{runtime}");
+        assert_eq!(run.attributes["loom.issue"], "18", "{runtime}");
+        assert_eq!(run.attributes["loom.sweep_id"], "legacy-sweep", "{runtime}");
+        assert_eq!(run.attributes.get("loom.model").map(String::as_str), expect_model, "{runtime}");
+        assert_eq!(
+            run.attributes.get("loom.effort").map(String::as_str),
+            expect_effort,
+            "{runtime} {env_tier} effort"
+        );
+        let bytes = serde_json::to_string(&records).unwrap();
+        assert!(!bytes.contains("SECRET-ACCOUNT-NAME"), "{runtime} leaks an account name");
     }
 }

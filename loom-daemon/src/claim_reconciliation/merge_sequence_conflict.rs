@@ -1,5 +1,6 @@
-//! Ordering edges require a REAL merge conflict, not just a shared filename
-//! (#10350).
+//! The real merge-conflict pair predicate (#10350): a shared filename is not a
+//! conflict. Since #12775 the planner no longer orders by it; Phase 1's
+//! no-overlap release and conflict stacking (`stack_parent`) still do.
 //!
 //! A shared changed filename is a cheap prefilter: two PRs that each add one
 //! `pub mod` line to `loom-daemon/src/lib.rs` share a file, but their edits
@@ -13,7 +14,9 @@
 //! ```
 //!
 //! — a three-way merge of the two heads against their merge base. Exit 0 is a
-//! clean merge (no edge); exit 1 is a conflict (keep the edge). The command
+//! clean merge (no edge); exit 1 is a conflict (keep the edge), unless the only
+//! conflicted path (`--name-only`) is `CHANGELOG.md`: a same-spot changelog
+//! insertion is resolved by the Doctor, not by serialising merges (#12595). The command
 //! writes objects only: no working tree, index or ref of the workspace is
 //! touched.
 //!
@@ -39,10 +42,11 @@
 //! verdicts are stored — a failure is retried next tick.
 //!
 //! Stacked-base edges (follower base == predecessor head) never consult this
-//! predicate: the planner keeps them unconditionally.
+//! predicate, and since #12775 nothing in the planner does.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -115,13 +119,6 @@ impl Deadline {
 /// The pair predicate the planner and Phase 1 take: `true` = the two PRs
 /// really conflict (or it is unknown).
 pub type Conflicts<'a> = &'a dyn Fn(&SequencePr, &SequencePr) -> bool;
-
-/// The filename-only behaviour: every shared-file pair conflicts. Used by the
-/// pure planner entry points that take no predicate.
-#[must_use]
-pub fn assume_conflict(_: &SequencePr, _: &SequencePr) -> bool {
-    true
-}
 
 /// Per-tick pair-conflict predicate over an evaluator `E`, which returns
 /// `Some(true)` for a conflict, `Some(false)` for a clean merge and `None`
@@ -216,6 +213,12 @@ fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     let Some(sha) = pr.head_sha.as_deref().filter(|s| !s.is_empty()) else {
         return false;
     };
+    ensure_pr_head(root, pr.number, sha, deadline)
+}
+
+/// [`ensure_head`] for a caller holding a bare PR number and pinned SHA (the
+/// conflict-stacking verb, #12759, reads a `RestPull`, not a `SequencePr`).
+pub(crate) fn ensure_pr_head(root: &Path, number: u32, sha: &str, deadline: &Deadline) -> bool {
     let commit = format!("{sha}^{{commit}}");
     let has = || git_code(root, &["cat-file", "-e", &commit], GIT_TIMEOUT, deadline) == Some(0);
     if has() {
@@ -224,7 +227,7 @@ fn ensure_head(root: &Path, pr: &SequencePr, deadline: &Deadline) -> bool {
     // Fetch to FETCH_HEAD rather than a private ref: the objects land either
     // way, and there is no ref to delete afterwards, so no git command can start
     // after the deadline has expired.
-    let spec = format!("refs/pull/{}/head", pr.number);
+    let spec = format!("refs/pull/{number}/head");
     let fetch = ["fetch", "--quiet", "--no-tags", REMOTE, "--", &spec];
     let fetched = git_code(root, &fetch, FETCH_TIMEOUT, deadline) == Some(0);
     fetched && has()
@@ -238,15 +241,37 @@ pub fn merge_tree_conflicts(root: &Path, a: &str, b: &str) -> Option<bool> {
     merge_tree_within(root, a, b, &Deadline::unbounded())
 }
 
+/// The one append-only file whose textual conflicts never order two PRs
+/// (#12595): both PRs prepend an entry at the same spot, which the Doctor
+/// resolves on the rebase, so serialising their merges saves nothing.
+const CHANGELOG_PATH: &str = "CHANGELOG.md";
+
 /// [`merge_tree_conflicts`] with its timeout clamped to `deadline`; `None`
-/// without launching git once the deadline is spent.
+/// without launching git once the deadline is spent. A conflict confined to
+/// [`CHANGELOG_PATH`] reads as a clean merge (#12595).
 fn merge_tree_within(root: &Path, a: &str, b: &str, deadline: &Deadline) -> Option<bool> {
-    let args = ["merge-tree", "--write-tree", "--no-messages", a, b];
-    match git_code(root, &args, GIT_TIMEOUT, deadline)? {
-        0 => Some(false),
-        1 => Some(true),
+    let args = [
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "--no-messages",
+        a,
+        b,
+    ];
+    match git_run(root, &args, GIT_TIMEOUT, deadline)? {
+        (0, _) => Some(false),
+        (1, out) => Some(!only_changelog_conflicts(&out)),
         _ => None,
     }
+}
+
+/// Does `git merge-tree --write-tree --name-only --no-messages` stdout name
+/// [`CHANGELOG_PATH`] as the only conflicted path? Line 1 is the result tree;
+/// the rest are conflicted paths. An empty or unreadable list is `false`
+/// (fail closed: the conflict stays a conflict).
+fn only_changelog_conflicts(stdout: &str) -> bool {
+    let mut paths = stdout.lines().skip(1).filter(|l| !l.is_empty()).peekable();
+    paths.peek().is_some() && paths.all(|p| p == CHANGELOG_PATH)
 }
 
 /// Run `git args…` in `root` with every stream closed, killing it after
@@ -254,6 +279,17 @@ fn merge_tree_within(root: &Path, a: &str, b: &str, deadline: &Deadline) -> Opti
 /// spawn failure, signal, timeout, or an already-spent deadline (nothing is
 /// launched then).
 fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) -> Option<i32> {
+    git_run(root, args, timeout, deadline).map(|(code, _)| code)
+}
+
+/// As [`git_code`], also returning stdout. The pipe is drained on a thread so
+/// a large output cannot stall the child while this loop polls it.
+fn git_run(
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    deadline: &Deadline,
+) -> Option<(i32, String)> {
     let timeout = timeout.min(deadline.remaining());
     if timeout.is_zero() {
         return None;
@@ -263,67 +299,32 @@ fn git_code(root: &Path, args: &[&str], timeout: Duration, deadline: &Deadline) 
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut pipe = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = pipe.read_to_string(&mut buf);
+        buf
+    });
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.code(),
+            Ok(Some(status)) => {
+                let out = reader.join().unwrap_or_default();
+                return status.code().map(|c| (c, out));
+            }
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(POLL),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = reader.join();
                 return None;
             }
         }
     }
-}
-
-/// [`overlap_components`] where a shared-file pair is an edge only when the
-/// two PRs are stacked or `conflicts` says they really conflict (#10350).
-#[must_use]
-pub fn overlap_components_with(
-    eligible: &[&SequencePr],
-    files: &BTreeMap<u32, BTreeSet<String>>,
-    conflicts: Conflicts<'_>,
-) -> Vec<Vec<u32>> {
-    let nums: Vec<u32> = eligible.iter().map(|p| p.number).collect();
-    let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (i, a) in eligible.iter().enumerate() {
-        for b in &eligible[i + 1..] {
-            let shared = files
-                .get(&a.number)
-                .zip(files.get(&b.number))
-                .is_some_and(|(fa, fb)| fa.iter().any(|f| fb.contains(f)));
-            let stacked = a.base_ref == b.head_ref || b.base_ref == a.head_ref;
-            if shared && (stacked || conflicts(a, b)) {
-                adj.entry(a.number).or_default().push(b.number);
-                adj.entry(b.number).or_default().push(a.number);
-            }
-        }
-    }
-    let mut seen: BTreeSet<u32> = BTreeSet::new();
-    let mut out = Vec::new();
-    for start in &nums {
-        if seen.contains(start) {
-            continue;
-        }
-        let mut component = Vec::new();
-        let mut queue = VecDeque::from([*start]);
-        seen.insert(*start);
-        while let Some(n) = queue.pop_front() {
-            component.push(n);
-            for next in adj.get(&n).into_iter().flatten() {
-                if seen.insert(*next) {
-                    queue.push_back(*next);
-                }
-            }
-        }
-        out.push(component);
-    }
-    out
 }
 
 #[cfg(test)]

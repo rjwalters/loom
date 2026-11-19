@@ -23,24 +23,14 @@
 //! `shellcheck disable=SC2086` for it), so any run of whitespace separates
 //! nodes.
 //!
-//! # A portability landmine, faithfully NOT reproduced
-//!
-//! The shell's `_sha256` falls back through `sha256sum` → `shasum -a 256` →
-//! **`cksum`**. That last branch is not a SHA at all: on a host with neither
-//! tool, every fingerprint silently becomes a 32-bit CRC in a different format,
-//! so markers written there never match markers written anywhere else.
-//!
-//! This port always computes SHA-256. That is a deliberate *divergence* from
-//! the shell on hosts missing both tools — and it is the right one, because on
-//! such a host the shell's own output was already incompatible with every other
-//! host's. Every machine in practice has one of the two (both are present on
-//! the development and CI images), so no live fingerprint changes.
+//! The "sha256 → first 16 hex characters" tail is the repo-wide short-hash
+//! convention, owned by [`crate::short_hash`] — including the `cksum`
+//! portability landmine the shell original carries and this port deliberately
+//! does not reproduce. Only the sort/dedupe/join step above is specific to
+//! this module.
 
-use sha2::{Digest, Sha256};
+use crate::short_hash::short_sha16;
 use std::collections::BTreeSet;
-
-/// Number of leading hex characters kept. `awk '{print substr($1, 1, 16)}'`.
-const FINGERPRINT_LEN: usize = 16;
 
 /// The fingerprint for a whitespace-separated set of blocker nodes.
 ///
@@ -52,12 +42,7 @@ const FINGERPRINT_LEN: usize = 16;
 pub fn fingerprint(nodes: &str) -> String {
     let unique: BTreeSet<&str> = nodes.split_whitespace().collect();
     let joined = unique.into_iter().collect::<Vec<_>>().join(" ");
-    let digest = Sha256::digest(joined.as_bytes());
-    let hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    hex.chars().take(FINGERPRINT_LEN).collect()
+    short_sha16(&joined)
 }
 
 /// The fingerprint for a fact-based un-escalation, which keys on the escalation
@@ -69,12 +54,7 @@ pub fn fingerprint(nodes: &str) -> String {
 /// owner.
 #[must_use]
 pub fn fact_fingerprint(escalation: &str, commit_sha: &str) -> String {
-    let digest = Sha256::digest(format!("{escalation}\n{commit_sha}").as_bytes());
-    let hex = digest
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    format!("fact-{}", hex.chars().take(FINGERPRINT_LEN).collect::<String>())
+    format!("fact-{}", short_sha16(&format!("{escalation}\n{commit_sha}")))
 }
 
 #[cfg(test)]

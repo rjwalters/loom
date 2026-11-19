@@ -38,9 +38,8 @@
 //!    executable logic goes into `loom-daemon`, not into shell
 //!    (`.loom/docs/shell-language-policy.md`, ADR-0018). Both files it would
 //!    have to grow — `lib/classify-error.sh` and `spawn-codex.sh` — are
-//!    `contract` entries in the epic #7810 portable pool, so
-//!    `loom-daemon shell-budget --check` refuses the growth by design and
-//!    names this module's approach as the first-listed remedy.
+//!    `contract` entries in the epic #7810 portable pool, which is not meant
+//!    to grow.
 //! 2. **No version skew.** A `v=3` record is silently dropped by any daemon
 //!    older than the adapter that emitted it (the parser fails closed on an
 //!    unknown arity), which would lose the *whole* terminal signal — the
@@ -102,7 +101,7 @@ pub const CAPTURED_USAGE_LIMIT_REFUSAL: &str = "ERROR: You've hit your usage lim
      25, 2026 3:00 PM.";
 
 /// The refusal family this module reads a horizon out of — the same wording
-/// `classify-error.sh`'s `_classify_error_codex` maps to `TOKEN_EXHAUSTED`,
+/// `loom-daemon classify-error`'s codex table maps to `TOKEN_EXHAUSTED`,
 /// restricted to the *usage-limit* rows (the credit-limit and API-error rows
 /// carry no "try again at"). Matched case-insensitively.
 const USAGE_LIMIT_NEEDLES: &[&str] = &[
@@ -120,9 +119,11 @@ const TRY_AGAIN_AT: &str = "try again at ";
 const HORIZON_TOKENS: usize = 5;
 
 /// Parse the horizon out of the text **following** `try again at ` — the
-/// captured form `<Month> <day>, <year> <h:mm AM/PM>`, read as host-local.
+/// captured form `<Month> <day>, <year> <h:mm AM/PM>`, read as host-local. The
+/// month may be abbreviated and the day may carry an ordinal suffix
+/// (`Nov 25th, 2026 7:44 AM`, issue #14564).
 ///
-/// Only that one form is recognised. A relative horizon ("try again in 3
+/// Only that form is recognised. A relative horizon ("try again in 3
 /// hours"), a bare time with no date ("try again at 3:00 PM" — today or
 /// tomorrow is not knowable), or any other shape returns `None`, which leaves
 /// the caller on its configured cooldown. That is the fail-safe direction: a
@@ -134,8 +135,15 @@ pub fn parse_reset_instant(after_try_again_at: &str) -> Option<DateTime<Utc>> {
     if tokens.len() < HORIZON_TOKENS {
         return None;
     }
+    // The CLI also prints `Nov 25th, 2026 7:44 AM` (abbreviated month, ordinal
+    // day; issue #14564). chrono's `%B` accepts the abbreviated month on
+    // input, but `%d` cannot consume `th`, so drop the suffix from the day
+    // token — only when it follows digits, so `th,` or `25xx,` stay refused.
+    let mut date_tokens = tokens[..HORIZON_TOKENS].to_vec();
+    let day = strip_ordinal_suffix(date_tokens[1]);
+    date_tokens[1] = &day;
     // Trailing sentence punctuation belongs to the prose, not to the date.
-    let candidate = tokens[..HORIZON_TOKENS]
+    let candidate = date_tokens
         .join(" ")
         .trim_end_matches(['.', ',', ';', ')', '"', '\''])
         .to_string();
@@ -147,6 +155,27 @@ pub fn parse_reset_instant(after_try_again_at: &str) -> Option<DateTime<Utc>> {
         .from_local_datetime(&naive)
         .single()
         .map(|local| local.with_timezone(&Utc))
+}
+
+/// `25th,` → `25,`; `1st,` → `1,`. Anything whose digits are not followed by
+/// exactly `st|nd|rd|th` (then the comma) is returned unchanged, so the date
+/// parse rejects it.
+fn strip_ordinal_suffix(day_token: &str) -> String {
+    let Some(without_comma) = day_token.strip_suffix(',') else {
+        return day_token.to_string();
+    };
+    let digits = without_comma.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let suffix = &without_comma[digits.len()..];
+    if !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && ["st", "nd", "rd", "th"]
+            .iter()
+            .any(|ord| suffix.eq_ignore_ascii_case(ord))
+    {
+        format!("{digits},")
+    } else {
+        day_token.to_string()
+    }
 }
 
 /// The reset horizon named by the **last** usage-limit refusal in `region`, or

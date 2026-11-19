@@ -24,15 +24,18 @@
 use chrono::{DateTime, Utc};
 
 use super::authz::{
-    authorize_and_enqueue, merge_group_check, revoke_then_dequeue, CheckConclusion, DenyReason,
-    HandoffError, Revocation, REQUIRED_CHECK_CONTEXT,
+    authorize_and_enqueue, merge_group_check, revoke_then_dequeue, withdraw_head_status,
+    CheckConclusion, DenyReason, HandoffError, Revocation, REQUIRED_CHECK_CONTEXT,
 };
 use super::events::{secs_between, EventKind, EventSink, QueueEvent};
-use super::forge::{read_facts, LifecycleForge};
-use super::grants::{reason_token, CommentGrantStore, GrantRecord};
+use super::forge::{read_facts, LifecycleForge, RemovalEvent};
+use super::grants::{marker_re, reason_token, CommentGrantStore, GrantRecord};
+use super::group_authz::StatusApi;
 use super::mode::MergeMode;
 use super::ops::{self, DequeueOutcome, EnqueueOutcome, PrState, QueueApi, QueueError};
-use super::removal::{classify, drop_prose, route, RemovalKind};
+use super::removal::{
+    classify, drop_prose, infra_decline_reason, infra_detail, infra_only, route, RemovalKind,
+};
 
 /// Everything a lifecycle step needs.
 pub struct Ctx<'a> {
@@ -40,6 +43,8 @@ pub struct Ctx<'a> {
     pub execution_enabled: bool,
     pub queue: &'a dyn QueueApi,
     pub forge: &'a dyn LifecycleForge,
+    /// Writer for the `loom/merge-authorization` status on the PR head.
+    pub statuses: &'a dyn StatusApi,
     pub events: &'a dyn EventSink,
     pub now: DateTime<Utc>,
 }
@@ -171,8 +176,11 @@ pub fn reconcile_pr(ctx: &Ctx<'_>, pr: u32) -> Reconciled {
             }
         }
         PrState::Open => match status.entry {
-            Some(entry) => {
-                let head = entry.head_oid.unwrap_or_else(|| status.head_oid.clone());
+            Some(_) => {
+                // The grant vouches for the PR head. `entry.head_oid` is the
+                // queue's `headCommit`, which on GitHub can be the merge-group
+                // commit, so it must not stand in for the head (#13124).
+                let head = status.head_oid.clone();
                 match merge_group_check(&store, pr, &head, read_facts(ctx.forge, pr)) {
                     CheckConclusion::Success => Reconciled::StillQueued { head },
                     CheckConclusion::Failure(why) => {
@@ -188,6 +196,9 @@ pub fn reconcile_pr(ctx: &Ctx<'_>, pr: u32) -> Reconciled {
                                  nor the dequeue was confirmed: {rev:?}",
                                 join(&why)
                             ));
+                        }
+                        if let GrantRecord::Live { sha, .. } = &rec {
+                            withdraw_head_status(ctx.statuses, pr, sha);
                         }
                         ctx.removed_event(pr, &rec, format!("revoked-{}", why_token(&why)), None);
                         Reconciled::Continue(Some(format!(
@@ -286,12 +297,20 @@ fn reconcile_drop(
             Err(e) => Reconciled::Undetermined(format!("revoke stale grant: {e}")),
         };
     };
-    let kind = classify(ev.reason.as_deref());
-    let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at));
+    let (kind, detail) = match refine_hold(ctx, pr, classify(ev.reason.as_deref())) {
+        Some(held) => held,
+        None => refine_infra(ctx, pr, rec, ev, classify(ev.reason.as_deref())),
+    };
+    let prose = drop_prose(kind, ev.reason.as_deref(), Some(&ev.created_at), detail.as_deref());
     // Revoke (with the verified reason) BEFORE any label transition. The
     // revoke marker is also the dedup point: a later pass sees `Revoked` and
     // never re-routes or re-comments this drop.
-    if let Err(e) = store.revoke_with(pr, &format!("dropped-{}", kind.as_str()), &prose) {
+    let marker = if kind == RemovalKind::DroppedInfra {
+        kind.as_str().to_string() // already `dropped-infra`; the bound reads it back
+    } else {
+        format!("dropped-{}", kind.as_str())
+    };
+    if let Err(e) = store.revoke_with(pr, &marker, &prose) {
         return Reconciled::Undetermined(format!("revoke after drop: {e}"));
     }
     let r = route(kind);
@@ -306,6 +325,105 @@ fn reconcile_drop(
         raw: ev.reason.clone(),
         route_error,
     }
+}
+
+/// Reclassify a `check-failure` drop as `human-hold` while a Champion hold
+/// stands on the PR (r7-q35): the group check fails because the hold revoked
+/// the authorization, which is not a CI failure for Doctor. An unreadable
+/// comment list keeps the original kind.
+fn refine_hold(ctx: &Ctx<'_>, pr: u32, kind: RemovalKind) -> Option<(RemovalKind, Option<String>)> {
+    if kind != RemovalKind::CheckFailure {
+        return None;
+    }
+    let bodies = ctx.forge.trusted_comments(pr).ok()?;
+    crate::champion_hold::standing_hold(&bodies).map(|_| {
+        (
+            RemovalKind::HumanHold,
+            Some(
+                "A Champion hold stands on this PR; the group failure is the hold, not CI.".into(),
+            ),
+        )
+    })
+}
+
+/// Downgrade a `check-failure` drop to `dropped-infra` (#12573) only when the
+/// group commit's failed checks are all infrastructure and this head has not
+/// already had its one infra retry. Every ambiguity — no group commit, a read
+/// error, a non-infra or in-progress run, an earlier infra drop — keeps
+/// `kind`. The earlier-drop bound reads the revoke markers, which are the
+/// durable per-head record.
+fn refine_infra(
+    ctx: &Ctx<'_>,
+    pr: u32,
+    rec: &GrantRecord,
+    ev: &RemovalEvent,
+    kind: RemovalKind,
+) -> (RemovalKind, Option<String>) {
+    let (RemovalKind::CheckFailure, GrantRecord::Live { sha, .. }) = (kind, rec) else {
+        return (kind, None);
+    };
+    let Some(commit) = ev.before_commit.as_deref().filter(|c| !c.is_empty()) else {
+        return (kind, Some("Infra refinement skipped: GitHub gave no group commit.".into()));
+    };
+    let runs = match ctx.forge.group_check_runs(commit) {
+        Ok(runs) => runs,
+        Err(e) => {
+            log::warn!("merge-queue: PR #{pr}: group check runs unreadable ({e}); not infra");
+            return (
+                kind,
+                Some("Infra refinement skipped: the group's check runs were unreadable.".into()),
+            );
+        }
+    };
+    if !infra_only(&runs) {
+        return (kind, infra_decline_reason(&runs));
+    }
+    match ctx.forge.trusted_comments(pr) {
+        Ok(bodies) if !infra_retry_spent(&bodies, pr, sha) => {
+            (RemovalKind::DroppedInfra, Some(infra_detail(&runs)))
+        }
+        Ok(_) => (
+            kind,
+            Some(format!(
+                "Infra refinement declined: this head already had its one infra retry. {}",
+                infra_detail(&runs)
+            )),
+        ),
+        Err(_) => (
+            kind,
+            Some("Infra refinement skipped: earlier revoke comments were unreadable.".into()),
+        ),
+    }
+}
+
+/// True when an earlier `dropped-infra` revoke already covers head `sha`.
+fn infra_retry_spent(bodies: &[String], pr: u32, sha: &str) -> bool {
+    let mut grant_sha: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    for body in bodies {
+        for c in marker_re().captures_iter(body) {
+            if c[2].parse::<u32>().ok() != Some(pr) {
+                continue;
+            }
+            let Ok(nonce) = c[4].parse::<u64>() else {
+                continue;
+            };
+            match &c[1] {
+                "grant" => {
+                    if let Some(s) = c.get(3) {
+                        grant_sha.insert(nonce, s.as_str().to_string());
+                    }
+                }
+                _ => {
+                    if c.get(5).map(|m| m.as_str()) == Some("dropped-infra")
+                        && grant_sha.get(&nonce).is_some_and(|s| s == sha)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Why [`handoff`] did not leave the PR queued.
@@ -341,6 +459,11 @@ impl std::fmt::Display for HandoffFailure {
                 } else {
                     required.join(", ")
                 }
+            ),
+            HandoffFailure::Authz(HandoffError::WriterCannotPostStatuses(why)) => write!(
+                f,
+                "[WRITER_CANNOT_POST_STATUSES] {why}; no grant was written or revoked and any \
+                 existing queue entry is untouched"
             ),
             HandoffFailure::Authz(e) => write!(f, "[AUTHZ_REFUSED] {e:?}"),
             HandoffFailure::Telemetry { error, revoked } => write!(
@@ -387,6 +510,7 @@ pub fn handoff(
         ctx.execution_enabled,
         ctx.queue,
         &store,
+        ctx.statuses,
         &|| read_facts(ctx.forge, pr),
         pr,
         approved_sha,
@@ -410,6 +534,7 @@ pub fn handoff(
             // `sweep` discovers queued PRs only through this record: fail closed.
             let revoked =
                 revoke_then_dequeue(ctx.mode, ctx.execution_enabled, ctx.queue, &store, pr);
+            withdraw_head_status(ctx.statuses, pr, approved_sha);
             return Err(HandoffFailure::Telemetry { error, revoked });
         }
     }
@@ -481,25 +606,4 @@ pub fn authorize_check(
 ) -> CheckConclusion {
     let store = CommentGrantStore::new(forge, "check", now);
     merge_group_check(&store, pr, pr_head, read_facts(forge, pr))
-}
-
-/// May the #8508 re-date remedy push for this repository? Never in queue
-/// mode: the queue validates against the latest base itself, so a
-/// tree-identical push would only move the head and invalidate the verdict.
-/// An unreadable mode refuses too.
-///
-/// # Errors
-///
-/// The refusal text.
-pub fn redate_permitted(root: &std::path::Path) -> Result<(), String> {
-    match super::mode::resolve_merge_mode(root) {
-        Ok(m) if m.mode == MergeMode::Direct => Ok(()),
-        Ok(m) => Err(format!(
-            "champion.mergeMode={} (from {}): queue mode never pushes a tree-identical re-date \
-             commit; the merge queue tests against the latest base itself (#10256)",
-            m.mode.as_str(),
-            m.source.as_str()
-        )),
-        Err(e) => Err(format!("champion.mergeMode could not be resolved: {e}")),
-    }
 }

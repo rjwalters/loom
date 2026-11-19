@@ -10,12 +10,26 @@
 //! `loom.queue.priority_score` (the comparator keys that placed it, as one
 //! compact JSON object).
 //!
+//! # Dispatch-plan attributes (Issue #12827)
+//!
+//! Each queue-row span also carries the row's dispatch-plan fields that
+//! loom-ui's Backlog reads from `queue.snapshot`, so they have an OTLP
+//! carrier before that native kind is retired (#12813). See
+//! [`PlanAttributes`] for the field → attribute table. Every value is a
+//! closed set, a bounded integer, or a re-formatted timestamp; each is
+//! present only when the row has it ("absent stays absent"), and a
+//! `left_queue` span carries none of them. They ride the existing emissions
+//! (a transition or the refresh), never a new trigger, so like
+//! `loom.queue.candidate_rank` they hold the value as of the last emission:
+//! a plan-only change (a new position, a gate) is not re-sent until the
+//! row's disposition changes or the refresh window elapses.
+//!
 //! # Where this runs, and why not the tick loop
 //!
-//! Driven from the collector's periodic sample
-//! (`observability::collector::sample_snapshots`, the same cadence as
-//! [`super::super::queue_snapshot::record`] / [`super::stage_dwell::record`]),
-//! reading [`crate::work_finder::last_tick_summary`] — never from the
+//! Driven by the collector's disposition timer and its slower host snapshot
+//! pass, both sharing one sampler of [`crate::work_finder::last_tick_summary`].
+//! The disposition timer only reads cached repo references. The host snapshot
+//! pass owns the existing forge-capable resolution. Neither runs in the
 //! work-finder tick itself, which must never block on a `gh repo view` probe
 //! (see `queue_snapshot`'s module doc for the identical rationale). A
 //! disposition can therefore be missed if it lasts less than one collector
@@ -32,8 +46,9 @@
 //! One `(repo, issue)` row is exported when:
 //! - **transition**: its disposition differs from the last one this process
 //!   emitted for that key, including first sight; or
-//! - **refresh**: the last emission for that key is older than
-//!   [`REFRESH_SECS_ENV`] (default [`DEFAULT_REFRESH_SECS`], ten minutes).
+//! - **refresh**: the current source summary is at least [`REFRESH_SECS_ENV`]
+//!   seconds newer than the source of this key's last emission (default
+//!   [`DEFAULT_REFRESH_SECS`]).
 //!
 //! A terminal `left_queue` span is emitted once when a previously emitted key
 //! disappears from a repo whose listing succeeded this tick. A key belonging
@@ -42,13 +57,12 @@
 //! incomplete repo, so a transient `gh` failure never reads as "the issue
 //! left the queue".
 //!
-//! # Cardinality bound
+//! # Dropped rows
 //!
-//! At most [`MAX_ROWS`] rows are turned into spans per [`record`] call;
-//! further rows are dropped and counted on
-//! [`MetricName::QueueDispositionRowsDropped`] with `reason = "truncated"`, as
-//! is a row whose repo root never resolved to a forge slug (`reason =
-//! "unresolved"`). A single-workspace-loop tick names every row `workspace
+//! Every row is turned into a span; none is dropped for volume, because a
+//! cap would make which items carry facts depend on iteration order. A row
+//! whose repo root never resolved to a forge slug is dropped and counted on
+//! [`MetricName::QueueDispositionRowsDropped`] (`reason = "unresolved"`). A single-workspace-loop tick names every row `workspace
 //! #N` (never an absolute path), which never resolves either — those rows are
 //! dropped the same way, exactly like `queue_snapshot`.
 //!
@@ -56,8 +70,8 @@
 //!
 //! The single-workspace work-finder loop records no per-issue queue rows at
 //! all (`WorkFinderTickSummary::queue` is empty), so it never has anything to
-//! export here — the same limitation `queue_snapshot` and `stage_dwell`
-//! already document.
+//! export here — the same limitation `queue_snapshot` already
+//! documents.
 //!
 //! # Repo lockout attributes (Issue #9674)
 //!
@@ -71,27 +85,28 @@
 //! over this tick's rows; nothing here ever reads the forge.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes, TraceContext};
 use crate::telemetry::RepoVisibility;
-use crate::types::{PlanKey, QueueDisposition, WorkFinderTickSummary};
+use crate::types::{
+    PlanGate, PlanKey, PlanState, PlanStep, QueueDisposition, ReadyQueueRow, WorkFinderTickSummary,
+};
 use crate::work_finder::halt_cause::HaltCause;
 use crate::work_finder::{PARK_LABELS, SKIP_LABELS};
 
+use super::super::repo_ref::{cached_repo_ref, is_new_tick, resolve_repo_refs};
+
 /// Env override for the refresh cadence, in seconds.
 pub const REFRESH_SECS_ENV: &str = "LOOM_DISPATCH_DISPOSITION_REFRESH_SECS";
-/// Default refresh cadence: ten minutes.
-pub const DEFAULT_REFRESH_SECS: i64 = 600;
-
-/// Most rows turned into spans per [`record`] call. A row past this is
-/// dropped and counted with `reason = "truncated"`.
-pub const MAX_ROWS: usize = 256;
+/// With a 60s source gap, 30s collection and a 30s exporter flush, this
+/// threshold leaves 30s for delivery and query within the 300s freshness limit.
+pub const DEFAULT_REFRESH_SECS: i64 = 150;
 
 /// How a row's span relates to the previous emission this process made for
 /// the same `(repo, issue)` key. The wire value of
@@ -115,6 +130,131 @@ impl Transition {
             Self::Changed => "changed",
             Self::Refresh => "refresh",
             Self::LeftQueue => "left_queue",
+        }
+    }
+}
+
+/// The literal a closed-vocabulary attribute exports for a value this build
+/// does not know (`PlanState::Unknown`, `PlanGate::Unknown`,
+/// `PlanStep::Unknown(_)`) — never the raw daemon or forge string.
+pub const UNKNOWN_VALUE: &str = "unknown";
+
+/// A row's dispatch-plan fields as span attributes (Issue #12827):
+///
+/// | Field (`queue.snapshot`) | Source | Attribute | Values |
+/// |---|---|---|---|
+/// | `plan_state` | `RowPlan::plan_state` | `loom.queue.plan_state` | `running`/`next`/`queued`/`blocked`/`unknown`; present whenever the tick published a plan |
+/// | `position` | `RowPlan::position` | `loom.queue.position` | 1-based integer ≤ the queue depth; only when the plan gave one |
+/// | `gate` | `RowPlan::gate` | `loom.queue.gate` | `capacity`/`build_backoff`/`file_overlap`/`unknown`; only when the plan names one |
+/// | `step` | `RowPlan::step` | `loom.queue.step` | a `Step` name or `unknown`; only when the row names one (absent = `builder`, as on the wire) |
+/// | `owning_shard` | `RowPlan::owning_shard` | `loom.queue.owning_shard` | integer < `shard_count`; only when sharding is configured |
+/// | `level` | `ReadyQueueRow::level` | `loom.queue.level` | `default`/`important`/`very-important`; present on every emission that has a row |
+/// | `workspace_weight` | `ReadyQueueRow::workspace_weight` | `loom.queue.workspace_weight` | integer (the owning workspace's draw weight) |
+/// | `created_at` | `ReadyQueueRow::created_at` | `loom.queue.created_at` | RFC 3339 UTC, seconds precision; only when the listing supplied a parseable one |
+///
+/// Every field is `None` on a `left_queue` emission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanAttributes {
+    pub plan_state: Option<&'static str>,
+    pub position: Option<u32>,
+    pub gate: Option<&'static str>,
+    pub step: Option<&'static str>,
+    pub owning_shard: Option<u32>,
+    pub level: Option<&'static str>,
+    pub workspace_weight: Option<u32>,
+    pub created_at: Option<String>,
+}
+
+/// The wire name of a plan state, `unknown` for [`PlanState::Unknown`].
+#[must_use]
+pub fn plan_state_token(state: PlanState) -> &'static str {
+    match state {
+        PlanState::Running => "running",
+        PlanState::Next => "next",
+        PlanState::Queued => "queued",
+        PlanState::Blocked => "blocked",
+        PlanState::Unknown => UNKNOWN_VALUE,
+    }
+}
+
+/// The wire name of a plan gate, `unknown` for [`PlanGate::Unknown`].
+#[must_use]
+pub fn plan_gate_token(gate: PlanGate) -> &'static str {
+    match gate {
+        PlanGate::Capacity => "capacity",
+        PlanGate::BuildBackoff => "build_backoff",
+        PlanGate::FileOverlap => "file_overlap",
+        PlanGate::Unknown => UNKNOWN_VALUE,
+    }
+}
+
+/// The wire name of a plan step: a known [`crate::work_finder::step_item::Step`]
+/// name, or the literal `unknown` for [`PlanStep::Unknown`] — never the raw
+/// unknown string, which a newer daemon or a malformed payload controls.
+#[must_use]
+pub fn plan_step_token(step: &PlanStep) -> &'static str {
+    match step {
+        PlanStep::Known(step) => step.as_str(),
+        PlanStep::Unknown(_) => UNKNOWN_VALUE,
+    }
+}
+
+/// A listing's `createdAt`, re-formatted as RFC 3339 UTC with seconds
+/// precision — never the raw text. `None` when absent or unparseable.
+#[must_use]
+fn created_at_token(raw: Option<&str>) -> Option<String> {
+    let parsed = DateTime::parse_from_rfc3339(raw?.trim()).ok()?;
+    Some(
+        parsed
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+impl PlanAttributes {
+    /// The attributes for `row`. `plan_published` is whether the tick
+    /// published a dispatch plan at all: without one every row's
+    /// `plan_state` is the default `Unknown`, which says nothing, so it is
+    /// left absent rather than exported as `unknown`.
+    #[must_use]
+    pub fn from_row(row: &ReadyQueueRow, plan_published: bool) -> Self {
+        Self {
+            plan_state: plan_published.then(|| plan_state_token(row.plan.plan_state)),
+            position: row.plan.position,
+            gate: row.plan.gate.map(plan_gate_token),
+            step: row.plan.step.as_ref().map(plan_step_token),
+            owning_shard: row.plan.owning_shard,
+            level: Some(row.level.as_str()),
+            workspace_weight: Some(row.workspace_weight),
+            created_at: created_at_token(row.created_at.as_deref()),
+        }
+    }
+
+    /// Insert each present attribute into `attributes`.
+    fn stamp(&self, attributes: &mut TraceAttributes) {
+        if let Some(state) = self.plan_state {
+            attributes.insert("loom.queue.plan_state".to_string(), state.to_string());
+        }
+        if let Some(position) = self.position {
+            attributes.insert("loom.queue.position".to_string(), position.to_string());
+        }
+        if let Some(gate) = self.gate {
+            attributes.insert("loom.queue.gate".to_string(), gate.to_string());
+        }
+        if let Some(step) = self.step {
+            attributes.insert("loom.queue.step".to_string(), step.to_string());
+        }
+        if let Some(shard) = self.owning_shard {
+            attributes.insert("loom.queue.owning_shard".to_string(), shard.to_string());
+        }
+        if let Some(level) = self.level {
+            attributes.insert("loom.queue.level".to_string(), level.to_string());
+        }
+        if let Some(weight) = self.workspace_weight {
+            attributes.insert("loom.queue.workspace_weight".to_string(), weight.to_string());
+        }
+        if let Some(created_at) = &self.created_at {
+            attributes.insert("loom.queue.created_at".to_string(), created_at.clone());
         }
     }
 }
@@ -156,6 +296,8 @@ pub struct DispositionRow {
     /// `work_finder::halt_cause` vocabulary (#9017) — see [`halt_cause_token`]
     /// (#9673).
     pub halt_cause: Option<String>,
+    /// The row's dispatch-plan fields (Issue #12827) — see [`PlanAttributes`].
+    pub plan: PlanAttributes,
 }
 
 /// One row's outcome for a [`record`] sample: enough to build its span.
@@ -185,19 +327,21 @@ pub struct Emission {
     /// Present only for a `WorkspaceHalted` row whose detail named a
     /// closed-vocabulary halt cause — see [`halt_cause_token`] (#9673).
     pub halt_cause: Option<String>,
+    /// The row's dispatch-plan fields (Issue #12827); all `None` on a
+    /// `left_queue` emission, whose row is no longer planned.
+    pub plan: PlanAttributes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrackedState {
     disposition: QueueDisposition,
     visibility: RepoVisibility,
-    emitted_at: DateTime<Utc>,
+    source_at: DateTime<Utc>,
 }
 
-/// Per-`(slug, issue)` last-emitted disposition and instant (Issue #9222).
+/// Per-`(slug, issue)` last-emitted disposition and source instant (Issue #9222).
 /// Modeled on [`super::dwell::DwellTracker`]: a plain struct with a pure
-/// [`Self::diff`], driven by a process-global instance only at the [`record`]
-/// seam.
+/// [`Self::diff`], owned by the collector sampler.
 #[derive(Debug, Default)]
 pub struct DispositionTracker {
     last: HashMap<(String, u32), TrackedState>,
@@ -220,7 +364,7 @@ impl DispositionTracker {
         &mut self,
         rows: &[DispositionRow],
         failed_slugs: &[String],
-        now: DateTime<Utc>,
+        source_at: DateTime<Utc>,
         refresh: Duration,
     ) -> Vec<Emission> {
         let mut next: HashMap<(String, u32), TrackedState> = HashMap::new();
@@ -234,21 +378,21 @@ impl DispositionTracker {
                 Some(state) if state.disposition != row.disposition => {
                     Some((Transition::Changed, Some(state.disposition)))
                 }
-                Some(state) if now.signed_duration_since(state.emitted_at) >= refresh => {
+                Some(state) if source_at.signed_duration_since(state.source_at) >= refresh => {
                     Some((Transition::Refresh, None))
                 }
                 Some(_) => None,
             };
-            let emitted_at = match (&outcome, previous) {
-                (Some(_), _) | (None, None) => now,
-                (None, Some(state)) => state.emitted_at,
+            let source_at = match (&outcome, previous) {
+                (Some(_), _) | (None, None) => source_at,
+                (None, Some(state)) => state.source_at,
             };
             next.insert(
                 key,
                 TrackedState {
                     disposition: row.disposition,
                     visibility: row.visibility,
-                    emitted_at,
+                    source_at,
                 },
             );
             if let Some((transition, previous_disposition)) = outcome {
@@ -266,6 +410,7 @@ impl DispositionTracker {
                     total_candidates: Some(row.total_candidates),
                     priority_score: row.priority_score.clone(),
                     halt_cause: row.halt_cause.clone(),
+                    plan: row.plan.clone(),
                 });
             }
         }
@@ -293,6 +438,7 @@ impl DispositionTracker {
                     total_candidates: None,
                     priority_score: None,
                     halt_cause: None,
+                    plan: PlanAttributes::default(),
                 });
                 // Dropped: not reinserted into `next`, so this key reads as
                 // "first sight" (`Changed`) if the issue ever reappears.
@@ -309,7 +455,6 @@ impl DispositionTracker {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DroppedCounts {
     pub unresolved: usize,
-    pub truncated: usize,
 }
 
 /// The label on `detail`, only for rows whose disposition carries a label in
@@ -333,7 +478,7 @@ fn allowed_park_label(disposition: QueueDisposition, detail: Option<&str>) -> Op
 /// The PR number in an `OpenPr` row's detail (`"open PR #<n>"`, the text
 /// `work_finder::tick_report::classify` formats) — structured extraction,
 /// never the free-form text itself. Mirrors
-/// `telemetry::queue_snapshot::exportable_detail`'s allowlist-by-disposition
+/// `telemetry::queue_repo::exportable_detail`'s allowlist-by-disposition
 /// rule.
 #[must_use]
 fn open_pr_number(disposition: QueueDisposition, detail: Option<&str>) -> Option<u32> {
@@ -384,14 +529,14 @@ fn halt_cause_token(disposition: QueueDisposition, detail: Option<&str>) -> Opti
 /// Build this tick's disposition rows from `summary`'s ranked queue, resolving
 /// each row's repo through `repos` (as [`super::super::repo_ref::resolve_repo_refs`]
 /// already resolved it). A row whose repo did not resolve is dropped and
-/// counted as `unresolved`; a row past [`MAX_ROWS`] is dropped and counted as
-/// `truncated`. Pure.
+/// counted as `unresolved`. Pure.
 #[must_use]
 pub fn build_rows(
     summary: &WorkFinderTickSummary,
     repos: &HashMap<String, QueueRepoRef>,
 ) -> (Vec<DispositionRow>, DroppedCounts) {
     let total_candidates = summary.queue.len();
+    let plan_published = summary.plan.is_some();
     let mut rows = Vec::new();
     let mut dropped = DroppedCounts::default();
     for row in &summary.queue {
@@ -399,10 +544,6 @@ pub fn build_rows(
             dropped.unresolved += 1;
             continue;
         };
-        if rows.len() >= MAX_ROWS {
-            dropped.truncated += 1;
-            continue;
-        }
         rows.push(DispositionRow {
             slug: repo.repo.clone(),
             visibility: repo.visibility,
@@ -423,26 +564,49 @@ pub fn build_rows(
             priority_score: priority_score(&row.plan.keys),
             story_points: row.story_points,
             halt_cause: halt_cause_token(row.disposition, row.detail.as_deref()),
+            plan: PlanAttributes::from_row(row, plan_published),
         });
     }
     (rows, dropped)
 }
 
-/// The forge slugs of `summary`'s repos whose listing failed this tick, from
-/// the same `repos` map [`build_rows`] used. A failed repo whose root never
-/// resolved to a slug cannot be named here — its previously tracked keys (if
-/// any) fall back to [`DispositionTracker::diff`]'s default "successfully
-/// listed" treatment, the same edge case `queue_snapshot` accepts for its own
-/// `listing_failed_unresolved` counter.
+fn summary_roots(summary: &WorkFinderTickSummary) -> HashSet<&str> {
+    summary
+        .queue
+        .iter()
+        .map(|row| row.repo.as_str())
+        .chain(summary.listing_not_whole().map(String::as_str))
+        .collect()
+}
+
+/// Slugs whose missing rows are uncertain. A previous identity can preserve a
+/// tracked row after a probe failure. Only a currently resolved identity can
+/// attribute a new row. Each tracked row originally populated the ref cache.
 #[must_use]
 fn failed_slugs(
     summary: &WorkFinderTickSummary,
+    roots: &HashSet<&str>,
     repos: &HashMap<String, QueueRepoRef>,
+    cached_ref: impl Fn(&str) -> Option<QueueRepoRef>,
 ) -> Vec<String> {
     // #11139: a partial listing's missing rows are as unknown as a failed one's.
     summary
         .listing_not_whole()
-        .filter_map(|root| repos.get(root).map(|r| r.repo.clone()))
+        .map(String::as_str)
+        .chain(
+            roots
+                .iter()
+                .copied()
+                .filter(|root| !repos.contains_key(*root)),
+        )
+        .filter_map(|root| {
+            repos
+                .get(root)
+                .map(|repo| repo.repo.clone())
+                .or_else(|| cached_ref(root).map(|repo| repo.repo))
+        })
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -453,13 +617,6 @@ pub fn refresh_secs(raw: Option<&str>) -> i64 {
     raw.and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_REFRESH_SECS)
-}
-
-fn visibility_str(visibility: RepoVisibility) -> &'static str {
-    match visibility {
-        RepoVisibility::Public => "public",
-        RepoVisibility::Private => "private",
-    }
 }
 
 fn int(value: usize) -> i64 {
@@ -476,20 +633,16 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
                 .label("reason", "unresolved"),
         );
     }
-    if dropped.truncated > 0 {
-        points.push(
-            MetricPoint::int(MetricName::QueueDispositionRowsDropped, int(dropped.truncated))
-                .label("reason", "truncated"),
-        );
-    }
     points
 }
 
-/// One `loom.dispatch.disposition` span for `emission`, sampled at `now`.
+/// One `loom.dispatch.disposition` span for `emission` from `source_at`.
+/// The dashboard uses the span's start as the item's observation clock.
+/// [`super::OpsSink::emit_span`] stamps the later envelope time separately.
 /// Parented to `parent` (the tick's own span context) when its tick matches
 /// this sample; otherwise a deterministic root of its own, exactly like
 /// [`super::dispatch::tick_span`]'s own root when no parent applies. Span IDs
-/// are always derived from `(slug, issue, now)`, never random — the
+/// are always derived from `(slug, issue, source_at)`, never random — the
 /// trace-identity policy every span in this package follows.
 ///
 /// An `OpenPr` emission (a `pr-open-skip` row) in a repo this sample says is
@@ -501,14 +654,14 @@ pub fn dropped_points(dropped: DroppedCounts) -> Vec<MetricPoint> {
 #[must_use]
 pub fn build_span(
     emission: &Emission,
-    now: DateTime<Utc>,
+    source_at: DateTime<Utc>,
     parent: Option<&TraceContext>,
     lockouts: &HashMap<String, super::lockout::RepoLockout>,
 ) -> SpanRecord {
     let slug: &str = &emission.slug;
     let issue = emission.issue.to_string();
     let issue_str: &str = &issue;
-    let instant = crate::telemetry::trace::instant(now);
+    let instant = crate::telemetry::trace::instant(source_at);
     let instant_str: &str = &instant;
     let (context, parent_span_id) = match parent {
         Some(parent) => (
@@ -530,7 +683,7 @@ pub fn build_span(
     };
     let mut attributes: TraceAttributes = [
         ("loom.repo", emission.slug.clone()),
-        ("loom.repo.visibility", visibility_str(emission.visibility).to_string()),
+        ("loom.repo.visibility", emission.visibility.as_str().to_string()),
         ("loom.issue", issue),
         ("loom.queue.disposition", emission.disposition.as_str().to_string()),
         ("loom.queue.state", emission.disposition.state().to_string()),
@@ -590,13 +743,19 @@ pub fn build_span(
     if let Some(cause) = &emission.halt_cause {
         attributes.insert("loom.queue.halt_cause".to_string(), cause.clone());
     }
+    // Issue #12827: the row's dispatch-plan fields. A `left_queue` emission
+    // is no longer planned: `diff` gives it an empty `PlanAttributes`, and it
+    // is skipped here too, so a hand-built one cannot leak a stale plan.
+    if emission.transition != Transition::LeftQueue {
+        emission.plan.stamp(&mut attributes);
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,
         parent_span_id,
         name: SpanName::DispatchDisposition,
-        started_at: now,
-        ended_at: now,
+        started_at: source_at,
+        ended_at: source_at,
         status: SpanStatus::Ok,
         attributes,
         events: Vec::new(),
@@ -604,36 +763,135 @@ pub fn build_span(
     }
 }
 
-static TRACKER: OnceLock<Mutex<DispositionTracker>> = OnceLock::new();
-static LAST_SAMPLED_TICK: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
+/// Collector-local state shared by the two disposition collection paths.
+#[derive(Default)]
+pub(in crate::observability) struct Sampler {
+    tracker: DispositionTracker,
+    last_sampled_tick: Option<DateTime<Utc>>,
+    last_resolved_tick: Option<DateTime<Utc>>,
+    unresolved_roots: HashSet<String>,
+}
+
+struct Sample {
+    source_at: DateTime<Utc>,
+    emissions: Vec<Emission>,
+}
+
+impl Sample {
+    fn offer(
+        self,
+        sink: &super::OpsSink,
+        parent: Option<&TraceContext>,
+        lockouts: &HashMap<String, super::lockout::RepoLockout>,
+    ) {
+        for emission in &self.emissions {
+            sink.emit_span(build_span(emission, self.source_at, parent, lockouts));
+        }
+    }
+}
+
+impl Sampler {
+    fn note_resolution(&mut self, roots: &HashSet<&str>, repos: &HashMap<String, QueueRepoRef>) {
+        for root in roots
+            .iter()
+            .copied()
+            .filter(|root| Path::new(root).is_absolute())
+        {
+            if repos.contains_key(root) {
+                self.unresolved_roots.remove(root);
+            } else {
+                self.unresolved_roots.insert(root.to_string());
+            }
+        }
+    }
+
+    /// Keep the warm roots when another root needs the slow pass to resolve.
+    /// A relative placeholder never resolves and cannot have tracked rows.
+    fn cached_repos(
+        &self,
+        roots: &HashSet<&str>,
+        cached_ref: impl Fn(&str) -> Option<QueueRepoRef>,
+    ) -> HashMap<String, QueueRepoRef> {
+        // A failed slow lookup can leave an older repo reference in the
+        // shared cache. It can preserve prior rows but cannot refresh them.
+        roots
+            .iter()
+            .copied()
+            .filter(|root| Path::new(root).is_absolute() && !self.unresolved_roots.contains(*root))
+            .filter_map(|root| cached_ref(root).map(|repo| (root.to_string(), repo)))
+            .collect()
+    }
+
+    fn consume(
+        &mut self,
+        source_at: DateTime<Utc>,
+        rows: &[DispositionRow],
+        failed: &[String],
+        refresh: Duration,
+    ) -> Option<Sample> {
+        if !is_new_tick(source_at, self.last_sampled_tick) {
+            return None;
+        }
+        self.last_sampled_tick = Some(source_at);
+        Some(Sample {
+            source_at,
+            emissions: self.tracker.diff(rows, failed, source_at, refresh),
+        })
+    }
+}
 
 /// Sample the last work-finder tick and export a `loom.dispatch.disposition`
 /// span for every row [`DispositionTracker::diff`] says needs one. A no-op
 /// (no forge reads, no tracker mutation) without the OTLP ops sink, and a
-/// no-op when the work finder has not ticked since the previous sample.
-pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, String>) {
+/// no-op when the work finder has no newer applicable tick. Only the host
+/// snapshot passes a slug cache and can do forge-capable repo resolution.
+pub(in crate::observability) async fn record(
+    sampler: &mut Sampler,
+    slug_cache: Option<&mut HashMap<String, String>>,
+) {
     let Some(sink) = super::global_ops_sink() else {
         return;
     };
     let Some(summary) = crate::work_finder::last_tick_summary() else {
         return;
     };
-    let previous_sample = *LAST_SAMPLED_TICK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !super::super::queue_snapshot::is_new_tick(summary.at, previous_sample) {
+    let slow_pass = slug_cache.is_some();
+    let previous_lookup = sampler.last_resolved_tick;
+    let watermark = if slow_pass {
+        previous_lookup
+    } else {
+        sampler.last_sampled_tick
+    };
+    if !is_new_tick(summary.at, watermark) {
         return;
     }
-    let roots: HashSet<&str> = summary
-        .queue
-        .iter()
-        .map(|r| r.repo.as_str())
-        .chain(summary.listing_not_whole().map(String::as_str))
-        .collect();
-    let repos = super::super::repo_ref::resolve_repo_refs(roots, slug_cache).await;
+    let roots = summary_roots(&summary);
+    let repos = if let Some(slug_cache) = slug_cache {
+        // Even when the fast pass emitted this tick, keep the original
+        // cadence and watermark for trusted identity and drop-counter reads.
+        let repos = resolve_repo_refs(roots.iter().copied(), slug_cache).await;
+        sampler.note_resolution(&roots, &repos);
+        sampler.last_resolved_tick = Some(summary.at);
+        repos
+    } else {
+        let repos = sampler.cached_repos(&roots, cached_repo_ref);
+        // Leave an entirely cold source unconsumed so the slow pass can
+        // still offer it after resolving identities. In a mixed sample, the
+        // warm rows proceed and newly resolved roots join on a later tick.
+        if repos.is_empty() && roots.iter().any(|root| Path::new(root).is_absolute()) {
+            return;
+        }
+        repos
+    };
     let (rows, dropped) = build_rows(&summary, &repos);
-    let failed = failed_slugs(&summary, &repos);
-    let now = Utc::now();
+    if slow_pass {
+        sink.emit_metrics_since(dropped_points(dropped), previous_lookup);
+    }
+    let failed = failed_slugs(&summary, &roots, &repos, cached_repo_ref);
+    let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
+    let Some(sample) = sampler.consume(summary.at, &rows, &failed, refresh) else {
+        return;
+    };
     // Issue #9674: aggregate this tick's pr-open-skip rows per repo, advance
     // the global lockout clock (insert-if-absent, failed listings preserved),
     // and stamp the resulting weights on the repo's `open_pr` spans below.
@@ -641,24 +899,12 @@ pub(in crate::observability) async fn record(slug_cache: &mut HashMap<String, St
         rows.iter()
             .map(|r| (r.slug.as_str(), r.disposition, r.story_points)),
         &failed,
-        now,
+        Utc::now(),
     );
-    let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
-    let emissions = TRACKER
-        .get_or_init(|| Mutex::new(DispositionTracker::default()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .diff(&rows, &failed, now, refresh);
     let parent = super::dispatch::last_tick_context()
         .filter(|(at, _)| *at == summary.at)
         .map(|(_, context)| context);
-    for emission in &emissions {
-        sink.emit_span(build_span(emission, now, parent.as_ref(), &lockouts));
-    }
-    sink.emit_metrics_since(dropped_points(dropped), previous_sample);
-    *LAST_SAMPLED_TICK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary.at);
+    sample.offer(sink, parent.as_ref(), &lockouts);
 }
 
 #[cfg(test)]

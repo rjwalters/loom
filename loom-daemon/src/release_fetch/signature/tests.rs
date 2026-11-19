@@ -26,17 +26,8 @@ fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
     p
 }
 
-fn tempdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "loom-daemon-signature-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn tempdir() -> crate::release_fetch::TestDir {
+    crate::release_fetch::TestDir::new("signature")
 }
 
 /// Prepends `bindir` to `PATH` for the duration of `f`, then restores it

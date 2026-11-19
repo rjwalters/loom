@@ -577,8 +577,15 @@ impl Route {
             entry["headers"] = json!({ header.clone(): reference });
         }
         let models = json!({"providers": { provider: entry }});
-        write_private(&dir.join("models.json"), &models.to_string())
-            .map_err(|e| refuse(&format!("the Pi models.json override could not be written: {e}")))
+        crate::fs_util::write_atomic(
+            &dir.join("models.json"),
+            models.to_string().as_bytes(),
+            crate::fs_util::AtomicOpts {
+                private: true,
+                sync_dir: false,
+            },
+        )
+        .map_err(|e| refuse(&format!("the Pi models.json override could not be written: {e}")))
     }
 
     /// Secret-free per-launch log marker, a sibling of `# LOOM_LAUNCH`.
@@ -590,15 +597,4 @@ impl Route {
             self.plan.summary()
         )
     }
-}
-
-fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("no parent directory"))?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(content.as_bytes())?;
-    file.persist(path).map_err(|e| e.error)?;
-    Ok(())
 }

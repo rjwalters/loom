@@ -4,18 +4,11 @@
 
 use super::*;
 use crate::forge_bucket_book::{self, BucketKey, Resource};
+use crate::gh_invocation::test_support::stub;
 use crate::gh_invocation::{AccessIntent, GhTarget, Operation, ParentContext};
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use crate::test_git_helpers::run as git;
+use std::path::Path;
 use std::time::Duration;
-
-fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    path
-}
 
 fn inv(op: &'static str, args: &[&str], program: &Path) -> GhInvocation {
     GhInvocation::new(
@@ -44,17 +37,6 @@ fn raw_lines_after(body: impl FnOnce()) -> Vec<serde_json::Value> {
         }
     }
     out
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let ok = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 /// A tempdir git checkout whose `origin` is `url`.
@@ -425,8 +407,8 @@ fn a_rate_limit_probe_through_the_facade_is_never_charged() {
 }
 
 /// A probe of a credential whose core bucket is spent must not become the
-/// host's `other` budget reading: that would surface as a host-wide
-/// `rate_limit_quota` stall in the ETA for a bucket unrelated to the work.
+/// host's `other` budget reading: the facade records it under pool `other`
+/// with no rate-limit keys, so no `status_report` budget entry can cite it.
 #[test]
 fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
     let tmp = tempfile::tempdir().unwrap();
@@ -448,16 +430,20 @@ fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
     for key in ["rem", "usd", "rst"] {
         assert!(lines[0].get(key).is_none_or(serde_json::Value::is_null), "{key}: {lines:?}");
     }
-    let exhausted = crate::forge_call_stats::exhausted_pools(chrono::Utc::now());
-    assert!(!exhausted.iter().any(|(p, _)| *p == Pool::Other), "{exhausted:?}");
+    let report = crate::forge_call_stats::status_report(chrono::Utc::now(), None);
+    assert!(!report.budget.iter().any(|b| b.pool == "other"), "{:?}", report.budget);
 }
 
 // ===== 6. loom.forge.calls =====
 
 #[test]
+#[serial_test::serial]
 fn recorded_calls_drain_once_as_forge_calls_points() {
     use crate::observability::ops::{capture::capture, forge_calls};
     use crate::telemetry::ops::MetricName;
+
+    // The no-target call must not inherit a repository from the surrounding process.
+    let _env = crate::env_test_support::EnvGuard::clear(&["LOOM_REPO"]);
     let tmp = tempfile::tempdir().unwrap();
     let ok = stub(tmp.path(), "gh-ok", "echo '{}'");
     let fail = stub(tmp.path(), "gh-fail", "echo 'HTTP 404: Not Found' >&2; exit 1");
@@ -489,6 +475,7 @@ fn recorded_calls_drain_once_as_forge_calls_points() {
             "installation",
             "op",
             "outcome",
+            "purpose",
             "resource",
             "role",
             "route",

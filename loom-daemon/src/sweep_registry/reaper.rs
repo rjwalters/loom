@@ -291,66 +291,9 @@ pub fn spawn_reaper_task(registry: Arc<Mutex<SweepRegistry>>) -> tokio::task::Jo
             let changed = reap_once_releasing_poll_lock(&registry);
             match registry.lock() {
                 Ok(r) => {
-                    // Peer-claim heartbeat (#4431): re-advertise every
-                    // live claim each reaper tick so it never expires
-                    // from peers' views mid-run, now that label
-                    // reconciliation is a slow healing cadence on
-                    // safehouse-enabled hosts. Runs after `reap_once` so
-                    // a just-reaped (dead) sweep is never re-advertised.
-                    let readvertised = r.readvertise_peer_claims();
-                    if readvertised > 0 {
-                        // #5921: promoted from `debug!` — at the default
-                        // log level this heartbeat was previously
-                        // invisible, making every duplicate-dispatch
-                        // report undiagnosable ("did the re-advertise
-                        // path even run?"). The running count is also
-                        // now visible without log-scraping via
-                        // `PeerClaimStatus::advertised`
-                        // (`loom-daemon status` / `loom-daemon
-                        // peer-claims`).
-                        log::info!(
-                            "sweep_registry: re-advertised {readvertised} live peer \
-                             claim(s) (#4431)"
-                        );
-                    }
-                    // Liveness heartbeat (Issue #8736): published every tick
-                    // regardless of live-sweep count — unlike the
-                    // dispatch-claim re-advertise above, which only fires for
-                    // `Running`/`Pending` entries. Closes the converse of the
-                    // #8026 idle gate: this host busy, its peers idle. Silent
-                    // by design (no per-tick log line) — see
-                    // `heartbeat_broadcast`'s module doc for the cost/cadence
-                    // tradeoff.
-                    r.publish_peer_heartbeat();
-                    // Peer-coordination health (Issue #6157): evaluate on
-                    // this same cadence, right after re-advertising, so
-                    // the DEGRADED grace window is measured in reaper-tick
-                    // units. Only log on an actual transition — every
-                    // other tick would just repeat the same verdict.
-                    // Diagnostic-only as of Epic #6165 Phase 4 (#6317):
-                    // this verdict no longer gates stale-claim
-                    // reclamation (the lease record, #6286, is the sole
-                    // fleet-scoped gate for that) — it purely surfaces
-                    // whether the peer-claim/safehouse advertisement
-                    // channel itself looks healthy, for
-                    // `loom-daemon health`/`status`.
-                    if let Some(eval) = r.evaluate_peer_coordination() {
-                        if eval.transitioned {
-                            if eval.degraded {
-                                log::warn!(
-                                    "sweep_registry: peer coordination DEGRADED — {} \
-                                     (#6157, diagnostic-only since #6317)",
-                                    eval.reason
-                                );
-                            } else {
-                                log::info!(
-                                    "sweep_registry: peer coordination RECOVERED — {} \
-                                     (#6157)",
-                                    eval.reason
-                                );
-                            }
-                        }
-                    }
+                    // Fleet dispatch (#12450): the captain's heartbeat rides
+                    // this same 30 s cadence; a no-op with the flag off.
+                    r.fleet_dispatch_heartbeat();
                 }
                 Err(poisoned) => {
                     log::error!("sweep_registry: mutex poisoned ({poisoned:?})");
@@ -695,7 +638,7 @@ impl SweepRegistry {
                 .entries
                 .get(sweep_id)
                 .ok_or_else(|| anyhow!("unknown sweep_id: {sweep_id}"))?;
-            let alive = matches!(info.state, SweepState::Running | SweepState::Pending);
+            let alive = matches!(info.state, SweepState::Running);
             (info.pid, info.kind.clone(), alive, info.started_at)
         };
 
@@ -714,8 +657,9 @@ impl SweepRegistry {
         // both containerized dispatch shapes stamp `loom.sweep.issue=<N>` +
         // `loom.dispatch=container`, and no container / no docker / a docker
         // failure inside is a logged no-op.
-        if let SweepKind::Issue(issue) = &kind {
-            container_stop::begin_container_stop(sweep_id, *issue, grace);
+        // A step's container is labelled with its item (#11898).
+        if let Some(item) = kind.item_number() {
+            container_stop::begin_container_stop(sweep_id, item, grace);
         }
 
         let term_sent = self.signal_sweep(sweep_id, pid, 15);
@@ -765,6 +709,10 @@ impl SweepRegistry {
         started_at: DateTime<Utc>,
         exited_within_grace: bool,
     ) -> CancelOutcome {
+        // The lock release, cross-host claim check and label restore below are
+        // made for this sweep: stamp their `invoke github` spans (#13171). A
+        // step's own release re-enters with its role. Thread-local, synchronous.
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(sweep_id, None);
         // SIGKILL the group if still alive.
         let sigkill_sent = if exited_within_grace {
             false
@@ -780,8 +728,8 @@ impl SweepRegistry {
         // container teardown — `docker kill` whatever is still running for
         // this issue (a stop client that died before dockerd acted, a wedged
         // stop). Clean debug-level no-op when nothing is left.
-        if let SweepKind::Issue(issue) = kind {
-            container_stop::finish_container_stop(sweep_id, *issue, !exited_within_grace);
+        if let Some(item) = kind.item_number() {
+            container_stop::finish_container_stop(sweep_id, item, !exited_within_grace);
         }
 
         // Reap the retained handle so the killed leader does not linger as a
@@ -790,6 +738,13 @@ impl SweepRegistry {
         // handle is retained (reconstructed / test-injected entry).
         let _ = self.reap_handle(sweep_id);
         let pgid = self.entries.get(sweep_id).and_then(|info| info.pgid);
+        // #10802: a cancel is a terminal exit too.
+        let cancel_issue = match kind {
+            SweepKind::Issue(n) => Some(*n),
+            SweepKind::PrSet(_) => None,
+            SweepKind::Step { item, role } => (!role.acts_on_pr()).then_some(*item),
+        };
+        self.request_residue_teardown(sweep_id, cancel_issue, pid, pgid, started_at);
         self.on_sweep_process_end(sweep_id, pid, pgid); // #11031
 
         // Read `pr_number` BEFORE mutating terminal state so the
@@ -811,7 +766,17 @@ impl SweepRegistry {
                 at: now,
             };
         }
-        if let SweepKind::Issue(issue) = kind {
+        let issue = match kind {
+            SweepKind::Issue(issue) => Some(issue),
+            // A cancelled step releases its claim per role (#11898).
+            SweepKind::Step { item, role } => {
+                let end = super::step_spawn::capture::StepEnd::Cancelled;
+                self.release_dead_step(sweep_id, *item, *role, started_at, end);
+                None
+            }
+            SweepKind::PrSet(_) => None,
+        };
+        if let Some(issue) = issue {
             // Ownership-checked release (#4463): if a newer sweep re-acquired
             // this issue's lock after the sweep being cancelled died, leave its
             // live lock intact and skip the label restore below — the newer
@@ -970,6 +935,21 @@ impl SweepRegistry {
         // Insta-crash quarantine TTL (#3939): release any issue whose quarantine
         // has aged past the configured window before this tick's work. Cheap
         // early-return when nothing is quarantined.
+        // #11930: first adopt any park the startup reconciliation kept.
+        self.adopt_restored_parks();
+        // #13919: parks the captain ordered on this host's releases.
+        for issue in crate::fleet_dispatch::worker::take_park_orders(&self.config.workspace_root) {
+            // No park of ours stands behind the order (parks are disabled here,
+            // or another hold already has the item): say so, or the captain
+            // refuses the item for a park nobody will end.
+            if !self.park_ordered_fast_failure(issue) && !self.is_quarantined(issue) {
+                crate::fleet_dispatch::worker::park_ended(
+                    &self.config.workspace_root,
+                    issue,
+                    crate::fleet_dispatch::proto::ParkEndCause::Expired,
+                );
+            }
+        }
         self.expire_quarantine();
         // Retry any previously-failed quarantine label restores (Issue #4110)
         // and release no-op holds whose inputs changed (Issue #10156). Cheap
@@ -979,6 +959,10 @@ impl SweepRegistry {
         // crash-path SIGTERM (Issue #4980). Cheap early-return when nothing is
         // pending; never blocks (the grace is deadline-based, not slept).
         self.escalate_pending_group_reaps();
+        // #11906 (B3): a step past its role's timeout is killed and released.
+        changes += self.reap_step_timeouts();
+        // #11909: the outcome ledger's lapsed entries go each tick.
+        self.prune_step_ledger();
 
         // Snapshot keys + pids first so we can borrow mutably below.
         // Capture started_at so we can compute durations for Exited events.
@@ -1006,7 +990,7 @@ impl SweepRegistry {
 
         for (sweep_id, pid, pgid, state, kind, started_at) in candidates {
             // #10831: a sweep a roll's H4 pause holds keeps its lock (`roll_pause::hold`).
-            let live = matches!(state, SweepState::Running | SweepState::Pending);
+            let live = matches!(state, SweepState::Running);
             if !live || crate::roll_pause::hold::is_held(&sweep_id) {
                 continue;
             }
@@ -1028,6 +1012,10 @@ impl SweepRegistry {
                 self.watch_in_run_exhaustion(&sweep_id);
             }
             if is_dead {
+                // The claim check and label restore below act for this sweep:
+                // stamp their `invoke github` spans (#13171). Dropped per tick
+                // iteration; a step's release re-enters with its role.
+                let _sweep = crate::gh_invocation::telemetry::enter_sweep(&sweep_id, None);
                 // Issue #4980 crash-path reap: the tracked leader is gone, but
                 // its process group may still hold a live `claude` agent and
                 // whatever that agent spawned — the zombie-agent shape of the
@@ -1039,23 +1027,67 @@ impl SweepRegistry {
                 // live until a later tick finds the group empty; one owner of
                 // the session's lifetime, never daemon-released + still running.
                 // Immediate when the group is already empty (the ordinary case).
-                let issue = match &kind {
-                    SweepKind::Issue(n) => Some(*n),
-                    SweepKind::PrSet(_) => None,
+                let (issue, step) = match &kind {
+                    SweepKind::Issue(n) => (Some(*n), None),
+                    SweepKind::Step { item, role } => (None, Some((*item, *role))),
+                    SweepKind::PrSet(_) => (None, None),
                 };
-                let exit_code = match self.await_group_drain(&sweep_id, issue, pgid, exit_code) {
+                let drain_item = issue.or(step.map(|(item, _)| item));
+                let exit_code = match self.await_group_drain(&sweep_id, drain_item, pgid, exit_code)
+                {
                     GroupDrain::Draining => continue,
                     GroupDrain::Drained(code) => code,
                 };
+                // #10802: whatever the agent left behind (dev servers, its scope)
+                // goes with it, for any exit reason. Captured before the lock
+                // release below, which deletes the recorded scope unit.
+                self.request_residue_teardown(&sweep_id, issue, pid, pgid, started_at);
                 // #11031: drained, so the sweep's run target dir goes (off this thread).
                 self.on_sweep_process_end(&sweep_id, pid, pgid);
                 // #4493: account health must be updated before any bounded
                 // re-dispatch path below asks the selector for another profile.
                 self.apply_provider_health_feedback(&sweep_id, exit_code);
+                // A step has its own terminal path (`step_reap.rs`, #11898).
+                if let Some((item, role)) = step {
+                    changes += 1;
+                    let event = self.finish_dead_step(&sweep_id, item, role, started_at, exit_code);
+                    events_to_emit.push(event);
+                    continue;
+                }
                 {
                     changes += 1;
                     let now = Utc::now();
                     let duration_sec = (now - started_at).num_seconds();
+                    // #14443: a legacy issue sweep ends here whatever its
+                    // phase, so this is the one place a model-limit kill (the
+                    // child's log tail names `hit your Fable limit`) is
+                    // recorded for the next launch's step-down — the sweep
+                    // analogue of `end_step`'s observation (#13905). Any other
+                    // end clears the memo, so a step-down never outlives the
+                    // re-dispatch it was made for. The quarantine-tally
+                    // exemption for the banner is separate and unchanged.
+                    if let Some(issue) = issue {
+                        let log_path = self.entries.get(&sweep_id).map(|i| i.log_path.clone());
+                        if let Some(log_path) = log_path {
+                            let end = if exit_code == Some(0) {
+                                super::model_limit_kill::EndKind::Clean
+                            } else {
+                                super::model_limit_kill::EndKind::Died
+                            };
+                            if super::model_limit_kill::observe_step_end(
+                                &self.config.workspace_root,
+                                issue,
+                                super::model_limit_kill::ISSUE_SWEEP_ROLE,
+                                &log_path,
+                                end,
+                            ) {
+                                log::info!(
+                                    "sweep_registry: issue sweep {sweep_id} on #{issue} died on a \
+                                     model limit; its next launch steps down a rung (#14443)"
+                                );
+                            }
+                        }
+                    }
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
                         // Ownership-checked release (#4463): a reaper tick (in
@@ -1272,10 +1304,8 @@ impl SweepRegistry {
                                 // filed this issue. Neither arm nor clear it;
                                 // arm the HOST-level pool hold instead, which
                                 // holds every issue at once.
-                                self.broadcast_pool_hold(
-                                    crate::work_finder::pool_preflight::note_pool_dead(
-                                        &self.config.workspace_root,
-                                    ),
+                                let _ = crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
                                 );
                             } else if is_fast_failure(
                                 duration_sec,
@@ -1563,7 +1593,7 @@ impl SweepRegistry {
                                             match self.begin_issue_dispatch_with_model(
                                                 &SweepKind::Issue(issue),
                                                 None,
-                                                DispatchModel::Resolved(None),
+                                                DispatchModel::Retry(None),
                                                 None,
                                                 None,
                                                 Some(pr),
@@ -1982,10 +2012,8 @@ impl SweepRegistry {
                             // host-level pool hold is armed instead; see the
                             // sibling carve-out in the crashed branch above.
                             if pool_dead {
-                                self.broadcast_pool_hold(
-                                    crate::work_finder::pool_preflight::note_pool_dead(
-                                        &self.config.workspace_root,
-                                    ),
+                                let _ = crate::work_finder::pool_preflight::note_pool_dead(
+                                    &self.config.workspace_root,
                                 );
                             } else if fast_fail || no_progress || yielded_open_pr {
                                 // #11854: an open-PR yield backs off under the
@@ -2147,7 +2175,7 @@ impl SweepRegistry {
             // Prune the per-SweepId progress latch so it cannot grow unbounded
             // across many dispatches (Issue #4088). Safe because a GC'd entry is
             // terminal — the watchdog only ever consults the latch for
-            // Running/Pending entries it still owns a Child handle for.
+            // Running entries it still owns a Child handle for.
             self.watchdog_progressed.remove(&id);
             // Prune the per-SweepId phase-transition history for the same
             // reason (Issue #4704): its only consumer is the durable
@@ -2292,3 +2320,8 @@ mod tests;
     unused_imports
 )]
 mod claim_restore_tests;
+
+// #13171: span-attribute coverage for the legacy issue-sweep cancel path.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
+mod sweep_stamp_tests;

@@ -91,6 +91,9 @@ pub struct RestIssue {
     /// ([`crate::step_dispatch::stage_entry`]). `None` on every REST row (the
     /// listing carries no label times) and on a mirror row that sent none.
     pub labels_at: Option<BTreeMap<String, String>>,
+    /// The REST `draft` flag of a PR row (#12499): an unfinished PR is never
+    /// drawn for review. `false` on an issue row and when the forge omitted it.
+    pub draft: bool,
 }
 
 /// Keep only the real issues in a REST issues listing (Issue #9929).
@@ -257,16 +260,60 @@ pub fn list_open_issues_cached_all_as(
     cwd: Option<&Path>,
     repo_override: Option<&str>,
 ) -> Result<Vec<RestIssue>> {
-    let site = issue_list(caller).deferrable(crate::forge_identity::ReadClass::Hygiene);
-    walk_pages(
-        site,
+    list_open_issues_walk(
+        caller,
         gh_bin,
         cwd,
         repo_override,
-        ("", "open"),
-        MAX_OPEN_PAGES,
-        Snapshot::Membership,
+        crate::forge_identity::ReadClass::Hygiene,
     )
+}
+
+fn list_open_issues_walk(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    class: crate::forge_identity::ReadClass,
+) -> Result<Vec<RestIssue>> {
+    list_open_issues_on(
+        crate::forge_cmd::ForgeType::GitHub,
+        caller,
+        gh_bin,
+        cwd,
+        repo_override,
+        class,
+    )
+}
+
+/// Every open issue and pull request on `forge` (#12312). GitHub: the one
+/// `/issues` walk, which holds the PRs. Gitea: one walk per kind
+/// (`type=issues`, `type=pulls`), issues first, so the rows are the same
+/// set the GitHub walk yields. Each walk is all-or-nothing.
+pub fn list_open_issues_on(
+    forge: crate::forge_cmd::ForgeType,
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo_override: Option<&str>,
+    class: crate::forge_identity::ReadClass,
+) -> Result<Vec<RestIssue>> {
+    let mut all = Vec::new();
+    for &shape in store::Shape::for_forge(forge) {
+        let site = issue_list(caller).deferrable(class).shaped(shape);
+        // The same item ceiling whatever the forge's page size.
+        let max_pages = MAX_OPEN_PAGES * (PER_PAGE / shape.page_size()) as u32;
+        all.extend(walk_pages(
+            site,
+            gh_bin,
+            cwd,
+            repo_override,
+            ("", "open"),
+            max_pages,
+            Snapshot::Membership,
+        )?);
+    }
+    Ok(all)
 }
 
 /// What a page walk's mid-walk revalidation must find unchanged.
@@ -514,13 +561,15 @@ struct ListedPage {
     /// served from a `304`, which carries no `Link` (and GitHub's ETag
     /// covers only the body, so the stored body says nothing about it).
     next: Option<bool>,
+    /// The forge's page size: only a full page may have a successor.
+    page_size: usize,
 }
 
 impl ListedPage {
     /// Whether a walk must read the next page: the forge's word on a `200`,
     /// else (a `304`) only a full page may have a successor.
     fn has_successor(&self) -> bool {
-        self.next.unwrap_or(self.rows.len() >= PER_PAGE)
+        self.next.unwrap_or(self.rows.len() >= self.page_size)
     }
 }
 
@@ -551,7 +600,10 @@ fn list_issues_cached_once(
     // #9252: the URL names the SAME resolved repo the key does (never gh's
     // own placeholder remote choice), so key and request cannot disagree.
     let target = store::resolve_target(cwd, repo);
-    let mut url = build_issues_url(target.repo.as_deref(), label, state);
+    let mut url = match site.shape {
+        store::Shape::GitHub => build_issues_url(target.repo.as_deref(), label, state),
+        shape => build_gitea_items_url(target.repo.as_deref(), shape, label, state),
+    };
     if let Some(n) = page.filter(|n| *n > 1) {
         url.push_str(&format!("&page={n}"));
     }
@@ -577,6 +629,7 @@ fn list_issues_cached_once(
                 return Ok(ListedPage {
                     rows: entry.issues.as_ref().clone(),
                     next: None,
+                    page_size: site.shape.page_size(),
                 });
             }
             // A 304 can only happen because WE sent an etag; without one this
@@ -618,6 +671,7 @@ fn list_issues_cached_once(
             Ok(ListedPage {
                 rows: issues,
                 next: Some(r.next_page),
+                page_size: site.shape.page_size(),
             })
         }
         _ => Err(anyhow!(
@@ -691,6 +745,34 @@ pub fn build_issues_url(repo: Option<&str>, label: &str, state: &str) -> String 
         );
     }
     format!("repos/{repo_path}/issues?labels={label}&state={state}&per_page={PER_PAGE}")
+}
+
+/// The Gitea form of [`build_issues_url`] (#12312): `type=issues` or
+/// `type=pulls` (Gitea's `/issues` returns issues only unless asked), oldest
+/// first, paged by `limit` (Gitea's default cap is 50). An empty `label` is
+/// the unfiltered listing.
+#[must_use]
+pub(crate) fn build_gitea_items_url(
+    repo: Option<&str>,
+    shape: store::Shape,
+    label: &str,
+    state: &str,
+) -> String {
+    let repo_path = repo.unwrap_or("{owner}/{repo}");
+    let kind = if shape == store::Shape::GiteaPulls {
+        "pulls"
+    } else {
+        "issues"
+    };
+    let labels = if label.is_empty() {
+        String::new()
+    } else {
+        format!("&labels={label}")
+    };
+    format!(
+        "repos/{repo_path}/issues?state={state}&type={kind}&sort=oldest&limit={}{labels}",
+        shape.page_size()
+    )
 }
 
 /// A parsed `gh api --include` response: the status from the first
@@ -819,6 +901,8 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
         comments: u32,
         #[serde(default)]
         sub_issues_summary: Option<serde_json::Value>,
+        #[serde(default)]
+        draft: bool,
     }
     let rows: Vec<RawIssue> = serde_json::from_str(body.trim())?;
     Ok(rows
@@ -838,6 +922,7 @@ pub fn parse_rest_issues(body: &str) -> Result<Vec<RestIssue>> {
             is_pull_request: r.pull_request.is_some(),
             open_sub_issues: r.sub_issues_summary.as_ref().and_then(open_sub_issues),
             labels_at: None,
+            draft: r.draft,
         })
         .collect())
 }

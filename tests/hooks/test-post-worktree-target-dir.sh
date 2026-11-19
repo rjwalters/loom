@@ -29,7 +29,8 @@
 #
 # No real `cargo build` is ever invoked: every case pre-seeds a fake
 # executable "binary" at the resolved location and asserts the hook's fast
-# copy path is taken, not the rebuild fallback.
+# copy path is taken, not the rebuild fallback. Test 6 uses a fake `cargo` to
+# prove the hook never builds (#11329).
 #
 # Exit code 0 = all tests pass, 1 = failures detected.
 
@@ -380,6 +381,49 @@ else
 fi
 
 rm -f "$CARGO_HOME/config.toml"
+
+# ==========================================================================
+# Test 6 (#11329): no main binary -- the hook must skip, never build
+# ==========================================================================
+MAIN6="$WORKDIR/main6"
+WT6="$WORKDIR/wt6"
+make_main_workspace "$MAIN6"
+add_worktree "$MAIN6" "$WT6" "t6"
+FAKEBIN6="$WORKDIR/fakebin6"
+mkdir -p "$FAKEBIN6"
+REAL_CARGO6="$(command -v cargo || true)"
+# `cargo metadata` is the target-dir resolver's read-only query; anything else
+# (i.e. a build) is recorded and fails the test.
+printf '#!/usr/bin/env bash\nif [[ "${1:-}" == metadata && -n "%s" ]]; then exec "%s" "$@"; fi\necho "$@" >> "%s/cargo-invoked"\nexit 0\n' "$REAL_CARGO6" "$REAL_CARGO6" "$WORKDIR" > "$FAKEBIN6/cargo"
+chmod +x "$FAKEBIN6/cargo"
+rm -f "$WORKDIR/cargo-invoked"
+
+OUT6="$( unset CARGO_TARGET_DIR; PATH="$FAKEBIN6:$PATH" run_hook "$WT6" )"
+RC6=$?
+
+if [[ $RC6 -eq 0 ]]; then
+    pass "no main binary: hook exits 0"
+else
+    fail "no main binary: hook exited $RC6"
+fi
+
+if [[ ! -e "$WORKDIR/cargo-invoked" ]]; then
+    pass "no main binary: cargo was never invoked"
+else
+    fail "no main binary: cargo was invoked: $(cat "$WORKDIR/cargo-invoked")"
+fi
+
+if [[ ! -e "$WT6/target" ]]; then
+    pass "no main binary: destination dir not created"
+else
+    fail "no main binary: $WT6/target was created"
+fi
+
+if [[ "$OUT6" == *"not building one"* ]]; then
+    pass "no main binary: hook prints the skip line"
+else
+    fail "no main binary: hook output missing skip line: $OUT6"
+fi
 
 # ==========================================================================
 # Summary

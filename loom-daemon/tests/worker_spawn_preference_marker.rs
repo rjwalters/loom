@@ -2,8 +2,7 @@
 //! #8599), driven through the real `spawn-worker` path.
 //!
 //! A sibling of `worker_spawn.rs` rather than a section of it, for the same
-//! reason `worker_spawn_api_keys.rs` is one: that file sits just under the
-//! 1000-line file-size ratchet and these tests would carry it over. The
+//! reason `worker_spawn_api_keys.rs` is one: these tests get their own file. The
 //! `worker` helper below is a deliberate copy of its own.
 //!
 //! What is under test is the seam, not the resolver: the daemon decides the
@@ -92,3 +91,8 @@ fn an_unconfigured_launch_records_no_preference_line() {
     assert!(text.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{text}");
     assert!(!text.contains("LOOM_RUNTIME_PREFERENCE"), "{text}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -18,6 +18,13 @@
 //! `gh pr checks` buckets each row as pass / fail / pending / skipping /
 //! cancel. The rollup classifier treats `failure`, `timed_out`, `cancelled`
 //! and `action_required` as failing and any non-`completed` status as pending.
+//! One deliberate difference, in the not-green direction (#14571): a
+//! `cancelled` check-run is no verdict about the commit, so it is never read
+//! as failing here. A cancellation that no completed run replaced (the
+//! superseded-run drop has already removed every replaced one) is
+//! [`Rollup::cancelled`]: the wait holds on it (never `GREEN`, never `RED`),
+//! so a genuinely unreplaced cancellation ends `TIMEOUT` and the approval
+//! stays pending instead of being refused as red forever.
 //! One addition, in the fail-closed direction: a `completed` run whose
 //! conclusion is none of `success` / `neutral` / `skipped` (e.g.
 //! `startup_failure`, `stale`) is also failing here, so `GREEN` only ever
@@ -28,6 +35,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
+use crate::forge_merge_queue::authz::REQUIRED_CHECK_CONTEXT;
 use crate::merge_pr::check_runs_rollup;
 use crate::merge_pr::checks_failure::{self, Verdict as RequiredVerdict};
 
@@ -54,10 +62,49 @@ pub struct Rollup {
     pub failing: Vec<String>,
     /// Still-running check names, sorted and de-duplicated.
     pub pending: Vec<String>,
+    /// Names whose only terminal evidence is a `cancelled` check-run with no
+    /// replacement (#14571): neither a pass nor a failure. A name that also
+    /// has a genuine failing row is in [`Rollup::failing`], not here.
+    pub cancelled: Vec<String>,
     /// Every check name seen, for the required-context presence test.
     pub seen: BTreeSet<String>,
     /// Detail rows for [`Rollup::failing`], for the stderr listing.
     pub failed_detail: Vec<Failed>,
+}
+
+impl Rollup {
+    /// [`Rollup::pending`] without [`REQUIRED_CHECK_CONTEXT`], which never
+    /// holds a wait (#12526) — the one filter every verdict path shares.
+    #[must_use]
+    pub fn blocking_pending(&self) -> Vec<String> {
+        without_authorization(&self.pending)
+    }
+
+    /// [`Rollup::failing`] without [`REQUIRED_CHECK_CONTEXT`]: its `failure`
+    /// is an output of approval (a revocation), so reading it as an input
+    /// deadlocks a PR whose every other check is green.
+    #[must_use]
+    pub fn blocking_failing(&self) -> Vec<String> {
+        without_authorization(&self.failing)
+    }
+}
+
+impl Rollup {
+    /// [`Rollup::cancelled`] without [`REQUIRED_CHECK_CONTEXT`].
+    #[must_use]
+    pub fn blocking_cancelled(&self) -> Vec<String> {
+        without_authorization(&self.cancelled)
+    }
+}
+
+/// `names` minus [`REQUIRED_CHECK_CONTEXT`] (#12552).
+#[must_use]
+pub fn without_authorization(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| n.as_str() != REQUIRED_CHECK_CONTEXT)
+        .cloned()
+        .collect()
 }
 
 /// Merge a complete check-runs payload (`{total_count, check_runs}`, every
@@ -102,15 +149,28 @@ pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
     let rollup =
         check_runs_rollup::classify(&doc.to_string()).map_err(|r| format!("unreadable: {r}"))?;
 
-    let mut failing: BTreeSet<String> = lines(&rollup.failing);
-    // Fail-closed extension (module docs): an unknown terminal conclusion.
-    for row in &rows {
-        let done = row.get("status").and_then(Value::as_str) == Some("completed");
-        let conclusion = row.get("conclusion").and_then(Value::as_str);
-        if done && !conclusion.is_some_and(|c| SUCCESS_CONCLUSIONS.contains(&c)) {
-            failing.insert(name_of(row));
-        }
-    }
+    // A `cancelled` row is no verdict (#14571): the classifier's failing list
+    // minus the names that ONLY cancelled rows account for, plus every
+    // genuinely failing row (including an unknown terminal conclusion, the
+    // fail-closed extension in the module docs).
+    let cancelled_names: BTreeSet<String> = rows
+        .iter()
+        .filter(|r| conclusion_of(r) == Some("cancelled"))
+        .flat_map(|r| lines(&name_of(r)))
+        .collect();
+    let mut failing: BTreeSet<String> = lines(&rollup.failing)
+        .into_iter()
+        .filter(|n| !cancelled_names.contains(n))
+        .collect();
+    failing.extend(rows.iter().filter(|r| genuinely_failing(r)).map(name_of));
+    let cancelled: Vec<String> = rows
+        .iter()
+        .filter(|r| conclusion_of(r) == Some("cancelled"))
+        .map(name_of)
+        .filter(|n| !failing.contains(n))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let seen: BTreeSet<String> = rows.iter().map(name_of).collect();
     let failed_detail = failing
         .iter()
@@ -120,9 +180,29 @@ pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
         total,
         failing: failing.into_iter().collect(),
         pending: lines(&rollup.pending).into_iter().collect(),
+        cancelled,
         seen,
         failed_detail,
     })
+}
+
+fn conclusion_of(row: &Value) -> Option<&str> {
+    row.get("conclusion").and_then(Value::as_str)
+}
+
+/// A row that is a failure verdict about the commit: `failure` /
+/// `timed_out` / `action_required` (as the classifier reads them, settled or
+/// not), or a settled row with any other non-success conclusion except
+/// `cancelled`.
+fn genuinely_failing(row: &Value) -> bool {
+    match conclusion_of(row) {
+        Some("cancelled") => false,
+        Some("failure" | "timed_out" | "action_required") => true,
+        c => {
+            check_runs_rollup::is_settled(row)
+                && !c.is_some_and(|c| SUCCESS_CONCLUSIONS.contains(&c))
+        }
+    }
 }
 
 /// What a non-empty rollup means for the wait.
@@ -134,6 +214,14 @@ pub enum Decision {
     Pending(Vec<String>),
     /// Every relevant check is terminal-success.
     Green,
+}
+
+/// `pending` plus the unreplaced-cancelled names, de-duplicated: a name the
+/// wait holds on, as opposed to one it may settle past.
+fn held(pending: &[String], cancelled: &[String]) -> Vec<String> {
+    let mut out = pending.to_vec();
+    out.extend(cancelled.iter().filter(|c| !pending.contains(c)).cloned());
+    out
 }
 
 /// The pending name reported while the base branch's required-context set
@@ -159,49 +247,96 @@ pub const REQUIRED_UNKNOWN: &str = "(required-contexts-unknown)";
 /// - **Empty set under `--required-only`**: falls back to the default-mode
 ///   decision over every observed check. (`gh pr checks --required` errors
 ///   with "no required checks reported" here; it never passes.)
+///
+/// **The authorization context never holds the wait** (#12526): Champion posts
+/// [`REQUIRED_CHECK_CONTEXT`] only AFTER the Judge's approval, so a Judge
+/// waiting on it for a green verdict deadlocks until timeout. Its absence or
+/// `pending` state is ignored, and so is a posted `failure` (a revocation): the
+/// status is an output of approval, so counting it red would block the very
+/// approval that re-grants it. The merge queue's own required-check ruleset
+/// still enforces the grant at merge time.
 #[must_use]
 pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
+    let failing = r.blocking_failing();
     let Some(req) = required else {
-        if !required_only && !r.failing.is_empty() {
-            return Decision::Red(r.failing.clone());
+        if !required_only && !failing.is_empty() {
+            return Decision::Red(failing);
         }
         let mut waiting = if required_only {
             Vec::new()
         } else {
-            r.pending.clone()
+            held(&r.pending, &r.blocking_cancelled())
         };
         waiting.push(REQUIRED_UNKNOWN.to_string());
         return Decision::Pending(waiting);
     };
     let missing: Vec<String> = req
         .iter()
-        .filter(|c| !r.seen.contains(*c))
+        .filter(|c| c.as_str() != REQUIRED_CHECK_CONTEXT && !r.seen.contains(*c))
         .cloned()
         .collect();
+    let pending = r.blocking_pending();
     if required_only && !req.is_empty() {
-        let mut waiting: Vec<String> = r
-            .pending
+        let mut waiting: Vec<String> = pending
             .iter()
             .filter(|p| req.contains(p))
             .cloned()
             .collect();
+        waiting.extend(
+            r.blocking_cancelled()
+                .into_iter()
+                .filter(|c| req.contains(c)),
+        );
         waiting.extend(missing);
-        return match checks_failure::classify(&r.failing, req, !waiting.is_empty()) {
+        return match checks_failure::classify(&failing, req, !waiting.is_empty()) {
             RequiredVerdict::RequiredFailed(names) => Decision::Red(names),
             RequiredVerdict::StillPending => Decision::Pending(waiting),
             RequiredVerdict::InformationalOnly => Decision::Green,
         };
     }
-    if !r.failing.is_empty() {
-        return Decision::Red(r.failing.clone());
+    if !failing.is_empty() {
+        return Decision::Red(failing);
     }
-    if !r.pending.is_empty() {
-        return Decision::Pending(r.pending.clone());
+    // A cancellation nothing replaced holds the wait too (#14571).
+    let pending = held(&pending, &r.blocking_cancelled());
+    if !pending.is_empty() {
+        return Decision::Pending(pending);
     }
     if !missing.is_empty() {
         return Decision::Pending(missing);
     }
     Decision::Green
+}
+
+/// [`decide`] under `--settle-red` (#12011): a `Red` stands only once the
+/// run has finished — nothing observed is still pending. Until then it is
+/// `Pending` on what is still running (so the wait ends `TIMEOUT`, never an
+/// early `RED`). Every other decision is [`decide`]'s, unchanged.
+///
+/// Only observed pending checks hold a `Red` back (#12022): the job log is
+/// readable once they finish, whatever the required set. An unknown or
+/// unregistered required set must not — nothing would ever resolve it once
+/// the run is over, so a finished red would `TIMEOUT` on every pass and never
+/// reach the Doctor. The required-set fail-closed rules stay in [`decide`],
+/// where they keep `Green` honest.
+///
+/// Why opt-in: an early `RED` is right for a caller that only *refuses* on it
+/// (the approval gate, `merge-pr.sh`, Champion), but wrong as the trigger for
+/// a changes-requested verdict — a Judge cannot read a job log (`gh run view
+/// --log-failed`) until the whole run completes, so it cannot name the
+/// failing test, nor tell a tracked flake from a regression (#12011).
+#[must_use]
+pub fn decide_settled(r: &Rollup, required: Option<&[String]>, required_only: bool) -> Decision {
+    let d = decide(r, required, required_only);
+    if !matches!(d, Decision::Red(_)) {
+        return d;
+    }
+    let pending = r.blocking_pending();
+    if pending.is_empty() {
+        d
+    } else {
+        Decision::Pending(pending)
+    }
 }
 
 /// The terminal answer of one `wait-checks` run — exactly one sentinel line.
@@ -286,7 +421,12 @@ fn name_of(row: &Value) -> String {
 }
 
 fn detail(name: &str, rows: &[Value]) -> Failed {
-    let row = rows.iter().find(|r| name_of(r) == name);
+    // The row that actually failed (#14571): a same-named passing sibling
+    // must not donate its URL and run id to a failure it did not cause.
+    let named = || rows.iter().filter(|r| name_of(r) == name);
+    let row = named()
+        .find(|r| genuinely_failing(r))
+        .or_else(|| named().next());
     let field = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
     let details = field("details_url").unwrap_or("");
     Failed {
@@ -336,7 +476,8 @@ mod tests {
     }
 
     /// Each conclusion lands where `gh pr checks`' bucket would put it:
-    /// pass/skipping → GREEN, fail/cancel → RED, pending → wait.
+    /// pass/skipping → GREEN, fail → RED, pending → wait. `cancel` differs
+    /// on purpose (#14571): it is a wait, never RED or GREEN.
     #[test]
     fn conclusion_table_matches_gh_pr_checks_buckets() {
         for (status, conclusion, want) in [
@@ -345,7 +486,8 @@ mod tests {
             ("completed", Some("skipped"), "green"),
             ("completed", Some("failure"), "red"),
             ("completed", Some("timed_out"), "red"),
-            ("completed", Some("cancelled"), "red"),
+            // No verdict about the commit (#14571): held, never RED or GREEN.
+            ("completed", Some("cancelled"), "pending"),
             ("completed", Some("action_required"), "red"),
             ("completed", Some("startup_failure"), "red"),
             ("completed", Some("stale"), "red"),
@@ -361,6 +503,25 @@ mod tests {
             };
             assert_eq!(got, want, "{status}/{conclusion:?}");
         }
+    }
+
+    /// #13758: a run GitHub left at `in_progress` after it finished is settled.
+    #[test]
+    fn stuck_in_progress_run_with_conclusion_is_settled() {
+        for (conclusion, want) in [("success", "green"), ("failure", "red"), ("stale", "red")] {
+            let mut row = run("ci", "in_progress", Some(conclusion));
+            row["completed_at"] = json!("2026-11-10T03:25:28Z");
+            let r = fold(&runs(vec![row]), &no_status()).unwrap();
+            let got = match decide(&r, Some(&[][..]), false) {
+                Decision::Green => "green",
+                Decision::Red(_) => "red",
+                Decision::Pending(_) => "pending",
+            };
+            assert_eq!(got, want, "{conclusion}");
+        }
+        // Without `completed_at` the row is still pending.
+        let r = fold(&runs(vec![run("ci", "in_progress", Some("success"))]), &no_status()).unwrap();
+        assert!(matches!(decide(&r, Some(&[][..]), false), Decision::Pending(_)));
     }
 
     #[test]
@@ -459,6 +620,171 @@ mod tests {
             decide(&r, Some(req.as_slice()), true),
             Decision::Pending(vec!["Backend".into(), "Gate".into()])
         );
+    }
+
+    /// #12011: under `--settle-red` a failure is not RED while anything else
+    /// is still running (the PR #11974 replay); once the run has finished it
+    /// is. Without the flag the same rollup is RED at once, as before.
+    #[test]
+    fn settle_red_waits_for_the_run_to_finish_before_red() {
+        let none: &[String] = &[];
+        let partial = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "in_progress", None),
+            run("lint", "completed", Some("success")),
+        ];
+        let r = fold(&runs(partial), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Pending(vec!["Rust Unit Tests (1/3)".into()])
+        );
+        assert_eq!(
+            decide(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+        let done = vec![
+            run("Rust Unit Tests (2/3)", "completed", Some("failure")),
+            run("Rust Unit Tests (1/3)", "completed", Some("success")),
+        ];
+        let r = fold(&runs(done), &no_status()).unwrap();
+        assert_eq!(
+            decide_settled(&r, Some(none), false),
+            Decision::Red(vec!["Rust Unit Tests (2/3)".into()])
+        );
+    }
+
+    /// #12022: under `--settle-red` an unknown or unregistered required set
+    /// does not hold back a finished red — nothing would ever resolve it, so
+    /// the wait would `TIMEOUT` every pass. It still keeps `Green` from
+    /// standing (the fail-closed rules live in `decide`).
+    #[test]
+    fn settle_red_is_red_once_nothing_is_pending_even_with_an_unknown_or_unregistered_required_set()
+    {
+        let r = fold(&runs(vec![run("lint", "completed", Some("failure"))]), &no_status()).unwrap();
+        assert_eq!(decide(&r, None, false), Decision::Red(vec!["lint".into()]));
+        assert_eq!(decide_settled(&r, None, false), Decision::Red(vec!["lint".into()]));
+        let req = vec!["Backend".to_string()];
+        assert_eq!(
+            decide_settled(&r, Some(req.as_slice()), false),
+            Decision::Red(vec!["lint".into()])
+        );
+        // Non-RED decisions are untouched.
+        let ok = fold(&runs(vec![run("ci", "completed", Some("success"))]), &no_status()).unwrap();
+        assert_eq!(decide_settled(&ok, Some(&[][..]), false), Decision::Green);
+        // Fail-closed side: a green-only rollup with an unknown set still waits.
+        assert_eq!(
+            decide_settled(&ok, None, false),
+            Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
+        );
+    }
+
+    fn url_run(name: &str, conclusion: &str, job: u64, run: u64) -> Value {
+        json!({"name": name, "status": "completed", "conclusion": conclusion,
+               "html_url": format!("https://github.com/o/r/actions/runs/{run}/job/{job}"),
+               "details_url": format!("https://github.com/o/r/actions/runs/{run}/job/{job}")})
+    }
+
+    /// #14571: a lone cancellation is neither GREEN nor RED, in every mode.
+    #[test]
+    fn a_lone_cancellation_is_pending_in_every_mode() {
+        let r = fold(&runs(vec![run("ci", "completed", Some("cancelled"))]), &no_status()).unwrap();
+        assert!(r.failing.is_empty());
+        assert_eq!(r.cancelled, vec!["ci"]);
+        let none: &[String] = &[];
+        let req = vec!["ci".to_string()];
+        for required in [Some(none), Some(req.as_slice()), None] {
+            for required_only in [false, true] {
+                for settled in [false, true] {
+                    let d = if settled {
+                        decide_settled(&r, required, required_only)
+                    } else {
+                        decide(&r, required, required_only)
+                    };
+                    assert!(
+                        matches!(d, Decision::Pending(_)),
+                        "{required:?} {required_only} {settled}: {d:?}"
+                    );
+                }
+            }
+        }
+        // Under --required-only an unrequired cancellation is informational.
+        let other = vec!["Backend".to_string()];
+        let r = fold(
+            &runs(vec![
+                run("Backend", "completed", Some("success")),
+                run("lint", "completed", Some("cancelled")),
+            ]),
+            &no_status(),
+        )
+        .unwrap();
+        assert_eq!(decide(&r, Some(other.as_slice()), true), Decision::Green);
+        assert_eq!(
+            decide(&r, Some(other.as_slice()), false),
+            Decision::Pending(vec!["lint".into()])
+        );
+    }
+
+    /// A required cancellation holds `--required-only` too.
+    #[test]
+    fn a_required_cancellation_holds_required_only() {
+        let r = fold(&runs(vec![run("Backend", "completed", Some("cancelled"))]), &no_status())
+            .unwrap();
+        let req = vec!["Backend".to_string()];
+        assert_eq!(
+            decide(&r, Some(req.as_slice()), true),
+            Decision::Pending(vec!["Backend".into()])
+        );
+    }
+
+    /// An unrelated cancellation neither makes a genuine failure pending nor
+    /// hides it; a same-named genuine failure is failing, not cancelled.
+    #[test]
+    fn a_cancellation_does_not_mask_or_hold_a_genuine_failure() {
+        let none: &[String] = &[];
+        let rows = vec![
+            run("lint", "completed", Some("cancelled")),
+            run("build", "completed", Some("failure")),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(decide(&r, Some(none), false), Decision::Red(vec!["build".into()]));
+        assert_eq!(decide_settled(&r, Some(none), false), Decision::Red(vec!["build".into()]));
+        let rows = vec![
+            run("build", "completed", Some("cancelled")),
+            run("build", "completed", Some("failure")),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(r.failing, vec!["build"]);
+        assert!(r.cancelled.is_empty());
+    }
+
+    /// An outstanding same-named run keeps the wait pending (listed once).
+    #[test]
+    fn a_cancellation_beside_an_outstanding_twin_stays_pending() {
+        let rows = vec![
+            run("ci", "completed", Some("cancelled")),
+            run("ci", "in_progress", None),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(decide(&r, Some(&[][..]), false), Decision::Pending(vec!["ci".into()]));
+    }
+
+    /// #14571: the RED detail names the failing row even when a passing
+    /// sibling shares its name, whatever the row order.
+    #[test]
+    fn red_detail_comes_from_the_failing_row_in_either_order() {
+        for flip in [false, true] {
+            let mut rows = vec![
+                url_run("Gate", "success", 111, 11),
+                url_run("Gate", "failure", 222, 22),
+            ];
+            if flip {
+                rows.reverse();
+            }
+            let r = fold(&runs(rows), &no_status()).unwrap();
+            assert_eq!(r.failed_detail.len(), 1);
+            assert_eq!(r.failed_detail[0].url, "https://github.com/o/r/actions/runs/22/job/222");
+            assert_eq!(r.failed_detail[0].run_id, "22");
+        }
     }
 
     #[test]

@@ -34,8 +34,7 @@
 #
 # That gate lives in the `vendored-private-refs` job in
 # .github/workflows/ci.yml, NOT in this script: this script is
-# `contract`-category portable shell, and `loom-daemon shell-budget --check`
-# refuses any net growth of that pool with no override (epic #7810). Same
+# `contract`-category portable shell, which epic #7810 is retiring. Same
 # concern, same CI job, different file — see that job's comment. Like the
 # checks here, it reports file:line and never the matched value.
 #
@@ -79,8 +78,7 @@ ALLOWED_HOST_SUFFIXES=(
   # `defaults/docs/runtime-model-trials.md` cites, the latter the platform API
   # endpoint its example model profile names. Same category as anthropic.com /
   # openai.com on these two lines — a vendor Loom drives, not an
-  # operator-owned deployment. Folded onto the existing lines rather than
-  # given their own so this stays a zero-line change to the shell budget.
+  # operator-owned deployment. Folded onto the existing lines.
   # `chatgpt.com` is OpenAI's public product host, cited verbatim in the
   # Codex usage-limit refusal captured for #8539 (token-pool.md and the
   # matching assert_classify row) — same category, folded onto this line.
@@ -209,6 +207,21 @@ scan_tree() {
     fi
   done < <(scan_matches '\b[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.(com|net|org|io|dev)\b' "$dir")
 
+  # 3. Bare `forge wait-checks` in a role prompt (#12691). Only
+  #    `loom-daemon forge wait-checks` resolves in a consumer repo; a prompt that
+  #    teaches the bare form sends a Judge to "not a valid subcommand". Scoped to
+  #    the prompt surfaces (.claude/, .agents/): prose elsewhere may name the
+  #    subcommand. The 12-char lead-in is exactly `loom-daemon `.
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    file="${line%%:*}"; line="${line#*:}"
+    lineno="${line%%:*}"; ref="${line#*:}"
+    case "$file" in *.claude/*|*.agents/*) ;; *) continue ;; esac
+    [[ "$ref" == *"loom-daemon forge wait-checks" ]] && continue
+    echo "  $file:$lineno: bare 'forge wait-checks' (write 'loom-daemon forge wait-checks')"
+    violations=1
+  done < <(scan_matches '.{0,12}forge wait-checks' "$dir")
+
   return $violations
 }
 
@@ -248,6 +261,19 @@ EOF
   else
     echo "self-test: FAIL — dirty fixture was not fully detected. Got:" >&2
     echo "$out" >&2
+    fails=1
+  fi
+
+  # Bare `forge wait-checks` in a role prompt (#12691): flagged; the qualified
+  # form and a prose mention outside .claude/.agents pass.
+  mkdir -p "$tmp/wc-ok/.claude/commands" "$tmp/wc-ok/docs" "$tmp/wc-bad/.claude/commands"
+  printf 'Run loom-daemon forge wait-checks 42 --timeout 20.\n' > "$tmp/wc-ok/.claude/commands/j.md"
+  printf 'The forge wait-checks subcommand polls CI.\n' > "$tmp/wc-ok/docs/d.md"
+  printf 'Run forge wait-checks 42 --timeout 20.\n' > "$tmp/wc-bad/.claude/commands/j.md"
+  if scan_tree "$tmp/wc-ok" >/dev/null && ! scan_tree "$tmp/wc-bad" >/dev/null; then
+    echo "self-test: OK — bare 'forge wait-checks' in a prompt fails; the qualified form passes"
+  else
+    echo "self-test: FAIL — bare 'forge wait-checks' rule did not discriminate" >&2
     fails=1
   fi
 

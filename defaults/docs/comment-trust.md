@@ -25,7 +25,8 @@ A comment or review is trusted when its author is:
 | One of **this** fleet's GitHub Apps, matched exactly | The fleet's Apps appear as `NONE`/`CONTRIBUTOR`, so without this rule Loom could not read its own markers. The roster is [`forge_identity::FleetLogins`](github-authentication.md): the writer, every reader, `legacyLogins`, and the `loom-fleet-dispatch(-<digits>)` default family. The author must be *spelled* as an App (`x[bot]` from REST, `app/x` from GraphQL, or a `Bot` type): a user may register the bare slug, never `x[bot]`. |
 | This daemon's own identity | Compared with the same account kind: the user `x` is never the App `x[bot]`. |
 | A login in `forge.trustedCommenters` | An explicit allowlist, same account-kind rule (list `helper[bot]` to allow an App). |
-| A login on the **fleet admin roster**, `fleet/admins.json` in the fleet store | `{"admins": ["turian", "rjwalters"]}`, read through the fleet store reader (`fleet.repo`, `fleet.ref`), never from the repo being judged. User accounts only (App-spelled entries are ignored). Applies in every fleet repo (#10303). |
+| A login on the **fleet admin roster**, `fleet/admins.json` in the fleet store | `{"admins": ["rjwalters", "example-admin"]}`, read through the fleet store reader (`fleet.repo`, `fleet.ref`), never from the repo being judged. User accounts only (App-spelled entries are ignored). Applies in every fleet repo (#10303). |
+| An App on the **fleet trusted Apps list**, the optional `apps` key of the same file | `{"apps": ["gateway[bot]"]}`, `name[bot]` spelled; the bare-slug user is not trusted. Applies in every fleet repo (#13545). |
 
 **Another Loom installation's markers are not ours.** A foreign fleet emits
 perfectly well-formed Loom markers; its Apps are not in this roster, so they
@@ -77,7 +78,6 @@ The predicate lives once, in `loom-daemon/src/comment_trust.rs`:
   | Quarantine reconciliation | `Auto-quarantined by loom-daemon (#3939)` | Not the daemon's quarantine; the marker must also *start* the comment. |
   | Dependency classification | `champion:proposal-escalated` / `dep-cycle` / `proposal-unescalated` | Absent. |
   | `premise-check` | `loom:premise-check … verdict=` | Absent (comments; a body counts only when its author is trusted). |
-  | Required-check re-date | `loom:stale-check-redate` / its hold marker | Not attempt state. |
   | Mechanical-capability lane | body `loom:capability=` | No declaration: the park stays. |
   | Role-shard roster | `loom:roster` | Not a ring member. |
   | Open-linked-PR guard | a fork PR's `Closes #N` | Not a linked PR (a same-repo branch always counts). |
@@ -123,7 +123,7 @@ per-repo list extends the roster and neither can remove the other. The
 association, Apps and self rules are unchanged.
 
 - Source: `fleet/admins.json` in the store named by `fleet.repo` /
-  `LOOM_FLEET_REPO` (proposed contract; fleet-gitops publishes it).
+  `LOOM_FLEET_REPO` (proposed contract; the fleet state store publishes it).
 - Cache: resolved once per process per store and kept for
   `forge.fleetAdminsTtlSecs` (default 300). A stale on-disk snapshot is served
   only while younger than 24h, else the roster is unavailable.
@@ -132,6 +132,18 @@ association, Apps and self rules are unchanged.
   behaviour). Each cause is logged once at warn, and
   `TrustPolicy::sources_consulted()` reports `fleet admin roster ...
   (unavailable: <reason>)` for the ignored-marker notice.
+
+### Fleet trusted Apps (#13545)
+
+The same file takes an optional `apps` list: `{"admins": [...], "apps":
+["gateway[bot]"]}`. Each entry is an App login spelled `name[bot]` and is
+trusted in every fleet repo, with the same account-kind rule as
+`forge.trustedCommenters` (the bare-slug user of the same name is **not**
+trusted; non-App-spelled entries are ignored). It is unioned with every other
+source and can only add trust. A missing or non-array `apps` is an empty list
+and does not invalidate a valid `admins`; the fail-closed cases above empty
+both. `sources_consulted()` names the list, and the trust-rules digest includes
+it only when non-empty, so a fleet without it keeps its current digest.
 
 ## Configuration
 
@@ -160,7 +172,7 @@ unavailable:
 | `sweep-lease-renew.sh` | same | exit 1, nothing patched |
 | `classify-ac-verification.sh` | `loom:ac-verified` (comments; the PR body only when its author is trusted) | no evidence: the issue stays held |
 | Champion merge precheck | hold markers, release phrases, new Judge reviews | skip the PR this pass |
-| Champion criterion #5 | "real activity" comments | the raw read (it can only read as more active) |
+| Champion's `recency` criterion | "real activity" comments | the raw read (it can only read as more active) |
 | Critical-file hold | `champion:critical-file-*`, `hold-state` | the raw read, which may hold but never release — a `none`/`respect` decision defers with no write (#10875) |
 | Champion epic | epic verdict / escalation markers | skip the epic this pass |
 | Judge fast-track | `loom:conflict-only` | full evaluation |
@@ -213,16 +225,11 @@ Anything unverifiable is a refusal. Reads are never gated.
   scheduled role tick skip a refused workspace, logging the reason once. The
   `forge issue|pr` write passthroughs and `forge auto-merge` /
   `disable-auto-merge` vet their target first. The roster heartbeat checks its
-  configured repository; `notify-cleared-blockers` and the stale-check redate
-  take the repository `merge-pr.sh` already vetted; dependency classification
+  configured repository; `notify-cleared-blockers` takes the repository `merge-pr.sh` already vetted; dependency classification
   resolves `origin` (never gh's preference) or takes its caller's explicit
   `--repo`. The structural test
   `write_scope::tests::daemon_write_paths_are_scoped` fails when a new daemon
-  file writes to the forge without being reviewed into its list. One
-  autonomous write sits outside the rule above, scoped narrower by that test:
-  the declared captain's gauge heartbeat (#10395) goes to the configured
-  fleet store (`fleet.repo`, never gh's resolution) under its writer App, and
-  only to the dedicated `fleet.captainGauges.ref` branch, never the reviewed one.
+  file writes to the forge without being reviewed into its list.
 - **Shell:** `loom-daemon forge may-write [--repo OWNER/REPO]` prints the
   repository to name on the write (exit 0) or the reason (exit 1).
   `loom_write_repo` in `lib/forge-helpers.sh` wraps it. Every script that

@@ -3,8 +3,8 @@
 //! harness: what a routed native harness receives, that an unrouted profile is
 //! untouched, and that Claude and Codex never receive any of it.
 //!
-//! A sibling of `worker_spawn.rs` rather than a section of it: that file sits
-//! at the 1000-line file-size ratchet. `worker`, `config` and `builder_role`
+//! A sibling of `worker_spawn.rs` rather than a section of it: the routing
+//! tests get their own file. `worker`, `config` and `builder_role`
 //! below are deliberate copies of its own.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -537,3 +537,8 @@ fn a_routed_profile_launches_without_its_provider_variable() {
     assert!(stderr.contains("LOOM_TEST_GW_REQUIRED_KEY"), "{stderr}");
     assert!(stdout.is_empty(), "{stdout}");
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

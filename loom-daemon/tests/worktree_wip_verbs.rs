@@ -31,6 +31,9 @@
 //! - **JSON that survives a hostile path**, which the shell's raw `printf`
 //!   interpolation did not.
 
+mod common;
+
+use common::git;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -109,15 +112,6 @@ impl Fixture {
     fn stash_list(&self) -> String {
         stdout(&git_out(&self.repo, &["stash", "list"]))
     }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = git_out(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Output {
@@ -680,3 +674,8 @@ fn a_change_stash_create_cannot_see_fails_the_push_and_pop_still_restores() {
         "the captured tracked edit must come back"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

@@ -41,12 +41,13 @@
 //!
 //! ## Only trusted authors' records count (#9631)
 //!
-//! Every row is attributed ([`AUTHOR_JQ`]) and passed through
-//! [`TrustPolicy`] before any marker is parsed, exactly like
-//! `sweep_registry::guards`' lease reader (#9593/#9548): a lease or
-//! lease-yield from an untrusted author reads as absent, and a row with no
-//! author at all is untrusted. Otherwise an outsider could post two fresh
-//! "leases" to wedge every Builder dispatch on the issue, or a fake yield to
+//! Every row is attributed (the shared `issue_lease_comments_jq` projection
+//! attaches the author) and passed through [`TrustPolicy`] before any marker
+//! is parsed, exactly like `sweep_registry::guards`' lease reader
+//! (#9593/#9548): a lease or lease-yield from an untrusted author reads as
+//! absent, and a row with no author at all is untrusted. Otherwise an outsider
+//! could post two fresh "leases" to wedge every Builder dispatch on the
+//! issue, or a fake yield to
 //! excuse a real peer's live lease. Trust fails closed (nothing an
 //! unresolved roster cannot vouch for is believed); the verdict itself stays
 //! fail-open on a failed read, as above.
@@ -54,8 +55,8 @@
 //! ## Why this is Rust and not a `lib/*.sh` helper
 //!
 //! The kicad-tools fix shipped as a new `lib/worktree-foreign-lease-guard.sh`.
-//! Upstream, `worktree.sh` is a `contract` shell-budget file whose portable
-//! pool may not grow, and a new `.sh` cannot be admitted to the shell allowlist
+//! Upstream, `worktree.sh` is a `contract` file whose portable
+//! shell should not grow, and a new `.sh` cannot be admitted to the shell allowlist
 //! as `contract` (`.loom/docs/shell-language-policy.md`). So the logic lives
 //! here and `worktree.sh` keeps a one-line reach into it, the same shape as
 //! `worktree-lock check-issue` (#8553) directly above it.
@@ -64,13 +65,18 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::comment_trust::TrustPolicy;
+use crate::forge_check_claim::issue_lease_comments_jq;
+use crate::sweep_registry::SweepRegistry;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use loom_daemon::comment_trust::{records::AUTHOR_JQ, TrustPolicy};
-use loom_daemon::sweep_registry::{SweepRegistry, LEASE_MARKER_PREFIX};
 
-/// The first-line prefix of a `loom:lease-yield` standdown record (#6287).
-const YIELD_MARKER_PREFIX: &str = "<!-- loom:lease-yield host=";
+/// The lease-comment row type, its NDJSON parser, and the first-line
+/// yield-marker parser are the claim guard's (`forge_check_claim`), shared
+/// here since #14580 so a record-format change needs one edit. Re-exported
+/// crate-locally so `lease ensure` / `lease release` keep their
+/// `cli::lease_co_occupancy` paths.
+pub(crate) use crate::forge_check_claim::{parse_lease_rows, parse_yield_marker_line, LeaseRow};
 
 /// Set to `1` to proceed despite a detected co-occupancy.
 pub(crate) const OVERRIDE_ENV: &str = "WORKTREE_ALLOW_SHARED_LEASE";
@@ -97,42 +103,6 @@ pub(crate) struct LeaseCoOccupancyArgs {
     /// stdout (for its `--json` contract) instead of human text on stderr.
     #[arg(long)]
     pub(crate) json: bool,
-}
-
-/// One lease or lease-yield comment, as read off the forge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LeaseRow {
-    pub(crate) updated_at: DateTime<Utc>,
-    pub(crate) body: String,
-}
-
-/// Parse `gh api --paginate --jq` NDJSON (one `{updated_at, body}` per line —
-/// never a `[...]` array, which `--paginate` would corrupt, #4637). Malformed
-/// lines are dropped rather than failing the batch.
-pub(crate) fn parse_rows(ndjson: &str) -> Vec<LeaseRow> {
-    ndjson
-        .lines()
-        .filter_map(|line| {
-            let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-            let updated_at = DateTime::parse_from_rfc3339(v.get("updated_at")?.as_str()?)
-                .ok()?
-                .with_timezone(&Utc);
-            let body = v.get("body")?.as_str()?.to_string();
-            Some(LeaseRow { updated_at, body })
-        })
-        .collect()
-}
-
-/// `(host, sweep)` from a yield record's first line:
-/// `<!-- loom:lease-yield host=H sweep=S earliest_host=EH earliest_sweep=ES -->`.
-fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
-    let rest = body.lines().next()?.strip_prefix(YIELD_MARKER_PREFIX)?;
-    let (host, rest) = rest.split_once(" sweep=")?;
-    let sweep = rest.split_whitespace().next()?;
-    if host.is_empty() || sweep.is_empty() || sweep == "-->" {
-        return None;
-    }
-    Some((host.to_string(), sweep.to_string()))
 }
 
 /// Every distinct `(host, sweep)` pair holding a lease on the issue that is
@@ -165,7 +135,7 @@ pub(crate) fn read_rows(
     timeout: Duration,
     policy: &TrustPolicy,
 ) -> Option<Vec<LeaseRow>> {
-    use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
     // Counted as `lease.co_occupancy_comments` (#10089). The facade supplies
     // the cross-owner `GH_CONFIG_DIR` from `repo` (#5401) and the `LOOM_REPO`
     // -> `GH_REPO` override, nulls stdin, and bounds the call by `timeout`.
@@ -175,22 +145,20 @@ pub(crate) fn read_rows(
         GhTarget::None,
         timeout,
     )
-    .forge_op(loom_daemon::forge_call_stats::ops::COMMENT_LIST)
+    .forge_op(crate::forge_call_stats::ops::COMMENT_LIST)
     .program(gh_bin)
     .arg("api")
     .arg(format!("repos/{{owner}}/{{repo}}/issues/{issue}/comments"))
     .arg("--paginate")
     .arg("--jq")
-    .arg(format!(
-        r#".[] | select(.body != null and ((.body | startswith("{LEASE_MARKER_PREFIX}")) or (.body | startswith("{YIELD_MARKER_PREFIX}")))) | {{updated_at: .updated_at, body: .body, {AUTHOR_JQ}}}"#
-    ))
+    .arg(issue_lease_comments_jq())
     .current_dir(repo)
     .run();
     match outcome.ok_output() {
         Some(out) => {
             // #9631: an untrusted (or unattributed) row is prose.
             let trusted = policy.trusted_ndjson(&out.stdout);
-            Some(parse_rows(&String::from_utf8_lossy(&trusted)))
+            Some(parse_lease_rows(&String::from_utf8_lossy(&trusted)))
         }
         _ => None,
     }

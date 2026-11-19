@@ -153,6 +153,8 @@ pub async fn try_flush<E: Exporter>(
     status.record_signals(&outcome.signals);
     if outcome.exported > 0 {
         status.record_success(outcome.exported);
+        // Per-kind liveness (#12120): the acked prefix is what landed.
+        status.record_kinds(batch[..acknowledged].iter().map(|e| e.record.kind()));
     }
     if let Some(error) = outcome.error {
         log::warn!(
@@ -294,11 +296,24 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    /// A fixed instant with non-zero nanoseconds (#11981). chrono serializes a
+    /// `DateTime<Utc>` with 0, 3, 6 or 9 fractional digits depending on its
+    /// trailing zero nanos, so a `Utc::now()` stamp makes two fixtures differ in
+    /// JSON length and breaks the exact byte-budget assertions below. Nine
+    /// non-zero digits match the production serialized width.
+    fn fixed_instant() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .timestamp_opt(1_700_000_000, 123_456_789)
+            .single()
+            .expect("fixed fixture instant is valid")
+    }
+
     fn envelope() -> TelemetryEnvelope {
-        TelemetryEnvelope::new(
+        let mut envelope = TelemetryEnvelope::new(
             "host-test",
             TelemetryRecord::HostHealth(HostHealthRecord {
-                captured_at: chrono::Utc::now(),
+                captured_at: fixed_instant(),
                 daemon_version: "0.16.0".to_string(),
                 build_commit: "deadbeef".to_string(),
                 built_at: None,
@@ -309,12 +324,9 @@ mod tests {
                 worktree_root_free_gb: None,
                 worktree_root_total_gb: None,
                 active_sweep_ids: Vec::new(),
-                dispatch_halted: false,
-                halt_reason: None,
                 managed_repos: Vec::new(),
                 roles: crate::telemetry::RoleTickHealth::default(),
                 protection: None,
-                admission_brake: None,
                 is_captain: None,
                 armed_singleton_jobs: Vec::new(),
                 captainless_singleton_jobs: Vec::new(),
@@ -322,8 +334,14 @@ mod tests {
                 exporters: Vec::new(),
                 otlp_export: None,
                 memory: None,
+                agent_scopes: Vec::new(),
+                agent_scopes_total: None,
             }),
-        )
+        );
+        // `TelemetryEnvelope::new` stamps `emitted_at` with `Utc::now()`; pin it
+        // too, or its serialized width still varies between fixtures.
+        envelope.emitted_at = fixed_instant();
+        envelope
     }
 
     /// A toggleable in-memory exporter: [`FakeExporter::set_up`] flips
@@ -501,42 +519,6 @@ mod tests {
         // #5083: the record count accumulates across flushes, so the status
         // line's "N record(s)" is a running total, not a per-batch figure.
         assert_eq!(status.snapshot().records_exported, 5);
-    }
-
-    /// #10928: a batch is cut by bytes as well as count, so queued large
-    /// envelopes go out over several POSTs instead of one the sink rejects
-    /// forever; a lone envelope over the budget still goes out.
-    #[tokio::test]
-    async fn a_batch_is_cut_at_the_byte_budget_and_never_below_one_envelope() {
-        let one = json_len(&envelope());
-        let batch = vec![envelope(), envelope(), envelope()];
-        assert_eq!(byte_bounded_len(&batch, 2 + 3 * one + 2), 3);
-        assert_eq!(byte_bounded_len(&batch, 2 + 2 * one + 1), 2);
-        assert_eq!(byte_bounded_len(&batch, 2 + 2 * one), 1);
-        assert_eq!(byte_bounded_len(&batch, 1), 1, "never zero: the sink decides");
-        assert_eq!(byte_bounded_len(&[], 1), 0);
-        assert_eq!(serde_json::to_vec(&batch).unwrap().len(), 2 + 3 * one + 2);
-
-        // Through try_flush with the real budget: envelopes just over a
-        // third of it go out one or two per POST, all acked in order.
-        let dir = tempfile::tempdir().unwrap();
-        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
-        let mut big = envelope();
-        if let TelemetryRecord::HostHealth(h) = &mut big.record {
-            h.halt_reason = Some("x".repeat(MAX_BATCH_BYTES / 3 + 1));
-        }
-        for _ in 0..5 {
-            queue.push(big.clone());
-        }
-        let exporter = FakeExporter::new(true);
-        let status = status_cell();
-        let mut posts = Vec::new();
-        while let FlushOutcome::Sent(n) = try_flush(&queue, &exporter, 50, &status).await {
-            posts.push(n);
-        }
-        assert_eq!(posts, vec![2, 2, 1]);
-        assert!(queue.is_empty());
-        assert_eq!(exporter.received.lock().unwrap().len(), 5);
     }
 
     // ------------------------------------------------------------------

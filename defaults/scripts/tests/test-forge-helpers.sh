@@ -371,6 +371,102 @@ fi
 
 rm -rf "$REV_STUB_DIR"
 
+# --- Test review reads are wall-clock bounded (#13927) ----------------------
+# The wedge: under multi-sweep host load a fraction of `gh` invocations block
+# indefinitely (SNl, no output, no progress) instead of erroring. The three
+# review-read helpers must fail the read inside the budget (rc 124, GNU
+# timeout's code) rather than hang the caller's command substitution forever.
+echo ""
+echo "Testing review reads are wall-clock bounded (#13927)..."
+
+HUNG_STUB_DIR=$(mktemp -d)
+cat > "$HUNG_STUB_DIR/gh" <<'STUB'
+#!/usr/bin/env bash
+# Simulates a wedged gh: never writes, never exits on its own (the SNl
+# process tree of #13927). Plain `sleep` dies on SIGTERM, as the real
+# binary does under `timeout`'s TERM.
+sleep 30
+exit 0
+STUB
+chmod +x "$HUNG_STUB_DIR/gh"
+
+run_hung_read() { # FUNC ARGS... -> sets hung_rc/hung_elapsed
+  local t0=$SECONDS
+  set +e
+  LOOM_FORGE_REVIEW_READ_TIMEOUT=1 "$@" > /dev/null 2>&1
+  hung_rc=$?
+  set -e
+  hung_elapsed=$((SECONDS - t0))
+}
+
+FORGE_TYPE="github"
+run_hung_read forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+assert_eq "124" "$hung_rc" "a hung gh fails forge_get_pr_reviews with rc 124 (timeout, fail closed)"
+if [[ "$hung_elapsed" -le 10 ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the reviews read returned in ${hung_elapsed}s, not the 30s the stub sleeps (bounded)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the reviews read took ${hung_elapsed}s — the hung gh was not bounded"
+fi
+
+run_hung_read forge_get_pr_review_comments "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+assert_eq "124" "$hung_rc" "a hung gh fails forge_get_pr_review_comments with rc 124"
+
+# The threads helper folds a per-page timeout into its documented rc 1 (any
+# non-zero means "fall back / fail closed") — the caller never hangs.
+run_hung_read forge_get_pr_review_threads "owner/repo" "5369" "$HUNG_STUB_DIR/gh"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$hung_rc" -ne 0 ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: a hung graphql read fails forge_get_pr_review_threads non-zero (rc $hung_rc), never hangs"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: a hung graphql read exited 0 — the wedge would look like an empty thread list"
+fi
+
+# LOOM_FORCE_PORTABLE_TIMEOUT=1 exercises the no-timeout(1) fallback path
+# (the default macOS shape) so the bound holds there too. Assignment prefixes
+# before a function call are visible inside it and restored afterwards.
+run_hung_read_portable() {
+  local t0=$SECONDS
+  set +e
+  LOOM_FORCE_PORTABLE_TIMEOUT=1 LOOM_FORGE_REVIEW_READ_TIMEOUT=1 \
+    forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh" > /dev/null 2>&1
+  hung_rc=$?
+  set -e
+  hung_elapsed=$((SECONDS - t0))
+}
+run_hung_read_portable
+assert_eq "124" "$hung_rc" "the portable bounded_run path (no timeout(1)) also bounds a hung read"
+if [[ "$hung_elapsed" -le 10 ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the portable path returned in ${hung_elapsed}s (bounded)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the portable path took ${hung_elapsed}s — not bounded"
+fi
+
+# 0 restores the unbounded pre-#13927 behaviour (escape hatch): with it the
+# budget is not applied at all — asserted structurally by the fast stub still
+# succeeding under a 1s budget above and below, which a clipped call would not.
+set +e
+LOOM_FORGE_REVIEW_READ_TIMEOUT=0 forge_get_pr_reviews "owner/repo" "5369" "$HUNG_STUB_DIR/gh" > /dev/null 2>&1 &
+UNBOUNDED_PID=$!
+sleep 2
+if kill -0 "$UNBOUNDED_PID" 2>/dev/null; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: LOOM_FORGE_REVIEW_READ_TIMEOUT=0 leaves the read unbounded (still running after 2s)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: LOOM_FORGE_REVIEW_READ_TIMEOUT=0 was bounded anyway — the escape hatch is broken"
+fi
+kill "$UNBOUNDED_PID" 2>/dev/null
+wait "$UNBOUNDED_PID" 2>/dev/null
+set -e
+
+rm -rf "$HUNG_STUB_DIR"
+
 # --- Test gitea_api auth-mode selection (issue #3297) ---
 # Use a `curl` shim on PATH that records its argv and returns a fake 200.
 echo ""
@@ -378,13 +474,19 @@ echo "Testing gitea_api auth mode selection (Basic vs token)..."
 
 SHIM_DIR=$(mktemp -d)
 CURL_ARGS_FILE=$(mktemp)
-export CURL_ARGS_FILE
+CURL_CFG_FILE=$(mktemp)
+export CURL_ARGS_FILE CURL_CFG_FILE
 cat > "$SHIM_DIR/curl" <<'SHIM'
 #!/usr/bin/env bash
 # Record argv (one per line) and emit a fake 200 OK response.
-: > "$CURL_ARGS_FILE"
+: > "$CURL_ARGS_FILE"; : > "$CURL_CFG_FILE"
+prev=""
 for a in "$@"; do
   printf '%s\n' "$a" >> "$CURL_ARGS_FILE"
+  # Credentials travel via `--config <(...)` (#10463): capture the config
+  # contents separately; they must NOT appear in argv.
+  if [[ "$prev" == "--config" ]]; then cat "$a" >> "$CURL_CFG_FILE"; fi
+  prev="$a"
 done
 # gitea_api expects body lines followed by a final-line HTTP status code.
 printf '{"ok":true}\n200\n'
@@ -397,7 +499,7 @@ _GITEA_TOKEN="tok-abc"
 _GITEA_USERNAME=""
 PATH="$SHIM_DIR:$PATH" gitea_api GET "user" >/dev/null 2>&1 || true
 
-if grep -q "^Authorization: token tok-abc$" "$CURL_ARGS_FILE"; then
+if grep -qx 'header = "Authorization: token tok-abc"' "$CURL_CFG_FILE"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: token mode sends 'Authorization: token …' header"
 else
@@ -414,21 +516,29 @@ else
     echo -e "  ${GREEN}PASS${NC}: token mode does NOT use '-u'"
 fi
 
+if grep -q 'tok-abc\|Authorization:' "$CURL_ARGS_FILE"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: token mode leaked the credential onto curl argv (#10463)"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: token mode keeps the credential off curl argv"
+fi
+
 # --- Subtest 2: Basic mode sends -u user:pass and NOT Authorization: token ---
 _GITEA_USERNAME="alice"
 _GITEA_BASE_URL="https://gitea.example.com"
 PATH="$SHIM_DIR:$PATH" gitea_api GET "user" >/dev/null 2>&1 || true
 
-if grep -qx -- "-u" "$CURL_ARGS_FILE" && grep -qx -- "alice:tok-abc" "$CURL_ARGS_FILE"; then
+if grep -qx 'user = "alice:tok-abc"' "$CURL_CFG_FILE"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: Basic mode sends '-u user:pass'"
+    echo -e "  ${GREEN}PASS${NC}: Basic mode sends user:pass via curl config"
 else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: Basic mode missing '-u user:pass'"
+    echo -e "  ${RED}FAIL${NC}: Basic mode missing user:pass curl config"
     echo "    curl argv:"; sed 's/^/      /' "$CURL_ARGS_FILE"
 fi
 
-if grep -q "^Authorization: token" "$CURL_ARGS_FILE"; then
+if grep -q "Authorization: token" "$CURL_CFG_FILE"; then
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: Basic mode unexpectedly sent 'Authorization: token …'"
 else

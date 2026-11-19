@@ -32,6 +32,27 @@ from the tracked `.loom-project/project.json` (or legacy `.loom/config.json`)
 through the tiered resolver. Implementation vs. policy are split: scripts machine-
 level, config per-repo.
 
+**Daemon-spawned sessions run the daemon's own release (2am#4501).** A host
+that updates `loom-daemon` from release artifacts never moves the machine checkout, so
+hooks run from it lagged the daemon that launched the session. The binary embeds
+its `defaults/` tree. On first use, `loom-daemon` unpacks the hook-runtime part of it
+(everything but `tests/`) once per distinct payload into
+`~/.local/share/loom-daemon/hooks-home/<version>-<sha>/`. It exports that path to
+every session it spawns as `LOOM_HOOKS_HOME`, and the wrapper prefers
+`$LOOM_HOOKS_HOME/defaults/hooks/<name>`. When the variable is unset or blank (an
+attended session), or the file is missing there, the wrapper falls back to the
+checkout, so nothing fails open that did not before. `loom-daemon hooks-home`
+prints the directory. `LOOM_HOOKS_HOME` set in the daemon's own environment is a
+pin, and set empty it turns the export off. Older copies are pruned only when they
+are outside the newest three and more than three days past their last use
+(`hooks_home.rs`). The tree is private to the user: the base is `0700`, no file or
+directory in it is group- or world-writable whatever the umask, and a copy that
+fails that check, or is not owned by the user, is unpacked again rather than
+reused. Hooks that log beside their own tree write `hook-errors.log` and the
+decision logs to `<hooks-home>/<key>/.loom/logs`, which moves with each release.
+`guard-background-subagents.sh` resolves its root as `/` there and stays enabled
+(stricter, not fail-open).
+
 Each user-scope entry is a **fail-open, self-gating** command wrapper, because a
 user-scope hook fires in *every* repo the operator opens:
 
@@ -90,6 +111,29 @@ provenance, so no project-level entry can survive an uninstall by design.
 If you want the machine-level end state (no per-repo copies at all), run
 `loom migrate` (Phase 6 / #4254) — it untracks the legacy copies, after which
 `ensure_project_hook_wiring` stops writing project entries on its own.
+
+### Canonical scope and duplicate wiring (#13958)
+
+The **canonical scope is user-scope, machine-level**: the `~/.claude/settings.json`
+wrapper entries written by `provision_loom_hooks` are the designed execution path
+(Phase 5, above). Project-level `.claude/settings.json` entries are
+**transition-only** — the #4401 fallback that keeps guards live while a repo still
+carries `.loom/hooks/` copies. Both scopes wired at once is therefore an **expected
+transition shape, not a defect**: Claude Code does not dedupe the two entries, but
+the user-scope wrapper defers to the project copy (step 2), so each guard fires
+exactly once — the duplicate costs one extra `bash` spawn per matching tool call,
+nothing more.
+
+The shape becomes a **genuine double-fire** only when both scopes are wired *and*
+the defer cannot hold — in practice, a project entry whose `.loom/hooks/<name>`
+copy is missing or no longer executable, so the wrapper stops deferring and execs
+the machine hook on top of the (failing) project entry. The install self-check's
+`duplicate-hook-wiring` invariant (`Invariant::ALL` in
+`loom-daemon/src/install_self_check.rs`; see `defaults/docs/daemon-reference.md`
+§ "Install/host invariant self-check") warns on exactly that case. It is
+**warn-only** — it never edits either settings file; the fix is to remove the stale
+project-level entry (or run `loom migrate`, which retires the project copies
+wholesale), or restore an executable copy so the wrapper defers.
 
 ### Backup retention (#5387)
 
@@ -175,7 +219,7 @@ outside that array for parsing reasons:
   (`guards.forceScope`), worktree/Bash write confinement
   (`guards.worktreeIsolation`), the stash-stack ask (`guards.stashScope`), the
   unowned cargo target dir deny (`guards.cargoTargetDir`, #11582), the shared
-  cargo target dir ask (`guards.cargoSharedTarget`, #10646), and the
+  cargo target dir deny (`guards.cargoSharedTarget`, #10646, #11625), and the
   remote-fleet-exec ask (`guards.remoteFleetExec`, #11568 — an ask, never a
   deny, so it is above the floor by construction). Each
   is off-able **by design** because each has a legitimate repo class for which it
@@ -607,6 +651,8 @@ Whether the vendored copy is **installed** is a separate, per-repo choice, and b
 
 The committed case is deliberate, not drift: a git-tracked vendored guard is repo-shared state, so contributors and CI runners **without** Repo Skills installed still get full generic-guard coverage. Resync must therefore never delete it on the strength of one host's local, typically-gitignored `.claude/skills/repo/` install (#4403) — and because that state is the expected steady state rather than an anomaly, it is reported as a `note` (suppressed under `--quiet`) instead of a `WARN` that would reprint on every resync forever (#4566).
 
+**Direction (#8570, design only):** the operator ruled that the generic guard becomes a standalone shared `loom-guard` component installable by either `/repo` or `/loom`, with exactly one active generic engine per invocation and Loom-specific workflow/path hooks (`guard-loom-workflow.sh`, `guard-worktree-paths.sh`) staying Loom-owned. Nothing described above changes until that component is published and separately authorized for install. The boundary, install matrix, compatibility contract and measured divergences are in [`docs/design/loom-guard-extraction.md`](https://github.com/rjwalters/loom/blob/main/docs/design/loom-guard-extraction.md); `tests/hooks/compare-guard-engines.sh` runs one corpus through both engines and exits 3 (incomplete evidence, not a pass) when the canonical engine is missing; `tests/hooks/test-guard-install-matrix.sh` exercises the install/update/uninstall/rollback cells against stub Repo Skills trees and asserts exactly one active engine.
+
 If a repo genuinely wants to rely on Repo Skills provisioning instead, it drops the vendored copy **deliberately and repo-wide** with `git rm .loom/hooks/guard-destructive-generic.sh`; after that commit the branch above stops firing entirely and hosts without Repo Skills fall back to no generic guard, so make that trade consciously.
 
 ### SQL DDL/DML Guard Opt-Out (`guards.sqlDdl` / `LOOM_GUARD_SQL`)
@@ -922,7 +968,7 @@ env CARGO_TARGET_DIR="$(mktemp -d)" cargo nextest run       # DENIED ($TMPDIR)
 CARGO_TARGET_DIR=.loom/target-9 cargo check                 # DENIED (.loom/target-*)
 ```
 
-### Shared Cargo Target Dir Ask (`guards.cargoSharedTarget` / `LOOM_GUARD_CARGO_SHARED_TARGET`)
+### Shared Cargo Target Dir Deny (`guards.cargoSharedTarget` / `LOOM_GUARD_CARGO_SHARED_TARGET`)
 
 The deny above allows a build with **no** explicit target dir, because that
 normally means `<worktree>/target`. On a host whose `~/.cargo/config.toml` sets
@@ -933,21 +979,31 @@ artifacts outlive it and nothing reclaims them (#10646: 427 GB of
 `CARGO_TARGET_DIR`; an in-session Task subagent never goes through it.
 
 So the same verb (`loom-daemon cargo-target-dir guard`, tag
-`loom:cargo-shared-target`) **asks** when all of these hold: the cwd is in a
+`loom:cargo-shared-target`) **denies** when all of these hold: the cwd is in a
 Loom-managed worktree (`.loom-managed`); the build sets no `CARGO_TARGET_DIR`
 or `--target-dir` and the session carries none; and cargo's configured target
 dir lies outside the worktree, its per-worktree dir and `<repo>/.loom/targets/`.
 The configured dir is resolved the way cargo does: `CARGO_BUILD_TARGET_DIR`,
 then the closest `.cargo/config.toml` (or `.cargo/config`) from the cwd up,
 then `$CARGO_HOME/config.toml` (`~/.cargo` by default). A relative value is
-anchored at the parent of its `.cargo` dir. `make` never asks. The prompt names
+anchored at the parent of its `.cargo` dir. `make` never denies. The denial names
 the dir, where the setting came from, and the prefix to use instead:
 `CARGO_TARGET_DIR="<per-worktree marker dir>"` when the worktree has one
 (#8458), else `CARGO_TARGET_DIR="<worktree>/target"`.
 
-It is an ask, not a deny, because sharing a target dir is sometimes deliberate
-(with sccache, say). The verb prints the ask on exit 0, so a hook older than
-the ask treats it as an allow. Toggle (default on):
+It is a deny, not an ask (#11625), by the #7795 per-site rule (as with
+`cargo-clean-scope-outside-repo`). An ask has no answerer in a headless
+`claude -p` started outside `spawn-worker`, so it acts as a silent deny, and in
+an in-session sweep Claude Code shows an ask's reason to the human, not the
+model, so the agent never sees the prefix and hits the same ask again. A deny
+puts the reason in front of the model, which reruns the command with the
+prefix; nothing is lost, since nothing ran. Sharing a target dir is sometimes
+deliberate (with sccache, say), so that case keeps the toggle below. The verb
+prints `BLOCKED [cargo-shared-target]: …` and exits 1; a daemon that still
+prints the older `ASK [cargo-shared-target]` with exit 0 is treated as an
+allow (the rule is inert). `cargo --config build.target-dir=…` and an inline
+`CARGO_BUILD_TARGET_DIR=…` are not read and still fall through. Toggle
+(default on):
 
 1. **`LOOM_GUARD_CARGO_SHARED_TARGET` env var** (Claude Code settings `env`):
    `0`/`false`/`no` disables; `1`/`true`/`yes` forces on. Overrides config.
@@ -960,6 +1016,15 @@ the ask treats it as an allow. Toggle (default on):
 ### Worktree Isolation Guard Opt-Out (`guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`)
 
 `guard-worktree-paths.sh` (issue #4007) denies Edit/Write tool calls whose target resolves into the **main** repository checkout while a Loom-managed worktree exists (path-derived — see the guard inventory bullet above for the mechanism). This is the mechanical enforcement behind "never work on main branch": a builder that used a repo-relative path after a cwd reset, or that otherwise escaped its issue worktree, is denied instead of silently corrupting the main checkout.
+
+**One rule across tools (#13569).** Edit/Write and Bash are confined by the
+same rule, and **gitignored status does not exempt a path**: a write into the
+main checkout (an ignored `.notes/` journal included) is denied from either
+tool while a managed worktree exists, and allowed from both when none does.
+Repo-local scratch, notes, or journal files belong under your issue worktree or
+under `/tmp` (session scratch); both deny messages say so.
+`tests/hooks/test-guard-worktree-edit-bash-parity.sh` feeds identical targets to
+both hooks and fails on any verdict divergence.
 
 **Bash-tool write confinement (issue #4178).** The same toggle *also* gates a
 second, independent check inside `guard-destructive-generic.sh` (the `Bash`
@@ -1302,6 +1367,20 @@ nothing and `NAME` becomes empty) or prints the canonical path of that same
 directory. Everything else still fails closed — a third assignment, the
 reverse order, `${NAME}` inside the `realpath` call, a canonicalization of a
 *different* variable, or any prefix/suffix around the admitted form.
+
+**`/tmp` scratch loops (#12285)**: `wt_write_tmp_cwd_loop_var_safe()` allows
+`cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done`, i.e. a write
+target `$var`/`${var}` plus a literal suffix, when ALL hold: the tracked cwd is a
+literal `/tmp/<dir>` outside every managed worktree and the main checkout, set by
+an earlier `cd /tmp/<literal>` in the same command; the suffix has no `/`, `..`
+or expansion; every binding of `var` is a literal `for var in <words>` or
+`var=<word>` (non-absolute, `/`-free, `..`-free) and the first one precedes the
+write; and the command has no `ln` command word. Anything else (a variable
+directory component, `read`/`+=`/`eval` rebinding, no assignment, a `$`/`..` in the
+`cd` target, a write before the `cd`) still denies. **Residual gap**: a symlink
+that already exists in `/tmp/<dir>` from an *earlier* command is not seen — the
+guard is lexical and never resolves paths. No new toggle; it narrows an existing
+`worktreeIsolation` deny.
 
 **`$(cd "$NAME" && pwd -P)` is deliberately NOT admitted**, even though it
 looks like an equally safe canonicalization of the same shape: `cd ""` is a
@@ -1722,7 +1801,19 @@ The config read is best-effort: a missing, empty, or malformed `.loom/config.jso
 
 It asks when **both** hold:
 
-- **A remote invocation aimed at a fleet host**: `ssh`, `tailscale ssh`, `scp`, `rsync`, `aws ssm send-command` / `start-session` — also fanned out by `xargs` / `parallel`, where a host or command read from stdin (`xargs -I{} ssh {} …`, `parallel ssh {} … ::: hosts`) counts as unresolvable — or nested in another hop's remote command (`ssh bastion ssh <fleet> …`, `ssh devvm "tailscale ssh <fleet> …"`; a script fed to the outer hop runs on the inner one, and a hop nested too deep to follow asks). A fleet host is a tailnet name or address (`*.ts.net`, IPv4 in `100.64.0.0/10`, IPv6 in `fd7a:115c:a1e0::/48`); a name on the Loom fleet registry (`LOOM_FLEET_PATH`, else `~/.loom/fleet.json`: `ssh_host`, `tailnet_name`; `provider_instance_id` for SSM); a `tailscale status --json` peer; or an entry in the extend-only `guards.remoteFleetHosts` array (list the hosts a roster file such as a fleet-gitops `hosts.yml` names there). An ssh alias is resolved through `ssh -G` first. A host spelled with a variable or substitution (`ubuntu@$IP`, `ubuntu@$(getent hosts x.ts.net …)`) and SSM `--targets` cannot be resolved, so they count as fleet hosts.
+- **A remote invocation aimed at a fleet host**: `ssh`, `tailscale ssh`, `scp`, `rsync`, `aws ssm send-command` / `start-session` — also fanned out by `xargs` / `parallel`, where a host or command read from stdin (`xargs -I{} ssh {} …`, `parallel ssh {} … ::: hosts`) counts as unresolvable — or nested in another hop's remote command (`ssh bastion ssh <fleet> …`, `ssh devvm "tailscale ssh <fleet> …"`; a script fed to the outer hop runs on the inner one, and a hop nested too deep to follow asks). A fleet host is a tailnet name or address (`*.ts.net`, IPv4 in `100.64.0.0/10`, IPv6 in `fd7a:115c:a1e0::/48`); a name on the Loom fleet registry (`LOOM_FLEET_PATH`, else `~/.loom/fleet.json`: `ssh_host`, `tailnet_name`; `provider_instance_id` for SSM); a `tailscale status --json` peer; or an entry in the extend-only `guards.remoteFleetHosts` array (list the hosts a roster file such as the fleet state store `hosts.yml` names there). An ssh alias is resolved through `ssh -G` first. A host spelled with a variable or substitution (`ubuntu@$IP`, `ubuntu@$(getent hosts x.ts.net …)`) and SSM `--targets` cannot be resolved, so they count as fleet hosts.
+
+  **Scoping out unmanaged hosts (`guards.remoteUnmanagedHosts`).** A disposable test network that happens to sit in a tailnet range is not fleet. List its exact names/addresses and/or IPv4/IPv6 CIDRs in the repo-local array and the guard stops asking about them:
+
+  ```json
+  { "guards": { "remoteUnmanagedHosts": ["100.100.0.0/16", "lab-1.ts.net"] } }
+  ```
+
+  The list only removes the *range-based* tailnet classification (matched on the literal spelling and the `ssh -G` hostname). A host on the fleet registry, a `tailscale status` peer, or `guards.remoteFleetHosts` stays protected even if also listed, and break-glass is still required for it. Malformed CIDR entries match nothing. Unresolvable targets (`$VAR`, SSM `--targets`) cannot be listed; their ask text says they were *unresolved* and tells you to spell the host literally and list it.
+
+  **Per-run ssh configs (`-F`).** `ssh -F <cfg> <alias>` and `scp -F <cfg> … <alias>:` resolve `<alias>` with `ssh -F <cfg> -G`, so an alias defined only in a generated config reaches the list through its real address (e.g. a VM's address inside a listed CIDR). The path must be literal (`-F run.cfg`, `-Frun.cfg`, relative to the command's directory); a `$VAR` path, or a missing or unreadable file, is ignored and the host is classified as if `-F` were absent — it never adds an allow. A host spelled with a variable (`"$VM"`) stays unresolvable and counts as a fleet host, so spell it literally.
+
+  **Which rule classified the host.** For a literal host the ask text names the rule that made it a fleet host — `the fleet registry`, `a tailscale peer`, `` `guards.remoteFleetHosts` ``, or `the tailnet address range` — and, when the match came from an alias, the `ssh -G` address it resolved to (for example `classified by the tailnet address range, resolved by ssh -G to 100.x.y.z`). A roster rule means the host is fleet and `remoteUnmanagedHosts` will not release it; the range rule means listing it there will.
 - **A payload that is not read-only**: the inline remote command, or — when the remote side is a shell reading stdin (`bash -s`, `sudo bash`, no remote command) — the script it is fed via `< file`, a heredoc, a here-string, or `cat file |` / `echo … |`. Destructive patterns: `reset --hard`, `clean -f`, `rm -r`, `rebase --abort`, `stash drop|clear`, `branch -D`, `push --force` / `-f` / `+ref`, `systemctl stop|disable|mask|kill`, `launchctl bootout|unload|disable|remove`, host power-off/restart commands, and writes under `~/.loom` or `~/loom-daemon`. A script it **cannot read** (missing file, variable path, output of another program) **asks**, and so does a payload **built at run time**: a local `$( … )` / backtick anywhere in it (`ssh h "$(cat fix.sh)"`, `<<< "$(cat fix.sh)"`, an unquoted heredoc whose body is `$(cat fix.sh)`), or an expansion as a command, `sh -c` script, `eval` or `source` argument (`ssh h "$CMD"`, `printf '%s\n' "$CMD" | ssh h bash`). A variable that is only an argument of a known command (`ssh h "ls $DIR"`) does not. An `scp`/`rsync` push onto a fleet host is an outward change and asks; a pull does not.
 
 It sees through `bash -c`, `eval`, wrappers (`sudo`, `timeout`, `env`, …), `$( … )` and heredocs fed to a local shell. `ssh host 'git status'`, a read-only script, and any host off the roster (a dev VM) are unaffected; prose in a `--body` / `-m` value is never an invocation, because the classifier's lexer is quote-aware.
@@ -1976,7 +2067,7 @@ The decision log sized that gap. **Which log matters**: the hook writes to
 `<its own checkout>/.loom/logs/guard-decisions.log`, so every worktree keeps a
 separate one and no single file is authoritative for the host. The figure below
 is from the **primary clone's** log
-(`/Users/joseph/dev/loom/.loom/logs/guard-decisions.log`) over
+(`.loom/logs/guard-decisions.log`) over
 2026-09-16T03:12Z–2026-09-17T05:12Z: **17 of 18 ASKs were `force-op:all`**,
 every one an own-branch force op. (The 18th is a `force-op:detached` ask —
 which `"protected"` still raises, by design.) A reviewer on another checkout
@@ -2046,6 +2137,33 @@ LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
 # Force the old always-ask behaviour even when the repo opts into protected:
 LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
 ```
+
+### Primary-Checkout Mutation Guard (`guards.primaryCheckoutMutation` / `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION`)
+
+**An agent step never commits or switches branches in a workspace's primary
+checkout (#13589).** A stray `git commit` / `git checkout <branch>` there parks
+the primary clone off the default branch (observed on loom-worker-4,
+2026-11-04) and holds fleet sync with a `wrong-branch` hold (self-heal: #13588).
+Builder and Doctor work in `.loom/worktrees/issue-<N>`.
+
+- **Agent step** = `LOOM_SWEEP_ID` or `LOOM_WORKTREE_PATH` is exported (set by
+  the dispatcher). An operator's interactive session has neither and is untouched.
+- **Denied** (tier: deny, since headless runs cannot answer an ask) when the
+  resolved cwd — honouring `cd X &&` and `git -C X` — is a primary checkout:
+  `git commit`, `git switch <x>`/`-c`, `git checkout -b|-B <x>`, `--detach`,
+  and `git checkout <branch|sha>`. The message names
+  `./.loom/scripts/worktree.sh <issue-number>` and this toggle.
+- **Allowed**: everything inside a linked worktree; checkout/switch whose target
+  is `main`/`master` (the Auditor's `git checkout -B main origin/main`);
+  `git checkout -- <path>` and `git checkout <path>` file restores; `-h/--help`;
+  read-only git. `worktree.sh`, `check-main-clean.sh --quarantine`,
+  `resync-installed.sh`, `merge-pr.sh` and `scripts/version.sh` are unaffected:
+  the hook only sees the top-level command text, not their internal git calls.
+- **Decision-log tag**: `primary-checkout-mutation:<commit|switch|checkout>`.
+- **Toggle**: `LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0` (env, agent's own
+  environment) or `"guards": {"primaryCheckoutMutation": false}` in
+  `.loom/config.json`. Default on.
+- Tests: `tests/hooks/test-guard-destructive-primary-checkout.sh`.
 
 ### Stash-Stack Scope Guard (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`)
 

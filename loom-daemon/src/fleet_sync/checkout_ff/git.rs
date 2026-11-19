@@ -27,7 +27,7 @@ pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fetch of one branch.
 pub(super) const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Starting bound for each local read.
-pub(super) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const LOCAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for the fast-forward itself. Long on purpose, and never shortened by
 /// the startup budget: a `merge` killed halfway leaves a half-written working
 /// tree and a stale `index.lock`, which is exactly the damage this step must
@@ -44,12 +44,13 @@ const NAMED_PATHS: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Refusal {
     /// A local file sits where an incoming commit writes one. Nothing changed.
-    WouldOverwrite(String),
+    /// The short list for a detail line, and every path git named.
+    WouldOverwrite(String, Vec<String>),
     /// Anything else git said, or a command that did not finish.
     Other(String),
 }
 
-pub(super) fn tracking(branch: &str) -> String {
+pub(crate) fn tracking(branch: &str) -> String {
     format!("refs/remotes/origin/{branch}")
 }
 
@@ -120,7 +121,7 @@ pub(super) fn stdout(out: &Output) -> String {
 }
 
 /// [`run`], requiring exit 0. Returns trimmed stdout.
-pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+pub(crate) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let out = run(root, &[], args, timeout)?;
     if out.status.success() {
         Ok(stdout(&out))
@@ -132,7 +133,7 @@ pub(super) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String
 /// The default branch's name, from the clone's own `origin/HEAD`. Local: no
 /// remote is asked, and `main` is never guessed. `None` when `origin/HEAD` is
 /// unset, or names a branch git could read as an option (#9106).
-pub(super) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
+pub(crate) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
     let args = [
         "symbolic-ref",
         "--quiet",
@@ -160,7 +161,7 @@ pub(super) fn remote_head(root: &Path, branch: &str, timeout: Duration) -> Resul
 
 /// The commit the clone's `origin/<branch>` is at; `None` when it has never
 /// been fetched. Local.
-pub(super) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
+pub(crate) fn tracking_head(root: &Path, branch: &str, timeout: Duration) -> Option<String> {
     let spec = format!("{}^{{commit}}", tracking(branch));
     ok(root, &["rev-parse", "--verify", "--quiet", &spec], timeout)
         .ok()
@@ -382,7 +383,7 @@ pub(super) fn classify_refusal(stderr: &str) -> Refusal {
         .filter_map(|l| l.strip_prefix('\t'))
         .map(|p| p.trim().to_string())
         .collect();
-    Refusal::WouldOverwrite(summarize(&paths))
+    Refusal::WouldOverwrite(summarize(&paths), paths)
 }
 
 /// A short list of `paths` for a one-line detail.

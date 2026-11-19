@@ -95,3 +95,8 @@ fn a_second_signal_also_kills_a_docker_group_that_ignores_the_first() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

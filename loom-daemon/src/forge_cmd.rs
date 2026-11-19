@@ -632,7 +632,7 @@ pub(crate) fn repo_nwo(gh: &str) -> Option<String> {
     repo_nwo_in(gh, None)
 }
 
-fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
+pub(crate) fn repo_nwo_in(gh: &str, cwd: Option<&Path>) -> Option<String> {
     // #7810 PR 2: `--json` without `--jq`. The scalar the filter produced could
     // not distinguish "not a repo", "gh not authenticated" and "empty name".
     #[derive(serde::Deserialize)]
@@ -804,9 +804,23 @@ pub enum ForgeCmd {
         pr: u32,
         reviewed: String,
         head: String,
+        allowed_paths: Vec<String>,
+        repo: Option<String>,
     },
     /// `forge version-only-diff` (#9611): see [`crate::forge_version_only_diff`].
     VersionOnlyDiff(crate::forge_version_only_diff::Args),
+    /// `forge additive-migrations` (#13102): see [`crate::forge_additive_migrations`].
+    AdditiveMigrations(crate::forge_additive_migrations::Args),
+    /// `forge locked-deps-only` (2am#6942): see [`crate::forge_locked_deps_only`].
+    LockedDepsOnly(crate::forge_locked_deps_only::Args),
+    /// `forge resync-waiver` (#13487): the resync waiver proof, shared with the daemon's landing.
+    ResyncWaiver {
+        pr: u32,
+        repo: Option<String>,
+        strict: bool,
+    },
+    /// `forge suspect-critical-diff` (#12999): see [`crate::forge_suspect_critical_diff`].
+    SuspectCriticalDiff(crate::forge_suspect_critical_diff::Args),
     /// `forge merge-method --repo <nwo> [--requested squash|merge|rebase]`
     /// (#8845) — resolve/validate the merge method `merge-pr.sh` should pass
     /// to `forge_merge_pr`. See
@@ -876,10 +890,26 @@ pub fn dispatch(cmd: ForgeCmd) -> Result<()> {
             hold.as_deref(),
         ),
         ForgeCmd::TreeUnchanged { base, head } => crate::forge_tree_unchanged::handle(&base, &head),
-        ForgeCmd::VerdictEquivalent { pr, reviewed, head } => {
-            crate::verdict_equivalence::handle(pr, &reviewed, &head)
-        }
+        ForgeCmd::VerdictEquivalent {
+            pr,
+            reviewed,
+            head,
+            allowed_paths,
+            repo,
+        } => crate::verdict_equivalence::handle(
+            pr,
+            &reviewed,
+            &head,
+            &allowed_paths,
+            repo.as_deref(),
+        ),
         ForgeCmd::VersionOnlyDiff(args) => crate::forge_version_only_diff::handle(&args),
+        ForgeCmd::AdditiveMigrations(args) => crate::forge_additive_migrations::handle(&args),
+        ForgeCmd::LockedDepsOnly(args) => crate::forge_locked_deps_only::handle(&args),
+        ForgeCmd::ResyncWaiver { pr, repo, strict } => std::process::exit(
+            crate::fleet_sync::workspace_resync::waiver_gh::cli(pr, repo.as_deref(), strict),
+        ),
+        ForgeCmd::SuspectCriticalDiff(args) => crate::forge_suspect_critical_diff::handle(&args),
         ForgeCmd::MergeMethod { repo, requested } => {
             crate::forge_merge_method::handle_merge_method(&repo, requested.as_deref())
         }
@@ -919,7 +949,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use serial_test::serial;
-    use std::process::Command as StdCommand;
     use tempfile::tempdir;
 
     /// Disable the private-defaults config tier so tests only see the config
@@ -938,16 +967,7 @@ mod tests {
         std::env::remove_var("LOOM_ALLOW_INSECURE_BASIC_AUTH");
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let ok = StdCommand::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed in {}", dir.display());
-    }
+    use crate::test_git_helpers::run as git;
 
     fn init_repo(dir: &Path, remote: &str) {
         git(dir, &["init", "-q"]);

@@ -39,8 +39,7 @@
 //!
 //! A sibling of [`crate::install_compat`], not a child of it, on purpose:
 //! `init` uses the constants and the classifier there, and must not reach the
-//! release lookup and download here (the `.gitignore Convergence Check`
-//! input set in `merge_pr/stale_checks/inputs.rs` stops at `install_compat`).
+//! release lookup and download here.
 
 use crate::install_compat::Version;
 use crate::release_fetch::{checksum, fetch};

@@ -11,8 +11,8 @@
 use std::path::Path;
 
 use super::{InvariantStatus, SelfCheckReport};
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 
 /// The ledger scope.
 pub const SCOPE: &str = "install_self_check";

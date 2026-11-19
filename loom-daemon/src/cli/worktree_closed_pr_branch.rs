@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::closed_pr_branch;
+use crate::worktree_cli::closed_pr_branch;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeClosedPrBranchArgs {

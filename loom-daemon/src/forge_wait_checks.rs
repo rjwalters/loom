@@ -32,7 +32,14 @@
 //! the head commit message. A stderr hint says so. See [`no_run`].
 //!
 //! `--timeout 0` takes exactly one poll (a snapshot). A RED is reported as
-//! soon as a failing check is terminal, without waiting for the rest.
+//! soon as a failing check is terminal, without waiting for the rest —
+//! unless `--settle-red` (#12011): then RED only once nothing observed is
+//! pending (the required set does not hold it back, #12022); a failure seen while
+//! the run is still going keeps the wait pending (→ `TIMEOUT`, with a
+//! `wait-checks: --settle-red: already failing: …` stderr note). The Judge
+//! uses it before a changes-requested verdict, which must name the failing
+//! test from a finished log; refusing callers (approval, merge) keep the
+//! early RED. See [`verdict::decide_settled`].
 //!
 //! # Zero rows
 //!
@@ -43,7 +50,38 @@
 //! the wait runs to `TIMEOUT` — never `NONE`. That also covers a fork PR whose
 //! workflow awaits approval (#9257).
 //!
+//! # Vanished runs (#13940)
+//!
+//! A workflow whose startup fails — a duplicate step id after a conflict
+//! merge, say — concludes `failure`/`startup_failure` with zero jobs and
+//! registers **no check runs**, so the rollup reads the missing gate as an
+//! absence and the wait settles GREEN/NONE. On a poll that would otherwise
+//! settle a non-failure verdict, the head's workflow runs are read
+//! (best-effort, like the twin drop below) and every terminal-failed run
+//! that owns no check run is folded into the verdict as a failing check
+//! named after the workflow: `LOOM-CHECKS-RED <sha> <workflow name>`.
+//! Attribution is the run's `check_suite_id` ↔ the check run's
+//! `check_suite.id` (field-verified against the live API). Doubt injects
+//! nothing: an unreadable or truncated runs payload, a check-run row
+//! without a suite id, a run that has not failed yet, and a run superseded
+//! by a twin authority ([`crate::merge_pr::superseded_runs`]) all leave the
+//! verdict as it was.
+//!
+//! # Stranded check runs (#14128)
+//!
+//! A terminal-failed run (`startup_failure`, `failure`, …) can leave its
+//! jobs' check runs `queued` with a null conclusion for good — measured on a
+//! live `startup_failure` run months after it ended. Read as pending they
+//! hold the wait to `LOOM-CHECKS-TIMEOUT`. On a poll with a non-terminal row
+//! that carries a check-suite id, the head's workflow runs are read
+//! (best-effort) and every such row whose suite is a terminal-failed,
+//! non-superseded run's `check_suite_id` is classified as failed under its
+//! own name, so the verdict is RED (and `--required-only` still sees a
+//! stranded required job). A row under a run that has not failed stays
+//! pending. See `fail_stranded_check_runs`.
+//!
 //! # The required-context set
+//!
 //!
 //! Looked up from the base branch only when a verdict needs it, cached once
 //! it succeeds, and RETRIED on every later poll while it fails — a failed
@@ -94,6 +132,7 @@ mod tests;
 pub use verdict::{Failed, Outcome};
 
 use reads::{GhReads, ReadError};
+use serde_json::Value;
 use verdict::Decision;
 
 /// Default `--timeout`, seconds (the retired prompt loops' 30-minute cap).
@@ -184,6 +223,8 @@ impl Clock for RealClock {
 pub struct Opts {
     pub timeout: Duration,
     pub required_only: bool,
+    /// `--settle-red` (#12011): no RED while anything is still pending.
+    pub settle_red: bool,
     /// Base branch for the required-context lookup in SHA mode; `None` =
     /// the repository's default branch.
     pub base: Option<String>,
@@ -203,6 +244,7 @@ pub struct WaitArgs {
     pub base: Option<String>,
     pub timeout: u64,
     pub required_only: bool,
+    pub settle_red: bool,
     pub min_interval: Option<u64>,
     pub max_interval: Option<u64>,
 }
@@ -240,6 +282,7 @@ fn run_cli(args: &WaitArgs) -> (Outcome, Vec<String>) {
     let opts = Opts {
         timeout: Duration::from_secs(args.timeout),
         required_only: args.required_only,
+        settle_red: args.settle_red,
         base: args.base.clone(),
         min_interval,
         max_interval: args
@@ -296,11 +339,18 @@ struct State {
     /// Failed lookups so far, and the latest reason.
     lookup_failures: u32,
     lookup_error: String,
+    /// The lookup was refused for want of a permission (#11837): `required`
+    /// is then the empty set (default mode over every observed check), but
+    /// the set is still unknown, so an empty rollup never settles `NONE`.
+    required_unreadable: bool,
     zero_polls: u64,
     /// Why the legacy commit-status read was refused for want of a
     /// permission, once it has been (#10633). From then on the wait reads
     /// check-runs only and never asks again.
     statuses_denied: Option<String>,
+    /// `--settle-red`: failures already seen on the latest poll while the
+    /// run was still going, for the stderr note on `TIMEOUT`.
+    early_red: Vec<String>,
     notes: Vec<String>,
 }
 
@@ -317,8 +367,10 @@ pub fn wait<C: Clock>(
         required: None,
         lookup_failures: 0,
         lookup_error: String::new(),
+        required_unreadable: false,
         zero_polls: 0,
         statuses_denied: None,
+        early_red: Vec::new(),
         notes: Vec::new(),
     };
     let mut backoff = Backoff::new(opts.min_interval, opts.max_interval);
@@ -360,6 +412,13 @@ pub fn wait<C: Clock>(
         };
         if deadline_reached {
             let sha = sha.unwrap_or_default();
+            if !st.early_red.is_empty() {
+                let line = format!(
+                    "wait-checks: --settle-red: already failing: {}",
+                    st.early_red.join(",")
+                );
+                note(&mut st, line);
+            }
             return (
                 Outcome::Timeout {
                     sha,
@@ -400,15 +459,31 @@ fn poll(
         }
     };
     let mut runs = reads.check_runs(&sha)?;
+    // The pre-drop rows (#13940): a run that owned check runs before the
+    // twin drop was already reported by them, and a superseded twin's
+    // dropped residue must not be re-reported as a vanished failure. The
+    // vanished fold below reads these, not the dropped doc.
+    let original_rows = runs.get("check_runs").and_then(Value::as_array).cloned();
     drop_superseded_twins(reads, &sha, &mut runs);
+    fail_stranded_check_runs(reads, &sha, &mut runs);
     let status = legacy_statuses(reads, &sha, st)?;
-    let rollup = verdict::fold(&runs, &status).map_err(ReadError::Fatal)?;
+    let mut rollup = verdict::fold(&runs, &status).map_err(ReadError::Fatal)?;
+    // A startup-failed run registers no check runs (#13940): on a poll that
+    // would otherwise settle a non-failure verdict, fold it in as failing.
+    // Polls whose verdict is already non-green skip the extra read.
+    if rollup.blocking_failing().is_empty() && rollup.blocking_pending().is_empty() {
+        fold_vanished_failed_workflows(reads, &sha, original_rows.as_deref(), &mut rollup);
+    }
 
     if rollup.total == 0 {
         st.zero_polls += 1;
         let required = resolve_required(reads, st)?;
+        // The authorization context never holds a wait (#12526): a set of
+        // only that context is no required set at all.
+        let required = required.map(|r| verdict::without_authorization(&r));
         let req_state = match &required {
             None => Required::LookupFailed,
+            Some(_) if st.required_unreadable => Required::LookupFailed,
             Some(r) if r.is_empty() => Required::None,
             Some(_) => Required::Present,
         };
@@ -446,8 +521,11 @@ fn poll(
     st.zero_polls = 0;
 
     // Required contexts are looked up only when a verdict needs them.
-    let needs_required =
-        opts.required_only || (rollup.failing.is_empty() && rollup.pending.is_empty());
+    // A failure needs no required set, `--settle-red` included (#12022): it
+    // waits only on observed pending checks, so a failed lookup (#11837)
+    // cannot hide a finished red.
+    let needs_required = opts.required_only
+        || (rollup.blocking_pending().is_empty() && rollup.blocking_failing().is_empty());
     let required = if needs_required {
         resolve_required(reads, st)?
     } else {
@@ -470,7 +548,17 @@ fn poll(
             ),
         );
     }
-    Ok(match verdict::decide(&rollup, required.as_deref(), opts.required_only) {
+    let decision = if opts.settle_red {
+        verdict::decide_settled(&rollup, required.as_deref(), opts.required_only)
+    } else {
+        verdict::decide(&rollup, required.as_deref(), opts.required_only)
+    };
+    st.early_red = if opts.settle_red && matches!(decision, Decision::Pending(_)) {
+        rollup.blocking_failing()
+    } else {
+        Vec::new()
+    };
+    Ok(match decision {
         Decision::Green => Poll::Done(Outcome::Green { sha }),
         Decision::Red(names) => {
             let failed = rollup
@@ -484,7 +572,7 @@ fn poll(
             sha,
             names,
             sleep: None,
-            idle: rollup.pending.is_empty(),
+            idle: rollup.blocking_pending().is_empty(),
         },
     })
 }
@@ -512,6 +600,22 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
             st.lookup_failures = 0;
             st.required = Some(contexts);
         }
+        // A permission refusal never clears by retrying (#11837): decide as
+        // for a branch that requires nothing — green only when every observed
+        // check is terminal-success, at least as strict as a required-only
+        // verdict. Rate limits and other failures stay fail-closed below.
+        Err(why) if permission_refused(&why) => {
+            note(
+                st,
+                format!(
+                    "wait-checks: required-context lookup for {base} refused for want of a \
+                     permission ({why}); deciding over every observed check. Grant the GitHub \
+                     App 'Administration: Read' to restore the required-only verdict (#11837)."
+                ),
+            );
+            st.required_unreadable = true;
+            st.required = Some(Vec::new());
+        }
         Err(why) => {
             st.lookup_failures += 1;
             note(st, format!("wait-checks: required-context lookup for {base} failed: {why}"));
@@ -519,6 +623,23 @@ fn resolve_required(reads: &mut GhReads, st: &mut State) -> Result<Option<Vec<St
         }
     }
     Ok(st.required.clone())
+}
+
+/// Whether a failed required-context lookup was refused for want of a
+/// permission on **every** source it tried (#11837): the classic GraphQL read
+/// *and* the REST branch fallback (#11855). Anything else — a rate limit, a
+/// ruleset failure, a withheld summary — is not, and keeps failing closed.
+fn permission_refused(why: &str) -> bool {
+    use crate::forge_denial::{classify, Denial};
+    let Some(rest) = why.strip_prefix("classic branch-protection lookup failed: ") else {
+        return false;
+    };
+    let Some((graphql, rest_branch)) = rest.split_once("; REST branch fallback: ") else {
+        return false;
+    };
+    [graphql, rest_branch]
+        .iter()
+        .all(|part| classify(Some(403), part, None) == Some(Denial::Permission))
 }
 
 /// Drop the check-runs of a superseded twin workflow run on `sha` (#11097,
@@ -541,6 +662,198 @@ fn drop_superseded_twins(reads: &mut GhReads, sha: &str, runs: &mut serde_json::
         .and_then(|p| twins::superseded_suites(&p, sha))
     {
         twins::drop_superseded(runs, &superseded);
+    }
+}
+
+/// Terminal workflow-run conclusions that are NOT a failure verdict about
+/// the commit: the pass bucket, a `cancelled` run (not a verdict about the
+/// commit — [`crate::merge_pr::superseded_runs`]), `action_required` (a
+/// fork run awaiting a human's approval, #9257) and `stale` (stopped, not
+/// failed). Anything else terminal — `failure`, `startup_failure`,
+/// `timed_out`, and any conclusion a future API adds — fails closed,
+/// mirroring the check-run rule in [`verdict`].
+const NOT_A_RUN_FAILURE: [&str; 6] = [
+    "success",
+    "neutral",
+    "skipped",
+    "cancelled",
+    "action_required",
+    "stale",
+];
+
+/// Whether a workflow-runs row is a completed failure verdict about its
+/// head. An absent conclusion is payload doubt, not a positive verdict,
+/// and fails nothing.
+fn run_failed(run: &serde_json::Value) -> bool {
+    let Some(conclusion) = run.get("conclusion").and_then(Value::as_str) else {
+        return false;
+    };
+    run.get("status").and_then(Value::as_str) == Some("completed")
+        && !NOT_A_RUN_FAILURE.contains(&conclusion)
+}
+
+/// The check-suite id a check-run row belongs to: GitHub's raw
+/// `check_suite.id`, or the flat `check_suite_id` some projections use —
+/// the same rule as [`crate::merge_pr::superseded_runs`].
+fn check_suite_id(row: &serde_json::Value) -> Option<u64> {
+    row.pointer("/check_suite/id")
+        .and_then(Value::as_u64)
+        .or_else(|| row.get("check_suite_id").and_then(Value::as_u64))
+}
+
+/// The terminal-failed runs on `sha` that own no check runs (#13940): a
+/// startup failure registers zero check runs, so the rollup alone reads
+/// the failure as an absence. A run owns a check run when some row's
+/// check-suite id equals the run's `check_suite_id` (both field shapes
+/// verified against the live API).
+///
+/// Doubt answers empty, mirroring [`drop_superseded_twins`]: a row without
+/// a resolvable suite id could belong to any run; a truncated payload may
+/// hide the newer authority run that superseded a visible failed one; and
+/// the superseded suites of
+/// [`crate::merge_pr::superseded_runs::superseded_suites`] are excluded —
+/// a run a newer verdict replaced is not this commit's verdict either.
+fn vanished_failed_workflows(
+    payload: &serde_json::Value,
+    rows: &[serde_json::Value],
+    sha: &str,
+) -> Vec<Failed> {
+    if rows.iter().any(|row| check_suite_id(row).is_none()) {
+        return Vec::new();
+    }
+    failed_runs(payload, sha)
+        .into_iter()
+        .filter_map(|(suite, run)| {
+            if rows.iter().any(|row| check_suite_id(row) == Some(suite)) {
+                return None;
+            }
+            let name = run.get("name").and_then(Value::as_str)?.to_string();
+            let url = run
+                .get("html_url")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string();
+            let run_id = run
+                .get("id")
+                .and_then(Value::as_u64)
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "-".into());
+            Some(Failed { name, url, run_id })
+        })
+        .collect()
+}
+
+/// The terminal-failed workflow runs on `sha` as `(check_suite_id, run)`
+/// pairs — the verdict-bearing runs both [`vanished_failed_workflows`] and
+/// [`fail_stranded_check_runs`] attribute from.
+///
+/// Doubt answers empty: an unreadable or truncated payload may hide the
+/// newer authority run that superseded a visible failed one, and the
+/// superseded suites of
+/// [`crate::merge_pr::superseded_runs::superseded_suites`] are excluded —
+/// a run a newer verdict replaced is not this commit's verdict either.
+fn failed_runs<'a>(payload: &'a serde_json::Value, sha: &str) -> Vec<(u64, &'a serde_json::Value)> {
+    use crate::merge_pr::superseded_runs;
+    let Some(runs) = payload.get("workflow_runs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    match payload.get("total_count").and_then(Value::as_u64) {
+        Some(n) if n as usize <= runs.len() => {}
+        _ => return Vec::new(),
+    }
+    let Ok(superseded) = superseded_runs::superseded_suites(payload, sha) else {
+        return Vec::new();
+    };
+    runs.iter()
+        .filter(|run| run.get("head_sha").and_then(Value::as_str) == Some(sha))
+        .filter(|run| run_failed(run))
+        .filter_map(|run| {
+            let suite = run.get("check_suite_id").and_then(Value::as_u64)?;
+            (!superseded.contains_key(&suite)).then_some((suite, run))
+        })
+        .collect()
+}
+
+/// Settle the check runs a terminal-failed workflow run left non-terminal
+/// (#14128): `startup_failure` (and kin) concludes the run while its jobs
+/// stay `queued` with a null conclusion — measured on this repo, a
+/// `startup_failure` run from 2026-08-26 still owned 19 queued rows
+/// months later, so they never settle. Read as pending they held the wait
+/// to `TIMEOUT` (and, under `--settle-red`, kept any RED pending forever).
+///
+/// A non-terminal row whose `check_suite.id` equals a terminal-failed run's
+/// `check_suite_id` is rewritten as terminal with that run's conclusion, so
+/// it is reported failing under its own name — the same name a required
+/// context would carry, so `--required-only` still sees the failure. Only
+/// positive attribution acts (the failing direction); a row without a
+/// suite id, a run that has not failed, a superseded twin, and an
+/// unreadable or truncated runs payload leave the row pending as before.
+/// A run that is not terminal (queued, in progress — including a re-run of
+/// its failed jobs) never strands anything.
+///
+/// The runs read happens only when some row is non-terminal and has a suite
+/// id; its failure changes nothing. Silent: nothing may reach stderr before
+/// the sentinel.
+fn fail_stranded_check_runs(reads: &mut GhReads, sha: &str, runs: &mut serde_json::Value) {
+    let Some(rows) = runs.get_mut("check_runs").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let stranded_candidate = |row: &Value| {
+        !crate::merge_pr::check_runs_rollup::is_settled(row) && check_suite_id(row).is_some()
+    };
+    if !rows.iter().any(stranded_candidate) {
+        return;
+    }
+    let Ok(payload) = reads.workflow_runs(sha) else {
+        return;
+    };
+    let failed = failed_runs(&payload, sha);
+    for row in rows.iter_mut().filter(|r| stranded_candidate(r)) {
+        let Some(suite) = check_suite_id(row) else {
+            continue;
+        };
+        let Some((_, run)) = failed.iter().find(|(s, _)| *s == suite) else {
+            continue;
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("status".into(), Value::String("completed".into()));
+            obj.insert("conclusion".into(), run.get("conclusion").cloned().unwrap_or(Value::Null));
+        }
+    }
+}
+
+/// Fold #13940's vanished failures into a poll that would otherwise settle
+/// a non-failure verdict: read the head's workflow runs (best-effort, like
+/// [`drop_superseded_twins`] — a failed read changes nothing) and add each
+/// vanished run as a failing check named after the workflow. `rows` are
+/// the check-run rows BEFORE the twin drop: a run that owned rows was
+/// already reported by them, and a superseded twin's dropped residue must
+/// not be re-reported. Silent: nothing may reach stderr before the
+/// sentinel.
+fn fold_vanished_failed_workflows(
+    reads: &mut GhReads,
+    sha: &str,
+    rows: Option<&[serde_json::Value]>,
+    rollup: &mut verdict::Rollup,
+) {
+    let Some(rows) = rows else { return };
+    let vanished = match reads.workflow_runs(sha) {
+        Ok(payload) => vanished_failed_workflows(&payload, rows, sha),
+        Err(_) => Vec::new(),
+    };
+    for failed in vanished {
+        rollup.total += 1;
+        rollup.seen.insert(failed.name.clone());
+        let at = rollup
+            .failing
+            .partition_point(|n| n.as_str() < failed.name.as_str());
+        if rollup.failing.get(at).map(String::as_str) != Some(failed.name.as_str()) {
+            rollup.failing.insert(at, failed.name.clone());
+            let at = rollup
+                .failed_detail
+                .partition_point(|f| f.name < failed.name);
+            rollup.failed_detail.insert(at, failed);
+        }
     }
 }
 

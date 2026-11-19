@@ -50,6 +50,10 @@ pub struct Candidate {
     pub role: Option<String>,
     pub timeout_remaining_secs: Option<u64>,
     pub holds_issue_creation_mutex: bool,
+    /// A PR step's PR (#11898); an issue step's item is `issue`.
+    pub pr: Option<u32>,
+    /// The step role of a `SweepKind::Step` sweep (#11898).
+    pub step: Option<crate::step_role::StepRole>,
 }
 
 impl Candidate {
@@ -139,6 +143,12 @@ pub trait PauseHost: Send + Sync {
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String>;
     /// Publish an event on the daemon's bus.
     fn emit(&self, topic: &str, payload: serde_json::Value);
+    /// The fleet floor re-read from the store now, not from the last sync
+    /// pass (#12610). H4 asks before it stops anything. Defaults to "no fleet
+    /// store", which never disarms.
+    fn fresh_floor(&self) -> crate::fleet_sync::FloorKnowledge {
+        crate::fleet_sync::FloorKnowledge::NoStore
+    }
 }
 
 /// The production [`PauseHost`]: the workspace pool's sweep registries, the
@@ -289,6 +299,8 @@ fn role_candidate(run: &roll_pause::live_runs::LiveRun, holders: &[String]) -> C
         role: Some(run.role.clone()),
         timeout_remaining_secs: Some(run.timeout_remaining_secs(std::time::Instant::now())),
         holds_issue_creation_mutex: holders.iter().any(|r| r.eq_ignore_ascii_case(&run.role)),
+        pr: None,
+        step: None,
     }
 }
 
@@ -310,9 +322,16 @@ pub(crate) fn sweep_candidates(
         .into_iter()
         .filter(|i| !i.state.is_terminal())
         .map(|info| {
-            let issue = match &info.kind {
-                crate::types::SweepKind::Issue(n) => Some(*n),
-                crate::types::SweepKind::PrSet(_) => None,
+            // A step pauses like the sweep it stands in for (#11898): an
+            // issue step carries its issue, a PR step its PR, and both their
+            // role, so H5 resumes or requeues it as that step.
+            let (issue, pr, step) = match &info.kind {
+                crate::types::SweepKind::Issue(n) => (Some(*n), None, None),
+                crate::types::SweepKind::Step { item, role } if role.acts_on_pr() => {
+                    (None, Some(*item), Some(*role))
+                }
+                crate::types::SweepKind::Step { item, role } => (Some(*item), None, Some(*role)),
+                crate::types::SweepKind::PrSet(_) => (None, None, None),
             };
             let agent = locks.get(&info.sweep_id);
             let facts = issue.map(|n| sr.roll_item_facts(n)).unwrap_or_default();
@@ -350,12 +369,18 @@ pub(crate) fn sweep_candidates(
                 role: None,
                 timeout_remaining_secs: None,
                 holds_issue_creation_mutex: false,
+                pr,
+                step,
             }
         })
         .collect()
 }
 
 impl PauseHost for DaemonPauseHost {
+    fn fresh_floor(&self) -> crate::fleet_sync::FloorKnowledge {
+        crate::fleet_sync::refresh_floor()
+    }
+
     fn close_dispatch(&self, closed: bool, run: &str) {
         *self
             .closed_by

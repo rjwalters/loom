@@ -63,21 +63,6 @@ pub struct CycleSummary {
     /// silent, for the same reason as `suite_artifact_failures`.
     #[serde(default)]
     pub test_artifact_failures: usize,
-    /// Emitted runs also stitched into their issue's story trace (#9088).
-    #[serde(default)]
-    pub story_runs_stitched: usize,
-    /// Emitted runs with no story candidate (no PR closing ref, no
-    /// `feature/issue-N` branch) — e.g. pushes to `main`.
-    #[serde(default)]
-    pub story_runs_no_candidate: usize,
-    /// Emitted runs NOT stitched because they had several candidate issues.
-    #[serde(default)]
-    pub story_runs_ambiguous: usize,
-    /// Emitted runs NOT stitched because a candidate could not be established
-    /// (unresolvable `repo_id`, unreadable PR closing references, a
-    /// cross-repo closing reference).
-    #[serde(default)]
-    pub story_runs_unresolved: usize,
 }
 
 /// `status.json` — every field needed to tell never-polled / ok / stale /
@@ -118,13 +103,6 @@ pub struct PollStatus {
     /// the refusal was visible only as a per-tick WARN in the daemon log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub captain_refusal: Option<CaptainRefusal>,
-    /// The repo-sweep cadence the daemon poller is currently running at
-    /// (#9201): the configured interval, or the slower correction floor while
-    /// a healthy feed drives capture. [`classify`] measures staleness against
-    /// the larger of this and the configured interval, so a deliberately slow
-    /// floor does not read as a stuck poller. Absent ⇒ the configured interval.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sweep_cadence_secs: Option<u64>,
 }
 
 /// Why the daemon poller is not polling on this host: the
@@ -189,6 +167,12 @@ pub enum Health {
     /// The last cycle succeeded, but longer ago than three poll intervals —
     /// the poller has gone quiet, which must not read as healthy.
     Stale { age_secs: i64 },
+    /// The last cycle polled, but one or more owners were skipped at
+    /// discovery (`(owner, reason)`); the others are healthy.
+    Degraded {
+        age_secs: i64,
+        failing_owners: Vec<(String, String)>,
+    },
     /// The last cycle failed.
     Failing {
         since: Option<DateTime<Utc>>,
@@ -212,6 +196,7 @@ impl Health {
             Health::NeverPolled => "never-polled",
             Health::Ok { .. } => "ok",
             Health::Stale { .. } => "stale",
+            Health::Degraded { .. } => "degraded",
             Health::Failing { .. } => "failing",
             Health::Refused { .. } => "refused",
         }
@@ -256,12 +241,21 @@ pub fn classify(status: &PollStatus, now: DateTime<Utc>, interval_secs: u64) -> 
         return Health::NeverPolled;
     };
     let age_secs = (now - last_ok).num_seconds().max(0);
-    let cadence = interval_secs.max(status.sweep_cadence_secs.unwrap_or(0));
-    let stale_after = i64::try_from(cadence.saturating_mul(3)).unwrap_or(i64::MAX);
+    let stale_after = i64::try_from(interval_secs.saturating_mul(3)).unwrap_or(i64::MAX);
+    let failing_owners: Vec<(String, String)> = status
+        .owners
+        .iter()
+        .filter_map(|o| Some((o.owner.clone(), o.error.clone()?)))
+        .collect();
     if age_secs > stale_after {
         Health::Stale { age_secs }
-    } else {
+    } else if failing_owners.is_empty() {
         Health::Ok { age_secs }
+    } else {
+        Health::Degraded {
+            age_secs,
+            failing_owners,
+        }
     }
 }
 
@@ -293,21 +287,6 @@ pub fn note_captain_gate(
         return Ok(());
     }
     status.captain_refusal = next;
-    save_status(dir, &status)
-}
-
-/// Record the sweep cadence the daemon poller is running at (#9201) — see
-/// [`PollStatus::sweep_cadence_secs`]. A no-op when unchanged, and skipped
-/// (not failed) while a cycle holds the lock: the next tick records it.
-pub fn note_sweep_cadence(dir: &Path, cadence_secs: u64) -> io::Result<()> {
-    let Some(_lock) = CycleLock::try_acquire(dir)? else {
-        return Ok(());
-    };
-    let mut status = load_status(dir);
-    if status.sweep_cadence_secs == Some(cadence_secs) {
-        return Ok(());
-    }
-    status.sweep_cadence_secs = Some(cadence_secs);
     save_status(dir, &status)
 }
 

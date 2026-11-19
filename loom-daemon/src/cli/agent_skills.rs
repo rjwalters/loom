@@ -1,14 +1,14 @@
 //! `loom-daemon generate-agent-skills` — the CLI surface over
-//! [`loom_daemon::agent_skills`] (issue #8673, contract point 5).
+//! [`crate::agent_skills`] (issue #8673, contract point 5).
 //!
 //! Backs `defaults/scripts/generate-agent-skills.sh`, a Shape-A stub per the
 //! shell-language policy (issue #7762, ADR-0018): this subcommand is brand
 //! new logic, so it is native Rust from the start rather than a script that
 //! would later need porting.
 
+use crate::agent_skills;
+use crate::repo_root;
 use anyhow::{Context, Result};
-use loom_daemon::agent_skills;
-use loom_daemon::repo_root;
 use std::fs;
 use std::path::PathBuf;
 

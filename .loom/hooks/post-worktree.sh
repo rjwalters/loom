@@ -9,7 +9,8 @@
 # rebuilding from scratch. This avoids cargo lock contention and minutes-long
 # release builds that block parallel worktrees.
 #
-# Falls back to building only if the main workspace binary doesn't exist.
+# If the main workspace binary doesn't exist the hook skips and never builds
+# (#11329).
 #
 # Issue #6013: Cargo's build output is NOT necessarily `<repo>/target/` -- a
 # `CARGO_TARGET_DIR` env var or `build.target-dir` in `~/.cargo/config.toml`
@@ -183,25 +184,8 @@ if [[ -x "$MAIN_BINARY" ]]; then
     fi
 fi
 
-# Fallback: build if main binary doesn't exist and cargo is available
-if ! command -v cargo &>/dev/null; then
-    echo "  cargo not found and no main workspace binary, skipping loom-daemon setup"
-    exit 0
-fi
-
-echo "  Building loom-daemon (release)..."
-echo "  (main workspace binary not found at $MAIN_BINARY)"
-# CARGO_TARGET_DIR is pinned to the resolved DESTINATION rather than left to
-# cargo: under the per-worktree scheme (#8458) the marker, not the config
-# hierarchy, is what says where this worktree builds, and a rebuild that landed in
-# the shared root would both miss the binary check above on the next run and
-# re-create the cross-worktree uplift collision this scheme exists to remove.
-if CARGO_TARGET_DIR="$WORKTREE_TARGET_DIR" cargo build --release -p loom-daemon --manifest-path "$WORKTREE_PATH/Cargo.toml" 2>&1; then
-    echo "  loom-daemon build complete"
-else
-    echo "  loom-daemon build failed (non-fatal, worktree still usable)"
-fi
-
-# Restore Cargo.lock — the build output is in target/ (gitignored),
-# but cargo may update the lockfile which confuses shepherd diagnostics.
-git -C "$WORKTREE_PATH" checkout -- Cargo.lock 2>/dev/null || true
+# No main-workspace binary: do NOT build one (#11329). A per-worktree release
+# build wrote 0.4-10 GB each and nothing needs it -- Builders build what they
+# test and scripts resolve the installed daemon.
+echo "  no main-workspace loom-daemon at $MAIN_BINARY; not building one (build it yourself if this worktree needs it)"
+exit 0

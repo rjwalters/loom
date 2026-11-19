@@ -143,3 +143,84 @@ scripts/tests/test-champion-needs-revision-routing.sh
 # its idempotency classifier has no caller; the script and its suite go.
 scripts/classify-capacity-defer.sh
 scripts/tests/test-classify-capacity-defer.sh
+
+# #9782 (2026-10-15) — every suite now registers a real write-scope fixture
+# (write-scope-fixture.sh); the allow-all forge may-write stub goes.
+scripts/tests/lib/write-scope-stub.sh
+
+# #12063 (2026-10-15) — merge-pr's freshness guard, re-date remedy and
+# ci-result gate removed (slice 1); their doc and shell suites go with them.
+docs/stale-check-inputs.md
+scripts/tests/test-merge-pr-ci-result.sh
+scripts/tests/test-merge-pr-stale-check-redate.sh
+scripts/tests/test-merge-pr-stale-required-checks.sh
+
+# #12106 (2026-10-15) — CI simplification: the Dependabot manifest-label check
+# and the pipefail ratchet's suite leave the PR path with their checkers.
+scripts/check-dependabot-labels.sh
+scripts/tests/test-check-dependabot-labels.sh
+scripts/tests/test-check-pipefail-early-exit.sh
+# #12063 slice 2 (2026-10-15) — merge-pr no longer waits for checks, self-syncs or pre-reads
+# mergeability; the suites for that machinery leave with it.
+scripts/tests/test-merge-pr-auto-blocked-settle.sh
+scripts/tests/test-merge-pr-auto-merge-disabled-fallback.sh
+scripts/tests/test-merge-pr-auto-queued-stacked-children.sh
+scripts/tests/test-merge-pr-check-runs-404-fallback.sh
+scripts/tests/test-merge-pr-head-sync-retry.sh
+scripts/tests/test-merge-pr-rate-limit-fallback.sh
+scripts/tests/test-merge-pr-stale-mergeable.sh
+scripts/tests/test-merge-pr-unstable-fallback.sh
+scripts/tests/test-merge-pr-wait-for-checks-empty-settle.sh
+
+# #12121 (2026-10-16) — the operator presence hook is retired; operator
+# activity is inferred by consumers, not emitted.
+hooks/presence-beat.sh
+
+# #11983 (2026-10-16) — the stamp-only create-pr provenance test is removed.
+scripts/tests/test-create-pr-provenance.sh
+
+# #12709 (2026-10-18) — the unmeasured Judge fan-out experiment scaffold is
+# retired (PR #12743).
+scripts/experiments/README.md
+scripts/experiments/judge-fanout-corpus-runner.sh
+scripts/experiments/judge-fanout-experiment.sh
+scripts/experiments/judge-fanout-results-template.md
+scripts/experiments/judge-fanout-workflow.js
+scripts/tests/test-judge-fanout-experiment.sh
+
+# #13020 (2026-10-21) — the orphaned heredoc-body-safety test lib is removed (PR #13023).
+scripts/tests/lib/heredoc-body-safety.sh
+
+# #12094 (2026-10-16) — the telemetry-replay CLI and its SigNoz replay queries
+# are deleted; the replay doc goes with them.
+docs/telemetry-replay.md
+
+# #13118 (2026-10-24) — worktree-return.sh and worktree.sh --return-to are removed (PR #13160).
+scripts/worktree-return.sh
+
+# #13148 (2026-10-27) — the forked installer sync-labels test is removed with the fork (PR #13213).
+scripts/tests/test-install-sync-labels.sh
+
+# #13628 (2026-11-06) — deprecated tmux `loom scale` verb removed.
+scripts/cli/loom-scale.sh
+
+# #13960 (2026-11-17) — the deprecated two-tier-daemon tombstone commands
+# stopped shipping: both carried DEPRECATED in their own descriptions, and
+# migrate-consumer.sh has been deleting them from migrated repos since v0.10.0
+# (#3372). This entry makes the removal reach already-installed repos on their
+# next resync too.
+commands/loom/loom-iteration.md
+commands/loom/loom-parent.md
+
+# #13911 (2026-11-17) — generate-agents-md.sh is source-tree-only tooling (it
+# resolves defaults/.loom/ from the repo root) and exited 1 in every consumer;
+# it moved to the upstream-only scripts/ and stopped shipping.
+scripts/generate-agents-md.sh
+
+# #13911 (2026-11-18) — #13910's two-layout test suite rode along when
+# test-generate-agents-md-layouts.sh shipped briefly (2026-11-17..18): it
+# copies defaults/scripts/generate-agents-md.sh, which no longer ships, so
+# consumers holding it carry a permanently-failing suite. Removed upstream
+# together with the generator it tested; this entry removes it from
+# already-installed repos on their next resync.
+scripts/tests/test-generate-agents-md-layouts.sh

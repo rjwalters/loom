@@ -67,8 +67,6 @@ This starts both the Vite dev server and the Tauri development window with hot r
 │   │   └── judge.md        # Desktop app review criteria
 │   └── scripts/
 │       └── worktree.sh
-├── .github/
-│   └── labels.yml
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs         # Tauri app entry point

@@ -1,5 +1,6 @@
 //! Blocking role launch; runtime decision polling never performs Docker I/O.
 use super::*;
+use crate::observability::lifecycle::pre_launch;
 
 // #10003: an exit-0 Codex tick whose sandbox refused every tool call is a
 // failure, and arms the host-wide hold the preference walk falls through on.
@@ -38,6 +39,8 @@ pub(super) fn apply_role_observability(
     runtime: Option<&str>,
 ) -> Option<crate::observability::agent_relay::SessionLease> {
     use crate::telemetry::trace::store::{TRACEPARENT_ENV, W3C_TRACEPARENT_ENV};
+    // #12342: where the tick runs rides its span at open.
+    crate::observability::lifecycle::role_runtime::note_launch(cmd, runtime);
     let execution = crate::observability::lifecycle::role_command(cmd);
     if let Some(execution) = &execution {
         // #11855: where a won PR claim names this tick's PR.
@@ -101,6 +104,7 @@ pub(super) fn run_role_with_timeout(
     // before anything is spawned, and H5 requeues the run.
     if let Some(refused) = resume.and_then(|r| r.refuse(admission)) {
         note_pre_spawn_skip(&logs_dir, role, &refused);
+        pre_launch::note(pre_launch::RESUME_REFUSED);
         return RoleTickOutcome::Failure(refused);
     }
     // #9548: every scheduled role (Champion, Curator, Judge, Doctor, ...)
@@ -115,6 +119,7 @@ pub(super) fn run_role_with_timeout(
         let reason = "write scope refused (#9548): this installation may not write to the \
                       workspace's repository; see the write_scope log line for why";
         note_pre_spawn_skip(&logs_dir, role, reason);
+        pre_launch::note(pre_launch::WRITE_SCOPE_REFUSED);
         return RoleTickOutcome::Failure(reason.to_string());
     }
     // #8787: an admission that relied on private-clone containment must launch
@@ -123,7 +128,11 @@ pub(super) fn run_role_with_timeout(
     // and never without one at all.
     let contained_admission = admission.is_some_and(|a| a.execution.is_some());
     let prepared = match contained {
-        Some(selection) if contained_admission => Ok(Some(selection)),
+        // A selection handed in is ALWAYS the one to launch through: either the
+        // containment proof's (#8787) or a seat reserved before the claim
+        // (#14481, `execution == None`). Re-preparing would flock the same
+        // account.lock a second time in this process and fail `AccountBusy`.
+        Some(selection) => Ok(Some(selection)),
         _ if contained_admission => Err(anyhow::anyhow!(
             "containment admission has no prepared private selection; refusing launch"
         )),
@@ -140,10 +149,12 @@ pub(super) fn run_role_with_timeout(
         Ok(selection) => selection,
         Err(error) => {
             note_pre_spawn_skip(&logs_dir, role, &error.to_string());
+            pre_launch::note(pre_launch::SELECTION_PREPARE_FAILED);
             return RoleTickOutcome::Failure(error.to_string());
         }
     };
     if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        pre_launch::note(pre_launch::LOGS_DIR_FAILED);
         return RoleTickOutcome::Failure(format!(
             "could not create logs dir {}: {e}",
             logs_dir.display()
@@ -160,6 +171,11 @@ pub(super) fn run_role_with_timeout(
     // crate writes — `tick_anchor` is used purely as an opaque string anchor
     // (never re-parsed as a datetime), so this is a pure formatting change.
     let tick_anchor = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let service_tier = model_resolution::resolve_role_runner_service_tier_for_runtime(
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
 
     {
         use std::io::Write;
@@ -168,8 +184,7 @@ pub(super) fn run_role_with_timeout(
             .append(true)
             .open(&log_path)
         {
-            // Rendered by `model_resolution::role_log_header` (#4501/#8054) —
-            // the module that resolved the pair owns how it is reported.
+            // Keep the header and the child environment on the same tier resolution.
             let _ = writeln!(
                 f,
                 "\n{}",
@@ -180,6 +195,9 @@ pub(super) fn run_role_with_timeout(
                     model_source,
                     effort,
                     effort_source,
+                    service_tier
+                        .as_ref()
+                        .map(|(tier, source)| (tier.as_str(), source.as_str())),
                 )
             );
         }
@@ -192,15 +210,19 @@ pub(super) fn run_role_with_timeout(
     {
         Ok(f) => f,
         Err(e) => {
+            pre_launch::note(pre_launch::LOG_OPEN_FAILED);
             return RoleTickOutcome::Failure(format!(
                 "could not open log {}: {e}",
                 log_path.display()
-            ))
+            ));
         }
     };
     let stderr_file = match out_file.try_clone() {
         Ok(f) => f,
-        Err(e) => return RoleTickOutcome::Failure(format!("could not clone log handle: {e}")),
+        Err(e) => {
+            pre_launch::note(pre_launch::LOG_HANDLE_FAILED);
+            return RoleTickOutcome::Failure(format!("could not clone log handle: {e}"));
+        }
     };
 
     let mut cmd = Command::new(script);
@@ -239,6 +261,16 @@ pub(super) fn run_role_with_timeout(
         cmd.arg("--effort").arg(effort);
     }
     cmd.arg("--dangerously-skip-permissions");
+    // Service tier (#14454, producer for #14141): a tier has no CLI flag, so the
+    // resolved value rides the child's environment as `LOOM_SERVICE_TIER`, which
+    // the `spawn-*.sh` adapters map per runtime. Unset exports nothing — an
+    // operator-exported value in the daemon's own environment is inherited as-is.
+    if let Some((tier, tier_source)) = service_tier {
+        log::info!(
+            "role_runner: {role} service_tier={tier} (source={tier_source}) -> LOOM_SERVICE_TIER"
+        );
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     // Transient-error recovery (issue #4255): scheduled role spawns are the
     // same unattended class as daemon-dispatched sweeps, so route them through
     // `claude-wrapper.sh` (retry/backoff/classification, bounded by
@@ -328,6 +360,7 @@ pub(super) fn run_role_with_timeout(
     if resume.is_some() && session.is_none() {
         let reason = "roll resume refused: the saved session id is not usable (#10832)";
         note_pre_spawn_skip(&logs_dir, role, reason);
+        pre_launch::note(pre_launch::RESUME_SESSION_UNUSABLE);
         return RoleTickOutcome::Failure(reason.to_string());
     }
     if let Some(session) = &session {
@@ -335,6 +368,8 @@ pub(super) fn run_role_with_timeout(
     }
     // #10432: the agent's pick journal, read back into this tick's `pick.decision`.
     crate::observability::pick_journal::attach(&mut cmd, workspace_root, role);
+    // #12119: the serving PR queue, journaled by the daemon, not the agent.
+    crate::observability::pick_journal::record_queue_at_dispatch(&cmd, workspace_root, role);
     if let Some(selection) = &selection {
         selection.apply(&mut cmd);
     }
@@ -342,11 +377,13 @@ pub(super) fn run_role_with_timeout(
     // is held until the run is registered, so the pause's snapshot cannot
     // fall between this spawn and that registration.
     let Some(launch_permit) = crate::roll_pause::live_runs::begin_launch(workspace_root) else {
+        pre_launch::note(pre_launch::PAUSED_FOR_ROLL);
         return RoleTickOutcome::Failure(
             "role launch refused: the daemon is pausing every agent for a version roll (#10831)"
                 .to_string(),
         );
     };
+    let spawned_at = chrono::Utc::now();
     // #11453: from here on every failure note also feeds the tap's
     // launch-failure streak; a pre-spawn refusal above never counts.
     let hold = hold_feed::HoldFeed::new(workspace_root, role, admission);
@@ -374,6 +411,17 @@ pub(super) fn run_role_with_timeout(
     // tap; every bail-out before this point dropped it, releasing it.
     crate::runtime_preference::handoff::attach(backstop, pid);
     crate::observability::lifecycle::role_child_spawned(pid);
+    // #10802: whatever the run leaves behind (its scope, its process group)
+    // is torn down on every return below, exactly as a terminal sweep's is.
+    let _residue = crate::agent_residue_reaper::ExitTeardownOnDrop(Some(
+        crate::agent_residue_reaper::ExitRequest::for_role(
+            workspace_root,
+            &item,
+            pid,
+            spawned_at,
+            session.as_ref().and_then(|s| s.scope_unit.clone()),
+        ),
+    ));
     // #10831: list this run for the pause-and-roll H4 snapshot until it ends
     // (every return below drops the guard).
     let live_run = session
@@ -513,7 +561,7 @@ pub(super) fn run_role_with_timeout(
                     // a fake saturated/unsaturated host can be asserted
                     // deterministically.
                     let load_per_core =
-                        load_per_core_override.or_else(crate::cpu_headroom::load_per_core);
+                        load_per_core_override.or_else(crate::host_status::load_per_core_or_raw);
                     let outcome =
                         terminate_timed_out(&mut child, pid, script, &log_path, load_per_core);
                     // #11931: the agent never reached `lease pr release`; do
@@ -633,5 +681,70 @@ mod tests {
             other => panic!("expected a write-scope refusal, got {other:?}"),
         }
         assert!(!marker.exists(), "nothing may be spawned on a refused root");
+    }
+
+    /// #14481: a seat reserved before the claim (`execution == None`) must be
+    /// launched through, never re-prepared. The child inheriting the lease on
+    /// fd 198 proves the reservation travelled; re-preparing would instead
+    /// flock the same account.lock a second time in-process and fail busy.
+    #[test]
+    #[serial_test::serial(private_workspace_fork)]
+    fn a_reserved_seat_without_containment_is_launched_through() {
+        let root = tempfile::tempdir().unwrap();
+        let seat = tempfile::tempdir().unwrap();
+        let selection =
+            crate::tokens_pool::private_workspace::dispatch::Selection::reserved_for_test(
+                seat.path(),
+            );
+        let admitted = crate::runtime_admission::ResolvedRuntime {
+            role: "judge".into(),
+            runtime: "codex".into(),
+            source: crate::runtime_admission::RuntimeSource::RoleConfig,
+            adapter: PathBuf::from("/nonexistent/spawn-codex.sh"),
+            role_manifest: PathBuf::from("/nonexistent/judge.json"),
+            runtime_manifest: PathBuf::from("/nonexistent/codex.json"),
+            suggested_worker_type: None,
+            preference: None,
+            execution: None,
+        };
+        let marker = root.path().join("inherited");
+        let script = root.path().join("spawn.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$LOOM_PRIVATE_LEASE_FD\" = '{}' ] && \
+                 [ -e \"/dev/fd/$LOOM_PRIVATE_LEASE_FD\" ] && touch '{}'\n",
+                crate::tokens_pool::private_workspace::dispatch::LEASE_FD,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ws = crate::write_scope_test_support::WritableRoot::register(root.path());
+        let outcome = run_role_with_timeout(
+            &script,
+            root.path(),
+            &ws.gh,
+            "judge",
+            "/loom:judge",
+            root.path().join("logs"),
+            Duration::from_secs(5),
+            "",
+            "default",
+            "",
+            "default",
+            Some(&admitted),
+            None,
+            None,
+            Some(selection),
+            None,
+        );
+        if let RoleTickOutcome::Failure(reason) = &outcome {
+            assert!(!reason.contains("busy"), "re-prepared a held seat: {reason}");
+        }
+        assert!(marker.exists(), "the reserved lease must reach the child: {outcome:?}");
     }
 }

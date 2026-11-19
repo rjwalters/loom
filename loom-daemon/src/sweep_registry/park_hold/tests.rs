@@ -46,6 +46,7 @@ fn is_daemon_hold_rejects_role_parks_and_other_reasons() {
         by: Some(DAEMON_HOLD_BY.to_string()),
         at: Some(AT.to_string()),
         reason: Some(PRLESS_HOLD_REASON.to_string()),
+        transient: None,
     };
     assert!(is_daemon_hold(&hold));
     let numbered = ParkRecord {

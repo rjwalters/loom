@@ -4,7 +4,7 @@
 # systemd-run argv. The sizing policy itself (history-gated, env-disable-able)
 # is unit-tested in loom-daemon/src/cli/ram_scope_limit.rs; here the daemon is
 # a stub so only the shell call-site is under test.
-# Split from test-spawn-claude.sh, which is frozen by the file-size ratchet.
+# Split from test-spawn-claude.sh.
 set -uo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,6 +41,7 @@ cat >"$T/bin/loom-daemon" <<STUB
 [[ "\$1" == ram-scope-limit ]] || exit 2
 echo "\$*" >>"$DAEMON_LOG"
 [[ -n "\${STUB_MEM_OUT:-}" ]] && echo "\$STUB_MEM_OUT"
+echo "ram-scope-limit: stub-source-line" >&2
 exit "\${STUB_MEM_RC:-0}"
 STUB
 chmod +x "$T/bin/loom-daemon"
@@ -63,6 +64,9 @@ if [[ "$OUT" == *"stub-claude ran"* ]]; then ok "stub claude still runs"; else b
 if grep -q -- "ram-scope-limit --workspace $WS --probe" "$DAEMON_LOG"; then
     ok "daemon asked with --workspace and --probe"
 else bad "daemon asked with --workspace and --probe: $(cat "$DAEMON_LOG")"; fi
+if [[ "$OUT" == *"ram-scope-limit: stub-source-line"* ]]; then
+    ok "the source line on stderr reaches the spawn log (#12246)"
+else bad "the source line on stderr reaches the spawn log (#12246)"; fi
 
 run STUB_MEM_RC=1 >/dev/null
 if grep -q MemoryMax "$SYSTEMD_RUN_LOG"; then bad "exit 1 (no limit) -> no MemoryMax"; else ok "exit 1 (no limit) -> no MemoryMax"; fi

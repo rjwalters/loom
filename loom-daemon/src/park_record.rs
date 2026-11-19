@@ -73,9 +73,11 @@
 //! role must write, is `defaults/docs/park-record.md`.
 
 pub mod apply;
+mod code;
 
 use regex::Regex;
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::OnceLock;
 
 /// The opening sentinel. A body containing this substring carries a park record
@@ -184,6 +186,58 @@ pub struct ParkRecord {
     pub at: Option<String>,
     /// `reason="…"` — free text, already unescaped.
     pub reason: Option<String>,
+    /// `transient=`/`attempt=`/`until=` — a self-expiring park (#13606).
+    pub transient: Option<Transient>,
+}
+
+/// The backoff schedule of a transient park (#13606): a park whose cause (for
+/// example `capacity:batch`) clears by itself, so it carries a retry time
+/// instead of waiting for a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transient {
+    /// What is transiently unavailable, e.g. `capacity:batch`.
+    pub cause: String,
+    /// 1 for the first park for this cause, then +1 per re-park.
+    pub attempt: u32,
+    /// RFC 3339 time after which the park may be released. `None` (missing or
+    /// unparseable on a hand-edited record) is treated as already due.
+    pub until: Option<String>,
+}
+
+/// First transient delay, in seconds (30 min); doubles per attempt.
+pub const TRANSIENT_BASE_SECS: i64 = 30 * 60;
+/// Longest transient delay (24 h).
+pub const TRANSIENT_CAP_SECS: i64 = 24 * 60 * 60;
+/// A prior transient record whose `until` is older than this no longer counts
+/// toward `attempt`; the backoff chain restarts at 1.
+pub const TRANSIENT_CHAIN_RESET_SECS: i64 = TRANSIENT_CAP_SECS;
+/// Jitter is at most this fraction of the delay, either way (±10%).
+pub const TRANSIENT_JITTER_FRACTION: f64 = 0.10;
+/// From this attempt on the release pass escalates once (comment only).
+pub const TRANSIENT_ESCALATE_ATTEMPT: u32 = 6;
+
+/// Delay in seconds before attempt `attempt` (1-based) may be retried:
+/// `30min * 2^(attempt-1)`, with `jitter` (clamped to `-1.0..=1.0`) scaling a
+/// ±[`TRANSIENT_JITTER_FRACTION`] adjustment, then capped at 24 h.
+#[must_use]
+pub fn transient_delay_secs(attempt: u32, jitter: f64) -> i64 {
+    let exp = attempt.saturating_sub(1).min(16);
+    let base = (TRANSIENT_BASE_SECS << exp).min(TRANSIENT_CAP_SECS);
+    let j = jitter.clamp(-1.0, 1.0) * TRANSIENT_JITTER_FRACTION;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    let adjusted = (base as f64 * (1.0 + j)).round() as i64;
+    adjusted.min(TRANSIENT_CAP_SECS)
+}
+
+/// Whether a transient park may be released at `now` (RFC 3339): `until` has
+/// passed, or is missing/unparseable (treated as due).
+#[must_use]
+pub fn transient_due(t: &Transient, now: &str) -> bool {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    match (t.until.as_deref().and_then(parse), parse(now)) {
+        (Some(u), Some(n)) => n >= u,
+        _ => true,
+    }
 }
 
 /// `<!-- loom:park …( -->)` spans, captured lazily.
@@ -209,7 +263,9 @@ fn reason_re() -> &'static Regex {
 /// `key=value` for the unquoted provenance attributes.
 fn attr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\b(by|at)=([^\s]+)").expect("static park-attr pattern"))
+    RE.get_or_init(|| {
+        Regex::new(r"\b(by|at|transient|attempt|until)=([^\s]+)").expect("static park-attr pattern")
+    })
 }
 
 /// Every `#N`, optionally qualified as `OWNER/REPO#N` (#10443). A bare `#N`
@@ -222,27 +278,29 @@ fn ref_re() -> &'static Regex {
     })
 }
 
-/// Whether `text` carries at least one park record.
-///
-/// Deliberately keyed on [`parse`] rather than on the sentinel substring: a
-/// truncated `<!-- loom:park` with no terminator is not a record, and treating
-/// it as one would report a park as documented when nothing can read it.
-#[must_use]
-pub fn has_record(text: &str) -> bool {
-    !parse(text).is_empty()
-}
-
 /// Every park record in `text`, in document order, one per declared blocker.
 ///
 /// More than one is legitimate and expected: a multi-blocker park is written as
 /// several records, and a second park applied later (by a different role, for a
 /// different blocker) appends its own rather than editing someone else's.
+///
+/// A marker quoted inside a fenced block or an inline code span is not a
+/// record: it renders as visible text, not a comment (#10837, [`code`]).
 #[must_use]
 pub fn parse(text: &str) -> Vec<ParkRecord> {
+    markers(text)
+        .into_iter()
+        .flat_map(|(_, inner)| parse_inner(&text[inner]))
+        .collect()
+}
+
+/// The `(whole, interior)` byte ranges of every park marker outside code,
+/// in document order. Offsets index `text` itself ([`code::blank`] keeps them).
+fn markers(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let masked = code::blank(text);
     marker_re()
-        .captures_iter(text)
-        .filter_map(|c| c.get(1))
-        .flat_map(|m| parse_inner(m.as_str()))
+        .captures_iter(&masked)
+        .filter_map(|c| Some((c.get(0)?.range(), c.get(1)?.range())))
         .collect()
 }
 
@@ -261,6 +319,7 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
 
     let mut by = None;
     let mut at = None;
+    let (mut cause, mut attempt, mut until) = (None, None, None);
     for c in attr_re().captures_iter(&without_reason) {
         let (Some(k), Some(v)) = (c.get(1), c.get(2)) else {
             continue;
@@ -268,6 +327,9 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
         match k.as_str() {
             "by" => by = Some(v.as_str().to_string()),
             "at" => at = Some(v.as_str().to_string()),
+            "transient" => cause = Some(v.as_str().to_string()),
+            "attempt" => attempt = v.as_str().parse::<u32>().ok(),
+            "until" => until = Some(v.as_str().to_string()),
             _ => {}
         }
     }
@@ -287,6 +349,11 @@ fn parse_inner(inner: &str) -> Vec<ParkRecord> {
         by,
         at,
         reason,
+        transient: cause.map(|cause| Transient {
+            cause,
+            attempt: attempt.unwrap_or(1),
+            until,
+        }),
     };
 
     if refs.is_empty() {
@@ -333,69 +400,132 @@ pub fn blockers(text: &str) -> Vec<BlockerRef> {
     set.into_iter().collect()
 }
 
-/// Whether any park record in `text` names a **qualified** (`OWNER/REPO#N`)
-/// blocker (#10556).
-///
-/// Read through [`parse`], so it agrees with [`blockers`] exactly: a mention
-/// inside `reason="…"` or outside any marker does not count. A caller that
-/// acts only on local blockers (the #10556 release pass) must skip a park
-/// carrying one rather than let it drop out of a local-only check.
-#[must_use]
-pub fn has_qualified_ref(text: &str) -> bool {
-    parse(text)
-        .iter()
-        .any(|r| r.blocker.as_ref().is_some_and(|b| b.repo.is_some()))
+/// The prefix of the visible audit line a retraction appends (#13895). Plain
+/// text, so it renders — unlike the marker it demotes — and deliberately
+/// without the phrase every dependency parser matches (`Blocked by`), so the
+/// withdrawal never declares anything itself.
+pub const WITHDRAWN_PHRASE: &str = "Park withdrawn:";
+
+/// One withdrawn blocker, parsed from a retraction's audit line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withdrawn {
+    /// The blocker the withdrawal names.
+    pub blocker: BlockerRef,
+    /// `by=` — the role or identity that withdrew it.
+    pub by: Option<String>,
+    /// `at=` — when, as written.
+    pub at: Option<String>,
+    /// `reason="…"` — why it no longer gates the artifact.
+    pub reason: Option<String>,
 }
 
-/// `body` with every park record naming a **local** blocker in `resolved`
-/// removed, and every other record kept (#10556's re-park).
+/// `text` with every live park marker naming `target` wrapped in an inline
+/// code span — the marker's own bytes unchanged — so [`parse`] and
+/// [`blockers`] stop reading it as a declaration (#13895, [`code`]). This is
+/// the mechanical form of the manual demotion `parse` has honoured since
+/// #10837: a quoted marker renders as visible text, not a comment.
 ///
-/// `resolved` holds local issue/PR numbers; a qualified `OWNER/REPO#N` record
-/// is never matched by them, so it is always kept.
-///
-/// A marker naming only resolved blockers is dropped — with its whole line
-/// when it stood alone on one. A hand-written multi-reference marker naming a
-/// mix is re-rendered as one record per still-open blocker, keeping its
-/// provenance. Everything else in the body is left byte-for-byte.
+/// Returns the rewritten text and the number of markers demoted; zero means
+/// no live marker names `target` (the caller's idempotent no-op). A marker
+/// naming `target` *and* other references is never split — demoting it would
+/// silently drop the other blockers — and is refused with the other refs.
+pub fn demote_blocker(text: &str, target: &BlockerRef) -> Result<(String, usize), Vec<BlockerRef>> {
+    let mut wrap: Vec<Range<usize>> = Vec::new();
+    let mut refused = None;
+    for (whole, inner) in markers(text) {
+        let records = parse_inner(&text[inner]);
+        if !records.iter().any(|r| r.blocker.as_ref() == Some(target)) {
+            continue;
+        }
+        let others: BTreeSet<BlockerRef> = records
+            .iter()
+            .filter_map(|r| r.blocker.clone())
+            .filter(|b| b != target)
+            .collect();
+        if !others.is_empty() {
+            // Refuse the whole retraction, not just this marker: a partial
+            // withdrawal of a multi-reference record reads as done.
+            refused.get_or_insert(others);
+            continue;
+        }
+        wrap.push(whole);
+    }
+    if let Some(others) = refused {
+        return Err(others.into_iter().collect());
+    }
+    let count = wrap.len();
+    let mut out = text.to_string();
+    // Later offsets first: every insert shifts everything after it by one
+    // byte. `r.end` is one past the marker's final `>`, so the closing
+    // backtick lands on the marker's own line; both insert points are ASCII,
+    // so they stay on char boundaries.
+    for r in wrap.iter().rev() {
+        out.insert(r.end, '`');
+        out.insert(r.start, '`');
+    }
+    Ok((out, count))
+}
+
+/// Render the visible audit line a retraction appends: who, when, why, in the
+/// body's plain text rather than a comment, so the withdrawal is reviewable
+/// and machine-readable (`parse --json`'s `withdrawn`).
 #[must_use]
-pub fn drop_blockers(body: &str, resolved: &[u64]) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut last = 0;
-    for caps in marker_re().captures_iter(body) {
-        let (Some(whole), Some(inner)) = (caps.get(0), caps.get(1)) else {
+pub fn render_withdrawn(blocker: &BlockerRef, by: Option<&str>, at: &str, reason: &str) -> String {
+    let mut out = format!("{WITHDRAWN_PHRASE} {blocker} —");
+    if let Some(b) = by.map(sanitize_attr).filter(|b| !b.is_empty()) {
+        out.push_str(&format!(" by={b}"));
+    }
+    let clean_at = sanitize_attr(at);
+    if !clean_at.is_empty() {
+        out.push_str(&format!(" at={clean_at}"));
+    }
+    let clean = sanitize_reason(reason);
+    if !clean.is_empty() {
+        out.push_str(&format!(" reason=\"{clean}\""));
+    }
+    out
+}
+
+/// Parse one retraction audit line:
+/// `Park withdrawn: #N — by=<role> at=<RFC3339> reason="…"`. The reason is
+/// stripped before the reference is extracted, the same rule as [`parse_inner`]:
+/// a `#N` inside the why is a mention, never the withdrawn blocker.
+#[must_use]
+pub fn parse_withdrawn(line: &str) -> Option<Withdrawn> {
+    let rest = line.trim().strip_prefix(WITHDRAWN_PHRASE)?.trim_start();
+    let reason = reason_re()
+        .captures(rest)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+    let without_reason = reason_re().replace_all(rest, "");
+    let c = ref_re().captures(&without_reason)?;
+    let blocker = BlockerRef {
+        repo: c.get(1).map(|m| m.as_str().to_string()),
+        number: c.get(2)?.as_str().parse().ok()?,
+    };
+    let (mut by, mut at) = (None, None);
+    for c in attr_re().captures_iter(&without_reason) {
+        let (Some(k), Some(v)) = (c.get(1), c.get(2)) else {
             continue;
         };
-        let records = parse_inner(inner.as_str());
-        let keep: Vec<ParkRecord> = records
-            .iter()
-            .filter(|r| {
-                r.blocker
-                    .as_ref()
-                    .is_none_or(|b| b.repo.is_some() || !resolved.contains(&b.number))
-            })
-            .cloned()
-            .collect();
-        if keep.len() == records.len() {
-            continue;
+        match k.as_str() {
+            "by" => by = Some(v.as_str().to_string()),
+            "at" => at = Some(v.as_str().to_string()),
+            _ => {}
         }
-        let (mut start, mut end) = (whole.start(), whole.end());
-        let replacement = keep.iter().map(render).collect::<Vec<_>>().join("\n");
-        if replacement.is_empty() {
-            // Take the whole line when the marker was alone on it.
-            let line_start = body[..start].rfind('\n').map_or(0, |i| i + 1);
-            let line_end = body[end..].find('\n').map_or(body.len(), |i| end + i + 1);
-            let alone =
-                body[line_start..start].trim().is_empty() && body[end..line_end].trim().is_empty();
-            if alone && line_start >= last {
-                (start, end) = (line_start, line_end);
-            }
-        }
-        out.push_str(&body[last..start]);
-        out.push_str(&replacement);
-        last = end;
     }
-    out.push_str(&body[last..]);
-    out
+    Some(Withdrawn {
+        blocker,
+        by,
+        at,
+        reason,
+    })
+}
+
+/// Every retraction audit line in `text`, in document order.
+#[must_use]
+pub fn withdrawn(text: &str) -> Vec<Withdrawn> {
+    text.lines().filter_map(parse_withdrawn).collect()
 }
 
 /// Render one park record as the one line a role writes into the artifact body.
@@ -412,6 +542,12 @@ pub fn render(record: &ParkRecord) -> String {
     }
     if let Some(at) = &record.at {
         out.push_str(&format!(" at={}", sanitize_attr(at)));
+    }
+    if let Some(t) = &record.transient {
+        out.push_str(&format!(" transient={} attempt={}", sanitize_attr(&t.cause), t.attempt));
+        if let Some(u) = &t.until {
+            out.push_str(&format!(" until={}", sanitize_attr(u)));
+        }
     }
     if let Some(reason) = &record.reason {
         let clean = sanitize_reason(reason);
@@ -437,6 +573,7 @@ pub fn render_park(
         by: by.map(str::to_string),
         at: at.map(str::to_string),
         reason: reason.map(str::to_string),
+        transient: None,
     };
     if blockers.is_empty() {
         return render(&template);

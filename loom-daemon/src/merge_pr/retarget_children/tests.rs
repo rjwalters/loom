@@ -12,6 +12,8 @@ struct Fake {
     lists: RefCell<Vec<Result<Vec<Child>, String>>>,
     fail: Vec<i64>,
     edits: RefCell<Vec<(i64, String)>>,
+    rebased: RefCell<Vec<i64>>,
+    rebase_fail: Vec<i64>,
 }
 
 impl Fake {
@@ -20,6 +22,8 @@ impl Fake {
             lists: RefCell::new(lists),
             fail,
             edits: RefCell::new(Vec::new()),
+            rebased: RefCell::new(Vec::new()),
+            rebase_fail: Vec::new(),
         }
     }
 }
@@ -37,6 +41,21 @@ impl Forge for Fake {
         } else {
             Ok(())
         }
+    }
+    fn rebase_child(&self, _repo: &str, number: i64, _parent: &str) -> Result<(), String> {
+        self.rebased.borrow_mut().push(number);
+        if self.rebase_fail.contains(&number) {
+            Err("conflict".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Fake {
+    fn rebase_failing(mut self, fail: Vec<i64>) -> Self {
+        self.rebase_fail = fail;
+        self
     }
 }
 
@@ -174,9 +193,49 @@ fn an_invalid_repo_slug_fails_closed_without_running_gh() {
     for bad in ["", "acme", "acme/w/x", "acme/ w", "/w"] {
         assert!(list_invocation(bad, B).is_err(), "{bad:?}");
         assert!(edit_invocation(bad, 7, "main").is_err(), "{bad:?}");
-        assert!(GhForge.open_children(bad, B).is_err(), "{bad:?}");
-        assert!(GhForge.retarget(bad, 7, "main").is_err(), "{bad:?}");
-        let r = prepare_delete(&GhForge, bad, B, "main");
+        assert!(GhForge::default().open_children(bad, B).is_err(), "{bad:?}");
+        assert!(GhForge::default().retarget(bad, 7, "main").is_err(), "{bad:?}");
+        let r = prepare_delete(&GhForge::default(), bad, B, "main");
         assert_eq!(r.verdict, Verdict::Keep, "{bad:?}");
     }
+}
+
+const CHORE: &str = "chore/kct-0.24.0";
+
+/// #13332: a parent on a non-`feature/issue-<N>` branch never got the
+/// post-merge reconcile, so each child is rebased BEFORE its base moves.
+#[test]
+fn non_stackable_parent_rebases_every_child_before_retargeting() {
+    let f = Fake::new(vec![Ok(vec![child(2), child(3)]), Ok(vec![])], vec![]);
+    let r = prepare_delete(&f, R, CHORE, "main");
+    assert_eq!(r.verdict, Verdict::Delete);
+    assert_eq!(*f.rebased.borrow(), vec![2, 3]);
+    assert_eq!(f.edits.borrow().len(), 2);
+}
+
+/// A stackable parent keeps the old behaviour: no rebase here.
+#[test]
+fn stackable_parent_does_not_rebase() {
+    let f = Fake::new(vec![Ok(vec![child(2)]), Ok(vec![])], vec![]);
+    assert_eq!(prepare_delete(&f, R, B, "main").verdict, Verdict::Delete);
+    assert!(f.rebased.borrow().is_empty());
+}
+
+/// A rebase that cannot be done leaves the child unretargeted and keeps the
+/// parent branch, naming the manual command.
+#[test]
+fn failed_rebase_neither_retargets_that_child_nor_deletes_the_branch() {
+    let f = Fake::new(vec![Ok(vec![child(2), child(3)])], vec![]).rebase_failing(vec![3]);
+    let r = prepare_delete(&f, R, CHORE, "main");
+    assert_eq!(r.verdict, Verdict::Keep);
+    assert_eq!(*f.edits.borrow(), vec![(2, "main".to_string())]);
+    let (_, msg) = r.lines.last().unwrap();
+    assert!(msg.contains("#3 (rebase onto the default branch failed: conflict"), "{msg}");
+    assert!(msg.contains("reconcile-stack.sh 3 chore/kct-0.24.0"), "{msg}");
+}
+
+/// Without a script dir the live forge cannot rebase, so it fails closed.
+#[test]
+fn live_forge_without_script_dir_fails_the_rebase() {
+    assert!(GhForge::default().rebase_child(R, 2, CHORE).is_err());
 }

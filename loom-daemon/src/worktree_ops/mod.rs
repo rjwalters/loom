@@ -26,7 +26,7 @@
 //! - [`removal_log`] — the worktree-removal ledger (#5950): every Loom-owned
 //!   worktree removal, from any path, appended to one greppable file so
 //!   "what removed this worktree?" has a single answer.
-//! - `repo`, `naming`, `safety`, `claim_file`, `spawn_loop_state`, `liveness`
+//! - `repo`, `naming`, `safety`, `claim_file`, `liveness`
 //!   — internal helpers shared across the above (not part of the public
 //!   surface; see each module's doc comment for its Python counterpart).
 //! - [`gh`] — likewise internal to the family, but exported crate-wide (not
@@ -61,11 +61,13 @@ pub mod logs;
 /// `strip_prefix("feature/issue-")` in the CLI would be a copy of the
 /// convention, not a use of it.
 pub mod naming;
+pub mod open_backup;
 pub mod orphan_recovery;
 pub mod removal_log;
 pub mod repo;
 pub(crate) mod safety;
-mod spawn_loop_state;
+/// Report-only listing of unfamiliar worktree-root directories (#11194).
+pub(crate) mod unrecognized_report;
 
 pub use claim_file::{
     has_valid_claim, is_abandoned as claim_is_abandoned, is_expired as claim_is_expired,

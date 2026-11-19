@@ -162,3 +162,8 @@ fn a_served_read_reaches_the_gh_placed_second_on_path_as_its_conditional_request
         ]
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

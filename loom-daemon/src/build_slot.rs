@@ -14,7 +14,7 @@
 //! concurrent sweeps (#4512's evidence).
 //!
 //! #4512 deleted the CPU term from admission
-//! ([`crate::work_finder::resolve_dynamic_max_concurrent`] is now `min(token
+//! (`crate::work_finder::resolve_dynamic_max_concurrent` (removed, #12406) is now `min(token
 //! axis, disk headroom, configured maxConcurrent)`) and moved the protection
 //! **to where the load actually is**: N sweeps run concurrently, but at most
 //! [`DEFAULT_BUILD_SLOTS`] of them hold the build slot at any moment, so the

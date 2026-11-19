@@ -57,6 +57,8 @@
 //! post-state checked too, so a regression to the shell's answer fails rather
 //! than quietly re-agreeing.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -125,25 +127,11 @@ struct Side {
 }
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-wt-existing-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
+    common::unique_tmpdir("loom-wt-existing-diff", tag)
 }
 
 fn hermetic(cmd: &mut Command) -> &mut Command {
-    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Loom Test")
-        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Loom Test")
-        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
-        .env("LC_ALL", "C")
-        .env("TERM", "dumb")
+    common::hermetic_git(cmd)
         // The landed ladder's top rung is a forge round-trip. Both sides skip
         // it: a differential test whose answer depends on the network is not
         // one.
@@ -828,3 +816,8 @@ fn fallback_expression() -> String {
         rest[..end].replace("return 0", "exit 0")
     )
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

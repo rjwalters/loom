@@ -130,7 +130,7 @@ fn a_bare_build_into_a_shared_config_dir_asks() {
     asks("bash -c 'cargo nextest run'", &c);
     asks("timeout 600 cargo t", &c);
     let reason = ask_reason(&a);
-    assert!(reason.starts_with(ASK_PREFIX), "{reason}");
+    assert!(reason.starts_with(BLOCKED_PREFIX), "{reason}");
     assert!(reason.contains(&format!("CARGO_TARGET_DIR=\"{WT}/target\"")), "{reason}");
 }
 

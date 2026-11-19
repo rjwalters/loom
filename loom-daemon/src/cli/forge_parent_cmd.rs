@@ -1,13 +1,13 @@
 //! `loom-daemon forge parent body|link` (#10012 §4): the logic behind
 //! `create-issue.sh --parent N`. The script only passes the flag; see
-//! [`loom_daemon::parent_link`].
+//! [`crate::parent_link`].
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+use crate::parent_link::{child_body, fetch_parent_body, link_created, split_state, SplitState};
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
-use loom_daemon::parent_link::{child_body, fetch_parent_body, link_created};
 
 #[derive(Subcommand, Debug)]
 pub enum ParentAction {
@@ -33,13 +33,26 @@ pub enum ParentAction {
         #[arg(long, value_name = "OWNER/REPO")]
         repo: Option<String>,
     },
+    /// Is `--parent` a split tracker whose children are all closed? Prints
+    /// `SPLIT_ALL_CLOSED #a #b` and exits 0 when so (do NOT build it, do NOT
+    /// promote it to `loom:issue`); exits 1 with `NOT_SPLIT` when there are no
+    /// children or one is still open; exits 2 when the children could not be
+    /// read (unanswered, never an all-clear for promotion). #13635.
+    SplitState {
+        /// The parent issue number.
+        #[arg(long)]
+        parent: u32,
+        /// Target `owner/repo`; omitted resolves from the origin remote.
+        #[arg(long, value_name = "OWNER/REPO")]
+        repo: Option<String>,
+    },
 }
 
 fn target(repo: Option<String>) -> Result<(PathBuf, String)> {
     let root = std::env::current_dir()?;
     let slug = match repo {
         Some(r) => r,
-        None => loom_daemon::worktree_ops::gh::resolve_owner_repo(&root)
+        None => crate::worktree_ops::gh::resolve_owner_repo(&root)
             .map(|(o, n)| format!("{o}/{n}"))
             .ok_or_else(|| anyhow!("cannot resolve owner/repo; pass --repo OWNER/REPO"))?,
     };
@@ -49,7 +62,7 @@ fn target(repo: Option<String>) -> Result<(PathBuf, String)> {
 /// The child's issue number, refusing a reference into another repository
 /// (#10012 excludes cross-repo propagation): nothing is written for it.
 fn child_number(child: &str, slug: &str) -> Result<u32> {
-    let (child_slug, number) = loom_daemon::forge_comment::parse_issue_ref(child)
+    let (child_slug, number) = crate::forge_comment::parse_issue_ref(child)
         .ok_or_else(|| anyhow!("--child: not an issue reference: {child:?}"))?;
     if let Some(named) = child_slug {
         if !named.eq_ignore_ascii_case(slug) {
@@ -86,6 +99,32 @@ pub fn handle(action: ParentAction) -> Result<()> {
             let (root, slug) = target(repo)?;
             let number = child_number(&child, &slug)?;
             link_created(&root, &slug, parent, number)
+        }
+        ParentAction::SplitState { parent, repo } => {
+            // Fail closed: any failure (incl. an unresolvable repo) is exit 2,
+            // never the startup-failure exit 1 that callers read as NOT_SPLIT.
+            let (root, slug) = match target(repo) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("loom-daemon forge parent split-state: {e}");
+                    std::process::exit(2);
+                }
+            };
+            match split_state(&root, &slug, parent) {
+                Ok(SplitState::AllClosed(kids)) => {
+                    let list: Vec<String> = kids.iter().map(|n| format!("#{n}")).collect();
+                    println!("SPLIT_ALL_CLOSED {}", list.join(" "));
+                    Ok(())
+                }
+                Ok(_) => {
+                    println!("NOT_SPLIT");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("loom-daemon forge parent split-state: {e}");
+                    std::process::exit(2);
+                }
+            }
         }
     }
 }

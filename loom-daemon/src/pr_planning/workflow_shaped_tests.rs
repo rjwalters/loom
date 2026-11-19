@@ -15,9 +15,13 @@ fn repo(id: u64, name: &str) -> Value {
 }
 /// A REST pull row: head branch `head_ref` in repository `head_repo`.
 fn pr(n: u64, origin: &str, labels: &[&str], head_ref: &str, head_repo: Value) -> Value {
-    let body = format!("<!-- loom:provenance v1 build=unknown unknown unknown prompts=unknown unknown sweep=none story=none trace=unknown host=unknown base=unknown run=none origin={origin} -->");
+    let (user, association) = if origin == "interactive" {
+        (json!({"login":"operator","type":"User"}), "OWNER")
+    } else {
+        (json!({"login":"session-app[bot]","type":"Bot"}), "NONE")
+    };
     json!({"number":n,"state":"open","draft":false,"title":"test","created_at":format!("2026-09-{n:02}"),
-        "body":body,"user":{"login":"session-app[bot]","type":"Bot"},"author_association":"NONE",
+        "body":"","user":user,"author_association":association,
         "labels":labels.iter().map(|l| json!({"name":l})).collect::<Vec<_>>(),
         "head":{"ref":head_ref,"label":format!("acme:{head_ref}"),"repo":head_repo},
         "base":{"ref":"main","repo":repo(BASE_ID, "acme/widgets")}})
@@ -59,8 +63,7 @@ fn unlabeled_issue_branch_pr_joins_a_busy_queue_behind_labeled_work() {
 
 #[test]
 fn interactive_fallback_keeps_its_preference_and_shape_alone_goes_last() {
-    let mut human = pr(3, "interactive", &[], "topic", repo(BASE_ID, "acme/widgets"));
-    human["author_association"] = json!("OWNER");
+    let human = pr(3, "interactive", &[], "topic", repo(BASE_ID, "acme/widgets"));
     let rows = vec![shaped(4, "unknown"), human, labeled(2), labeled(1)];
     assert_eq!(
         ids(&ordered_queue(rows.clone(), PrRole::Judge, true, &policy())),

@@ -46,6 +46,7 @@ fn inputs<'a>(anchor: &'a AnchorSetting, record: Option<&'a Path>, sha: &'a str)
     GateInputs {
         slug: SLUG,
         tag: "v1.0.0",
+        binary: "loom-daemon",
         target: TARGET,
         asset_sha256: sha,
         anchor,
@@ -353,10 +354,7 @@ fn api_key(path: &str) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex::encode(Sha256::digest(bytes))
 }
 
 const BIN: &str = "loom-daemon-x86_64-unknown-linux-gnu";
@@ -466,6 +464,7 @@ exit 1
     ) -> (FetchOutcome, serde_json::Value) {
         let inputs = FetchInputs {
             repo_root: &self.root,
+            binary: "loom-daemon",
             target: TARGET,
             repo_slug: SLUG,
             tag,

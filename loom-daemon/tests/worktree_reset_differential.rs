@@ -75,6 +75,8 @@
 //! into agreement on the wrong thing.
 
 use std::collections::BTreeMap;
+mod common;
+
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -782,14 +784,7 @@ fn run_rust(cwd: &Path, repo: &Path, s: &Scenario) -> (i32, Vec<u8>, Vec<u8>) {
 // ---------------------------------------------------------------------------
 
 fn tmproot(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-reset-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).unwrap();
-    fs::canonicalize(&base).unwrap()
+    common::unique_tmpdir("loom-reset-diff", tag)
 }
 
 /// Write the corpus to disk and read it straight back, so everything below is
@@ -1068,3 +1063,8 @@ fn a_malformed_corpus_line_is_fatal() {
     let unknown = "n\trepo\tno-such-state\tbaseline\tlabel\tnone";
     assert!(std::panic::catch_unwind(|| Scenario::from_line(unknown)).is_err());
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

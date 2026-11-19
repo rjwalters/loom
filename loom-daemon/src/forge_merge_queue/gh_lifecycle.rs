@@ -8,13 +8,15 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::authz::HandoffError;
 use super::events::FileEventSink;
-use super::forge::{LifecycleForge, PrSnapshot, RemovalEvent};
+use super::forge::{GroupRun, LifecycleForge, PrSnapshot, RemovalEvent};
 use super::github::{safe_detail, GhQueueApi};
 use super::group_github::{group_transition_line, revoke_for_transition_groups};
-use super::lifecycle::{sweep, Ctx, Reconciled};
+use super::lifecycle::{handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
+use super::status_command::{self, StatusCommand};
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
@@ -24,7 +26,7 @@ pub const REMOVALS_QUERY: &str = "query($owner: String!, $name: String!, $number
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       timelineItems(last: 20, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-        nodes { ... on RemovedFromMergeQueueEvent { reason createdAt } }
+        nodes { ... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } }
       }
     }
   }
@@ -36,6 +38,9 @@ pub struct GhLifecycleForge {
     root: PathBuf,
     owner: String,
     name: String,
+    /// `forge.mergeQueue.statusCommand` as read at construction: `Ok(None)`
+    /// when unset, `Err` when set but unusable (posts then refuse, #12679).
+    status_command: Result<Option<StatusCommand>, String>,
 }
 
 impl GhLifecycleForge {
@@ -49,13 +54,26 @@ impl GhLifecycleForge {
                 root: root.to_path_buf(),
                 owner,
                 name: repo,
+                status_command: status_command::resolve(root),
             }),
             _ => Err("repository must be an `owner/repo` slug".to_string()),
         }
     }
 
+    pub(super) fn gh(&self) -> &str {
+        &self.gh
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(super) fn owner(&self) -> &str {
         &self.owner
+    }
+
+    pub(super) fn status_command(&self) -> &Result<Option<StatusCommand>, String> {
+        &self.status_command
     }
 
     pub(super) fn repo_name(&self) -> &str {
@@ -154,6 +172,10 @@ pub fn parse_removals(data: &serde_json::Value) -> Result<Vec<RemovalEvent>, Str
             Some(RemovalEvent {
                 reason: n.get("reason").and_then(serde_json::Value::as_str).map(s),
                 created_at: n.get("createdAt")?.as_str()?.to_string(),
+                before_commit: n
+                    .pointer("/beforeCommit/oid")
+                    .and_then(serde_json::Value::as_str)
+                    .map(s),
             })
         })
         .collect())
@@ -254,6 +276,98 @@ impl LifecycleForge for GhLifecycleForge {
         }
         parse_removals(&v)
     }
+
+    fn group_check_runs(&self, commit: &str) -> Result<Vec<GroupRun>, String> {
+        let text = self.ok(
+            "merge_queue.group_check_runs",
+            AccessIntent::Read,
+            &[
+                s("api"),
+                format!("repos/{}/commits/{commit}/check-runs?per_page=100", self.nwo()),
+            ],
+        )?;
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("unparseable check runs: {e}"))?;
+        // `per_page=100` without pagination: a larger list cannot be proven
+        // complete, so it is an error (the caller fails closed).
+        if v.get("total_count").and_then(serde_json::Value::as_u64) > Some(100) {
+            return Err("more than 100 check runs; completeness not confirmed".to_string());
+        }
+        parse_check_runs(&v)?
+            .into_iter()
+            .map(|(id, name, conclusion)| {
+                // Only a run that did not succeed needs its steps read.
+                let failed_steps = match conclusion.as_deref() {
+                    Some("cancelled" | "timed_out") => {
+                        let job = self.ok(
+                            "merge_queue.group_job",
+                            AccessIntent::Read,
+                            &[s("api"), format!("repos/{}/actions/jobs/{id}", self.nwo())],
+                        )?;
+                        let job: serde_json::Value = serde_json::from_str(&job)
+                            .map_err(|e| format!("unparseable job: {e}"))?;
+                        failed_steps(&job)?
+                    }
+                    _ => 0,
+                };
+                Ok(GroupRun {
+                    name,
+                    conclusion,
+                    failed_steps,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Decode `GET commits/<sha>/check-runs` into `(check-run id, name,
+/// conclusion)` rows. Pure.
+///
+/// # Errors
+///
+/// A shape it cannot read.
+pub fn parse_check_runs(
+    v: &serde_json::Value,
+) -> Result<Vec<(u64, String, Option<String>)>, String> {
+    let runs = v
+        .get("check_runs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("unexpected check-runs shape")?;
+    runs.iter()
+        .map(|r| {
+            let id = r
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("check run without an id")?;
+            let name = r
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("check run without a name")?;
+            let conclusion = r
+                .get("conclusion")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_ascii_lowercase);
+            Ok((id, name.to_string(), conclusion))
+        })
+        .collect()
+}
+
+/// Count the steps of an Actions job (`GET actions/jobs/<id>`) that ended
+/// `failure`. Pure.
+///
+/// # Errors
+///
+/// A job without a `steps` array.
+pub fn failed_steps(job: &serde_json::Value) -> Result<u32, String> {
+    let steps = job
+        .get("steps")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("job without steps")?;
+    let n = steps
+        .iter()
+        .filter(|st| st.get("conclusion").and_then(serde_json::Value::as_str) == Some("failure"))
+        .count();
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 /// `owner/repo` of the checkout at `root`.
@@ -321,6 +435,7 @@ fn with_live<R>(
         execution_enabled: super::QUEUE_EXECUTION_ENABLED,
         queue: &queue,
         forge: &forge,
+        statuses: &forge,
         events: &events,
         now: chrono::Utc::now(),
     };
@@ -373,5 +488,81 @@ pub fn revoke_for_root(gh: &Path, root: &Path, pr: u32, reason: &str) -> Option<
         Live::Direct => None,
         Live::Unresolved(why) => Some(unresolved_line(&why)),
         Live::Ran(line) => line,
+    }
+}
+
+/// Where a daemon-owned landing of one PR stands (#13268).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Landed {
+    /// The repository is in `direct` mode (or its mode is unresolved): the
+    /// queue has nothing to hand off to.
+    NotQueueMode(String),
+    /// Not authorized yet (no Judge approval at the current head, a hold, a
+    /// claim): nothing was written. Retried on the next pass.
+    Waiting(String),
+    /// Queued at the approved head, or already queued.
+    Queued,
+    /// GitHub reports the PR merged.
+    Merged,
+    /// Refused, dropped or undetermined; the PR is left unauthorized.
+    Failed(String),
+}
+
+/// Hand `pr` in `root` to the merge queue from the daemon itself: the same
+/// guarded [`handoff`] the Champion's `merge-pr.sh` reaches, but with no
+/// installed hook or prompt in the path. The approved head is the PR's
+/// current head; [`handoff`] denies unless a trusted Judge verdict marker and
+/// `loom:pr` cover exactly that head, and the queue's required checks gate
+/// the merge itself.
+///
+/// Narrowed by operator ruling r7-q35: a Judge verdict alone never enqueues.
+/// The landing needs (a) `proven`, the byte-identity proof held at this head,
+/// or (b) a Champion clear recorded at the live head
+/// ([`super::clear_gate::champion_clear_at`]); otherwise [`Landed::Waiting`].
+/// Any read failure is `Waiting` too.
+#[must_use]
+pub fn land_for_root(gh: &Path, root: &Path, pr: u32, proven: bool) -> Landed {
+    let gh_s = gh.to_string_lossy().to_string();
+    match with_live(gh, root, |ctx, forge| land(ctx, forge, &gh_s, pr, proven)) {
+        Live::Direct => Landed::NotQueueMode("champion.mergeMode is direct".to_string()),
+        Live::Unresolved(why) => Landed::NotQueueMode(why),
+        Live::Ran(landed) => landed,
+    }
+}
+
+fn land(ctx: &Ctx<'_>, forge: &GhLifecycleForge, gh: &str, pr: u32, proven: bool) -> Landed {
+    match reconcile_pr(ctx, pr) {
+        Reconciled::Merged { .. } => return Landed::Merged,
+        Reconciled::StillQueued { .. } => return Landed::Queued,
+        Reconciled::Undetermined(why) => return Landed::Failed(why),
+        Reconciled::Dropped { kind, .. } => {
+            return Landed::Failed(format!("dropped from the queue: {}", kind.as_str()))
+        }
+        Reconciled::Direct => return Landed::NotQueueMode("direct".to_string()),
+        Reconciled::Continue(_) => {}
+    }
+    let head = match forge.snapshot(pr) {
+        Ok(s) if s.state == PrState::Open => s.head_sha,
+        Ok(s) => return Landed::Failed(format!("PR #{pr} is {}", s.state.as_str())),
+        Err(e) => return Landed::Failed(e),
+    };
+    if let Some(why) = super::clear_gate::gate(forge, pr, &head, proven) {
+        return Landed::Waiting(why);
+    }
+    let nwo = forge.nwo();
+    let required = || {
+        super::preflight::github_preflight(gh, &nwo, None)
+            .map(|c| c.required_checks)
+            .map_err(|e| format!("[{}] {e}", e.code()))
+    };
+    match handoff(ctx, pr, &head, &required) {
+        Ok(_) => Landed::Queued,
+        Err(HandoffFailure::Authz(HandoffError::Denied(why))) => Landed::Waiting(
+            why.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "),
+        ),
+        Err(e) => Landed::Failed(e.to_string()),
     }
 }

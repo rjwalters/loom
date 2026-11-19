@@ -574,7 +574,6 @@ pub(crate) fn insert_clean_exit_running(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     registry.children.insert(sweep_id.clone(), child);
@@ -692,7 +691,6 @@ pub(crate) fn insert_running_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -733,7 +731,6 @@ pub(crate) fn insert_running_with_pid_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -798,7 +795,6 @@ pub(crate) fn insert_dead_running_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -1229,10 +1225,6 @@ pub(crate) use git_worktree_fixture::make_dirty_git_worktree;
 // It is an inherent method, so there is nothing to re-export here.
 mod activity_window;
 
-// `SweepRegistry::seed_entry_for_test` (Issue #11123) likewise lives in a child
-// module, `seed_entry`, to keep it out of the over-threshold `mod.rs`.
-mod seed_entry;
-
 /// [`make_dirty_git_worktree`] plus the other half of what a fixture worktree
 /// has always meant: **dirty and QUIET** (Issue #8487).
 ///
@@ -1289,7 +1281,6 @@ pub(crate) fn insert_terminal_issue(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 }
@@ -1390,7 +1381,7 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(i.kind, SweepKind::Issue(n) if n == issue)
         })
         .map(|i| i.sweep_id.clone())
@@ -1403,7 +1394,7 @@ pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
         })
         .map(|i| i.sweep_id.clone())
@@ -2362,7 +2353,6 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 }
@@ -2389,4 +2379,36 @@ pub(crate) fn write_local_cfg(dir: &Path, body: &str) {
     let full = dir.join(crate::config_resolver::LOCAL_CONFIG_REL);
     std::fs::create_dir_all(full.parent().unwrap()).unwrap();
     std::fs::write(full, body).unwrap();
+}
+
+/// A registry whose `gh` is `script` and whose forge probes are NOT skipped
+/// (the fixture registries set `skip_label_flip`, which suppresses every real
+/// forge read on the outcome-journal path by design). Journals are confined to
+/// `ws`. Shared by the `outcome_journal` sibling test files.
+pub(crate) fn forge_probing_registry(ws: &Path, script: &str) -> SweepRegistry {
+    let fake_gh = ws.join("fake-gh-forge-probing.sh");
+    std::fs::write(&fake_gh, script).unwrap();
+    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake_gh, perms).unwrap();
+    if let Ok(f) = std::fs::File::open(&fake_gh) {
+        let _ = f.sync_all();
+    }
+
+    let scripts_dir = ws.join(".loom").join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let spawn = scripts_dir.join("spawn-claude.sh");
+    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
+    sperms.set_mode(0o755);
+    std::fs::set_permissions(&spawn, sperms).unwrap();
+
+    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
+    config.spawn_bin = Some(spawn);
+    config.gh_bin = Some(fake_gh);
+    config.skip_label_flip = false;
+    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
+    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
+    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
+    SweepRegistry::new(config)
 }

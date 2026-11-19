@@ -1,4 +1,4 @@
-//! `pass.summary` / `pass.verdict` (#10752): wire shape, registry rows, and
+//! `pass.verdict` (#10752): wire shape, registry rows, and
 //! the gateway collector contract for their `loom.pass.*` attributes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -18,40 +18,6 @@ fn provenance() -> Provenance {
     }
 }
 
-fn summary() -> PassSummaryRecord {
-    let at = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
-    PassSummaryRecord {
-        pass_id: "0123456789abcdef0123456789abcdef".to_string(),
-        mechanism: "stale_blocked_release".to_string(),
-        repo: "rjwalters/loom".to_string(),
-        host: "loom-worker-1".to_string(),
-        mode: PassMode::On,
-        outcome: PassOutcome::Completed,
-        refusal: None,
-        started_at: at,
-        ended_at: at + chrono::Duration::milliseconds(1500),
-        duration_ms: 1500,
-        examined: 46,
-        verdicts: [("released", 1), ("skipped", 40), ("still_blocked", 5)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        skipped: [("no-park-record", 30), ("unstated", 10)]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v))
-            .collect(),
-        write_cap_hit: false,
-        github: GithubSpend {
-            calls: 9,
-            writes: 2,
-            not_modified: 5,
-        },
-        verdicts_emitted: 3,
-        verdicts_unchanged: 43,
-        loom: provenance(),
-    }
-}
-
 fn verdict() -> PassVerdictRecord {
     PassVerdictRecord {
         pass_id: "0123456789abcdef0123456789abcdef".to_string(),
@@ -63,6 +29,8 @@ fn verdict() -> PassVerdictRecord {
         verdict: "released".to_string(),
         reason: None,
         detail: None,
+        unevaluated_reason: None,
+        budget: None,
         blockers: vec![BlockerState {
             reference: "#10753".to_string(),
             state: "closed".to_string(),
@@ -72,15 +40,14 @@ fn verdict() -> PassVerdictRecord {
         mode: PassMode::On,
         applied: true,
         at: Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 1).unwrap(),
+        step: Default::default(),
     }
 }
 
 #[test]
-fn both_kinds_round_trip_with_their_wire_tags() {
-    for (record, tag) in [
-        (TelemetryRecord::PassSummary(summary()), "pass.summary"),
-        (TelemetryRecord::PassVerdict(verdict()), "pass.verdict"),
-    ] {
+fn the_verdict_round_trips_with_its_wire_tag() {
+    {
+        let (record, tag) = (TelemetryRecord::PassVerdict(verdict()), "pass.verdict");
         let envelope = TelemetryEnvelope::new("loom-worker-1", record.clone());
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["record"]["kind"], tag, "{json}");
@@ -102,13 +69,13 @@ fn the_verdict_body_uses_ref_and_omits_empty_fields() {
 }
 
 #[test]
-fn both_kinds_are_otlp_only_logs() {
-    for tag in ["pass.summary", "pass.verdict"] {
-        let row = TELEMETRY_KINDS.iter().find(|k| k.kind == tag).unwrap();
-        assert_eq!(row.otlp, TelemetryKindOtlp::Logs);
-        assert!(!row.native_ingest);
-        assert_eq!(row.schema_version, NEW_KIND_SCHEMA_VERSION);
-    }
+fn the_verdict_is_an_otlp_only_log() {
+    let row = TELEMETRY_KINDS
+        .iter()
+        .find(|k| k.kind == "pass.verdict")
+        .unwrap();
+    assert_eq!(row.otlp, TelemetryKindOtlp::Logs);
+    assert_eq!(row.schema_version, NEW_KIND_SCHEMA_VERSION);
 }
 
 #[test]
@@ -119,7 +86,7 @@ fn collector_keeps_every_pass_log_attribute() {
         .find(|l| {
             l.contains("keep_keys(attributes, [")
                 && l.contains("loom.ci.chunk_index")
-                && l.contains("loom.eta.pr.state")
+                && l.contains("loom.eta.dispatch_state.artifact")
         })
         .expect("the transform/privacy log keep_keys line");
     for key in PASS_LOG_ATTRIBUTE_KEYS
@@ -152,7 +119,36 @@ fn the_saved_queries_read_only_exported_keys() {
         assert!(known, "pass-queries.sql reads {key}, which nothing exports");
     }
     assert!(read > 10, "found the queries' keys");
-    for kind in ["'pass.summary'", "'pass.verdict'", "'invoke github'"] {
-        assert!(QUERIES.contains(kind), "pass-queries.sql no longer reads {kind}");
-    }
+    assert!(
+        QUERIES.contains("'pass.verdict'"),
+        "pass-queries.sql no longer reads pass.verdict"
+    );
+}
+
+/// #12027: the step facts are additive. A daemon pass's verdict serializes
+/// exactly as before they existed (golden), and reads back unchanged.
+#[test]
+fn a_release_pass_verdict_is_byte_identical_to_before_the_step_facts() {
+    const GOLDEN: &str = r##"{"pass_id":"0123456789abcdef0123456789abcdef","mechanism":"stale_blocked_release","repo":"rjwalters/loom","number":10752,"artifact":"issue","verdict":"released","blockers":[{"ref":"#10753","state":"closed"}],"labels_added":["loom:issue"],"labels_removed":["loom:blocked"],"mode":"on","applied":true,"at":"2026-10-07T12:00:01Z"}"##;
+    assert_eq!(serde_json::to_string(&verdict()).unwrap(), GOLDEN);
+    let back: PassVerdictRecord = serde_json::from_str(GOLDEN).unwrap();
+    assert_eq!(back, verdict());
+    assert_eq!(back.step, StepFacts::default());
+}
+
+#[test]
+fn a_step_verdict_round_trips_its_facts() {
+    let mut v = verdict();
+    v.step = StepFacts {
+        class: Some("refused".to_string()),
+        first_refused_at: Some(v.at),
+        pre_labels: vec!["loom:pr".to_string()],
+        loom: Some(provenance()),
+        ..StepFacts::default()
+    };
+    let record = TelemetryRecord::PassVerdict(v);
+    let envelope = TelemetryEnvelope::new("loom-worker-1", record.clone());
+    let back: TelemetryEnvelope =
+        serde_json::from_value(serde_json::to_value(&envelope).unwrap()).unwrap();
+    assert_eq!(back.record, record);
 }

@@ -6,12 +6,12 @@
 //! 200 / 304 / limited / error counts over the last hour host-wide, this
 //! daemon's own since-start totals, and the latest free budget reading.
 
-use chrono::{DateTime, Utc};
-use loom_daemon::health::format_window;
-use loom_daemon::types::{
+use crate::health::format_window;
+use crate::types::{
     DaemonStatusReport, ForgeBucketStatus, ForgeBudgetReading, ForgeCallCounts, ReadSpillStatus,
-    ReaderWithdrawalStatus,
+    ReaderWithdrawalStatus, WriterRouteHoldStatus,
 };
+use chrono::{DateTime, Utc};
 
 /// Every line of the section; empty for a pre-#9251 daemon (no field).
 pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>) -> Vec<String> {
@@ -66,6 +66,7 @@ pub fn render_forge_calls_lines(report: &DaemonStatusReport, now: DateTime<Utc>)
         lines.push(format!("  budget: {}", readings.join(" · ")));
     }
     lines.extend(render_bucket_block(fc.buckets.as_deref().unwrap_or_default(), now));
+    lines.extend(render_writer_holds(&fc.writer_holds, now));
     lines.extend(render_withdrawals(&fc.reader_withdrawals, now));
     lines.extend(render_spills(&fc.read_spills, now));
     lines
@@ -112,6 +113,26 @@ fn render_withdrawals(rows: &[ReaderWithdrawalStatus], now: DateTime<Utc>) -> Ve
 
 /// Most bucket rows the compact block shows; the rest are summarised.
 const MAX_BUCKET_ROWS: usize = 12;
+
+/// #13746: each writer route currently held by a confirmed exhaustion — the
+/// work finder stands that route's candidates down until the reset.
+fn render_writer_holds(rows: &[WriterRouteHoldStatus], now: DateTime<Utc>) -> Vec<String> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["  writer route holds:".to_string()];
+    lines.extend(rows.iter().map(|h| {
+        format!(
+            "    {} {} {} {}: back in {}",
+            h.account,
+            h.owner,
+            h.installation,
+            h.resource,
+            ago((h.until - now).num_seconds())
+        )
+    }));
+    lines
+}
 
 /// The W1 per-bucket block: one line per billed bucket, busiest first —
 /// what this host charged it over the window and its newest reading.
@@ -201,7 +222,7 @@ fn render_budget(b: &ForgeBudgetReading, own: Option<u64>, now: DateTime<Utc>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_daemon::types::ForgeCallsStatus;
+    use crate::types::ForgeCallsStatus;
 
     fn report(fc: Option<ForgeCallsStatus>) -> DaemonStatusReport {
         DaemonStatusReport {
@@ -249,6 +270,7 @@ mod tests {
             buckets: None,
             reader_withdrawals: Vec::new(),
             read_spills: Vec::new(),
+            writer_holds: Vec::new(),
         };
         let lines = render_forge_calls_lines(&report(Some(fc)), now);
         let text = lines.join("\n");
@@ -280,7 +302,7 @@ mod tests {
                 observed_at: now - chrono::Duration::seconds(5),
                 source: "headers".into(),
             }],
-            own_window: Some(vec![loom_daemon::types::ForgePoolSpend {
+            own_window: Some(vec![crate::types::ForgePoolSpend {
                 pool: "core".into(),
                 consumed: 36,
             }]),
@@ -335,6 +357,31 @@ mod tests {
         let at = lines.iter().position(|l| l.contains("buckets (")).unwrap();
         assert!(lines[at + 1].contains("app-42 acme core: 120 · 0 · 0 · 900/5000, resets in 20m"));
         assert!(lines[at + 2].contains("app-7 acme core: 3 · 0 · 0 · -"), "{lines:?}");
+    }
+
+    #[test]
+    fn armed_writer_route_holds_are_listed() {
+        let now = Utc::now();
+        let fc = ForgeCallsStatus {
+            window_secs: 3600,
+            writer_holds: vec![WriterRouteHoldStatus {
+                account: "app-4486636".into(),
+                owner: "acme".into(),
+                installation: "151241341".into(),
+                resource: "core".into(),
+                until: now + chrono::Duration::minutes(25),
+            }],
+            ..Default::default()
+        };
+        let lines = render_forge_calls_lines(&report(Some(fc)), now);
+        let at = lines
+            .iter()
+            .position(|l| l.contains("writer route holds"))
+            .unwrap();
+        assert!(
+            lines[at + 1].contains("app-4486636 acme 151241341 core: back in 2"),
+            "{lines:?}"
+        );
     }
 
     #[test]

@@ -35,6 +35,9 @@
 //!   and it is the only test in the repository that fails when the gate is
 //!   widened to `Err(_)`; all 80 retained shell assertions stay green.
 
+mod common;
+
+use common::git;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -211,15 +214,6 @@ impl Fixture {
                 p.canonicalize().unwrap_or(p) == want
             })
     }
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let out = git_out(dir, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 fn git_out(dir: &Path, args: &[&str]) -> Output {
@@ -676,3 +670,8 @@ fn a_refused_removal_writes_no_ledger_entry() {
         "a refusal must not be recorded as a removal"
     );
 }
+
+// Fail this test binary on any spawn of the real `gh` (#10225, extends #10138).
+#[allow(dead_code)]
+#[path = "../src/live_gh_guard.rs"]
+mod live_gh_guard;

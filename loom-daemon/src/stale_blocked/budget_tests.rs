@@ -5,7 +5,7 @@
 
 use super::batch::{gather_all, Gathering, Options};
 use super::batch_tests::{fleet, issue, row, state, Fake};
-use super::budget::{project, refusal, Budget, Floor, ForgeCost, Projection};
+use super::budget::{project, refusal, Bucket, Budget, Floor, FloorStop, ForgeCost, Projection};
 use super::{classify, Artifact, Verdict};
 
 fn gather(fake: &mut Fake, floor: Floor) -> Gathering {
@@ -299,4 +299,37 @@ fn projection_is_an_upper_bound_per_bucket() {
     assert!(refusal(&budget(1010, 1000), project(&selected), floor).is_some());
     // Nothing projected on a bucket, nothing refused on it.
     assert!(refusal(&budget(0, 0), Projection::default(), floor).is_none());
+}
+
+/// #12036: the typed stop renders exactly the strings the run has always
+/// reported (copied from `origin/main`).
+#[test]
+fn floor_stop_display_is_the_text_the_run_always_reported() {
+    let stop = |bucket, remaining, floor, projected, mid_run| FloorStop {
+        bucket,
+        remaining,
+        floor,
+        projected,
+        mid_run,
+    };
+    assert_eq!(
+        stop(Bucket::Core, 100, 1000, Some(7), false).to_string(),
+        "budget floor: core remaining 100, projected 7, floor 1000 — not evaluated this run \
+         (advisory; exit 0)"
+    );
+    assert_eq!(
+        stop(Bucket::Graphql, 100, 1000, Some(2), false).to_string(),
+        "budget floor: graphql remaining 100, projected 2, floor 1000 — not evaluated this run \
+         (advisory; exit 0)"
+    );
+    assert_eq!(
+        stop(Bucket::Core, 920, 1000, None, true).to_string(),
+        "budget floor reached mid-run: core remaining 920 < floor 1000 — not evaluated \
+         (advisory; exit 0)"
+    );
+    assert_eq!(
+        stop(Bucket::Graphql, 920, 1000, None, true).to_string(),
+        "budget floor reached mid-run: graphql remaining 920 < floor 1000 — not evaluated \
+         (advisory; exit 0)"
+    );
 }

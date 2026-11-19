@@ -161,18 +161,7 @@ impl Drop for TempTree {
     }
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        status.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&status.stderr)
-    );
-}
+use crate::test_git_helpers::run as git;
 
 fn init_repo(dir: &Path) {
     git(dir, &["init", "-q", "-b", "main"]);

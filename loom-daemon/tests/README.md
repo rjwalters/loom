@@ -69,7 +69,7 @@ tests/
 └── <subject>.rs            # One-subject suites named for what they pin: worktree locking
                             #   and WIP verbs, clean/aggressive behavior, epic state
                             #   invariants, worker spawn, telemetry/collector fan-out,
-                            #   model pricing, shell budget ratchet, and so on.
+                            #   model pricing, and so on.
 ```
 
 ## Markdown Doc-Lint Tests: No New Prose-Existence Assertions
@@ -119,11 +119,7 @@ e.g. by heading prefix or a tolerant phrasing set) per #3877 — that framework
 predates and is compatible with this rule, but "pin the CONTRACT identifier
 exact" is not license to add a fresh *sentence* pin under a PROSE label.
 
-**Ratchet-exemption decision**: see the "Correctness-PR exemption decision"
-comment block in `scripts/check-markdown-token-budget.sh` for the recorded
-answer to "should a purely-correctness PR be exempt from the per-file markdown
-token ratchet when the fix requires adding explanatory text?" (short version:
-no — trim elsewhere).
+
 
 ## Test Helpers
 

@@ -41,6 +41,12 @@
 //! not [`host_identity`]. Changing it would make the daemon and the scripts
 //! disagree on lease ownership on any host without `LOOM_HOST_ID`.
 //!
+//! Both sides read [`LEASE_HOST_ID_ENV`] ahead of that chain. A dispatcher
+//! exports it to the session it spawns (`apply_step_env`), `spawn-codex.sh`
+//! and the private-clone exec carry it into a session container, and there it
+//! is the only thing naming the host the dispatcher's lease was published
+//! under: the container's `$HOSTNAME` is its own.
+//!
 //! # Migrating a hostname-keyed host
 //!
 //! A host that ran without `$LOOM_HOST_ID` used to report its hostname. After
@@ -67,6 +73,13 @@ use std::sync::{Mutex, OnceLock};
 /// It is also the top of the lease chain ([`lease_host_identity`]).
 pub const HOST_ID_ENV: &str = "LOOM_HOST_ID";
 
+/// Lease-only host identity pin, ahead of [`HOST_ID_ENV`] in the lease chain
+/// ([`lease_host_identity`]) and absent from [`host_identity`]. A step child
+/// carries the daemon's lease host here so a containered session's lease owner
+/// matches the daemon's without touching the child's telemetry `host.id`
+/// (Issue #11906, #11530).
+pub const LEASE_HOST_ID_ENV: &str = "LOOM_LEASE_HOST_ID";
+
 /// Overrides the persisted id's path (default `~/.loom/host-id`). Used by
 /// tests and by an operator who keeps `~/.loom` somewhere unusual.
 pub const HOST_ID_FILE_ENV: &str = "LOOM_HOST_ID_FILE";
@@ -85,8 +98,7 @@ pub const GENERATED_PREFIX: &str = "loom-host-";
 const MAX_ID_LEN: usize = 128;
 
 /// Sentinel returned when no identity can be resolved or persisted. Exported
-/// so callers that reason about self-claim recognition (e.g.
-/// [`crate::peer_claims::PeerClaimView`]) can special-case it without
+/// so callers that reason about self-claim recognition can special-case it without
 /// duplicating the literal string (Issue #5063).
 ///
 /// **This value must never participate in self-claim recognition.** Two
@@ -137,6 +149,31 @@ pub struct ResolvedHostId {
 #[must_use]
 pub fn host_identity() -> String {
     resolve().id
+}
+
+/// A **cross-host-stable** repo identity, for keying anything that must agree
+/// across hosts (moved here from the retired peer-claim module, #13945).
+///
+/// A local absolute `workspace_root` differs per host for the same logical repo
+/// (`/Users/a/loom` vs `/home/b/loom`). This resolves, in order: `$LOOM_REPO`
+/// (the forge `owner/repo` slug the daemon already threads through `gh
+/// --repo`), else the final path component, else the full path.
+///
+/// Two *different* repos sharing a directory basename can collide; set
+/// `$LOOM_REPO` to the `owner/repo` slug to make the key precise.
+#[must_use]
+pub fn repo_slug(workspace_root: &Path) -> String {
+    if let Ok(v) = std::env::var("LOOM_REPO") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    workspace_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| workspace_root.display().to_string())
 }
 
 /// Resolve this host's identity with its provenance.
@@ -549,7 +586,7 @@ pub(crate) fn adopt_at(path: &Path, expected: &str, name: &str) -> std::io::Resu
     Ok(true)
 }
 
-/// The **lease** host identity: `LOOM_HOST_ID` > `$HOSTNAME` > the
+/// The **lease** host identity: `LOOM_LEASE_HOST_ID` > `LOOM_HOST_ID` > `$HOSTNAME` > the
 /// `hostname` binary > [`UNKNOWN_HOST`] — the pre-#11530 chain, unchanged.
 ///
 /// Used only where an id is published into, or compared against, a
@@ -564,6 +601,13 @@ pub fn lease_host_identity() -> String {
     let warn_once = |message: String| {
         FALLBACK_WARNED.get_or_init(|| log::warn!("{message}"));
     };
+    if let Some(id) = std::env::var(LEASE_HOST_ID_ENV)
+        .ok()
+        .as_deref()
+        .and_then(non_blank)
+    {
+        return id;
+    }
     if let Some(id) = env_host_id() {
         return id;
     }
@@ -599,3 +643,7 @@ pub fn lease_host_identity() -> String {
 #[cfg(test)]
 #[path = "host_identity_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "host_identity_repo_slug_tests.rs"]
+mod repo_slug_tests;

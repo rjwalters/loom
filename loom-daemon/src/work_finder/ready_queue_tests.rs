@@ -1,6 +1,6 @@
 //! Coverage for the per-issue ready queue (Issue #8852). Its own file with
-//! its own minimal fakes, for the file-size-ratchet reason
-//! `prless_retry_tests.rs` gives: `work_finder/tests.rs` is frozen.
+//! its own minimal fakes, for the reason `prless_retry_tests.rs` gives: it
+//! stays independent of the shared `work_finder/tests.rs` harness.
 
 #![allow(clippy::unwrap_used)]
 
@@ -43,7 +43,6 @@ struct Disp {
     dispatched: Vec<u32>,
     in_flight: HashSet<u32>,
     backed_off: HashSet<u32>,
-    peer: HashSet<u32>,
     open_pr: HashSet<u32>,
     quarantined: HashSet<u32>,
     noop: HashSet<u32>,
@@ -58,9 +57,6 @@ impl WorkDispatcher for Disp {
     }
     fn backed_off(&self) -> HashSet<u32> {
         self.backed_off.clone()
-    }
-    fn peer_claimed(&self) -> HashSet<u32> {
-        self.peer.clone()
     }
     fn quarantined(&self) -> HashSet<u32> {
         self.quarantined.clone()
@@ -158,7 +154,6 @@ fn every_seen_issue_gets_one_row_with_its_reason() {
         Disp {
             in_flight: HashSet::from([3]),
             backed_off: HashSet::from([4]),
-            peer: HashSet::from([5]),
             open_pr: HashSet::from([1]),
             ..Default::default()
         },
@@ -174,7 +169,7 @@ fn every_seen_issue_gets_one_row_with_its_reason() {
             (2, QueueDisposition::Parked),
             (3, QueueDisposition::InFlight),
             (4, QueueDisposition::DispatchBackoff),
-            (5, QueueDisposition::PeerClaim),
+            (5, QueueDisposition::Dispatched),
             (6, QueueDisposition::Dispatched),
         ]
     );
@@ -252,43 +247,6 @@ fn short_detail_keeps_one_bounded_line() {
     assert_eq!(ready_queue::short_detail("a\nb"), "a");
     let long = "x".repeat(400);
     assert_eq!(ready_queue::short_detail(&long).chars().count(), 161);
-}
-
-/// Pass-2 limits resolve to their own dispositions: the ramp cap and the
-/// saturation brake. (No repo-sharding slice since #11682: two workspaces'
-/// candidates both dispatch.)
-#[test]
-fn pass_two_limits_resolve_to_their_own_dispositions() {
-    let src = |ns: &[u32]| {
-        OneShotSource(Some(
-            ns.iter()
-                .map(|n| item(*n, &["loom:issue"], &format!("2026-09-0{n}T00:00:00Z")))
-                .collect(),
-        ))
-    };
-    let mut multi = vec![(src(&[1, 2]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 1, false);
-    assert_eq!(
-        order(&rows(&r, &[])),
-        vec![
-            (1, QueueDisposition::Dispatched),
-            (2, QueueDisposition::DeferredRampCap)
-        ]
-    );
-
-    let mut multi = vec![(src(&[3]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false], 10, true);
-    assert_eq!(order(&rows(&r, &[])), vec![(3, QueueDisposition::DeferredSaturation)]);
-
-    let mut multi = vec![(src(&[4]), Disp::default()), (src(&[5]), Disp::default())];
-    let r = tick_multi_with_sharding(&mut multi, &[], 10, &[false, false], 10, false);
-    assert_eq!(
-        order(&rows(&r, &[])),
-        vec![
-            (4, QueueDisposition::Dispatched),
-            (5, QueueDisposition::Dispatched)
-        ]
-    );
 }
 
 /// Brakes that live on the dispatcher, and a real dispatch failure, each get

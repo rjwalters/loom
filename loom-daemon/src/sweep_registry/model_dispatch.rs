@@ -6,6 +6,8 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(crate) enum DispatchModel<'a> {
     Resolved(Option<&'a str>),
+    /// The previous attempt's model. Only an active kill can step this retry down.
+    Retry(Option<&'a str>),
     Request(Option<&'a str>),
     Autonomous,
 }
@@ -34,6 +36,46 @@ impl DispatchModel<'_> {
         self.resolve_for_runtime(config, kind, admitted.map(|a| a.runtime.as_str()))
     }
 
+    /// The model a step launches with when its admission may carry a role
+    /// draw's pick (#12748). A literal or explicit request pin keeps its
+    /// precedence; otherwise a drawn model is the launch model, reconciled
+    /// against the admitted runtime exactly as a non-Builder step's is, and a
+    /// provable runtime conflict is refused rather than silently replaced. With
+    /// no drawn model this is [`Self::resolve_for_runtime`] unchanged.
+    ///
+    /// # Errors
+    /// The conflict description when the drawn model cannot run on `runtime`.
+    pub(crate) fn resolve_drawn(
+        self,
+        config: &SweepRegistryConfig,
+        kind: &SweepKind,
+        runtime: &str,
+        drawn: Option<&str>,
+    ) -> std::result::Result<Option<String>, String> {
+        let pinned = match self {
+            Self::Resolved(Some(_)) | Self::Retry(Some(_)) => true,
+            Self::Request(Some(model)) => !model.trim().is_empty(),
+            _ => false,
+        };
+        let drawn = drawn.map(str::trim).filter(|m| !m.is_empty());
+        let (false, Some(drawn)) = (pinned, drawn) else {
+            return Ok(self.resolve_for_runtime(config, kind, Some(runtime)));
+        };
+        let (model, _) =
+            crate::role_runner::model_resolution::reconcile_unpinned_model_with_runtime(
+                runtime,
+                drawn.to_string(),
+                "role-draw".to_string(),
+            );
+        if let Some(why) = model_runtime_mismatch(runtime, &model) {
+            return Err(why);
+        }
+        log::info!(
+            "sweep dispatch: attempting {kind:?} runtime={runtime} model={model} (source=role-draw)"
+        );
+        Ok((!model.is_empty()).then_some(model))
+    }
+
     /// [`Self::resolve`] keyed on the admitted runtime's NAME — the only part
     /// of the admission it actually reads. Private-clone containment (#8787)
     /// needs the model BEFORE its own admission completes, because account
@@ -45,10 +87,35 @@ impl DispatchModel<'_> {
         kind: &SweepKind,
         admitted: Option<&str>,
     ) -> Option<String> {
-        if let Self::Resolved(model) = self {
-            return model.map(str::to_owned);
-        }
         let root = &config.workspace_root;
+        match self {
+            Self::Resolved(model) => return model.map(str::to_owned),
+            Self::Retry(model) => {
+                let issue = match kind {
+                    SweepKind::Issue(issue) => *issue,
+                    SweepKind::Step { .. } | SweepKind::PrSet(_) => {
+                        return model.map(str::to_owned);
+                    }
+                };
+                if let Some(model) = model {
+                    return Some(
+                        issue_sweep_step_down(root, issue, model, model)
+                            .unwrap_or_else(|| model.to_owned()),
+                    );
+                }
+                // A reaper resume without a previous model uses the CLI
+                // default unless a pending kill requires model resolution.
+                if !super::model_limit_kill::step_down_pending(
+                    root,
+                    issue,
+                    super::model_limit_kill::ISSUE_SWEEP_ROLE,
+                ) || !super::model_fallback::read_model_fallback_config(root).enabled
+                {
+                    return None;
+                }
+            }
+            Self::Request(_) | Self::Autonomous => {}
+        }
         // Only hermetic skip-label fixtures lack admission. Reading their
         // configured binding does not select credentials or reserve a slot.
         //
@@ -61,9 +128,20 @@ impl DispatchModel<'_> {
         // actually launched.
         let policy = admitted
             .map_or_else(|| DefaultModelPolicy::resolve(root), DefaultModelPolicy::for_runtime);
-        let resolved = match (self, kind) {
-            (Self::Request(None) | Self::Autonomous, SweepKind::Issue(issue)) => {
-                resolve_autonomous_model_for_runtime(root, *issue, policy)
+        // Only Builder work keeps the per-issue experiment arm (design #11894
+        // §4.4): an issue sweep, or a Builder step (#11898). Other steps take
+        // their role's resolvers at spawn (#11906), so here the default.
+        let experiment_issue = match kind {
+            SweepKind::Issue(n)
+            | SweepKind::Step {
+                item: n,
+                role: crate::step_role::StepRole::Builder,
+            } => Some(*n),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => None,
+        };
+        let resolved = match (self, experiment_issue) {
+            (Self::Request(None) | Self::Autonomous | Self::Retry(None), Some(issue)) => {
+                resolve_autonomous_model_for_runtime(root, issue, policy)
             }
             _ => {
                 let explicit = match self {
@@ -94,8 +172,55 @@ impl DispatchModel<'_> {
             resolved.source_label,
             resolved.arm,
         );
-        (!resolved.model.is_empty()).then_some(resolved.model)
+        match kind {
+            SweepKind::Issue(issue) => issue_sweep_fallback(root, *issue, resolved.model),
+            SweepKind::Step { .. } | SweepKind::PrSet(_) => {
+                (!resolved.model.is_empty()).then_some(resolved.model)
+            }
+        }
     }
+}
+
+/// The two-stage model fallback the step engine applies at launch
+/// (`step_spawn::with_model_fallback`), for a legacy issue sweep (#14443):
+/// selection-time fallback (#13873), then the in-flight step-down (#13905)
+/// when the issue's previous sweep was killed by a model limit. Both are
+/// no-ops while `autonomous.modelFallback` is absent or disabled, and an empty
+/// model (the CLI default) has no class to fall back from.
+fn issue_sweep_fallback(root: &Path, issue: u32, configured: String) -> Option<String> {
+    if configured.is_empty() {
+        return None;
+    }
+    let effective = super::model_fallback::effective_model(root, &configured);
+    if let Some(model) = issue_sweep_step_down(root, issue, &effective.model, &effective.configured)
+    {
+        return Some(model);
+    }
+    if let Some(decision) = &effective.fallback {
+        log::info!(
+            "sweep dispatch: issue sweep #{issue} fell back {} -> {} ({})",
+            decision.from,
+            decision.model,
+            decision.reason
+        );
+    }
+    (!effective.model.is_empty()).then_some(effective.model)
+}
+
+fn issue_sweep_step_down(root: &Path, issue: u32, model: &str, configured: &str) -> Option<String> {
+    let (model, decision) = super::model_limit_kill::step_down(
+        root,
+        issue,
+        super::model_limit_kill::ISSUE_SWEEP_ROLE,
+        model,
+        configured,
+    )?;
+    log::info!(
+        "sweep dispatch: issue sweep #{issue} stepped down {} -> {model} ({})",
+        decision.from,
+        decision.reason
+    );
+    Some(model)
 }
 
 impl SweepRegistry {

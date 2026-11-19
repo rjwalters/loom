@@ -95,16 +95,6 @@ pub const BUILT_COMMIT_FULL: &str = env!("LOOM_DAEMON_GIT_COMMIT_FULL");
 /// `"clean"`, `"dirty"` or `"unknown"`.
 pub const BUILT_TREE_STATE: &str = env!("LOOM_DAEMON_GIT_DIRTY");
 
-/// `<version> <40-hex> clean|dirty|unknown` — the D33 `build` field, as
-/// written into `Loom-Build:` trailers and `loom:provenance` markers.
-pub const BUILD_STAMP: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " ",
-    env!("LOOM_DAEMON_GIT_COMMIT_FULL"),
-    " ",
-    env!("LOOM_DAEMON_GIT_DIRTY")
-);
-
 /// The full build identity of this binary — `"<version> (commit <sha>, built
 /// <ts>, source <40-hex> <tree-state>)"` — as shown by `loom-daemon --version`.
 /// The leading `(commit <sha>, built <ts>` shape is what

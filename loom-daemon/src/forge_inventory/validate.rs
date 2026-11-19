@@ -36,7 +36,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::forge_inventory::model::{
-    is_stale_version, Coverage, Disposition, Inventory, Operation, Profile, Support, TestStatus,
+    is_stale_version, Coverage, Disposition, Inventory, Operation, Support, TestStatus,
     INVENTORY_GROUPS, NON_WAIVABLE_GROUPS, SEEDED_HIGH_RISK_CASES,
 };
 
@@ -597,14 +597,4 @@ pub fn totals(inv: &Inventory) -> Totals {
         }
     }
     t
-}
-
-/// Active rows per profile, for the report header.
-#[must_use]
-pub fn by_profile(inv: &Inventory) -> BTreeMap<Profile, Vec<&Operation>> {
-    let mut out: BTreeMap<Profile, Vec<&Operation>> = BTreeMap::new();
-    for op in inv.operations.iter().filter(|o| o.is_active()) {
-        out.entry(op.profile).or_default().push(op);
-    }
-    out
 }

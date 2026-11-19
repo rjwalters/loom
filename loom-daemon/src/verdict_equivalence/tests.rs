@@ -104,17 +104,6 @@ fn one_file(patch: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merge_tree_version_floor_is_2_38() {
-    use super::git_objects::merge_tree_in_version;
-    assert!(merge_tree_in_version("2.38.0"));
-    assert!(merge_tree_in_version("2.51.1"));
-    assert!(merge_tree_in_version("3.0.0"));
-    assert!(!merge_tree_in_version("2.37.3"));
-    assert!(!merge_tree_in_version("1.9"));
-    assert!(!merge_tree_in_version("not-a-version"));
-}
-
-#[test]
 fn ref_names_that_could_address_another_endpoint_are_refused() {
     assert!(is_safe_ref("main"));
     assert!(is_safe_ref("release/v1.2"));
@@ -571,7 +560,7 @@ fn fixture(pr_file: &str, pr_content: &str) -> (TempDir, String, String) {
 /// Skip rather than fail on a git with no `merge-tree --write-tree`, the same
 /// floor the two existing callers use.
 pub(super) fn merge_tree_available(repo: &Path) -> bool {
-    if super::git_objects::supports_merge_tree(repo) {
+    if crate::git_merge_tree::supports_merge_tree(Some(repo)) {
         return true;
     }
     eprintln!("SKIP: git < 2.38 has no `merge-tree --write-tree`");
@@ -887,4 +876,270 @@ fn detect_reports_clean_merge_for_a_merge_of_the_base() {
         &reviewed,
         &head,
     );
+}
+
+// ---------------------------------------------------------------------------
+// #13114: compare retry, `equivalence=unread`, requested-change carry
+// ---------------------------------------------------------------------------
+
+/// A compare response with two changed files.
+fn two_files(a_patch: &str, b_patch: &str) -> String {
+    format!(
+        r#"{{"status": "diverged", "files": [{{"filename": "src/a.rs", "status": "modified", "sha": "aaaa", "patch": "{a_patch}"}}, {{"filename": "docs/run.md", "status": "modified", "sha": "bbbb", "patch": "{b_patch}"}}]}}"#
+    )
+}
+
+fn scoped(gh: &Path, cwd: &Path, allowed: &[&str]) -> Assessment {
+    let allowed: Vec<String> = allowed.iter().map(|s| (*s).to_string()).collect();
+    assess_with_scope(true, true, gh, Some(cwd), 9416, REVIEWED, HEAD, &allowed)
+}
+
+/// A fake `gh` that fails the first `fail_first` calls to the reviewed-side
+/// compare, then answers.
+fn flaky_gh(dir: &Path, fail_first: u32, reviewed_body: &str, head_body: &str) -> PathBuf {
+    let count = dir.join("count");
+    std::fs::write(&count, "0").unwrap();
+    let bin = dir.join("flaky-gh.sh");
+    std::fs::write(
+        &bin,
+        format!(
+            r#"#!/usr/bin/env bash
+case "$*" in
+  *"--json baseRefName"*) printf '%s' '{{"baseRefName": "main"}}'; exit 0 ;;
+  *"compare/{REVIEWED}...{HEAD}"*) printf '%s' '{{"status": "diverged", "files": [{{"filename": "x"}}]}}'; exit 0 ;;
+  *"compare/main...{REVIEWED}"*)
+    n=$(cat "{count}"); echo $((n+1)) > "{count}"
+    if [ "$n" -lt {fail_first} ]; then exit 1; fi
+    printf '%s' '{reviewed_body}'; exit 0 ;;
+  *"compare/main...{HEAD}"*) printf '%s' '{head_body}'; exit 0 ;;
+esac
+exit 1
+"#,
+            count = count.display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+#[test]
+fn an_unreadable_compare_is_retried_then_carries() {
+    let dir = tempdir().unwrap();
+    let body = one_file("@@ -1 +1 @@\\n-a\\n+b\\n");
+    let gh = flaky_gh(dir.path(), 2, &body, &body);
+    let a = scoped(&gh, dir.path(), &[]);
+    assert_eq!(a.equivalence, Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical));
+}
+
+#[test]
+fn a_compare_unreadable_after_the_retries_holds_as_unread() {
+    let dir = tempdir().unwrap();
+    let body = one_file("@@ -1 +1 @@\\n-a\\n+b\\n");
+    let gh = flaky_gh(dir.path(), 99, &body, &body);
+    let a = scoped(&gh, dir.path(), &["src/a.rs"]);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate);
+    assert!(a.unavailable_note().unwrap().contains(UNREAD_TOKEN), "{a:?}");
+    // 1 attempt + COMPARE_RETRIES retries, bounded.
+    let n: u32 = std::fs::read_to_string(dir.path().join("count"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(n, 3);
+}
+
+#[test]
+fn a_delta_confined_to_the_named_paths_carries_as_requested_change() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p1", "r2")),
+        ],
+    );
+    let a = scoped(&gh, dir.path(), &["docs/run.md"]);
+    assert_eq!(a.equivalence, Equivalence::Equivalent(EquivalenceKind::RequestedChange));
+    assert_eq!(EquivalenceKind::RequestedChange.token(), "requested-change");
+}
+
+#[test]
+fn a_delta_outside_the_named_paths_holds() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p2", "r2")),
+        ],
+    );
+    // Both files changed, only one named: re-arm.
+    assert_eq!(scoped(&gh, dir.path(), &["docs/run.md"]).equivalence, Equivalence::Changed);
+    // No named paths at all: re-arm, as without the flag.
+    assert_eq!(scoped(&gh, dir.path(), &[]).equivalence, Equivalence::Changed);
+}
+
+#[test]
+fn the_kill_switches_disable_the_requested_change_carry() {
+    let dir = tempdir().unwrap();
+    let log = dir.path().join("gh.log");
+    let gh = fake_gh(
+        dir.path(),
+        &log,
+        &[
+            (
+                &format!("compare/{REVIEWED}...{HEAD}"),
+                r#"{"status": "diverged", "files": [{"filename": "x"}]}"#,
+            ),
+            BASE_MAIN,
+            (&format!("compare/main...{REVIEWED}"), &two_files("p1", "r1")),
+            (&format!("compare/main...{HEAD}"), &two_files("p1", "r2")),
+        ],
+    );
+    let allowed = vec!["docs/run.md".to_string()];
+    for (outer, inner) in [(false, true), (true, false)] {
+        let a =
+            assess_with_scope(outer, inner, &gh, Some(dir.path()), 9416, REVIEWED, HEAD, &allowed);
+        assert_eq!(a.equivalence, Equivalence::Indeterminate, "outer={outer} inner={inner}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// local patch-identity fallback (#13359) — real git fixtures
+// ---------------------------------------------------------------------------
+
+/// `fixture` plus a rebase of the PR onto the moved main, with
+/// `refs/remotes/origin/main` pointing at the new base. Returns
+/// `(tempdir, reviewed, rebased_head)`; `rebased_content` is the PR file's
+/// content on the rebased head (the reviewed one is `feature-1`).
+fn rebased_fixture(rebased_content: &str) -> (TempDir, String, String) {
+    let (dir, reviewed, base1) = fixture("f.txt", "feature-1\n");
+    let repo = dir.path();
+    git_ok(repo, &["checkout", "--quiet", "-b", "rebased", &base1]);
+    write(repo, "f.txt", rebased_content);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change, rebased"]);
+    let head = git_ok(repo, &["rev-parse", "HEAD"]);
+    git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base1]);
+    (dir, reviewed, head)
+}
+
+fn assess_unreadable(repo: &Path, gh_dir: &Path, reviewed: &str, head: &str) -> Assessment {
+    let gh = flaky_gh_main_only(gh_dir);
+    assess_with(true, true, &gh, Some(repo), 9416, reviewed, head)
+}
+
+/// Answers the base-branch lookup and nothing else, so every compare is
+/// unreadable (the tree kind's `Err` and the patch kind's `Unread`).
+fn flaky_gh_main_only(dir: &Path) -> PathBuf {
+    let bin = dir.join("main-only-gh.sh");
+    std::fs::write(
+        &bin,
+        "#!/usr/bin/env bash\ncase \"$*\" in\n  *\"--json baseRefName\"*) printf '%s' \
+         '{\"baseRefName\": \"main\"}'; exit 0 ;;\nesac\nexit 1\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+#[test]
+fn an_unreadable_compare_falls_back_to_local_patch_identity() {
+    let (dir, reviewed, head) = rebased_fixture("feature-1\n");
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &reviewed, &head);
+    assert_eq!(
+        a.equivalence,
+        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn local_fallback_survives_main_editing_the_same_file_elsewhere() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path();
+    let body = |l2: &str, l10: &str| -> String {
+        (1..=12)
+            .map(|i| match i {
+                2 => format!("{l2}\n"),
+                10 => format!("{l10}\n"),
+                _ => format!("line{i}\n"),
+            })
+            .collect()
+    };
+    git_ok(repo, &["init", "--quiet", "."]);
+    git_ok(repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    write(repo, "f.txt", &body("line2", "line10"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "base0"]);
+    let base0 = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "feature"]);
+    write(repo, "f.txt", &body("pr-change", "line10"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change"]);
+    let reviewed = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "moved", &base0]);
+    write(repo, "f.txt", &body("line2", "main-change"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "main edits the same file"]);
+    let base1 = git_ok(repo, &["rev-parse", "HEAD"]);
+
+    git_ok(repo, &["checkout", "--quiet", "-b", "rebased", &base1]);
+    write(repo, "f.txt", &body("pr-change", "main-change"));
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "--quiet", "-m", "the PR's own change, rebased"]);
+    let head = git_ok(repo, &["rev-parse", "HEAD"]);
+    git_ok(repo, &["update-ref", "refs/remotes/origin/main", &base1]);
+
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(repo, gh_dir.path(), &reviewed, &head);
+    assert_eq!(
+        a.equivalence,
+        Equivalence::Equivalent(EquivalenceKind::RebasePatchIdentical),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn an_unreadable_compare_and_an_absent_reviewed_head_name_both_failures() {
+    let (dir, _reviewed, head) = rebased_fixture("feature-1\n");
+    let gh_dir = tempdir().unwrap();
+    let absent = "d".repeat(40);
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &absent, &head);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate);
+    let note = a.unavailable_note().unwrap();
+    assert!(note.contains(UNREAD_TOKEN), "{note}");
+    assert!(note.contains("unreadable after retries"), "{note}");
+    assert!(note.contains("not fetchable"), "{note}");
+}
+
+#[test]
+fn an_unreadable_compare_and_differing_local_patches_stay_indeterminate() {
+    let (dir, reviewed, head) = rebased_fixture("feature-2\n");
+    let gh_dir = tempdir().unwrap();
+    let a = assess_unreadable(dir.path(), gh_dir.path(), &reviewed, &head);
+    assert_eq!(a.equivalence, Equivalence::Indeterminate, "{a:?}");
+    assert!(a.unavailable_note().unwrap().contains("patches differ"));
 }

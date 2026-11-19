@@ -1,5 +1,5 @@
 //! `loom-daemon preflight` — the Builder's in-session pre-PR gate
-//! (Issue #10476). Logic lives in [`loom_daemon::preflight`].
+//! (Issue #10476). Logic lives in [`crate::preflight`].
 //!
 //! Exit codes: `0` pass / gate not configured; `1` failed, attempts remain
 //! (output tail printed — fix and re-run); `4` attempts exhausted
@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use loom_daemon::preflight::{self, skip_ci, Verdict};
+use crate::preflight::{self, skip_ci, Verdict};
 
 #[derive(clap::Args)]
 pub(crate) struct PreflightArgs {
@@ -54,6 +54,9 @@ impl PreflightArgs {
             );
             std::process::exit(preflight::EXIT_NOT_PASSED);
         }
+        if let Err(e) = preflight::install_signal_handlers() {
+            eprintln!("preflight: cannot install signal handlers: {e}");
+        }
         let verdict = preflight::run(&wt);
         match &verdict {
             Verdict::Disabled => eprintln!("preflight: no enabled buildGate — skipped"),
@@ -74,6 +77,9 @@ impl PreflightArgs {
                     "preflight: reason=preflight_unresolved after {attempts}/{max} attempts — open NO PR.\n{tail}"
                 );
             }
+            Verdict::Cancelled { signal } => eprintln!(
+                "preflight: cancelled by signal {signal}; gate processes were killed, nothing recorded"
+            ),
             Verdict::TimedOut {
                 attempt, max, tail, ..
             } if attempt >= max => {

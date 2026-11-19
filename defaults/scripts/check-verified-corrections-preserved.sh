@@ -13,12 +13,21 @@
 # first. See `.loom/roles/curator.md` -> "Verified Corrections Are
 # Append-Only" for the full convention this script enforces.
 #
-# What it checks: every paragraph under the OLD body's `## Verified
-# corrections` heading (case-insensitive; up to the next `## ` heading or
-# EOF) must still be present, verbatim after whitespace normalization,
-# somewhere under the NEW body's `## Verified corrections` section. New
-# paragraphs may freely be appended -- this only detects paragraphs that
-# would be *lost*, exactly the "append-only" invariant.
+# What it checks: every paragraph under the OLD body's `Verified
+# corrections` heading (case-insensitive, at any ATX heading depth >= 2 --
+# `##`, `###`, ... including one nested under a `## Curator Enhancement`
+# parent; up to the next heading of the SAME OR SHALLOWER depth, or EOF --
+# deeper subheadings stay inside the section) must still be present, verbatim
+# after whitespace normalization, somewhere under the NEW body's `Verified
+# corrections` section. New paragraphs may freely be appended -- this only
+# detects paragraphs that would be *lost*, exactly the "append-only"
+# invariant. A level-1 `# Verified corrections` heading is deliberately NOT
+# matched (a lone h1 is a document title, not a section) but is named in a
+# WARN on stderr, so the "no section" OK stays distinguishable from a
+# found-and-checked pass (#13938). Heading recognition is fenced-code-block
+# aware: a `Verified corrections` heading (or any `#`-comment) quoted inside
+# a ``` / ~~~ fence is never a heading -- it can neither open a phantom
+# section nor close a real one early (#14001).
 #
 # Usage:
 #   check-verified-corrections-preserved.sh <old-body-file> <new-body-file>
@@ -49,19 +58,76 @@ for f in "$OLD_FILE" "$NEW_FILE"; do
   fi
 done
 
-# Extract the body of a "## Verified corrections" section (case-insensitive
-# heading match), i.e. everything after the heading line up to the next `## `
-# heading or EOF. Prints nothing if the heading is absent.
+# Extract the body of a "Verified corrections" section. The heading is
+# recognised case-insensitively at any ATX depth >= 2 (`##`, `###`, ...);
+# the section runs to the next heading of the SAME OR SHALLOWER depth or to
+# EOF, so deeper subheadings (and their text) stay inside the section while
+# a sibling heading closes it. A depth-1 `# Verified corrections` heading is
+# deliberately ignored, but named in a WARN on stderr so a "no section" pass
+# is never silent about having seen one (#13938). The extractor is
+# fenced-code-block aware (#14001): a fence opens at 3+ backticks or tildes
+# after optional indentation (a backtick opener may carry an info string,
+# which must itself contain no backtick) and closes only at a line of the
+# SAME character, at least as long, followed solely by whitespace -- so a
+# longer outer fence quoting a shorter fence stays open, and an unclosed
+# fence runs to EOF (named in a WARN on stderr, with the opener's line, so
+# a body whose section it swallows is never silently "unprotected", #14123). While in a fence no line is a heading: a quoted
+# "Verified corrections" heading cannot open a phantom section, and a
+# `#`-comment inside a real section cannot close it early. Fence lines that
+# sit inside a real section remain part of its text, verbatim. Carriage
+# returns (CRLF bodies) are stripped before any matching. POSIX awk only --
+# match()/RLENGTH, tolower(), print-to-command are portable; no gawk
+# constructs, and the depth comes from the leading '#' run via match(),
+# never from index($0, " ") which breaks when a tab follows the hashes
+# (#13938's sketch bug; #12044's bash-3.2 portability history is why nothing
+# fancy is used at all).
 extract_section() {
-  awk '
-    BEGIN { insec = 0 }
+  local which="$2"
+  awk -v which="$which" '
+    BEGIN { insec = 0; depth = 0; infence = 0; fchar = ""; flen = 0; fopen = 0 }
     {
       line = $0
+      sub(/\r$/, "", line)
       lower = tolower(line)
+      fline = line
+      sub(/^[ \t]+/, "", fline)
+      if (infence) {
+        # Close only on the same fence character as the opener, at least as
+        # long, with nothing but trailing whitespace after the run.
+        if (match(fline, "^" fchar "+") && RLENGTH >= flen && substr(fline, RLENGTH + 1) ~ /^[ \t]*$/) {
+          infence = 0; fchar = ""; flen = 0
+        }
+        if (insec) print line
+        next
+      }
+      if (match(fline, /^`+/) && RLENGTH >= 3 && substr(fline, RLENGTH + 1) !~ /`/) {
+        infence = 1; fchar = "`"; flen = RLENGTH; fopen = FNR
+        if (insec) print line
+        next
+      }
+      if (match(fline, /^~+/) && RLENGTH >= 3) {
+        infence = 1; fchar = "~"; flen = RLENGTH; fopen = FNR
+        if (insec) print line
+        next
+      }
+      d = 0
+      if (match(lower, /^#+/)) d = RLENGTH
+      # A heading at or above the section depth closes it (deeper stays in).
+      if (insec && d >= 1 && d <= depth && lower ~ /^#+[ \t]/) insec = 0
+      if (lower ~ /^#+[ \t]+verified corrections[ \t]*$/) {
+        if (d >= 2) { insec = 1; depth = d; next }
+        print "check-verified-corrections-preserved: WARN — " which " body line " FNR ": ignoring heading [ " line " ] — the Verified corrections heading is only recognised at heading depth >= 2, so this section is NOT being checked." | "cat 1>&2"
+        next
+      }
     }
-    insec && lower ~ /^##[ \t]/ { insec = 0 }
-    lower ~ /^##[ \t]+verified corrections[ \t]*$/ { insec = 1; next }
     insec { print line }
+    END {
+      # An unterminated fence runs to EOF (CommonMark), so any Verified
+      # corrections section after it is swallowed and NOT checked. Exit codes
+      # are unchanged; the WARN just keeps that distinguishable from "no
+      # section" (#14123), like the depth-1 WARN above.
+      if (infence) print "check-verified-corrections-preserved: WARN — " which " body line " fopen ": unterminated code fence opened here swallows the rest of the body, so any Verified corrections section after it is NOT being checked." | "cat 1>&2"
+    }
   ' "$1"
 }
 
@@ -82,22 +148,23 @@ normalize_paragraphs() {
   '
 }
 
-OLD_SECTION="$(extract_section "$OLD_FILE")"
+OLD_SECTION="$(extract_section "$OLD_FILE" old)"
 
-if [[ -z "${OLD_SECTION// /}" ]]; then
+# "No non-space char" == the old -z "${X// /}", minus bash 3.2's ${//} cost (#12044).
+if [[ "$OLD_SECTION" != *[!\ ]* ]]; then
   echo "check-verified-corrections-preserved: OK — old body has no '## Verified corrections' section (nothing to preserve)."
   exit 0
 fi
 
-NEW_SECTION="$(extract_section "$NEW_FILE")"
+NEW_SECTION="$(extract_section "$NEW_FILE" new)"
 
-if [[ -z "${NEW_SECTION// /}" ]]; then
+if [[ "$NEW_SECTION" != *[!\ ]* ]]; then
   echo "check-verified-corrections-preserved: FAIL — old body has a '## Verified corrections' section but the new body has none at all. A re-curation pass may append to this section but must never remove it." >&2
   exit 1
 fi
 
 OLD_PARAS="$(printf '%s' "$OLD_SECTION" | normalize_paragraphs)"
-NEW_PARAS="$(printf '%s' "$NEW_SECTION" | normalize_paragraphs)"
+NEW_LINES="$(printf '%s' "$NEW_SECTION" | normalize_paragraphs | tr '\036' '\n')"
 
 MISSING=0
 while IFS= read -r -d $'\x1e' para; do
@@ -105,17 +172,15 @@ while IFS= read -r -d $'\x1e' para; do
   # Exact-match a normalized old paragraph against the set of normalized new
   # paragraphs. grep -F/-x avoids both regex-metacharacter surprises in
   # issue text and accidental substring matches across paragraph boundaries.
-  # NOTE: do the 0x1e -> newline conversion via bash parameter expansion
-  # (${var//pat/repl}) into a here-string, not a `tr | grep -q` pipe. Under
-  # `set -o pipefail`, `grep -qFx` exits as soon as it finds its first match
-  # (that's what -q means), which sends the upstream `tr` a SIGPIPE; tr's
-  # resulting non-zero exit then becomes the *pipeline's* exit status even
-  # though grep genuinely found the match. That produced false-positive FAILs
-  # on large "## Verified corrections" sections, especially when the match
-  # landed early in the paragraph stream (#6768). The parameter expansion
-  # below is pure bash string substitution -- no pipe, no subprocess, so
-  # there is nothing for pipefail to trip over.
-  if ! grep -qFx -- "$para" <<< "${NEW_PARAS//$'\x1e'/$'\n'}"; then
+  # NOTE: match against NEW_LINES, built once above via a full-reading
+  # `normalize_paragraphs | tr` (no early exit, so no SIGPIPE), fed here as a
+  # here-string -- never a `tr | grep -q` pipe. Under `set -o pipefail`,
+  # `grep -q` exits on its first match, SIGPIPEs the upstream `tr`, and tr's
+  # non-zero exit becomes the pipeline's status: false-positive FAILs on large
+  # sections (#6768). Nor a per-iteration ${NEW_PARAS//$'\x1e'/$'\n'}: bash
+  # 3.2's ${//} is quadratic -- ~13 s per call on a 300-paragraph section, so
+  # the loop hung past CI's 1200 s suite timeout on macOS (#12044).
+  if ! grep -qFx -- "$para" <<< "$NEW_LINES"; then
     MISSING=$((MISSING + 1))
     echo "check-verified-corrections-preserved: missing verified-corrections paragraph:" >&2
     echo "  $para" >&2

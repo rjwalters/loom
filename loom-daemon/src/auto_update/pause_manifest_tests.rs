@@ -69,11 +69,11 @@ fn sample() -> PauseManifest {
             lease_comment_id: Some(5_822_662_982),
             lease_refreshed_at: None,
             log_path: None,
-            overflow: false,
             role: None,
             timeout_remaining_secs: None,
             holds_issue_creation_mutex: false,
             stopped_at: None,
+            step: None,
         }],
         events: vec![],
     }

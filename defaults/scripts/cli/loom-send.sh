@@ -7,8 +7,8 @@
 #   loom send --help                     Show help
 #
 # Examples:
-#   loom send shepherd-1 "/loom:shepherd 123"
-#   loom send shepherd-1 "/loom:shepherd 123 --merge"
+#   loom send builder-1 "/loom:sweep 123"
+#   loom send builder-1 "/loom:sweep 123 --merge"
 #   loom send terminal-2 "/loom:builder 456"
 #   loom send champion "/loom:champion"
 #
@@ -19,31 +19,6 @@
 
 set -euo pipefail
 
-# Find repository root
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then
-            echo "$dir"
-            return 0
-        fi
-        if [[ -f "$dir/.git" ]]; then
-            local gitdir
-            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
-            local main_repo
-            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
-            if [[ -d "$main_repo/.loom" ]]; then
-                echo "$main_repo"
-                return 0
-            fi
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo ""
-}
-
-# shellcheck disable=SC2034  # Used for validation side-effect of find_repo_root
-REPO_ROOT=$(find_repo_root)
 TMUX_SOCKET="loom"
 
 # ANSI colors
@@ -83,18 +58,18 @@ ${YELLOW}OPTIONS:${NC}
     --json            Output result as JSON
 
 ${YELLOW}EXAMPLES:${NC}
-    loom send shepherd-1 "/loom:shepherd 123"
-    loom send shepherd-1 "/loom:shepherd 123 --merge"
+    loom send builder-1 "/loom:sweep 123"
+    loom send builder-1 "/loom:sweep 123 --merge"
     loom send terminal-2 "/loom:builder 456"
     loom send champion "/loom:champion"
 
 ${YELLOW}SESSION NAMING:${NC}
     Loom uses tmux sessions with the naming pattern:
-      loom-<agent-name>           e.g., loom-shepherd-1, loom-terminal-2
+      loom-<agent-name>           e.g., loom-builder-1, loom-terminal-2
 
     You can specify either the full session name or just the agent name:
-      loom send loom-shepherd-1 "..."   (full name)
-      loom send shepherd-1 "..."        (short name - loom- prefix added)
+      loom send loom-builder-1 "..."   (full name)
+      loom send builder-1 "..."        (short name - loom- prefix added)
 
 ${YELLOW}NOTES:${NC}
     - Commands are sent with a trailing newline (Enter key) by default

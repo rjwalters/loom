@@ -122,6 +122,7 @@ use crate::worktree_activity::{removal_veto, resolve_activity_window};
 use crate::worktree_ops::clean::{
     self, CleanOptions, WorktreeDecision, WorktreeProbes, DEFAULT_GRACE_PERIOD_SECS,
 };
+use crate::worktree_ops::open_backup;
 
 // ============================================================================
 // Constants
@@ -143,6 +144,15 @@ pub const WORKTREE_REAPER_DISK_WARN_ENV: &str = "LOOM_WORKTREE_REAPER_DISK_WARN_
 /// negligible next to normal sweep traffic, fast enough that a merged
 /// worktree's ~1G of build artifacts is reclaimed the same hour.
 pub const DEFAULT_WORKTREE_REAPER_INTERVAL_SECS: u64 = 900;
+
+/// Env override for the open-item idle period (seconds; `0` disables).
+pub const WORKTREE_REAPER_IDLE_OPEN_ENV: &str = "LOOM_WORKTREE_REAPER_IDLE_OPEN_SECS";
+
+/// Default idle period (24 h) before the worktree of an **open** issue / PR is
+/// reapable (issue #12458). Long enough that a builder, judge or doctor step
+/// bouncing on the same item within a day keeps its warm worktree; short
+/// enough that ~400 open-item worktrees do not outlive their usefulness.
+pub const DEFAULT_IDLE_OPEN_SECS: i64 = 24 * 60 * 60;
 
 /// Default low-disk warning floor (GB). Below this, a host is close enough to
 /// full that a sweep's build can fail with a confusing unrelated error.
@@ -170,6 +180,10 @@ pub struct WorktreeReaperConfig {
     /// `autonomous.worktreeReaper.diskWarnFreeGb` — free-GB floor below which
     /// the pass logs a low-disk warning.
     pub disk_warn_free_gb: Option<u64>,
+    /// `autonomous.worktreeReaper.idleOpenSecs` — how long an `issue-<N>` /
+    /// `pr-<N>` worktree of an **open** item must sit untouched before it is
+    /// reapable (issue #12458). `0` disables the open-item decision.
+    pub idle_open_secs: Option<i64>,
 }
 
 /// Read `.loom/config.json → autonomous.worktreeReaper`, soft-failing every
@@ -196,6 +210,10 @@ pub fn read_worktree_reaper_config(repo_root: &Path) -> WorktreeReaperConfig {
         disk_warn_free_gb: block
             .get("diskWarnFreeGb")
             .and_then(serde_json::Value::as_u64),
+        idle_open_secs: block
+            .get("idleOpenSecs")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&s| s >= 0),
     }
 }
 
@@ -233,6 +251,20 @@ pub fn resolve_grace_period(config: &WorktreeReaperConfig) -> i64 {
         .unwrap_or(DEFAULT_GRACE_PERIOD_SECS)
 }
 
+/// Resolve the open-item idle period — precedence **env > config > default**.
+/// `None` means the decision is disabled (a `0` from env or config); an
+/// unparseable or negative env value falls through to config/default.
+#[must_use]
+pub fn resolve_idle_open_secs(config: &WorktreeReaperConfig) -> Option<i64> {
+    let secs = std::env::var(WORKTREE_REAPER_IDLE_OPEN_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&s| s >= 0)
+        .or(config.idle_open_secs)
+        .unwrap_or(DEFAULT_IDLE_OPEN_SECS);
+    (secs > 0).then_some(secs)
+}
+
 /// Resolve the low-disk warning floor — precedence **env > config > default**.
 #[must_use]
 pub fn resolve_disk_warn_free_gb(config: &WorktreeReaperConfig) -> u64 {
@@ -257,6 +289,20 @@ pub fn reaper_clean_options(grace_period_secs: i64) -> CleanOptions {
         branches_only: false,
         tmux_only: false,
         require_managed_sentinel: true,
+        // Off here; the production pass layers the configured idle period on
+        // top (`reaper_clean_options_for`), so a caller that builds options
+        // from a bare grace period never reaps an open item.
+        idle_open_secs: None,
+    }
+}
+
+/// [`reaper_clean_options`] plus the idle-open period resolved from `config`
+/// (issue #12458) — what the production reap pass runs with.
+#[must_use]
+pub fn reaper_clean_options_for(config: &WorktreeReaperConfig) -> CleanOptions {
+    CleanOptions {
+        idle_open_secs: resolve_idle_open_secs(config),
+        ..reaper_clean_options(resolve_grace_period(config))
     }
 }
 
@@ -277,6 +323,16 @@ pub struct ReapReport {
     pub failed: Vec<u32>,
     /// Worktrees a safety gate preserved, keyed by the gate's own wording.
     pub skipped: Vec<(u32, String)>,
+    /// Open-item worktrees (#12458) whose whole state was pushed to a remote
+    /// backup ref before removal — the record names remote, ref, sha, parent
+    /// and branch (`open_backup::BackupRecord`). Every entry here is also in
+    /// [`Self::removed`] or [`Self::failed`]: the backup happened whether or
+    /// not the removal that followed it succeeded.
+    pub backed_up: Vec<(u32, crate::worktree_ops::open_backup::BackupRecord)>,
+    /// Bytes the removed worktrees held (#12461). Measured before removal and
+    /// only while an ops sink is registered, so `0` means "not measured" as
+    /// much as "nothing removed".
+    pub bytes_removed: u64,
     /// Free GB on the worktree-root volume, or `None` when unmeasurable
     /// (#4164 — unknown is never treated as zero).
     pub free_gb: Option<u64>,
@@ -287,11 +343,12 @@ impl ReapReport {
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "scanned={} removed={} failed={} skipped={}",
+            "scanned={} removed={} failed={} skipped={} backed_up={}",
             self.scanned,
             self.removed.len(),
             self.failed.len(),
-            self.skipped.len()
+            self.skipped.len(),
+            self.backed_up.len()
         )
     }
 }
@@ -332,19 +389,22 @@ fn enumerate_worktree_dirs(repo_root: &Path) -> Vec<std::fs::DirEntry> {
 /// Enumerate `issue-<N>` worktrees under `repo_root`'s worktree root, classify
 /// each with [`clean::classify_worktree`], and remove the eligible ones via
 /// `remove` — quarantine-stashing a dirty-but-past-grace worktree via
-/// `quarantine` first (issue #6653) when the decision calls for it.
+/// `quarantine` first (issue #6653) when the decision calls for it, and
+/// pushing an **open** item's worktree to a remote backup ref via `backup`
+/// first (issue #12458) — a failed backup keeps the worktree.
 ///
-/// The probes and the remover are injected so the whole pass is unit-testable
-/// without a forge, a process table, or real `git worktree` state — production
-/// wiring lives in [`reap_repo`].
+/// The probes, the backup and the remover are injected so the whole pass is
+/// unit-testable without a forge, a process table, or real `git worktree`
+/// state — production wiring lives in [`reap_repo`].
 pub fn reap_worktrees(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &WorktreeProbes<'_>,
     quarantine: &dyn Fn(&Path, u32) -> Option<String>,
+    backup: &dyn Fn(&Path, u32) -> Result<open_backup::BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, remove, &|_| None)
+    reap_worktrees_confirmed(repo_root, opts, probes, quarantine, backup, remove, &|_| None)
 }
 
 /// Enumerate `pr-<N>` worktrees under `repo_root`'s worktree root, classify
@@ -368,9 +428,10 @@ pub fn reap_pr_worktrees(
     repo_root: &Path,
     opts: &CleanOptions,
     probes: &clean::PrWorktreeProbes<'_>,
+    backup: &dyn Fn(&Path, u32) -> Result<open_backup::BackupRecord, String>,
     remove: &dyn Fn(&Path, u32) -> bool,
 ) -> ReapReport {
-    reap_pr_worktrees_confirmed(repo_root, opts, probes, remove, &|_| None)
+    reap_pr_worktrees_confirmed(repo_root, opts, probes, backup, remove, &|_| None)
 }
 
 // ============================================================================
@@ -475,11 +536,13 @@ pub fn reclaim_kept_pr_worktree_artifacts(
 /// Log an `issue-<N>` artifact-reclaim pass's outcome
 /// ([`artifact_reclaim::log_report`]).
 pub fn log_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    publish_reclaim(repo_root, report, "issue");
     artifact_reclaim::log_report(repo_root, report, "issue");
 }
 
 /// Log a `pr-<N>` artifact-reclaim pass's outcome (#5939).
 pub fn log_pr_reclaim_report(repo_root: &Path, report: &ReclaimReport) {
+    publish_reclaim(repo_root, report, "pr");
     artifact_reclaim::log_report(repo_root, report, "pr");
 }
 
@@ -611,7 +674,7 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
     // enumerate — so drop those before the pass rather than letting the
     // tracker accumulate dead entries between status calls.
     prune_orphaned_removal_records();
-    let opts = reaper_clean_options(resolve_grace_period(config));
+    let opts = reaper_clean_options_for(config);
     let active_issues = crate::worktree_ops::liveness::active_spawn_loop_issues(repo_root);
 
     // One hygiene pass (W6 PR2, `worktree_ops::hygiene_pass`): the owner is
@@ -681,9 +744,23 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
         )
     };
 
+    // #12458: an OPEN item's idle worktree is pushed, whole, to a remote
+    // backup ref and read back from the remote before `remover` may run; the
+    // ledger (#5950) gets the ref next to the removal it precedes, so "what
+    // happened to my worktree?" and "where is its content?" have one answer.
+    let backup_issue =
+        |path: &Path, issue: u32| backup_open_worktree(repo_root, path, &format!("issue-{issue}"));
+
     let confirm_issue = |n: u32| pass.confirm_issue(n).keep_reason();
-    let mut report =
-        reap_worktrees_confirmed(repo_root, &opts, &probes, &quarantine, &remover, &confirm_issue);
+    let mut report = reap_worktrees_confirmed(
+        repo_root,
+        &opts,
+        &probes,
+        &quarantine,
+        &backup_issue,
+        &remover,
+        &confirm_issue,
+    );
 
     // pr-<N> pass (#5939): a `pr-<N>` worktree has no backing issue, so it
     // never matched the issue-keyed pass above — the one worktree class no
@@ -728,9 +805,18 @@ pub fn reap_worktrees_only(repo_root: &Path, config: &WorktreeReaperConfig) -> R
             )
         })
     };
+    // #12458: same backup-before-removal contract for an open PR's worktree.
+    let backup_pr =
+        |path: &Path, pr: u32| backup_open_worktree(repo_root, path, &format!("pr-{pr}"));
     let confirm_pr = |n: u32| pass.confirm_pull(n).keep_reason();
-    let pr_report =
-        reap_pr_worktrees_confirmed(repo_root, &opts, &pr_probes, &pr_remover, &confirm_pr);
+    let pr_report = reap_pr_worktrees_confirmed(
+        repo_root,
+        &opts,
+        &pr_probes,
+        &backup_pr,
+        &pr_remover,
+        &confirm_pr,
+    );
     log_pr_report(repo_root, &pr_report);
 
     report.free_gb = crate::disk_headroom::worktree_root_free_gb(repo_root);
@@ -822,6 +908,68 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
     report
 }
 
+/// The production `backup` closure body for both passes (#12458): push the
+/// open item's worktree to a remote backup ref, verify the remote holds it,
+/// and write the ref to the removal ledger (#5950) under the same path the
+/// removal that follows will be recorded against. `Err` keeps the worktree.
+fn backup_open_worktree(
+    repo_root: &Path,
+    path: &Path,
+    item: &str,
+) -> Result<open_backup::BackupRecord, String> {
+    let record = open_backup::backup_to_remote(repo_root, path, item, Utc::now())?;
+    crate::worktree_ops::removal_log::record(
+        repo_root,
+        "worktree_reaper",
+        path,
+        record.branch.as_deref(),
+        &format!("idle-open backup pushed before removal: {}", record.describe()),
+    );
+    Ok(record)
+}
+
+/// Export one removal pass as a `reaper.pass` span (#12461).
+fn publish_reap(repo_root: &Path, report: &ReapReport, class: &str) {
+    use crate::observability::ops::reaper;
+    reaper::publish(
+        repo_root,
+        &reaper::Pass {
+            class,
+            phase: reaper::PHASE_REAP,
+            scanned: report.scanned,
+            removed: report.removed.len(),
+            failed: report.failed.len(),
+            preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
+            bytes: report.bytes_removed,
+            backed_up: report.backed_up.len(),
+            backup_refs: report
+                .backed_up
+                .iter()
+                .map(|(_, record)| record.ref_name.as_str())
+                .collect(),
+        },
+    );
+}
+
+/// Export one artifact-reclaim pass as a `reaper.pass` span (#12461).
+fn publish_reclaim(repo_root: &Path, report: &ReclaimReport, class: &str) {
+    use crate::observability::ops::reaper;
+    reaper::publish(
+        repo_root,
+        &reaper::Pass {
+            class,
+            phase: reaper::PHASE_RECLAIM,
+            scanned: report.scanned,
+            removed: report.removed.len(),
+            failed: report.failed.len(),
+            preserved: report.skipped.iter().map(|(_, why)| why.as_str()).collect(),
+            bytes: report.bytes_freed(),
+            backed_up: 0,
+            backup_refs: Vec::new(),
+        },
+    );
+}
+
 /// Log a `pr-<N>` reap pass's outcome — the PR counterpart of [`log_report`].
 /// Deliberately does not repeat the disk-headroom warning: [`reap_repo`] runs
 /// this pass and the issue-keyed pass on the same tick, and the disk probe is
@@ -836,6 +984,7 @@ pub fn reap_repo(repo_root: &Path, config: &WorktreeReaperConfig) -> ReapReport 
 /// exactly the property the removal ledger exists to guarantee. The per-PR
 /// *reasons* stay at debug, where the volume is.
 pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
+    publish_reap(repo_root, report, "pr");
     let preserved: Vec<u32> = report.skipped.iter().map(|(pr, _)| *pr).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
         log::info!(
@@ -879,6 +1028,7 @@ pub fn log_pr_report(repo_root: &Path, report: &ReapReport) {
 /// per repo) buys back exactly that: which issues the reaper looked at, and
 /// which it kept. The per-issue *reasons* stay at debug, where the volume is.
 pub fn log_report(repo_root: &Path, report: &ReapReport, warn_below_gb: u64) {
+    publish_reap(repo_root, report, "issue");
     let preserved: Vec<u32> = report.skipped.iter().map(|(issue, _)| *issue).collect();
     if report.removed.is_empty() && report.failed.is_empty() {
         log::info!(
@@ -980,13 +1130,13 @@ pub fn spawn_multi_worktree_reaper_task(
                 })
                 .effective_roots(&fallback_root);
 
-            for root in roots {
+            for root in roots.clone() {
                 // Orphaned *process* trees first (#5110): a runaway driver
                 // inside an issue worktree pins the worktree's "active
                 // process(es) using worktree" gate, so reaping the processes
                 // before the directory pass is also what lets the directory
                 // pass make progress on the same tick.
-                reap_orphan_processes_for(&root).await;
+                crate::agent_residue_reaper::reap_orphan_processes_for(&root).await;
 
                 // Primary-checkout reap (#5268): answers a different question
                 // about the SAME registered root ("is the primary checkout's
@@ -1019,39 +1169,11 @@ pub fn spawn_multi_worktree_reaper_task(
                     ),
                 }
             }
+            // Host-wide agent residue (#10802): scopes and deleted or
+            // deregistered worktrees, once per tick.
+            crate::agent_residue_reaper::tick(roots).await;
         }
     })
-}
-
-/// Run one [`crate::orphan_process_reaper`] pass for `root` on the blocking
-/// pool, gated by that repo's own `autonomous.processReaper.enabled`.
-///
-/// Kept beside the directory reaper (rather than as its own daemon loop)
-/// because the two answer the same question about the same worktrees — "does
-/// anything still own issue-N's worktree?" — and sharing a tick keeps them from
-/// racing each other's `/proc` and forge probes.
-async fn reap_orphan_processes_for(root: &Path) {
-    let config = crate::orphan_process_reaper::read_config(root);
-    if !crate::orphan_process_reaper::resolve_enabled(&config) {
-        log::debug!(
-            "orphan_process_reaper: {} disabled (autonomous.processReaper.enabled=false \
-             or LOOM_ORPHAN_PROCESS_REAPER unset-falsy) — skipping",
-            root.display()
-        );
-        return;
-    }
-    let root_for_task = root.to_path_buf();
-    let joined = tokio::task::spawn_blocking(move || {
-        crate::orphan_process_reaper::reap_repo_processes(&root_for_task, &config)
-    })
-    .await;
-    match joined {
-        Ok(report) => crate::orphan_process_reaper::log_report(root, &report),
-        Err(e) => log::error!(
-            "orphan_process_reaper: pass for {} panicked ({e}); continuing to the next repo",
-            root.display()
-        ),
-    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1192,9 @@ mod tests {
     // sibling file (`worktree_reaper/tests/liveness.rs`) because this file is
     // at its file-size ratchet baseline; see `.loom/docs/file-size-policy.md`.
     mod liveness;
+
+    // #12458's idle-open-item cases live in a sibling file for the same reason.
+    mod idle_open;
 
     // ===================================================================
     // Test fixtures
@@ -1107,6 +1232,7 @@ mod tests {
         tmp
     }
 
+    #[derive(Clone, Debug)]
     struct ProbeSpec {
         active: HashSet<u32>,
         issue_state: String,
@@ -1133,6 +1259,17 @@ mod tests {
         /// stash push`, which must preserve the worktree rather than remove
         /// it.
         quarantine_ok: bool,
+        /// Whether the scripted `idle_for` probe reports the worktree idle for
+        /// the whole open-item period (issue #12458). Default `false`.
+        idle: bool,
+        /// Whether the issue-keyed `unsaved_work` probe (tracked changes or
+        /// untracked user files) reports anything at risk (issue #12458).
+        unsaved: bool,
+        /// Whether the scripted remote-backup closure (issue #12458) reports a
+        /// verified push. `true` (the default) simulates a backup the remote
+        /// confirmed; `false` simulates a rejected / offline push, which must
+        /// preserve the worktree.
+        backup_ok: bool,
     }
 
     impl Default for ProbeSpec {
@@ -1151,7 +1288,22 @@ mod tests {
                 branch_reachable: true,
                 is_registered: true,
                 quarantine_ok: true,
+                idle: false,
+                unsaved: false,
+                backup_ok: true,
             }
+        }
+    }
+
+    /// The scripted remote-backup record `run_pass` / `run_pr_pass` hand back
+    /// for a successful backup (issue #12458).
+    fn scripted_backup(item: &str) -> open_backup::BackupRecord {
+        open_backup::BackupRecord {
+            remote: "origin".to_string(),
+            ref_name: format!("refs/loom/backup/{item}/feature/{item}/20261020T000000Z"),
+            sha: "deadbeefcafe".to_string(),
+            head: "deadbeefcafe".to_string(),
+            branch: Some(format!("feature/{item}")),
         }
     }
 
@@ -1210,6 +1362,8 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1225,7 +1379,15 @@ mod tests {
             true
         };
 
-        let report = reap_worktrees(repo, opts, &probes, &quarantine, &remover);
+        let backup = |_: &Path, issue: u32| {
+            if spec.backup_ok {
+                Ok(scripted_backup(&format!("issue-{issue}")))
+            } else {
+                Err("scripted push rejection".to_string())
+            }
+        };
+
+        let report = reap_worktrees(repo, opts, &probes, &quarantine, &backup, &remover);
         let removed = removed.lock().unwrap().clone();
         let quarantined = quarantined.lock().unwrap().clone();
         (report, removed, quarantined)
@@ -1258,6 +1420,7 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1267,7 +1430,15 @@ mod tests {
             true
         };
 
-        let report = reap_pr_worktrees(repo, opts, &probes, &remover);
+        let backup = |_: &Path, pr: u32| {
+            if spec.backup_ok {
+                Ok(scripted_backup(&format!("pr-{pr}")))
+            } else {
+                Err("scripted push rejection".to_string())
+            }
+        };
+
+        let report = reap_pr_worktrees(repo, opts, &probes, &backup, &remover);
         let removed = removed.lock().unwrap().clone();
         (report, removed)
     }
@@ -1307,6 +1478,8 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -1320,11 +1493,24 @@ mod tests {
     /// Populate `issue-<N>`'s worktree with a `target/` and `node_modules/`
     /// directory plus an untouchable `Cargo.lock` file, so tests can assert
     /// on what a reclaim pass did and did not remove.
+    /// Make `wt` a git repo: the fixed-name reclaim path asks git whether an
+    /// artifact directory holds tracked files, and keeps it when git cannot say.
+    fn git_init(wt: &Path) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
     fn populate_build_artifacts(repo: &Path, issue: u32) {
         let wt = repo.join(".loom/worktrees").join(format!("issue-{issue}"));
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     // ===================================================================
@@ -1342,6 +1528,34 @@ mod tests {
         assert_eq!(report.removed, vec![100, 101]);
         assert!(report.failed.is_empty());
         assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_pass_over_a_fixture_repo_exports_one_reaper_span_with_its_counts() {
+        // #12461: issue-100 is removed (2 KiB held), issue-101 is unmanaged and
+        // preserved. The log seam exports the pass; the span's counts match.
+        let repo = make_repo(&[(100, true), (101, false)]);
+        fs::write(repo.path().join(".loom/worktrees/issue-100/blob"), vec![0u8; 2048]).unwrap();
+        let ((report, ()), captured) = crate::observability::ops::capture::capture(|| {
+            let (report, _) = run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+            log_report(repo.path(), &report, 0);
+            (report, ())
+        });
+        assert_eq!(report.removed, vec![100]);
+        assert_eq!(captured.spans.len(), 1);
+        let span = &captured.spans[0];
+        assert_eq!(span.name.as_str(), "reaper.pass");
+        let a = &span.attributes;
+        assert_eq!(a["loom.reaper.class"], "issue");
+        assert_eq!(a["loom.reaper.phase"], "reap");
+        assert_eq!(a["loom.reaper.scanned"], "2");
+        assert_eq!(a["loom.reaper.removed"], "1");
+        assert_eq!(a["loom.reaper.failed"], "0");
+        assert_eq!(a["loom.reaper.preserved"], "1");
+        assert_eq!(a["loom.reaper.preserved.unmanaged"], "1");
+        assert!(a["loom.reaper.bytes"].parse::<u64>().unwrap() >= 2048);
+        assert!(a.contains_key("loom.daemon.revision"));
     }
 
     #[test]
@@ -1719,9 +1933,18 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            unsaved_work: &|_: &Path| spec.unsaved,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
-        let report = reap_worktrees(repo.path(), &opts, &probes, &|_, _| None, &|_, _| false);
+        let report = reap_worktrees(
+            repo.path(),
+            &opts,
+            &probes,
+            &|_, _| None,
+            &|_, _| Err("no backup route in this test".to_string()),
+            &|_, _| false,
+        );
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![500]);
     }
@@ -2036,9 +2259,16 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
-        let report = reap_pr_worktrees(repo.path(), &opts, &probes, &|_, _| false);
+        let report = reap_pr_worktrees(
+            repo.path(),
+            &opts,
+            &probes,
+            &|_, _| Err("no backup route in this test".to_string()),
+            &|_, _| false,
+        );
         assert!(report.removed.is_empty());
         assert_eq!(report.failed, vec![5408]);
     }
@@ -2064,6 +2294,8 @@ mod tests {
                 removed: vec![5312],
                 failed: vec![5349],
                 skipped: vec![(5350, "PR still open".to_string())],
+                backed_up: Vec::new(),
+                bytes_removed: 0,
                 free_gb: None,
             },
         );
@@ -2098,6 +2330,7 @@ mod tests {
             pr_status: &pr_status,
             branch_reachable_from_remotes: &branch_reachable,
             uncommitted: &uncommitted,
+            idle_for: &|_: &Path, _: i64| spec.idle,
             now: Utc::now(),
         };
 
@@ -2111,6 +2344,7 @@ mod tests {
         fs::create_dir_all(wt.join("target/debug")).unwrap();
         fs::create_dir_all(wt.join("node_modules/.bin")).unwrap();
         fs::write(wt.join("Cargo.lock"), b"lockfile").unwrap();
+        git_init(&wt);
     }
 
     #[test]
@@ -2201,6 +2435,7 @@ mod tests {
             let wt = repo.path().join(".loom/worktrees").join(name);
             fs::create_dir_all(wt.join("target")).unwrap();
             fs::write(wt.join(".loom-managed"), "").unwrap();
+            git_init(&wt);
         }
         let spec = ProbeSpec {
             pr_status: PrStatus::Open,
@@ -2528,6 +2763,7 @@ mod tests {
                 interval_secs: Some(120),
                 grace_period_secs: Some(30),
                 disk_warn_free_gb: Some(5),
+                idle_open_secs: None,
             }
         );
     }
@@ -2686,9 +2922,11 @@ mod tests {
             removed: vec![1, 2],
             failed: vec![3],
             skipped: vec![(4, "PR still open".to_string())],
+            backed_up: Vec::new(),
+            bytes_removed: 0,
             free_gb: Some(10),
         };
-        assert_eq!(report.summary(), "scanned=5 removed=2 failed=1 skipped=1");
+        assert_eq!(report.summary(), "scanned=5 removed=2 failed=1 skipped=1 backed_up=0");
     }
 
     #[test]

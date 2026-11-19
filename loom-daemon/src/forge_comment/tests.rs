@@ -325,3 +325,44 @@ impl Drop for DefaultDashboardEnv {
         }
     }
 }
+
+// ── #14286: `--body @path` must not post the literal string ──────────────
+
+#[test]
+fn lone_at_token_bodies_are_refused_before_posting() {
+    for body in ["@path", "@-", "@/tmp/x", "  @path\n"] {
+        let err = reject_lone_at_body(body).expect_err(body).to_string();
+        assert!(err.contains("--body-file"), "{body:?}: {err}");
+    }
+}
+
+#[test]
+fn cli_entrypoint_refuses_a_lone_at_body_without_posting() {
+    // The refusal fires before repo resolution and the POST, so this needs no
+    // `gh` and no network: an `Err` naming `--body-file` proves it stopped early.
+    let err = cli_entrypoint(CommentArgs {
+        number: Some(1),
+        repo: Some("o/r".to_string()),
+        body: Some("@path".to_string()),
+        body_file: None,
+        is_pr: false,
+        patch_created: None,
+    })
+    .expect_err("a lone @-token body must be refused")
+    .to_string();
+    assert!(err.contains("refusing to post") && err.contains("--body-file"), "{err}");
+}
+
+#[test]
+fn short_and_mention_bodies_still_pass() {
+    for body in [
+        "LGTM",
+        "ok",
+        "-",
+        "",
+        "@alice thanks for the fix",
+        "see @path here",
+    ] {
+        assert!(reject_lone_at_body(body).is_ok(), "{body:?} must not be refused");
+    }
+}

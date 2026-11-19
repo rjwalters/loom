@@ -66,6 +66,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                 "held_conflicting": null,
                 "held_oldest_days": null,
                 "operator_only_issues": null,
+                "champion_held": null,
             }),
         );
     }
@@ -80,6 +81,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                 "held_conflicting": null,
                 "held_oldest_days": null,
                 "operator_only_issues": null,
+                "champion_held": null,
             }),
         );
     };
@@ -93,6 +95,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                 "held_conflicting": 0,
                 "held_oldest_days": null,
                 "operator_only_issues": 0,
+                "champion_held": 0,
                 "repos": [],
             }),
         );
@@ -102,6 +105,9 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
     let mut conflicting_total: Option<usize> = None;
     let mut oldest_days: Option<i64> = None;
     let mut issues_total: Option<usize> = None;
+    // Held approvals, `loom:pr` + `loom:blocked` by label (#11905): details only,
+    // so the summary line and every existing key are unchanged.
+    let mut champion_total: Option<usize> = None;
     let mut failed: Vec<String> = Vec::new();
 
     for snap in pipeline {
@@ -112,6 +118,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
             None => repo_failed = true,
         }
         accumulate_observed(&mut conflicting_total, snap.operator_held_conflicting);
+        accumulate_observed(&mut champion_total, snap.champion_held);
         if let Some(days) = snap.operator_held_oldest_days {
             oldest_days = Some(oldest_days.map_or(days, |cur: i64| cur.max(days)));
         }
@@ -160,6 +167,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
             "held_conflicting": conflicting_total,
             "held_oldest_days": oldest_days,
             "operator_only_issues": issues_total,
+            "champion_held": champion_total,
             "repos": pipeline
                 .iter()
                 .map(|s| serde_json::json!({
@@ -168,6 +176,7 @@ pub fn assess_operator_attention(inputs: &HealthInputs) -> HealthSection {
                     "operator_held_conflicting": s.operator_held_conflicting,
                     "operator_held_oldest_days": s.operator_held_oldest_days,
                     "operator_only_issues": s.operator_only_issues,
+                    "champion_held": s.champion_held,
                     "error": s.error,
                 }))
                 .collect::<Vec<_>>(),

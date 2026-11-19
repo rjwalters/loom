@@ -27,11 +27,16 @@
 //! process tree is torn down first ([`tree_kill`], #10955), and timeouts have
 //! a cap of their own, after which the episode runs the gate no more.
 //!
+//! A SIGTERM/SIGINT/SIGHUP to `preflight` itself ([`install_signal_handlers`],
+//! #10839) tears the same tree down and yields [`Verdict::Cancelled`]
+//! (exit 128+signal); nothing is recorded.
+//!
 //! Every run that executes the command emits one `build_gate.run` span
 //! ([`crate::observability::ops::build_gate`], #11690).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +100,10 @@ pub enum Verdict {
         stage: Option<String>,
         tail: String,
     },
+    /// `preflight` itself was sent SIGTERM/SIGINT/SIGHUP while the gate ran.
+    /// The gate tree was torn down; nothing is recorded (no pass, no attempt
+    /// consumed) and the claim is kept.
+    Cancelled { signal: i32 },
 }
 
 impl Verdict {
@@ -106,6 +115,7 @@ impl Verdict {
             Self::Failed { .. } => EXIT_FAILED,
             Self::Unresolved { .. } => EXIT_UNRESOLVED,
             Self::TimedOut { .. } => EXIT_TIMED_OUT,
+            Self::Cancelled { signal } => 128 + signal,
         }
     }
 
@@ -119,6 +129,7 @@ impl Verdict {
             Self::Failed { .. } => "fail",
             Self::Unresolved { .. } => "unresolved",
             Self::TimedOut { .. } => "timeout",
+            Self::Cancelled { .. } => "cancelled",
         }
     }
 
@@ -210,6 +221,36 @@ fn kill_gate_tree(child: &mut std::process::Child) {
     }
 }
 
+/// Signal that asked this process to stop (0 = none). Set only by
+/// [`on_signal`], which is async-signal-safe.
+static SIGNALLED: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn on_signal(sig: libc::c_int) {
+    SIGNALLED.store(sig, Ordering::Relaxed);
+}
+
+/// Catch SIGTERM, SIGINT and SIGHUP so a caller's `timeout`, Ctrl-C or tool
+/// timeout tears the gate tree down instead of orphaning it (#10839: the gate
+/// is in its own session, so the signal never reaches it). Call before
+/// [`run`]; the poll loop in `run_command` notices the flag.
+pub fn install_signal_handlers() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: the handler only stores to a lock-free atomic.
+        if unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) }
+            == libc::SIG_ERR
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
+}
+
+fn signalled() -> Option<i32> {
+    Some(SIGNALLED.load(Ordering::Relaxed)).filter(|s| *s != 0)
+}
+
 /// The last `[build-gate] <stage>` marker in the full gate log — the stage
 /// that was running when the budget ran out (#10860). `WARNING`/`note:` lines
 /// are not stages. `None` for a gate that prints no markers.
@@ -228,10 +269,23 @@ enum RunError {
     Failed(String),
     /// Killed at the budget (#10860).
     TimedOut { stage: Option<String>, tail: String },
+    /// `preflight` was signalled; the tree is already torn down.
+    Cancelled(i32),
 }
 
 /// Run `command` via `sh -c`.
 fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<Vec<String>, RunError> {
+    run_command_with(command, cwd, timeout, signalled)
+}
+
+/// [`run_command`] with an injectable cancellation source (the signal number
+/// once `preflight` has been asked to stop).
+fn run_command_with(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    cancelled: impl Fn() -> Option<i32>,
+) -> Result<Vec<String>, RunError> {
     let log = std::env::temp_dir().join(format!("loom-preflight-{}.log", uuid::Uuid::new_v4()));
     let out = std::fs::File::create(&log)
         .map_err(|e| RunError::Failed(format!("cannot create output file: {e}")))?;
@@ -264,6 +318,12 @@ fn run_command(command: &str, cwd: &Path, timeout: Duration) -> Result<Vec<Strin
                 return Ok(flaky);
             }
             Ok(Some(s)) => break format!("command exited with {s}"),
+            Ok(None) if cancelled().is_some() => {
+                let sig = cancelled().unwrap_or(libc::SIGTERM);
+                kill_gate_tree(&mut child);
+                let _ = std::fs::remove_file(&log);
+                return Err(RunError::Cancelled(sig));
+            }
             Ok(None) if start.elapsed() >= timeout => {
                 kill_gate_tree(&mut child);
                 timed_out = true;
@@ -363,6 +423,7 @@ pub fn run_in_episode(worktree: &Path, episode: &str) -> Verdict {
                 tail,
             }
         }
+        Err(RunError::Cancelled(signal)) => return Verdict::Cancelled { signal },
         Err(RunError::Failed(tail)) => {
             st.failed_attempts += 1;
             st.passed_head = None;
@@ -596,6 +657,36 @@ mod tests {
         assert!(matches!(run_in_episode(d.path(), "e1"), Verdict::TimedOut { .. }));
         std::thread::sleep(Duration::from_millis(3500));
         assert!(!d.path().join("marker").exists(), "descendant outlived the timeout");
+    }
+
+    /// #10839: a signal to `preflight` itself must take the gate tree down,
+    /// including a stage that moved into another session, and record nothing.
+    #[test]
+    fn cancellation_kills_a_descendant_in_another_session() {
+        let cmd = r#"perl -MPOSIX -e 'POSIX::setsid(); sleep 3; open(F,">","marker"); print F "survived"; close F' & wait"#;
+        let d = repo(None);
+        let began = Instant::now();
+        let cancelled = || (began.elapsed() >= Duration::from_millis(600)).then_some(libc::SIGTERM);
+        let r = run_command_with(cmd, d.path(), Duration::from_secs(60), cancelled);
+        assert!(matches!(r, Err(RunError::Cancelled(s)) if s == libc::SIGTERM));
+        assert!(began.elapsed() < Duration::from_secs(1) + tree_kill::TERM_GRACE * 2);
+        std::thread::sleep(Duration::from_millis(3500));
+        assert!(!d.path().join("marker").exists(), "descendant outlived the cancellation");
+    }
+
+    #[test]
+    fn cancelled_verdict_exits_128_plus_signal() {
+        assert_eq!(
+            Verdict::Cancelled {
+                signal: libc::SIGTERM
+            }
+            .exit_code(),
+            143
+        );
+        assert!(!Verdict::Cancelled {
+            signal: libc::SIGINT
+        }
+        .releases_claim());
     }
 
     /// #10955: a gate that passed only on a retry passes, writes a receipt,

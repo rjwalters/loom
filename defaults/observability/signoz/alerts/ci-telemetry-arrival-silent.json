@@ -1,0 +1,35 @@
+{
+  "alert": "CI telemetry arrival silent",
+  "alertType": "LOGS_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "12h0m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.start_timestamp_nano}}) AS start_ns,\n  toInt64({{.end_timestamp_nano}}) AS end_ns,\n  series AS (\n    SELECT fingerprint, any(if(JSONExtractString(labels, 'host.name') != '', JSONExtractString(labels, 'host.name'), JSONExtractString(labels, 'host.id'))) AS host\n    FROM signoz_metrics.time_series_v4\n    WHERE metric_name = 'loom.ci_telemetry.cycles'\n    GROUP BY fingerprint\n  ),\n  pollers AS (\n    SELECT DISTINCT series.host AS host\n    FROM signoz_metrics.samples_v4 AS s\n    INNER JOIN series USING (fingerprint)\n    WHERE s.metric_name = 'loom.ci_telemetry.cycles'\n      AND s.unix_milli >= intDiv(start_ns, 1000000)\n      AND s.unix_milli < intDiv(end_ns, 1000000)\n  ),\n  seen AS (\n    SELECT if(resources_string['host.name'] != '', resources_string['host.name'], resources_string['host.id']) AS host,\n           maxIf(toInt64(observed_timestamp), body = 'ci.run') AS last_run_ns,\n           maxIf(toInt64(timestamp), attributes_string['loom.kind'] = 'host.export') AS last_export_ns\n    FROM signoz_logs.distributed_logs_v2\n    WHERE timestamp >= {{.start_timestamp_nano}}\n      AND timestamp < {{.end_timestamp_nano}}\n    GROUP BY host\n  )\nSELECT toDateTime(intDiv(end_ns, 1000000000)) AS ts,\n       p.host AS host,\n       'arrival_silent' AS state,\n       toFloat64(if(s.last_run_ns = 0, intDiv(end_ns - start_ns, 1000000000), intDiv(end_ns - s.last_run_ns, 1000000000)) - 21600) AS value\nFROM pollers AS p\nINNER JOIN seen AS s ON p.host = s.host\nWHERE s.last_export_ns > 0\n  AND intDiv(end_ns - s.last_export_ns, 1000000000) <= 1800\nORDER BY host",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "critical",
+    "loom_signal": "ci_telemetry_arrival_silent",
+    "state": "arrival_silent"
+  },
+  "annotations": {
+    "summary": "CI telemetry arrival silent",
+    "description": "Poller host {{$labels.host}} has sent no ci.run log that SigNoz observed for {{$value}} s past the 6 h limit, while its host.export is healthy (a host.export log within 30 min). End-to-end check that CI telemetry arrives, whatever the internal cause (export backlog, failing poll, broken pipeline). Only hosts that emitted loom.ci_telemetry.cycles in the 12 h window are judged, so a host with no poller never fires, and a host whose host.export is also silent is left to host-export-silent. A poller host that sent no ci.run in the whole window reports the window length minus 6 h. Issues #12908, #12792."
+  },
+  "disabled": false
+}

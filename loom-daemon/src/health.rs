@@ -28,11 +28,10 @@
 //! | queues | [`crate::pipeline_snapshot`] (`queued`) |
 //! | throughput | [`crate::pipeline_snapshot`] (`merged_24h`, over the requested window) |
 //! | operator_attention | [`crate::pipeline_snapshot`] (`operator_held`, `operator_held_conflicting`, `operator_held_oldest_days`, `operator_only_issues`) — **always [`Verdict::Green`]**, deliberately (Issue #8091, see [`assess_operator_attention`]) |
-//! | peer_coordination | [`crate::types::DaemonStatusReport::safehouse`] (RPC socket reachability) + [`crate::types::DaemonStatusReport::peer_claims`]`.coordination` (published by [`crate::peer_claims::PeerClaimView::evaluate_coordination`], Issue #6157) |
 //! | auto_update | [`crate::types::DaemonStatusReport::auto_update_*`] (the daemon-side rebuild loop's own state, Issue #4055) + [`crate::self_update::check`] (this CLI process's own source-vs-built-commit staleness magnitude, Issue #6261) — unconditional, mirroring `liveness`/`dispatch` (Issue #7584) |
 //! | worktree_reaper | [`crate::types::DaemonStatusReport::stuck_worktree_reclaims`] (published by [`crate::worktree_reaper::stuck_worktree_removals`], Issue #7590) |
 //! | pool_hold | [`crate::types::DaemonStatusReport::pool_exhaustion_holds`] (published by [`crate::work_finder::pool_preflight::active_hold_statuses`], Issues #7708/#7990) — its own bucket, deliberately NOT folded into `tokens` |
-//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_host_id_mismatch`] (published by [`crate::observability::HostIdStatus`]) + [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
+//! | observability *(only when non-green)* | [`crate::types::DaemonStatusReport::observability_export`] (published by [`crate::observability::ExportStatus`], #5083) |
 //!
 //! [`assess`] itself is **pure** — it takes an already-collected
 //! [`HealthInputs`] and returns a [`HealthReport`] — so every verdict rule
@@ -579,6 +578,10 @@ pub struct HealthInputs {
     /// The last fleet-sync pass snapshot ([`crate::fleet_sync::probe_status`]),
     /// rendered by [`fleet_identity_section::assess_fleet_identity`] (#11740).
     pub fleet_sync: Option<crate::fleet_sync::FleetSyncStatus>,
+    /// Each managed root's `.loom/resync-ignore` pins, `(root, labels)`
+    /// ([`crate::resync_pin::read_pins`]), for
+    /// [`review_role_pins_section::assess_review_role_pins`] (#11970).
+    pub resync_pins: Vec<(String, Vec<String>)>,
 }
 
 // ============================================================================
@@ -1182,7 +1185,9 @@ pub enum MissingTick {
 /// The grace window (seconds) a missing tick is tolerated for after a daemon
 /// (re)start: [`WORK_FINDER_TICK_GRACE_INTERVALS`] × the daemon's own resolved
 /// tick interval, falling back to the default cadence for a pre-#4824 daemon
-/// that does not report one.
+/// that does not report one. Plus the daemon's startup jitter (#12073): the
+/// first tick waits that per-host delay, so the window runs from the gate's
+/// opening, not from the process start.
 #[must_use]
 pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
     status
@@ -1190,6 +1195,7 @@ pub fn work_finder_grace_secs(status: &DaemonStatusReport) -> u64 {
         .filter(|s| *s > 0)
         .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS)
         .saturating_mul(WORK_FINDER_TICK_GRACE_INTERVALS)
+        .saturating_add(status.startup_jitter_delay_secs.unwrap_or(0))
 }
 
 /// Classify a missing work-finder tick (#4824), in strict precedence order:
@@ -1243,40 +1249,7 @@ pub fn classify_missing_tick(inputs: &HealthInputs, status: &DaemonStatusReport)
     MissingTick::Dead
 }
 
-/// Whether `disk_headroom` is the **strictly** binding term of the dynamic
-/// concurrency cap `min(disk_headroom, ram_headroom, configured_max)` (#5177;
-/// token axis removed / ram_headroom added in #5270 — see
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`]).
-///
-/// True when disk headroom is at most RAM headroom (a tie resolves to disk,
-/// matching [`crate::calibrate::binding_term`]'s tie-break order) AND
-/// strictly smaller than the operator's configured admission ceiling — i.e.
-/// the scratch volume is throttling dispatch below what `configured_max`
-/// would otherwise allow. A tie **with the ceiling** is deliberately NOT
-/// flagged: that ceiling is the operator's own deliberate choice, not a disk
-/// fault. Mirrors the input shape of
-/// [`crate::work_finder::resolve_dynamic_max_concurrent`] so the two agree on
-/// what "binding" means.
-#[must_use]
-pub fn disk_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    disk_headroom <= ram_headroom && disk_headroom < configured_max
-}
-
-/// Whether `ram_headroom` is the **uniquely** binding term of the dynamic
-/// concurrency cap (#5270) — the RAM-headroom mirror of [`disk_binds_cap`].
-///
-/// True only when RAM headroom is strictly smaller than **both** the disk
-/// headroom and the operator's configured admission ceiling. A tie with disk
-/// resolves to [`disk_binds_cap`] instead (mirroring
-/// [`crate::calibrate::binding_term`]'s tie-break order), keeping the two
-/// predicates mutually exclusive so `assess_dispatch` never double-reports
-/// the same throttling event under both names.
-#[must_use]
-pub fn ram_binds_cap(disk_headroom: usize, ram_headroom: usize, configured_max: usize) -> bool {
-    ram_headroom < disk_headroom && ram_headroom < configured_max
-}
-
-/// Assess the dispatch section: in-flight occupancy against the dynamic cap,
+/// Assess the dispatch section: in-flight occupancy against the cap,
 /// plus the last work-finder tick's dispatch/skip-reason summary.
 #[must_use]
 pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
@@ -1297,9 +1270,6 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
     if status.draining {
         degraded.push("DRAINING".to_string());
     }
-    if status.host_breaker.as_ref().is_some_and(|b| b.suppressed) {
-        degraded.push("host-distress breaker TRIPPED".to_string());
-    }
     if status
         .rate_limit_breaker
         .as_ref()
@@ -1314,50 +1284,6 @@ pub fn assess_dispatch(inputs: &HealthInputs) -> HealthSection {
                 .clone()
                 .unwrap_or_else(|| "claude-wrapper preflight tripwire active".to_string()),
         );
-    }
-    // #5177: a small-disk host silently decays as merged worktrees leak their
-    // multi-GB target/ dirs, until disk headroom becomes the binding term of the
-    // cap and throttles the host to a fraction of its configured capacity. That
-    // used to present as a green daemon dispatching at, say, cap 2 — a fault an
-    // operator had to notice in the `min(...)` breakdown. Name it as degraded.
-    if disk_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
-        degraded.push(format!(
-            "disk headroom is throttling dispatch (cap {} bound by disk headroom {} — free scratch \
-             disk; e.g. `loom-daemon clean --aggressive` / `--deep`)",
-            cap, status.disk_headroom
-        ));
-    }
-    // #5270: the RAM-headroom mirror of the #5177 disk case above — the second
-    // "dumb mode" machine-headroom axis, so a critically-low-memory host is
-    // named as degraded the same way a critically-low-disk host already is.
-    if ram_binds_cap(status.disk_headroom, status.ram_headroom, status.configured_max) {
-        degraded.push(format!(
-            "RAM headroom is throttling dispatch (cap {} bound by ram headroom {} — free memory \
-             or lower LOOM_PER_WORKTREE_RAM_GB, #5270)",
-            cap, status.ram_headroom
-        ));
-    }
-    // #5270: name the machine axis (max/disk/RAM/CPU) currently HOLDING new
-    // admissions outright — the CPU saturation admission brake is a
-    // point-in-time gate outside the `min(...)` cap formula (see
-    // `crate::admission_brake`'s module docs for why), so it cannot be named
-    // by `disk_binds_cap` / `ram_binds_cap` above; it is checked independently
-    // here, mirroring the host-distress breaker check above it.
-    if status.admission_brake.as_ref().is_some_and(|b| b.held) {
-        let load = status
-            .admission_brake
-            .as_ref()
-            .and_then(|b| b.load_per_core)
-            .map_or_else(|| "n/a".to_string(), |l| format!("{l:.2}"));
-        let threshold = status
-            .admission_brake
-            .as_ref()
-            .map_or(0.0, |b| b.load_per_core_threshold);
-        degraded.push(format!(
-            "CPU saturation admission brake HOLDING new admissions (load {load}/core \u{2265} \
-             {threshold:.2} — in-flight sweeps are untouched; releases automatically once load \
-             drops, #5270/#4903)"
-        ));
     }
 
     // #4824: why the tick is missing, when it is. `None` whenever a tick was
@@ -2296,166 +2222,6 @@ pub mod operator_attention;
 pub use operator_attention::assess_operator_attention;
 
 // ============================================================================
-// Peer-coordination section (Issue #6157)
-// ============================================================================
-
-/// Assess the peer-coordination section: whether this host's safehouse RPC
-/// socket is reachable, and whether the peer-claim RECEIVE path looks
-/// alive — DEGRADED when either invariant from the 2026-08-13 incident
-/// fires:
-///
-/// 1. The socket itself is unreachable/rejected
-///    ([`crate::types::SafehouseStatus::state`]) — coordination cannot even
-///    be attempted.
-/// 2. This host has been advertising sustained peer claims with no receive
-///    in return
-///    ([`crate::peer_claims::PeerClaimView::evaluate_coordination`], surfaced
-///    via [`crate::types::PeerClaimStatus::coordination`]).
-///
-/// This section is diagnostic-only as of Epic #6165 Phase 4 (#6317):
-/// [`crate::claim_reconciliation::forge::reconcile_workspace`] used to
-/// refuse stale-claim reclamation while DEGRADED (Issue #6157), on the
-/// theory that a one-way channel's silence could not be trusted as evidence
-/// of anything. That gate has been removed — the lease record (Epic #6165
-/// Phase 2, Issue #6286) is the sole fleet-scoped reclamation gate now, and
-/// it needs no receipt from this channel at all — so a DEGRADED verdict
-/// here reports a real transport problem worth an operator's attention, but
-/// no longer changes reclamation behavior.
-///
-/// Green (not Unknown) when safehouse is not configured at all — there is
-/// nothing broken about a host that was never asked to coordinate with
-/// peers, and reporting `Unknown` there would make every non-fleet
-/// single-host repo look perpetually "could not determine".
-#[must_use]
-pub fn assess_peer_coordination(inputs: &HealthInputs) -> HealthSection {
-    let Some(status) = &inputs.status else {
-        return unknown_section("peer_coordination", &no_status_reason(inputs));
-    };
-
-    if let Some(safehouse) = &status.safehouse {
-        if matches!(safehouse.state.as_str(), "unreachable" | "send_rejected") {
-            let detail = safehouse
-                .reason
-                .clone()
-                .or_else(|| safehouse.socket.as_ref().map(|p| p.display().to_string()));
-            return HealthSection::new(
-                "peer_coordination",
-                Verdict::Degraded,
-                format!(
-                    "safehouse RPC socket {}{} — peer-coordination liveness is unknowable \
-                     (#6157)",
-                    safehouse.state,
-                    detail
-                        .as_ref()
-                        .map(|d| format!(": {d}"))
-                        .unwrap_or_default()
-                ),
-                serde_json::json!({
-                    "safehouse_state": safehouse.state,
-                    "detail": detail,
-                }),
-            );
-        }
-    }
-
-    let Some(peer_claims) = &status.peer_claims else {
-        return HealthSection::new(
-            "peer_coordination",
-            Verdict::Green,
-            "safehouse not configured — nothing to report".to_string(),
-            serde_json::json!({ "configured": false }),
-        );
-    };
-    let c = &peer_claims.coordination;
-    // Issue #6242: the resolved claims-room identity, so comparing two
-    // hosts' `health`/`status` output makes a `rooms.claims` /
-    // `LOOM_SAFEHOUSE_ROOM_CLAIMS` mismatch a one-line diff. Visibility
-    // only — no cross-host comparison is performed here.
-    let room = peer_claims.claims_room.as_deref().unwrap_or("none");
-    // Issue #6243: the repo-sharding verification AC ("zero cross-host claims
-    // on the SAME issue over a 24h window") is read by an operator off this
-    // section. Append it to the human-readable summary only when it is
-    // NON-zero, so the healthy/default rendering — and every pre-#6243
-    // assertion on that wording — is byte-for-byte unchanged, while a fleet
-    // that IS colliding says so without needing `--json`.
-    let collisions_note = if peer_claims.same_issue_collisions > 0 {
-        format!(
-            ", {} same-issue cross-host claim(s) in 24h (#6243)",
-            peer_claims.same_issue_collisions
-        )
-    } else {
-        String::new()
-    };
-    // Issue #9294: the verdict's own `reason`, appended so this section says WHY
-    // it is degraded. Without it, "N received / M advertised" reads identically
-    // whether peers are idle or the homeserver is refusing every single send —
-    // the measured 2026-09-23 outage was the latter and presented as the former.
-    // Appended (not interpolated) so every pre-#9294 assertion on this sentence's
-    // existing prefix is unchanged.
-    let reason_note = c
-        .reason
-        .as_deref()
-        .map_or_else(String::new, |r| format!(" — {r}"));
-    if c.degraded {
-        return HealthSection::new(
-            "peer_coordination",
-            Verdict::Degraded,
-            format!(
-                "peer-claim receive path DEGRADED ({} received / {} advertised, {} rejected, \
-                 room: {room}), degraded for {} — {}/{} sustained receive(s) toward recovery \
-                 (#6157){collisions_note}{reason_note}",
-                peer_claims.received,
-                peer_claims.advertised,
-                peer_claims.advertise_rejected,
-                c.degraded_for_secs
-                    .map(|s| format_age(i64::try_from(s).unwrap_or(i64::MAX)))
-                    .unwrap_or_else(|| "?".to_string()),
-                c.consecutive_receives_toward_recovery,
-                c.recovery_threshold,
-            ),
-            serde_json::json!({
-                "advertised": peer_claims.advertised,
-                "advertise_rejected": peer_claims.advertise_rejected,
-                "reason": c.reason,
-                "received": peer_claims.received,
-                "claims_room": peer_claims.claims_room,
-                "degraded_for_secs": c.degraded_for_secs,
-                "consecutive_receives_toward_recovery": c.consecutive_receives_toward_recovery,
-                "recovery_threshold": c.recovery_threshold,
-                // Issue #6243: surfaced here as a plain counter — this
-                // section's DEGRADED/Green verdict above is #6157's mesh-
-                // liveness question ("is the receive path alive"), a
-                // different question from "did repo-sharding actually keep
-                // cross-host claims on the same issue rare" this counter
-                // answers. Not folded into the verdict (that is #6242's
-                // scope, tracked separately) — visibility only.
-                "same_issue_collisions_24h": peer_claims.same_issue_collisions,
-            }),
-        );
-    }
-    HealthSection::new(
-        "peer_coordination",
-        Verdict::Green,
-        format!(
-            "peer-claim receive path healthy ({} received / {} advertised, room: {room})\
-             {collisions_note}",
-            peer_claims.received, peer_claims.advertised
-        ),
-        serde_json::json!({
-            "advertised": peer_claims.advertised,
-            // Issue #9294: surfaced on the healthy path too, so a fleet script
-            // diffing two hosts sees the publish-side counter without having to
-            // wait for a degraded verdict to expose it.
-            "advertise_rejected": peer_claims.advertise_rejected,
-            "received": peer_claims.received,
-            "claims_room": peer_claims.claims_room,
-            // Issue #6243: see the DEGRADED branch's comment above.
-            "same_issue_collisions_24h": peer_claims.same_issue_collisions,
-        }),
-    )
-}
-
-// ============================================================================
 // Stale-untracked-sweep section (Issue #7529)
 // ============================================================================
 
@@ -2554,7 +2320,11 @@ mod auto_update_stale_repo;
 ///   [`Verdict::Degraded`] when
 ///   [`auto_update_stale_repo::stalled_summary`] fires (#8513) — a distinct
 ///   hard finding from the staleness checks above, since it can fire even
-///   while the SOURCE checkout is perfectly current.
+///   while the SOURCE checkout is perfectly current. Also
+///   [`Verdict::Degraded`] (#9736) when the loop has no recent successful
+///   release check, or a newer release stays unapplied past its deadline
+///   ([`crate::auto_update::freshness`]); neither needs a source checkout.
+///   A disabled loop stays Green: it returns before any of this.
 #[must_use]
 pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
     let Some(status) = &inputs.status else {
@@ -2594,6 +2364,10 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
         // place as everything else this section already reports.
         "stale_repo_ticks": status.auto_update_stale_repo_ticks,
         "stale_repo": status.auto_update_stale_repo,
+        // Issue #9736: the daemon-authoritative convergence view — the
+        // RUNNING daemon's version (not this CLI's `installed_version`),
+        // last successful check, pending age, next attempt, blocking reason.
+        "freshness": status.auto_update_freshness,
     });
 
     if !status.auto_update_enabled {
@@ -2622,6 +2396,13 @@ pub fn assess_auto_update(inputs: &HealthInputs) -> HealthSection {
     // those compare against the SOURCE checkout's HEAD, which says nothing
     // about a release-artifact-path wrong-repo resolution.
     if let Some(summary) = auto_update_stale_repo::stalled_summary(status) {
+        return HealthSection::new("auto_update", Verdict::Degraded, summary, detail);
+    }
+
+    // Issue #9736: an enabled loop that has not completed a check in too long,
+    // or has left a newer release unapplied past its deadline. Needs no git or
+    // source checkout, which is the blind spot the checks below leave.
+    if let Some(summary) = crate::auto_update::freshness::finding_for(status, inputs.at) {
         return HealthSection::new("auto_update", Verdict::Degraded, summary, detail);
     }
 
@@ -2727,6 +2508,15 @@ mod fleet_identity_section;
 
 pub use fleet_identity_section::assess_fleet_identity;
 
+/// The `review_role_pins` section (#11970): a warning (Green, exit code
+/// unchanged) when a managed repo pins a Champion, Judge or Doctor prompt in
+/// `.loom/resync-ignore`.
+mod review_role_pins_section;
+
+pub use review_role_pins_section::{
+    assess_review_role_pins, is_review_role_pin, pinned_review_roles,
+};
+
 // ============================================================================
 // Codex accounts (Issue #8407) — conditional
 // ============================================================================
@@ -2786,7 +2576,6 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
         assess_queues(inputs),
         assess_throughput(inputs),
         assess_operator_attention(inputs),
-        assess_peer_coordination(inputs),
         assess_stale_sweeps(inputs),
         assess_auto_update(inputs),
         assess_worktree_reaper(inputs),
@@ -2801,6 +2590,7 @@ pub fn assess(inputs: &HealthInputs) -> HealthReport {
     sections.extend(assess_tmpfs_visibility(inputs));
     sections.extend(assess_ci_telemetry(inputs));
     sections.extend(assess_fleet_identity(inputs));
+    sections.extend(assess_review_role_pins(inputs));
     let overall = if dead {
         Verdict::Dead
     } else if sections.iter().all(|s| s.verdict.is_green()) {
@@ -2921,7 +2711,7 @@ const WORK_FINDER_LOG_MARKER: &str = "work_finder:";
 
 /// How much of the daemon log's tail to read for the corroborating probe.
 ///
-/// The log rotates at 10 MiB and the work finder writes at least one line per
+/// The log rolls daily (#13917) and the work finder writes at least one line per
 /// tick, so a quarter-megabyte tail always spans far more than the grace window
 /// this signal is compared against — while keeping the probe a single bounded
 /// read rather than a scan of the whole file.
@@ -2966,20 +2756,16 @@ pub fn work_finder_log_tick_age_secs(
 
 /// Resolve the daemon log path the way the daemon itself does: `LOOM_DAEMON_LOG`
 /// (full override) when set, else `<loom dir>/daemon.log` where the loom dir is
-/// `LOOM_SOCKET_PATH`'s parent (test isolation) or `$HOME/.loom`.
-///
-/// Mirrors the binary-side `daemon_service::resolve_log_path` /
-/// `resolve_loom_dir` pair (#4010), which is private to the binary crate and so
-/// unreachable from this library module and from `cli::health`.
+/// resolved by the shared [`crate::autonomy_marker::resolve_loom_dir`] (#13833):
+/// `LOOM_SOCKET_PATH`'s parent (test isolation) or `$HOME/.loom`. The
+/// `LOOM_DAEMON_LOG` tier itself mirrors the binary-side
+/// `daemon_service::resolve_log_path` (#4010).
 #[must_use]
 pub fn resolve_daemon_log_path() -> Option<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_DAEMON_LOG") {
         return Some(PathBuf::from(path));
     }
-    let loom_dir = match std::env::var("LOOM_SOCKET_PATH") {
-        Ok(socket) => PathBuf::from(socket).parent()?.to_path_buf(),
-        Err(_) => dirs::home_dir()?.join(".loom"),
-    };
+    let loom_dir = crate::autonomy_marker::resolve_loom_dir()?;
     Some(loom_dir.join("daemon.log"))
 }
 
@@ -2991,10 +2777,23 @@ pub fn resolve_daemon_log_path() -> Option<PathBuf> {
 /// treats as "no corroboration either way".
 #[must_use]
 pub fn probe_work_finder_log_tick_age() -> Option<u64> {
+    let path = resolve_daemon_log_path()?;
+    let now = chrono::Utc::now().naive_utc();
+    // Right after a daily roll (#13917) the live file is empty or short, so
+    // fall back to the newest `daemon.log.YYYY-MM-DD[.N]` day file.
+    read_log_tail(&path)
+        .and_then(|t| work_finder_log_tick_age_secs(&t, now))
+        .or_else(|| {
+            let day_file = newest_day_file(&path)?;
+            work_finder_log_tick_age_secs(&read_log_tail(&day_file)?, now)
+        })
+}
+
+/// Read the last [`DAEMON_LOG_TAIL_BYTES`] of `path` (lossy UTF-8).
+fn read_log_tail(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let path = resolve_daemon_log_path()?;
-    let mut file = std::fs::File::open(&path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     if len > DAEMON_LOG_TAIL_BYTES {
         file.seek(SeekFrom::Start(len - DAEMON_LOG_TAIL_BYTES))
@@ -3004,7 +2803,29 @@ pub fn probe_work_finder_log_tick_age() -> Option<u64> {
     file.take(DAEMON_LOG_TAIL_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
-    work_finder_log_tick_age_secs(&String::from_utf8_lossy(&buf), chrono::Utc::now().naive_utc())
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Newest `<live>.YYYY-MM-DD[.N]` day file next to `live` (date, then `.N`).
+#[must_use]
+pub fn newest_day_file(live: &std::path::Path) -> Option<PathBuf> {
+    let dir = live.parent()?;
+    let base = live.file_name()?.to_str()?;
+    let key = |name: &str| -> Option<(String, u32)> {
+        let rest = name.strip_prefix(base)?.strip_prefix('.')?;
+        let (date, n) = match rest.split_once('.') {
+            Some((d, n)) => (d, n.parse::<u32>().ok()?),
+            None => (rest, 0),
+        };
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        (date.len() == 10).then(|| (date.to_string(), n))
+    };
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|e| Some((key(e.file_name().to_str()?)?, e.path())))
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, p)| p)
 }
 
 /// Render an age in seconds compactly (`43s`, `7m`, `2h`, `3d`). Negative ages

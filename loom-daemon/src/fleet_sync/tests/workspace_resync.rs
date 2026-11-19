@@ -21,8 +21,10 @@ use super::git::WORKTREE_PREFIX;
 use super::*;
 use crate::fleet_store::resync_claim::test_support::{FakeRefForge, Fault, Shared};
 use crate::fleet_store::resync_claim::{claim_message, CLAIM_REF};
+use crate::fleet_sync::workspace_resync::waiver::Waived;
 use crate::init::payload::{resync_workspace_with, ResyncOutcome, Stamp};
 use crate::install_compat::INSTALL_METADATA_PATH;
+use crate::test_git_helpers::run as git;
 
 const RUNNING: &str = "0.19.880";
 const REPO: &str = "acme/app";
@@ -34,22 +36,6 @@ fn t0() -> DateTime<Utc> {
 
 fn v(s: &str) -> Version {
     Version::parse(s).unwrap()
-}
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 fn write(path: &Path, contents: &str) {
@@ -257,6 +243,13 @@ struct Host<'f> {
     /// deadline.
     heads: head_check::ForgeHeads,
     overdue: Cell<bool>,
+    /// What the daemon-owned landing answers, and every `(repo, PR)` it was
+    /// asked about (#13268).
+    landing: RefCell<Landed>,
+    /// What the waiver landing answers, and every `(repo, PR)` it was asked.
+    waiver: RefCell<Waived>,
+    waived: RefCell<Vec<(String, u32)>>,
+    landed: RefCell<Vec<(String, u32)>>,
 }
 
 impl<'f> Host<'f> {
@@ -289,6 +282,10 @@ impl<'f> Host<'f> {
             before_claim: RefCell::new(None),
             heads: head_check::ForgeHeads::default(),
             overdue: Cell::new(false),
+            landing: RefCell::new(Landed::Waiting("no Judge approval".to_string())),
+            waiver: RefCell::new(Waived::Lane("waiver proof failed: not exercised".to_string())),
+            waived: RefCell::new(Vec::new()),
+            landed: RefCell::new(Vec::new()),
         }
     }
 
@@ -350,6 +347,14 @@ impl<'f> Host<'f> {
             },
             overdue: &|| self.overdue.get(),
             heads: &|asks| self.heads.answer(asks),
+            land: &|_, nwo, pr| {
+                self.landed.borrow_mut().push((nwo.to_string(), pr));
+                self.landing.borrow().clone()
+            },
+            waive: &|_, nwo, pr| {
+                self.waived.borrow_mut().push((nwo.to_string(), pr));
+                self.waiver.borrow().clone()
+            },
         };
         run(&env, roots, mode, &mut self.memory.borrow_mut())
     }
@@ -497,11 +502,16 @@ fn a_stale_workspace_is_resynced_with_one_commit_and_the_claim_released() {
     assert!(meta.contains("\"loom_version\": \"0.19.880\""), "{meta}");
     assert!(!meta.contains("resync_pending"), "{meta}");
     let message = git(&fx.origin, &["log", "-1", "--format=%B", "refs/heads/main"]);
+    // Subject plus the resync trailers only: a sweep's injected `GIT_CONFIG_*`
+    // `core.hooksPath` may stamp extra provenance trailers onto the commit.
     assert_eq!(
-        message,
-        "chore(loom): resync installed Loom to v0.19.880\n\nLoom-Resync-Host: host-a\n\
-         Loom-Resync-Version: 0.19.880"
+        message.lines().next(),
+        Some("chore(loom): resync installed Loom to v0.19.880"),
+        "{message}"
     );
+    for trailer in ["Loom-Resync-Host: host-a", "Loom-Resync-Version: 0.19.880"] {
+        assert!(message.lines().any(|l| l == trailer), "missing {trailer:?} in {message}");
+    }
     // The commit's parent is the head that was fetched: a plain fast-forward.
     assert_eq!(git(&fx.origin, &["rev-list", "--count", "--merges", "refs/heads/main"]), "0");
 
@@ -901,18 +911,30 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
     let host = Host::new(&fx, "host-a");
     let before = fx.origin_head();
 
-    let pass = host.pass();
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // No PR was opened, so this stays an ERROR (#13465).
+    assert!(
+        logs.iter()
+            .any(|l| l.0 == log::Level::Error && l.1.contains("branch rule")),
+        "{logs:?}"
+    );
     let report = only(&pass);
     assert_eq!(report.state, WState::W1, "{report:?}");
     let until = t0() + ChronoDuration::hours(6);
-    assert_eq!(
-        reason(report),
-        format!(
+    // The hook refuses every ref, so the pull-request route fails too and the
+    // old behaviour stands (#12572).
+    let text = reason(report);
+    assert!(
+        text.starts_with(&format!(
             "backoff until {}: push refused by a branch rule: GH006: Protected branch update \
-             failed for refs/heads/main.",
+             failed for refs/heads/main.; pull-request route: pushing chore/loom-resync-v",
             stamp(until)
-        )
+        )),
+        "{text}"
     );
+    assert!(fx.forge.pulls.borrow().is_empty(), "no PR when the branch cannot be pushed");
     assert_eq!(pass.alerts.len(), 1, "alert on the first protection failure");
     let alert = &pass.alerts[0];
     assert_eq!(
@@ -948,6 +970,183 @@ fn branch_protection_backs_off_at_the_cap_and_alerts_at_once() {
         .set(until + ChronoDuration::hours(6) + ChronoDuration::seconds(2));
     assert_eq!(only(&host.pass()).state, WState::W0);
     assert!(host.memory.borrow().backoff.is_empty(), "cleared on success");
+}
+
+/// A pre-receive hook that refuses only the default branch, as a merge queue
+/// does; a side branch lands.
+fn refuse_main_only(fx: &Fixture) {
+    let hook = fx.origin.join("hooks/pre-receive");
+    write(
+        &hook,
+        "#!/bin/sh\nwhile read old new ref; do\n  if [ \"$ref\" = refs/heads/main ]; then\n    \
+         echo 'GH013: Repository rule violations found for refs/heads/main.' >&2\n    exit 1\n  \
+         fi\ndone\n",
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+#[test]
+fn a_refused_default_branch_gets_a_resync_pull_request_once() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    let before = fx.origin_head();
+    let branch = format!("chore/loom-resync-v{RUNNING}");
+
+    let mut pass = None;
+    let logs = crate::test_log_capture::capture_logs(|| pass = Some(host.pass()));
+    let pass = pass.unwrap();
+    // The refused push ended in an open PR: expected path, so never ERROR (#13465).
+    let line = |l: &&(log::Level, String)| l.1.contains("resync pull request open");
+    assert!(logs.iter().filter(line).all(|l| l.0 == log::Level::Warn), "{logs:?}");
+    assert!(logs.iter().any(|l| line(&l) && l.0 == log::Level::Warn), "{logs:?}");
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W1, "{report:?}");
+    assert!(reason(report).contains("resync pull request open: #1 "), "{report:?}");
+    assert_eq!(fx.origin_head(), before, "main is untouched");
+    let pushed = git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]);
+    assert_eq!(
+        git(&fx.origin, &["log", "-1", "--format=%s", &pushed]),
+        format!("chore(loom): resync installed Loom to v{RUNNING}")
+    );
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+    assert_eq!(*fx.forge.labels.borrow(), vec![(1, "loom:review-requested".to_string())]);
+    assert_eq!(pass.alerts.len(), 1, "branch-protection stays raised while the PR is open");
+    assert_eq!(pass.alerts[0].kind, "branch-protection");
+    for want in ["#1 ", "installed v", &format!("target v{RUNNING}")] {
+        assert!(pass.alerts[0].detail.contains(want), "{want}: {:?}", pass.alerts[0]);
+    }
+    assert_eq!(fx.forge.ref_sha(CLAIM_REF), None, "claim released");
+
+    // Past the backoff the PR is still open: no second branch, commit or PR.
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let again = host.pass();
+    assert!(reason(only(&again)).contains("resync pull request open: #1 "), "{again:?}");
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+    assert_eq!(git(&fx.origin, &["rev-parse", &format!("refs/heads/{branch}")]), pushed);
+    assert!(again.alerts.is_empty(), "alerted once per repo");
+}
+
+#[test]
+fn a_provable_resync_pull_request_lands_without_a_judge_label() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.waiver.borrow_mut() = Waived::Landed("merged on the waiver proof against v1".to_string());
+
+    let pass = host.pass();
+    assert!(
+        reason(only(&pass)).contains("landed-by-daemon: merged on the waiver proof"),
+        "{pass:?}"
+    );
+    assert_eq!(*host.waived.borrow(), vec![(REPO.to_string(), 1)]);
+    // Never the review label, and the queue hand-off is not asked.
+    assert!(fx.forge.labels.borrow().is_empty(), "{:?}", fx.forge.labels);
+    assert!(host.landed.borrow().is_empty());
+}
+
+#[test]
+fn an_unprovable_resync_pull_request_takes_the_ordinary_lane_with_the_reason() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.waiver.borrow_mut() =
+        Waived::Lane("waiver proof failed: x.sh differs from v1:defaults/scripts/x.sh".to_string());
+
+    let pass = host.pass();
+    assert!(
+        reason(only(&pass)).contains("handed-to-lane: waiver proof failed: x.sh differs"),
+        "{pass:?}"
+    );
+    assert_eq!(*fx.forge.labels.borrow(), vec![(1, "loom:review-requested".to_string())]);
+    assert_eq!(*host.landed.borrow(), vec![(REPO.to_string(), 1)]);
+}
+
+#[test]
+fn the_daemon_hands_its_own_resync_pull_request_to_the_queue() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+
+    // Opening the PR asks for the landing at once; no approval yet, so it waits.
+    let first = host.pass();
+    assert!(
+        reason(only(&first)).contains("landing: waiting (no Judge approval)"),
+        "{first:?}"
+    );
+    assert_eq!(*host.landed.borrow(), vec![(REPO.to_string(), 1)]);
+
+    // Judge approves; the next look hands it over without any Champion step.
+    *host.landing.borrow_mut() = Landed::Queued;
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let second = host.pass();
+    assert!(reason(only(&second)).contains("landing: queued"), "{second:?}");
+    assert_eq!(host.landed.borrow().len(), 2);
+    assert_eq!(fx.forge.pulls.borrow().len(), 1, "still one PR");
+}
+
+#[test]
+fn a_landing_that_fails_leaves_the_pull_request_and_the_alert() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    *host.landing.borrow_mut() = Landed::Failed("head moved".to_string());
+    let pass = host.pass();
+    let report = only(&pass);
+    assert_eq!(report.state, WState::W1, "{report:?}");
+    assert!(reason(report).contains("landing: failed (head moved)"), "{report:?}");
+    assert_eq!(pass.alerts.len(), 1, "branch-protection stays raised");
+}
+
+#[test]
+fn a_direct_push_never_asks_for_a_landing() {
+    let fx = Fixture::new(STALE);
+    let host = Host::new(&fx, "host-a");
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert!(host.landed.borrow().is_empty());
+}
+
+#[test]
+fn a_resync_branch_left_without_a_pull_request_gets_its_pull_request() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    // The PR was never opened, so the branch exists alone (an earlier try).
+    fx.forge
+        .fault("POST repos/acme/app/pulls", Fault::Status(503));
+    let first = host.pass();
+    assert!(reason(only(&first)).contains("opening the PR: HTTP 503"), "{first:?}");
+    assert!(fx.forge.pulls.borrow().is_empty());
+
+    host.now.set(t0() + ChronoDuration::hours(7));
+    let second = host.pass();
+    assert!(reason(only(&second)).contains("resync pull request open: #1 "), "{second:?}");
+    assert_eq!(fx.forge.pulls.borrow().len(), 1);
+}
+
+#[test]
+fn a_merged_resync_pull_request_makes_the_repo_current_and_clears_the_alert() {
+    let fx = Fixture::new(STALE);
+    refuse_main_only(&fx);
+    let host = Host::new(&fx, "host-a");
+    assert_eq!(only(&host.pass()).state, WState::W1);
+    // The merge queue lands the PR: main gains the resync commit.
+    let branch = format!("refs/heads/chore/loom-resync-v{RUNNING}");
+    let sha = git(&fx.origin, &["rev-parse", &branch]);
+    git(&fx.origin, &["update-ref", "-d", &branch]);
+    fx.forge.pulls.borrow_mut().clear();
+    let hook = fx.origin.join("hooks/pre-receive");
+    fs::remove_file(&hook).unwrap();
+    git(&fx.seed, &["fetch", "origin", "--", &sha]);
+    git(&fx.seed, &["merge", "--ff-only", &sha]);
+    git(&fx.seed, &["push", "origin", "HEAD:main"]);
+    host.now.set(t0() + ChronoDuration::hours(7));
+    assert_eq!(only(&host.pass()).state, WState::W0);
+    assert!(host.memory.borrow().backoff.is_empty(), "the alert's backoff is gone");
 }
 
 #[test]
@@ -1176,5 +1375,7 @@ mod head_check;
 mod hold_pass;
 #[path = "workspace_resync_online.rs"]
 mod online;
+#[path = "workspace_resync_supersede.rs"]
+mod supersede;
 #[path = "workspace_resync_surfaces.rs"]
 mod surfaces;

@@ -69,6 +69,8 @@ pub const PR_CLOSING_ISSUE_REFERENCES: ForgeOp =
 pub const REVIEW_LIST_FORMAL: ForgeOp = ForgeOp::inventoried("review.list-formal");
 /// `GET repos/{o}/{r}/commits/{sha}/check-runs` — one commit's check runs.
 pub const CI_CHECK_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.check-runs-for-sha");
+/// `GET repos/{o}/{r}/commits/{sha}/status` — one commit's legacy combined status.
+pub const CI_COMMIT_STATUS: ForgeOp = ForgeOp::inventoried("ci.commit-status");
 /// `GET repos/{o}/{r}/actions/runs…` (and the jobs of one run).
 pub const CI_WORKFLOW_RUNS_FOR_SHA: ForgeOp = ForgeOp::inventoried("ci.workflow-runs-for-sha");
 /// Job logs, run artifacts and artifact downloads.
@@ -94,6 +96,8 @@ pub const QUOTA_RATE_LIMIT_READING: ForgeOp = ForgeOp::inventoried("quota.rate-l
 pub const PR_LIST_BY_HEAD: ForgeOp = ForgeOp::inventoried("pr.list-by-head");
 /// `GET repos/{o}/{r}/pulls?state=open` — every open PR (#10382).
 pub const PR_LIST_OPEN: ForgeOp = ForgeOp::inventoried("pr.list-open");
+/// `PATCH repos/{o}/{r}/pulls/{n}` with a new `base` (#12769).
+pub const PR_EDIT_BASE: ForgeOp = ForgeOp::inventoried("pr.edit-base");
 /// Add / remove labels on one issue or PR (a PR's labels are issue labels).
 pub const ISSUE_EDIT_LABELS: ForgeOp = ForgeOp::inventoried("issue.edit-labels");
 /// `PATCH repos/{o}/{r}/issues/{n}` — replace an issue's (or PR's) body.
@@ -126,6 +130,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     PR_CLOSING_ISSUE_REFERENCES,
     REVIEW_LIST_FORMAL,
     CI_CHECK_RUNS_FOR_SHA,
+    CI_COMMIT_STATUS,
     CI_WORKFLOW_RUNS_FOR_SHA,
     CI_RUN_LOGS_AND_ARTIFACTS,
     CI_RERUN,
@@ -137,6 +142,7 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     TIMELINE_READ,
     QUOTA_RATE_LIMIT_READING,
     PR_LIST_BY_HEAD,
+    PR_EDIT_BASE,
     PR_LIST_OPEN,
     ISSUE_EDIT_LABELS,
     ISSUE_EDIT_BODY,

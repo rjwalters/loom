@@ -95,6 +95,7 @@ fn second_resolve_within_ttl_does_not_fetch() {
         fetches.set(fetches.get() + 1);
         Admins {
             logins: vec!["turian".into()],
+            apps: Vec::new(),
             state: "loaded 1".into(),
         }
     };
@@ -105,4 +106,22 @@ fn second_resolve_within_ttl_does_not_fetch() {
     assert_eq!(again.logins, vec!["turian"]);
     cache.get_or_load("a/b@main", Duration::ZERO, load);
     assert_eq!(fetches.get(), 2, "an expired entry reloads");
+}
+
+#[test]
+fn parse_apps_keeps_only_app_spelled_entries() {
+    let t = r#"{"admins":["a"],"apps":["gw[bot]","plain"," x[bot] ",7]}"#;
+    assert_eq!(parse_apps(t), vec!["gw[bot]".to_string(), "x[bot]".to_string()]);
+}
+
+#[test]
+fn bad_or_missing_apps_is_empty_and_keeps_admins() {
+    for t in [
+        r#"{"admins":["a"]}"#,
+        r#"{"admins":["a"],"apps":"gw[bot]"}"#,
+        "nonsense",
+    ] {
+        assert!(parse_apps(t).is_empty(), "{t}");
+    }
+    assert_eq!(parse(r#"{"admins":["a"],"apps":"oops"}"#).unwrap(), vec!["a".to_string()]);
 }

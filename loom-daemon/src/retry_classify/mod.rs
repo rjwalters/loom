@@ -219,8 +219,14 @@ static SESSION_LIMIT_FALLBACK: LazyLock<Regex> = LazyLock::new(|| {
 /// `{1,3}`, not [`EXHAUSTION_FALLBACK`]'s `{0,3}`: a bare "reached your limit"
 /// names no class at all, so there is nothing for a class-scoped mark to be
 /// scoped *to*.
+///
+/// Both verbs, not just "reached" (#13872): the CLI writes "hit your <Model>
+/// limit" for the same per-model ceiling — [`EXHAUSTION_FALLBACK`] has always
+/// matched that verb — and a verb mismatch here widened every per-model
+/// ceiling mark on the 2026-11-13 fleet into an account-wide one, parking the
+/// whole token pool off one model's limit.
 static CEILING_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)reached your ([^[:space:]]+[[:space:]]+){1,3}limit")
+    Regex::new(r"(?i)(hit|reached) your ([^[:space:]]+[[:space:]]+){1,3}limit")
         .expect("ceiling phrase is a compile-time constant")
 });
 
@@ -299,8 +305,9 @@ pub fn is_account_exhaustion(input: &Input<'_>) -> bool {
 ///    only on the library path; a caller with no `classify_error` (the
 ///    `classification: None` degraded arm) falls through to the regex, exactly
 ///    as the shell's `declare -F classify_error` guard did.
-/// 2. A [`CEILING_PHRASE`] match (#4501, "You've reached your Fable 5 limit")
-///    whose own words are not an [`ACCOUNT_WIDE_QUALIFIER`].
+/// 2. A [`CEILING_PHRASE`] match (#4501, "You've reached your Fable 5 limit";
+///    #13872, "hit your Fable limit") whose own words are not an
+///    [`ACCOUNT_WIDE_QUALIFIER`].
 ///
 /// The class always comes from `model` — the resolved model in flight — not
 /// from the error text: a ceiling kill means "the class we were running ran

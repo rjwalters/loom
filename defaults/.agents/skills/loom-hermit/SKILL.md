@@ -85,6 +85,26 @@ rg "export function myFunction" --files-with-matches | while read file; do
 done
 ```
 
+**Limits of a name grep.** A negative result above proves only "no explicit
+reference" — it does **not** prove "never runs". Runners reach code by
+filename/path convention without naming it: pytest/unittest collecting
+`test_*.py` under a directory argument, Rust `tests/`, Jest `*.test.ts`,
+Go `_test.go`, autoloaded plugin/`conf.d` directories, `.github/workflows/*.yml`.
+Before filing any "run by nothing" claim, run a second check that asks the
+runner or the convention, not the text:
+
+```bash
+pytest <dir> --collect-only -q | grep <name>   # does a test runner collect it?
+```
+
+Also check workflow `on:`/`run:` paths, a runner's directory arguments, and an
+adjacent `test_<name>` file. Worked example (example-org/tool-repo#202):
+`git grep` found no reference to `tools/check_m1a_selection.py` in any build
+file, but `make verify` runs `pytest … tools/ …`, which collects the adjacent
+`tools/test_check_m1a_selection.py` on every run — so the "committed but run
+by nothing" premise was false, and the proposed removal would have deleted a
+working, control-carrying gate.
+
 **Commented-Out Code:**
 ```bash
 rg "^[[:space:]]*//" -A 3 | grep -E "function|class|const|let|var"
@@ -187,10 +207,10 @@ Current hermit flags "one-method classes" but not "zero-state classes." A class 
 - **Internal method dispatch**: Classes where methods call `self.other_method()` are using the class for method organization/dispatch, not state. These are intentional namespace designs.
 - **Large method count (10+)**: Classes with 10 or more methods are using the class as a namespace. Suggesting conversion to 10+ module-level functions is impractical and noisy.
 - **Dispatch-table pattern**: Classes that build dicts/lists of `self.method` references (e.g., `{"key": self.handle_create, ...}`) are intentional dispatch tables.
+- **Structural types and test doubles**: `@dataclass` classes (the generated `__init__` is the state), any class with a base class (Exception/NamedTuple/TypedDict/Enum/Protocol/ABC subclasses and polymorphic hierarchies), classes with declared class-level fields or a `@<x>.setter` property pair, and classes in `test_*.py` / `*_stub*.py` / `conftest.py` (duck-typed test doubles). See `hermit-patterns.md` → "9. Stateless Ceremony".
 
-The AST-based Python detector (with all three exclusions: internal method
-dispatch, the 10+-method namespace threshold, and the dispatch-table pattern) and
-its TypeScript/Rust counterparts live in the companion file so this pattern's
+The AST-based Python detector (with all the exclusions listed above) and its
+TypeScript/Rust counterparts live in the companion file so this pattern's
 detection scripts are maintained in one place. See `hermit-patterns.md` →
 "9. Stateless Ceremony → Detection scripts".
 
@@ -204,6 +224,8 @@ Look for these patterns that often indicate bloat. *For detailed examples with b
 - Generic utilities used only once
 - Premature generalization
 - Unused configuration options
+
+**Very large source files**: you may propose splitting one into sibling modules when the split makes the code clearer. This is a judgement call — no fixed line threshold, no CI gate (#12099).
 
 ## How to Analyze
 
@@ -220,6 +242,13 @@ rg "use.*::" --type rust | cut -d':' -f3 | sort -u       # Backend
 rg "export (function|class|const|interface)" --type ts -n
 # For each export, check if it's imported elsewhere
 ```
+
+No import found is "no explicit reference", not "never runs" — a runner or
+discovery convention can still reach it. Before filing a "run by nothing"
+claim, ask the runner/convention (`pytest <dir> --collect-only -q | grep
+<name>`, workflow `on:`/`run:` paths, a runner's directory arguments, an
+adjacent `test_<name>` file). See "Limits of a name grep" under Dead Code
+above.
 
 ### 3. Complexity Metrics
 
@@ -347,6 +376,8 @@ repo's paths or lines. Full rule: `.loom/docs/citation-scope.md`.
 > same issue URL, and falls back to a single REST POST that applies labels **atomically with
 > creation**. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`.
 > (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 ```bash
 # Check if similar issue already exists; exit 0 = clear to file (below)
@@ -401,7 +432,15 @@ needs `premise-evidence:`, `deliberate=no` needs `premise-searched: <path you
 read>` — deliberateness is never inferred from absence. A removal proposal
 routinely meets deliberate code, so say so: `deliberate=yes reversal=yes` MUST
 be `verdict=operator-decision` — route your own reversal to a human, never
-self-clear it. Rules: `.loom/docs/premise-gate.md` § "Filing-time emission";
+self-clear it. **Exception, only when the repo sets
+`hermit.reversalNeedsOperator: "protected-only"`**: a removal of code that
+nothing in-tree calls may be `deliberate=yes reversal=yes verdict=clear` if you
+add `premise-protected: none`, attesting that the target is none of: attested
+or tier evidence / append-only sim or measurement records; a provenance or
+vendoring attestation; the public API of a published package; infra state
+(IaC state, moved/removed blocks); a product-direction feature. If any applies,
+name it in `premise-protected:` and keep `verdict=operator-decision`. Default
+is `always` — then Rule 1 has no exception. Rules: `.loom/docs/premise-gate.md` § "Filing-time emission";
 verify with `./.loom/scripts/premise-check.sh --issue "$N"` (0 ⇒ ready for
 Curator).
 

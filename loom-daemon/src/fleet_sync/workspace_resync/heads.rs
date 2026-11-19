@@ -13,19 +13,25 @@
 //!
 //! Per owner because the credential is: an App installation token sees its
 //! own installation's repos and no others. More than [`CHUNK`] repos of one
-//! owner are split across queries. Each query runs under the writer
-//! credential through the fleet store's transport
-//! ([`GhTransport::graphql_as_writer`]), is accounted as
+//! owner are split across queries. Each query runs on the read path only (the
+//! gateway, then a reader App, never the writer: [`GhTransport::graphql_read`],
+//! booked as `fleet_store_graphql`, #12389 / #12394), is accounted as
 //! `git.default-branch-heads`, and is not sent while the rate-limit breaker
-//! is open. GraphQL is a `POST`, so there is no ETag and no free `304`: a
-//! query costs one point on the credential's GraphQL bucket.
+//! is open. A reader not installed on a repo says `NOT_FOUND` for it, so a
+//! missing or forbidden repo is asked about with `git ls-remote`, like a repo
+//! whose query was shed. GraphQL is a `POST`, so
+//! there is no ETag and no free `304`: a query costs one point on the
+//! answering credential's GraphQL bucket.
 //!
 //! # What a caller does with the answer
 //!
 //! * [`Answer::At`]: the forge named the default branch and its head.
-//! * [`Answer::Fault`]: the forge answered, and has no such repo for this
-//!   credential (deleted, renamed, or not visible). A fact about one repo,
-//!   never about the host's network.
+//! * [`Answer::Fault`]: the forge answered without a head: no default branch,
+//!   or no such repo for the read path's credential. The gateway or a reader
+//!   says `NOT_FOUND` for a repo outside its installation as well as for a
+//!   deleted one, so the repo's own remote is asked. When it answers, the
+//!   query was blind (logged once); when it fails too, it is the repo's own
+//!   failure. Never a fact about the host's network.
 //! * No entry: the query for that owner failed, or the breaker is open.
 //!
 //! The pass asks `git ls-remote` about a repo with no usable answer
@@ -272,11 +278,13 @@ pub(super) fn gather(
     heads
 }
 
-/// The production head check: one query per owner (per [`CHUNK`] repos),
-/// under that owner's writer credential.
+/// The production head check: one query per owner (per [`CHUNK`] repos), on
+/// the read path only ([`GhTransport::graphql_read`], #12389): it never runs
+/// on the writer. A repo it names as missing or forbidden is asked about at
+/// its remote ([`Answer::Fault`]).
 pub(super) fn live(asks: &[HeadAsk]) -> Heads {
     gather(asks, &|| crate::rate_limit_breaker::global_skip_pass(CALLER), &|batch| {
-        GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_as_writer(
+        GhTransport::new(&batch.under.root, &batch.under.nwo).graphql_read(
             ops::GIT_DEFAULT_BRANCH_HEADS,
             &query(&batch.repos),
             QUERY_TIMEOUT,
@@ -415,20 +423,22 @@ pub(super) fn check(
             };
             let head = match (head, fault) {
                 (Ok(head), Some(_)) => {
-                    // A credential that cannot see the repo is the query's
-                    // problem, not the repo's: its own remote answers.
+                    // A gateway or reader that cannot see the repo is the
+                    // query's problem, not the repo's: its own remote
+                    // answers.
                     if memory.noted.insert(format!("blind:{}", ask.root.display())) {
                         log::warn!(
-                            "workspace_resync: {}: the head query's credential cannot see this \
-                             repo, so its remote is asked with git ls-remote every tick \
-                             (reported once)",
+                            "workspace_resync: {}: the head query's gateway or reader cannot \
+                             see this repo, so its remote is asked with git ls-remote every \
+                             tick (reported once)",
                             ask.nwo
                         );
                     }
                     Ok(head)
                 }
-                // The forge says it has no such repo and the remote gave no
-                // head either: the repo's failure, however git worded it.
+                // The forge says it has no such repo (or no default branch)
+                // and the remote gave no head either: the repo's failure,
+                // however git worded it. Never the host's network.
                 (Err(e), Some(fault)) => Err(git::Refused(format!("{fault} ({e:#})")).into()),
                 (head, None) => head,
             };

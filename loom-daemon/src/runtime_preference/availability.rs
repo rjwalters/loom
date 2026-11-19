@@ -52,6 +52,7 @@
 //! would fail at spawn must be passed over here, not selected and then killed.
 
 use super::resolve::{SkipReason, Tap};
+use crate::fs_util::is_executable;
 use crate::role_runner::{PoolHold, PoolStateFile};
 use crate::runtime_admission::ResolvedRuntime;
 use std::ffi::{OsStr, OsString};
@@ -255,7 +256,7 @@ fn generic(
 fn binary_resolves(bin: &str, path: Option<&OsStr>) -> Option<bool> {
     let candidate = Path::new(bin);
     if candidate.is_absolute() {
-        return Some(is_executable_file(candidate));
+        return Some(is_executable(candidate));
     }
     if candidate.components().count() != 1 {
         return None;
@@ -264,27 +265,11 @@ fn binary_resolves(bin: &str, path: Option<&OsStr>) -> Option<bool> {
     for dir in std::env::split_paths(path?) {
         if !dir.is_absolute() {
             cwd_dependent = true;
-        } else if is_executable_file(&dir.join(candidate)) {
+        } else if is_executable(&dir.join(candidate)) {
             return Some(true);
         }
     }
     (!cwd_dependent).then_some(false)
-}
-
-/// An existing regular file (symlinks followed) with any execute bit set.
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.is_file() && meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        meta.is_file()
-    }
 }
 
 fn ungated(source: CredentialSource) -> Availability {
@@ -316,7 +301,20 @@ fn claude(root: &Path) -> Availability {
                 .to_string(),
         };
     }
-    let pool = crate::tokens_pool::select::spawnable_pool_state(root);
+    // #13873: `model_fallback::preflight_pool_state` shares the gate's
+    // scans but asks the pool-level question — account-wide unless the
+    // fallback block is enabled, in which case an account counts while
+    // some known model class stays unmarked for it, so this mapping holds
+    // only when no class could serve any spawn the pool would receive.
+    // `claude_gate` (`exhausted_for_launch`) keeps its finer per-launch
+    // scope: the resolved model's own rung chain, or the account-wide read
+    // when no model resolves. The two agree at the states the preference
+    // walk decides on — a pool no class can serve is Exhausted here and
+    // skipped there; anything else is Spawnable here and gated only
+    // per-launch — which is what
+    // `claude_availability_agrees_with_the_preflight_gate` pins, toggle
+    // included.
+    let pool = crate::sweep_registry::model_fallback::preflight_pool_state(root);
     if pool.total > 0 && pool.usable == 0 {
         return Availability::Exhausted {
             source,

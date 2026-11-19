@@ -45,6 +45,10 @@ pub struct TickQueueRow {
     /// exporter can sum the frozen backlog's weight without reading the
     /// forge.
     pub story_points: Option<u32>,
+    /// The step the row's item is drawn for (#11909): every step-tick row
+    /// names one; `None` on the issue-sweep rows, which the plan reads as
+    /// `builder`.
+    pub step: Option<crate::work_finder::step_item::Step>,
 }
 
 /// The quiet resolution of `item`'s story points: [`PointsLabels::value`] —
@@ -156,6 +160,7 @@ pub fn record_skip_held(
         updated_at: item.updated_at.clone(),
         held_until,
         story_points: points_of(item),
+        step: None,
     });
 }
 
@@ -171,6 +176,7 @@ pub fn record_candidate(rows: &mut Vec<TickQueueRow>, key: &PriorityCandidate, i
         updated_at: item.updated_at.clone(),
         held_until: None,
         story_points: points_of(item),
+        step: None,
     });
 }
 

@@ -121,6 +121,7 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         settle,
         defer_deadline: Duration::from_secs(3600),
         chase_enabled: true,
+        freshness: crate::auto_update::freshness::Thresholds::default(),
     }
 }
 
@@ -209,7 +210,6 @@ fn a_tick_with_a_roll_already_armed_reports_drain_wait_and_the_drain() {
     let summary = run_tick(&mut state(&dir), &status, &mut probe, &trigger, NOW, NOW);
     assert_eq!(summary.decision, TickDecisionKind::DrainWait, "{}", summary.note);
     assert!(summary.drain.armed && summary.drain.pending);
-    assert_eq!(summary.drain.refusals, 0, "no deadline refusals are counted any more");
 }
 
 /// The #10414 failure mode: before the fix a panicking tick ended the loop
@@ -311,6 +311,51 @@ async fn the_loop_keeps_ticking_after_a_panicking_tick() {
         !status.snapshot().note.unwrap().contains("panicked"),
         "the latest tick was normal"
     );
+}
+
+/// #14016: after a retryable failure the loop wakes at the back-off its log
+/// line stated, not at the next interval. The failure is seeded 57 s into a
+/// 60 s first-backoff, leaving ~3 s: with a 120 s interval the pre-#14016
+/// loop would resolve again only at ~120 s, this one at ~3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loop_resolves_again_at_the_backoff_not_the_next_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(newer("0.19.731", "0.19.701"));
+    let (resolve_tx, mut resolve_rx) = tokio::sync::mpsc::unbounded_channel();
+    probe.resolve_notify = Some(resolve_tx);
+    let mut st = state(&dir);
+    // Seed the streak the failure belongs to, so the first tick's
+    // `track_target` sees the same target and does not reset the backoff.
+    st.tracked_target = Some(format!("artifact:0.19.731:{}", "a".repeat(64)));
+    st.stale_since = Some(std::time::Instant::now());
+    let recorded_at = std::time::Instant::now() - Duration::from_secs(57);
+    st.record_rebuild(recorded_at, &RebuildOutcome::Retryable("seeded".into()), false);
+    let status = Arc::new(AutoUpdateStatus::new(true));
+    let tune = tuning(Duration::from_secs(120), Duration::from_secs(3600));
+    let handle =
+        tokio::spawn(run_loop(st, probe, Trigger::default(), status.clone(), tune, no_store()));
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(count) = resolve_rx.recv().await {
+            if count >= 2 {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        waited,
+        Ok(true),
+        "the second resolve ran at the seeded backoff (~3s), not at the 120s interval"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the second resolve came at the backoff, not the interval: {elapsed:?}"
+    );
+    assert!(!handle.is_finished(), "the loop is still running");
+    handle.abort();
 }
 
 /// A tick that runs past its bound is reported once as an overrun, and the
@@ -611,4 +656,129 @@ fn a_roll_that_took_is_forgotten_after_the_startup_grace() {
     st.attempt.set_started(long_ago);
     guarded_tick(&mut st, &status, &mut probe, &Trigger::default(), &tune, &no_store());
     assert_eq!(st.attempt.record(), None, "cleared after the grace");
+}
+
+/// #12420: the tick record carries the host's state and who would choose the
+/// target, read from the same facts `status` shows.
+mod host_observation {
+    use super::*;
+
+    const RUNNING: &str = env!("CARGO_PKG_VERSION");
+
+    fn artifact(version: &str, on_disk: Option<&str>) -> ArtifactResolution {
+        match newer(version, RUNNING) {
+            ArtifactResolution::Resolved(mut info) => {
+                info.on_disk_version = on_disk.map(str::to_string);
+                // Same published bytes: a same-version artifact is up to date.
+                info.installed_sha256 = info.asset_sha256.clone();
+                ArtifactResolution::Resolved(info)
+            }
+            other => other,
+        }
+    }
+
+    fn tick_record(
+        artifact: ArtifactResolution,
+        settle: Duration,
+    ) -> (TickSummary, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = ScriptedProbe::new(artifact);
+        let status = AutoUpdateStatus::new(true);
+        let tune = tuning(Duration::from_secs(900), settle);
+        let summary = guarded_tick(
+            &mut state(&dir),
+            &status,
+            &mut probe,
+            &Trigger::default(),
+            &tune,
+            &no_store(),
+        );
+        let record = tick_telemetry::record(
+            &summary,
+            0,
+            "host-a",
+            Utc::now(),
+            Duration::from_millis(5),
+            crate::telemetry::provenance::Provenance::current(),
+        );
+        (
+            summary,
+            record
+                .host_state
+                .expect("the record carries the host state"),
+            record
+                .target_source
+                .expect("the record carries the target source"),
+        )
+    }
+
+    #[test]
+    fn an_up_to_date_host_records_h0() {
+        let (_, state, source) = tick_record(artifact(RUNNING, Some(RUNNING)), NOW);
+        assert_eq!((state.as_str(), source.as_str()), ("H0", "autoUpdate"));
+    }
+
+    #[test]
+    fn a_newer_release_inside_the_settle_window_records_h1() {
+        let (_, state, source) =
+            tick_record(artifact("999.0.0", Some(RUNNING)), Duration::from_secs(600));
+        assert_eq!((state.as_str(), source.as_str()), ("H1", "autoUpdate"));
+    }
+
+    #[test]
+    fn a_staged_binary_records_h3() {
+        let (_, state, _) =
+            tick_record(artifact("999.0.0", Some("999.0.0")), Duration::from_secs(600));
+        assert_eq!(state, "H3");
+    }
+
+    #[test]
+    fn an_unreadable_on_disk_version_records_unknown() {
+        let (_, state, _) = tick_record(artifact(RUNNING, None), NOW);
+        assert_eq!(state, "unknown");
+    }
+
+    #[test]
+    fn the_tick_that_arms_a_roll_records_h4() {
+        let (summary, state, _) = tick_record(artifact("999.0.0", Some(RUNNING)), NOW);
+        assert!(summary.roll_armed);
+        assert_eq!(state, "H4");
+    }
+
+    #[test]
+    fn a_fetch_in_progress_reads_h2_and_the_tick_close_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = AutoUpdateStatus::new(true);
+        let st = state(&dir);
+        let resolved = artifact(RUNNING, Some(RUNNING));
+        status.publish(st.snapshot(true, Utc::now(), "tick".into(), &resolved));
+        assert_eq!(
+            update_observation::observe(&status.snapshot(), None, false, RUNNING)
+                .state
+                .as_str(),
+            "H0"
+        );
+        status.set_fetching();
+        assert_eq!(
+            update_observation::observe(&status.snapshot(), None, false, RUNNING)
+                .state
+                .as_str(),
+            "H2"
+        );
+        status.publish(st.snapshot(true, Utc::now(), "tick".into(), &resolved));
+        assert!(!status.snapshot().observation.fetching);
+    }
+
+    #[test]
+    fn observing_changes_no_status_the_loop_publishes() {
+        // Same tick, with and without the observation read: the note and the
+        // decision are the loop's own and are untouched by it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe = ScriptedProbe::new(artifact(RUNNING, Some(RUNNING)));
+        let status = AutoUpdateStatus::new(true);
+        let summary =
+            run_tick(&mut state(&dir), &status, &mut probe, &Trigger::default(), NOW, NOW);
+        assert_eq!(summary.decision, TickDecisionKind::Skip);
+        assert!(summary.observed.is_none(), "run_tick leaves the observation to the loop");
+    }
 }
