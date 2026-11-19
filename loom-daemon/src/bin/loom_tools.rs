@@ -383,33 +383,58 @@ mod tests {
             .unwrap()
     }
 
-    /// #14395: the capability list is the clap tree. Every top-level
-    /// command is listed (`forge` through its verbs), and every listed command
-    /// names a real one, so `capabilities --json` cannot drift from what the
-    /// binary serves.
+    /// Every top-level command is represented. Families listed by verb also
+    /// have their verbs checked, with `forge` covered by `forge_read` tests.
     #[test]
     fn capability_list_matches_the_clap_tree() {
         use loom_daemon::install_compat::TOOLS_COMMANDS;
-        let top: Vec<String> = on_main_sized_stack(|| {
+        on_main_sized_stack(|| {
             let mut cmd = ToolsCli::command();
             cmd.build();
-            cmd.get_subcommands()
-                .map(|c| c.get_name().to_string())
-                .filter(|n| n != "help")
-                .collect()
+
+            for listed in TOOLS_COMMANDS
+                .iter()
+                .filter(|path| !path.starts_with("forge "))
+            {
+                let found = listed.split(' ').try_fold(&cmd, |parent, segment| {
+                    parent
+                        .find_subcommand(segment)
+                        .filter(|child| child.get_name() != "help")
+                });
+                assert!(found.is_some(), "`{listed}` names no loom-tools command");
+            }
+
+            for family in cmd
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+            {
+                let name = family.get_name();
+                let lists_verbs = TOOLS_COMMANDS.iter().any(|path| {
+                    path.strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with(' '))
+                });
+                assert!(
+                    lists_verbs || TOOLS_COMMANDS.contains(&name),
+                    "`{name}` is served but missing from TOOLS_COMMANDS"
+                );
+                if name == "forge" || !lists_verbs {
+                    continue;
+                }
+                for verb in family
+                    .get_subcommands()
+                    .filter(|child| child.get_name() != "help")
+                {
+                    let path = format!("{name} {}", verb.get_name());
+                    assert!(
+                        TOOLS_COMMANDS.contains(&path.as_str())
+                            || TOOLS_COMMANDS
+                                .iter()
+                                .any(|listed| listed.starts_with(&format!("{path} "))),
+                        "`{path}` is served but missing from TOOLS_COMMANDS"
+                    );
+                }
+            }
         });
-        for name in &top {
-            let listed = TOOLS_COMMANDS.iter().any(|c| {
-                c == name
-                    || c.strip_prefix(name.as_str())
-                        .is_some_and(|r| r.starts_with(' '))
-            });
-            assert!(listed, "`{name}` is served but missing from TOOLS_COMMANDS");
-        }
-        for listed in TOOLS_COMMANDS {
-            let head = listed.split(' ').next().unwrap();
-            assert!(top.iter().any(|n| n == head), "`{listed}` names no loom-tools command");
-        }
     }
 
     /// #14395: `loom-tools forge <verb>` accepts the daemon's argv, including

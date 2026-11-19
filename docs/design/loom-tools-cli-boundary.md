@@ -964,8 +964,9 @@ scoped writes and integration with the shared filing verb are tracked in
 
 `install_compat::TOOLS_COMMANDS` lists all nine subcommands: `park-record
 render|parse|apply|released|decision|retract` and `operator-decision
-validate|apply|resolve`. The unit test in `bin/loom_tools.rs` still fails if the
-list and the clap tree disagree.
+validate|apply|resolve`. The unit test in `bin/loom_tools.rs` checks that each
+listed verb resolves in the clap tree and that every declared verb in these
+two families is listed.
 
 ## 15. Phase 3c: issue leases (#14488)
 
