@@ -1905,6 +1905,8 @@ Every other name is a **`Gauge`**:
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
 | `loom.agent_scope.peak_memory_bytes` (`repo`) | bytes | once per finished agent scope, sweep or role agent (cgroup `memory.peak`, #11094); `repo` is `(unattributed)` for a scope outside every workspace; absent without cgroup v2 |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
+| `loom.host.codex_workspace_volume.used_bytes` (`account` = seat name) | bytes | `host.health` interval, at most once per 15 minutes |
+| `loom.host.codex_workspace_volume.total_used_bytes` | bytes | same sample, only when complete |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
 | `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
@@ -1915,6 +1917,17 @@ Every other name is a **`Gauge`**:
 | `loom.dispatch.busy_slots` (`role`; step series also carry `pool="step"` and `loom.daemon.process_instance_id`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
 | `loom.dispatch.running_oldest_age_sec` (`role`, `pool="step"`), `loom.dispatch.running_by_age` (`role`, `pool="step"`, `age`), #12873 | seconds, count | every work-finder tick (default 60 s) once a registry has published its steps; the oldest age only for a role with a live step |
 | `loom.dispatch.running_by_points` (`role`, `pool="step"`, `points`), #12957 | count | every work-finder tick (default 60 s) once a registry has published its steps, `0` included |
+
+The Codex workspace volume gauges (#14678) report allocated bytes on the
+worker's discovered private workspace volumes. The sampler verifies each
+volume's ownership and its running seat's `/workspace` mount before reading
+it as the seat user. Each read is bounded, and the whole pass has a 45-second
+budget. Measurements run off the host-health loop and export only to the ops
+sink. A missing or stopped session, an unreadable or unexpected mount, or a
+timed-out read leaves its seat point absent. A successful empty measurement
+can report zero. The host total is absent when inventory is unavailable,
+contains no seat volumes, or any discovered seat volume is unmeasured, even
+when other per-seat points are present.
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,

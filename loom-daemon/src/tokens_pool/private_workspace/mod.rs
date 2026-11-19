@@ -22,6 +22,7 @@ mod repository;
 #[cfg(test)]
 mod tests;
 pub mod transport;
+mod volume_usage;
 mod worker_setup;
 
 pub use lease::AccountBusy;
@@ -30,6 +31,7 @@ pub use lifecycle::{
     run_job, session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
+pub(crate) use volume_usage::{sample_seat_volumes, SeatVolumeUsage};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

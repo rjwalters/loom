@@ -16,6 +16,10 @@
 //! handed in by the collector.
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::tokens_pool::private_workspace::{sample_seat_volumes, SeatVolumeUsage};
+use std::time::{Duration, Instant};
+
+const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// One host resource sample, in bytes. `None` = unmeasurable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -186,5 +190,48 @@ pub async fn record(worktree_volume: (Option<u64>, Option<u64>)) {
     };
     if let Ok(resources) = tokio::task::spawn_blocking(move || sample(worktree_volume)).await {
         sink.emit_metrics(resources.points());
+    }
+}
+
+pub(super) fn seat_volume_points(sample: SeatVolumeUsage) -> Vec<MetricPoint> {
+    let mut points: Vec<_> = sample
+        .seats
+        .into_iter()
+        .map(|(account, bytes)| {
+            MetricPoint::int(MetricName::HostCodexWorkspaceVolumeUsedBytes, bytes)
+                .label("account", account)
+        })
+        .collect();
+    if let Some(total) = sample.total {
+        points.push(MetricPoint::int(MetricName::HostCodexWorkspaceVolumeTotalUsedBytes, total));
+    }
+    points
+}
+
+/// Walk storage less often than ordinary host probes. A slow walk does not
+/// hold up host-health events or overlap a later sample.
+#[derive(Default)]
+pub(crate) struct SeatVolumeSampler {
+    last_attempt: Option<Instant>,
+    active: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SeatVolumeSampler {
+    pub(crate) fn record_if_due(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_attempt
+            .is_some_and(|last| now.duration_since(last) < SEAT_VOLUME_SAMPLE_INTERVAL)
+            || self.active.as_ref().is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let Some(sink) = super::global_ops_sink() else {
+            return;
+        };
+        self.last_attempt = Some(now);
+        self.active = Some(tokio::task::spawn_blocking(move || {
+            sink.emit_metrics(seat_volume_points(sample_seat_volumes()));
+        }));
     }
 }

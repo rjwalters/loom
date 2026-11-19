@@ -152,6 +152,7 @@ async fn run_collector(
     identity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut seat_volume_sampler = super::ops::host::SeatVolumeSampler::default();
     let mut disposition_sampler = super::ops::disposition::Sampler::default();
     let mut disposition_timer = tokio::time::interval(DISPOSITION_INTERVAL);
     disposition_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -238,6 +239,7 @@ async fn run_collector(
                     &mut disposition_sampler,
                 )
                 .await;
+                seat_volume_sampler.record_if_due();
                 // Periodic backfill (Issue #5084), same cadence as the host
                 // snapshot: self-heals any terminal record the live
                 // event-bus path missed or mis-attributed, not just the
