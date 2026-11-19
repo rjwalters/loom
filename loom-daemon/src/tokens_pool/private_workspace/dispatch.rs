@@ -4,6 +4,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
+/// Every matching seat is busy or could not be prepared; self-heals as seats free.
+pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
+/// The resolved repository is served by no inventoried account: a routing
+/// misconfiguration, not contention (#14512).
+pub(super) const NO_SEAT_SERVES_REPOSITORY: &str = "no seat serves this repository";
+
 /// The one descriptor a private dispatch hands its account lease down on.
 /// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
 pub(crate) const LEASE_FD: i32 = 198;
@@ -224,7 +230,20 @@ impl Selection {
                     if try_idle_seats
                         && error.is::<super::super::health::NoHealthyAccountError>() =>
                 {
-                    return Err(error.context("no idle seat"));
+                    // Same error class either way (so the host-local seat
+                    // classification is unchanged); only the surfaced text
+                    // differs (#14512).
+                    let routed = logical.is_none()
+                        || account_inventory(root, AccountProvider::Codex)?
+                            .iter()
+                            .any(|a| {
+                                serves_repository(&a.credential_reference, logical.as_deref())
+                            });
+                    return Err(error.context(if routed {
+                        NO_IDLE_SEAT
+                    } else {
+                        NO_SEAT_SERVES_REPOSITORY
+                    }));
                 }
                 other => other?,
             };

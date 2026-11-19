@@ -2077,9 +2077,15 @@ fn concurrent_judge_draws_share_one_idle_seat() {
         else {
             panic!("expected the role draw");
         };
-        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), preparer.take())
+        // The launch consumes the held reservation as `private_dispatch`
+        // does for a host-admitted Codex candidate (#14512): it is handed
+        // over whole, so nothing is re-prepared.
+        let held = crate::sweep_registry::private_dispatch::take_held(&mut preparer, false)
+            .unwrap()
+            .map(|(selection, _)| selection);
+        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), held)
     };
-    let assert_falls_through = |case: &str| {
+    let assert_falls_through_with = |case: &str, reason: &str| {
         let (runtime, record, selection) = draw(case.to_owned());
         assert_eq!(runtime, "claude", "{case}: {record:?}");
         assert!(selection.is_none(), "{case}");
@@ -2087,10 +2093,11 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             record
                 .passed_over
                 .iter()
-                .any(|reason| reason == "codex: not-admitted(no idle seat)"),
-            "{record:?}"
+                .any(|passed| passed == &format!("codex: not-admitted({reason})")),
+            "{case}: {record:?}"
         );
     };
+    let assert_falls_through = |case: &str| assert_falls_through_with(case, "no idle seat");
 
     assert_falls_through("hook trust unproven");
     let controls = tempfile::tempdir().unwrap();
@@ -2108,7 +2115,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             "https://forge.example/other/repo",
         ],
     );
-    assert_falls_through("repository unregistered");
+    // No inventoried account serves the resolved repository: a routing miss,
+    // reported apart from contention (#14512).
+    assert_falls_through_with("repository unregistered", "no seat serves this repository");
     crate::test_git_helpers::run(root, &["remote", "set-url", "origin", &env.config.repository]);
 
     env.seed_container(CONTAINER_ID, false);

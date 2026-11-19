@@ -69,7 +69,7 @@ pub const REFUSE_CLAIM_LOST: &str = "claim_lost";
 /// The `refuse` reasons the captain counts by name (spec §5.4): the worker's
 /// existing refusal tokens. Any other token is counted as `other`, so a
 /// worker cannot grow the refusals metric's label set.
-pub const REFUSE_REASONS: [&str; 19] = [
+pub const REFUSE_REASONS: [&str; 20] = [
     REFUSE_CLAIM_LOST,
     "already_closed",
     "already_landed",
@@ -89,6 +89,9 @@ pub const REFUSE_REASONS: [&str; 19] = [
     "runtime_rejected",
     "model_runtime_mismatch",
     "admission_refused",
+    // `step_spawn::give_back` substitutes this for the step's own reason when
+    // the local draw could not reserve a seat (#14512).
+    crate::session_exec::refusal::SEAT_BUSY_REASON,
 ];
 
 #[cfg(test)]
@@ -116,6 +119,14 @@ mod refuse_reason_tests {
         ];
         let emitted: BTreeSet<String> = sources.iter().flat_map(|s| tokens(s)).collect();
         assert!(emitted.len() >= 10, "the scan found too few tokens: {emitted:?}");
+        // `give_back` also substitutes a shared constant for the literal, which
+        // the scan above cannot see (#14512).
+        assert!(
+            sources[0].contains("crate::session_exec::refusal::SEAT_BUSY_REASON"),
+            "give_back no longer substitutes SEAT_BUSY_REASON; update this guard"
+        );
+        let mut emitted = emitted;
+        emitted.insert(crate::session_exec::refusal::SEAT_BUSY_REASON.to_string());
         let counted: BTreeSet<String> = REFUSE_REASONS.iter().map(|r| (*r).to_string()).collect();
         let missing: Vec<_> = emitted.difference(&counted).collect();
         assert!(
