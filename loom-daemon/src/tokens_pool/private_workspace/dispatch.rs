@@ -19,6 +19,14 @@ pub struct Selection {
     pub name: String,
     profile: PathBuf,
     prepared: Option<Prepared>,
+    /// The containment proof this selection's own admission walk captured
+    /// (#14626). The walk proves every winning candidate before it can win;
+    /// the admission that consumes this selection runs against exactly that
+    /// proof instead of re-proving the same seat a second Docker
+    /// inspect-and-exec round-trip later. Never carried across an await, a
+    /// lock or a second dispatch: it is spent by the one admission it was
+    /// taken for, and anything later proves fresh.
+    proven: Option<containment::ContainmentProof>,
 }
 
 struct Prepared {
@@ -180,6 +188,7 @@ impl Selection {
                 record: None,
                 handed_off: std::cell::Cell::new(false),
             }),
+            proven: None,
         }
     }
 }
@@ -213,7 +222,9 @@ impl Selection {
     /// bounded walk tries each eligible seat at most once, and a candidate
     /// only wins when its OWN containment can be proven — so one busy seat
     /// never refuses a draw another idle seat could serve. Explicit profile
-    /// pins keep binding: they never walk.
+    /// pins keep binding: they never walk. The winning proof is carried on
+    /// the returned selection (#14626): admission consumes it through
+    /// [`Selection::proof_for_admission`] instead of re-proving the seat.
     pub(super) fn prepare_contained(
         root: &Path,
         model: Option<&str>,
@@ -266,7 +277,7 @@ impl Selection {
         };
         let try_idle_seats = matches!(policy, SeatPolicy::Idle { .. });
         let prepare = |name, profile| -> Result<Self> {
-            let selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
+            let mut selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
             match policy {
                 // A guarded read-only reservation must already prove
                 // containment for its own seat (#14481).
@@ -278,12 +289,14 @@ impl Selection {
                 // Containment admission: an account with no private clone,
                 // and a clone whose boundary cannot be re-proven, cannot win.
                 // The walk reports each refusal with its own reason and tries
-                // the next eligible seat (#14578).
+                // the next eligible seat (#14578). The proof captured here is
+                // carried on the selection so the admission that consumes it
+                // need not take the same proof twice (#14626).
                 SeatPolicy::Contained => {
                     if selection.lease().is_none() {
                         bail!("selected Codex account holds no private-clone workspace");
                     }
-                    selection.contain(root)?;
+                    selection.prove(root)?;
                 }
                 _ => {}
             }
@@ -390,6 +403,7 @@ impl Selection {
             name,
             profile,
             prepared: None,
+            proven: None,
         };
         let dir = state_dir(&selection.profile)?;
         if !dir.join("workspace.json").exists() {
@@ -453,6 +467,34 @@ impl Selection {
             handed_off: std::cell::Cell::new(false),
         });
         Ok(selection)
+    }
+
+    /// Capture this selection's containment proof during the admission walk
+    /// (#14626). The proof still comes from this selection's own [`contain`]
+    /// — nothing is remembered from another seat or an earlier dispatch — it
+    /// is simply kept for the admission that asked the walk to prove this
+    /// candidate, instead of being dropped on the floor.
+    fn prove(&mut self, root: &Path) -> Result<()> {
+        let proof = self.contain(root)?;
+        self.proven = Some(proof);
+        Ok(())
+    }
+
+    /// The containment proof to admit against (#14626): the one this
+    /// selection's own walk captured, or a fresh [`contain`] when none was.
+    /// Single-use by design — the captured proof is spent here, so a later
+    /// admission re-proves rather than reusing spent evidence.
+    ///
+    /// # Errors
+    /// A fixed, secret-free obligation string naming what could not be proven.
+    pub(super) fn proof_for_admission(
+        &mut self,
+        root: &Path,
+    ) -> Result<containment::ContainmentProof> {
+        match self.proven.take() {
+            Some(proof) => Ok(proof),
+            None => self.contain(root),
+        }
     }
 
     pub fn rebind(&self, _root: &Path, owner: &str) -> Result<()> {
@@ -929,6 +971,7 @@ mod tests {
                 record: None,
                 handed_off: std::cell::Cell::new(false),
             }),
+            proven: None,
         }
     }
     #[test]
