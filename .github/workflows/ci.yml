@@ -701,7 +701,7 @@ jobs:
           import glob, sys, yaml
           PARSE_ONLY = 'defaults/optional/github-workflows/*.y*ml'
           INSTALLED = 'defaults/.github/ISSUE_TEMPLATE/*.y*ml'
-          FORBIDDEN = ('github.com/rjwalters/loom', '{' * 2)
+          FORBIDDEN = ('github.com/rjwalters/loom', 'github.com/2amlogic/loom', '{' * 2)
           bad = 0
           for pattern in (PARSE_ONLY, INSTALLED):
               files = sorted(glob.glob(pattern))
@@ -2373,7 +2373,7 @@ jobs:
     # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
     # or merge_group token holds `packages: write` (#10846). The cache is
     # WRITTEN only by `worker-buildcache` below, a separate job gated at job
-    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # level to a push to main in 2AMLogic/loom (mirrors rust-cache's
     # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
     # same-repo PR must not be able to seed the cache main builds from. The
     # published `:latest` is not used as cache-from: CI passes APT_MIRROR and
