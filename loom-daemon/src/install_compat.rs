@@ -357,6 +357,72 @@ fn git(repo_root: &Path, args: &[&str]) -> anyhow::Result<std::process::Output> 
 /// changes meaning; adding a key does not.
 pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 
+/// The commands `loom-tools` serves, as typed after the binary name: the one
+/// capability list (#14395). `capabilities --json` and `install-compat show
+/// --json` both print it as `tools_commands`, so a wrapper asks the binary
+/// what it serves and carries no list of its own.
+///
+/// Sub-verbs are listed only where the verb splits into reads and writes
+/// (`forge`, `forge merge-queue`, `forge parent`); the tests in
+/// `src/bin/loom_tools.rs` and `src/cli/forge_read/tests.rs` fail when this
+/// list and the clap tree disagree.
+pub const TOOLS_COMMANDS: &[&str] = &[
+    "strip-ansi",
+    "checkpoint",
+    "config",
+    "release-fetch",
+    "install-binary",
+    "resync-payload",
+    "resolve-model",
+    "resolve-role-model",
+    "capabilities",
+    "forge issue",
+    "forge pr",
+    "forge auth",
+    "forge check-open-pr",
+    "forge priority-labels",
+    "forge rebase-guard",
+    "forge pr-congestion",
+    "forge wait-checks",
+    "forge check-claim",
+    "forge check-branch",
+    "forge tree-unchanged",
+    "forge verdict-equivalent",
+    "forge version-only-diff",
+    "forge additive-migrations",
+    "forge locked-deps-only",
+    "forge resync-waiver",
+    "forge suspect-critical-diff",
+    "forge merge-method",
+    "forge merge-config",
+    "forge merge-queue mode",
+    "forge merge-queue preflight",
+    "forge merge-queue status",
+    "forge token",
+    "forge is-fleet",
+    "forge trusted-comments",
+    "forge promotion-author",
+    "forge claim-liveness",
+    "forge verdict-stale-notice",
+    "forge verdict-body-check",
+    "forge verdict-gate",
+    "forge may-write",
+    "forge calls",
+    "forge identities",
+    "forge parent body",
+    "forge parent split-state",
+    "forge dashboard-link",
+    "park-record render",
+    "park-record parse",
+    "park-record apply",
+    "park-record released",
+    "park-record decision",
+    "park-record retract",
+    "operator-decision validate",
+    "operator-decision apply",
+    "operator-decision resolve",
+];
+
 /// The identity of the installed-file payload this binary was built against:
 /// the contract claims plus the daemon-invoked file list, in one string.
 ///
@@ -391,6 +457,7 @@ pub fn capabilities_json(
         "requires_daemon": REQUIRES_DAEMON,
         "payload_identity": payload_identity(),
         "invoked_files": DAEMON_INVOKED_INSTALLED_FILES,
+        "tools_commands": TOOLS_COMMANDS,
         "installed": installed.map(|m| serde_json::json!({
             "loom_version": m.loom_version,
             "requires_daemon": m.requires_daemon,

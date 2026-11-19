@@ -726,6 +726,52 @@ fn a_removed_host_mounted_container_is_recreated_with_its_last_workspace_and_ima
 
 #[test]
 #[serial]
+fn a_missing_container_is_recreated_on_the_configured_image_not_the_recorded_pin() {
+    // Issue #14421 (regression guard for #14019): the configured
+    // `accounts.session.image` beats the image recorded for the seat.
+    let env = setup(&["alice"], &["alice"]);
+    let container = container_name("alice");
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container, true, false, Some(Path::new("/home/u/GitHub")));
+    let config = SessionImageConfig {
+        image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
+        extra_mounts: Vec::new(),
+    };
+    let mut state = ReconcileState::default();
+    let pass_cfg = |lifecycle: &mut SessionLifecycle<Fake>, state: &mut ReconcileState, now| {
+        pass_named_with_session_config(
+            lifecycle,
+            &env.accounts,
+            &host,
+            Path::new("/srv/checkouts"),
+            state,
+            now,
+            &config,
+        )
+        .into_iter()
+        .map(|o| o.outcome)
+        .collect::<Vec<_>>()
+    };
+    // Observed running first, so the pass records the stale image pin.
+    assert_eq!(pass_cfg(&mut lifecycle, &mut state, 0), vec![Outcome::Running]);
+    // `docker rm -f`
+    lifecycle.runner().containers.lock().unwrap().clear();
+    assert_eq!(
+        pass_cfg(&mut lifecycle, &mut state, 60),
+        vec![Outcome::Recreated {
+            workspace: "/home/u/GitHub".into()
+        }]
+    );
+    let creates = lifecycle.runner().creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0].1, "ghcr.io/example/session-mine@sha256:aa55");
+    assert_ne!(creates[0].1, "example/session:pinned", "not the recorded pin");
+}
+
+#[test]
+#[serial]
 fn a_never_seen_missing_container_uses_the_fallback_workspace() {
     let env = setup(&["alice"], &["alice"]);
     let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);

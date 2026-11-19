@@ -293,6 +293,8 @@ fn malformed_or_absent_identity_is_refused() {
         volume: "v".into(),
         profile: profile.clone(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let ok = report(true, &profile);
     for (what, job) in [
@@ -348,6 +350,8 @@ fn a_proof_is_bound_to_the_clone_it_was_measured_against() {
         volume: "v".into(),
         profile: profile.clone(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let second = identify("https://example.invalid/o/second").unwrap();
     config.repositories.push(Registered {
@@ -451,6 +455,8 @@ fn multi_clone_config(profile: &Path) -> (Config, RepoId) {
         volume: "v".into(),
         profile: profile.to_owned(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let second = identify("https://example.invalid/o/second").unwrap();
     config.repositories.push(Registered {

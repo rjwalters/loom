@@ -200,7 +200,7 @@ fn start_with(
     let lease = lease::Lease::acquire(&dir)?;
     let engine = docker::engine()?;
     let existed = dir.join("workspace.json").exists();
-    let config = if existed {
+    let mut config = if existed {
         let mut existing = load(&dir)?;
         if existing.account != account.id.name
             || existing.profile != profile
@@ -236,6 +236,8 @@ fn start_with(
             volume: format!("loom-codex-workspace-{}", account.id.name),
             profile,
             gh_config,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     };
     let state = docker::inspect(&config.container)?;
@@ -261,6 +263,34 @@ fn start_with(
             bail!("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)");
         }
     }
+    // The image and read-only mounts a NEW container gets are decided here,
+    // once, and recorded in `workspace.json` (#14451): `validate_settings`,
+    // `recover` and `status` all read the record, never the live config, so a
+    // config edit cannot reshape a seat behind an unattended restart. A
+    // container that already exists keeps what it was created with; the
+    // configured values apply from the next stop + start. The host tier decides
+    // for a seat serving several repositories — `workspace` is the same root
+    // the reconciler reads the keys from.
+    let mut start_image = image.map(str::to_owned);
+    if state.is_none() {
+        let configured = super::super::session_image::read_session_image_config(workspace)?;
+        let configured_image = configured.image.clone();
+        if start_image.is_none() {
+            start_image.clone_from(&configured_image);
+        }
+        config.session_image = if start_image == configured_image {
+            configured_image
+        } else {
+            None
+        };
+        config.extra_mounts = configured.extra_mounts;
+        check_extra_mounts(workspace, &config)?;
+        if let Some(configured) = &config.session_image {
+            docker::verify_image(configured)?;
+        }
+    } else if image.is_none() {
+        warn_if_config_drifted(workspace, &config);
+    }
     save(&dir.join("workspace.json"), &config)?;
     if unattended.is_none() {
         // An operator start lifts the hold an operator `stop` left, before the
@@ -271,7 +301,7 @@ fn start_with(
     }
     match state {
         None => {
-            let image = image.unwrap_or(DEFAULT_SESSION_IMAGE);
+            let image = start_image.as_deref().unwrap_or(DEFAULT_SESSION_IMAGE);
             // The account profile's hook registration, Codex trust state and
             // readiness receipt are established HERE, in a throwaway container
             // carrying nothing but the profile — because the session created on
@@ -355,11 +385,23 @@ pub fn recover(
                     config.volume
                 );
             }
-            let image = image.context(
-                "recorded session image is unknown; refusing to substitute one (start the \
-                 session by hand with --image)",
-            )?;
+            // The image an operator `start` recorded from the configuration wins
+            // over the last one the reconciler saw, and is re-verified: a
+            // daemon roll that changed the sealed bundle refuses a
+            // not-yet-rebuilt derived image rather than swapping in another
+            // (#14451), exactly as host mode does.
+            let image = match config.session_image.as_deref() {
+                Some(recorded) => recorded,
+                None => image.context(
+                    "recorded session image is unknown; refusing to substitute one (start the \
+                     session by hand with --image)",
+                )?,
+            };
             docker::image_present(image)?;
+            if config.session_image.is_some() {
+                docker::verify_image(image)?;
+            }
+            check_extra_mounts(workspace, &config)?;
             held()?;
             docker::provision_controls(&config, image)?;
             docker::create(&config, image)?;
@@ -375,6 +417,45 @@ pub fn recover(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// Refuse the recorded extra read-only mounts a private session must never
+/// have (#14451): the host-mode denylist for the host source, and a container
+/// target that shadows or nests inside `/workspace`, the `CODEX_HOME` profile,
+/// the sealed bundle root or the forge-configuration mount. Run before a
+/// container is created, so a refused mount never reaches Docker.
+fn check_extra_mounts(workspace: &Path, config: &Config) -> Result<()> {
+    if config.extra_mounts.is_empty() {
+        return Ok(());
+    }
+    let reserved = [
+        PathBuf::from(ROOT),
+        PathBuf::from(PROFILE),
+        PathBuf::from(GH_CONFIG),
+    ];
+    super::super::session_mount_gate::check_private_extra_mounts(
+        &config.extra_mounts,
+        workspace,
+        &reserved,
+    )
+}
+
+/// An operator `start` over a container that already exists keeps the
+/// image and mounts it was created with; say so when the configuration now
+/// asks for something else, so the edit is not mistaken for applied.
+fn warn_if_config_drifted(workspace: &Path, config: &Config) {
+    let Ok(configured) = super::super::session_image::read_session_image_config(workspace) else {
+        return;
+    };
+    if configured.extra_mounts != config.extra_mounts
+        || (configured.image.is_some() && configured.image != config.session_image)
+    {
+        log::warn!(
+            "private session {}: accounts.session image/extraMounts differ from the running \
+             container's; they apply after `accounts session stop` and a new `start`",
+            config.account
+        );
+    }
 }
 
 /// Publish, discard or just list the unpublished branches of an account's
@@ -574,6 +655,10 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         container_id: state
             .as_ref()
             .and_then(|s| s["Id"].as_str().map(str::to_owned)),
+        image: state
+            .as_ref()
+            .and_then(|s| s["Config"]["Image"].as_str().map(str::to_owned)),
+        extra_mounts: config.extra_mounts.clone(),
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
