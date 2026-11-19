@@ -50,7 +50,7 @@ pub struct WorktreeClosedPrBranchArgs {
 }
 
 impl WorktreeClosedPrBranchArgs {
-    /// Never returns.
+    /// Exits with the worktree result, or returns a mode configuration error.
     pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
         let opts = closed_pr_branch::Options {
             branch: self.branch,
@@ -59,8 +59,11 @@ impl WorktreeClosedPrBranchArgs {
             repo: self.repo_root,
             json_output: self.json_output,
         };
-        std::process::exit(closed_pr_branch::run_with(&opts, &|branch| {
-            closed_pr_branch::forge_probe_with(&opts.repo, branch, pr_list)
-        }));
+        std::process::exit(
+            closed_pr_branch::try_run_with(&opts, &|branch| {
+                closed_pr_branch::forge_probe_with(&opts.repo, branch, pr_list)
+            })
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }

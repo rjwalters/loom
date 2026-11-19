@@ -93,7 +93,7 @@
 //! `LOOM_BRANCH_LANDED_OFFLINE=1` skips the probe, the same seam
 //! [`super::branch_landed::forge_probe`] honours.
 
-use super::pr_list::PrList;
+use super::pr_list::{PrList, Read};
 use std::path::{Path, PathBuf};
 
 use super::branch_landed::resolve_commit;
@@ -221,22 +221,30 @@ pub fn run(opts: &Options) -> i32 {
 /// [`run`] with the forge round-trip injected — the seam a test uses instead
 /// of a network, a `gh`, or a `loom-daemon`.
 pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> Probe) -> i32 {
+    try_run_with(opts, &|branch| Ok::<_, std::convert::Infallible>(forge(branch)))
+        .unwrap_or_else(|never| match never {})
+}
+
+pub(crate) fn try_run_with<E>(
+    opts: &Options,
+    forge: &dyn Fn(&str) -> Result<Probe, E>,
+) -> Result<i32, E> {
     let tip = resolve_commit(&opts.repo, &format!("refs/remotes/origin/{}", opts.branch));
     // Do not spend a forge round-trip when the local half already cannot
     // answer: with no resolvable tip there is nothing to match a PR head
     // against, and the decision is Proceed either way.
     let probe = if tip.is_some() {
-        forge(&opts.branch)
+        forge(&opts.branch)?
     } else {
         Probe::Unavailable
     };
-    match decide(tip.as_deref(), &probe) {
+    Ok(match decide(tip.as_deref(), &probe) {
         Decision::Proceed(_) => 0,
         Decision::Refuse(pr) => {
             report(opts, &pr);
             1
         }
-    }
+    })
 }
 
 /// The refusal, in whichever of the two output modes the caller is in.
@@ -298,18 +306,23 @@ fn json_number(number: &str) -> String {
 /// CLI supplies its configured read route through the same probe.
 #[must_use]
 pub fn forge_probe(repo: &Path, branch: &str) -> Probe {
-    forge_probe_with(repo, branch, PrList::Legacy)
+    forge_probe_with(repo, branch, PrList::Legacy).expect("legacy reads do not resolve tools mode")
 }
 
-pub(crate) fn forge_probe_with(repo: &Path, branch: &str, pr_list: PrList) -> Probe {
+pub(crate) fn forge_probe_with(
+    repo: &Path,
+    branch: &str,
+    pr_list: PrList,
+) -> Result<Probe, String> {
     let branch = branch.strip_prefix("origin/").unwrap_or(branch);
     if branch.is_empty() {
-        return Probe::Unavailable;
+        return Ok(Probe::Unavailable);
     }
     if std::env::var("LOOM_BRANCH_LANDED_OFFLINE").as_deref() == Ok("1") {
-        return Probe::Unavailable;
+        return Ok(Probe::Unavailable);
     }
-    let Ok(text) = pr_list.fetch(
+    let Read::Answered(text) = pr_list.fetch(
+        repo,
         repo,
         &[
             "--head",
@@ -321,10 +334,11 @@ pub(crate) fn forge_probe_with(repo: &Path, branch: &str, pr_list: PrList) -> Pr
             "--limit",
             "20",
         ],
-    ) else {
-        return Probe::Unavailable;
+    )?
+    else {
+        return Ok(Probe::Unavailable);
     };
-    parse_probe(&text)
+    Ok(parse_probe(&text))
 }
 
 /// Parse the forge's `--json number,state,mergedAt,headRefOid,url` array.

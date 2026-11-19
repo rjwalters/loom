@@ -92,6 +92,7 @@ pub fn maybe_delete_local_branch(
     expected_head_sha: &str,
 ) -> BranchOutcome {
     maybe_delete_local_branch_with(ctx, out, branch, expected_head_sha, PrList::Legacy)
+        .expect("legacy reads do not resolve tools mode")
 }
 
 pub(crate) fn maybe_delete_local_branch_with(
@@ -100,13 +101,13 @@ pub(crate) fn maybe_delete_local_branch_with(
     branch: &str,
     expected_head_sha: &str,
     pr_list: PrList,
-) -> BranchOutcome {
+) -> Result<BranchOutcome, String> {
     if branch.is_empty() {
-        return BranchOutcome::Kept;
+        return Ok(BranchOutcome::Kept);
     }
     if !branch_exists(ctx.repo_root, branch) {
         out.info(&format!("Local branch '{branch}' does not exist — skipping branch delete"));
-        return BranchOutcome::Kept;
+        return Ok(BranchOutcome::Kept);
     }
     // Never delete the repo's default branch. Cheap belt-and-suspenders: the
     // attached branch of an `issue-<N>` worktree should never legitimately BE
@@ -120,16 +121,16 @@ pub(crate) fn maybe_delete_local_branch_with(
         out.warning(&format!(
             "Refusing to delete local branch '{branch}' — it is the repository's default branch"
         ));
-        return BranchOutcome::Kept;
+        return Ok(BranchOutcome::Kept);
     }
 
-    let landed = branch_landed::probe_with(
+    let landed = branch_landed::try_probe_with(
         ctx.repo_root,
         branch,
         ctx.default_branch,
         expected_head_sha,
-        &|branch| branch_landed::forge_probe_with(ctx.repo_root, branch, pr_list),
-    );
+        &|branch| branch_landed::forge_probe_with(ctx.repo_root, ctx.repo_root, branch, pr_list),
+    )?;
 
     // Fail closed: ONLY a `landed` verdict force-deletes. `not-landed` and
     // `unknown` both keep `git branch -d`, which still deletes a branch git
@@ -165,11 +166,11 @@ pub(crate) fn maybe_delete_local_branch_with(
         out.warning(&format!(
             "Could not delete local branch '{branch}': git could not be executed"
         ));
-        return BranchOutcome::Kept;
+        return Ok(BranchOutcome::Kept);
     };
     if attempt.status.success() {
         out.success(&format!("Local branch '{branch}' deleted{safety_note}"));
-        return BranchOutcome::Deleted;
+        return Ok(BranchOutcome::Deleted);
     }
 
     let mut delete_output = String::from_utf8_lossy(&attempt.stderr).into_owned();
@@ -177,7 +178,7 @@ pub(crate) fn maybe_delete_local_branch_with(
     let delete_output = delete_output.trim().to_string();
 
     if is_checked_out_refusal(&delete_output) {
-        return handle_checked_out(ctx, out, branch, flag, &safety_note);
+        return Ok(handle_checked_out(ctx, out, branch, flag, &safety_note));
     }
     if flag == "-d" {
         out.warning(&format!(
@@ -187,7 +188,7 @@ pub(crate) fn maybe_delete_local_branch_with(
     } else {
         out.warning(&format!("Could not delete local branch '{branch}': {delete_output}"));
     }
-    BranchOutcome::Kept
+    Ok(BranchOutcome::Kept)
 }
 
 /// Distinguish "checked out somewhere" from a genuine "not fully merged"

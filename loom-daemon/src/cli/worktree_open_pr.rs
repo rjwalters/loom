@@ -42,8 +42,10 @@ pub struct WorktreeOpenPrArgs {
 }
 
 impl WorktreeOpenPrArgs {
-    /// Never returns.
+    /// Exits with the worktree result, or returns a mode configuration error.
     pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
-        std::process::exit(open_pr::run_with(&self.repo, &self.branch, pr_list));
+        std::process::exit(
+            open_pr::run_with(&self.repo, &self.branch, pr_list).map_err(anyhow::Error::msg)?,
+        );
     }
 }

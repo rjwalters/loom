@@ -75,22 +75,25 @@ pub struct WorktreeExistingArgs {
 }
 
 impl WorktreeExistingArgs {
-    /// Never returns.
+    /// Exits with the worktree result, or returns a mode configuration error.
     pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
-        std::process::exit(existing::run_with(
-            &existing::Options {
-                worktree: self.worktree,
-                repo: self.repo,
-                issue: self.issue,
-                branch: self.branch,
-                default_branch: self.default_branch,
-                base_ref: self.base_ref,
-                base_display: self.base_display,
-                base_branch: self.base_branch,
-                quiet: self.quiet,
-                ignore_pids: self.ignore_pid,
-            },
-            pr_list,
-        ));
+        std::process::exit(
+            existing::run_with(
+                &existing::Options {
+                    worktree: self.worktree,
+                    repo: self.repo,
+                    issue: self.issue,
+                    branch: self.branch,
+                    default_branch: self.default_branch,
+                    base_ref: self.base_ref,
+                    base_display: self.base_display,
+                    base_branch: self.base_branch,
+                    quiet: self.quiet,
+                    ignore_pids: self.ignore_pid,
+                },
+                pr_list,
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }

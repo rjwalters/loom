@@ -14,17 +14,37 @@ pub(crate) enum PrList {
     Tools,
 }
 
+pub(crate) enum Read {
+    Answered(String),
+    Unanswered(String),
+}
+
 impl PrList {
-    pub(crate) fn fetch(self, repo: &Path, args: &[&str]) -> Result<String, String> {
+    pub(crate) fn fetch(
+        self,
+        mode_repo: &Path,
+        git_repo: &Path,
+        args: &[&str],
+    ) -> Result<Read, String> {
         let output = match self {
-            Self::Legacy => legacy_output(repo, args)?,
-            Self::Tools => tools_output(repo, args)?,
+            Self::Legacy => legacy_output(git_repo, args),
+            Self::Tools => {
+                if detect_forge(Some(git_repo)) == ForgeType::Gitea {
+                    return Ok(Read::Unanswered("gitea is not handled natively".into()));
+                }
+                // Mode is required only at an actual forge read. Linked
+                // worktrees still use the primary checkout's effective mode.
+                crate::tools_mode::configure_forge_reads(mode_repo)?;
+                tools_output(git_repo, args)
+            }
         };
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr).into_owned())
-        }
+        Ok(match output {
+            Ok(output) if output.status.success() => {
+                Read::Answered(String::from_utf8_lossy(&output.stdout).into_owned())
+            }
+            Ok(output) => Read::Unanswered(String::from_utf8_lossy(&output.stderr).into_owned()),
+            Err(error) => Read::Unanswered(error),
+        })
     }
 }
 
@@ -47,15 +67,6 @@ fn legacy_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
 }
 
 fn tools_output(repo: &Path, args: &[&str]) -> Result<Output, String> {
-    if detect_forge(Some(repo)) == ForgeType::Gitea {
-        return Err("gitea is not handled natively".into());
-    }
-    // Resolve mode only on an actual forge read. Guards that finish using
-    // local Git and filesystem evidence can run without a configured mode.
-    if let Err(message) = crate::tools_mode::configure_forge_reads(repo) {
-        eprintln!("{message}");
-        return Err(message);
-    }
     let completed = GhInvocation::new(
         Operation::new("worktree.pr_list"),
         AccessIntent::Read,

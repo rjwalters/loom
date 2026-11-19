@@ -134,9 +134,8 @@ pub enum WorktreeCommands {
     /// fresh, distinguishing "confirmed no PR" / "no forge remote at all,
     /// nothing to shadow" from "the query itself failed" — the #7863
     /// regression was exactly those last two collapsing into each other.
-    /// Prints a `TOKEN<TAB>text` record stream; always exits 0 (a query, not
-    /// a refusal — the shell library still builds the `jq -cn` refusal
-    /// documents itself).
+    /// Prints a `TOKEN<TAB>text` record stream and exits 0 for query results.
+    /// The shell library builds its own refusal documents.
     WorktreeOpenPr(super::worktree_open_pr::WorktreeOpenPrArgs),
 }
 

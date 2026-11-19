@@ -45,7 +45,7 @@ pub struct WorktreeBranchReuseArgs {
 }
 
 impl WorktreeBranchReuseArgs {
-    /// Never returns.
+    /// Exits with the worktree result, or returns a mode configuration error.
     pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
         let opts = branch_reuse::Options {
             repo: self.repo.unwrap_or_else(|| PathBuf::from(".")),
@@ -56,8 +56,13 @@ impl WorktreeBranchReuseArgs {
             base_display: self.base_display,
             json_output: self.json_output,
         };
-        std::process::exit(branch_reuse::run_with(&opts, &|branch| {
-            crate::worktree_cli::branch_landed::forge_probe_with(&opts.repo, branch, pr_list)
-        }));
+        std::process::exit(
+            branch_reuse::try_run_with(&opts, &|branch| {
+                crate::worktree_cli::branch_landed::forge_probe_with(
+                    &opts.repo, &opts.repo, branch, pr_list,
+                )
+            })
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }
