@@ -11334,11 +11334,12 @@ configured; when its limit resets, the next spawn returns to it:
   recorded and nothing changes. **Legacy issue sweeps (#14443)** use the same
   memo under the fixed pseudo-role `issue-sweep` (one process runs the whole
   lifecycle, so there is no per-role key): the sweep reaper records the kill
-  when it reaps the dead child. Fresh dispatches and watchdog or reaper
-  retries step down a rung with the same never-climb, last-rung and
-  `enabled: false` semantics. A watchdog retry keeps its previous resolved
-  model unless the memo calls for a lower rung. An ordinary already-resolved
-  launch uses its supplied model. Fresh issue-sweep launches also receive
+  when it reaps the dead child. Fresh dispatches, watchdog retries and both
+  read-triggered and background reaper resumes step down under the same rules.
+  A watchdog retry keeps its previous resolved model unless the memo calls
+  for a lower rung. It reports `loom.model_source=default` because the model
+  comes from the previous dispatch. An ordinary already-resolved launch
+  uses its supplied model. Fresh issue-sweep launches also receive
   selection-time fallback. The issue-sweep path's insta-crash quarantine
   tally already exempts these banners (`account-exhaustion` re-attribution,
   #4122/#4501); a kill is still counted by the PR-less retry bound, unlike a step's uncharged
