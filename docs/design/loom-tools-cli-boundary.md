@@ -737,7 +737,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 `priority-labels`, `pr-congestion`, `rebase-guard`, `tree-unchanged`,
 `verdict-equivalent`, `version-only-diff`, `additive-migrations`,
 `locked-deps-only`, `resync-waiver`, `suspect-critical-diff`, `merge-method`,
-`merge-config`, `merge-queue mode|preflight|status`, `token`, `is-fleet`,
+`merge-config`, `merge-queue mode|preflight|status` and (#14520, §15) `merge-queue enqueue|dequeue|reconcile|handoff|step|revoke|group-check|authorize-check`, `token`, `is-fleet`,
 `trusted-comments`, `promotion-author`, `claim-liveness`,
 `verdict-stale-notice`, `verdict-body-check`, `verdict-gate`, `may-write`,
 `calls`, `identities`, `parent body|split-state`, `dashboard-link`.
@@ -746,7 +746,7 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 
 | Verb or family | Reason |
 | --- | --- |
-| `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link`, `merge-queue enqueue\|dequeue\|reconcile\|handoff\|step\|revoke\|group-check\|authorize-check` | write the forge, a local journal or lock, or were not shown to be read-only (`authorize-check` and `group-check` post or compute merge-authorization state). #14396 |
+| `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link` | write the forge, a local journal or lock, or were not shown to be read-only. #14396 |
 | `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
@@ -826,3 +826,86 @@ facade's decline already do, identical from both roots.
 render|parse|apply|released|decision|retract` and `operator-decision
 validate|apply|resolve`. The unit test in `bin/loom_tools.rs` still fails if the
 list and the clap tree disagree.
+
+## 15. Phase 3b: the remaining merge-queue actions (#14520)
+
+Part of #14461 (Phase 3b). `loom-tools forge merge-queue` now serves all eleven
+verbs. `mode`, `preflight` and `status` shipped in §13; this batch adds
+`enqueue`, `dequeue`, `reconcile`, `handoff`, `step`, `revoke`, `group-check`
+and `authorize-check`. The sanctioned end-to-end merge script and its nested
+merge helpers stay #14463; wrapper cutover stays #14398.
+
+### 15.1 Mechanism
+
+Admission is `ForgeAction::is_read` (`cli/forge_read.rs`): the `MergeQueue` arm
+is an exhaustive `match` over `MergeQueueAction` that names every verb, so a
+twelfth verb does not compile until its author classifies it. The handler call
+is unchanged: `handle_forge_command` -> `forge_merge_queue_cmd::run` ->
+`forge_merge_queue::handle`. Both binaries therefore share arguments, output
+and exit codes, the exact approved-SHA, authorization, required-check and
+checkout rules, and the scoped writer / status-command path
+(`forge_merge_queue/status_command.rs`), and a fleet failure still never falls
+back to a direct merge (`Nothing fell back to a direct merge.`). Nothing was
+copied into `loom-tools`. #14519 edits the same admission seam for the non-queue
+verbs; whichever lands second reuses the other's route rather than adding a
+second one.
+
+### 15.2 Scope checks, traced per verb
+
+Every write to the forge is preceded by `write_scope::may_write_from` against
+the named `--repo` (or the checkout's own target). Where it runs differs by
+verb, and `loom-tools` reaches the same call because it runs the same
+`handle_forge_command`:
+
+| Verb | Where the scope check runs | Remote effect | Denied or unreadable scope |
+| --- | --- | --- | --- |
+| `enqueue`, `dequeue`, `handoff`, `revoke` | `write_target` in `handle_forge_command`, before the handler and in every mode | enqueue/dequeue; `handoff` also posts the approved-head status; `revoke` comments, fails statuses, dequeues | exit 1, `refusing the write (#9548)`, handler never runs |
+| `reconcile --pr` / sweep | inside the handler's queue branch, after the direct, Gitea and `--mode-only` short circuits and before any forge client is used | comments, relabels, dequeues | `LOOM-MERGE-QUEUE-UNDETERMINED`, exit 3 |
+| `reconcile --mode-only` | none: reads and writes nothing in any mode | none | n/a |
+| `step` | direct mode: none (prints `DIRECT`). Otherwise it runs `reconcile` first, so its check is reconcile's; `handoff` runs only on a first line of `LOOM-MERGE-QUEUE-CONTINUE`, which a denied reconcile never prints | as `reconcile`, then `handoff` | as `reconcile`, exit 3, no handoff |
+| `group-check` | inside the handler, after the clients are built (no forge call) and before the required contexts are read or any status is posted | posts `loom/merge-authorization` on the merge group commit | `UNDETERMINED`, exit 3, nothing posted |
+| `authorize-check` | none, because it never posts: it evaluates the check body for the PR head from forge facts, and any unknown fact, outage or forge error is a failure (exit 1). Posting the check is the caller's job (the `merge_group` workflow, or `group-check`) | none | n/a (a read) |
+
+Evaluating a status (`authorize-check`, the evaluation half of `group-check`) is
+therefore separate from posting one (`group-check`'s post, `handoff`'s
+head status), and only the posting paths are vetted.
+
+### 15.3 Mode gate, classified by effect
+
+`loom-tools` resolves its `mode` (§10.3) only for a verb that can reach the
+forge. `MergeQueueAction::reaches_forge(&resolved_merge_mode)` mirrors the
+handler's own short circuits, so the forge-free answers work with `mode` unset:
+
+- an invalid `champion.mergeMode` is answered (exit 2) before anything else;
+- `reconcile --mode-only` is forge-free in every mode;
+- `reconcile` and `step` are forge-free in `direct` mode (`DIRECT` sentinel);
+- `enqueue`, `dequeue`, `handoff` and `revoke` are gated in every mode, because
+  `write_target` probes the target's credential before the handler's own
+  direct-mode refusal (exit 4 for the first three, `DIRECT` for `revoke`);
+- `mode`, `preflight`, `status`, `group-check` and `authorize-check` are gated
+  (the last two are mode-independent).
+
+### 15.4 Gitea
+
+Unchanged and identical from both roots: the queue handlers answer a Gitea
+checkout themselves (`UNSUPPORTED_FORGE`, exit 1, for `preflight`, `enqueue`,
+`dequeue` and `status`; `UNDETERMINED`, exit 3, for the queue-mode lifecycle
+verbs) and never fall through to a merge. No Gitea behavior was ported (§13.4).
+
+### 15.5 Served commands and evidence
+
+`install_compat::TOOLS_COMMANDS` lists `forge merge-queue` plus each of the
+eleven verbs; the tests in `bin/loom_tools.rs` and `cli/forge_read/tests.rs`
+fail if the list and the clap tree disagree. Coverage: `cli/forge_read/tests.rs`
+(`merge_queue_verbs_reach_the_forge_by_effect`), `tests/loom_tools_slice.rs`
+(direct-mode parity with `loom-daemon`, the mode gate, and an unreadable scope
+that makes no remote mutation against a recording fake `gh`), and the existing
+fixture suites under `forge_merge_queue/` (stale vs current approved head,
+failed status post, direct vs queue mode).
+
+**Live verification NOT performed in the implementing worktree**: running the
+migrated actions in tools-only session mode against a controlled merge-queue
+repository with disposable PRs, and recording the resulting queue entry and
+status state, needs that repository and a writer credential. It is recorded on
+the PR and the issue for an operator with that access; no repo permission is
+broadened here.

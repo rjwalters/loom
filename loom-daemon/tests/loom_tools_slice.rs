@@ -265,14 +265,6 @@ fn forge_write_verbs_are_refused_with_exit_64() {
     for args in [
         &["forge", "comment", "7", "--body", "x"][..],
         &["forge", "auto-merge", "7"],
-        &[
-            "forge",
-            "merge-queue",
-            "enqueue",
-            "7",
-            "--approved-sha",
-            "abc",
-        ],
         &["forge", "parent", "link", "--parent", "1", "--child", "2"],
     ] {
         let mut c = base(TOOLS, tmp.path(), tmp.path());
@@ -341,6 +333,14 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
         "forge check-claim",
         "forge wait-checks",
         "forge merge-queue status",
+        "forge merge-queue enqueue",
+        "forge merge-queue dequeue",
+        "forge merge-queue reconcile",
+        "forge merge-queue handoff",
+        "forge merge-queue step",
+        "forge merge-queue revoke",
+        "forge merge-queue group-check",
+        "forge merge-queue authorize-check",
         "forge issue",
     ] {
         assert!(cmds.contains(&read), "{read} missing from {cmds:?}");
@@ -794,5 +794,269 @@ fn capabilities_list_park_record_and_operator_decision() {
         "operator-decision resolve",
     ] {
         assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
+    }
+}
+
+// ---- #14520: the merge-queue actions --------------------------------------
+//
+// Both roots parse the one `ForgeAction` tree and run the one
+// `forge_merge_queue::handle`, so the real binaries must agree on stdout and
+// exit code. `base()` has no `champion.mergeMode`, so the default (`direct`)
+// applies unless a test sets `LOOM_MERGE_MODE`.
+
+const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn queue_verbs() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["forge", "merge-queue", "reconcile", "--mode-only"],
+        vec!["forge", "merge-queue", "reconcile", "--pr", "7"],
+        vec!["forge", "merge-queue", "step", "7", "--approved-sha", SHA],
+        vec![
+            "forge",
+            "merge-queue",
+            "revoke",
+            "7",
+            "--reason",
+            "stale-verdict",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "enqueue",
+            "7",
+            "--approved-sha",
+            SHA,
+        ],
+        vec!["forge", "merge-queue", "dequeue", "7"],
+        vec![
+            "forge",
+            "merge-queue",
+            "handoff",
+            "7",
+            "--approved-sha",
+            SHA,
+        ],
+    ]
+}
+
+/// Direct mode (the default): `reconcile` (with or without `--mode-only`) and
+/// `step` answer `DIRECT` before any forge call, identically from both
+/// binaries, with no credential, no `gh`, and `LOOM_MODE` unset behind a leaked
+/// gateway variable, which would be an error for a gated verb.
+#[test]
+fn merge_queue_direct_mode_short_circuits_match_loom_daemon_without_a_forge() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    for args in queue_verbs()
+        .into_iter()
+        .filter(|a| matches!(a[2], "reconcile" | "step"))
+    {
+        let run_one = |bin: &str| {
+            let mut c = base(bin, home.path(), wt.path());
+            c.env_remove("LOOM_MODE")
+                .env("LOOM_GH_GATEWAY_DIR", gw.path())
+                .args(&args);
+            run(c, None)
+        };
+        let t = run_one(TOOLS);
+        let d = run_one(DAEMON);
+        let err = String::from_utf8_lossy(&t.stderr);
+        assert!(
+            !err.contains("LOOM_GH_GATEWAY_DIR"),
+            "{args:?} must not be mode-gated in direct mode: {err}"
+        );
+        assert_eq!(t.status.code(), Some(0), "{args:?}: {err}");
+        assert_eq!(t.status.code(), d.status.code(), "{args:?}: {err}");
+        assert_eq!(t.stdout, d.stdout, "{args:?}");
+        let out = String::from_utf8_lossy(&t.stdout);
+        assert!(out.starts_with("LOOM-MERGE-QUEUE-DIRECT"), "{args:?}: {out}");
+    }
+}
+
+/// The verbs `write_target` vets, and the queue-mode paths, may reach the
+/// forge, so the mode gate runs first; `reconcile --mode-only` reads and
+/// writes nothing and is not gated; the two checks are gated in every mode.
+#[test]
+fn merge_queue_mode_gate_follows_the_resolved_merge_mode() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let gated = |args: &[&str], merge_mode: Option<&str>| {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .args(args);
+        if let Some(m) = merge_mode {
+            c.env("LOOM_MERGE_MODE", m);
+        }
+        run(c, None)
+    };
+    let assert_gated = |args: &[&str], merge_mode: Option<&str>| {
+        let o = gated(args, merge_mode);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{args:?} {merge_mode:?}: {err}");
+        assert!(
+            err.contains("LOOM_GH_GATEWAY_DIR") && err.contains("LOOM_MODE=session"),
+            "{args:?} {merge_mode:?}: {err}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?} {merge_mode:?}");
+    };
+    for args in queue_verbs()
+        .into_iter()
+        .filter(|a| !a.contains(&"--mode-only"))
+    {
+        assert_gated(&args, Some("queue"));
+        // Vetted before the handler's direct-mode refusal: gated in every mode.
+        if matches!(args[2], "enqueue" | "dequeue" | "handoff" | "revoke") {
+            assert_gated(&args, None);
+        }
+    }
+    assert_gated(&["forge", "merge-queue", "group-check", "--commit", SHA], None);
+    assert_gated(
+        &[
+            "forge",
+            "merge-queue",
+            "authorize-check",
+            "7",
+            "--pr-head",
+            SHA,
+        ],
+        None,
+    );
+    // `reconcile --mode-only` is observable with no forge effect and no mode.
+    let o = gated(&["forge", "merge-queue", "reconcile", "--mode-only"], Some("queue"));
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).trim(),
+        "LOOM-MERGE-QUEUE-MODE queue execution=enabled"
+    );
+}
+
+/// A `gh` that records every argv and fails every call: any write it were
+/// asked to make would show up in the log.
+fn failing_gh(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = dir.join("gh-calls.log");
+    let path = dir.join("gh");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'gh: not authorized' >&2\nexit 1\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Queue mode with a target the writer cannot vet (an unreadable scope): the
+/// writing verbs refuse or report "nothing confirmed" and make no remote
+/// mutation, and `loom-tools` and `loom-daemon` agree on every answer.
+#[test]
+fn merge_queue_unreadable_scope_makes_no_remote_mutation() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    failing_gh(bin.path());
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let args_list: Vec<Vec<&str>> = vec![
+        vec![
+            "forge",
+            "merge-queue",
+            "reconcile",
+            "--pr",
+            "7",
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "step",
+            "7",
+            "--approved-sha",
+            SHA,
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "revoke",
+            "7",
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "enqueue",
+            "7",
+            "--approved-sha",
+            SHA,
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "handoff",
+            "7",
+            "--approved-sha",
+            SHA,
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "dequeue",
+            "7",
+            "--repo",
+            "acme/widgets",
+        ],
+        vec![
+            "forge",
+            "merge-queue",
+            "group-check",
+            "--commit",
+            SHA,
+            "--repo",
+            "acme/widgets",
+        ],
+    ];
+    for args in args_list {
+        let mut outs = Vec::new();
+        for b in [TOOLS, DAEMON] {
+            let mut c = base(b, home.path(), wt.path());
+            c.env("PATH", &path)
+                .env("LOOM_MERGE_MODE", "queue")
+                .env("LOOM_GH_BIN", bin.path().join("gh"))
+                .args(&args);
+            outs.push(run(c, None));
+        }
+        let (t, d) = (&outs[0], &outs[1]);
+        let err = String::from_utf8_lossy(&t.stderr);
+        assert_eq!(t.status.code(), d.status.code(), "{args:?}: {err}");
+        assert_ne!(t.status.code(), Some(0), "{args:?} must not succeed: {err}");
+        let first = String::from_utf8_lossy(&t.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !first.starts_with("LOOM-MERGE-QUEUE-CONTINUE")
+                && !first.starts_with("LOOM-MERGE-QUEUE-DIRECT")
+                && !first.starts_with("LOOM-MERGE-QUEUE-HANDED-OFF")
+                && !first.starts_with("LOOM-MERGE-QUEUE-MERGED"),
+            "{args:?}: {first}"
+        );
+    }
+    let log = std::fs::read_to_string(bin.path().join("gh-calls.log")).unwrap_or_default();
+    for write in [
+        "POST", "PATCH", "DELETE", "--method", "-X", "mutation", "comment", "edit",
+    ] {
+        assert!(!log.contains(write), "a remote mutation ({write}) was attempted:\n{log}");
     }
 }
