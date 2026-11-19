@@ -44,6 +44,7 @@ use loom_daemon::cli::{
     StaleBlockedArgs,
 };
 use loom_daemon::install_compat;
+use loom_daemon::script_helpers;
 use loom_daemon::tools_mode;
 
 #[derive(Parser)]
@@ -107,7 +108,8 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
-    /// Claim, check, fence and release role-keyed pull-request leases.
+    /// Publish and renew issue leases, or claim, check, fence and release
+    /// role-keyed pull-request leases.
     Lease(LeaseCli),
     /// Query the label registry (#10013): the same subcommands, stdout and
     /// exit codes as `loom-daemon labels` (#14429). `undeclared` and
@@ -181,6 +183,23 @@ enum ToolsCommands {
     /// user-scope hooks from (2am#4501): the same line and exit codes as
     /// `loom-daemon hooks-home` (#14429).
     HooksHome(HooksHomeArgs),
+    /// Atomic file-based issue claiming in this checkout (`claim`, `extend`,
+    /// `release`, `check`, `list`, `cleanup`): the same arguments, stdout and
+    /// exit codes as `loom-daemon claim` (#14487), so an attended builder can
+    /// claim with no daemon binary installed. Filesystem only: no forge call
+    /// and no mode gate.
+    ///
+    /// Exit codes: `0` success, `1` already claimed / general error, `2`
+    /// invalid arguments, `3` claim not found, `4` agent-ID mismatch.
+    Claim {
+        /// One of: `claim`, `extend`, `release`, `check`, `list`, `cleanup`.
+        #[arg(value_name = "COMMAND")]
+        command: Option<String>,
+
+        /// Positional command arguments (issue number, agent id, ttl).
+        #[arg(value_name = "ARGS", trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -253,24 +272,36 @@ fn run() -> Result<()> {
             }
             handle_forge_read_command(cli)
         }
-        ToolsCommands::ParkRecord(cli) => {
-            // Classified by effect, from the parsed invocation: the offline
-            // forms never resolve `mode`, so they work with `mode` unset.
-            if cli.reaches_forge() {
-                mode_gate()?;
-            }
-            handle_park_record_command(cli)
-        }
+        ToolsCommands::ParkRecord(cli) => handle_park_record_command(cli),
         ToolsCommands::OperatorDecision(cli) => {
-            if cli.reaches_forge() {
-                mode_gate()?;
-            }
             if cli.files_new_issue() {
                 use_this_binary_for_nested_filing();
             }
             handle_operator_decision_command(cli)
         }
-        ToolsCommands::Lease(cli) => handle_lease_command(cli),
+        ToolsCommands::Lease(cli) => {
+            // Classified by effect, from the parsed invocation: the renewer
+            // actions, and an `ensure` the environment settles by itself, never
+            // resolve `mode`. PR leases resolve it for their own workspace.
+            if cli.needs_issue_mode_gate() {
+                if let Err(err) = mode_gate() {
+                    // `ensure` always exits 0 and `co-occupancy` fails open with
+                    // 0 (its exit 1 means "refuse the shared worktree"): a mode
+                    // error must not alias either, so it is reported and the
+                    // verb ends as it does on any other unreadable forge.
+                    if cli.fails_open_on_mode_error() {
+                        eprintln!(
+                            "lease {}: {err:#} -- failing open (a lease is evidence, never a \
+                             precondition)",
+                            cli.verb()
+                        );
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
+            handle_lease_command(cli)
+        }
         // #14429, design §13.7: the same classified-by-effect gate the forge
         // and park-record families use, and the same exit-64 refusals for
         // the write forms (#14396).
@@ -314,6 +345,12 @@ fn run() -> Result<()> {
         ToolsCommands::Guards(cmd) => cmd.run(),
         ToolsCommands::InstallCompat(cmd) => cmd.run(),
         ToolsCommands::HooksHome(args) => args.run(),
+        // Filesystem only (`.loom/claims/`), so no mode gate: it works with
+        // `mode` unset, offline. Same handler `Commands::Claim` calls.
+        ToolsCommands::Claim { command, args } => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
+        }
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }
@@ -344,33 +381,58 @@ mod tests {
             .unwrap()
     }
 
-    /// #14395: the capability list is the clap tree. Every top-level
-    /// command is listed (`forge` through its verbs), and every listed command
-    /// names a real one, so `capabilities --json` cannot drift from what the
-    /// binary serves.
+    /// Every top-level command is represented. Families listed by verb also
+    /// have their verbs checked, with `forge` covered by `forge_read` tests.
     #[test]
     fn capability_list_matches_the_clap_tree() {
         use loom_daemon::install_compat::TOOLS_COMMANDS;
-        let top: Vec<String> = on_main_sized_stack(|| {
+        on_main_sized_stack(|| {
             let mut cmd = ToolsCli::command();
             cmd.build();
-            cmd.get_subcommands()
-                .map(|c| c.get_name().to_string())
-                .filter(|n| n != "help")
-                .collect()
+
+            for listed in TOOLS_COMMANDS
+                .iter()
+                .filter(|path| !path.starts_with("forge "))
+            {
+                let found = listed.split(' ').try_fold(&cmd, |parent, segment| {
+                    parent
+                        .find_subcommand(segment)
+                        .filter(|child| child.get_name() != "help")
+                });
+                assert!(found.is_some(), "`{listed}` names no loom-tools command");
+            }
+
+            for family in cmd
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+            {
+                let name = family.get_name();
+                let lists_verbs = TOOLS_COMMANDS.iter().any(|path| {
+                    path.strip_prefix(name)
+                        .is_some_and(|tail| tail.starts_with(' '))
+                });
+                assert!(
+                    lists_verbs || TOOLS_COMMANDS.contains(&name),
+                    "`{name}` is served but missing from TOOLS_COMMANDS"
+                );
+                if name == "forge" || !lists_verbs {
+                    continue;
+                }
+                for verb in family
+                    .get_subcommands()
+                    .filter(|child| child.get_name() != "help")
+                {
+                    let path = format!("{name} {}", verb.get_name());
+                    assert!(
+                        TOOLS_COMMANDS.contains(&path.as_str())
+                            || TOOLS_COMMANDS
+                                .iter()
+                                .any(|listed| listed.starts_with(&format!("{path} "))),
+                        "`{path}` is served but missing from TOOLS_COMMANDS"
+                    );
+                }
+            }
         });
-        for name in &top {
-            let listed = TOOLS_COMMANDS.iter().any(|c| {
-                c == name
-                    || c.strip_prefix(name.as_str())
-                        .is_some_and(|r| r.starts_with(' '))
-            });
-            assert!(listed, "`{name}` is served but missing from TOOLS_COMMANDS");
-        }
-        for listed in TOOLS_COMMANDS {
-            let head = listed.split(' ').next().unwrap();
-            assert!(top.iter().any(|n| n == head), "`{listed}` names no loom-tools command");
-        }
     }
 
     /// #14395: `loom-tools forge <verb>` accepts the daemon's argv, including
@@ -511,6 +573,33 @@ mod tests {
         });
     }
 
+    /// #14488: `loom-tools lease` keeps the daemon's argv, and the mode gate is
+    /// chosen from the parsed invocation's effects.
+    #[test]
+    fn lease_keeps_the_daemon_argv_and_classifies_by_effect() {
+        on_main_sized_stack(|| {
+            // (argv tail, uses the issue-mode gate)
+            let table: [(&[&str], bool); 6] = [
+                (&["ensure", "7", "--watch-pid", "1", "--force"], true),
+                (&["co-occupancy", "7"], true),
+                (&["release", "7"], true),
+                (&["renewer", "stop", "--issue", "7"], false),
+                (&["renewer", "sanitize-exec", "--check"], false),
+                (&["pr", "check", "7", "--role", "judge"], false),
+            ];
+            for (tail, issue_gate) in table {
+                let mut argv = vec!["loom-tools", "lease"];
+                argv.extend(tail);
+                let cli =
+                    ToolsCli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+                let ToolsCommands::Lease(c) = cli.command else {
+                    panic!("{argv:?}")
+                };
+                assert_eq!(c.needs_issue_mode_gate(), issue_gate, "{argv:?}");
+            }
+        });
+    }
+
     /// #14429: the top-level reads and config-inspection commands keep the
     /// daemon's argv, and the gate / refusal classification is by parsed
     /// effect: only a forge-reaching form reports `reaches_forge`, and only
@@ -560,7 +649,6 @@ mod tests {
                 (&["premise-check", "--body-file", "b", "--title", "T"], false, true),
             ];
             for (tail, reaches, read) in cases {
-                let head = tail[0];
                 let mut argv = vec!["loom-tools"];
                 argv.extend_from_slice(tail);
                 let cli =
@@ -573,7 +661,6 @@ mod tests {
                 };
                 assert_eq!(got_reaches, reaches, "{argv:?}: reaches_forge");
                 assert_eq!(got_read, read, "{argv:?}: is_read");
-                let _ = head;
             }
             // `premise-check --issue` is forge mode and gated.
             let cli =

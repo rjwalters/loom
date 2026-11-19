@@ -22,6 +22,7 @@ pub use root::{
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
+pub(crate) mod accounts_session_claude;
 mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
@@ -111,8 +112,8 @@ mod labels_migrate;
 mod labels_migrate_holds;
 mod labels_undeclared;
 mod lease_cli;
-pub use lease_cli::{handle_lease_command, LeaseCli};
 pub(crate) mod lease_co_occupancy;
+pub use lease_cli::{handle_lease_command, LeaseCli};
 pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;

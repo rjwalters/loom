@@ -3481,14 +3481,15 @@ by `candidate_cmp`, with what the tick did with it:
 - **blocked** (held by something specific to the issue or repo): `parked` (with
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
-  `prless_retry`, `peer_claim`, `recheck_interval`, `hard_exclusion`,
+  `prless_retry`, `lease_held`, `recheck_interval`, `hard_exclusion`,
   `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
   `main`, a gate in flight, a pre-flight or token-pool hold, or a drain;
   the row does not say which), `workspace_commands_missing`,
   `dispatch_error` (with the error text), `already_landed` (#11429: the issue
   is closed, or this host recorded a `landed` sweep for it in the last 30
   minutes; detail `forge_closed` or `journal_landed`), `already_closed`
-  (#11429: the issue is closed as not planned)
+  (#11429: the issue is closed as not planned). The `peer_claim` token was
+  replaced by `lease_held` when #13945 retired the peer-claim channel.
 
 Each disposition is recorded next to the `TickReport` counter it matches, so the
 rows and the counters agree. Issues dropped before the sort are still ranked by the same
@@ -11154,8 +11155,9 @@ configured; when its limit resets, the next spawn returns to it:
   explicit per-repo choice; the shipped `chain` is `fable → opus → sonnet`
   (the sweep ladder's upper rungs), configurable per repo through the
   effective config like the model keys.
-- **What falls back.** Role-runner ticks and step-engine spawns (every
-  `StepRole`, including Builder steps): after the model-resolution chain
+- **What falls back.** Role-runner ticks, step-engine spawns (every
+  `StepRole`, including Builder steps) and legacy issue-sweep launches
+  (#14443): after the model-resolution chain
   above resolves the configured model, the daemon probes the pool for that
   model's *class* and, finding no usable account, walks the chain strictly
   **below** the configured model to the first rung with one and launches
@@ -11203,10 +11205,19 @@ configured; when its limit resets, the next spawn returns to it:
   step's own dispatch and only for a non-zero exit with no verdict line — a
   generic `hit your weekly limit` is account-wide, no rung escapes it, and
   stays as today. With the block absent or `enabled: false` nothing is
-  recorded and nothing changes. The issue-sweep path's insta-crash
-  quarantine tally already exempts these banners (`account-exhaustion`
-  re-attribution, #4122/#4501); it re-dispatches through the sweep reaper,
-  not this memo.
+  recorded and nothing changes. **Legacy issue sweeps (#14443)** use the same
+  memo under the fixed pseudo-role `issue-sweep` (one process runs the whole
+  lifecycle, so there is no per-role key): the sweep reaper records the kill
+  when it reaps the dead child. Fresh dispatches, watchdog retries and both
+  read-triggered and background reaper resumes step down under the same rules.
+  A watchdog retry keeps its previous resolved model unless the memo calls
+  for a lower rung. It reports `loom.model_source=default` because the model
+  comes from the previous dispatch. An ordinary already-resolved launch
+  uses its supplied model. Fresh issue-sweep launches also receive
+  selection-time fallback. The issue-sweep path's insta-crash quarantine
+  tally already exempts these banners (`account-exhaustion` re-attribution,
+  #4122/#4501); a kill is still counted by the PR-less retry bound, unlike a step's uncharged
+  `provider_exhausted` end.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). **It is an allowlist, not an

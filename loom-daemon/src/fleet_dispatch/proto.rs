@@ -69,7 +69,7 @@ pub const REFUSE_CLAIM_LOST: &str = "claim_lost";
 /// The `refuse` reasons the captain counts by name (spec §5.4): the worker's
 /// existing refusal tokens. Any other token is counted as `other`, so a
 /// worker cannot grow the refusals metric's label set.
-pub const REFUSE_REASONS: [&str; 18] = [
+pub const REFUSE_REASONS: [&str; 19] = [
     REFUSE_CLAIM_LOST,
     "already_closed",
     "already_landed",
@@ -78,6 +78,7 @@ pub const REFUSE_REASONS: [&str; 18] = [
     "peer_active",
     "backstop_hold",
     "claim_unverified",
+    "writer_rate_limited",
     "roll_paused",
     "spawn_failed",
     "label_flip_failed",
