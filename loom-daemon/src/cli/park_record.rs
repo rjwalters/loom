@@ -234,7 +234,54 @@ pub(crate) struct ParseArgs {
     pub json: bool,
 }
 
+/// `loom-tools park-record <action>`: the [`ParkRecordCommand`] tree, unchanged
+/// (#14464, epic #12708 Phase 3b). `loom-tools` and `loom-daemon park-record`
+/// parse the one clap family and run the one handler in-process, so there is no
+/// second implementation to drift. The field is private so the crate-private
+/// command type does not leak into the public API.
+#[derive(clap::Args)]
+pub struct ParkRecordCli {
+    #[command(subcommand)]
+    command: ParkRecordCommand,
+}
+
+impl ParkRecordCli {
+    /// Whether this invocation can reach the forge, and so must pass the mode
+    /// gate (design §10.3) before it runs. Classified by effect, not by verb:
+    /// `render`, `parse`, `retract --file`, `released` and `decision` touch only
+    /// argv, stdin, a file or the local role journal; `apply` (a dry-run still
+    /// reads the target and any blocker) and a forge `retract` do reach it.
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.command.reaches_forge()
+    }
+}
+
+/// Run the park-record action through the one shared handler.
+///
+/// # Errors
+/// Whatever the handler returns; most actions exit the process themselves with
+/// their documented exit codes.
+pub fn handle_park_record_command(cli: ParkRecordCli) -> Result<()> {
+    cli.command.run()
+}
+
 impl ParkRecordCommand {
+    /// See [`ParkRecordCli::reaches_forge`]. An exhaustive `match` with no
+    /// wildcard: a new action does not compile until its author says whether it
+    /// reaches the forge.
+    pub(crate) fn reaches_forge(&self) -> bool {
+        match self {
+            ParkRecordCommand::Render(_)
+            | ParkRecordCommand::Parse(_)
+            | ParkRecordCommand::Released(_)
+            | ParkRecordCommand::Decision(_) => false,
+            ParkRecordCommand::Apply(_) => true,
+            // `--file` composes against a local body: the forge is never read.
+            ParkRecordCommand::Retract(args) => args.file.is_none(),
+        }
+    }
+
     pub(crate) fn run(self) -> Result<()> {
         match self {
             ParkRecordCommand::Render(args) => args.run(),

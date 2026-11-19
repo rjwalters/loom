@@ -282,30 +282,95 @@ pub(super) fn parse_effort_config(
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(String::from);
-    let role_efforts = block
-        .get("roleEfforts")
+    let role_efforts = parse_role_keyed_map(block, "roleEfforts");
+    (effort, role_efforts)
+}
+
+/// Parse one `autonomous.roleRunner` object of `{"<role>[@<runtime>]": "<value>"}`
+/// entries: keys normalised by [`normalize_role_runtime_key`], blank or
+/// non-string values dropped, each **per entry**; absent / non-object soft-fails
+/// to an empty map. Shared by `roleEfforts` and `roleServiceTiers` (#14454).
+fn parse_role_keyed_map(block: &serde_json::Value, name: &str) -> BTreeMap<String, String> {
+    block
+        .get(name)
         .and_then(serde_json::Value::as_object)
         .map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| {
-                    let key = normalize_role_effort_key(k)?;
+                    let key = normalize_role_runtime_key(k, name)?;
                     let val = v.as_str().map(str::trim).filter(|e| !e.is_empty())?;
                     Some((key, val.to_string()))
                 })
                 .collect::<BTreeMap<String, String>>()
         })
-        .unwrap_or_default();
-    (effort, role_efforts)
+        .unwrap_or_default()
 }
 
-/// Issue #14017: normalise one `roleEfforts` key — `"<role>"` or the
+/// Issue #14454: parse the two service-tier keys out of an `autonomous.roleRunner`
+/// block, returning `(service_tier, role_service_tiers)` — the exact contract of
+/// [`parse_effort_config`] (trim, blank-is-unset, per-entry soft-fail,
+/// `"<role>@<runtime>"` keys). Values are trimmed but neither lower-cased nor
+/// validated: the spawn scripts own the tier vocabulary and its validation.
+#[must_use]
+pub(super) fn parse_service_tier_config(
+    block: &serde_json::Value,
+) -> (Option<String>, BTreeMap<String, String>) {
+    let tier = block
+        .get("serviceTier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from);
+    (tier, parse_role_keyed_map(block, "roleServiceTiers"))
+}
+
+/// Issue #14454: resolve the service tier (the runtime-neutral speed setting of
+/// #14141) a role child is launched with — the producer of the spawn scripts'
+/// `LOOM_SERVICE_TIER` contract.
+///
+/// **`roleServiceTiers.<role>@<runtime>` > `roleServiceTiers.<role>` >
+/// `autonomous.roleRunner.serviceTier` > unset**, i.e. the effort chain
+/// ([`resolve_role_runner_effort_for_runtime`]) minus the Codex default. Returns
+/// `None` when nothing is configured, in which case the caller exports nothing
+/// and an inherited `LOOM_SERVICE_TIER` stays as the operator set it; otherwise
+/// the tier plus a label naming the config key that supplied it.
+#[must_use]
+pub fn resolve_role_runner_service_tier_for_runtime(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<(String, String)> {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    let runtime_key = runtime
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty());
+    if let Some(rt) = &runtime_key {
+        let qualified = format!("{role_key}@{rt}");
+        if let Some(t) = config.role_service_tiers.get(&qualified) {
+            return Some((
+                t.clone(),
+                format!("autonomous.roleRunner.roleServiceTiers.{qualified}"),
+            ));
+        }
+    }
+    if let Some(t) = config.role_service_tiers.get(&role_key) {
+        return Some((t.clone(), format!("autonomous.roleRunner.roleServiceTiers.{role_key}")));
+    }
+    config
+        .service_tier
+        .map(|t| (t, "autonomous.roleRunner.serviceTier".to_string()))
+}
+
+/// Issue #14017: normalise one `roleEfforts` (or, #14454, `roleServiceTiers`)
+/// key — `"<role>"` or the
 /// runtime-qualified `"<role>@<runtime>"` — to its trimmed, lower-cased form.
 /// A blank key, or a qualified key that is not exactly one `@` between two
 /// non-blank halves (`"builder@"`, `"@codex"`, `"a@b@c"`), returns `None`; the
 /// qualified case warns, since it is a typo that would otherwise silently
 /// fall back to the per-role value. A well-formed key naming a runtime that
 /// never launches is kept: it simply never matches.
-fn normalize_role_effort_key(raw: &str) -> Option<String> {
+fn normalize_role_runtime_key(raw: &str, map_name: &str) -> Option<String> {
     let key = raw.trim().to_ascii_lowercase();
     if key.is_empty() {
         return None;
@@ -322,7 +387,7 @@ fn normalize_role_effort_key(raw: &str) -> Option<String> {
         }
         _ => {
             log::warn!(
-                "role_runner: ignoring malformed autonomous.roleRunner.roleEfforts key \
+                "role_runner: ignoring malformed autonomous.roleRunner.{map_name} key \
                  {raw:?}; expected \"<role>\" or \"<role>@<runtime>\""
             );
             None

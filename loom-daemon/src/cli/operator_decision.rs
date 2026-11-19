@@ -90,7 +90,68 @@ pub(crate) enum OperatorDecisionCommand {
     },
 }
 
+/// `loom-tools operator-decision <action>`: the [`OperatorDecisionCommand`]
+/// tree, unchanged (#14464, epic #12708 Phase 3b); see
+/// [`ParkRecordCli`](super::park_record::ParkRecordCli).
+#[derive(clap::Args)]
+pub struct OperatorDecisionCli {
+    #[command(subcommand)]
+    command: OperatorDecisionCommand,
+}
+
+impl OperatorDecisionCli {
+    /// Whether this invocation can reach the forge, and so must pass the mode
+    /// gate (design §10.3) before it runs. See
+    /// [`OperatorDecisionCommand::reaches_forge`].
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.command.reaches_forge()
+    }
+
+    /// Whether this invocation files a new issue, which runs
+    /// `create-issue.sh` (duplicate check, filing lock) and a nested
+    /// `forge create-issue`.
+    #[must_use]
+    pub fn files_new_issue(&self) -> bool {
+        matches!(
+            self.command,
+            OperatorDecisionCommand::Apply {
+                new: true,
+                dry_run: false,
+                ..
+            }
+        )
+    }
+}
+
+/// Run the operator-decision action through the one shared handler.
+///
+/// # Errors
+/// Whatever the handler returns; it exits the process with its own code.
+pub fn handle_operator_decision_command(cli: OperatorDecisionCli) -> Result<()> {
+    cli.command.run()
+}
+
 impl OperatorDecisionCommand {
+    /// Whether this invocation can reach the forge. `validate` and
+    /// `apply --new --dry-run` render offline; an existing-issue `apply`
+    /// (including its preview) reads the body and labels; `apply --new` files.
+    /// `resolve` reads the decision even as a preview, but a recording run that
+    /// is not attended, or names an unknown effect, refuses before any forge
+    /// call, so it must not be turned into a mode error first (exit 5/2 stay).
+    pub(crate) fn reaches_forge(&self) -> bool {
+        match self {
+            OperatorDecisionCommand::Validate { .. } => false,
+            OperatorDecisionCommand::Apply { new, dry_run, .. } => !(*new && *dry_run),
+            OperatorDecisionCommand::Resolve {
+                effect, dry_run, ..
+            } => {
+                crate::operator_decision::resolution::Effect::parse(effect).is_ok()
+                    && (*dry_run || crate::operator_decision::resolve::require_attended().is_ok())
+            }
+        }
+    }
+
     /// Never returns: exits with the command's own code.
     pub(crate) fn run(self) -> Result<()> {
         let mut out = std::io::stdout();

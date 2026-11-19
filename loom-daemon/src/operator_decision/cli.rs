@@ -485,6 +485,10 @@ impl Forge for GhForge {
         body: &str,
         labels: &[String],
     ) -> Result<String, (i32, String)> {
+        // The target's write scope is checked here, before `create-issue.sh`
+        // runs its duplicate scan and takes the filing lock (#14464): a denied
+        // or unverifiable target is refused with no nested call at all.
+        self.check_write().map_err(|e| (exit::FORGE, e))?;
         let script = self
             .repo_root
             .join(".loom")
