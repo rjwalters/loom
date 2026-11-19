@@ -872,6 +872,78 @@ mod denied_dirs {
 
     #[serial_test::serial(codex_home_env)]
     #[test]
+    fn listable_directories_with_denied_candidate_metadata_make_a_miss_no_store() {
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[
+                (
+                    "2026/08/31",
+                    "rollout-readable.jsonl",
+                    rollout("/w", "2026-09-01T02:06:31Z", "unrelated", "gpt-5", &[(500, 0, 50, 0)]),
+                ),
+                (
+                    "2026/09/01",
+                    "rollout-requested.jsonl",
+                    rollout("/w", "2026-09-01T02:06:31Z", "wanted", "gpt-5", &[(500, 0, 50, 0)]),
+                ),
+            ],
+        );
+        let month = home.join(SESSIONS_DIR).join("2026/09");
+        let day = month.join("01");
+        let wanted = day.join("rollout-requested.jsonl");
+        let window = (instant("2026-09-01T01:00:00Z"), instant("2026-09-01T03:00:00Z"));
+        let id = ["wanted".into()];
+        let lookup = || with_codex_home(&home, || lookup_ids(&id, window, None));
+        assert!(matches!(lookup(), IdLookup::Found(_)));
+
+        // Listing succeeds even without the search bit. The eligible child's
+        // metadata is inaccessible, whether it is a rollout or a date directory.
+        for (directory, child) in [(&day, &wanted), (&month, &day)] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o400)).unwrap();
+            let entries = std::fs::read_dir(directory)
+                .and_then(|entries| entries.collect::<std::io::Result<Vec<_>>>());
+            let metadata = std::fs::metadata(child);
+            let result = lookup();
+            restore(directory);
+            assert!(entries.unwrap().iter().any(|entry| entry.path() == *child));
+            assert_eq!(metadata.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(result, IdLookup::NoStore);
+            assert!(matches!(lookup(), IdLookup::Found(_)));
+        }
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
+    fn invalid_month_is_excluded_before_a_cross_year_lookup_reads_it() {
+        if !denials_are_enforced() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = seed_codex_home(
+            tmp.path(),
+            &[(
+                "2026/12/31",
+                "rollout-complete.jsonl",
+                rollout("/w", "2026-12-31T02:06:31Z", "known-zero", "gpt-5", &[]),
+            )],
+        );
+        let invalid_month = home.join(SESSIONS_DIR).join("2026/13");
+        std::fs::create_dir(&invalid_month).unwrap();
+        let window = (instant("2026-12-31T00:00:00Z"), instant("2027-01-01T03:00:00Z"));
+        deny(&invalid_month);
+        let failed_read = std::fs::read_dir(&invalid_month);
+        let result = with_codex_home(&home, || lookup_ids(&["absent".into()], window, None));
+        restore(&invalid_month);
+        assert_eq!(failed_read.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(result, IdLookup::NotFound);
+    }
+
+    #[serial_test::serial(codex_home_env)]
+    #[test]
     fn an_unreadable_in_window_day_directory_makes_a_by_id_miss_no_store() {
         if !denials_are_enforced() {
             return;
@@ -1262,4 +1334,84 @@ fn with_codex_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
 fn clear_home_env() {
     std::env::remove_var(CODEX_HOME_ENV);
     std::env::remove_var(CODEX_NATIVE_HOME_ENV);
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn an_unused_profile_does_not_poison_a_readable_home() {
+    let _profile_root = clear_all_home_env();
+    let tmp = tempfile::tempdir().unwrap();
+    let _ambient = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-complete.jsonl",
+            rollout("/w", "2026-09-21T02:06:31Z", "known-zero", "gpt-5", &[]),
+        )],
+    );
+    let unused = tmp.path().join(".loom/codex-profiles/unused");
+    std::fs::create_dir_all(&unused).unwrap();
+    assert_eq!(
+        std::fs::read_dir(unused.join(SESSIONS_DIR))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound,
+    );
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        (
+            lookup_ids(&["known-zero".into()], window, Some(tmp.path())),
+            lookup_ids(&["absent".into()], window, Some(tmp.path())),
+        ),
+        (IdLookup::NoUsage, IdLookup::NotFound),
+    );
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn blank_records_do_not_poison_a_selected_zero_token_rollout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut lines = rollout("/w", "2026-09-21T02:06:31Z", "known-zero", "gpt-5", &[]);
+    lines.push(String::new());
+    lines.push(" \t".to_string());
+    let home = seed_codex_home(tmp.path(), &[("2026/09/20", "rollout-spaced.jsonl", lines)]);
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(&["known-zero".into()], window, None)),
+        IdLookup::NoUsage
+    );
+}
+
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn a_partial_byte_read_refuses_to_print_partial_tokens() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[(
+            "2026/09/20",
+            "rollout-incomplete.jsonl",
+            rollout("/w", "2026-09-21T02:06:31Z", "known-good", "gpt-5", &[(500, 0, 50, 0)]),
+        )],
+    );
+    let file = home
+        .join(SESSIONS_DIR)
+        .join("2026/09/20/rollout-incomplete.jsonl");
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
+    let id = ["known-good".into()];
+    assert!(matches!(
+        with_codex_home(&home, || lookup_ids(&id, window, None)),
+        IdLookup::Found(_)
+    ));
+    let mut file_handle = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&file)
+        .unwrap();
+    file_handle.write_all(&[0xff, b'\n']).unwrap();
+    drop(file_handle);
+    let read = read_rollout(&home, &file, u64::MAX).unwrap();
+    assert!(!read.complete);
+    assert!(!read.lines.is_empty());
+    assert_eq!(with_codex_home(&home, || lookup_ids(&id, window, None)), IdLookup::NoStore);
 }

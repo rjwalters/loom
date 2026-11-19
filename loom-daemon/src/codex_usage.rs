@@ -313,7 +313,7 @@ fn discover_home_rollouts(
 }
 
 /// Every rollout file that could hold a session inside `window`, under one
-/// `$CODEX_HOME`, paired with whether the walk is **complete** (#14668).
+/// `$CODEX_HOME`, paired with whether the walk is incomplete (#14668).
 ///
 /// Only `<sessions>/<YYYY>/<MM>/<DD>/` directories whose date falls inside the
 /// window padded by [`DATE_PAD`] are descended into; `window: None` scans the
@@ -321,13 +321,10 @@ fn discover_home_rollouts(
 /// the authorization gate, and this is the only producer of paths
 /// [`read_rollout`] is ever given.
 ///
-/// The flag is `false` when a directory that could have held an in-window
-/// rollout (the `sessions/` tree itself, a year or month that overlaps the
-/// padded window, an in-window day) could not be enumerated: its contents are
-/// then unknown, not absent, and a by-id miss over it must not be reported as
-/// confirmed absence. A year/month/day the padded window already excludes is
-/// never read at all, so an unreadable out-of-window directory does not make
-/// the walk incomplete.
+/// A walk is incomplete when it cannot enumerate a candidate directory or
+/// identify an eligible child. An absent `sessions/` tree contributes no
+/// rollouts. Names outside the padded window are excluded before checking
+/// their metadata or attempting to descend into them.
 ///
 /// Sorted, so output is deterministic for tests and operator diffs.
 fn rollouts_under(
@@ -342,55 +339,45 @@ fn rollouts_under(
         )
     });
     let mut found = Vec::new();
-    let mut incomplete = false;
-    // sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl — three fixed levels, walked
-    // explicitly rather than recursively so no sibling tree can ever be
-    // entered by a symlink or an unexpected nesting depth.
-    let (years, unreadable) = numeric_children(&sessions);
-    incomplete |= unreadable;
-    for year in years {
-        if let Some((first, last)) = allowed_dates {
-            // Every date under a year outside the padded window is itself
-            // out of window, so the year is excluded from consideration
-            // without reading it (#14668).
-            if year.1 < first.year() || year.1 > last.year() {
-                continue;
-            }
-        }
-        let (months, unreadable) = numeric_children(&year.0);
+    // sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl — three fixed levels.
+    let (years, mut incomplete) = numeric_children(&sessions, true, |year| {
+        allowed_dates.is_none_or(|(first, last)| (first.year()..=last.year()).contains(&year))
+    });
+    for (year_path, year) in years {
+        let (months, unreadable) = numeric_children(&year_path, false, |month| {
+            allowed_dates.is_none_or(|(first, last)| {
+                (1..=12).contains(&month)
+                    && (year != first.year() || month >= first.month() as i32)
+                    && (year != last.year() || month <= last.month() as i32)
+            })
+        });
         incomplete |= unreadable;
-        for month in months {
-            if let Some((first, last)) = allowed_dates {
-                // Same exclusion at month granularity, for the edge years of
-                // the padded window.
-                if (year.1 == first.year() && month.1 < first.month() as i32)
-                    || (year.1 == last.year() && month.1 > last.month() as i32)
-                {
-                    continue;
-                }
-            }
-            let (days, unreadable) = numeric_children(&month.0);
+        for (month_path, month) in months {
+            let (days, unreadable) = numeric_children(&month_path, false, |day| {
+                allowed_dates.is_none_or(|(first, last)| {
+                    NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+                        .is_some_and(|date| (first..=last).contains(&date))
+                })
+            });
             incomplete |= unreadable;
-            for day in days {
-                if let Some((first, last)) = allowed_dates {
-                    let Some(date) = NaiveDate::from_ymd_opt(year.1, month.1 as u32, day.1 as u32)
-                    else {
-                        continue;
-                    };
-                    if date < first || date > last {
-                        continue;
-                    }
-                }
-                let Ok(entries) = std::fs::read_dir(&day.0) else {
-                    // An in-window day that cannot be enumerated could hold
-                    // the requested session: unknown, not absent (#14668).
+            for (day_path, _) in days {
+                let Ok(entries) = std::fs::read_dir(&day_path) else {
                     incomplete = true;
                     continue;
                 };
-                for entry in entries.flatten() {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        incomplete = true;
+                        continue;
+                    };
                     let path = entry.path();
-                    if path.is_file() && is_rollout_path(codex_home, &path) {
-                        found.push(path);
+                    if !is_rollout_path(codex_home, &path) {
+                        continue;
+                    }
+                    match path.metadata() {
+                        Ok(metadata) if metadata.is_file() => found.push(path),
+                        Ok(_) => {}
+                        Err(_) => incomplete = true,
                     }
                 }
             }
@@ -400,32 +387,45 @@ fn rollouts_under(
     (found, incomplete)
 }
 
-/// The numerically-named child directories of `dir`, as `(path, value)`,
-/// paired with whether `dir` could not be enumerated at all.
-///
-/// Non-numeric names are skipped rather than descended: that is what keeps the
-/// walk to the `<YYYY>/<MM>/<DD>` shape the store documents, and it is why a
-/// stray `sessions/auth.json` could never be reached even before
-/// [`is_rollout_path`] gets a say. The enumeration flag (`true` = `read_dir`
-/// failed, #14668) lets the walk report an unlistable directory's children as
-/// unknown rather than absent.
-fn numeric_children(dir: &Path) -> (Vec<(PathBuf, i32)>, bool) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return (Vec::new(), true);
+/// Enumerate numerically named directories that could contain candidate
+/// rollouts. Check eligibility before metadata, so failures on irrelevant
+/// names cannot affect the result. A failed entry read has no known name
+/// to exclude and makes enumeration incomplete.
+fn numeric_children(
+    dir: &Path,
+    missing_is_empty: bool,
+    eligible: impl Fn(i32) -> bool,
+) -> (Vec<(PathBuf, i32)>, bool) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (Vec::new(), !missing_is_empty || error.kind() != std::io::ErrorKind::NotFound);
+        }
     };
-    let mut out: Vec<(PathBuf, i32)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let value: i32 = path.file_name()?.to_str()?.parse().ok()?;
-            Some((path, value))
-        })
-        .collect();
+    let mut out = Vec::new();
+    let mut incomplete = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(value) = name
+            .to_str()
+            .and_then(|name| name.parse().ok())
+            .filter(|v| eligible(*v))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => out.push((path, value)),
+            Ok(_) => {}
+            Err(_) => incomplete = true,
+        }
+    }
     out.sort();
-    (out, false)
+    (out, incomplete)
 }
 
 /// Which sessions a caller wants attributed.
@@ -677,12 +677,9 @@ pub fn fold_rollout(
 }
 
 /// [`fold_rollout`]'s full outcome, keeping the evidence a by-id read needs
-/// ([`lookup_ids`], #14664/#14668): `selected` says this rollout passed the
-/// whole key — `filter` AND the window — so empty `rows` on a selected
-/// rollout means "this session recorded no tokens", never "this is another
-/// session's rollout". `discarded` says at least one line was dropped as
-/// unparseable JSON: the unread part could be the identity, the window or the
-/// usage, so even a selected empty result cannot establish absence (#14668).
+/// ([`lookup_ids`], #14664/#14668). A `selected` rollout passed both the
+/// filter and window. A `discarded` nonblank JSON line could carry identity,
+/// window, or usage evidence, so a read like that cannot establish absence.
 struct FoldedRollout {
     selected: bool,
     discarded: bool,
@@ -705,7 +702,7 @@ fn fold_rollout_selected(
 
     for line in lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            discarded = true;
+            discarded |= !line.trim().is_empty();
             continue;
         };
         let payload = value.get("payload");
