@@ -16,6 +16,35 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **Issue #14607** (closed): Main CI red: Guide Approved provenance query includes frozen PRs
+- **PR #14609**: fix(guide): exclude frozen PRs from plan provenance
+- **Issue #14602** (closed): daemon-reference: self-heal now prunes loom-rescue stash entries, not just rescue refs
+- **PR #14604**: docs: rescue-stash pruning shares the rescue-ref retention window
+- **Issue #14564** (closed): Codex pool: an account at its weekly limit is retried with real steps every ~20–30 min; the provider's stated reset (6 days out) is not used
+- **PR #14579**: fix: parse Codex reset horizons with ordinal day and abbreviated month
+- **Issue #14456** (closed): Confirm loom.runtime.usage rows for step-dispatched work roles in SigNoz after #14423 rolls
+- **Issue #13977** (closed): self-heal's loom-rescue-* stashes accumulate forever, and #13970 adds a recurring generator
+- **PR #14042**: fix: prune expired loom-rescue stash entries in the self-heal sweep
+- **Issue #14571** (closed): Fix forge wait-checks reporting RED after a skipped workflow run hides a successful replacement
+- **PR #14598**: fix: resolve CI replacement runs per job name in wait-checks
+- **Issue #14575** (closed): Guide rejects approved PR closing references when verifying WORK_PLAN titles
+- **PR #14587**: fix(guide): verify Approved rows against forge closing references
+- **PR #14591**: Split work-finder pre-span time into reclaim and CPU-fallback phases
+- **Issue #14577** (closed): Test the dispatch-only and force requirements for minor version bumps
+- **PR #14595**: test: pin dispatch-only and force requirements for minor version bumps
+- **Issue #14582** (closed): w1 forge-calls test fails under the forge_calls filter batch but passes solo (test isolation)
+- **PR #14592**: test: isolate forge call accounting from the ambient repo
+- **Issue #14559** (closed): A missed writer route hold is invisible: writer_holds_snapshot has no caller and route_key can disagree with the claim's attribution
+- **PR #14581**: feat: report armed writer route holds in status; log armed-but-not-found holds
+- **PR #14590**: fix(observability): refresh quiet dispatch rows from source time
+- **PR #14573**: feat: bundle zai-full, the full-strength GLM-5.3 profile
+- **Issue #14540** (closed): Telemetry: Codex steps in private-clone seats will never get loom.runtime.usage rows (session filter requires the host workspace path; the rollout's cwd is the container path)
+- **PR #14555**: fix: attribute Codex step usage by exact session id, not host directory
+- **PR #14568**: fix: raise the installed Loom compatibility floor to 0.19.175
+- **PR #14499**: feat: register and start per-seat Claude session containers
+- **PR #14563**: ci: add level: minor to the forced bump dispatch (for v0.20.0)
+- **Issue #14561** (closed): spawn-codex.sh's APPLIED_EFFORT reports an effort codex was never handed when an inline --config= value contains model_reasoning_effort=
+- **PR #14567**: fix: recognize Codex effort overrides only at the start of inline config
 - **PR #14562**: feat: record work-finder tick phase timings
 - **Issue #14414** (closed): adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort=
 - **PR #14468**: fix: report an explicit codex model_reasoning_effort config as the launched effort

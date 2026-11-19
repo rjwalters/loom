@@ -139,8 +139,9 @@ fn a_cooldown_refusal_keeps_retry_after_and_tolerates_its_absence() {
 fn grace_fails_open_without_touching_the_hysteresis() {
     reset_for_test();
     let dir = tempdir().unwrap();
-    let dead = TestServer::dead_url();
-    enable(dir.path(), &dead, true);
+    // Keep the failing endpoint bound so the grace server cannot reuse its port.
+    let unavailable = TestServer::start(|_, _| (503, json!({})));
+    enable(dir.path(), &unavailable.url(), true);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     let grace = refusing("grace");
@@ -149,8 +150,10 @@ fn grace_fails_open_without_touching_the_hysteresis() {
         assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     }
     assert_eq!(mode(), Mode::Normal);
-    enable(dir.path(), &dead, true);
+    enable(dir.path(), &unavailable.url(), true);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
+    assert_eq!(unavailable.requests_to(proto::CLAIM_PATH).len(), 3);
+    assert_eq!(grace.requests_to(proto::CLAIM_PATH).len(), 5);
     assert_eq!(mode(), Mode::Fallback, "the graces neither failed nor reset the run");
 }
 
