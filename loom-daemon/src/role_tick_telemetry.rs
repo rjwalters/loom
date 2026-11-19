@@ -81,6 +81,7 @@ use serde_json::Value;
 
 use crate::role_runner::RoleTickOutcome;
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
+use crate::telemetry::trace::TraceContext;
 use crate::telemetry::{
     RepoVisibility, RoleTickActions, RoleTickOutcomeRecord, RoleTickResult, TelemetryEnvelope,
     TelemetryRecord,
@@ -364,9 +365,7 @@ pub fn emit_for_tick_correlated(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
 ) {
-    emit_tick(
-        root, role, started_at, outcome, resolved, trace, unlaunched, None, None, None, None, None,
-    );
+    emit_tick(root, role, started_at, outcome, resolved, trace, unlaunched, None);
 }
 
 /// The step-specific inputs of [`emit_for_step`], bundled so the emit stays
@@ -376,6 +375,8 @@ pub struct StepTelemetry<'a> {
     /// back to `unclassified:step`.
     pub failure: Option<crate::observability::lifecycle::RoleFailure>,
     pub sweep_id: &'a str,
+    /// Root context returned by the step close, before backfill can retire its journal.
+    pub trace_context: Option<&'a TraceContext>,
     /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362).
     pub step_outcome: Option<(String, String)>,
     /// The step's work item and whether it is a PR (#13563).
@@ -403,20 +404,7 @@ pub fn emit_for_step(
     resolved: Option<ResolvedLaunch>,
     step: StepTelemetry<'_>,
 ) {
-    emit_tick(
-        root,
-        role,
-        started_at,
-        outcome,
-        resolved,
-        None,
-        step.failure,
-        Some(step.sweep_id.to_string()),
-        Some(step.item),
-        step.step_outcome,
-        Some(step.stage.to_string()),
-        Some(step.log_path.to_path_buf()),
-    );
+    emit_tick(root, role, started_at, outcome, resolved, None, None, Some(step));
 }
 
 /// The `loom.failure_class` of a failed tick (#12028), `None` for any other
@@ -427,7 +415,7 @@ pub fn emit_for_step(
 fn failure_class_of(
     outcome: &RoleTickOutcome,
     trace: Option<&crate::observability::lifecycle::RoleTrace>,
-    unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+    unlaunched: Option<&crate::observability::lifecycle::RoleFailure>,
     is_step: bool,
 ) -> Option<String> {
     use crate::observability::lifecycle::{UNCLASSIFIED_PRE_LAUNCH, UNCLASSIFIED_STEP};
@@ -436,7 +424,7 @@ fn failure_class_of(
     }
     let class = trace
         .and_then(|t| t.failure.as_ref())
-        .or(unlaunched.as_ref())
+        .or(unlaunched)
         .map(|f| f.class().to_string());
     Some(class.unwrap_or_else(|| {
         if is_step {
@@ -457,11 +445,7 @@ fn emit_tick(
     resolved: Option<ResolvedLaunch>,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
-    step_sweep_id: Option<String>,
-    step_item: Option<(u32, bool)>,
-    step_outcome: Option<(String, String)>,
-    stage: Option<String>,
-    step_log: Option<PathBuf>,
+    step: Option<StepTelemetry<'_>>,
 ) {
     // #10212: the gate listing this tick read, as a ranked `pick.decision`.
     crate::observability::pick_decision::emit_role_tick(
@@ -486,6 +470,7 @@ fn emit_tick(
     let role_draw = preference
         .as_ref()
         .and_then(|stamp| stamp.draw.as_deref().cloned());
+    let step_context = step.as_ref().and_then(|s| s.trace_context);
     emit_correlated(
         &RoleTickTelemetry {
             root: root.to_path_buf(),
@@ -500,8 +485,10 @@ fn emit_tick(
             failure_class: failure_class_of(
                 outcome,
                 trace.as_ref(),
-                unlaunched,
-                step_sweep_id.is_some(),
+                step.as_ref()
+                    .and_then(|s| s.failure.as_ref())
+                    .or(unlaunched.as_ref()),
+                step.is_some(),
             ),
             preference_tier: preference
                 .as_ref()
@@ -509,15 +496,16 @@ fn emit_tick(
             preference_tap: preference.map(|stamp| stamp.tap),
             role_draw,
             prompt,
-            step_sweep_id,
-            stage,
-            step_log,
-            step_item,
+            step_sweep_id: step.as_ref().map(|s| s.sweep_id.to_string()),
+            stage: step.as_ref().map(|s| s.stage.to_string()),
+            step_log: step.as_ref().map(|s| s.log_path.to_path_buf()),
+            step_item: step.as_ref().map(|s| s.item),
             deferred_by: None,
             shard_owner: None,
-            extras: TickExtras::of(trace.as_ref(), step_outcome),
+            extras: TickExtras::of(trace.as_ref(), step.and_then(|s| s.step_outcome)),
         },
         trace,
+        step_context,
     );
 }
 
@@ -561,11 +549,18 @@ fn mtime_in_tick_window(path: &Path, started_at: DateTime<Utc>, ended_at: DateTi
 /// under `projects_dir/<project slug>` whose head names `/loom:<role>` and
 /// whose mtime is in the tick window, plus that session's subagent
 /// transcripts (which carry no slash command of their own).
+///
+/// A step (#14406) also passes its `(number, is_pr)` item: several steps of one
+/// role run concurrently on a busy host, so a role-and-window match alone would
+/// fold a sibling step's session into this one. With an item, the session's
+/// command must also name that item — an issue (`/loom:builder N`,
+/// `champion --issue N`) or a PR (`/loom:judge N`, `champion --pr N`).
 #[must_use]
 fn attributed_transcripts(
     projects_dir: &Path,
     root: &Path,
     role: &str,
+    item: Option<(u32, bool)>,
     started_at: DateTime<Utc>,
     ended_at: DateTime<Utc>,
 ) -> Vec<PathBuf> {
@@ -586,6 +581,16 @@ fn attributed_transcripts(
             continue;
         };
         if !head_names_role(&head, role) {
+            continue;
+        }
+        let names_item = |(number, is_pr): (u32, bool)| {
+            if is_pr {
+                crate::transcript_tokens::head_names_pr_session(&head, number)
+            } else {
+                crate::transcript_tokens::head_names_issue_session(&head, number)
+            }
+        };
+        if !item.is_none_or(names_item) {
             continue;
         }
         out.extend(crate::transcript_tokens::session_transcripts(&path));
@@ -959,12 +964,13 @@ fn apply_runtime_attribution(
 /// `append_outcome_telemetry_journal`: any failure is logged and swallowed,
 /// because a telemetry write must never change whether a role keeps ticking.
 pub fn emit(tick: &RoleTickTelemetry) {
-    emit_correlated(tick, None);
+    emit_correlated(tick, None, None);
 }
 
 fn emit_correlated(
     tick: &RoleTickTelemetry,
     trace: Option<crate::observability::lifecycle::RoleTrace>,
+    step_context: Option<&TraceContext>,
 ) {
     let (repo, visibility) = resolve_repo(&tick.root);
     // #14048: a step's launch facts live in ITS OWN per-item log
@@ -1068,16 +1074,31 @@ fn emit_correlated(
             //
             // `usage_runtime`, not the launch record alone: a legacy-adapter
             // Codex tick has no record, only the resolved-runtime marker (#8594).
-            return crate::usage_source::role_tick_tokens_by_model(
-                usage_runtime.as_ref().and_then(|r| r.as_deref()),
-                &tick.root,
-                // Pi's usage is its event stream, captured in this log (#8594)
-                // — a step's OWN log, never the per-role one (#14048).
-                tick.step_log.as_deref().unwrap_or(&role_log),
-                Some((tick.started_at, tick.ended_at)),
-                &session_ids,
-            )
-            .map(|tokens_by_model| TranscriptScan {
+            let runtime = usage_runtime.as_ref().and_then(|r| r.as_deref());
+            let window = Some((tick.started_at, tick.ended_at));
+            // Pi's usage is its event stream, captured in this log (#8594)
+            // — a step's OWN log, never the per-role one (#14048).
+            let log = tick.step_log.as_deref().unwrap_or(&role_log);
+            let tokens = match tick.step_item {
+                // #14406: a step reads the issue's worktree too, keyed by
+                // its exact native session ids (#14048) when its log names them.
+                Some(item) => crate::usage_source::step_tokens_by_model(
+                    runtime,
+                    &tick.root,
+                    item,
+                    log,
+                    window,
+                    &session_ids,
+                ),
+                None => crate::usage_source::role_tick_tokens_by_model(
+                    runtime,
+                    &tick.root,
+                    log,
+                    window,
+                    &session_ids,
+                ),
+            };
+            return tokens.map(|tokens_by_model| TranscriptScan {
                 tokens_by_model,
                 actions: None,
             });
@@ -1087,6 +1108,7 @@ fn emit_correlated(
             &projects_dir,
             &tick.root,
             &tick.role,
+            tick.step_item,
             tick.started_at,
             tick.ended_at,
         );
@@ -1132,7 +1154,13 @@ fn emit_correlated(
     // a tick that never spawned (pool exhausted, runtime rejected, queue
     // empty) is visible there. The journal above stays the local copy.
     export(&envelope);
-    if let (Some(trace), Some(rows)) = (&trace, &tokens_by_model) {
+    // #14406: a step has no `RoleTrace` of a tick's kind — its root is the
+    // `loom.sweep` span the spawn opened under its own sweep id — but its usage
+    // belongs on that root exactly as a tick's does. Without this every
+    // step-dispatched Builder/Judge/Curator/Doctor spent tokens and journalled
+    // no `loom.runtime.usage` span.
+    let usage_trace = trace.clone().or_else(|| step_trace(tick, step_context));
+    if let (Some(trace), Some(rows)) = (&usage_trace, &tokens_by_model) {
         usage::journal_execution(
             &tick.root,
             trace,
@@ -1157,6 +1185,29 @@ fn emit_correlated(
             tick.ended_at,
         );
     }
+}
+
+/// Use the context retained at close even if backfill has since retired the
+/// sidecar. A close without a context can still use a surviving sidecar.
+fn step_trace(
+    tick: &RoleTickTelemetry,
+    closed_context: Option<&TraceContext>,
+) -> Option<crate::observability::lifecycle::RoleTrace> {
+    let execution = tick.step_sweep_id.as_deref()?;
+    let context = closed_context.cloned().or_else(|| {
+        use crate::telemetry::trace::store::TraceStore;
+        let store = TraceStore::new(&tick.root);
+        TraceStore::load(&store.path(&tick.root, execution))
+            .ok()
+            .map(|saved| saved.context)
+    })?;
+    Some(crate::observability::lifecycle::RoleTrace {
+        context,
+        execution: execution.to_string(),
+        started_at: tick.started_at,
+        failure: None,
+        judge: None,
+    })
 }
 
 /// Offer a `role_tick.outcome` envelope to the OTLP exporters (#11858). A

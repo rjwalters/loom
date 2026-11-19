@@ -286,8 +286,11 @@ _loom_filing_lock_captain_acquire() {
     local label="$1" wait_secs="$2" bin="${LOOM_DAEMON_BIN:-loom-daemon}" holder rc=0
     LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
     command -v "$bin" >/dev/null 2>&1 || return 0
+    # stdout is the holder id; stderr is deliberately NOT redirected (#14422), so
+    # the subcommand's `warn` log lines (the fail-open and the defer reason)
+    # reach the caller. A granted acquire logs nothing at the default filter.
     holder="$("$bin" fleet-dispatch filing-lock acquire --label "$label" \
-        --wait-secs "$wait_secs" 2>/dev/null)" || rc=$?
+        --wait-secs "$wait_secs")" || rc=$?
     if [[ "$rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
         return "$LOOM_FILING_LOCK_DEFER_RC"
     fi
