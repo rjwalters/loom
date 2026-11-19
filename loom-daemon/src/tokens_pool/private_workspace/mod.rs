@@ -262,6 +262,8 @@ pub enum RecoverAction {
     List,
     Publish,
     Discard,
+    #[doc(hidden)]
+    ValidateWorktrees,
 }
 
 /// One branch whose tip is not reachable from `origin`.
@@ -301,6 +303,26 @@ pub struct DirtyWorktree {
     pub untracked: usize,
     /// Commits at this worktree's HEAD that no ref of `origin` reaches.
     pub unpublished: u64,
+    /// An in-volume linked worktree with no unpublished commits. Older
+    /// workers may omit this proof, so default to in-place advice.
+    #[serde(default)]
+    pub discardable: bool,
+}
+
+impl DirtyWorktree {
+    pub(crate) fn recovery_guidance(&self, account: &str) -> String {
+        recovery_guidance(account, &self.path, self.discardable)
+    }
+}
+
+fn recovery_guidance(account: &str, path: &str, discardable: bool) -> String {
+    if discardable {
+        let account = crate::shell_quote::shell_quote(account);
+        let path = crate::shell_quote::shell_quote(path);
+        format!("if the local changes can be discarded, run `loom-daemon accounts session recover {account} --discard --worktree {path}`")
+    } else {
+        "save or resolve its changes in place".into()
+    }
 }
 
 /// One clone's recover outcome, as the in-container

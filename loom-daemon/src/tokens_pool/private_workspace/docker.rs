@@ -604,7 +604,8 @@ pub(super) fn recover_target(
     ]);
     match action {
         RecoverAction::Publish => args.extend(["--publish"]),
-        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::Discard => args.push("--discard"),
+        RecoverAction::ValidateWorktrees => args.extend(["--discard", "--validate-worktrees"]),
         RecoverAction::List => {}
     }
     if let Some(issue) = &issue_flag {

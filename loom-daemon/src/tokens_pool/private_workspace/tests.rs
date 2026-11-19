@@ -426,6 +426,7 @@ fn recover_args(remote: &Path) -> repository::RecoverArgs {
         issue: None,
         branch: Vec::new(),
         worktree: Vec::new(),
+        validate_worktrees: false,
         slug: None,
     }
 }
@@ -1476,7 +1477,7 @@ fn untracked_tool_caches_do_not_refuse_preparation_but_other_dirt_does() {
     assert!(error.contains("seat_dirty"), "{error}");
     assert!(error.contains("stray.txt"), "{error}");
     assert!(!error.contains(".cache"), "{error}");
-    assert!(error.contains("accounts session recover fixture"), "{error}");
+    assert!(error.contains("accounts session recover 'fixture'"), "{error}");
     assert!(error.contains(worktree.to_str().unwrap()), "{error}");
 }
 
@@ -1576,8 +1577,11 @@ fn discard_worktree_refuses_unpublished_commits_main_checkout_and_unknown_paths(
     let stray = f.root.join("not-a-worktree");
     std::fs::create_dir(&stray).unwrap();
     args.worktree = vec![stray.clone()];
+    args.validate_worktrees = true;
     let out = repository::recover(&f.root, &args).unwrap();
     assert_eq!(out.ignored, vec![stray.display().to_string()]);
+    args.validate_worktrees = false;
+    assert!(repository::recover(&f.root, &args).is_err());
     assert!(stray.exists());
     // Discard still needs some scope.
     args.worktree.clear();
@@ -1596,38 +1600,185 @@ fn discard_worktree_refuses_unpublished_commits_main_checkout_and_unknown_paths(
 }
 
 #[test]
-#[serial_test::serial(private_workspace_fork)]
-#[serial_test::serial]
-fn preparation_reaps_a_dirty_worktree_whose_branch_is_merged_into_the_base() {
+fn preparation_keeps_a_fast_forwarded_draft_without_finished_pr_evidence() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
     f.prepare().unwrap();
-    let repo = f.root.join("repo");
-    // A branch with a commit, pushed and merged (fast-forwarded) into the
-    // base on the remote: its worktree carries nothing the base lacks.
-    let merged = linked_worktree(&f, "issue-5550");
-    std::fs::write(merged.join("fixture"), "merged work").unwrap();
-    git(&merged, &["commit", "-am", "work"]);
-    git(&merged, &["push", "origin", "issue-5550"]);
-    git(&f.remote, &["merge", "--ff-only", "issue-5550"]);
-    // The base moves on after the merge, as a live one does.
-    std::fs::write(f.remote.join("later"), "later").unwrap();
-    git(&f.remote, &["add", "later"]);
-    git(&f.remote, &["commit", "-m", "later"]);
-    std::fs::write(merged.join("leftover"), "abandoned").unwrap();
-    git(&merged, &["add", "leftover"]);
-    // A dirty worktree cut from the old base, with no commits of its own, is
-    // unsaved work, not a merged one — even though the base has moved past it.
-    let fresh = linked_worktree(&f, "issue-7000");
-    std::fs::write(fresh.join("wip.txt"), "wip").unwrap();
-    // The refusal is for the fresh one only: the merged leftover is reaped.
-    let error = f.prepare().unwrap_err().to_string();
-    assert!(!merged.exists(), "merged leftover reaped");
-    assert!(error.contains(fresh.to_str().unwrap()), "{error}");
-    assert!(fresh.join("wip.txt").exists());
-    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-5550"]), "branch kept");
-    std::fs::remove_file(fresh.join("wip.txt")).unwrap();
+    let draft = linked_worktree(&f, "draft");
+    std::fs::write(f.remote.join("fixture"), "B").unwrap();
+    git(&f.remote, &["commit", "-am", "B"]);
+    git(&draft, &["fetch", "origin"]);
+    git(&draft, &["merge", "--ff-only", "origin/main"]);
+    let tip = git(&draft, &["rev-parse", "HEAD"]);
+    std::fs::write(f.remote.join("fixture"), "C").unwrap();
+    git(&f.remote, &["commit", "-am", "C"]);
+    std::fs::write(draft.join("unsaved.txt"), "preserve").unwrap();
+
+    let lookup = |_: &Path, repository: &str, branch: &str, revision: &str| {
+        assert_eq!(repository, f.args.repository);
+        assert_eq!(branch, "draft");
+        assert_eq!(revision, tip);
+        false
+    };
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("seat_dirty") && error.contains("unsaved.txt"), "{error}");
+    assert_eq!(std::fs::read_to_string(draft.join("unsaved.txt")).unwrap(), "preserve");
+}
+
+#[test]
+fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
+    let _fork = fork_guard();
+    for state in ["fast-forward", "squash", "closed"] {
+        let f = RepoFixture::new();
+        f.prepare().unwrap();
+        let worktree = linked_worktree(&f, "finished");
+        for text in ["first", "second"] {
+            std::fs::write(worktree.join("fixture"), text).unwrap();
+            git(&worktree, &["commit", "-am", text]);
+        }
+        git(&worktree, &["push", "origin", "finished"]);
+        let tip = git(&worktree, &["rev-parse", "HEAD"]);
+        match state {
+            "fast-forward" => {
+                git(&f.remote, &["merge", "--ff-only", "finished"]);
+                assert_eq!(git(&f.remote, &["rev-parse", "HEAD"]), tip);
+            }
+            "squash" => {
+                git(&f.remote, &["merge", "--squash", "finished"]);
+                git(&f.remote, &["commit", "-m", "squash"]);
+                assert!(!git_ok(&f.remote, &["merge-base", "--is-ancestor", &tip, "HEAD"]));
+            }
+            "closed" => {
+                assert!(!git_ok(&f.remote, &["merge-base", "--is-ancestor", &tip, "HEAD"]));
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(worktree.join("leftover"), "abandoned").unwrap();
+        git(&worktree, &["add", "leftover"]);
+        let repo = f.root.join("repo").canonicalize().unwrap();
+        let evidence = |cwd: &Path, repository: &str, branch: &str, revision: &str| {
+            assert_eq!(cwd, repo);
+            assert_eq!(repository, f.args.repository);
+            assert_eq!(branch, "finished");
+            assert_eq!(revision, tip);
+            true
+        };
+        repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
+        assert!(!worktree.exists(), "{state} leftover removed");
+        assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
+        assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
+    }
+}
+
+#[test]
+fn preparation_preserves_commits_missing_from_origin_even_with_finished_pr_evidence() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
     f.prepare().unwrap();
+    let worktree = linked_worktree(&f, "unpublished");
+    std::fs::write(worktree.join("fixture"), "unpublished").unwrap();
+    git(&worktree, &["commit", "-am", "unpublished"]);
+    let tip = git(&worktree, &["rev-parse", "HEAD"]);
+    std::fs::write(worktree.join("leftover"), "keep").unwrap();
+    let lookup =
+        |_: &Path, _: &str, _: &str, _: &str| panic!("unpublished tips must skip the PR read");
+    let error = repository::prepare_with_pr_lookup(&f.root, &f.args, &lookup)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("seat_dirty"), "{error}");
+    assert!(worktree.join("leftover").exists());
+    assert_eq!(git(&worktree, &["rev-parse", "HEAD"]), tip);
+}
+
+#[test]
+fn preparation_and_recovery_show_tracked_cache_edits_and_main_checkout_guidance() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    std::fs::create_dir(f.remote.join(".cache")).unwrap();
+    std::fs::write(f.remote.join(".cache/tracked"), "base").unwrap();
+    git(&f.remote, &["add", ".cache/tracked"]);
+    git(&f.remote, &["commit", "-m", "track fixture"]);
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    std::fs::write(main.join(".cache/tracked"), "real edit").unwrap();
+    std::fs::write(main.join(".cache/ephemeral\ncache"), "untracked").unwrap();
+
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("seat_dirty") && error.contains(".cache/tracked"), "{error}");
+    assert!(error.contains("save or resolve its changes in place"), "{error}");
+    assert!(
+        !error.contains("--discard --worktree") && !error.contains("ephemeral"),
+        "{error}"
+    );
+    let out = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(out.dirty_worktrees.len(), 1);
+    let dirty = &out.dirty_worktrees[0];
+    assert_eq!(dirty.path, main.display().to_string());
+    assert_eq!((dirty.tracked, dirty.untracked), (1, 0));
+    assert_eq!(dirty.recovery_guidance("fixture"), "save or resolve its changes in place");
+}
+
+#[test]
+fn discard_validates_every_path_before_removing_any_and_deduplicates_aliases() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    let worktree = linked_worktree(&f, "leftover");
+    std::fs::write(worktree.join("keep.txt"), "keep").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.worktree = vec![worktree.clone(), main.clone()];
+    assert!(repository::recover(&f.root, &args)
+        .unwrap_err()
+        .to_string()
+        .contains("main checkout"));
+    assert!(worktree.join("keep.txt").exists());
+
+    let missing = f.root.join("missing");
+    args.worktree = vec![worktree.clone(), missing.clone()];
+    assert!(repository::recover(&f.root, &args).is_err());
+    assert!(worktree.join("keep.txt").exists());
+
+    args.validate_worktrees = true;
+    let validates = repository::recover(&f.root, &args).unwrap();
+    assert!(lifecycle::plan_worktree_discard(&args.worktree, &[validates])
+        .unwrap_err()
+        .to_string()
+        .contains("nothing removed"));
+    assert!(worktree.join("keep.txt").exists());
+
+    let alias = f.root.join("alias");
+    std::os::unix::fs::symlink(&worktree, &alias).unwrap();
+    args.worktree = vec![worktree.clone(), alias, worktree.clone()];
+    args.validate_worktrees = false;
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.removed_worktrees, vec![worktree.display().to_string()]);
+    assert!(!worktree.exists());
+}
+
+#[test]
+fn mixed_branch_and_worktree_discard_changes_nothing() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let main = f.root.join("repo");
+    git(&main, &["switch", "-c", "unpublished"]);
+    std::fs::write(main.join("fixture"), "keep this commit").unwrap();
+    git(&main, &["commit", "-am", "unpublished"]);
+    let tip = git(&main, &["rev-parse", "HEAD"]);
+    git(&main, &["switch", "--detach", "origin/main"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["unpublished".into()];
+    args.worktree = vec![main.clone()];
+
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("separately"), "{error}");
+    assert_eq!(git(&main, &["rev-parse", "refs/heads/unpublished"]), tip);
 }
 
 #[test]

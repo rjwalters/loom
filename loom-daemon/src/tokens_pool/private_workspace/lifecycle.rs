@@ -472,6 +472,11 @@ pub fn session_recover(
     branches: &[String],
     worktrees: &[PathBuf],
 ) -> Result<RecoverReport> {
+    if !worktrees.is_empty()
+        && (action != RecoverAction::Discard || !branches.is_empty() || issue.is_some())
+    {
+        bail!("discard accepts a worktree scope or a branch/issue scope, separately");
+    }
     let (config, dir) = resolve(workspace, name)?;
     let targets = {
         let mut targets = vec![config.primary()];
@@ -492,12 +497,39 @@ pub fn session_recover(
     if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
         bail!("private session is not running and idle; refuse recover admission");
     }
+    let recovery_targets: Vec<_> = targets
+        .iter()
+        .map(|target| (target, forge_auth::ExecAuth::resolve(workspace, &target.repository)))
+        .collect();
+    let paths_by_clone = if worktrees.is_empty() {
+        vec![Vec::new(); targets.len()]
+    } else {
+        // Check every path across all clones while holding the same account
+        // lease. A refusal in a later clone must not follow a removal in an
+        // earlier one. The worker revalidates its scope before executing it.
+        let mut validations = Vec::new();
+        for (target, auth) in &recovery_targets {
+            validations.push(docker::recover_target(
+                &config,
+                target,
+                RecoverAction::ValidateWorktrees,
+                None,
+                &[],
+                worktrees,
+                auth,
+            )?);
+        }
+        plan_worktree_discard(worktrees, &validations)?
+    };
     let mut clones = Vec::new();
-    for target in &targets {
-        let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
-        clones.push(docker::recover_target(
-            &config, target, action, issue, branches, worktrees, &auth,
-        )?);
+    for ((target, auth), paths) in recovery_targets.into_iter().zip(paths_by_clone) {
+        let action = if !worktrees.is_empty() && paths.is_empty() {
+            RecoverAction::List
+        } else {
+            action
+        };
+        clones
+            .push(docker::recover_target(&config, target, action, issue, branches, &paths, &auth)?);
     }
     let report = RecoverReport {
         account: config.account.clone(),
@@ -518,6 +550,28 @@ pub fn session_recover(
         );
     }
     Ok(report)
+}
+
+pub(super) fn plan_worktree_discard(
+    worktrees: &[PathBuf],
+    validations: &[RecoverOutcome],
+) -> Result<Vec<Vec<PathBuf>>> {
+    let mut by_clone = vec![Vec::new(); validations.len()];
+    for path in worktrees {
+        let name = path.display().to_string();
+        let mut owners = validations
+            .iter()
+            .enumerate()
+            .filter(|(_, clone)| clone.cloned && !clone.ignored.contains(&name));
+        let Some((index, _)) = owners.next() else {
+            bail!("no clone of this account owns worktree {}; nothing removed", path.display());
+        };
+        if owners.next().is_some() {
+            bail!("multiple clones claim worktree {}; nothing removed", path.display());
+        }
+        by_clone[index].push(path.clone());
+    }
+    Ok(by_clone)
 }
 
 /// Rebind an additional private-clone registration to the repository's

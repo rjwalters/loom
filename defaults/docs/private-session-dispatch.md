@@ -151,21 +151,23 @@ independently) with a message starting `seat_dirty:`; the step's failure is
 recorded with that reason instead of `unclassified`. The listing form of
 `accounts session recover <account>` names every dirty worktree — path,
 branch, tracked and untracked counts, and commits unpublished at its HEAD —
-even when no branch is unpublished. Clear one with
-`recover <account> --discard --worktree <path>` (repeatable): it removes
-exactly the named linked worktree and its uncommitted files, never a branch
-ref and never an unnamed worktree. It refuses the main checkout, a path
-outside the volume, and a worktree whose HEAD carries unpublished commits —
-`--publish` them (or `--discard --branch B`) first.
+even when no branch is unpublished. Save or resolve changes in the main
+checkout in place. To remove a leftover linked worktree, use
+`recover <account> --discard --worktree <path>`. Repeat `--worktree` to
+name multiple paths in one call. Recovery validates all paths across the
+account's clones before removing anything and resolves aliases to one
+worktree. It keeps branch refs and refuses primary, locked, out-of-volume,
+or unpublished worktrees. Publish or save any local commits before retrying.
+Use a separate call for `--branch` or `--issue` discards.
 
-Two things are forgiven rather than listed: Loom's own `.loom/lease-renew`
-residue and a worktree-root `.cache/` of tool caches (untracked files there
-never count as dirty; tracked changes under `.cache/` are hidden too). During
-preparation, a linked worktree whose branch has commits of its own and whose
-tip is already an ancestor of `origin/<base>` is removed automatically, dirty
-or not, since the base carries everything it had. The proof is git-only:
-preparation holds no forge credential to ask whether the pull request merged,
-so a squash-merged branch is not recognized and needs `--discard --worktree`.
+Untracked files under `.loom/lease-renew/` and the worktree-root `.cache/`
+are ignored. Tracked changes in those directories are reported.
+Preparation can remove an unlocked linked worktree when its commits are
+reachable from the freshly fetched origin and the GitHub PR listing confirms
+a merged or closed PR for that exact repository, branch, and head commit.
+This includes squash and fast-forward merges and published PRs closed without
+merge. An open PR on the same branch, an unverifiable response, or an
+unsupported forge leaves the worktree in place.
 
 ## Rebinding a registration after a repository transfer
 

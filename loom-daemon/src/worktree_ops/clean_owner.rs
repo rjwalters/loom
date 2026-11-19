@@ -52,6 +52,8 @@ pub(crate) struct PrRowRest {
 /// owner the `head=` filter matched.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct PrHeadRest {
+    #[serde(default, rename = "ref")]
+    pub(crate) branch: Option<String>,
     #[serde(default)]
     pub(crate) sha: Option<String>,
     #[serde(default)]
@@ -140,6 +142,108 @@ pub(crate) fn fetch_pr_rows(
         return Err(RowsError::Failed);
     }
     serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).map_err(|_| RowsError::Failed)
+}
+
+/// Fresh GitHub PR evidence for an independent clone. Use the clone's
+/// verified origin rather than resolving a base from its Git config. One
+/// complete page suffices; if it could be truncated, preserve the worktree.
+pub(crate) fn finished_pr_at_head(
+    repo_root: &Path,
+    host: &str,
+    slug: &str,
+    branch: &str,
+    tip: &str,
+) -> bool {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation, ReadClass};
+
+    let Ok(target) = GhTarget::repo(slug) else {
+        return false;
+    };
+    let Some((owner, _)) = slug.split_once('/') else {
+        return false;
+    };
+    let head = format!("head={owner}:{branch}");
+    let endpoint = format!("repos/{slug}/pulls");
+    let out = super::gh::bounded_via(
+        GhInvocation::new(
+            Operation::new("clean.pr_status_rest"),
+            AccessIntent::Read,
+            target,
+            super::gh::GH_PROBE_TIMEOUT,
+        )
+        .args([
+            "api",
+            "--hostname",
+            host,
+            "--method",
+            "GET",
+            &endpoint,
+            "--raw-field",
+            "state=all",
+            "--raw-field",
+            &head,
+            "--raw-field",
+            "per_page=100",
+        ])
+        .current_dir(repo_root)
+        .read_class(ReadClass::Hygiene)
+        .strip_env("GH_REPO"),
+    );
+    let Some(rows) = out
+        .filter(|out| out.status.success())
+        .and_then(|out| serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).ok())
+    else {
+        return false;
+    };
+    finished_pr_in_rows(&rows, slug, branch, tip)
+}
+
+fn finished_pr_in_rows(rows: &[PrRowRest], slug: &str, branch: &str, tip: &str) -> bool {
+    if rows.len() >= 100 {
+        return false;
+    }
+    let mut finished = false;
+    for row in rows {
+        if !row
+            .base_full_name()
+            .is_some_and(|base| base.eq_ignore_ascii_case(slug))
+        {
+            return false;
+        }
+        let Some(head) = row.head.as_ref() else {
+            return false;
+        };
+        let Some(head_repository) = head
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.full_name.as_deref())
+        else {
+            return false;
+        };
+        if !head_repository.eq_ignore_ascii_case(slug) {
+            continue;
+        }
+        if head.branch.as_deref() != Some(branch) {
+            return false;
+        }
+        // The host reaper prefers a merge anywhere in a branch's history.
+        // Forced removal of dirty private work is narrower: a newer open PR
+        // on the same branch must take precedence over any historical merge.
+        if !row.state.eq_ignore_ascii_case("closed") {
+            return false;
+        }
+        let status =
+            clean::classify_pr_row(&row.state, row.merged_at.as_deref(), row.closed_at.as_deref());
+        if head.sha.as_deref() == Some(tip)
+            && matches!(
+                status,
+                PrStatus::Merged { .. } | PrStatus::ClosedNoMerge { closed_at: Some(_) }
+            )
+        {
+            finished = true;
+        }
+    }
+    finished
 }
 
 /// [`clean::select_pr_status`] over REST rows (empty ⇒ `NoPr`).
@@ -237,5 +341,48 @@ pub(crate) fn pr_status_confirmed(repo_root: &Path, owner: &OwnerFact, branch: &
         PrStatus::NoPr
     } else {
         PrStatus::Unknown
+    }
+}
+
+#[cfg(test)]
+mod private_clone_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn row(state: &str, repository: &str, branch: &str, tip: &str) -> Value {
+        json!({
+            "state": state,
+            "head": {"ref": branch, "sha": tip, "repo": {"full_name": repository}},
+            "base": {"repo": {"full_name": "Org/Repo"}},
+        })
+    }
+
+    #[test]
+    fn finished_pr_proves_exact_repository_branch_and_head() {
+        let qualifies = |rows| {
+            let rows: Vec<PrRowRest> = serde_json::from_value(rows).unwrap();
+            finished_pr_in_rows(&rows, "org/repo", "topic", "abc")
+        };
+        let mut closed = row("closed", "Org/Repo", "topic", "abc");
+        closed["closed_at"] = json!("2026-11-18T21:12:00Z");
+        assert!(qualifies(json!([closed])));
+        let mut merged = closed.clone();
+        merged["merged_at"] = closed["closed_at"].clone();
+        assert!(qualifies(json!([merged])));
+
+        assert!(!qualifies(json!([])));
+        assert!(!qualifies(json!([merged, row("open", "Org/Repo", "topic", "new-tip")])));
+        for (field, value) in [
+            ("/base/repo/full_name", "Org/Other"),
+            ("/head/repo/full_name", "Org/Fork"),
+            ("/head/ref", "different-topic"),
+            ("/head/sha", "stale-tip"),
+        ] {
+            let mut wrong = merged.clone();
+            *wrong.pointer_mut(field).unwrap() = json!(value);
+            assert!(!qualifies(json!([wrong])), "{field}");
+        }
+        assert!(!qualifies(json!([row("closed", "Org/Repo", "topic", "abc")])));
+        assert!(!qualifies(json!(vec![merged; 100])));
     }
 }

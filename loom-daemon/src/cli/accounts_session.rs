@@ -115,7 +115,7 @@ pub(crate) enum SessionAction {
         /// With `--discard`: remove a leftover worktree (repeatable) and its
         /// uncommitted files; refused while commits on it are unpublished.
         /// The listing form names every dirty worktree and its path.
-        #[arg(long, value_name = "PATH", requires = "discard")]
+        #[arg(long, value_name = "PATH", requires = "discard", conflicts_with_all = ["branch", "issue"])]
         worktree: Vec<std::path::PathBuf>,
         #[arg(long)]
         json: bool,
@@ -355,21 +355,14 @@ pub(crate) fn handle_session_command(
             }
             for dirty in &clone.dirty_worktrees {
                 println!(
-                    "{}: dirty worktree {} ({}): {} tracked, {} untracked, {} unpublished; \
-                     remove it with `recover {} --discard --worktree {}`{}",
+                    "{}: dirty worktree {} ({}): {} tracked, {} untracked, {} unpublished; {}",
                     report.account,
                     dirty.path,
                     dirty.branch.as_deref().unwrap_or("detached HEAD"),
                     dirty.tracked,
                     dirty.untracked,
                     dirty.unpublished,
-                    report.account,
-                    dirty.path,
-                    if dirty.unpublished > 0 {
-                        " after publishing it"
-                    } else {
-                        ""
-                    }
+                    dirty.recovery_guidance(&report.account)
                 );
             }
             if clone.published.is_empty()
