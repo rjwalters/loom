@@ -253,7 +253,8 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
         name: String,
     }
 
-    let q: crate::cmd_out::Query<View> = crate::script_helpers::gh_query(
+    let q: crate::cmd_out::Query<View> = crate::script_helpers::gh_read_json(
+        "premise.issue_view",
         &[
             "issue",
             "view",
@@ -328,7 +329,8 @@ fn graphql_listing_and_object(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, serde_json::Value)> {
     let (owner, name) = repo.split_once('/')?;
-    let out = crate::script_helpers::run_gh(
+    let out = crate::script_helpers::gh_read(
+        "premise.graphql_comments",
         &[
             "api",
             "graphql",
@@ -462,7 +464,8 @@ pub(crate) fn resolve_repo(repo_root: &Path) -> Option<String> {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
     }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_query(
+    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
+        "premise.repo_view",
         &["repo", "view", "--json", "nameWithOwner"],
         repo_root,
         false,

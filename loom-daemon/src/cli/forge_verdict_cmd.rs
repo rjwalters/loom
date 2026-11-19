@@ -29,7 +29,7 @@ const fn journal_action(kind: VerdictKind) -> &'static str {
 /// The PR's label names, live (uncached). `None` when the read failed.
 fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100");
-    let out = crate::script_helpers::run_gh(&["api", &path], root, false);
+    let out = crate::script_helpers::gh_read("verdict.labels", &["api", &path], root, false);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     gate::label_names(&doc)
 }
@@ -73,7 +73,7 @@ fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit
         format!("i={n}"),
     ];
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = crate::script_helpers::run_gh(&argv, root, false);
+    let out = crate::script_helpers::gh_read("verdict.body_edits", &argv, root, false);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     let nodes = doc
         .pointer("/data/repository/issueOrPullRequest/userContentEdits/nodes")?
@@ -248,9 +248,14 @@ pub(crate) fn verdict_reconcile(
     // exactly one stands. A failed delete is an unconfirmed state, not a pass.
     if let gate::Reconciled::Duplicate(id) = &outcome {
         let path = format!("repos/{repo}/issues/comments/{id}");
-        let deleted = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
-            .ok_output()
-            .is_some();
+        let deleted = crate::script_helpers::gh_write(
+            "verdict.withdraw_comment",
+            &["api", "-X", "DELETE", &path],
+            &root,
+            false,
+        )
+        .ok_output()
+        .is_some();
         if !deleted {
             println!(
                 "{} UNREAD duplicate comment {id} could not be withdrawn",
@@ -281,7 +286,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     // Never delete the source/claim labels unless the add landed: a failed
     // POST followed by the DELETEs would drop the PR out of its queue with
     // no verdict label to replace it.
-    if crate::script_helpers::run_gh(&argv, &root, false)
+    if crate::script_helpers::gh_write("verdict.add_labels", &argv, &root, false)
         .ok_output()
         .is_none()
     {
@@ -297,7 +302,12 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     // is what decides success, so the individual results are not consulted.
     for l in remove {
         let path = format!("{base}/{}", l.replace(':', "%3A"));
-        let _ = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
+        let _ = crate::script_helpers::gh_write(
+            "verdict.remove_label",
+            &["api", "-X", "DELETE", &path],
+            &root,
+            false,
+        );
     }
     let problems = match read_labels(repo, pr, &root) {
         Some(labels) => gate::label_problems(kind, &labels),
@@ -355,7 +365,12 @@ impl GhHandback<'_> {
 impl crate::doctor_handback::Forge for GhHandback<'_> {
     fn read(&mut self) -> Option<crate::doctor_handback::Snapshot> {
         // One `pulls/{n}` read carries both labels and head, so they agree.
-        let out = crate::script_helpers::run_gh(&["api", &self.pull], self.root, false);
+        let out = crate::script_helpers::gh_read(
+            "verdict.handback_read",
+            &["api", &self.pull],
+            self.root,
+            false,
+        );
         if !out.succeeded() {
             self.note("pull read (labels+head)", &out);
             return None;
@@ -382,7 +397,7 @@ impl crate::doctor_handback::Forge for GhHandback<'_> {
     fn add(&mut self, label: &str) -> bool {
         let field = format!("labels[]={label}");
         let argv = ["api", "-X", "POST", &self.labels, "-f", &field];
-        let out = crate::script_helpers::run_gh(&argv, self.root, false);
+        let out = crate::script_helpers::gh_write("verdict.handback_add", &argv, self.root, false);
         if !out.succeeded() {
             self.note(&format!("label add {label}"), &out);
         }
@@ -390,7 +405,12 @@ impl crate::doctor_handback::Forge for GhHandback<'_> {
     }
     fn remove(&mut self, label: &str) -> bool {
         let path = format!("{}/{}", self.labels, label.replace(':', "%3A"));
-        let out = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], self.root, false);
+        let out = crate::script_helpers::gh_write(
+            "verdict.handback_remove",
+            &["api", "-X", "DELETE", &path],
+            self.root,
+            false,
+        );
         if !out.succeeded() {
             self.note(&format!("label remove {label}"), &out);
         }
