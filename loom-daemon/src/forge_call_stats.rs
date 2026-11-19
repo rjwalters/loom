@@ -1024,6 +1024,7 @@ pub fn status_report(
         buckets: sink_dir().map(|d| buckets::status_rows(&d, now_ts)),
         reader_withdrawals: reader_withdrawal_rows(now),
         read_spills: read_spill_rows(now),
+        writer_holds: writer_hold_rows(now_ts),
         host_window: window.map(|w| w.rows()),
         since_start,
         since,
@@ -1055,6 +1056,22 @@ fn read_spill_rows(now: DateTime<Utc>) -> Vec<crate::types::ReadSpillStatus> {
             from: crate::observability::ops::ratelimit::app_account_label(&app),
             mode: latch.mode.as_str().to_string(),
             until: latch.release_at.into(),
+        })
+        .collect()
+}
+
+/// This process's armed writer route holds (#13746), for `status`.
+fn writer_hold_rows(now_ts: i64) -> Vec<crate::types::WriterRouteHoldStatus> {
+    crate::forge_bucket_book::writer_holds_snapshot(now_ts)
+        .into_iter()
+        .filter_map(|(key, until)| {
+            Some(crate::types::WriterRouteHoldStatus {
+                account: key.account,
+                owner: key.owner,
+                installation: key.installation,
+                resource: key.resource.as_str().to_string(),
+                until: epoch(until)?,
+            })
         })
         .collect()
 }
