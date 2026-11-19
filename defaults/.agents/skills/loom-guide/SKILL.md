@@ -2545,23 +2545,44 @@ update_work_plan() {
 # is NOT enough — a foreign render's numbers can all exist, closed, under
 # unrelated titles. Zero bullets passes; a failed lookup fails closed.
 #
-# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
-# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
-# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
-# forge title followed by exactly one of those combinations, so a title is
-# never guessed by stripping (a title that itself ends in ` *(held)*` still
-# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
-# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
-# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
-# fails if this gate rejects any of them.
+# SUFFIX LOCKSTEP: Approved rows append ` — closes #A, #B` for the PR's
+# sorted closing refs. Other sections may append one section tag
+# (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) then ` *(held)*`.
+# Compare the complete title and suffix literally: either can be title text.
+# Keep these rules paired with the render in test-guide-work-plan-provenance.sh.
 verify_plan_provenance() {
-  local body="$1" line num rest got tag ok bad=0
+  local body="$1" line num rest got tag ok bad=0 approved=0 approved_json="" refs
   while IFS= read -r line; do
+    case "$line" in
+      '## Approved (Awaiting Merge)') approved=1; continue ;;
+      '## '*) approved=0; continue ;;
+    esac
     num="${line#- **#}"; num="${num%%\**}"
     rest="${line#*\*\*: }"
     got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
     if [ -z "$got" ]; then
       echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+      continue
+    fi
+    if [ "$approved" -eq 1 ]; then
+      # Fetch once on the first Approved row, even a plain one: omitting
+      # every ref must fail just as changing a single number does.
+      if [ -z "$approved_json" ]; then
+        approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,closingIssuesReferences) || return 1
+      fi
+      # jq 1.6 exits 0 on zero-byte or whitespace-only input without consuming
+      # a JSON value, which would leave refs empty and accept a bare title:
+      # require an actual JSON value for the matching PR first (#14575).
+      [ -n "${approved_json//[[:space:]]/}" ] || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      refs=$(jq -er --argjson n "$num" '.[] | select(.number == $n) | .closingIssuesReferences
+        | arrays | select(all(.[]; .number | type == "number")) | map(.number) | sort | map("#" + tostring) | join(", ")' <<<"$approved_json") || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      if [ "$rest" != "$got${refs:+ — closes $refs}" ]; then
+        echo "provenance: #$num Approved title or closing refs differ from $GUIDE_REPO" >&2; bad=1
+      fi
       continue
     fi
     # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
@@ -2573,7 +2594,7 @@ verify_plan_provenance() {
     if [ "$ok" -ne 1 ]; then
       echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
     fi
-  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  done < <(printf '%s\n' "$body" | grep -E '^(## |- \*\*#[0-9]+\*\*: )')
   return "$bad"
 }
 

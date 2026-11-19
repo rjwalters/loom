@@ -437,9 +437,13 @@ fn an_exhausted_rate_limit_probe_never_reads_as_an_exhausted_other_pool() {
 // ===== 6. loom.forge.calls =====
 
 #[test]
+#[serial_test::serial]
 fn recorded_calls_drain_once_as_forge_calls_points() {
     use crate::observability::ops::{capture::capture, forge_calls};
     use crate::telemetry::ops::MetricName;
+
+    // The no-target call must not inherit a repository from the surrounding process.
+    let _env = crate::env_test_support::EnvGuard::clear(&["LOOM_REPO"]);
     let tmp = tempfile::tempdir().unwrap();
     let ok = stub(tmp.path(), "gh-ok", "echo '{}'");
     let fail = stub(tmp.path(), "gh-fail", "echo 'HTTP 404: Not Found' >&2; exit 1");
