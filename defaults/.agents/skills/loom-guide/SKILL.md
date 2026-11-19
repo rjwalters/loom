@@ -2568,7 +2568,8 @@ verify_plan_provenance() {
       # Fetch once on the first Approved row, even a plain one: omitting
       # every ref must fail just as changing a single number does.
       if [ -z "$approved_json" ]; then
-        approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,closingIssuesReferences) || return 1
+        approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,labels,closingIssuesReferences \
+          --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]') || return 1
       fi
       # jq 1.6 exits 0 on zero-byte or whitespace-only input without consuming
       # a JSON value, which would leave refs empty and accept a bare title:
