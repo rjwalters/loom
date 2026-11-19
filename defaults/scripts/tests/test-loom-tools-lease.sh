@@ -71,7 +71,8 @@ assert_match() {
     fi
 }
 
-T="$(mktemp -d)"
+T="$(mktemp -d)" || exit 1
+T="$(cd "$T" && pwd -P)" || exit 1
 cleanup() {
     jobs -p | xargs kill 2> /dev/null
     pkill -f "$T/" 2> /dev/null || true
@@ -134,6 +135,7 @@ if [[ "$method" == "PATCH" && "$path" == repos/*/issues/comments/* ]]; then
   jq --argjson id "$id" --arg t "$(now)" \
     'map(if .id == $id then .updated_at = $t else . end)' "$D/comments.json" > "$D/c.tmp" \
     && mv "$D/c.tmp" "$D/comments.json"
+  printf '%s\n' "${LOOM_DAEMON_BIN-<unset>}" >> "$D/renew-bins.log"
   echo "$id" >> "$D/patches.log"
   echo '{}'; exit 0
 fi
@@ -172,14 +174,39 @@ assert_eq "" "$(command -v loom-daemon || true)" "the host really has no loom-da
 ISSUE=4242
 reset_forge() {
     rm -f "$FORGE"/comments.json "$FORGE"/comments-fail "$FORGE"/posts.log "$FORGE"/patches.log \
-        "$FORGE"/calls.log "$FORGE"/env.log "$FORGE"/issue-state
+        "$FORGE"/calls.log "$FORGE"/env.log "$FORGE"/renew-bins.log "$FORGE"/issue-state
     rm -rf "$LOOM_LEASE_RENEW_STATE_DIR" "$CO/.loom/logs" 2> /dev/null || true
 }
 count_lines() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
 posts() { count_lines "$FORGE/posts.log"; }
 patches() { count_lines "$FORGE/patches.log"; }
-# Renewer loops of this checkout for this issue (the script's own argv).
-renewers() { pgrep -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null | wc -l | tr -d ' '; }
+# Bash children can inherit the start argv while a renewal is in progress.
+# One process snapshot distinguishes the detached roots from their descendants.
+renewer_roots() {
+    awk -v start="$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " '
+        {
+            parent[$1] = $2
+            if ($3 ~ /^Z/ || $4 !~ /(^|\/)bash$/) next
+            command = $0
+            sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+/, "", command)
+            if (index(command, start) == 1) matching[$1] = 1
+        }
+        END {
+            for (pid in matching) {
+                ancestor = parent[pid]
+                while (ancestor > 1 && ancestor in parent && !(ancestor in matching)) {
+                    ancestor = parent[ancestor]
+                }
+                if (!(ancestor in matching)) print pid
+            }
+        }' | sort -n
+}
+renewer_pids() { ps -axww -o pid= -o ppid= -o stat= -o command= | renewer_roots; }
+renewers() { renewer_pids | wc -l | tr -d ' '; }
+has_renewer() { [[ "$(renewers)" -ge 1 ]]; }
+no_renewers() { [[ "$(renewers)" -eq 0 ]]; }
+has_patch() { [[ "$(patches)" -ge 1 ]]; }
+no_deferred_publishers() { ! pgrep -f "$DEF" > /dev/null; }
 session() { sleep 600 & SESSION_PID=$!; disown "$SESSION_PID" 2> /dev/null || true; }
 wait_for() { # <seconds> <command...>
     local n=$(($1 * 4)); shift
@@ -188,8 +215,10 @@ wait_for() { # <seconds> <command...>
 }
 ensure() { CLAUDE_PID="$SESSION_PID" loom-tools lease ensure "$ISSUE" --watch-pid "$SESSION_PID" 2>&1; }
 stale_peer() { # <host> <sweep> <age-seconds>
-    local t
-    t="$(date -u -d "@$(($(date +%s) - $3))" +%Y-%m-%dT%H:%M:%SZ)"
+    local epoch t
+    epoch=$(($(date +%s) - $3))
+    t="$(date -u -d "@$epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+        date -u -r "$epoch" +%Y-%m-%dT%H:%M:%SZ)" || return 1
     jq -n --arg h "$1" --arg s "$2" --arg t "$t" \
         '[{id: 77, updated_at: $t, created_at: $t,
            body: ("<!-- loom:lease host=" + $h + " sweep=" + $s + " -->\nprose"),
@@ -212,6 +241,16 @@ assert_eq 0 "$(posts)" "(a) neither case posted a lease"
 assert_eq 0 "$(renewers)" "(a) neither case started a renewer"
 
 echo "(b) ensure publishes one lease and one renewer; repeating it adds none"
+START="$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE"
+ROOTS="$(renewer_roots <<EOF
+101 1 S bash $START --watch-pid 42
+102 101 S bash $START --watch-pid 42
+103 102 S bash $START --watch-pid 42
+201 1 S bash $START --watch-pid 42
+301 1 Z bash $START --watch-pid 42
+EOF
+)"
+assert_eq $'101\n201' "$ROOTS" "(b) the census detects independent loops and ignores descendants and zombies"
 reset_forge
 session
 OUT="$(ensure)"
@@ -219,26 +258,31 @@ RC=$?
 assert_eq 0 "$RC" "(b) ensure exits 0"
 assert_match "renewal" "$OUT" "(b) ensure reports the renewal loop: $OUT"
 assert_eq 1 "$(posts)" "(b) one lease comment was posted"
-wait_for 10 test "$(renewers)" -ge 1
+wait_for 10 has_renewer
 assert_eq 1 "$(renewers)" "(b) one renewer is running"
+FIRST_LOOP="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' <<< "$OUT")"
 OUT2="$(ensure)"
 assert_eq 1 "$(posts)" "(b) the repeat posted no second lease"
-sleep 1
-assert_eq 1 "$(renewers)" "(b) the repeat left exactly one renewer"
+assert_eq "$FIRST_LOOP" "$(renewer_pids)" "(b) the repeat left the original renewer as the only loop root"
 OWNERS="$(find "$LOOM_LEASE_RENEW_STATE_DIR" -type f ! -name '.lock' ! -name '*.tmp*' 2> /dev/null | wc -l | tr -d ' ')"
 assert_eq 1 "$OWNERS" "(b) exactly one owner record exists"
-FIRST_LOOP="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' <<< "$OUT")"
 assert_match "renewal loop $FIRST_LOOP is running" "$OUT2" "(b) the repeat re-attached to the same renewal loop ($FIRST_LOOP)"
-wait_for 10 test "$(patches)" -ge 1
+wait_for 10 has_patch
 assert_eq 0 "$([[ "$(patches)" -ge 1 ]] && echo 0 || echo 1)" "(b) the renewer refreshed the lease through the stub forge"
 
 echo "(c) the chain ran on loom-tools"
-RENEWER_ENV="$(for p in $(pgrep -f "sweep-lease-renew.sh start $ISSUE "); do tr '\0' '\n' < "/proc/$p/environ" 2> /dev/null | grep '^LOOM_DAEMON_BIN='; done | sort -u)"
-assert_eq "LOOM_DAEMON_BIN=$(readlink -f "$TOOLS_SRC")" "$RENEWER_ENV" "(c) the renewer's LOOM_DAEMON_BIN is the running loom-tools"
+# The stub observes the pin on the actual PATCH from the detached loop.
+RENEWER_BINS="$(while IFS= read -r pin; do
+    case "$pin" in
+        /*) readlink -f "$pin" ;;
+        *) printf '%s\n' "$pin" ;;
+    esac
+done < "$FORGE/renew-bins.log" | sort -u)"
+assert_eq "$(readlink -f "$TOOLS_SRC")" "$RENEWER_BINS" "(c) the renewer used the running loom-tools pin"
 
 echo "(e) the watched process ending stops renewal"
 kill "$SESSION_PID" 2> /dev/null
-wait_for 15 test "$(renewers)" -eq 0
+wait_for 15 no_renewers
 assert_eq 0 "$(renewers)" "(e) the renewer exited with its session"
 BEFORE="$(patches)"
 sleep 3
@@ -248,12 +292,12 @@ echo "(f) release is idempotent and stops the renewer"
 reset_forge
 session
 ensure > /dev/null
-wait_for 10 test "$(renewers)" -ge 1
+wait_for 10 has_renewer
 OUT="$(loom-tools lease release "$ISSUE" 2>&1)"
 RC=$?
 assert_eq 0 "$RC" "(f) release exits 0"
 assert_match "posted 1 yield" "$OUT" "(f) release posted a yield record: $OUT"
-wait_for 10 test "$(renewers)" -eq 0
+wait_for 10 no_renewers
 assert_eq 0 "$(renewers)" "(f) release stopped the renewer"
 OUT="$(loom-tools lease release "$ISSUE" 2>&1)"
 RC=$?
@@ -284,7 +328,7 @@ ensure > /dev/null
 sleep 1
 assert_eq 1 "$(pgrep -f "$DEF" | wc -l | tr -d ' ')" "(d) repeating ensure for the session adds no second publisher"
 kill "$SESSION_PID" 2> /dev/null
-wait_for 20 test "$(pgrep -f "$DEF" | wc -l | tr -d ' ')" -eq 0
+wait_for 20 no_deferred_publishers
 assert_eq 0 "$(pgrep -f "$DEF" | wc -l | tr -d ' ')" "(d) the deferred publisher stopped when its session ended"
 assert_eq 0 "$(posts)" "(d) ...without ever posting over the live peer"
 
