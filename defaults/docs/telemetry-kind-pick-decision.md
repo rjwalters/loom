@@ -145,7 +145,7 @@ it, only a hold label names a reason; other candidates are undecided.
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `peer_claim`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
+| `host_constraint` | not for this host | `host_constraint`, `lease_held`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |

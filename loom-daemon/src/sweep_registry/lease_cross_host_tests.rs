@@ -93,10 +93,6 @@ fn decide_seeing(
     let _id = HostIdGuard::set(host);
     let workspace = tempdir().unwrap();
     let registry = fixture_registry_with_lease_gh(workspace.path(), forge, exit);
-    assert!(
-        registry.peer_claim_publisher.is_none(),
-        "the proof must not lean on the safehouse peer-claim channel"
-    );
     assert_eq!(registry.published_host_id(), opaque_host_id(host));
     registry.resolve_lease_order(ISSUE, sweep, episode_start)
 }
@@ -229,7 +225,6 @@ fn share_comment_store(
 /// Dispatch `ISSUE` on `host`'s registry; returns whether a builder spawned.
 fn dispatch_spawns(host: &str, registry: &mut SweepRegistry, spawn_log: &std::path::Path) -> bool {
     let _id = HostIdGuard::set(host);
-    assert!(registry.peer_claim_publisher.is_none());
     match registry.dispatch(&SweepKind::Issue(ISSUE), None, None, None, None) {
         Ok(_) => wait_for_contents(spawn_log, "spawned", FIXTURE_CHILD_WAIT_MS),
         Err(err) => {

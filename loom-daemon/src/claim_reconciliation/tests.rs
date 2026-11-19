@@ -1279,10 +1279,8 @@ fn reconcile_workspace_reclaims_dead_pid_with_no_peer_coordination_signal_consul
     std::env::set_var(sweep_journal::JOURNAL_PATH_ENV, &journal_path);
 
     // Same dead-PID fixture as #3975's regression test: an
-    // unconditional, immediate reclaim, with the peer-coordination
-    // global view never registered at all (the default state for every
-    // test in this binary — see `peer_claims::GLOBAL_VIEW`'s removal in
-    // #6317).
+    // unconditional, immediate reclaim, with no peer-coordination signal
+    // anywhere (the peer-claim channel was removed in #6317 and #13945).
     let mut journal = SweepJournal::default();
     journal.entries.push(journal_entry(&repo_str, 99, 0));
     sweep_journal::save(&journal_path, &journal).unwrap();
@@ -1602,8 +1600,7 @@ exit 0
 /// peer sweep whose lease is being renewed, but whose local liveness
 /// evidence (dead-PID journal entry -- the #3975 fixture that normally
 /// fires an IMMEDIATE, unconditional reclaim) looks dead, with the
-/// peer-claim/safehouse channel simply absent (no `PeerClaimView` ever
-/// registered — the reading a host with no safehouse configured
+/// peer-claim/safehouse channel simply absent (the reading a host with no safehouse configured
 /// produces, and per Epic #6165 Phase 4/#6317 now the ONLY reading that
 /// exists, since the peer-claim channel is no longer consulted by this
 /// decision at all). Reclamation must NOT fire while the lease is
@@ -1870,8 +1867,7 @@ fn reconcile_workspace_keeps_claim_when_lease_probe_read_fails() {
 /// This is the total-absence-of-evidence case, on EVERY axis this
 /// module and Epic #6165 collectively consult: no journal entry, no
 /// run-registry/checkpoint join, no lease comment, AND (implicitly,
-/// since the peer-coordination global view is never registered in this
-/// test binary — see `peer_claims::GLOBAL_VIEW`) no peer-claim
+/// since the peer-claim channel no longer exists) no peer-claim
 /// advertisement either. With the `loom:building` label itself freshly
 /// applied (well under [`DEFAULT_STALE_BUILDING_HOURS`]), the claim
 /// must be `Keep`, not reclaimed — a total absence of information is

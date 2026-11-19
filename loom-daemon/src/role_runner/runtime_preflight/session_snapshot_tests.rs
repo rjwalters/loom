@@ -151,6 +151,31 @@ fn a_held_account_is_reported_as_held_with_no_start_hint() {
     assert!(!reason.contains("session start"), "no hint to undo the stop: {reason}");
 }
 
+#[test]
+#[serial]
+fn mixed_pool_exhaustion_names_both_hook_and_session_remedies() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    mark_session_managed(profiles.path(), "agent-1");
+    fs::create_dir(profiles.path().join("untrusted")).unwrap();
+    fs::create_dir_all(workspace.path().join(".loom")).unwrap();
+    let _down = set(running(&[]));
+    let state = codex_pool_state(workspace.path(), epoch_now(), true);
+    assert_eq!((state.enabled, state.spawnable, state.session_down), (2, 0, 1));
+    assert_eq!(state.untrusted, ["untrusted"]);
+    let reason = codex_exhausted_reason(&state);
+    for text in [
+        "untrusted",
+        "provision-codex-hooks.sh verify",
+        "#9390",
+        "SessionDown",
+        "session start",
+    ] {
+        assert!(reason.contains(text), "{reason}");
+    }
+}
+
 /// The pinned-runtime skip, end to end, for a held account: the tick is
 /// passed over and the role log says held, not "start it".
 #[test]

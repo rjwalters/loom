@@ -622,6 +622,14 @@ pub(crate) mod test_support {
         std::fs::write(profile.join(".session-managed.json"), "{}").unwrap();
     }
 
+    /// Register the bare profile and put a readable bridge in its fixture workspace.
+    pub(crate) fn guard_ready_in_workspace(workspace: &Path, profile: &Path) {
+        let hooks = workspace.join(".loom/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("guard-codex-bridge.sh"), "#!/bin/sh\n").unwrap();
+        guard_ready(profile, None);
+    }
+
     /// Make `profile` guard-ready for a run with `CODEX_HOME=runtime_home`
     /// (`None`: a bare-metal run of the canonical profile path).
     pub(crate) fn guard_ready(profile: &Path, runtime_home: Option<&Path>) {

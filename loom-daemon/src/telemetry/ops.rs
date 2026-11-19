@@ -200,6 +200,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",

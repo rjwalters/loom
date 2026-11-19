@@ -4,9 +4,10 @@
 
 Accepted (2026-10-10). Recorded by slice 1 of #11112, the removal of the
 safehouse (Matrix) integration. The code that this ADR retires (the
-peer-claim channel and the #7477 cooldown broadcast) is deleted in a later
-slice of the same issue. This ADR stands on its own and does not depend on any
-safehouse document, since those are being deleted too.
+peer-claim channel and the #7477 cooldown broadcast) was deleted in #13945
+(child 1 of #13920, 2026-11): the channel and its claims room are gone, and the
+statements below that describe them as still present are historical. This ADR
+stands on its own and does not depend on any safehouse document.
 
 Amended by [ADR-0027](0027-captain-owned-fleet-coordination.md) (2026-10-17):
 decision 2 covers only the #7477 cooldown window. The landed cooldown, the
@@ -62,20 +63,21 @@ fail-open cases where it does not (see "Retained fail-open limitation").
    forge's id order wins.
    `loom-daemon/src/sweep_registry/lease_cross_host_tests.rs` pins both what
    this gives and what it does not. It runs two registries under two
-   `LOOM_HOST_ID`s with no shared local state and no peer-claim publisher.
+   `LOOM_HOST_ID`s with no shared local state (and, since #13945, no
+   peer-claim publisher to attach).
    With both leases visible, exactly one host proceeds and flipping the forge
    order flips the winner. A dispatch-level case runs the two hosts one after
    the other on one shared forge comment list and shows only the first-leased
    host reaching builder spawn. That is the visible case. It is not a test of
    concurrent publication. The same file
    also asserts the fail-open cases below, where both hosts proceed.
-2. **No-op cooldown (#7477): per-host only.** The cooldown broadcast is
-   removed with the peer-claim code in a later slice of #11112. Each host keeps
-   its own local cooldown. No forge marker replaces the broadcast.
+2. **No-op cooldown (#7477): per-host only.** The cooldown broadcast was
+   removed with the peer-claim code (#13945). Each host keeps its own local
+   cooldown. No forge marker replaces the broadcast.
 3. **Quarantine broadcast (#9936): dropped.** It was never built, so nothing
    is removed. #9936 is closed as not planned and points here.
-4. **Pool-hold (#8001) and heartbeat broadcasts** go with the peer-claim
-   channel for the same reason. The local pre-flight already stops each host
+4. **Pool-hold (#8001) and heartbeat broadcasts** went with the peer-claim
+   channel for the same reason (#13945). The local pre-flight already stops each host
    on its next tick.
 
 ## Consequences
@@ -84,8 +86,9 @@ fail-open cases where it does not (see "Retained fail-open limitation").
 
 - One claim mechanism, readable by every host and by a human looking at the
   issue. No Matrix daemon, socket or room is needed to run a fleet.
-- The "peer-claim coordination is DEGRADED" alert class goes away, because
-  the thing it monitored goes away.
+- The "peer-claim coordination is DEGRADED" alert class is gone (#13945): the
+  `peer_coordination` health section and the watchdog's 50-series check were
+  deleted with the thing they monitored.
 - No new forge writes. A forge-visible cooldown marker would add a comment or
   label write on every no-op release.
 

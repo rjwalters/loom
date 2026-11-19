@@ -54,7 +54,7 @@ impl EnvGuard {
 /// A workspace whose `judge` role is pinned to the codex runtime, with one
 /// enabled codex account (`alice`) and a fake `spawn-worker.sh` this test
 /// overwrites per-case to script the adapter's own terminal output.
-fn codex_judge_workspace(root: &Path) {
+fn codex_judge_workspace(root: &Path, profiles: &Path) {
     for sub in [
         ".loom/roles",
         ".loom/runtimes",
@@ -74,6 +74,10 @@ fn codex_judge_workspace(root: &Path) {
         r#"{"runtime":"codex","accountProvider":"codex","capabilities":{"mcp":"yes"}}"#,
     )
     .unwrap();
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        root,
+        &profiles.join("alice"),
+    );
     write_executable(&root.join(".loom/scripts/spawn-codex.sh"), "#!/bin/sh\nexit 0\n");
 }
 
@@ -102,8 +106,7 @@ fn codex_role_tick_token_exhausted_records_a_hold_that_gates_the_next_tick() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -143,6 +146,42 @@ category=TOKEN_EXHAUSTED exit_code=1 model=none'\n\
     assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
 }
 
+/// An untrusted seat stops a guarded tick before a worker can emit feedback.
+#[test]
+#[serial]
+fn codex_role_tick_refuses_an_untrusted_profile_before_spawning() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
+    fs::remove_file(profiles.path().join("alice/hooks.json")).unwrap();
+    let marker = workspace.path().join("spawned");
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-worker.sh"),
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
+    let outcome = judge_runner(workspace.path())
+        .with_gh_bin(ws.gh.clone())
+        .invoke("judge", "/loom:judge");
+    assert!(
+        matches!(
+            outcome,
+            RoleTickOutcome::PoolExhausted {
+                pool: CredentialPool::CodexAccounts,
+                hold: crate::role_runner::PoolHold::Unprovisioned,
+                total: 1,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    assert!(!marker.exists());
+    assert!(tokens_pool::account_health(workspace.path(), &codex_id("alice"))
+        .unwrap()
+        .is_none());
+}
+
 /// AC3: a `SUCCESS` terminal result from a role tick clears a pre-existing
 /// hold, exactly as it does for sweeps. The pre-existing hold is seeded
 /// directly (the test's precondition, not the behavior under test) — but
@@ -158,8 +197,7 @@ fn codex_role_tick_success_clears_a_pre_existing_hold() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     record_terminal_at(
         workspace.path(),
         &codex_id("alice"),
@@ -201,8 +239,7 @@ fn codex_role_tick_ignores_a_terminal_result_with_a_mismatched_account() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -237,8 +274,7 @@ fn codex_role_tick_ignores_a_terminal_result_with_a_mismatched_exit_code() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -311,8 +347,7 @@ fn codex_role_tick_honours_the_refusals_own_reset_horizon() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
 
     let horizon = (Local::now() + chrono::Duration::days(2))
         .with_minute(0)
@@ -364,8 +399,7 @@ fn codex_role_tick_mark_emits_exactly_one_reason_classified_point() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -463,8 +497,7 @@ fn codex_role_tick_sandbox_no_op_is_a_failure_that_leaves_account_health_alone()
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -516,8 +549,7 @@ fn codex_role_tick_session_down_is_a_distinct_outcome_with_no_account_hold() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\
@@ -577,8 +609,7 @@ fn codex_role_tick_mount_stale_is_a_distinct_outcome_with_no_account_hold() {
     let workspace = tempfile::tempdir().unwrap();
     let profiles = tempfile::tempdir().unwrap();
     let _env = EnvGuard::new(profiles.path());
-    fs::create_dir(profiles.path().join("alice")).unwrap();
-    codex_judge_workspace(workspace.path());
+    codex_judge_workspace(workspace.path(), profiles.path());
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
         "#!/bin/sh\n\

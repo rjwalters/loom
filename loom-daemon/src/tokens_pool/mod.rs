@@ -69,6 +69,7 @@ pub mod allowlist;
 pub mod bad_tokens;
 pub mod bootstrap;
 pub mod check;
+pub mod claude_seat;
 pub mod codex_check;
 pub mod codex_hooks;
 pub mod codex_probe;

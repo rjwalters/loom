@@ -812,6 +812,53 @@ fn offered(answer: &Value) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::capture::{
+        parse_outcome_line, seat_busy_exit_reason, StepEnd,
+    };
+
+    let mut snapshot = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+    snapshot.rows[0].is_pull_request = true;
+    snapshot.rows[0].labels = vec!["loom:review-requested".into()];
+    for early in [true, false] {
+        let s = open_server("node-a");
+        s.queue().refresh_repos([&snapshot]);
+        let first = ask_next(&s, A, 1, &["judge"]);
+        assert_eq!(offered(&first), [("acme/w".into(), 7)]);
+        let first_id = first["assignments"][0]["assignment_id"].as_str().unwrap();
+        assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
+        if early {
+            assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
+        } else {
+            let line = parse_outcome_line(
+                "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
+            );
+            let outcome = seat_busy_exit_reason(
+                StepRole::Judge,
+                7,
+                StepEnd::Exited(Some(REFUSAL_EXIT_CODE)),
+                line.as_ref(),
+            )
+            .unwrap();
+            let release = json!({"host_id": A, "assignment_id": first_id, "outcome": outcome});
+            let (reply, _) = s.handle(A, "/v1/release", release.to_string().as_bytes());
+            assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], true);
+        }
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (1, 0));
+        s.queue().refresh_repos([&snapshot]);
+        let second = ask_next(&s, B, 1, &["judge"]);
+        assert_eq!(offered(&second), [("acme/w".into(), 7)]);
+        assert_ne!(second["assignments"][0]["assignment_id"], first_id);
+    }
+}
+
+#[test]
 fn next_grants_up_to_free_slots_in_rounds_of_one_item_per_repo() {
     let s = open_server("node-a");
     let (w, x) = (next_snapshot("acme/w", &[1, 2, 3]), next_snapshot("acme/x", &[10, 11]));

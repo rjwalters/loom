@@ -468,8 +468,16 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -c=*|--config=*)
-            case "$1" in
-                *model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true; EXPLICIT_EFFORT_VALUE="${1##*model_reasoning_effort=}" ;;
+            config_assignment="${1#*=}"
+            case "$config_assignment" in
+                *model_reasoning_effort=*)
+                    # Keep mixed-key text out of the legacy service_tier arm below.
+                    # Only the assignment key itself can override effort.
+                    if [[ "$config_assignment" == model_reasoning_effort=* ]]; then
+                        HAS_EFFORT_OVERRIDE=true
+                        EXPLICIT_EFFORT_VALUE="${config_assignment#model_reasoning_effort=}"
+                    fi
+                    ;;
                 *service_tier=*) HAS_TIER_OVERRIDE=true; EXPLICIT_TIER_VALUE="${1##*service_tier=}" ;;
             esac
             PASSTHROUGH_ARGS+=("$1")
@@ -1093,10 +1101,9 @@ LOOM_CODEX_MUTABLE_ROLES="builder doctor"
 # GUARDED roles (#9390) do not write the repository, so they keep the read-only
 # sandbox, but they act with merge (champion) or verdict (judge) authority on
 # the forge, which is what Loom's guards police. They need the same proven hook
-# and fail closed the same way. loom-daemon's runtime preference already passes
-# Codex over for them while any shared profile is unready
-# (runtime_preference::codex_guard, which mirrors this list); this is the
-# backstop, not the router.
+# and fail closed the same way. The runtime preference and account selection
+# skip unready shared seats for these and the mutable roles
+# (runtime_preference::codex_guard). This verifies the seat at launch.
 LOOM_CODEX_GUARDED_ROLES="champion judge"
 _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in

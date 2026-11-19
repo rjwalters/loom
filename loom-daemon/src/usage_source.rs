@@ -597,15 +597,16 @@ pub fn sweep_tokens_by_window(
 ///
 /// - **OpenCode**: the id is the whole key — no directory, no window — because
 ///   the id cannot name another launch's session.
-/// - **Codex**: the ids are ANDed with the workspace directory and the window
-///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
-///   `cwd` is not the workspace root, or that started outside the window, is
-///   not attributed. The window is kept deliberately: it bounds the rollout
-///   scan to the window's date directories, where dropping it would read
-///   every rollout in the store. A step child's cwd is pinned to the workspace
-///   root, so the directory constraint holds for every step dispatch today; a
-///   launch path that runs Codex from a worktree would need an ids-only
-///   filter here.
+/// - **Codex**: the key depends on the caller. A **step**
+///   ([`step_tokens_by_model`], #14540) with ids and a bounded window reads by
+///   id + window only, since a private-clone seat's rollout reports the
+///   container path as `cwd`. A **role tick** ANDs the ids with the workspace
+///   directory and the window (`SessionFilter::matches` in `codex_usage`), so
+///   an id-named rollout whose `cwd` is not the workspace root is not
+///   attributed. The window is kept deliberately in both: it bounds the
+///   rollout scan to the window's date directories and the rollout's
+///   `session_meta.timestamp`, where dropping it would read every rollout in
+///   the store.
 ///
 /// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
 /// and keeps the directory+window key.
@@ -635,6 +636,16 @@ pub fn role_tick_tokens_by_model(
 /// the transcript's own command) and Pi (which reads the step's own log) are
 /// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
 /// tick reader.
+///
+/// **Codex is the exception (#14540).** A step that captured exact Codex
+/// session ids from its own dispatch region AND has a bounded window reads
+/// Codex by those ids alone, with no directory constraint: a step in a
+/// private-clone seat runs inside the session container, so its rollout's
+/// `session_meta.cwd` is the container path (`/workspace/work/…`) and never
+/// equals the host workspace root. The id names this step's own session, and
+/// the window still bounds the date-directory scan and the rollout's
+/// `session_meta.timestamp`. An exact-id miss stays unknown: attribution is
+/// NOT retried by directory, which could fold a sibling's spend in.
 #[must_use]
 pub fn step_tokens_by_model(
     runtime: Option<&str>,
@@ -644,6 +655,19 @@ pub fn step_tokens_by_model(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
+    if UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts
+        && !session_ids.codex.is_empty()
+        && window.is_some()
+    {
+        return crate::codex_usage::tokens_by_model(
+            &crate::codex_usage::SessionFilter {
+                directories: Vec::new(),
+                ids: session_ids.codex.clone(),
+            },
+            window,
+            None,
+        );
+    }
     let (number, acts_on_pr) = item;
     let directories = if acts_on_pr {
         role_tick_directories(root)
@@ -651,6 +675,39 @@ pub fn step_tokens_by_model(
         sweep_directories(root, number)
     };
     native_tokens_by_model(runtime, &directories, log_path, window, session_ids)
+}
+
+/// Resolve native usage for one close with its missing reason. OpenCode's
+/// keyed lookup returns rows and absence evidence from the same read.
+pub(crate) fn native_close_usage(
+    runtime: Option<&str>,
+    root: &Path,
+    step_item: Option<(u32, bool)>,
+    log_path: &Path,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    session_ids: &NativeSessionIds,
+) -> Result<Vec<ModelUsageTotals>, crate::observability::runtime_usage::missing::UsageMissing> {
+    use crate::observability::runtime_usage::missing::UsageMissing;
+    use crate::opencode_usage::IdLookup;
+    let opencode = UsageSource::for_runtime(runtime) == UsageSource::OpenCodeSessionDb;
+    if opencode && !session_ids.opencode.is_empty() {
+        return match crate::opencode_usage::lookup_ids(&session_ids.opencode, None) {
+            IdLookup::Found(rows) => Ok(rows),
+            IdLookup::NoStore => Err(UsageMissing::StoreUnreadable),
+            IdLookup::NotFound => Err(UsageMissing::SessionNotFound),
+            IdLookup::NoUsage => Err(UsageMissing::NoUsageTokens),
+            IdLookup::Unattributable => Err(UsageMissing::NoAttributableUsage),
+        };
+    }
+    let rows = match step_item {
+        Some(item) => step_tokens_by_model(runtime, root, item, log_path, window, session_ids),
+        None => role_tick_tokens_by_model(runtime, root, log_path, window, session_ids),
+    };
+    rows.ok_or(if opencode {
+        UsageMissing::NoSessionId
+    } else {
+        UsageMissing::NoAttributableUsage
+    })
 }
 
 fn native_tokens_by_model(
@@ -688,6 +745,54 @@ fn native_tokens_by_model(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #14566: a step whose OpenCode read found nothing is told apart by why:
+    /// no session id in its log, no store, an id no store holds, or an id whose
+    /// session recorded no tokens. Another native runtime can only say nothing
+    /// was attributable.
+    #[test]
+    #[serial_test::serial(opencode_db_env)]
+    fn a_native_read_that_found_nothing_says_why() {
+        use crate::observability::runtime_usage::missing::UsageMissing as M;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let ids = |id: &str| NativeSessionIds {
+            opencode: vec![id.to_string()],
+            codex: Vec::new(),
+        };
+        let _db =
+            crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        let close = |runtime, ids: &NativeSessionIds| {
+            native_close_usage(Some(runtime), tmp.path(), Some((42, false)), &db, None, ids)
+        };
+
+        // No session id in the log: nothing to look up, whatever the store holds.
+        assert_eq!(close("opencode", &NativeSessionIds::default()), Err(M::NoSessionId));
+
+        // The override names a store that does not exist: nothing is readable.
+        assert_eq!(close("opencode", &ids("ses_a")), Err(M::StoreUnreadable));
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER, \
+             tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, \
+             tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+             INSERT INTO session VALUES ('ses_zero', '{\"id\":\"m\",\"providerID\":\"p\"}', \
+             0, 0, 0, 0, 0, '/repo', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(close("opencode", &ids("ses_absent")), Err(M::SessionNotFound));
+        assert_eq!(close("opencode", &ids("ses_zero")), Err(M::NoUsageTokens));
+        // A later close sees the committed tokens through the same lookup
+        // that classifies absence. It hands those rows back to the emitter.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE session SET tokens_input = 10 WHERE id = 'ses_zero'", [])
+            .unwrap();
+        let rows = close("opencode", &ids("ses_zero")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input, 10);
+    }
 
     #[test]
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {

@@ -1855,7 +1855,7 @@ inventing a record kind per signal. Envelopes carry `schema_version: 10`.
 Each name fixes its OTLP kind. `loom.dispatch.decisions` is a monotonic
 **delta `Sum`**, one point per non-zero work-finder outcome per tick, labelled
 `reason` ∈ `dispatched`, `labeled`, `in_flight`, `quarantined`,
-`workspace_commands_missing`, `pr_open`, `peer_claim`, `backoff`,
+`workspace_commands_missing`, `pr_open`, `backoff`,
 `pr_open_backoff`, `noop_cooldown`, `declined`, `prless_retry`,
 `already_landed` (#11429: the issue's work already landed),
 `already_closed` (#11429: the issue is closed as not planned),
@@ -1866,6 +1866,7 @@ emitted), `error`, plus the typed dispatch refusals (#8907):
 `lease_order_lost` (lost the lease-order tie-break), `token_selection_failed`
 (empty or fully bad-marked token pool), `claim_collision` (cross-host collision
 enforcement) and `claim_lock_held` (the local claim lock already existed).
+The `peer_claim` metric reason stopped emitting with #13945.
 These are the same buckets as the `work_finder: tick` log line
 (`loom-daemon health`'s last-tick summary omits `prless_retry`), except that
 the log line and `health` still fold `lease_order_lost` into `backoff` and the
@@ -2309,20 +2310,23 @@ traces.
 Every ready-queue row the work finder ranked on its most recent tick
 (`WorkFinderTickSummary::queue`, #8852) gets its own `loom.dispatch.disposition`
 span whenever its disposition changes (including first sight), on a periodic
-refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s), or once as a
-terminal record when it leaves a successfully-listed repo's queue. Unlike
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 150 seconds of
+source time), or once as a terminal record when it leaves a successfully-listed
+repo's queue. Unlike
 `loom.dispatch.admission`, this covers every candidate the tick evaluated —
 including one filtered out before `dispatch()` was ever attempted
 (`workspace_halted`, `parked`, `host_constraint`,
 …) — so a per-issue "why" is answerable for the entire `QueueDisposition`
 vocabulary, not just the subset that reached an admission attempt.
 
-Sampled from the collector's periodic pass (the same cadence as
-`queue.snapshot`), never from the tick loop
-itself, so a disposition that lasts less than one collector interval can be
-missed — only the last-tick state per interval is exported. Parented to the
-tick's own `loom.dispatch.tick` span when the sampled summary is that exact
-tick; otherwise a root of its own. Attributes:
+The collector checks for a newer completed tick every 30 seconds using
+cached identities. The five-minute host snapshot pass resolves repo identities
+and counts unresolved rows. Only the latest eligible summary at a poll can
+enter the tracker, so short-lived dispositions can be missed. The span start
+and end equal the source tick completion time. The envelope records the
+separate collector emission time. A span is parented to the exact source
+`loom.dispatch.tick` span when its context is available. Otherwise it has
+its own root. Attributes:
 
 | Attribute | Value |
 |---|---|
@@ -2413,6 +2417,7 @@ Tokens, providers and pools (Issues #8908, #8931):
 | `loom.egress.requests` / `.tokens` / `.latency` / `.ttft` | delta `Sum` | `{request}` / `{token}` / `s` / `s`; labels `provider`, `account` (the seat), `model`, `role`, `outcome` (`ok`/`error`), `reason` (classified code on an error), plus `kind` (`input`/`output`/`cache_read`/`cache_write`) on `.tokens` | egress-proxy observe mode (#11300), default off: one set per proxied provider request. Counts and classified codes only, never a body or credential |
 | `loom.egress.request` span | own root trace (derived from launch id, start, sequence) | `loom.egress.{seat,tap,profile,launch_id,status,latency_ms,ttft_ms,error_code,stream}`, `loom.runtime`, `loom.role`, `loom.issue`, `loom.pr_number`, `loom.sweep_id`, `loom.model`, `loom.tokens.*` | the per-request record behind the metrics above, carrying the ids too high-cardinality for a label |
 | `loom.runtime.usage` span | one per **model**, child of the unit it measures (see below) | `loom.usage.scope` (`execution` \| `attempt`), `loom.model`, `loom.tokens.input`, `.output`, `.cache_read`, `.cache_write` (= `.cache_write_5m` + `.cache_write_1h`), `.total`; aliases `gen_ai.usage.input_tokens` (**uncached input only, NOT total input** — decision #9315: kept, following Anthropic's vocabulary and so that `input + cache_read + cache_write` never double-counts; a generic OTel GenAI consumer must add `.cache_read_input_tokens` and `.cache_creation_input_tokens` to get total input, as the downstream telemetry consumer must), `.output_tokens`, `.cache_read_input_tokens`, `.cache_creation_input_tokens`; `llm.billing`, `llm.credential.kind`, `llm.provider.profile` (see [LLM billing class](#llm-billing-class-10749)); `loom.cost.usd_estimate` = `gen_ai.cost.usd_estimate` with `loom.pricing.verified_on` and `loom.pricing.source` (`asset` \| `compiled`); optional `loom.runtime` (a role tick whose usage came from Claude Code transcripts reports `claude`; a sweep or step reports the runtime its usage was read from, so a Codex run with no `# LOOM_LAUNCH` record still reports `codex` — #14166), `loom.role`, `loom.attempt`, `loom.sweep_id`, `loom.issue`, `loom.pr_number` | one unit's exact token usage for one model (#8908, #9204, #9303). Absent when usage is unknown or has no model rows; a model row's measured-zero counter is `"0"`. No cost attributes for a model the rate card does not know (never a Sonnet fallback). Covered runtimes: Claude, Codex, OpenCode, Kimi and Pi — including step-dispatched runs for Claude, Codex, OpenCode and Kimi (the runtime marker is read from the step's own log, #14166); Pi covers sweep-dispatched runs only (its usage is the launch log's `--mode json` stream, which a step's own log does not carry, so a step-dispatched Pi run resolves its runtime but yields no usage span yet); the cache-write attributes (`loom.tokens.cache_write`, `.cache_write_5m`, `.cache_write_1h`, `gen_ai.usage.cache_creation_input_tokens`) are **absent** on a Codex span whose rollout reported no cache-write tokens (its reader cannot tell "not reported" from `0`, #14166), and a measured `"0"` for every other runtime |
+| `loom.runtime.usage_missing` span | one per unit whose usage could not be read, child of the unit (like the usage span) | `loom.usage.missing_reason` — a fixed set: `no_step_log` (the step's own log or dispatch header was unreadable, so session ids are unknown), `no_session_id` (a native-store step's log names no session id and the directory + window read found nothing), `store_unreadable` (candidate usage data absent or unreadable), `session_not_found` (all candidate stores read, none holds a session the log names), `no_usage_tokens` (the named session recorded no tokens), `no_attributable_usage` (usage could not be attributed to this run), `no_sweep_window` (a sweep with no start instant); `loom.usage.scope`, `loom.runtime` (from launch metadata when the log is unavailable), `loom.role`, `loom.sweep_id` | Why a run has no `loom.runtime.usage` span (#14566): never counters, never an estimate. Emitted for each completed run whose usage was unreadable and whose trace context is known; a run with no persisted trace has nowhere to hang a span and is a daemon `warn` instead. Count the gap with `count()` of `loom.runtime.usage_missing` grouped by `loom.usage.missing_reason`. |
 
 Guard denies (Issue #11582):
 
@@ -2714,7 +2719,7 @@ Body fields (`observability/otlp/mapping/dispatch_eligibility.rs`,
 | Field | Meaning |
 |---|---|
 | `eligibility` | `eligible` (schedulable, held only by a capacity-style limit) or `blocked` (held by something specific to the item/repo/history). |
-| `reason` | the dispatcher's `QueueDisposition` token — `deferred_capacity`, `deferred_build_backoff`, `deferred_file_overlap`, `open_pr`, `parked`, `workspace_halted`, `quarantined`, `peer_claim`, `host_constraint`, … |
+| `reason` | the dispatcher's `QueueDisposition` token — `deferred_capacity`, `deferred_build_backoff`, `deferred_file_overlap`, `open_pr`, `parked`, `workspace_halted`, `quarantined`, `lease_held`, `host_constraint`, … |
 | `state` | the coarse `ready` / `blocked` state the eligibility is derived from. |
 | `block_start` | when the item entered its current eligibility class on this host, as first observed (the tick of the first same-class sample). An observation floor — a class shorter than one collector interval can be missed, and a daemon restart re-anchors it (same tradeoff as `ops::disposition`). This is the dwell split point. |
 | `transition` | `changed` (class flip / first sight; `block_start` re-anchored) or `refresh` (same class, window elapsed; `block_start` preserved). |

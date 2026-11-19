@@ -167,11 +167,9 @@ fn guarded_roles_can_use_a_mixed_pool_and_refuse_an_entirely_untrusted_pool() {
         let selected = select(f.root.path(), None, Some(role), |_| true).unwrap();
         assert_eq!(selected.id.name, "ready", "{role}");
     }
-    let step = crate::tokens_pool::private_workspace::dispatch::Selection::guarded_step(
+    let step = crate::tokens_pool::private_workspace::dispatch::Selection::guarded_shared_step(
         f.root.path(),
         "judge",
-        None,
-        crate::tokens_pool::private_workspace::JobKind::Role,
         None,
     )
     .unwrap();

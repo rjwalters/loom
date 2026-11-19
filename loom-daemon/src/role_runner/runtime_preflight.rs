@@ -170,8 +170,17 @@ pub(crate) fn check(
     else {
         // No preference list applies to this role, an operator pin is in
         // force (a pin disables fall-through by design), or the preference
-        // config itself is malformed: byte-identical to before #8554.
+        // config itself is malformed. There is no fall-through, but a
+        // host-admitted Codex launch still needs to reserve its seat.
         gate(admission)?;
+        if let Some(Ok(admitted)) = admission {
+            containment
+                .reserve_seat(admitted, None)
+                .map_err(|rejection| {
+                    note_pre_spawn_skip(logs, role, rejection.refusal_line());
+                    RoleTickOutcome::RuntimeRejected(rejection)
+                })?;
+        }
         return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
     // #11726: a role draw's record rides on the marker, the diagnostic and
@@ -444,15 +453,31 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64, require_hook: bool) -> Cod
 /// pre-spawn skip and `runtime_preference::availability`'s Exhausted detail so
 /// both name `SessionDown` (#10454) the same way.
 pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
-    use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
-    if !state.untrusted.is_empty() {
-        return format!(
-            "guard hook not ready on Codex profile(s) {}; no eligible seat is spawnable",
-            state.untrusted.join(", ")
-        );
+    if state.untrusted.is_empty() {
+        return codex_health_exhausted_reason(state);
     }
+    let hook = format!(
+        "guard hook not ready on Codex profile(s) {}; run `provision-codex-hooks.sh verify \
+         --all-profiles --workspace <repo>` (#9390)",
+        state.untrusted.join(", ")
+    );
+    if state.untrusted.len() == state.enabled {
+        hook
+    } else {
+        format!("{hook}; {}", codex_health_exhausted_reason(state))
+    }
+}
+
+fn codex_health_exhausted_reason(state: &CodexPoolState) -> String {
+    use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+
+    let subject = if state.untrusted.is_empty() {
+        "every enabled account"
+    } else {
+        "every remaining enabled account"
+    };
     if state.session_down == 0 {
-        return "every enabled account is cooling down or needs re-auth".to_string();
+        return format!("{subject} is cooling down or needs re-auth");
     }
     // #10660: never tell the operator to start a container they stopped.
     let (down, held) = (state.session_down, state.session_held);
@@ -468,7 +493,7 @@ pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
         )
     };
     format!(
-        "every enabled account is cooling down, needs re-auth, or is {} ({down}/{} session \
+        "{subject} is cooling down, needs re-auth, or is {} ({down}/{} session \
          container(s) not running{remedy}; #10454)",
         crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
         state.enabled

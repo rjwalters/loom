@@ -251,6 +251,13 @@
 
 set -euo pipefail
 
+# #14488: one binary for the whole lease chain (see loom_select_lease_bin).
+# Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
+# shellcheck source=lib/locate-daemon-bin.sh
+_lease_lib="$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
+if [[ -r "$_lease_lib" ]]; then source "$_lease_lib" && loom_select_lease_bin "$PWD" || true; fi
+unset _lease_lib
+
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"

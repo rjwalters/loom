@@ -325,6 +325,33 @@ fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
     );
 }
 
+/// A caller must select one scope before either registry can be written.
+#[test]
+fn shared_toggle_and_explicit_workspace_are_mutually_exclusive() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".loom")).unwrap();
+    let shared_before = fixture.shared_registry();
+    for verb in ["disable", "enable"] {
+        let output = fixture.command(
+            repo.path(),
+            &[
+                verb,
+                "codex",
+                "alpha",
+                "--shared",
+                "--workspace",
+                repo.path().to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{verb}: {stderr}");
+        assert!(stderr.contains("--shared") && stderr.contains("--workspace"), "{stderr}");
+        assert_eq!(fixture.shared_registry(), shared_before);
+        assert!(!repo.path().join(".loom/accounts.json").exists());
+    }
+}
+
 /// A shared disable works from a checkout and vetoes both discovered and
 /// locally enabled seats. Re-enabling the shared seat lifts that veto.
 #[test]

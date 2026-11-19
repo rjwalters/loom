@@ -388,7 +388,16 @@ caller that will pass the waiver may opt in.
 Builder, Doctor, Champion and Judge draw from the shared profiles that report
 `ready: true`. The selector names each skipped profile. If none is eligible,
 the runtime preference can fall through to its next tap. The adapter verifies
-the selected profile again before starting Codex. Test coverage for the readiness signal itself:
+the selected profile again before starting Codex.
+
+The work finder probes Builder preferences for step dispatch (#13983).
+An untrusted shared Codex seat cannot make a host-admitted Builder tap
+available. A workspace with no available Builder tap holds until an eligible
+tap recovers. A rejection that private containment could lift still leaves
+dispatch eligible, and the legacy `sweep-lifecycle` preference table does
+not participate in the step hold.
+
+Test coverage for the readiness signal itself:
 `defaults/scripts/tests/test-provision-codex-hooks.sh` (trust-baseline
 scenarios). Coverage that trust is waived only behind the sealed verdict:
 `test-provision-codex-hooks.sh`'s credential-hygiene section and
@@ -526,11 +535,8 @@ spawn-codex: hooks=<ready|not-ready|unavailable|verified-in-private-session> rol
   which is what `guard-loom-workflow.sh` and `guard-destructive.sh` police. They
   exit **78** unless `hooks=ready` (or `verified-in-private-session`, where
   `private-workspace execute` re-proves the registration and trust in-container
-  for them as for a mutable role). This is the backstop: the daemon's runtime
-  preference (`runtime_preference::codex_guard`) already treats Codex as
-  *unavailable* to these roles while any enabled shared profile fails `verify`
-  for the workspace, so the walk falls through to the next tap (Claude) instead
-  of selecting Codex and failing the tick (#9390).
+  for them as for a mutable role). The runtime preference skips the Codex
+  tap when no guard-ready seat is eligible for the workspace (#9390).
 - **Read-only roles** keep the conservative sandbox fallback but are told
   explicitly that hook parity was unavailable, and are never reported as
   Builder-capable.
