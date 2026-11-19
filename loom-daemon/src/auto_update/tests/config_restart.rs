@@ -16,6 +16,15 @@ use std::sync::Mutex;
 
 const RUNNING: &str = env!("CARGO_PKG_VERSION");
 
+/// A release strictly newer than the running version: the same triple with
+/// the patch bumped, so the fixture stays valid as the workspace version
+/// moves (`0.19.999999` froze below it once the workspace reached `0.20.0`
+/// — issue #14643).
+fn newer_release() -> String {
+    let (head, patch) = RUNNING.rsplit_once('.').unwrap();
+    format!("{head}.{}", patch.parse::<u64>().unwrap() + 1)
+}
+
 fn demand(paths: &[&str]) -> ConfigRestartDemand {
     ConfigRestartDemand {
         paths: paths.iter().map(ToString::to_string).collect(),
@@ -84,7 +93,7 @@ impl RollTrigger for Trigger {
 
 fn probe(installed: &str, fetch_calls: &Arc<AtomicUsize>) -> ArtifactFakeProbe {
     ArtifactFakeProbe {
-        artifact: resolved(artifact("0.19.999999", Some(installed), Some(SHA_B), Some(SHA_A))),
+        artifact: resolved(artifact(&newer_release(), Some(installed), Some(SHA_B), Some(SHA_A))),
         check: UpdateCheck {
             update_available: None,
             source_commit: None,
@@ -174,8 +183,10 @@ fn a_host_with_no_fleet_store_arms_nothing() {
 
 #[test]
 fn a_version_roll_arming_keeps_the_tick() {
-    // The floor is above the running version and a release meets it.
-    let run = tick(FloorKnowledge::Set("0.19.999999".to_string()), Some(demand(&["a.restart"])));
+    // The floor is above the running version, and the release that meets it
+    // is the fixture's newer release.
+    let release = newer_release();
+    let run = tick(FloorKnowledge::Set(release.clone()), Some(demand(&["a.restart"])));
     assert_ne!(run.summary.decision, TickDecisionKind::ConfigRestart);
     assert!(
         run.trigger
@@ -185,6 +196,17 @@ fn a_version_roll_arming_keeps_the_tick() {
             .iter()
             .all(|t| t.source != pause_manifest::TargetSource::ConfigRestart),
         "{}",
+        run.summary.note
+    );
+    // The floor drives the roll, onto the release that meets it.
+    let targets = run.trigger.targets.lock().unwrap().clone();
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.source == pause_manifest::TargetSource::Floor
+                && t.to_version.as_deref() == Some(release.as_str())),
+        "{:?} — {}",
+        targets,
         run.summary.note
     );
 }
