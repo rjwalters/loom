@@ -636,6 +636,105 @@ fn an_id_only_filter_attributes_across_directories() {
     assert_eq!(fold_rollout(&lines, &filter, None).len(), 1);
 }
 
+/// #14664: a by-id read says WHY no rows came back, keeping the precedence
+/// the OpenCode store's `lookup_ids` keeps — found rows first, then a store
+/// that could not be read, then a named session without tokens, then an id
+/// nothing holds.
+#[serial_test::serial(codex_home_env)]
+#[test]
+fn lookup_ids_says_why_no_rows_came_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = seed_codex_home(
+        tmp.path(),
+        &[
+            (
+                "2026/09/20",
+                "rollout-real.jsonl",
+                rollout(
+                    // A private-clone seat's container path: never a host
+                    // workspace directory, which is the miss #14664 closes.
+                    "/workspace/work/repo-clone",
+                    "2026-09-21T02:06:31Z",
+                    "11111111-2222-3333-4444-555555555555",
+                    "gpt-5",
+                    &[(1_000, 400, 100, 40)],
+                ),
+            ),
+            (
+                "2026/09/20",
+                "rollout-zero.jsonl",
+                rollout(
+                    "/w",
+                    "2026-09-21T02:06:31Z",
+                    "99999999-8888-7777-6666-555555555555",
+                    "gpt-5",
+                    &[],
+                ),
+            ),
+        ],
+    );
+    let window = Some((instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z")));
+
+    // An empty id set is no key at all.
+    assert_eq!(with_codex_home(&home, || lookup_ids(&[], window, None)), IdLookup::NotFound);
+
+    // No rollout in the window's date directories anywhere: candidate data
+    // absent, so nothing follows about the ids.
+    let far = Some((instant("2026-01-01T00:00:00Z"), instant("2026-01-02T00:00:00Z")));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            far,
+            None
+        )),
+        IdLookup::NoStore
+    );
+
+    // Stores read, id held by none of them.
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["00000000-0000-0000-0000-000000000000".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NotFound
+    );
+
+    // A named rollout selected by the whole key but with no tokens.
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["99999999-8888-7777-6666-555555555555".to_string()],
+            window,
+            None
+        )),
+        IdLookup::NoUsage
+    );
+
+    // The named rollout is attributed across the directory mismatch…
+    let IdLookup::Found(rows) = with_codex_home(&home, || {
+        lookup_ids(&["11111111-2222-3333-4444-555555555555".to_string()], window, None)
+    }) else {
+        panic!("expected rows");
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].model, "gpt-5");
+    assert_eq!(rows[0].input, 1_000 - 400);
+    assert_eq!(rows[0].cache_read, 400);
+    assert_eq!(rows[0].output, 100);
+
+    // …and the window still applies: an id-named rollout outside it is NOT
+    // selected, so the id + window key never degrades to id-alone.
+    let later = Some((instant("2026-09-21T03:00:01Z"), instant("2026-09-21T04:00:00Z")));
+    assert_eq!(
+        with_codex_home(&home, || lookup_ids(
+            &["11111111-2222-3333-4444-555555555555".to_string()],
+            later,
+            None
+        )),
+        IdLookup::NotFound
+    );
+}
+
 // ---------------------------------------------------------------------------
 // End-to-end over a fixture $CODEX_HOME
 // ---------------------------------------------------------------------------

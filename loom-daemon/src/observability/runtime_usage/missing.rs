@@ -28,7 +28,10 @@ pub enum UsageMissing {
     /// native session ids are unknown. The registry can still know the runtime.
     NoStepLog,
     /// The step's log names no native session id (the child died before its
-    /// event stream emitted one) and the directory + window read found nothing.
+    /// event stream emitted one) and the directory + window read found
+    /// nothing. For a role tick the "own log" is its latest per-role-log
+    /// slice (#14664); a Codex run whose ids WERE captured reports the
+    /// store/session reasons below instead, from the by-id read.
     NoSessionId,
     /// Candidate usage data was unavailable (absent, unreadable or locked
     /// past the bounded wait).

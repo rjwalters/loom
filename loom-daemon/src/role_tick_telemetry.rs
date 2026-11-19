@@ -1057,13 +1057,22 @@ fn emit_correlated(
     let source = crate::usage_source::UsageSource::for_runtime(usage_runtime_name.as_deref());
     // #14048: the exact native session ids this step's own log names — the
     // strictly-more-precise attribution key for the OpenCode (event-stream
-    // `sessionID`) and Codex (`session id: <uuid>` banner) stores. Role ticks
-    // and readable step logs without ids keep the existing directory +
-    // window fallback. An unreadable native step log has no attribution key.
-    let session_ids = step_log
-        .as_ref()
-        .map(|(_, region)| crate::usage_source::native_session_ids(region))
-        .unwrap_or_default();
+    // `sessionID`) and Codex (`session id: <uuid>` banner) stores. A role
+    // tick's ids come from its own per-role log slice instead (#14664): the
+    // region after the last invocation header, so an earlier tick's banner is
+    // never attributed to a later one. Only the Codex arm keys a role tick on
+    // its ids today; OpenCode role ticks keep the directory + window key
+    // (OpenCode attribution is out of scope for #14664). An unreadable native
+    // step log has no attribution key.
+    let session_ids = match step_log.as_ref() {
+        Some((_, region)) => crate::usage_source::native_session_ids(region),
+        None if source.is_native_store() => {
+            let mut ids = crate::usage_source::role_tick_session_ids(&role_log);
+            ids.opencode.clear();
+            ids
+        }
+        None => crate::usage_source::NativeSessionIds::default(),
+    };
     use crate::observability::runtime_usage::missing::UsageMissing;
     let no_step_log = tick.step_log.is_some() && step_log.is_none();
     let capture_usage = || {

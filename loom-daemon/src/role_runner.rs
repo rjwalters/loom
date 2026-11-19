@@ -1033,6 +1033,24 @@ pub fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
     logs_dir.join(format!("role-{role}.log"))
 }
 
+/// This tick's own slice of the append-only per-role log: everything after
+/// the LAST `==== loom-daemon role_runner: … ====` invocation header
+/// ([`model_resolution::role_log_header`]'s line), or `None` when the log
+/// predates the header.
+///
+/// The per-role-log counterpart of `api_keys_pool::ingest::region_after`'s
+/// `sweep_id=` anchor: a fresh line above the anchor never leaks into an
+/// older tick's region, and this tick's region never reads a stale record
+/// left by a previous one. #14664: a role tick's native session ids are
+/// parsed out of exactly this slice, so an earlier tick's `session id:`
+/// banner is never attributed to a later tick.
+#[must_use]
+pub fn last_invocation_region(contents: &str) -> Option<&str> {
+    contents
+        .rfind("==== loom-daemon role_runner:")
+        .map(|at| &contents[at..])
+}
+
 /// Append a one-line **pre-spawn skip marker** to the role's own log file
 /// (issue #6201, confirmed root cause).
 ///

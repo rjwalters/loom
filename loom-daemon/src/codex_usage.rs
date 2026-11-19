@@ -613,6 +613,19 @@ pub fn fold_rollout(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<CodexSessionUsage> {
+    fold_rollout_selected(lines, filter, window).1
+}
+
+/// [`fold_rollout`] keeping the evidence a by-id read needs
+/// ([`lookup_ids`], #14664): `selected` says this rollout passed the whole
+/// key — `filter` AND the window — so empty `rows` on a selected rollout
+/// means "this session recorded no tokens", never "this is another
+/// session's rollout".
+fn fold_rollout_selected(
+    lines: &[String],
+    filter: &SessionFilter,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> (bool, Vec<CodexSessionUsage>) {
     let mut directory: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut session_id: Option<String> = None;
@@ -678,40 +691,43 @@ pub fn fold_rollout(
     }
 
     let Some(directory) = directory else {
-        return Vec::new();
+        return (false, Vec::new());
     };
     if !filter.matches(&directory, session_id.as_deref()) {
-        return Vec::new();
+        return (false, Vec::new());
     }
     // `session_meta.timestamp` is present in every observed rollout; one
     // without a decodable instant is unattributable to a window, so it is
     // dropped rather than assumed to be inside it.
     let Some(created_at) = created_at else {
-        return Vec::new();
+        return (false, Vec::new());
     };
     if let Some((start, end)) = window {
         if created_at < start || created_at > end {
-            return Vec::new();
+            return (false, Vec::new());
         }
     }
-    by_model
-        .into_iter()
-        .map(|(model, counters)| CodexSessionUsage {
-            model,
-            provider: provider.clone(),
-            directory: directory.clone(),
-            session_id: session_id.clone(),
-            created_at,
-            // Keep Claude's DISJOINT vocabulary: Codex's `input_tokens`
-            // includes its `cached_input_tokens`, so the cached part is moved
-            // to `cache_read` rather than counted twice.
-            input: counters.uncached_input(),
-            cache_read: counters.cached_input,
-            cache_write: counters.cache_write,
-            output: counters.output,
-        })
-        .filter(|row| !row.is_empty())
-        .collect()
+    (
+        true,
+        by_model
+            .into_iter()
+            .map(|(model, counters)| CodexSessionUsage {
+                model,
+                provider: provider.clone(),
+                directory: directory.clone(),
+                session_id: session_id.clone(),
+                created_at,
+                // Keep Claude's DISJOINT vocabulary: Codex's `input_tokens`
+                // includes its `cached_input_tokens`, so the cached part is moved
+                // to `cache_read` rather than counted twice.
+                input: counters.uncached_input(),
+                cache_read: counters.cached_input,
+                cache_write: counters.cache_write,
+                output: counters.output,
+            })
+            .filter(|row| !row.is_empty())
+            .collect(),
+    )
 }
 
 /// A non-empty, trimmed string field, or `None` — the "omit rather than guess"
@@ -781,6 +797,72 @@ pub fn tokens_by_model(
     home: Option<&Path>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions(filter, window, home))
+}
+
+/// The usage rows or the reason a by-id Codex read could not produce them —
+/// the rollout-store counterpart of [`crate::opencode_usage::IdLookup`], so
+/// `usage_source::native_close_usage` can say WHY a Codex run closed without
+/// usage (#14664) instead of one undifferentiated "nothing attributable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdLookup {
+    /// The named sessions' attributable per-model rows.
+    Found(Vec<ModelUsageTotals>),
+    /// No rollout store held a readable candidate rollout: the store side of
+    /// the read failed (absent — nothing discovered in the window's date
+    /// directories — or unreadable), so no conclusion about the ids follows.
+    NoStore,
+    /// Every candidate rollout was read and none was selected by the
+    /// id + window key.
+    NotFound,
+    /// A named rollout was selected by the whole key but recorded no tokens.
+    NoUsage,
+}
+
+/// Read the sessions named in `ids` once and preserve the evidence for a
+/// missing result (#14664), mirroring [`crate::opencode_usage::lookup_ids`].
+///
+/// The key is id + window, exactly as a step's read has been since #14540:
+/// `window` bounds the date-directory scan and each rollout's
+/// `session_meta.timestamp`. There is deliberately NO directory retry on an
+/// id miss — a directory-keyed second read could fold a sibling launch's
+/// spend into this one, the hazard #14540 already ruled out.
+#[must_use]
+pub fn lookup_ids(
+    ids: &[String],
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    home: Option<&Path>,
+) -> IdLookup {
+    if ids.is_empty() {
+        return IdLookup::NotFound;
+    }
+    let filter = SessionFilter {
+        directories: Vec::new(),
+        ids: ids.to_vec(),
+    };
+    let mut rows: Vec<CodexSessionUsage> = Vec::new();
+    let mut selected = false;
+    let mut read_any = false;
+    let mut unreadable = false;
+    for (root, path) in discover_home_rollouts(home, window) {
+        let Some(lines) = read_rollout(&root, &path, u64::MAX) else {
+            unreadable = true;
+            continue;
+        };
+        read_any = true;
+        let (matched, folded) = fold_rollout_selected(&lines, &filter, window);
+        selected |= matched;
+        rows.extend(folded);
+    }
+    if let Some(totals) = fold_sessions(rows) {
+        return IdLookup::Found(totals);
+    }
+    if unreadable || !read_any {
+        IdLookup::NoStore
+    } else if selected {
+        IdLookup::NoUsage
+    } else {
+        IdLookup::NotFound
+    }
 }
 
 /// Fold already-selected session rows into per-model totals.
