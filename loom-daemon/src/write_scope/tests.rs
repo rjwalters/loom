@@ -1002,6 +1002,7 @@ fn daemon_write_paths_are_scoped() {
     };
     let matches =
         |f: &str| writes.is_match(&std::fs::read_to_string(src.join(f)).unwrap_or_default());
+    let calls = regex::Regex::new(r"(?:^|[^.\w])gh_write\s*(?:\(|as\b)").unwrap();
     for (file, scope) in reviewed {
         match scope {
             Gated => assert!(gated(file), "{file} is listed as gated but never calls write_scope"),
@@ -1016,7 +1017,6 @@ fn daemon_write_paths_are_scoped() {
                 assert!(matches(file), "stale entry: {file} ({why}) no longer writes");
             }
             ViaCallers(parents) => {
-                let calls = regex::Regex::new(r"(?:^|[^.\w])gh_write\s*(?:\(|as\b)").unwrap();
                 let mut actual: Vec<_> = sources
                     .iter()
                     .filter(|(path, text)| {
