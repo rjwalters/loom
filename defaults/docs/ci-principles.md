@@ -157,9 +157,11 @@ the next person to add one will have an equally good argument.
     reports. A suite that is skipped on `merge_group` is not coverage
     (rule 6), and path filters do not apply there (rule 3). `merge_group` runs
     the full suite: everything `push` runs, plus the image jobs that `push`
-    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit` checks all of
-    this statically, and it counts any suite it cannot prove runs as
-    uncovered. See [merge-queue-ci](merge-queue-ci.md).
+    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit`
+    checks static job eligibility and compares step conditions. Equal unknown
+    step conditions can pass that comparison even when runtime outputs differ.
+    Verify full-suite execution from the actual job and step results on the
+    merge-group SHA. See the [step comparison example](merge-queue-ci.md#reproduce-the-step-comparison).
 
 ## The daily backstop and its tracking issues
 

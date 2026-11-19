@@ -76,7 +76,6 @@ pub enum StatusSection {
     RateLimitBreaker,
     ForgeCalls,
     Safehouse,
-    PeerClaims,
     Protection,
     AgentResidue,
     JournalAdoptedAtStartup,
@@ -159,7 +158,6 @@ impl StatusSection {
             S::RateLimitBreaker => ("rate_limit_breaker", &["rate_limit_breaker"]),
             S::ForgeCalls => ("forge_calls", &["forge_calls"]),
             S::Safehouse => ("safehouse", &["safehouse"]),
-            S::PeerClaims => ("peer_claims", &["peer_claims"]),
             S::Protection => ("protection", &["protection"]),
             S::AgentResidue => ("agent_residue", &["agent_residue"]),
             S::JournalAdoptedAtStartup => {

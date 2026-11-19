@@ -145,25 +145,28 @@ it, only a hold label names a reason; other candidates are undecided.
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `peer_claim`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
+| `host_constraint` | not for this host | `host_constraint`, `lease_held`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
 | `not_selected` | the role ran, its writes were observed, and it did not act on this candidate | roles only, with `decisions_observed` |
 | `already_landed` | the item's work already landed: the issue is closed, or this host recorded a `landed` sweep for it in the last 30 minutes (#11429) | `already_landed` |
 | `already_closed` | the issue is closed as not planned (#11429) | `already_closed` |
-| `no_step` | the item's state calls for no step: an epic, an unpromoted proposal, an unlabelled draft PR | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `proposal`, `no_stage`, `draft` |
+| `no_step` | the item's state calls for no step: an epic, a tracker, an unpromoted proposal, an unlabelled draft PR | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `tracker`, `proposal`, `no_stage`, `draft` |
 
 `QueueDisposition::Dispatched` is the one disposition with no reason: it is
 *acted*. The mapping is a total match in
 `PickSkipReason::from_disposition`, so a new disposition must be classified
 there. The step engine's weight-0 exclusions map through the parallel total match
-`PickSkipReason::from_exclusion`: `pool_exhausted` → `quota`, `build_backoff`
-→ `backoff`, `ci_pending` (a Judge step whose PR head has CI running, #12042)
-→ `backoff`, `frozen` / `operator` / `hard_exclusion` → `operator_hold`,
-`claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
-→ `overlap_chain`, `blocked` → `blocked`, `capability_missing` / `host_skip_label` →
-`host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
+`PickSkipReason::from_exclusion` (24 wire names: `Exclusion::as_str` and
+`PassReason::as_str`): `pool_exhausted` → `quota`, `build_backoff` /
+`cooling_down` → `backoff`, `ci_pending` (a Judge step whose PR head has CI
+running, #12042) / `held_at_head` / `author_gate_held` / `conflicting` /
+`stacked` → `backoff`, `frozen` / `operator` / `hard_exclusion` →
+`operator_hold`, `claimed` / `queued` / `merge_in_flight` → `in_flight`,
+`shared_pr` → `pr_open_skip`, `sequenced` → `overlap_chain`, `blocked` →
+`blocked`, `capability_missing` / `host_skip_label` → `host_constraint`,
+`epic` / `tracker` / `proposal` / `no_stage` / `draft` → `no_step`.
 An `extraSkipLabels` match reads differently on the two paths: the step engine
 excludes it as `host_skip_label` → `host_constraint` (#13891), while the
 work-finder role tick skips the same item as disposition `parked` →

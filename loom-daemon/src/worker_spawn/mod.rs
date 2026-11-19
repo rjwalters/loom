@@ -20,6 +20,7 @@ mod phase_run;
 mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
+pub(crate) mod rejection;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 // #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
@@ -27,6 +28,7 @@ pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 #[cfg(test)]
 pub(crate) use phase_run::escalation_report;
 
+use crate::runtime_admission::RuntimeSource;
 use harness::Harness;
 use std::{
     fs,
@@ -117,12 +119,18 @@ impl Options {
 pub struct LaunchError {
     pub code: i32,
     pub message: String,
+    /// The typed preflight boundary that produced this error (#14634): a
+    /// closed, non-sensitive vocabulary naming which launch prerequisite
+    /// failed. `None` for the post-`exec` mechanics errors (126/127), which
+    /// are not preflight outcomes.
+    pub stage: Option<LaunchStage>,
 }
 impl LaunchError {
     fn config(message: impl Into<String>) -> Self {
         Self {
             code: 78,
             message: message.into(),
+            stage: None,
         }
     }
     /// A pre-exec failure discovered one step before `exec` would have hit
@@ -138,9 +146,160 @@ impl LaunchError {
         Self {
             code: 126,
             message: message.into(),
+            stage: None,
+        }
+    }
+    /// Name the preflight boundary that produced this error (#14634). The
+    /// stage rides the rejection's span attribute and the step-log rejection
+    /// marker, never the free-form message.
+    #[must_use]
+    fn with_stage(mut self, stage: LaunchStage) -> Self {
+        self.stage = Some(stage);
+        self
+    }
+    /// [`Self::with_stage`] for an error an inner boundary may already have
+    /// typed: the innermost typed boundary wins.
+    #[must_use]
+    fn or_stage(self, stage: LaunchStage) -> Self {
+        match self.stage {
+            Some(_) => self,
+            None => self.with_stage(stage),
         }
     }
 }
+
+/// The closed vocabulary of launcher preflight boundaries (#14634). One
+/// variant per launch prerequisite that can reject a worker before the
+/// harness ever starts; `as_str` is the stable, non-sensitive token that
+/// reaches span attributes, the step log's rejection marker, and — prefixed
+/// with `preflight_` — the step ledger's outcome reason. Never carries
+/// free-form diagnostic text: the message stays on local stderr only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchStage {
+    /// The runtime name could not be resolved or validated (workspace
+    /// lookup, the role/env/config tiers, or a name that failed the charset
+    /// check).
+    RuntimeResolution,
+    /// The launch argv failed the worker options parser.
+    WorkerOptions,
+    /// Role admission refused this runtime/profile/role pairing.
+    RoleAdmission,
+    /// Model-profile selection failed for this launch.
+    ProfileSelection,
+    /// The selected model profile excludes this role (`excludedRoles`).
+    ProfileRoleExcluded,
+    /// The LLM gateway refused, or could not plan, this launch.
+    GatewayPlan,
+    /// Contained-launch preparation failed (or a gateway pairing it does not
+    /// support was requested).
+    Containment,
+    /// Credential egress proxy preparation failed.
+    EgressProxy,
+    /// The profile's credential could not be resolved.
+    Credential,
+    /// Prompt expansion failed.
+    PromptExpansion,
+    /// No `spawn-<runtime>.sh` runner exists for a legacy adapter runtime.
+    RunnerMissing,
+    /// Token-pool private-workspace admission failed.
+    WorkspaceAdmission,
+    /// The worker log (or a launch-record line in it) could not be written.
+    LogWrite,
+    /// The harness command could not be assembled from the resolved
+    /// selection.
+    LaunchPrep,
+    /// The harness CLI's own version is not qualified for this launch shape
+    /// (the OpenCode major guard, #8438/#11283): the probe answered with an
+    /// unsupported or canary-unverified version.
+    CliQualification,
+}
+
+impl LaunchStage {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeResolution => "runtime_resolution",
+            Self::WorkerOptions => "worker_options",
+            Self::RoleAdmission => "role_admission",
+            Self::ProfileSelection => "profile_selection",
+            Self::ProfileRoleExcluded => "profile_role_excluded",
+            Self::GatewayPlan => "gateway_plan",
+            Self::Containment => "containment",
+            Self::EgressProxy => "egress_proxy",
+            Self::Credential => "credential",
+            Self::PromptExpansion => "prompt_expansion",
+            Self::RunnerMissing => "runner_missing",
+            Self::WorkspaceAdmission => "workspace_admission",
+            Self::LogWrite => "log_write",
+            Self::LaunchPrep => "launch_prep",
+            Self::CliQualification => "cli_qualification",
+        }
+    }
+
+    /// The one variant whose marker token is `token`, or `None` for anything
+    /// else — an unknown token is never carried through: the reader degrades
+    /// to the coarse rejection reason instead of passing foreign text on.
+    #[must_use]
+    pub fn parse(token: &str) -> Option<Self> {
+        Some(match token {
+            "runtime_resolution" => Self::RuntimeResolution,
+            "worker_options" => Self::WorkerOptions,
+            "role_admission" => Self::RoleAdmission,
+            "profile_selection" => Self::ProfileSelection,
+            "profile_role_excluded" => Self::ProfileRoleExcluded,
+            "gateway_plan" => Self::GatewayPlan,
+            "containment" => Self::Containment,
+            "egress_proxy" => Self::EgressProxy,
+            "credential" => Self::Credential,
+            "prompt_expansion" => Self::PromptExpansion,
+            "runner_missing" => Self::RunnerMissing,
+            "workspace_admission" => Self::WorkspaceAdmission,
+            "log_write" => Self::LogWrite,
+            "launch_prep" => Self::LaunchPrep,
+            "cli_qualification" => Self::CliQualification,
+            _ => return None,
+        })
+    }
+}
+
+/// The launcher's own typed rejection marker (#14634), written to the launch
+/// log the moment a preflight rejection reaches the launcher's exit. This
+/// is for operators; step classification uses the separate per-spawn socket.
+/// Fields are `code=` (the
+/// numeric exit, always `78` here) and, when the failing boundary is typed,
+/// `stage=` (a [`LaunchStage`] token). Never the error message: raw
+/// diagnostics stay on local stderr and out of receipts and telemetry.
+pub const LAUNCH_REJECTED_MARKER: &str = "# LOOM_LAUNCH_REJECTED ";
+
+/// The ledger outcome reason for a rejected preflight whose boundary is
+/// proven (the marker exists) but untyped (no stage, or a stage this build
+/// does not know).
+pub const PREFLIGHT_REJECTED: &str = "preflight_rejected";
+
+/// The ledger outcome reason for a marker naming a typed [`LaunchStage`]:
+/// `preflight_<stage>`.
+fn stage_reason(stage: LaunchStage) -> &'static str {
+    // `_` is not a valid stage token character, so the prefix cannot collide
+    // with a stage's own token.
+    match stage {
+        LaunchStage::RuntimeResolution => "preflight_runtime_resolution",
+        LaunchStage::WorkerOptions => "preflight_worker_options",
+        LaunchStage::RoleAdmission => "preflight_role_admission",
+        LaunchStage::ProfileSelection => "preflight_profile_selection",
+        LaunchStage::ProfileRoleExcluded => "preflight_profile_role_excluded",
+        LaunchStage::GatewayPlan => "preflight_gateway_plan",
+        LaunchStage::Containment => "preflight_containment",
+        LaunchStage::EgressProxy => "preflight_egress_proxy",
+        LaunchStage::Credential => "preflight_credential",
+        LaunchStage::PromptExpansion => "preflight_prompt_expansion",
+        LaunchStage::RunnerMissing => "preflight_runner_missing",
+        LaunchStage::WorkspaceAdmission => "preflight_workspace_admission",
+        LaunchStage::LogWrite => "preflight_log_write",
+        LaunchStage::LaunchPrep => "preflight_launch_prep",
+        LaunchStage::CliQualification => "preflight_cli_qualification",
+    }
+}
+
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
@@ -178,19 +337,108 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
 /// Beyond that tier the adapter picks its own, so an absent value stays
 /// absent rather than being filled with a configured guess. `--` ends
 /// adapter flags, and a prompt or config value that looks like a flag is
-/// data, mirroring `codex_adapter_model`'s scan.
+/// data, mirroring `codex_adapter_model`'s scan. For codex an explicit
+/// `-c model_reasoning_effort=` is the highest-precedence effort (#14414).
 fn adapter_launch_facts(
     runtime: &str,
     args: &[std::ffi::OsString],
 ) -> (Option<String>, Option<String>) {
     let (model, effort) = adapter_flag_facts(args);
-    let model = model.or_else(|| nonempty_env("LOOM_MODEL")).or_else(|| {
-        (runtime == "codex")
-            .then(|| nonempty_env("LOOM_CODEX_MODEL"))
-            .flatten()
-    });
-    let effort = effort.or_else(|| nonempty_env("LOOM_EFFORT"));
-    (model, effort)
+    let env_effort = nonempty_env("LOOM_EFFORT");
+    if runtime == "codex" {
+        let config = adapter_effort_config(args);
+        if model.is_none() {
+            // #14302: spawn-codex.sh splits the env-tier model on its first `@`
+            // (`model@effort`, #8387) when no `-m` is present; record the base
+            // and the suffix it actually launches with, not the raw string.
+            let sources = [nonempty_env("LOOM_MODEL"), nonempty_env("LOOM_CODEX_MODEL")];
+            let (model, suffix) = codex_env_model_split(sources.each_ref().map(Option::as_deref));
+            return (model, codex_effort(config, effort, env_effort, suffix));
+        }
+        return (model, codex_effort(config, effort, env_effort, None));
+    }
+    let model = model.or_else(|| nonempty_env("LOOM_MODEL"));
+    (model, effort.or(env_effort))
+}
+
+/// spawn-codex.sh's effort precedence, highest first: explicit
+/// `-c model_reasoning_effort=`, `--effort`, `LOOM_EFFORT`, then the
+/// `model@effort` suffix. An explicit config key is what codex launches with
+/// even when its value is blank, so a blank one reports absent rather than
+/// falling through to a lower tier the adapter would not have used.
+fn codex_effort(
+    config: CodexEffortConfig<'_>,
+    flag: Option<String>,
+    env: Option<String>,
+    suffix: Option<String>,
+) -> Option<String> {
+    match config {
+        CodexEffortConfig::Explicit(value) if !value.trim().is_empty() => Some(value.to_owned()),
+        CodexEffortConfig::Explicit(_) | CodexEffortConfig::Suppressed => None,
+        CodexEffortConfig::Unset => flag.or(env).or(suffix),
+    }
+}
+
+/// spawn-codex.sh's `model@effort` split over the env tier (`LOOM_MODEL`,
+/// then `LOOM_CODEX_MODEL`), used only when argv has no `-m`. Each source is
+/// split on its first `@`; an empty base falls through to the next source
+/// (its suffix is discarded), an empty suffix means no effort. Deliberately
+/// not `model_tiers::base_of`, which lower-cases and would change the
+/// recorded model. `codex_adapter_model` stays raw on purpose: containment
+/// admission wants the value as configured.
+fn codex_env_model_split(sources: [Option<&str>; 2]) -> (Option<String>, Option<String>) {
+    for value in sources.into_iter().flatten() {
+        let (base, suffix) = value.split_once('@').unwrap_or((value, ""));
+        if !base.trim().is_empty() {
+            return (Some(base.to_owned()), (!suffix.trim().is_empty()).then(|| suffix.to_owned()));
+        }
+    }
+    (None, None)
+}
+
+enum CodexEffortConfig<'a> {
+    Unset,
+    Suppressed,
+    Explicit(&'a str),
+}
+
+/// Read the last genuine config assignment. The launcher also suppresses its
+/// fallback for any inline config containing this text, even inside another
+/// key's value. In that case alone there is no effort assignment to report.
+fn adapter_effort_config(args: &[std::ffi::OsString]) -> CodexEffortConfig<'_> {
+    const KEY: &[u8] = b"model_reasoning_effort=";
+    let mut explicit = None;
+    let mut suppress_fallback = false;
+    let mut args = args.iter().map(|arg| arg.as_encoded_bytes());
+    while let Some(arg) = args.next() {
+        let config = match arg {
+            b"--" => break,
+            b"-c" | b"--config" => args.next(),
+            b"-p" | b"--prompt" | b"-m" | b"--model" | b"--effort" | b"-s" | b"--sandbox"
+            | b"--log" | b"--profile" => {
+                args.next();
+                continue;
+            }
+            _ => {
+                let inline = arg
+                    .strip_prefix(b"-c=")
+                    .or_else(|| arg.strip_prefix(b"--config="));
+                suppress_fallback |=
+                    inline.is_some_and(|kv| kv.windows(KEY.len()).any(|w| w == KEY));
+                inline
+            }
+        };
+        if let Some(value) = config.and_then(|kv| kv.strip_prefix(KEY)) {
+            explicit = Some(value);
+        }
+    }
+    match explicit {
+        Some(value) => std::str::from_utf8(value).map_or(CodexEffortConfig::Suppressed, |value| {
+            CodexEffortConfig::Explicit(value.trim_matches(['"', '\'']))
+        }),
+        None if suppress_fallback => CodexEffortConfig::Suppressed,
+        None => CodexEffortConfig::Unset,
+    }
 }
 
 /// The argv-only half of [`adapter_launch_facts`]: the explicit
@@ -328,15 +576,27 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let result = run_preflight(args, &root, role.as_deref(), preflight.as_ref(), attempt.as_ref());
+    let mut resolved_runtime = None;
+    let result = run_preflight(
+        args,
+        &root,
+        role.as_deref(),
+        preflight.as_ref(),
+        attempt.as_ref(),
+        &mut resolved_runtime,
+    );
     if let Some(span) = preflight {
         // A rejected preflight is one of the two shapes an operator reports
         // ("the attempt failed in 300 ms with no runtime span"): record the
         // host memory state at the rejection and the fixed reason. No
         // LaunchError text goes into span attributes — the 256-byte,
         // allowlist-bounded surface never carries free-form error messages.
-        let mut attributes = lifecycle::attributes(&[("loom.result", "rejected")]);
-        attributes.insert("loom.admission.reason".into(), "preflight-rejected".into());
+        // #14634: the typed boundary (`loom.admission.stage`) and the
+        // runtime the launcher resolved before rejecting
+        // (`loom.launch.runtime` / `loom.launch.source`) ride along as the
+        // bounded facts the launcher could prove at this boundary.
+        let stage = result.as_ref().err().and_then(|error| error.stage);
+        let mut attributes = rejection_attributes(stage, resolved_runtime.as_ref());
         attributes.extend(lifecycle::host_attributes());
         span.finish_attributes(SpanStatus::Error, attributes);
     }
@@ -355,6 +615,31 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         span.finish_attempt(outcome, SpanStatus::Error, Some(false));
     }
     result
+}
+
+fn rejection_attributes(
+    stage: Option<LaunchStage>,
+    resolution: Option<&LaunchRuntime>,
+) -> crate::telemetry::trace::TraceAttributes {
+    let mut attributes = crate::observability::lifecycle::attributes(&[
+        ("loom.result", "rejected"),
+        ("loom.admission.reason", "preflight-rejected"),
+    ]);
+    if let Some(stage) = stage {
+        attributes.insert("loom.admission.stage".into(), stage.as_str().into());
+    }
+    if let Some(resolution) = resolution {
+        let runtime = match resolution.runtime.as_str() {
+            "aider" => "aider",
+            "claude" => "claude",
+            "codex" => "codex",
+            "gemini" => "gemini",
+            name => Harness::parse(name).map_or("other", Harness::name),
+        };
+        attributes.insert("loom.launch.runtime".into(), runtime.into());
+        attributes.insert("loom.launch.source".into(), resolution.source.as_str().into());
+    }
+    attributes
 }
 
 /// The billing class of a native-harness launch (#10749). The profile is
@@ -386,26 +671,73 @@ fn native_llm_billing(
 /// single source of truth for the launch's runtime — downstream attribution
 /// (e.g. the egress proxy's observe tags, #11300) takes this value rather than
 /// rereading the environment.
+pub(crate) struct LaunchRuntime {
+    pub(crate) runtime: String,
+    source: RuntimeSource,
+    source_label: &'static str,
+}
+
 pub(crate) fn resolve_launch_runtime(
     root: &Path,
     config: &serde_json::Value,
-) -> Result<(String, String), LaunchError> {
-    if let Some(role) = nonempty_env("LOOM_ROLE") {
+) -> Result<LaunchRuntime, LaunchError> {
+    let (runtime, source, source_label) = if let Some(role) = nonempty_env("LOOM_ROLE") {
         let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
             .map_err(|e| LaunchError::config(e.diagnostic()))?;
-        return Ok((runtime, source.to_string()));
-    }
-    if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
-        return Ok((runtime, "env (LOOM_RUNTIME)".to_string()));
-    }
-    if let Some(runtime) = config
+        let source_label = source.as_str();
+        (runtime, source, source_label)
+    } else if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
+        (runtime, RuntimeSource::GlobalEnvironment, "env (LOOM_RUNTIME)")
+    } else if let Some(runtime) = config
         .pointer("/runtimes/default")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
     {
-        return Ok((runtime.into(), "config (runtimes.default)".to_string()));
+        (runtime.into(), RuntimeSource::DefaultConfig, "config (runtimes.default)")
+    } else {
+        ("claude".into(), RuntimeSource::BuiltIn, "default")
+    };
+    Ok(LaunchRuntime {
+        runtime,
+        source,
+        source_label,
+    })
+}
+
+/// Open the launch's own log sink: the `--log` file the launch declares
+/// (created, appended), else the process stderr every dispatch surface
+/// captures as the dispatch log.
+fn open_launch_log(path: Option<&Path>) -> Result<Box<dyn Write>, LaunchError> {
+    match path {
+        None => Ok(Box::new(std::io::stderr())),
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent).map_err(|e| {
+                    LaunchError::config(format!("cannot create log directory: {e}"))
+                })?;
+            }
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| LaunchError::config(format!("cannot open worker log: {e}")))?;
+            Ok(Box::new(file))
+        }
     }
-    Ok(("claude".into(), "default".to_string()))
+}
+
+/// The launcher's resolved-runtime record (#14634): which runtime the
+/// launcher resolved and from which tier, written before any admission,
+/// profile, credential or containment check can reject the launch — so a
+/// rejected preflight's log proves the selection instead of leaving it
+/// unknown.
+fn record_resolved_runtime(
+    log: &mut dyn Write,
+    runtime: &str,
+    source: &str,
+) -> Result<(), LaunchError> {
+    writeln!(log, "spawn-worker: runtime={runtime} (from {source})\n# LOOM_RUNTIME_RESOLVED runtime={runtime}")
+        .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))
 }
 
 fn run_preflight(
@@ -414,17 +746,35 @@ fn run_preflight(
     invocation_role: Option<&str>,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
+    resolved_runtime: &mut Option<LaunchRuntime>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
-    let (runtime, source) = resolve_launch_runtime(root, &config)?;
+    let resolution = resolve_launch_runtime(root, &config)
+        .map_err(|e| e.or_stage(LaunchStage::RuntimeResolution))?;
+    let runtime = resolution.runtime.clone();
+    let source = resolution.source_label;
     if runtime.is_empty()
         || !runtime
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
-        return Err(LaunchError::config("invalid runtime name"));
+        return Err(
+            LaunchError::config("invalid runtime name").with_stage(LaunchStage::RuntimeResolution)
+        );
     }
+    // #14634: record the launcher's resolved runtime BEFORE any admission,
+    // profile, credential or containment check can reject the launch. A
+    // rejected preflight's log then proves which runtime the launcher
+    // resolved ("all three went to OpenCode") instead of leaving it unknown.
+    // The write itself sits in each launch arm below (a native launch's
+    // record goes to its declared `--log` file, a legacy adapter's to the
+    // captured stderr), preserving the exact sink contract the old
+    // post-check write had; only the position moved ahead of the checks, and
+    // every consumer anchors on the line's content, not the launch's
+    // success.
+    *resolved_runtime = Some(resolution);
+    let mut log: Box<dyn Write> = Box::new(std::io::stderr());
     // #14167: identity facts ride every runtime span, for every runtime —
     // the repo/item scope the inherited execution root carries, plus the
     // sweep id and role the dispatcher pinned into this process's
@@ -440,14 +790,21 @@ fn run_preflight(
         trace_identity.insert("loom.role".into(), role.to_owned());
     }
     let scripts = args.scripts_dir.unwrap_or_else(|| scripts_dir(root));
-    let mut log: Box<dyn Write> = Box::new(std::io::stderr());
     // #11300 slice 3, item 5: an uncontained native launch whose profile
     // declares `credentialProxy` arms a loopback-only proxy inside the native
     // arm below and is served here, in place of the `exec`. Declared out here
     // because the arm's `selection` (and everything it resolved) dies with it.
     let mut native_prepared: Option<egress_proxy::Prepared> = None;
     let mut command = if let Some(harness) = Harness::parse(&runtime) {
-        let options = Options::parse(&args.args)?;
+        let options =
+            Options::parse(&args.args).map_err(|e| e.or_stage(LaunchStage::WorkerOptions))?;
+        record_resolved_runtime(
+            open_launch_log(options.log.as_deref())
+                .map_err(|e| e.or_stage(LaunchStage::LogWrite))?
+                .as_mut(),
+            &runtime,
+            source,
+        )?;
         // A role-tagged invocation must meet the same capabilities as daemon dispatch.
         // Free-form prompts remain available for controlled, isolated experiments.
         let role = nonempty_env("LOOM_ROLE");
@@ -471,9 +828,12 @@ fn run_preflight(
                 launch_profile,
                 crate::runtime_admission::AdmissionContext::Host,
             )
-            .map_err(|e| LaunchError::config(e.diagnostic()))?;
+            .map_err(|e| {
+                LaunchError::config(e.diagnostic()).with_stage(LaunchStage::RoleAdmission)
+            })?;
         }
-        let mut selection = profiles::select(&runtime, &options, &config)?;
+        let mut selection = profiles::select(&runtime, &options, &config)
+            .map_err(|e| e.or_stage(LaunchStage::ProfileSelection))?;
         // #11400: the profile actually selected (an explicit `--profile` may
         // differ from the one admission judged) must not exclude this role.
         if let Some(name) = selection.profile.as_deref() {
@@ -491,7 +851,8 @@ fn run_preflight(
                     if profiles::excluded_role(&runtime, Some(name), checked, &config).is_some() {
                         return Err(LaunchError::config(format!(
                             "model profile {name:?} excludes role {checked:?} (excludedRoles, #11400)"
-                        )));
+                        ))
+                        .with_stage(LaunchStage::ProfileRoleExcluded));
                     }
                 }
             }
@@ -508,7 +869,8 @@ fn run_preflight(
         // #9473: decided after profile selection and before both containment
         // and the credential ladder — a routed launch reads no provider key.
         // Reads no secret yet; an opted-in profile it cannot route refuses.
-        let gateway = llm_gateway::plan(&runtime, &selection, &config)?;
+        let gateway = llm_gateway::plan(&runtime, &selection, &config)
+            .map_err(|e| e.or_stage(LaunchStage::GatewayPlan))?;
 
         // Per-sweep ephemeral containment (issue #8403). Decided here, after
         // admission and profile selection (so a misconfigured launch still
@@ -522,7 +884,8 @@ fn run_preflight(
                     "this model profile is routed through the LLM gateway, which contained \
                      launches do not support yet; turn off runtimes.containment.native or \
                      drop the profile from LOOM_LLM_GATEWAY_PROFILES (#9473)",
-                ));
+                )
+                .with_stage(LaunchStage::Containment));
             }
             // Forward the profile's credential variables by NAME: every
             // declared source (profile resolution re-runs inside the container
@@ -546,7 +909,8 @@ fn run_preflight(
             // proxy. `prepare` fails closed — it never silently reverts to
             // forwarding the real value — and returns `None` only when the
             // feature is off or the profile opts out.
-            let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)?;
+            let prepared = egress_proxy::prepare(root, &selection, &config, &runtime)
+                .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
             let mut command = containment::docker_command(
                 &profile,
                 root,
@@ -555,9 +919,11 @@ fn run_preflight(
                 &args.args,
                 &credentials,
                 prepared.as_ref().map(|p| &p.injection),
-            )?;
+            )
+            .map_err(|e| e.or_stage(LaunchStage::Containment))?;
             llm_gateway::scrub(&mut command);
-            let mut log = attach_log(&mut command, options.log.as_deref())?;
+            let mut log = attach_log(&mut command, options.log.as_deref())
+                .map_err(|e| e.or_stage(LaunchStage::LogWrite))?;
             writeln!(log, "{}", profile.dispatch_marker())
                 .map_err(|e| LaunchError::config(e.to_string()))?;
             if let Some(prepared) = prepared {
@@ -576,7 +942,10 @@ fn run_preflight(
         containment::materialize_launch_dirs();
         // Fails closed (78) only when this host has a pool for the profile's
         // credential provider and none of its accounts is usable (#8401).
-        let gateway = gateway.map(llm_gateway::Plan::open).transpose()?;
+        let gateway = gateway
+            .map(llm_gateway::Plan::open)
+            .transpose()
+            .map_err(|e| e.or_stage(LaunchStage::GatewayPlan))?;
         // #11300 slice 3, item 5: substitute the credential for an
         // UNCONTAINED native launch through a loopback-only proxy. Host side
         // only — the in-container copy must never arm a second proxy (its
@@ -585,7 +954,8 @@ fn run_preflight(
         // A gateway-routed profile never reaches here with an armed proxy:
         // `llm_gateway::plan` refuses that pairing (gated on the same switch).
         let prepared = if gateway.is_none() && nonempty_env("LOOM_SPAWN_CONTAINERIZED").is_none() {
-            egress_proxy::prepare_native(root, &selection, &config, &runtime)?
+            egress_proxy::prepare_native(root, &selection, &config, &runtime)
+                .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?
         } else {
             None
         };
@@ -595,7 +965,8 @@ fn run_preflight(
                 route.credential()
             }
             (None, Some((_, resolved))) => resolved.clone(),
-            (None, None) => credential::resolve(root, &selection)?,
+            (None, None) => credential::resolve(root, &selection)
+                .map_err(|e| e.or_stage(LaunchStage::Credential))?,
         };
         // #10749: how this launch is billed, from the profile's declared class
         // and the credential source actually resolved. Enumerated vocabulary
@@ -606,17 +977,22 @@ fn run_preflight(
             .prompt
             .as_deref()
             .map(|p| prompt::expand(root, p))
-            .transpose()?;
-        let mut command = harness.command(
-            &options,
-            &selection,
-            &credential,
-            expanded.as_deref(),
-            root,
-            role.is_some() || prompt_role.is_some(),
-        )?;
+            .transpose()
+            .map_err(|e| e.or_stage(LaunchStage::PromptExpansion))?;
+        let mut command = harness
+            .command(
+                &options,
+                &selection,
+                &credential,
+                expanded.as_deref(),
+                root,
+                role.is_some() || prompt_role.is_some(),
+            )
+            .map_err(|e| e.or_stage(LaunchStage::LaunchPrep))?;
         if let Some(route) = &gateway {
-            route.finish(&runtime, &selection.provider, &mut command)?;
+            route
+                .finish(&runtime, &selection.provider, &mut command)
+                .map_err(|e| e.or_stage(LaunchStage::GatewayPlan))?;
         }
         // The substitution overrides the real credential `credential.apply`
         // wrote above, whatever order the two ran in — later wins per name.
@@ -625,9 +1001,12 @@ fn run_preflight(
                 .credential_proxy
                 .as_ref()
                 .and_then(|proxy| proxy.base_url_config.as_deref());
-            prepared.apply_native_env(&mut command, &selection.provider, config_option)?;
+            prepared
+                .apply_native_env(&mut command, &selection.provider, config_option)
+                .map_err(|e| e.or_stage(LaunchStage::EgressProxy))?;
         }
-        log = attach_log(&mut command, options.log.as_deref())?;
+        log = attach_log(&mut command, options.log.as_deref())
+            .map_err(|e| e.or_stage(LaunchStage::LogWrite))?;
         // `credentialAccount` is an account NAME, never key material (#8401).
         // `promptBytes` (#8506) is the expanded prompt's size, so an E2BIG-class
         // failure or a slow launch is diagnosable from the log alone.
@@ -646,19 +1025,24 @@ fn run_preflight(
             None => crate::runtime_preference::Tap::runtime(&runtime),
         };
         let launch = serde_json::json!({"schema":1,"runtime":runtime,"tap":tap.to_string(),"provider":selection.provider,"model":selection.model,"profile":selection.profile,"effort":selection.effort,"credentialSource":credential.source.as_str(),"credentialProvider":credential.provider,"credentialAccount":credential.account,"usage":"native-json-events","billing":"not-measured","llmBilling":llm_billing.billing,"llmCredentialKind":llm_billing.credential_kind,"prompt_bytes":expanded.as_deref().map(str::len)}).to_string();
-        writeln!(log, "# LOOM_LAUNCH {launch}").map_err(|e| LaunchError::config(e.to_string()))?;
+        writeln!(log, "# LOOM_LAUNCH {launch}")
+            .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))?;
         if let Some((prepared, _)) = &prepared {
             writeln!(log, "{}", prepared.dispatch_marker())
                 .and_then(|()| log.flush())
-                .map_err(|e| LaunchError::config(e.to_string()))?;
+                .map_err(|e| {
+                    LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite)
+                })?;
         }
         if let Some(route) = &gateway {
-            writeln!(log, "{}", route.marker(&runtime))
-                .map_err(|e| LaunchError::config(e.to_string()))?;
+            writeln!(log, "{}", route.marker(&runtime)).map_err(|e| {
+                LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite)
+            })?;
         }
         native_prepared = prepared.map(|(prepared, _)| prepared);
         command
     } else {
+        record_resolved_runtime(log.as_mut(), &runtime, source)?;
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
         if !runner.is_file() {
             let available = fs::read_dir(&scripts)
@@ -673,7 +1057,8 @@ fn run_preflight(
                 })
                 .filter(|s| s != "worker")
                 .collect::<Vec<_>>();
-            return Err(LaunchError::config(format!("Unknown runtime '{runtime}' (resolved from {source}): no runner found at {}. Available runtimes on disk: {}; native: pi opencode kimi", runner.display(), available.join(" "))));
+            return Err(LaunchError::config(format!("Unknown runtime '{runtime}' (resolved from {source}): no runner found at {}. Available runtimes on disk: {}; native: pi opencode kimi", runner.display(), available.join(" ")))
+                .with_stage(LaunchStage::RunnerMissing));
         }
         let mut command = Command::new(runner);
         command.args(&args.args);
@@ -728,10 +1113,16 @@ fn run_preflight(
                         None,
                         &owner,
                     )
-                    .map_err(|e| LaunchError::config(e.diagnostic()))?;
+                    .map_err(|e| {
+                        LaunchError::config(e.diagnostic())
+                            .with_stage(LaunchStage::WorkspaceAdmission)
+                    })?;
                 Some(selection)
             }
-            Some(Err(rejection)) => return Err(LaunchError::config(rejection.diagnostic())),
+            Some(Err(rejection)) => {
+                return Err(LaunchError::config(rejection.diagnostic())
+                    .with_stage(LaunchStage::RoleAdmission))
+            }
             _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
                 root,
                 &runtime,
@@ -740,7 +1131,9 @@ fn run_preflight(
                 None,
                 &owner,
             )
-            .map_err(|e| LaunchError::config(e.to_string()))?,
+            .map_err(|e| {
+                LaunchError::config(e.to_string()).with_stage(LaunchStage::WorkspaceAdmission)
+            })?,
         }
     } else {
         None
@@ -859,24 +1252,28 @@ fn run_preflight(
     if nonempty_env("LOOM_TEST_ALLOW_SYSTEMD").is_none() {
         command.env("LOOM_TEST_ALLOW_SYSTEMD", "0");
     }
-    writeln!(log, "spawn-worker: runtime={runtime} (from {source})\n# LOOM_RUNTIME_RESOLVED runtime={runtime}").map_err(|e| LaunchError::config(e.to_string()))?;
+    // The resolved-runtime record itself moved above the admission/profile
+    // checks (#14634) so a rejected preflight's log proves what the launcher
+    // resolved; only the preference marker and CLI_START stay here, beside
+    // the launch they annotate.
     // #8599: the ordered-preference walk's own marker, verbatim as the daemon
-    // rendered and logged it, written as a SIBLING of the line above (never
-    // extra fields on it — `crash_signals::resolved_runtime_after` reads the
-    // whole rest of that line as the runtime name). Present only when a
-    // `runtimes.preference` / `rolePreference.<role>` list decided this
-    // launch, so a host without one writes a byte-identical log. This is the
-    // whole point of the variable: the tier is decided in the daemon's
-    // process, and the per-launch record is written here.
+    // rendered and logged it (never extra fields on the resolved-runtime line
+    // — `crash_signals::resolved_runtime_after` reads the whole rest of that
+    // line as the runtime name). Present only when a `runtimes.preference` /
+    // `rolePreference.<role>` list decided this launch, so a host without one
+    // writes a byte-identical log. This is the whole point of the variable:
+    // the tier is decided in the daemon's process, and the per-launch record
+    // is written here.
     if let Some(marker) = nonempty_env(crate::launch_env::PREFERENCE_MARKER_ENV) {
-        writeln!(log, "{marker}").map_err(|e| LaunchError::config(e.to_string()))?;
+        writeln!(log, "{marker}")
+            .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))?;
     }
     if is_native(&runtime) {
         writeln!(log, "# LOOM_CLI_START runtime={runtime}")
-            .map_err(|e| LaunchError::config(e.to_string()))?;
+            .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))?;
     }
     log.flush()
-        .map_err(|e| LaunchError::config(e.to_string()))?;
+        .map_err(|e| LaunchError::config(e.to_string()).with_stage(LaunchStage::LogWrite))?;
     trace_identity.insert("loom.runtime".into(), runtime.clone());
     // #10749: Claude/Codex (legacy adapters) are classified by runtime; a
     // native harness already stamped its own billing above.
@@ -916,6 +1313,7 @@ fn run_preflight(
             runtime_span = Some(run);
         }
     }
+    rejection::Reporter::scrub(&mut command);
     let result = if let Some(prepared) = native_prepared {
         // #11300 slice 3, item 5: this launcher stays alive as the harness's
         // parent for exactly the launch's lifetime — the one native path that
@@ -954,6 +1352,7 @@ fn exec(mut command: Command) -> Result<(), LaunchError> {
             126
         },
         message,
+        stage: None,
     })
 }
 #[cfg(not(unix))]
@@ -963,16 +1362,79 @@ fn exec(mut command: Command) -> Result<(), LaunchError> {
         Err(error) => Err(LaunchError {
             code: 127,
             message: error.to_string(),
+            stage: None,
         }),
     }
 }
 
 pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
+    let reporter = rejection::Reporter::from_environment();
     if let Err(error) = run(args) {
         eprintln!("{}", error.message);
+        // #14634: report before writing the diagnostic log marker. The
+        // ledger consumes only the launcher's per-spawn socket. Preflight-class
+        // rejections (78) only: post-exec mechanics failures (126/127) are
+        // not preflight outcomes and must never read as one. The marker
+        // carries the exit code and, when the failing boundary is typed, its
+        // stage token — never the free-form message above.
+        if error.code == 78 {
+            if let Some(reporter) = reporter {
+                reporter.report(error.stage);
+            }
+            match error.stage {
+                Some(stage) => {
+                    eprintln!(
+                        "{}code={} stage={}",
+                        LAUNCH_REJECTED_MARKER,
+                        error.code,
+                        stage.as_str()
+                    );
+                }
+                None => eprintln!("{}code={}", LAUNCH_REJECTED_MARKER, error.code),
+            }
+        }
         std::process::exit(error.code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod launch_rejection_tests {
+    use super::{stage_reason, LaunchStage};
+
+    #[test]
+    fn the_stage_vocabulary_is_closed_and_round_trips() {
+        let all = [
+            LaunchStage::RuntimeResolution,
+            LaunchStage::WorkerOptions,
+            LaunchStage::RoleAdmission,
+            LaunchStage::ProfileSelection,
+            LaunchStage::ProfileRoleExcluded,
+            LaunchStage::GatewayPlan,
+            LaunchStage::Containment,
+            LaunchStage::EgressProxy,
+            LaunchStage::Credential,
+            LaunchStage::PromptExpansion,
+            LaunchStage::RunnerMissing,
+            LaunchStage::WorkspaceAdmission,
+            LaunchStage::LogWrite,
+            LaunchStage::LaunchPrep,
+            LaunchStage::CliQualification,
+        ];
+        for stage in all {
+            assert_eq!(LaunchStage::parse(stage.as_str()), Some(stage));
+            assert!(!stage.as_str().is_empty());
+            // Ledger-reason shape: the marker token prefixed, never the raw
+            // token alone (a stage name must never collide with an existing
+            // outcome reason).
+            let reason = stage_reason(stage);
+            assert!(reason.starts_with("preflight_"));
+            assert_eq!(reason.strip_prefix("preflight_"), Some(stage.as_str()));
+        }
+        assert_eq!(LaunchStage::parse("credential "), None, "exact tokens only");
+        assert_eq!(LaunchStage::parse("Credential"), None);
+        assert_eq!(LaunchStage::parse(""), None);
+    }
 }
 
 #[cfg(test)]
@@ -999,6 +1461,8 @@ mod codex_adapter_tests {
 
 #[cfg(test)]
 mod adapter_launch_facts_tests {
+    use super::CodexEffortConfig::{Explicit, Suppressed, Unset};
+
     fn facts(args: &[&str]) -> (Option<String>, Option<String>) {
         let args = args
             .iter()
@@ -1052,5 +1516,124 @@ mod adapter_launch_facts_tests {
     fn an_empty_value_is_absent_not_empty() {
         assert_eq!(facts(&["--model=", "--effort="]).0, None);
         assert_eq!(facts(&["--model=", "--effort="]).1, None);
+    }
+
+    fn split(a: Option<&str>, b: Option<&str>) -> (Option<String>, Option<String>) {
+        super::codex_env_model_split([a, b])
+    }
+
+    #[test]
+    fn env_model_splits_on_first_at_without_changing_case() {
+        assert_eq!(
+            split(Some("GPT-5-Codex@high"), None),
+            (Some("GPT-5-Codex".into()), Some("high".into()))
+        );
+        assert_eq!(split(Some("a@b@c"), None), (Some("a".into()), Some("b@c".into())));
+        assert_eq!(split(Some("gpt-5"), None), (Some("gpt-5".into()), None));
+    }
+
+    #[test]
+    fn env_model_empty_base_falls_through_and_empty_suffix_is_no_effort() {
+        assert_eq!(
+            split(Some("@high"), Some("seat@low")),
+            (Some("seat".into()), Some("low".into()))
+        );
+        assert_eq!(split(Some("@high"), None), (None, None));
+        assert_eq!(split(Some("gpt-5-codex@"), None), (Some("gpt-5-codex".into()), None));
+        assert_eq!(split(Some("a@x"), Some("b@y")), (Some("a".into()), Some("x".into())));
+    }
+
+    #[test]
+    fn a_config_effort_override_is_read_only_outside_data() {
+        let get = |args: &[&str]| {
+            let args = args
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>();
+            match super::adapter_effort_config(&args) {
+                Explicit(value) => Some(value.to_owned()),
+                Suppressed | Unset => None,
+            }
+        };
+        assert_eq!(get(&["-c", "model_reasoning_effort=low"]).as_deref(), Some("low"));
+        assert_eq!(get(&["--config", "model_reasoning_effort=\"low\""]).as_deref(), Some("low"));
+        assert_eq!(get(&["--config=model_reasoning_effort=low"]).as_deref(), Some("low"));
+        assert_eq!(get(&["-c=model_reasoning_effort=high"]).as_deref(), Some("high"));
+        assert_eq!(get(&["-c", "model_reasoning_effort="]).as_deref(), Some(""));
+        assert_eq!(
+            get(&[
+                "-c",
+                "model_reasoning_effort=low",
+                "-c",
+                "model_reasoning_effort=high"
+            ])
+            .as_deref(),
+            Some("high")
+        );
+        assert_eq!(get(&["-p", "-c model_reasoning_effort=low"]), None);
+        assert_eq!(get(&["--", "-c", "model_reasoning_effort=low"]), None);
+        assert_eq!(get(&["-c", "foo=bar"]), None);
+        assert_eq!(get(&["--effort", "-c", "model_reasoning_effort=low"]), None);
+    }
+
+    fn some(v: &str) -> Option<String> {
+        Some(v.to_owned())
+    }
+
+    #[test]
+    fn codex_effort_precedence_is_config_then_flag_then_env_then_suffix() {
+        // The three rows of #14414 (explicit config beside --effort / env / suffix).
+        assert_eq!(super::codex_effort(Explicit("low"), some("high"), None, None), some("low"));
+        assert_eq!(super::codex_effort(Explicit("low"), None, some("high"), None), some("low"));
+        assert_eq!(super::codex_effort(Explicit("low"), None, None, some("high")), some("low"));
+        // Without an explicit config the pre-existing order is unchanged.
+        assert_eq!(super::codex_effort(Unset, some("a"), some("b"), some("c")), some("a"));
+        assert_eq!(super::codex_effort(Unset, None, some("b"), some("c")), some("b"));
+        assert_eq!(super::codex_effort(Unset, None, None, some("c")), some("c"));
+        assert_eq!(super::codex_effort(Unset, None, None, None), None);
+        // A blank explicit value is what codex launches with: absent, not a fallthrough.
+        assert_eq!(super::codex_effort(Explicit(""), some("high"), None, some("c")), None);
+        assert_eq!(super::codex_effort(Suppressed, some("a"), some("b"), some("c")), None);
+    }
+
+    #[test]
+    fn unrelated_config_data_never_supplies_a_codex_effort() {
+        let effort = |tail: &[&str]| {
+            let args: Vec<_> = ["--effort", "high"]
+                .into_iter()
+                .chain(tail.iter().copied())
+                .map(std::ffi::OsString::from)
+                .collect();
+            super::adapter_launch_facts("codex", &args).1
+        };
+        let unrelated = r#"developer_instructions="model_reasoning_effort=low""#;
+        let real = "model_reasoning_effort=medium";
+        for flag in ["-c=", "--config="] {
+            let inline = format!("{flag}{unrelated}");
+            assert_eq!(effort(&[&inline]), None);
+            assert_eq!(effort(&["-c", real, &inline]), some("medium"));
+            assert_eq!(effort(&[&inline, "--config", real]), some("medium"));
+            assert_eq!(effort(&["--prompt", &inline]), some("high"));
+            assert_eq!(effort(&["--", &inline]), some("high"));
+        }
+        assert_eq!(effort(&["--config", unrelated]), some("high"));
+    }
+
+    #[test]
+    fn a_config_effort_wins_for_codex_with_or_without_a_model_flag() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let with_model = args(&[
+            "-m",
+            "gpt-5",
+            "--effort",
+            "high",
+            "-c",
+            "model_reasoning_effort=low",
+        ]);
+        assert_eq!(super::adapter_launch_facts("codex", &with_model).1, some("low"));
+        let no_model = args(&["--effort", "high", "-c", "model_reasoning_effort=low"]);
+        assert_eq!(super::adapter_launch_facts("codex", &no_model).1, some("low"));
+        // Non-codex runtimes are unchanged: the config key is not read.
+        assert_eq!(super::adapter_launch_facts("claude", &no_model).1, some("high"));
     }
 }

@@ -10,6 +10,20 @@ use crate::telemetry::TokenSnapshotRecord;
 /// The per-account gauge samples for one `tokens.snapshot` record.
 pub(super) fn samples(r: &TokenSnapshotRecord, time_unix_nano: u64) -> Vec<MetricSample> {
     let mut samples = Vec::new();
+    // #13942: the fleet-probe drift signal beside the per-account series —
+    // absent when this host has no fleet sidecar, per the absent-not-zero
+    // rule. Host-level: no `account` attribute, so it compares across hosts.
+    if let Some(age_secs) = r.fleet_probe_age_secs {
+        samples.push(MetricSample {
+            name: "loom.tokens.fleet_probe_age",
+            description:
+                "Age of the fleet token-probe snapshot this host applied (sample time minus the captain's probe).",
+            unit: "s",
+            attributes: Vec::new(),
+            value: number_data_point::Value::AsInt(age_secs),
+            time_unix_nano,
+        });
+    }
     for account in &r.accounts {
         let mut attributes = vec![
             kv_string("account", account.account.clone()),

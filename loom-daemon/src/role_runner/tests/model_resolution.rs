@@ -99,7 +99,8 @@ fn test_invoke_refuses_a_provable_model_runtime_mismatch_before_spawning() {
 /// "codex"` with NO `roleModels.judge` pin used to resolve the Claude-shaped
 /// shipped default (`sonnet`) and get refused as a `ModelRuntimeMismatch` —
 /// every tick, forever (453+ consecutive skips on the affected host), with no
-/// escape, because a ChatGPT-plan Codex seat rejects an explicit pin too. That
+/// escape, because a ChatGPT-plan Codex seat then rejected an explicit pin too
+/// (since #14121 it accepts one its own catalog lists). That
 /// configuration must now ADMIT: the unpinned conflict degrades to the runtime
 /// CLI's own default, so the adapter is actually spawned and receives no
 /// `--model` argument at all.
@@ -140,9 +141,11 @@ fn test_invoke_admits_an_unpinned_codex_role_with_no_model_pin() {
 
 /// Issue #7894: the same admission is reachable *deliberately* — a
 /// `roleModels.<role> = "default"` pin is an explicit "let the runtime CLI pick
-/// its own model" statement (the only shape a ChatGPT-plan Codex seat accepts),
-/// and it must spawn with no `--model` rather than being resolved to a model
-/// name or falling through to the shipped Claude default.
+/// its own model" statement (the guaranteed-working shape on any seat,
+/// including a ChatGPT-plan Codex seat, which also accepts a pin its own
+/// catalog lists since #14121), and it must spawn with no `--model` rather
+/// than being resolved to a model name or falling through to the shipped
+/// Claude default.
 #[test]
 #[serial]
 fn test_invoke_admits_an_explicit_cli_default_sentinel_pin() {
@@ -197,8 +200,9 @@ fn test_invoke_succeeds_once_role_models_supplies_a_matching_model() {
 /// Issue #7894: a `"default"` pin is a sentinel, not a model name — it resolves
 /// to the empty string (which `run_role_with_timeout` renders as *no* `--model`
 /// argument) instead of falling through to a lower tier or being run through
-/// the `sweep.modelAliases` map. This is the only configuration a ChatGPT-plan
-/// Codex seat accepts, since such a seat rejects every explicit pin on the wire.
+/// the `sweep.modelAliases` map. This is the guaranteed-working configuration on
+/// any seat, including a ChatGPT-plan Codex seat (which also accepts a pin its
+/// own catalog lists, #14121).
 #[test]
 #[serial(loom_config_env)]
 fn test_resolve_role_runner_model_cli_default_sentinel() {
@@ -235,7 +239,7 @@ fn test_resolve_role_runner_model_cli_default_sentinel() {
     );
 
     // The global role-runner tier accepts the sentinel too, for a fleet whose
-    // every role runs on a seat that cannot serve a pinned model.
+    // every role runs on a seat where the CLI's own default is the safest choice.
     let global = tempfile::tempdir().unwrap();
     write_config(global.path(), r#"{"autonomous": {"roleRunner": {"model": "Default"}}}"#);
     assert_eq!(
@@ -329,8 +333,10 @@ fn test_reconcile_unpinned_model_with_runtime() {
 }
 
 /// Issue #7894 AC4: the mismatch detail no longer presents a `roleModels` model
-/// pin as the ONLY remedy — a pin is not viable at all on a ChatGPT-plan Codex
-/// seat, so the text must also name the CLI-default pass-through.
+/// pin as the ONLY remedy — when #6565 was filed, no pin was viable at all on a
+/// ChatGPT-plan Codex seat (catalog-listed pins have worked there since
+/// #14121), so the text must also name the CLI-default pass-through, the
+/// guaranteed-working shape on any seat.
 #[test]
 fn test_model_runtime_mismatch_detail_offers_the_cli_default_passthrough() {
     let detail = ModelRuntimeMismatch {
@@ -799,9 +805,9 @@ fn test_invoke_per_role_effort_override_reaches_argv_body() {
 /// Issue #8054: the per-role log header reports the resolved effort and the
 /// tier that supplied it, alongside the pre-existing model fields — the surface
 /// the transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
-/// to. Both the set and the unset rendering are pinned here.
+/// to. Cover both the configured service tier and the original unset shape.
 #[test]
-fn test_role_log_header_reports_model_and_effort_with_sources() {
+fn test_role_log_header_reports_configured_values_with_sources() {
     use crate::role_runner::model_resolution::role_log_header;
 
     let set = role_log_header(
@@ -811,12 +817,14 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "autonomous.roleRunner.roleModels.curator",
         "low",
         "autonomous.roleRunner.roleEfforts.curator",
+        Some(("flex", "autonomous.roleRunner.serviceTier")),
     );
     assert_eq!(
         set,
         "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=haiku \
          (source=autonomous.roleRunner.roleModels.curator) effort=low \
-         (source=autonomous.roleRunner.roleEfforts.curator) ===="
+         (source=autonomous.roleRunner.roleEfforts.curator) \
+         service_tier=flex (source=autonomous.roleRunner.serviceTier) ===="
     );
 
     // Unset effort renders as a NAME, not as `effort=` followed by nothing —
@@ -829,14 +837,13 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "default",
         "",
         UNSET_EFFORT_SOURCE,
+        None,
     );
-    assert!(
-        unset.contains("effort=<runtime CLI default> (source=unset)"),
-        "an unset effort must read like a name, not a bug: {unset}"
+    assert_eq!(
+        unset,
+        "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=sonnet \
+         (source=default) effort=<runtime CLI default> (source=unset) ===="
     );
-    assert!(!unset.contains("effort= "), "never an empty rendered value: {unset}");
-    // The pre-#8054 model fields are untouched.
-    assert!(unset.contains("model=sonnet (source=default)"), "{unset}");
 }
 
 /// Issue #8054: the header is actually written to `role-<role>.log` by a real
@@ -911,4 +918,75 @@ fn autonomous_role_overrides_interactive_parent_origin_body() {
     }
     assert_eq!(result, RoleTickOutcome::Success);
     assert_eq!(fs::read_to_string(tmp.path().join("origin.txt")).unwrap(), "autonomous");
+}
+
+/// Issue #14454: `serviceTier` / `roleServiceTiers` parse with `roleEfforts`'s
+/// contract and resolve `<role>@<runtime>` > `<role>` > global > unset.
+#[test]
+#[serial(loom_config_env)]
+fn test_resolve_role_runner_service_tier_precedence_and_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let at = |root: &Path, role: &str, rt: Option<&str>| {
+        resolve_role_runner_service_tier_for_runtime(root, role, rt)
+    };
+    let src = |k: &str| format!("autonomous.roleRunner.{k}");
+
+    // Unset at every tier resolves to nothing: no export, not even for Codex.
+    let none = tempfile::tempdir().unwrap();
+    write_config(none.path(), r#"{"autonomous": {"roleRunner": {"effort": "low"}}}"#);
+    assert_eq!(at(none.path(), "builder", Some("codex")), None);
+    assert_eq!(at(none.path(), "builder", None), None);
+
+    let full = tempfile::tempdir().unwrap();
+    write_config(
+        full.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": " flex ",
+            "roleServiceTiers": {"Builder": "default", " Builder@Codex ": "priority"}}}}"#,
+    );
+    assert_eq!(
+        at(full.path(), "builder", Some("codex")),
+        Some(("priority".into(), src("roleServiceTiers.builder@codex")))
+    );
+    assert_eq!(at(full.path(), "builder", Some(" CODEX ")).unwrap().0, "priority");
+    assert_eq!(
+        at(full.path(), "builder", Some("claude")),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "builder", None),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "judge", Some("codex")),
+        Some(("flex".into(), src("serviceTier")))
+    );
+
+    // Malformed keys and blank values drop per entry; siblings and the global hold.
+    let bad = tempfile::tempdir().unwrap();
+    write_config(
+        bad.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "  ",
+            "roleServiceTiers": {"builder": "fast", "builder@": "x", "@codex": "x",
+            "a@b@c": "x", "judge": "  ", "doctor": 7, "curator@ghost": "slow"}}}}"#,
+    );
+    let cfg = read_role_runner_config(bad.path());
+    assert_eq!(cfg.service_tier, None);
+    assert_eq!(
+        cfg.role_service_tiers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["builder", "curator@ghost"]
+    );
+    assert_eq!(at(bad.path(), "judge", Some("codex")), None);
+
+    // A non-object map soft-fails to empty.
+    let odd = tempfile::tempdir().unwrap();
+    write_config(
+        odd.path(),
+        r#"{"autonomous": {"roleRunner": {"roleServiceTiers": "priority"}}}"#,
+    );
+    assert!(read_role_runner_config(odd.path())
+        .role_service_tiers
+        .is_empty());
 }

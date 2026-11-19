@@ -50,9 +50,10 @@ impl ModelRuntimeMismatch {
         format!(
             "model/runtime mismatch: {} (model source={}); set \
              autonomous.roleRunner.roleModels.{} to a model the {} runtime accepts — or to \
-             \"{}\" to pass through to the {} CLI's own default model, which is the only \
-             working shape on a seat that rejects an explicit pin (e.g. a ChatGPT-plan Codex \
-             account) — or point this role back at a Claude runtime",
+             \"{}\" to pass through to the {} CLI's own default model, the guaranteed-working \
+             shape on any seat (a ChatGPT-plan Codex account also accepts a model its own \
+             catalog lists, see `codex debug models`) — or point this role back at a Claude \
+             runtime",
             self.reason,
             self.model_source,
             self.role,
@@ -85,13 +86,15 @@ impl ModelRuntimeMismatch {
 /// `"cli-default"` spelling) resolves to the empty string, which
 /// [`run_role_with_timeout`] renders as **no `--model` argument at all** so the
 /// runtime's own CLI picks the model. That is not a stylistic option — it is the
-/// only configuration a ChatGPT-plan Codex seat accepts, because such a seat
-/// rejects *every* explicit pin on the wire (`400 invalid_request_error: The
-/// 'gpt-5-codex' model is not supported when using Codex with a ChatGPT
-/// account`), including a perfectly valid Codex model ID. Before #7894 the only
-/// way to express it was to omit the pin entirely — which fell through to the
-/// Claude-shaped shipped default and made #5028's mismatch preflight skip the
-/// tick forever (#6565).
+/// guaranteed-working configuration on any seat. When #6565 was filed, a
+/// ChatGPT-plan Codex seat rejected *every* explicit pin on the wire (`400
+/// invalid_request_error: The 'gpt-5-codex' model is not supported when using
+/// Codex with a ChatGPT account`), including a perfectly valid Codex model ID;
+/// #14121 has since let a plan seat keep a pin its own catalog lists (`codex
+/// debug models`), but `"default"` stays the one shape that works regardless
+/// of catalog. Before #7894 the only way to express it was to omit the pin
+/// entirely — which fell through to the Claude-shaped shipped default and made
+/// #5028's mismatch preflight skip the tick forever (#6565).
 ///
 /// # Why the per-role tier (#5001)
 ///
@@ -279,30 +282,95 @@ pub(super) fn parse_effort_config(
         .map(str::trim)
         .filter(|e| !e.is_empty())
         .map(String::from);
-    let role_efforts = block
-        .get("roleEfforts")
+    let role_efforts = parse_role_keyed_map(block, "roleEfforts");
+    (effort, role_efforts)
+}
+
+/// Parse one `autonomous.roleRunner` object of `{"<role>[@<runtime>]": "<value>"}`
+/// entries: keys normalised by [`normalize_role_runtime_key`], blank or
+/// non-string values dropped, each **per entry**; absent / non-object soft-fails
+/// to an empty map. Shared by `roleEfforts` and `roleServiceTiers` (#14454).
+fn parse_role_keyed_map(block: &serde_json::Value, name: &str) -> BTreeMap<String, String> {
+    block
+        .get(name)
         .and_then(serde_json::Value::as_object)
         .map(|obj| {
             obj.iter()
                 .filter_map(|(k, v)| {
-                    let key = normalize_role_effort_key(k)?;
+                    let key = normalize_role_runtime_key(k, name)?;
                     let val = v.as_str().map(str::trim).filter(|e| !e.is_empty())?;
                     Some((key, val.to_string()))
                 })
                 .collect::<BTreeMap<String, String>>()
         })
-        .unwrap_or_default();
-    (effort, role_efforts)
+        .unwrap_or_default()
 }
 
-/// Issue #14017: normalise one `roleEfforts` key — `"<role>"` or the
+/// Issue #14454: parse the two service-tier keys out of an `autonomous.roleRunner`
+/// block, returning `(service_tier, role_service_tiers)` — the exact contract of
+/// [`parse_effort_config`] (trim, blank-is-unset, per-entry soft-fail,
+/// `"<role>@<runtime>"` keys). Values are trimmed but neither lower-cased nor
+/// validated: the spawn scripts own the tier vocabulary and its validation.
+#[must_use]
+pub(super) fn parse_service_tier_config(
+    block: &serde_json::Value,
+) -> (Option<String>, BTreeMap<String, String>) {
+    let tier = block
+        .get("serviceTier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from);
+    (tier, parse_role_keyed_map(block, "roleServiceTiers"))
+}
+
+/// Issue #14454: resolve the service tier (the runtime-neutral speed setting of
+/// #14141) a role child is launched with — the producer of the spawn scripts'
+/// `LOOM_SERVICE_TIER` contract.
+///
+/// **`roleServiceTiers.<role>@<runtime>` > `roleServiceTiers.<role>` >
+/// `autonomous.roleRunner.serviceTier` > unset**, i.e. the effort chain
+/// ([`resolve_role_runner_effort_for_runtime`]) minus the Codex default. Returns
+/// `None` when nothing is configured, in which case the caller exports nothing
+/// and an inherited `LOOM_SERVICE_TIER` stays as the operator set it; otherwise
+/// the tier plus a label naming the config key that supplied it.
+#[must_use]
+pub fn resolve_role_runner_service_tier_for_runtime(
+    repo_root: &Path,
+    role: &str,
+    runtime: Option<&str>,
+) -> Option<(String, String)> {
+    let config = read_role_runner_config(repo_root);
+    let role_key = role.trim().to_ascii_lowercase();
+    let runtime_key = runtime
+        .map(|r| r.trim().to_ascii_lowercase())
+        .filter(|r| !r.is_empty());
+    if let Some(rt) = &runtime_key {
+        let qualified = format!("{role_key}@{rt}");
+        if let Some(t) = config.role_service_tiers.get(&qualified) {
+            return Some((
+                t.clone(),
+                format!("autonomous.roleRunner.roleServiceTiers.{qualified}"),
+            ));
+        }
+    }
+    if let Some(t) = config.role_service_tiers.get(&role_key) {
+        return Some((t.clone(), format!("autonomous.roleRunner.roleServiceTiers.{role_key}")));
+    }
+    config
+        .service_tier
+        .map(|t| (t, "autonomous.roleRunner.serviceTier".to_string()))
+}
+
+/// Issue #14017: normalise one `roleEfforts` (or, #14454, `roleServiceTiers`)
+/// key — `"<role>"` or the
 /// runtime-qualified `"<role>@<runtime>"` — to its trimmed, lower-cased form.
 /// A blank key, or a qualified key that is not exactly one `@` between two
 /// non-blank halves (`"builder@"`, `"@codex"`, `"a@b@c"`), returns `None`; the
 /// qualified case warns, since it is a typo that would otherwise silently
 /// fall back to the per-role value. A well-formed key naming a runtime that
 /// never launches is kept: it simply never matches.
-fn normalize_role_effort_key(raw: &str) -> Option<String> {
+fn normalize_role_runtime_key(raw: &str, map_name: &str) -> Option<String> {
     let key = raw.trim().to_ascii_lowercase();
     if key.is_empty() {
         return None;
@@ -319,7 +387,7 @@ fn normalize_role_effort_key(raw: &str) -> Option<String> {
         }
         _ => {
             log::warn!(
-                "role_runner: ignoring malformed autonomous.roleRunner.roleEfforts key \
+                "role_runner: ignoring malformed autonomous.roleRunner.{map_name} key \
                  {raw:?}; expected \"<role>\" or \"<role>@<runtime>\""
             );
             None
@@ -329,16 +397,17 @@ fn normalize_role_effort_key(raw: &str) -> Option<String> {
 
 /// The `==== loom-daemon role_runner: … ====` header line
 /// [`run_role_with_timeout`] appends to `role-<role>.log` at the start of every
-/// real invocation — the ONE artifact an operator inspects to confirm which
-/// model *and*, since #8054, which reasoning effort a scheduled child actually
-/// ran with, and which config tier supplied each (#4501 / #8054). The
-/// transcript-side cost telemetry (#8052/#8059) attributes a tick's spend to
-/// this line.
+/// real invocation. It reports the model, reasoning effort, and configured
+/// service tier for the launch with their respective configuration sources.
+/// The transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
+/// to this line.
 ///
 /// An empty `model` is the deliberate CLI-default pass-through (#7894) and an
 /// empty `effort` is the (overwhelmingly common) unconfigured case; both render
 /// as the [`RUNTIME_CLI_DEFAULT_PLACECARD`] name rather than as `model=` /
 /// `effort=` followed by nothing, which reads like a bug in the header itself.
+/// An unconfigured service tier keeps the header's existing shape and leaves
+/// any inherited tier to the child environment.
 #[must_use]
 pub(super) fn role_log_header(
     timestamp: &str,
@@ -347,6 +416,7 @@ pub(super) fn role_log_header(
     model_source: &str,
     effort: &str,
     effort_source: &str,
+    service_tier: Option<(&str, &str)>,
 ) -> String {
     let model_display = if model.is_empty() {
         RUNTIME_CLI_DEFAULT_PLACECARD
@@ -358,9 +428,12 @@ pub(super) fn role_log_header(
     } else {
         effort
     };
+    let service_tier_display = service_tier
+        .map(|(tier, source)| format!(" service_tier={tier} (source={source})"))
+        .unwrap_or_default();
     format!(
         "==== loom-daemon role_runner: {timestamp} role={role} model={model_display} \
-         (source={model_source}) effort={effort_display} (source={effort_source}) ===="
+         (source={model_source}) effort={effort_display} (source={effort_source}){service_tier_display} ===="
     )
 }
 
@@ -410,7 +483,8 @@ pub fn is_cli_default_model_sentinel(value: &str) -> bool {
 /// skips. Forever: the condition is a pure function of static config, so every
 /// subsequent tick skips identically (453+ consecutive skips on the host that
 /// filed #6565). And the "obvious" remedy of pinning a Codex model is not
-/// available on a ChatGPT-plan seat, which rejects every explicit pin — so that
+/// available on a ChatGPT-plan seat as of #6565, which rejected every explicit pin
+/// (#14121 later let a plan seat keep a model its own catalog lists) — so that
 /// configuration was simultaneously the only correct one and permanently
 /// unadmittable.
 ///

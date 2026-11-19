@@ -33,6 +33,8 @@ pub enum Route {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Resolution {
     pub route: Route,
+    /// The exact selected mode, retained when a tools command re-execs itself.
+    mode: String,
     /// Inherited routing variables the tools path ignores (local routes only).
     pub ignored_vars: Vec<&'static str>,
     /// Warnings for stderr, already worded.
@@ -134,6 +136,7 @@ pub fn resolve(inputs: &Inputs) -> Result<Resolution, String> {
             }
             Ok(Resolution {
                 route: Route::Local,
+                mode: chosen.value,
                 ignored_vars: named,
                 notes,
             })
@@ -165,6 +168,7 @@ pub fn resolve(inputs: &Inputs) -> Result<Resolution, String> {
             }
             Ok(Resolution {
                 route: Route::Fleet,
+                mode: chosen.value,
                 ignored_vars: Vec::new(),
                 notes,
             })
@@ -195,6 +199,33 @@ pub fn inputs_from_env(repo_root: &Path) -> Inputs {
         gateway_dir: std::env::var_os(GATEWAY_DIR_ENV),
         reader_root: std::env::var_os(READER_ROOT_ENV),
     }
+}
+
+/// Resolve the workspace's mode and configure forge reads for this tools process.
+///
+/// # Errors
+/// The mode or its configured fleet route is missing or invalid.
+pub fn configure_forge_reads(repo_root: &Path) -> Result<(), String> {
+    configure_forge_read_route(repo_root).map(|_| ())
+}
+
+/// Like [`configure_forge_reads`], but also return the selected mode for a
+/// detached self-invocation. Route input paths are inherited separately.
+pub(crate) fn configure_forge_read_route(repo_root: &Path) -> Result<String, String> {
+    let resolution = resolve(&inputs_from_env(repo_root))?;
+    for note in resolution.notes {
+        eprintln!("{note}");
+    }
+    match resolution.route {
+        Route::Fleet => crate::forge_gateway::enable_cli_reads(),
+        // Discard fleet readers before this process or one it starts can use them.
+        Route::Local => {
+            for var in resolution.ignored_vars {
+                std::env::remove_var(var);
+            }
+        }
+    }
+    Ok(resolution.mode)
 }
 
 #[cfg(test)]

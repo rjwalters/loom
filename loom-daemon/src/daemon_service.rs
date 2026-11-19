@@ -121,13 +121,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::Health { since, json } => {
                 cli::health::handle_health_command(since, json).await
             }
-            // `peer-claims` connects to the running daemon over its Unix
-            // socket for the same `DaemonStatus` round-trip `status` performs
-            // (Issue #5921), so it needs the async runtime for the same
-            // reason.
-            Commands::PeerClaims { json } => {
-                cli::peer_claims_cmd::handle_peer_claims_command(json).await
-            }
             // `queue` (#8852) reads the same `DaemonStatus` round-trip.
             Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
@@ -418,6 +411,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         minted_token,
         credential_preflight,
         cross_owner_retry,
+        startup_roots,
     } = credential_startup::run_startup(&sweep_workspace);
 
     // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
@@ -451,6 +445,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             minted_token,
             github_app_gh_config_dir_active,
             cross_owner_retry,
+            startup_roots,
         );
     }
 
@@ -634,36 +629,26 @@ pub(crate) async fn run_daemon() -> Result<()> {
         }
     }
 
-    // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
-    // connection that advertises this daemon's dispatch claims and consumes peer
-    // advertisements into a shared TTL-bounded view, so peer daemons back off
-    // before the non-atomic `loom:building` label flip would let them race.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
-    // the seeded default registry here (the IPC `DispatchSweep` path); every other
-    // provisioned registry is injected in `get_or_provision`.
+    // Optional cross-host completion dedup (#6352): a dedicated safehouse
+    // connection that announces this daemon's narrated completions and consumes
+    // peers', so a merge is posted to the public feed once fleet-wide.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
     //
-    // Deliberately started **before** `start_safehouse_narration` below (Issue
-    // #6352): the narration sink reads back this call's publisher + view
-    // synchronously (`WorkspacePool::start_safehouse_narration` locks
-    // `peer_coord`) to build its fleet-wide completion-dedup handle, so peer
-    // coordination must already be established by the time narration starts
-    // — reversing this order would silently leave completion dedup
-    // per-host-only even with `safehouse.enabled` true.
-    workspace_pool.start_peer_coordination(&sweep_workspace);
-    {
-        let mut reg = sweep_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        workspace_pool.inject_peer_coordination(&mut reg);
-    }
+    // Deliberately started **before** `start_safehouse_narration` below: the
+    // narration sink reads back this call's publisher + view synchronously
+    // (`WorkspacePool::start_safehouse_narration` locks `completion_dedup`) to
+    // build its fleet-wide completion-dedup handle — reversing this order would
+    // silently leave completion dedup per-host-only even with `safehouse.enabled`
+    // true.
+    workspace_pool.start_completion_dedup(&sweep_workspace);
 
     // Optional safehouse fleet-comms narration (#3997): subscribe the shared
     // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
     // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
     // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
     // public-feed `completion` envelope can carry a best-effort per-issue token
-    // total; the sink only ever reads, on the blocking pool. Started after peer
-    // coordination above (Issue #6352) so it can pick up the fleet-wide
+    // total; the sink only ever reads, on the blocking pool. Started after the
+    // completion dedup above (Issue #6352) so it can pick up the fleet-wide
     // completion-dedup handle.
     workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
 

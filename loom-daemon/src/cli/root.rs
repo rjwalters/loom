@@ -135,21 +135,6 @@ pub enum Commands {
     /// sections, and the daemon builds only what they need.
     Status(super::status::sections::StatusArgs),
 
-    /// Show the peer-claim view: which issues this host currently sees a
-    /// peer host claiming, by which host and with what remaining TTL, plus
-    /// the four transport counters (advertised / received / expired /
-    /// dispatch-skipped) that make the re-advertisement heartbeat and the
-    /// #5789 duplicate-dispatch backoff observable instead of a `debug!`-only
-    /// log line (Issue #5921). A thin standalone view of the same data
-    /// `loom-daemon status` renders in its "Peer claims" section — useful for
-    /// a fleet script comparing two hosts' views directly (`ssh host-a
-    /// loom-daemon peer-claims --json` vs `ssh host-b …`).
-    PeerClaims {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Show the work finder's ready queue in its real dispatch order
     /// (verified red-main fixes first, then priority level, oldest first —
     /// #11103, #11547) with what the last
@@ -965,6 +950,15 @@ pub enum Commands {
     #[command(flatten)]
     ScriptPorts(super::script_ports::ScriptPortCommand),
     Labels(super::labels_cmd::LabelsArgs),
+
+    /// Structural lint for GitHub Actions workflow YAML (#13896): duplicate
+    /// step `id` within one job and duplicate mapping keys anywhere — the two
+    /// shapes a textual conflict-merge union produces. GitHub rejects such a
+    /// file at validation with zero jobs, so its gate vanishes while every
+    /// rollup reads green. Exit 0 clean, non-zero on any defect (fail closed).
+    /// Args live in `crate::workflow_lint` because this file is frozen by the
+    /// file-size ratchet.
+    WorkflowLint(crate::workflow_lint::WorkflowLintArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -2268,6 +2262,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
+        Commands::WorkflowLint(args) => args.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
@@ -2458,10 +2453,10 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
+        Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
+            unreachable!("Queue is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }

@@ -1604,6 +1604,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
+            installed_behind: crate::workspace_hold::installed_behind_for(root),
             weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
@@ -1827,15 +1828,10 @@ pub fn build_daemon_status_for(
         // no pool is held, which is the steady state.
         pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
-        // updated by the narration sink / peer-coordination tasks
-        // `start_safehouse_narration`/`start_peer_coordination` spawn, and
+        // updated by the narration sink / completion-dedup tasks
+        // `start_safehouse_narration`/`start_completion_dedup` spawn, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
-        // Peer-claim view + transport counters (Issue #5921) — same
-        // process-global-cell read-back pattern as `safehouse` above. `None`
-        // when peer-claim coordination was never established (see
-        // `WorkspacePool::peer_claim_status`'s doc comment).
-        peer_claims: workspace_pool.peer_claim_status(),
         // Whether the work-finder loop is enabled for THIS running daemon
         // process (#4693) — read from this process's own env/config, the same
         // `wf_config` already resolved above for the dynamic-cap fields, so it

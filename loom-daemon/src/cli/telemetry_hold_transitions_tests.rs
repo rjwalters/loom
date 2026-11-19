@@ -6,36 +6,19 @@ use chrono::{TimeZone, Utc};
 
 use super::*;
 use crate::telemetry::kinds::hold_transition::reason;
-use crate::telemetry::provenance::Provenance;
 
-fn record(
-    repo: &str,
-    pr: u32,
-    reason_code: &str,
-    confidence_pct: Option<u8>,
-) -> HoldTransitionRecord {
-    let at = Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap();
-    HoldTransitionRecord {
+fn record(repo: &str, reason_code: &str, confidence_pct: Option<u8>) -> HoldTransitionRow {
+    HoldTransitionRow {
         repo: repo.to_string(),
-        pr,
-        transition: "decision".to_string(),
         reason_code: reason_code.to_string(),
-        trigger: "champion_role".to_string(),
-        confirmed: true,
-        episode_id: None,
-        entered_at: None,
-        entered_at_lower_bound: false,
         confidence_pct,
-        event_at: at,
-        observed_at: at,
-        loom: Provenance {
-            version: "0.19.1".to_string(),
-            revision: "9d8e226ce0123456789abcdef0123456789abcde".to_string(),
-            tree_state: "clean".to_string(),
-            complete: true,
-        },
     }
 }
+
+const FIRST_ROW: &str =
+    r#"{"repo":"o/one","reason_code":"merge-risk-self-release","confidence_pct":90}"#;
+const SECOND_ROW: &str =
+    r#"{"repo":"o/two","reason_code":"merge-risk-pass","confidence_pct":null}"#;
 
 #[test]
 fn since_and_until_are_required_and_flags_parse() {
@@ -141,7 +124,15 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
         100,
     );
     assert!(sql.contains("FROM signoz_logs.distributed_logs_v2 "), "{sql}");
-    assert!(sql.contains("SELECT body"), "{sql}");
+    assert!(sql.starts_with("SELECT attributes_string['loom.repo'] AS repo,"), "{sql}");
+    assert!(
+        sql.contains("attributes_string['loom.hold.reason_code'] AS reason_code"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("mapContains(attributes_number, 'loom.hold.confidence_pct')"),
+        "{sql}"
+    );
     assert!(sql.contains("attributes_string['loom.kind'] = 'hold.transition'"), "{sql}");
     // The store's timestamp is UInt64 nanoseconds: the generated bounds are
     // compared against the raw column, no DateTime64 conversion either way.
@@ -155,7 +146,7 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
         sql.contains("attributes_string['loom.hold.reason_code'] = {reason_code:String}"),
         "{sql}"
     );
-    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 101"), "{sql}");
+    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 101 FORMAT JSONEachRow"), "{sql}");
     assert_eq!(
         params,
         vec![
@@ -167,120 +158,84 @@ fn the_query_is_one_windowed_statement_and_user_text_is_bound() {
 
     // No filters: no bound params, no filter clauses, cap still max+1.
     let (sql, params) = build_query(1, 2, &[], None, 5);
-    assert!(!sql.contains("loom.repo"), "{sql}");
-    assert!(!sql.contains("reason_code"), "{sql}");
-    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 6"), "{sql}");
+    assert!(!sql.contains("{repo0:String}"), "{sql}");
+    assert!(!sql.contains("{reason_code:String}"), "{sql}");
+    assert!(sql.ends_with(" ORDER BY timestamp ASC LIMIT 6 FORMAT JSONEachRow"), "{sql}");
     assert!(params.is_empty());
 }
 
 #[test]
-fn rows_parse_from_the_body_string() {
-    // In the store the body column is a JSON *string* (JSONEachRow escapes
-    // it), so the fixture double-encodes.
-    let good = format!(
-        r#"{{"body": {}}}"#,
-        serde_json::to_string(
-            &serde_json::to_string(&record("o/r", 42, reason::MERGE_RISK_SELF_RELEASE, Some(93)))
-                .unwrap()
-        )
-        .unwrap()
-    );
-    let parsed = parse_row(&good).unwrap();
-    assert_eq!(parsed.repo, "o/r");
-    assert_eq!(parsed.confidence_pct, Some(93));
+fn observed_projected_reader_line_decodes() {
+    // Sanitized projection from the attended reader, with its exact JSONEachRow framing (#14569).
+    let body =
+        r#"{"repo":"2amlogic/2am","reason_code":"merge-risk-self-release","confidence_pct":93}"#;
+    let rows = collect_rows(body, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].repo, "2amlogic/2am");
+    assert_eq!(rows[0].reason_code, reason::MERGE_RISK_SELF_RELEASE);
+    assert_eq!(rows[0].confidence_pct, Some(93));
+}
 
-    // A record with no confidence (null / absent) parses as None.
-    let bare = record("o/r", 7, reason::MERGE_RISK_PASS, None);
-    let good = format!(
-        r#"{{"body": {}}}"#,
-        serde_json::to_string(&serde_json::to_string(&bare).unwrap()).unwrap()
-    );
-    assert_eq!(parse_row(&good).unwrap().confidence_pct, None);
+#[test]
+fn row_fields_are_strict_and_confidence_is_optional() {
+    assert_eq!(parse_row(SECOND_ROW).unwrap().confidence_pct, None);
+    let without_confidence = r#"{"repo":"o/one","reason_code":"merge-risk-pass","timestamp":123}"#;
+    assert_eq!(parse_row(without_confidence).unwrap().confidence_pct, None);
 
-    // Extra columns from the store (here `timestamp`) are ignored, not
-    // required: nothing but `body` is a parse requirement.
-    let with_extra = format!(
-        r#"{{"timestamp": 123, "body": {}}}"#,
-        serde_json::to_string(
-            &serde_json::to_string(&record("o/r", 42, reason::MERGE_RISK_PASS, None)).unwrap()
-        )
-        .unwrap()
-    );
-    assert_eq!(parse_row(&with_extra).unwrap().repo, "o/r");
-
-    assert!(parse_row("not json").is_err());
-    assert!(parse_row(r#"{"timestamp": 1}"#).is_err());
-    assert!(parse_row(r#"{"body": "not a record"}"#).is_err());
+    for bad in [
+        "not json",
+        r#"{"timestamp":123}"#,
+        r#"{"body":"{\"repo\":\"o/one\",\"reason_code\":\"merge-risk-pass\"}"}"#,
+        r#"{"repo":"","reason_code":"merge-risk-pass"}"#,
+        r#"{"repo":"o/one","reason_code":""}"#,
+        r#"{"repo":42,"reason_code":"merge-risk-pass"}"#,
+        r#"{"repo":"o/one","reason_code":"merge-risk-pass","confidence_pct":"93"}"#,
+        r#"{"repo":"o/one","reason_code":"merge-risk-pass","confidence_pct":93.5}"#,
+        r#"{"repo":"o/one","reason_code":"merge-risk-pass","confidence_pct":256}"#,
+    ] {
+        assert!(parse_row(bad).is_err(), "{bad}");
+    }
 }
 
 #[test]
 fn collect_rows_refuses_a_capped_window_counting_unparseable_lines() {
-    // A capped fetch is cap+1 lines however they parse: with unparseable
-    // lines among them the parsed count alone must not sneak under the cap.
+    // Cap+1 malformed lines count towards overflow just like valid lines.
     let body = ["not json"; 5].join("\n");
-    let err = format!("{}", collect_rows(&body, 4).unwrap_err());
+    let err = collect_rows(&body, 4).unwrap_err().to_string();
     assert!(err.contains("more than 4 records"), "{err}");
 
-    let good = |pr: u32| {
-        format!(
-            r#"{{"body": {}}}"#,
-            serde_json::to_string(
-                &serde_json::to_string(&record("o/r", pr, reason::MERGE_RISK_PASS, None)).unwrap()
-            )
-            .unwrap()
-        )
-    };
-    let mixed = format!("{}\n{}\n{}", good(1), "not json", good(2));
-    let err = format!("{}", collect_rows(&mixed, 2).unwrap_err());
+    let mixed = format!("{FIRST_ROW}\nnot json\n{SECOND_ROW}");
+    let err = collect_rows(&mixed, 2).unwrap_err().to_string();
     assert!(err.contains("more than 2 records"), "{err}");
-    // At exactly cap lines there is no cap refusal (that is a cap+1 fetch),
-    // but the unparseable line still refuses the read.
-    let err = format!("{}", collect_rows(&mixed, 3).unwrap_err());
+    // At exactly the cap, the malformed line still refuses the read.
+    let err = collect_rows(&mixed, 3).unwrap_err().to_string();
     assert!(err.contains("did not decode"), "{err}");
 }
 
 #[test]
 fn collect_rows_refuses_any_unparseable_row_with_its_count_and_first_reason() {
-    let good = |pr: u32| {
-        format!(
-            r#"{{"body": {}}}"#,
-            serde_json::to_string(
-                &serde_json::to_string(&record("o/r", pr, reason::MERGE_RISK_PASS, None)).unwrap()
-            )
-            .unwrap()
-        )
-    };
-    // First reason is the malformed line, not the later bad record.
-    let body = format!("{}\nnot json\n{}", good(1), r#"{"body": "not a record"}"#);
-    let err = format!("{}", collect_rows(&body, 10).unwrap_err());
+    let body = format!("{FIRST_ROW}\nnot json\n{}\n{SECOND_ROW}", r#"{"repo":"o/one"}"#);
+    let err = collect_rows(&body, 10).unwrap_err().to_string();
     assert!(err.contains("2 fetched row(s)"), "{err}");
     assert!(err.contains("first: malformed row"), "{err}");
     assert!(err.contains("partial total"), "{err}");
 
-    // All lines parse: records pass through in fetch order.
-    let rows = collect_rows(&format!("{}\n{}", good(1), good(2)), 10).unwrap();
+    let rows = collect_rows(&format!("\n {FIRST_ROW}\n\n{SECOND_ROW}\n"), 2).unwrap();
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].pr, 1);
-    assert_eq!(rows[1].pr, 2);
-    // Blank lines are not rows.
-    assert_eq!(
-        collect_rows(&format!("\n\n{}\n \n", good(1)), 10)
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(rows[0].repo, "o/one");
+    assert_eq!(rows[1].repo, "o/two");
 }
 
 #[test]
 fn aggregation_rolls_up_per_repo_and_overall() {
     let rows = vec![
-        record("o/a", 1, reason::MERGE_RISK_SELF_RELEASE, Some(80)),
-        record("o/a", 2, reason::MERGE_RISK_SELF_RELEASE, Some(90)),
-        record("o/a", 3, reason::MERGE_RISK_PASS, Some(99)),
-        record("o/b", 4, reason::MERGE_RISK_SELF_RELEASE, Some(70)),
+        record("o/a", reason::MERGE_RISK_SELF_RELEASE, Some(80)),
+        record("o/a", reason::MERGE_RISK_SELF_RELEASE, Some(90)),
+        record("o/a", reason::MERGE_RISK_PASS, Some(99)),
+        record("o/b", reason::MERGE_RISK_SELF_RELEASE, Some(70)),
         // A null-confidence self-release still counts; it carries no value.
-        record("o/b", 5, reason::MERGE_RISK_SELF_RELEASE, None),
-        record("o/c", 6, "add", None),
+        record("o/b", reason::MERGE_RISK_SELF_RELEASE, None),
+        record("o/c", "add", None),
     ];
     let mut outcome = Outcome {
         since: "s".to_string(),

@@ -739,6 +739,8 @@ fn config() -> Config {
         volume: "private-volume".into(),
         profile: "/external/account".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     }
 }
 
@@ -917,6 +919,8 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         volume: "volume".into(),
         profile: "/external/profile".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     assert!(lease
         .recover(&config, Some(&serde_json::json!({"Id":"new", "State":{"Running":false}})))
@@ -1260,4 +1264,183 @@ fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
         .windows(2)
         .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"));
     assert_eq!(docker::fake::seen_env().last().unwrap(), &Vec::new());
+}
+
+// ---- rebind after a repository transfer (#14357) ----
+
+const OLD_SLUG: &str = "old-one-11111111";
+const NEW_SLUG: &str = "new-one-22222222";
+
+/// A transferred repository: the old remote's history under a new location.
+fn transferred(f: &RepoFixture, old: &Path) -> PathBuf {
+    let new = f._temp.path().join("transferred");
+    git(
+        f._temp.path(),
+        &[
+            "clone",
+            "--bare",
+            &old.to_string_lossy(),
+            &new.to_string_lossy(),
+        ],
+    );
+    new
+}
+
+fn rebind_args(old: &Path, new: &Path, dry_run: bool) -> repository::RebindArgs {
+    repository::RebindArgs {
+        account: "fixture".into(),
+        from: old.to_string_lossy().into_owned(),
+        from_slug: OLD_SLUG.into(),
+        to: new.to_string_lossy().into_owned(),
+        to_slug: NEW_SLUG.into(),
+        base: "main".into(),
+        dry_run,
+    }
+}
+
+/// A primary plus a populated old clone carrying an unpublished branch and a
+/// dirty file, and the transferred remote.
+fn old_clone_with_work() -> (RepoFixture, PathBuf, PathBuf, PathBuf) {
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let old = f.second_remote("old");
+    repository::prepare(&f.root, &f.additional_args(&old.to_string_lossy(), OLD_SLUG)).unwrap();
+    let clone = f.root.join("work").join(OLD_SLUG);
+    git(&clone, &["switch", "-c", "feature/issue-9"]);
+    std::fs::write(clone.join("fixture"), "unpublished").unwrap();
+    git(&clone, &["commit", "-am", "work"]);
+    std::fs::write(clone.join("scratch"), "dirty").unwrap();
+    let new = transferred(&f, &old);
+    (f, old, new, clone)
+}
+
+fn record_of(f: &RepoFixture, slug: &str) -> String {
+    std::fs::read_to_string(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap()
+}
+
+#[test]
+fn rebind_moves_an_old_clone_keeping_its_work_and_is_idempotent() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    let moved = f.root.join("work").join(NEW_SLUG);
+    // The dry run verifies and reports; nothing moves.
+    let dry = repository::rebind(&f.root, &rebind_args(&old, &new, true)).unwrap();
+    assert_eq!(dry.status, RebindStatus::DryRun);
+    assert!(clone.exists() && !moved.exists());
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::Moved);
+    assert!(!clone.exists());
+    assert_eq!(done.from.branches, done.to.branches);
+    assert_eq!(done.to.branches[0].branch, "feature/issue-9");
+    assert!(done.to.dirty);
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+    assert_eq!(git(&moved, &["rev-parse", "feature/issue-9"]).len(), 40);
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+    assert!(record_of(&f, NEW_SLUG).contains(&*new.to_string_lossy()));
+    assert!(!f
+        .root
+        .join("work/.identity")
+        .join(format!("{OLD_SLUG}.json"))
+        .exists());
+
+    // Re-running verifies and changes nothing.
+    let again = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(again.status, RebindStatus::AlreadyBound);
+    assert_eq!(again.to.branches, done.to.branches);
+    // The moved clone prepares under the canonical identity (dirty refusal
+    // proves it got past the identity check).
+    let error = repository::prepare(&f.root, &f.additional_args(&new.to_string_lossy(), NEW_SLUG))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dirty"), "{error}");
+}
+
+#[test]
+fn rebind_succeeds_when_the_canonical_remote_already_publishes_a_local_branch() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    // The transferred repository already carries the branch (published by
+    // someone else, or pushed after the transfer): the move's `fetch --prune`
+    // shifts the unpublished count without any local work changing.
+    git(&clone, &["push", &new.to_string_lossy(), "feature/issue-9"]);
+    let tip = git(&clone, &["rev-parse", "feature/issue-9"]);
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::Moved);
+    assert_eq!(done.from.branches[0].branch, "feature/issue-9");
+    assert!(done.to.branches.is_empty(), "published upstream by now");
+    let moved = f.root.join("work").join(NEW_SLUG);
+    assert_eq!(git(&moved, &["rev-parse", "feature/issue-9"]), tip);
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+}
+
+#[test]
+fn rebind_finishes_an_interrupted_move() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    // Crash after the directory move, before the record or origin changed.
+    std::fs::rename(&clone, f.root.join("work").join(NEW_SLUG)).unwrap();
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::AlreadyBound);
+    let moved = f.root.join("work").join(NEW_SLUG);
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+    assert!(record_of(&f, NEW_SLUG).contains(&*new.to_string_lossy()));
+    assert!(!f
+        .root
+        .join("work/.identity")
+        .join(format!("{OLD_SLUG}.json"))
+        .exists());
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+}
+
+#[test]
+fn rebind_refuses_a_wrong_repository_without_changing_anything() {
+    let _fork = fork_guard();
+    let (f, old, _new, clone) = old_clone_with_work();
+    let unrelated = f.second_remote("unrelated");
+    let before = record_of(&f, OLD_SLUG);
+    let error = repository::rebind(&f.root, &rebind_args(&old, &unrelated, false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("wrong repository"), "{error}");
+    assert!(clone.exists() && !f.root.join("work").join(NEW_SLUG).exists());
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+    assert_eq!(record_of(&f, OLD_SLUG), before);
+    assert_eq!(std::fs::read_to_string(clone.join("scratch")).unwrap(), "dirty");
+}
+
+#[test]
+fn rebind_reports_two_populated_clones_and_leaves_both_intact() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    repository::prepare(&f.root, &f.additional_args(&new.to_string_lossy(), NEW_SLUG)).unwrap();
+    let other = f.root.join("work").join(NEW_SLUG);
+    std::fs::write(other.join("mine"), "also work").unwrap();
+    let outcome = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(outcome.status, RebindStatus::BothPopulated);
+    assert!(outcome.from.populated && outcome.to.populated);
+    assert_eq!(std::fs::read_to_string(clone.join("scratch")).unwrap(), "dirty");
+    assert_eq!(std::fs::read_to_string(other.join("mine")).unwrap(), "also work");
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+    assert_eq!(git(&other, &["remote", "get-url", "origin"]), new.to_string_lossy());
+}
+
+#[test]
+fn rebind_of_an_uncloned_registration_moves_nothing_and_a_foreign_dir_is_kept() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let (old, new) = (f.second_remote("old"), f.second_remote("new"));
+    let outcome = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(outcome.status, RebindStatus::NotCloned);
+    std::fs::create_dir_all(f.root.join("work").join(OLD_SLUG)).unwrap();
+    let error = repository::rebind(&f.root, &rebind_args(&old, &new, false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unrecognized"), "{error}");
+    let mut same = rebind_args(&old, &new, false);
+    same.to_slug = OLD_SLUG.into();
+    assert!(repository::rebind(&f.root, &same).is_err());
 }

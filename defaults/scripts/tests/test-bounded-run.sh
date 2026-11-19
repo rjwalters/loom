@@ -19,6 +19,10 @@
 #      bounded_run returns.
 #   5. Arguments containing spaces survive (no word-splitting through the
 #      `"$@"` forwarding).
+#   6. A caller's `$(bounded_run ...)` is released within the budget even when
+#      the bounded command has a child holding the stdout pipe, and that child
+#      is signalled too — the whole process group, not one pid (#14284). Also:
+#      the caller's `set -m` setting is unchanged on return.
 #
 # ## Which exit codes the wedge case may legitimately see (#7788)
 #
@@ -106,6 +110,18 @@ echo "$$" > "$1"
 while true; do sleep 1; done
 EOF
 chmod +x "$WEDGE"
+
+# A command with a CHILD that inherits its stdout (#14284): backgrounds a sleep,
+# records the sleep's pid, then waits on it. The child, not this script, is what
+# holds a caller's `$(...)` pipe open once this script has been signalled.
+GRAND="$WORKDIR/grand.sh"
+cat > "$GRAND" <<'EOF'
+#!/usr/bin/env bash
+sleep 8 &
+echo "$!" > "$1"
+wait
+EOF
+chmod +x "$GRAND"
 
 # How many times the wedge case may re-run an attempt that produced no pid
 # handshake (see the header). Three, not "until it passes": the cap is what keeps
@@ -221,6 +237,52 @@ for MODE in native portable; do
         else
             pass "[$MODE] the wedged child is reaped, not orphaned"
         fi
+    fi
+
+    # A caller capturing stdout with `$(...)` must itself be released on time
+    # when the bounded command has a CHILD that inherited the pipe (#14284). The
+    # pre-fix portable path signalled only the command's own pid: the grandchild
+    # `sleep` survived, kept the substitution's pipe open, and the caller blocked
+    # for the grandchild's full 8s even though bounded_run returned 124 promptly.
+    # So this asserts wall-clock around the substitution, not just the code.
+    GRAND_PIDFILE="$WORKDIR/grand-$MODE.pid"
+    rm -f "$GRAND_PIDFILE"
+    S=$SECONDS
+    out="$(bounded_run 1 "$GRAND" "$GRAND_PIDFILE" 2>/dev/null)"; rc=$?
+    ELAPSED=$((SECONDS - S))
+    assert_eq "124" "$rc" "[$MODE] a bounded command with a child is reported as 124"
+    if (( ELAPSED <= 5 )); then
+        pass "[$MODE] the caller's \$(...) is released on time (${ELAPSED}s, budget 1s, child sleeps 8s)"
+    else
+        fail "[$MODE] the caller's \$(...) is released on time (blocked ${ELAPSED}s, budget 1s, child sleeps 8s)"
+    fi
+    grand_pid="$(cat "$GRAND_PIDFILE" 2>/dev/null || true)"
+    if [[ -z "$grand_pid" ]]; then
+        fail "[$MODE] the grandchild recorded its pid (fixture sanity)"
+    else
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "$grand_pid" 2>/dev/null || break
+            sleep 0.3
+        done
+        if kill -0 "$grand_pid" 2>/dev/null; then
+            kill -KILL "$grand_pid" 2>/dev/null || true
+            fail "[$MODE] the grandchild is signalled with the group, not left running"
+        else
+            pass "[$MODE] the grandchild is signalled with the group, not left running"
+        fi
+    fi
+
+    # bounded_run must leave the caller's job-control (`set -m`) setting as it
+    # found it: it turns monitor mode on only to give the command its own group.
+    if ( set +m; bounded_run 5 true; [[ $- != *m* ]] ); then
+        pass "[$MODE] a caller with monitor mode off still has it off afterwards"
+    else
+        fail "[$MODE] a caller with monitor mode off still has it off afterwards"
+    fi
+    if ( set -m; bounded_run 5 true; [[ $- == *m* ]] ); then
+        pass "[$MODE] a caller with monitor mode on still has it on afterwards"
+    else
+        fail "[$MODE] a caller with monitor mode on still has it on afterwards"
     fi
 done
 unset LOOM_FORCE_PORTABLE_TIMEOUT

@@ -795,10 +795,10 @@ pub fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
 
 /// `(host, sweep)` from a yield record's first line:
 /// `<!-- loom:lease-yield host=H sweep=S earliest_host=EH earliest_sweep=ES -->`.
-/// Same shape as the publish/fence scripts' parser and
-/// `cli/lease_co_occupancy`'s — only the first line is inspected, and never
-/// the free-form prose after the closing `-->` (`lease-record.md`).
-fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
+/// Same shape as the publish/fence scripts' parser, and shared with
+/// `cli/lease_co_occupancy` (#14580) — only the first line is inspected, and
+/// never the free-form prose after the closing `-->` (`lease-record.md`).
+pub(crate) fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
     let rest = body.lines().next()?.strip_prefix(YIELD_MARKER_PREFIX)?;
     let (host, rest) = rest.split_once(" sweep=")?;
     let sweep = rest.split_whitespace().next()?;

@@ -15,6 +15,8 @@ struct RacingRunner {
     recreated_busy: bool,
 }
 
+impl session_image::BundleProbe for RacingRunner {}
+
 impl ContainerRunner for RacingRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         let seen = self.inner.inspect(container)?;
@@ -26,8 +28,16 @@ impl ContainerRunner for RacingRunner {
         }
         Ok(seen)
     }
-    fn create(&self, c: &str, i: &str, h: &Path, w: &Path, d: &Path) -> Result<()> {
-        self.inner.create(c, i, h, w, d)
+    fn create(
+        &self,
+        c: &str,
+        i: &str,
+        h: &Path,
+        w: &Path,
+        d: &Path,
+        m: &[ExtraMount],
+    ) -> Result<()> {
+        self.inner.create(c, i, h, w, d, m)
     }
     fn start_existing(&self, container: &str) -> Result<()> {
         self.inner.start_existing(container)

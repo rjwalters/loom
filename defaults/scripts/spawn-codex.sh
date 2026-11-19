@@ -215,6 +215,14 @@
 #                        `-c model_reasoning_effort=<value>`. Skipped when an
 #                        explicit `-c model_reasoning_effort=` override is
 #                        already present in the passthrough args.
+#   LOOM_SERVICE_TIER    Runtime-neutral speed tier (issue #14141), mapped to
+#                        `-c service_tier=<id>` (the tier ids come from
+#                        `codex debug models` -> `service_tiers[].id`).
+#                        `fast` is shorthand for the catalog's `priority` id;
+#                        `standard`/`default` emit nothing; any other value is
+#                        passed through verbatim as a catalog id. Skipped when
+#                        an explicit `-c service_tier=` is already present in
+#                        the passthrough args. Empty = unset.
 #   LOOM_CODEX_SANDBOX   read-only | workspace-write | danger-full-access.
 #                        Overrides the skip-permissions mapping and the default.
 #   LOOM_CODEX_NETWORK   When 1 and the effective sandbox is workspace-write,
@@ -349,6 +357,11 @@ EXPLICIT_MODEL=""
 HAS_SANDBOX_ARG=false
 EXPLICIT_SANDBOX=""
 HAS_EFFORT_OVERRIDE=false
+# #14141: an explicit `-c service_tier=` wins over LOOM_SERVICE_TIER; the
+# explicit effort/tier VALUES are kept so the terminal record can name them.
+HAS_TIER_OVERRIDE=false
+EXPLICIT_EFFORT_VALUE=""
+EXPLICIT_TIER_VALUE=""
 GENERIC_EFFORT=""
 HAS_SKIP_GIT_CHECK_ARG=false
 PASSTHROUGH_ARGS=()
@@ -445,7 +458,8 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH_ARGS+=("$1")
             if [[ $# -ge 2 ]]; then
                 case "$2" in
-                    model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true ;;
+                    model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true; EXPLICIT_EFFORT_VALUE="${2#model_reasoning_effort=}" ;;
+                    service_tier=*) HAS_TIER_OVERRIDE=true; EXPLICIT_TIER_VALUE="${2#service_tier=}" ;;
                 esac
                 PASSTHROUGH_ARGS+=("$2")
                 shift 2
@@ -454,8 +468,17 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -c=*|--config=*)
-            case "$1" in
-                *model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true ;;
+            config_assignment="${1#*=}"
+            case "$config_assignment" in
+                *model_reasoning_effort=*)
+                    # Keep mixed-key text out of the legacy service_tier arm below.
+                    # Only the assignment key itself can override effort.
+                    if [[ "$config_assignment" == model_reasoning_effort=* ]]; then
+                        HAS_EFFORT_OVERRIDE=true
+                        EXPLICIT_EFFORT_VALUE="${config_assignment#model_reasoning_effort=}"
+                    fi
+                    ;;
+                *service_tier=*) HAS_TIER_OVERRIDE=true; EXPLICIT_TIER_VALUE="${1##*service_tier=}" ;;
             esac
             PASSTHROUGH_ARGS+=("$1")
             shift
@@ -551,7 +574,7 @@ if [[ -n "$EFFECTIVE_MODEL" && "${LOOM_CODEX_MODEL_CHECK:-1}" != "0" ]]; then
             log_error "This model/runtime combination is guaranteed to fail on the wire (HTTP 400)."
             log_error "Fix one of:"
             log_error "  - set autonomous.roleRunner.roleModels.<role> to a Codex-valid model in .loom/config.json"
-            log_error "  - set autonomous.roleRunner.roleModels.<role> to \"default\" to pass through to the Codex CLI's own default model (#7894) -- the only working shape on a ChatGPT-plan seat, which rejects every explicit pin"
+            log_error "  - set autonomous.roleRunner.roleModels.<role> to \"default\" to pass through to the Codex CLI's own default model (#7894) -- the guaranteed-working shape on any seat (a ChatGPT-plan seat also accepts a model its own catalog lists; see \`codex debug models\`)"
             log_error "  - set LOOM_MODEL / LOOM_CODEX_MODEL to a Codex-valid model for this invocation"
             log_error "  - point this role/runtime binding back at Claude (unset runtimes.roles.<role> / LOOM_RUNTIME_<ROLE>)"
             log_error "Escape hatch: LOOM_CODEX_MODEL_CHECK=0 (only if this really is a valid Codex model name)."
@@ -566,17 +589,54 @@ fi
 # `-c model_reasoning_effort=` in the passthrough args wins, then --effort, then
 # LOOM_EFFORT, then a `model@effort` suffix (#8387), then nothing (no override
 # emitted, CLI default preserved).
+# APPLIED_EFFORT / APPLIED_TIER (#14141) are the values actually in force after
+# the precedence below, for the step log and the LOOM_TERMINAL_RESULT record.
+APPLIED_EFFORT=""
+APPLIED_TIER=""
 if [[ "$HAS_EFFORT_OVERRIDE" == "true" ]]; then
+    APPLIED_EFFORT="$EXPLICIT_EFFORT_VALUE"
     [[ -z "${LOOM_EFFORT:-}" ]] || log_info "spawn-codex: explicit -c model_reasoning_effort= wins over LOOM_EFFORT='$LOOM_EFFORT'"
 elif [[ -n "$GENERIC_EFFORT" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$GENERIC_EFFORT")
+    APPLIED_EFFORT="$GENERIC_EFFORT"
     log_info "spawn-codex: effort=$GENERIC_EFFORT (from --effort)"
 elif [[ -n "${LOOM_EFFORT:-}" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$LOOM_EFFORT")
+    APPLIED_EFFORT="$LOOM_EFFORT"
     log_info "spawn-codex: effort=$LOOM_EFFORT (from LOOM_EFFORT)"
 elif [[ -n "$MODEL_SUFFIX_EFFORT" ]]; then
     PASSTHROUGH_ARGS+=(-c "model_reasoning_effort=$MODEL_SUFFIX_EFFORT")
+    APPLIED_EFFORT="$MODEL_SUFFIX_EFFORT"
     log_info "spawn-codex: effort=$MODEL_SUFFIX_EFFORT (from model@effort suffix)"
+fi
+
+# --- Service-tier / speed selection (issue #14141) ---
+# `codex exec` has no tier flag; the knob is the `service_tier` config key (a
+# catalog id from `codex debug models` -> `service_tiers[].id`, e.g. `priority`,
+# shown as "Fast"). Precedence: explicit `-c service_tier=` in the passthrough
+# args > LOOM_SERVICE_TIER > nothing (no override, the profile's tier applies).
+# `fast` is the runtime-neutral shorthand for `priority`; `standard`/`default`
+# mean "the default tier" and emit nothing. Empty LOOM_SERVICE_TIER is unset.
+if [[ "$HAS_TIER_OVERRIDE" == "true" ]]; then
+    APPLIED_TIER="$EXPLICIT_TIER_VALUE"
+    [[ -z "${LOOM_SERVICE_TIER:-}" ]] || log_info "spawn-codex: explicit -c service_tier= wins over LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER'"
+elif [[ -n "${LOOM_SERVICE_TIER:-}" ]]; then
+    _tier_norm="$(printf '%s' "$LOOM_SERVICE_TIER" | tr '[:upper:]' '[:lower:]')"
+    case "$_tier_norm" in
+        standard|default)
+            log_info "spawn-codex: service_tier=standard (default tier; no override emitted, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            ;;
+        *)
+            [[ "$_tier_norm" != "fast" ]] || _tier_norm="priority"
+            if [[ "$_tier_norm" =~ ^[a-z0-9._-]+$ ]]; then
+                PASSTHROUGH_ARGS+=(-c "service_tier=$_tier_norm")
+                APPLIED_TIER="$_tier_norm"
+                log_info "spawn-codex: service_tier=$_tier_norm (from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            else
+                log_warn "spawn-codex: LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER' is not a valid tier id; ignoring it"
+            fi
+            ;;
+    esac
 fi
 
 # --- Sandbox mapping (SAFETY-CRITICAL; see header + guardrail-parity-codex.md) ---
@@ -1425,6 +1485,21 @@ if [[ -f "$_classifier_lib" ]]; then
         && "${CODEX_DROPPED_MODEL:-}" =~ ^[A-Za-z0-9._@-]+$ ]]; then
         _terminal_version="v=3"
         _terminal_requested_field=" requested_model=${CODEX_DROPPED_MODEL}"
+    fi
+    # #14141: the launch settings actually applied ride on a v4 record —
+    # `effort=` and `tier=` (each `none` when unset), appended after
+    # `model=`/`requested_model=`. A launch that applied NEITHER keeps the
+    # v2/v3 record byte-for-byte, so the new fields only exist when there is
+    # something to report; an older daemon fails closed on v4 (no health
+    # mutation, the same safe direction as v3). Values that are not
+    # record-safe report `none`.
+    _terminal_effort="${APPLIED_EFFORT:-none}"
+    [[ "$_terminal_effort" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_effort="none"
+    _terminal_tier="${APPLIED_TIER:-none}"
+    [[ "$_terminal_tier" =~ ^[A-Za-z0-9._-]+$ ]] || _terminal_tier="none"
+    if [[ "$_terminal_effort" != "none" || "$_terminal_tier" != "none" ]]; then
+        _terminal_version="v=4"
+        _terminal_requested_field="${_terminal_requested_field} effort=${_terminal_effort} tier=${_terminal_tier}"
     fi
     case "$_terminal_category" in
         # MODEL_CREDITS_EXHAUSTED (#5687) is listed so the allowlist stays a

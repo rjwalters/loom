@@ -281,8 +281,16 @@ macro_rules! define_telemetry_record {
         ///
         /// **Generated** from the one-row-per-kind registry in
         /// [`kinds`](crate::telemetry::kinds) — add a kind there, never here.
+        ///
+        /// `large_enum_variant` is allowed here on purpose: the payloads are
+        /// serde records whose field count is the wire contract, not a sizing
+        /// decision — the honest alternatives (boxing a field, splitting a
+        /// record) would change the wire shape or the reader for every
+        /// consumer to save stack bytes an envelope that is cloned once per
+        /// emit never cared about.
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
         #[serde(tag = "kind")]
+        #[allow(clippy::large_enum_variant)]
         pub enum TelemetryRecord {
             $(
                 $(#[$attr])*
@@ -1293,6 +1301,16 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
+    /// The step-engine stage a step ran (#14048) — the wire
+    /// [`crate::step_role::StepRole`] name (`builder`, `judge`,
+    /// `champion_promote`, …), which is FINER than `role`: `role` folds
+    /// Champion's two stages (`champion_promote`, `champion_merge`) to
+    /// `champion`, so a consumer splitting per-stage usage cross-host reads
+    /// this key. Present only on a step-sourced record (`source = "step"`);
+    /// absent on every role tick and on records written before #14048 —
+    /// additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
     /// The issue a step worked (#13563); set only on a step whose item is an
     /// issue, so its token totals attribute to that issue. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1406,6 +1424,14 @@ pub struct TokenSnapshotRecord {
     pub captured_at: DateTime<Utc>,
     /// Per-account state for every account in the pool.
     pub accounts: Vec<TokenAccountState>,
+    /// Age of the fleet token-probe snapshot this host has applied
+    /// (#13942): `captured_at` minus the captain's probe instant. `None`
+    /// when no fleet sidecar exists (fleet mode off, or the captain has not
+    /// answered a heartbeat yet) — unknown, not zero. Signed on purpose: a
+    /// small negative value is captain/worker clock skew, the same honest
+    /// contract `seconds_until_reset` holds for a stale instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_probe_age_secs: Option<i64>,
 }
 
 /// One `(root, role)` pair's persistent tick-failure detail inside a host's

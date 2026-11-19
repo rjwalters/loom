@@ -351,8 +351,34 @@ pub fn merge_runtime_attribution(
     }
 }
 
+/// The part of an append-mode step log that belongs to its **last** dispatch
+/// (#14210): from the last line that starts with the dispatch header onward,
+/// or all of `contents` when no such line exists.
+///
+/// Line-anchored like the launch-record scan: an agent echoing the header
+/// mid-line, or inside a JSON event string, can never be read as a new dispatch.
+fn last_dispatch_region(contents: &str) -> &str {
+    let mut offset = 0;
+    let mut start = 0;
+    for line in contents.split_inclusive('\n') {
+        if line.starts_with(crate::sweep_registry::DISPATCH_HEADER_MARKER) {
+            start = offset;
+        }
+        offset += line.len();
+    }
+    &contents[start..]
+}
+
 /// Every OpenCode session id named by the event stream in a step log's
-/// `contents` (#14018), first-seen order, de-duplicated.
+/// `contents` — **every** dispatch region — first-seen order, de-duplicated
+/// (#14018).
+///
+/// This is the read for the PR-keyed step logs (Doctor, Judge,
+/// `champion_merge`, #14210): such a log exists only for its own PR, so each
+/// dispatch region is a later round on that PR — a completed Doctor round whose
+/// commits are in the merge, not an abandoned attempt — and all of them are
+/// in the Claude side's `(PR createdAt, mergedAt)` window. See
+/// [`opencode_session_ids_last_dispatch`] for the issue-keyed Builder log.
 ///
 /// An OpenCode launch's `--format json` stream puts `"sessionID":"ses_…"` at
 /// the top level of every event. Only a line that is itself a JSON object is
@@ -362,9 +388,26 @@ pub fn merge_runtime_attribution(
 /// compared with a store row.
 #[must_use]
 pub fn opencode_session_ids(contents: &str) -> Vec<String> {
+    session_ids_in(contents)
+}
+
+/// [`opencode_session_ids`] restricted to the **last dispatch** of a step log
+/// (#14210): the read for the issue-keyed Builder log.
+///
+/// `step-builder-<issue>.log` is opened in append mode and keyed by issue, so a
+/// retried Builder leaves one region per dispatch and every earlier one is an
+/// abandoned attempt (its Claude transcript predates the PR's `createdAt`, so
+/// the Claude side drops it too). Only the last — the attempt that produced the
+/// PR — is counted. A log with no dispatch header is read whole.
+#[must_use]
+pub fn opencode_session_ids_last_dispatch(contents: &str) -> Vec<String> {
+    session_ids_in(last_dispatch_region(contents))
+}
+
+fn session_ids_in(region: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
-    for line in contents.lines() {
+    for line in region.lines() {
         let line = line.trim_start();
         if !line.starts_with('{') || !line.contains("\"sessionID\"") {
             continue;
@@ -1106,6 +1149,40 @@ mod tests {
         .join("\n");
         assert_eq!(opencode_session_ids(&log), vec!["ses_abc123", "ses_def456"]);
         assert!(opencode_session_ids("").is_empty());
+    }
+
+    /// #14210: the issue-keyed Builder log is append-mode, so a retried Builder
+    /// leaves several dispatch regions. Only the last one — the attempt that
+    /// produced the PR — is counted; an abandoned earlier attempt's sessions are
+    /// not.
+    #[test]
+    fn opencode_session_ids_last_dispatch_counts_only_the_last_region() {
+        let log = [
+            "==== loom-daemon dispatch: 2026-11-16T14:27:46+00:00 sweep_id=a item=7 ====",
+            r#"{"type":"step_start","sessionID":"ses_first"}"#,
+            "==== loom-daemon dispatch: 2026-11-16T17:04:20+00:00 sweep_id=b item=7 ====",
+            r#"{"type":"step_start","sessionID":"ses_second"}"#,
+            // Quoted inside an event, or mid-line, so never a header.
+            r#"{"type":"text","sessionID":"ses_second","part":{"text":"==== loom-daemon dispatch: x ===="}}"#,
+            "agent echoed ==== loom-daemon dispatch: z ==== mid-line",
+            r#"{"type":"step_finish","sessionID":"ses_third"}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_session_ids_last_dispatch(&log), vec!["ses_second", "ses_third"]);
+        // The PR-keyed read is the whole log: each region is a completed round.
+        assert_eq!(opencode_session_ids(&log), vec!["ses_first", "ses_second", "ses_third"]);
+    }
+
+    /// A log with no dispatch header (a hand-written or pre-header log) is one
+    /// undivided launch: every session in it counts.
+    #[test]
+    fn opencode_session_ids_last_dispatch_without_a_header_reads_the_whole_log() {
+        let log = [
+            r#"{"type":"step_start","sessionID":"ses_one"}"#,
+            r#"{"type":"step_start","sessionID":"ses_two"}"#,
+        ]
+        .join("\n");
+        assert_eq!(opencode_session_ids_last_dispatch(&log), vec!["ses_one", "ses_two"]);
     }
 
     // ========================================================================

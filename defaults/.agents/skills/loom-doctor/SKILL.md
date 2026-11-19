@@ -125,6 +125,10 @@ fi
 
 Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge.
 
+**Detached `pr-<N>` is read-only for Doctor (#14403).** If `pr-worktree.sh` exits `0` but leaves `pr-<N>` **detached** (the PR's branch is checked out in the primary clone), do not edit or commit there: a plain `git push` cannot land from a detached HEAD, and a commit on it has no surviving ref once the worktree is removed. Stop, release the PR lease and `loom:treating`, and route or park the PR instead (same review-only rule as `judge.md`).
+
+Detect it with a command, not by reading the helper's output (a caller may have suppressed it): after `pr-worktree.sh` returns, `git -C .loom/worktrees/pr-<N> symbolic-ref -q --short HEAD` exits non-zero when `pr-<N>` is detached. A detached HEAD equals the PR head sha, so "Verify the pin" does not catch it.
+
 ### Expected worktree state after setup (#4823)
 
 For a `feature/issue-<N>` branch, `worktree.sh <N>` fetches `origin/feature/issue-<N>`
@@ -613,7 +617,9 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       cd ".loom/worktrees/issue-$ISSUE_NUM"
       gh pr checkout "$UNLABELED_PR"
     else
-      ./.loom/scripts/pr-worktree.sh "$UNLABELED_PR" >/dev/null
+      # Keep the helper's output visible: it reports a detached pr-<N> (see
+      # "Detached `pr-<N>` is read-only for Doctor" above).
+      ./.loom/scripts/pr-worktree.sh "$UNLABELED_PR"
       cd ".loom/worktrees/pr-$UNLABELED_PR"
     fi
 
@@ -976,6 +982,9 @@ PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
 [ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { echo "Pin unverified: STOP." >&2; exit 1; }
 git fetch origin main || exit 1
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: update before push)" origin/main; fi || exit 1  # conflict: resolve, add, `--continue` / `git commit --no-edit`, resume here
+# Workflow-lint gate (#13896): the update above — and any conflict resolution in it — can textually union two copies of one setup block, leaving a touched workflow with a duplicate step id or a duplicate mapping key. GitHub rejects such a file at validation with zero jobs, so its gate vanishes and every rollup reads green. Lint every workflow the resolved result touched BEFORE pushing; a defect — or the lint being unable to run (a stale loom-daemon without the subcommand exits non-zero) — blocks the push and any "conflict resolved" claim. Fail closed: never treat silence as a pass.
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — resolve the defect; do not push and do not claim the conflict resolved." >&2; exit 1; }
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
@@ -1432,6 +1441,10 @@ BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #1
 git fetch origin main
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
+
+# Workflow-lint gate (#13896): the merge above — and any conflict resolution in it — can textually union two copies of one setup block, leaving a touched workflow with a duplicate step id or a duplicate mapping key. GitHub rejects such a file at validation with zero jobs, so its gate vanishes and every rollup reads green. Lint every workflow the resolved result touched BEFORE pushing; a defect — or the lint being unable to run (a stale loom-daemon without the subcommand exits non-zero) — blocks the push and any "conflict resolved" claim. Fail closed: never treat silence as a pass.
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — resolve the defect; do not push and do not claim the conflict resolved." >&2; exit 1; }
 
 # Version-gate: if it fires, stop and report; never hand-bump.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then

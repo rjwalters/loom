@@ -90,6 +90,16 @@ pub enum Event {
         /// The head the write was made against, when its writer knew it.
         head_sha: Option<String>,
     },
+    /// The run's own successful PR lease release (`lease pr release`,
+    /// #14639): the typed outcome Champion's release recorded. Trusted
+    /// because the release verified the lease was the run's own before its
+    /// PATCH landed — a release marker read off the forge (#9548) never
+    /// becomes one.
+    Released {
+        at: DateTime<Utc>,
+        outcome: String,
+        reason: Option<String>,
+    },
 }
 
 /// Everything known about one item of one run.
@@ -343,6 +353,21 @@ fn events(journal: &Journal) -> Vec<(u32, Option<bool>, Event)> {
                     action: action.clone(),
                     by: by.clone(),
                     head_sha: head_sha.clone(),
+                },
+            )),
+            // A lease release is a PR write; its number is the PR.
+            JournalEntry::Released {
+                at,
+                number,
+                outcome,
+                reason,
+            } => Some((
+                *number,
+                Some(true),
+                Event::Released {
+                    at: *at,
+                    outcome: outcome.clone(),
+                    reason: reason.clone(),
                 },
             )),
             JournalEntry::Queue { .. }

@@ -40,6 +40,10 @@ pub enum WorkerCommand {
     /// (`accounts session recover`, issue #14030). Without `--publish` or
     /// `--discard` nothing is mutated.
     Recover(RecoverArgs),
+    /// Move an additional clone to its canonical (transferred) repository
+    /// location, preserving every branch and file (`accounts session
+    /// rebind`, issue #14357).
+    Rebind(RebindArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
         operation: String,
@@ -90,6 +94,27 @@ pub struct RecoverArgs {
     /// Absent: the legacy `<volume>/repo`.
     #[arg(long)]
     pub slug: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct RebindArgs {
+    #[arg(long)]
+    pub account: String,
+    /// The registered (pre-transfer) repository URL.
+    #[arg(long)]
+    pub from: String,
+    #[arg(long)]
+    pub from_slug: String,
+    /// The canonical repository URL after the transfer.
+    #[arg(long)]
+    pub to: String,
+    #[arg(long)]
+    pub to_slug: String,
+    #[arg(long)]
+    pub base: String,
+    /// Verify and report; change nothing.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -151,10 +176,35 @@ impl WorkerCommand {
                     }
                 }
             }
+            Self::Rebind(args) => {
+                repository_url(&args.from)?;
+                repository_url(&args.to)?;
+                valid_base(&args.base)?;
+                match rebind(Path::new(ROOT), &args) {
+                    Ok(outcome) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "outcome": outcome}))
+                    }
+                    Err(error) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
+                    }
+                }
+            }
             Self::Credential { operation } => credential(&operation)?,
         }
         Ok(())
     }
+}
+
+/// The credential helper's own diagnostics (`credential`), the only text from
+/// Git's stderr that is ever surfaced (#14433).
+const HELPER_CAUSES: [&str; 2] = [
+    "forge authentication helper failed",
+    "forge authentication unavailable",
+];
+
+fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(stderr);
+    HELPER_CAUSES.into_iter().find(|cause| text.contains(cause))
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String> {
@@ -175,8 +225,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     if !result.status.success() {
         // Neither URLs nor Git's stderr are emitted: a configured helper may
         // include a secret in its own diagnostic. Preserve the clone in place.
+        // The one exception is a fixed allowlist of this binary's own helper
+        // messages (never Git's text), so a failed push names its cause.
+        let cause = helper_cause(&result.stderr)
+            .map(|cause| format!(", cause: {cause}"))
+            .unwrap_or_default();
         bail!(
-            "workspace Git {} failed ({}); work is retained for recovery",
+            "workspace Git {} failed ({}{cause}); work is retained for recovery",
             args.first().unwrap_or(&"operation"),
             result.status
         );
@@ -605,6 +660,217 @@ pub(super) fn recover(root: &Path, args: &RecoverArgs) -> Result<RecoverOutcome>
     Ok(outcome)
 }
 
+fn clone_state(path: &Path) -> Result<CloneState> {
+    if !path.join(".git").is_dir() {
+        return Ok(CloneState {
+            path: path.to_string_lossy().into_owned(),
+            ..CloneState::default()
+        });
+    }
+    Ok(CloneState {
+        path: path.to_string_lossy().into_owned(),
+        populated: true,
+        branches: unpublished_branches(path)?,
+        dirty: is_dirty(path)?,
+        detached: stranded_heads(path)?.len(),
+    })
+}
+
+fn is_dirty(path: &Path) -> Result<bool> {
+    Ok(!git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty())
+}
+
+/// The local work a move must leave exactly as it found it: every branch tip,
+/// the checked-out revision and the uncommitted files. Unlike [`CloneState`]
+/// this holds nothing derived from remote-tracking refs, so a branch published
+/// (or a remote ref pruned) while the move runs cannot change it.
+#[derive(Debug, PartialEq)]
+struct LocalWork {
+    tips: String,
+    head: String,
+    dirty: bool,
+}
+
+fn local_work(path: &Path) -> Result<LocalWork> {
+    Ok(LocalWork {
+        tips: git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                "refs/heads",
+            ],
+        )?,
+        // An unborn HEAD has no revision to compare: both sides read empty.
+        head: git(path, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        dirty: is_dirty(path)?,
+    })
+}
+
+fn read_identity(record: &Path, account: &str) -> Result<Option<Identity>> {
+    if !record.exists() {
+        return Ok(None);
+    }
+    let identity: Identity = serde_json::from_slice(&std::fs::read(record)?)?;
+    if identity.protocol != PROTOCOL || identity.account != account {
+        bail!("private clone identity mismatch; do not reset or remove unknown work");
+    }
+    Ok(Some(identity))
+}
+
+/// A clone location must be absent or a real clone: anything else is not ours.
+fn require_clone_or_absent(path: &Path) -> Result<()> {
+    if path.symlink_metadata().is_ok() && !path.join(".git").is_dir() {
+        bail!("unrecognized directory at {}; retain it for recovery", path.display());
+    }
+    Ok(())
+}
+
+/// The canonical repository must be the transferred one: its base branch
+/// shares history with the clone's own `origin/<base>`. Reads the remote into
+/// `FETCH_HEAD` only; no ref or branch of the clone moves.
+fn verify_canonical(repo: &Path, to: &str, base: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{base}^{{commit}}"),
+        ],
+    )
+    .context("the clone has no origin/<base> to compare the canonical repository with")?;
+    git(repo, &["fetch", "--no-tags", "--", to, base])
+        .context("cannot read the base branch of the canonical repository")?;
+    git(
+        repo,
+        &[
+            "merge-base",
+            &format!("refs/remotes/origin/{base}"),
+            "FETCH_HEAD",
+        ],
+    )
+    .context(
+        "wrong repository: the canonical URL's base branch shares no history with this clone",
+    )?;
+    Ok(())
+}
+
+/// Move an additional clone to the slug of its canonical (post-transfer)
+/// repository and re-point it (#14357). Nothing is deleted: the directory is
+/// renamed on the same volume, the identity record is rewritten, and `origin`
+/// is set. Both locations populated is reported and left intact. Every step is
+/// ordered so an interrupted run is finished by repeating it.
+pub(super) fn rebind(root: &Path, args: &RebindArgs) -> Result<RebindOutcome> {
+    for slug in [&args.from_slug, &args.to_slug] {
+        if !safe_segment(slug) || slug.contains("..") {
+            bail!("additional repository directory name is unsafe");
+        }
+    }
+    if args.from_slug == args.to_slug {
+        bail!("old and canonical repositories share one directory; this is not a transfer");
+    }
+    let root = root.canonicalize()?;
+    read_identity(&root.join("identity.json"), &args.account)?
+        .context("the account's primary workspace is not prepared; start the session first")?;
+    let work = root.join("work");
+    let identities = work.join(".identity");
+    let (old, new) = (work.join(&args.from_slug), work.join(&args.to_slug));
+    let old_record = identities.join(format!("{}.json", args.from_slug));
+    let new_record = identities.join(format!("{}.json", args.to_slug));
+    require_clone_or_absent(&old)?;
+    require_clone_or_absent(&new)?;
+    let (old_pop, new_pop) = (old.join(".git").is_dir(), new.join(".git").is_dir());
+    let outcome = |status, from: CloneState, to: CloneState| Ok(RebindOutcome { status, from, to });
+    if !old_pop && !new_pop {
+        return outcome(RebindStatus::NotCloned, clone_state(&old)?, clone_state(&new)?);
+    }
+    if old_pop && new_pop {
+        return outcome(RebindStatus::BothPopulated, clone_state(&old)?, clone_state(&new)?);
+    }
+    let repo = if old_pop { &old } else { &new };
+    if repo.canonicalize()? != *repo || !repo.join(".git").canonicalize()?.starts_with(repo) {
+        bail!("workspace clone must be a real directory without symlinks");
+    }
+    let before = clone_state(repo)?;
+    let local_before = local_work(repo)?;
+    // A linked worktree records absolute paths into the old location.
+    if worktrees(repo)?.len() > 1 {
+        bail!(
+            "the clone has linked worktrees whose paths a move would break; \
+             finish or remove them first (nothing was changed)"
+        );
+    }
+    let origin = git(repo, &["remote", "get-url", "origin"])?;
+    let origin = origin.trim();
+    // A leftover record at the canonical slug from an earlier preparation that
+    // never cloned must not shadow the record of the clone that exists.
+    let record = if old_pop {
+        read_identity(&old_record, &args.account)?
+    } else {
+        match read_identity(&new_record, &args.account)? {
+            Some(found) => Some(found),
+            None => read_identity(&old_record, &args.account)?,
+        }
+    };
+    let record = record.context("the clone has no identity record; retain it for recovery")?;
+    let known = |url: &str| same_repository(url, &args.from) || same_repository(url, &args.to);
+    if !known(&record.repository) || !known(origin) {
+        bail!("private clone identity mismatch; do not reset or remove unknown work");
+    }
+    let settled =
+        !old_pop && record.repository == args.to && origin == args.to && !old_record.exists();
+    if !settled {
+        verify_canonical(repo, &args.to, &args.base)?;
+    }
+    if args.dry_run {
+        let status = if settled {
+            RebindStatus::AlreadyBound
+        } else {
+            RebindStatus::DryRun
+        };
+        let (from, to) = if old_pop {
+            (before, clone_state(&new)?)
+        } else {
+            (clone_state(&old)?, before)
+        };
+        return outcome(status, from, to);
+    }
+    if old_pop {
+        std::fs::rename(&old, &new)?;
+    }
+    // Record before origin before retiring the old record: each step is
+    // idempotent, and a crash leaves the clone at its new directory with a
+    // record or origin the repeat recognizes (either spelling) and finishes.
+    let mut identity = record;
+    identity.repository.clone_from(&args.to);
+    save(&new_record, &identity)?;
+    git(&new, &["remote", "set-url", "origin", &args.to])?;
+    if old_record.exists() {
+        std::fs::remove_file(&old_record)?;
+    }
+    git(&new, &["fetch", "--prune", "origin"])?;
+    // Verify what the move could have lost (branch tips, HEAD, dirty files),
+    // not the unpublished counts: `fetch --prune` moves the remote-tracking
+    // refs those are derived from, so an upstream publish or prune is not a
+    // bad move (the report below shows the post-fetch counts).
+    if local_work(&new)? != local_before {
+        bail!(
+            "the clone's branches or files changed during the move; inspect {} before retrying",
+            new.display()
+        );
+    }
+    let after = clone_state(&new)?;
+    outcome(
+        if old_pop {
+            RebindStatus::Moved
+        } else {
+            RebindStatus::AlreadyBound
+        },
+        if old_pop { before } else { clone_state(&old)? },
+        after,
+    )
+}
+
 /// Push `branch` to `origin` without ever forcing: a diverged remote refuses.
 fn publish(repo: &Path, branch: &str) -> Result<()> {
     git(
@@ -920,4 +1186,23 @@ fn private_metadata(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod helper_cause_tests {
+    use super::*;
+
+    /// #14433: only this binary's own helper diagnostics are surfaced from
+    /// Git's stderr; anything else (URLs, a secret a helper printed) is not.
+    #[test]
+    fn only_the_credential_helpers_own_diagnostics_name_a_push_cause() {
+        let stderr = b"Error: forge authentication helper failed\nfatal: could not read Username for 'https://github.com'\n";
+        assert_eq!(helper_cause(stderr), Some("forge authentication helper failed"));
+        let missing = b"Error: forge authentication unavailable; provide an external gh profile";
+        assert_eq!(helper_cause(missing), Some("forge authentication unavailable"));
+        assert_eq!(
+            helper_cause(b"fatal: unable to access 'https://x:ghs_SECRET@github.com/a/b/'"),
+            None
+        );
+    }
 }

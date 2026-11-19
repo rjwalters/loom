@@ -90,7 +90,7 @@ pub fn wait_class(disposition: QueueDisposition) -> Option<WaitClass> {
         | D::HardExclusion
         | D::Declined
         | D::HostConstraint
-        | D::PeerClaim
+        | D::LeaseHeld
         | D::OpenPr
         | D::OpenPrBackoff
         | D::AlreadyLanded

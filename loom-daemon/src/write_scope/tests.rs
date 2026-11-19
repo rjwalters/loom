@@ -907,6 +907,13 @@ fn daemon_write_paths_are_scoped() {
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),
+        (
+            "cli/forge_read.rs",
+            NotAWrite(
+                "the `verb()` diagnostic table names the `comment` verb as a string; \
+                 the file routes to handle_forge_command and makes no forge call",
+            ),
+        ),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
             "merge_group_ci/eligibility.rs",

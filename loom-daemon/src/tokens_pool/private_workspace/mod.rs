@@ -26,14 +26,16 @@ mod worker_setup;
 
 pub use lease::AccountBusy;
 pub use lifecycle::{
-    check_binding, configured, converge, recover, registered_repositories, run_job,
-    session_recover, start, status, stop, Converged,
+    check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
+    run_job, session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+use super::session_image::ExtraMount;
 
 pub const ROOT: &str = "/workspace";
 pub const REPO: &str = "/workspace/repo";
@@ -74,6 +76,18 @@ pub struct Config {
     pub volume: String,
     pub profile: PathBuf,
     pub gh_config: Option<PathBuf>,
+    /// The configured `accounts.session.image` the container was last created
+    /// from by an operator `start` (#14451). `None` for the stock image or an
+    /// explicit `--image`. Recorded so an unattended [`recover`] recreates a
+    /// missing container from — and re-verifies — the same pinned image, never
+    /// the stock one and never whatever the config names by then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_image: Option<String>,
+    /// The `accounts.session.extraMounts` resolved at the last operator `start`
+    /// (#14451): bound read-only, and the exact set `validate_settings` expects.
+    /// Absent in state written before it, which reads as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_mounts: Vec<ExtraMount>,
 }
 
 /// One additional repository of an account (registered, not necessarily cloned).
@@ -197,6 +211,12 @@ pub struct Status {
     pub private_root: &'static str,
     pub config: Config,
     pub container_id: Option<String>,
+    /// The image the session container was created from, as Docker reports it
+    /// (#14451); `None` while there is no container.
+    pub image: Option<String>,
+    /// The read-only extra mounts the session is validated against (#14451).
+    /// Also under `config.extra_mounts`; empty without the setting.
+    pub extra_mounts: Vec<ExtraMount>,
     pub running: bool,
     pub lease: Option<lease::Job>,
     /// Secret-free containment-admission provenance for the CURRENT job
@@ -287,6 +307,59 @@ pub struct RecoverOutcome {
 pub struct RecoverReport {
     pub account: String,
     pub clones: Vec<RecoverOutcome>,
+}
+
+/// What one clone looked like to a rebind (#14357): enough to prove a move
+/// kept every branch, dirty file and unpublished commit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CloneState {
+    pub path: String,
+    pub populated: bool,
+    pub branches: Vec<UnpublishedBranch>,
+    /// Uncommitted or untracked files in the main checkout.
+    pub dirty: bool,
+    /// Detached HEADs carrying unpublished commits.
+    pub detached: usize,
+}
+
+/// How a rebind ended. `BothPopulated` is a refusal: nothing was changed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebindStatus {
+    /// The old clone was moved to the canonical location and re-pointed.
+    Moved,
+    /// Already bound to the canonical repository; verified (and any
+    /// interrupted step finished) without moving anything.
+    AlreadyBound,
+    /// Neither location holds a clone yet: only the registration changed.
+    NotCloned,
+    /// `--dry-run`: the move was verified possible and not made.
+    DryRun,
+    /// Both locations hold a populated clone; both were left intact.
+    BothPopulated,
+}
+
+/// The in-volume half of a rebind, as `private-workspace rebind` reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindOutcome {
+    pub status: RebindStatus,
+    pub from: CloneState,
+    pub to: CloneState,
+}
+
+/// What `accounts session rebind` did.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindReport {
+    pub account: String,
+    pub from: String,
+    pub to: String,
+    pub base: String,
+    pub status: RebindStatus,
+    /// Whether `workspace.json` was (or, under `--dry-run`, would be) changed.
+    pub registration_changed: bool,
+    pub clone_path: String,
+    pub before: CloneState,
+    pub after: CloneState,
 }
 
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {
