@@ -7,22 +7,21 @@
 //! only thing this module adds is the answer to "is this verb served?". A verb
 //! that is not served is refused with [`EX_WRITE_VERB_NOT_MIGRATED`] before
 //! any handler runs, so no second implementation exists and no write can slip
-//! onto the tools path ahead of its own slice. Since #14519 every verb is
-//! served except the merge-queue writes, which stay in `loom-daemon` until
-//! their own slice (#14520) — so the refusal is now about *which* slice owns
-//! the verb, not about reads versus writes.
+//! onto the tools path ahead of its own slice. #14519 added the shared writes
+//! and #14520 added the remaining merge-queue verbs. The whole declared
+//! forge family is now served.
 //!
 //! [`ForgeAction::is_served`] is an exhaustive `match` with no wildcard:
 //! adding a verb to `ForgeAction` does not compile until its author has said
-//! whether the tools binary serves it. [`ForgeAction::reaches_forge`] is the
-//! same decision for the mode gate (§10.3), so a served verb that can reach
-//! the forge still resolves `mode` before it runs.
+//! whether the tools binary serves it. [`ForgeReadCli::reaches_forge`]
+//! determines which served invocations resolve `mode` before they run (§10.3).
 
 use anyhow::Result;
 use clap::Args;
 
 use super::forge_action::{handle_forge_command, ForgeAction};
 use super::forge_merge_queue_cmd::MergeQueueAction;
+use crate::forge_merge_queue::mode::{resolve_merge_mode, MergeModeError, ResolvedMergeMode};
 
 /// Exit status for a `forge` verb `loom-tools` does not serve (BSD
 /// `EX_USAGE`). Not `1`: `check-claim`, `check-open-pr` and friends use `1` as
@@ -50,10 +49,14 @@ impl ForgeReadCli {
 
     /// Whether the selected verb may reach the forge, and so must pass the
     /// mode gate (design §10.3) before it runs. `false` only for verbs that
-    /// touch nothing but stdin, argv, local git objects, a local lock
-    /// directory or a local journal.
+    /// stay local or reject an invalid merge mode before any forge call.
     #[must_use]
     pub fn reaches_forge(&self) -> bool {
+        // #14520: a merge-queue verb is classified by what it does in the
+        // resolved `champion.mergeMode`, not by its name.
+        if let ForgeAction::MergeQueue { action } = &self.action {
+            return action.0.reaches_forge(&current_merge_mode());
+        }
         !matches!(
             self.action,
             // Reads local git objects only (its own doc comment).
@@ -83,6 +86,15 @@ impl ForgeReadCli {
     }
 }
 
+/// `champion.mergeMode` for the current checkout, resolved exactly as
+/// `forge_merge_queue::Env::current` does (without detecting the forge).
+fn current_merge_mode() -> Result<ResolvedMergeMode, MergeModeError> {
+    let root = crate::repo_root::find_repo_root_from_cwd()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    resolve_merge_mode(&root)
+}
+
 /// Run the verb through the one shared handler. Refuses (exit
 /// [`EX_WRITE_VERB_NOT_MIGRATED`]) a verb the tools binary does not serve.
 ///
@@ -92,8 +104,7 @@ impl ForgeReadCli {
 pub fn handle_forge_read_command(cli: ForgeReadCli) -> Result<()> {
     if !cli.is_served() {
         eprintln!(
-            "loom-tools forge: `{}` is a merge-queue write and is not served by loom-tools yet \
-             (epic #12708 Phase 3b, #14520); use `loom-daemon forge {}`.",
+            "loom-tools forge: `{}` is not served by loom-tools; use `loom-daemon forge {}`.",
             cli.verb(),
             cli.verb()
         );
@@ -104,12 +115,9 @@ pub fn handle_forge_read_command(cli: ForgeReadCli) -> Result<()> {
 
 impl ForgeAction {
     /// `true` for a verb the tools binary serves, `false` for one still kept
-    /// in `loom-daemon`. Since #14519 the only unserved verbs are the
-    /// merge-queue writes, owned by the sibling slice #14520: everything else
-    /// — reads and the write verbs of #14395/#14464/#14519 — runs through the
-    /// one shared [`handle_forge_command`](super::forge_action::handle_forge_command),
-    /// whose `write_target` gate vets a write exactly as `loom-daemon forge`
-    /// does, and whose mode gate the binary resolves before any forge call.
+    /// in `loom-daemon`. All currently declared verbs run through the shared
+    /// [`handle_forge_command`](super::forge_action::handle_forge_command).
+    /// A verb that can reach the forge also passes the binary's mode gate.
     ///
     /// The `issue` and `pr` passthroughs exec the person's own `gh`;
     /// [`handle_forge_command`] vets a write op (`pr merge`, `issue
@@ -154,9 +162,8 @@ impl ForgeAction {
             // Writes served since #14519: the comment chokepoint, REST issue
             // filing, CI rerun, the auto-merge compat verbs, the verdict
             // labels/reconcile/lock family, the Doctor's handback and the
-            // parent sub-issue link. All run the shared handler's `write_target`
-            // gate (or, for `verdict-lock` and `journal-ci-refusal`, touch only
-            // local state — see [`Self::reaches_forge`]).
+            // parent sub-issue link. The shared handler retains each scope
+            // check. Verdict locks and the CI-refusal journal stay local.
             | Self::Comment { .. }
             | Self::CreateIssue(_)
             | Self::Parent { .. }
@@ -165,14 +172,23 @@ impl ForgeAction {
             | Self::DoctorHandback { .. }
             | Self::VerdictReconcile { .. }
             | Self::VerdictLock { .. } => true,
-            // The merge-queue reads only; its writes stay in `loom-daemon`
-            // for #14520.
-            Self::MergeQueue { action } => matches!(
-                action.0,
+            // #14520: every queue verb. The mutating ones keep their own
+            // vetting: `write_target` (enqueue, dequeue, handoff, revoke) and
+            // the in-handler `may_write_from` (reconcile's queue branch,
+            // group-check; `step` runs reconcile first) run on this path too.
+            Self::MergeQueue { action } => match action.0 {
                 MergeQueueAction::Mode
-                    | MergeQueueAction::Preflight { .. }
-                    | MergeQueueAction::Status { .. }
-            ),
+                | MergeQueueAction::Preflight { .. }
+                | MergeQueueAction::Status { .. }
+                | MergeQueueAction::Enqueue { .. }
+                | MergeQueueAction::Dequeue { .. }
+                | MergeQueueAction::Reconcile { .. }
+                | MergeQueueAction::Handoff { .. }
+                | MergeQueueAction::Step { .. }
+                | MergeQueueAction::Revoke { .. }
+                | MergeQueueAction::GroupCheck { .. }
+                | MergeQueueAction::AuthorizeCheck { .. } => true,
+            },
         }
     }
 

@@ -16,6 +16,79 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **Issue #14607** (closed): Main CI red: Guide Approved provenance query includes frozen PRs
+- **PR #14609**: fix(guide): exclude frozen PRs from plan provenance
+- **Issue #14602** (closed): daemon-reference: self-heal now prunes loom-rescue stash entries, not just rescue refs
+- **PR #14604**: docs: rescue-stash pruning shares the rescue-ref retention window
+- **Issue #14564** (closed): Codex pool: an account at its weekly limit is retried with real steps every ~20–30 min; the provider's stated reset (6 days out) is not used
+- **PR #14579**: fix: parse Codex reset horizons with ordinal day and abbreviated month
+- **Issue #14456** (closed): Confirm loom.runtime.usage rows for step-dispatched work roles in SigNoz after #14423 rolls
+- **Issue #13977** (closed): self-heal's loom-rescue-* stashes accumulate forever, and #13970 adds a recurring generator
+- **PR #14042**: fix: prune expired loom-rescue stash entries in the self-heal sweep
+- **Issue #14571** (closed): Fix forge wait-checks reporting RED after a skipped workflow run hides a successful replacement
+- **PR #14598**: fix: resolve CI replacement runs per job name in wait-checks
+- **Issue #14575** (closed): Guide rejects approved PR closing references when verifying WORK_PLAN titles
+- **PR #14587**: fix(guide): verify Approved rows against forge closing references
+- **PR #14591**: Split work-finder pre-span time into reclaim and CPU-fallback phases
+- **Issue #14577** (closed): Test the dispatch-only and force requirements for minor version bumps
+- **PR #14595**: test: pin dispatch-only and force requirements for minor version bumps
+- **Issue #14582** (closed): w1 forge-calls test fails under the forge_calls filter batch but passes solo (test isolation)
+- **PR #14592**: test: isolate forge call accounting from the ambient repo
+- **Issue #14559** (closed): A missed writer route hold is invisible: writer_holds_snapshot has no caller and route_key can disagree with the claim's attribution
+- **PR #14581**: feat: report armed writer route holds in status; log armed-but-not-found holds
+- **PR #14590**: fix(observability): refresh quiet dispatch rows from source time
+- **PR #14573**: feat: bundle zai-full, the full-strength GLM-5.3 profile
+- **Issue #14540** (closed): Telemetry: Codex steps in private-clone seats will never get loom.runtime.usage rows (session filter requires the host workspace path; the rollout's cwd is the container path)
+- **PR #14555**: fix: attribute Codex step usage by exact session id, not host directory
+- **PR #14568**: fix: raise the installed Loom compatibility floor to 0.19.175
+- **PR #14499**: feat: register and start per-seat Claude session containers
+- **PR #14563**: ci: add level: minor to the forced bump dispatch (for v0.20.0)
+- **Issue #14561** (closed): spawn-codex.sh's APPLIED_EFFORT reports an effort codex was never handed when an inline --config= value contains model_reasoning_effort=
+- **PR #14567**: fix: recognize Codex effort overrides only at the start of inline config
+- **PR #14562**: feat: record work-finder tick phase timings
+- **Issue #14414** (closed): adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort=
+- **PR #14468**: fix: report an explicit codex model_reasoning_effort config as the launched effort
+- **Issue #14557** (closed): Fix the WORK_PLAN stamp regression suite on macOS
+- **PR #14558**: test: use the shipped Guide splice in the plan stamp fixture
+- **Issue #13746** (closed): Writer rate limit is misreported: lease claim says 'could not read lease records', and the finder keeps drawing steps it must refuse
+- **PR #14551**: fix: classify writer rate-limit refusals in lease pr claim and hold the route until reset
+- **Issue #14369** (closed): [ci-daily] Session and Private-Workspace Docker Fixtures (unfiltered)
+- **Issue #14092** (closed): [ci-daily] Full Suite (clean, unpartitioned)
+- **Issue #14484** (closed): capability_list_matches_the_clap_tree only validates top-level heads, not subcommand names
+- **PR #14509**: test(tools): check advertised capability verb paths
+- **Issue #14541** (closed): loom_tools_slice: one allowed-target daemon re-run bypasses the shim cache isolation and leaks a host-global write-scope verdict
+- **PR #14552**: test: compare park-apply stdout from the isolated runs, drop unisolated daemon re-run
+- **Issue #14318** (closed): Private-job record: choose how a merged one-shot sweep's recovery-required stamp should be read
+- **Issue #14520** (closed): loom-tools: serve the remaining merge-queue actions
+- **PR #14528**: feat: serve every merge-queue verb from loom-tools
+- **PR #14550**: fix: prevent fleet park and decision writes from using local gh
+- **Issue #14507** (closed): Classify pr-worktree.sh under both forge operations and retire its bypass
+- **PR #14549**: chore: classify PR worktree reads and checkouts in the forge inventory
+- **Issue #14523** (closed): config_dir_for candidate 1 returns a registered GH_CONFIG_DIR without checking it still exists
+- **PR #14527**: fix: skip registered GitHub config directories missing hosts.yml
+- **Issue #14488** (closed): Run the attended issue lease publisher, renewer and fence with loom-tools
+- **PR #14515**: feat: serve the issue lease verbs from loom-tools
+- **Issue #14485** (closed): Docs: the renamed QueueDisposition token is still documented as `peer_claim` (post-#13945)
+- **PR #14543**: docs: update the retired peer-claim vocabulary
+- **Issue #14538** (closed): Tidy three leftovers from the loom-tools top-level-reads slice (#14429)
+- **PR #14544**: refactor: drop dead loom-tools leftovers and fold is_read into the main impl
+- **PR #14537**: test: cover the tools fleet-mode no-route arms in route_read and host_has_read_pool
+- **Issue #14529** (closed): Cover the tools fleet-mode no-route arm in route_read and host_has_read_pool (#14489 follow-up)
+- **PR #14536**: test: pin the loom-tools park/decision write ordering, routing and nested filing
+- **PR #14494**: feat: serve the checkout-local claim commands from loom-tools
+- **Issue #14487** (closed): Expose checkout-local claim commands through loom-tools
+- **PR #14472**: feat: step a legacy issue sweep down a rung when its child dies on a model limit
+- **Issue #14443** (closed): Model-limit kill on the legacy issue-sweep path does not step down a rung
+- **Issue #12167** (closed): telemetry: export peer_coordination verdict and degraded duration on host.health
+- **Issue #14429** (closed): loom-tools Phase 3a follow-up: top-level reads and config inspection — epic #12708
+- **PR #14524**: feat: serve the top-level reads and config inspection from loom-tools
+- **Issue #13945** (closed): Delete the safehouse peer-claim channel and claims room (#13920 part 1)
+- **PR #14479**: refactor: delete the safehouse peer-claim channel and claims room
+- **PR #14469**: fix: refuse recover --publish before exec when no GitHub write credential resolves
+- **Issue #14162** (closed): Guide skips Step 4b (pool-pressure check) and reports a tool-policy denial, although the role file routes around that denial
+- **PR #14533**: fix(guide): treat a non-reading pool-pressure read as unavailable and defer
+- **Issue #14481** (closed): Codex read-only steps are sent to a busy seat and refused after the claim (exit 78) while other seats are idle
+- **PR #14492**: fix: reserve private Codex seats before read-only claims
 - **PR #14526**: feat(loom-tools): serve role-keyed PR leases
 - **PR #14522**: test: cover the SigNoz per-run usage query
 - **PR #14502**: test: assert a denied target gets reads but no writes on every online park/decision form

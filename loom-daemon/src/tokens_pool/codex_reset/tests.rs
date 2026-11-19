@@ -111,6 +111,95 @@ fn unrecognised_horizon_shapes_yield_nothing() {
     );
 }
 
+/// The verbatim refusal observed on loom-worker-1/-2 (issue #14564): an
+/// abbreviated month and an ordinal day. Before the fix this parsed to `None`
+/// and the caller fell back to the blind 5h cooldown.
+const OBSERVED_ORDINAL_REFUSAL: &str = "ERROR: You've hit your usage limit. Visit \
+     https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Nov 25th, \
+     2026 7:44 AM.";
+
+/// Issue #14564: abbreviated month + ordinal day suffix is the same horizon as
+/// the long form, read as host-local.
+#[test]
+fn abbreviated_month_with_ordinal_day_parses() {
+    assert_eq!(usage_limit_reset_in(OBSERVED_ORDINAL_REFUSAL), Some(local(2026, 11, 25, 7, 44)),);
+}
+
+/// Every ordinal suffix the English day-of-month takes, with and without the
+/// trailing period, and with both month spellings.
+#[test]
+fn every_ordinal_suffix_parses() {
+    for (horizon, expected) in [
+        ("Jan 1st, 2027 8:05 AM.", local(2027, 1, 1, 8, 5)),
+        ("Feb 2nd, 2027 8:05 AM", local(2027, 2, 2, 8, 5)),
+        ("March 3rd, 2027 8:05 PM.", local(2027, 3, 3, 20, 5)),
+        ("Apr 4th, 2027 8:05 AM.", local(2027, 4, 4, 8, 5)),
+        ("May 21st, 2027 8:05 AM.", local(2027, 5, 21, 8, 5)),
+        ("Jun 22nd, 2027 8:05 AM.", local(2027, 6, 22, 8, 5)),
+        ("Jul 23rd, 2027 8:05 AM.", local(2027, 7, 23, 8, 5)),
+        ("September 25th, 2026 3:00 PM.", local(2026, 9, 25, 15, 0)),
+    ] {
+        assert_eq!(
+            usage_limit_reset_in(&refusal_with(horizon)),
+            Some(expected),
+            "horizon {horizon:?} should parse"
+        );
+    }
+}
+
+/// The long, unsuffixed form the original capture uses is unaffected.
+#[test]
+fn long_form_without_ordinal_still_parses() {
+    assert_eq!(
+        usage_limit_reset_in(&refusal_with("September 25, 2026 3:00 PM.")),
+        Some(local(2026, 9, 25, 15, 0)),
+    );
+    assert_eq!(
+        usage_limit_reset_in(&refusal_with("Nov 25, 2026 7:44 AM.")),
+        Some(local(2026, 11, 25, 7, 44)),
+    );
+}
+
+/// An ordinal suffix is only accepted on a numeric day. Anything else stays a
+/// shape this parser refuses rather than guesses at.
+#[test]
+fn malformed_ordinals_yield_nothing() {
+    for horizon in [
+        "Nov 25xx, 2026 7:44 AM.",  // not an ordinal suffix
+        "Nov th, 2026 7:44 AM.",    // suffix with no day
+        "Nov 25th 2026 7:44 AM.",   // missing the comma after the day
+        "Sept 25th, 2026 7:44 AM.", // four-letter month abbreviation
+    ] {
+        assert_eq!(
+            usage_limit_reset_in(&refusal_with(horizon)),
+            None,
+            "horizon {horizon:?} must not be guessed at"
+        );
+    }
+}
+
+/// Canned full transcript for #14564: the CLI's refusal line followed by the
+/// adapter's `LOOM_TERMINAL_RESULT` record, scoped by its dispatch anchor.
+/// `exhaustion_reset_horizon` must yield the provider's epoch, not `None`.
+#[test]
+fn full_observed_transcript_yields_the_provider_horizon() {
+    let transcript = format!(
+        "sweep_id=current\n{OBSERVED_ORDINAL_REFUSAL}\n# LOOM_TERMINAL_RESULT v=2 provider=codex \
+         account=agent-3 category=TOKEN_EXHAUSTED exit_code=1 model=gpt-6.2-astra\n"
+    );
+    let expected = Some(
+        u64::try_from(local(2026, 11, 25, 7, 44).timestamp()).expect("a 2026 instant is positive"),
+    );
+    assert_eq!(
+        exhaustion_reset_horizon(
+            &transcript,
+            "sweep_id=current",
+            TerminalClassification::TokenExhausted,
+        ),
+        expected,
+    );
+}
+
 /// The horizon is only ever read out of the refusal family itself. A line that
 /// says "try again at <date>" for any other reason is not a usage limit.
 #[test]

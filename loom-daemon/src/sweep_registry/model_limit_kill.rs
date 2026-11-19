@@ -49,6 +49,12 @@ use crate::tokens_pool::bad_tokens::model_class_of;
 /// `no-account-for-class`.
 pub(crate) const REASON_MODEL_LIMIT_KILL: &str = "model-limit-kill";
 
+/// The memo's `role` for a legacy `SweepKind::Issue` sweep (#14443). One
+/// process runs the whole lifecycle, so there is no per-role key: the sweep is
+/// one pseudo-role, distinct from every [`StepRole`](crate::step_role::StepRole)
+/// name so a step and a sweep on the same item never share a memo.
+pub(crate) const ISSUE_SWEEP_ROLE: &str = "issue-sweep";
+
 /// How long a kill's step-down stays pending. Past it the redraw launches the
 /// configured model again: per-model limits are windows, not permanent.
 const MEMO_TTL: Duration = Duration::from_secs(3600);
@@ -178,6 +184,16 @@ pub(crate) fn observe_step_end(
     );
     lock().insert(key(root, item, role), (class.to_string(), Instant::now()));
     true
+}
+
+/// Whether a step-down is pending (and unexpired) for `(item, role)`. Read-only
+/// and ignores the config, so it only answers "was this pair killed lately";
+/// [`step_down`] decides what the launch becomes. The issue-sweep resume
+/// re-dispatch names no model (#14443), so it asks this before resolving one.
+pub(crate) fn step_down_pending(root: &Path, item: u32, role: &str) -> bool {
+    lock()
+        .get(&key(root, item, role))
+        .is_some_and(|(_, at)| at.elapsed() < MEMO_TTL)
 }
 
 /// The launch the memo asks for: given the model a launch would run

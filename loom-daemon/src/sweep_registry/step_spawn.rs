@@ -35,10 +35,6 @@
 //!   sweep, the step being metadata (#11950), so it re-attaches to the
 //!   pre-taken lease instead of standing down.
 //!
-//! The `(item, step)` claim is advertised to peers at spawn ([`lease`]), not
-//! only on the reaper's heartbeat, so two hosts cannot draw the same item in
-//! between.
-//!
 //! # Landed work (#12251)
 //!
 //! Before a Builder step claims an issue, the forge is asked once whether
@@ -161,6 +157,11 @@ pub struct StepRefusal {
     /// Seconds the captain says its hold lasts (`retry_after_s`), for a
     /// `captain_cooldown` refusal that carried one (#12704).
     pub hold_secs: Option<u32>,
+    /// The confirmed writer rate limit behind a `writer_rate_limited`
+    /// refusal (#13746): the typed handoff the claim child emitted, with the
+    /// facts the spawn records as a route hold. `None` for every other
+    /// refusal.
+    pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
     seat_unavailable: bool,
 }
 
@@ -173,6 +174,7 @@ impl StepRefusal {
             assignment_id: None,
             captain: None,
             hold_secs: None,
+            writer_limit: None,
             seat_unavailable: false,
         }
     }
@@ -403,8 +405,6 @@ impl SweepRegistry {
             self.acquire_lock(item, &sweep_id)
         };
         locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
-        // Advertise at spawn, before any forge write (#11906 review item 4).
-        self.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
         let claim = match self.pre_claim_step(item, role, &sweep_id) {
             Ok(claim) => claim,
             Err(refusal) => {
@@ -639,10 +639,9 @@ impl SweepRegistry {
         Err(self.roll_back_builder_claim(item, sweep_id, wrote, &loss, episode_start, refusal))
     }
 
-    /// Undo a step's claim: the peer advertisement, the forge claim when one
-    /// was taken (`claimed`), and the lock.
+    /// Undo a step's claim: the forge claim when one was taken (`claimed`), and
+    /// the lock.
     fn unwind_step_claim(&mut self, item: u32, role: StepRole, sweep_id: &str, claimed: bool) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if claimed && !self.config.skip_label_flip {
             match role {
                 StepRole::Builder => {

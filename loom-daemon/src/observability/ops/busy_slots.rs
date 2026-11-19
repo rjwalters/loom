@@ -136,6 +136,10 @@ pub type StepStarts = BTreeMap<&'static str, Vec<DateTime<Utc>>>;
 
 static REPORTING_PROCESS_ID: OnceLock<Uuid> = OnceLock::new();
 
+pub(crate) fn reporting_process_id() -> Uuid {
+    *REPORTING_PROCESS_ID.get_or_init(Uuid::new_v4)
+}
+
 /// The step points for live steps by role name, including explicit zeros.
 /// The process identity comes from the observer at capture.
 #[must_use]
@@ -371,8 +375,7 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     let mut points = busy_points(report.occupancy, roles);
     if let Some(live) = published_steps() {
         let steps = step_starts(&live);
-        let process_id = *REPORTING_PROCESS_ID.get_or_init(Uuid::new_v4);
-        points.extend(step_points(&steps, process_id));
+        points.extend(step_points(&steps, reporting_process_id()));
         points.extend(age_points(Utc::now(), &steps));
         points.extend(size_points(&live));
     }
