@@ -327,7 +327,7 @@ pub(super) fn host_id() -> String {
 /// `owner/name` of `root`, without a forge call.
 fn repo_of(root: &Path) -> String {
     crate::observability::ops::dispatch_facts::repo_for_root(root)
-        .unwrap_or_else(|| crate::peer_claims::repo_slug(root))
+        .unwrap_or_else(|| crate::host_identity::repo_slug(root))
 }
 
 /// A claim answer, typed.

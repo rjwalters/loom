@@ -20,7 +20,7 @@ use super::*;
 /// managed registration naming the image-owned bridge, Loom's receipt pinning
 /// it, and a `config.toml` carrying `trusted` hashes plus the receipt's
 /// install-time `baseline`.
-fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
+pub(super) fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
     let profile = dir.join("profile");
     std::fs::create_dir_all(&profile).unwrap();
     let command = bundle::registration();

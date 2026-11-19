@@ -135,21 +135,6 @@ pub enum Commands {
     /// sections, and the daemon builds only what they need.
     Status(super::status::sections::StatusArgs),
 
-    /// Show the peer-claim view: which issues this host currently sees a
-    /// peer host claiming, by which host and with what remaining TTL, plus
-    /// the four transport counters (advertised / received / expired /
-    /// dispatch-skipped) that make the re-advertisement heartbeat and the
-    /// #5789 duplicate-dispatch backoff observable instead of a `debug!`-only
-    /// log line (Issue #5921). A thin standalone view of the same data
-    /// `loom-daemon status` renders in its "Peer claims" section — useful for
-    /// a fleet script comparing two hosts' views directly (`ssh host-a
-    /// loom-daemon peer-claims --json` vs `ssh host-b …`).
-    PeerClaims {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Show the work finder's ready queue in its real dispatch order
     /// (verified red-main fixes first, then priority level, oldest first —
     /// #11103, #11547) with what the last
@@ -2458,10 +2443,10 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
+        Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
+            unreachable!("Queue is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }
