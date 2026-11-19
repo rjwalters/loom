@@ -430,7 +430,7 @@ pub(crate) struct StepCapture {
 pub(crate) fn emit_step_capture(capture: &StepCapture) {
     crate::observability::pick_journal::adopt(
         &capture.root,
-        crate::observability::pick_journal::step_path(&capture.sweep_id),
+        crate::observability::pick_journal::step_path(&capture.root, &capture.sweep_id),
     );
     crate::role_tick_telemetry::emit_for_step(
         &capture.root,

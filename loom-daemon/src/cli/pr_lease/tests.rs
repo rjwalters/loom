@@ -1026,6 +1026,207 @@ fn a_reaped_champion_records_no_outcome() {
     assert!(patched.contains(&dead.released_marker_with(" outcome=none")), "{patched}");
 }
 
+#[test]
+fn adjacent_workspaces_with_the_same_step_id_drain_only_their_own_journal() {
+    use crate::observability::pick_journal::{adopt, set_test_journal, step_path, take};
+    use crate::observability::step_verdict::{
+        self, refusals::RefusalStore, Context, Source, StepSource,
+    };
+
+    let writer = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let journals = TempDir::new().unwrap();
+    let sweep = "step-champion_merge-77-1795104600";
+    let path_for = |root: &Path| {
+        journals
+            .path()
+            .join(step_path(root, sweep).file_name().unwrap())
+    };
+    let writer_path = path_for(writer.path());
+    let other_path = path_for(other.path());
+
+    fake_gh(writer.path());
+    let owner = Identity::new(Role::Champion, "host-a1b2c3d4".into(), sweep.into(), None).unwrap();
+    fs::write(writer.path().join("rows"), live_row(100, &owner)).unwrap();
+    set_test_journal(Some(writer_path.clone()));
+    let result =
+        ctx(writer.path(), owner.clone()).release(None, Some("skipped"), Some("guard_refused"));
+    set_test_journal(None);
+    assert_eq!(result, EXIT_HELD);
+    let rows = fs::read_to_string(writer.path().join("rows")).unwrap();
+    assert!(
+        rows.contains(RELEASED_PREFIX) && rows.contains("outcome=skipped reason=guard_refused")
+    );
+    assert!(writer_path.is_file());
+
+    // A release from the other checkout can succeed without writing to the
+    // journal it inherited from the first checkout.
+    fake_gh(other.path());
+    fs::write(other.path().join("rows"), live_row(101, &owner)).unwrap();
+    let mut foreign = ctx(other.path(), owner);
+    foreign.gh.write_repo = Ok("acme/other".to_string());
+    let owned_entries = fs::read(&writer_path).unwrap();
+    set_test_journal(Some(writer_path.clone()));
+    let result = foreign.release(None, Some("skipped"), Some("facts_unread"));
+    set_test_journal(None);
+    assert_eq!(result, EXIT_HELD);
+    let rows = fs::read_to_string(other.path().join("rows")).unwrap();
+    assert!(rows.contains(RELEASED_PREFIX) && rows.contains("outcome=skipped reason=facts_unread"));
+    assert_eq!(fs::read(&writer_path).unwrap(), owned_entries);
+
+    let legacy_path = journals.path().join(format!("step-{sweep}.jsonl"));
+    fs::write(&legacy_path, &owned_entries).unwrap();
+
+    let step = Source::Step(StepSource {
+        sweep_id: sweep.to_string(),
+        step: StepRole::ChampionMerge,
+        item: 77,
+        log_text: None,
+        hold_auth_before: None,
+    });
+    let reason = |root: &Path, path, repo| {
+        adopt(root, path);
+        let journal = take(root).unwrap();
+        let cx = Context {
+            role: "champion",
+            repo,
+            host: "host-a1b2c3d4",
+            now: Utc::now(),
+        };
+        step_verdict::records_for(&cx, &step, Some(&journal), &mut RefusalStore::default())
+            .into_iter()
+            .next()
+            .unwrap()
+            .reason
+    };
+    assert_eq!(reason(other.path(), other_path, "acme/other").as_deref(), Some("unclassified"));
+    assert!(writer_path.is_file(), "the other workspace consumed the writer's journal");
+    assert_eq!(
+        reason(writer.path(), writer_path.clone(), "acme/widgets").as_deref(),
+        Some("guard_refused")
+    );
+    assert!(!writer_path.exists());
+    assert_eq!(fs::read(legacy_path).unwrap(), owned_entries);
+}
+
+/// #14639: the step's own successful release journals its typed outcome —
+/// the trusted fallback evidence the step's projection reads when its log
+/// has no `CHAMPION-STEP` line. A reap (not the step's own word) and a
+/// failed patch journal nothing, and neither does a release that records
+/// no typed outcome (another role, a merge).
+#[test]
+fn a_successful_release_journals_its_typed_outcome_and_a_reap_does_not() {
+    use crate::observability::pick_journal::{parse, set_test_journal, step_path, JournalEntry};
+    use StepRole::{ChampionMerge, ChampionPromote};
+
+    const SWEEP: &str = "step-champion_merge-77-1";
+    let journal_for = |dir: &Path| dir.join(step_path(dir, SWEEP).file_name().unwrap());
+    let journal_after =
+        |dir: &Path, holder: &Identity, run: &dyn Fn(Ctx) -> i32| -> Vec<JournalEntry> {
+            let journal = journal_for(dir);
+            set_test_journal(Some(journal.clone()));
+            let code = run(ctx(dir, holder.clone()));
+            set_test_journal(None);
+            assert_eq!(code, EXIT_HELD);
+            parse(&fs::read_to_string(journal).unwrap_or_default())
+        };
+    let stage = |rows_holder: &Identity| -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        fs::write(dir.path().join("rows"), live_row(100, rows_holder)).unwrap();
+        dir
+    };
+    let typed = |entries: &[JournalEntry]| -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                JournalEntry::Released {
+                    outcome, reason, ..
+                } => Some((outcome.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // The typed release journals its outcome and its gate.
+    let me = Identity::new(Role::Champion, "host-a1b2c3d4".into(), SWEEP.into(), None).unwrap();
+    let entries = journal_after(stage(&me).path(), &me, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![("skipped".into(), Some("guard_refused".into()))]);
+
+    // No outcome passed: the release records `none`, and journals that.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, None, None));
+    assert_eq!(typed(&entries), vec![("none".into(), None)]);
+
+    // A merge records no typed outcome, so it journals nothing.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, Some("merged"), None));
+    assert_eq!(typed(&entries), vec![]);
+
+    // A Judge release journals nothing (its record is the backstop's, not a
+    // typed outcome).
+    let judge = who(Role::Judge, "sweep-j");
+    let entries = journal_after(stage(&judge).path(), &judge, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![]);
+
+    // The lease still releases when its sweep, item or step does not belong
+    // to this merge journal. Only the telemetry attribution is withheld.
+    for (sweep, holder_step, caller_step) in [
+        ("step-champion_merge-77-2", Some(ChampionMerge), ChampionMerge),
+        (SWEEP, Some(ChampionPromote), ChampionMerge),
+        (SWEEP, Some(ChampionMerge), ChampionPromote),
+        (SWEEP, None, ChampionMerge),
+    ] {
+        let holder = Identity {
+            sweep: sweep.into(),
+            step: holder_step,
+            ..me.clone()
+        };
+        let caller = Identity {
+            step: Some(caller_step),
+            ..holder.clone()
+        };
+        let dir = stage(&holder);
+        let entries = journal_after(dir.path(), &caller, &|c| {
+            c.release(None, Some("skipped"), Some("guard_refused"))
+        });
+        assert!(fs::read_to_string(dir.path().join("patched"))
+            .unwrap()
+            .contains(RELEASED_PREFIX));
+        assert!(entries.is_empty(), "{sweep} {holder_step:?} {caller_step}: {entries:?}");
+    }
+
+    // Even when the journal and lease name the same sweep, its item must
+    // be the PR that was released.
+    let entries = journal_after(stage(&me).path(), &me, &|mut c| {
+        c.common.pr = 78;
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert!(entries.is_empty());
+
+    // The daemon's reap of a dead step journals nothing.
+    let dir = stage(&me);
+    let journal = journal_for(dir.path());
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(ctx(dir.path(), me.clone()).reap("timeout"), EXIT_HELD);
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
+
+    // A patch that fails journals nothing.
+    let dir = stage(&me);
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    let journal = journal_for(dir.path());
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(
+        ctx(dir.path(), me).release(None, Some("skipped"), Some("guard_refused")),
+        EXIT_HELD
+    );
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
+}
+
 // ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
 
 const HEAD: &str = "3333333333333333333333333333333333333333";
