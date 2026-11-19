@@ -347,6 +347,7 @@ impl GhLifecycleForge {
             StatusState::Failure => "failure",
         };
         let desc: String = description.chars().take(STATUS_DESCRIPTION_MAX).collect();
+        self.record_handoff(pr, commit);
         match self.status_command() {
             Err(e) => return Err(e.clone()),
             Ok(Some(cmd)) => {

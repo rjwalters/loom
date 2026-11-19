@@ -9,7 +9,9 @@
 //! target named only by `--repo`. The broker then silently disappeared: the
 //! post fell back to the writer credential, which the operator had
 //! deliberately kept without `statuses: write`, and the handoff failed after
-//! the grant with a 403 (2AMLogic/loom#14632).
+//! the grant with a 403 (#14632). The retained traces cannot establish that
+//! this was the cause of the incident; this module closes the path and records
+//! evidence, nothing more.
 //!
 //! # The rule
 //!
@@ -87,6 +89,16 @@ pub enum Refusal {
     UntrustedCommand,
     /// The setting is present but unusable (same failure class as #12679).
     Malformed,
+    /// The workspace registry could not be read, so no root can be verified
+    /// as managed and the invocation checkout cannot vouch for itself.
+    RegistryUnavailable,
+    /// A trusted root's config tier is unreadable or malformed, so a command
+    /// it may have carried cannot be ruled out.
+    TierUnavailable,
+    /// This target is known (from earlier route observations) to be
+    /// broker-routed, but no command resolves now: refuse rather than fall
+    /// through to the direct writer.
+    BrokerMissing,
 }
 
 impl Refusal {
@@ -96,6 +108,9 @@ impl Refusal {
         match self {
             Refusal::UntrustedCommand => "untrusted-command",
             Refusal::Malformed => "malformed",
+            Refusal::RegistryUnavailable => "registry-unavailable",
+            Refusal::TierUnavailable => "tier-unavailable",
+            Refusal::BrokerMissing => "broker-missing",
         }
     }
 }
@@ -126,9 +141,23 @@ impl ResolvedRoute {
     }
 }
 
-/// The `origin` `owner/repo` of the git checkout at `root`, when readable.
-fn origin_nwo_of(root: &Path) -> Option<String> {
-    crate::write_scope::target::origin_nwo(&crate::write_scope::target::read_remotes(root))
+/// The host a target slug lives on: `GH_HOST` when set, else `github.com`.
+fn target_host() -> String {
+    std::env::var("GH_HOST")
+        .ok()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "github.com".to_string())
+}
+
+/// Whether the git checkout at `root` has an `origin` that is exactly the
+/// target: same host **and** same `owner/repo` (a same-slug remote on another
+/// host is a different repository).
+fn is_target_checkout(root: &Path, target: &str, host: &str) -> bool {
+    crate::write_scope::target::read_remotes(root)
+        .iter()
+        .find(|r| r.name == "origin")
+        .is_some_and(|r| r.host.eq_ignore_ascii_case(host) && r.nwo.eq_ignore_ascii_case(target))
 }
 
 /// Canonical path for identity and comparison; the literal path when the
@@ -138,34 +167,50 @@ fn canonical(root: &Path) -> PathBuf {
 }
 
 /// The registered workspace roots on this machine: the production input of
-/// [`resolve`]. A registry that cannot be read answers none (fail closed —
-/// no root is then verifiable except the invocation's own checkout).
+/// [`resolve_with`]. `None` when the registry cannot be read — then no root
+/// is verifiable as managed (fail closed), which is different from a registry
+/// that loaded and is empty.
 #[must_use]
-pub fn default_registered_roots() -> Vec<PathBuf> {
+pub fn default_registered_roots() -> Option<Vec<PathBuf>> {
     crate::workspace_registry::WorkspaceRegistry::load_default()
+        .ok()
         .map(|r| r.roots())
-        .unwrap_or_default()
+}
+
+/// [`resolve_with`] for a registry that loaded.
+#[must_use]
+pub fn resolve(invocation_root: &Path, target: &str, registered: &[PathBuf]) -> ResolvedRoute {
+    resolve_with(invocation_root, target, Some(registered))
 }
 
 /// Resolve the status route for `target` as invoked from `invocation_root`,
-/// given the machine's registered workspace roots.
+/// given the machine's registered workspace roots (`None` = registry
+/// unreadable).
 ///
-/// Pure with respect to the arguments (filesystem reads and one `git config`
-/// per candidate root); the production caller passes
-/// [`default_registered_roots`], tests pass explicit roots.
+/// Trust is bound to the managed identity of the target: a registered root
+/// whose `origin` host and slug are the target's. The invocation checkout may
+/// vouch for itself only on a machine with **no** registered workspaces (a
+/// developer clone, a CI checkout); an unreadable registry, or a registry that
+/// manages other repositories but not this one, trusts nothing — an untrusted
+/// same-slug clone must not supply the broker.
 #[must_use]
-pub fn resolve(invocation_root: &Path, target: &str, registered: &[PathBuf]) -> ResolvedRoute {
+pub fn resolve_with(
+    invocation_root: &Path,
+    target: &str,
+    registered: Option<&[PathBuf]>,
+) -> ResolvedRoute {
+    let host = target_host();
     // A linked worktree resolves to its main checkout, whose remotes and
     // local config tiers it shares (the same deref `Env::current` performs).
     let invocation_checkout = crate::repo_root::find_repo_root(invocation_root)
         .unwrap_or_else(|| invocation_root.to_path_buf());
-    let is_target =
-        |root: &Path| origin_nwo_of(root).is_some_and(|o| o.eq_ignore_ascii_case(target));
 
-    let registered_match = registered
-        .iter()
-        .find(|r| is_target(r))
-        .map(|r| canonical(r));
+    let registered_match = registered.and_then(|roots| {
+        roots
+            .iter()
+            .find(|r| is_target_checkout(r, target, &host))
+            .map(|r| canonical(r))
+    });
 
     let (trusted_root, root_class) = match &registered_match {
         Some(r) if *r == canonical(&invocation_checkout) => {
@@ -173,7 +218,8 @@ pub fn resolve(invocation_root: &Path, target: &str, registered: &[PathBuf]) -> 
         }
         Some(_) => (registered_match, RootClass::RegisteredOther),
         None => {
-            if is_target(&invocation_checkout) {
+            let no_fleet = registered.is_some_and(<[PathBuf]>::is_empty);
+            if no_fleet && is_target_checkout(&invocation_checkout, target, &host) {
                 (Some(invocation_checkout.clone()), RootClass::InvocationCheckout)
             } else {
                 (None, RootClass::Unverified)
@@ -183,9 +229,34 @@ pub fn resolve(invocation_root: &Path, target: &str, registered: &[PathBuf]) -> 
 
     match trusted_root {
         Some(root) => {
-            let command = status_command::resolve(&root);
-            // A malformed setting in a trusted root keeps its #12679 class.
-            let refusal = command.is_err().then_some(Refusal::Malformed);
+            let mut command = status_command::resolve(&root);
+            let mut refusal = command.is_err().then_some(Refusal::Malformed);
+            if command.is_ok() {
+                // `resolve_effective_config` soft-fails a dead tier to `{}`,
+                // which reads as "no command": that must not become the
+                // direct writer for a target whose tier is merely broken.
+                if let Some((_, why)) = crate::config_resolver::unreadable_tiers(&root)
+                    .into_iter()
+                    .next()
+                {
+                    command = Err(format!(
+                        "a config tier of the trusted root for {target} is unreadable or \
+                         malformed ({why}), so {CONFIG_KEY} cannot be ruled out; nothing was \
+                         granted, posted or enqueued (#14632)"
+                    ));
+                    refusal = Some(Refusal::TierUnavailable);
+                } else if matches!(command, Ok(None))
+                    && broker_required(&[&root, invocation_root], target)
+                {
+                    command = Err(format!(
+                        "{target} was routed through {CONFIG_KEY} on an earlier handoff but \
+                         no command resolves from its trusted root now; refusing rather than \
+                         using the direct writer. If the broker was removed on purpose, delete \
+                         {ROUTE_LOG_RELATIVE_PATH} (#14632)"
+                    ));
+                    refusal = Some(Refusal::BrokerMissing);
+                }
+            }
             ResolvedRoute {
                 command,
                 refusal,
@@ -196,20 +267,38 @@ pub fn resolve(invocation_root: &Path, target: &str, registered: &[PathBuf]) -> 
         None => {
             // Nothing verifiable is of the target. The invocation root's own
             // value may not authorize a broker for it (#14632); an unset one
-            // keeps the direct route, and a malformed one still refuses.
-            let (command, refusal) = match status_command::resolve(invocation_root) {
-                Ok(Some(_)) => (
-                    Err(format!(
+            // keeps the direct route unless the target is known broker-routed,
+            // and a malformed one still refuses.
+            let unavailable = registered.is_none();
+            let (command, refusal) =
+                match status_command::resolve(invocation_root) {
+                    Ok(Some(_)) => {
+                        (
+                            Err(format!(
                         "{CONFIG_KEY} is configured in this root, but the root is neither a \
-                         registered workspace for {target} nor a checkout of it, so it cannot \
-                         authorize the status route for {target}; nothing was granted, posted \
-                         or enqueued (#14632)"
+                         registered workspace for {target} nor a trusted checkout of it{}, so it \
+                         cannot authorize the status route for {target}; nothing was granted, \
+                         posted or enqueued (#14632)",
+                        if unavailable { " (the workspace registry is unreadable)" } else { "" }
                     )),
-                    Some(Refusal::UntrustedCommand),
-                ),
-                Ok(None) => (Ok(None), None),
-                Err(e) => (Err(e), Some(Refusal::Malformed)),
-            };
+                            Some(if unavailable {
+                                Refusal::RegistryUnavailable
+                            } else {
+                                Refusal::UntrustedCommand
+                            }),
+                        )
+                    }
+                    Ok(None) if broker_required(&[invocation_root], target) => (
+                        Err(format!(
+                        "{target} was routed through {CONFIG_KEY} on an earlier handoff but no \
+                         trusted root resolves now; refusing rather than using the direct \
+                         writer (#14632)"
+                    )),
+                        Some(Refusal::BrokerMissing),
+                    ),
+                    Ok(None) => (Ok(None), None),
+                    Err(e) => (Err(e), Some(Refusal::Malformed)),
+                };
             ResolvedRoute {
                 command,
                 refusal,
@@ -238,7 +327,7 @@ fn command_tier(root: &Path) -> Option<&'static str> {
 /// One bounded route observation (#14632). Field names are the contract; the
 /// values never include command argv, credentials, environment, URLs, absolute
 /// paths or raw stderr.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RouteRecord {
     /// RFC 3339.
     pub at: String,
@@ -260,6 +349,17 @@ pub struct RouteRecord {
     pub command_tier: Option<&'static str>,
     /// [`Refusal::as_str`] when the route is `refused`.
     pub refusal: Option<&'static str>,
+    /// Handoff correlation (#14636): the PR a status write was for. `None` on
+    /// a construction observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u32>,
+    /// The approved head sha the status write was for (a public git object
+    /// id, never a secret).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// The operation the record belongs to (`post_status`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<&'static str>,
 }
 
 /// `sha256:<12 hex>` of a root's canonical path — a stable opaque identity.
@@ -290,15 +390,22 @@ fn tier_name(repo_root: &Path, source: &Path) -> &'static str {
     }
 }
 
-/// Record one observation for a resolved route: an info line always, and an
-/// append to [`ROUTE_LOG_RELATIVE_PATH`] under the invocation root when that
-/// root is a Loom surface (`.loom/` present). Consecutive duplicate
-/// observations (same fields except `at`) are not re-appended, so a daemon
-/// tick that constructs the forge every pass cannot grow the log unboundedly.
-/// Best effort: a write failure is logged, never an error of the handoff.
-pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
+/// Bound on the route log (#14632): above `MAX_LOG_BYTES` the file is cut to
+/// its last `KEEP_LOG_BYTES`, at a line boundary.
+const MAX_LOG_BYTES: u64 = 256 * 1024;
+const KEEP_LOG_BYTES: u64 = 128 * 1024;
+/// How much of the tail is read for deduplication and history: never the
+/// whole file.
+const TAIL_BYTES: u64 = 64 * 1024;
+/// A construction observation is not re-appended when it equals any of the
+/// last this-many records, so an alternating pair cannot grow the log either.
+const DEDUPE_WINDOW: usize = 32;
+
+/// Build the observation for a resolved route (no I/O beyond reading config).
+#[must_use]
+pub fn observe(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) -> RouteRecord {
     let rec = RouteRecord {
-        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        at: String::new(),
         target: target.to_string(),
         route: resolved.route(),
         root_class: resolved.root_class.as_str(),
@@ -321,6 +428,9 @@ pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
                 .flatten()
             }),
         refusal: resolved.refusal.map(Refusal::as_str),
+        pr: None,
+        head_sha: None,
+        operation: None,
     };
     log::info!(
         "merge-queue: status route for {} is {} (root class {}, command tier {})",
@@ -329,9 +439,42 @@ pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
         rec.root_class,
         rec.command_tier.unwrap_or("none")
     );
+    rec
+}
+
+/// Record one construction observation for a resolved route: an info line
+/// always, and an append to [`ROUTE_LOG_RELATIVE_PATH`] under the invocation
+/// root when that root is a Loom surface (`.loom/` present). An observation
+/// equal (but for `at`) to one of the last [`DEDUPE_WINDOW`] records is not
+/// re-appended. Best effort: a write failure is logged, never an error of the
+/// handoff.
+pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
+    let rec = observe(invocation_root, resolved, target);
+    append(invocation_root, rec, true);
+}
+
+/// Record the route used by one specific status write (#14636): the same
+/// bounded fields plus the PR and the approved head sha, so the normal
+/// handoff can be joined to the route it actually took. Always appended.
+pub fn record_handoff(
+    invocation_root: &Path,
+    base: &RouteRecord,
+    pr: Option<u32>,
+    head_sha: &str,
+    operation: &'static str,
+) {
+    let mut rec = base.clone();
+    rec.pr = pr;
+    rec.head_sha = Some(head_sha.to_string());
+    rec.operation = Some(operation);
+    append(invocation_root, rec, false);
+}
+
+fn append(invocation_root: &Path, mut rec: RouteRecord, dedupe: bool) {
     if !invocation_root.join(".loom").is_dir() {
         return;
     }
+    rec.at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let path = invocation_root.join(ROUTE_LOG_RELATIVE_PATH);
     let line = match serde_json::to_string(&rec) {
         Ok(l) => l,
@@ -341,14 +484,19 @@ pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
         }
     };
     let write = || -> std::io::Result<()> {
-        if let Some(prev) = last_record(&path) {
-            if record_equivalent(&prev, &line) {
-                return Ok(());
-            }
+        if dedupe
+            && tail_records(&path)
+                .iter()
+                .rev()
+                .take(DEDUPE_WINDOW)
+                .any(|prev| record_equivalent(prev, &line))
+        {
+            return Ok(());
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        trim_log(&path)?;
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -361,25 +509,77 @@ pub fn record(invocation_root: &Path, resolved: &ResolvedRoute, target: &str) {
     }
 }
 
-/// The last complete line of the route log, parsed, when any.
-fn last_record(path: &Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
-    serde_json::from_str(line).ok()
+/// Cut an oversized log to its last [`KEEP_LOG_BYTES`] at a line boundary.
+fn trim_log(path: &Path) -> std::io::Result<()> {
+    let len = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return Ok(()),
+    };
+    if len <= MAX_LOG_BYTES {
+        return Ok(());
+    }
+    let tail = read_tail(path, KEEP_LOG_BYTES)?;
+    let kept = match tail.find('\n') {
+        Some(i) => &tail[i + 1..],
+        None => "",
+    };
+    std::fs::write(path, kept)
+}
+
+/// The last `max` bytes of a file, lossily decoded — never the whole file.
+fn read_tail(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max)))?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Complete records in the log's tail window, oldest first (a partial leading
+/// line is dropped).
+fn tail_records(path: &Path) -> Vec<String> {
+    let Ok(text) = read_tail(path, TAIL_BYTES) else {
+        return Vec::new();
+    };
+    let whole = std::fs::metadata(path).map_or(true, |m| m.len() <= TAIL_BYTES);
+    text.lines()
+        .skip(usize::from(!whole))
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether an earlier record in any of `roots`' route logs shows `target`
+/// routed through a command — i.e. a broker is required for it.
+fn broker_required(roots: &[&Path], target: &str) -> bool {
+    roots.iter().any(|root| {
+        tail_records(&root.join(ROUTE_LOG_RELATIVE_PATH))
+            .iter()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| {
+                v["route"] == "command"
+                    && v["target"]
+                        .as_str()
+                        .is_some_and(|t| t.eq_ignore_ascii_case(target))
+            })
+    })
 }
 
 /// Two records are equivalent when every field except `at` matches.
-fn record_equivalent(a: &serde_json::Value, line: &str) -> bool {
-    let mut b = match serde_json::from_str::<serde_json::Value>(line) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let mut a = a.clone();
-    if !a.is_object() || !b.is_object() {
+fn record_equivalent(prev: &str, line: &str) -> bool {
+    let (Ok(mut a), Ok(mut b)) = (
+        serde_json::from_str::<serde_json::Value>(prev),
+        serde_json::from_str::<serde_json::Value>(line),
+    ) else {
         return false;
-    }
-    a.as_object_mut().unwrap().remove("at");
-    b.as_object_mut().unwrap().remove("at");
+    };
+    let (Some(ao), Some(bo)) = (a.as_object_mut(), b.as_object_mut()) else {
+        return false;
+    };
+    ao.remove("at");
+    bo.remove("at");
     a == b
 }
 
@@ -451,7 +651,10 @@ mod tests {
         let r = resolve(dir.path(), "o/r", &[]);
         assert_eq!(r.root_class, RootClass::InvocationCheckout);
         assert!(matches!(r.command, Ok(Some(_))));
-        assert_eq!(r.trusted_root.as_deref(), Some(dir.path()));
+        assert_eq!(
+            r.trusted_root.as_deref(),
+            Some(std::fs::canonicalize(dir.path()).unwrap().as_path())
+        );
     }
 
     #[test]
@@ -480,7 +683,10 @@ mod tests {
         let r = resolve(isolated.path(), "o/r", &[registered.path().to_path_buf()]);
         assert_eq!(r.root_class, RootClass::RegisteredOther);
         assert!(matches!(r.command, Ok(Some(_))), "the command came from the registered root");
-        assert_eq!(r.trusted_root.as_deref(), Some(registered.path()));
+        assert_eq!(
+            r.trusted_root.as_deref(),
+            Some(std::fs::canonicalize(registered.path()).unwrap().as_path())
+        );
     }
 
     #[test]
@@ -583,5 +789,99 @@ mod tests {
         assert!(matches!(r.command, Ok(Some(_))));
         let tier = command_tier(registered.path()).unwrap();
         assert_eq!(tier, "fleet-repo");
+    }
+
+    #[test]
+    fn an_unreadable_registry_trusts_no_invocation_checkout() {
+        let dir = checkout_of("o/r");
+        with_command(&dir, CMD);
+        let r = resolve_with(dir.path(), "o/r", None);
+        assert_eq!(r.root_class, RootClass::Unverified);
+        assert_eq!(r.refusal, Some(Refusal::RegistryUnavailable));
+        assert!(r.command.is_err());
+    }
+
+    #[test]
+    fn a_same_slug_clone_is_untrusted_when_the_registry_manages_others() {
+        let other = checkout_of("o/other");
+        let clone = checkout_of("o/r");
+        with_command(&clone, CMD);
+        let r = resolve(clone.path(), "o/r", &[other.path().to_path_buf()]);
+        assert_eq!(r.root_class, RootClass::Unverified);
+        assert_eq!(r.refusal, Some(Refusal::UntrustedCommand));
+    }
+
+    #[test]
+    fn a_registered_checkout_on_another_host_is_not_the_target() {
+        let wrong_host = tempfile::tempdir().unwrap();
+        git(wrong_host.path(), &["init", "-q"]);
+        git(
+            wrong_host.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://ghe.example.invalid/o/r.git",
+            ],
+        );
+        std::fs::create_dir_all(wrong_host.path().join(".loom")).unwrap();
+        std::fs::write(wrong_host.path().join(".loom/config.json"), CMD).unwrap();
+        let isolated = checkout_of("o/r");
+        let r = resolve(isolated.path(), "o/r", &[wrong_host.path().to_path_buf()]);
+        assert_eq!(r.root_class, RootClass::Unverified);
+        assert!(r.command.is_ok() || r.refusal.is_some());
+        assert_ne!(r.route(), "command");
+    }
+
+    #[test]
+    fn a_malformed_trusted_tier_refuses() {
+        let dir = checkout_of("o/r");
+        std::fs::create_dir_all(dir.path().join(".loom-local")).unwrap();
+        std::fs::write(dir.path().join(".loom-local/fleet-repo.json"), "{not json").unwrap();
+        let r = resolve(dir.path(), "o/r", &[dir.path().to_path_buf()]);
+        assert_eq!(r.refusal, Some(Refusal::TierUnavailable));
+        assert_eq!(r.route(), "refused");
+    }
+
+    #[test]
+    fn a_known_broker_target_refuses_when_its_tier_disappears() {
+        let dir = checkout_of("o/r");
+        std::fs::create_dir_all(dir.path().join(".loom-local")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom-local/fleet-repo.json"),
+            r#"{"forge":{"mergeQueue":{"statusCommand":["true"]}}}"#,
+        )
+        .unwrap();
+        let reg = [dir.path().to_path_buf()];
+        let first = resolve(dir.path(), "o/r", &reg);
+        assert_eq!(first.route(), "command");
+        record(dir.path(), &first, "o/r");
+        std::fs::remove_file(dir.path().join(".loom-local/fleet-repo.json")).unwrap();
+        let second = resolve(dir.path(), "o/r", &reg);
+        assert_eq!(second.refusal, Some(Refusal::BrokerMissing));
+        assert_eq!(second.route(), "refused");
+    }
+
+    #[test]
+    fn a_handoff_record_carries_pr_and_head_and_the_log_stays_bounded() {
+        let dir = checkout_of("o/r");
+        let r = resolve(dir.path(), "o/r", &[]);
+        let base = observe(dir.path(), &r, "o/r");
+        let sha = "a".repeat(40);
+        for _ in 0..3 {
+            record_handoff(dir.path(), &base, Some(7), &sha, "post_status");
+        }
+        let text = std::fs::read_to_string(dir.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(v["pr"], 7);
+        assert_eq!(v["head_sha"], sha.as_str());
+        for _ in 0..4000 {
+            record_handoff(dir.path(), &base, Some(7), &sha, "post_status");
+        }
+        let len = std::fs::metadata(dir.path().join(ROUTE_LOG_RELATIVE_PATH))
+            .unwrap()
+            .len();
+        assert!(len <= MAX_LOG_BYTES + 1024, "{len}");
     }
 }

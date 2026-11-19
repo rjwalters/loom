@@ -215,23 +215,37 @@ invocation happened to run in:
    `origin` is the target — the checkout the fleet sync materializes
    `.loom-local/fleet-repo.json` into;
 2. otherwise the invocation's own checkout, when its `origin` is the target
-   (a developer clone, a CI checkout, a host without a registry).
+   **and the machine has no registered workspaces at all** (a developer clone,
+   a CI checkout). An unreadable registry, or one that manages other
+   repositories but not this one, trusts no invocation checkout.
+
+`origin` must match the target's host (`github.com`, or `GH_HOST`) as well as
+its `owner/repo` slug; a same-slug remote on another host is another repository.
 
 A registered root wins even when the invocation runs from another clone of the
 same repository: an isolated clone's git-ignored local tiers are not the
-fleet's configuration for it, which is exactly how a handoff once lost the
-broker and fell back to a writer credential without `statuses: write`
-(2AMLogic/loom#14632). With no verifiable root, a command configured in the
-invocation directory **refuses** the route before any grant, status or enqueue
-(a bare `--repo` cannot authorize a broker), while an unset one keeps the
-direct path for repositories that never configured a broker. Global config
-precedence is unchanged — this selects the root the existing resolution reads.
+fleet's configuration for it. This closes one plausible way a handoff could
+lose the broker and fall back to a writer credential without `statuses: write`
+(#14632); the retained traces of that incident cannot establish that this was
+the cause, so #14632 and #14636 stay open until a natural admission is
+observed. With no verifiable root, a command configured in the invocation
+directory **refuses** the route before any grant, status or enqueue (a bare
+`--repo` cannot authorize a broker), while an unset one keeps the direct path
+for repositories that never configured a broker. A trusted root with an
+unreadable or malformed config tier refuses too (a dead tier would otherwise
+read as "no command"), and so does a target whose earlier route observations
+show a command route but which resolves none now: the direct writer is never
+the silent fallback for a known broker target (delete the route log after
+removing a broker on purpose). Global config precedence is unchanged — this
+selects the root the existing resolution reads.
 
 Every invocation appends one bounded observation to
-`.loom/logs/merge-queue-route.jsonl` (deduplicated, so a daemon tick cannot
-grow it unboundedly): target, route, root class, an opaque root identity, and
-the config tier that supplied the command. Never command argv, credentials,
-environment, URLs, absolute paths or raw stderr.
+`.loom/logs/merge-queue-route.jsonl` (deduplicated against its recent tail, and
+the file is cut to a bounded size): target, route, root class, an opaque root
+identity, and the config tier that supplied the command. Each status write
+additionally appends a record carrying the PR and the approved head sha, so a
+normal handoff can be joined to the route it took. Never command argv,
+credentials, environment, URLs, absolute paths or raw stderr.
 
 Still open: the grant store is PR comments (not tamper-proof), the
 post-pass-to-merge window above, and no live pilot has yet confirmed the fake's

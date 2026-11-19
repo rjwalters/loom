@@ -49,6 +49,9 @@ pub struct GhLifecycleForge {
     /// a root that cannot authorize the route for this target (posts then
     /// refuse, #12679/#14632).
     status_command: Result<Option<StatusCommand>, String>,
+    /// The route observation made at construction, joined to each status
+    /// write by [`Self::record_handoff`] (#14636).
+    route_obs: super::status_route::RouteRecord,
 }
 
 impl GhLifecycleForge {
@@ -56,7 +59,12 @@ impl GhLifecycleForge {
     ///
     /// When `nwo` is not `owner/repo`.
     pub fn new(gh: &str, root: &Path, nwo: &str) -> Result<Self, String> {
-        Self::new_with_registered(gh, root, nwo, &super::status_route::default_registered_roots())
+        Self::new_with_registry(
+            gh,
+            root,
+            nwo,
+            super::status_route::default_registered_roots().as_deref(),
+        )
     }
 
     /// [`new`] with the machine's registered workspace roots supplied by the
@@ -71,9 +79,25 @@ impl GhLifecycleForge {
         nwo: &str,
         registered: &[PathBuf],
     ) -> Result<Self, String> {
+        Self::new_with_registry(gh, root, nwo, Some(registered))
+    }
+
+    /// [`new`] with the registry supplied as the production loader reports it:
+    /// `None` when it could not be read (nothing is then verifiable as managed).
+    ///
+    /// # Errors
+    ///
+    /// As [`new`].
+    pub fn new_with_registry(
+        gh: &str,
+        root: &Path,
+        nwo: &str,
+        registered: Option<&[PathBuf]>,
+    ) -> Result<Self, String> {
         match GhTarget::repo(nwo) {
             Ok(GhTarget::Repo { owner, repo }) => {
-                let route = super::status_route::resolve(root, nwo, registered);
+                let route = super::status_route::resolve_with(root, nwo, registered);
+                let route_obs = super::status_route::observe(root, &route, nwo);
                 super::status_route::record(root, &route, nwo);
                 Ok(Self {
                     gh: gh.to_string(),
@@ -85,6 +109,7 @@ impl GhLifecycleForge {
                     owner,
                     name: repo,
                     status_command: route.command,
+                    route_obs,
                 })
             }
             _ => Err("repository must be an `owner/repo` slug".to_string()),
@@ -107,6 +132,18 @@ impl GhLifecycleForge {
     /// the exact target, falling back to the invocation root.
     pub(super) fn command_root(&self) -> &Path {
         &self.command_root
+    }
+
+    /// Record the route one specific status write takes, with its PR and the
+    /// approved head sha (#14636).
+    pub(super) fn record_handoff(&self, pr: Option<u32>, head_sha: &str) {
+        super::status_route::record_handoff(
+            &self.root,
+            &self.route_obs,
+            pr,
+            head_sha,
+            "post_status",
+        );
     }
 
     pub(super) fn repo_name(&self) -> &str {
