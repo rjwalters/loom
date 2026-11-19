@@ -62,6 +62,53 @@ enum SeatPolicy {
     Idle { guarded: bool },
 }
 
+#[cfg(test)]
+impl Selection {
+    /// A held reservation (lease taken, job begun) for tests in other modules,
+    /// shaped like the one `reserve_seat` hands a read-only launch (#14481).
+    pub(crate) fn reserved_for_test(dir: &Path) -> Self {
+        let lease = lease::Lease::acquire(dir).unwrap();
+        lease
+            .begin(&lease::Job {
+                owner: "test".into(),
+                kind: JobKind::Role,
+                issue: None,
+                branch: None,
+                container_id: "a".repeat(64),
+                base_revision: String::new(),
+                host_pid: std::process::id(),
+                control: "c".repeat(64),
+                repository: String::new(),
+            })
+            .unwrap();
+        let config = Config {
+            schema_version: 1,
+            account: "fixture".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/owner/repo".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: PathBuf::from("/nonexistent"),
+            gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
+        };
+        Selection {
+            name: "fixture".into(),
+            profile: dir.join("profile"),
+            prepared: Some(Prepared {
+                lease,
+                target: Config::primary(&config),
+                record: None,
+                handed_off: std::cell::Cell::new(false),
+            }),
+        }
+    }
+}
+
 impl Selection {
     pub fn prepare(
         root: &Path,
