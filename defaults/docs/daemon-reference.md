@@ -2610,7 +2610,9 @@ blocker is Loom-owned:
 - **Write gates.** Nothing is written while `fleet.autoApply` is off, the host
   is held, a main-health gate run or the self-update is in that checkout.
 - **Rescue refs** older than 14 days are pruned
-  (`LOOM_RESCUE_REF_RETAIN_DAYS`).
+  (`LOOM_RESCUE_REF_RETAIN_DAYS`), and so are the `loom-rescue-<ts>` stash
+  entries on the same window. Pruning a stash discards its working-tree diff,
+  which the rescue ref does not hold (it pins HEAD only).
 - **Escalation.** A hold in one of those four states (or `would-overwrite`)
   that stays for 120 minutes (`LOOM_CHECKOUT_ESCALATE_AFTER_MINUTES`) produces
   one `escalated` event and an `error` log line, naming the repo, the state and

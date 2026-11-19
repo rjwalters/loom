@@ -53,17 +53,26 @@ cat >"$GH_STUB" <<'EOF'
 [[ "${FAIL_LOOKUP:-}" == 1 ]] && exit 1
 if [[ "$2" == list ]]; then
   if [[ "$1 $3 $4" == "pr --label loom:pr" ]]; then
-    if [[ "${!#}" == number,closingIssuesReferences ]]; then
+    fields="${!#}"
+    filter='.'
+    if [[ "${*: -2:1}" == --jq ]]; then
+      fields="${*: -3:1}"
+      filter="${!#}"
+    fi
+    rows="$APPROVED_PRS"
+    if [[ ",$fields," != *,title,* ]]; then
       echo lookup >> "$0.calls"
       [[ "${FAIL_REFS:-}" == 1 ]] && exit 1
       # #14575: a successful lookup that emits no JSON value (jq 1.6 exits 0
       # on empty input without consuming a value) must not pass a bare title.
       [[ "${EMPTY_REFS:-}" == 1 ]] && exit 0
       [[ "${WS_REFS:-}" == 1 ]] && { printf '  \n\t '; exit 0; }
-      jq 'map({number, closingIssuesReferences})' <<< "${VERIFY_PRS:-$APPROVED_PRS}"
-    else
-      jq -r "${!#}" <<< "$APPROVED_PRS"  # render_plan_body's --jq
+      rows="${VERIFY_PRS:-$APPROVED_PRS}"
     fi
+    # Apply the requested field projection before the actual gh --jq filter.
+    jq -r --arg fields "$fields" \
+      'map(with_entries(select(.key as $key | ($fields | split(",") | index($key))))) | '"$filter" \
+      <<< "$rows"
   else
     jq -r "${!#}" <<< '[]'
   fi
@@ -74,6 +83,7 @@ case "$2" in
   repos/owner/mine/issues/2) echo "Fix gizmo" ;;
   repos/owner/mine/issues/3) echo "Odd title *(held)*" ;;
   repos/owner/mine/issues/4) echo "Title — closes #42" ;;
+  repos/owner/mine/issues/5) echo "Frozen pull request" ;;
   repos/owner/mine/issues/13582) echo "fix: honour a trusted loom:issue adoption in the promotion author gate" ;;
   *) exit 1 ;;
 esac
@@ -129,7 +139,8 @@ echo "Test 2c: verify the rendered Approved section against forge closing refs"
 export APPROVED_PRS='[
   {"number":13582,"title":"fix: honour a trusted loom:issue adoption in the promotion author gate","closingIssuesReferences":[{"number":13578}]},
   {"number":1,"title":"Add widget","closingIssuesReferences":[{"number":42},{"number":7}]},
-  {"number":4,"title":"Title — closes #42","closingIssuesReferences":[]}
+  {"number":4,"title":"Title — closes #42","closingIssuesReferences":[]},
+  {"number":5,"title":"Frozen pull request","labels":[{"name":"loom:pr"},{"name":"loom:frozen"}],"closingIssuesReferences":[{"number":12}]}
 ]'
 eval "$RPB"
 approved_body="$(render_plan_body | awk '/^## / {approved=($0 == "## Approved (Awaiting Merge)")} approved')"
@@ -138,6 +149,13 @@ assert_contains "$approved_body" 'gate — closes #13578' "rendered the reported
 assert_contains "$approved_body" '- **#4**: Title — closes #42' "rendered literal closes title"
 ok "$approved_body" "genuine Approved rows"
 assert_eq 1 "$(wc -l < "$GH_STUB.calls" | tr -d ' ')" "one refs lookup for all Approved rows"
+if [[ "$approved_body" == *"Frozen pull request"* ]]; then
+  fail "renderer included a frozen PR in Approved"
+else
+  pass "renderer omits a frozen PR from Approved"
+fi
+no "$approved_body"$'\n- **#5**: Frozen pull request — closes #12' \
+  "frozen Approved row with matching title and closing ref"
 for changed in ' — closes #7, #43' ' — closes #7' '' ' — closes #7, #42, #43' ' — closes #7 #42' ' *(bogus)*'; do
   no "${approved_body/Add widget — closes #7, #42/Add widget$changed}" "altered closing annotation [$changed]"
 done
