@@ -2044,6 +2044,9 @@ jobs:
       - name: spawn-claude credential egress proxy (#8697)
         if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
         run: bash defaults/scripts/tests/test-spawn-claude-credential-proxy.sh
+      - name: Claude seat selection and supervised dispatch (#14371)
+        if: ${{ !cancelled() && steps.daemon-bin.outcome == 'success' }}
+        run: bash defaults/scripts/tests/test-spawn-claude-session-exec.sh
       # #10413: ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must not
       # shadow the pool token spawn-claude.sh selects — drives a real
       # `loom-daemon tokens select`, so it needs the binary this job
@@ -2559,6 +2562,8 @@ jobs:
             -t loom-worker-session:ci-smoke .
       - name: Run the smoke test
         run: ./docker/session/test-image.sh loom-worker-session:ci-smoke
+      - name: Check the Claude seat filesystem after a real CLI dispatch
+        run: python3 docker/session/test-claude-seat.py loom-worker-session:ci-smoke
 
   native-image-smoke:
     name: loom-worker-native Image Smoke Test

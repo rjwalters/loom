@@ -2,6 +2,7 @@
 //! No PID files or account-wide cancellation: Linux subreaping keeps even
 //! setsid/double-fork descendants owned until they have all been reaped.
 
+mod claude;
 mod host;
 #[cfg(test)]
 pub(crate) use host::exec_command;
@@ -38,6 +39,8 @@ pub enum SessionExecCommand {
     Protocol,
     /// Host transport; owns heartbeats, cancellation and cleanup acknowledgement.
     Host(HostArgs),
+    /// Run the Claude adapter in the host-selected account's persistent seat.
+    ClaudeSeat(claude::Args),
     /// Linux container endpoint. Stdin is the lease, never worker input.
     Worker(WorkerArgs),
     /// May Codex run with its own sandbox off in this container? Checks the
@@ -83,6 +86,7 @@ impl SessionExecCommand {
                 println!("{PROTOCOL}");
                 Ok(0)
             }
+            Self::ClaudeSeat(args) => claude::run(args),
             Self::Host(args) => crate::tokens_pool::private_workspace::transport::run(args),
             Self::Posture(args) => Ok(posture::run(&args)),
             #[cfg(target_os = "linux")]

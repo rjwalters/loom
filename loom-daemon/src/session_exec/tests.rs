@@ -115,8 +115,11 @@ fn preflight_reads_the_mounts_from_the_same_inspect() {
         )
     };
     let host_mode = running(r#"[{"Type":"bind","Destination":"/w/repo"}]"#, "{}");
-    assert_eq!(preflight(Some(&host_mode), "/w/repo"), Preflight::Ready);
-    assert_eq!(preflight(Some(&host_mode), "/w/repo/.loom/worktrees/issue-1"), Preflight::Ready);
+    assert!(matches!(preflight(Some(&host_mode), "/w/repo"), Preflight::Ready(_)));
+    assert!(matches!(
+        preflight(Some(&host_mode), "/w/repo/.loom/worktrees/issue-1"),
+        Preflight::Ready(_)
+    ));
     for unmounted in ["/w/repository", "/w/new", "/w"] {
         assert!(
             matches!(preflight(Some(&host_mode), unmounted), Preflight::MountStale(_)),
@@ -124,7 +127,7 @@ fn preflight_reads_the_mounts_from_the_same_inspect() {
         );
     }
     let private = running("[]", r#"{"loom.workspace-mode":"private-clone"}"#);
-    assert_eq!(preflight(Some(&private), "/workspace/repo"), Preflight::Ready);
+    assert!(matches!(preflight(Some(&private), "/workspace/repo"), Preflight::Ready(_)));
 }
 
 /// #13916: a host-resolved token rides on the `docker exec` child's

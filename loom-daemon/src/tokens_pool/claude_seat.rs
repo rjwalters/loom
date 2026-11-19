@@ -7,9 +7,8 @@
 //! Codex seam's [`ContainerRunner`] and the same hardened session image
 //! (`docker/session/`, ADR-0017) rather than adding a dispatch path.
 //!
-//! This slice is registration + lifecycle only: `start` / `status` / `stop`.
-//! Seat selection and the `docker exec` dispatch from `spawn-claude.sh` are
-//! the next slice.
+//! This module owns registration and lifecycle. The host adapter selects a
+//! token and enters the registered seat through `session-exec claude-seat`.
 //!
 //! # What a seat holds (and what it never does)
 //!
@@ -193,6 +192,41 @@ pub fn claude_seat_run_args(
     args
 }
 
+/// Workspace, credential and operator-supplied mounts cannot expose the
+/// host's selector or another seat, even through an ancestor or a symlink.
+/// The private home is the only allowed bind from the seat-state tree.
+pub(crate) fn check_mount_sources<'a>(
+    home: &Path,
+    others: impl Iterator<Item = &'a Path>,
+) -> Result<()> {
+    use crate::workspace_registry::normalize_path;
+    let seat_root = home
+        .parent()
+        .and_then(Path::parent)
+        .context("invalid Claude seat home")?;
+    let root = normalize_path(seat_root);
+    let registered_home = root.join(home.strip_prefix(seat_root)?);
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let pool = super::paths::shared_tokens_dir().map(|path| normalize_path(&path));
+    if normalize_path(home) != registered_home
+        || pool
+            .as_ref()
+            .is_some_and(|dir| overlaps(dir, &registered_home))
+    {
+        bail!("Claude seat home aliases another directory or overlaps the token pool");
+    }
+    for source in others {
+        let source = normalize_path(source);
+        if overlaps(&source, &root) || pool.as_ref().is_some_and(|dir| overlaps(&source, dir)) {
+            bail!(
+                "refusing Claude seat mount {} overlapping seat state or the token pool",
+                source.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Create and start a seat container with the real `docker` CLI: the
 /// `ProcessContainerRunner` half of [`ContainerRunner::create_claude_seat`].
 ///
@@ -213,6 +247,14 @@ pub fn docker_create_seat(
     let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
     let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
     super::session_mount_gate::check_extra_mounts(extra_mounts, workspace, &roots, &credentials)?;
+    check_mount_sources(
+        claude_home,
+        roots
+            .iter()
+            .chain(&credentials)
+            .map(PathBuf::as_path)
+            .chain(extra_mounts.iter().map(|mount| mount.host.as_path())),
+    )?;
     let args = claude_seat_run_args(
         container,
         image,

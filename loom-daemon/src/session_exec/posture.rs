@@ -97,7 +97,7 @@ fn strings(value: &Value) -> Vec<&str> {
 /// Every way `state`'s actual settings fall short of the container boundary.
 /// Empty means hardened.
 #[must_use]
-pub fn violations(state: &Value) -> Vec<String> {
+pub(super) fn container_violations(state: &Value) -> Vec<String> {
     let hc = &state["HostConfig"];
     let mut found = Vec::new();
     if hc["Privileged"] != Value::Bool(false) {
@@ -148,6 +148,17 @@ pub fn violations(state: &Value) -> Vec<String> {
     }) {
         found.push("docker-socket-mounted".into());
     }
+    found
+}
+
+/// Codex also requires immutable controls inside its profile.
+#[must_use]
+pub fn violations(state: &Value) -> Vec<String> {
+    let mut found = container_violations(state);
+    let mounts = state["Mounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     for name in PROFILE_CONTROLS {
         let destination = profile_control_destination(name);
         let frozen = mounts.iter().any(|m| {

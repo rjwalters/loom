@@ -131,7 +131,7 @@ pub(super) enum Preflight {
     /// inspect object, for the operator's recreate command.
     MountStale(serde_json::Value),
     /// Running and the workdir is mounted.
-    Ready,
+    Ready(serde_json::Value),
 }
 
 /// Read both pre-exec answers from one `docker inspect --type container`.
@@ -156,7 +156,7 @@ pub(super) fn preflight(inspect: &Probed, workdir: &str) -> Preflight {
     match state {
         Some(state) if !container_running(&state) => Preflight::NotRunning,
         Some(state) if workdir_unmounted(&state, workdir) => Preflight::MountStale(state),
-        Some(_) => Preflight::Ready,
+        Some(state) => Preflight::Ready(state),
         None => Preflight::NotRunning,
     }
 }
@@ -206,6 +206,13 @@ pub(crate) fn exec_command(args: &HostArgs, id: &str) -> Command {
 }
 
 pub fn run(args: HostArgs) -> Result<i32> {
+    run_with_seat(args, None)
+}
+
+pub(super) fn run_with_seat(
+    mut args: HostArgs,
+    seat_home: Option<&std::path::Path>,
+) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
     // A unique temporary marker revokes the captured shell's invocation without
@@ -265,15 +272,32 @@ pub fn run(args: HostArgs) -> Result<i32> {
         Err(_) => Preflight::Unknown,
     };
     match preflight {
-        Preflight::Ready => {}
+        Preflight::Ready(state) => {
+            if let Some(home) = seat_home {
+                claude::bind_launch(&mut args, &state, home)?;
+            }
+        }
         not_ready @ (Preflight::NotRunning | Preflight::Unknown) => {
             if not_ready == Preflight::NotRunning {
                 refusal::announce(TerminalClassification::SessionDown);
+            }
+            if seat_home.is_some() {
+                bail!(
+                    "Claude seat {} unavailable; check accounts session status --provider claude",
+                    args.container
+                );
             }
             bail!("Session container '{}' is not running. Start it with: loom-daemon accounts session start {}", args.container, args.container.trim_start_matches("loom-codex-session-"))
         }
         Preflight::MountStale(state) => {
             refusal::announce(TerminalClassification::SessionMountStale);
+            if seat_home.is_some() {
+                eprintln!(
+                    "Claude seat {} does not mount {}; recreate the seat with this workspace",
+                    args.container, args.workdir
+                );
+                return Ok(refusal::REFUSAL_EXIT_CODE);
+            }
             eprintln!("{}", mount_stale_line(&args.container, &args.workdir, &state));
             return Ok(refusal::REFUSAL_EXIT_CODE);
         }

@@ -2745,6 +2745,17 @@ run_with_retry() {
 
         log_warn "Claude CLI exited with code ${exit_code}"
 
+        # A persistent seat owns one login. Let the dispatcher classify the
+        # original failure and choose the next seat; its pool is host-only.
+        if [[ -n "${LOOM_CLAUDE_HOST_SELECTS_ACCOUNT:-}" ]] && {
+            is_account_session_limit "${output}" "${exit_code}" ||
+                is_account_exhaustion "${output}" "${exit_code}" ||
+                is_account_auth_dead "${output}" "${exit_code}"
+        }; then
+            clear_retry_state
+            return "${exit_code}"
+        fi
+
         # Concurrent-session-limit fault (#3947) → the active account is healthy
         # but cannot start another simultaneous session. Re-select a DIFFERENT
         # account WITHOUT marking this one bad (a capacity fault must not poison
