@@ -397,16 +397,17 @@ fn normalize_role_runtime_key(raw: &str, map_name: &str) -> Option<String> {
 
 /// The `==== loom-daemon role_runner: … ====` header line
 /// [`run_role_with_timeout`] appends to `role-<role>.log` at the start of every
-/// real invocation — the ONE artifact an operator inspects to confirm which
-/// model *and*, since #8054, which reasoning effort a scheduled child actually
-/// ran with, and which config tier supplied each (#4501 / #8054). The
-/// transcript-side cost telemetry (#8052/#8059) attributes a tick's spend to
-/// this line.
+/// real invocation. It reports the model, reasoning effort, and configured
+/// service tier for the launch with their respective configuration sources.
+/// The transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
+/// to this line.
 ///
 /// An empty `model` is the deliberate CLI-default pass-through (#7894) and an
 /// empty `effort` is the (overwhelmingly common) unconfigured case; both render
 /// as the [`RUNTIME_CLI_DEFAULT_PLACECARD`] name rather than as `model=` /
 /// `effort=` followed by nothing, which reads like a bug in the header itself.
+/// An unconfigured service tier keeps the header's existing shape and leaves
+/// any inherited tier to the child environment.
 #[must_use]
 pub(super) fn role_log_header(
     timestamp: &str,
@@ -415,6 +416,7 @@ pub(super) fn role_log_header(
     model_source: &str,
     effort: &str,
     effort_source: &str,
+    service_tier: Option<(&str, &str)>,
 ) -> String {
     let model_display = if model.is_empty() {
         RUNTIME_CLI_DEFAULT_PLACECARD
@@ -426,9 +428,12 @@ pub(super) fn role_log_header(
     } else {
         effort
     };
+    let service_tier_display = service_tier
+        .map(|(tier, source)| format!(" service_tier={tier} (source={source})"))
+        .unwrap_or_default();
     format!(
         "==== loom-daemon role_runner: {timestamp} role={role} model={model_display} \
-         (source={model_source}) effort={effort_display} (source={effort_source}) ===="
+         (source={model_source}) effort={effort_display} (source={effort_source}){service_tier_display} ===="
     )
 }
 
