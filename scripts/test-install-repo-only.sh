@@ -3,9 +3,8 @@
 # (issue #14570): write only the target repository's files, skipping every
 # machine-level provisioning step.
 #
-# A real install builds loom-daemon and writes to $HOME, so this suite does not
-# run one. It checks, with a throwaway HOME and local temp git repos (no network,
-# no build):
+# These tests use throwaway HOME directories and local Git repositories, with
+# machine writes, builds, and forge calls stubbed out:
 #   1. both installers document --repo-only in --help;
 #   2. install-loom.sh: every machine-level provision_* call / user-scope MCP
 #      registration sits in the `else`/`elif` arm of a REPO_ONLY guard, and the
@@ -17,6 +16,8 @@
 #      and leaves the temp HOME empty;
 #   5. Full Install's MCP phase leaves the user-served bundle and source
 #      config intact in repo-only mode and preserves the staged target tree.
+#   6. the full installer entry stages the same consumer tree with and without
+#      --repo-only when both runs use the same source commit.
 #
 # Usage: bash scripts/test-install-repo-only.sh
 
@@ -258,6 +259,171 @@ if diff -r "$repo_only_mcp/target" "$default_mcp/target"; then
   pass "Full Install MCP phase preserves identical staged target files in both modes"
 else
   fail "Full Install changed staged target file content between modes"
+fi
+
+# --- 6. Full installer entry with local staging and inert boundaries ---------
+FULL_FIXTURE="$(cd "$TEST_DIR" && pwd -P)/full-stage"
+STAGE_PATH=.loom/worktrees/install-fixture
+
+prepare_full_stage() (
+  local root="$1" source="$1/source" name function_name verifier
+  mkdir -p "$root/bin" "$root/build/release" "$root/home" || return
+  export HOME="$root/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
+  git clone --quiet --shared --no-checkout -- "$LOOM_ROOT" "$source" || return
+  git -C "$source" remote remove origin || return
+  git -C "$source" checkout --quiet -B main "$(git -C "$LOOM_ROOT" rev-parse HEAD)" || return
+
+  # Stock macOS /bin/bash is below Loom's Bash 4 floor. Run the unmodified
+  # verifier body with the fixture's PATH Bash when the system Bash is older.
+  if [[ "$(/bin/bash -c 'echo "${BASH_VERSINFO[0]}"')" -lt 4 ]]; then
+    verifier="$source/defaults/scripts/verify-install.sh"
+    sed '1s|^#!/bin/bash$|#!/usr/bin/env bash|' "$verifier" > "$root/verifier" || return
+    cat "$root/verifier" > "$verifier" || return
+  fi
+
+  # The two targets use identical starting commits and independent worktrees.
+  git init --quiet -b main "$root/seed" || return
+  printf '%s\n' '# Consumer repository' > "$root/seed/README.md"
+  printf '%s\n' "$mcp_config" > "$root/seed/.mcp.json"
+  printf '%s\n' '.loom/worktrees/' '.loom/loom-source-path' > "$root/seed/.gitignore"
+  git -C "$root/seed" add -A || return
+  git -C "$root/seed" -c user.name=Fixture -c user.email=fixture@example.invalid \
+    -c commit.gpgsign=false commit --quiet -m seed || return
+
+  ln -s "$(command -v bash)" "$root/bin/bash" || return
+  ln -s "$(command -v jq)" "$root/bin/jq" || return
+  cat > "$root/bin/shim" <<'SHIM' || return
+#!/usr/bin/env bash
+set -eu
+case "${0##*/}:$*" in
+  'node:--version') echo v22.0.0 ;;
+  'node:-pe '*) jq -r .version "$FIXTURE_SOURCE/package.json" ;;
+  'cargo:--version') echo 'cargo 1.90.0' ;;
+  'pnpm:--version') echo 10.15.1 ;;
+  'gh:pr list '*|'gh:label create '*) : ;;
+  'claude:mcp remove --scope user loom') : ;;
+  'claude:mcp add --scope user loom -- node '*) echo claude-register >> "$FIXTURE_MACHINE" ;;
+  'date:+%Y-%m-%d') echo 2026-01-01 ;;
+  'date:-u +%Y-%m-%dT%H:%M:%SZ') echo 2026-01-01T00:00:00Z ;;
+  'date:'*) exec /bin/date "$@" ;;
+  *) printf 'Blocked external call: %s\n' "${0##*/}" >&2; exit 1 ;;
+esac
+SHIM
+  chmod +x "$root/bin/shim" || return
+  for name in node cargo pnpm gh claude date npm curl wget ssh; do
+    ln -s shim "$root/bin/$name" || return
+  done
+
+  for name in daemon dispatcher skills hooks; do
+    case "$name" in
+      daemon) function_name=provision_machine_daemon ;;
+      *) function_name="provision_loom_$name" ;;
+    esac
+    printf '%s() { echo %s >> "$FIXTURE_MACHINE"; }\n' "$function_name" "$name" \
+      > "$source/scripts/install/provision-$name.sh" || return
+  done
+  cat > "$source/scripts/setup-mcp.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+echo setup-mcp >> "$FIXTURE_MACHINE"
+SHIM
+  cat > "$source/scripts/daemon-build.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+printf '%s\n' "$FIXTURE_BUILD"
+SHIM
+  cat > "$root/build/release/loom-daemon" <<'SHIM' || return
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  '--version') echo 'loom-daemon fixture'; exit ;;
+  'forge merge-config --help'|'forge merge-config --verbose') exit ;;
+  "init --defaults $FIXTURE_SOURCE/defaults .") ;;
+  *) exit 1 ;;
+esac
+test "$PWD" = "$FIXTURE_TARGET/$FIXTURE_STAGE"
+defaults="$3"
+# Inert init scaffold, as in test-installer.sh. The actual shell installer
+# still writes configs, source/install metadata, merge attributes and checksums.
+mkdir -p .loom
+cp -RL "$defaults/"{roles,scripts,runtimes,docs,config.json,pricing.json} .loom/
+cp -RL "$defaults/.loom/." .loom/
+cp -RL "$defaults/"{.claude,.github,loom.sh,package.json} .
+cp "$defaults/.loom-README.md" .loom/README.md
+printf '%s\n' '<!-- BEGIN LOOM ORCHESTRATION -->' '# Loom guide' '<!-- END LOOM ORCHESTRATION -->' > CLAUDE.md
+SHIM
+  cat > "$source/scripts/install/validate-target.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+[[ "$*" == "$FIXTURE_TARGET" ]]
+SHIM
+  cat > "$source/scripts/install/create-worktree.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+set -eu
+[[ "$*" == "$FIXTURE_TARGET" ]]
+git -C "$1" worktree add --quiet -b install-fixture "$FIXTURE_STAGE" HEAD
+printf '%s|install-fixture|main\n' "$FIXTURE_STAGE"
+SHIM
+  cat > "$source/scripts/install/setup-repository-settings.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+[[ "$*" == "$FIXTURE_TARGET" ]]
+SHIM
+  cat > "$source/scripts/install/create-pr.sh" <<'SHIM' || return
+#!/usr/bin/env bash
+set -eu
+[[ "$*" == "$FIXTURE_TARGET/$FIXTURE_STAGE main" ]]
+git -C "$1" add -A
+git -C "$1" write-tree > "$FIXTURE_TREE"
+printf '%s\n' 'https://example.invalid/fixture/target/pull/1|manual'
+SHIM
+  chmod +x "$root/build/release/loom-daemon" "$source/scripts/daemon-build.sh" \
+    "$source/scripts/setup-mcp.sh" "$source/scripts/install/"{validate-target,create-worktree,setup-repository-settings,create-pr}.sh
+)
+
+run_full_stage() (
+  local mode="$1" root="$FULL_FIXTURE" target="$FULL_FIXTURE/$1/target"
+  shift
+  export HOME="$root/$mode/home" GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file
+  mkdir -p "$HOME" || return
+  git clone --quiet --local -- "$root/seed" "$target" || return
+  git -C "$target" remote set-url origin https://example.invalid/fixture/target.git || return
+  env -i HOME="$HOME" PATH="$root/bin:/usr/bin:/bin" LC_ALL=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ALLOW_PROTOCOL=file \
+    FIXTURE_SOURCE="$root/source" FIXTURE_BUILD="$root/build" \
+    FIXTURE_TARGET="$target" FIXTURE_STAGE="$STAGE_PATH" \
+    FIXTURE_MACHINE="$root/$mode/machine" FIXTURE_TREE="$root/$mode/git-tree" \
+    bash "$root/source/scripts/install-loom.sh" --yes --no-dogfood "$@" "$target" \
+      < /dev/null > "$root/$mode/output" 2>&1 || {
+        cat "$root/$mode/output" >&2
+        return 1
+      }
+  if grep -q 'Installation Complete!' "$root/$mode/output" &&
+    git -C "$target/$STAGE_PATH" diff --cached --name-only > "$root/$mode/staged" &&
+    grep -Fxq '.loom/install-metadata.json' "$root/$mode/staged" &&
+    grep -Fxq '.gitattributes' "$root/$mode/staged" &&
+    test -s "$target/$STAGE_PATH/.loom/manifest.json"; then
+    return 0
+  fi
+  printf 'Missing completed stage for %s\n' "$mode" >&2
+  cat "$root/$mode/output" >&2
+  return 1
+)
+
+default_stage="$FULL_FIXTURE/default/target/$STAGE_PATH"
+repo_only_stage="$FULL_FIXTURE/repo-only/target/$STAGE_PATH"
+if prepare_full_stage "$FULL_FIXTURE" && run_full_stage default && run_full_stage repo-only --repo-only; then
+  if [[ ! -s "$FULL_FIXTURE/repo-only/machine" ]] &&
+     [[ "$(grep -c 'Skipping .*(--repo-only)' "$FULL_FIXTURE/repo-only/output")" -eq 6 ]] &&
+     cmp -s "$FULL_FIXTURE/default/machine" <(printf '%s\n' daemon dispatcher skills hooks setup-mcp claude-register); then
+    pass "Full installer entry exercises default machine steps and skips all six in repo-only mode"
+  else
+    fail "Full installer entry did not exercise the two provisioning modes"
+  fi
+  if diff -r -x .git "$default_stage" "$repo_only_stage" &&
+     cmp -s "$FULL_FIXTURE/default/git-tree" "$FULL_FIXTURE/repo-only/git-tree"; then
+    pass "Full installer entry produces identical staged target trees from the same source"
+  else
+    fail "Full installer entry staged target trees differ between modes"
+  fi
+else
+  fail "Full installer entry did not stage a complete target in both modes"
 fi
 
 echo ""
