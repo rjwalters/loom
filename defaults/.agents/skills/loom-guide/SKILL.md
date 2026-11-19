@@ -1464,6 +1464,21 @@ a defer. See "WORK_PLAN.md vs a hand-written ROADMAP.md", rule 2.
 **Redact host identifiers, even quoting a title** — that is how 127 leaked
 into this public repo (#8589); the CI scrub job fails on the next one.
 
+**Provenance gate (#13760).** Before anything is written, the tick composes the
+exact canonical lines it would publish (`compose_work_log_delta`, from the
+verified candidates only) and verifies every one against the pinned repo
+(`verify_work_log_provenance`): the number must exist in `$GUIDE_REPO`, with
+the matching kind (merged PR vs closed issue), under exactly the emitted
+title. A foreign listing, a missing item, a wrong kind, a mismatched title,
+or an unreadable lookup refuses the **whole** delta (fail closed, no partial
+writes) and names the offending entry on stderr — a Guide backfill once wrote
+another repository's merged history into a consumer repo's WORK_LOG.md
+(sg13g2-vco#311), and Judge's docs-only fast path approved the file-name shape
+without reading the content. Judge re-checks the same records independently
+from the PR diff (see "Docs-Only Fast Path" in judge.md, #13760); this gate
+stops the bad delta one step earlier, before the PR exists. Zero new entries
+skips the gate trivially (a no-op tick stays a no-op).
+
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
 # "new content". Every `docs: Guide document maintenance update` PR is itself a
@@ -1738,6 +1753,91 @@ docs_maintenance_skipped() {
     .loom/config.json 2>/dev/null | grep -Fxq -- "$1"
 }
 
+# #13760: the exact canonical lines this tick publishes, composed mechanically
+# from the verified candidate arrays ($new_prs / $new_issues) — the same text
+# verify_work_log_provenance() gates below and the pass then writes verbatim.
+# Grouping by date happens at write time; the gate needs only the lines
+# themselves. Entry format is the renderer's: `- **PR #N**: Title` and
+# `- **Issue #N** (closed): Title`.
+compose_work_log_delta() {
+  local prs="$1" issues="$2"
+  printf '%s\n' "$prs" | jq -r '.[] | "- **PR #\(.number)**: \(.title)"'
+  printf '%s\n' "$issues" | jq -r '.[] | "- **Issue #\(.number)** (closed): \(.title)"'
+}
+
+# #13760 PROVENANCE GATE, DO NOT REMOVE: a Guide backfill once wrote another
+# repository's merged history into WORK_LOG.md (sg13g2-vco#311 carried 61
+# entries above that repo's highest number, verbatim titles from
+# sg13g2-comparator). Every canonical entry line in $1 — the exact lines this
+# tick is about to publish — must match the pinned repo's own forge state:
+# the number must exist there, with the right kind (merged PR vs issue), under
+# exactly the title the renderer emits. A foreign listing's numbers can all
+# exist under unrelated titles, so existence alone is NOT enough; a wrong kind
+# (an issue recorded as a PR) and a title mismatch fail the same way. An
+# unreadable item fails closed. One foreign/missing/wrong-kind/mismatched
+# entry refuses the WHOLE delta (no partial writes). Distinct numbers are read
+# once each. Zero entries passes (nothing to verify — a no-op tick).
+#
+# TITLE ESCAPING LOCKSTEP: the renderer emits titles verbatim from the
+# listing JSON's `.title`, so this gate compares verbatim too. If the renderer
+# ever applies additional escaping or redaction (e.g. the #8589 host-identifier
+# redaction), the SAME transformation must be applied here in the same change —
+# an unmirrored escaping fails closed and WORK_LOG.md stops updating.
+#
+# REPOSITORY METADATA CANNOT OVERRIDE THE TARGET BINDING: if an entry itself
+# names a repository (`owner/other#N` qualifier), that identity must be the
+# pinned `$GUIDE_REPO` — refused even when the number and title coincide with
+# a real target item.
+verify_work_log_provenance() {
+  local delta="$1" line body mid num stated kind rest got got_title got_is_pr bad=0
+  local -A seen=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      "- **PR "*) kind=pr ;;
+      "- **Issue "*) kind=issue ;;
+      *) continue ;;
+    esac
+    body="${line#- **}"
+    mid="${body#* }"; mid="${mid%%\*\**}"
+    num="${mid##*\#}"
+    case "$num" in
+      ''|*[!0-9]*) echo "provenance: unparseable WORK_LOG entry: $line" >&2; bad=1; continue ;;
+    esac
+    stated="${mid%%#*}"; stated="${stated%/}"
+    if [ -n "$stated" ] && [ "$stated" != "$GUIDE_REPO" ]; then
+      echo "provenance: entry claims repository $stated, not the pinned $GUIDE_REPO: $line" >&2
+      bad=1; continue
+    fi
+    [ -n "${seen[$num]:-}" ] && continue
+    seen[$num]=1
+    got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '"\(.title)\t\(.pull_request != null)"' 2>/dev/null)" || got=""
+    if [ -z "$got" ]; then
+      echo "provenance: cannot fetch #$num from $GUIDE_REPO" >&2; bad=1; continue
+    fi
+    got_title="${got%$'\t'*}"
+    got_is_pr="${got##*$'\t'}"
+    if [ "$kind" = pr ]; then
+      rest="${body#*\*\*: }"
+      if [ "$got_is_pr" != "true" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not a PR but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+    else
+      rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
+      if [ "$got_is_pr" != "false" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not an issue but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+    fi
+    if [ "$rest" != "$got_title" ]; then
+      echo "provenance: #$num title mismatch in $GUIDE_REPO (entry '$rest', forge '$got_title')" >&2
+      bad=1
+    fi
+  done < <(printf '%s\n' "$delta")
+  return "$bad"
+}
+
 update_work_log() {
   # #14116: a repo that opted out of WORK_LOG.md via
   # `guide.docsMaintenance.skipDocs` gets no create and no update, so return
@@ -1940,14 +2040,30 @@ update_work_log() {
     fi
   fi
 
+  # #13760 PROVENANCE GATE, DO NOT REMOVE: before anything can be written,
+  # compose the exact canonical lines this tick would publish and verify every
+  # reference against the pinned repo — the number exists there, the kind
+  # matches, the title matches — mirroring the same gate Judge applies
+  # independently to the resulting docs PR. Any foreign/missing/wrong-kind/
+  # mismatched/unreadable entry refuses the WHOLE delta (fail closed, no
+  # partial writes) and names it on stderr; write ONLY the verified lines.
+  local delta
+  delta="$(compose_work_log_delta "$new_prs" "$new_issues")"
+  if ! verify_work_log_provenance "$delta"; then
+    echo "WORK_LOG.md NOT written: provenance check failed (fail closed) — see the provenance: lines above for the offending entries." >&2
+    return 1
+  fi
+
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
   # header/comment block, above the newest existing `### ` section).
   # Format: ### YYYY-MM-DD
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
   #
-  # Append ONLY what is in `$new_prs` / `$new_issues` — never hand-add a docs
-  # PR the filter above removed, and never "helpfully" log this tick's own PR.
+  # Append ONLY the verified delta above — the exact lines
+  # `compose_work_log_delta` produced and `verify_work_log_provenance` passed
+  # — never hand-add a docs PR the filter above removed, and never "helpfully"
+  # log this tick's own PR.
   #
   # Write with the Edit/Write tool against the ABSOLUTE "$DOCS_WT/WORK_LOG.md"
   # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
