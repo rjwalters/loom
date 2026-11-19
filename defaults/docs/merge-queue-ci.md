@@ -56,11 +56,12 @@ compares the `pull_request` and `merge_group` truth values in the order
 `false < unknown < true`. A lower value on `merge_group` produces a finding.
 Equal unknown values produce no step finding even when runtime outputs differ.
 
-`covered: true` for a required context means its matching relied-on job has a
-`merge_group` trigger, is statically evaluated to run, and has no associated
-findings, including detected step findings. The overall audit also checks for
-workflow-wide findings. Verify suite execution from the job and step results
-on the exact merge-group SHA.
+`covered: true` for a required context means its matching job is relied on,
+its workflow has a `merge_group` trigger, and the job is statically evaluated
+to run and passes the per-job checks, including step checks. A workflow-wide
+finding can still name that job or one of its steps and cause the overall
+audit to fail. Verify suite execution from the job and step results on the
+exact merge-group SHA.
 
 | Code | Meaning |
 |---|---|
