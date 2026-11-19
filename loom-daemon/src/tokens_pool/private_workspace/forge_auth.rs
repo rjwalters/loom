@@ -19,7 +19,7 @@
 use super::FORGE_ENV;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// The variable a resolved token is exported as.
 pub(super) const TOKEN_ENV: &str = "GH_TOKEN";
@@ -35,6 +35,12 @@ const TOKEN_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub(super) struct ExecAuth {
     names: Vec<&'static str>,
     secret: Option<String>,
+    /// The repository is on GitHub and neither the process environment nor
+    /// the owner's published App directory yielded a token (#14433).
+    github_unresolved: bool,
+    /// A credential directory matched to this repository's owner exists but
+    /// its token is provably expired, and no fresher one was found (#14435).
+    expired: bool,
 }
 
 impl ExecAuth {
@@ -91,6 +97,8 @@ impl ExecAuth {
             return Self {
                 names,
                 secret: None,
+                github_unresolved: false,
+                expired: false,
             };
         }
         let gh_host = env("GH_HOST")
@@ -101,6 +109,8 @@ impl ExecAuth {
             return Self {
                 names,
                 secret: None,
+                github_unresolved: false,
+                expired: false,
             };
         };
         // No directory proven to hold THIS owner's installation token: read
@@ -108,12 +118,25 @@ impl ExecAuth {
         // credential on a daemon host, and handing it to another owner's
         // repository would forward the wrong installation's token.
         let primary = primary_root(env, registered);
-        let secret = config_dir_for(workspace, primary.as_deref(), &slug, &gh_host)
-            .and_then(|dir| read(&dir));
+        let choice =
+            config_dir_for(workspace, primary.as_deref(), &slug, &gh_host, SystemTime::now());
+        let secret = choice.dir.and_then(|dir| read(&dir));
         if secret.is_some() && !names.contains(&TOKEN_ENV) {
             names.push(TOKEN_ENV);
         }
-        Self { names, secret }
+        Self {
+            names,
+            github_unresolved: secret.is_none(),
+            expired: secret.is_none() && choice.expired,
+            secret,
+        }
+    }
+
+    /// `true` when this owner's only published credential is provably
+    /// expired: the exec would carry a dead token (or none), so the caller
+    /// should refuse before it claims anything (#14435).
+    pub(super) fn expired(&self) -> bool {
+        self.expired
     }
 
     /// The variable names to pass as bare `--env NAME` arguments.
@@ -133,6 +156,15 @@ impl ExecAuth {
     #[cfg(test)]
     pub(super) fn resolved(&self) -> bool {
         self.secret.is_some()
+    }
+
+    /// `true` for a GitHub repository with no write credential at all: no
+    /// `GH_TOKEN`/`GITHUB_TOKEN` in the process and no installation token read
+    /// from the owner's published App directory. A non-GitHub forge is never
+    /// unresolved here (it keeps its own `GITEA_TOKEN` path), and neither is a
+    /// process that carries a token (#14433).
+    pub(super) fn github_token_missing(&self) -> bool {
+        self.github_unresolved
     }
 }
 
@@ -206,17 +238,22 @@ fn primary_root(
 /// The root-owner step is what a hand-run `accounts session job` from an SSH
 /// shell needs: that shell has no `GH_CONFIG_DIR`, and the daemon's own
 /// registry is not in its process.
+///
+/// A candidate whose `identity.json` proves its token expired is skipped, not
+/// returned (#14435): on a daemon whose workspace root is itself the repository
+/// owner, `gh-config-by-owner/<owner>/hosts.yml` is a leftover that nothing
+/// refreshes (the reader pool's `<app-id>/` subdirectories keep the directory
+/// itself looking live), while the live writer token sits in `.loom/gh-config`.
+/// Returning the leftover first handed every exec for that owner a dead token.
 fn config_dir_for(
     workspace: &Path,
     primary: Option<&Path>,
     slug: &str,
     gh_host: &str,
-) -> Option<PathBuf> {
+    now: SystemTime,
+) -> DirChoice {
     use crate::credential_preflight as creds;
     let owner = creds::owner_of_nwo(slug);
-    if let Some(dir) = creds::gh_config_dir_for_owner_slug(slug) {
-        return Some(dir);
-    }
     let published = |root: &Path| {
         let dir = creds::github_app_gh_config_dir_for_owner(root, owner);
         dir.join("hosts.yml").is_file().then_some(dir)
@@ -230,11 +267,53 @@ fn config_dir_for(
             .eq_ignore_ascii_case(owner)
             .then_some(dir)
     };
-    primary
-        .and_then(published)
-        .or_else(|| published(workspace))
-        .or_else(|| primary.and_then(root_owned))
-        .or_else(|| root_owned(workspace))
+    let candidates: [&dyn Fn() -> Option<PathBuf>; 5] = [
+        &|| creds::gh_config_dir_for_owner_slug(slug).filter(|dir| dir.join("hosts.yml").is_file()),
+        &|| primary.and_then(published),
+        &|| published(workspace),
+        &|| primary.and_then(root_owned),
+        &|| root_owned(workspace),
+    ];
+    // The first candidate whose token is not provably dead wins. A directory
+    // that is merely present is NOT enough (#14435): `gh-config-by-owner/
+    // <owner>/hosts.yml` outlives its token whenever nothing refreshes it
+    // (the workspace-root owner's live token is in `.loom/gh-config`), and
+    // `gh auth token` hands back an expired value without complaint.
+    let mut expired = false;
+    for candidate in candidates {
+        let Some(dir) = candidate() else { continue };
+        if token_expired(&dir, now) {
+            expired = true;
+            continue;
+        }
+        return DirChoice {
+            dir: Some(dir),
+            expired: false,
+        };
+    }
+    DirChoice { dir: None, expired }
+}
+
+/// Which credential directory an exec reads, and whether a matched one was
+/// passed over because its token is dead.
+struct DirChoice {
+    dir: Option<PathBuf>,
+    expired: bool,
+}
+
+/// `true` only when `dir`'s `identity.json` sidecar PROVES the token expired
+/// (or inside [`READER_MIN_REMAINING`] of it). A directory with no readable
+/// sidecar is unknown, not expired: it keeps the pre-sidecar behaviour.
+fn token_expired(dir: &Path, now: SystemTime) -> bool {
+    let Some(side) = crate::forge_identity::read_sidecar(dir) else {
+        return false;
+    };
+    let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&side.expires_at) else {
+        return false;
+    };
+    let exp: SystemTime = exp.with_timezone(&chrono::Utc).into();
+    exp.duration_since(now)
+        .map_or(true, |left| left < crate::forge_identity::READER_MIN_REMAINING)
 }
 
 /// The owner of `root`'s `origin`, only when that remote is on `gh_host`
@@ -325,6 +404,47 @@ mod tests {
         assert!(auth.resolved());
         assert_eq!(auth.names(), &["GH_TOKEN"]);
         assert_eq!(auth.child_env(), vec![("GH_TOKEN".into(), SECRET.into())]);
+    }
+
+    /// #14433: a GitHub repository is "missing" its write token only when the
+    /// process has none AND no owner App directory yields one; a published
+    /// directory (the operator-shell root fallback), a process token and a
+    /// non-GitHub forge are all not missing.
+    #[test]
+    fn github_token_missing_only_when_no_route_yields_a_credential() {
+        let repo = "https://github.com/acme/widget";
+        let empty = tempfile::tempdir().unwrap();
+        let none = env_of(&[]);
+        let unread = |_: &Path| -> Option<String> { None };
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &none, &unread, None);
+        assert!(auth.github_token_missing());
+        assert!(auth.names().is_empty() && auth.child_env().is_empty());
+
+        // The owner's App dir is published under the daemon root, and the
+        // process (an operator shell) has no env token and no registry.
+        let root = published_owner_workspace("acme");
+        let read = |_: &Path| Some(SECRET.to_owned());
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &none, &read, Some(root.path()));
+        assert!(!auth.github_token_missing());
+        assert!(auth.resolved());
+
+        // Published, but the token read yields nothing: still missing.
+        let auth =
+            ExecAuth::resolve_with_root(empty.path(), repo, &none, &unread, Some(root.path()));
+        assert!(auth.github_token_missing());
+
+        let with_env = env_of(&[("GITHUB_TOKEN", "from-process")]);
+        let auth = ExecAuth::resolve_with_root(empty.path(), repo, &with_env, &unread, None);
+        assert!(!auth.github_token_missing());
+
+        let gitea = ExecAuth::resolve_with_root(
+            empty.path(),
+            "https://forge.example/acme/widget",
+            &none,
+            &unread,
+            None,
+        );
+        assert!(!gitea.github_token_missing());
     }
 
     #[test]
@@ -539,6 +659,171 @@ mod tests {
         assert!(!auth.resolved());
         assert!(auth.names().is_empty());
         assert!(auth.child_env().is_empty());
+    }
+
+    #[test]
+    fn a_reaped_registration_falls_back_only_to_a_matching_root() {
+        use crate::credential_preflight as creds;
+        use crate::test_git_helpers::run;
+
+        let owner = "registered-owner-14523";
+        let repo = format!("https://github.com/{owner}/widget");
+        let ws = tempfile::tempdir().unwrap();
+        run(ws.path(), &["init", "-q"]);
+        run(ws.path(), &["remote", "add", "origin", &repo]);
+        let published = published_owner_workspace(owner);
+        let registered = creds::github_app_gh_config_dir_for_owner(published.path(), owner);
+        creds::register_owner_gh_config_dir(owner, &registered);
+        let root = creds::github_app_gh_config_dir(ws.path());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("hosts.yml"), "github.com: {}\n").unwrap();
+
+        let env = env_of(&[("GH_CONFIG_DIR", root.to_str().unwrap())]);
+        let expect_read = |expected: &Path| {
+            let auth = ExecAuth::resolve_with_root(
+                ws.path(),
+                &repo,
+                &env,
+                &|dir| {
+                    assert_eq!(dir, expected);
+                    Some(SECRET.into())
+                },
+                None,
+            );
+            assert!(auth.resolved());
+            assert!(!auth.expired());
+        };
+        expect_read(&registered);
+        std::fs::remove_file(registered.join("hosts.yml")).unwrap();
+        expect_read(&root);
+        std::fs::remove_dir(&registered).unwrap();
+        expect_read(&root);
+
+        for origin in [
+            "https://github.com/other-owner-14523/widget",
+            "https://ghe.example/registered-owner-14523/widget",
+        ] {
+            run(ws.path(), &["remote", "set-url", "origin", origin]);
+            let auth = ExecAuth::resolve_with_root(
+                ws.path(),
+                &repo,
+                &env,
+                &|_| panic!("read a credential without a matching owner and host"),
+                None,
+            );
+            assert!(auth.child_env().is_empty());
+            assert!(!auth.expired());
+        }
+    }
+
+    /// Publish an `identity.json` sidecar beside `dir`'s `hosts.yml`.
+    fn write_sidecar(dir: &Path, expires_at: &str) {
+        std::fs::write(
+            dir.join("identity.json"),
+            format!(
+                r#"{{"appId":"1","slug":null,"installationId":"2","owner":"acme","role":"writer","expiresAt":"{expires_at}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// #14435: on a daemon whose root IS the repository owner, a leftover
+    /// `gh-config-by-owner/<owner>` with an expired token must not shadow the
+    /// root's live `.loom/gh-config` (the layout measured on a fleet worker:
+    /// stale per-owner writer file, fresh root writer file). Judge and Builder
+    /// execs alike would otherwise carry a dead token (`401` / git `128`).
+    #[test]
+    fn an_expired_owner_dir_never_shadows_the_live_root_owner_dir() {
+        let ws = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(ws.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/RootOwner14435/primary.git",
+        ]);
+        let stale = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+            ws.path(),
+            "rootowner14435",
+        );
+        let live = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+        for dir in [&stale, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+        }
+        write_sidecar(&stale, "2020-01-01T00:00:00Z");
+        write_sidecar(&live, "2999-01-01T00:00:00Z");
+        let seen = std::cell::RefCell::new(None);
+        let read = |dir: &Path| {
+            *seen.borrow_mut() = Some(dir.to_path_buf());
+            Some(SECRET.to_owned())
+        };
+        let auth = ExecAuth::resolve_with_root(
+            ws.path(),
+            "https://github.com/rootowner14435/second",
+            &env_of(&[]),
+            &read,
+            Some(ws.path()),
+        );
+        assert!(auth.resolved());
+        assert!(!auth.expired());
+        assert_eq!(seen.borrow().as_deref(), Some(live.as_path()));
+    }
+
+    /// #14435: with nothing fresher, an expired credential is neither read nor
+    /// forwarded, and the exec says so, so admission can refuse up front.
+    #[test]
+    fn an_owner_whose_only_credential_is_expired_reads_nothing_and_reports_it() {
+        let ws = published_owner_workspace("acme-expired-14435");
+        let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+            ws.path(),
+            "acme-expired-14435",
+        );
+        write_sidecar(&dir, "2020-01-01T00:00:00Z");
+        let never = |_: &Path| -> Option<String> { panic!("read an expired token") };
+        let auth = ExecAuth::resolve_with_root(
+            ws.path(),
+            "https://github.com/acme-expired-14435/widget",
+            &env_of(&[]),
+            &never,
+            None,
+        );
+        assert!(!auth.resolved());
+        assert!(auth.expired());
+        assert!(auth.names().is_empty());
+        assert!(auth.child_env().is_empty());
+        // A sidecar-less directory is unknown, not expired: still read.
+        std::fs::remove_file(dir.join("identity.json")).unwrap();
+        let auth = ExecAuth::resolve_with_root(
+            ws.path(),
+            "https://github.com/acme-expired-14435/widget",
+            &env_of(&[]),
+            &|_| Some(SECRET.into()),
+            None,
+        );
+        assert!(auth.resolved());
+        assert!(!auth.expired());
+        // An owner with no directory at all is unmatched, not expired
+        // (a public repository needs no credential).
+        let none = ExecAuth::resolve_with_root(
+            ws.path(),
+            "https://github.com/nobody-14435/widget",
+            &env_of(&[]),
+            &never,
+            None,
+        );
+        assert!(!none.expired());
     }
 
     #[test]

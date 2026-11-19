@@ -227,3 +227,70 @@ fn every_new_usage_key_survives_both_allowlists() {
         assert!(collector.contains(&format!("\"{key}\"")), "{key} missing from keep_keys");
     }
 }
+
+/// The usage span for `rows` stamped with `runtime`.
+fn spans_for_runtime(runtime: &str, rows: &[ModelUsageTotals]) -> Vec<SpanRecord> {
+    let at = Utc::now();
+    let mut common = TraceAttributes::new();
+    common.insert("loom.runtime".into(), runtime.into());
+    model_usage_spans(
+        &TraceContext::root(true),
+        (at, at),
+        rows,
+        UsageScope::Execution,
+        &common,
+        &Pricing::with(None),
+    )
+}
+
+const CACHE_WRITE_ATTRIBUTES: [&str; 4] = [
+    "loom.tokens.cache_write",
+    "loom.tokens.cache_write_5m",
+    "loom.tokens.cache_write_1h",
+    "gen_ai.usage.cache_creation_input_tokens",
+];
+
+#[test]
+fn a_codex_row_with_no_cache_write_leaves_the_cache_write_counters_absent() {
+    // Issue #14166: Codex reports no cache-write counter on most versions and
+    // its reader maps that to 0, so the span must not claim a measured zero.
+    let spans = spans_for_runtime("codex", &[model("gpt-fixture", 600, 100, 400, 0, 0)]);
+    let [span] = spans.as_slice() else {
+        panic!("one span: {spans:?}")
+    };
+    for key in CACHE_WRITE_ATTRIBUTES {
+        assert!(
+            !span.attributes.contains_key(key),
+            "{key} must be absent: {:?}",
+            span.attributes
+        );
+    }
+    // The counters the CLI does report are still there.
+    assert_eq!(span.attributes["loom.tokens.input"], "600");
+    assert_eq!(span.attributes["loom.tokens.cache_read"], "400");
+    assert_eq!(span.attributes["loom.tokens.output"], "100");
+}
+
+#[test]
+fn a_codex_row_that_did_report_cache_writes_keeps_them() {
+    let spans = spans_for_runtime("codex", &[model("gpt-fixture", 600, 100, 400, 50, 0)]);
+    let [span] = spans.as_slice() else {
+        panic!("one span: {spans:?}")
+    };
+    assert_eq!(span.attributes["loom.tokens.cache_write"], "50");
+    assert_eq!(span.attributes["loom.tokens.cache_write_5m"], "50");
+    assert_eq!(span.attributes["gen_ai.usage.cache_creation_input_tokens"], "50");
+}
+
+#[test]
+fn a_runtime_that_reports_cache_writes_keeps_a_measured_zero() {
+    for runtime in ["claude", "opencode"] {
+        let spans = spans_for_runtime(runtime, &[model("m", 1, 1, 1, 0, 0)]);
+        let [span] = spans.as_slice() else {
+            panic!("one span: {spans:?}")
+        };
+        for key in CACHE_WRITE_ATTRIBUTES {
+            assert_eq!(span.attributes[key], "0", "{runtime}: a measured zero is exported: {key}");
+        }
+    }
+}

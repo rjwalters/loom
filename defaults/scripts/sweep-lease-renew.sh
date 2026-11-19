@@ -291,6 +291,12 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # of failing closed for the sweep's entire lease lifetime.
 # shellcheck source=./lib/forge-helpers.sh
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
+# #14488: one binary for the whole lease chain (see loom_select_lease_bin).
+# Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
+if [[ -r "$SCRIPT_DIR/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    source "$SCRIPT_DIR/lib/locate-daemon-bin.sh" && loom_select_lease_bin "$PWD" || true
+fi
 
 # lease_gh <read|write> <gh args...> (#10229): run one forge call on this host's
 # GitHub App installation -- `loom-daemon forge token` picks a reader App for the

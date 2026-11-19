@@ -154,7 +154,7 @@ run_create_pr --title "t" --body "b" --head feature/issue-78 --base release --dr
 assert_eq "0" "$EXIT_CODE" "T2: rate-limited --draft create -> exit 0"
 assert_eq "release" "$(payload .base)" "T2: --base is used verbatim"
 assert_eq "true" "$(payload .draft)" "T2: --draft -> draft:true"
-assert_eq "0" "$(calls_matching '^api repos/owner/repo --jq')" "T2: no default-branch lookup when --base is given"
+assert_eq "0" "$(calls_matching '^api repos/owner/repo --jq \.default_branch')" "T2: no default-branch lookup when --base is given"
 assert_eq "0" "$(calls_matching '/labels')" "T2: no labels requested -> no labels POST"
 
 # T3/T4: a NON-rate-limit failure makes no REST call and keeps today's exit 1.

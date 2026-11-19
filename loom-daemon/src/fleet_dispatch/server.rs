@@ -29,6 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -42,12 +43,14 @@ use tokio::sync::Semaphore;
 
 use crate::discovery::mirror::TickWorklist;
 
+use super::filing_slot::{ExpiredFiling, FilingSlot, LockDecision, UnlockOutcome};
 use super::identity::{Identity, IdentityError};
 use super::proto::{
-    AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, HeartbeatRequest,
-    HeartbeatResponse, NextRequest, NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest,
-    ReleaseRequest, CLAIM_PATH, HEARTBEAT_PATH, NEXT_PATH, PARK_ENDED_PATH, PATHS, REFUSE_PATH,
-    RELEASE_PATH,
+    AckResponse, Assignment, ClaimRequest, ClaimResponse, ErrorResponse, FilingLockRequest,
+    FilingLockResponse, FilingUnlockRequest, HeartbeatRequest, HeartbeatResponse, NextRequest,
+    NextResponse, ParkEndedRequest, RefusalReason, RefuseRequest, ReleaseRequest, CLAIM_PATH,
+    FILING_LOCK_PATH, FILING_UNLOCK_PATH, HEARTBEAT_PATH, MAX_HOLDER_LEN, NEXT_PATH,
+    PARK_ENDED_PATH, PATHS, REFUSE_PATH, RELEASE_PATH,
 };
 use super::queue::{Queue, DEFAULT_REFRESH_SECS};
 use super::roster::{Roster, RosterSource};
@@ -132,9 +135,19 @@ pub struct Server<I: Identity> {
     epoch: String,
     roster: RwLock<Arc<Roster>>,
     table: Mutex<Table>,
+    /// The fleet-wide issue-filing slot (#13918).
+    filing: Mutex<FilingSlot>,
     queue: Mutex<Queue>,
     counters: Mutex<Counters>,
     seq: AtomicU64,
+    /// The captain's own token-pool dir, whose `.ranking` the heartbeat
+    /// answer publishes as the fleet probe snapshot (#13942). `None` on a
+    /// server built without one: the answer omits the field.
+    token_probe: Option<PathBuf>,
+    /// The last probe cycle already emitted as the captain-side per-account
+    /// record (#13942): one record per distinct `.ranking` mtime, not one
+    /// per heartbeat.
+    last_probe_cycle: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl<I: Identity> Server<I> {
@@ -154,10 +167,45 @@ impl<I: Identity> Server<I> {
             epoch,
             roster: RwLock::new(Arc::new(roster)),
             table: Mutex::new(table),
+            filing: Mutex::new(FilingSlot::new()),
             queue: Mutex::new(Queue::new(Duration::from_secs(DEFAULT_REFRESH_SECS))),
             counters: Mutex::new(Counters::default()),
             seq: AtomicU64::new(0),
+            token_probe: None,
+            last_probe_cycle: Mutex::new(None),
         }
+    }
+
+    /// Publish the token-pool probe of the pool at `tokens_dir` on every
+    /// heartbeat answer (#13942). Read fresh on each heartbeat: the file is
+    /// tiny, the cadence is at most one answer per worker per
+    /// [`super::worker::HEARTBEAT_GAP`], and a `tokens check --ranking` run
+    /// landing mid-flight is picked up by the very next heartbeat.
+    #[must_use]
+    pub fn with_token_probe(mut self, tokens_dir: PathBuf) -> Self {
+        self.token_probe = Some(tokens_dir);
+        self
+    }
+
+    /// The snapshot to publish, and the captain-side per-account record for
+    /// a cycle this process has not yet emitted (#13942). Emits one point
+    /// per account per distinct probe instant (the `.ranking` mtime), so
+    /// SigNoz shows what the captain published each cycle without one point
+    /// per heartbeat per worker.
+    fn token_probe_snapshot(&self) -> Option<crate::tokens_pool::fleet_probe::TokenProbeSnapshot> {
+        let dir = self.token_probe.as_ref()?;
+        let snapshot = crate::tokens_pool::fleet_probe::snapshot_from_tokens_dir(dir)?;
+        let mut last = self
+            .last_probe_cycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last != Some(snapshot.probed_at) {
+            *last = Some(snapshot.probed_at);
+            crate::observability::ops::emit_metrics(
+                crate::tokens_pool::fleet_probe::published_cycle_points(&snapshot),
+            );
+        }
+        Some(snapshot)
     }
 
     /// Set the full-refresh period (`fleetDispatch.queueRefreshSecs`).
@@ -298,6 +346,7 @@ impl<I: Identity> Server<I> {
     /// Expire due rows, then flush the counters and the table's gauges
     /// (#12873) as metric points, both read under the one table lock.
     pub fn sweep(&self) {
+        self.expire_filing();
         let points = self.sweep_points(Utc::now());
         if !points.is_empty() {
             crate::observability::ops::emit_metrics(points);
@@ -312,6 +361,52 @@ impl<I: Identity> Server<I> {
             points.extend(super::telemetry::gauge_points(&gauges, wall_now));
             points
         })
+    }
+
+    /// Run `f` on the filing slot after expiring a hold that ran out (its
+    /// span is emitted, #13918).
+    fn with_filing<T>(&self, f: impl FnOnce(&mut FilingSlot, Mono) -> T) -> T {
+        let now = self.clock.now();
+        let (expired, out) = {
+            let mut slot = self
+                .filing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let expired = slot.expire(now);
+            let out = f(&mut slot, now);
+            (expired, out)
+        };
+        if let Some(row) = &expired {
+            self.report_filing_expired(row);
+        }
+        out
+    }
+
+    /// Expire the filing slot's hold if its TTL ran out (the sweep's pass).
+    pub fn expire_filing(&self) {
+        self.with_filing(|_, _| ());
+    }
+
+    /// The captain's span for a filing hold that was never unlocked: the host
+    /// that lost it and how long it held it.
+    fn report_filing_expired(&self, row: &ExpiredFiling) {
+        log::warn!(
+            "fleet-dispatch: filing lock held by {} ('{}') expired after {}s without an unlock",
+            row.host,
+            row.label,
+            row.hold.as_secs()
+        );
+        let call = Call {
+            host: Some(row.host.clone()),
+            endpoint: telemetry::FILING_EXPIRE_ENDPOINT.to_string(),
+            status: 0,
+            result: telemetry::RESULT_EXPIRED,
+            reason: Some(telemetry::CAUSE_LEASE_EXPIRED.to_string()),
+            server_epoch: self.epoch.clone(),
+            hold_ms: Some(u64::try_from(row.hold.as_millis()).unwrap_or(u64::MAX)),
+            ..Call::default()
+        };
+        telemetry::emit_call(&call, chrono::Utc::now(), self.next_seq());
     }
 
     /// Resolve `peer` to its roster host id. `Err` is the reply to send.
@@ -355,6 +450,8 @@ impl<I: Identity> Server<I> {
             RELEASE_PATH => self.release(host, body, &mut call),
             NEXT_PATH => self.next(host, body, &mut call),
             PARK_ENDED_PATH => self.park_ended(host, body, &mut call),
+            FILING_LOCK_PATH => self.filing_lock(host, body, &mut call),
+            FILING_UNLOCK_PATH => self.filing_unlock(host, body, &mut call),
             _ => Err(self.error(404, "not found")),
         };
         let reply = reply.unwrap_or_else(|e| e);
@@ -385,6 +482,7 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&HeartbeatResponse {
             server_epoch: self.epoch.clone(),
             grace,
+            token_probe: self.token_probe_snapshot(),
         }))
     }
 
@@ -541,10 +639,13 @@ impl<I: Identity> Server<I> {
             }
             outcome
         });
-        if outcome != RefuseOutcome::Unknown {
+        if outcome != RefuseOutcome::Unknown
+            && req.reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+        {
             if let Some((repo, item, _)) = &call.item {
-                // Only an accepted owner's refusal can suppress the candidate.
-                // Refreshing the same `updated_at` must not re-admit it (§10.3).
+                // An accepted owner's definitive refusal suppresses the candidate
+                // until its next forge revision (§10.3). A busy local seat
+                // only gives back the assignment so another worker may try.
                 if let Ok(item) = u32::try_from(*item) {
                     self.queue().tombstone(repo, item);
                 }
@@ -553,6 +654,78 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&AckResponse {
             server_epoch: self.epoch.clone(),
             known: outcome != RefuseOutcome::Unknown,
+            park: false,
+        }))
+    }
+
+    /// `host` asks for the fleet-wide issue-filing slot (#13918). A refusal
+    /// is an answer, not an error. Not gated on the start-up grace window: the
+    /// slot is soft state, so a restarted captain simply grants it again to a
+    /// holder's refresh rather than wedge filing for the grace period.
+    fn filing_lock(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+        let req: FilingLockRequest = self.parse(host, body)?;
+        check_holder(&req.holder).map_err(|m| self.error(400, m))?;
+        let label: String = req.label.chars().take(64).collect();
+        let decision = self.with_filing(|slot, now| slot.lock(now, host, &req.holder, &label));
+        let response = match decision {
+            LockDecision::Granted { ttl_s, refreshed } => {
+                call.result = "granted";
+                call.reason = Some(if refreshed { "refreshed" } else { "granted" }.to_string());
+                log::info!(
+                    "fleet-dispatch: filing lock to {host} ('{label}', refreshed={refreshed})"
+                );
+                FilingLockResponse {
+                    server_epoch: self.epoch.clone(),
+                    granted: true,
+                    ttl_s: Some(ttl_s),
+                    held_by: None,
+                    retry_after_s: None,
+                }
+            }
+            LockDecision::Held {
+                held_by,
+                retry_after_s,
+            } => {
+                call.result = "refused";
+                call.reason = Some("held".to_string());
+                call.held_by = Some(held_by.clone());
+                call.retry_after_s = Some(retry_after_s);
+                FilingLockResponse {
+                    server_epoch: self.epoch.clone(),
+                    granted: false,
+                    ttl_s: None,
+                    held_by: Some(held_by),
+                    retry_after_s: Some(retry_after_s),
+                }
+            }
+        };
+        Ok(self.ok(&response))
+    }
+
+    /// `host` releases the filing slot it holds (#13918); a no-op unless the
+    /// host and `holder` are the grant's.
+    fn filing_unlock(&self, host: &str, body: &[u8], call: &mut Call) -> Result<Reply, Reply> {
+        let req: FilingUnlockRequest = self.parse(host, body)?;
+        check_holder(&req.holder).map_err(|m| self.error(400, m))?;
+        let outcome = self.with_filing(|slot, now| slot.unlock(now, host, &req.holder));
+        let known = match outcome {
+            UnlockOutcome::Released { hold } => {
+                call.reason = Some("released".to_string());
+                call.hold_ms = Some(u64::try_from(hold.as_millis()).unwrap_or(u64::MAX));
+                true
+            }
+            UnlockOutcome::NotHolder => {
+                call.reason = Some("not_holder".to_string());
+                false
+            }
+            UnlockOutcome::Empty => {
+                call.reason = Some("empty".to_string());
+                false
+            }
+        };
+        Ok(self.ok(&AckResponse {
+            server_epoch: self.epoch.clone(),
+            known,
             park: false,
         }))
     }
@@ -616,6 +789,14 @@ impl<I: Identity> Server<I> {
     }
 }
 
+/// A filing `holder` id: non-empty and bounded.
+fn check_holder(holder: &str) -> Result<(), &'static str> {
+    if holder.is_empty() || holder.len() > MAX_HOLDER_LEN {
+        return Err("holder must be 1 to 128 bytes");
+    }
+    Ok(())
+}
+
 fn step_is_merge(step: &str) -> bool {
     step == StepRole::ChampionMerge.as_str()
 }
@@ -646,7 +827,9 @@ host_body!(
     RefuseRequest,
     ReleaseRequest,
     NextRequest,
-    ParkEndedRequest
+    ParkEndedRequest,
+    FilingLockRequest,
+    FilingUnlockRequest
 );
 
 /// A parsed request head.

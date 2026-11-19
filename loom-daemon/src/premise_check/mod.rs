@@ -102,6 +102,12 @@ pub struct Inputs {
     /// independently: companion `premise-evidence:` lines must live in the
     /// *same* comment as the marker they support.
     pub comments: Vec<String>,
+    /// The authoritative forge read of the operator's resolution of a ranked
+    /// decision (#14399). `None` (hermetic `--body-file` input, or a caller
+    /// that did not read the forge) can never open a deliberate-reversal
+    /// gate: a resolution is attested by the forge's author metadata, and a
+    /// pasted file has none.
+    pub resolution: Option<crate::operator_decision::resolution::Evidence>,
 }
 
 /// The gate's whole answer for one issue.
@@ -111,6 +117,35 @@ pub struct Decision {
     pub record: Option<Record>,
     pub outcome: Outcome,
     pub exit_code: i32,
+    /// For a deliberate reversal routed to the operator: what the verifier
+    /// found. The record itself is never rewritten (#14399).
+    pub resolution: Option<crate::operator_decision::resolution::Assessment>,
+}
+
+/// A deliberate reversal routed to the operator stays routed unless the
+/// operator's explicit resolution of the current decision verifies. Anything
+/// else (no evidence, stale, conflicting, malformed, unreadable) keeps
+/// [`Outcome::RouteOperator`]; only a verified `proceed` yields
+/// [`Outcome::Proceed`].
+fn apply_resolution(
+    rec: &Record,
+    outcome: Outcome,
+    evidence: Option<&crate::operator_decision::resolution::Evidence>,
+) -> (Outcome, Option<crate::operator_decision::resolution::Assessment>) {
+    use crate::operator_decision::resolution::{verify, Assessment};
+    if outcome != Outcome::RouteOperator || !(rec.deliberate && rec.reversal) {
+        return (outcome, None);
+    }
+    let assessment = evidence.map_or_else(
+        || Assessment::unavailable("no authoritative forge read of the decision (offline input)"),
+        verify,
+    );
+    let outcome = if assessment.status.approves() {
+        Outcome::Proceed
+    } else {
+        outcome
+    };
+    (outcome, Some(assessment))
 }
 
 /// Run stages 1 and 2. The evidence scan is the caller's, because it needs a
@@ -145,6 +180,7 @@ pub fn decide_with(
             record: None,
             outcome: Outcome::OutOfScope,
             exit_code: exit::PROCEED,
+            resolution: None,
         };
     };
 
@@ -161,6 +197,7 @@ pub fn decide_with(
             record: None,
             outcome: Outcome::RecordRequired,
             exit_code: exit::RECORD_REQUIRED,
+            resolution: None,
         };
     };
 
@@ -170,9 +207,11 @@ pub fn decide_with(
             record: None,
             outcome: Outcome::Malformed(why),
             exit_code: exit::RECORD_MALFORMED,
+            resolution: None,
         },
         Ok(rec) => {
             let outcome = record::check_with(&rec, content_root, policy);
+            let (outcome, resolution) = apply_resolution(&rec, outcome, inputs.resolution.as_ref());
             let exit_code = match outcome {
                 Outcome::Proceed => exit::PROCEED,
                 Outcome::RouteOperator => exit::ROUTE_OPERATOR,
@@ -188,6 +227,7 @@ pub fn decide_with(
                 record: Some(rec),
                 outcome,
                 exit_code,
+                resolution,
             }
         }
     }
@@ -206,6 +246,7 @@ mod policy_scope_tests {
                     .into(),
             labels: labels.iter().map(ToString::to_string).collect(),
             comments: vec![],
+            resolution: None,
         }
     }
 
@@ -224,3 +265,6 @@ mod policy_scope_tests {
         assert_ne!(other.outcome, Outcome::Proceed);
     }
 }
+
+#[cfg(test)]
+mod resolution_gate_tests;

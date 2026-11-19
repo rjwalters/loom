@@ -403,6 +403,15 @@ accepted.
    stale statements. This is the successor of the deletions #11717 attempted,
    replayed on a fresh branch; #11717 itself stays blocked.
 
+   **Status (#13920, operator ruling 2026-11-15).** Child 1 (#13945) landed the
+   deletion: the peer-claim channel, its claims room and config, every
+   broadcast, the `peer-claims` CLI and its health/watchdog alert class;
+   `QueueDisposition::PeerClaim` is now `LeaseHeld`; ADR-0025's stale statements
+   are retired. Only the `completed` narration ad survives, as a shim in
+   `safehouse/claim_sink.rs`. **Not done until child 2 lands** (the merged-PR
+   report and slimming `safehouse/`), which replaces that shim; mark this
+   increment done then.
+
 ## Amendment: fast-fail lane cut over to the captain (#13919, 2026-11-16)
 
 The fleet fast-fail streak lane (#11854, #11930, #11952) is **cut over**. The

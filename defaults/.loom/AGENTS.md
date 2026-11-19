@@ -1,5 +1,5 @@
 <!-- GENERATED FILE — DO NOT EDIT DIRECTLY.
-     Produced by defaults/scripts/generate-agents-md.sh from the
+     Produced by scripts/generate-agents-md.sh from the
      `agents-md:include` marker ranges in defaults/.loom/CLAUDE.md. To change
      this file, edit those ranges in the source and re-run the generator;
      CI (scripts/check-agents-md-sync.sh) fails if this file is stale.

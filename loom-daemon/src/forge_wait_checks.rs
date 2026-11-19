@@ -67,7 +67,21 @@
 //! by a twin authority ([`crate::merge_pr::superseded_runs`]) all leave the
 //! verdict as it was.
 //!
+//! # Stranded check runs (#14128)
+//!
+//! A terminal-failed run (`startup_failure`, `failure`, …) can leave its
+//! jobs' check runs `queued` with a null conclusion for good — measured on a
+//! live `startup_failure` run months after it ended. Read as pending they
+//! hold the wait to `LOOM-CHECKS-TIMEOUT`. On a poll with a non-terminal row
+//! that carries a check-suite id, the head's workflow runs are read
+//! (best-effort) and every such row whose suite is a terminal-failed,
+//! non-superseded run's `check_suite_id` is classified as failed under its
+//! own name, so the verdict is RED (and `--required-only` still sees a
+//! stranded required job). A row under a run that has not failed stays
+//! pending. See `fail_stranded_check_runs`.
+//!
 //! # The required-context set
+//!
 //!
 //! Looked up from the base branch only when a verdict needs it, cached once
 //! it succeeds, and RETRIED on every later poll while it fails — a failed
@@ -451,6 +465,7 @@ fn poll(
     // vanished fold below reads these, not the dropped doc.
     let original_rows = runs.get("check_runs").and_then(Value::as_array).cloned();
     drop_superseded_twins(reads, &sha, &mut runs);
+    fail_stranded_check_runs(reads, &sha, &mut runs);
     let status = legacy_statuses(reads, &sha, st)?;
     let mut rollup = verdict::fold(&runs, &status).map_err(ReadError::Fatal)?;
     // A startup-failed run registers no check runs (#13940): on a poll that
@@ -703,28 +718,13 @@ fn vanished_failed_workflows(
     rows: &[serde_json::Value],
     sha: &str,
 ) -> Vec<Failed> {
-    use crate::merge_pr::superseded_runs;
     if rows.iter().any(|row| check_suite_id(row).is_none()) {
         return Vec::new();
     }
-    let Some(runs) = payload.get("workflow_runs").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    match payload.get("total_count").and_then(Value::as_u64) {
-        Some(n) if n as usize <= runs.len() => {}
-        _ => return Vec::new(),
-    }
-    let Ok(superseded) = superseded_runs::superseded_suites(payload, sha) else {
-        return Vec::new();
-    };
-    runs.iter()
-        .filter(|run| run.get("head_sha").and_then(Value::as_str) == Some(sha))
-        .filter(|run| run_failed(run))
-        .filter_map(|run| {
-            let suite = run.get("check_suite_id").and_then(Value::as_u64)?;
-            if superseded.contains_key(&suite)
-                || rows.iter().any(|row| check_suite_id(row) == Some(suite))
-            {
+    failed_runs(payload, sha)
+        .into_iter()
+        .filter_map(|(suite, run)| {
+            if rows.iter().any(|row| check_suite_id(row) == Some(suite)) {
                 return None;
             }
             let name = run.get("name").and_then(Value::as_str)?.to_string();
@@ -741,6 +741,85 @@ fn vanished_failed_workflows(
             Some(Failed { name, url, run_id })
         })
         .collect()
+}
+
+/// The terminal-failed workflow runs on `sha` as `(check_suite_id, run)`
+/// pairs — the verdict-bearing runs both [`vanished_failed_workflows`] and
+/// [`fail_stranded_check_runs`] attribute from.
+///
+/// Doubt answers empty: an unreadable or truncated payload may hide the
+/// newer authority run that superseded a visible failed one, and the
+/// superseded suites of
+/// [`crate::merge_pr::superseded_runs::superseded_suites`] are excluded —
+/// a run a newer verdict replaced is not this commit's verdict either.
+fn failed_runs<'a>(payload: &'a serde_json::Value, sha: &str) -> Vec<(u64, &'a serde_json::Value)> {
+    use crate::merge_pr::superseded_runs;
+    let Some(runs) = payload.get("workflow_runs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    match payload.get("total_count").and_then(Value::as_u64) {
+        Some(n) if n as usize <= runs.len() => {}
+        _ => return Vec::new(),
+    }
+    let Ok(superseded) = superseded_runs::superseded_suites(payload, sha) else {
+        return Vec::new();
+    };
+    runs.iter()
+        .filter(|run| run.get("head_sha").and_then(Value::as_str) == Some(sha))
+        .filter(|run| run_failed(run))
+        .filter_map(|run| {
+            let suite = run.get("check_suite_id").and_then(Value::as_u64)?;
+            (!superseded.contains_key(&suite)).then_some((suite, run))
+        })
+        .collect()
+}
+
+/// Settle the check runs a terminal-failed workflow run left non-terminal
+/// (#14128): `startup_failure` (and kin) concludes the run while its jobs
+/// stay `queued` with a null conclusion — measured on this repo, a
+/// `startup_failure` run from 2026-08-26 still owned 19 queued rows
+/// months later, so they never settle. Read as pending they held the wait
+/// to `TIMEOUT` (and, under `--settle-red`, kept any RED pending forever).
+///
+/// A non-terminal row whose `check_suite.id` equals a terminal-failed run's
+/// `check_suite_id` is rewritten as terminal with that run's conclusion, so
+/// it is reported failing under its own name — the same name a required
+/// context would carry, so `--required-only` still sees the failure. Only
+/// positive attribution acts (the failing direction); a row without a
+/// suite id, a run that has not failed, a superseded twin, and an
+/// unreadable or truncated runs payload leave the row pending as before.
+/// A run that is not terminal (queued, in progress — including a re-run of
+/// its failed jobs) never strands anything.
+///
+/// The runs read happens only when some row is non-terminal and has a suite
+/// id; its failure changes nothing. Silent: nothing may reach stderr before
+/// the sentinel.
+fn fail_stranded_check_runs(reads: &mut GhReads, sha: &str, runs: &mut serde_json::Value) {
+    let Some(rows) = runs.get_mut("check_runs").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let stranded_candidate = |row: &Value| {
+        !crate::merge_pr::check_runs_rollup::is_settled(row) && check_suite_id(row).is_some()
+    };
+    if !rows.iter().any(stranded_candidate) {
+        return;
+    }
+    let Ok(payload) = reads.workflow_runs(sha) else {
+        return;
+    };
+    let failed = failed_runs(&payload, sha);
+    for row in rows.iter_mut().filter(|r| stranded_candidate(r)) {
+        let Some(suite) = check_suite_id(row) else {
+            continue;
+        };
+        let Some((_, run)) = failed.iter().find(|(s, _)| *s == suite) else {
+            continue;
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("status".into(), Value::String("completed".into()));
+            obj.insert("conclusion".into(), run.get("conclusion").cloned().unwrap_or(Value::Null));
+        }
+    }
 }
 
 /// Fold #13940's vanished failures into a poll that would otherwise settle

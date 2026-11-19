@@ -352,6 +352,18 @@ pub fn cli_reads_reader_only() -> bool {
     CLI_READER_ONLY.get().copied().unwrap_or(false)
 }
 
+/// A tools CLI in explicit fleet mode still expects a reader when a configured
+/// gateway is unavailable or its reader pool cannot serve this repository.
+static REQUIRE_CLI_READER: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn require_cli_read_route() {
+    let _ = REQUIRE_CLI_READER.set(());
+}
+
+pub(crate) fn cli_read_route_required() -> bool {
+    REQUIRE_CLI_READER.get().is_some()
+}
+
 /// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
 /// on `PATH`, as the facade will run it.
 #[cfg(test)]
@@ -506,7 +518,13 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     } else {
         withdrawn_until(&owner, req, now)
     };
-    past_withdrawn_gateway(pool, gateway_until)
+    match past_withdrawn_gateway(pool, gateway_until) {
+        RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {
+            until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        },
+        decision => decision,
+    }
 }
 
 /// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]

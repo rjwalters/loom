@@ -16,10 +16,10 @@ use crate::hooks_home;
 use anyhow::{bail, Result};
 
 #[derive(clap::Args)]
-pub(crate) struct HooksHomeArgs {}
+pub struct HooksHomeArgs {}
 
 impl HooksHomeArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let Some(dir) = hooks_home::current() else {
             bail!(
                 "no hooks home: {} is set empty, there is no home directory, or this release's \

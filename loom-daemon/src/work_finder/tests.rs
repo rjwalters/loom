@@ -180,8 +180,6 @@ struct RecordingDispatcher {
     backoff_refuse_issues: HashSet<u32>,
     /// Cumulative cross-host collision count this dispatcher reports (#4085).
     collisions: u64,
-    /// Issue numbers a peer host has soft-claimed over safehouse (#4028).
-    peer_claimed: HashSet<u32>,
     /// Issue numbers whose dispatch should be refused by the live-claim
     /// guard (#4556) — the dispatcher returns the typed
     /// [`LiveClaimDispatchError`], as `SweepRegistry::dispatch` step 2.9 does
@@ -248,9 +246,6 @@ impl WorkDispatcher for RecordingDispatcher {
     }
     fn collisions(&self) -> u64 {
         self.collisions
-    }
-    fn peer_claimed(&self) -> HashSet<u32> {
-        self.peer_claimed.clone()
     }
     fn extra_skip_labels(&self) -> Vec<String> {
         self.extra_skip_labels.clone()
@@ -1235,39 +1230,6 @@ fn test_tick_multi_backoff_refusal_counts_as_backoff_skip() {
 }
 
 #[test]
-fn test_tick_peer_claim_skipped_under_distinct_counter() {
-    // A peer host's live soft claim (#4028) skips the issue under its OWN
-    // distinct counter — never folded into labeled/in-flight/quarantine — and
-    // does not consume a capacity slot (checked before the cap gate), so the
-    // healthy sibling issue takes the slot.
-    let mut source = FakeSource::once(vec![issue(1), issue(2)]);
-    let mut disp = RecordingDispatcher {
-        peer_claimed: HashSet::from([1]),
-        ..Default::default()
-    };
-    let report = tick(&mut source, &mut disp, 1, false).unwrap();
-
-    assert_eq!(report.skipped_peer_claim, 1, "#1 is peer-claimed");
-    assert_eq!(report.skipped_labeled, 0, "peer-claim is NOT a label skip");
-    assert_eq!(report.skipped_in_flight, 0, "peer-claim is NOT an in-flight skip");
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(disp.dispatched, vec![2], "the slot goes to the un-claimed #2");
-}
-
-#[test]
-fn test_tick_stops_skipping_once_peer_claim_clears() {
-    // Once the peer claim lapses (empty peer_claimed set, mirroring a TTL
-    // expiry / retraction), the previously-skipped issue dispatches normally.
-    let mut source = FakeSource::once(vec![issue(1)]);
-    let mut disp = RecordingDispatcher::default(); // no peer claims now
-    let report = tick(&mut source, &mut disp, 5, false).unwrap();
-
-    assert_eq!(report.skipped_peer_claim, 0);
-    assert_eq!(report.dispatched, 1);
-    assert_eq!(disp.dispatched, vec![1]);
-}
-
-#[test]
 fn test_tick_idempotency_noop_not_counted_as_dispatch() {
     // dispatch() returns Ok(false) (a sweep with the same key was already
     // running) — it must not count as a new dispatch nor consume a slot.
@@ -1510,10 +1472,9 @@ fn test_park_labels_are_the_non_building_subset_of_skip_labels() {
 }
 
 // The vibesql#6664 operator-hold skip-not-park test lives in its own
-// sibling file rather than being appended here: this module is over the
-// 1000-line ratchet threshold and frozen at its current size
-// (`.loom/docs/file-size-policy.md`), the same pattern `roster_fence`
-// already uses in this file. `epic_container` (#11399) follows it.
+// sibling file rather than being appended here, the same pattern
+// `roster_fence` already uses in this file. `epic_container` (#11399)
+// follows it.
 mod epic_container;
 mod operator_hold;
 mod restore_veto;

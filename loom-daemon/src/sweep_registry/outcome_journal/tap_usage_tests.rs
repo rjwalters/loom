@@ -2,8 +2,7 @@
 //! journals carry (Issue #8556).
 //!
 //! Sibling module rather than an append to `tests`/`credential_tests`, for the
-//! same file-size-ratchet reason those two exist
-//! (`scripts/check-file-size-budget.sh`).
+//! same reason those two exist: keeping `tests` from growing further.
 //!
 //! The property under test is the one #8556 turns into a requirement: a
 //! terminal transition must leave behind *which tap paid* and *what its own

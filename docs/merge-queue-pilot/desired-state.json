@@ -1,0 +1,28 @@
+{
+  "_comment": "DESIRED STATE ONLY (#14159). Nothing in this repository applies this file. An operator applies it after every prerequisite in defaults/docs/merge-queue-ci.md 'Pilot cutover' passes. Direct mode stays until then (champion.mergeMode is unset/direct).",
+  "repository": "2AMLogic/loom",
+  "branch": "main",
+  "champion": { "mergeMode": "direct", "_cutover_value": "queue" },
+  "required_status_checks": {
+    "_note": "loom/merge-authorization is a commit status posted by `forge merge-queue group-check` (merge-group-check.yml), not a CI job: it records the Judge/Champion grant, never test success. CI Result is the test verdict.",
+    "contexts": ["CI Result", "loom/merge-authorization"]
+  },
+  "merge_queue_rule": {
+    "type": "merge_queue",
+    "parameters": {
+      "merge_method": "MERGE",
+      "grouping_strategy": "ALLGREEN",
+      "max_entries_to_build": 1,
+      "max_entries_to_merge": 1,
+      "min_entries_to_merge": 1,
+      "min_entries_to_merge_wait_minutes": 0,
+      "check_response_timeout_minutes": 40
+    },
+    "_rationale": {
+      "merge_method": "MERGE only (pilot is merge-commit-only; no squash/rebase queue).",
+      "max_entries_to_build": "1 = conservative: one group CI run (~86 runner-minutes, ci.yml) at a time on the shared runner budget. Raise only with pilot evidence.",
+      "check_response_timeout_minutes": "CI push wall time p90 is 13.9 min (merge-queue-ci.md, 2026-10-04 data); 40 min is ~3x p90, enough for a slow runner day without holding the queue for an hour. Re-derive from the baseline run before cutover."
+    }
+  },
+  "not_part_of_this_file": ["bypass actors", "any direct-push bypass for the version bump (see 'Pilot cutover (2AMLogic/loom)' steps 4-5 in defaults/docs/merge-queue-ci.md)"]
+}

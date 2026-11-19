@@ -58,7 +58,7 @@ pub(crate) enum ChampionHoldCommand {
     /// Decide the ratification hold's tick for a PR (#12992): reads the head
     /// contents of every spec/decision file the PR changes and the trusted
     /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold|
-    /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
+    /// unreadable> action=<none|hold|stands|release|clear> pr=<N>
     /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
     Ratification(TargetArgs),
 

@@ -7,7 +7,9 @@
 //!   `install-incompatible`. W3 already means "too old AND the payload
 //!   differs" (an empty diff is W0), so the hold keys on the diff. A W3 copy
 //!   that is behind but compatible ([`behind_compatible`]) is not held
-//!   (#11052); it stays W3, so the pass still resyncs it first. A
+//!   (#11052); it stays W3, so the pass still resyncs it first. It is
+//!   recorded as behind ([`Finding::behind`]) so `status` shows it and the
+//!   daemon says so once (#14015). A
 //!   repo-ahead workspace is clear unless what the gate refused is an
 //!   interrupted newer resync, which holds and asks for no roll.
 //! * **The checkout** is `<root>/.loom/install-metadata.json` in the working
@@ -93,9 +95,12 @@ pub(super) fn observe(
         .collect()
 }
 
-/// The Loom source repo is never resynced, so no W3 hold could clear there.
+/// The Loom source repo is never resynced, so no W3 hold could clear there,
+/// and it is never behind its own files.
 fn unless_source(source: bool, found: Finding) -> Finding {
-    if source && found.verdict == Verdict::Hold(HoldKind::InstallIncompatible) {
+    if source
+        && (found.verdict == Verdict::Hold(HoldKind::InstallIncompatible) || found.behind.is_some())
+    {
         Finding::clear()
     } else {
         found
@@ -164,7 +169,10 @@ fn from_report(judge: &Judge<'_>, report: &WorkspaceReport) -> Finding {
         ),
         // Behind, but its files say they work here: not held, still W3 to
         // the resync (#11052).
-        WState::W3 if behind_compatible(&recorded(report), &judge.daemon()) => Finding::clear(),
+        // It is named for `status` and logged once (#14015).
+        WState::W3 if behind_compatible(&recorded(report), &judge.daemon()) => {
+            Finding::clear_behind(report.installed.clone())
+        }
         WState::W3 => Finding::install_incompatible(too_old(judge, report.installed.as_deref())),
         // `RepoAhead` is the ratchet guard's case: ahead, yet compatible. The
         // one exception is an interrupted newer resync: held, and no demand.
@@ -196,6 +204,13 @@ fn from_gate(
 ) -> Finding {
     match decide_hold(gate, diff_stale, behind_compatible(meta, &judge.daemon())) {
         Verdict::Unknown => Finding::unknown(),
+        // Too old and compatible: named for `status` and logged once (#14015).
+        Verdict::Clear
+            if matches!(gate, Ok(Compat::InstalledTooOld))
+                && behind_compatible(meta, &judge.daemon()) =>
+        {
+            Finding::clear_behind(meta.loom_version.clone())
+        }
         Verdict::Clear => Finding::clear(),
         // `Ok` is W3; a refusal here is an interrupted newer resync.
         Verdict::Hold(HoldKind::InstallIncompatible) => Finding::install_incompatible(

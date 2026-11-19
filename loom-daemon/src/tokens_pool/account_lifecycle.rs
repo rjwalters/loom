@@ -81,6 +81,27 @@ pub struct AccountStatus {
     /// indistinguishable from a host-direct one, the mechanism is reported
     /// separately instead of being inferred from a missing probe.
     pub session_managed: bool,
+    /// This account's registered private-clone repositories (issue #14298),
+    /// read from its private-workspace `workspace.json`. Populated by
+    /// `accounts list` only; absent for host-mode accounts and for every
+    /// other verb, so their JSON is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_clone: Option<PrivateCloneStatus>,
+    /// The image the account's session container was created with (issue
+    /// #14298), read back from the running container — `None` when no
+    /// running container can be observed (stopped session, no docker),
+    /// never a placeholder value. Populated by `accounts list` only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// An account's registered private-clone repositories as `accounts list`
+/// reports them (issue #14298): the primary clone plus every additional
+/// registration, by URL — the same facts `accounts session status` prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrivateCloneStatus {
+    pub repository: String,
+    pub additional_repositories: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -181,6 +202,16 @@ pub trait CodexCommandRunner {
     /// container seam (every test double predating #6927) truthfully reports
     /// "could not probe" rather than fabricating an auth state.
     fn session_login_status(&self, container: &str) -> Result<Option<RunnerOutput>> {
+        let _ = container;
+        Ok(None)
+    }
+
+    /// The image the named session container was created with, read back
+    /// from the running container (issue #14298). `Ok(None)` means no image
+    /// is known — the container is absent or not running, or the runner has
+    /// no container seam (every test double predating #14298) — so
+    /// `accounts list` reports "image unknown" instead of a placeholder.
+    fn container_image(&self, container: &str) -> Result<Option<String>> {
         let _ = container;
         Ok(None)
     }
@@ -294,6 +325,18 @@ impl CodexCommandRunner for ProcessCodexRunner {
             &super::session_lifecycle::ProcessContainerRunner,
             container,
         )
+    }
+
+    fn container_image(&self, container: &str) -> Result<Option<String>> {
+        use super::session_lifecycle::ContainerRunner;
+        // The image is knowable only from a running container: a stopped
+        // one may be one recreate-on-start away from a different image
+        // (#11727), so reporting its recorded ref could be stale (issue
+        // #14298).
+        Ok(super::session_lifecycle::ProcessContainerRunner
+            .inspect(container)?
+            .filter(|state| state.running)
+            .and_then(|state| state.image))
     }
 }
 
@@ -451,8 +494,46 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
     pub fn list(&self, probe: bool) -> Result<Vec<AccountStatus>> {
         account_inventory(&self.workspace, AccountProvider::Codex)?
             .into_iter()
-            .map(|account| self.status_for(account, probe))
+            .map(|account| {
+                let profile = account.credential_reference.clone();
+                let mut status = self.status_for(account, probe)?;
+                self.attach_list_details(&mut status, &profile);
+                Ok(status)
+            })
             .collect()
+    }
+
+    /// Attach the session facts only `accounts list` reports (issue #14298):
+    /// the account's registered private-clone repositories and the image of
+    /// its running session container. Deliberately not part of
+    /// [`Self::status_for`] — every other verb that returns
+    /// [`AccountStatus`] keeps its output unchanged. Best-effort by
+    /// contract: a container runtime that cannot answer (missing binary,
+    /// daemon down) yields an absent image rather than a failed list, and
+    /// an account with neither private-workspace state nor a session marker
+    /// costs no docker call at all.
+    fn attach_list_details(&self, status: &mut AccountStatus, profile: &Path) {
+        if let Some(config) = super::private_workspace::registrations(profile) {
+            status.private_clone = Some(PrivateCloneStatus {
+                repository: config.repository.clone(),
+                additional_repositories: config
+                    .repositories
+                    .iter()
+                    .map(|registered| registered.repository.clone())
+                    .collect(),
+            });
+            status.image = self
+                .runner
+                .container_image(&config.container)
+                .ok()
+                .flatten();
+        } else if status.session_managed {
+            status.image = self
+                .runner
+                .container_image(&container_name(&status.name))
+                .ok()
+                .flatten();
+        }
     }
 
     pub fn status(&self, name: &str) -> Result<AccountStatus> {
@@ -765,6 +846,8 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             diagnostics,
             login_state,
             session_managed,
+            private_clone: None,
+            image: None,
         })
     }
 
@@ -2000,6 +2083,216 @@ mod tests {
             assert!(!serde_json::to_string(&status)
                 .unwrap()
                 .contains("recognizable-fake-secret"));
+        }
+    }
+
+    /// A runner whose only seam is [`CodexCommandRunner::container_image`]:
+    /// it records every container it is asked about and answers from a
+    /// fixed table (issue #14298).
+    struct ImageRunner {
+        images: Vec<(String, String)>,
+        fail: bool,
+        probes: Mutex<Vec<String>>,
+    }
+
+    impl CodexCommandRunner for ImageRunner {
+        fn login(&self, _profile: &Path, _device_auth: bool) -> Result<RunnerOutput> {
+            unreachable!("list-only test runner")
+        }
+
+        fn login_status(&self, _profile: &Path) -> Result<RunnerOutput> {
+            unreachable!("list(false) never probes login")
+        }
+
+        fn container_image(&self, container: &str) -> Result<Option<String>> {
+            self.probes.lock().unwrap().push(container.to_string());
+            if self.fail {
+                bail!("docker is unreachable");
+            }
+            Ok(self
+                .images
+                .iter()
+                .find(|(name, _)| name == container)
+                .map(|(_, image)| image.clone()))
+        }
+    }
+
+    fn import_account(workspace: &Path, name: &str) {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("auth.json");
+        fs::write(&source, "recognizable-fake-secret").unwrap();
+        AccountLifecycle::new(workspace, FakeRunner::default())
+            .unwrap()
+            .import(name, &source)
+            .unwrap();
+    }
+
+    /// Issue #14298's JSON contract is purely additive: a host-mode account
+    /// — no private workspace, no session marker — must serialize byte for
+    /// byte as before (neither `private_clone` nor `image` may appear), and
+    /// `accounts list` must not touch the container runtime for it at all.
+    #[test]
+    #[serial]
+    fn host_account_list_json_is_byte_identical_and_makes_no_container_call() {
+        let (workspace, _root, _env) = setup();
+        import_account(workspace.path(), "alice");
+        let service = AccountLifecycle::new(
+            workspace.path(),
+            ImageRunner {
+                images: Vec::new(),
+                fail: false,
+                probes: Mutex::new(Vec::new()),
+            },
+        )
+        .unwrap();
+
+        let statuses = service.list(false).unwrap();
+        assert_eq!(statuses.len(), 1);
+        let expected = serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "provider": "codex",
+            "name": "alice",
+            "enabled": true,
+            "credential_kind": "codex_home",
+            "provenance": "repo",
+            "diagnostics": {
+                "profile_exists": true,
+                "auth_shape": "valid",
+                "directory_mode_valid": true,
+                "auth_mode_valid": true,
+                "owner_valid": true
+            },
+            "login_state": "not_checked",
+            "session_managed": false
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&statuses[0]).unwrap(),
+            expected,
+            "a host-mode account's JSON must be unchanged by #14298"
+        );
+        assert!(
+            service.runner.probes.lock().unwrap().is_empty(),
+            "an account with no session/private config must cost no docker call"
+        );
+    }
+
+    /// Issue #14298: for a private-clone account, `accounts list` reports
+    /// the primary plus every additional registered repository and the
+    /// image of the account's own session container.
+    #[test]
+    #[serial]
+    fn list_reports_private_clone_registrations_and_the_running_containers_image() {
+        use super::super::private_workspace::{Config, Registered};
+        let (workspace, root, _env) = setup();
+        import_account(workspace.path(), "alice");
+        import_account(workspace.path(), "bob");
+        let profile = root.path().join("alice");
+        let dir = root.path().join(".private-sessions").join("alice");
+        fs::create_dir_all(&dir).unwrap();
+        let container = container_name("alice");
+        fs::write(
+            dir.join("workspace.json"),
+            serde_json::to_vec_pretty(&Config {
+                schema_version: 1,
+                account: "alice".into(),
+                container: container.clone(),
+                engine: "fake-engine".into(),
+                docker_desktop: false,
+                repository: "https://forge.example/a/b".into(),
+                base: "main".into(),
+                repositories: vec![
+                    Registered {
+                        repository: "https://forge.example/c/d".into(),
+                        base: "main".into(),
+                        slug: "c-d".into(),
+                    },
+                    Registered {
+                        repository: "https://forge.example/e/f".into(),
+                        base: "release".into(),
+                        slug: "e-f".into(),
+                    },
+                ],
+                volume: "loom-codex-workspace-alice".into(),
+                profile: profile.clone(),
+                gh_config: None,
+                session_image: None,
+                extra_mounts: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let image = "ghcr.io/example/loom-worker:1.2.3";
+        let service = AccountLifecycle::new(
+            workspace.path(),
+            ImageRunner {
+                images: vec![(container.clone(), image.to_string())],
+                fail: false,
+                probes: Mutex::new(Vec::new()),
+            },
+        )
+        .unwrap();
+
+        let statuses = service.list(false).unwrap();
+        let alice = statuses.iter().find(|s| s.name == "alice").unwrap();
+        assert_eq!(
+            alice.private_clone,
+            Some(super::PrivateCloneStatus {
+                repository: "https://forge.example/a/b".into(),
+                additional_repositories: vec![
+                    "https://forge.example/c/d".into(),
+                    "https://forge.example/e/f".into(),
+                ],
+            })
+        );
+        assert_eq!(alice.image.as_deref(), Some(image));
+        // Only alice's own container is asked; bob (host mode) costs nothing.
+        assert_eq!(
+            *service.runner.probes.lock().unwrap(),
+            vec![container],
+            "the image must be read from the private session's own container"
+        );
+        let bob = statuses.iter().find(|s| s.name == "bob").unwrap();
+        assert_eq!(bob.private_clone, None);
+        assert_eq!(bob.image, None);
+    }
+
+    /// Issue #14298: a host-mounted session-managed account reports its
+    /// session container's image; a stopped session (or a runtime that
+    /// cannot answer, or one that fails) degrades to "image absent" rather
+    /// than failing the list.
+    #[test]
+    #[serial]
+    fn list_reports_a_session_managed_accounts_image_and_degrades_gracefully() {
+        let (workspace, root, _env) = setup();
+        import_session_managed(workspace.path(), root.path(), "alice");
+        for (images, fail, expected) in [
+            (
+                vec![(container_name("alice"), "ghcr.io/example/session:9".to_string())],
+                false,
+                Some("ghcr.io/example/session:9"),
+            ),
+            (Vec::new(), false, None),
+            (Vec::new(), true, None),
+        ] {
+            let service = AccountLifecycle::new(
+                workspace.path(),
+                ImageRunner {
+                    images,
+                    fail,
+                    probes: Mutex::new(Vec::new()),
+                },
+            )
+            .unwrap();
+            let statuses = service.list(false).unwrap();
+            assert_eq!(statuses.len(), 1, "the list must survive a failing runtime");
+            assert_eq!(statuses[0].image.as_deref(), expected);
+            assert_eq!(statuses[0].private_clone, None);
+            assert_eq!(
+                *service.runner.probes.lock().unwrap(),
+                vec![container_name("alice")],
+                "the image must be read from the account's session container"
+            );
         }
     }
 }

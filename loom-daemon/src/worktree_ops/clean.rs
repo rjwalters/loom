@@ -2954,6 +2954,15 @@ pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 30;
 /// default**, matching every other Loom knob.
 pub const LOG_RETENTION_DAYS_ENV: &str = "LOOM_LOGS_RETENTION_DAYS";
 
+/// Env var: `1` enables archive-gated step-log retention (`step-<role>-<item>.log`,
+/// #14177). Unset — the default — the step-log branch of
+/// [`clean_log_files_with`] never fires: step logs are the only durable
+/// source of per-step `LOOM_STEP_OUTCOME` history, so they are deliberately
+/// never deleted until the off-host preserver (2AMLogic/2am#7548) is rolled
+/// out. Mirrors the daemon-log day-file gate's shape
+/// ([`crate::daily_log::REQUIRE_ARCHIVE_ENV`], #13917).
+pub const STEP_LOG_REQUIRE_ARCHIVE_ENV: &str = "LOOM_STEP_LOG_REQUIRE_ARCHIVE";
+
 /// Resolve the `.loom/logs/*.log` retention window (days) — env
 /// (`LOOM_LOGS_RETENTION_DAYS`) > config (`logs.retentionDays`) > default
 /// (#6655). A non-positive or unparseable value at a tier is treated as
@@ -2996,6 +3005,68 @@ fn log_file_issue_number(filename: &str) -> Option<u32> {
     }
 }
 
+/// Extract the item number from a step log name `step-<role>-<item>.log`
+/// (#11898's [`crate::sweep_registry::log_paths`] naming), where `<role>` is
+/// one of the known step-role wire names
+/// ([`crate::step_role::StepRole::as_str`]).
+///
+/// Returns `None` for anything else — an unknown role, a non-numeric item,
+/// or a name that is not a step log at all. Strict on purpose: this feeds a
+/// deletion gate, so a name the pass cannot positively identify is never a
+/// candidate. Disjoint from [`log_file_issue_number`]: a step-log name never
+/// embeds `issue-`, so the two passes can never claim the same file.
+fn step_log_file_item(filename: &str) -> Option<u32> {
+    let stem = filename.strip_prefix("step-")?.strip_suffix(".log")?;
+    let (role, item) = stem.rsplit_once('-')?;
+    if !crate::step_role::StepRole::ALL
+        .iter()
+        .any(|r| r.as_str() == role)
+    {
+        return None;
+    }
+    item.parse().ok()
+}
+
+/// `<log>.archived` — the archiver's proof sidecar, the same convention as
+/// the daemon-log day-file gate (#13917). Shares
+/// [`crate::daily_log::ARCHIVED_SUFFIX`] so the two gates can never drift on
+/// the marker's spelling.
+fn archived_sidecar_path(log: &Path) -> PathBuf {
+    let mut s = log.as_os_str().to_os_string();
+    s.push(crate::daily_log::ARCHIVED_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Modification time of `path`; `None` when unreadable (callers keep).
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether a step log's most recent dispatch attempt is known to have ended:
+/// the region after the last dispatch header
+/// ([`crate::sweep_registry::DISPATCH_HEADER_MARKER`]) contains a terminal
+/// `LOOM_STEP_OUTCOME` line, parsed by the same line parser the outcome
+/// ledger's reader uses (`read_outcome_line`'s own, #11900). This is the
+/// content-side active-vs-completed signal — no file-age heuristic (#14177).
+///
+/// Fail-safe in every ambiguous shape: an unreadable log, a log with no
+/// dispatch header, or a last attempt that has not written its outcome line
+/// (a re-dispatch with a fresh sweep id re-anchors the region, so an earlier
+/// attempt's line never reads as completed) is *not* completed — keep.
+fn step_log_completed(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(start) = text.rfind(crate::sweep_registry::DISPATCH_HEADER_MARKER) else {
+        return false;
+    };
+    text[start..]
+        .lines()
+        .rev()
+        .any(|line| crate::sweep_registry::step_spawn::capture::parse_outcome_line(line).is_some())
+}
+
 /// Runtime dependencies of [`clean_log_files_with`], injected so the decision
 /// logic is unit-testable without a real clock or live daemon state.
 struct LogRetentionEnv<'a> {
@@ -3007,6 +3078,10 @@ struct LogRetentionEnv<'a> {
     /// Whether `.loom/sweep-checkpoint/issue-<N>.json` exists — a resumable
     /// (possibly crashed-but-not-abandoned) sweep for that issue.
     checkpoint_exists: &'a dyn Fn(u32) -> bool,
+    /// Whether step-log retention is enabled (`LOOM_STEP_LOG_REQUIRE_ARCHIVE=1`,
+    /// #14177). Unset: `step-<role>-<item>.log` files are untouched — the
+    /// gate is inert until the off-host preserver exists.
+    step_log_retention: bool,
 }
 
 /// Bulk prune of stale per-issue `.loom/logs/*.log` files (#6655).
@@ -3026,6 +3101,11 @@ struct LogRetentionEnv<'a> {
 /// checkpoint all mean *keep*. A `.log` file with no embedded issue number,
 /// and anything that is not a `.log` file (JSON/JSONL state, directories), is
 /// never touched by this pass.
+///
+/// Step logs (`step-<role>-<item>.log`, #14177) carry no `issue-` substring
+/// and so never match branch 1; they flow to the archive-gated step branch
+/// ([`clean_step_log_file`]) instead, which without
+/// `LOOM_STEP_LOG_REQUIRE_ARCHIVE=1` never deletes anything.
 fn clean_log_files_with(
     repo_root: &Path,
     stats: &mut CleanupStats,
@@ -3048,10 +3128,15 @@ fn clean_log_files_with(
         if !name.ends_with(".log") {
             continue;
         }
+        let path = entry.path();
         let Some(issue) = log_file_issue_number(&name) else {
+            if env.step_log_retention {
+                if let Some(item) = step_log_file_item(&name) {
+                    clean_step_log_file(&path, item, env, stats, dry_run);
+                }
+            }
             continue;
         };
-        let path = entry.path();
 
         if env.live_issues.contains(&issue) {
             println!("  Keeping log of in-flight sweep: {name}");
@@ -3078,6 +3163,101 @@ fn clean_log_files_with(
     }
 }
 
+/// One archive-gated `step-<role>-<item>.log` candidate (#14177).
+///
+/// Requires everything the issue-log branch above requires (no live sweep for
+/// the item, no `.loom/sweep-checkpoint/issue-<item>.json`, mtime past the
+/// retention window) PLUS the two archive-gate proofs, so a completed step's
+/// durable outcome history can never be discarded before confirmed off-host
+/// archival:
+///
+/// - the `.archived` sidecar ([`archived_sidecar_path`], the preserver's
+///   checksum-confirmed proof — a missing or unstat-able sidecar means keep)
+///   that is **at least as new as the log** (#14228): a step log is
+///   append-only across re-dispatched attempts, so its bytes can grow after
+///   the sidecar was written and a sidecar older than the log proves only
+///   the earlier bytes were archived, not the appended tail (any stat
+///   failure on either file means keep),
+/// - a terminal outcome line for the last dispatch attempt
+///   ([`step_log_completed`]).
+///
+/// Deleting removes the pair (log + sidecar). Every unreadable or ambiguous
+/// case means keep.
+fn clean_step_log_file(
+    path: &Path,
+    item: u32,
+    env: &LogRetentionEnv,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+) {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if env.live_issues.contains(&item) {
+        println!("  Keeping log of in-flight sweep: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    if (env.checkpoint_exists)(item) {
+        println!("  Keeping log with a live checkpoint: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    let sidecar = archived_sidecar_path(path);
+    if !sidecar.exists() {
+        println!("  Keeping unarchived step log: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    // The sidecar is a point-in-time proof (#14228): the log is append-only
+    // across re-dispatched attempts, so bytes can arrive after archival.
+    // Delete only when the sidecar is at least as new as the log; a sidecar
+    // older than the log means the appended tail was never archived — keep.
+    // Any unreadable mtime is ambiguous — keep.
+    match (modified_time(path), modified_time(&sidecar)) {
+        (Some(log_mtime), Some(sidecar_mtime)) if sidecar_mtime >= log_mtime => {}
+        (Some(_), Some(_)) => {
+            println!("  Keeping step log appended after its archival: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
+        _ => {
+            println!("  Keeping step log with an unreadable mtime: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
+    }
+    if !step_log_completed(path) {
+        println!("  Keeping step log without a terminal outcome: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+
+    match file_age(path, env.now) {
+        Some(age) if age >= env.retention => {
+            match remove_transient(path, "stale step log", dry_run) {
+                Ok(()) => {
+                    if !dry_run {
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                    stats.cleaned_log_files += 1;
+                }
+                Err(cause) => {
+                    stats.record_error(
+                        &path.display().to_string(),
+                        "remove stale step log",
+                        &cause,
+                    );
+                }
+            }
+        }
+        _ => stats.kept_log_files += 1,
+    }
+}
+
 /// Production entry point for [`clean_log_files_with`]: real clock,
 /// [`resolve_log_retention_days`], [`active_spawn_loop_issues`] liveness, and
 /// a direct `.loom/sweep-checkpoint/issue-<N>.json` existence check.
@@ -3090,6 +3270,8 @@ pub fn clean_log_files(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
         retention: Duration::from_secs(resolve_log_retention_days(repo_root) * 24 * 60 * 60),
         live_issues: &live_issues,
         checkpoint_exists: &checkpoint_exists,
+        step_log_retention: std::env::var(STEP_LOG_REQUIRE_ARCHIVE_ENV)
+            .is_ok_and(|v| v.trim() == "1"),
     };
     clean_log_files_with(repo_root, stats, dry_run, &env);
 }
@@ -3361,26 +3543,52 @@ fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
     super::liveness::locks_dir(repo_root)
 }
 
+/// Read-side view of a claim lock's `owner.json` for
+/// [`clear_stale_spawn_loop_locks`]: `owner_pid` plus the `acquired_at`
+/// stamp the identity-paired liveness probe needs — neither more nor less.
+///
+/// Deliberately local (mirroring [`crate::live_claim`]'s private
+/// `LockOwnerView`) rather than a re-export of `sweep_registry`'s private
+/// `LockOwner`: unknown writer-side fields are ignored, and a lock stamped
+/// before the field existed deserialises with an empty `acquired_at`,
+/// which `owner_pid_alive_since` treats as "no opinion" (bare liveness).
+#[derive(serde::Deserialize)]
+struct LockOwnerLivenessView {
+    owner_pid: u32,
+    #[serde(default)]
+    acquired_at: String,
+}
+
 /// Remove `.loom/locks/issue-<N>/` claim-lock dirs with no live owner.
 ///
-/// Staleness is judged from the lock itself: a lock whose `owner.json`
-/// names a **live, non-zombie** `owner_pid` is kept
-/// ([`crate::live_claim::live_lock_owner_in`] with bare
-/// [`crate::live_claim::pid_is_live_process`] — deliberately NOT the
-/// argv-verified [`crate::live_claim::pid_is_live_claim_for`], because
-/// `acquire_lock` provisionally stamps the *dispatching daemon's own pid*
-/// and only rewrites it to the child's pid after spawn; a cleanup pass
-/// running in that window must not delete a mid-flight lock, and bare
-/// liveness is what keeps it). Everything else — dead owner, missing or
-/// unparseable `owner.json` — is stale and removed. `own_untracked_pid` is
-/// `None`: this is a standalone cleanup pass with no child bookkeeping to
-/// consult.
+/// Staleness is judged from the lock itself: a lock is kept only while
+/// [`pid_identity::owner_pid_alive_since`] — bare liveness **plus** the
+/// #7935 recycled-pid identity guard — vouches for its `owner_pid`
+/// relative to the lock's `acquired_at`, so this pass and the registry's
+/// `reconstruct` agree on what "live owner" means (#14056). A lock whose
+/// pid number was recycled onto an unrelated live process (started after
+/// `acquired_at` + [`RECYCLED_PID_SKEW_SECS`]) is therefore stale here
+/// too, not just on daemon startup. A missing or unparseable `acquired_at`
+/// degrades to bare liveness rather than guessing.
+///
+/// Deliberately NOT the argv-verified
+/// [`crate::live_claim::pid_is_live_claim_for`]: `acquire_lock`
+/// provisionally stamps the *dispatching daemon's own pid* and only
+/// rewrites it to the child's pid after spawn; a cleanup pass running in
+/// that window must not delete a mid-flight lock. The identity-paired
+/// probe keeps it — the daemon's own process started before the stamp —
+/// so PR #14044's rationale for rejecting argv verification still stands.
+/// Everything else — dead owner, missing or unparseable `owner.json` — is
+/// stale and removed.
 ///
 /// These directories are the daemon's live claim locks
 /// (`SweepRegistry::acquire_lock`), so over-removal double-dispatches;
 /// historically this function consulted the retired
 /// `spawn-loop-state.json` whose `running` list was always empty and
 /// therefore removed **every** lock (#13818).
+///
+/// [`pid_identity::owner_pid_alive_since`]: crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since
+/// [`RECYCLED_PID_SKEW_SECS`]: crate::sweep_registry::reaper::pid_identity::RECYCLED_PID_SKEW_SECS
 pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
     let locks_dir = spawn_loop_locks_dir(repo_root);
     if !locks_dir.is_dir() {
@@ -3408,13 +3616,22 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
             eprintln!("  Skipping malformed lock dir: {name}");
             continue;
         };
-        let live = crate::live_claim::live_lock_owner_in(
-            &locks_dir,
-            issue_num,
-            &crate::live_claim::pid_is_live_process,
-            None,
+        // Owner read is local rather than via `live_lock_owner_in`: its
+        // `is_live` closure sees only the pid, so the lock's `acquired_at`
+        // (the other half of the identity-paired probe) never reaches it.
+        let live = std::fs::read_to_string(
+            locks_dir
+                .join(format!("issue-{issue_num}"))
+                .join("owner.json"),
         )
-        .is_some();
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LockOwnerLivenessView>(&raw).ok())
+        .is_some_and(|owner| {
+            crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since(
+                owner.owner_pid,
+                &owner.acquired_at,
+            )
+        });
         if live {
             println!("  Keeping lock for live task: {name}");
             continue;

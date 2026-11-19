@@ -88,7 +88,6 @@ impl SweepRegistry {
         };
         let held_elsewhere =
             retained || self.step_claim_held_elsewhere(item, role, sweep_id, started_at);
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if held_elsewhere {
             log::info!(
                 "sweep_registry: {role} step {sweep_id} on #{item} ended, but its claim is held \
@@ -115,8 +114,10 @@ impl SweepRegistry {
     }
 
     /// Whether another claimant holds a step's item on the forge (#11898), the
-    /// forge half of every step release (the reaper's, startup's, a roll
-    /// requeue's):
+    /// forge half of the reaper's and startup adoption's step release, and of
+    /// a roll requeue's PR-role release (via
+    /// [`Self::roll_pr_step_claim_still_ours`]); a roll requeue of an issue
+    /// role makes its own ownership check instead (`roll_claim_still_ours`):
     ///
     /// - Builder: `loom:building` re-applied more than
     ///   [`LABEL_CLOCK_SKEW_SECS`] after the step started;
@@ -175,53 +176,6 @@ impl SweepRegistry {
             return Err(format!("another sweep holds the live {role} claim"));
         }
         Ok(())
-    }
-
-    /// Publish a step's `(item, step)` peer claim (#11898): `Advertise` while
-    /// it runs, `Retract` when it ends. Fail-open and a no-op without a
-    /// publisher, like every peer-claim send. A Champion merge step's
-    /// advertisement is the repo-keyed merge signal peers read through
-    /// `PeerClaimView::merge_in_flight_at`.
-    pub(crate) fn publish_step_claim(
-        &self,
-        kind: peer_claims::ClaimKind,
-        item: u32,
-        role: StepRole,
-    ) {
-        let Some(tx) = &self.peer_claim_publisher else {
-            return;
-        };
-        let ad = ClaimAd::step(
-            kind,
-            item,
-            role,
-            peer_claims::repo_slug(&self.config.workspace_root),
-            host_identity(),
-            std::process::id(),
-            Utc::now().to_rfc3339(),
-        );
-        if let Err(e) = tx.try_send(ad) {
-            log::debug!("sweep_registry: {role} step claim for #{item} dropped ({e})");
-        }
-    }
-
-    /// Re-advertise every live step's claim on the reaper's heartbeat, as
-    /// [`Self::readvertise_peer_claims`] does for issue sweeps. Returns the
-    /// number advertised.
-    pub(crate) fn readvertise_step_claims(&self) -> usize {
-        let live: Vec<(u32, StepRole)> = self
-            .entries
-            .values()
-            .filter(|info| matches!(info.state, SweepState::Running))
-            .filter_map(|info| match info.kind {
-                SweepKind::Step { item, role } => Some((item, role)),
-                SweepKind::Issue(_) | SweepKind::PrSet(_) => None,
-            })
-            .collect();
-        for (item, role) in &live {
-            self.publish_step_claim(peer_claims::ClaimKind::Advertise, *item, *role);
-        }
-        live.len()
     }
 
     /// The terminal transition of a step the reaper (or a cancel) found dead:

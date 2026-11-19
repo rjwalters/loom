@@ -58,6 +58,8 @@ When you claim an issue with `loom:building`, you are committing to ONE of these
 > (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
 > This matters most exactly here: a decomposition burst files 2-5 issues in a row, so it is the
 > single likeliest place in a Builder run to meet an exhausted GraphQL pool mid-sequence.
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 ### If You Discover an Issue Is Too Complex
 

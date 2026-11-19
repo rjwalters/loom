@@ -53,6 +53,8 @@ const ALLOWED_KEYS: &[&str] = &[
     // the `loom.sweep` close.
     "loom.step.outcome.class",
     "loom.step.outcome.reason",
+    // #14234: whether the forge post-state agreed with the step's claim.
+    "loom.step.outcome.agrees",
 ];
 
 fn traced_root() -> tempfile::TempDir {

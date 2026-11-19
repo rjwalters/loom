@@ -10,6 +10,7 @@ use crate::telemetry::kinds::token_ranking_refresh::{
     AccountOutcome, CredentialKind, TokenRankingAccount,
 };
 use crate::token_ranking_refresh::ScriptRankingRefreshRunner;
+use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 
 fn account(name: &str, kind: CredentialKind, probed: bool) -> TokenRankingAccount {
     TokenRankingAccount {
@@ -189,6 +190,10 @@ fn write_fake_bin(dir: &Path, body: &str) -> PathBuf {
 /// path the parent hands it, and the record carries those accounts.
 #[test]
 fn the_real_runner_reads_the_childs_summary_file() {
+    // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+    // #9964 guard panics under cfg(test) when it is unset (#14584).
+    let profiles = tempfile::tempdir().unwrap();
+    let _profile_root = ProfileRootEnv::set(profiles.path());
     let tmp = tempfile::tempdir().unwrap();
     let json = serde_json::to_string(&summary()).unwrap();
     fs::write(tmp.path().join("summary.json"), &json).unwrap();
@@ -210,6 +215,10 @@ fn the_real_runner_reads_the_childs_summary_file() {
 /// failure record with no fabricated accounts.
 #[test]
 fn the_real_runner_without_a_summary_reports_unknown_source() {
+    // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+    // #9964 guard panics under cfg(test) when it is unset (#14584).
+    let profiles = tempfile::tempdir().unwrap();
+    let _profile_root = ProfileRootEnv::set(profiles.path());
     let tmp = tempfile::tempdir().unwrap();
     let bin = write_fake_bin(tmp.path(), "echo no tokens; exit 1");
     let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bin);
