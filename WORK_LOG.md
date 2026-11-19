@@ -16,6 +16,22 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14267**: fix: clear recycled-pid claim locks in loom-clean's stale-lock pass
+- **PR #14283**: docs: drop retired claude-md-budget and docs-defaults-parity CI jobs from judge prompt
+- **PR #14289**: feat(daemon): publish the captain's token probe to fleet workers
+- **PR #14322**: fix: drop unreachable action=defer from champion-hold ratification --help
+- **PR #14330**: daemon: detect a checkout whose origin owner drifted from its resolved credential
+- **PR #14619**: fix: private-clone admission tries every eligible seat before refusing
+- **PR #14673**: fix(dispatch): ignore released leases in claim ordering
+- **PR #14675**: Compare epic-phase siblings on their own issue content
+- **Issue #13942** (closed): Token pool: captain publishes its account probe; workers apply it (part 2 of #13893)
+- **Issue #14056** (closed): loom-clean's claim-lock pass uses bare pid liveness, so a recycled-pid lock is now never cleared
+- **Issue #14223** (closed): Daemon and doctor: detect a checkout whose origin owner differs from the forge's canonical owner
+- **Issue #14269** (closed): docs: six stale references to scripts/check-claude-md-budget.sh, removed in #12106
+- **Issue #14271** (closed): champion-hold ratification: --help still advertises action=defer, which the verb can no longer emit
+- **Issue #14578** (closed): Codex Builder/Doctor admission says 'account session is busy' while other seats on the host are idle (0.19.1316; #14492 covered read-only roles only)
+- **Issue #14660** (closed): create-issue.sh duplicate check rejects sibling epic-phase issues; only --force gets through
+- **Issue #14671** (closed): Builder lease ordering can yield to a peer that already released its lease
 - **PR #14086**: feat: add workflow-lint subcommand and Doctor pre-push workflow gate
 - **PR #14295**: ci: gate docs/README.md index against the docs/ tree
 - **PR #14319**: ci: cover all of defaults/ in the backend PR path filter
