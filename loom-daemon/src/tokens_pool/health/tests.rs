@@ -1154,3 +1154,172 @@ fn a_horizon_shapes_the_class_hold_a_named_model_records() {
     assert_eq!(entry.cooldown_until, None, "the account itself is not held");
     assert_eq!(entry.class_cooldowns.get("gpt-5-codex"), Some(&horizon));
 }
+
+// ============================================================================
+// Weekly-headroom preference among equally healthy Codex seats (#14585)
+// ============================================================================
+
+/// One enabled Codex seat whose profile directory carries a single rollout
+/// line. `weekly` / `short` are `used_percent` values; `None` omits that window.
+/// Both windows reset in the future relative to the file's own mtime.
+fn seat_with_usage(
+    root: &Path,
+    name: &str,
+    short: Option<f64>,
+    weekly: Option<f64>,
+) -> AccountDescriptor {
+    let mut account = descriptor(AccountProvider::Codex, name);
+    let profile = root.join("profiles").join(name);
+    let sessions = profile.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let window = |used: f64, minutes: u64, resets: u64| {
+        serde_json::json!({
+            "used_percent": used,
+            "window_minutes": minutes,
+            "resets_in_seconds": resets,
+        })
+    };
+    let line = serde_json::json!({
+        "rate_limits": {
+            "primary": short.map(|used| window(used, 300, 3_600)),
+            "secondary": weekly.map(|used| window(used, 10_080, 400_000)),
+        }
+    });
+    fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+    account.credential_reference = profile;
+    account
+}
+
+fn pick(root: &Path, accounts: &[AccountDescriptor]) -> String {
+    select_healthy_at(root, AccountProvider::Codex, accounts, now_epoch_secs())
+        .unwrap()
+        .id
+        .name
+}
+
+#[test]
+fn lowest_weekly_utilization_wins_at_every_cursor_position() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The 5h readings point the opposite way, so a window mix-up flips the result.
+    let accounts = vec![
+        seat_with_usage(tmp.path(), "a", Some(1.0), Some(49.0)),
+        seat_with_usage(tmp.path(), "b", Some(90.0), Some(5.0)),
+    ];
+    for _ in 0..4 {
+        assert_eq!(pick(tmp.path(), &accounts), "b");
+    }
+    // Inverting only the weekly readings inverts the choice.
+    let flipped = vec![
+        seat_with_usage(tmp.path(), "a", Some(1.0), Some(5.0)),
+        seat_with_usage(tmp.path(), "b", Some(90.0), Some(49.0)),
+    ];
+    for _ in 0..4 {
+        assert_eq!(pick(tmp.path(), &flipped), "a");
+    }
+}
+
+#[test]
+fn seats_tied_for_lowest_weekly_utilization_still_rotate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        seat_with_usage(tmp.path(), "a", None, Some(5.0)),
+        seat_with_usage(tmp.path(), "b", None, Some(49.0)),
+        seat_with_usage(tmp.path(), "c", None, Some(5.0)),
+    ];
+    let picks: HashSet<String> = (0..4).map(|_| pick(tmp.path(), &accounts)).collect();
+    assert_eq!(picks, HashSet::from(["a".to_string(), "c".to_string()]));
+}
+
+#[test]
+fn a_measured_zero_is_a_reading_not_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        seat_with_usage(tmp.path(), "a", None, Some(7.0)),
+        seat_with_usage(tmp.path(), "b", None, Some(0.0)),
+    ];
+    for _ in 0..3 {
+        assert_eq!(pick(tmp.path(), &accounts), "b");
+    }
+}
+
+#[test]
+fn missing_partial_or_five_hour_only_evidence_keeps_round_robin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rotates = |accounts: &[AccountDescriptor]| {
+        let picks: HashSet<String> = (0..4).map(|_| pick(tmp.path(), accounts)).collect();
+        picks.len() == accounts.len()
+    };
+    // Nothing measured at all (no profile on disk).
+    assert!(rotates(&[
+        descriptor(AccountProvider::Codex, "a"),
+        descriptor(AccountProvider::Codex, "b"),
+    ]));
+    // Partial: one measured seat must not be favoured over an unknown one.
+    assert!(rotates(&[
+        seat_with_usage(tmp.path(), "c", None, Some(49.0)),
+        descriptor(AccountProvider::Codex, "d"),
+    ]));
+    assert!(rotates(&[
+        seat_with_usage(tmp.path(), "e", None, Some(5.0)),
+        descriptor(AccountProvider::Codex, "f"),
+    ]));
+    // 5h-only readings say nothing about the weekly window.
+    assert!(rotates(&[
+        seat_with_usage(tmp.path(), "g", Some(80.0), None),
+        seat_with_usage(tmp.path(), "h", Some(2.0), None),
+    ]));
+}
+
+#[test]
+fn a_rolled_over_weekly_window_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        seat_with_usage(tmp.path(), "a", None, Some(49.0)),
+        seat_with_usage(tmp.path(), "b", None, Some(5.0)),
+    ];
+    // Both windows reset 400_000s after the snapshot; ask well past that.
+    let later = now_epoch_secs() + 1_000_000;
+    let picks: HashSet<String> = (0..4)
+        .map(|_| {
+            select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, later)
+                .unwrap()
+                .id
+                .name
+        })
+        .collect();
+    assert_eq!(picks.len(), 2, "expired readings must not rank: {picks:?}");
+}
+
+#[test]
+fn weekly_preference_stays_inside_the_fewest_transient_failures_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = vec![
+        seat_with_usage(tmp.path(), "a", None, Some(1.0)),
+        seat_with_usage(tmp.path(), "b", None, Some(60.0)),
+    ];
+    // `a` has the most headroom but a recent transient failure: health first.
+    record_terminal_at(
+        tmp.path(),
+        &accounts[0].id,
+        TerminalClassification::Recoverable,
+        "adapter_v1",
+        now_epoch_secs(),
+    )
+    .unwrap();
+    assert_eq!(pick(tmp.path(), &accounts), "b");
+}
+
+#[test]
+fn weekly_preference_never_resurrects_an_ineligible_seat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut disabled = seat_with_usage(tmp.path(), "a", None, Some(0.0));
+    disabled.enabled = false;
+    let accounts = vec![
+        disabled,
+        seat_with_usage(tmp.path(), "b", None, Some(80.0)),
+        seat_with_usage(tmp.path(), "c", None, Some(90.0)),
+    ];
+    for _ in 0..3 {
+        assert_eq!(pick(tmp.path(), &accounts), "b");
+    }
+}

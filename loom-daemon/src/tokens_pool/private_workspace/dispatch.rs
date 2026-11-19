@@ -691,6 +691,71 @@ mod tests {
         );
         assert!(none.is_err());
     }
+    /// #14585: among equally healthy seats that serve this repository, the one
+    /// with the most weekly headroom is drawn first; when it is busy (the idle
+    /// reservation retry excludes it via `tried`) the next-best eligible seat
+    /// is drawn; and a lower-utilization seat that is bound to another
+    /// repository can never win.
+    #[test]
+    #[serial_test::serial]
+    fn pool_selection_prefers_weekly_headroom_and_yields_when_busy() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
+        let ws = workspace_with_origin("https://github.com/2AMLogic/gf180-parasynth.git");
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let usage = [("agent-3", 10.0), ("agent-4", 30.0), ("agent-5", 49.0)];
+        for (name, weekly) in usage {
+            let sessions = profiles.path().join(name).join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let line = serde_json::json!({"rate_limits": {"secondary": {
+                "used_percent": weekly, "window_minutes": 10_080, "resets_in_seconds": 400_000,
+            }}});
+            std::fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+        }
+        // The emptiest seat of all, but a private clone of another repository.
+        private_profile(profiles.path(), "agent-1", "https://github.com/2AMLogic/vibesql");
+        let sessions = profiles.path().join("agent-1").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-fixture.jsonl"),
+            r#"{"rate_limits":{"secondary":{"used_percent":0,"window_minutes":10080,"resets_in_seconds":400000}}}
+"#,
+        )
+        .unwrap();
+        let accounts = ["agent-1", "agent-3", "agent-4", "agent-5"]
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let logical = logical_repository(ws.path());
+        // The loop in `prepare_with`: each busy seat joins `tried`.
+        let mut tried = std::collections::BTreeSet::new();
+        let mut order = Vec::new();
+        while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
+            !tried.contains(&account.id.name)
+                && serves_repository(&account.credential_reference, logical.as_deref())
+        }) {
+            tried.insert(account.id.name.clone());
+            order.push(account.id.name);
+        }
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert_eq!(order, ["agent-3", "agent-4", "agent-5"]);
+    }
     fn fixture_config() -> Config {
         Config {
             schema_version: 1,

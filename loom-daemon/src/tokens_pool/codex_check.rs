@@ -490,6 +490,28 @@ pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
 /// How many rollout files, newest first, `latest_usage_snapshot` examines.
 const MAX_ROLLOUT_FILES_EXAMINED: usize = 8;
 
+/// The **weekly** (long-window) utilization this profile's freshest snapshot
+/// reports as of `now_epoch`, as a 0..1 fraction — or `None` when there is no
+/// usable measurement (#14585).
+///
+/// This is the one reading Codex seat selection ranks on. It goes through
+/// [`latest_usage_snapshot`] and the same window normalization and liveness
+/// rule [`assess_account`] reports as `s7d_utilization`, so selection and
+/// `accounts check --ranking` can never disagree about which number is the
+/// weekly one. Everything that is not a live weekly reading is *unknown*, not
+/// zero: no rollout log, a malformed line, a snapshot carrying only the 5h
+/// window, or a weekly window whose own reset has already passed. A measured
+/// `0.0` is a reading.
+#[must_use]
+pub fn weekly_utilization_at(profile: &Path, now_epoch: u64) -> Option<f64> {
+    let now = epoch_to_utc(now_epoch)?;
+    latest_usage_snapshot(profile)?
+        .secondary
+        .filter(|window| window.is_live_at(now))
+        .map(|window| window.used_fraction)
+        .filter(|fraction| fraction.is_finite())
+}
+
 // ---------------------------------------------------------------------------
 // Assessment
 // ---------------------------------------------------------------------------

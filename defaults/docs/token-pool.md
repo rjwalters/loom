@@ -1994,9 +1994,19 @@ under a sibling `mkdir` lock.
 For managed headless runs, `spawn-codex.sh` asks the native selector for an
 eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
-then prefers fewer recent transient failures and round-robins equal candidates.
-If none are healthy, selection exits closed rather than using ambient
-`~/.codex`.
+then prefers fewer recent transient failures. Within that group it prefers the
+seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
+among seats tied for the lowest. The figure is the same live weekly reading
+`accounts check --ranking` reports as `s7d_utilization`, read from the profile's
+own rollout log (`codex_check::weekly_utilization_at`); the 5h window is never
+used. Ranking needs comparable evidence: if **any** candidate in the group has
+no live weekly reading (no rollout log, malformed, 5h-only, or a window whose
+reset has passed), the whole group falls back to plain round-robin. A measured
+`0%` is a reading, not an unknown. Live-session preference, repository and
+model eligibility, and explicit profile pins are applied first and unchanged; a
+seat that turns out busy at lease time is skipped and the next-best eligible
+seat is tried. If none are healthy, selection exits closed rather than using
+ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:
 
@@ -2014,8 +2024,8 @@ Terminal policy is intentionally conservative:
   the tick's working directory) do not poison account health. Those three also
   record no freshness, because nothing ran.
 
-Codex exposes no trustworthy quota-headroom percentage here. Status/capacity
-therefore reports raw, enabled, healthy, cooldown, and reauth-required counts;
+Capacity reporting makes no use of utilization: Status/capacity
+reports raw, enabled, healthy, cooldown, and reauth-required counts;
 transcript token totals remain observability and are never presented as
 remaining quota. Claude's existing global daemon concurrency cap is unchanged.
 
