@@ -354,6 +354,50 @@ fn unreadable_expired_and_unconfigured_routes_keep_their_contracts() {
     }
 }
 
+/// #14529: fleet mode with no eligible reader is fail-closed on both
+/// routing branches, and the positive route through the same fixture shows
+/// each absent-route case differs only by its missing element.
+#[test]
+fn fleet_mode_without_an_eligible_reader_never_reaches_the_writer() {
+    // route_read's no-route arm: a named origin and an adopted gateway
+    // (gh-ok matches), but the owner has no profile, so neither the gateway
+    // nor a reader pool can answer. Fleet mode must exhaust the read, and
+    // claim's only forge call is its separate writer write-scope probe.
+    let f = Fixture::new("fleet");
+    fs::remove_file(f.gateway.join("acme/hosts.yml")).unwrap();
+    assert_code(&f.lease(TOOLS, "claim", "judge", "me", &[]), 5);
+    let check = f.lease(TOOLS, "check", "judge", "me", &[]);
+    assert_code(&check, 5);
+    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=unknown"));
+    let calls = f.read("calls");
+    assert!(!calls.contains("comments"), "{calls}");
+    assert!(!calls.lines().any(|line| line.ends_with(" post")), "{calls}");
+    assert!(calls.lines().all(|line| line == "writer permissions"), "{calls}");
+
+    // host_has_read_pool()'s fleet-required disjunct: no repo is derivable
+    // (no origin), the gateway directory validates fleet mode but adopts no
+    // gateway (no gh-ok marker, so any_live() stays false), and there is no
+    // reader pool. The untargeted read must shed with zero forge calls; a
+    // writer fallback would read empty rows and answer `free`.
+    let f = Fixture::new("fleet");
+    fs::remove_file(f.gateway.join("gh-ok")).unwrap();
+    let mut git = base("/usr/bin/git", f.tmp.path(), &f.root);
+    git.args(["remote", "remove", "origin"]);
+    assert!(run(git, None).status.success());
+    let check = f.lease(TOOLS, "check", "judge", "me", &[]);
+    assert_code(&check, 5);
+    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=unknown"));
+    assert!(f.read("calls").is_empty(), "{}", f.read("calls"));
+
+    // The positive route: origin, matching marker and the owner profile in
+    // place, the same check answers `free` through the gateway.
+    let f = Fixture::new("fleet");
+    let check = f.lease(TOOLS, "check", "judge", "me", &[]);
+    assert_code(&check, 0);
+    assert!(check.stdout.starts_with(b"PR_LEASE_STATE=free"));
+    assert!(f.read("calls").contains("gateway comments"));
+}
+
 #[test]
 fn daemon_service_actions_are_refused_by_tools_before_routing() {
     let f = Fixture::new("invalid");
