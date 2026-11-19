@@ -1878,7 +1878,7 @@ update_work_log() {
   # shape, plus an entry-count escape hatch WORK_PLAN has no equivalent of,
   # since a "diff" is binary for WORK_PLAN but WORK_LOG has a natural
   # "how much is pending" signal):
-  #   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): once the pending delta
+  #   - `workLogMinEntries` (default 5): once the pending delta
   #     reaches this size, write IMMEDIATELY, debounce window or not — this
   #     is the "no starvation" guarantee for a large accumulated delta from
   #     the acceptance criteria: a burst of activity must never sit
@@ -1911,7 +1911,19 @@ update_work_log() {
   local debounce_secs min_entries
   debounce_secs="${LOOM_WORK_LOG_DEBOUNCE_SECS:-$(jq -r '.guide.docsMaintenance.workLogDebounceSecs // 1800' .loom/config.json 2>/dev/null)}"
   [ -n "$debounce_secs" ] || debounce_secs=1800
-  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-5}"
+  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-}"
+  if [ -z "$min_entries" ]; then
+    min_entries="$(jq -rs '
+      select(length == 1)
+      | .[0].guide.docsMaintenance.workLogMinEntries
+      | select(type == "number")
+      | select(. > 0 and floor == .)
+      | floor
+    ' .loom/config.json 2>/dev/null)" || min_entries=""
+    if ! [ "$min_entries" -gt 0 ] 2>/dev/null; then
+      min_entries=5
+    fi
+  fi
 
   if [ "$total_new" -lt "$min_entries" ]; then
     local last_merged_epoch now_epoch elapsed
@@ -1948,6 +1960,16 @@ update_work_log() {
   return 0
 }
 ```
+
+Set `guide.docsMaintenance.workLogMinEntries` in `.loom/config.json` to a
+positive JSON integer that the shell can compare. An absent or invalid setting
+falls back to 5. A nonempty `LOOM_WORK_LOG_MIN_ENTRIES` still takes precedence.
+
+For example, loom-ui could set `workLogMinEntries` to 12 and
+`workLogDebounceSecs` to 7200. Thirty minutes after a known Guide merge that
+touched WORK_LOG, six pending records would wait, and 12 would be eligible.
+A smaller delta becomes eligible two hours after that merge, on the next
+eligible Guide pass. WORK_PLAN keeps its independent publication window.
 
 **Entry format** (grouped by date, newest first):
 
