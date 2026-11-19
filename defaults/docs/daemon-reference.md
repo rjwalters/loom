@@ -1299,7 +1299,7 @@ cancel`'s SIGTERM→grace→SIGKILL), plus the three deltas teardown needs:
    normally in the meantime (no longer `loom:building`) is left alone.
 3. **Safehoused flush verification is a documented stub pending #3998.** No
    invocable key-backup steady-state check exists in this repo yet (only the
-   narration-sink/peer-claim client seams in `safehouse.rs`) — rather than block
+   narration-sink/completion-dedup client seams in `safehouse.rs`) — rather than block
    every drain on #3998, this phase degrades honestly: `safehouse.enabled ==
    false` skips cleanly (no room keys in play); `safehouse.enabled == true`
    still lets the drain complete (workspace/roster cleanup proceed — loom never
@@ -1549,7 +1549,7 @@ Calls are counted in the forge-call stats as `fleet_store`. GitHub only.
 
 `host_identity()` (`loom-daemon/src/host_identity.rs`, re-exported as
 `sweep_registry::host_identity`) is this host's one name: telemetry `host.id`,
-the envelope `host_id` (and so ingest-key binding), peer-claim
+the envelope `host_id` (and so ingest-key binding), completion-dedup
 self-recognition, collision records, `fleet.captain` matching, the default
 `--host` of `fleet-config`, and the fleet dashboard. Precedence:
 
@@ -3684,7 +3684,7 @@ without parsing anything:
 | `3` | busy, not confirmed unhealthy — see "Busy vs degraded" (#6191) below |
 
 Several sections, one line each (or the full structured payload with `--json`);
-the table below is not exhaustive — `peer_coordination` (#6157), `stale_sweeps`
+the table below is not exhaustive — `stale_sweeps`
 (#7529), `auto_update` (#7584), `worktree_reaper` (#7590), `pool_hold`
 (#7708/#7990), and `transcript_ingest` (#8477) also always render, each
 documented at its own point in this file. `tmpfs_visibility` (#8572, split
@@ -6382,14 +6382,11 @@ knobs not yet audited here.
 | `autonomous.watchdog.staleSweepAgeSecs` | `LOOM_SWEEP_STALE_AGE_SECS` | `10800` (3h, 4× `reviewStallTimeoutSecs`) | Age sanity ceiling before an untracked, log-silent sweep is reaped |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision detection and enforcement (#4085, upgraded from detection-only by #5789). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. When enabled, a confirmed pre-flip collision backs off the dispatch instead of only logging/counting it |
 | `safehouse.enabled` | `LOOM_SAFEHOUSE_ENABLED` | `false` | Enables safehouse fleet-comms (#3997) **and** cross-host soft-claim coordination (#4028). Off by default — a byte-for-byte no-op (no socket, no coordination task) when unset |
-| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick. Since #4431 live claims are re-advertised every reaper tick, so the TTL only bounds how long a **crashed** host's claim lingers |
-| *(env-only)* | `LOOM_PEER_COORDINATION_DEGRADE_GRACE_SECS` | `1200` (20m, raised from 10m by #8276) | How long this host may advertise peer claims with **no** receive before peer coordination is judged DEGRADED (#6157), in whole seconds. Raised from the original 10-minute default (Issue #8276, 2026-09-19): three independent flap episodes each crossed the (then-)600s grace and later recovered, within 1089s/3579s/8792s of crossing — an upper bound on, not a clean measurement of, the true genuine-peer-traffic quiet gap (see `DEFAULT_COORDINATION_DEGRADE_GRACE`'s doc comment in `peer_claims.rs` for the full derivation). 1200s is a pragmatic compromise — it may not have prevented DEGRADED on all three episodes, only delayed it — that reduces the false-positive rate for shorter flaps while staying a ~60× margin below the reference incident (2026-08-13, ~21h). Zero/unparseable → default. A DEGRADED verdict surfaces as `loom-daemon health`'s `peer_coordination` section — diagnostic only since Epic #6165 Phase 4 (#6317): it no longer freezes stale-claim reclamation, which now gates solely on the lease record (#6286) |
-| *(env-only)* | `LOOM_PEER_COORDINATION_RECOVERY_THRESHOLD` | `3` | How many **consecutive** genuine peer receives must land while coordination is DEGRADED before it is judged recovered (#6157). Self-advertisements never count, so a single stray ad cannot clear a verdict whose whole point was sustained receive absence. Zero/unparseable → default |
 | `safehouse.rooms.signal` | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | *(falls back to `safehouse.room`)* | Attention-class routing (#4225): the **signal** room id (`loom-fleet`) — operator conversation, every `handoff`, terminal `ack`/`completion`. Absent **and** no `byRepo` ⇒ single-room mode, byte-identical to pre-#4225 |
 | `safehouse.rooms.byRepo` | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,…`) | `{}` | Attention-class routing (#4225): per-repo **firehose** room ids keyed by workspace-root basename — `task`/`chat` narration. A repo absent from the map is created lazily as `fleet-<repo>`; a refused creation degrades that repo to the signal room with one `warn!`. The env form replaces the whole map |
 | `safehouse.rooms.alerts` | `LOOM_SAFEHOUSE_ROOM_ALERTS` | *(unset)* | Optional alerts room (#13070): when set, `handoff` envelopes (fleet-degraded edges and `Cleared`, BLOCKED, crashed) go only here; dispatch, phase, ack and completion stay in the main room. Unset ⇒ behavior unchanged. Does not enable attention-class routing |
-| `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
-| `fleet.hostId` (machine tier only) | `LOOM_HOST_ID` | the persisted `~/.loom/host-id` → `unknown-host` | This host's identity string (`host.id`), used in telemetry, collision log records (#4085) **and** peer-claim self-recognition (#4028). **Config wins over env** here, and there is no hostname fallback (#11530); see [Host identity](#host-identity-loom-daemon-host-id-11530) |
+| `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). The 30-minute safehouse default dates from when peer claims carried the fast in-flight signal (retired in #13945; the cadence is unchanged). Env wins on any host; floored at 60s |
+| `fleet.hostId` (machine tier only) | `LOOM_HOST_ID` | the persisted `~/.loom/host-id` → `unknown-host` | This host's identity string (`host.id`), used in telemetry, collision log records (#4085) **and** self-recognition in the completion dedup (#6352). **Config wins over env** here, and there is no hostname fallback (#11530); see [Host identity](#host-identity-loom-daemon-host-id-11530) |
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055) **on a host with no fleet store only**. **Opt-in** there (it rebuilds + restarts the daemon process). On a fleet host (`fleet.repo` set) it governs nothing: the loop runs whatever it says, for the fleet floor and for a workspace that needs a newer daemon, and never chases the newest release (#10954, see [The fleet floor drives rolls](#the-fleet-floor-drives-rolls-no-roll-windows-10885)). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default. **Only on a host with no fleet store** (#10885): a fleet host rolls for its floor on the tick that sees it and never waits on settle |
@@ -6985,40 +6982,20 @@ class (`unclassified:no-class` when nothing classified it). It never parks twice
 an issue already quarantined, nor one held by the PR-less or no-op hold, and
 the quarantine's own tally does not re-park one the ladder parked. An open-PR
 yield never parks; a `loom:frozen` issue gets the in-memory pause and no forge
-write. Disabled with the quarantine. **Note:** each armed window is broadcast
-once to peer hosts (#7477), and `loom-daemon quarantine clear <issue>` (there
-is no separate `dispatch-backoff clear`) clears only this host's window and
-park — a peer keeps skipping the issue until the window it received expires.
-**The streak is fleet-wide (#11942).** Each `DispatchBackoffArmed` broadcast
-also carries the sender's own fast-failure streak (`0` when the window was
-armed by any other cause: a lost lease race, an environmental class, an
-open-PR yield). A receiving host keeps one count per peer host, replacing it
-rather than adding to it, and parks when its **own** streak plus every peer's
-reaches the quarantine `threshold` — so three hosts failing fast once each park
-the issue, where before none of them reached three. Our own echo and an
-unknown-host ad contribute `0`, and an ad without a count (an older peer, or a
-landed cooldown's window) leaves the tally alone. A peer's count is read against
-the reader's own `maxSecs` from local receipt and is dropped after at most a
-day. Without peer coordination each host counts alone, as before. The park also
-survives a daemon restart: the startup pass keeps a marked `loom:blocked` park
-younger than its TTL on the forge and rebuilds the in-memory quarantine from the
-marker's timestamp, instead of releasing it. Source:
-`loom-daemon/src/peer_claims/fast_fail_tally.rs`,
-`loom-daemon/src/sweep_registry/fast_fail_fleet.rs`.
+write. Disabled with the quarantine. **Note:** `loom-daemon quarantine clear
+<issue>` (there is no separate `dispatch-backoff clear`) clears this host's
+window and park. The windows are host-local: the broadcast of them to peers
+(#7477) was retired in #13945.
+**The streak is this host's own (#13945).** It was summed with every peer's
+over the safehouse claims room (#11942); that channel was retired, and the
+captain counts the fleet-wide fast-fail streak (#13919). The park survives a
+daemon restart: the startup pass keeps a marked `loom:blocked` park younger than
+its TTL on the forge and rebuilds the in-memory quarantine from the marker's
+timestamp, instead of releasing it. Source:
+`loom-daemon/src/sweep_registry/fast_fail_park.rs` (`adopt_restored_parks`).
 
-**Streak breaks and the `streak_break` marker (#12006).** The streak is
-consecutive across the fleet, so whatever breaks it on one host breaks it on all
-of them: real progress on an issue, and `loom-daemon quarantine clear <issue>`,
-broadcast a **break** — a `DispatchBackoffArmed` ad with `streak_break = true`,
-a zero window and a zero streak. A receiver drops every host's count for the
-issue and resets its own streak to start over, but leaves every backoff
-**window** running. An ordinary ladder ad carries `streak_break = false`, so a
-zero streak on it breaks only the sender's own entry; an ad from an older peer
-with no marker is read as before (a zero window and a zero streak is a break).
-Because a zero window used to be the only break signal, an ordinary ad always
-advertises a window of at least 1 s, and `baseSecs` / `maxSecs` are floored at
-1 s: a zero from env or config is refused with a warning and the default is
-used, and a hand-built zero config is clamped to 1 s with a warning.
+`baseSecs` / `maxSecs` are floored at 1 s: a zero from env or config is
+ignored and the default is used.
 
 **Startup quarantine pass is retried once (#12005).** The startup pass over
 `loom:blocked` parks skips a workspace while the shared GitHub rate-limit
@@ -7073,28 +7050,13 @@ its cooldown automatically. Defaults **on**; disable with
 `LOOM_WORK_FINDER_NOOP_COOLDOWN=0` or
 `autonomous.workFinder.noopCooldown.enabled = false`.
 
-**Both brakes are fleet-wide as of #7477.** The dispatch backoff and the no-op
-cooldown were each a plain per-process `HashMap` — correct on one host, nearly
-useless on a fleet: host A arms its window and stops offering the issue, but
-B/C/D never saw it and re-claim the same freshly-released row, so an N-host
-fleet round-robins the claim/release bail loop up to N× faster than a
-single-host brake was designed to prevent (evidence: #7466/#7468 flapping
-`loom:issue` ↔ `loom:building` every 1-2 minutes for hours across four hosts).
-Arming either window now also broadcasts it over the **peer-claim channel**
-(two new `ClaimKind`s, `DispatchBackoffArmed` / `NoopCooldownArmed`, carrying
-the remaining seconds), and `dispatch_backoff_issues` / `noop_cooldown_issues`
-union the local map with the peer view before the work finder reads them.
-Publish is fail-open and one-shot (a re-arm re-broadcasts), the expiry is
-measured against **local receipt** rather than the advertiser's clock, and a
-host with no peer-claim view attached (`safehouse.enabled` false) degrades
-byte-for-byte to the pre-#7477 per-host behavior. The lease-reclaim path
+**Both brakes are host-local (#13945).** The dispatch backoff and the no-op
+cooldown are plain per-process maps. They were broadcast to every peer over the
+safehouse claims room (#7477) so a fleet did not round-robin a claim/release
+bail loop; that channel was retired, and cross-host coordination is the
+captain's assignment plus the forge lease. The lease-reclaim path
 (`claim_reconciliation`) reads none of this, so a genuinely orphaned claim that
-never armed a window is still reclaimed promptly. Full mechanism:
-[`safehouse.md` → "Fleet-wide no-op cooldown / dispatch backoff"](safehouse.md).
-A third brake lane rides the same channel with a **pool**-wide rather than
-per-issue scope — `PoolHoldArmed`/`PoolHoldCleared`, keyed by account-set
-fingerprint (#8001/#7708): [`safehouse.md` → "Fleet-wide token-pool exhaustion
-hold"](safehouse.md).
+never armed a window is still reclaimed promptly.
 
 **First in-repo caller (#6740).** `defaults/scripts/record-noop-release.sh`
 is the shell helper that actually makes this call — resolving the daemon
@@ -7221,28 +7183,15 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   release arms a window the work finder skips *before* the capacity gate —
   counted as **`prless-retry-skip`** on the per-tick summary line — so a
   re-claim cannot land in the same minute as the release, and a held candidate
-  never reserves a shared dispatch slot. A peer host's window is unioned into
-  the same skip set (#9292), so it spaces out *every* host's next claim, not
-  only the one that armed it. A streak older than `maxBackoffSecs` is cold and
+  never reserves a shared dispatch slot. A streak older than `maxBackoffSecs` is cold and
   restarts at 1: a failure an hour ago and a failure now are not a pattern.
-- **The tally is fleet-wide (#9292).** Every recorded release is broadcast over
-  the peer-claim room's brake lane carrying that host's own running count, and
-  `threshold` is compared against the **sum** — so four dispatch hosts spend
-  `threshold` claims between them, not `threshold` claims each. Before #9292 the
-  tally was a per-process integer: on `rjwalters/loom#8812` (2026-09-24) four
-  hosts spent nine claim/release cycles and posted four near-identical
-  `Attempt 2 of 3` notes before any one of them reached a hold. Requires peer
-  coordination (`safehouse.enabled`); without it each host counts alone, exactly
-  as before, and says so once per release —
-  `grep "HOST-LOCAL only" ~/.loom/daemon.log`. A dropped ad, a pre-#9292 peer,
-  or an unreadable view all fail open to this host's own exact count. A peer's
-  contribution lapses after an hour (the fleet-wide form of the streak-cold
-  rule), so a crashed host cannot pin an issue one release short of a hold.
-- **Visibility.** When the **fleet** count reaches 2 the failure reason is
+- **The tally is per-host (#13945).** It was summed with every peer's over the
+  safehouse claims room (#9292); that channel was retired, so each dispatch host
+  counts its own claims.
+- **Visibility.** When the count reaches 2 the failure reason is
   posted to the issue, so the next claimer starts from "the last attempt died
   like *this*" instead of from nothing. Bounded by construction: one attempt
-  note per streak per *issue* (#9292 — it used to be one per streak per *host*),
-  versus the fourteen claim cycles and eighteen comments the observed loop
+  note per streak, versus the fourteen claim cycles and eighteen comments the observed loop
   produced. These are **attempt notes, not holds** — they apply no label and the
   issue stays in the queue. Each body declares its kind
   (`<!-- loom:prless-retry-kind=attempt -->` / `…=hold` / `…=hold-failed`,
@@ -8577,92 +8526,16 @@ rooms to its `sink_url` — that is what fills the public fleet feed. Notes:
   all narration: a failed/absent/slow `gh`, invalid `meta`, or an unreachable
   safehoused drops the completion silently and never touches the sweep.
 
-### Cross-host soft claim over safehouse (#4028, Phase 1 of #4028)
+### Cross-host soft claim over safehouse (retired, #13945)
 
-Where collision detection (above) only *measures* the race, the soft claim
-*shrinks* it. When `safehouse.enabled` is true, each daemon advertises its
-dispatch claims into the shared safehouse room and consumes peer advertisements,
-so a peer daemon backs off before the non-atomic `loom:building` label flip would
-let it race. This is Phase 1 of #4028 — see
-[`.loom/docs/safehouse.md` → Peer-claim coordination](safehouse.md#peer-claim-coordination-cross-host-soft-claim-4028)
-for the full design.
-
-**Advisory-only for reclamation (Epic #6165).** The dispatch-time backoff
-described here is unaffected by Epic #6165 — it is exactly #4028's original,
-non-load-bearing role. What Epic #6165 changes is a *different* consumer of
-this same channel: `claim_reconciliation`'s decision to reclaim an
-already-`loom:building` issue, which for a period also froze while peer
-coordination was judged DEGRADED (#6157, config rows below). That freeze was
-superseded by the fleet-scoped lease record ([`lease-record.md`](lease-record.md),
-Phase 2 #6286) and removed from the reclamation decision path entirely by
-Phase 4 (#6317) — see [`safehouse.md` → Peer-claim
-coordination](safehouse.md#peer-claim-coordination-cross-host-soft-claim-4028)
-for the full note.
-
-- **Advertise before the flip.** In `SweepRegistry::dispatch()`, right after the
-  local claim lock and **before** `flip_label_to_building`, the daemon publishes a
-  claim advertisement (issue, cross-host-stable repo slug, host identity, PID,
-  timestamp) over the room. It rides a **`task`** envelope — the envelope `type`
-  enum is closed and owned by the safehouse repo, so **no type is invented here**
-  (loom only *uses* the members safehoused already defines) — with the bare issue
-  number as `task_id` and the structured payload (`loom_claim`-marked JSON) in
-  the `body`.
-- **Dedicated inbound read task.** A coordination task on its own safehouse
-  connection drains the socket continuously (`select!` over read + outbound), so
-  an **idle** daemon that emits no narration still sees peer claims promptly — the
-  narration sink only reads while it is emitting, so peer-claim consumption cannot
-  piggyback on it. Inbound claims fold into a shared `PeerClaimView`
-  (`loom-daemon/src/peer_claims.rs`, pure/socket-free).
-- **Back off with a distinct counter.** The work-finder skips any issue with a
-  live peer claim, counted as **`peer-claim-skip`** on the per-tick summary line —
-  its **own** reason, never folded into `cross-host-collision(s)` (a post-hoc
-  count) or the label/in-flight skips:
-
-  ```
-  work_finder: tick — cap 3 (...); 5 seen, 1 dispatched, 0 labeled-skip,
-  0 in-flight-skip, 0 quarantine-skip, 0 pr-open-skip, 1 peer-claim-skip,
-  0 deferred, 0 error(s), 0 cross-host-collision(s)
-  ```
-
-- **TTL + retraction.** Peer claims expire after **`safehouse.peerClaimTtlSecs`
-  (env `LOOM_PEER_CLAIM_TTL_SECS`; default 120s = 2× the 60s work-finder tick)**,
-  measured against **local receipt time** (never the advertiser's wall clock —
-  clock skew is not comparable across hosts), so a crashed peer cannot
-  permanently starve an issue. A peer also emits a `retract` ad from its reaper on
-  a terminal sweep outcome, freeing the issue before the TTL.
-- **Re-advertisement heartbeat (#4431).** The dispatch-time ad is no longer
-  one-shot: the reaper re-advertises every live (`Running`) Issue
-  sweep's claim each tick (default 30s — ~4 refreshes per TTL window), and a
-  repeat ad **restarts** the receiver's TTL clock. A live sweep's claim
-  therefore never expires from peers' views mid-run, while a crashed host's
-  claims still free within one TTL of its last heartbeat. This is what lets
-  the peer claim serve as the **primary fast in-flight signal** on
-  safehouse-enabled hosts, with the `loom:building` label demoted to a slow
-  healing audit trail:
-- **Safehouse-conditional reconciliation cadence (#4431).** On a host with
-  `safehouse.enabled`, `claim_reconciliation`'s periodic pass defaults to
-  **1800s** (30 min, healing-only) instead of 600s. Precedence:
-  `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` env >
-  `safehouse.claimReconcileIntervalSecs` config > 1800s (safehouse) / 600s
-  (no safehouse), floored at 60s. Hosts without safehouse are byte-for-byte
-  unchanged.
-- **Self-claim recognition.** A daemon never backs off on its own advertisement:
-  the claim body carries the host identity (`host_identity()`:
-  `fleet.hostId` > `LOOM_HOST_ID` > the persisted `~/.loom/host-id` >
-  `unknown-host`, #11530 — loom's single, restart-stable host concept), and the view ignores ads from this host.
-  safehoused's socket `from` is stamped from the *persona* (all daemons share
-  `loom_daemon`) and cannot distinguish hosts, hence the body-carried identity.
-- **Fail-open, no-op when off.** An unreachable/refusing/timing-out socket, a
-  malformed envelope, or a full outbound channel is logged once and **dispatch
-  proceeds** — the outbound ad is a bounded non-blocking `try_send` off the
-  dispatch path. `safehouse.enabled` false/absent is a **byte-for-byte no-op**: no
-  view, no channel, no coordination task, no socket. No new event-bus topic is
-  added (the frozen taxonomy is untouched — claims travel entirely over the room).
-
-> **Soft claim, NOT a mutex.** A room broadcast is eventually consistent, so this
-> is a fast backoff, not a lock — two hosts advertising near-simultaneously still
-> race. The **atomic** cross-host claim authority (a real CAS, e.g. a `git push`
-> to a claim ref) is **Phase 2 of #4028**, filed separately.
+The safehouse peer-claim channel — dispatch advertisements, the
+`peer-claim-skip` counter, the re-advertisement heartbeat, the brake lanes and
+the `loom-daemon peer-claims` command — was removed (operator ruling
+2026-11-15, #13920). The fleet runs on captain assignment plus forge leases; the
+local ledgers stay as the fallback path's own. A leftover `rooms.claims`,
+`peerClaimTtlSecs`, `LOOM_SAFEHOUSE_ROOM_CLAIMS` or `LOOM_PEER_CLAIM_TTL_SECS`
+is ignored and named in one startup warning. What remains on the room is the
+completion dedup: [`safehouse.md` → Completion dedup](safehouse.md#completion-dedup-the-one-cross-host-ad-left-6352).
 
 ### Prerequisite: a fresh token ranking (#3894, self-refreshed by the daemon since #3969)
 

@@ -226,7 +226,7 @@ fn every_stage_gets_its_step_and_claimed_and_parked_items_are_skipped() {
         .iter()
         .find(|r| r.key.number == 3)
         .unwrap();
-    assert_eq!(row3.disposition, Some(Qd::PeerClaim));
+    assert_eq!(row3.disposition, Some(Qd::LeaseHeld));
     // Claimed (7, 100), parked (8) and operator-held (9) items never reach
     // the spawner and are counted by reason; every pooled row names its step.
     assert!(tick.report.skipped_in_flight >= 2);
@@ -447,7 +447,7 @@ fn a_merge_spawned_mid_tick_defers_the_repos_other_merges() {
         .queue
         .iter()
         .filter(|r| r.detail.as_deref() == Some(PASS_MERGE))
-        .all(|r| r.disposition == Some(Qd::PeerClaim)));
+        .all(|r| r.disposition == Some(Qd::LeaseHeld)));
     // The record names the partial closure and still replays.
     let record = tick.report.item_draw.as_ref().unwrap();
     assert_eq!(record.closures.len(), 1);
@@ -778,7 +778,7 @@ fn a_landed_refusal_reads_as_already_landed() {
 #[test]
 fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
     for reason in ["peer_active", "backstop_hold"] {
-        assert_eq!(disposition_of(reason), Qd::PeerClaim, "{reason}");
+        assert_eq!(disposition_of(reason), Qd::LeaseHeld, "{reason}");
     }
     let mut spawner = FakeSpawner {
         refuse: vec![(3, "peer_active")],
@@ -951,7 +951,7 @@ fn refusals_in_a_round_are_counted_in_draw_order() {
         .report
         .queue
         .iter()
-        .filter(|r| r.disposition == Some(Qd::PeerClaim))
+        .filter(|r| r.disposition == Some(Qd::LeaseHeld))
         .all(|r| r.detail.as_deref() == Some("claimed")));
 
     // Some refused: the dispatched count, the passes and the rows agree with
@@ -1136,7 +1136,7 @@ fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
         .report
         .queue
         .iter()
-        .find(|r| r.disposition == Some(Qd::PeerClaim));
+        .find(|r| r.disposition == Some(Qd::LeaseHeld));
     assert!(row.is_some(), "a held item reads as a peer's claim");
 
     for reason in ["claim_lost", "captain_held"] {
@@ -1177,7 +1177,7 @@ fn a_captain_cooldown_refusal_is_free_and_does_not_end_the_tick() {
         .report
         .queue
         .iter()
-        .any(|r| r.disposition == Some(Qd::PeerClaim)));
+        .any(|r| r.disposition == Some(Qd::LeaseHeld)));
 }
 
 /// #12704: the pairs a tick's captain refused as cooling down are armed on
