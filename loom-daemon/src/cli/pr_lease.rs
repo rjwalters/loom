@@ -1666,14 +1666,15 @@ impl Ctx {
             // The released marker keeps the lease's own step.
             // A Champion merge step's release records its outcome (#12616);
             // a reaped one died without releasing, so it has none.
-            let champion = if holder.step == Some(StepRole::ChampionPromote) {
-                String::new()
-            } else {
-                backstop::champion_outcome_fields(
-                    self.me.role,
-                    outcome.filter(|_| reaped.is_none()),
-                    stop_reason.filter(|_| reaped.is_none()),
-                )
+            let typed = backstop::champion_outcome(
+                self.me.role,
+                holder.step,
+                outcome.filter(|_| reaped.is_none()),
+                stop_reason.filter(|_| reaped.is_none()),
+            );
+            let champion = match &typed {
+                Some((word, reason)) => backstop::format_champion_outcome(word, reason.as_deref()),
+                None => String::new(),
             };
             let body = format!(
                 "{}\n{}",
@@ -1682,6 +1683,20 @@ impl Ctx {
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
+                // #14639: this release verified the lease was its own
+                // (`holder == self.me`: role, host, sweep and step) and its
+                // PATCH landed, so its typed outcome is trusted fallback
+                // evidence for the step's projection. A reap journals
+                // nothing — it is not the step's own word.
+                if reaped.is_none() {
+                    if let Some((word, reason)) = &typed {
+                        crate::observability::pick_journal::record_released(
+                            self.pr(),
+                            word,
+                            reason.as_deref(),
+                        );
+                    }
+                }
             }
         }
         let verb = if reaped.is_some() {

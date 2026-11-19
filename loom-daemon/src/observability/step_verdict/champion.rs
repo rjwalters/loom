@@ -7,7 +7,8 @@
 //! Evidence, strongest first: the write the gh front journaled (`merged`,
 //! `promoted`), then the markers Champion's comments opened with, then the
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
-//! the step's `CHAMPION-STEP … outcome=` word.
+//! the step's `CHAMPION-STEP … outcome=` word — and, when its log has no
+//! such line, the typed outcome of the step's own released lease (#14639).
 
 use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
@@ -271,8 +272,32 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             });
         }
     }
+    // #14639: a step a guard refused mid-flight can end with its lease
+    // released and its typed outcome recorded there, its `CHAMPION-STEP`
+    // line never written. The run's own journaled release is the fallback
+    // for exactly that gap — the step log still wins, and only the release
+    // the daemon itself made and vetted counts, never a marker read off
+    // the forge (#9548).
+    let released = if e.step_path {
+        e.events.iter().rev().find_map(|event| match event {
+            Event::Released {
+                outcome, reason, ..
+            } => Some((outcome.clone(), reason.clone())),
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let outcome = e
+        .outcome
+        .clone()
+        .or_else(|| released.as_ref().map(|(o, _)| o.clone()));
+    let reason = e
+        .reason
+        .clone()
+        .or_else(|| released.as_ref().and_then(|(_, r)| r.clone()));
     let triage = TRIAGE_REASON_SET;
-    let p = match e.outcome.as_deref() {
+    let p = match outcome.as_deref() {
         Some("triaged") => projection("verdict", "review_requested", triage),
         Some("triage-blocked") => projection("refused", "blocked", triage),
         Some("triage-operator") => projection("refused", "operator", triage),
@@ -285,8 +310,8 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             ..projection("refused", "unknown", set)
         },
         Some("requeued" | "skipped") => Projection {
-            detail: e.reason.as_deref().map(sanitize_detail),
-            ..projection("noop", &stop_reason(e.reason.as_deref()), set)
+            detail: reason.as_deref().map(sanitize_detail),
+            ..projection("noop", &stop_reason(reason.as_deref()), set)
         },
         Some("held") => projection("noop", "held", set),
         Some("head-moved") => Projection {
@@ -338,7 +363,7 @@ fn project_promotion(e: &Evidence) -> Option<Projection> {
                 ("escalated", "operator_decision") => (at, "needs_operator"),
                 _ => continue,
             },
-            Event::Act { .. } => continue,
+            Event::Act { .. } | Event::Released { .. } => continue,
         };
         return Some(with_hash(Projection {
             wrote: true,

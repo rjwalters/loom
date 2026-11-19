@@ -119,6 +119,22 @@ pub enum JournalEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
     },
+    /// A PR lease release a daemon subcommand made (`lease pr release`,
+    /// #14639): the typed outcome Champion's release records on its marker.
+    /// Written only after the release's own PATCH landed and never for a
+    /// reap, so it is the trusted record of the step's own release — a
+    /// release marker read back off the forge is untrusted prose (#9548)
+    /// and never becomes one.
+    Released {
+        at: DateTime<Utc>,
+        number: u32,
+        /// The outcome word the release recorded (`none` when it passed
+        /// none).
+        outcome: String,
+        /// The `reason=` gate a requeue or skip named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// A hold-label transition a daemon subcommand or the Champion prompt
     /// made on a PR (#12665): the source of `hold.transition`. `confirmed` is
     /// `false` for a write that was attempted and failed.
@@ -708,6 +724,25 @@ pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_
             action: action.to_string(),
             by: by.to_string(),
             head_sha: head_sha.filter(|s| !s.is_empty()).map(str::to_string),
+        });
+    }
+}
+
+/// Journal a PR lease release this run made (`lease pr release`, #14639):
+/// the typed outcome Champion's release records. Called only after the
+/// release's own PATCH landed, and never for a reap, so the entry is the
+/// trusted record of the step's own release. A no-op outside a journaled
+/// run.
+pub fn record_released(pr: u64, outcome: &str, reason: Option<&str>) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(pr) {
+        append(&JournalEntry::Released {
+            at: Utc::now(),
+            number,
+            outcome: outcome.to_string(),
+            reason: reason.filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
 }

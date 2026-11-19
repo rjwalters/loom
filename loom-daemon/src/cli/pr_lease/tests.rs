@@ -1026,6 +1026,85 @@ fn a_reaped_champion_records_no_outcome() {
     assert!(patched.contains(&dead.released_marker_with(" outcome=none")), "{patched}");
 }
 
+/// #14639: the step's own successful release journals its typed outcome —
+/// the trusted fallback evidence the step's projection reads when its log
+/// has no `CHAMPION-STEP` line. A reap (not the step's own word) and a
+/// failed patch journal nothing, and neither does a release that records
+/// no typed outcome (another role, a merge).
+#[test]
+fn a_successful_release_journals_its_typed_outcome_and_a_reap_does_not() {
+    use crate::observability::pick_journal::{parse, set_test_journal, JournalEntry};
+    let journal_after =
+        |dir: &Path, holder: &Identity, run: &dyn Fn(Ctx) -> i32| -> Vec<JournalEntry> {
+            let journal = dir.join("journal");
+            set_test_journal(Some(journal.clone()));
+            let code = run(ctx(dir, holder.clone()));
+            set_test_journal(None);
+            assert_eq!(code, EXIT_HELD);
+            parse(&fs::read_to_string(journal).unwrap_or_default())
+        };
+    let stage = |rows_holder: &Identity| -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        fs::write(dir.path().join("rows"), live_row(100, rows_holder)).unwrap();
+        dir
+    };
+    let typed = |entries: &[JournalEntry]| -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                JournalEntry::Released {
+                    outcome, reason, ..
+                } => Some((outcome.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // The typed release journals its outcome and its gate.
+    let me = who(Role::Champion, "sweep-c");
+    let entries = journal_after(stage(&me).path(), &me, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![("skipped".into(), Some("guard_refused".into()))]);
+
+    // No outcome passed: the release records `none`, and journals that.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, None, None));
+    assert_eq!(typed(&entries), vec![("none".into(), None)]);
+
+    // A merge records no typed outcome, so it journals nothing.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, Some("merged"), None));
+    assert_eq!(typed(&entries), vec![]);
+
+    // A Judge release journals nothing (its record is the backstop's, not a
+    // typed outcome).
+    let judge = who(Role::Judge, "sweep-j");
+    let entries = journal_after(stage(&judge).path(), &judge, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![]);
+
+    // The daemon's reap of a dead step journals nothing.
+    let dir = stage(&me);
+    let journal = dir.path().join("journal");
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(ctx(dir.path(), me.clone()).reap("timeout"), EXIT_HELD);
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
+
+    // A patch that fails journals nothing.
+    let dir = stage(&me);
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    let journal = dir.path().join("journal");
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(
+        ctx(dir.path(), me).release(None, Some("skipped"), Some("guard_refused")),
+        EXIT_HELD
+    );
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
+}
+
 // ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
 
 const HEAD: &str = "3333333333333333333333333333333333333333";

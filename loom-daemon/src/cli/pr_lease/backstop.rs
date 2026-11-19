@@ -6,6 +6,7 @@
 use crate::forge_call_stats::ops;
 use crate::gh_invocation::AccessIntent;
 use crate::judge_backstop::{self as backstop, CiRead, CiState};
+use crate::step_role::StepRole;
 use chrono::{DateTime, Utc};
 
 use super::{Ctx, Gh, Role, Row};
@@ -106,19 +107,22 @@ pub(crate) fn reaped_release_fields(
     }
 }
 
-/// The `outcome=` field a Champion release records (#12616): the step's
-/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
-/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
-/// is dropped so the word cannot break the marker. A `requeued` / `skipped`
-/// outcome also records the gate it stopped at, `reason=<token>` (#12715);
-/// `unspecified` when the step named none.
-pub(crate) fn champion_outcome_fields(
+/// The typed outcome a Champion release records (#12616), as the pair its
+/// marker's fields and the step's journal (#14639) both carry: the step's
+/// `CHAMPION-STEP` outcome word (`none` when it wrote no line — a step that
+/// died), and for a `requeued` / `skipped` outcome the gate it stopped at,
+/// `reason=<token>` (#12715; `unspecified` when it named none). Anything but
+/// `[A-Za-z0-9_-]` is dropped so the word cannot break the marker. `None`
+/// when this release records no typed outcome: another role, a promotion
+/// step, or a merge (the marker keeps only its identity).
+pub(crate) fn champion_outcome(
     role: Role,
+    step: Option<StepRole>,
     outcome: Option<&str>,
     stop_reason: Option<&str>,
-) -> String {
-    if role != Role::Champion {
-        return String::new();
+) -> Option<(String, Option<String>)> {
+    if role != Role::Champion || step == Some(StepRole::ChampionPromote) {
+        return None;
     }
     let token = |raw: Option<&str>, max: usize| -> String {
         raw.unwrap_or_default()
@@ -129,8 +133,8 @@ pub(crate) fn champion_outcome_fields(
     };
     let word = token(outcome, 32);
     match word.as_str() {
-        "merged" => String::new(),
-        "" => " outcome=none".to_string(),
+        "merged" => None,
+        "" => Some(("none".to_string(), None)),
         w @ ("requeued" | "skipped") => {
             let reason = token(stop_reason, 32);
             let reason = if reason.is_empty() {
@@ -138,9 +142,18 @@ pub(crate) fn champion_outcome_fields(
             } else {
                 &reason
             };
-            format!(" outcome={w} reason={reason}")
+            Some((w.to_string(), Some(reason.to_string())))
         }
-        w => format!(" outcome={w}"),
+        w => Some((w.to_string(), None)),
+    }
+}
+
+/// The marker fields of [`champion_outcome`]'s pair.
+pub(crate) fn format_champion_outcome(word: &str, reason: Option<&str>) -> String {
+    match (word, reason) {
+        (w, Some(r)) => format!(" outcome={w} reason={r}"),
+        ("none", None) => " outcome=none".to_string(),
+        (w, None) => format!(" outcome={w}"),
     }
 }
 
