@@ -2199,6 +2199,27 @@ pub struct ForgeCallsStatus {
     /// routing table. Empty when none are.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_spills: Vec<ReadSpillStatus>,
+    /// Writer route holds armed right now (#13746, #14559): one per
+    /// confirmed-exhaustion bucket the work finder stands down until its
+    /// reset. Empty when none are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writer_holds: Vec<WriterRouteHoldStatus>,
+}
+
+/// One armed writer route hold of [`ForgeCallsStatus`] (#13746): the bucket
+/// a confirmed writer exhaustion held, until its reset releases the route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriterRouteHoldStatus {
+    /// `app-<id>`.
+    pub account: String,
+    /// The installation's owner, lowercased.
+    pub owner: String,
+    /// The installation id, or `-` when unknown.
+    pub installation: String,
+    /// The billed resource (`core` is the only one a writer hold arms).
+    pub resource: String,
+    /// When the hold releases.
+    pub until: DateTime<Utc>,
 }
 
 /// One engaged read-pool spill latch of [`ForgeCallsStatus`] (W4-B).
