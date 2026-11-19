@@ -512,6 +512,27 @@ else
     fail "(#14222) gh absent: remote=$(read_field "$C14N/.loom/install-metadata.json" loom_source_remote) out=$OUT14N"
 fi
 
+# --- bash 3.2 static guard (operator round 2026-11-19, #7749) -----------------
+# canonicalize_source_remote lower-cases with tr because ${var,,} is a bash-4+
+# case modifier: under stock macOS /bin/bash 3.2 (#7749) it is a `bad
+# substitution` that aborts the helper and leaves loom_source_remote EMPTY even
+# when the remote is unchanged (reproduced by the operator). bash 3.2 is not
+# assumed present in CI, so — like the watchdog's #7508 bash-3.2 lexer scans —
+# this asserts the structural properties statically: no bash-4+ case modifier
+# anywhere in the script, and the canonical-vs-slug comparison really does go
+# through tr (so it cannot pass vacuously). Comment lines are stripped so the
+# scan matches executed code, not prose that names the hazard.
+if grep -v '^[[:space:]]*#' "$SCRIPT" | grep -qE '\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}'; then
+    fail "(#14222) bash-3.2 guard: resync-installed.sh uses a bash-4+ case-modifier expansion: $(grep -v '^[[:space:]]*#' "$SCRIPT" | grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)\}' | head -1)"
+else
+    pass "(#14222) bash-3.2 guard: no \${var,,}/\${var^^} case modifier anywhere in resync-installed.sh"
+fi
+if [[ "$(grep -cF "tr '[:upper:]' '[:lower:]'" "$SCRIPT")" -ge 2 ]]; then
+    pass "(#14222) bash-3.2 guard: canonicalize_source_remote lower-cases both sides via tr"
+else
+    fail "(#14222) bash-3.2 guard: expected >=2 tr '[:upper:]' '[:lower:]' lower-casings in resync-installed.sh, found $(grep -cF "tr '[:upper:]' '[:lower:]'" "$SCRIPT")"
+fi
+
 # --- summary -----------------------------------------------------------------
 echo ""
 echo "========================================"

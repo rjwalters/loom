@@ -3156,7 +3156,7 @@ normalize_source_remote() {
 #   resync. When the canonical name differs (case-insensitively) the rebuilt
 #   URL is printed and ONE warning goes to stderr.
 canonicalize_source_remote() {
-    local url="$1" slug owner repo canonical
+    local url="$1" slug owner repo canonical canonical_lc slug_lc
     if [[ "$url" != https://github.com/*/*.git ]]; then
         printf '%s' "$url"
         return 0
@@ -3171,8 +3171,13 @@ canonicalize_source_remote() {
     repo="${slug#*/}"
     # A non-zero exit discards whatever was printed: only a clean answer counts.
     canonical="$(timeout 10 gh api "repos/$owner/$repo" --jq .full_name 2>/dev/null </dev/null)" || canonical=""
+    # Lower-case via tr, not ${var,,}: the script must also run under stock
+    # macOS /bin/bash 3.2 (#7749), which has no case-modifier expansion and
+    # aborts the helper (writing an empty loom_source_remote) on one.
+    canonical_lc="$(printf '%s' "$canonical" | tr '[:upper:]' '[:lower:]')"
+    slug_lc="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]')"
     if [[ "$canonical" =~ ^[^/[:space:]]+/[^/[:space:]]+$ ]] \
-        && [[ "${canonical,,}" != "${slug,,}" ]]; then
+        && [[ "$canonical_lc" != "$slug_lc" ]]; then
         warn "The Loom source clone's origin remote is stale: it names $slug but GitHub now reports $canonical. Stamping the canonical URL into loom_source_remote; update the clone with: git -C \"$SOURCE_ROOT\" remote set-url origin https://github.com/$canonical.git"
         printf 'https://github.com/%s.git' "$canonical"
         return 0
