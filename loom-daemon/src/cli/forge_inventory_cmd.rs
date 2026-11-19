@@ -52,6 +52,21 @@ impl ForgeInventoryCommand {
             ForgeInventoryCommand::Observed(a) => a.run(),
         }
     }
+
+    /// Whether the parsed invocation is served by `loom-tools`: every verb,
+    /// except `gate --update`, which rewrites the change-gate baseline
+    /// instead of judging it — a write, and #14396's (#14429). The
+    /// exhaustive `match` keeps a new verb from compiling until its author
+    /// has said which side it is on.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        match self {
+            Self::Validate(_) | Self::Report(_) | Self::ProbeManifest(_) | Self::Observed(_) => {
+                true
+            }
+            Self::Gate(args) => !args.update,
+        }
+    }
 }
 
 /// Load the embedded manifest, or a synthetic one from `--manifest-dir`.
@@ -434,23 +449,6 @@ impl ObservedArgs {
             print!("{}", observed::render_text(&diff));
         }
         Ok(())
-    }
-}
-
-impl ForgeInventoryCommand {
-    /// Whether the parsed invocation is served by `loom-tools`: every verb,
-    /// except `gate --update`, which rewrites the change-gate baseline
-    /// instead of judging it — a write, and #14396's (#14429). The
-    /// exhaustive `match` keeps a new verb from compiling until its author
-    /// has said which side it is on.
-    #[must_use]
-    pub fn is_read(&self) -> bool {
-        match self {
-            Self::Validate(_) | Self::Report(_) | Self::ProbeManifest(_) | Self::Observed(_) => {
-                true
-            }
-            Self::Gate(args) => !args.update,
-        }
     }
 }
 

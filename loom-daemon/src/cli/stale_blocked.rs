@@ -151,14 +151,6 @@ impl Finding {
 }
 
 impl StaleBlockedArgs {
-    /// Always reads the forge (the open `loom:blocked` listing, the archived
-    /// probe, the budget floor), so the tools path always passes the mode
-    /// gate (design §10.3) before running (#14429).
-    #[must_use]
-    pub fn reaches_forge(&self) -> bool {
-        true
-    }
-
     /// Always `Ok(())`. See the module doc: the exit code is contract.
     pub fn run(self) -> Result<()> {
         let root = match &self.repo_root {

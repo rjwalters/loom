@@ -584,7 +584,6 @@ mod tests {
                 (&["premise-check", "--body-file", "b", "--title", "T"], false, true),
             ];
             for (tail, reaches, read) in cases {
-                let head = tail[0];
                 let mut argv = vec!["loom-tools"];
                 argv.extend_from_slice(tail);
                 let cli =
@@ -597,7 +596,6 @@ mod tests {
                 };
                 assert_eq!(got_reaches, reaches, "{argv:?}: reaches_forge");
                 assert_eq!(got_read, read, "{argv:?}: is_read");
-                let _ = head;
             }
             // `premise-check --issue` is forge mode and gated.
             let cli =
