@@ -516,7 +516,8 @@ file_phase_pair() {
 
     STUB_ISSUE_LIST="$WORK/$size-open.json" run_create --title "$first_title" --body-file "$WORK/$size-first.md"
     assert_eq "$RC" "3" "($size) repeating the first phase is still blocked"
-    assert_eq "$(wc -l < "$GH_CREATES" | tr -d ' ')" "0" "($size) duplicate reaches no write"
+    assert_contains "$OUT" "#9999" "($size) duplicate names the first filing"
+    assert_eq "$(awk '$1 == "issue" && $2 == "create" { writes++ } END { print writes + 0 }' "$GH_CREATES")" "0" "($size) duplicate reaches no write"
 }
 
 phase_body 'Generate CSV from elapsed runner records.' 'Escape commas' 'Sort timestamps' > "$WORK/compact-first.md"
@@ -528,6 +529,10 @@ phase_body 'Add a CSV export to the throughput table. Extract runner elapsed sec
 phase_body 'Restore the active element after dismissing the branch selector. Use the popover close handler in web/filters.tsx.' \
     'Escape closes an open selector' 'Tab reaches the next enabled control' > "$WORK/expanded-second.md"
 file_phase_pair expanded '[Epic #2468] Export job timing reports' '[Epic #2468] Restore keyboard focus in filter menu'
+
+phase_body 'CI' 'CI' 'CI' > "$WORK/low-signal-first.md"
+phase_body 'Measure runner cache misses.' 'Report restore times' 'Count successful reuse' > "$WORK/low-signal-second.md"
+file_phase_pair low-signal '[Epic #2468] CI' '[Epic #2468] Report cache reuse'
 
 mv "$WORK/check-duplicate.stub" "$FAKE_SCRIPTS/check-duplicate.sh"
 

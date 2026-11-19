@@ -379,6 +379,24 @@ fn duplicate_text<'a>(pool: Pool, title: &'a str, body: &'a str) -> (&'a str, Co
     (title, Cow::Owned(kept))
 }
 
+/// A repeat of the same generated phase can have the footer added at filing.
+/// Content added after the phase remains part of the candidate's own work.
+fn same_phase_body(phase: &str, candidate: &str) -> bool {
+    let Some(suffix) = candidate.trim().strip_prefix(phase) else {
+        return false;
+    };
+    if suffix.trim().is_empty() {
+        return true;
+    }
+    let mut lines = suffix.trim().lines();
+    suffix.starts_with(['\n', '\r'])
+        && lines
+            .next()
+            .is_some_and(|link| link.starts_with("[loom dashboard](") && link.ends_with(')'))
+        && lines.next() == Some(crate::forge_comment::FOOTER_MARKER)
+        && lines.next().is_none()
+}
+
 /// True Jaccard similarity as a truncated integer percentage:
 /// `matches * 100 / |union|` where `union = |a| + |b| - matches` — the exact
 /// arithmetic `check-duplicate.sh`'s `calculate_similarity` performed in
@@ -436,24 +454,35 @@ impl Default for ScanThresholds {
     }
 }
 
+struct ScanQuery<'a> {
+    keywords: &'a [String],
+    title_keywords: &'a [String],
+    /// The original title and body of a generated phase with no significant keywords.
+    empty_phase: Option<(&'a str, &'a str)>,
+}
+
 /// The banding decision, pure: given query keywords and candidates (already
 /// parsed), produce the outcome the caller prints. The probed issue itself
 /// (when given) is skipped before scoring (#4662).
 ///
-/// `query_title_keywords` is the query's **title alone**, the second signal
+/// `title_keywords` is the query's **title alone**, the second signal
 /// the low-confidence corroboration rule (#8591) scores against; pass an
 /// empty slice to opt out (the rule then cannot fire, so every in-band match
 /// blocks exactly as it did before).
 #[must_use]
-pub(crate) fn scan(
+fn scan(
     pool: Pool,
-    query_keywords: &[String],
-    query_title_keywords: &[String],
+    query: ScanQuery<'_>,
     candidates: &[Candidate],
     thresholds: ScanThresholds,
     self_issue: Option<u64>,
     rest_fallback: bool,
 ) -> ScanOutcome {
+    let ScanQuery {
+        keywords: query_keywords,
+        title_keywords: query_title_keywords,
+        empty_phase,
+    } = query;
     let ScanThresholds {
         threshold,
         warn_threshold,
@@ -483,7 +512,7 @@ pub(crate) fn scan(
     let mut matched_rows: Vec<String> = Vec::new();
     let mut near: Vec<NearMatch> = Vec::new();
 
-    if query_keywords.is_empty() {
+    if query_keywords.is_empty() && empty_phase.is_none() {
         // The shell warned (open pool) and bailed before scoring; merged and
         // closed pools were silent. Either way: no scan, exit 0.
         if pool == Pool::OpenIssues {
@@ -498,9 +527,16 @@ pub(crate) fn scan(
             continue;
         }
         scanned += 1;
-        let (title, body) = duplicate_text(pool, &c.title, &c.body);
-        let existing = extract_keywords(&format!("{title} {body}"));
-        let similarity = jaccard_percent(query_keywords, &existing);
+        let (title, similarity) = if let Some((phase_title, phase_body)) = empty_phase {
+            if c.title.trim() != phase_title || !same_phase_body(phase_body, &c.body) {
+                continue;
+            }
+            (c.title.as_str(), 100)
+        } else {
+            let (title, body) = duplicate_text(pool, &c.title, &c.body);
+            let existing = extract_keywords(&format!("{title} {body}"));
+            (title, jaccard_percent(query_keywords, &existing))
+        };
         if similarity >= threshold {
             // #8591: a block from the low-confidence region needs the title
             // to agree too. A candidate whose own title yields no keywords
@@ -538,11 +574,10 @@ pub(crate) fn scan(
         }
     }
 
-    // Degenerate-result self-detection (#4409). Deliberately counted on
-    // BLOCK matches only: near-band rows must not tip it, and it cannot fire
-    // at matched == 0 (0*2 > scanned is never true), so evaluating it before
-    // the matched==0 path is equivalent to the shell's original ordering.
-    if !matched_rows.is_empty()
+    // Degenerate-result detection (#4409) counts keyword-based block matches.
+    // Exact phase repeats remain meaningful even in a pool dominated by copies.
+    if empty_phase.is_none()
+        && !matched_rows.is_empty()
         && scanned >= MIN_SCANNED_FOR_DEGENERATE
         && matched_rows.len() * 2 > scanned
     {
@@ -577,6 +612,9 @@ pub(crate) fn scan(
         }
         outcome.stdout_lines.extend(matched_rows);
     } else {
+        if empty_phase.is_some() {
+            eprintln!("WARNING: No significant keywords extracted from title/body");
+        }
         outcome.exit_code = 0;
     }
 
@@ -662,10 +700,17 @@ impl DuplicateScanArgs {
         // against candidate titles, never against their bodies, so a long
         // body cannot dilute or manufacture the agreement.
         let query_title_keywords = extract_keywords(title);
+        // A recognized generated phase can lose every keyword after
+        // normalization. Compare its exact pre-filing text for repeats.
+        let empty_phase = (query_keywords.is_empty() && matches!(body, Cow::Owned(_)))
+            .then_some((self.title.trim(), self.body.trim()));
         let outcome = scan(
             self.pool,
-            &query_keywords,
-            &query_title_keywords,
+            ScanQuery {
+                keywords: &query_keywords,
+                title_keywords: &query_title_keywords,
+                empty_phase,
+            },
             &candidates,
             ScanThresholds {
                 threshold: self.threshold,
@@ -728,6 +773,29 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
         }
+    }
+
+    fn scan(
+        pool: Pool,
+        keywords: &[String],
+        title_keywords: &[String],
+        candidates: &[Candidate],
+        thresholds: ScanThresholds,
+        self_issue: Option<u64>,
+        rest_fallback: bool,
+    ) -> ScanOutcome {
+        super::scan(
+            pool,
+            ScanQuery {
+                keywords,
+                title_keywords,
+                empty_phase: None,
+            },
+            candidates,
+            thresholds,
+            self_issue,
+            rest_fallback,
+        )
     }
 
     fn render_phase_body(description: &str, criteria: [&str; 2]) -> String {
@@ -816,6 +884,51 @@ mod tests {
         assert_eq!(
             duplicate_text(Pool::OpenIssues, title, &wrong_footer),
             (title, Cow::Borrowed(wrong_footer.as_str()))
+        );
+    }
+
+    #[test]
+    fn empty_generated_phase_blocks_exact_repeats_only() {
+        let title = "[Epic #2468] CI";
+        let phase = render_phase_body("CI", ["CI", "CI"]);
+        let (normalized_title, normalized_body) = duplicate_text(Pool::OpenIssues, title, &phase);
+        assert!(extract_keywords(&format!("{normalized_title} {normalized_body}")).is_empty());
+        let filed = crate::forge_comment::build_dashboard_footer(
+            "https://dashboard.example.com",
+            "acme/project",
+            60001,
+            false,
+            &phase,
+        );
+        let extended = format!("{filed}\n## Description\nMeasure runner cache misses.");
+        let query = ScanQuery {
+            keywords: &[],
+            title_keywords: &[],
+            empty_phase: Some((title, phase.trim())),
+        };
+        let candidates = [
+            cand(60001, title, &filed),
+            cand(60002, title, &phase),
+            cand(60003, title, &extended),
+            cand(60004, "[Epic #2468] UI", &phase),
+            cand(60005, title, &phase.replace("1 of 3", "2 of 3")),
+        ];
+        let out = super::scan(
+            Pool::OpenIssues,
+            query,
+            &candidates,
+            ScanThresholds::default(),
+            None,
+            false,
+        );
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(
+            out.stdout_lines,
+            [
+                "DUPLICATE_FOUND",
+                "#60001: [Epic #2468] CI (similarity: 100%)",
+                "#60002: [Epic #2468] CI (similarity: 100%)",
+            ]
         );
     }
 
