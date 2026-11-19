@@ -6,7 +6,7 @@
 
 use crate::cmd_out::Query;
 use crate::comment_trust::records;
-use crate::script_helpers::{gh_query, run_gh};
+use crate::script_helpers::{gh_read_json, gh_write};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -106,7 +106,8 @@ pub fn read_issue_in(
     let mut view = if other.is_empty() {
         IssueView::default()
     } else {
-        let q: Query<IssueView> = gh_query(
+        let q: Query<IssueView> = gh_read_json(
+            "dep.issue_view",
             &[
                 "issue",
                 "view",
@@ -149,7 +150,8 @@ pub fn fetch_node(node: &str, repo_root: &Path, use_cache: bool) -> Option<super
         body: String,
     }
     let (repo, num) = node.rsplit_once('#')?;
-    let q: Query<StateBody> = gh_query(
+    let q: Query<StateBody> = gh_read_json(
+        "dep.node_view",
         &["issue", "view", num, "--repo", repo, "--json", "state,body"],
         repo_root,
         use_cache,
@@ -176,7 +178,8 @@ impl GhWriter<'_> {
     /// so it lives here rather than on the [`super::apply::Writer`] trait.
     pub fn add_labels(&mut self, labels: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
-        run_gh(
+        gh_write(
+            "dep.add_labels",
             &[
                 "issue",
                 "edit",
@@ -197,7 +200,8 @@ impl super::apply::Writer for GhWriter<'_> {
         let n = self.issue.to_string();
         // Writes never use the read cache: a cached response to a mutation is
         // meaningless, and `gh-cached` is a read-side wrapper.
-        run_gh(
+        gh_write(
+            "dep.remove_label",
             &[
                 "issue",
                 "edit",
@@ -217,7 +221,8 @@ impl super::apply::Writer for GhWriter<'_> {
         // #9772: every daemon comment carries the dashboard footer.
         let body =
             crate::forge_comment::append_dashboard_footer(self.repo, self.issue, false, body);
-        run_gh(
+        gh_write(
+            "dep.comment",
             &["issue", "comment", &n, "--repo", self.repo, "--body", &body],
             self.repo_root,
             false,
@@ -226,7 +231,8 @@ impl super::apply::Writer for GhWriter<'_> {
 
     fn edit_body(&mut self, body: &str) -> crate::cmd_out::CmdOutcome {
         let n = self.issue.to_string();
-        run_gh(
+        gh_write(
+            "dep.edit_body",
             &["issue", "edit", &n, "--repo", self.repo, "--body", body],
             self.repo_root,
             false,
