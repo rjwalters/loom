@@ -258,6 +258,8 @@ RC=$?
 assert_eq 0 "$RC" "(b) ensure exits 0"
 assert_match "renewal" "$OUT" "(b) ensure reports the renewal loop: $OUT"
 assert_eq 1 "$(posts)" "(b) one lease comment was posted"
+# Use the marker the actual publisher wrote, including on hosts without sha256sum.
+LOCAL_LEASE_HOST="$(jq -er '.[0].body | capture("<!-- loom:lease host=(?<host>[^ ]+) sweep=").host' "$FORGE/comments.json")" || exit 1
 wait_for 10 has_renewer
 assert_eq 1 "$(renewers)" "(b) one renewer is running"
 FIRST_LOOP="$(sed -n 's/.*renewal loop \([0-9]*\) is running.*/\1/p' <<< "$OUT")"
@@ -413,8 +415,10 @@ OUT="$(ensure)"
 assert_eq 0 "$(posts)" "(k) read-only credential: no lease was posted"
 # publish exits 2 when `forge may-write` (answered by loom-tools) refuses the repo.
 assert_match "exited Some(2)" "$OUT" "(k) ...and the declined publish is reported, not swallowed"
-stale_peer "$(printf 'host-%s' "$(printf 'tools-host' | sha256sum | cut -c1-8)")" own-old-sweep 5
-loom-tools lease release "$ISSUE" > "$T/rel.out" 2>&1
+stale_peer "$LOCAL_LEASE_HOST" own-old-sweep 5 || exit 1
+OUT="$(loom-tools lease release "$ISSUE" 2>&1)"
+assert_eq 1 "$?" "(k) release refuses the write from a read-only credential"
+assert_match "could not post the yield" "$OUT" "(k) release reached the own-lease write"
 assert_eq 0 "$(posts)" "(k) read-only credential: release posts no yield"
 kill "$SESSION_PID" 2> /dev/null
 pkill -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null || true
