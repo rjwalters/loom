@@ -16,6 +16,7 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14638**: fix: classify launcher preflight rejections with a typed boundary
 - **PR #14646**: fix(tests): derive the config-restart fixture's release from the running version
 - **PR #14644**: chore: remove stale quickstart worktree.sh copies
 - **Issue #14643** (closed): Fix config-restart test fixtures that assume the running version is below 0.19.999999
