@@ -316,7 +316,7 @@ fn admit_selection(
     rejection: RuntimeRejection,
     selection: Result<Option<dispatch::Selection>>,
 ) -> Result<(ResolvedRuntime, dispatch::Selection, ContainmentProof), RuntimeRejection> {
-    let selection = match selection {
+    let mut selection = match selection {
         Ok(Some(selection)) => selection,
         Ok(None) => {
             return Err(rejection.with_containment_failure(
@@ -327,7 +327,12 @@ fn admit_selection(
         }
         Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),
     };
-    let proof = match selection.contain(root) {
+    // The bounded walk proved this winning seat moments earlier, in this same
+    // dispatch decision with nothing in between; admit against exactly that
+    // proof instead of a second Docker inspect-and-exec round-trip (#14626).
+    // A selection that arrives unproven still proves fresh here, so nothing
+    // outside the walk's own capture is ever admitted against.
+    let proof = match selection.proof_for_admission(root) {
         Ok(proof) => proof,
         Err(error) => return Err(rejection.with_containment_failure(&error.to_string())),
     };

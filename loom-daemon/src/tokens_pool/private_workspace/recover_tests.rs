@@ -2681,6 +2681,78 @@ fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
     drop(super::tests::reacquire(&env.dir));
 }
 
+/// #14626: one contained admission takes the winning seat's containment proof
+/// ONCE. The bounded walk already proves the winner; that same proof is what
+/// admission runs against, instead of a second `contain()` on the identical
+/// seat microseconds later. The fake engine therefore records exactly two
+/// in-container control observations per admission — the prepare-time binding
+/// of the control identity, and the single proof — both against the winning
+/// seat's own container.
+#[test]
+#[serial]
+fn a_contained_admission_proves_the_winning_seat_once() {
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let root = env.workspace.path();
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    env.with(|engine| engine.calls.clear());
+
+    let mut draw = builder_draw(root);
+    let (runtime, _, selection, _) = draw("admit-once".into());
+    assert_eq!(runtime, "codex");
+    let selection = selection.expect("the draw admitted a seat");
+    let winner = selection.name.clone();
+    let lease = selection.lease().expect("the winning seat is held");
+    let container = lease::read(&lease.dir).unwrap().unwrap().container_id;
+    drop(selection);
+    let seat_dir = if winner == "bob" {
+        bob.dir
+    } else {
+        env.dir.clone()
+    };
+    drop(super::tests::reacquire(&seat_dir));
+
+    let control_probes: Vec<String> = env
+        .engine()
+        .calls
+        .iter()
+        .filter(|args| {
+            args.first().is_some_and(|arg| arg == "exec")
+                && args.ends_with(&["private-workspace".to_owned(), "control".to_owned()])
+        })
+        .map(|args| args[1].clone())
+        .collect();
+    assert_eq!(
+        control_probes,
+        vec![container.clone(), container],
+        "one admission = the prepare-time control binding + the single carried proof, \
+         both against the winning seat's own container; calls:\n{}",
+        env.engine()
+            .calls
+            .iter()
+            .map(|call| call.join(" "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 #[test]
 #[serial]
 fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
