@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::branch_delete::{self, BranchOutcome, DeleteContext};
+use super::pr_list::PrList;
 use super::wip::{self, Out};
 use crate::worktree_ops::{cargo_target, clean, removal_log, safety};
 
@@ -133,6 +134,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
 /// looked at your worktree and declined".
 #[must_use]
 pub fn run(argv: &[String]) -> i32 {
+    run_with(argv, PrList::Legacy)
+}
+
+pub(crate) fn run_with(argv: &[String], pr_list: PrList) -> i32 {
     let args = match parse_args(argv) {
         Ok(a) => a,
         Err(ArgError::UnknownFlag(f)) => {
@@ -362,7 +367,7 @@ pub fn run(argv: &[String]) -> i32 {
                     cleanup_primary_checkout: cleanup_primary_checkout_enabled(),
                 };
                 let _outcome: BranchOutcome =
-                    branch_delete::maybe_delete_local_branch(&ctx, &out, b, "");
+                    branch_delete::maybe_delete_local_branch_with(&ctx, &out, b, "", pr_list);
                 // Re-read the ref rather than trusting the returned outcome:
                 // the shell reported `unmerged`/`deleted` from a fresh
                 // `show-ref`, and a status that disagrees with the repository

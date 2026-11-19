@@ -86,6 +86,216 @@ fn checkpoint_stages_match_loom_daemon() {
     assert!(out.status.success());
 }
 
+fn worktree_fixture_git(home: &Path, repo: &Path, args: &[&str]) -> Output {
+    let mut command = base("git", home, repo);
+    command.args(args);
+    let output = run(command, None);
+    assert!(output.status.success(), "{output:?}");
+    output
+}
+
+fn init_worktree_fixture(home: &Path, repo: &Path) {
+    std::fs::create_dir(repo).unwrap();
+    worktree_fixture_git(home, repo, &["init", "-q", "-b", "main"]);
+    worktree_fixture_git(
+        home,
+        repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "fixture",
+        ],
+    );
+}
+
+#[test]
+fn worktree_check_runs_offline_with_spaces_and_no_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("primary checkout");
+    let worktree = tmp.path().join("linked checkout");
+    init_worktree_fixture(tmp.path(), &repo);
+    worktree_fixture_git(
+        tmp.path(),
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let args = ["worktree-check", "--porcelain"];
+    let tools = run(
+        {
+            let mut command = base(TOOLS, tmp.path(), &worktree);
+            command.env_remove("LOOM_MODE").args(args);
+            command
+        },
+        None,
+    );
+    let daemon = run(
+        {
+            let mut command = base(DAEMON, tmp.path(), &worktree);
+            command.args(args);
+            command
+        },
+        None,
+    );
+    assert!(daemon.status.success(), "{daemon:?}");
+    assert_eq!(tools.status.code(), daemon.status.code(), "{tools:?}");
+    assert_eq!(tools.stdout, daemon.stdout);
+    assert_eq!(tools.stderr, daemon.stderr);
+    assert!(String::from_utf8_lossy(&tools.stdout).contains("primary checkout"));
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_closed_branch_reads_follow_tools_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("branch fixture");
+    init_worktree_fixture(tmp.path(), &repo);
+    let git = |args: &[&str]| worktree_fixture_git(tmp.path(), &repo, args);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/fixture.git",
+    ]);
+    git(&["update-ref", "refs/remotes/origin/feature/example", "HEAD"]);
+    let head = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    let payload = serde_json::json!([{"headRefOid":head.trim(), "number":19, "state":"CLOSED", "mergedAt":null}]);
+
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    let log = tmp.path().join("read.log");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+test "$1 $2" = 'pr list' || exit 90
+printf '%s\n' "${GH_CONFIG_DIR:-session}" >> "$FIXTURE_LOG"
+if test "$FIXTURE_FAIL" = 1; then exit 1; fi
+printf '%s\n' "$FIXTURE_RESPONSE"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let gateway = tmp.path().join(".loom/gh-config-gateway");
+    let profile = gateway.join("acme");
+    std::fs::create_dir_all(&profile).unwrap();
+    for path in [&gateway, &profile] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let hosts = profile.join("hosts.yml");
+    std::fs::write(&hosts, "github.com: {}\n").unwrap();
+    std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(gateway.join("gh-ok"), gh.canonicalize().unwrap().to_str().unwrap()).unwrap();
+
+    let decision = |binary, mode, fail| {
+        let mut command = base(binary, tmp.path(), &repo);
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("LOOM_MODE", mode)
+            .env("FIXTURE_LOG", &log)
+            .env("FIXTURE_FAIL", fail)
+            .env("FIXTURE_RESPONSE", payload.to_string());
+        if binary == TOOLS {
+            command.env("LOOM_GH_GATEWAY_DIR", &gateway);
+        }
+        command
+            .args([
+                "worktree-closed-pr-branch",
+                "--branch",
+                "feature/example",
+                "--issue",
+                "42",
+                "--base-display",
+                "main",
+                "--json-output",
+                "true",
+            ])
+            .arg("--repo-root")
+            .arg(&repo);
+        run(command, None)
+    };
+    let legacy = decision(DAEMON, "session", "0");
+    assert_eq!(legacy.status.code(), Some(1), "{legacy:?}");
+    for mode in ["session", "fleet"] {
+        let tools = decision(TOOLS, mode, "0");
+        assert_eq!(tools.status.code(), Some(1), "{tools:?}");
+        assert_eq!(tools.stdout, legacy.stdout);
+    }
+    let failure = decision(TOOLS, "fleet", "1");
+    assert_eq!(failure.status.code(), Some(0), "{failure:?}");
+    assert!(failure.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "session",
+            "session",
+            profile.to_str().unwrap(),
+            profile.to_str().unwrap()
+        ]
+    );
+}
+
+#[test]
+fn worktree_capabilities_match_both_binaries_and_the_migrated_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capabilities = |binary, args: &[&str]| {
+        let mut command = base(binary, tmp.path(), tmp.path());
+        command.args(args);
+        let output = run(command, None);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["tools_commands"]
+            .clone()
+    };
+    let tools = capabilities(TOOLS, &["capabilities", "--json"]);
+    let daemon = capabilities(DAEMON, &["install-compat", "show", "--json"]);
+    assert_eq!(tools, daemon);
+    let mut worktree_commands: Vec<_> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|name| name.starts_with("worktree-"))
+        .collect();
+    worktree_commands.sort_unstable();
+    assert_eq!(
+        worktree_commands,
+        [
+            "worktree-base",
+            "worktree-branch-conflict",
+            "worktree-branch-reuse",
+            "worktree-check",
+            "worktree-cleanup",
+            "worktree-closed-pr-branch",
+            "worktree-existing",
+            "worktree-link",
+            "worktree-lock",
+            "worktree-open-pr",
+            "worktree-remove",
+            "worktree-sparse",
+            "worktree-submodules",
+        ]
+    );
+}
+
 #[test]
 fn checkpoint_write_read_clear_match_loom_daemon() {
     let home = tempfile::tempdir().unwrap();

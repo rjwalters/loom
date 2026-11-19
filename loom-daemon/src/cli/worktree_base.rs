@@ -12,7 +12,7 @@ use anyhow::Result;
 use crate::worktree_cli::base;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeBaseArgs {
+pub struct WorktreeBaseArgs {
     /// The resolved default branch (`loom_default_branch`'s answer).
     #[arg(long)]
     default_branch: String,

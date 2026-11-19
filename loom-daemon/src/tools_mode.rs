@@ -4,8 +4,8 @@
 //! `loom-tools` must not silently inherit a fleet session's routing: a shell
 //! that carries `LOOM_GH_GATEWAY_DIR` / `LOOM_GH_READER_ROOT` would otherwise
 //! have its forge reads shed by [`crate::forge_gateway::enable_cli_reads`]
-//! (`CLI_READER_ONLY`). [`resolve`] is the pure table; the bin applies the
-//! result and only then, on the fleet route, enables the reader routing.
+//! (`CLI_READER_ONLY`). [`resolve`] is the pure routing table.
+//! [`configure_forge_reads`] enables reader routing in fleet mode.
 //! `loom-daemon <name>` never calls this: it ignores `mode`.
 
 use std::ffi::OsString;
@@ -195,6 +195,23 @@ pub fn inputs_from_env(repo_root: &Path) -> Inputs {
         gateway_dir: std::env::var_os(GATEWAY_DIR_ENV),
         reader_root: std::env::var_os(READER_ROOT_ENV),
     }
+}
+
+/// Apply the resolved tools route before a forge read.
+pub fn configure_forge_reads(repo_root: &Path) -> Result<(), String> {
+    let resolution = resolve(&inputs_from_env(repo_root))?;
+    for note in resolution.notes {
+        eprintln!("{note}");
+    }
+    match resolution.route {
+        Route::Fleet => crate::forge_gateway::enable_cli_reads(),
+        Route::Local => {
+            for var in &resolution.ignored_vars {
+                std::env::remove_var(var);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

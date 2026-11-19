@@ -36,7 +36,17 @@ fn git_init(dir: &Path) {
 /// Acquire via the CLI on behalf of `owner_pid`. Returns the token, or `None`
 /// when the attempt timed out.
 fn cli_acquire(repo: &Path, issue: u32, owner_pid: u32, timeout: &str) -> Option<String> {
-    let out = Command::new(bin())
+    cli_acquire_via(bin(), repo, issue, owner_pid, timeout)
+}
+
+fn cli_acquire_via(
+    binary: &str,
+    repo: &Path,
+    issue: u32,
+    owner_pid: u32,
+    timeout: &str,
+) -> Option<String> {
+    let out = Command::new(binary)
         .args(["worktree-lock", "acquire", "--issue"])
         .arg(issue.to_string())
         .arg("--owner-pid")
@@ -58,7 +68,11 @@ fn cli_acquire(repo: &Path, issue: u32, owner_pid: u32, timeout: &str) -> Option
 }
 
 fn cli_release(repo: &Path, token: &str) {
-    let ok = Command::new(bin())
+    cli_release_via(bin(), repo, token);
+}
+
+fn cli_release_via(binary: &str, repo: &Path, token: &str) {
+    let ok = Command::new(binary)
         .args(["worktree-lock", "release", "--token", token, "--repo"])
         .arg(repo)
         .status()
@@ -149,23 +163,21 @@ fn a_lock_whose_caller_really_died_is_still_reclaimable() {
 
 #[test]
 fn a_stale_token_from_a_previous_holder_cannot_release_the_current_lock() {
-    // #6014 through the process boundary, not just the library.
-    let d = tempfile::tempdir().expect("tempdir");
-    git_init(d.path());
-    let holder = std::process::id();
+    for binary in [bin(), env!("CARGO_BIN_EXE_loom-tools")] {
+        let d = tempfile::tempdir().expect("tempdir");
+        git_init(d.path());
+        let holder = std::process::id();
 
-    let a = cli_acquire(d.path(), 1, holder, "5").expect("A");
-    cli_release(d.path(), &a);
-    let b = cli_acquire(d.path(), 2, holder, "5").expect("B");
+        let a = cli_acquire_via(binary, d.path(), 1, holder, "5").expect("A");
+        cli_release_via(binary, d.path(), &a);
+        let b = cli_acquire_via(binary, d.path(), 2, holder, "5").expect("B");
+        cli_release_via(binary, d.path(), &a);
 
-    cli_release(d.path(), &a); // A's late, stale release
-
-    assert!(
-        d.path().join(".loom/locks/worktree-add").is_dir(),
-        "B's lock must survive A's stale release"
-    );
-    cli_release(d.path(), &b);
-    assert!(!d.path().join(".loom/locks/worktree-add").is_dir());
+        let lock = d.path().join(".loom/locks/worktree-add");
+        assert!(lock.is_dir(), "B's lock must survive A's stale release in {binary}");
+        cli_release_via(binary, d.path(), &b);
+        assert!(!lock.is_dir());
+    }
 }
 
 /// #8702: a dispatched sweep's own `worktree.sh` calls must not be refused

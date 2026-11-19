@@ -1,21 +1,15 @@
 //! `loom-tools`: the tools-only entry point (#12938, epic #12708; design
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
-//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
-//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940), plus
-//! `resolve-model` (#13878) and `resolve-role-model` (#13956): the
-//! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
-//! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config|resolve-model`
-//! call), so there is no second copy. This crate links `loom_daemon` and not
-//! `daemon_service`, which is private to the `loom-daemon` bin.
+//! The tools-only installer (`scripts/install/provision-tools.sh`) can run
+//! the commands advertised by `capabilities` without a daemon. Both binaries
+//! use the library's handlers, including the worktree operations in #14474.
 //!
 //! `forge <read verb>` (#14395) is the family of forge reads: the same
 //! `ForgeAction` tree and handler `loom-daemon forge` runs, minus the verbs
-//! that write (#14396). It and `checkpoint read` (§10.3) are the commands
-//! behind the mode gate: it resolves `mode` ([`tools_mode`])
-//! before `forge_gateway::enable_cli_reads()` is considered, and enables it
-//! only on the fleet route. `strip-ansi`, the other checkpoint actions and
-//! `config get` never route, and `config get mode` must work with `mode` unset.
+//! that write (#14396). See [`tools_mode`] for how commands that reach the
+//! forge choose a route. Worktree commands resolve mode at the nested read,
+//! keeping their local operations available offline.
 
 use std::io::Write;
 
@@ -26,10 +20,10 @@ use loom_daemon::cli::{
     handle_operator_decision_command, handle_park_record_command, handle_resolve_model_command,
     handle_resolve_role_model_command, handle_strip_ansi_command, CheckpointAction, ConfigArgs,
     ForgeReadCli, InstallBinaryCommand, OperatorDecisionCli, ParkRecordCli, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs,
+    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs, WorktreeCommands,
 };
 use loom_daemon::install_compat;
-use loom_daemon::tools_mode::{self, Route};
+use loom_daemon::tools_mode;
 
 #[derive(Parser)]
 #[command(
@@ -92,6 +86,8 @@ enum ToolsCommands {
     /// stdin, stdout and exit codes as `loom-daemon operator-decision`
     /// (#14464). `resolve` records only from an attended terminal.
     OperatorDecision(OperatorDecisionCli),
+    #[command(flatten)]
+    Worktree(WorktreeCommands),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -125,21 +121,7 @@ fn capabilities(repo: Option<&std::path::Path>) -> Result<()> {
 /// Resolve `mode`, then (fleet route only) adopt the exported read routing.
 fn mode_gate() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let resolution =
-        tools_mode::resolve(&tools_mode::inputs_from_env(&cwd)).map_err(anyhow::Error::msg)?;
-    for note in &resolution.notes {
-        eprintln!("{note}");
-    }
-    match resolution.route {
-        Route::Fleet => loom_daemon::forge_gateway::enable_cli_reads(),
-        // Nothing has read them yet; drop them so no later code honors them.
-        Route::Local => {
-            for var in &resolution.ignored_vars {
-                std::env::remove_var(var);
-            }
-        }
-    }
-    Ok(())
+    tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
 }
 
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
@@ -195,6 +177,7 @@ fn run() -> Result<()> {
             }
             handle_operator_decision_command(cli)
         }
+        ToolsCommands::Worktree(commands) => commands.run_tools(),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }

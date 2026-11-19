@@ -33,7 +33,7 @@ use anyhow::Result;
 use crate::worktree_cli::branch_conflict;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeBranchConflictArgs {
+pub struct WorktreeBranchConflictArgs {
     /// The branch `git worktree add` was trying to create or attach.
     #[arg(long)]
     branch: String,

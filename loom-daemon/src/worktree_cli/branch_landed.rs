@@ -42,13 +42,9 @@
 //!    verdict *toward* a definitive answer — it never turns a `NotLanded` into
 //!    a `Landed` the shell would have refused, because the tip-equality
 //!    requirement below is unchanged.
-//! 2. **`loom-daemon forge` is still preferred over `gh` when a `loom-daemon`
-//!    is on `PATH`.** We *are* loom-daemon, so calling the in-process forge
-//!    client would be the obvious shortcut — and it is deliberately not taken.
-//!    The shell's choice is observable behaviour (a Gitea host has no `gh` at
-//!    all, and `loom-daemon forge` is how it answers), and a port that quietly
-//!    changed which credential path a probe uses would be changing the forge
-//!    contract under cover of a refactor.
+//! 2. The daemon's transport still prefers `loom-daemon forge` over `gh`
+//!    on `PATH`. The tools transport uses the configured read route. Both
+//!    feed the same branch decision ladder.
 //!
 //! # The one Rust ladder (#8470)
 //!
@@ -76,7 +72,7 @@
 //!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
 //!   reasons.
 
-use crate::fs_util::is_executable;
+use super::pr_list::PrList;
 use crate::git_merge_tree::merge_tree_in_version;
 use std::path::Path;
 use std::process::Command;
@@ -427,6 +423,10 @@ pub fn ladder(
 /// `gh` — and its `LOOM_BRANCH_LANDED_OFFLINE=1` seam.
 #[must_use]
 pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
+    forge_probe_with(repo, branch, PrList::Legacy)
+}
+
+pub(crate) fn forge_probe_with(repo: &Path, branch: &str, pr_list: PrList) -> ForgeProbe {
     let branch = branch.strip_prefix("origin/").unwrap_or(branch);
     if branch.is_empty() {
         return ForgeProbe::unavailable();
@@ -435,19 +435,9 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
         return ForgeProbe::unavailable();
     }
 
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
-        ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
-        ("gh", &[])
-    } else {
-        return ForgeProbe::unavailable();
-    };
-
-    let out = Command::new(program)
-        .args(leading)
-        .args([
-            "pr",
-            "list",
+    let Ok(text) = pr_list.fetch(
+        repo,
+        &[
             "--head",
             branch,
             "--state",
@@ -456,17 +446,10 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
             "headRefOid,number",
             "--limit",
             "1",
-        ])
-        .current_dir(repo)
-        .output();
-    let Ok(out) = out else {
+        ],
+    ) else {
         return ForgeProbe::unavailable();
     };
-    if !out.status.success() {
-        return ForgeProbe::unavailable();
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return ForgeProbe::unavailable();
     };
@@ -495,16 +478,6 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
             number: None,
         },
     }
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 /// Accept a local branch, a remote branch, a bare ref name, or any rev —

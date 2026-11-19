@@ -205,6 +205,8 @@ pub(crate) mod worktree_branch_conflict;
 pub(crate) mod worktree_branch_reuse;
 pub(crate) mod worktree_check;
 pub(crate) mod worktree_cleanup;
+mod worktree_commands;
+pub use worktree_commands::WorktreeCommands;
 pub(crate) mod worktree_closed_pr_branch;
 pub(crate) mod worktree_existing;
 pub(crate) mod worktree_link;

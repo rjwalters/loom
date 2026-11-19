@@ -102,6 +102,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::pr_list::PrList;
 use super::wip::{git_ok, Out};
 
 /// Everything the arm needs, all of it already resolved by `worktree.sh`.
@@ -169,7 +170,11 @@ impl Outcome {
 /// Run the arm: print what the shell printed, do what the shell did, return its
 /// exit code.
 pub fn run(opts: &Options) -> i32 {
-    decide(opts, &|req| perform_reset_with(opts, req)).code()
+    run_with(opts, PrList::Legacy)
+}
+
+pub(crate) fn run_with(opts: &Options, pr_list: PrList) -> i32 {
+    decide_with(opts, &|req| perform_reset_with(opts, req), pr_list).code()
 }
 
 /// [`run`] with the destructive step injected — the seam the unit tests use to
@@ -180,6 +185,10 @@ pub fn run(opts: &Options) -> i32 {
 /// returns `true` when the worktree ended up reset (the shell's `git fetch && …
 /// reset_or_rescue` succeeding as a pair).
 pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome {
+    decide_with(opts, reset, PrList::Legacy)
+}
+
+fn decide_with(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool, pr_list: PrList) -> Outcome {
     let out = Reporter {
         out: Out::new(opts.quiet),
         quiet: opts.quiet,
@@ -228,13 +237,16 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
     // ONE resolution of the reference, feeding both the verdict below and the
     // reset target (#8287). `ahead`/`behind` are measured against whichever
     // reference it chose, never against `$BASE_REF` regardless.
-    let resolved = super::stale_ref::resolve(&super::stale_ref::Options {
-        worktree: opts.worktree.clone(),
-        branch: opts.branch.clone(),
-        default_branch: opts.default_branch.clone(),
-        base_ref: opts.base_ref.clone(),
-        base_display: opts.base_display.clone(),
-    });
+    let resolved = super::stale_ref::resolve_with(
+        &super::stale_ref::Options {
+            worktree: opts.worktree.clone(),
+            branch: opts.branch.clone(),
+            default_branch: opts.default_branch.clone(),
+            base_ref: opts.base_ref.clone(),
+            base_display: opts.base_display.clone(),
+        },
+        &|branch| super::branch_landed::forge_probe_with(&opts.worktree, branch, pr_list),
+    );
 
     if resolved.ahead > 0 || uncommitted {
         // Real work — preserve it, after back-filling the sentinel so a resumed

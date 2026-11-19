@@ -202,6 +202,7 @@ pub mod issue_lock;
 pub mod link;
 pub mod lock;
 pub mod open_pr;
+pub(crate) mod pr_list;
 pub mod remove;
 pub mod reset;
 pub mod sentinel;

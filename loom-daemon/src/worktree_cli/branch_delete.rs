@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::branch_landed::{self, ForgeStatus, Verdict};
+use super::pr_list::PrList;
 use super::wip::Sink;
 
 /// What happened, for the caller's `branchStatus` field.
@@ -90,6 +91,16 @@ pub fn maybe_delete_local_branch(
     branch: &str,
     expected_head_sha: &str,
 ) -> BranchOutcome {
+    maybe_delete_local_branch_with(ctx, out, branch, expected_head_sha, PrList::Legacy)
+}
+
+pub(crate) fn maybe_delete_local_branch_with(
+    ctx: &DeleteContext,
+    out: &dyn Sink,
+    branch: &str,
+    expected_head_sha: &str,
+    pr_list: PrList,
+) -> BranchOutcome {
     if branch.is_empty() {
         return BranchOutcome::Kept;
     }
@@ -112,7 +123,13 @@ pub fn maybe_delete_local_branch(
         return BranchOutcome::Kept;
     }
 
-    let landed = branch_landed::probe(ctx.repo_root, branch, ctx.default_branch, expected_head_sha);
+    let landed = branch_landed::probe_with(
+        ctx.repo_root,
+        branch,
+        ctx.default_branch,
+        expected_head_sha,
+        &|branch| branch_landed::forge_probe_with(ctx.repo_root, branch, pr_list),
+    );
 
     // Fail closed: ONLY a `landed` verdict force-deletes. `not-landed` and
     // `unknown` both keep `git branch -d`, which still deletes a branch git

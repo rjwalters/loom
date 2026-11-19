@@ -93,9 +93,8 @@
 //! `LOOM_BRANCH_LANDED_OFFLINE=1` skips the probe, the same seam
 //! [`super::branch_landed::forge_probe`] honours.
 
-use crate::fs_util::is_executable;
+use super::pr_list::PrList;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use super::branch_landed::resolve_commit;
 use super::wip::Out;
@@ -295,14 +294,14 @@ fn json_number(number: &str) -> String {
 /// rung of [`decide`] needs to see an open PR that shares the branch with a
 /// closed one anyway. One query answers both.
 ///
-/// Command selection mirrors [`super::branch_landed::forge_probe`] exactly —
-/// `loom-daemon forge` when one is on `PATH` (the Gitea passthrough), else
-/// `gh`. We *are* loom-daemon, and calling the in-process forge client would
-/// be the obvious shortcut; it is deliberately not taken, for the reason
-/// `branch_landed` records: which credential path a probe uses is observable
-/// forge behaviour, not an implementation detail.
+/// Legacy CLI callers retain their forge executable selection. The tools
+/// CLI supplies its configured read route through the same probe.
 #[must_use]
 pub fn forge_probe(repo: &Path, branch: &str) -> Probe {
+    forge_probe_with(repo, branch, PrList::Legacy)
+}
+
+pub(crate) fn forge_probe_with(repo: &Path, branch: &str, pr_list: PrList) -> Probe {
     let branch = branch.strip_prefix("origin/").unwrap_or(branch);
     if branch.is_empty() {
         return Probe::Unavailable;
@@ -310,18 +309,9 @@ pub fn forge_probe(repo: &Path, branch: &str) -> Probe {
     if std::env::var("LOOM_BRANCH_LANDED_OFFLINE").as_deref() == Ok("1") {
         return Probe::Unavailable;
     }
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
-        ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
-        ("gh", &[])
-    } else {
-        return Probe::Unavailable;
-    };
-    let out = Command::new(program)
-        .args(leading)
-        .args([
-            "pr",
-            "list",
+    let Ok(text) = pr_list.fetch(
+        repo,
+        &[
             "--head",
             branch,
             "--state",
@@ -330,22 +320,11 @@ pub fn forge_probe(repo: &Path, branch: &str) -> Probe {
             "number,state,mergedAt,headRefOid,url",
             "--limit",
             "20",
-        ])
-        .current_dir(repo)
-        .output();
-    let Ok(out) = out else {
+        ],
+    ) else {
         return Probe::Unavailable;
     };
-    if !out.status.success() {
-        // Every failure shape — an unauthenticated `gh`, a rate limit, a local
-        // filesystem `origin` with no forge relationship at all, a
-        // `loom-daemon forge` decline on Gitea — lands here, and all of them
-        // proceed. There is no need to tell them apart the way
-        // `_worktree_open_pr_for_branch` must: that helper gates a refusal on
-        // "could not check", this one gates a refusal on positive evidence.
-        return Probe::Unavailable;
-    }
-    parse_probe(&String::from_utf8_lossy(&out.stdout))
+    parse_probe(&text)
 }
 
 /// Parse the forge's `--json number,state,mergedAt,headRefOid,url` array.
@@ -394,16 +373,6 @@ pub fn parse_probe(text: &str) -> Probe {
             })
             .collect(),
     )
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
-    })
 }
 
 #[cfg(test)]
