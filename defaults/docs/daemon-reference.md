@@ -11138,6 +11138,10 @@ values are treated as unset at every tier (`--model ""` is never emitted). The
 resolved model and the tier that supplied it are recorded in the per-role log
 header, alongside the resolved effort (#8054):
 `==== loom-daemon role_runner: <ts> role=<role> model=<m> (source=<tier>) effort=<e> (source=<tier>) ====`.
+When Loom configures a service tier, the same line appends
+`service_tier=<tier> (source=<config key>)` before the closing `====`. The child
+receives that value as `LOOM_SERVICE_TIER`. Without a configured tier, the
+header keeps the format above and the child inherits the daemon's environment.
 
 **Role children can also pin reasoning effort — but nothing is pinned by
 default (#8054).** Until #8054 the role-runner path emitted no `--effort` at
