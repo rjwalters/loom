@@ -774,9 +774,9 @@ fn a_landed_refusal_reads_as_already_landed() {
 
 /// #12105: a Doctor that stands down because another actor is working the PR
 /// (`peer_active`), and a step the Judge backstop holds (`backstop_hold`),
-/// read as a peer's claim: not a dispatch error, an in-flight skip.
+/// report a held lease and count as in-flight skips.
 #[test]
-fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
+fn peer_active_and_backstop_hold_report_lease_held() {
     for reason in ["peer_active", "backstop_hold"] {
         assert_eq!(disposition_of(reason), Qd::LeaseHeld, "{reason}");
     }
