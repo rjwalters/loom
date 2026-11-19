@@ -9,7 +9,7 @@
 //! is where [`record_execution_usage`] journals one late **`loom.runtime.usage`**
 //! span into the execution's own trace journal:
 //!
-//! - parented to the execution's last completed `loom.runtime.run` span
+//! - parented to a sole completed `loom.runtime.run` span
 //!   (a `worker_spawn` launch journals one), else to the execution's root
 //!   span, and covering the run span's interval (else the sweep window);
 //! - **one span per model** ([`spans`], #9204/#9303), each with
@@ -42,6 +42,7 @@ pub mod join;
 pub mod missing;
 pub mod spans;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -140,9 +141,8 @@ pub fn record_execution_usage(
 /// already carries, and close the session join entry [`join::open`] wrote at
 /// dispatch. Call before `lifecycle::finish_execution`.
 ///
-/// `missing` is why `tokens_by_model` is unreadable (Issue #14566), when the
-/// caller knows; with no rows it journals one `loom.runtime.usage_missing` span
-/// instead of nothing.
+/// `missing` is a sweep-level absence reason. Completed OpenCode runs can
+/// also lack their own usage evidence within a sweep that has aggregate rows.
 pub fn finish_sweep(
     root: &Path,
     execution: &str,
@@ -154,62 +154,118 @@ pub fn finish_sweep(
     let now = Utc::now();
     let window = (started_at.unwrap_or(now), now);
     record_execution_usage(root, execution, window, tokens_by_model, runtime);
-    let known = tokens_by_model.is_some_and(|rows| !rows.is_empty());
-    if let (false, Some(reason), true) = (known, missing, super::tracing::enabled(root)) {
-        if let Err(error) = journal_missing(root, execution, window, reason, runtime) {
+    let aggregate_known = tokens_by_model.is_some_and(|rows| !rows.is_empty());
+    if super::tracing::enabled(root) {
+        if let Err(error) =
+            journal_missing(root, execution, window, missing, runtime, aggregate_known)
+        {
             log::warn!("observability: runtime usage_missing span not journalled: {error}");
         }
     }
     join::close(root, execution, now);
 }
 
-/// Journal the execution's `loom.runtime.usage_missing` span (Issue #14566),
-/// without the enablement check: a child of its last completed
-/// `loom.runtime.run` span, else of its root, like [`journal_usage`]. Empty
-/// when the execution has no persisted trace context, which is logged (a span
-/// with no known parent would need an invented trace id).
+/// Journal one absence marker per completed run that lacks attributable
+/// usage. Fall back to the execution root only when there is no run span.
 pub fn journal_missing(
     root: &Path,
     execution: &str,
     window: (DateTime<Utc>, DateTime<Utc>),
-    reason: missing::UsageMissing,
+    reason: Option<missing::UsageMissing>,
     runtime: Option<&str>,
+    aggregate_known: bool,
 ) -> anyhow::Result<Vec<SpanRecord>> {
     let store = TraceStore::new(root);
     let path = store.path(root, execution);
     if !path.exists() {
-        log::warn!(
-            "observability: {execution} usage is missing ({}) and it has no trace to say so on",
-            reason.as_str()
-        );
+        if let Some(reason) = reason {
+            log::warn!(
+                "observability: {execution} usage is missing ({}) and it has no trace to say so on",
+                reason.as_str()
+            );
+        }
         return Ok(Vec::new());
     }
     let saved = TraceStore::load(&path)?;
     let journal = Journal::for_context(&path);
-    let run = journal
+    let completed = journal
         .completed()?
         .into_iter()
-        .filter(|span| {
-            span.name == SpanName::RuntimeRun && span.context.trace_id == saved.context.trace_id
-        })
-        .max_by_key(|span| span.ended_at);
-    let (parent, started_at, ended_at) = match &run {
-        Some(run) => (&run.context, run.started_at, run.ended_at),
-        None => (&saved.context, window.0, window.1),
-    };
-    let mut common = TraceAttributes::new();
-    common.insert("loom.sweep_id".into(), execution.to_string());
-    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
-        common.insert("loom.runtime".into(), runtime.to_string());
+        .filter(|span| span.context.trace_id == saved.context.trace_id)
+        .collect::<Vec<_>>();
+    let runs = completed
+        .iter()
+        .filter(|span| span.name == SpanName::RuntimeRun)
+        .cloned()
+        .collect::<Vec<_>>();
+    let marker =
+        |parent: &crate::telemetry::trace::TraceContext, window, reason, runtime: Option<&str>| {
+            let mut common = TraceAttributes::new();
+            common.insert("loom.sweep_id".into(), execution.to_string());
+            if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+                common.insert("loom.runtime".into(), runtime.to_string());
+            }
+            missing::span(parent, window, reason, spans::UsageScope::Execution, &common)
+        };
+    if runs.is_empty() {
+        let spans = reason
+            .filter(|_| !aggregate_known)
+            .map(|reason| marker(&saved.context, window, reason, runtime))
+            .into_iter()
+            .collect();
+        return spans::append_new(&journal, spans);
     }
-    let span = missing::span(
-        parent,
-        (started_at, ended_at),
-        reason,
-        spans::UsageScope::Execution,
-        &common,
-    );
-    spans::append_new(&journal, vec![span])
+    if runs.len() == 1 && aggregate_known {
+        return Ok(Vec::new());
+    }
+    let covered = runs_with_usage(&journal, &completed, &runs)?;
+    let markers = runs
+        .iter()
+        .filter(|run| !covered.contains(run.context.span_id.as_str()))
+        .filter_map(|run| {
+            let runtime = run
+                .attributes
+                .get("loom.runtime")
+                .map(String::as_str)
+                .or(runtime);
+            let reason = reason.or_else(|| {
+                (runtime == Some("opencode")).then_some(missing::UsageMissing::NoAttributableUsage)
+            })?;
+            Some(marker(&run.context, (run.started_at, run.ended_at), reason, runtime))
+        })
+        .collect();
+    spans::append_new(&journal, markers)
+}
+
+/// Direct usage is evidence for its run. Attempt totals can cover a run
+/// only when the same association used to assign billing names exactly one.
+fn runs_with_usage(
+    journal: &Journal,
+    completed: &[SpanRecord],
+    runs: &[SpanRecord],
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut trace = completed.to_vec();
+    trace.extend(journal.active()?.into_iter().map(|active| active.record));
+    let mut covered = BTreeSet::new();
+    for usage in completed
+        .iter()
+        .filter(|span| span.name == SpanName::RuntimeUsage)
+    {
+        let Some(parent) = usage.parent_span_id.as_ref() else {
+            continue;
+        };
+        if runs.iter().any(|run| &run.context.span_id == parent) {
+            covered.insert(parent.as_str().to_owned());
+        } else if let Some(attempt) = completed
+            .iter()
+            .find(|span| span.name == SpanName::RoleAttempt && &span.context.span_id == parent)
+        {
+            if let [run] = billing::runs_for_attempt(&trace, runs, attempt).as_slice() {
+                covered.insert(run.context.span_id.as_str().to_owned());
+            }
+        }
+    }
+    Ok(covered)
 }
 
 /// One phase attempt's usage, exactly as `sweep.outcome`'s `phase_durations`
@@ -381,10 +437,11 @@ pub fn journal_usage(
             span.name == SpanName::RuntimeRun && span.context.trace_id == saved.context.trace_id
         })
         .collect();
-    let run = runs.iter().max_by_key(|span| span.ended_at);
-    let (parent, started_at, ended_at) = match run {
-        Some(run) => (&run.context, run.started_at, run.ended_at),
-        None => (&saved.context, window.0, window.1),
+    // An execution total with several runs cannot be attributed to the last
+    // run. Keep it at the root so it cannot stand in for run-level evidence.
+    let (parent, started_at, ended_at) = match runs.as_slice() {
+        [run] => (&run.context, run.started_at, run.ended_at),
+        _ => (&saved.context, window.0, window.1),
     };
     let mut common = TraceAttributes::new();
     common.insert("loom.sweep_id".into(), execution.to_string());

@@ -25,13 +25,13 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageMissing {
     /// The step's own log (or its dispatch header) could not be read, so the
-    /// run's runtime and native session ids are unknown.
+    /// native session ids are unknown. The registry can still know the runtime.
     NoStepLog,
     /// The step's log names no native session id (the child died before its
     /// event stream emitted one) and the directory + window read found nothing.
     NoSessionId,
-    /// No usage store could be found or opened (absent, or locked past the
-    /// bounded wait).
+    /// Candidate usage data was unavailable (absent, unreadable or locked
+    /// past the bounded wait).
     StoreUnreadable,
     /// Stores were read and none held a session the log names.
     SessionNotFound,

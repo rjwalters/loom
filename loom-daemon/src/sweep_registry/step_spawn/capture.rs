@@ -408,6 +408,7 @@ pub(crate) struct StepCapture {
     /// record, resolved-runtime marker and native session ids. The per-role
     /// log a role tick reads is wrong for a step.
     pub(crate) log_path: PathBuf,
+    pub(crate) runtime: Option<String>,
 }
 
 /// Emit the role tick's capture for one finished step: its journal drained
@@ -431,6 +432,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
             item: (capture.item, capture.role.acts_on_pr()),
             stage: &capture.stage,
             log_path: &capture.log_path,
+            runtime: capture.runtime.as_deref(),
         },
     );
 }
@@ -625,6 +627,7 @@ impl SweepRegistry {
                 effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
                 stage: role.as_str().to_string(),
                 log_path: log_path.clone(),
+                runtime: info.map(|i| i.runtime.clone()),
             };
             // #12027: the step's verdict record reads its log at the drain.
             let staged = crate::observability::step_verdict::StagedStep {
