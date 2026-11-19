@@ -920,3 +920,6 @@ fn capabilities_list_park_record_and_operator_decision() {
         assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
     }
 }
+
+#[path = "loom_tools_slice/pr_lease.rs"]
+mod pr_lease;

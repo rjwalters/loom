@@ -91,6 +91,8 @@ pub(crate) mod labels_cmd;
 mod labels_migrate;
 mod labels_migrate_holds;
 mod labels_undeclared;
+mod lease_cli;
+pub use lease_cli::{handle_lease_command, LeaseCli};
 pub(crate) mod lease_co_occupancy;
 pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
