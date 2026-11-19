@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::operator_decision::cli::WorkflowWriter;
 use crate::park_record::{self, BlockerRef, ParkRecord, Withdrawn};
 
 #[derive(clap::Subcommand)]
@@ -263,7 +264,8 @@ impl ParkRecordCli {
 /// Whatever the handler returns; most actions exit the process themselves with
 /// their documented exit codes.
 pub fn handle_park_record_command(cli: ParkRecordCli) -> Result<()> {
-    cli.command.run()
+    let writer = WorkflowWriter::for_tools(cli.reaches_forge())?;
+    cli.command.run(writer)
 }
 
 impl ParkRecordCommand {
@@ -282,11 +284,11 @@ impl ParkRecordCommand {
         }
     }
 
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) fn run(self, writer: WorkflowWriter) -> Result<()> {
         match self {
             ParkRecordCommand::Render(args) => args.run(),
             ParkRecordCommand::Parse(args) => args.run(),
-            ParkRecordCommand::Apply(args) => args.run(),
+            ParkRecordCommand::Apply(args) => args.run(writer),
             ParkRecordCommand::Released(args) => {
                 args.run();
                 Ok(())
@@ -295,7 +297,7 @@ impl ParkRecordCommand {
                 args.run();
                 Ok(())
             }
-            ParkRecordCommand::Retract(args) => args.run(),
+            ParkRecordCommand::Retract(args) => args.run(writer),
         }
     }
 }
@@ -376,8 +378,8 @@ impl DecisionArgs {
 
 impl ApplyArgs {
     /// Never returns: exits with the command's own code.
-    fn run(self) -> Result<()> {
-        use crate::operator_decision::cli::{default_repo_root, GhForge};
+    fn run(self, writer: WorkflowWriter) -> Result<()> {
+        use crate::operator_decision::cli::default_repo_root;
         use crate::park_record::apply::{apply, ApplyRequest};
         let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
@@ -393,7 +395,7 @@ impl ApplyArgs {
             transient: self.transient,
             jitter: random_unit(),
         };
-        let mut forge = GhForge::new(default_repo_root(), self.repo);
+        let mut forge = writer.forge(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
@@ -402,8 +404,8 @@ impl ApplyArgs {
 
 impl RetractArgs {
     /// Never returns: exits with the command's own code.
-    fn run(self) -> Result<()> {
-        use crate::operator_decision::cli::{default_repo_root, GhForge};
+    fn run(self, writer: WorkflowWriter) -> Result<()> {
+        use crate::operator_decision::cli::default_repo_root;
         use crate::park_record::apply::{retract, RetractRequest};
         let req = RetractRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
@@ -432,7 +434,7 @@ impl RetractArgs {
                 )
             }
             None => {
-                let mut forge = GhForge::new(default_repo_root(), self.repo);
+                let mut forge = writer.forge(default_repo_root(), self.repo);
                 retract(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr())
             }
         };

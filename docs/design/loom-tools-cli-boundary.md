@@ -886,8 +886,8 @@ reaches the forge.
 
 ### 14.2 Mode gate, classified by effect
 
-`mode_gate()` (§7.3, §10.3) runs only for an invocation that can reach the
-forge; the offline forms work with `mode` unset.
+The tools entry points resolve mode (§7.3, §10.3) only for an invocation
+that can reach the forge. The offline forms work with `mode` unset.
 
 | Invocation | Gate | Effect |
 | --- | --- | --- |
@@ -912,6 +912,15 @@ tools-only `apply --new` that reaches the nested call fails with the handler's
 forge-failure exit (4) until #14461 lands; the existing-issue forms do not depend
 on it. Gitea behavior is unchanged: it is whatever the shared adapter and the
 facade's decline already do, identical from both roots.
+
+In fleet mode, tools-only park and decision commands read through the fleet
+reader. A missing reader fails the read. When the shared handler needs to
+change a body, label or comment, or invoke nested filing, it returns its forge
+failure (exit 4) before using a local writer. Previews and idempotent calls
+that need only reads can finish. The current fleet role can create issues and
+post statuses. It has no operation to edit an existing issue body. Successful
+scoped writes and integration with the shared filing verb are tracked in
+#14464.
 
 ### 14.4 Served commands
 

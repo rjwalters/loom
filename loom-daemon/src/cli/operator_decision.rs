@@ -4,7 +4,7 @@
 //! `PremiseCheckArgs` gives.
 
 use crate::operator_decision::cli::{
-    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, GhForge, Target,
+    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, Target, WorkflowWriter,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -129,7 +129,8 @@ impl OperatorDecisionCli {
 /// # Errors
 /// Whatever the handler returns; it exits the process with its own code.
 pub fn handle_operator_decision_command(cli: OperatorDecisionCli) -> Result<()> {
-    cli.command.run()
+    let writer = WorkflowWriter::for_tools(cli.reaches_forge())?;
+    cli.command.run(writer)
 }
 
 impl OperatorDecisionCommand {
@@ -153,7 +154,7 @@ impl OperatorDecisionCommand {
     }
 
     /// Never returns: exits with the command's own code.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) fn run(self, writer: WorkflowWriter) -> Result<()> {
         let mut out = std::io::stdout();
         let mut err = std::io::stderr();
         let code = match self {
@@ -184,7 +185,7 @@ impl OperatorDecisionCommand {
                 };
                 match read_input(&input) {
                     Ok(text) => {
-                        let mut forge = GhForge::new(default_repo_root(), repo);
+                        let mut forge = writer.forge(default_repo_root(), repo);
                         let req = ApplyRequest {
                             target,
                             also_labels: also_label,
@@ -209,7 +210,9 @@ impl OperatorDecisionCommand {
                 release,
                 dry_run,
                 repo,
-            } => run_resolve(issue, option, &effect, release, dry_run, repo, &mut out, &mut err),
+            } => run_resolve(
+                writer, issue, option, &effect, release, dry_run, repo, &mut out, &mut err,
+            ),
         };
         std::process::exit(code)
     }
@@ -220,6 +223,7 @@ impl OperatorDecisionCommand {
 /// option id.
 #[allow(clippy::too_many_arguments)]
 fn run_resolve(
+    writer: WorkflowWriter,
     issue: u64,
     option: String,
     effect: &str,
@@ -247,7 +251,9 @@ fn run_resolve(
     }
     let root = default_repo_root();
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
-    let mut forge = GhForge::new(root, repo).with_call_site("operator_decision.resolve");
+    let mut forge = writer
+        .forge(root, repo)
+        .with_call_site("operator_decision.resolve");
     let req = resolve::ResolveRequest {
         issue,
         option,
