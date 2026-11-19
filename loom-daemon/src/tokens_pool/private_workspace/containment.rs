@@ -506,7 +506,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             source: admitted.source.clone(),
             unmet_capabilities: vec![],
             reason: if error.is::<super::AccountBusy>() {
-                "no idle seat".to_string()
+                dispatch::NO_IDLE_SEAT.to_string()
             } else {
                 error.to_string()
             },

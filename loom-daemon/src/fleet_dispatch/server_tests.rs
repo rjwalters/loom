@@ -831,6 +831,10 @@ fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
         assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
         if early {
             assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
         } else {
             let line = parse_outcome_line(
                 "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
