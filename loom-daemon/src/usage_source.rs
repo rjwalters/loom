@@ -653,6 +653,35 @@ pub fn step_tokens_by_model(
     native_tokens_by_model(runtime, &directories, log_path, window, session_ids)
 }
 
+/// Why a spawned step's or tick's native-store read found nothing (#14566),
+/// so the run says so instead of leaving no row. OpenCode is told apart down to
+/// the session; every other native reader can only say nothing was attributable.
+///
+/// Call only after the read returned `None`: for OpenCode it opens the stores
+/// again to look for the log's session ids.
+#[must_use]
+pub fn native_usage_missing(
+    source: UsageSource,
+    session_ids: &NativeSessionIds,
+) -> crate::observability::runtime_usage::missing::UsageMissing {
+    use crate::observability::runtime_usage::missing::UsageMissing;
+    use crate::opencode_usage::IdLookup;
+    if source != UsageSource::OpenCodeSessionDb {
+        return UsageMissing::NoAttributableUsage;
+    }
+    if session_ids.opencode.is_empty() {
+        return UsageMissing::NoSessionId;
+    }
+    match crate::opencode_usage::lookup_ids(&session_ids.opencode, None) {
+        IdLookup::NoStore => UsageMissing::StoreUnreadable,
+        IdLookup::NotFound => UsageMissing::SessionNotFound,
+        IdLookup::NoUsage => UsageMissing::NoUsageTokens,
+        // The first read found nothing and this one found usage: the store
+        // changed in between, so nothing more specific is true.
+        IdLookup::Found => UsageMissing::NoAttributableUsage,
+    }
+}
+
 fn native_tokens_by_model(
     runtime: Option<&str>,
     directories: &[PathBuf],
@@ -688,6 +717,50 @@ fn native_tokens_by_model(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #14566: a step whose OpenCode read found nothing is told apart by why:
+    /// no session id in its log, no store, an id no store holds, or an id whose
+    /// session recorded no tokens. Another native runtime can only say nothing
+    /// was attributable.
+    #[test]
+    #[serial_test::serial(opencode_db_env)]
+    fn a_native_read_that_found_nothing_says_why() {
+        use crate::observability::runtime_usage::missing::UsageMissing as M;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("opencode.db");
+        let ids = |id: &str| NativeSessionIds {
+            opencode: vec![id.to_string()],
+            codex: Vec::new(),
+        };
+        let missing = |source, ids: &NativeSessionIds| native_usage_missing(source, ids);
+        let oc = UsageSource::OpenCodeSessionDb;
+
+        // No session id in the log: nothing to look up, whatever the store holds.
+        assert_eq!(missing(oc, &NativeSessionIds::default()), M::NoSessionId);
+
+        // The override names a store that does not exist: nothing is readable.
+        std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+        assert_eq!(missing(oc, &ids("ses_a")), M::StoreUnreadable);
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER, \
+             tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER, \
+             tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+             INSERT INTO session VALUES ('ses_zero', '{\"id\":\"m\",\"providerID\":\"p\"}', \
+             0, 0, 0, 0, 0, '/repo', 1);",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(missing(oc, &ids("ses_absent")), M::SessionNotFound);
+        assert_eq!(missing(oc, &ids("ses_zero")), M::NoUsageTokens);
+        std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+        assert_eq!(
+            missing(UsageSource::CodexSessionRollouts, &NativeSessionIds::default()),
+            M::NoAttributableUsage
+        );
+    }
 
     #[test]
     fn each_mapped_runtime_selects_its_own_store_and_everything_else_stays_on_transcripts() {

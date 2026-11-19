@@ -52,6 +52,10 @@ pub enum SpanName {
     /// `loom.runtime.run` span, journalled once usage is known.
     #[serde(rename = "loom.runtime.usage")]
     RuntimeUsage,
+    /// A run whose usage could not be read (Issue #14566): no counters, only
+    /// `loom.usage.missing_reason`, so the gap is countable.
+    #[serde(rename = "loom.runtime.usage_missing")]
+    RuntimeUsageMissing,
     /// One pool dispatch hold, from arming to clearing (Issue #8931) — its own
     /// root trace.
     #[serde(rename = "loom.pool.hold")]
@@ -161,6 +165,7 @@ impl SpanName {
             Self::CiTest => "loom.ci.test",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
+            Self::RuntimeUsageMissing => "loom.runtime.usage_missing",
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",

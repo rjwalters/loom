@@ -39,6 +39,7 @@
 mod billing;
 pub mod cost;
 pub mod join;
+pub mod missing;
 pub mod spans;
 
 use std::path::Path;
@@ -138,17 +139,77 @@ pub fn record_execution_usage(
 /// spans (`scope=execution`) from the per-model totals the outcome record
 /// already carries, and close the session join entry [`join::open`] wrote at
 /// dispatch. Call before `lifecycle::finish_execution`.
+///
+/// `missing` is why `tokens_by_model` is unreadable (Issue #14566), when the
+/// caller knows; with no rows it journals one `loom.runtime.usage_missing` span
+/// instead of nothing.
 pub fn finish_sweep(
     root: &Path,
     execution: &str,
     started_at: Option<DateTime<Utc>>,
     tokens_by_model: Option<&[ModelUsageTotals]>,
+    missing: Option<missing::UsageMissing>,
     runtime: Option<&str>,
 ) {
     let now = Utc::now();
     let window = (started_at.unwrap_or(now), now);
     record_execution_usage(root, execution, window, tokens_by_model, runtime);
+    let known = tokens_by_model.is_some_and(|rows| !rows.is_empty());
+    if let (false, Some(reason), true) = (known, missing, super::tracing::enabled(root)) {
+        if let Err(error) = journal_missing(root, execution, window, reason, runtime) {
+            log::warn!("observability: runtime usage_missing span not journalled: {error}");
+        }
+    }
     join::close(root, execution, now);
+}
+
+/// Journal the execution's `loom.runtime.usage_missing` span (Issue #14566),
+/// without the enablement check: a child of its last completed
+/// `loom.runtime.run` span, else of its root, like [`journal_usage`]. Empty
+/// when the execution has no persisted trace context, which is logged (a span
+/// with no known parent would need an invented trace id).
+pub fn journal_missing(
+    root: &Path,
+    execution: &str,
+    window: (DateTime<Utc>, DateTime<Utc>),
+    reason: missing::UsageMissing,
+    runtime: Option<&str>,
+) -> anyhow::Result<Vec<SpanRecord>> {
+    let store = TraceStore::new(root);
+    let path = store.path(root, execution);
+    if !path.exists() {
+        log::warn!(
+            "observability: {execution} usage is missing ({}) and it has no trace to say so on",
+            reason.as_str()
+        );
+        return Ok(Vec::new());
+    }
+    let saved = TraceStore::load(&path)?;
+    let journal = Journal::for_context(&path);
+    let run = journal
+        .completed()?
+        .into_iter()
+        .filter(|span| {
+            span.name == SpanName::RuntimeRun && span.context.trace_id == saved.context.trace_id
+        })
+        .max_by_key(|span| span.ended_at);
+    let (parent, started_at, ended_at) = match &run {
+        Some(run) => (&run.context, run.started_at, run.ended_at),
+        None => (&saved.context, window.0, window.1),
+    };
+    let mut common = TraceAttributes::new();
+    common.insert("loom.sweep_id".into(), execution.to_string());
+    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+        common.insert("loom.runtime".into(), runtime.to_string());
+    }
+    let span = missing::span(
+        parent,
+        (started_at, ended_at),
+        reason,
+        spans::UsageScope::Execution,
+        &common,
+    );
+    spans::append_new(&journal, vec![span])
 }
 
 /// One phase attempt's usage, exactly as `sweep.outcome`'s `phase_durations`

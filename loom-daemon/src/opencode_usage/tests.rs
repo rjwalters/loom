@@ -1092,3 +1092,38 @@ fn an_empty_id_set_selects_nothing_even_with_a_populated_store() {
     assert_eq!(tokens_by_model_for_ids(&[], Some(tmp.path())), None);
     assert_eq!(tokens_by_session_ids(&[], Some(tmp.path())), None);
 }
+
+/// #14566: `lookup_ids` says why a by-id read came back empty: no store at
+/// all, a store without the id, or a session that recorded no tokens.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn lookup_ids_tells_no_store_from_not_found_from_no_usage_from_found() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = |id: &str| [id.to_string()];
+
+    assert_eq!(lookup_ids(&ids("ses_a"), Some(tmp.path())), IdLookup::NoStore, "no store");
+
+    let dir = tmp
+        .path()
+        .join(".loom")
+        .join("opt")
+        .join("opencode-1.18.31")
+        .join("xdg")
+        .join("data")
+        .join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = model_json("zai-org/GLM-5.3", "friendli");
+    seed_db(
+        &dir.join("opencode.db"),
+        &[
+            id_row("ses_used", &model, "/repo", 7),
+            id_row("ses_zero", &model, "/repo", 0),
+        ],
+    );
+    assert_eq!(lookup_ids(&ids("ses_used"), Some(tmp.path())), IdLookup::Found);
+    assert_eq!(lookup_ids(&ids("ses_zero"), Some(tmp.path())), IdLookup::NoUsage);
+    assert_eq!(lookup_ids(&ids("ses_absent"), Some(tmp.path())), IdLookup::NotFound);
+    assert_eq!(lookup_ids(&[], Some(tmp.path())), IdLookup::NotFound, "no ids names nothing");
+}

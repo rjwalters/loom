@@ -1171,6 +1171,42 @@ fn emit_correlated(
             rows,
         );
     }
+    // #14566: a spawned run whose usage could not be read says so, with the
+    // reason, instead of leaving no row. A step whose own log was unreadable
+    // has no runtime or session ids to read by; a native-store run is told
+    // apart down to the session. A Claude tick with no transcript is not a
+    // case this covers.
+    if tick.result.spawned() && tokens_by_model.is_none() {
+        use crate::observability::runtime_usage::missing::UsageMissing;
+        let reason = if tick.step_log.is_some() && step_log.is_none() {
+            Some(UsageMissing::NoStepLog)
+        } else {
+            source
+                .is_native_store()
+                .then(|| crate::usage_source::native_usage_missing(source, &session_ids))
+        };
+        if let Some(reason) = reason {
+            match &usage_trace {
+                Some(trace) => usage::journal_missing(
+                    &tick.root,
+                    trace,
+                    &tick.role,
+                    tick.ended_at,
+                    // No step log means the runtime is unknown, not `claude`.
+                    (reason != UsageMissing::NoStepLog)
+                        .then(|| usage::span_runtime(usage_runtime_name.as_deref(), source))
+                        .flatten(),
+                    reason,
+                ),
+                None => log::warn!(
+                    "role_tick_telemetry: {} usage is missing ({}) and the run has no trace to \
+                     say so on (#14566)",
+                    tick.role,
+                    reason.as_str()
+                ),
+            }
+        }
+    }
     // #9231: the tick's terminal transition, mirroring
     // `runtime_usage::finish_sweep` — the usage spans above, then the close of
     // the join entry `lifecycle::role_invocation` opened at dispatch.

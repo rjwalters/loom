@@ -770,3 +770,50 @@ fn a_sessions_join_key_prefers_its_issue_and_falls_back_to_its_slash_role() {
     assert_eq!(session_key(None, Some("judge")), Some(JoinKey::Role("judge")));
     assert_eq!(session_key(None, None), None);
 }
+
+/// #14566: an unreadable sweep journals one `usage_missing` span under its last
+/// `loom.runtime.run` span, with the reason and no counters; an untraced one
+/// has nowhere to say so and journals nothing.
+#[test]
+fn an_unreadable_sweep_journals_a_usage_missing_span_under_its_run_span() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root_context, run) = traced_execution(tmp.path(), "sweep-gone");
+    let window = (Utc::now() - Duration::hours(1), Utc::now());
+    let spans = journal_missing(
+        tmp.path(),
+        "sweep-gone",
+        window,
+        missing::UsageMissing::NoAttributableUsage,
+        Some("opencode"),
+    )
+    .unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one span: {spans:?}");
+    };
+    assert_eq!(span.name, SpanName::RuntimeUsageMissing);
+    assert_eq!(span.context.trace_id, root_context.trace_id);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&run.context.span_id));
+    assert_eq!(span.attributes["loom.usage.missing_reason"], "no_attributable_usage");
+    assert_eq!(span.attributes["loom.runtime"], "opencode");
+    assert_eq!(span.attributes["loom.sweep_id"], "sweep-gone");
+    // A re-emit adds nothing.
+    assert!(journal_missing(
+        tmp.path(),
+        "sweep-gone",
+        window,
+        missing::UsageMissing::NoAttributableUsage,
+        Some("opencode"),
+    )
+    .unwrap()
+    .is_empty());
+
+    assert!(journal_missing(
+        tmp.path(),
+        "never-traced",
+        window,
+        missing::UsageMissing::NoWindow,
+        None
+    )
+    .unwrap()
+    .is_empty());
+}

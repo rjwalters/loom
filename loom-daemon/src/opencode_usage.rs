@@ -679,6 +679,51 @@ pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<
     tokens_by_model_for_ids(ids, home)
 }
 
+/// Why a by-id read found no usage (#14566): what [`lookup_ids`] saw when it
+/// looked for the sessions a launch's own log names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdLookup {
+    /// At least one named session recorded usage.
+    Found,
+    /// No `opencode.db` could be found or opened (absent, or a lock held
+    /// past the bounded wait), so nothing was looked at.
+    NoStore,
+    /// Stores were read and none held any of the ids.
+    NotFound,
+    /// A named session exists but recorded no tokens (an all-zero creation
+    /// row: the launch produced no turn).
+    NoUsage,
+}
+
+/// Classify a by-id read, over the same stores and rows [`sessions_for_ids`]
+/// selects from. Only worth calling after that read came back empty: it opens
+/// every store again to say *why*. An empty `ids` is [`IdLookup::NotFound`].
+#[must_use]
+pub fn lookup_ids(ids: &[String], home: Option<&Path>) -> IdLookup {
+    if ids.is_empty() {
+        return IdLookup::NotFound;
+    }
+    let filter = SessionFilter::ids(ids);
+    let (mut readable, mut matched) = (false, false);
+    for db in discover_opencode_dbs(home) {
+        let Some(rows) = sessions_in(&db, &filter, None) else {
+            continue;
+        };
+        readable = true;
+        for row in rows {
+            matched = true;
+            if !row.is_empty() {
+                return IdLookup::Found;
+            }
+        }
+    }
+    match (readable, matched) {
+        (false, _) => IdLookup::NoStore,
+        (true, true) => IdLookup::NoUsage,
+        (true, false) => IdLookup::NotFound,
+    }
+}
+
 /// Fold already-selected sessions into per-model totals — the whole of
 /// [`tokens_by_model`]'s arithmetic, split out so the mapping documented above
 /// has exactly one implementation (and so a test can drive it from a fixture
