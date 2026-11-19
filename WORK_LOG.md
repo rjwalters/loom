@@ -14,8 +14,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-19
+
+- **PR #14401**: fix: detach pr-<N> review worktree when the primary clone holds the PR branch
+- **Issue #14391** (closed): pr-worktree.sh refuses a PR whose branch is checked out in the primary clone, leaving Judge no sanctioned way to review it
+
 ### 2026-11-18
 
+- **PR #14480**: feat: serve park-record and operator-decision from loom-tools
+- **PR #14473**: fix: retain the step root for usage capture after journal retirement
+- **Issue #14457** (closed): A step's usage span can be lost when its trace journal is retired between the span close and the capture thread
 - **PR #14471**: feat: apply session image and extra mounts to private-clone seats
 - **PR #14459**: test: guard configured session image preference in recreate paths
 - **PR #14453**: feat: attribute waiver-checks and curation-complete daemon self-spawns
