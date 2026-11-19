@@ -5,9 +5,8 @@ enqueue a Judge-approved PR rather than merging it directly. That
 only protects `main` if every suite Loom relies on validates the **combined
 merge-group tree**, meaning the base plus every PR queued ahead of this one. A
 workflow can list `merge_group` as a trigger and still skip the suites that
-matter on it. This document covers the read-only tooling that proves a
-repository's workflows are qualified, the prerequisites for enabling queue mode,
-and how to roll back.
+matter on it. This document covers the read-only qualification checks, the
+prerequisites for enabling queue mode, and how to roll back.
 
 **Status:** queue execution is compiled on (#12323) but opt-in via
 `champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
@@ -31,7 +30,7 @@ branch protection, and neither writes to any repository.
 
 | Verb | Exit 0 | Exit 1 | Exit 2 |
 |---|---|---|---|
-| `audit` | every relied-on suite and required context covers `merge_group` | a finding | could not run |
+| `audit` | the static audit passes | a finding | could not run |
 | `eligibility` | the repository may pilot queue mode | a named prerequisite failed | could not run |
 
 ```bash
@@ -49,9 +48,19 @@ path-filtered PR workflow is listed as advisory: a skipped required check never
 reports, so such a workflow cannot be a required gate. The audit evaluates each
 job and step of a relied-on workflow under synthetic `pull_request`, `push` and
 `merge_group` contexts with a small GitHub-expression evaluator. A value the
-evaluator cannot know statically, such as `matrix`, `steps`, or a `needs`
-output of a job that actually ran, counts as **unknown**, and an unknown
-counts as uncovered.
+evaluator cannot know statically, such as a `steps` output, is **unknown**.
+
+A relied-on job with an unknown `merge_group` condition is uncovered. For
+steps inside a job that is statically runnable on `merge_group`, the audit
+compares the `pull_request` and `merge_group` truth values in the order
+`false < unknown < true`. A lower value on `merge_group` produces a finding.
+Equal unknown values produce no step finding even when runtime outputs differ.
+
+`covered: true` for a required context means its matching relied-on job has a
+`merge_group` trigger, is statically evaluated to run, and has no associated
+findings, including detected step findings. The overall audit also checks for
+workflow-wide findings. Verify suite execution from the job and step results
+on the exact merge-group SHA.
 
 | Code | Meaning |
 |---|---|
@@ -59,8 +68,8 @@ counts as uncovered.
 | `PR_ONLY_CONDITION` | a job's `if:` is false on `merge_group` (`github.event_name == 'pull_request'`, …) |
 | `SKIPPED_DEPENDENCY` | a job `needs:` a job skipped on `merge_group` and has no status function (`!cancelled() && …`) |
 | `PATH_FILTER_SKIP` | a job/step runs on `merge_group` only if a path-filter job's output says so |
-| `UNDETERMINED_CONDITION` | the condition cannot be decided on `merge_group` |
-| `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
+| `UNDETERMINED_CONDITION` | a job condition is unknown on `merge_group`, or a step condition is true on `pull_request` and unknown on `merge_group`, with no path-filter finding |
+| `PR_ONLY_STEP` | a step condition is false on `merge_group` and true or unknown on `pull_request` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
 | `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
 | `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` that contains both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (a text check for both clauses, not an evaluation of the condition; see Trust boundary below) |
@@ -72,6 +81,45 @@ counts as uncovered.
 
 The output records each workflow's and job's `permissions:` for review, but
 permissions do not produce findings.
+
+#### Reproduce the step comparison
+
+In a disposable checkout, save this example as `.github/workflows/ci.yml` and
+run the audit locally.
+
+```yaml
+name: Audit example
+on: [pull_request, merge_group]
+jobs:
+  tests:
+    name: Dashboard Tests
+    runs-on: ubuntu-latest
+    steps:
+      - id: guide
+        if: github.event_name == 'merge_group'
+        run: echo "reuse=true" >> "$GITHUB_OUTPUT"
+      - name: Run suite
+        run: echo "suite ran"
+```
+
+```bash
+loom-daemon merge-group-ci audit --workflow ci.yml --required 'Dashboard Tests' --json
+```
+
+Run the same command after placing each `if:` in turn on `Run suite`.
+
+| Condition on `Run suite` | Exit | Required context | Step finding |
+|---|---:|---|---|
+| Omitted | 0 | Covered | None |
+| `github.event_name == 'pull_request'` | 1 | Uncovered | `PR_ONLY_STEP` |
+| `steps.guide.outputs.reuse != 'true'` | 0 | Covered | None |
+| `github.event_name != 'merge_group' \|\| steps.guide.outputs.reuse != 'true'` | 1 | Uncovered | `UNDETERMINED_CONDITION` |
+
+In the third case, the preceding step writes `reuse=true` only on
+`merge_group`, so the suite can be skipped there even though the static
+comparison passes. For a job-level control, omit the suite condition and add
+`if: vars.SUITE_ENABLED == 'true'` to the `tests` job. The unknown job condition
+produces `UNDETERMINED_CONDITION` and leaves the required context uncovered.
 
 The shipped `merge-group-check.yml` template needs `statuses: write`,
 `pull-requests: read`, `checks: read` and `contents: read`; without the reads
