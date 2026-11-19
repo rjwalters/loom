@@ -487,7 +487,9 @@ pub fn writer_hold(key: &BucketKey, now: i64) -> Option<i64> {
         .filter(|&reset| reset > now)
 }
 
-/// Every active hold at `now`, for the status surface.
+/// Every active hold at `now`: the `status` Forge-calls section lists them,
+/// and the work-finder tick compares them with what its route resolution
+/// finds, so an armed-but-not-found hold is greppable (#14559).
 #[must_use]
 pub fn writer_holds_snapshot(now: i64) -> Vec<(BucketKey, i64)> {
     let mut out: Vec<(BucketKey, i64)> = holds()

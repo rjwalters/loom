@@ -306,12 +306,19 @@ impl RegistrySpawner {
                     .and_then(|r| r.writer_limit.as_deref())
                 {
                     if limited.arm_hold(Utc::now().timestamp()) {
+                        // #14559: name the armed key, so an armed-but-not-found
+                        // hold (the tick's warning for it) is greppable against
+                        // what was actually armed.
                         log::warn!(
-                            "work_finder: writer {} route held until {} (#13746)",
+                            "work_finder: writer {} route held until {} (account {} owner {} \
+                             installation {}) (#13746)",
                             limited.stage.as_str(),
                             limited
                                 .reset_utc()
-                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string())
+                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string()),
+                            limited.account.as_deref().unwrap_or("-"),
+                            limited.owner.as_deref().unwrap_or("-"),
+                            limited.installation.as_deref().unwrap_or("-")
                         );
                     }
                 }
@@ -659,8 +666,40 @@ impl StepDriver {
                 // #13746: the workspace's writer route, when a confirmed
                 // exhaustion hold stands for it — its candidates wait before
                 // the draw until the reset.
-                writer_hold: crate::writer_limit::hold_note(Some(root), &repo, now.timestamp())
-                    .and_then(|until| tick::WriterHold::from_reset(until, now.timestamp())),
+                writer_hold: {
+                    let now_ts = now.timestamp();
+                    let hold = crate::writer_limit::hold_note(Some(root), &repo, now_ts)
+                        .and_then(|until| tick::WriterHold::from_reset(until, now_ts));
+                    // #14559: a hold that was armed but this route's resolution
+                    // cannot find (a key the tick misses while it stands) is
+                    // exactly how dispatch silently degrades to draw-and-refuse
+                    // — make it greppable.
+                    if hold.is_none() {
+                        let owner = crate::writer_limit::owner_of(&repo);
+                        if let Some((key, until)) =
+                            crate::forge_bucket_book::writer_holds_snapshot(now_ts)
+                                .into_iter()
+                                .find(|(k, _)| {
+                                    k.owner == owner
+                                        && k.resource == crate::forge_bucket_book::Resource::Core
+                                })
+                        {
+                            let until = chrono::DateTime::from_timestamp(until, 0).map_or_else(
+                                || until.to_string(),
+                                |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            );
+                            log::warn!(
+                                "work_finder: {repo}: writer hold armed (account {} owner {} \
+                                 installation {}) until {until} but this tick's route resolved \
+                                 to no hold — writes draw and refuse (#14559)",
+                                key.account,
+                                key.owner,
+                                key.installation
+                            );
+                        }
+                    }
+                    hold
+                },
             });
         }
         let filter_ms = millis(filter_started.elapsed());
