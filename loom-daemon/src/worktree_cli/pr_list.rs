@@ -14,6 +14,7 @@ pub(crate) enum PrList {
     Tools,
 }
 
+/// A transport outcome. Invalid tools routing returns a command error instead.
 pub(crate) enum Read {
     Answered(String),
     Unanswered(String),
@@ -29,12 +30,12 @@ impl PrList {
         let output = match self {
             Self::Legacy => legacy_output(git_repo, args),
             Self::Tools => {
+                // Mode is required when the probe reaches the forge. Linked
+                // worktrees still use the primary checkout's effective mode.
+                crate::tools_mode::configure_forge_reads(mode_repo)?;
                 if detect_forge(Some(git_repo)) == ForgeType::Gitea {
                     return Ok(Read::Unanswered("gitea is not handled natively".into()));
                 }
-                // Mode is required only at an actual forge read. Linked
-                // worktrees still use the primary checkout's effective mode.
-                crate::tools_mode::configure_forge_reads(mode_repo)?;
                 tools_output(git_repo, args)
             }
         };

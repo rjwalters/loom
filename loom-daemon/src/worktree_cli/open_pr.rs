@@ -228,25 +228,24 @@ fn query_with(repo: &Path, branch: &str, pr_list: PrList) -> Result<Probe, Strin
     if !has_forge_remote(repo) {
         return Ok(Probe::status_only(Status::NoForgeRemote));
     }
-    Ok(
-        match pr_list.fetch(
-            repo,
-            repo,
-            &[
-                "--state",
-                "open",
-                "--head",
-                branch,
-                "--json",
-                "number,isCrossRepository,headRepository,headRefName,url",
-                "--limit",
-                "5",
-            ],
-        )? {
-            Read::Answered(text) => parse_probe(&text),
-            Read::Unanswered(error) => Probe::status_only(classify_failure(&error)),
-        },
-    )
+    let read = pr_list.fetch(
+        repo,
+        repo,
+        &[
+            "--state",
+            "open",
+            "--head",
+            branch,
+            "--json",
+            "number,isCrossRepository,headRepository,headRefName,url",
+            "--limit",
+            "5",
+        ],
+    )?;
+    Ok(match read {
+        Read::Answered(text) => parse_probe(&text),
+        Read::Unanswered(error) => Probe::status_only(classify_failure(&error)),
+    })
 }
 
 /// Classify a failed forge call's stderr. Mirrors the shell's two `grep -qi`
