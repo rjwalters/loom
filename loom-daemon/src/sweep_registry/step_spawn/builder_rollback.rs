@@ -147,7 +147,7 @@ impl SweepRegistry {
     /// Whether a fresh read shows no lease but this step's own live on the
     /// issue. `false` when the read fails: unknown is not "none".
     fn no_peer_lease_live(&self, item: u32, sweep_id: &str, episode_start: DateTime<Utc>) -> bool {
-        let Some(comments) = self.read_lease_comments(item) else {
+        let Some(comments) = self.read_order_lease_comments(item) else {
             return false;
         };
         let host = self.published_host_id();

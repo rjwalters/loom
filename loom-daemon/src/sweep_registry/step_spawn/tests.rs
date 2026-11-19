@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
-    StepEnd, StepOutcomeClass, StepOutcomeLine,
+    emit_step_capture, launch_rejection_of, parse_outcome_line, read_outcome_line,
+    release_class_fallback, release_class_of_line, step_failure, step_outcome_projection,
+    tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -521,6 +521,25 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
         "the earlier run's anchor reads to the end of the log"
     );
     assert!(read_outcome_line(&log, "step-judge-4-3").is_none());
+}
+
+#[test]
+fn a_launch_rejection_is_spent_only_on_a_genuine_exit_78_without_a_line() {
+    let reported = Some("preflight_role_admission");
+    let end = StepEnd::Exited(Some(78));
+    assert_eq!(launch_rejection_of(end, None, reported), reported);
+    let line =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=2 class=failed reason=no_pr");
+    assert_eq!(launch_rejection_of(end, line.as_ref(), reported), None);
+    assert_eq!(launch_rejection_of(end, None, None), None);
+    for other in [
+        StepEnd::TimedOut,
+        StepEnd::Cancelled,
+        StepEnd::Exited(None),
+        StepEnd::Exited(Some(1)),
+    ] {
+        assert_eq!(launch_rejection_of(other, None, reported), None);
+    }
 }
 
 #[test]
@@ -1113,9 +1132,7 @@ mod builder_terminal_cleanup {
             crate::sweep_registry::test_support::lease_order_dispatch_registry(ws, &[]);
         std::fs::write(ws.join("labels.json"), r#"["loom:issue"]"#).unwrap();
         let fake = ws.join("fake-gh.sh");
-        let script = std::fs::read_to_string(&fake)
-            .unwrap()
-            .replace("[[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n", "");
+        let script = std::fs::read_to_string(&fake).unwrap();
         let prefix = format!(
             r#"#!/usr/bin/env bash
 labels='{root}/labels.json'
@@ -1184,6 +1201,121 @@ if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'*
             Utc::now(),
             StepEnd::Exited(Some(1)),
         );
+    }
+
+    fn released_peer_history(author: &str, host: &str, sweep: &str, renewed: bool) -> String {
+        let now = Utc::now();
+        let started = now - chrono::Duration::seconds(164);
+        let terminal = now - chrono::Duration::seconds(56);
+        let lease = serde_json::json!({
+            "id": 1, "created_at": started, "updated_at": if renewed { now } else { started },
+            "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
+            "body": "<!-- loom:lease host=peer-host sweep=peer-old -->"
+        });
+        let release = serde_json::json!({
+            "id": 2, "created_at": terminal, "updated_at": terminal,
+            "user": {"login": author, "type": "Bot"},
+            "body": format!("<!-- loom:lease-yield host={host} sweep={sweep} earliest_host=terminal earliest_sweep=terminal -->")
+        });
+        format!("{lease}\n{release}\n")
+    }
+
+    #[test]
+    #[serial]
+    fn a_builder_proceeds_after_another_hosts_terminal_yield() {
+        let (peer, later) = (tempdir().unwrap(), tempdir().unwrap());
+        let (_, shared_store) = fixture(peer.path());
+        let (mut registry, later_store) = fixture(later.path());
+        let history =
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", false);
+        std::fs::write(&shared_store, &history).unwrap();
+        let labels = peer.path().join("labels.json");
+        let later_fake = later.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&later_fake)
+            .unwrap()
+            .replace(later_store.to_str().unwrap(), shared_store.to_str().unwrap())
+            .replace(later.path().join("labels.json").to_str().unwrap(), labels.to_str().unwrap());
+        std::fs::write(later_fake, script).unwrap();
+        let result = builder_claim(&mut registry, MINE);
+        let stored = stored_comments(&shared_store);
+        assert!(result.is_ok(), "later claim refused: {result:?}; {stored}");
+        let labels: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(labels).unwrap()).unwrap();
+        assert_eq!(labels, ["loom:building"]);
+        assert!(stored
+            .contains(&format!("loom:lease host={} sweep={MINE}", registry.published_host_id())));
+        assert!(!stored.contains(&format!(
+            "loom:lease-yield host={} sweep={MINE}",
+            registry.published_host_id()
+        )));
+    }
+
+    #[test]
+    #[serial]
+    fn a_released_peer_appearing_during_confirmation_cannot_win_by_late_renewal() {
+        let dir = tempdir().unwrap();
+        let (mut registry, store) = fixture(dir.path());
+        let history = dir.path().join("late-comments");
+        std::fs::write(
+            &history,
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", true),
+        )
+        .unwrap();
+        let fake = dir.path().join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake).unwrap().replacen(
+            COMMENT_READ_ARM,
+            &format!(
+                "{COMMENT_READ_ARM}if [[ -f '{first}' && ! -f '{added}' ]]; then\n\
+                 cat '{history}' >> '{store}'\n\
+                 touch '{added}'\n\
+                 fi\n\
+                 touch '{first}'\n",
+                first = dir.path().join("first-read").display(),
+                added = dir.path().join("peer-added").display(),
+                history = history.display(),
+                store = store.display(),
+            ),
+            1,
+        );
+        std::fs::write(fake, script).unwrap();
+        // Reserve the earlier IDs without exposing either peer marker.
+        std::fs::write(&store, "{\"body\":\"\"}\n{\"body\":\"\"}\n").unwrap();
+        assert!(builder_claim(&mut registry, MINE).is_ok());
+        assert!(dir.path().join("peer-added").is_file(), "peer must appear in confirmation");
+    }
+
+    #[test]
+    #[serial]
+    fn an_untrusted_or_nonmatching_yield_cannot_exclude_a_live_peer() {
+        for (author, host, sweep) in [
+            ("untrusted[bot]", "peer-host", "peer-old"),
+            ("loom-fleet-dispatch[bot]", "other-host", "peer-old"),
+            ("loom-fleet-dispatch[bot]", "peer-host", "other-sweep"),
+        ] {
+            let dir = tempdir().unwrap();
+            let (mut registry, store) = fixture(dir.path());
+            std::fs::write(&store, released_peer_history(author, host, sweep, false)).unwrap();
+            let refusal = builder_claim(&mut registry, MINE).unwrap_err();
+            assert_eq!(refusal.reason, "claim_lost");
+            assert!(stored_comments(&store).contains("earliest_sweep=peer-old"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn unverified_builder_claim_restores_label_behind_only_a_released_peer() {
+        let dir = tempdir().unwrap();
+        let (mut registry, store) = fixture(dir.path());
+        std::fs::write(
+            &store,
+            released_peer_history("loom-fleet-dispatch[bot]", "peer-host", "peer-old", false),
+        )
+        .unwrap();
+        break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+        let refusal = builder_claim(&mut registry, MINE).unwrap_err();
+        assert_eq!(refusal.reason, "claim_unverified");
+        assert_eq!(rollback_of(&refusal), Some("label_restored"));
+        assert_eq!(admission(&registry).code, guard::EX_SAFE_TO_CLAIM);
     }
 
     #[test]

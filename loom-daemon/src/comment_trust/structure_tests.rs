@@ -75,12 +75,12 @@ const MARKER_FILES: &[(&str, &str)] = &[
     ),
     (
         "sweep_registry/guards.rs",
-        "writer; reader in read_lease_comments (FETCH_SITES)",
+        "writer; lease and yield reader in read_lease_comment_rows (FETCH_SITES)",
     ),
     (
         "sweep_registry/lease_step.rs",
         "writer (moved from guards.rs, #11898); pure second-line step parser over a body \
-         guards.rs's trusted read_lease_comments already returned",
+         guards.rs's trusted lease reader already returned",
     ),
     ("sweep_registry/fast_fail_park.rs", "writer (quarantine park comment, #11854)"),
     ("sweep_registry/quarantine.rs", "writer"),
@@ -134,7 +134,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "fetch_comment_bodies",
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
-    ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    ("sweep_registry/guards.rs", "read_lease_comment_rows", "policy.trusted_ndjson("),
     (
         "sweep_registry/step_spawn/builder_rollback.rs",
         "yield_finished_builder_lease",

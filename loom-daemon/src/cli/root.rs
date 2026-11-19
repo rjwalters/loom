@@ -951,6 +951,15 @@ pub enum Commands {
     ScriptPorts(super::script_ports::ScriptPortCommand),
     Labels(super::labels_cmd::LabelsArgs),
 
+    /// Structural lint for GitHub Actions workflow YAML (#13896): duplicate
+    /// step `id` within one job and duplicate mapping keys anywhere — the two
+    /// shapes a textual conflict-merge union produces. GitHub rejects such a
+    /// file at validation with zero jobs, so its gate vanishes while every
+    /// rollup reads green. Exit 0 clean, non-zero on any defect (fail closed).
+    /// Args live in `crate::workflow_lint` because this file is frozen by the
+    /// file-size ratchet.
+    WorkflowLint(crate::workflow_lint::WorkflowLintArgs),
+
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
     /// so the verb names cannot collide with existing top-level commands;
@@ -2254,6 +2263,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
+        Commands::WorkflowLint(args) => args.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),

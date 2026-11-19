@@ -29,6 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -139,6 +140,14 @@ pub struct Server<I: Identity> {
     queue: Mutex<Queue>,
     counters: Mutex<Counters>,
     seq: AtomicU64,
+    /// The captain's own token-pool dir, whose `.ranking` the heartbeat
+    /// answer publishes as the fleet probe snapshot (#13942). `None` on a
+    /// server built without one: the answer omits the field.
+    token_probe: Option<PathBuf>,
+    /// The last probe cycle already emitted as the captain-side per-account
+    /// record (#13942): one record per distinct `.ranking` mtime, not one
+    /// per heartbeat.
+    last_probe_cycle: Mutex<Option<DateTime<Utc>>>,
 }
 
 impl<I: Identity> Server<I> {
@@ -162,7 +171,41 @@ impl<I: Identity> Server<I> {
             queue: Mutex::new(Queue::new(Duration::from_secs(DEFAULT_REFRESH_SECS))),
             counters: Mutex::new(Counters::default()),
             seq: AtomicU64::new(0),
+            token_probe: None,
+            last_probe_cycle: Mutex::new(None),
         }
+    }
+
+    /// Publish the token-pool probe of the pool at `tokens_dir` on every
+    /// heartbeat answer (#13942). Read fresh on each heartbeat: the file is
+    /// tiny, the cadence is at most one answer per worker per
+    /// [`super::worker::HEARTBEAT_GAP`], and a `tokens check --ranking` run
+    /// landing mid-flight is picked up by the very next heartbeat.
+    #[must_use]
+    pub fn with_token_probe(mut self, tokens_dir: PathBuf) -> Self {
+        self.token_probe = Some(tokens_dir);
+        self
+    }
+
+    /// The snapshot to publish, and the captain-side per-account record for
+    /// a cycle this process has not yet emitted (#13942). Emits one point
+    /// per account per distinct probe instant (the `.ranking` mtime), so
+    /// SigNoz shows what the captain published each cycle without one point
+    /// per heartbeat per worker.
+    fn token_probe_snapshot(&self) -> Option<crate::tokens_pool::fleet_probe::TokenProbeSnapshot> {
+        let dir = self.token_probe.as_ref()?;
+        let snapshot = crate::tokens_pool::fleet_probe::snapshot_from_tokens_dir(dir)?;
+        let mut last = self
+            .last_probe_cycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *last != Some(snapshot.probed_at) {
+            *last = Some(snapshot.probed_at);
+            crate::observability::ops::emit_metrics(
+                crate::tokens_pool::fleet_probe::published_cycle_points(&snapshot),
+            );
+        }
+        Some(snapshot)
     }
 
     /// Set the full-refresh period (`fleetDispatch.queueRefreshSecs`).
@@ -439,6 +482,7 @@ impl<I: Identity> Server<I> {
         Ok(self.ok(&HeartbeatResponse {
             server_epoch: self.epoch.clone(),
             grace,
+            token_probe: self.token_probe_snapshot(),
         }))
     }
 

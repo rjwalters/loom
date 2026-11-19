@@ -2103,11 +2103,7 @@ pub(crate) fn lease_order_dispatch_registry(
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
              if [[ -f \"{store}\" ]]; then\n\
-             while IFS= read -r line; do\n\
-             [[ -z \"$line\" ]] && continue\n\
-             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
-             printf '%s\\n' \"$line\"\n\
-             done < \"{store}\"\n\
+             jq -cs \"${{@: -1}}\" < \"{store}\" || exit $?\n\
              fi\n\
              exit 0\n\
              fi\n\
@@ -2166,6 +2162,14 @@ pub(crate) fn lease_order_dispatch_registry(
     config.skip_label_flip = false; // exercise the real flip + lease-order path
     config.journal_path = Some(ws.join("test-sweeps-journal.json"));
     (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
+}
+
+/// A posted yield is an issue-comment write. The read projection also names
+/// the marker, so searching the whole invocation log would match a read.
+pub(crate) fn posted_lease_yield(gh_calls: &str) -> bool {
+    gh_calls
+        .lines()
+        .any(|line| line.starts_with("issue comment ") && line.contains("<!-- loom:lease-yield "))
 }
 
 /// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the

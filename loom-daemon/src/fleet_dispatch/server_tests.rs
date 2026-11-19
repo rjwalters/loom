@@ -1201,3 +1201,90 @@ async fn an_operator_clear_lifts_the_no_progress_hold_but_a_ttl_expiry_does_not(
     assert_eq!(reply.status, 200);
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
 }
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer publishes the captain's token probe.
+// -----------------------------------------------------------------
+
+/// A server with a token-probe pool dir holding one ranking row.
+fn probing_server(
+    node_name: &str,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir) {
+    let pool = tempfile::tempdir().unwrap();
+    std::fs::write(pool.path().join(".ranking"), ranking).unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity(node_name),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf()),
+    );
+    clock.set(91);
+    (s, pool)
+}
+
+#[test]
+fn the_heartbeat_answer_carries_the_captains_snapshot() {
+    let (s, _pool) = probing_server(
+        "node-a",
+        "agent-1|available|0.42\nagent-2|exhausted||2026-11-20T03:00:00Z\n",
+    );
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    let probe = &body["token_probe"];
+    assert!(probe.is_object(), "the snapshot rides the answer: {body}");
+    assert_eq!(probe["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(probe["accounts"][0]["name"], "agent-1");
+    assert_eq!(probe["accounts"][0]["util_5h"], 0.42);
+    assert_eq!(probe["accounts"][1]["limit_reset"], "2026-11-20T03:00:00Z");
+    // The probe instant is recorded, not sampled: the worker's freshness
+    // comparison needs the captain's probe time, not this answer's.
+    assert!(probe["probed_at"].is_string());
+}
+
+/// A server built without a pool dir omits the field entirely — the exact
+/// body an old captain sent.
+#[test]
+fn a_server_without_a_pool_dir_omits_the_field() {
+    let s = open_server("node-a");
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body.get("token_probe").is_none(), "absent, not null: {body}");
+}
+
+/// The captain-side per-account record is one per distinct probe cycle, not
+/// one per heartbeat: a second heartbeat over the same `.ranking` emits
+/// nothing, a rewritten `.ranking` emits the new cycle.
+#[test]
+fn the_per_account_cycle_record_fires_once_per_cycle() {
+    let (s, pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let beat = hb_body(A, json!([]), 1).to_string();
+    let (_, first) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    let cycle = |captured: &crate::observability::ops::capture::Captured| {
+        captured
+            .metrics
+            .iter()
+            .filter(|p| p.name == crate::telemetry::ops::MetricName::TokensFleetProbeAccounts)
+            .count()
+    };
+    assert_eq!(cycle(&first), 1, "one point per account of the new cycle");
+
+    let (_, again) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&again), 0, "the same cycle is not re-emitted");
+
+    std::fs::write(pool.path().join(".ranking"), "agent-1|available|0.10\nagent-2|error\n")
+        .unwrap();
+    let (_, next) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&next), 2, "a new probe cycle records every account");
+}

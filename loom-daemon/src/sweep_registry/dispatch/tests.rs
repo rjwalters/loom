@@ -314,7 +314,7 @@ fn dispatch_yields_claim_then_verify_order_tie_break_when_a_peer_lease_is_earlie
              {gh_calls}"
     );
     assert!(
-        gh_calls.contains("loom:lease-yield"),
+        posted_lease_yield(&gh_calls),
         "a standdown annotation must be posted when yielding; gh log: {gh_calls}"
     );
 
@@ -408,7 +408,7 @@ fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
 
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "a winning tie-break must never post a standdown annotation; gh log: {gh_calls}"
     );
 
