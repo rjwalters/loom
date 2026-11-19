@@ -872,6 +872,14 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
         assert_eq!(o.status.code(), Some(4), "{args:?}: {err}");
         assert!(err.contains("#9548"), "{args:?} must name the write-scope refusal: {err}");
         let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        if !args.contains(&"--new") {
+            assert!(
+                calls
+                    .lines()
+                    .any(|call| call == "api repos/acme/widgets/issues/7"),
+                "{args:?} did not read the denied issue before the write was refused:\n{calls}"
+            );
+        }
         for mutation in ["-X", "--input", "issue create", "issue edit"] {
             assert!(
                 !calls.contains(mutation),
