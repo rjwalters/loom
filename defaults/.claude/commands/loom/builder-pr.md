@@ -844,7 +844,17 @@ round-trip this step absorbs up front.
    A branch already pushed is pushed plain in merge mode — never forced.
 2. Re-run pre-flight (a new commit voids its receipt) and the targeted tests
    — a rebase can silently change behavior even when it resolves cleanly.
-3. **Version-bearing-file sync gate (#7168; moot after #7743)**: a clean rebase
+3. **Workflow-lint gate (#14156, as Doctor's #13896)**: the update above — and any
+   conflict resolution in it — can textually union two copies of one setup block,
+   leaving a touched workflow with a duplicate step `id` or mapping key. GitHub
+   then runs zero jobs and every rollup reads green. Lint every workflow your
+   branch touches before `git push`; a defect, or the lint being unable to run,
+   blocks the push (fail closed — silence is not a pass):
+   ```bash
+   WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files." >&2; exit 1; }
+   [ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — fix the defect; do not push." >&2; exit 1; }
+   ```
+4. **Version-bearing-file sync gate (#7168; moot after #7743)**: a clean rebase
    lands `origin/main`'s exact version values, so it never fires unless your
    branch carries its own version-bearing edit — revert it, never `version.sh bump`:
    ```bash
