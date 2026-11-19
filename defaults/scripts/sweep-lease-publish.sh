@@ -143,7 +143,10 @@ set -euo pipefail
 # Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
 # shellcheck source=lib/locate-daemon-bin.sh
 _lease_lib="$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
-if [[ -r "$_lease_lib" ]]; then source "$_lease_lib" && loom_select_lease_bin "$PWD" || true; fi
+LEASE_READ_API=(gh api)
+if [[ -r "$_lease_lib" ]]; then
+    source "$_lease_lib" && loom_select_lease_bin "$PWD" && loom_select_lease_read || true
+fi
 unset _lease_lib
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
@@ -385,11 +388,10 @@ cmd_publish() {
     # scan below for why a publish-side peer check needs the yield records
     # too (Issue #5331).
     local comments_ndjson read_ok=1
-    if ! comments_ndjson="$(gh api "repos/${repo_path}/issues/${issue}/comments" \
+    if ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
         --paginate --jq \
-        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}" \
-        2>&1)"; then
-        echo "WARN: could not read existing lease comments for issue #${issue} (${comments_ndjson}) -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
+        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}")"; then
+        echo "WARN: could not read existing lease comments for issue #${issue} -- publishing anyway (absence of evidence is not evidence of a peer)" >&2
         read_ok=0
         comments_ndjson=""
     fi

@@ -679,6 +679,16 @@ loom_select_lease_bin() {
     return 0
 }
 
+# Put the tools process's mode gate in front of the lease scripts' GETs.
+# A daemon or older tools binary keeps the script's existing read adapter.
+loom_select_lease_read() {
+    local bin="${LOOM_DAEMON_BIN:-loom-daemon}"
+    if [[ "${bin##*/}" == loom-tools ]] && "$bin" lease read --help > /dev/null 2>&1; then
+        # shellcheck disable=SC2034  # consumed by the three sweep-lease scripts
+        LEASE_READ_API=("$bin" lease read)
+    fi
+}
+
 # loom_tools_daemon_fallback_allowed -- 0 unless explicitly or session-disabled.
 loom_tools_daemon_fallback_allowed() {
     [[ "${LOOM_TOOLS_DAEMON_FALLBACK:-1}" == "0" ]] && return 1
