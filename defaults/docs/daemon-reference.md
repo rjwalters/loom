@@ -3481,14 +3481,15 @@ by `candidate_cmp`, with what the tick did with it:
 - **blocked** (held by something specific to the issue or repo): `parked` (with
   the label), `open_pr` (with the PR number), `dispatch_backoff`,
   `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
-  `prless_retry`, `peer_claim`, `recheck_interval`, `hard_exclusion`,
+  `prless_retry`, `lease_held`, `recheck_interval`, `hard_exclusion`,
   `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
   `main`, a gate in flight, a pre-flight or token-pool hold, or a drain;
   the row does not say which), `workspace_commands_missing`,
   `dispatch_error` (with the error text), `already_landed` (#11429: the issue
   is closed, or this host recorded a `landed` sweep for it in the last 30
   minutes; detail `forge_closed` or `journal_landed`), `already_closed`
-  (#11429: the issue is closed as not planned)
+  (#11429: the issue is closed as not planned). The `peer_claim` token was
+  replaced by `lease_held` when #13945 retired the peer-claim channel.
 
 Each disposition is recorded next to the `TickReport` counter it matches, so the
 rows and the counters agree. Issues dropped before the sort are still ranked by the same
