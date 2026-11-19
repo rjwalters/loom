@@ -805,9 +805,9 @@ fn test_invoke_per_role_effort_override_reaches_argv_body() {
 /// Issue #8054: the per-role log header reports the resolved effort and the
 /// tier that supplied it, alongside the pre-existing model fields — the surface
 /// the transcript-side cost telemetry (#8052/#8059) attributes a tick's spend
-/// to. Both the set and the unset rendering are pinned here.
+/// to. Cover both the configured service tier and the original unset shape.
 #[test]
-fn test_role_log_header_reports_model_and_effort_with_sources() {
+fn test_role_log_header_reports_configured_values_with_sources() {
     use crate::role_runner::model_resolution::role_log_header;
 
     let set = role_log_header(
@@ -817,12 +817,14 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "autonomous.roleRunner.roleModels.curator",
         "low",
         "autonomous.roleRunner.roleEfforts.curator",
+        Some(("flex", "autonomous.roleRunner.serviceTier")),
     );
     assert_eq!(
         set,
         "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=haiku \
          (source=autonomous.roleRunner.roleModels.curator) effort=low \
-         (source=autonomous.roleRunner.roleEfforts.curator) ===="
+         (source=autonomous.roleRunner.roleEfforts.curator) \
+         service_tier=flex (source=autonomous.roleRunner.serviceTier) ===="
     );
 
     // Unset effort renders as a NAME, not as `effort=` followed by nothing —
@@ -835,14 +837,13 @@ fn test_role_log_header_reports_model_and_effort_with_sources() {
         "default",
         "",
         UNSET_EFFORT_SOURCE,
+        None,
     );
-    assert!(
-        unset.contains("effort=<runtime CLI default> (source=unset)"),
-        "an unset effort must read like a name, not a bug: {unset}"
+    assert_eq!(
+        unset,
+        "==== loom-daemon role_runner: 2026-09-17T00:00:00+00:00 role=curator model=sonnet \
+         (source=default) effort=<runtime CLI default> (source=unset) ===="
     );
-    assert!(!unset.contains("effort= "), "never an empty rendered value: {unset}");
-    // The pre-#8054 model fields are untouched.
-    assert!(unset.contains("model=sonnet (source=default)"), "{unset}");
 }
 
 /// Issue #8054: the header is actually written to `role-<role>.log` by a real

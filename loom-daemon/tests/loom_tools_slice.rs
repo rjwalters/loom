@@ -769,6 +769,130 @@ fn mode_gate_follows_the_invocation_not_the_verb() {
     }
 }
 
+/// A recording `gh`: appends each argv to `gh.log` and answers an issue read
+/// with a parked body, anything else with `{}`. Returns the directory holding
+/// the `gh` shim (to put first on `PATH`) and the log path.
+fn recording_gh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("gh.log");
+    let issue = dir.join("issue.json");
+    let json = serde_json::json!({
+        "body": PARKED_BODY,
+        "labels": [{ "name": "loom:building" }],
+        "state": "open",
+    });
+    std::fs::write(&issue, json.to_string()).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n  \
+         *issues/7|*pulls/7) cat '{}';;\n  *) echo '{{}}';;\nesac\n",
+        log.display(),
+        issue.display()
+    );
+    let gh = bin.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// An unmanaged target (#9548) is read but never written, on every online form
+/// that can mutate, including the nested filing of `apply --new`: the write
+/// scope is checked before `create-issue.sh` runs, so a denied target gets no
+/// duplicate scan, no filing lock and no forge write. Asserted on the recorded
+/// `gh` argv, not on the exit code alone.
+#[test]
+fn a_denied_target_is_read_but_never_written_on_any_online_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (shim, log) = recording_gh(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", shim.display());
+    for (args, stdin) in [
+        (
+            vec![
+                "park-record",
+                "apply",
+                "--issue",
+                "7",
+                "--reason",
+                "operator",
+                "--repo",
+                "acme/widgets",
+                "--remove-label",
+                "loom:building",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "park-record",
+                "retract",
+                "--issue",
+                "7",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "r",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "7",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some(DECISION),
+        ),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "--new",
+                "--title",
+                "Ship or wait",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some(DECISION),
+        ),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        c.env("PATH", &path).args(&args);
+        let o = run(c, stdin);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(4), "{args:?}: {err}");
+        assert!(err.contains("#9548"), "{args:?} must name the write-scope refusal: {err}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        if !args.contains(&"--new") {
+            assert!(
+                calls
+                    .lines()
+                    .any(|call| call == "api repos/acme/widgets/issues/7"),
+                "{args:?} did not read the denied issue before the write was refused:\n{calls}"
+            );
+        }
+        for mutation in ["-X", "--input", "issue create", "issue edit"] {
+            assert!(
+                !calls.contains(mutation),
+                "{args:?} issued a forge mutation ({mutation}):\n{calls}"
+            );
+        }
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains("APPLIED=true"),
+            "{args:?} must not report a write"
+        );
+    }
+}
+
 /// `capabilities --json` lists exactly the nine served subcommands.
 #[test]
 fn capabilities_list_park_record_and_operator_decision() {
@@ -796,6 +920,9 @@ fn capabilities_list_park_record_and_operator_decision() {
         assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
     }
 }
+
+#[path = "loom_tools_slice/pr_lease.rs"]
+mod pr_lease;
 
 // ---- #14429: top-level reads and config inspection -------------------------
 //
