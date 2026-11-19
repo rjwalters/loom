@@ -333,3 +333,30 @@ fn an_unmanaged_owner_dir_is_reaped_but_an_empty_managed_list_reaps_nothing() {
     establish_cross_owner_credentials(&bare, &home, &managed, &minter);
     assert_eq!(minter.calls.get(), 0, "no cross owner, no mint");
 }
+
+/// A failed registry read leaves `managed` as only the root fallback: the
+/// no-plan arm must reap nothing, while the root-owner directory (independent
+/// of `managed`) is still reaped (#14450).
+#[test]
+#[serial_test::serial]
+fn a_failed_registry_read_reaps_no_unmanaged_owner_but_still_reaps_the_root_owner() {
+    let env = Env::new(&[]);
+    let _cache = ScratchCache::new(env.tmp.path());
+    let (home, gone) = (unique("home-"), unique("gone-"));
+    let home_repo = format!("{home}/loom");
+    let workspace = env.repo("ws", &[("origin", &format!("https://github.com/{home_repo}.git"))]);
+    let minter = ScriptedMinter::new(vec![minted()]);
+
+    let gone_dir = publish_owner_dir(&workspace, &gone);
+    let root_dir = publish_owner_dir(&workspace, &home);
+    let managed = vec![(workspace.clone(), home_repo)];
+    establish_cross_owner_credentials_with(&workspace, &home, &managed, false, &minter);
+    assert!(
+        gone_dir.join("hosts.yml").is_file(),
+        "unreadable registry: unmanaged owner kept"
+    );
+    assert!(!root_dir.exists(), "root-owner dir reaped regardless");
+
+    establish_cross_owner_credentials_with(&workspace, &home, &managed, true, &minter);
+    assert!(!gone_dir.exists(), "readable registry: unmanaged owner reaped");
+}

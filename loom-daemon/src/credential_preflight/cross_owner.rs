@@ -57,14 +57,28 @@ impl CrossOwnerPass {
 /// Every effective managed root of `workspace_root`'s registry, paired with
 /// the `owner/repo` its git remote names. Roots with no GitHub remote are
 /// dropped.
+///
+/// The `bool` is whether the registry was read: `false` means the read failed
+/// and the list is only the workspace-root fallback, so it is not
+/// authoritative about which owners are still managed (#14450).
 #[must_use]
-pub fn managed_roots(workspace_root: &Path) -> Vec<(PathBuf, String)> {
-    crate::workspace_registry::WorkspaceRegistry::load_default()
-        .unwrap_or_default()
+pub fn managed_roots(workspace_root: &Path) -> (Vec<(PathBuf, String)>, bool) {
+    let (registry, loaded) = match crate::workspace_registry::WorkspaceRegistry::load_default() {
+        Ok(registry) => (registry, true),
+        Err(e) => {
+            log::warn!(
+                "credential_preflight: workspace registry unreadable ({e:#}); not reaping \
+                 per-owner credentials for owners with no managed repo — #14450"
+            );
+            (Default::default(), false)
+        }
+    };
+    let managed = registry
         .effective_roots(workspace_root)
         .into_iter()
         .filter_map(|root| nwo_from_git_remote(&root).map(|nwo| (root, nwo)))
-        .collect()
+        .collect();
+    (managed, loaded)
 }
 
 /// [`establish_for_workspace`] on a blocking thread, for the refresh tick's
@@ -93,15 +107,16 @@ pub fn establish_for_workspace(
     root_owner_repo: &str,
     script_path: &Path,
 ) -> CrossOwnerPass {
-    let managed = managed_roots(workspace_root);
+    let (managed, registry_loaded) = managed_roots(workspace_root);
     let minter = RealGithubAppMinter {
         script_path: script_path.to_path_buf(),
         cwd: workspace_root.to_path_buf(),
     };
-    establish_cross_owner_credentials(
+    establish_cross_owner_credentials_with(
         workspace_root,
         owner_of_nwo(root_owner_repo),
         &managed,
+        registry_loaded,
         &minter,
     )
 }
@@ -120,9 +135,28 @@ pub fn establish_cross_owner_credentials(
     managed: &[(PathBuf, String)],
     minter: &dyn GithubAppMinter,
 ) -> CrossOwnerPass {
+    establish_cross_owner_credentials_with(workspace_root, root_owner, managed, true, minter)
+}
+
+/// [`establish_cross_owner_credentials`] with `managed_authoritative` false
+/// when `managed` came from a failed registry read (#14450): the reap then
+/// skips its no-plan arm, since `managed` is only the root fallback.
+pub fn establish_cross_owner_credentials_with(
+    workspace_root: &Path,
+    root_owner: &str,
+    managed: &[(PathBuf, String)],
+    managed_authoritative: bool,
+    minter: &dyn GithubAppMinter,
+) -> CrossOwnerPass {
     let mut pass = CrossOwnerPass::default();
     let plans = plan_cross_owner_credentials(root_owner, managed);
-    reap_stale_owner_credentials(workspace_root, root_owner, managed, &plans);
+    reap_stale_owner_credentials(
+        workspace_root,
+        root_owner,
+        managed,
+        managed_authoritative,
+        &plans,
+    );
     for plan in plans {
         let owner_dir = match gh_config_dir_for_owner_slug(&plan.representative_owner_repo) {
             Some(dir) => dir,
@@ -157,8 +191,8 @@ const OWNER_WRITER_FILES: [&str; 4] = ["hosts.yml", "hosts.yml.tmp", "config.yml
 /// - an owner equal to `root_owner` is stale in every root (the root owner's
 ///   repos ride the process-global credential, never a by-owner directory);
 /// - in the primary root, an owner with no plan (no managed repo left) is
-///   stale too, unless `managed` is empty, which is indistinguishable from a
-///   registry or remote read that failed and must not wipe live credentials.
+///   stale too, but only when `managed_authoritative` (the registry was read)
+///   and `managed` is non-empty: a failed read must not wipe live credentials.
 ///
 /// Only the writer files are removed, then the directory itself if that left
 /// it empty: a reader App's `<owner>/<app id>/` subdirectories, the live
@@ -168,6 +202,7 @@ fn reap_stale_owner_credentials(
     workspace_root: &Path,
     root_owner: &str,
     managed: &[(PathBuf, String)],
+    managed_authoritative: bool,
     plans: &[CrossOwnerCredentialPlan],
 ) {
     let mut roots: Vec<&Path> = vec![workspace_root];
@@ -194,8 +229,9 @@ fn reap_stale_owner_credentials(
             else {
                 continue;
             };
-            let stale = (!root_owner.is_empty() && owner == root_owner)
+            let stale = (!root_owner.is_empty() && owner.eq_ignore_ascii_case(root_owner))
                 || (is_primary
+                    && managed_authoritative
                     && !managed.is_empty()
                     && !plans.iter().any(|plan| plan.owner == owner));
             if stale {
