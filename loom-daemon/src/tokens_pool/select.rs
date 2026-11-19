@@ -426,8 +426,8 @@ pub fn spawnable_pool_state_any_class(workspace_root: &Path) -> SpawnablePoolSta
 ///
 /// [`SpawnablePoolState::dir`] is a **local absolute path**, so it is the
 /// wrong shape for any cross-host key — exactly the reason
-/// [`crate::peer_claims::ClaimAd::repo`] carries a
-/// [`crate::peer_claims::repo_slug`] rather than the workspace root. A path
+/// [`crate::host_identity::repo_slug`] exists rather than keying on the
+/// workspace root. A path
 /// key is wrong in *both* directions here:
 ///
 /// - **False negative.** Two hosts sharing the same accounts resolve

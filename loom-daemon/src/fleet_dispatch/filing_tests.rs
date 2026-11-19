@@ -176,7 +176,6 @@ fn the_filing_lock_layers_the_captain_over_the_host_lock_and_releases_both_in_re
             Duration::from_millis(100),
             Duration::from_millis(10),
             Duration::from_secs(300),
-            Duration::from_secs(60),
         )
     };
     let outcome =

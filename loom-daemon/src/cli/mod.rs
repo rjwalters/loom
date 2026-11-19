@@ -74,6 +74,25 @@ mod forge_parent_cmd;
 pub(crate) mod forge_probe_cmd;
 mod forge_read;
 pub use forge_read::{handle_forge_read_command, ForgeReadCli, EX_WRITE_VERB_NOT_MIGRATED};
+// #14429: the `loom-tools` bin (src/bin/loom_tools.rs) is a separate crate
+// and serves these top-level read and config-inspection commands through the
+// same handlers `loom-daemon` runs; the Args types and entry points are
+// re-exported for it alone.
+pub use affected_files_check::AffectedFilesCommand;
+pub use duplicate_scan::DuplicateScanArgs;
+pub use forge_inventory_cmd::{handle_forge_inventory_read_command, ForgeInventoryCommand};
+pub use forge_probe_cmd::{handle_forge_probe_read_command, ForgeProbeArgs};
+pub use guards_status::GuardsCommand;
+pub use hooks_home_cmd::HooksHomeArgs;
+pub use install_compat_cli::InstallCompatCommand;
+pub use label_duplicates::LabelDuplicatesArgs;
+pub use labels_cmd::{handle_labels_read_command, LabelsArgs};
+pub use points_marker_check::CheckPointsMarkerArgs;
+pub use pr_queue::PrQueueArgs;
+pub use premise_check::PremiseCheckArgs;
+pub use roles_draw_cmd::RolesCommand;
+pub use skip_labels::SkipLabelsArgs;
+pub use stale_blocked::StaleBlockedArgs;
 mod forge_verdict_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
@@ -91,7 +110,9 @@ pub(crate) mod labels_cmd;
 mod labels_migrate;
 mod labels_migrate_holds;
 mod labels_undeclared;
+mod lease_cli;
 pub(crate) mod lease_co_occupancy;
+pub use lease_cli::{handle_lease_command, LeaseCli};
 pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
@@ -148,7 +169,6 @@ pub(crate) mod orphan_replace;
 pub(crate) mod overlap_replay;
 mod park_record;
 pub use park_record::{handle_park_record_command, ParkRecordCli};
-pub mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
 mod points_marker_check;
 mod pr_latency_cmd;

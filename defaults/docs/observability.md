@@ -993,7 +993,7 @@ override for a stopped daemon or an opted-out reconciler.
 
 **Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
 `auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
-`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+and `main_health_gate` bypasses the `invoke github` span, so it
 reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
 operational check on a fleet host (shadow recipe above), not a CI check.
 

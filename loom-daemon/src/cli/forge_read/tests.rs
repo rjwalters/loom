@@ -109,7 +109,8 @@ fn the_write_verbs_are_refused_and_the_split_verbs_are_split() {
         (&["comment", "1", "--body", "x"][..], false),
         (&["create-issue", "--title", "t", "--body", "b"], false),
         (&["auto-merge", "1"], false),
-        (&["merge-queue", "enqueue", "1", "--approved-sha", "a"], false),
+        // #14520: the whole queue family is served.
+        (&["merge-queue", "enqueue", "1", "--approved-sha", "a"], true),
         (&["merge-queue", "status", "1"], true),
         (&["parent", "link", "--parent", "1", "--child", "2"], false),
         (&["parent", "split-state", "--parent", "1"], true),
@@ -136,6 +137,10 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
             let names: Vec<&str> = path.iter().map(String::as_str).collect();
             (names.join(" "), parse(&argv_for(&names, &cmd)))
         })
+        // The queue verbs are classified by the resolved `champion.mergeMode`
+        // (the environment decides, so they are pinned by
+        // `merge_queue_verbs_reach_the_forge_by_effect` with an injected mode).
+        .filter(|(name, _)| !name.starts_with("merge-queue "))
         .filter(|(_, cli)| cli.is_read() && !cli.reaches_forge())
         .map(|(name, _)| name)
         .collect();
@@ -149,4 +154,61 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
             "verdict-body-check"
         ]
     );
+}
+
+/// #14520: every queue verb is served, and the mode gate follows what the verb
+/// does in the resolved `champion.mergeMode`: `reconcile --mode-only` and the
+/// direct-mode `DIRECT` answers of `reconcile` and `step` never reach the
+/// forge; the verbs `write_target` vets, the queue-mode paths and the two
+/// mode-independent checks do.
+#[test]
+fn merge_queue_verbs_reach_the_forge_by_effect() {
+    use crate::cli::forge_action::ForgeAction;
+    use crate::forge_merge_queue::mode::{
+        MergeMode, MergeModeError, MergeModeSource, ResolvedMergeMode,
+    };
+
+    let sha = "a".repeat(40);
+    let direct: Result<ResolvedMergeMode, MergeModeError> = Ok(ResolvedMergeMode {
+        mode: MergeMode::Direct,
+        source: MergeModeSource::Default,
+    });
+    let queue: Result<ResolvedMergeMode, MergeModeError> = Ok(ResolvedMergeMode {
+        mode: MergeMode::Queue,
+        source: MergeModeSource::Config,
+    });
+    let invalid: Result<ResolvedMergeMode, MergeModeError> = Err(MergeModeError {
+        source: MergeModeSource::Config,
+        value: "\"queued\"".into(),
+    });
+    // (argv tail, reaches in direct, reaches in queue)
+    let table: Vec<(Vec<&str>, bool, bool)> = vec![
+        (vec!["mode"], true, true),
+        (vec!["preflight"], true, true),
+        (vec!["status", "7"], true, true),
+        // Vetted by `write_target` before the direct-mode refusal.
+        (vec!["enqueue", "7", "--approved-sha", &sha], true, true),
+        (vec!["dequeue", "7"], true, true),
+        (vec!["reconcile", "--pr", "7"], false, true),
+        (vec!["reconcile"], false, true),
+        (vec!["reconcile", "--mode-only"], false, false),
+        (vec!["handoff", "7", "--approved-sha", &sha], true, true),
+        (vec!["step", "7", "--approved-sha", &sha], false, true),
+        (vec!["revoke", "7"], true, true),
+        (vec!["group-check", "--commit", &sha], true, true),
+        (vec!["authorize-check", "7", "--pr-head", &sha], true, true),
+    ];
+    for (tail, in_direct, in_queue) in table {
+        let mut argv: Vec<String> = vec!["forge".into(), "merge-queue".into()];
+        argv.extend(tail.iter().map(|a| (*a).to_string()));
+        let cli = parse(&argv);
+        assert!(cli.is_read(), "{argv:?} must be served");
+        let ForgeAction::MergeQueue { action } = &cli.action else {
+            panic!("{argv:?}: not a merge-queue verb");
+        };
+        assert_eq!(action.0.reaches_forge(&direct), in_direct, "{argv:?} in direct mode");
+        assert_eq!(action.0.reaches_forge(&queue), in_queue, "{argv:?} in queue mode");
+        // An invalid mode is answered (exit 2) before anything is read.
+        assert!(!action.0.reaches_forge(&invalid), "{argv:?} with an invalid mode");
+    }
 }

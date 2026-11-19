@@ -13,8 +13,8 @@
 //!    ([`captain_claim`], #12450: a refusal ends here, with no forge call),
 //!    a Builder step's landed check ([`landed_at_spawn`],
 //!    #12251), then the role's resolvers, containment included;
-//! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
-//!    the pre-claim command;
+//! 3. **locked**: the sweep id, the item's lock, and the pre-claim
+//!    command;
 //! 4. **unlocked**: the pre-claim (non-Builder roles);
 //! 5. **locked**: the roll gate again (a roll may have paused spawns while the
 //!    lock was released), a Builder's claim flip and lease comment (the same
@@ -193,7 +193,6 @@ impl SweepRegistry {
                 drop(reg);
                 return Err(refuse(StepRefusal::new("claimed", format!("{e:#}"))));
             }
-            reg.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
             (role != StepRole::Builder && !config.skip_label_flip)
                 .then(|| reg.step_claim_command(item, role, &sweep_id))
         };
