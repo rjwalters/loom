@@ -2206,6 +2206,128 @@ fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
 
 #[test]
 #[serial]
+fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease() {
+    use crate::env_test_support::EnvGuard;
+    use crate::tokens_pool::{paths::SHARED_ACCOUNTS_ROOT_ENV, session_lifecycle};
+    use std::ffi::OsStr;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let _fork = super::tests::fork_guard();
+    let home = tempfile::tempdir().unwrap();
+    let _runtime_env = EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_PRIVATE_LEASE_FD",
+        "LOOM_SPAWN_NO_EXPORT",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ])
+    .and_set("HOME", Some(home.path().as_os_str()))
+    .and_set("GH_HOST", Some(OsStr::new("fixture.invalid")))
+    .and_set(SHARED_ACCOUNTS_ROOT_ENV, Some(OsStr::new("")))
+    .and_set("LOOM_CODEX_DEFAULT_HOME", Some(OsStr::new("")))
+    .and_set("LOOM_CODEX_SESSION_PROBE", Some(OsStr::new("0")));
+    let mut env = setup();
+    let root = env.workspace.path().to_path_buf();
+    let alice = env.config.clone();
+    let alice_dir = env.dir.clone();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    session_lifecycle::mark_session_managed(&alice.profile, &alice.container).unwrap();
+
+    let service = AccountLifecycle::new(&root, ProcessCodexRunner).unwrap();
+    service
+        .import_with_email("bob", &alice.profile.join("auth.json"), None)
+        .unwrap();
+    env.account = account_inventory(&root, AccountProvider::Codex)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id.name == "bob")
+        .unwrap();
+    env.config.account = "bob".into();
+    env.config.container = container_name("bob");
+    env.config.volume = "loom-codex-workspace-bob".into();
+    env.config.profile = env.account.credential_reference.canonicalize().unwrap();
+    env.dir = state_dir(&env.config.profile).unwrap();
+    std::fs::create_dir_all(&env.dir).unwrap();
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    session_lifecycle::mark_session_managed(&env.config.profile, &env.config.container).unwrap();
+    for name in bundle::PROFILE_CONTROLS {
+        std::fs::copy(alice.profile.join(name), env.config.profile.join(name)).unwrap();
+    }
+    env.seed_volume();
+    env.seed_container(OTHER_ID, true);
+
+    for (profile, weekly) in [(&alice.profile, 5), (&env.config.profile, 30)] {
+        let sessions = profile.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let line = json!({"rate_limits": {"secondary": {
+            "used_percent": weekly, "window_minutes": 10_080, "resets_in_seconds": 400_000,
+        }}});
+        std::fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+    }
+    crate::test_git_helpers::run(&root, &["init", "-q"]);
+    crate::test_git_helpers::run(&root, &["remote", "add", "origin", &alice.repository]);
+    let runtimes = root.join(".loom/runtimes");
+    std::fs::create_dir_all(&runtimes).unwrap();
+    save(&runtimes.join("codex.json"), &json!({"accountProvider": "codex"})).unwrap();
+
+    let reserve = |issue, owner| {
+        dispatch::Selection::prepare_idle(&root, None, JobKind::Sweep, Some(issue), owner, false)
+            .unwrap()
+            .unwrap()
+    };
+    // Advance the cursor past Alice with a real locked draw. The next draw
+    // would still favor Alice on usage, independent of the cursor.
+    let preferred = reserve(6, "unheld-control");
+    assert_eq!(preferred.name, "alice");
+    drop(preferred);
+    let busy = super::tests::reacquire(&alice_dir);
+
+    env.with(|e| e.profile = env.config.profile.clone());
+    let next = reserve(7, "busy-favorite");
+    assert_eq!(next.name, "bob");
+    assert_eq!(next.lease().unwrap().dir, env.dir);
+    let job = lease::read(&env.dir).unwrap().unwrap();
+    assert_eq!(job.owner, "busy-favorite");
+    assert_eq!(job.issue, Some(7));
+    assert_eq!(job.container_id, OTHER_ID);
+    assert_eq!(job.base_revision, "a".repeat(40));
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .env_clear()
+        .arg("-c")
+        .arg(concat!(
+            "test -e \"/dev/fd/${LOOM_PRIVATE_LEASE_FD:?}\" || exit 3; ",
+            "printf '%s\\n' \"$LOOM_ACCOUNT_NAME\"; read -r release || :",
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    next.apply(&mut command);
+    let mut child = command.spawn().unwrap();
+    next.spawned();
+    drop(next);
+    let mut name = String::new();
+    let read = BufReader::new(child.stdout.take().unwrap()).read_line(&mut name);
+    let held_by_child = lease::Lease::acquire(&env.dir)
+        .err()
+        .is_some_and(|error| error.is::<lease::AccountBusy>());
+    drop(child.stdin.take());
+    let exit = child.wait().unwrap();
+    assert!(read.is_ok() && exit.success());
+    assert_eq!(name.trim_end(), "bob");
+    assert!(held_by_child, "the child must retain Bob's lease");
+    drop(super::tests::reacquire(&env.dir));
+    drop(busy);
+}
+
+#[test]
+#[serial]
 fn concurrent_judge_draws_share_one_idle_seat() {
     use crate::runtime_preference::{
         resolve_runtime_contained, role_draw, Decision, DispatchContext, Intent,
