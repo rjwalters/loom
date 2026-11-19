@@ -750,6 +750,21 @@ async fn handle_client(
             continue;
         }
 
+        // GetPrimaryWorkspaceRoot (#14534) needs `fallback_root`, the root the
+        // daemon registered as its primary at startup, which the synchronous
+        // `handle_request` dispatcher does not receive. A managed-workspace
+        // list is deliberately not consulted: its order does not say which
+        // root the credential refresh publishes into.
+        if matches!(request, Request::GetPrimaryWorkspaceRoot) {
+            let response = Response::PrimaryWorkspaceRoot {
+                path: fallback_root.display().to_string(),
+            };
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
         // DaemonStatus (Issue #3891) is handled here rather than in the
         // synchronous `handle_request` dispatcher because it reads the per-repo
         // `health_states` halt flags, which the dispatcher does not receive.
@@ -2392,6 +2407,12 @@ fn handle_request(
 ) -> Response {
     match request {
         Request::Ping => Response::Pong,
+
+        // Structurally unreachable: `handle_client` answers it from
+        // `fallback_root` before dispatching here (#14534).
+        Request::GetPrimaryWorkspaceRoot => Response::Error {
+            message: "GetPrimaryWorkspaceRoot is answered by handle_client".into(),
+        },
 
         Request::CreateTerminal {
             config_id,

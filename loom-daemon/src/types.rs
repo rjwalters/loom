@@ -19,6 +19,13 @@ pub type SweepId = String;
 #[serde(tag = "type", content = "payload")]
 pub enum Request {
     Ping,
+    /// Ask the daemon for the absolute path of its primary workspace root
+    /// (#14534): the directory where the credential refresh publishes every
+    /// owner's App `GH_CONFIG_DIR`. A CLI process launched outside the unit
+    /// has neither `LOOM_MACHINE_CHECKOUT` nor the in-process registration, so
+    /// it asks here instead of requiring an exported variable. Answered
+    /// with [`Response::PrimaryWorkspaceRoot`]; carries only the path.
+    GetPrimaryWorkspaceRoot,
     CreateTerminal {
         config_id: String,
         name: String,
@@ -579,6 +586,11 @@ pub enum Request {
 #[serde(tag = "type", content = "payload")]
 pub enum Response {
     Pong,
+    /// Result of [`Request::GetPrimaryWorkspaceRoot`] (#14534): the daemon's
+    /// absolute primary workspace root, and nothing else.
+    PrimaryWorkspaceRoot {
+        path: String,
+    },
     TerminalCreated {
         id: TerminalId,
     },

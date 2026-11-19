@@ -1136,6 +1136,9 @@ fn session_recover_publish_without_a_github_credential_is_refused_before_exec() 
     let text = message(&error);
     assert!(text.contains("no GitHub write credential"), "{text}");
     assert!(text.contains("GH_TOKEN") && text.contains("gh-config-by-owner"), "{text}");
+    // #14534: the export is an override, not the normal route.
+    assert!(text.contains("override"), "{text}");
+    assert!(!text.contains("set LOOM_MACHINE_CHECKOUT to that root"), "{text}");
     assert_eq!(recover_calls(&env), 0, "refused before any exec");
 
     // Listing pushes nothing: it still reaches the worker (both clones).
