@@ -290,7 +290,7 @@ pub(crate) fn handle_session_command(
             println!(
                 "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
                 status.config.account,
-                if status.running { "running" } else { "stopped" },
+                status.state_label(),
                 status.workspace_mode,
                 status.private_root,
                 status.config.volume,

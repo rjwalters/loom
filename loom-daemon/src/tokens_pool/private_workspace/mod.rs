@@ -218,12 +218,26 @@ pub struct Status {
     /// Also under `config.extra_mounts`; empty without the setting.
     pub extra_mounts: Vec<ExtraMount>,
     pub running: bool,
+    /// An operator hold on this seat's private profile, even if still running.
+    pub held: bool,
     pub lease: Option<lease::Job>,
     /// Secret-free containment-admission provenance for the CURRENT job
     /// (#8787), so `session status` reports what an execution-specific
     /// admission actually relied on. Absent on every ordinary session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<serde_json::Value>,
+}
+
+impl Status {
+    pub(crate) fn state_label(&self) -> &'static str {
+        if self.running {
+            "running"
+        } else if self.held {
+            "stopped, held (operator stop)"
+        } else {
+            "stopped"
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::Args)]
