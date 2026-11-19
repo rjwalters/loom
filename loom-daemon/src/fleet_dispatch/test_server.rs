@@ -12,30 +12,34 @@ use serde_json::Value;
 
 type Handler = dyn Fn(&str, &Value) -> (u16, Value) + Send + Sync;
 
-/// Ports handed out by [`TestServer::dead_url`]. `start()`/`silent()` refuse to
-/// bind them, so a released "dead" port cannot be re-issued by the OS to a
-/// later server in the same process and silently bring the dead URL back to
-/// life (#14601, #14610).
+/// Ports handed out by [`TestServer::dead_url`]. `start()` and `silent()`
+/// discard any listener the OS assigns to a recorded port before serving
+/// connections (#14601, #14610).
 static DEAD_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
 
 fn dead_ports() -> &'static Mutex<HashSet<u16>> {
     DEAD_PORTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Bind a fresh loopback port, retrying `127.0.0.1:0` while `rejected` says
-/// the drawn port is unavailable.
-fn bind_excluding(rejected: impl Fn(u16) -> bool) -> TcpListener {
+/// Keep drawing candidates until one has an available port.
+fn bind_excluding<T>(mut draw: impl FnMut() -> (u16, T), rejected: impl Fn(u16) -> bool) -> T {
     loop {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        if !rejected(listener.local_addr().unwrap().port()) {
-            return listener;
+        let (port, candidate) = draw();
+        if !rejected(port) {
+            return candidate;
         }
     }
 }
 
 /// Bind a fresh loopback port that is not a recorded dead port.
 fn bind_live() -> TcpListener {
-    bind_excluding(|port| dead_ports().lock().unwrap().contains(&port))
+    bind_excluding(
+        || {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            (listener.local_addr().unwrap().port(), listener)
+        },
+        |port| dead_ports().lock().unwrap().contains(&port),
+    )
 }
 
 /// One recorded request: its path and JSON body.
@@ -81,17 +85,14 @@ impl TestServer {
 
     /// A loopback URL nothing listens on.
     ///
-    /// The port is released back to the OS ephemeral pool and recorded in a
-    /// process-global set that [`TestServer::start`] and [`TestServer::silent`]
-    /// refuse to bind: without that guard a later server in the same process
-    /// can be handed this exact port, the "dead" URL comes back to life, and a
-    /// call the test expects to fail silently succeeds — surfacing much later
-    /// at an unrelated assertion (#14601, fixed for one test in #14605).
+    /// Record the port before releasing the listener so another test server
+    /// drawing that port finds it in the registry. Without the check, a dead
+    /// URL can point at a later server in the same process (#14601, #14605).
     pub fn dead_url() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        drop(listener);
         dead_ports().lock().unwrap().insert(addr.port());
+        drop(listener);
         format!("http://{addr}")
     }
 
@@ -166,11 +167,13 @@ mod tests {
 
     #[test]
     fn bind_excluding_retries_rejected_ports() {
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let listener =
-            bind_excluding(|_| attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
-        assert!(listener.local_addr().unwrap().is_ipv4());
+        let mut candidates = [(1, "first"), (2, "second"), (3, "third"), (4, "fourth")].into_iter();
+        let selected = bind_excluding(
+            || candidates.next().expect("expected at most four candidates"),
+            |port| port < 4,
+        );
+        assert_eq!(selected, "fourth");
+        assert_eq!(candidates.next(), None);
     }
 
     #[test]
