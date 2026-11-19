@@ -427,7 +427,7 @@ of:
 
 1. Its mtime is older than the retention window (below).
 2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
-   lock, no `.loom/spawn-loop-state.json` entry).
+   lock).
 3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
    sweep (even one not currently running) keeps its log regardless of age.
 
@@ -445,6 +445,17 @@ LOOM_LOGS_RETENTION_DAYS=14 loom-clean --dry-run
 A non-positive or unparseable value at either tier is treated as absent (falls
 through to the next tier), never as "disable retention" — a config typo can
 never silently turn this pass into a no-op.
+
+**Step logs are excluded by default (#14177).** Per-step logs
+`step-<role>-<item>.log` (the durable `LOOM_STEP_OUTCOME` history) carry no
+`issue-` in their name and are never removed by this pass unless
+`LOOM_STEP_LOG_REQUIRE_ARCHIVE=1` is set. With the gate on, a step log is
+deleted — together with its `<log>.archived` sidecar, written by the off-host
+preserver only after a checksum-confirmed store put — only when it is past the
+retention window, its item has no live sweep and no sweep checkpoint, and its
+last dispatch attempt wrote a terminal outcome line. See
+*Daily-rolling `daemon.log`* → "Step-log archive gate" in
+[`daemon-reference.md`](daemon-reference.md).
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
@@ -2394,14 +2405,10 @@ coordination problems, not a general-purpose external-mutex library):
   scheduled" half of the pattern above, which is exactly why a resource nobody
   else ever tries to (re-)claim can stay stale-held indefinitely under this
   model alone.
-- `PeerClaimView` (`loom-daemon/src/peer_claims.rs`) is the scheduled-reaper
-  half: it expires a peer's soft claim once local receipt time exceeds a fixed
-  TTL since the *last* observed heartbeat ad (`is_claimed_at` /
-  `claimed_issues_at`), and a periodic re-advertisement
-  (`sweep_registry::readvertise_peer_claims`) refreshes that clock well inside
-  the TTL for a still-live holder — see the module doc comment's "TTL is
-  measured against LOCAL receipt, never the advertiser's clock" section for why
-  wall-clock skew across hosts rules out comparing timestamps directly.
+- The scheduled-reaper half is now the forge lease record
+  ([`lease-record.md`](lease-record.md)): a lease expires by its own
+  forge-assigned `updated_at`, and a still-live holder renews it. (The safehouse
+  peer-claim soft claim that once played this role was retired in #13945.)
 
 **Prior art establishing this as Loom's actual mitigation pattern** (both
 resolved without a kill-time hook, because none is available):

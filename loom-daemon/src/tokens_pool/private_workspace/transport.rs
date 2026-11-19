@@ -243,6 +243,10 @@ fn authorize_unleased(
 /// so the step ends `refused claim_lost` on its own claim. Without
 /// `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` it cannot know the dispatch already
 /// published and renews that lease, and tries to publish a second one.
+/// `LOOM_LEASE_PUBLISH_HOSTNAME` must agree with `LOOM_LEASE_HOST_ID`
+/// (#13998): a host that opts into raw publishing has its daemon publish
+/// `host=<raw>`, and a session without the opt-in derives the opaque id
+/// instead — it would read its own lease as a peer's (fails closed).
 ///
 /// The four `GIT_*` names are the commit identity. The session image has no
 /// global git config and the private clone no local one, so without them
@@ -257,6 +261,7 @@ const FORWARDED_CONTEXT: &[&str] = &[
     "LOOM_SWEEP_CLAIM_OWNED",
     "LOOM_SWEEP_LEASE_RENEW_DISPATCHED",
     "LOOM_LEASE_HOST_ID",
+    "LOOM_LEASE_PUBLISH_HOSTNAME",
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
@@ -343,6 +348,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "sweep-7".into(),
@@ -400,6 +407,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "step-builder-20-1".into(),
@@ -417,6 +426,7 @@ mod tests {
             "LOOM_SWEEP_CLAIM_OWNED=20",
             "LOOM_SWEEP_LEASE_RENEW_DISPATCHED=20",
             "LOOM_LEASE_HOST_ID=fleet-host-7",
+            "LOOM_LEASE_PUBLISH_HOSTNAME=1",
             "GIT_AUTHOR_NAME=fleet-bot[bot]",
             "GIT_AUTHOR_EMAIL=1+fleet-bot[bot]@users.noreply.example.invalid",
             "GIT_COMMITTER_NAME=fleet-bot[bot]",
@@ -463,6 +473,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let id = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -504,6 +516,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     }
 
@@ -640,6 +654,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "o".into(),

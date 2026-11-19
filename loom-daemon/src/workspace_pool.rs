@@ -53,23 +53,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::event_bus::EventBus;
-use crate::peer_claims::{self, ClaimAd, PeerClaimView};
-use crate::safehouse::{self, InboundEventSink, PeerClaimSink};
+use crate::safehouse::{self, CompletedAd, CompletionSink, CompletionView, InboundEventSink};
 use crate::sweep_registry::{self, host_identity, SweepRegistry, SweepRegistryConfig};
 
-/// The daemon-wide safehouse peer-claim coordination context (Issue #4028): one
-/// shared inbound view + one outbound publisher + the single coordination task
-/// that bridges them to the room. Created lazily by
-/// [`WorkspacePool::start_peer_coordination`] when `safehouse.enabled` is true;
-/// every provisioned registry gets clones of the publisher + view so a soft
-/// claim advertised by any repo's dispatch reaches the room and every repo's
-/// work-finder sees peer claims. `None` ⇒ byte-for-byte no-op.
-struct PeerCoordination {
+/// The daemon-wide safehouse completion-dedup context (Issue #6352): one shared
+/// inbound view + one outbound publisher + the single task that bridges them to
+/// the room. Created lazily by [`WorkspacePool::start_completion_dedup`] when
+/// `safehouse.enabled` is true; the narration sink reads both to dedup
+/// public-feed completions fleet-wide. `None` ⇒ per-host-only dedup.
+struct CompletionDedup {
     /// Bounded, non-blocking outbound channel to the coordination task.
-    publisher: tokio::sync::mpsc::Sender<ClaimAd>,
-    /// The shared inbound view the coordination task feeds and every
-    /// dispatcher queries.
-    view: Arc<Mutex<PeerClaimView>>,
+    publisher: tokio::sync::mpsc::Sender<CompletedAd>,
+    /// The shared inbound view the coordination task feeds.
+    view: Arc<Mutex<CompletionView>>,
     /// The coordination task handle, kept alive for the daemon's lifetime.
     _task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -101,14 +97,13 @@ pub struct WorkspacePool {
     /// dedicated OS thread.
     runtime: tokio::runtime::Handle,
     inner: Mutex<HashMap<PathBuf, PooledRegistry>>,
-    /// The daemon-wide safehouse peer-claim coordination context (Issue #4028),
-    /// or `None` when `safehouse.enabled` is false. Set once by
-    /// [`start_peer_coordination`](Self::start_peer_coordination); injected into
-    /// every registry [`get_or_provision`](Self::get_or_provision) builds.
-    peer_coord: Mutex<Option<PeerCoordination>>,
+    /// The daemon-wide completion-dedup context (Issue #6352), or `None` when
+    /// `safehouse.enabled` is false. Set once by
+    /// [`start_completion_dedup`](Self::start_completion_dedup).
+    completion_dedup: Mutex<Option<CompletionDedup>>,
     /// The daemon-wide live safehouse connection-state cell (Issue #4345),
     /// updated by both [`start_safehouse_narration`](Self::start_safehouse_narration)'s
-    /// sink and [`start_peer_coordination`](Self::start_peer_coordination)'s
+    /// sink and [`start_completion_dedup`](Self::start_completion_dedup)'s
     /// coordination task. Read back by [`safehouse_status`](Self::safehouse_status)
     /// for `loom-daemon status` — see `crate::safehouse::SafehouseState`.
     safehouse_state: safehouse::SharedSafehouseState,
@@ -123,7 +118,7 @@ impl WorkspacePool {
             event_bus,
             runtime,
             inner: Mutex::new(HashMap::new()),
-            peer_coord: Mutex::new(None),
+            completion_dedup: Mutex::new(None),
             safehouse_state: safehouse::new_shared_state(),
         }
     }
@@ -148,19 +143,17 @@ impl WorkspacePool {
     /// which is exactly the key `safehouse::RoomRouter` routes firehose traffic
     /// by. So one sink resolving `safehouse.rooms` once (from `repo_root`, the
     /// daemon's default workspace, the same layer that already owns socket /
-    /// persona / peer-claim TTL) routes **every** managed repo correctly, and no
+    /// persona) routes **every** managed repo correctly, and no
     /// per-workspace sink or per-repo config resolution is introduced.
     ///
     /// **Fleet-wide completion dedup (Issue #6352).** If
-    /// [`start_peer_coordination`](Self::start_peer_coordination) has already
-    /// established peer-claim coordination for this pool (it MUST be called
-    /// first — `daemon_service::run` does so), its publisher + view are
-    /// reused to build a [`crate::safehouse::PeerCompletionHandle`] so the
-    /// narration sink can consult/announce completions fleet-wide over the
-    /// same channel dispatch already uses for soft claims. Called before
-    /// coordination is established (or with `safehouse.enabled` false), this
-    /// is `None` — the narration sink then falls back to its pre-#6352
-    /// per-host-only dedup, byte-for-byte.
+    /// [`start_completion_dedup`](Self::start_completion_dedup) has already
+    /// established the dedup connection for this pool (it MUST be called first —
+    /// `daemon_service::run` does so), its publisher + view are used to build a
+    /// [`crate::safehouse::PeerCompletionHandle`] so the narration sink can
+    /// consult/announce completions fleet-wide. Called before it is established
+    /// (or with `safehouse.enabled` false), this is `None` — the narration sink
+    /// then falls back to per-host-only dedup.
     pub fn start_safehouse_narration(
         &self,
         repo_root: &Path,
@@ -179,7 +172,7 @@ impl WorkspacePool {
         let config = crate::safehouse::resolve_config(repo_root);
         let peer_completions = {
             let slot = self
-                .peer_coord
+                .completion_dedup
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.as_ref().map(|coord| {
@@ -208,83 +201,42 @@ impl WorkspacePool {
         safehouse::snapshot_state(&self.safehouse_state).to_status()
     }
 
-    /// Snapshot the daemon-wide peer-claim view + transport counters (Issue
-    /// #5921) for `loom-daemon status` / `loom-daemon peer-claims`. `None`
-    /// when [`start_peer_coordination`](Self::start_peer_coordination) has
-    /// never established coordination (`safehouse.enabled` false, or enabled
-    /// with no socket ever resolving) — mirrored honestly here rather than as
-    /// an empty-but-present view, matching the same "no view attached"
-    /// condition [`SweepRegistry::peer_claimed_issues`](crate::sweep_registry::SweepRegistry::peer_claimed_issues)
-    /// already treats identically.
-    #[must_use]
-    pub fn peer_claim_status(&self) -> Option<crate::types::PeerClaimStatus> {
-        let slot = self
-            .peer_coord
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let coord = slot.as_ref()?;
-        let view = coord
-            .view
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(view.to_status(std::time::Instant::now()))
-    }
-
-    /// Start the daemon-wide safehouse **peer-claim coordination** (Issue #4028)
-    /// keyed off `repo_root`'s config. Creates the shared inbound
-    /// [`PeerClaimView`], the bounded outbound advertiser channel, and the single
-    /// coordination task that bridges them to the room, then stores them so every
-    /// registry [`get_or_provision`](Self::get_or_provision) builds — and the
-    /// seeded default registry via [`inject_peer_coordination`](Self::inject_peer_coordination)
-    /// — advertises and consumes soft claims.
+    /// Start the daemon-wide safehouse **completion dedup** (Issue #6352) keyed
+    /// off `repo_root`'s config: creates the shared inbound [`CompletionView`],
+    /// the bounded outbound channel, and the single task that bridges them to the
+    /// room, then stores them for [`start_safehouse_narration`](Self::start_safehouse_narration).
     ///
-    /// **Byte-for-byte no-op** when `safehouse.enabled` is false/absent: no view,
-    /// no channel, no task, no socket. Idempotent — a second call is a no-op once
-    /// coordination is established.
-    pub fn start_peer_coordination(&self, repo_root: &Path) {
+    /// **No-op** when `safehouse.enabled` is false/absent: no view, no channel,
+    /// no task, no socket. Idempotent — a second call is a no-op once the dedup
+    /// is established.
+    pub fn start_completion_dedup(&self, repo_root: &Path) {
         // #5822: same repo_root-mismatch caveat as `start_safehouse_narration`
         // above — this resolves `.loom-local/local.json` against `repo_root` as
         // received, not against wherever an operator happens to have edited it.
         log::info!(
-            "workspace_pool: peer-claim coordination resolving config against repo_root={}",
+            "workspace_pool: completion dedup resolving config against repo_root={}",
             repo_root.display()
         );
         let config = safehouse::resolve_config(repo_root);
         if !config.enabled {
             // Mirrors spawn_sink's own disabled handling — set here too since
-            // this early return means spawn_peer_coordination (which would
+            // this early return means spawn_completion_dedup (which would
             // otherwise set it) is never reached (#4345).
             safehouse::set_not_configured(&self.safehouse_state);
-            return; // disabled ⇒ no coordination, byte-for-byte no-op
+            return; // disabled ⇒ byte-for-byte no-op
         }
         let mut slot = self
-            .peer_coord
+            .completion_dedup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.is_some() {
             return; // already established
         }
-        let ttl = peer_claims::resolve_peer_claim_ttl(repo_root);
-        let mut inner_view = PeerClaimView::new(host_identity(), ttl);
-        // Issue #6242: capture the resolved claims-room identity now, while
-        // `config` is still in scope, so `loom-daemon status`/`health` can
-        // render it and a two-host room mismatch becomes a one-line diff.
-        inner_view.set_claims_room(config.claims_room().map(str::to_owned));
-        // Issue #6352: the fleet-wide completion-narration dedup TTL —
-        // deliberately resolved and set independently of the dispatch-claim
-        // `ttl` above (see `PeerClaimView::completion_ttl`'s doc comment for
-        // why the two must differ).
-        let completion_ttl = peer_claims::resolve_peer_completion_ttl(repo_root);
-        inner_view.set_completion_ttl(completion_ttl);
-        // Issue #8026: how recently this host must have advertised for its own
-        // receive-quiet verdict to carry weight. Env-only (no config key) —
-        // resolved here so a host with a deliberately slow reaper can widen it
-        // without recompiling.
-        inner_view.set_advertise_activity_window(peer_claims::resolve_advertise_activity_window());
-        let view = Arc::new(Mutex::new(inner_view));
-        let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(safehouse::PEER_CLAIM_CHANNEL_CAP);
-        let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
-        let task = safehouse::spawn_peer_coordination(
+        let completion_ttl = safehouse::resolve_completion_ttl(repo_root);
+        let view = Arc::new(Mutex::new(CompletionView::new(host_identity(), completion_ttl)));
+        let (tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(safehouse::COMPLETION_CHANNEL_CAP);
+        let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view.clone()));
+        let task = safehouse::spawn_completion_dedup(
             config,
             sink,
             rx,
@@ -292,43 +244,20 @@ impl WorkspacePool {
             self.safehouse_state.clone(),
         );
         if task.is_none() {
-            // Enabled but no socket resolved: leave coordination unestablished so
-            // registries stay in the no-op path (the outbound sender would have
-            // no consumer). spawn_peer_coordination already logged the reason.
+            // Enabled but no socket resolved: leave it unestablished (the
+            // outbound sender would have no consumer). spawn_completion_dedup
+            // already logged the reason.
             return;
         }
         log::info!(
-            "workspace_pool: safehouse peer-claim coordination started (ttl={}s, completion_ttl={}s)",
-            ttl.as_secs(),
+            "workspace_pool: safehouse completion dedup started (completion_ttl={}s)",
             completion_ttl.as_secs()
         );
-        // Issue #6157 used to also publish this view process-globally here
-        // so `claim_reconciliation`'s reclamation pass could freeze reclaim
-        // while peer-coordination looked DEGRADED. Epic #6165 Phase 4
-        // (#6317) removed that consultation — the lease record (Phase 2,
-        // #6286) is the sole fleet-scoped reclamation gate now — so there is
-        // no longer any cross-module consumer for a process-global handle.
-        *slot = Some(PeerCoordination {
+        *slot = Some(CompletionDedup {
             publisher: tx,
             view,
             _task: task,
         });
-    }
-
-    /// Inject the peer-claim publisher + view into `registry` when coordination
-    /// is established (Issue #4028). A no-op when `safehouse.enabled` is false, so
-    /// a registry with no coordination behaves byte-for-byte as before. Called by
-    /// [`get_or_provision`](Self::get_or_provision) and by `main.rs` for the
-    /// seeded default registry.
-    pub fn inject_peer_coordination(&self, registry: &mut SweepRegistry) {
-        let slot = self
-            .peer_coord
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(coord) = slot.as_ref() {
-            registry.set_peer_claim_publisher(coord.publisher.clone());
-            registry.set_peer_claims(coord.view.clone());
-        }
     }
 
     /// Seed the pool with a pre-built registry for `root` — used for the default
@@ -423,10 +352,6 @@ impl WorkspacePool {
         // enabled, a confirmed pre-flip collision now backs off the dispatch
         // instead of only recording it.
         registry.set_collision_detection(sweep_registry::resolve_collision_detection(root));
-        // Cross-host soft claim (#4028): attach the shared peer-claim publisher +
-        // view when safehouse coordination is established. A no-op otherwise.
-        self.inject_peer_coordination(&mut registry);
-
         let arc = Arc::new(Mutex::new(registry));
         // Spawn the reaper and watchdog on the shared daemon runtime
         // regardless of which thread we are called from (the epic supervisor
@@ -664,8 +589,8 @@ mod tests {
             "LOOM_SAFEHOUSE_ROOMS_BY_REPO",
             "LOOM_SAFEHOUSE_PERSONA",
             "SAFEHOUSED_SOCKET",
-            // #4713/#6242: the peer-claim-coordination-only room override —
-            // same leak risk as the others above.
+            // Retired claims-room override (#13945) — still cleared so an
+            // ambient value cannot trigger the leftover-key warning.
             "LOOM_SAFEHOUSE_ROOM_CLAIMS",
         ] {
             std::env::remove_var(key);
@@ -846,7 +771,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn start_peer_coordination_disabled_reports_not_configured_even_after_prior_state() {
+    async fn start_completion_dedup_disabled_reports_not_configured_even_after_prior_state() {
         clear_safehouse_env();
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
@@ -872,132 +797,13 @@ mod tests {
         }
         assert_eq!(status.state, "unreachable", "precondition: cell must be non-default");
 
-        // Now disable and re-resolve via the peer-coordination entry point's
+        // Now disable and re-resolve via the completion-dedup entry point's
         // own disabled fast path (which returns before ever calling
-        // spawn_peer_coordination — the code path #4345 had to patch
+        // spawn_completion_dedup — the code path #4345 had to patch
         // explicitly).
         write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
-        pool.start_peer_coordination(&root);
+        pool.start_completion_dedup(&root);
         assert_eq!(pool.safehouse_status().state, "not_configured");
-    }
-
-    // ---- peer-claim status (Issue #5921) ----
-
-    /// Before any [`WorkspacePool::start_peer_coordination`] call — and
-    /// (#5921's target case) after one that resolved to `safehouse.enabled:
-    /// false` and so never established coordination — `peer_claim_status`
-    /// must read `None`, never an empty-but-present view. This is the exact
-    /// condition `DaemonStatusReport::peer_claims` documents as "no view
-    /// attached", which `loom-daemon status`/`peer-claims` render as "not
-    /// configured" rather than a misleading empty table.
-    #[tokio::test]
-    async fn peer_claim_status_is_none_before_coordination_established() {
-        let pool = pool();
-        assert!(pool.peer_claim_status().is_none());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn peer_claim_status_stays_none_when_coordination_is_disabled() {
-        clear_safehouse_env();
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
-        let pool = pool();
-
-        pool.start_peer_coordination(&root);
-        assert!(pool.peer_claim_status().is_none());
-    }
-
-    // ---- claims-room visibility (Issue #6242) ----
-
-    /// `start_peer_coordination` must capture `SafehouseConfig::claims_room()`
-    /// and thread it all the way to `peer_claim_status()` — the "no cross-host
-    /// comparison, visibility only" AC's whole mechanism.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn peer_claim_status_carries_the_explicit_claims_room() {
-        clear_safehouse_env();
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let socket = dir.path().join("safehoused.sock");
-        write_config(
-            &root,
-            &format!(
-                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"claims": "!claims:example.org"}}}}}}"#,
-                socket.display().to_string()
-            ),
-        );
-        let pool = pool();
-
-        pool.start_peer_coordination(&root);
-        let status = pool.peer_claim_status().expect("coordination established");
-        assert_eq!(status.claims_room.as_deref(), Some("!claims:example.org"));
-    }
-
-    /// `rooms.claims` unset ⇒ `claims_room()` falls back to the signal room
-    /// (#4713's chain) — the captured value must still render that fallback,
-    /// not `None`, since coordination genuinely joined a room.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn peer_claim_status_falls_back_to_signal_room_when_claims_room_unset() {
-        clear_safehouse_env();
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let socket = dir.path().join("safehoused.sock");
-        write_config(
-            &root,
-            &format!(
-                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"signal": "!signal:example.org"}}}}}}"#,
-                socket.display().to_string()
-            ),
-        );
-        let pool = pool();
-
-        pool.start_peer_coordination(&root);
-        let status = pool.peer_claim_status().expect("coordination established");
-        assert_eq!(status.claims_room.as_deref(), Some("!signal:example.org"));
-    }
-
-    /// `LOOM_SAFEHOUSE_ROOM_CLAIMS` must win over `rooms.claims` in config —
-    /// the same env-over-config precedence every other safehouse knob honors.
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn peer_claim_status_honors_claims_room_env_override() {
-        clear_safehouse_env();
-        std::env::set_var("LOOM_SAFEHOUSE_ROOM_CLAIMS", "!env-claims:example.org");
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        let socket = dir.path().join("safehoused.sock");
-        write_config(
-            &root,
-            &format!(
-                r#"{{"safehouse": {{"enabled": true, "socket": {:?}, "rooms": {{"claims": "!config-claims:example.org"}}}}}}"#,
-                socket.display().to_string()
-            ),
-        );
-        let pool = pool();
-
-        pool.start_peer_coordination(&root);
-        let status = pool.peer_claim_status().expect("coordination established");
-        std::env::remove_var("LOOM_SAFEHOUSE_ROOM_CLAIMS");
-        assert_eq!(status.claims_room.as_deref(), Some("!env-claims:example.org"));
-    }
-
-    /// Safehouse disabled entirely ⇒ coordination is never established ⇒
-    /// `peer_claim_status()` is `None` — `claims_room` must never render as
-    /// an empty string standing in for "not configured".
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn peer_claim_status_is_none_not_empty_string_when_safehouse_disabled() {
-        clear_safehouse_env();
-        let dir = tempdir().unwrap();
-        let root = dir.path().to_path_buf();
-        write_config(&root, r#"{"safehouse": {"enabled": false}}"#);
-        let pool = pool();
-
-        pool.start_peer_coordination(&root);
-        assert!(pool.peer_claim_status().is_none());
     }
 
     #[tokio::test]
@@ -1286,10 +1092,7 @@ mod tests {
             .into_iter()
             .filter(|i| {
                 matches!(i.kind, crate::types::SweepKind::Issue(n) if n == 999_001)
-                    && matches!(
-                        i.state,
-                        crate::types::SweepState::Running | crate::types::SweepState::Pending
-                    )
+                    && matches!(i.state, crate::types::SweepState::Running)
             })
             .map(|i| i.sweep_id)
             .collect();

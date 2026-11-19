@@ -146,6 +146,10 @@ loud startup banner names the active mode, the canary confirmation source, and,
 in `experiment`, the arm assigned to each issue. `.loom/stats/` and `.loom/CANARY`
 are gitignored.
 
+**Comparing whole role mixes** (per-role model/provider/effort, bounces, cost) rather than the
+Builder arm: [`role-mix-comparison.md`](role-mix-comparison.md) (`sweep-outcomes summary
+--group-by mix`, #14067).
+
 **Harvesting the evidence:**
 
 ```bash

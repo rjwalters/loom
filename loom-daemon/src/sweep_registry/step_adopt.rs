@@ -36,7 +36,6 @@ impl SweepRegistry {
         sweep_id: &str,
         started_at: DateTime<Utc>,
     ) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         // The step's end, as the reaper runs it for a step it saw die
         // (#11906): its listed leases reaped (a Judge's no-verdict record
         // included, and the lease file removed), its capture emitted.
@@ -158,7 +157,6 @@ impl SweepRegistry {
                     effort: owner.effort.clone(),
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
-                    overflow: owner.overflow,
                 },
             );
             crate::observability::lifecycle::execution_adopted(

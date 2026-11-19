@@ -383,7 +383,6 @@ fn routing_config() -> SafehouseConfig {
             by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                 .into_iter()
                 .collect(),
-            claims: None,
             alerts: None,
         }),
         ..SafehouseConfig::default()
@@ -394,11 +393,7 @@ fn routing_config() -> SafehouseConfig {
 /// every envelope of every kind resolves to the single configured `room`,
 /// exactly as before — including the `None` "let safehoused resolve its sole
 /// room" form, which must still serialize with no `room` key at all.
-///
-/// Also covers #4713: with no `rooms` map (and so no `rooms.claims`),
-/// [`SafehouseConfig::claims_room`] must resolve to the exact same single
-/// `room` — the claim-ad routing path must be byte-identical to pre-#4713
-/// behavior too, not just the narration path.
+
 #[test]
 fn absent_rooms_map_is_byte_identical_single_room_behavior() {
     for room in [Some("loom-fleet".to_owned()), None] {
@@ -408,11 +403,6 @@ fn absent_rooms_map_is_byte_identical_single_room_behavior() {
             ..SafehouseConfig::default()
         };
         assert!(!cfg.routes_by_attention());
-        assert_eq!(
-            cfg.claims_room(),
-            room.as_deref(),
-            "with no rooms map, claim ads must resolve to the same single room as narration"
-        );
         let router = RoomRouter::new(&cfg);
         for kind in KNOWN_TYPES {
             for repo in [Some("/home/x/GitHub/vibesql"), None] {
@@ -449,7 +439,6 @@ fn signal_room_falls_back_to_the_legacy_room_key() {
             by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                 .into_iter()
                 .collect(),
-            claims: None,
             alerts: None,
         }),
         ..SafehouseConfig::default()
@@ -462,85 +451,6 @@ fn signal_room_falls_back_to_the_legacy_room_key() {
     );
     // …and `rooms.signal`, when set, wins over the legacy scalar.
     assert_eq!(routing_config().signal_room(), Some("!signal:example.org"));
-}
-
-/// #4713: `claims_room()` falls back to `signal_room()` — which itself may
-/// fall back further to the legacy scalar `room` — when `rooms.claims` is
-/// absent, mirroring `signal_room`'s own fallback chain one level down.
-#[test]
-fn claims_room_falls_back_to_signal_room_when_absent() {
-    // rooms.claims absent, rooms.signal present ⇒ claims_room is the signal room.
-    let cfg = routing_config();
-    assert!(cfg.rooms.as_ref().unwrap().claims.is_none());
-    assert_eq!(cfg.claims_room(), Some("!signal:example.org"));
-    assert_eq!(cfg.claims_room(), cfg.signal_room());
-
-    // rooms.claims present ⇒ it wins over the signal room.
-    let cfg_with_claims = SafehouseConfig {
-        rooms: Some(RoomMap {
-            claims: Some("!claims:example.org".to_owned()),
-            alerts: None,
-            ..cfg.rooms.clone().unwrap()
-        }),
-        ..cfg
-    };
-    assert_eq!(cfg_with_claims.claims_room(), Some("!claims:example.org"));
-    assert_eq!(
-        cfg_with_claims.signal_room(),
-        Some("!signal:example.org"),
-        "narration routing (signal_room) must be unaffected by rooms.claims"
-    );
-
-    // No rooms map at all ⇒ claims_room falls all the way back to the
-    // legacy scalar `room`, exactly like `signal_room` does.
-    let legacy = SafehouseConfig {
-        enabled: true,
-        room: Some("!legacy:example.org".to_owned()),
-        ..SafehouseConfig::default()
-    };
-    assert_eq!(legacy.claims_room(), Some("!legacy:example.org"));
-}
-
-/// #4713's "opt-in, default-unchanged" contract, claims-only edition:
-/// setting `rooms.claims` **alone** (no `signal`, no `byRepo`) redirects
-/// the peer-claim coordination connection and nothing else. Narration must
-/// stay in single-room mode — byte-identical to the absent-map case —
-/// rather than silently activating attention-class routing (per-repo lazy
-/// firehose creation) as a side effect of an unrelated knob.
-#[test]
-fn claims_only_map_does_not_activate_attention_class_narration_routing() {
-    for room in [Some("loom-fleet".to_owned()), None] {
-        let cfg = SafehouseConfig {
-            enabled: true,
-            room: room.clone(),
-            rooms: Some(RoomMap {
-                signal: None,
-                by_repo: std::collections::BTreeMap::new(),
-                claims: Some("!claims:example.org".to_owned()),
-                alerts: None,
-            }),
-            ..SafehouseConfig::default()
-        };
-        // The claims knob works…
-        assert_eq!(cfg.claims_room(), Some("!claims:example.org"));
-        // …and narration routing does not notice it.
-        assert!(
-            !cfg.routes_by_attention(),
-            "a claims-only rooms map must not enable attention-class narration routing"
-        );
-        let router = RoomRouter::new(&cfg);
-        assert_eq!(router.signal_room(), room.clone());
-        for kind in KNOWN_TYPES {
-            for repo in [Some("/home/x/GitHub/vibesql"), None] {
-                assert_eq!(
-                    router.resolve(kind, repo),
-                    RoomDecision::Send(room.clone()),
-                    "claims-only map: {kind:?} (repo={repo:?}) must stay in \
-                         single-room mode, never Create a firehose room"
-                );
-            }
-        }
-    }
 }
 
 #[test]
@@ -634,7 +544,6 @@ fn firehose_without_a_repo_degrades_to_signal_rather_than_inventing_a_room() {
             by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                 .into_iter()
                 .collect(),
-            claims: None,
             alerts: None,
         }),
         ..SafehouseConfig::default()
@@ -683,8 +592,7 @@ fn config_parses_the_rooms_map() {
         "enabled": true,
         "rooms": {
             "signal": "!signal:example.org",
-            "byRepo": {"loom": "!fleet-loom:example.org", "vibesql": "!fleet-vibesql:example.org"},
-            "claims": "!claims:example.org"
+            "byRepo": {"loom": "!fleet-loom:example.org", "vibesql": "!fleet-vibesql:example.org"}
         }
     });
     let cfg = config_from_value(Some(&block));
@@ -695,32 +603,50 @@ fn config_parses_the_rooms_map() {
         rooms.by_repo.get("vibesql").map(String::as_str),
         Some("!fleet-vibesql:example.org")
     );
-    assert_eq!(rooms.claims.as_deref(), Some("!claims:example.org"));
 }
 
-/// #4713: `rooms.claims` parses independently of `rooms.signal`/`byRepo` —
-/// an operator can set only the claims room and leave narration routing
-/// entirely on the legacy single-room scalar.
+/// #13945: a config still carrying the retired claims-room keys starts cleanly
+/// — they parse to nothing — and is named once in a warning.
 #[test]
-fn config_parses_the_rooms_claims_field_alone() {
+fn leftover_claims_room_keys_parse_to_nothing_and_are_named() {
     let block = json!({
         "enabled": true,
         "room": "loom-fleet",
+        "peerClaimTtlSecs": 90,
+        "peerCompletionTtlSecs": 3600,
         "rooms": {"claims": "!claims:example.org"}
     });
     let cfg = config_from_value(Some(&block));
-    assert_eq!(cfg.claims_room(), Some("!claims:example.org"));
-    assert_eq!(
-        cfg.signal_room(),
-        Some("loom-fleet"),
-        "narration keeps using the legacy scalar room when only rooms.claims is set"
-    );
-    let rooms = cfg
-        .rooms
-        .expect("rooms.claims alone must still produce a non-empty map");
-    assert!(rooms.signal.is_none());
-    assert!(rooms.by_repo.is_empty());
-    assert_eq!(rooms.claims.as_deref(), Some("!claims:example.org"));
+    assert!(cfg.rooms.is_none(), "rooms.claims alone no longer produces a map");
+    assert_eq!(cfg.signal_room(), Some("loom-fleet"));
+
+    let keys = retired_claims_keys(Some(&block), |_| false);
+    assert_eq!(keys, ["safehouse.rooms.claims", "safehouse.peerClaimTtlSecs"]);
+
+    // The completion TTL still has a consumer, so it is not retired.
+    let live = json!({"enabled": true, "peerCompletionTtlSecs": 3600});
+    assert!(retired_claims_keys(Some(&live), |_| false).is_empty());
+    assert!(retired_claims_keys(None, |_| false).is_empty());
+
+    // The retired env vars are named too.
+    let env_keys = retired_claims_keys(None, |name| name == "LOOM_SAFEHOUSE_ROOM_CLAIMS");
+    assert_eq!(env_keys, ["LOOM_SAFEHOUSE_ROOM_CLAIMS"]);
+}
+
+/// #13945: "exactly one warning" — however many times the config is
+/// re-resolved, the leftover-key warning is emitted once.
+#[test]
+fn the_leftover_key_warning_is_emitted_exactly_once() {
+    let once = std::sync::Once::new();
+    let keys = vec!["safehouse.rooms.claims".to_owned()];
+    assert!(warn_retired_claims_keys_once(&once, &keys), "the first call warns");
+    assert!(!warn_retired_claims_keys_once(&once, &keys), "a repeat does not");
+    assert!(!warn_retired_claims_keys_once(&once, &keys));
+
+    // Nothing leftover ⇒ nothing emitted, and the one-shot stays unspent.
+    let fresh = std::sync::Once::new();
+    assert!(!warn_retired_claims_keys_once(&fresh, &[]));
+    assert!(warn_retired_claims_keys_once(&fresh, &keys));
 }
 
 #[test]
@@ -750,15 +676,13 @@ fn config_without_a_rooms_map_stays_in_single_room_mode() {
 #[serial]
 fn env_overrides_config_for_the_rooms_map() {
     std::env::set_var(ROOM_SIGNAL_ENV, "!env-signal:example.org");
-    std::env::set_var(ROOM_CLAIMS_ENV, "!env-claims:example.org");
     std::env::set_var(ROOMS_BY_REPO_ENV, "loom=!env-loom:example.org, anvil=!env-anvil:x");
 
     let cfg = apply_env_overrides(config_from_value(Some(&json!({
         "enabled": true,
         "rooms": {
             "signal": "!cfg-signal:example.org",
-            "byRepo": {"loom": "!cfg-loom:example.org", "vibesql": "!cfg-vibesql:example.org"},
-            "claims": "!cfg-claims:example.org"
+            "byRepo": {"loom": "!cfg-loom:example.org", "vibesql": "!cfg-vibesql:example.org"}
         }
     }))));
     let rooms = cfg.rooms.expect("env must keep the map present");
@@ -769,10 +693,8 @@ fn env_overrides_config_for_the_rooms_map() {
         !rooms.by_repo.contains_key("vibesql"),
         "the byRepo env override replaces the whole map rather than merging into it"
     );
-    assert_eq!(rooms.claims.as_deref(), Some("!env-claims:example.org"));
 
     std::env::remove_var(ROOM_SIGNAL_ENV);
-    std::env::remove_var(ROOM_CLAIMS_ENV);
     std::env::remove_var(ROOMS_BY_REPO_ENV);
 }
 
@@ -783,8 +705,7 @@ fn env_alone_can_enable_routing_and_absent_env_changes_nothing() {
     // loom-daemon dogfooding host sets this permanently in its process
     // environment, and `signal_room()` falls back to the legacy scalar
     // `room` field (populated from this env var by `apply_env_overrides`)
-    // whenever `rooms.signal` is unset — exactly the state the
-    // `rooms.claims`-alone assertion below exercises. Save/clear it for the
+    // whenever `rooms.signal` is unset. Save/clear it for the
     // duration of this test and restore whatever the host had on exit
     // (even on panic), the same guard-on-Drop idiom `SafehouseTestPaths`
     // uses above for a similar ambient-state hazard.
@@ -806,17 +727,6 @@ fn env_alone_can_enable_routing_and_absent_env_changes_nothing() {
     assert_eq!(cfg.signal_room(), Some("!env-signal:example.org"));
     std::env::remove_var(ROOM_SIGNAL_ENV);
 
-    // `LOOM_SAFEHOUSE_ROOM_CLAIMS` alone (#4713) is likewise enough to
-    // enable routing from env, with no `rooms.signal` present at all.
-    std::env::set_var(ROOM_CLAIMS_ENV, "!env-claims:example.org");
-    let cfg = apply_env_overrides(config_from_value(Some(&json!({"enabled": true}))));
-    assert_eq!(cfg.claims_room(), Some("!env-claims:example.org"));
-    assert!(
-        cfg.signal_room().is_none(),
-        "rooms.claims alone must not affect the (unset) signal room"
-    );
-    std::env::remove_var(ROOM_CLAIMS_ENV);
-
     // Neither env var set ⇒ the config layer's map is returned untouched, so
     // the absent-map single-room default stays byte-identical. `LOOM_SAFEHOUSE_ROOM`
     // itself is cleared for the whole test above, so `room` precedence here is
@@ -830,11 +740,6 @@ fn env_alone_can_enable_routing_and_absent_env_changes_nothing() {
         config_from_value(Some(&json!({"enabled": true, "room": "loom-fleet"}))).signal_room(),
         Some("loom-fleet"),
         "with no rooms map the signal room IS the legacy scalar room"
-    );
-    assert_eq!(
-        config_from_value(Some(&json!({"enabled": true, "room": "loom-fleet"}))).claims_room(),
-        Some("loom-fleet"),
-        "with no rooms map the claims room IS also the legacy scalar room"
     );
 
     // A garbage byRepo env value degrades to the pairs it can parse (here:
@@ -2006,7 +1911,6 @@ async fn run_sink_routes_by_attention_class_and_creates_the_repo_room_lazily() {
             rooms: Some(RoomMap {
                 signal: Some("!signal:example.org".to_owned()),
                 by_repo: std::collections::BTreeMap::new(),
-                claims: None,
                 alerts: None,
             }),
             ..SafehouseConfig::default()
@@ -3229,12 +3133,12 @@ fn peer_completion_handle_with_view(
     self_host: &str,
 ) -> (
     PeerCompletionHandle,
-    Arc<Mutex<PeerClaimView>>,
-    tokio::sync::mpsc::Receiver<ClaimAd>,
+    Arc<Mutex<CompletionView>>,
+    tokio::sync::mpsc::Receiver<CompletedAd>,
 ) {
     let view =
-        Arc::new(Mutex::new(PeerClaimView::new(self_host.to_owned(), Duration::from_secs(3600))));
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
+        Arc::new(Mutex::new(CompletionView::new(self_host.to_owned(), Duration::from_secs(3600))));
+    let (tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(8);
     (PeerCompletionHandle::new(tx, view.clone()), view, rx)
 }
 
@@ -3270,9 +3174,8 @@ async fn build_and_narrate_completion_publishes_a_completed_ad_after_narrating()
     let ad = rx
         .try_recv()
         .expect("a Completed ad must have been published");
-    assert_eq!(ad.kind, crate::peer_claims::ClaimKind::Completed);
     assert_eq!(ad.issue, 4426);
-    assert_eq!(ad.repo, crate::peer_claims::repo_slug(dir.path()));
+    assert_eq!(ad.repo, crate::host_identity::repo_slug(dir.path()));
     assert!(rx.try_recv().is_err(), "exactly one Completed ad per narrated completion");
 }
 
@@ -3291,15 +3194,15 @@ async fn build_and_narrate_completion_suppresses_when_a_peer_already_narrated() 
 
     let root = dir.path().to_string_lossy().into_owned();
     let (handle, view, _rx) = peer_completion_handle_with_view("host-b");
-    let repo_key = crate::peer_claims::repo_slug(dir.path());
+    let repo_key = crate::host_identity::repo_slug(dir.path());
     {
         let mut v = view.lock().unwrap();
-        v.observe_completion_at(
+        v.observe_at(
             // PR #4400 matches `MERGED_PR_JSON`'s merged-PR number — the
             // dedup key is now `(repo, issue, pr)` (Issue #6062), so the
             // peer ad must name the same PR `fetch_merged_pr` will
             // discover for this suppression to actually engage.
-            &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
+            &CompletedAd::new(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
             Instant::now(),
         );
     }
@@ -3350,8 +3253,8 @@ async fn build_and_narrate_completion_suppresses_when_a_peer_already_narrated() 
 /// exactly one completion envelope fleet-wide. Mirrors
 /// `reconcile_recent_merges_skips_a_merge_already_narrated_in_sweep`
 /// above, but across two INDEPENDENT dedup states (separate
-/// `already_narrated` sets, separate `PeerClaimView`s) connected only by
-/// manually relaying the outbound `ClaimAd` — simulating the room —
+/// `already_narrated` sets, separate `CompletionView`s) connected only by
+/// manually relaying the outbound `CompletedAd` — simulating the room —
 /// rather than sharing one process-local set.
 #[tokio::test]
 #[serial]
@@ -3395,7 +3298,7 @@ async fn two_hosts_build_on_a_merge_on_b_produce_exactly_one_completion_envelope
     let (handle_b, view_b, _rx_b) = peer_completion_handle_with_view("host-b");
     {
         let mut v = view_b.lock().unwrap();
-        v.observe_completion_at(&ad, Instant::now());
+        v.observe_at(&ad, Instant::now());
     }
     let mut completed_b = std::collections::HashSet::new();
     let reconciled_b = reconcile_merges_unwatermarked(
@@ -3440,15 +3343,15 @@ async fn a_suppressed_completion_never_re_publishes_its_own_completed_ad() {
     let root = dir.path().to_string_lossy().into_owned();
 
     let (handle, view, mut rx) = peer_completion_handle_with_view("host-b");
-    let repo_key = crate::peer_claims::repo_slug(dir.path());
+    let repo_key = crate::host_identity::repo_slug(dir.path());
     {
         let mut v = view.lock().unwrap();
-        v.observe_completion_at(
+        v.observe_at(
             // PR #4400 matches `MERGED_PR_JSON`'s merged-PR number — the
             // dedup key is now `(repo, issue, pr)` (Issue #6062), so the
             // peer ad must name the same PR `fetch_merged_pr` will
             // discover for this suppression to actually engage.
-            &ClaimAd::completed(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
+            &CompletedAd::new(4426, repo_key, "host-a".into(), 1, "ts".into(), 4400),
             Instant::now(),
         );
     }
@@ -4603,43 +4506,40 @@ async fn reconnects_after_mid_run_disconnect() {
     let _ = tokio::time::timeout(Duration::from_secs(2), sink).await;
 }
 
-// ---- peer-claim coordination (#4028) ----
+// ---- completion dedup (#6352; the surviving remnant of #4028's claims room) ----
 
 #[test]
-fn claim_ad_serializes_to_a_valid_task_envelope() {
+fn completion_ad_serializes_to_a_valid_task_envelope() {
     // Envelope-validity AC: the advertisement must serialize to a `type`
     // within KNOWN_TYPES, asserted against build_send_request so a
     // rejected-by-safehoused envelope fails at test time, not runtime.
-    let ad = ClaimAd::advertise(4028, "loom".into(), "maple".into(), 7, "ts".into());
-    let env = claim_ad_to_envelope(&ad);
+    let ad = CompletedAd::new(6352, "loom".into(), "maple".into(), 7, "ts".into(), 42);
+    let env = completion_ad_to_envelope(&ad);
     assert_eq!(env.kind, "task");
     assert!(KNOWN_TYPES.contains(&env.kind.as_str()));
-    // A claim ad carries no thread key: safehoused threads by `task_id`, and a
-    // bare issue number threaded unrelated ads together.
+    // The ad carries no thread key: safehoused threads by `task_id`.
     assert_eq!(env.task_id, None);
 
     let req = build_send_request(&env, 1, Some("fleet")).unwrap();
     assert_eq!(req["type"], json!("task"));
     assert!(req.get("task_id").is_none(), "no task_id key on the wire: {req}");
-    // The body round-trips back to the same claim on the receive side.
+    // The body round-trips back to the same ad on the receive side.
     let body = req["body"].as_str().unwrap();
-    assert_eq!(ClaimAd::from_body_str(body), Some(ad));
+    assert_eq!(CompletedAd::from_body_str(body), Some(ad));
 }
 
 #[test]
-fn peer_claim_sink_reads_envelope_body_from_safehoused_push_shape() {
+fn completion_sink_reads_envelope_body_from_safehoused_push_shape() {
     // #6249 regression: this push line is derived from safehoused's actual
     // dispatch format (`main.rs` `on_message` builds
     // `json!({"event":"message", ..., "envelope": env})`, and its `Envelope`
     // serde shape carries the message text as `body`, with `kind` renamed to
-    // `type`) — NOT from the sink's expectation. The sink previously read
-    // only a top-level `body` that this shape never carries, so every
-    // cross-host claim was silently dropped (`received=0` fleet-wide).
-    let ad = ClaimAd::advertise(6249, "loom".into(), "peer-host".into(), 7, "ts".into());
+    // `type`) — NOT from the sink's expectation.
+    let ad = CompletedAd::new(6249, "loom".into(), "peer-host".into(), 7, "ts".into(), 9);
     let push = json!({
         "event": "message",
         "room_id": "!x:example.org",
-        "room_name": "loom-claims",
+        "room_name": "loom-fleet",
         "sender": "@bot:example.org",
         "event_id": "$e",
         "envelope": {
@@ -4652,66 +4552,65 @@ fn peer_claim_sink_reads_envelope_body_from_safehoused_push_shape() {
         },
     });
 
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
-    let sink = PeerClaimSink::new(view.clone());
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(120))));
+    let sink = CompletionSink::new(view.clone());
     sink.on_event(&push);
 
     assert!(
         view.lock()
             .unwrap()
-            .is_claimed_at("loom", 6249, Instant::now()),
-        "claim carried in envelope.body must fold into the PeerClaimView"
+            .is_narrated_at("loom", 6249, 9, Instant::now()),
+        "a completion carried in envelope.body must fold into the CompletionView"
     );
 }
 
 #[test]
-fn peer_claim_sink_still_reads_legacy_top_level_body() {
+fn completion_sink_still_reads_legacy_top_level_body() {
     // #6249 fallback: a flat `{"event":"message","body":...}` line (any
     // legacy emitter of the pre-envelope shape) must keep parsing.
-    let ad = ClaimAd::advertise(6250, "loom".into(), "peer-host".into(), 7, "ts".into());
+    let ad = CompletedAd::new(6250, "loom".into(), "peer-host".into(), 7, "ts".into(), 3);
     let push = json!({
         "event": "message",
         "from": "loom_daemon",
         "body": ad.to_body_json(),
     });
 
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
-    let sink = PeerClaimSink::new(view.clone());
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(120))));
+    let sink = CompletionSink::new(view.clone());
     sink.on_event(&push);
 
     assert!(
         view.lock()
             .unwrap()
-            .is_claimed_at("loom", 6250, Instant::now()),
-        "claim carried in a legacy top-level body must still fold into the view"
+            .is_narrated_at("loom", 6250, 3, Instant::now()),
+        "a completion carried in a legacy top-level body must still fold into the view"
     );
 }
 
 #[tokio::test]
-async fn disabled_config_spawns_no_coordination_task() {
-    // Byte-for-byte no-op AC: safehouse.enabled=false ⇒ no coordination task
-    // and no socket.
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
-    let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
-    let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(1);
+async fn disabled_config_spawns_no_completion_task() {
+    // No-op AC: safehouse.enabled=false ⇒ no dedup task and no socket.
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(1))));
+    let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view));
+    let (_tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(1);
     let state = new_shared_state();
-    let handle = spawn_peer_coordination(
+    let handle = spawn_completion_dedup(
         SafehouseConfig::default(), // disabled
         sink,
         rx,
         &tokio::runtime::Handle::current(),
         state.clone(),
     );
-    assert!(handle.is_none(), "disabled ⇒ no coordination task");
+    assert!(handle.is_none(), "disabled ⇒ no dedup task");
     // #4345: disabled must report as "not configured".
     assert_eq!(snapshot_state(&state), SafehouseState::NotConfigured);
 }
 
 #[tokio::test]
-async fn idle_daemon_still_reads_inbound_peer_ad() {
-    // The core regression Gap 1a exists to fix: a daemon that emits NOTHING
-    // must still observe an inbound peer advertisement. A read_reply-piggyback
-    // implementation only reads while sending, so it would never see this.
+async fn idle_daemon_still_reads_an_inbound_peer_completion() {
+    // A daemon that emits NOTHING must still hear a peer's completion ad. A
+    // read_reply-piggyback implementation only reads while sending, so it would
+    // never see this.
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -4727,10 +4626,10 @@ async fn idle_daemon_still_reads_inbound_peer_ad() {
             .write_all(b"{\"ok\":true,\"id\":0}\n")
             .await
             .unwrap();
-        // Unprompted inbound room event carrying a peer claim — the client
+        // Unprompted inbound room event carrying a peer completion — the client
         // sends nothing.
-        let claim = ClaimAd::advertise(4028, "loom".into(), "peer".into(), 5, "ts".into());
-        let push = json!({"event": "message", "from": "loom_daemon", "body": claim.to_body_json()});
+        let ad = CompletedAd::new(4028, "loom".into(), "peer".into(), 5, "ts".into(), 11);
+        let push = json!({"event": "message", "from": "loom_daemon", "body": ad.to_body_json()});
         write_half
             .write_all(format!("{push}\n").as_bytes())
             .await
@@ -4739,9 +4638,9 @@ async fn idle_daemon_still_reads_inbound_peer_ad() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
 
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
-    let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view.clone()));
-    let (_tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8); // held → task stays alive; never send (idle)
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(120))));
+    let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view.clone()));
+    let (_tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(8); // held → task stays alive; never send (idle)
 
     let state = new_shared_state();
     let task = tokio::spawn(run_coordination(
@@ -4758,22 +4657,21 @@ async fn idle_daemon_still_reads_inbound_peer_ad() {
         state.clone(),
     ));
 
-    // Poll the view for the claim (bounded condition-poll, not a fixed
-    // ordering sleep).
+    // Poll the view (bounded condition-poll, not a fixed ordering sleep).
     let mut seen = false;
     for _ in 0..50 {
         if view
             .lock()
             .unwrap()
-            .is_claimed_at("loom", 4028, Instant::now())
+            .is_narrated_at("loom", 4028, 11, Instant::now())
         {
             seen = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(seen, "an idle daemon must still observe the inbound peer claim (Gap 1a)");
-    // #4345: a live, idle coordination connection must report Connected.
+    assert!(seen, "an idle daemon must still observe the inbound peer completion");
+    // #4345: a live, idle connection must report Connected.
     match snapshot_state(&state) {
         SafehouseState::Connected { socket: s, .. } => assert_eq!(s, socket),
         other => panic!("expected Connected, got {other:?}"),
@@ -4782,14 +4680,13 @@ async fn idle_daemon_still_reads_inbound_peer_ad() {
     task.abort();
 }
 
-/// #4225's resolved open question: claim ads are per-repo `task` chatter, but
-/// they are advertised into the **signal room** as a deliberate exception —
-/// it is the only room every host's bot is guaranteed to be joined to, and
-/// cross-host dedup is a correctness property (see `run_coordination`'s doc
-/// comment). The reader is trivially consistent with that choice because it
-/// consumes any inbound claim regardless of room.
+/// #4225's resolved open question: completion ads are per-repo `task` chatter,
+/// but they are advertised into the **signal room** as a deliberate exception —
+/// it is the only room every host's bot is guaranteed to be joined to (see
+/// `run_coordination`'s doc comment). The reader is trivially consistent with
+/// that choice because it consumes any inbound ad regardless of room.
 #[tokio::test]
-async fn coordination_advertises_claim_ads_into_the_signal_room() {
+async fn coordination_advertises_completion_ads_into_the_signal_room() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("safehoused.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -4814,9 +4711,10 @@ async fn coordination_advertises_claim_ads_into_the_signal_room() {
         ad
     });
 
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
-    let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(120))));
+    let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view));
+    let (tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(8);
+    let state = new_shared_state();
 
     let task = tokio::spawn(run_coordination(
         SafehouseConfig {
@@ -4831,83 +4729,6 @@ async fn coordination_advertises_claim_ads_into_the_signal_room() {
                 by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
                     .into_iter()
                     .collect(),
-                claims: None,
-                alerts: None,
-            }),
-            ..SafehouseConfig::default()
-        },
-        socket,
-        sink,
-        rx,
-        Duration::from_millis(20),
-        Duration::from_millis(80),
-        new_shared_state(),
-    ));
-
-    tx.send(ClaimAd::advertise(4225, "loom".into(), "maple".into(), 7, "ts".into()))
-        .await
-        .unwrap();
-
-    let ad = tokio::time::timeout(Duration::from_secs(2), server)
-        .await
-        .expect("the stub must receive the claim ad")
-        .unwrap();
-    assert_eq!(ad["op"], json!("send"));
-    assert_eq!(ad["type"], json!("task"));
-    assert_eq!(
-        ad["room"],
-        json!("!signal:example.org"),
-        "claim ads ride the signal room, NOT the repo firehose (documented exception)"
-    );
-    task.abort();
-}
-
-/// #4713: when `rooms.claims` is configured, claim ads route into that
-/// dedicated coordination room instead of the signal room — the opt-in
-/// escape hatch `run_coordination`'s doc comment describes. The signal room
-/// stays reserved for sweep-lifecycle narration.
-#[tokio::test]
-async fn coordination_advertises_claim_ads_into_a_dedicated_claims_room_when_configured() {
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("safehoused.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let (read_half, mut write_half) = stream.into_split();
-        let mut lines = BufReader::new(read_half).lines();
-        let hello: Value =
-            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        assert_eq!(hello["op"], json!("hello"));
-        write_half
-            .write_all(b"{\"ok\":true,\"id\":0}\n")
-            .await
-            .unwrap();
-        let ad: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
-        let reply = json!({"ok": true, "id": ad["id"].clone()});
-        write_half
-            .write_all(format!("{reply}\n").as_bytes())
-            .await
-            .unwrap();
-        ad
-    });
-
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(120))));
-    let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(8);
-    let state = new_shared_state();
-
-    let task = tokio::spawn(run_coordination(
-        SafehouseConfig {
-            enabled: true,
-            socket: Some(socket.clone()),
-            room: None,
-            rooms: Some(RoomMap {
-                signal: Some("!signal:example.org".to_owned()),
-                by_repo: [("loom".to_owned(), "!fleet-loom:example.org".to_owned())]
-                    .into_iter()
-                    .collect(),
-                claims: Some("!claims:example.org".to_owned()),
                 alerts: None,
             }),
             ..SafehouseConfig::default()
@@ -4920,27 +4741,26 @@ async fn coordination_advertises_claim_ads_into_a_dedicated_claims_room_when_con
         state.clone(),
     ));
 
-    tx.send(ClaimAd::advertise(4713, "loom".into(), "maple".into(), 7, "ts".into()))
+    tx.send(CompletedAd::new(4225, "loom".into(), "maple".into(), 7, "ts".into(), 5))
         .await
         .unwrap();
 
     let ad = tokio::time::timeout(Duration::from_secs(2), server)
         .await
-        .expect("the stub must receive the claim ad")
+        .expect("the stub must receive the completion ad")
         .unwrap();
     assert_eq!(ad["op"], json!("send"));
     assert_eq!(ad["type"], json!("task"));
     assert_eq!(
         ad["room"],
-        json!("!claims:example.org"),
-        "with rooms.claims configured, claim ads ride the dedicated claims room, \
-             not the signal room and not the repo firehose"
+        json!("!signal:example.org"),
+        "completion ads ride the signal room, NOT the repo firehose (documented exception)"
     );
     // The connection state (#4345) reflects the room this connection
     // actually advertises into.
     match snapshot_state(&state) {
         SafehouseState::Connected { room, .. } => {
-            assert_eq!(room.as_deref(), Some("!claims:example.org"));
+            assert_eq!(room.as_deref(), Some("!signal:example.org"));
         }
         other => panic!("expected Connected, got {other:?}"),
     }
@@ -4953,9 +4773,9 @@ async fn coordination_reconnects_when_socket_absent_and_exits_on_sender_drop() {
     // backoff and exits cleanly once its senders drop.
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("nope.sock"); // never bound
-    let view = Arc::new(Mutex::new(PeerClaimView::new("me".into(), Duration::from_secs(1))));
-    let sink: Arc<dyn InboundEventSink> = Arc::new(PeerClaimSink::new(view));
-    let (tx, rx) = tokio::sync::mpsc::channel::<ClaimAd>(4);
+    let view = Arc::new(Mutex::new(CompletionView::new("me".into(), Duration::from_secs(1))));
+    let sink: Arc<dyn InboundEventSink> = Arc::new(CompletionSink::new(view));
+    let (tx, rx) = tokio::sync::mpsc::channel::<CompletedAd>(4);
     let state = new_shared_state();
 
     let task = tokio::spawn(run_coordination(

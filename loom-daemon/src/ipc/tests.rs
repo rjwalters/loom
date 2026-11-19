@@ -170,37 +170,6 @@ fn test_handle_request_get_claims_summary() {
     }
 }
 
-// ===== CaptureGitChanges with nonexistent dir =====
-
-#[test]
-fn test_handle_request_capture_git_changes_no_repo() {
-    let (tm, db, sr, bus) = setup_test_context();
-    let response = handle_request(
-        Request::CaptureGitChanges {
-            input_id: 1,
-            working_dir: "/nonexistent/path".to_string(),
-            before_commit: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
-    match response {
-        Response::GitChangesCaptured {
-            files_changed,
-            lines_added,
-            lines_removed,
-        } => {
-            assert_eq!(files_changed, 0);
-            assert_eq!(lines_added, 0);
-            assert_eq!(lines_removed, 0);
-        }
-        other => panic!("Expected GitChangesCaptured, got: {other:?}"),
-    }
-}
-
 // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
 
 /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
@@ -1396,6 +1365,7 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
         source: crate::runtime_admission::RuntimeSource::DefaultConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     });
     let wire = serde_json::to_string(&response).unwrap();
     assert!(wire.contains("\"type\":\"RuntimeRejected\""));
@@ -2773,7 +2743,11 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
         }
         other => panic!("Expected NoopReleaseRecorded, got: {other:?}"),
     }
-    assert_eq!(sr.lock().unwrap().noop_release_count(6670), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6670, Utc::now())
+        .is_some());
 }
 
 #[test]
@@ -2961,11 +2935,10 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
     assert!(
         sr_b.lock()
             .unwrap()
-            .noop_cooldown_issues(now)
-            .contains(&EPIC_PHASE_ISSUE),
+            .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+            .is_some(),
         "repo B's own registry must see the armed cooldown for its issue"
     );
-    assert_eq!(sr_b.lock().unwrap().noop_release_count(EPIC_PHASE_ISSUE), 1);
 
     // The WRONG registry (the daemon's cwd-seeded default, repo A) must
     // NOT see it — this is the exact failure mode #6957 reports: a
@@ -2979,13 +2952,11 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
             .contains(&EPIC_PHASE_ISSUE),
         "the default (wrong) registry must NOT see repo B's cooldown"
     );
-    assert_eq!(
-        sr_default
-            .lock()
-            .unwrap()
-            .noop_release_count(EPIC_PHASE_ISSUE),
-        0
-    );
+    assert!(sr_default
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(EPIC_PHASE_ISSUE, now)
+        .is_none());
 }
 
 /// Issue #6957 (edge case from the acceptance criteria): a
@@ -3022,7 +2993,11 @@ fn test_record_noop_release_none_workspace_root_still_targets_default() {
             ..
         }
     ));
-    assert_eq!(sr.lock().unwrap().noop_release_count(6959), 1);
+    assert!(sr
+        .lock()
+        .unwrap()
+        .noop_cooldown_remaining(6959, Utc::now())
+        .is_some());
 }
 
 // ===== ListQuarantines (Issue #4215) =====
@@ -3960,7 +3935,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
+    // start_completion_dedup still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse
@@ -5202,14 +5177,11 @@ fn test_abort_supersedes_running_supervisor_generation() {
 mod status_round_trip;
 
 // The #9194 burst-calibration helper lives in its own sibling module rather
-// than being appended here: this module is over the 1000-line ratchet
-// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
-// — "put the new code in a NEW sibling module").
+// than being appended here.
 mod dispatch_burst_calibration;
 
 // The #4666 rate-limit dispatch-refusal tests live in their own sibling
-// module (moved out of this over-threshold, frozen file, #9855):
-// `.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling module".
+// module (moved out of this file, #9855).
 mod rate_limit_dispatch_refusal_tests;
 
 /// #13350: the removed `runtime` / `model_profile` fields are gone from the

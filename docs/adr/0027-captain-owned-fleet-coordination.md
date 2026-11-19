@@ -403,6 +403,76 @@ accepted.
    stale statements. This is the successor of the deletions #11717 attempted,
    replayed on a fresh branch; #11717 itself stays blocked.
 
+   **Status (#13920, operator ruling 2026-11-15).** Child 1 (#13945) landed the
+   deletion: the peer-claim channel, its claims room and config, every
+   broadcast, the `peer-claims` CLI and its health/watchdog alert class;
+   `QueueDisposition::PeerClaim` is now `LeaseHeld`; ADR-0025's stale statements
+   are retired. Only the `completed` narration ad survives, as a shim in
+   `safehouse/claim_sink.rs`. **Not done until child 2 lands** (the merged-PR
+   report and slimming `safehouse/`), which replaces that shim; mark this
+   increment done then.
+
+## Amendment: fast-fail lane cut over to the captain (#13919, 2026-11-16)
+
+The fleet fast-fail streak lane (#11854, #11930, #11952) is **cut over**. The
+peer channel that carried its tally has been silent since about 2026-11-14, so
+there was no shadow phase to compare: the incident sequences are replayed in
+`fleet_dispatch/table_tests.rs` and `server_tests.rs` instead.
+
+- A Builder step that fails inside the fast-fail window with a non-environmental
+  reason releases with the outcome `fast_fail` (still a non-progress outcome, so
+  it climbs the no-progress ladder like any other).
+- The captain counts consecutive `fast_fail` releases per `(repo, item)` across
+  hosts. A progressing release, or any other non-progress outcome, resets the
+  count; `ci_wait` and `host_lost` leave it alone. A streak that has not
+  ordered a park ages out after 24 h.
+- "Inside the fast-fail window" is each host's own ladder window: the wider of
+  120 s and its configured `insta_crash_secs`. A failure the local ladder
+  counts is therefore never released as a plain `failed`, which would end the
+  fleet's streak.
+- The release that makes the third answers `park: true`, to that worker only,
+  once. The worker makes the park (a forge write, section 8) on its next reaper
+  tick through the existing quarantine path.
+- **The captain's hold stands for the park, not for the streak.** While the
+  order stands, claims for the item are refused `held`. It ends when the park
+  ends: the worker calls `POST /v1/park_ended` when the quarantine's TTL runs
+  out, when an operator runs `loom-daemon quarantine clear` (on any host), and
+  when the ordered worker made no park (parks disabled there, or another hold
+  already has the item). The captain then forgets the streak and the order, so
+  the park comment's "clear the park, or wait for the TTL" holds for this lane
+  and a later streak counts from zero.
+- **`park_ended` names its cause, and only an operator's clear lifts the
+  no-progress hold (#14047).** The no-progress ladder (30 min, 2 h, 6 h, 24 h,
+  keyed `(repo, item, step)`) is separate from the park order and was left
+  standing by `park_ended`, so an item could stay `cooldown`-refused for hours
+  after its park ended. Decision: `cause: "cleared"` (`loom-daemon quarantine
+  clear`) also drops the item's no-progress hold for every step and resets its
+  streak, matching what the same command already does to the local dispatch
+  backoff (#4485) and no-op cooldown (#6670): an explicit human override must
+  not look like it did nothing. `cause: "expired"` (TTL expiry, or an ordered
+  worker that made no park; also the default when `cause` is absent) ends the
+  streak and order but leaves the hold: the ladder is the fleet's intentional
+  backoff for an item that keeps failing, and an automatic one-hour release
+  must not defeat a 6 h or 24 h hold, or a hopeless item loops. Rejected:
+  clearing on both (re-opens the loop the ladder stops), and on neither
+  (the operator's clear looks like it did nothing). The park comment says so:
+  after the TTL the item may still be refused `cooldown`, and `quarantine
+  clear` lifts both.
+- A park-ended call is sent once and not retried, and an ordered worker can die
+  before its reaper tick. So the order also lapses by itself one default
+  quarantine TTL (3600 s) after it was made, and the streak with it. Worst
+  case: a host whose TTL is configured below 3600 s loses the call and the
+  item is refused for the difference; a park that outlasts 3600 s (an
+  escalated TTL) keeps the item ineligible through `loom:blocked` on the
+  forge, as before. A captain older than this amendment answers `404` and the
+  same bound applies.
+- **Restart persistence: accepted gap, no snapshot.** The no-progress holds are
+  already soft, each host's local streak stays as the floor (section 4), and a
+  captain restart costs at most a few extra fast failures before the tally
+  rebuilds. Neither the holds nor the tally are written to disk.
+- No-op streak lane: still on the peer channel; the no-progress hold (#12541)
+  covers the fleet-wide delay but not its park. Unchanged here.
+
 ## Relationship to ADR-0025
 
 ADR-0025 decision 2 keeps the #7477 *no-op cooldown window* per host and

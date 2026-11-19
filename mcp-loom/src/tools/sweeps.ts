@@ -140,7 +140,6 @@ export function formatSweepKind(kind: SweepKind): string {
 
 /**
  * `SweepState` mirrors the Rust enum's serde-tagged shape:
- *   `{"state": "Pending"}`
  *   `{"state": "Running"}`
  *   `{"state": "Exited", "details": {"code": 0 | null, "at": "..."}}`
  *   `{"state": "Crashed", "details": {"at": "..."}}`
@@ -150,7 +149,6 @@ export function formatSweepKind(kind: SweepKind): string {
  * are accepted).
  */
 export type SweepState =
-  | { state: "Pending" }
   | { state: "Running" }
   | { state: "Exited"; details?: { code?: number | null; at?: string } }
   | { state: "Crashed"; details?: { at?: string } };
@@ -195,12 +193,6 @@ export interface SweepInfo {
    * Absent/undefined on pre-#3929 entries.
    */
   repo?: string;
-  /**
-   * True when the work finder admitted this sweep through the host's
-   * overflow slot (#9244): a starred issue run as the host's single sweep
-   * over the concurrency cap. Inert since #11508; absent means false.
-   */
-  overflow?: boolean;
 }
 
 interface DispatchResponse {
@@ -471,7 +463,7 @@ function extractError(response: DaemonResponse): string | null {
 }
 
 function isStateTag(s: string): s is SweepState["state"] {
-  return s === "Pending" || s === "Running" || s === "Exited" || s === "Crashed";
+  return s === "Running" || s === "Exited" || s === "Crashed";
 }
 
 /**
@@ -931,7 +923,7 @@ export const sweepTools: Tool[] = [
       properties: {
         state_filter: {
           type: "string",
-          enum: ["Pending", "Running", "Exited", "Crashed"],
+          enum: ["Running", "Exited", "Crashed"],
           description:
             "Optional lifecycle state filter. Omit to list all tracked sweeps.",
         },
@@ -1278,8 +1270,6 @@ function formatSweepLine(info: SweepInfo): string {
   // repos' identically-numbered issues are distinguishable in the listing.
   if (info.repo) parts.push(`  Repo:       ${info.repo}`);
   if (info.idempotency_key) parts.push(`  Idem. key:  ${info.idempotency_key}`);
-  // Issue #9244: the host's single over-limit starred sweep.
-  if (info.overflow) parts.push("  Overflow:   yes (starred, over the concurrency cap)");
   return parts.join("\n");
 }
 

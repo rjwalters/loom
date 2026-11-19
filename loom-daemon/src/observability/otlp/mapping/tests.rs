@@ -1,7 +1,6 @@
 //! Unit tests for [`super`] — extracted from the parent module's inline
-//! `#[cfg(test)] mod tests` (Issue #8056) so the parent stays inside the
-//! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
-//! unchanged apart from dedenting and the new-module additions.
+//! `#[cfg(test)] mod tests` (Issue #8056). Content is unchanged apart from
+//! dedenting and the new-module additions.
 
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 use opentelemetry_proto::tonic::resource::v1::Resource;
@@ -1039,6 +1038,7 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            stage: None,
             issue: None,
             pr_number: None,
             deferred_by: None,
@@ -1078,6 +1078,47 @@ fn a_steps_role_tick_outcome_is_marked_as_a_step() {
     assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
     assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
     assert_eq!(attr(&records[1], "loom.sweep_id"), None);
+}
+
+/// #14048: a step's `role_tick.outcome` carries its launch identity
+/// (`loom.runtime` / `loom.provider` / `loom.profile`, from the step's own
+/// `# LOOM_LAUNCH` record) and its `loom.stage` — finer than `loom.role`,
+/// which folds Champion's two stages. Each absent when unobserved, so the
+/// per-stage cross-host join keys never read a guessed value.
+#[test]
+fn a_steps_outcome_maps_stage_and_launch_identity_and_each_stays_absent_when_unobserved() {
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.source = Some(crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string());
+        r.stage = Some("champion_merge".to_string());
+        r.runtime = Some("opencode".to_string());
+        r.provider = Some("friendli".to_string());
+        r.profile = Some("glm-flash".to_string());
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.stage"), s("champion_merge"));
+    assert_eq!(attr(&records[0], "loom.runtime"), s("opencode"));
+    assert_eq!(attr(&records[0], "loom.provider"), s("friendli"));
+    assert_eq!(attr(&records[0], "loom.profile"), s("glm-flash"));
+    for key in [
+        "loom.stage",
+        "loom.runtime",
+        "loom.provider",
+        "loom.profile",
+    ] {
+        assert_eq!(attr(&records[1], key), None, "a tick with no launch record carries no {key}");
+    }
 }
 
 /// #12362: a Judge tick's found-work split reaches the wire, explicit `false`

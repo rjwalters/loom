@@ -394,8 +394,11 @@ precedence env > `.loom/config.json` > default, same as
 `buildGate.loadThreshold`); once at/above threshold, filing is deferred until
 either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
 (default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
-— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
-data fails open (proceeds as if there is no pressure). Full mechanism:
+— the "never starves permanently" ceiling. Absent or unparseable ranking
+data is a valid numeric `0` (no pressure), but a read that produces no
+number at all — a denied or failed call, empty or non-numeric output —
+reports `unavailable` and is treated as pressure-UNKNOWN: deferred, bounded
+by the same ceiling, never a silent proceed (#14162). Full mechanism:
 `defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
 Pressure".
 
@@ -816,10 +819,14 @@ credential blocks every class whatever marker the line carries.
 **Who writes a class-scoped mark.** Only `claude-wrapper.sh`'s rotation path,
 and only when the death is provably per-class — a `MODEL_CREDITS_EXHAUSTED`
 classification (definitionally per-tier) or a #4501 per-model ceiling
-("reached your `<model>` limit") whose named words are not an account-wide
+("hit/reached your `<model>` limit" — the CLI has used both verbs, and #13872
+fixed the fleet-wide class-less marks the "reached"-only match produced) whose
+named words are not an account-wide
 qualifier (`weekly`/`monthly`/`session`/`plan`/…). The class itself comes from
 the **resolved model in flight** (`$LOOM_MODEL`, or an explicit `--model` arg
-that beat it), mapped through `script_helpers::model_tiers::task_alias_of` —
+that beat it — `spawn-claude.sh` exports the resolved value as `LOOM_MODEL`
+so the wrapper's mark sees it either way, #13872), mapped through
+`script_helpers::model_tiers::task_alias_of` —
 the same classifier the sweep orchestrator's cost ladder uses. Anything
 ambiguous, any unrecognized model, and the daemon-side reaper
 (`sweep_registry::quarantine`, which has no model in hand) all write the
@@ -1359,25 +1366,10 @@ dispatch for that pool when `total > 0 && usable == 0`
 - A hold outranks #5030's half-open recovery probe: a probe dispatched into a
   pool with zero spawnable accounts tests nothing and costs exactly the label
   flip and lease comment this exists to prevent.
-- **Broadcast to peers, keyed by account set (#8001).** The arm/clear *edge* is
-  advertised over the peer-claim room (`ClaimKind::PoolHoldArmed` /
-  `PoolHoldCleared`), so a peer does not have to rediscover a dead pool the
-  expensive way — one doomed dispatch, one label flip and one permanent lease
-  comment at a time. The original "do not broadcast" caution is preserved as the
-  **key**, not as abstinence: each host resolves its *own* pool (repo-local
-  shadow if it holds `.token` files, else shared — #3938/#7527), so the ad is
-  keyed by `pool_account_fingerprint` — a hash of the pool's sorted account
-  names — never by the pool directory. A path key is wrong in both directions
-  (two hosts sharing accounts resolve different absolute paths; two hosts with
-  genuinely different repo-local shadow pools resolve the *same* relative path),
-  and the second failure is exactly the "suppress a peer whose pool is healthy"
-  hazard. Exhaustion is a property of the **accounts** — a `.bad_tokens` mark or
-  a `.ranking` hard exclusion records an upstream rate-limit state every host
-  holding that credential shares — so an account-set key matches precisely when
-  suppression is correct. Fail-open throughout: a dropped ad, a peer without
-  safehouse, or a host that has not received the ad yet degrades byte-for-byte
-  to the local-only pre-flight, which still stops that host on its own next
-  tick. See [`safehouse.md` → "Fleet-wide token-pool exhaustion hold"](safehouse.md).
+- **Not broadcast to peers (#13945).** The arm/clear edge was once advertised
+  over the safehouse claims room, keyed by account-set fingerprint (#8001); that
+  channel was retired, so the hold is this host's own.
+
 - `total == 0` (no pool provisioned at all) is a *different* condition with a
   different remedy (`loom-daemon tokens bootstrap`) and its own detection
   (#4642). It never arms this hold.
@@ -1678,9 +1670,9 @@ text, the CLI, and this document all agree on:
 | Reason class | Blocks selection until | Pruned from `.bad_tokens` after |
 |---|---|---|
 | `auth` (401 / OAuth / expired / blocked) | `loom-daemon tokens unblock <name>` — **never expires** | 30d (`AUTH_ENTRY_MIN_RETENTION_SECS`), a garbage-collection floor, *not* an expiry |
-| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
-| non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
-| non-auth, ambiguous reason (does not name the session window) | the exhaustion cooldown (unchanged fixed TTL), **or** earlier if a re-probe proves both signals clear — see [Ambiguous exhaustion entries: two-signal early release](#ambiguous-exhaustion-entries-two-signal-early-release-7538) | 24h (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth (`exhausted` / `rate-limited`) | the **exhaustion cooldown** — `LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS`, default `21600` (6h) — or, on a still-`exhausted` re-probe (#13893), until that probe's recorded 7d reset instant | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`, raised from 24h by #13893 so the on-disk clock never expires a live weekly hold) |
+| non-auth naming the **5h session limit** specifically | the earlier of: proven window reset, or `min(cooldown, 18000)` — see [Session-limit entries expire with their own window](#session-limit-entries-expire-with-their-own-window-7522) | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
+| non-auth, ambiguous reason (does not name the session window) | the exhaustion cooldown (unchanged fixed TTL), **earlier** if a re-probe proves both signals clear, or **later** — until the re-probe's recorded 7d reset instant when it is still `exhausted` (#13893) — see [Ambiguous exhaustion entries: two-signal early release](#ambiguous-exhaustion-entries-two-signal-early-release-7538) | 8d (`DEFAULT_CLEANUP_MAX_AGE_SECS`) |
 | unparseable timestamp | never (**fail-closed** — a malformed line never silently un-blocks a token) | never (malformed lines are always retained) |
 
 **Read time** (`bad_tokens::is_bad` / `blocking_entry`, enforced by the selector
@@ -1691,21 +1683,26 @@ TTL by design — a broken credential does not heal on a timer.
 
 **On disk** (`bad_tokens::cleanup_bad_tokens`, wired in #4643 into `tokens
 select` and `tokens check`): entries older than the max-age policy above are
-dropped. The auth floor is deliberately far longer than the routine 24h policy,
-because pruning an auth line *would* silently readmit a broken credential —
-the on-disk clock must never become a back-door expiry for the permanent class.
+dropped. The auth floor is deliberately far longer than the routine 8-day
+policy, because pruning an auth line *would* silently readmit a broken
+credential — the on-disk clock must never become a back-door expiry for the
+permanent class. The same logic is why #13893 raised the exhaustion retention
+from 24h to 8d: a weekly entry can now be held at read time until a re-probe's
+recorded 7d reset instant, and pruning the line mid-hold would readmit the
+still-exhausted account — the same back-door expiry, for the TTL class.
 Cleanup is best-effort and takes **no lock at all** when nothing is prunable, so
 a burst of concurrent spawns never serializes on `.bad_tokens`. Before #4643
 `cleanup_bad_tokens` had zero callers anywhere in the tree and pools accumulated
 entries indefinitely.
 
 **The oldest visible entry is usually not the deciding one.** Every failed spawn
-appends a *new* line, so an account with a genuinely long-lived limit (e.g.
-`hit your weekly limit`, which outlasts the 6h cooldown by days) is
-continuously re-marked: the 13h-old lines at the top of the file expired long
-ago, while a fresh line further down is what actually blocks. `blocking_entry`
-reports the deciding line, and the empty-pool error prints its timestamp — read
-that, not the head of the file.
+appends a *new* line, so `blocking_entry` reports the deciding line, and the
+empty-pool error prints its timestamp — read that, not the head of the file.
+Before #13893 a genuinely long-lived limit (e.g. `hit your weekly limit`, which
+outlasts the 6h cooldown by days) kept the account in a 6h re-mark churn (each
+expiry → retry → insta-crash → fresh line); since #13893 a still-`exhausted`
+re-probe holds the entry until the probe's recorded 7d reset instant instead,
+so the pile of re-mark lines at the head of the file is a pre-#13893 artifact.
 
 ### Session-limit entries expire with their own window (#7522)
 
@@ -1803,8 +1800,10 @@ check like `session_window_has_reset` is not safe to apply to an ambiguous
 reason — that is exactly the harm #4212 declined to risk.
 
 So an ambiguous (non-session-limit-matching) `Exhaustion` entry gets its own,
-separate, two-signal check — `bad_tokens::ambiguous_exhaustion_has_reset` —
-instead of being folded into the session-limit fast path:
+separate, evidence check — `bad_tokens::ambiguous_exhaustion_evidence`
+(renamed from #7538's `ambiguous_exhaustion_has_reset` by #13893, which also
+widened its verdicts) — instead of being folded into the session-limit fast
+path:
 
 1. Prerequisite: **freshness**. The `.ranking` file's mtime must be after the
    entry's `marked_at`, exactly like `session_window_has_reset`'s fallback
@@ -1831,10 +1830,32 @@ Never on 5h evidence alone. The session-limit-matching fast path
 (`SESSION_WINDOW_SECS` cap + `session_window_has_reset`) is completely
 unaffected — it keeps its existing single-signal behavior, unchanged.
 
-An ambiguous entry with no `.ranking` row at all (never probed, or probed
-before this change shipped) falls back to the full fixed-TTL cooldown, exactly
-as before #7538 — the two-signal check only ever narrows a hold, never widens
-one.
+**Hold to the recorded 7d reset when the re-probe says still exhausted
+(#13893).** The converse shape — a fresh row whose 7d verdict **is**
+`exhausted` — used to fall back to the fixed 6h cooldown, which just
+scheduled a retry that insta-crashed and re-marked (the 6h re-mark churn in
+the issue's evidence). Instead the entry is held until that row's recorded
+`limit_reset` — for an `exhausted` row `check::limit_reset` records the **7d**
+reset — provided the instant is **credible**: parseable
+(`%Y-%m-%dT%H:%M:%SZ`), strictly after the mark (a pre-mark instant describes
+the previous window, the same trap `session_window_has_reset` documents), and
+no more than 8 days in the future at read time
+(`MAX_WEEKLY_RESET_HORIZON_SECS` — a 7d window cannot end later, so anything
+beyond that horizon is garbage). A passed instant releases; a missing,
+unparseable, pre-mark, or beyond-horizon instant leaves the 6h behaviour
+unchanged; and `cooldown_remaining_secs` reports time to the hold instant, so
+the operator-facing countdown is never longer than the hold the code honors.
+
+One deliberate widening, one explicit cap: #7538's release only ever
+**narrowed** a hold, and #13893's hold-until-reset is the one place the fixed
+TTL is extended — only on fresh probe evidence, and an explicitly configured
+`LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS` caps the extension at the operator's
+value (the default does not cap, because holding past the default 6h is the
+whole point). An ambiguous entry with no `.ranking` row at all (never probed,
+or probed before this change shipped) falls back to the full fixed-TTL
+cooldown, exactly as before #7538. On disk, `DEFAULT_CLEANUP_MAX_AGE_SECS`
+was raised 24h → 8d in the same change so the routine prune can never expire
+a line whose hold is still live.
 
 ### Empty-pool error detail (#4643)
 

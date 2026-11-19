@@ -125,7 +125,6 @@ pub fn annotate(
             occupancy,
             free: occupancy.map(|o| inputs.max_concurrent.saturating_sub(o)),
             any_halted: report.halted,
-            overflow_free: report.overflow_free,
         },
         tick_interval_secs: inputs.tick_interval_secs,
         shard: inputs.shard,

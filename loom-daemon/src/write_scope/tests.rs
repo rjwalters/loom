@@ -349,6 +349,164 @@ fn a_registered_fixture_is_admitted_only_with_write() {
     );
 }
 
+// ---- the per-owner writer route (#13929) -----------------------------------
+
+use crate::credential_preflight::GithubAppOutcome;
+
+/// A workspace whose config gives `covered` per-owner `writers[]` Apps, plus
+/// a managed checkout of a repo owned by `checkout_owner` and a fake `gh`
+/// that answers WRITE only when the probe carries an established
+/// `GH_CONFIG_DIR` — the ambient credential it starts with must read as
+/// `pull`, so a pass proves the probe really switched to the minted
+/// credential. Returns `(checkout, gh, repo, gh_bin_dir)`; the caller mints
+/// with its own stub and holds the bin dir for the test's duration.
+fn writer_route_fixture(
+    dir: &Path,
+    checkout_owner: &str,
+    covered: &[&str],
+) -> (PathBuf, PathBuf, String, tempfile::TempDir) {
+    use crate::test_git_helpers::run as git;
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(ws.join(".loom")).unwrap();
+    let writers: Vec<_> = covered
+        .iter()
+        .map(|owner| {
+            serde_json::json!({"appId": "99", "privateKeyPath": "/tmp/key.pem", "owners": [owner]})
+        })
+        .collect();
+    let config = serde_json::json!({"forge": {"identities": {"writers": writers}}});
+    std::fs::write(ws.join(".loom/config.json"), config.to_string()).unwrap();
+
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let repo = format!("{checkout_owner}/w{}", &id[..12]);
+    let checkout = dir.join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    git(&checkout, &["init", "-q"]);
+    git(
+        &checkout,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("https://github.com/{repo}.git"),
+        ],
+    );
+    std::fs::create_dir_all(checkout.join(".loom")).unwrap();
+
+    // WRITE (push) only under the published per-owner credential; any other
+    // `GH_CONFIG_DIR` (including the ambient host one a test process can
+    // inherit) and an unset one answer `pull`, so an un-established probe
+    // must refuse.
+    let bin = tempfile::tempdir().unwrap();
+    let gh = bin.path().join("gh");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = api ] && [ \"$2\" = 'repos/{repo}' ]; then\n\
+         case \"${{GH_CONFIG_DIR:-}}\" in\n\
+         *gh-config-by-owner/{checkout_owner}) echo '{{\"push\":true}}';;\n\
+         *) echo '{{\"pull\":true}}';;\n\
+         esac\n\
+         exit 0\n\
+         fi\n\
+         if [ \"$1\" = api ] && [ \"$2\" = installation/repositories ]; then\n\
+         echo 'fake gh: not an App installation token' >&2\n\
+         exit 1\n\
+         fi\n\
+         echo \"fake gh: unexpected call: $*\" >&2\n\
+         exit 1\n"
+    );
+    std::fs::write(&gh, &script).unwrap();
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    // The gh script must outlive the returned PathBuf; the tempdir is
+    // released when the caller's `bin` binding drops at test end.
+    (checkout, gh, repo, bin)
+}
+
+fn mint_ok(
+    calls: &Cell<u32>,
+) -> impl Fn(&crate::forge_identity::Identity, &str) -> GithubAppOutcome + '_ {
+    move |_identity, _repo| {
+        calls.set(calls.get() + 1);
+        GithubAppOutcome::Minted {
+            token: "ghs_test_token".into(),
+            installation_id: "1".into(),
+            app_id: "99".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+        }
+    }
+}
+
+/// An owner a `forge.identities.writers[]` entry covers, whose writer can
+/// mint, is probed under that writer: the mint ran, the credential was
+/// published and registered, and the decision is Allow — today it is a false
+/// `pull` refusal, because a CLI process has nothing registered (#13929).
+#[test]
+#[serial_test::serial]
+fn may_write_probes_under_a_per_owner_writer_that_can_mint() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (checkout, gh, repo, _bin) =
+        writer_route_fixture(dir.path(), "loom-fixture", &["loom-fixture"]);
+    let ws = dir.path().join("ws");
+    let mints = Cell::new(0);
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint_ok(&mints));
+    assert_eq!(mints.get(), 1, "one mint for the covered owner");
+    assert_eq!(v, Verdict::Allow(repo.clone()), "{v:?}");
+    assert_eq!(
+        crate::credential_preflight::gh_config_dir_for_owner_slug(&repo),
+        Some(ws.join(".loom/gh-config-by-owner/loom-fixture")),
+        "the minted credential is registered for the owner"
+    );
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
+/// An owner no `writers[]` entry covers is never minted for: no mint runs,
+/// and the decision is today's ambient answer — here a `pull` refusal
+/// (fail closed, unchanged) (#13929).
+#[test]
+#[serial_test::serial]
+fn may_write_without_a_covering_writer_entry_stays_the_ambient_refusal() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    // The fixture's owner is `loom-fixture`; the config covers only `acme`.
+    let (checkout, gh, repo, _bin) = writer_route_fixture(dir.path(), "loom-fixture", &["acme"]);
+    let ws = dir.path().join("ws");
+    let mints = Cell::new(0);
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint_ok(&mints));
+    assert_eq!(mints.get(), 0, "no mint for an uncovered owner");
+    assert!(matches!(&v, Verdict::Deny(w) if w.contains("pull")), "{v:?}");
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
+/// A covered owner whose mint fails keeps the fail-closed refusal (exit 1
+/// upstream), and the refusal names the mint failure instead of leaving the
+/// ambient credential's answer as the whole story (#13929).
+#[test]
+#[serial_test::serial]
+fn a_failed_mint_on_the_writer_covered_path_names_it_in_the_refusal() {
+    crate::credential_preflight::clear_owner_root_registry();
+    let dir = tempfile::tempdir().unwrap();
+    let (checkout, gh, repo, _bin) =
+        writer_route_fixture(dir.path(), "loom-fixture", &["loom-fixture"]);
+    let ws = dir.path().join("ws");
+    let mint = |_identity: &crate::forge_identity::Identity, _repo: &str| {
+        GithubAppOutcome::Error("private key unreadable".into())
+    };
+    let v = may_write_decision_cli(&checkout, Some(&repo), &gh, &ws, &mint);
+    match &v {
+        Verdict::Deny(w) => {
+            assert!(w.contains("could not mint"), "{v:?}");
+            assert!(w.contains("private key unreadable"), "{v:?}");
+            assert!(w.contains("loom-fixture"), "{v:?}");
+        }
+        other => panic!("expected a Deny, got {other:?}"),
+    }
+    crate::credential_preflight::clear_owner_root_registry();
+}
+
 /// Write a disk-cache entry as if the probe had recorded it `age` ago. It is
 /// the on-disk format `probe::Cached` reads; the probe itself has no seeding
 /// hook.
@@ -749,6 +907,13 @@ fn daemon_write_paths_are_scoped() {
             "observability/pick_journal.rs",
             NotAWrite("classifies an agent gh argv for pick.decision, runs none"),
         ),
+        (
+            "cli/forge_read.rs",
+            NotAWrite(
+                "the `verb()` diagnostic table names the `comment` verb as a string; \
+                 the file routes to handle_forge_command and makes no forge call",
+            ),
+        ),
         ("fleet_store/gh.rs", NotAWrite("store reads: its one method is `--method GET`")),
         (
             "merge_group_ci/eligibility.rs",
@@ -1007,6 +1172,33 @@ fn every_deny_branch_has_its_refusal_class() {
     let ok = classified(target("a/b"), true, None, &["a/b"], &w);
     assert!(ok.verdict.is_allowed());
     assert_eq!(ok.class, None);
+}
+
+/// #13978: only the `NotInInstallation` refusal names the interim `gh issue
+/// create` route; every other class keeps its text, and the verdict is unchanged.
+#[test]
+fn only_the_not_in_installation_refusal_names_the_gh_issue_create_route() {
+    let ni = FakeProbe::new(Permission::Insufficient(probe::NOT_IN_INSTALLATION.into()));
+    let ro = FakeProbe::new(Permission::Insufficient("repository role `read`".into()));
+    let unk = FakeProbe::new(Permission::Unknown("timeout".into()));
+    let why = |d: Decision| match d.verdict {
+        Verdict::Deny(w) => w,
+        v => panic!("expected a deny, got {v:?}"),
+    };
+
+    let w = why(classified(target("a/b"), true, None, &["a/b"], &ni));
+    assert!(w.contains("gh issue create -R a/b"), "{w}");
+    assert!(w.contains("gh-issue-create-rest-fallback.md"), "{w}");
+    assert!(w.contains(probe::NOT_IN_INSTALLATION), "{w}");
+
+    for (name, probe) in [("insufficient", &ro), ("unverifiable", &unk)] {
+        let w = why(classified(target("a/b"), true, None, &["a/b"], probe));
+        assert!(!w.contains("gh issue create"), "{name}: {w}");
+    }
+    let w = why(classified(target("a/b"), true, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "unmanaged: {w}");
+    let w = why(classified(None, false, None, &[], &ni));
+    assert!(!w.contains("gh issue create"), "no target: {w}");
 }
 
 #[test]

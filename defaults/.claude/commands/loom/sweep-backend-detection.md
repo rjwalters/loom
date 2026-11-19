@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Sweep — Run identity, peer detection, and Stage -1 backend detection
 
 > **Reference file for [`sweep.md`](sweep.md)**, the `/loom:sweep` dispatcher.

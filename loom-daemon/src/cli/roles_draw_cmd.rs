@@ -3,20 +3,26 @@
 //! weight and probability, the config tier that set the table, and what
 //! `runtimes.excludeProviders` or weight 0 took out. A stage with no
 //! `runtimes.roleDraw` table shows the `rolePreference` list (or static
-//! binding) that still decides it. Read-only; never consults a credential pool.
+//! binding) that still decides it.
+//!
+//! Each candidate of a table is also marked admitted or not on this host for
+//! this workspace (#14027), using the real spawn path's admission walk — a
+//! probe that launches nothing and releases any account lease containment
+//! preparation takes before returning, but one that reads the credential
+//! pools and admission state a launch reads.
 
 use crate::runtime_preference::role_draw::explain;
 use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
-pub(crate) enum RolesCommand {
+pub enum RolesCommand {
     /// Show the weighted per-stage, per-attempt runtime draw tables (#11726).
     Draw(DrawArgs),
 }
 
 #[derive(clap::Args)]
-pub(crate) struct DrawArgs {
+pub struct DrawArgs {
     /// Show which config tier set each table and why entries are off. The
     /// view always includes this; the flag is accepted for symmetry with
     /// fleet-gitops' `--explain`.
@@ -31,7 +37,7 @@ pub(crate) struct DrawArgs {
 }
 
 impl RolesCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         match self {
             RolesCommand::Draw(args) => {
                 let _ = args.explain;

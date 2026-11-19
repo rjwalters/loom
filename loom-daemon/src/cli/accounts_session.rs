@@ -38,6 +38,10 @@ pub(crate) enum SessionAction {
         private_clone: Option<String>,
         #[arg(long, default_value = "main", requires = "private_clone")]
         base: String,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -52,6 +56,10 @@ pub(crate) enum SessionAction {
         /// Stop even if an in-flight `docker exec` is detected.
         #[arg(long)]
         force: bool,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -60,6 +68,10 @@ pub(crate) enum SessionAction {
     Status {
         #[arg(value_name = "NAME")]
         name: String,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -90,6 +102,52 @@ pub(crate) enum SessionAction {
         #[arg(last = true)]
         args: Vec<String>,
     },
+    /// List, publish or discard the unpublished branches of the account's
+    /// private clones — the cure a preparation refusal names (issue #14030).
+    /// Runs under the same exclusive account lease as a job, so it cannot
+    /// race a running step. Without `--publish`/`--discard` only the
+    /// listing is printed.
+    Recover {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Push the unpublished branches to origin (fast-forward only).
+        #[arg(long, conflicts_with = "discard")]
+        publish: bool,
+        /// Delete the named branches with their unpublished commits;
+        /// requires `--branch` or `--issue`.
+        #[arg(long, conflicts_with = "publish")]
+        discard: bool,
+        /// Scope the action to one issue's own branch (`feature/issue-N`).
+        #[arg(long)]
+        issue: Option<u64>,
+        /// Scope the action to a named branch (repeatable).
+        #[arg(long, value_name = "BRANCH")]
+        branch: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move an additional private-clone registration to the repository's
+    /// canonical URL after a forge transfer, keeping its clone, branches and
+    /// local changes (issue #14357). Runs under the exclusive idle account
+    /// lease; refuses (changing nothing) a busy or held account, a wrong
+    /// repository, and two populated clones. Safe to repeat.
+    Rebind {
+        /// The account's short profile name, or its registered email.
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The registered (pre-transfer) repository URL.
+        #[arg(long, value_name = "URL")]
+        from: String,
+        /// The canonical repository URL after the transfer.
+        #[arg(long, value_name = "URL")]
+        to: String,
+        /// Verify everything and report; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(crate) fn handle_session_command(
@@ -111,6 +169,32 @@ pub(crate) fn handle_session_command(
             .unwrap_or_default();
         let fallback = roots::recorded_daemon_fallback_root();
         roots::cli_peer_roots(workspace, &registered, fallback.as_deref())
+    }
+
+    /// The lifecycle for an operator command that may create a container
+    /// (`start`, and `shell`'s start-if-absent), plus the image to pull.
+    ///
+    /// Reads the resolved `accounts.session` settings (issue #14019); invalid
+    /// config refuses the command outright, since a seat created from the
+    /// stock image because its override failed to parse would be a fail-open.
+    /// Precedence: the operator's explicit `--image` beats the configured
+    /// override, which beats the stock image; the mounts ride either way. Only
+    /// a container created from the *configured* image gets the bundle
+    /// verification (`with_session_config` compares it against the effective
+    /// image).
+    fn configured_lifecycle(
+        workspace: PathBuf,
+        image: Option<String>,
+    ) -> Result<(SessionLifecycle<ProcessContainerRunner>, Option<String>)> {
+        let peers = peer_roots(&workspace);
+        let session_config =
+            crate::tokens_pool::session_image::read_session_image_config(&workspace)?;
+        let image = image.or_else(|| session_config.image.clone());
+        let pull = image.clone();
+        let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
+            .with_peer_roots(peers)
+            .with_session_config(Some(session_config));
+        Ok((lifecycle, pull))
     }
 
     /// Operator `start`/`shell` (#10661): Ctrl-C/SIGTERM is forwarded to the
@@ -184,6 +268,16 @@ pub(crate) fn handle_session_command(
             if let Some(removed) = removed {
                 println!("{}: {}", status.name, removed.trim_start_matches(", "));
             }
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!("{}: extra read-only mounts: {}", status.name, mounts.join(", "));
+            }
         }
         Ok(())
     }
@@ -207,6 +301,69 @@ pub(crate) fn handle_session_command(
                     .as_ref()
                     .map_or("idle", |job| job.owner.as_str())
             );
+            println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
+            if !status.extra_mounts.is_empty() {
+                let mounts: Vec<String> = status
+                    .extra_mounts
+                    .iter()
+                    .map(|mount| {
+                        format!("{} -> {}:ro", mount.host.display(), mount.container.display())
+                    })
+                    .collect();
+                println!(
+                    "{}: extra read-only mounts: {}",
+                    status.config.account,
+                    mounts.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+    fn print_recover(report: &private::RecoverReport, json: bool) -> Result<()> {
+        if json {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            return Ok(());
+        }
+        for clone in &report.clones {
+            if !clone.cloned {
+                println!(
+                    "{}: {} is registered but not cloned yet; nothing to recover",
+                    report.account, clone.repository
+                );
+                continue;
+            }
+            for branch in &clone.published {
+                println!("{}: published {}", report.account, branch);
+            }
+            for branch in &clone.discarded {
+                println!("{}: discarded {}", report.account, branch);
+            }
+            for name in &clone.ignored {
+                println!(
+                    "{}: no unpublished commits on {} in this clone; it was not touched",
+                    report.account, name
+                );
+            }
+            for branch in &clone.branches {
+                println!(
+                    "{}: still unpublished: {} ({} ahead)",
+                    report.account, branch.branch, branch.ahead
+                );
+            }
+            for head in &clone.detached {
+                println!(
+                    "{}: stranded on a detached HEAD: {} at {} ({} unpushed); \
+                     name it with a branch (git switch -c) — recover cannot clear it",
+                    report.account, head.path, head.revision, head.ahead
+                );
+            }
+            if clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.branches.is_empty()
+                && clone.detached.is_empty()
+            {
+                println!("{}: {} has no unpublished work", report.account, clone.repository);
+            }
         }
         Ok(())
     }
@@ -217,8 +374,23 @@ pub(crate) fn handle_session_command(
             mount_workspace: workspace_arg,
             private_clone,
             base,
+            provider,
             json,
         } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                if private_clone.is_some() {
+                    anyhow::bail!("--private-clone is Codex-only; a Claude seat mounts its own state directory");
+                }
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Start {
+                        name,
+                        image,
+                        mount_workspace: workspace_arg,
+                    },
+                    workspace,
+                    json,
+                );
+            }
             if let Some(repository) = private_clone {
                 return print_private(
                     &private::start(&workspace, &name, &repository, &base, image.as_deref())?,
@@ -228,10 +400,7 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("account uses private-clone mode; repeat start --private-clone URL --base BRANCH; host-mount reuse is refused");
             }
-            let peers = peer_roots(&workspace);
-            let pull = image.clone();
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, image)
-                .with_peer_roots(peers);
+            let (lifecycle, pull) = configured_lifecycle(workspace, image)?;
             prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             print_session_status(
                 &lifecycle.start_with_workspace(&name, workspace_arg.as_deref())?,
@@ -245,7 +414,80 @@ pub(crate) fn handle_session_command(
             }
             Ok(())
         }
-        SessionAction::Stop { name, force, json } => {
+        SessionAction::Recover {
+            name,
+            publish,
+            discard,
+            issue,
+            branch,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to recover");
+            }
+            let action = if publish {
+                private::RecoverAction::Publish
+            } else if discard {
+                private::RecoverAction::Discard
+            } else {
+                private::RecoverAction::List
+            };
+            print_recover(
+                &private::session_recover(&workspace, &name, action, issue, &branch)?,
+                json,
+            )
+        }
+        SessionAction::Rebind {
+            name,
+            from,
+            to,
+            dry_run,
+            json,
+        } => {
+            if !private::configured(&workspace, &name)? {
+                anyhow::bail!("account does not use a private workspace; nothing to rebind");
+            }
+            let report = private::rebind(&workspace, &name, &from, &to, dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}: {:?}: {} -> {} (clone {}, registration {})",
+                    report.account,
+                    report.status,
+                    report.from,
+                    report.to,
+                    report.clone_path,
+                    if report.registration_changed {
+                        "updated"
+                    } else {
+                        "unchanged"
+                    },
+                );
+            }
+            if report.status == private::RebindStatus::BothPopulated {
+                anyhow::bail!(
+                    "both {} and the old location hold a clone; nothing was changed. Publish or \
+                     discard one with `accounts session recover {name}` (or attach and move the \
+                     work by hand), then rerun",
+                    report.clone_path
+                );
+            }
+            Ok(())
+        }
+        SessionAction::Stop {
+            name,
+            force,
+            provider,
+            json,
+        } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Stop { name, force },
+                    workspace,
+                    json,
+                );
+            }
             if private::configured(&workspace, &name)? {
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
@@ -280,7 +522,18 @@ pub(crate) fn handle_session_command(
             };
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }
-        SessionAction::Status { name, json } => {
+        SessionAction::Status {
+            name,
+            provider,
+            json,
+        } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Status { name },
+                    workspace,
+                    json,
+                );
+            }
             if private::configured(&workspace, &name)? {
                 return print_private(&private::status(&workspace, &name)?, json);
             }
@@ -310,10 +563,20 @@ pub(crate) fn handle_session_command(
             if private::configured(&workspace, &name)? {
                 anyhow::bail!("private sessions do not permit unleased shell; use session job --kind interactive --owner NAME -- COMMAND (TTY input is unsupported)");
             }
-            let peers = peer_roots(&workspace);
-            let lifecycle = SessionLifecycle::new(workspace, ProcessContainerRunner, None)
-                .with_peer_roots(peers);
-            prepare_operator_start(&lifecycle, &name, None)?;
+            // `shell` is start-if-absent, so it creates a container exactly
+            // as `start` does and must carry the same configured image and
+            // extra mounts (issue #14019).
+            //
+            // No unit test covers this arm (issue #14421): it builds a
+            // `ProcessContainerRunner` and shells out to `docker`, so it is
+            // not reachable without a real daemon. The guard is this call
+            // going through `configured_lifecycle`: do not replace it with
+            // `SessionLifecycle::new(.., None)`, which silently creates a
+            // stock-image container with no extra mounts. The reconciler's
+            // recreate paths (which carry the same preference) are covered
+            // in `session_reconcile_tests.rs` / `session_reconcile_drift_tests.rs`.
+            let (lifecycle, pull) = configured_lifecycle(workspace, None)?;
+            prepare_operator_start(&lifecycle, &name, pull.as_deref())?;
             let code = lifecycle.shell(&name, workspace_arg.as_deref(), &args)?;
             if code != 0 {
                 std::process::exit(code);

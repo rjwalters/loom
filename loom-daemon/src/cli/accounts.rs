@@ -77,7 +77,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         if json {
             println!("{}", serde_json::to_string_pretty(status)?);
         } else {
-            println!(
+            let mut line = format!(
                 "codex/{}: {} ({:?}); credential={}, directory-permissions={}, \
                  auth-permissions={}, owner={}, session={}, login={:?}",
                 status.name,
@@ -113,6 +113,19 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
                 },
                 status.login_state,
             );
+            // Issue #14298: `accounts list` also reports each account's
+            // registered private-clone repositories and session image.
+            // Appended, and only when present, so every verb that does not
+            // populate them keeps its line unchanged.
+            if let Some(private) = &status.private_clone {
+                let mut repos = vec![private.repository.as_str()];
+                repos.extend(private.additional_repositories.iter().map(String::as_str));
+                line.push_str(&format!(", repos={}", repos.join(",")));
+            }
+            if let Some(image) = &status.image {
+                line.push_str(&format!(", image={image}"));
+            }
+            println!("{line}");
         }
         Ok(())
     }

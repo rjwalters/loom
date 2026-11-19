@@ -140,7 +140,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // refused below — see `reconcile_unpinned_model_with_runtime`. Only the
                 // shipped-default tier is touched, so an explicit pin still reaches
                 // #5028's refusal unchanged.
-                let (model, model_source) = match &admission {
+                let (model, mut model_source) = match &admission {
                     Some(admitted) => reconcile_unpinned_model_with_runtime(
                         &admitted.runtime,
                         model,
@@ -180,13 +180,48 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
                     }
                 }
+                // Selection-time model fallback (#13873): when no account is
+                // usable for the configured model's class, fall one rung down
+                // `autonomous.modelFallback.chain` instead of holding the
+                // tick. Applied AFTER the mismatch preflight above — a wrong
+                // *stated* intent keeps its refusal — and re-resolved on
+                // every tick, so the launch returns to the configured model
+                // the moment an account usable for it reappears. The
+                // per-role log header (model=… source=…) names the fallback
+                // through the source label so `role_tick.outcome` records it.
+                let model = {
+                    let effective = crate::sweep_registry::model_fallback::effective_model(
+                        &self.workspace_root,
+                        &model,
+                    );
+                    if let Some(fallback) = &effective.fallback {
+                        log::info!(
+                            "role_runner: {role} model {from} → {model} (selection-time \
+                             fallback: {reason}, #13873)",
+                            from = fallback.from,
+                            model = effective.model,
+                            reason = fallback.reason,
+                        );
+                        model_source = format!(
+                            "{model_source} +fallback({}→{}: {})",
+                            fallback.from, effective.model, fallback.reason
+                        );
+                    }
+                    effective.model
+                };
                 // Issue #8054: the reasoning-effort axis, resolved independently of the
                 // model (no shipped default — unconfigured resolves to the empty string,
                 // which the emission site renders as no `--effort` argument at all).
                 // Resolved AFTER the mismatch preflight above so a refused launch does
                 // not pay for a second config read.
-                let (effort, effort_source) =
-                    resolve_role_runner_effort(&self.workspace_root, role);
+                // Issue #14017: resolved against the admitted runtime, so a role that
+                // draws both Claude and Codex can carry a different effort for each
+                // (`roleEfforts.<role>@<runtime>`) and a Codex launch never runs unset.
+                let (effort, effort_source) = resolve_role_runner_effort_for_runtime(
+                    &self.workspace_root,
+                    role,
+                    admission.as_ref().map(|a| a.runtime.as_str()),
+                );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
                 // above has already returned — so "resolved" never claims a model for a

@@ -162,7 +162,7 @@ gh api --paginate "repos/{owner}/{repo}/issues?labels=loom:blocked,loom:changes-
   | jq -rs 'add | .[] | select(.pull_request) | select(any(.labels[]?.name; . == "loom:frozen") | not) | "#\(.number) \(.title)"'
 ```
 
-Ignore any that also carry `loom:operator` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's only close authority is the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657 — never a PR).
+Ignore any that also carry `loom:operator` (already routed to a human). If found, **read and follow instructions in `.claude/commands/loom/champion-pr-merge.md` → "Capped-PR Recovery Pass"**: read the full rejection history, apply the forward-progress test, and either grant one more Doctor→Judge cycle (remove `loom:blocked` only), keep the PR parked, or recommend closure to the operator — always with a rationale comment. This pass never merges or closes (Champion's close authority is limited to the proposal "premise-false close gate", `champion-issue-promo.md` Step 4, #7657, and its own duplicate-digest issue reconcile, `champion-pr-merge.md` Per-PR Digest Step 0 — never a PR).
 
 ### Rollout Check Pass (every pass, max 3 items)
 

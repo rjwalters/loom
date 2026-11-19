@@ -1,7 +1,7 @@
 //! Unit coverage for the native-ephemeral launch profile (issue #8403).
 //!
 //! Extracted to a sibling file rather than an inline `#[cfg(test)]` module so
-//! `containment.rs` stays small enough to hold in view (file-size policy).
+//! `containment.rs` stays small enough to hold in view.
 //!
 //! These tests assert the SHAPE of the dispatch — the properties a reviewer
 //! would otherwise have to run a live container to see: that every isolated

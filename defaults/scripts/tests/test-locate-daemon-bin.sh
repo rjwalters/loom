@@ -594,12 +594,17 @@ slice() { # <env assignments...> -- <sub>; echoes "<kind>|<bin>"
 }
 assert_eq "tools|$T31/path/loom-tools" "$(slice PATH="$T31/path:$MINIMAL_PATH" strip-ansi)" \
     "slice command resolves loom-tools before loom-daemon (#12939)"
+assert_eq "tools|$T31/path/loom-tools" "$(slice PATH="$T31/path:$MINIMAL_PATH" resolve-model)" \
+    "resolve-model is in the slice: loom-tools before loom-daemon (#13878)"
 rm "$T31/path/loom-tools"
 assert_eq "daemon-transitional|$T31/path/loom-daemon" "$(slice PATH="$T31/path:$MINIMAL_PATH" strip-ansi)" \
     "no loom-tools: the loom-daemon fallback is marked transitional (#12939)"
 assert_eq "|" "$(slice PATH="$T31/path:$MINIMAL_PATH" LOOM_MODE=session strip-ansi)" \
     "session mode never uses the daemon fallback (#12939)"
-assert_eq "daemon|$T31/path/loom-daemon" "$(slice PATH="$T31/path:$MINIMAL_PATH" resolve-model)" \
+assert_eq "daemon-transitional|$T31/path/loom-daemon" "$(slice PATH="$T31/path:$MINIMAL_PATH" resolve-model)" \
+    "no loom-tools: resolve-model takes the transitional daemon fallback (#13878)"
+# `claim` is still daemon-only (design 10.1: out of the slice, slice 2/3).
+assert_eq "daemon|$T31/path/loom-daemon" "$(slice PATH="$T31/path:$MINIMAL_PATH" claim)" \
     "a command outside the slice keeps the daemon-only resolution"
 
 # ---------- summary ----------

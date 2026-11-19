@@ -93,6 +93,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::Frozen,
         PassReason::Operator,
         PassReason::HardExclusion,
+        PassReason::HostSkipLabel,
         PassReason::Claimed,
         PassReason::Queued,
         PassReason::SharedPr,
@@ -425,4 +426,41 @@ fn an_approved_stacked_pr_is_not_a_merge_step() {
     assert_eq!(contradictory[0].step(), Some(Step::Doctor));
     let blocked = classify(&pr(&["loom:pr", "loom:blocked"], Some("feature/issue-371")));
     assert_eq!(blocked[0].verdict, Verdict::Pass(PassReason::Blocked));
+}
+
+/// #13891: a host's `extraSkipLabels` veto reaches every issue row and a PR's
+/// linked issue; an empty list changes nothing.
+#[test]
+fn host_skip_label_passes_issue_triage_and_linked_pr() {
+    let host = HostInput {
+        extra_skip_labels: vec!["codex-pilot".into()],
+        ..HostInput::default()
+    };
+    let issue = |n: u32, l: &[&str]| IssueInput {
+        number: n,
+        labels: labels(l),
+        ..IssueInput::default()
+    };
+    let inputs = |host: &HostInput| Inputs {
+        issues: vec![
+            issue(1, &["loom:issue", "codex-pilot"]),
+            issue(2, &["loom:triage", "codex-pilot"]),
+            issue(3, &["loom:issue", "codex-pilot"]),
+        ],
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels(&["loom:review-requested"]),
+            body: Some("Closes #3".into()),
+            same_repo: true,
+            ..PullInput::default()
+        }],
+        host: host.clone(),
+        ..Inputs::default()
+    };
+    for item in classify(&inputs(&host)) {
+        assert_eq!(item.verdict, Verdict::Pass(PassReason::HostSkipLabel), "{item:?}");
+    }
+    let open = classify(&inputs(&HostInput::default()));
+    assert!(open.iter().all(|i| i.step().is_some()), "{open:?}");
+    assert_eq!(PassReason::HostSkipLabel.as_str(), "host_skip_label");
 }

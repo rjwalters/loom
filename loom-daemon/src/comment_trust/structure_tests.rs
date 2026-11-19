@@ -36,6 +36,11 @@ const MARKERS: &[&str] = &[
 /// Every production file whose code names a covered marker.
 const MARKER_FILES: &[(&str, &str)] = &[
     (
+        "operator_decision/resolution.rs",
+        "names the premise marker only to skip it when hashing a proposal; resolution comments \
+         reach it as Candidates already judged by TrustPolicy::is_operator (#14399)",
+    ),
+    (
         "claim_reconciliation.rs",
         "lease, claim-activity, stand-down readers (FETCH_SITES)",
     ),
@@ -130,6 +135,11 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
         "TrustPolicy::for_root(root).trusted_bodies(",
     ),
     ("sweep_registry/guards.rs", "read_lease_comments", "policy.trusted_ndjson("),
+    (
+        "sweep_registry/step_spawn/builder_rollback.rs",
+        "yield_finished_builder_lease",
+        "policy.trusted_ndjson(",
+    ),
     // #11898: a dead step's role-keyed lease holder.
     (
         "sweep_registry/step_lease_owner.rs",

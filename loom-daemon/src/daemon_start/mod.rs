@@ -461,7 +461,7 @@ fn already_running_guard(ctx: &Ctx) {
     let existing = existing.trim().to_string();
     let alive = existing
         .parse::<i32>()
-        .is_ok_and(|p| p > 0 && unsafe { libc::kill(p, 0) } == 0);
+        .is_ok_and(crate::sweep_registry::pid_signalable);
     if !alive {
         // Stale PID file — clean it up and continue.
         let _ = std::fs::remove_file(&ctx.pid_file);

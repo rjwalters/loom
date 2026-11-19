@@ -617,7 +617,7 @@ loom_daemon_exec_checked() {
 # The commands loom-tools serves. Others keep resolving the daemon only.
 loom_tools_serves() {
     case "${1:-}" in
-        strip-ansi|checkpoint) return 0 ;;
+        strip-ansi|checkpoint|resolve-model|resolve-role-model) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -646,6 +646,36 @@ loom_locate_tools_bin() {
         candidate="${candidate%/loom-daemon}/loom-tools"
         [[ -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
     done < <(_loom_daemon_repo_candidates "$root")
+    return 0
+}
+
+# loom_select_lease_bin <repo_root> -- pick the binary the issue lease chain
+# (sweep-lease-publish.sh, sweep-lease-renew.sh, sweep-lease-fence.sh) calls for
+# `forge may-write|trusted-comments|token|check-branch` and `lease renewer`
+# (#14488). Exports $LOOM_DAEMON_BIN, which all three scripts already read as
+# `${LOOM_DAEMON_BIN:-loom-daemon}`, so one decision at the top keeps every later
+# call, the re-exec through `lease renewer sanitize-exec`, and the detached
+# renewal loop on the same binary. Always returns 0 (a lease is evidence).
+#   1. $LOOM_DAEMON_BIN already set: a caller pinned it. `loom-tools lease
+#      ensure` and `loom-daemon lease ensure` both pin the binary that is
+#      running them, so the whole chain stays on the route that was selected.
+#   2. A `loom-daemon` on PATH and $LOOM_MODE not "session": leave it unset, so
+#      a fleet host keeps resolving exactly what it did before. The wrapper
+#      switch-over (#14398) is what makes the tools binary preferred.
+#   3. Otherwise `loom-tools` (see loom_locate_tools_bin), but only one that
+#      answers `lease renewer --help`: an older loom-tools without the lease
+#      verbs would turn every call into a failure. Not found: left unset.
+loom_select_lease_bin() {
+    local root="${1:-$PWD}" tools=""
+    [[ -z "${LOOM_DAEMON_BIN:-}" ]] || return 0
+    if [[ "${LOOM_MODE:-}" != "session" ]] && command -v loom-daemon > /dev/null 2>&1; then
+        return 0
+    fi
+    tools="$(loom_locate_tools_bin "$root")"
+    if [[ -n "$tools" ]] && "$tools" lease renewer --help > /dev/null 2>&1; then
+        LOOM_DAEMON_BIN="$tools"
+        export LOOM_DAEMON_BIN
+    fi
     return 0
 }
 

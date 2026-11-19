@@ -130,6 +130,35 @@ pub(crate) async fn query_daemon_bounded(
         .map_err(|_| anyhow!("round-trip timed out after {}s", timeout.as_secs()))?
 }
 
+/// Handle the two daemon-failure arms shared by every CLI subcommand that
+/// sends one request and renders one reply (Issue #13912): a daemon-reported
+/// `Response::Error` and an unreachable daemon (`Err`). Both print their
+/// diagnostic to stderr and exit 1 — byte-identical to the arms this
+/// deduplicates, so user-visible output and exit codes are unchanged. Any
+/// other response is returned unwrapped for the caller to match its expected
+/// variants directly (no `Ok(...)` wrapper) with its own `other =>` catch-all
+/// printing "Unexpected response from daemon".
+///
+/// Deliberately does NOT fold in the install-state socket hint that
+/// `restart` special-cases (#4069): those arms are not verbatim copies of the
+/// five this helper serves, and unifying them would change stderr text.
+pub(crate) fn exit_on_daemon_failure(socket_path: &Path, result: Result<Response>) -> Response {
+    match result {
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Default bounded ack budget for the `dispatch` subcommand (Issue #3952).
 ///
 /// Dispatch is emphatically **not** an immediate ack: `SweepRegistry::dispatch()`
@@ -190,19 +219,13 @@ pub(crate) fn apply_ipc_timeout_env_floor(base: Duration) -> Duration {
 
 /// Resolve the loom directory (moved from `daemon_service` so the library CLI tree
 /// does not reach into the binary crate; `daemon_service` re-exports it).
+///
+/// Thin `Result` wrapper over [`crate::autonomy_marker::resolve_loom_dir`] —
+/// the single implementation of the rule (#13833). `None` (a socket path with
+/// no parent and no home directory) becomes one error.
 pub fn resolve_loom_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        let socket_path = PathBuf::from(path);
-        let loom_dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
-            .to_path_buf();
-        return Ok(loom_dir);
-    }
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    Ok(loom_dir)
+    crate::autonomy_marker::resolve_loom_dir()
+        .ok_or_else(|| anyhow!("no home directory and no resolvable LOOM_SOCKET_PATH parent"))
 }
 
 #[cfg(test)]

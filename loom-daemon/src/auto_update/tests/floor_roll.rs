@@ -10,8 +10,7 @@
 //! `select_target` and the verdict themselves are unit-tested in
 //! `auto_update/floor_roll.rs`.
 //!
-//! A sibling module rather than more lines in `tests.rs`, per
-//! `.loom/docs/file-size-policy.md`.
+//! A sibling module of `tests.rs` holding the fleet-floor tests.
 
 use super::*;
 use crate::auto_update::supersede::ArmedRoll;
@@ -226,6 +225,7 @@ fn below_the_floor_installs_the_exact_tag_regardless_of_settle() {
         check: &check,
         tree_clean: false,
         in_flight: 0,
+        repo_source: None,
     };
     let week = Duration::from_secs(7 * 86_400);
     match state.decide(Instant::now(), &inputs, week, DEFER) {
@@ -298,6 +298,7 @@ fn decide_at(
         check: &check,
         tree_clean: true,
         in_flight: 0,
+        repo_source: None,
     };
     state.decide(t0 + Duration::from_secs(at), &inputs, settle, DEFER)
 }
@@ -415,7 +416,8 @@ fn an_unknown_floor_rolls_nothing_and_says_the_floor_is_not_known() {
 
 /// #10885: below the floor with no release resolved (the newest tag has no
 /// assets yet, or the forge is unreachable), the host waits for the next tick.
-/// The source-rebuild path is not a substitute.
+/// The source-rebuild path is not a substitute. #14224: the wait is WARN from
+/// the first tick, not an INFO line.
 #[test]
 fn below_the_floor_with_no_release_resolved_waits_and_never_rebuilds() {
     let tmp = tempfile::tempdir().unwrap();
@@ -429,7 +431,7 @@ fn below_the_floor_with_no_release_resolved_waits_and_never_rebuilds() {
     let status = AutoUpdateStatus::new(true);
     let trigger = Trigger::new(false);
     let summary = run_tick(&mut state, &status, &mut probe, &trigger, Duration::ZERO, DEFER);
-    assert_eq!(summary.decision, TickDecisionKind::Skip, "{}", summary.note);
+    assert_eq!(summary.decision, TickDecisionKind::StaleRepo, "{}", summary.note);
     assert_eq!(rebuilds.load(Ordering::SeqCst), 0);
     assert_eq!(fetches.load(Ordering::SeqCst), 0);
     let note = status.snapshot().note.unwrap_or_default();
@@ -489,6 +491,7 @@ fn a_host_with_no_fleet_store_decides_exactly_as_before() {
                         check: &check,
                         tree_clean: true,
                         in_flight,
+                        repo_source: None,
                     };
                     let now = t0 + Duration::from_secs(*at);
                     let settle = Duration::from_secs(settle_secs);
@@ -703,6 +706,111 @@ fn an_unparseable_latest_version_is_unresolved_not_a_stall() {
         assert!(note.contains("is below the fleet floor"), "{floor:?}: {note}");
         assert!(note.contains("0.19.900-rc1"), "{floor:?}: {note}");
         assert!(!note.contains("FLEET FLOOR UNSATISFIABLE"), "{floor:?}: {note}");
+    }
+}
+
+/// #14224: a below-floor host whose release read failed names the repo it
+/// asked and the tier that supplied it, at WARN from the FIRST such tick —
+/// the #11029 streak only ever escalated the wording, not the first-tick
+/// level. Other fleet floors keep the INFO skip.
+#[test]
+fn a_below_floor_host_warns_on_the_first_unresolved_tick_naming_repo_and_source() {
+    let check = no_source();
+    for (slug, source) in [
+        ("override-owner/override-repo", crate::release_resolve::RepoSource::EnvOverride),
+        (
+            "workspace-owner/workspace-repo",
+            crate::release_resolve::RepoSource::WorkspaceOrigin,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = floored(tmp.path(), Floor::Below);
+        let art = unresolved();
+        let inputs = TickInputs {
+            artifact: &art,
+            check: &check,
+            tree_clean: false,
+            in_flight: 0,
+            repo_source: Some((slug, source)),
+        };
+        match state.decide(Instant::now(), &inputs, Duration::ZERO, DEFER) {
+            TickDecision::SkipWarn(note) => {
+                assert!(note.contains(slug), "{note}");
+                assert!(note.contains(source.label()), "{note}");
+            }
+            other => panic!("{source:?}: expected SkipWarn on the first tick, got {other:?}"),
+        }
+    }
+
+    // No repo resolvable: still WARN, but no invented name.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Below);
+    let art = unresolved();
+    let inputs = TickInputs {
+        artifact: &art,
+        check: &check,
+        tree_clean: false,
+        in_flight: 0,
+        repo_source: None,
+    };
+    match state.decide(Instant::now(), &inputs, Duration::ZERO, DEFER) {
+        TickDecision::SkipWarn(note) => assert!(!note.contains("asked"), "{note}"),
+        other => panic!("expected SkipWarn, got {other:?}"),
+    }
+
+    // Not below the floor: the level is unchanged (INFO skip), whatever the
+    // repo source would have said.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Satisfied);
+    let inputs = TickInputs {
+        artifact: &art,
+        check: &check,
+        tree_clean: false,
+        in_flight: 0,
+        repo_source: Some((
+            "workspace-owner/workspace-repo",
+            crate::release_resolve::RepoSource::WorkspaceOrigin,
+        )),
+    };
+    assert!(
+        matches!(
+            state.decide(Instant::now(), &inputs, Duration::ZERO, DEFER),
+            TickDecision::Skip(_)
+        ),
+        "a satisfied floor stays at INFO even with a repo source to name"
+    );
+
+    // The escalated wording keeps its level and gains repo + source too.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut state = floored(tmp.path(), Floor::Below);
+    for tick in 1..=5_u32 {
+        let art = unresolved();
+        let inputs = TickInputs {
+            artifact: &art,
+            check: &check,
+            tree_clean: false,
+            in_flight: 0,
+            repo_source: Some((
+                "pinned-owner/pinned-repo",
+                crate::release_resolve::RepoSource::EnvOverride,
+            )),
+        };
+        match state.decide(Instant::now(), &inputs, Duration::ZERO, DEFER) {
+            decision @ (TickDecision::Skip(_) | TickDecision::SkipWarn(_)) => {
+                let note = match decision {
+                    TickDecision::Skip(n) | TickDecision::SkipWarn(n) => n,
+                    _ => unreachable!(),
+                };
+                if tick >= 4 {
+                    assert!(note.contains("STILL BELOW THE FLEET FLOOR"), "tick {tick}: {note}");
+                    assert!(note.contains("pinned-owner/pinned-repo"), "tick {tick}: {note}");
+                    assert!(note.contains("env override"), "tick {tick}: {note}");
+                } else {
+                    assert!(!note.contains("STILL BELOW THE FLEET FLOOR"), "tick {tick}: {note}");
+                }
+            }
+            other => panic!("tick {tick}: expected a skip, got {other:?}"),
+        }
     }
 }
 

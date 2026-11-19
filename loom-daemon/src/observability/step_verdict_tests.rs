@@ -534,7 +534,6 @@ fn the_exporter_calls_no_ledger_effect_forge_write_or_command() {
             "forge_comment",
             "add_labels",
             "forge_mirror",
-            "peer_claims",
         ] {
             assert!(!code.contains(forbidden), "{name} uses {forbidden}");
         }

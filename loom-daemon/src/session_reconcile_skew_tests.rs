@@ -8,7 +8,7 @@ use super::*;
 use skew::{pinned_image, refuse_downgrade, DaemonVersion, PullRetry, PULL_RETRY_MAX_SKIP};
 
 /// The fake runner's version-skew behaviour (kept here so the shared fake in
-/// `session_reconcile_tests.rs` stays under the file-size threshold).
+/// `session_reconcile_tests.rs` stays smaller).
 impl FakeState {
     /// `docker exec <c> loom-daemon --version`: what the container's daemon
     /// prints; a missing entry fails like an image without the binary.
@@ -71,6 +71,28 @@ fn skew_pass(
     now: u64,
 ) -> Vec<Outcome> {
     pass(lifecycle, env, &host, state, now)
+}
+
+/// One pass with the resolved `accounts.session` settings (issue #14019).
+fn skew_pass_with_config(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    env: &Env,
+    state: &mut ReconcileState,
+    now: u64,
+    session_config: &SessionImageConfig,
+) -> Vec<Outcome> {
+    pass_named_with_session_config(
+        lifecycle,
+        &env.accounts,
+        &host,
+        Path::new("/srv/checkouts"),
+        state,
+        now,
+        session_config,
+    )
+    .into_iter()
+    .map(|o| o.outcome)
+    .collect()
 }
 
 #[test]
@@ -361,4 +383,50 @@ fn pull_backoff_doubles_and_caps() {
     let skips: Vec<u32> = (1..=8).map(PullRetry::skip_after).collect();
     assert_eq!(skips, [1, 2, 4, 8, 16, 30, 30, 30]);
     assert_eq!(PullRetry::skip_after(40), PULL_RETRY_MAX_SKIP, "no shift overflow");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14019: an override seat is never recreated for skew.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn an_override_seat_is_never_recreated_for_skew_and_never_from_the_stock_tag() {
+    let env = setup(&["alice"], &["alice"]);
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    seed(&lifecycle, Some("0.19.1151"), Some("0.19.624"));
+    // The seat runs the configured override image (what an operator start
+    // with `accounts.session.image` records).
+    lifecycle
+        .runner()
+        .containers
+        .lock()
+        .unwrap()
+        .get_mut(&container_name("alice"))
+        .expect("seeded")
+        .image = Some("ghcr.io/example/session-mine@sha256:aa55".into());
+    let config = SessionImageConfig {
+        image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
+        extra_mounts: Vec::new(),
+    };
+    let mut state = ReconcileState::default();
+    // The daemon rolled; the override seat is left running — never recreated
+    // from its own digest pin (same skew) and never from the stock tag.
+    let out = skew_pass_with_config(&mut lifecycle, &env, &mut state, 0, &config);
+    assert_eq!(out, vec![Outcome::Running], "{out:?}");
+    assert!(
+        lifecycle.runner().mutations().is_empty(),
+        "no stop, no create: {:?}",
+        lifecycle.runner().mutations()
+    );
+    // Not re-attempted every pass either (one diagnostic per version pair).
+    let again = skew_pass_with_config(&mut lifecycle, &env, &mut state, 60, &config);
+    assert_eq!(again, vec![Outcome::Running], "{again:?}");
+    assert!(lifecycle.runner().mutations().is_empty());
+    // Once the host rolls again — a new (container, host) pair — and only
+    // then without the override configured, the same seat recreates from the
+    // pinned tag again.
+    *lifecycle.runner().host_version.lock().unwrap() = Some(v("0.19.1152"));
+    let out = skew_pass(&mut lifecycle, &env, &mut state, 120);
+    assert!(matches!(out[..], [Outcome::SkewRecreated { .. }]), "{out:?}");
 }

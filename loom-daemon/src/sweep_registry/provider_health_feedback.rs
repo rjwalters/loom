@@ -152,6 +152,18 @@ impl SweepRegistry {
         ) else {
             return;
         };
+        // #13966: a step whose launch died on an exhausted seat carries that
+        // fact to its own end, so the release says `provider_exhausted` and
+        // the item is charged nothing. Only a step's end consumes it; an
+        // issue sweep's feedback notes nothing.
+        if feedback.classification == crate::api_keys_pool::classify::Classification::Exhausted
+            && self
+                .entries
+                .get(sweep_id)
+                .is_some_and(|info| matches!(info.kind, SweepKind::Step { .. }))
+        {
+            crate::sweep_registry::step_spawn::capture::note_step_provider_exhaustion(sweep_id);
+        }
         // `record_api_key` counts only a `Some` mark, so an exit that finds
         // the hold lapsed (`mark: None`) is not counted either.
         if feedback.mark != live_mark {
@@ -181,9 +193,9 @@ impl SweepRegistry {
             // A sweep that left the registry without an exit-time feedback
             // pass (cancelled, GC'd) must not keep its watcher forever.
             watches.retain(|id, _| {
-                self.entries.get(id).is_some_and(|entry| {
-                    matches!(entry.state, SweepState::Running | SweepState::Pending)
-                })
+                self.entries
+                    .get(id)
+                    .is_some_and(|entry| matches!(entry.state, SweepState::Running))
             });
             watches
                 .entry(sweep_id.to_string())

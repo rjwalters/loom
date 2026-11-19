@@ -1,6 +1,6 @@
 //! Coverage for the per-issue ready queue (Issue #8852). Its own file with
-//! its own minimal fakes, for the file-size-ratchet reason
-//! `prless_retry_tests.rs` gives: `work_finder/tests.rs` is frozen.
+//! its own minimal fakes, for the reason `prless_retry_tests.rs` gives: it
+//! stays independent of the shared `work_finder/tests.rs` harness.
 
 #![allow(clippy::unwrap_used)]
 
@@ -43,7 +43,6 @@ struct Disp {
     dispatched: Vec<u32>,
     in_flight: HashSet<u32>,
     backed_off: HashSet<u32>,
-    peer: HashSet<u32>,
     open_pr: HashSet<u32>,
     quarantined: HashSet<u32>,
     noop: HashSet<u32>,
@@ -58,9 +57,6 @@ impl WorkDispatcher for Disp {
     }
     fn backed_off(&self) -> HashSet<u32> {
         self.backed_off.clone()
-    }
-    fn peer_claimed(&self) -> HashSet<u32> {
-        self.peer.clone()
     }
     fn quarantined(&self) -> HashSet<u32> {
         self.quarantined.clone()
@@ -158,7 +154,6 @@ fn every_seen_issue_gets_one_row_with_its_reason() {
         Disp {
             in_flight: HashSet::from([3]),
             backed_off: HashSet::from([4]),
-            peer: HashSet::from([5]),
             open_pr: HashSet::from([1]),
             ..Default::default()
         },
@@ -174,7 +169,7 @@ fn every_seen_issue_gets_one_row_with_its_reason() {
             (2, QueueDisposition::Parked),
             (3, QueueDisposition::InFlight),
             (4, QueueDisposition::DispatchBackoff),
-            (5, QueueDisposition::PeerClaim),
+            (5, QueueDisposition::Dispatched),
             (6, QueueDisposition::Dispatched),
         ]
     );

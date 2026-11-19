@@ -5,7 +5,8 @@
 
 use super::capture::{
     emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, tick_outcome, StepCapture, StepEnd, StepOutcomeClass,
+    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
+    StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -179,6 +180,51 @@ fn a_pool_or_runtime_gate_refuses_with_its_own_reason() {
     assert_eq!(refusal_of(&RoleTickOutcome::Failure("x".into())).reason, "admission_refused");
 }
 
+/// #14026 acceptance criterion 3, at the refusal boundary: a preference-path
+/// exhaustion longer than the marker's 160-char cap reaches the step refusal
+/// — the text `begin_step_spawn` logs after its `sweep_registry:` prefix —
+/// as ONE line carrying the full untruncated reason, never the multi-line
+/// operator diagnostic.
+#[test]
+fn a_runtime_rejected_refusal_carries_the_one_line_candidate_rendering() {
+    let obligation = "owned account lease plus durable workspace preparation for model \
+                      claude/sonnet on profile zai-metered is still outstanding (#13916)";
+    let rejection = crate::runtime_admission::RuntimeRejection {
+        role: "curator".into(),
+        runtime: String::new(),
+        source: crate::runtime_admission::RuntimeSource::Preference,
+        unmet_capabilities: vec![],
+        reason: format!(
+            "No runtime in the preference list can serve role \"curator\" right now\n  \
+             codex -> not-admitted(unmet capabilities: worktreeIsolation; {obligation})"
+        ),
+        exhausted_summary_line: Some(
+            format!(
+                "runtime_rejected role=curator: codex -> not-admitted(unmet capabilities: \
+             worktreeIsolation; {obligation})"
+            )
+            .into_boxed_str(),
+        ),
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(rejection));
+    assert_eq!(refusal.reason, "runtime_rejected");
+    assert!(!refusal.detail.contains('\n'), "one line: {}", refusal.detail);
+    assert!(refusal.detail.contains(obligation), "{}", refusal.detail);
+    assert!(!refusal.detail.contains('\u{2026}'), "{}", refusal.detail);
+    // A rejection without the one-line rendering (the static path) falls back
+    // to its own reason, byte-identical to the pre-#14026 refusal text.
+    let static_rejection = crate::runtime_admission::RuntimeRejection {
+        role: "builder".into(),
+        runtime: "codex".into(),
+        source: crate::runtime_admission::RuntimeSource::RoleConfig,
+        unmet_capabilities: vec!["worktreeIsolation".into()],
+        reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
+    };
+    let refusal = refusal_of(&RoleTickOutcome::RuntimeRejected(static_rejection));
+    assert_eq!(refusal.detail, "unmet capabilities: worktreeIsolation");
+}
+
 // ---- B1: the claim --------------------------------------------------------
 
 /// The pre-claim takes the role-keyed lease with the step, under the step's
@@ -308,7 +354,6 @@ fn a_step_past_its_timeout_is_reaped_and_its_claim_restored() {
                 effort: None,
                 depends_on: None,
                 repo: None,
-                overflow: false,
             },
         );
         (id, pid)
@@ -354,6 +399,71 @@ fn an_outcome_line_parses_and_the_prompts_template_does_not() {
         "`LOOM_STEP_OUTCOME role=judge target=<n> class=<verdict|noop|refused|failed> reason=<token>`"
     )
     .is_none());
+}
+
+/// #14168: the three framings runtimes put on the line — bare, backticked,
+/// inside a JSON text event (the wrapper's `"}` or literal `\n` escape
+/// glued to the last token) — parse to the identical `StepOutcomeLine`.
+#[test]
+fn the_three_outcome_line_framings_parse_identically() {
+    let expected = StepOutcomeLine {
+        role: "judge".into(),
+        target: 7,
+        class: StepOutcomeClass::Verdict,
+        reason: "ci_pending".into(),
+    };
+    let bare = "LOOM_STEP_OUTCOME role=judge target=7 class=verdict reason=ci-pending";
+    let backticked = "`LOOM_STEP_OUTCOME role=judge target=7 class=`verdict` reason=`ci-pending`";
+    let json_event = concat!(
+        r#"{"type":"text","text":"LOOM_STEP_OUTCOME role=judge target=7 "#,
+        r#"class=verdict reason=ci-pending\n"}"#,
+    );
+    for (framing, raw) in [
+        ("bare", bare),
+        ("backticked", backticked),
+        ("json-text-event", json_event),
+    ] {
+        assert_eq!(parse_outcome_line(raw).unwrap(), expected, "{framing}");
+    }
+    // A quoted value inside the JSON framing ends at its closing quote, and
+    // the JSON keys around it never read as outcome fields.
+    let quoted = r#"{"role":"assistant","text":"LOOM_STEP_OUTCOME role=judge target=7 class=verdict reason=ci-pending"}"#;
+    assert_eq!(parse_outcome_line(quoted).unwrap(), expected);
+}
+
+/// #14168: a recorded `reason` is the reason as written (its `-` folded),
+/// truncated to a fixed bound so a runaway line cannot pin an unbounded
+/// attribute value.
+#[test]
+fn a_reason_is_recorded_bounded() {
+    let long = "r".repeat(500);
+    let line = parse_outcome_line(&format!(
+        "LOOM_STEP_OUTCOME role=judge target=1 class=noop reason={long}"
+    ))
+    .unwrap();
+    assert_eq!(line.reason.chars().count(), 64);
+    assert!(line.reason.chars().all(|c| c == 'r'));
+    let short =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=noop reason=ci-pending")
+            .unwrap();
+    assert_eq!(short.reason, "ci_pending", "as written, folded");
+}
+
+/// #14168: an unknown class is not a parseable line, so the step records
+/// `none` — the countable no-outcome value — on the span and the record.
+#[test]
+fn an_unknown_class_yields_none() {
+    assert!(
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=banana reason=x").is_none()
+    );
+    assert_eq!(step_outcome_projection(None), ("none".to_string(), String::new()));
+    assert_eq!(
+        step_outcome_projection(Some(
+            &parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=1 class=noop reason=x")
+                .unwrap()
+        )),
+        ("noop".to_string(), "x".to_string())
+    );
 }
 
 /// #12541: a Champion step writes only its `CHAMPION-STEP` line, so the
@@ -463,13 +573,13 @@ fn a_builder_that_opens_no_pr_reports_no_pr_with_its_reason() {
         RoleTickOutcome::Failure("no_pr: ci_pending".to_string())
     );
     let class = |line: Option<&_>| {
-        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line)
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), line, false)
             .map(|f| f.class().to_string())
     };
     assert_eq!(class(noop.as_ref()).as_deref(), Some("step-no-pr"));
     assert_eq!(class(None).as_deref(), Some("step-no-outcome-line"));
     assert_eq!(
-        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref())
+        step_failure(StepRole::Judge, StepEnd::Exited(Some(0)), noop.as_ref(), false)
             .map(|f| f.class().to_string()),
         None
     );
@@ -482,8 +592,9 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     let noop = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=noop reason=x");
     let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=c target=1 class=failed reason=a b");
     let judge = StepRole::Judge;
-    let class =
-        |end, line: Option<&_>| step_failure(judge, end, line).map(|f| f.class().to_string());
+    let class = |end, line: Option<&_>| {
+        step_failure(judge, end, line, false).map(|f| f.class().to_string())
+    };
     assert_eq!(class(StepEnd::TimedOut, noop.as_ref()).as_deref(), Some("step-timed-out"));
     assert_eq!(class(StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
     assert_eq!(
@@ -492,7 +603,7 @@ fn a_failed_steps_end_maps_to_its_own_class() {
     );
     assert_eq!(class(StepEnd::Exited(Some(7)), None).as_deref(), Some("step-exit-nonzero"));
     assert_eq!(
-        step_failure(judge, StepEnd::Exited(Some(7)), None)
+        step_failure(judge, StepEnd::Exited(Some(7)), None, false)
             .unwrap()
             .exit_code(),
         Some(7)
@@ -510,13 +621,69 @@ fn a_failed_steps_end_maps_to_its_own_class() {
         ] {
             for line in [None, noop.as_ref(), failed.as_ref()] {
                 assert_eq!(
-                    step_failure(role, end, line).is_some(),
+                    step_failure(role, end, line, false).is_some(),
                     matches!(tick_outcome(role, end, line), RoleTickOutcome::Failure(_)),
                     "{role:?} {end:?} {line:?}"
                 );
             }
         }
     }
+}
+
+/// #13966: a step whose provider feedback said its api-key seat was
+/// exhausted carries the exhaustion class instead of its exit shape — the
+/// launch never had a working credential — but a cancelled step keeps the
+/// operator's own class, and a successful end stays successful.
+#[test]
+fn a_provider_exhausted_step_carries_the_exhaustion_class() {
+    let class = |exhausted, end, line: Option<&_>| {
+        step_failure(StepRole::Builder, end, line, exhausted).map(|f| f.class().to_string())
+    };
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(1)), None).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    // The exit code still rides `exit_code`, never the class.
+    assert_eq!(
+        step_failure(StepRole::Builder, StepEnd::Exited(Some(1)), None, true)
+            .unwrap()
+            .exit_code(),
+        Some(1)
+    );
+    // Even a line the session did write, and a timeout, reclass to it.
+    let failed = parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=1 class=failed");
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(1)), failed.as_ref()).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    assert_eq!(class(true, StepEnd::TimedOut, None).as_deref(), Some("step-provider-exhausted"));
+    // A cancel is the operator's act; a Judge's clean exit is not a failure
+    // (a Builder's clean exit without a line is one, #12500, and reclasses).
+    assert_eq!(class(true, StepEnd::Cancelled, None).as_deref(), Some("step-cancelled"));
+    let judge_class = |exhausted, end| {
+        super::capture::step_failure(StepRole::Judge, end, None, exhausted)
+            .map(|f| f.class().to_string())
+    };
+    assert_eq!(judge_class(true, StepEnd::Exited(Some(0))), None);
+    assert_eq!(
+        class(true, StepEnd::Exited(Some(0)), None).as_deref(),
+        Some("step-provider-exhausted")
+    );
+    // Without the evidence the shapes are unchanged.
+    assert_eq!(
+        class(false, StepEnd::Exited(Some(1)), None).as_deref(),
+        Some("step-exit-nonzero")
+    );
+}
+
+/// #13966: the bridge-to-end hand-off is a take-once read of a bounded map.
+#[test]
+fn a_noted_provider_exhaustion_is_taken_once() {
+    let id = "step-builder-13966-take-once";
+    assert!(!super::capture::take_step_provider_exhaustion(id), "nothing noted yet");
+    super::capture::note_step_provider_exhaustion(id);
+    assert!(super::capture::take_step_provider_exhaustion(id), "the end reads it once");
+    assert!(!super::capture::take_step_provider_exhaustion(id), "and it is gone");
 }
 
 /// Capture parity with role ticks (#11877): a step's end writes the same
@@ -531,12 +698,15 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
         role: StepRole::ChampionMerge,
         item: 8,
         sweep_id: "step-champion_merge-8-1".into(),
+        trace_context: None,
         started_at: Utc::now() - chrono::Duration::seconds(30),
         outcome: RoleTickOutcome::Success,
         step_outcome: Some(("noop".into(), "already_judged".into())),
         failure: None,
         model: "opus".into(),
         effort: "high".into(),
+        stage: "champion_merge".into(),
+        log_path: dir.path().join("step-champion_merge-8.log"),
     });
     let journal = crate::sweep_outcomes::default_role_tick_telemetry_path(dir.path());
     let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
@@ -549,6 +719,36 @@ fn a_steps_end_writes_the_role_ticks_outcome_record() {
     assert_eq!(records[0].step_class.as_deref(), Some("noop"));
     assert_eq!(records[0].step_reason.as_deref(), Some("already_judged"));
     assert_eq!(records[0].result, crate::telemetry::RoleTickResult::Success);
+}
+
+/// #14168: a step that wrote no parseable outcome line records
+/// `step_class="none"` on its `role_tick.outcome` record — "no outcome" is
+/// countable, not an absence — with no `step_reason`.
+#[test]
+#[serial]
+fn a_step_with_no_outcome_line_records_none_on_its_record() {
+    let dir = tempdir().unwrap();
+    std::env::remove_var(crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV);
+    emit_step_capture(&StepCapture {
+        root: dir.path().to_path_buf(),
+        role: StepRole::Judge,
+        item: 9,
+        sweep_id: "step-judge-9-1".into(),
+        trace_context: None,
+        started_at: Utc::now() - chrono::Duration::seconds(30),
+        outcome: RoleTickOutcome::Success,
+        step_outcome: Some(step_outcome_projection(None)),
+        failure: None,
+        model: "opus".into(),
+        effort: "high".into(),
+        stage: "judge".into(),
+        log_path: dir.path().join("step-judge-9.log"),
+    });
+    let journal = crate::sweep_outcomes::default_role_tick_telemetry_path(dir.path());
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(&journal);
+    assert_eq!(records.len(), 1, "{journal:?}");
+    assert_eq!(records[0].step_class.as_deref(), Some("none"));
+    assert_eq!(records[0].step_reason.as_deref(), None);
 }
 
 /// Review item 4: a step found dead at startup runs the step end too, so the
@@ -895,6 +1095,251 @@ fn a_failed_rollback_still_returns_the_original_refusal() {
     assert_eq!(rollback_of(&refusal), Some("failed"));
 }
 
+// ---- #14482: a terminal Builder yields only its own issue lease -----------
+
+mod builder_terminal_cleanup {
+    use super::*;
+    use crate::forge_check_claim::{self as guard, BranchLeg, ClaimEvidence};
+    use crate::worktree_ops::gh::MergedBranchPrProbe;
+
+    const MINE: &str = "step-builder-12133-terminal";
+
+    /// Extend the existing claim fixture with persisted labels and yield reads.
+    /// The cleanup and admission readers consume the same forge state.
+    fn fixture(ws: &Path) -> (SweepRegistry, PathBuf) {
+        let (reg, _, _, store) =
+            crate::sweep_registry::test_support::lease_order_dispatch_registry(ws, &[]);
+        std::fs::write(ws.join("labels.json"), r#"["loom:issue"]"#).unwrap();
+        let fake = ws.join("fake-gh.sh");
+        let script = std::fs::read_to_string(&fake)
+            .unwrap()
+            .replace("[[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n", "");
+        let prefix = format!(
+            r#"#!/usr/bin/env bash
+labels='{root}/labels.json'
+if [[ "$1 $2" == 'api graphql' && -f '{root}/open-pr' ]]; then
+  echo '{{"data":{{"repository":{{"issue":{{"closedByPullRequestsReferences":{{"nodes":[{{"number":999,"state":"OPEN"}}]}}}}}}}}}}'
+  exit 0
+fi
+if [[ "$1 $2" == 'issue edit' ]]; then
+  printf '%s\n' "$*" >> '{root}/gh-invocations.log'
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --remove-label) shift; jq --arg l "$1" 'map(select(. != $l))' "$labels" > "$labels.next"; mv "$labels.next" "$labels" ;;
+      --add-label) shift; jq --arg l "$1" '. + [$l] | unique' "$labels" > "$labels.next"; mv "$labels.next" "$labels" ;;
+    esac
+    shift
+  done
+  exit 0
+fi
+if [[ "$1 $2" == 'issue view' ]]; then
+  [[ -f '{root}/unreadable' ]] && exit 1
+  jq '{{state:"OPEN",url:"https://github.com/rjwalters/loom/issues/12133",labels:map({{name:.}})}}' "$labels"
+  exit 0
+fi
+if [[ "$1" == api && "$*" == *closed_at* ]]; then
+  [[ -f '{root}/unreadable' ]] && exit 1
+  jq '{{state:"open",body:"",closed_at:null,labels:.}}' "$labels"
+  exit 0
+fi
+if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'* ]]; then echo false; exit 0; fi
+"#,
+            root = ws.display(),
+        );
+        std::fs::write(fake, prefix + &script).unwrap();
+        (reg, store)
+    }
+
+    /// The public check-claim verdict, using its real label/lease readers and
+    /// the registry's linked-PR probe. This fixture has no merged PR or branch.
+    fn admission(reg: &SweepRegistry) -> guard::Verdict {
+        let root = &reg.config.workspace_root;
+        let gh = reg.resolved_gh();
+        guard::decide(
+            BUILDER_ITEM,
+            &ClaimEvidence {
+                open_pr: reg.probe_open_linked_pr(BUILDER_ITEM),
+                merged_pr: Some(MergedBranchPrProbe::NoneMerged),
+                labels: Some(guard::read_claim_labels(&gh, root, BUILDER_ITEM)),
+                lease: Some(guard::read_freshest_live_lease(
+                    &gh,
+                    root,
+                    BUILDER_ITEM,
+                    Utc::now(),
+                    15.0,
+                )),
+                branch: Some(BranchLeg::Absent),
+            },
+            false,
+        )
+    }
+
+    fn finish(reg: &mut SweepRegistry) {
+        reg.release_dead_step(
+            MINE,
+            BUILDER_ITEM,
+            StepRole::Builder,
+            Utc::now(),
+            StepEnd::Exited(Some(1)),
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_builder_is_immediately_admissible_and_cleanup_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        assert_eq!(admission(&reg).stdout, "BUILDING");
+        // Retain a real exited child, using the existing reaper fixture.
+        let old_id = crate::sweep_registry::test_support::insert_clean_exit_running(
+            &mut reg,
+            BUILDER_ITEM,
+            1,
+        );
+        let mut entry = reg.entries.remove(&old_id).unwrap();
+        entry.sweep_id = MINE.into();
+        entry.kind = SweepKind::Step {
+            item: BUILDER_ITEM,
+            role: StepRole::Builder,
+        };
+        entry.log_path = reg.compute_step_log_path(BUILDER_ITEM, StepRole::Builder);
+        reg.entries.insert(MINE.into(), entry);
+        let child = reg.children.remove(&old_id).unwrap();
+        reg.children.insert(MINE.into(), child);
+        assert_eq!(reg.reap_once(), 1);
+        assert!(reg.entries[MINE].state.is_terminal());
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, guard::EX_SAFE_TO_CLAIM, "{verdict:?}");
+        let comments = stored_comments(&store);
+        assert!(comments
+            .contains(&format!("loom:lease-yield host={} sweep={MINE}", reg.published_host_id())));
+        finish(&mut reg);
+        assert_eq!(stored_comments(&store), comments, "repeat cleanup posts no duplicate yield");
+        assert_eq!(reg.reap_once(), 0);
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn won_builder_claim_spawn_failure_yields_its_lease() {
+        let dir = tempdir().unwrap();
+        let (mut reg, _) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        reg.unwind_step_claim(BUILDER_ITEM, StepRole::Builder, MINE, true);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, guard::EX_SAFE_TO_CLAIM, "{verdict:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_builder_never_yields_a_newer_peer_lease() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        let original = stored_comments(&store);
+        let peer = original
+            .lines()
+            .next()
+            .unwrap()
+            .replace(MINE, "new-peer")
+            .replace(&reg.published_host_id(), "peer-host");
+        std::fs::write(&store, format!("{original}{peer}\n")).unwrap();
+        finish(&mut reg);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, 0, "{verdict:?}");
+        assert!(verdict.stdout.ends_with(" new-peer"), "{verdict:?}");
+        assert!(!stored_comments(&store).contains("lease-yield host=peer-host sweep=new-peer"));
+    }
+
+    #[test]
+    #[serial]
+    fn failed_terminal_yield_keeps_the_fresh_lease_effective() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        break_gh_arm(dir.path(), COMMENT_WRITE_ARM);
+        finish(&mut reg);
+        let verdict = admission(&reg);
+        assert_eq!(verdict.code, 0, "{verdict:?}");
+        assert!(verdict.stdout.ends_with(MINE), "{verdict:?}");
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        let calls = std::fs::read_to_string(dir.path().join("gh-invocations.log")).unwrap();
+        assert!(
+            calls
+                .lines()
+                .any(|l| l.starts_with("issue comment") && l.contains("loom:lease-yield")),
+            "the failed write was attempted"
+        );
+        assert!(
+            !reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"),
+            "the failed yield is reported, not treated as success"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unreadable_terminal_lease_history_is_not_a_successful_yield() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        break_gh_arm(dir.path(), COMMENT_READ_ARM);
+        assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+        finish(&mut reg);
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        assert_eq!(admission(&reg).code, guard::EX_PROBE_FAILED);
+    }
+
+    #[test]
+    #[serial]
+    fn an_untrusted_yield_does_not_suppress_terminal_cleanup() {
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        let original = stored_comments(&store);
+        let mut forged: serde_json::Value =
+            serde_json::from_str(original.lines().next().unwrap()).unwrap();
+        forged["user"] = serde_json::json!({"login":"outsider", "type":"User"});
+        forged["body"] =
+            format!("<!-- loom:lease-yield host={} sweep={MINE} -->", reg.published_host_id())
+                .into();
+        std::fs::write(&store, format!("{original}{forged}\n")).unwrap();
+        finish(&mut reg);
+        assert_eq!(stored_comments(&store).matches("loom:lease-yield").count(), 2);
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_cleanup_preserves_open_pr_hold_and_unreadable_vetoes() {
+        for (veto, spawn_failed) in ["open-pr", "loom:frozen", "loom:operator", "unreadable"]
+            .into_iter()
+            .flat_map(|veto| [(veto, false), (veto, true)])
+        {
+            let dir = tempdir().unwrap();
+            let (mut reg, _) = fixture(dir.path());
+            builder_claim(&mut reg, MINE).unwrap();
+            match veto {
+                "open-pr" => std::fs::write(dir.path().join("open-pr"), "").unwrap(),
+                "unreadable" => std::fs::write(dir.path().join("unreadable"), "").unwrap(),
+                label => std::fs::write(
+                    dir.path().join("labels.json"),
+                    format!(r#"["loom:building","{label}"]"#),
+                )
+                .unwrap(),
+            }
+            if spawn_failed {
+                reg.unwind_step_claim(BUILDER_ITEM, StepRole::Builder, MINE, true);
+            } else {
+                finish(&mut reg);
+            }
+            let labels = std::fs::read_to_string(dir.path().join("labels.json")).unwrap();
+            assert!(!labels.contains("loom:issue"), "{veto}: {labels}");
+            assert_ne!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM, "{veto}");
+        }
+    }
+}
+
 // ---- #12450: the captain's claim ------------------------------------------
 
 mod captain {
@@ -1117,6 +1562,22 @@ mod captain {
     }
 }
 
+#[test]
+fn the_late_seat_busy_release_requires_the_matching_exit_and_outcome() {
+    use super::capture::seat_busy_exit_reason;
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+
+    let busy =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy");
+    let refused = StepEnd::Exited(Some(REFUSAL_EXIT_CODE));
+    let classified = |role, item, end| seat_busy_exit_reason(role, item, end, busy.as_ref());
+    assert_eq!(classified(StepRole::Judge, 7, refused), Some(SEAT_BUSY_REASON));
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::Exited(Some(1))), None);
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::TimedOut), None);
+    assert_eq!(classified(StepRole::Judge, 8, refused), None);
+    assert_eq!(classified(StepRole::Curator, 7, refused), None);
+}
+
 /// #12551: a step that ended waiting on CI releases as `ci_wait`, not `noop`.
 #[test]
 fn a_ci_pending_noop_line_releases_as_ci_wait() {
@@ -1183,10 +1644,115 @@ fn builders_completion_section_requires_a_parseable_outcome_line() {
 /// #13521: the capture-side class splits the same way, and only for it.
 #[test]
 fn a_no_line_builder_that_opened_a_pr_has_its_own_step_class() {
-    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None).unwrap();
+    let base = step_failure(StepRole::Builder, StepEnd::Exited(Some(0)), None, false).unwrap();
     let split = super::capture::no_outcome_line_with_pr(base);
     assert_eq!(split.class(), "step-no-outcome-line-pr-opened");
     assert_eq!(split.exit_code(), Some(0));
-    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None).unwrap();
+    let other = step_failure(StepRole::Builder, StepEnd::Exited(Some(3)), None, false).unwrap();
     assert_eq!(super::capture::no_outcome_line_with_pr(other).class(), "step-exit-nonzero");
+}
+
+// ---- selection-time model fallback (#13873) -------------------------------
+
+/// #13873, end-to-end on the step engine: with `roleModels.judge = fable`,
+/// `modelFallback.enabled` and every pool account bad-marked
+/// `[model-class:fable]`, a Judge step launches `/loom:judge` on the `opus`
+/// rung — and its `loom.dispatch.step` span records
+/// `model_configured=fable`, `model_launched=opus`,
+/// `model_fallback_from=fable` / `_reason=no-account-for-class`.
+#[test]
+#[serial]
+fn a_step_falls_back_a_model_rung_when_the_configured_class_is_exhausted() {
+    let dir = tempdir().unwrap();
+    let (mut reg, record) = fixture_registry(dir.path());
+    write_config(
+        dir.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}},
+            "modelFallback": {"enabled": true}}}"#,
+    );
+    // The fixture workspace is not a git worktree, so its per-repo pool is
+    // the one selection resolves: two accounts, every one fable-marked —
+    // fable has nothing to select, opus still does.
+    let tokens = dir.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        std::fs::write(tokens.join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
+
+    let request = StepSpawnRequest::new(9_101, StepRole::Judge);
+    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    let outcome = outcome.unwrap();
+    let recorded = assert_child_wrote(&record, "--model");
+    let lines: Vec<&str> = recorded.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| *l == "arg: --model")
+        .expect("--model pinned");
+    assert_eq!(lines[idx + 1], "arg: opus", "launched model must be the rung: {recorded}");
+
+    let span = signals
+        .spans
+        .iter()
+        .find(|s| s.name.as_str() == "loom.dispatch.step")
+        .unwrap();
+    assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+    assert_eq!(span.attributes["loom.step.model_launched"], "opus");
+    assert_eq!(span.attributes["loom.step.model_fallback_from"], "fable");
+    assert_eq!(span.attributes["loom.step.model_fallback_reason"], "no-account-for-class");
+    assert_eq!(span.attributes["loom.dispatch.admission_result"], "spawned");
+    cancel_all(&mut reg);
+    let _ = outcome;
+}
+
+/// #13873 AC: with the block absent, the same exhausted-for-fable pool is
+/// byte-identical to today — the step still launches on `fable` (and the
+/// real wrapper's selection is what fails later), with no fallback keys on
+/// the span.
+#[test]
+#[serial]
+fn a_step_without_the_fallback_block_launches_the_configured_model() {
+    let dir = tempdir().unwrap();
+    let (mut reg, record) = fixture_registry(dir.path());
+    write_config(
+        dir.path(),
+        r#"{"autonomous": {"roleRunner": {"roleModels": {"judge": "fable"}}}}"#,
+    );
+    let tokens = dir.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&tokens).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        std::fs::write(tokens.join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    std::fs::write(tokens.join(".bad_tokens"), marks).unwrap();
+
+    let request = StepSpawnRequest::new(9_102, StepRole::Judge);
+    let (outcome, signals) = capture(|| reg.spawn_step(&request));
+    outcome.unwrap();
+    let recorded = assert_child_wrote(&record, "--model");
+    let lines: Vec<&str> = recorded.lines().collect();
+    let idx = lines
+        .iter()
+        .position(|l| *l == "arg: --model")
+        .expect("--model pinned");
+    assert_eq!(lines[idx + 1], "arg: fable", "no fallback may fire: {recorded}");
+    let span = signals
+        .spans
+        .iter()
+        .find(|s| s.name.as_str() == "loom.dispatch.step")
+        .unwrap();
+    assert_eq!(span.attributes["loom.step.model_configured"], "fable");
+    assert!(!span
+        .attributes
+        .contains_key("loom.step.model_fallback_from"));
+    cancel_all(&mut reg);
 }

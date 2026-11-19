@@ -38,6 +38,14 @@ pub struct Comment {
     pub author: Author,
     #[serde(default)]
     pub body: String,
+    /// When the comment was posted (RFC 3339), when the forge said (#13889).
+    /// Read only by `check-stale-blocked`'s hold-comment ordering.
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// The forge's author trust decision ([`crate::comment_trust`]) — set only
+    /// by `check-stale-blocked`'s production reader; `false` otherwise (#13889).
+    #[serde(default, skip)]
+    pub trusted: bool,
 }
 
 /// The `--stdin` document — the same shape `gh issue view --json body,comments`

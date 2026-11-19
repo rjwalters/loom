@@ -216,6 +216,46 @@ fn a_stale_loom_only_merge_is_aborted_and_repaired() {
     assert!(kinds(&found).contains(&"abort"));
 }
 
+/// A neighbour runner's `git` that has exited but not been reaped is a
+/// zombie: it runs nothing and holds no working directory, but
+/// `kill(pid, 0)` still finds it, so `live_git`'s fail-closed rule counted
+/// it as working in the fixture and the repair was declined. That was the
+/// loaded-runner flake in this module (#14059, #14052).
+#[cfg(target_os = "linux")]
+#[test]
+fn an_unreaped_git_elsewhere_does_not_hold_the_repair() {
+    fn zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map(|s| {
+                s.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+    let fx = loom_fixture();
+    merge_in_progress(&fx);
+    let mut ghost = Command::new("git")
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("a foreign git that exits at once");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !zombie(ghost.id()) {
+        assert!(std::time::Instant::now() < deadline, "the foreign git never exited");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let found = heal(&fx, late());
+
+    let _ = ghost.wait();
+    assert!(healed(only(&found).state), "{found:?}");
+    assert!(!fx.host.join(".git/MERGE_HEAD").exists());
+}
+
 #[test]
 fn a_stale_loom_only_rebase_is_aborted_and_repaired() {
     let fx = loom_fixture();
@@ -376,6 +416,21 @@ fn a_recent_operation_is_not_touched() {
     let fx = loom_fixture();
     merge_in_progress(&fx);
     assert_eq!(assert_untouched(&fx, Utc::now()), CheckoutState::MidOperation);
+}
+
+/// A pass that declines a repair says why in its result (#14059): the
+/// self-heal tests print the pass, so a repeat flake names the cause of the
+/// skip and not only the state the checkout was left in.
+#[test]
+fn a_declined_repair_says_why_in_the_pass_result() {
+    let fx = loom_fixture();
+    merge_in_progress(&fx);
+
+    let found = pass_at(&fx, &Knobs::default(), &mut Memory::default(), Utc::now());
+
+    assert_eq!(only(&found).state, CheckoutState::MidOperation);
+    let why = found.self_heal_left.join("; ");
+    assert!(why.contains("the operation in progress is recent"), "{why}");
 }
 
 #[test]
@@ -973,7 +1028,13 @@ fn the_merged_pr_lookup_is_the_last_question_asked() {
     let fx = loom_fixture();
     stranded_with_its_own_commit(&fx);
     let (asked, found) = lookups_in_a_pass(&fx, &knobs_merged(Some(true)), much_later());
-    assert_eq!(asked, 1, "the lookup settles it: {:?}", kinds(&found));
+    assert_eq!(
+        asked,
+        1,
+        "the lookup settles it: {:?} {:?}",
+        kinds(&found),
+        found.self_heal_left
+    );
     assert!(kinds(&found).contains(&"rehomed"), "{:?}", kinds(&found));
 }
 
@@ -1033,8 +1094,15 @@ fn a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref() {
     let first = heal(&fx, much_later());
     let second = heal(&fx, much_later() + chrono::Duration::hours(1));
 
+    // `rehome` declines with a reason when `stranded` doubts the checkout
+    // (#14231); the reason travels in the pass result's `self_heal_left`.
     for pass in [&first, &second] {
-        assert!(kinds(pass).contains(&"repair-failed"), "{:?}", kinds(pass));
+        assert!(
+            kinds(pass).contains(&"repair-failed"),
+            "{:?}: {:?}",
+            kinds(pass),
+            pass.self_heal_left
+        );
         assert!(!kinds(pass).contains(&"rehomed"), "{:?}", kinds(pass));
     }
     assert_eq!(git(&fx.host, &["symbolic-ref", "--short", "HEAD"]), "feature/issue-756");
@@ -1044,6 +1112,27 @@ fn a_rehome_whose_checkout_keeps_failing_reuses_its_rescue_ref() {
     // Only the pass that made it reports making one.
     assert!(kinds(&first).contains(&"rescue-ref"), "{:?}", kinds(&first));
     assert!(!kinds(&second).contains(&"rescue-ref"), "{:?}", kinds(&second));
+}
+
+#[test]
+fn a_checkout_left_off_its_branch_says_why_it_was_not_put_back() {
+    let fx = loom_fixture();
+    git(&fx.host, &["checkout", "--quiet", "-b", "feature/issue-756"]);
+    fx.push("README.md", "two\n");
+    git(&fx.host, &["fetch", "--quiet", "origin"]);
+
+    // `late()` is inside the six-hour wait: `stranded` answers "HEAD moved recently".
+    let found = heal(&fx, late());
+
+    assert_eq!(only(&found).state, CheckoutState::WrongBranch, "{:?}", kinds(&found));
+    assert!(
+        found
+            .self_heal_left
+            .iter()
+            .any(|why| why.contains("HEAD moved recently")),
+        "{:?}",
+        found.self_heal_left
+    );
 }
 
 #[test]

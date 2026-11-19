@@ -186,6 +186,20 @@ pub fn scan(files: &[ChangedFile], cfg: &Config) -> Verdict {
     }
 }
 
+/// The candidate files whose head content could not be read — [`scan`]'s
+/// selection minus every readable file. The ratification verb fails closed
+/// on a non-empty result (exit 3, the read-failed path) instead of printing
+/// a truncated `files=` evidence list at rc=0 (#13932): a hold must state
+/// why it is armed, completely.
+#[must_use]
+pub fn unreadable_candidates(files: &[ChangedFile], cfg: &Config) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| f.status != "removed" && is_candidate(f, cfg) && f.head_content.is_none())
+        .map(|f| f.filename.clone())
+        .collect()
+}
+
 /// A PR comment, as the hold reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Comment {
@@ -318,9 +332,6 @@ pub enum Action {
     Release,
     /// The head no longer declares it: post [`CLEARED_MARKER`], remove the label.
     Clear,
-    /// A candidate could not be read and no hold stands: do not merge this
-    /// tick, write nothing.
-    Defer,
 }
 
 impl Action {
@@ -332,7 +343,6 @@ impl Action {
             Action::Stands => "stands",
             Action::Release => "release",
             Action::Clear => "clear",
-            Action::Defer => "defer",
         }
     }
 }
@@ -341,6 +351,10 @@ impl Action {
 /// the current head. The release is scoped to a head: a push after it that
 /// still declares ratification re-arms the hold, because the text the operator
 /// released may not be the text now on the PR.
+///
+/// A [`Verdict::Unreadable`] cannot reach `decide` from the CLI: the verb
+/// fails closed on it first (#13932). If one arrives anyway, it falls through
+/// to `Hold`/`Stands` — fail closed, never a silent pass.
 #[must_use]
 pub fn decide(verdict: &Verdict, comments: &[Comment], head: &str) -> Action {
     let ep = episode(comments);
@@ -352,7 +366,6 @@ pub fn decide(verdict: &Verdict, comments: &[Comment], head: &str) -> Action {
     match (verdict, ep) {
         (Verdict::Clear, Episode::None) => Action::None,
         (Verdict::Clear, _) => Action::Clear,
-        (Verdict::Unreadable(_), Episode::None | Episode::Released { .. }) => Action::Defer,
         (_, Episode::Held { .. }) if release_due(comments) => Action::Release,
         (_, Episode::Held { .. }) => Action::Stands,
         (_, Episode::None | Episode::Released { .. }) => Action::Hold,

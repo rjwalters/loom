@@ -215,14 +215,6 @@ pub enum CaptureOutcome {
     TimedOut,
 }
 
-fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks for existence and permission.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 /// Close the account lease descriptor a capture watcher inherited; `value` is
 /// what [`PRIVATE_LEASE_FD_ENV`] holds. Returns whether a descriptor was closed.
 ///
@@ -281,7 +273,10 @@ pub fn capture_codex(spec: &CaptureSpec) -> CaptureOutcome {
             }
             return CaptureOutcome::Captured(id);
         }
-        if spec.watch_pid.is_some_and(|p| !pid_alive(p)) {
+        if spec
+            .watch_pid
+            .is_some_and(|p| !i32::try_from(p).is_ok_and(crate::sweep_registry::pid_signalable))
+        {
             return CaptureOutcome::WatchedExited;
         }
         if Instant::now() >= deadline {

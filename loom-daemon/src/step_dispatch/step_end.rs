@@ -74,18 +74,36 @@ fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     outcome_ledger::parse_outcome_line(&text[from..], step.role, step.item)
 }
 
-/// The run the ledger records for `step`, given its post-state read.
+/// The run the ledger records for `step`, given its post-state read. A step
+/// whose provider feedback said its api-key seat was exhausted
+/// (`step.provider_exhausted`, #13966) records a refusal
+/// ([`outcome_ledger::PROVIDER_EXHAUSTED`]) whatever the forge post-state:
+/// the launch died on an empty seat, so the pair arms no cooldown and the
+/// run is not counted for the repeat cap.
+///
+/// No cancel carve-out is needed here, unlike the two `step_failure`s: the
+/// flag is set only by the exit-time provider feedback, which the cancel
+/// path (`reaper::finish_cancel`, the only producer of `StepEnd::Cancelled`)
+/// never runs, so a cancelled step cannot carry it.
 #[must_use]
 pub fn run_of(
     step: &EndedStep,
     line: Option<&outcome_ledger::StepOutcome>,
     post: Option<PostState>,
 ) -> StepRun {
+    let outcome = if step.provider_exhausted {
+        outcome_ledger::StepOutcome::new(
+            outcome_ledger::OutcomeClass::Refused,
+            outcome_ledger::PROVIDER_EXHAUSTED,
+        )
+    } else {
+        outcome_ledger::classify(line, post)
+    };
     StepRun {
         item: step.item,
         step: step.role,
         sweep_id: step.sweep_id.clone(),
-        outcome: outcome_ledger::classify(line, post),
+        outcome,
         ran_for: step.ran_for,
         failure_class: step
             .timed_out
@@ -96,8 +114,13 @@ pub fn run_of(
 /// The ledger's refusal reason for a spawn-time refusal
 /// (`sweep_registry::step_spawn::StepRefusal::reason`): the pool gate and a
 /// claim held elsewhere cool the `(item, step)` down; a lost claim is a
-/// counted redraw. `None` for a refusal that says nothing about the item (a
-/// roll pause, a workspace missing the role's command).
+/// counted redraw. A standing admission refusal (#14032: the runtime will
+/// not take the launch — a rejected runtime, a model/runtime mismatch, or
+/// any other role-tick admission failure) also cools the pair down, through
+/// the ledger's state-refusal streak ([`outcome_ledger::Effect::Reclassify`]),
+/// so a repeat backs off instead of being redrawn every tick. `None` for a
+/// refusal that says nothing about the item (a roll pause, a workspace
+/// missing the role's command).
 #[must_use]
 pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     match spawn_reason {
@@ -109,6 +132,12 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
         // item, so it falls through to `None`.
         "spawn_failed" | "label_flip_failed" => Some("pool_gate"),
         "claim_lost" => Some("claim_lost"),
+        // #14032: a standing admission refusal is neither a gate nor a
+        // claim, so it takes the state-refusal streak (the `Refused`
+        // fall-through in `outcome_ledger::effect_of`): the second identical
+        // one arms the refusal cooldown, doubling per further one up to
+        // `MAX_SHORT_COOLDOWN`.
+        "runtime_rejected" | "model_runtime_mismatch" | "admission_refused" => Some("admission"),
         _ => None,
     }
 }
@@ -283,6 +312,60 @@ mod tests {
         assert_eq!(ledger_reason("spawn_failed"), Some("pool_gate"));
         // #12048: says nothing about the item, so no window doubles against it.
         assert_eq!(ledger_reason("workspace_commands_missing"), None);
+        // #14032: a standing admission refusal cools the pair down (through
+        // the state-refusal streak), so it is not redrawn on every tick.
+        assert_eq!(ledger_reason("runtime_rejected"), Some("admission"));
+        assert_eq!(ledger_reason("model_runtime_mismatch"), Some("admission"));
+        assert_eq!(ledger_reason("admission_refused"), Some("admission"));
+    }
+
+    /// #13966: a step whose provider feedback said its api-key seat was
+    /// exhausted records a refusal, not a run — the fast-fail ladder and the
+    /// repeat cap never see it, and no item cooldown is armed.
+    #[test]
+    fn a_provider_exhausted_step_records_a_refusal_that_charges_nothing() {
+        let step = EndedStep {
+            sweep_id: "step-builder-13966-1".into(),
+            item: 13966,
+            role: StepRole::Builder,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(80),
+            timed_out: false,
+            provider_exhausted: true,
+        };
+        // The post-state of a crashed step (claim restored, item unchanged)
+        // would classify `failed`; the exhaustion override wins.
+        let post = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        assert!(post.claim_held, "fixture: a crashed step's shape");
+        let run = run_of(&step, None, Some(post));
+        assert_eq!(run.outcome.class, OutcomeClass::Refused);
+        assert_eq!(run.outcome.reason, outcome_ledger::PROVIDER_EXHAUSTED);
+        // And the refusal charges nothing: not a repeat-cap run, and not the
+        // state-refusal effect either, whose second identical refusal in a
+        // row arms a doubling window.
+        assert!(!outcome_ledger::counts_as_run(&run.outcome));
+        assert_eq!(
+            outcome_ledger::effect_of(
+                StepRole::Builder,
+                &run.outcome,
+                run.ran_for,
+                &outcome_ledger::LedgerConfig::default(),
+            ),
+            outcome_ledger::Effect::Uncharged
+        );
+        // Measured on the ledger itself, across consecutive exhaustions (the
+        // shape of a multi-seat outage, each launch discovering the next
+        // seat): the pair is never cooling, whatever the count.
+        let mut ledger = outcome_ledger::OutcomeLedger::default();
+        let t0 = chrono::Utc::now();
+        for k in 0..6 {
+            let at = t0 + chrono::Duration::minutes(k);
+            let rec = ledger.record(run.item, run.step, &run.outcome, run.ran_for, at);
+            assert_eq!(rec.effect, outcome_ledger::Effect::Uncharged, "exhaustion {k}");
+            assert_eq!(rec.cooling_until, None, "exhaustion {k} armed a window");
+            assert_eq!(ledger.cooling_cause(run.item, run.step, at), None, "exhaustion {k}");
+            assert!(!rec.repeat_capped, "exhaustion {k} counted as a run");
+        }
     }
 
     #[test]
@@ -294,6 +377,7 @@ mod tests {
             log_path: "/nonexistent".into(),
             ran_for: std::time::Duration::from_secs(60),
             timed_out: false,
+            provider_exhausted: false,
         };
         let run = run_of(&step, None, None);
         assert_eq!(run.outcome.class, OutcomeClass::Failed);

@@ -62,6 +62,7 @@ impl FakeRunner {
                 started_at: Some("2026-09-05T00:00:00Z".into()),
                 image: Some("ghcr.io/rjwalters/loom-worker-session:test".into()),
                 workspace,
+                extra_mounts: Vec::new(),
             },
         );
     }
@@ -73,6 +74,8 @@ impl FakeRunner {
             .insert(container.to_string(), busy);
     }
 }
+
+impl session_image::BundleProbe for FakeRunner {}
 
 impl ContainerRunner for FakeRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
@@ -86,6 +89,7 @@ impl ContainerRunner for FakeRunner {
         codex_home: &Path,
         workspace: &Path,
         daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         let mut roots = self.daemon_roots.lock().unwrap();
         roots.push(daemon_root.to_path_buf());
@@ -954,6 +958,7 @@ fn run_args_for(roots: &[PathBuf]) -> Vec<String> {
         Path::new("/home/u/GitHub"),
         roots,
         &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
+        &[],
     )
 }
 
@@ -1035,6 +1040,87 @@ fn host_session_run_args_mount_only_the_profile_and_the_given_roots() {
         ],
         "no Claude token pool, no personal gh config, no checkout parent; App token dir and profile controls read-only"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14019: configured extra read-only mounts.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn host_session_run_args_without_extra_mounts_are_unchanged() {
+    // Unset = today's behaviour byte for byte: no extra `--mount`, and no
+    // `loom.extra-mounts` label at all.
+    let args = run_args_for(&[PathBuf::from("/home/u/GitHub/loom")]);
+    let joined = args.join(" ");
+    assert!(!joined.contains(EXTRA_MOUNTS_LABEL), "{joined}");
+    assert_eq!(
+        args.iter().filter(|a| **a == "--mount").count(),
+        3,
+        "only the three profile-control binds: {args:?}"
+    );
+    assert_eq!(
+        args.iter().filter(|a| **a == "-v").count(),
+        3,
+        "the profile, the one root and the App-token dir, nothing else: {args:?}"
+    );
+}
+
+#[test]
+fn host_session_run_args_mount_extra_read_only_and_label_them() {
+    let mounts = vec![
+        ExtraMount {
+            host: PathBuf::from("/opt/pdk"),
+            container: PathBuf::from("/opt/pdk"),
+        },
+        ExtraMount {
+            host: PathBuf::from("/data/models"),
+            container: PathBuf::from("/srv/models"),
+        },
+    ];
+    let args = host_session_run_args(
+        "loom-codex-session-alice",
+        "img:tag",
+        Path::new("/profiles/alice"),
+        Path::new("/home/u/GitHub"),
+        &[PathBuf::from("/home/u/GitHub/loom")],
+        &[],
+        &mounts,
+    );
+    let joined = args.join(" ");
+    assert!(joined.contains("type=bind,src=/opt/pdk,dst=/opt/pdk,readonly"), "{joined}");
+    assert!(
+        joined.contains("type=bind,src=/data/models,dst=/srv/models,readonly"),
+        "{joined}"
+    );
+    let label = format!(
+        "{EXTRA_MOUNTS_LABEL}={}",
+        crate::tokens_pool::session_image::extra_mounts_label_json(&mounts)
+    );
+    assert!(args.contains(&label), "{args:?}");
+    // Every extra bind carries `readonly`.
+    for window in args.windows(2).filter(|pair| pair[0] == "--mount") {
+        assert!(window[1].ends_with(",readonly"), "{}", window[1]);
+    }
+}
+
+#[test]
+fn parse_inspect_line_reads_the_extra_mounts_label() {
+    let mounts = vec![ExtraMount {
+        host: PathBuf::from("/opt/pdk"),
+        container: PathBuf::from("/opt/pdk"),
+    }];
+    let line = format!(
+        "id\ttrue\tfalse\tstarted\timg\t/workspace\t{}",
+        crate::tokens_pool::session_image::extra_mounts_label_json(&mounts)
+    );
+    let state = parse_inspect_line(&line).expect("parses");
+    assert_eq!(state.extra_mounts, mounts);
+    // A container created before the feature has no label at all.
+    let legacy = "id\ttrue\tfalse\tstarted\timg\t/workspace\t";
+    let state = parse_inspect_line(legacy).expect("parses");
+    assert!(state.extra_mounts.is_empty());
+    let state = parse_inspect_line("id\ttrue\tfalse\tstarted\timg\t/workspace").expect("parses");
+    assert!(state.extra_mounts.is_empty());
 }
 
 #[test]
@@ -1128,6 +1214,7 @@ fn gh_credential_dirs_mounts_only_daemon_owned_app_token_dirs() {
         &repo,
         std::slice::from_ref(&repo),
         &gh_credential_dirs(std::slice::from_ref(&repo), None),
+        &[],
     );
     let token = repo.join(".loom/gh-config").display().to_string();
     assert!(args.contains(&format!("{token}:{token}:ro")), "{args:?}");
@@ -1174,6 +1261,168 @@ fn check_mount_denials_refuses_any_root_overlapping_a_firewalled_repo() {
     // A sibling whose name merely starts with the firewalled one is fine
     // (component-wise, not string-prefix, comparison).
     assert!(check_mount_denials(&[base.join("GitHub/notebook-public")], None, &wall).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14019: the configured extra read-only mounts are denied by the same
+// denylist discipline — one function beside `check_mount_denials`.
+// ---------------------------------------------------------------------------
+
+fn extra_mount(host: &str, container: &str) -> ExtraMount {
+    ExtraMount {
+        host: PathBuf::from(host),
+        container: PathBuf::from(container),
+    }
+}
+
+#[test]
+fn extra_mounts_with_clean_data_paths_are_accepted() {
+    let mounts = vec![
+        extra_mount("/opt/pdk", "/opt/pdk"),
+        extra_mount("/data/models", "/srv/models"),
+    ];
+    assert!(crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+        &mounts,
+        Some(Path::new("/home/u")),
+        &[],
+        &[PathBuf::from("/home/u/GitHub/loom")],
+        &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
+    )
+    .is_ok());
+}
+
+#[test]
+fn extra_mount_sources_pass_the_workspace_denials() {
+    // The home directory (or an ancestor of it) is refused as a source.
+    let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+        &[extra_mount("/home/u", "/data/home")],
+        Some(Path::new("/home/u")),
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("home directory"), "{err}");
+    // So is anything overlapping a firewalled repository.
+    let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+        &[extra_mount("/srv/notebook", "/data/notebook")],
+        None,
+        &[PathBuf::from("/srv/notebook")],
+        &[],
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("firewall: true"), "{err}");
+}
+
+#[test]
+fn extra_mount_targets_shadowing_protected_paths_are_refused() {
+    let mounts: Vec<ExtraMount> = [
+        ("/opt/pdk", "/home/u/GitHub/loom/vendor"), // inside a workspace root
+        ("/opt/pdk", "/home/u/GitHub/loom"),        // a workspace root itself
+        ("/opt/pdk", "/home/u/GitHub"),             // an ancestor of it (path parity)
+        ("/opt/pdk", "/home/loom/.codex-profile"),  // the profile
+        ("/opt/pdk", "/home/loom/.codex-profile/hooks.json"), // a control mount
+        ("/opt/pdk", "/home/loom/.claude"),
+        ("/opt/pdk", "/home/loom/.claude/projects"),
+        ("/opt/pdk", "/opt/loom/private-control"), // the sealed bundle
+        ("/opt/pdk", "/opt/loom/private-control/hooks"), // inside the bundle
+        ("/opt/pdk", "/home/u/loom-daemon/.loom/gh-config"), // a credential path
+        ("/opt/pdk", "/"),                         // the container root
+    ]
+    .iter()
+    .map(|(host, container)| extra_mount(host, container))
+    .collect();
+    for mount in mounts {
+        let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+            std::slice::from_ref(&mount),
+            Some(Path::new("/home/u")),
+            &[],
+            &[PathBuf::from("/home/u/GitHub/loom")],
+            &[PathBuf::from("/home/u/loom-daemon/.loom/gh-config")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&mount.container.display().to_string()),
+            "{}: {err}",
+            mount.container.display()
+        );
+    }
+}
+
+#[test]
+fn extra_mount_targets_under_the_workspace_label_are_refused() {
+    // Issue #14420: the "parent of repositories" shape. The label is
+    // `/home/u/GitHub`, only `/home/u/GitHub/loom` is registered, so a target
+    // under the label but outside every root would read as workspace mount
+    // drift to the reconciler unless the gate shields the label itself.
+    let workspace = Path::new("/home/u/GitHub");
+    let roots = [PathBuf::from("/home/u/GitHub/loom")];
+    let credentials = [PathBuf::from("/home/u/loom-daemon/.loom/gh-config")];
+    for container in [
+        "/home/u/GitHub/data",      // under the label, outside every root
+        "/home/u/GitHub",           // the label itself
+        "/home/u/GitHub/data/deep", // nested under the label
+        "/home/u/",                 // an ancestor of the label (trailing slash)
+    ] {
+        let err = crate::tokens_pool::session_mount_gate::check_extra_mounts(
+            &[extra_mount("/opt/pdk", container)],
+            workspace,
+            &roots,
+            &credentials,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(container), "{container}: {err}");
+        assert!(err.contains("/home/u/GitHub"), "{container}: {err}");
+    }
+    // Targets outside the label stay accepted.
+    assert!(crate::tokens_pool::session_mount_gate::check_extra_mounts(
+        &[
+            extra_mount("/opt/pdk", "/opt/pdk"),
+            extra_mount("/data/models", "/data/models")
+        ],
+        workspace,
+        &roots,
+        &credentials,
+    )
+    .is_ok());
+}
+
+#[test]
+fn extra_mount_targets_may_not_be_relative_and_may_not_overlap_each_other() {
+    let relative = ExtraMount {
+        host: PathBuf::from("/opt/pdk"),
+        container: PathBuf::from("relative"),
+    };
+    let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+        &[relative],
+        None,
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("absolute"), "{err}");
+
+    let overlapping = vec![
+        extra_mount("/opt/pdk", "/data"),
+        extra_mount("/data/models", "/data/models"),
+    ];
+    let err = crate::tokens_pool::session_mount_gate::check_extra_mount_denials(
+        &overlapping,
+        None,
+        &[],
+        &[],
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("overlapping"), "{err}");
 }
 
 #[path = "session_lifecycle_controls_tests.rs"]

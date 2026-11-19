@@ -144,6 +144,14 @@ pub fn is_merge_step(step: crate::work_finder::step_item::Step) -> bool {
 /// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
 /// tick (module docs, #12260).
 pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
+/// The spawn refusal of a confirmed writer rate limit
+/// (`sweep_registry::step_spawn::lease`, #13746): the owner's writer
+/// installation is exhausted until a confirmed reset, so like
+/// [`REFUSAL_CLAIM_UNVERIFIED`] every other draw of the same owner fails the
+/// same way — the owner's workspaces leave the draw for the rest of the tick,
+/// and the route hold armed from the handoff keeps the owner out of the next
+/// ticks' pools until its reset.
+pub const REFUSAL_WRITER_LIMITED: &str = crate::writer_limit::OUTCOME;
 /// The spawn refusal of a claim a peer won first: a cheap pass (module docs,
 /// #12410).
 pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
@@ -211,6 +219,37 @@ pub fn forge_owner(repo: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Close every still-open workspace of `owner` out of the tick's draw and
+/// resolve its queue rows as waiting on `reason` (#12260's close for
+/// `claim_unverified`; #13746 adds it for a confirmed writer rate limit):
+/// the first refusal suppresses the route's later requests this tick, while
+/// what already runs finishes normally. Returns the rows it resolved.
+fn close_owner(
+    workspaces: &[StepWorkspace],
+    draw: &mut ItemDraw,
+    rows: &mut [TickQueueRow],
+    owner: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0usize;
+    let held: Vec<usize> = workspaces
+        .iter()
+        .filter(|w| forge_owner(&w.repo) == owner)
+        .map(|w| w.idx)
+        .collect();
+    for idx in &held {
+        draw.close_repo(*idx);
+    }
+    for row in rows.iter_mut().filter(|r| r.disposition.is_none()) {
+        if held.contains(&row.key.workspace_idx) {
+            row.disposition = Some(Qd::DeferredCapacity);
+            row.detail = Some(reason.to_string());
+            resolved += 1;
+        }
+    }
+    resolved
+}
+
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The next value of this process's tick counter, the `loom-draw/v3` seed's
@@ -252,6 +291,46 @@ pub struct StepWorkspace {
     /// Merges in flight in the repo before the tick drew (this host's and
     /// the peers'), for the span.
     pub merges_in_flight: usize,
+    /// The workspace writer route's confirmed-exhaustion hold (#13746),
+    /// resolved by the driver before the tick: candidates that need the
+    /// writer wait instead of drawing and being refused. `None` while the
+    /// route is usable or unknown.
+    pub writer_hold: Option<WriterHold>,
+}
+
+/// A workspace's writer route hold (#13746): why its write-needing
+/// candidates wait, and when the confirmed reset releases them. The queue
+/// rows carry both (`detail`, `held_until`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterHold {
+    /// The waiting reason with the UTC reset, e.g.
+    /// `writer_rate_limited until 2026-11-19T21:39:45+00:00`.
+    pub detail: String,
+    /// The reset (epoch seconds): `held_until` on the queue rows.
+    pub until_epoch: i64,
+}
+
+impl WriterHold {
+    /// The hold `writer_limit::hold_note` found at `now`. Pure.
+    #[must_use]
+    pub fn from_reset(until_epoch: i64, now: i64) -> Option<Self> {
+        (until_epoch > now).then(|| {
+            let detail = chrono::DateTime::from_timestamp(until_epoch, 0).map_or_else(
+                || format!("{} (reset unconfirmed)", crate::writer_limit::OUTCOME),
+                |at| {
+                    format!(
+                        "{} until {}",
+                        crate::writer_limit::OUTCOME,
+                        at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    )
+                },
+            );
+            Self {
+                detail,
+                until_epoch,
+            }
+        })
+    }
 }
 
 /// The host-wide limits of one tick.
@@ -356,9 +435,12 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "peer_active"
         | "backstop_hold"
         | REFUSAL_CAPTAIN_HELD
-        | REFUSAL_CAPTAIN_COOLDOWN => Qd::PeerClaim,
+        | REFUSAL_CAPTAIN_COOLDOWN => Qd::LeaseHeld,
         "captain_not_eligible" => Qd::HostConstraint,
         REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
+        // #13746: a writer rate limit is a waiting state, not an error — the
+        // route holds until its reset, and the row names it.
+        REFUSAL_WRITER_LIMITED => Qd::DeferredCapacity,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"
@@ -368,7 +450,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
-        PASS_MERGE => Qd::PeerClaim,
+        PASS_MERGE => Qd::LeaseHeld,
         _ => Qd::DispatchError,
     }
 }
@@ -473,7 +555,7 @@ pub fn exclude_builders(w: &mut Weighing) -> usize {
 /// The closed-set skip reason a spawn refusal reads as on `pick.decision`.
 fn refusal_skip(reason: &str) -> PickSkipReason {
     match disposition_of(reason) {
-        Qd::PeerClaim => PickSkipReason::InFlight,
+        Qd::LeaseHeld => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
         Qd::DeferredCapacity => PickSkipReason::Cap,
         Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
@@ -513,7 +595,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::Tracker
                 | PassReason::Proposal
                 | PassReason::NoStage
-                | PassReason::Draft,
+                | PassReason::Draft
+                | PassReason::HostSkipLabel,
             ) => &mut report.skipped_labeled,
         };
         *slot += n;
@@ -632,6 +715,22 @@ pub fn run_with_offers(
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());
         for c in &ws.weighing.pool {
+            // #13746: a workspace whose writer route is confirmed exhausted
+            // waits before the draw — no draw, no spawn, no refusal span.
+            // Its row names the reason and the reset instead.
+            if let Some(hold) = &ws.writer_hold {
+                report.queue.push(TickQueueRow {
+                    key: key_of(ws, c),
+                    disposition: Some(Qd::DeferredCapacity),
+                    detail: Some(hold.detail.clone()),
+                    updated_at: None,
+                    held_until: chrono::DateTime::from_timestamp(hold.until_epoch, 0),
+                    story_points: c.item.story_points,
+                    step: Some(c.step),
+                });
+                report.deferred_capacity += 1;
+                continue;
+            }
             report.queue.push(TickQueueRow {
                 key: key_of(ws, c),
                 disposition: ws.halted.then_some(Qd::WorkspaceHalted),
@@ -642,7 +741,10 @@ pub fn run_with_offers(
                 step: Some(c.step),
             });
         }
-        if !ws.halted {
+        // A writer-held workspace contributes no candidates to the draw
+        // (before the captain's offers are taken, too), so its route is
+        // never asked to write this tick (#13746).
+        if !ws.halted && ws.writer_hold.is_none() {
             repos.insert(
                 ws.idx,
                 RepoTerms {
@@ -690,7 +792,7 @@ pub fn run_with_offers(
         let merge = is_merge_step(c.step);
         if merge && merging.get(&idx).copied().unwrap_or(0) >= ws.merge_slots {
             merge_deferred += 1;
-            resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+            resolve(&mut report.queue, &key, Qd::LeaseHeld, Some(PASS_MERGE.to_string()));
             continue;
         }
         if let Some(hold) = spawner.held() {
@@ -723,7 +825,7 @@ pub fn run_with_offers(
                         resolve(
                             &mut report.queue,
                             &key_of(ws, &other),
-                            Qd::PeerClaim,
+                            Qd::LeaseHeld,
                             Some(PASS_MERGE.to_string()),
                         );
                         merge_deferred += 1;
@@ -752,6 +854,11 @@ pub fn run_with_offers(
                             draw.close_repo(other.idx);
                         }
                     }
+                }
+                if reason == REFUSAL_WRITER_LIMITED {
+                    let owner = forge_owner(&ws.repo);
+                    report.deferred_capacity +=
+                        close_owner(&workspaces, &mut draw, &mut report.queue, &owner, &reason);
                 }
                 *pass_counts.entry(reason).or_default() += 1;
             }
@@ -848,7 +955,7 @@ pub fn run_with_offers(
                 if merge && merging.get(&idx).copied().unwrap_or(0) >= ws.merge_slots {
                     merge_deferred += 1;
                     draws_unspawned += 1;
-                    resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+                    resolve(&mut report.queue, &key, Qd::LeaseHeld, Some(PASS_MERGE.to_string()));
                     *deferred.entry(idx).or_default() += 1;
                     continue;
                 }
@@ -940,7 +1047,7 @@ pub fn run_with_offers(
                                 resolve(
                                     &mut report.queue,
                                     &key_of(ws, &c),
-                                    Qd::PeerClaim,
+                                    Qd::LeaseHeld,
                                     Some(PASS_MERGE.to_string()),
                                 );
                             }
@@ -1000,6 +1107,17 @@ pub fn run_with_offers(
                                 draw.close_repo(other.idx);
                             }
                         }
+                    }
+                    if reason == REFUSAL_WRITER_LIMITED {
+                        // The writer is exhausted until a confirmed reset:
+                        // suppress this route's later requests this tick,
+                        // and name the wait on the closed rows (#13746).
+                        let owner = match by_idx.get(&idx) {
+                            Some(ws) => forge_owner(&ws.repo),
+                            None => String::new(),
+                        };
+                        report.deferred_capacity +=
+                            close_owner(&workspaces, &mut draw, &mut report.queue, &owner, &reason);
                     }
                     if reason == REFUSAL_CAPTAIN_CAP {
                         // The captain holds this host at its cap: every repo

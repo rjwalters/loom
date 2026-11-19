@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Ratification Hold (#12992)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Safety Criteria"
@@ -132,8 +135,13 @@ A later push removed every ratification-by-merge declaration from this PR. Re-ev
 
 ---
 *Automated by Champion role*"
-    # The label is shared with the other holds: keep it while one still stands.
-    OTHER=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body] | any(startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->"))' 2>/dev/null)
+    # The label is shared with the other holds: keep it while one still STANDS —
+    # per kind, the latest hold marker outdates the latest cleared notice (#14185).
+    # Mere presence of a marker is not standing: a `-cleared` notice never un-matches it.
+    OTHER=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body] as $b
+      | def stands(h; c): ($b | map(h) | rindex(true)) as $h | ($b | map(c) | rindex(true)) as $c | $h != null and ($c == null or $h > $c);
+      stands(startswith("<!-- champion:merge-risk-hold -->"); contains("<!-- champion:merge-risk-hold-cleared -->"))
+      or stands(startswith("<!-- champion:critical-file-hold -->"); startswith("<!-- champion:critical-file-hold-cleared -->"))' 2>/dev/null)
     [ "$OTHER" = true ] || gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" >/dev/null 2>&1 || true
     ;;
 esac

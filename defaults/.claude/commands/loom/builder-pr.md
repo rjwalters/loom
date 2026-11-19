@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Builder: PR Creation and Quality
 
 This document covers PR creation, test output handling, and quality requirements for the Builder role. For the core builder workflow, see `builder.md`.
@@ -1077,6 +1080,8 @@ If you want to track pre-existing issues for future cleanup:
 > `.loom/docs/gh-issue-create-rest-fallback.md` (or `forge_gh_create_issue_rl_safe` in
 > `lib/forge-helpers.sh` if scripting). `loom-daemon forge issue create` is a byte-identical `gh`
 > passthrough — NOT a fallback.
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 ```bash
 ./.loom/scripts/create-issue.sh --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'

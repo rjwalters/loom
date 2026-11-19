@@ -11,8 +11,7 @@
 //! that; only a test that drives both entry points with the same inputs can.
 //!
 //! These live in `tests/` rather than inline because
-//! `script_helpers/sweep_experiment.rs` is over the file-size ratchet's
-//! threshold and may not grow (`.loom/docs/file-size-policy.md`).
+//! `script_helpers/sweep_experiment.rs` is a large non-test module.
 
 use loom_daemon::activity::resource_usage::ModelPricing;
 use loom_daemon::script_helpers::sweep_experiment::model_pricing;

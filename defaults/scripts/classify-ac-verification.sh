@@ -100,10 +100,13 @@ show_help() {
 # Instruction-shaped fragments, matched case-insensitively against ONE
 # acceptance-criterion item (the bullet plus its wrapped continuation lines,
 # joined and whitespace-normalized) with a LEADING word boundary: start of item
-# or any non-[a-z0-9_] character -- the item is already lowercased, and no
+# or any non-[a-z0-9] character -- the item is already lowercased, and no
 # phrase contains regex metacharacters. So "reproduction run" / "preproduction
 # run" do NOT match 'production run', while "production run" at item start,
-# "Production run:" and "(production run)" still do (#13900). Deliberately NO
+# "Production run:" and "(production run)" still do (#13900). `_` is a boundary
+# character, not an excluded one: a phrase in underscore emphasis (`_next
+# run_`) matches (#14004), and so does one after a snake_case identifier
+# (`nightly_live run` -- accepted edge, #14004). Deliberately NO
 # trailing boundary: a trailing boundary would stop `real pages` / `next runs`
 # matching, narrowing the vocabulary. Grouped by the three failure shapes #6883
 # names; the groups are documentation only -- matching iterates the array in
@@ -155,7 +158,7 @@ _ac_out_of_band_phrase_match() {
     local item="$1" phrase lower_item
     lower_item="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]')"
     for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
-        if printf '%s' "$lower_item" | grep -qE -- "(^|[^a-z0-9_])${phrase}"; then
+        if printf '%s' "$lower_item" | grep -qE -- "(^|[^a-z0-9])${phrase}"; then
             printf '%s' "$phrase"
             return 0
         fi

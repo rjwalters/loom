@@ -488,6 +488,7 @@ echo "stub-claude got token=${CLAUDE_CODE_OAUTH_TOKEN}"
 echo "stub-claude args=$*"
 echo "stub-claude ceiling=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}"
 echo "stub-claude headless=${LOOM_HEADLESS_SESSION:-unset}"
+echo "stub-claude model-env=${LOOM_MODEL:-unset}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -754,6 +755,18 @@ else
 fi
 assert_contains "spawn-claude: model=default" "$output" \
     "structured model=default log line emitted when nothing configured (#3482)"
+assert_contains "stub-claude model-env=unset" "$output" \
+    "a session-default spawn exports NO LOOM_MODEL (#13872 — an unknown model keeps the exhaustion mark class-less)"
+
+# Case 5 (#13872): an explicit --model argv — how the daemon dispatches a role
+# child (sweep_registry::dispatch) with no LOOM_MODEL in the environment — is
+# EXPORTED as LOOM_MODEL so claude-wrapper.sh's exhaustion mark can scope the
+# .bad_tokens entry to the model actually in flight. Without this, every
+# per-model ceiling on the 2026-11-13 fleet degraded to an account-wide mark.
+output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --model fable 2>&1 || true)
+assert_contains "stub-claude model-env=fable" "$output" \
+    "an explicit --model argv is exported as LOOM_MODEL for the wrapper's model-class mark (#13872)"
 
 # Empty LOOM_MODEL is treated as unset — no --model emitted
 output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
@@ -2759,6 +2772,70 @@ fi
 
 rm -rf "$PROVIDER_WS" "$PROVIDER_STUB_DIR"
 rm -f "$PROVIDER_ARGV_LOG"
+
+# ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER=fast -> inline --settings '{"fastMode":true}'
+#      (priority is an alias; case-insensitive)
+#   2. an existing inline --settings is MERGED, a file path WINS (warning)
+#   3. standard / unset / empty -> no --settings at all
+#   4. an unknown tier -> one warning, no flag, no failure
+# ============================================================
+
+echo ""
+echo "Testing spawn-claude.sh service tier (#14141)..."
+
+run_tier() {
+    LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
+        "$@" 2>&1 || true
+}
+
+output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "--settings {\"fastMode\":true}" "$output" \
+    "LOOM_SERVICE_TIER=fast injects fast mode via inline --settings (#14141)"
+assert_contains "spawn-claude: service_tier=fast" "$output" \
+    "applied tier is logged (#14141)"
+
+output=$(run_tier env LOOM_SERVICE_TIER=Priority "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "--settings {\"fastMode\":true}" "$output" \
+    "LOOM_SERVICE_TIER=Priority (alias, any case) also enables fast mode"
+
+if command -v jq >/dev/null 2>&1; then
+    output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --settings '{"a":1}')
+    assert_contains '"fastMode":true' "$output" "fast mode is merged into an existing inline --settings"
+    assert_contains '"a":1' "$output" "the existing inline --settings keys are preserved"
+    # Count flags on the stub's argv line only: the log lines name --settings too.
+    assert_eq_count=$(printf '%s\n' "$output" | grep '^stub-claude args=' | grep -o -- '--settings' | wc -l | tr -d ' ')
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$assert_eq_count" == "1" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: merge keeps exactly one --settings flag"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: merge keeps exactly one --settings flag (got $assert_eq_count)"
+        echo "    In: '$output'"
+    fi
+fi
+
+output=$(run_tier env LOOM_SERVICE_TIER=fast "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" --settings /tmp/loom-14141-own-settings.json)
+assert_contains "explicit --settings in args wins over LOOM_SERVICE_TIER" "$output" \
+    "an explicit --settings FILE wins; one warning, no failure"
+assert_not_contains '{"fastMode"' "$(printf '%s\n' "$output" | grep '^stub-claude args=')" \
+    "no fast mode is forced over an explicit --settings file"
+
+output=$(run_tier env LOOM_SERVICE_TIER=standard "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_not_contains "--settings" "$output" "LOOM_SERVICE_TIER=standard emits no --settings"
+assert_contains "spawn-claude: service_tier=standard" "$output" "standard tier is logged"
+
+output=$(run_tier env LOOM_SERVICE_TIER= "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_not_contains "fastMode" "$output" "empty LOOM_SERVICE_TIER is unset (no flag)"
+assert_not_contains "service_tier" "$output" "empty LOOM_SERVICE_TIER logs nothing"
+
+output=$(run_tier env LOOM_SERVICE_TIER=turbo "$SCRIPTS_DIR/spawn-claude.sh" -p "ping")
+assert_contains "is not a Claude tier" "$output" "an unsupported tier warns once"
+assert_contains "stub-claude args=-p ping" "$output" "an unsupported tier still launches claude"
+assert_not_contains "fastMode" "$output" "an unsupported tier emits no flag"
 
 # ============================================================
 # Summary

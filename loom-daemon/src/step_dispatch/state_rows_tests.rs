@@ -59,6 +59,7 @@ fn workspace(idx: usize, inputs: &[DrawInput], cooldowns: StepCooldowns) -> Step
         merge_concurrency: 1,
         merge_eligible: 0,
         merges_in_flight: 0,
+        writer_hold: None,
     }
 }
 

@@ -24,6 +24,11 @@
 # exits 1 naming it; reuse that worktree (after checking it matches the PR)
 # rather than creating another checkout.
 #
+# If the PRIMARY clone holds the PR's branch (an attended author left it checked
+# out), there is no builder worktree to reuse, so this script instead creates
+# `pr-<N>` DETACHED at the PR head sha, says so, and exits 0 (#14391). Review
+# only: do not commit or push from a detached `pr-<N>`.
+#
 # What it does:
 #   1. Fetches the PR's branch into a local tracking branch via `gh pr checkout`
 #      INSIDE the new worktree (not in the orchestrator's main worktree)
@@ -85,8 +90,10 @@ Checks the PR out in .loom/worktrees/pr-<PR_NUMBER>/ (reused if present), never
 in the main worktree, when no builder issue-<N> worktree holds its branch: the
 Judge's supported review checkout for any PR shape.
 
-If another worktree holds the branch, exits 1 and names the holder; use it or
-stop. Never invent a judge-* directory or run raw `git worktree add` instead.
+If a builder issue-<N> worktree holds the branch, exits 1 and names the holder;
+use it or stop. Never invent a judge-* directory or run raw `git worktree add`
+instead. If the primary clone holds the branch, pr-<PR_NUMBER> is created
+detached at the PR head sha instead (review only; the output says so).
 
 Exit codes:
   0 = worktree ready at .loom/worktrees/pr-<PR_NUMBER>/
@@ -134,14 +141,111 @@ fi
 
 WORKTREE_PATH="$WORKTREE_ROOT_DIR/pr-$PR_NUMBER"
 
+# --- Primary-clone holder: detached fallback (#14391) -----------------------
+# True when worktree path $1 is the primary clone (REPO_ROOT).
+is_primary_clone() {
+    [[ -n "$1" ]] || return 1
+    local a b
+    a="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    b="$(cd "$REPO_ROOT" 2>/dev/null && pwd -P)" || return 1
+    [[ "$a" == "$b" ]]
+}
+
+# Print the PR head sha, making sure the commit exists locally. Empty on failure.
+resolve_pr_head_sha() {
+    local sha
+    sha="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid 2>/dev/null || true)"
+    [[ "$sha" =~ ^[0-9a-f]{40,64}$ ]] || sha=""
+    if [[ -z "$sha" ]] || ! git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" 2>/dev/null; then
+        if git -C "$REPO_ROOT" fetch -q origin -- "pull/$PR_NUMBER/head" >/dev/null 2>&1; then
+            local fetched
+            fetched="$(git -C "$REPO_ROOT" rev-parse FETCH_HEAD 2>/dev/null || true)"
+            [[ -n "$sha" ]] || sha="$fetched"
+        fi
+    fi
+    if [[ -n "$sha" ]] && git -C "$REPO_ROOT" cat-file -e "$sha^{commit}" 2>/dev/null; then
+        echo "$sha"
+    fi
+}
+
+# Print the first NON-primary worktree (other than this PR's own pr-<N>) that
+# has branch $1 checked out, e.g. the builder's issue-<N> worktree. Empty if none.
+# The builder wins over a detached review checkout (#14391).
+builder_holder() {
+    [[ -n "$1" ]] || return 0
+    git -C "$REPO_ROOT" worktree list --porcelain | awk -v branch="refs/heads/$1" -v own="$WORKTREE_PATH" '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch /   { if ($2 == branch && wt != own) print wt }
+    ' | while IFS= read -r w; do
+        is_primary_clone "$w" || { echo "$w"; break; }
+    done
+}
+
+fail_builder_holds() {
+    print_error "The PR's branch ($HEAD_BRANCH) is already checked out in another worktree ($1) — the builder's worktree wins (#6594/#14391); no detached review checkout is created or reused."
+    print_info "Reuse the existing worktree directly instead: cd '$1'"
+    exit 1
+}
+
+write_sentinel() {
+    cat > "$WORKTREE_PATH/.loom-managed" <<SENTINEL
+# Loom-managed worktree marker
+# Created by .loom/scripts/pr-worktree.sh
+# PR: $PR_NUMBER
+# Removing this file makes Loom treat the worktree as user-owned and refuse
+# to clean it up automatically.
+SENTINEL
+}
+
+link_mcp_json() {
+    if [[ -f "$REPO_ROOT/.mcp.json" && ! -e "$WORKTREE_PATH/.mcp.json" ]]; then
+        ln -s "$REPO_ROOT/.mcp.json" "$WORKTREE_PATH/.mcp.json" 2>/dev/null || true
+    fi
+}
+
+# Create pr-<N> detached at the PR head sha (the branch itself is checked out in
+# the primary clone, which git will not allow twice). Exits the script.
+create_detached_pr_worktree() {
+    local sha
+    sha="$(resolve_pr_head_sha)"
+    if [[ -z "$sha" ]]; then
+        print_error "Could not resolve PR #$PR_NUMBER's head sha (gh pr view and 'git fetch origin -- pull/$PR_NUMBER/head' both failed)"
+        exit 1
+    fi
+    mkdir -p "$WORKTREE_ROOT_DIR"
+    if ! git -C "$REPO_ROOT" worktree add --detach "$WORKTREE_PATH" "$sha" >/dev/null 2>&1; then
+        print_error "Failed to create detached worktree at $WORKTREE_PATH"
+        exit 1
+    fi
+    write_sentinel
+    link_mcp_json
+    print_info "Detached at ${sha} because the PR's branch is checked out in the primary clone (${REPO_ROOT}); review only, do not commit or push from here. Record 'reviewed at detached worktree ${sha}' in the verdict."
+    print_success "PR worktree ready at $WORKTREE_PATH (detached at ${sha})"
+    echo "$WORKTREE_PATH"
+    exit 0
+}
+
 # If the worktree already exists, treat it as reusable. The doctor may
 # re-enter for the same PR across multiple iterations.
 if [[ -d "$WORKTREE_PATH" ]]; then
     if git -C "$REPO_ROOT" worktree list | grep -q "$WORKTREE_PATH"; then
+        HEAD_BRANCH="$(gh pr view "$PR_NUMBER" --json headRefName --jq .headRefName 2>/dev/null || true)"
+        BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
+        [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"
         print_info "PR worktree already exists at $WORKTREE_PATH (reusing)"
         # Refresh the PR branch in case upstream pushed new commits.
         if (cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --force >/dev/null 2>&1); then
             print_success "Refreshed PR branch in existing worktree"
+        elif ! git -C "$WORKTREE_PATH" symbolic-ref -q HEAD >/dev/null 2>&1; then
+            # #14391: a detached pr-<N> (primary-clone holder) cannot be refreshed
+            # by `gh pr checkout`; move it to the current PR head sha instead.
+            NEW_SHA="$(resolve_pr_head_sha)"
+            if [[ -n "$NEW_SHA" ]] && git -C "$WORKTREE_PATH" checkout -q --detach "$NEW_SHA" 2>/dev/null; then
+                print_success "Refreshed detached PR worktree to ${NEW_SHA}"
+            else
+                print_error "Could not move detached PR worktree $WORKTREE_PATH to the PR head (${NEW_SHA:-unresolved}); local edits are preserved and the checkout is still at $(git -C "$WORKTREE_PATH" rev-parse HEAD 2>/dev/null)"
+                exit 1
+            fi
         else
             print_warning "Could not refresh PR branch (continuing with existing checkout)"
         fi
@@ -169,6 +273,11 @@ if [[ -n "$HEAD_BRANCH" ]]; then
         /^worktree / { wt = substr($0, 10) }
         /^branch /   { if ($2 == branch) print wt }
     ' | head -1)"
+    BUILDER_WT="$(builder_holder "$HEAD_BRANCH")"
+    [[ -z "$BUILDER_WT" ]] || fail_builder_holds "$BUILDER_WT"
+    if is_primary_clone "$EXISTING_WT"; then
+        create_detached_pr_worktree
+    fi
     if [[ -n "$EXISTING_WT" ]]; then
         print_error "The PR's branch ($HEAD_BRANCH) is already checked out in another worktree ($EXISTING_WT) — this is the #6264 detached-HEAD collision, caught up front (#6594) before creating $WORKTREE_PATH."
         print_info "Reuse the existing worktree directly instead: cd '$EXISTING_WT'"
@@ -201,13 +310,7 @@ fi
 # recognize it as Loom-managed even if `gh pr checkout` fails midway.
 # Mirrors the heredoc shape used by worktree.sh:761-768 but records the PR
 # number instead of the issue number.
-cat > "$WORKTREE_PATH/.loom-managed" <<EOF
-# Loom-managed worktree marker
-# Created by .loom/scripts/pr-worktree.sh
-# PR: $PR_NUMBER
-# Removing this file makes Loom treat the worktree as user-owned and refuse
-# to clean it up automatically.
-EOF
+write_sentinel
 
 # Now check out the PR branch from inside the new worktree. Capture output
 # (rather than discarding it) so a failure can be diagnosed instead of just
@@ -225,6 +328,12 @@ if ! CHECKOUT_OUTPUT="$(cd "$WORKTREE_PATH" && gh pr checkout "$PR_NUMBER" --for
     # way (git already refused the checkout before touching HEAD here).
     if echo "$CHECKOUT_OUTPUT" | grep -qi "already used by worktree"; then
         COLLIDING_WT="$(echo "$CHECKOUT_OUTPUT" | grep -oE "worktree at '[^']*'" | sed -E "s/worktree at '(.*)'/\1/" | head -1)"
+        if is_primary_clone "$COLLIDING_WT"; then
+            # #14391: the holder is the primary clone, so there is nothing to
+            # reuse. Drop the half-built worktree and make a detached one.
+            git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force >/dev/null 2>&1 || true
+            create_detached_pr_worktree
+        fi
         print_error "The PR's branch is already checked out in another worktree${COLLIDING_WT:+ ($COLLIDING_WT)} — this is the #6264 detached-HEAD collision. $WORKTREE_PATH now sits on a detached HEAD instead of the PR branch; do NOT evaluate code in it as-is."
         if [[ -n "$COLLIDING_WT" ]]; then
             print_info "Prefer reusing the colliding worktree directly instead of retrying here: cd '$COLLIDING_WT'"
@@ -246,9 +355,7 @@ fi
 
 # Symlink .mcp.json so MCP servers work in the PR worktree (same pattern
 # as worktree.sh).
-if [[ -f "$REPO_ROOT/.mcp.json" && ! -e "$WORKTREE_PATH/.mcp.json" ]]; then
-    ln -s "$REPO_ROOT/.mcp.json" "$WORKTREE_PATH/.mcp.json" 2>/dev/null || true
-fi
+link_mcp_json
 
 print_success "PR worktree ready at $WORKTREE_PATH"
 echo "$WORKTREE_PATH"

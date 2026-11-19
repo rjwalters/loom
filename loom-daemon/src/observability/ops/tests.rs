@@ -38,6 +38,8 @@ fn sink() -> (Arc<RecordingQueue>, OpsSink) {
     (queue.clone(), OpsSink::new(queue, "host-a"))
 }
 
+const CAPTURE_PROCESS_KEY: &str = "loom.daemon.process_instance_id";
+
 fn at(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_790_000_000 + secs, 0).unwrap()
 }
@@ -81,6 +83,108 @@ fn emit_applies_policy_before_the_queue() {
     assert_eq!(record.points.len(), 1, "the NaN point never reaches the queue");
     assert!(record.points[0].labels.is_empty(), "oversize and unallowlisted labels dropped");
     assert!(!serde_json::to_string(&queued[0]).unwrap().contains("null"));
+}
+
+#[test]
+fn capture_retains_the_canonical_step_occupancy_process_identity() {
+    const PROCESS: &str = "00000000-0000-4000-8000-000000000001";
+    let (queue, sink) = sink();
+    let mut point = MetricPoint::int(MetricName::DispatchBusySlots, 0)
+        .label("role", "judge")
+        .label("pool", "step");
+    point
+        .labels
+        .insert(CAPTURE_PROCESS_KEY.into(), PROCESS.into());
+
+    sink.emit_metrics(vec![point.clone()]);
+
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.points, vec![point]);
+}
+
+#[test]
+fn capture_strips_unadmitted_process_identity_without_displacing_labels() {
+    const TOKEN: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    let (queue, sink) = sink();
+    let slots = |pool: Option<&str>| {
+        let point = MetricPoint::int(MetricName::DispatchBusySlots, 0).label("role", "judge");
+        match pool {
+            Some(pool) => point.label("pool", pool),
+            None => point,
+        }
+    };
+    let standard = slots(Some("step"));
+    let mut full = standard.clone();
+    for key in [
+        "account",
+        "age",
+        "agent",
+        "artifact",
+        "basis",
+        "caller",
+        "container",
+        "cred_owner",
+        "hold",
+        "host",
+    ] {
+        full = full.label(key, "fixture");
+    }
+    let mut pool_evicted = full
+        .clone()
+        .label("installation", "fixture")
+        .label("kind", "fixture");
+    assert!(!bounded_labels(&pool_evicted.labels).contains_key("pool"));
+    pool_evicted
+        .labels
+        .insert("unrelated-restored-key".to_string(), "fixture".to_string());
+    let mut cases = vec![
+        (slots(None), TOKEN.to_owned()),
+        (slots(Some("STEP")), TOKEN.to_owned()),
+        (slots(Some("step ")), TOKEN.to_owned()),
+        (
+            MetricPoint::int(MetricName::DispatchCandidates, 1).label("pool", "step"),
+            TOKEN.to_owned(),
+        ),
+        (full, TOKEN.to_owned()),
+        (pool_evicted, TOKEN.to_owned()),
+    ];
+    for invalid in [
+        "not-uuid".to_owned(),
+        "a".repeat(129),
+        TOKEN.to_ascii_uppercase(),
+        TOKEN.replace('-', ""),
+        TOKEN.replace("-4000-", "-1000-"),
+        TOKEN.replace("-8000-", "-0000-"),
+        format!(" {TOKEN}"),
+    ] {
+        cases.push((standard.clone(), invalid));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(point, _)| MetricPoint {
+            name: point.name,
+            value: point.value,
+            labels: bounded_labels(&point.labels),
+        })
+        .collect();
+    let points = cases
+        .into_iter()
+        .map(|(mut point, token)| {
+            point.labels.insert(CAPTURE_PROCESS_KEY.into(), token);
+            point
+        })
+        .collect();
+
+    sink.emit_metrics(points);
+
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.points, expected);
 }
 
 #[test]
@@ -496,7 +600,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
     let report = TickReport {
         seen: 6,
         dispatched: 2,
-        skipped_peer_claim: 1,
         skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
@@ -513,7 +616,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
             ("host_constraint".to_string(), MetricValue::Int(1)),
-            ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
         .collect()
@@ -706,7 +808,6 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     };
     assert_eq!(value("deferred_capacity"), MetricValue::Int(2));
     assert_eq!(value("dispatched"), MetricValue::Int(1));
-    assert_eq!(value("peer_claim"), MetricValue::Int(0));
     let open_pr = points
         .iter()
         .find(|p| p.labels.get("reason").map(String::as_str) == Some("open_pr"))
