@@ -96,7 +96,9 @@ pub(crate) fn reaped_release_fields(
 ) -> String {
     match state {
         Some((open, head, labels))
-            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
+            if reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+                && role == Role::Judge
+                && backstop::ended_without_verdict(open, &labels) =>
         {
             backstop::reaped_fields(&head, &labels, reason)
         }
@@ -238,6 +240,15 @@ mod tests {
             updated_at: at,
             body: format!("<!-- loom:pr-lease-released role=judge host=h sweep=s{id}{fields} -->"),
         }
+    }
+
+    #[test]
+    fn a_seat_busy_exit_does_not_stamp_a_judge_no_verdict() {
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), "seat_busy"), "");
+        assert!(
+            reaped_release_fields(Role::Judge, state(&waiting), "exited").contains("verdict=none")
+        );
     }
 
     #[test]

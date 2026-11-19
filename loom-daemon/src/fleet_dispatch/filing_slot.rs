@@ -18,9 +18,8 @@ use std::time::Duration;
 
 use super::table::Mono;
 
-/// How long a grant lives without a refresh. Parity with
-/// `filing_lock::DEFAULT_PEER_TTL_SECS`: a lost unlock costs at most a minute
-/// of extra queueing, never a wedge. A constant, not a knob.
+/// How long a grant lives without a refresh: a lost unlock costs at most a
+/// minute of extra queueing, never a wedge. A constant, not a knob.
 pub const FILING_LOCK_TTL: Duration = Duration::from_secs(60);
 
 /// The longest `retry_after_s` the slot suggests. A burst is a handful of API

@@ -16,6 +16,33 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14537**: test: cover the tools fleet-mode no-route arms in route_read and host_has_read_pool
+- **Issue #14529** (closed): Cover the tools fleet-mode no-route arm in route_read and host_has_read_pool (#14489 follow-up)
+- **PR #14536**: test: pin the loom-tools park/decision write ordering, routing and nested filing
+- **PR #14494**: feat: serve the checkout-local claim commands from loom-tools
+- **Issue #14487** (closed): Expose checkout-local claim commands through loom-tools
+- **PR #14472**: feat: step a legacy issue sweep down a rung when its child dies on a model limit
+- **Issue #14443** (closed): Model-limit kill on the legacy issue-sweep path does not step down a rung
+- **Issue #12167** (closed): telemetry: export peer_coordination verdict and degraded duration on host.health
+- **Issue #14429** (closed): loom-tools Phase 3a follow-up: top-level reads and config inspection — epic #12708
+- **PR #14524**: feat: serve the top-level reads and config inspection from loom-tools
+- **Issue #13945** (closed): Delete the safehouse peer-claim channel and claims room (#13920 part 1)
+- **PR #14479**: refactor: delete the safehouse peer-claim channel and claims room
+- **PR #14469**: fix: refuse recover --publish before exec when no GitHub write credential resolves
+- **Issue #14162** (closed): Guide skips Step 4b (pool-pressure check) and reports a tool-policy denial, although the role file routes around that denial
+- **PR #14533**: fix(guide): treat a non-reading pool-pressure read as unavailable and defer
+- **Issue #14481** (closed): Codex read-only steps are sent to a busy seat and refused after the claim (exit 78) while other seats are idle
+- **PR #14492**: fix: reserve private Codex seats before read-only claims
+- **PR #14526**: feat(loom-tools): serve role-keyed PR leases
+- **PR #14522**: test: cover the SigNoz per-run usage query
+- **PR #14502**: test: assert a denied target gets reads but no writes on every online park/decision form
+- **Issue #14489** (closed): Run role-keyed PR leases and their detached renewer with loom-tools
+- **PR #14490**: fix: yield finished Builder issue leases
+- **PR #14513**: fix: apply service tiers to named sweep steps
+- **PR #12639**: test: create registered roots before registering their gh config dir
+- **Issue #14482** (closed): Ended Builder step leaves its Forge issue lease blocking a new claim
+- **Issue #14504** (closed): Sweep-worker spawns do not read serviceTier / roleServiceTiers (LOOM_SERVICE_TIER producer gap)
+- **Issue #12638** (closed): Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
 - **PR #14511**: fix(role-runner): log configured service tier and source
 - **PR #14503**: docs: make doctor's detached pr-<N> rule observable on the unlabeled-PR path
 - **PR #14501**: fix(forge-inventory): re-baseline pr-worktree.sh to 8 direct forge calls

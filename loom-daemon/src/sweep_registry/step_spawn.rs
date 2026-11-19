@@ -35,10 +35,6 @@
 //!   sweep, the step being metadata (#11950), so it re-attaches to the
 //!   pre-taken lease instead of standing down.
 //!
-//! The `(item, step)` claim is advertised to peers at spawn ([`lease`]), not
-//! only on the reaper's heartbeat, so two hosts cannot draw the same item in
-//! between.
-//!
 //! # Landed work (#12251)
 //!
 //! Before a Builder step claims an issue, the forge is asked once whether
@@ -161,6 +157,12 @@ pub struct StepRefusal {
     /// Seconds the captain says its hold lasts (`retry_after_s`), for a
     /// `captain_cooldown` refusal that carried one (#12704).
     pub hold_secs: Option<u32>,
+    /// The confirmed writer rate limit behind a `writer_rate_limited`
+    /// refusal (#13746): the typed handoff the claim child emitted, with the
+    /// facts the spawn records as a route hold. `None` for every other
+    /// refusal.
+    pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
+    seat_unavailable: bool,
 }
 
 impl StepRefusal {
@@ -172,7 +174,14 @@ impl StepRefusal {
             assignment_id: None,
             captain: None,
             hold_secs: None,
+            writer_limit: None,
+            seat_unavailable: false,
         }
+    }
+
+    fn with_seat_unavailable(mut self, seat_unavailable: bool) -> Self {
+        self.seat_unavailable |= seat_unavailable;
+        self
     }
 
     /// A refusal of the fleet-dispatch server's (#12450): no forge call ran.
@@ -217,7 +226,12 @@ pub(crate) fn give_back(
     mut refusal: StepRefusal,
 ) -> StepRefusal {
     if let Some(grant) = grant {
-        crate::fleet_dispatch::worker::refuse(grant, refusal.reason);
+        let reason = if refusal.seat_unavailable {
+            crate::session_exec::refusal::SEAT_BUSY_REASON
+        } else {
+            refusal.reason
+        };
+        crate::fleet_dispatch::worker::refuse(grant, reason);
         refusal.assignment_id = Some(grant.assignment_id.as_str().into());
     }
     refusal
@@ -288,10 +302,15 @@ pub(crate) fn landed_refusal(item: u32, pr: u32) -> StepRefusal {
 
 /// Map a role tick's pre-spawn refusal to a step refusal. Pure.
 pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepRefusal {
-    use crate::role_runner::RoleTickOutcome as O;
+    use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome as O};
     match outcome {
         O::NoTokenPool => StepRefusal::new("no_token_pool", "no credential pool for the runtime"),
-        O::PoolExhausted { .. } => StepRefusal::new("pool_exhausted", format!("{outcome:?}")),
+        O::PoolExhausted { pool, hold, .. } => {
+            StepRefusal::new("pool_exhausted", format!("{outcome:?}")).with_seat_unavailable(
+                *pool == CredentialPool::CodexAccounts
+                    && matches!(hold, PoolHold::SelfHealing | PoolHold::Unprovisioned),
+            )
+        }
         O::RuntimeRejected(rejection) => {
             StepRefusal::new("runtime_rejected", rejection.refusal_line())
         }
@@ -386,8 +405,6 @@ impl SweepRegistry {
             self.acquire_lock(item, &sweep_id)
         };
         locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
-        // Advertise at spawn, before any forge write (#11906 review item 4).
-        self.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
         let claim = match self.pre_claim_step(item, role, &sweep_id) {
             Ok(claim) => claim,
             Err(refusal) => {
@@ -622,10 +639,9 @@ impl SweepRegistry {
         Err(self.roll_back_builder_claim(item, sweep_id, wrote, &loss, episode_start, refusal))
     }
 
-    /// Undo a step's claim: the peer advertisement, the forge claim when one
-    /// was taken (`claimed`), and the lock.
+    /// Undo a step's claim: the forge claim when one was taken (`claimed`), and
+    /// the lock.
     fn unwind_step_claim(&mut self, item: u32, role: StepRole, sweep_id: &str, claimed: bool) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if claimed && !self.config.skip_label_flip {
             match role {
                 StepRole::Builder => {
@@ -991,13 +1007,14 @@ impl SweepRegistry {
             if matches!(outcome, crate::role_runner::RoleTickOutcome::PoolExhausted { .. }) {
                 log::info!("sweep_registry: the {name} pool is exhausted; steps refused (#11906)");
             }
-            refusal_of(&outcome)
+            refusal_of(&outcome).with_seat_unavailable(containment.seat_unavailable())
         })?;
         let selection = containment.take().map(|(selection, _)| selection);
         let admitted = match chosen.admitted.map_or(statically, Ok) {
             Ok(admitted) => admitted,
             Err(rejection) => {
-                return Err(StepRefusal::new("runtime_rejected", rejection.refusal_line()))
+                return Err(StepRefusal::new("runtime_rejected", rejection.refusal_line())
+                    .with_seat_unavailable(containment.seat_unavailable()));
             }
         };
         let model = match role {

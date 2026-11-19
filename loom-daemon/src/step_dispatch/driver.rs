@@ -298,6 +298,23 @@ impl RegistrySpawner {
                 {
                     lock(registry).arm_captain_hold(request.item, request.role, secs);
                 }
+                // #13746: a confirmed writer rate limit arms its route hold,
+                // so the next tick's candidates wait before the draw until
+                // the reset instead of drawing and being refused again.
+                if let Some(limited) = e
+                    .downcast_ref::<StepRefusal>()
+                    .and_then(|r| r.writer_limit.as_deref())
+                {
+                    if limited.arm_hold(Utc::now().timestamp()) {
+                        log::warn!(
+                            "work_finder: writer {} route held until {} (#13746)",
+                            limited.stage.as_str(),
+                            limited
+                                .reset_utc()
+                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string())
+                        );
+                    }
+                }
                 if let Some(root) = self.roots.get(idx) {
                     super::step_end::record_refusal(
                         root,
@@ -470,6 +487,7 @@ impl StepDriver {
                     merge_concurrency: 0,
                     merge_eligible: 0,
                     merges_in_flight: 0,
+                    writer_hold: None,
                 });
                 continue;
             }
@@ -628,7 +646,7 @@ impl StepDriver {
             actionable.extend(actionable_point(&repo, Some(&weighing)));
             workspaces.push(StepWorkspace {
                 idx,
-                repo,
+                repo: repo.clone(),
                 weight,
                 in_flight,
                 weighing,
@@ -638,6 +656,11 @@ impl StepDriver {
                 merge_concurrency: claims.merge_limit(),
                 merge_eligible: eligible,
                 merges_in_flight: claims.merges_in_flight.len(),
+                // #13746: the workspace's writer route, when a confirmed
+                // exhaustion hold stands for it — its candidates wait before
+                // the draw until the reset.
+                writer_hold: crate::writer_limit::hold_note(Some(root), &repo, now.timestamp())
+                    .and_then(|until| tick::WriterHold::from_reset(until, now.timestamp())),
             });
         }
         let filter_ms = millis(filter_started.elapsed());

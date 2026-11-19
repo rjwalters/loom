@@ -600,7 +600,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
     let report = TickReport {
         seen: 6,
         dispatched: 2,
-        skipped_peer_claim: 1,
         skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
@@ -617,7 +616,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
             ("host_constraint".to_string(), MetricValue::Int(1)),
-            ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
         .collect()
@@ -810,7 +808,6 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     };
     assert_eq!(value("deferred_capacity"), MetricValue::Int(2));
     assert_eq!(value("dispatched"), MetricValue::Int(1));
-    assert_eq!(value("peer_claim"), MetricValue::Int(0));
     let open_pr = points
         .iter()
         .find(|p| p.labels.get("reason").map(String::as_str) == Some("open_pr"))

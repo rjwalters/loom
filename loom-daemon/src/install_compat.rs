@@ -362,8 +362,9 @@ pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 /// --json` both print it as `tools_commands`, so a wrapper asks the binary
 /// what it serves and carries no list of its own.
 ///
-/// Sub-verbs are listed only where the verb splits into reads and writes
-/// (`forge`, `forge merge-queue`, `forge parent`); the tests in
+/// Sub-verbs are listed only where the verb has sub-verbs (`forge`,
+/// `forge merge-queue`, `forge parent`; every `merge-queue` verb is served
+/// since #14520, `parent link` is not); the tests in
 /// `src/bin/loom_tools.rs` and `src/cli/forge_read/tests.rs` fail when this
 /// list and the clap tree disagree.
 pub const TOOLS_COMMANDS: &[&str] = &[
@@ -398,6 +399,14 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge merge-queue mode",
     "forge merge-queue preflight",
     "forge merge-queue status",
+    "forge merge-queue enqueue",
+    "forge merge-queue dequeue",
+    "forge merge-queue reconcile",
+    "forge merge-queue handoff",
+    "forge merge-queue step",
+    "forge merge-queue revoke",
+    "forge merge-queue group-check",
+    "forge merge-queue authorize-check",
     "forge token",
     "forge is-fleet",
     "forge trusted-comments",
@@ -421,6 +430,33 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    "lease ensure",
+    "lease co-occupancy",
+    "lease release",
+    "lease renewer",
+    "lease pr claim",
+    "lease pr check",
+    "lease pr fence",
+    "lease pr release",
+    // #14429: top-level reads and config inspection. The write forms inside
+    // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
+    // (#14396) exactly as a `forge` write verb does.
+    "labels",
+    "pr-queue",
+    "premise-check",
+    "duplicate-scan",
+    "check-points-marker",
+    "label-duplicates",
+    "forge-probe",
+    "forge-inventory",
+    "affected-files",
+    "check-stale-blocked",
+    "skip-labels",
+    "roles",
+    "guards",
+    "install-compat",
+    "hooks-home",
+    "claim",
 ];
 
 /// The identity of the installed-file payload this binary was built against:
