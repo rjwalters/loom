@@ -101,6 +101,7 @@ fn workspace_cooling(
         merge_concurrency: 1,
         merge_eligible: 0,
         merges_in_flight: 0,
+        writer_hold: None,
     }
 }
 
@@ -1084,6 +1085,138 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
     assert!(spawner.asked[refused_at + 1..].iter().all(|a| a.0 == 2), "{:?}", spawner.asked);
     // `other/three` fills every slot the refusal left.
     assert_eq!(tick.report.dispatched, 4);
+}
+
+/// #13746: a workspace whose writer route is confirmed exhausted waits
+/// before the draw — no claim attempt, no slot, no refusal span — its rows
+/// name the wait and the reset, and a captain's offer for it is not taken.
+#[test]
+fn a_pre_held_writer_route_waits_before_the_draw() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut held = workspace(0, "acme/one", &rows);
+    let reset = now().timestamp() + 600;
+    held.writer_hold = Some(WriterHold::from_reset(reset, now().timestamp()).unwrap());
+    let healthy = workspace(1, "other/two", &rows);
+    let mut spawner = FakeSpawner::default();
+    // A captain's offer for the held workspace is not taken; the healthy
+    // one is.
+    let offers = vec![
+        Offer {
+            repo: "acme/one".to_string(),
+            item: 1,
+            role: StepRole::Curator,
+        },
+        Offer {
+            repo: "other/two".to_string(),
+            item: 1,
+            role: StepRole::Curator,
+        },
+    ];
+    let tick = run_with_offers(
+        vec![held, healthy],
+        limits(4),
+        &seed(),
+        &PoolKnobs::default(),
+        &mut spawner,
+        &offers,
+    );
+    // Only the healthy workspace was ever asked to spawn.
+    assert!(spawner.asked.iter().all(|a| a.0 == 1), "{:?}", spawner.asked);
+    assert!(spawner.asked.iter().any(|a| a.1 == 1), "the healthy offer spawned");
+    // Every held candidate's row waits, with the reason and the reset.
+    let held_rows: Vec<_> = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.key.workspace_idx == 0)
+        .collect();
+    assert!(!held_rows.is_empty());
+    for r in &held_rows {
+        assert_eq!(r.disposition, Some(Qd::DeferredCapacity), "{}", r.key.number);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some("writer_rate_limited until 2026-10-14T12:10:00Z"),
+            "{}",
+            r.key.number
+        );
+        assert_eq!(r.held_until, Some(chrono::DateTime::from_timestamp(reset, 0).unwrap()));
+    }
+    // The held candidates count as capacity-waiting, not as draws or passes.
+    assert!(!tick.passes.contains_key(REFUSAL_WRITER_LIMITED));
+    assert_eq!(held_rows.len(), 10);
+    assert!(
+        tick.report.deferred_capacity >= held_rows.len(),
+        "{}",
+        tick.report.deferred_capacity
+    );
+    // The held workspace never entered the draw at all: absent from the
+    // record's repos and pools, so it has no draw or refusal span (#13746).
+    let record = tick.report.item_draw.as_ref().unwrap();
+    let held_repo = record.repos.iter().any(|r| r.repo == "acme/one");
+    let held_pool = record.pools.iter().any(|p| p.repo == "acme/one");
+    assert!(!held_repo, "acme/one in the draw: {:?}", record.repos);
+    assert!(!held_pool, "acme/one in the pool: {:?}", record.pools);
+}
+
+/// #13746: the first `writer_rate_limited` refusal in a tick closes the
+/// owner's other workspaces for the rest of the tick — no further claim or
+/// write attempt on that route — while another owner's work proceeds; the
+/// closed rows carry the reason.
+#[test]
+fn a_writer_limited_refusal_closes_the_owner_for_the_tick() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((1, REFUSAL_WRITER_LIMITED)),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "ACME/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(6),
+        &mut spawner,
+    );
+    // Exactly one acme spawn attempt (the refused one); other/three fills
+    // the rest.
+    let acme_attempts = spawner.asked.iter().filter(|a| a.0 != 2).count();
+    assert_eq!(acme_attempts, 1, "{:?}", spawner.asked);
+    assert_eq!(tick.passes.get(REFUSAL_WRITER_LIMITED), Some(&1));
+    assert_eq!(tick.report.dispatched, 6, "every slot filled by other/three");
+    // The still-open acme rows name the reason (resolved mid-tick).
+    let closed: Vec<_> = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.key.workspace_idx != 2 && r.key.number != 1)
+        .collect();
+    assert!(!closed.is_empty());
+    for r in closed {
+        assert_eq!(r.disposition, Some(Qd::DeferredCapacity), "{}", r.key.number);
+        assert_eq!(r.detail.as_deref(), Some(REFUSAL_WRITER_LIMITED), "{}", r.key.number);
+    }
+}
+
+/// #13746: the waiting disposition of a writer rate limit is a capacity
+/// wait, not a dispatch error.
+#[test]
+fn a_writer_limited_refusal_is_a_capacity_wait() {
+    assert_eq!(disposition_of(REFUSAL_WRITER_LIMITED), Qd::DeferredCapacity);
+    let skipped = refusal_skip(REFUSAL_WRITER_LIMITED);
+    assert_eq!(skipped, PickSkipReason::Cap);
+    // The reset-bound hold names itself.
+    let hold = WriterHold::from_reset(now().timestamp() + 600, now().timestamp()).unwrap();
+    assert!(hold.detail.starts_with("writer_rate_limited until "));
+    assert!(
+        WriterHold::from_reset(now().timestamp() - 1, now().timestamp()).is_none(),
+        "a past reset is no hold"
+    );
+    assert!(WriterHold::from_reset(now().timestamp() + 600, now().timestamp()).is_some(),);
 }
 
 #[test]

@@ -649,6 +649,27 @@ fn unreadable_claim_line(why: Option<&str>) -> String {
     }
 }
 
+/// The writer credential directory this process inherited
+/// (`GH_CONFIG_DIR`): the daemon resolved it for this claim
+/// (`lease_command` sets it from its own per-root registry, or the child
+/// inherits the daemon's process-global one), so its `identity.json` sidecar
+/// names the effective writer — app and installation ids only, no credential
+/// read.
+fn writer_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from)
+}
+
+/// Why a lease comment POST failed, with the two causes `claim` tells apart
+/// (#13746): a confirmed rate limit of the writer the POST ran on, and
+/// everything else (a bounded diagnostic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostFailure {
+    /// A confirmed primary rate limit of the effective writer.
+    WriterLimited(crate::writer_limit::WriterLimited),
+    /// Anything else: the bounded failure reason.
+    Other(String),
+}
+
 impl Gh {
     /// The `owner/repo` a read names explicitly (#13743): the vetted write
     /// target if there is one, else this checkout's `origin`. An untargeted
@@ -758,9 +779,21 @@ impl Gh {
         Err(last)
     }
 
-    /// Post a comment; its forge `id` on success.
+    /// Post a comment; its forge `id` on success. A failure keeps its cause:
+    /// a confirmed rate limit of the writer this POST runs on is
+    /// [`PostFailure::WriterLimited`], anything else is a bounded reason.
     pub(crate) fn post(&self, pr: u64, body: &str) -> Option<u64> {
-        let nwo = self.write_repo.as_ref().ok()?;
+        self.post_detail(pr, body).ok()
+    }
+
+    /// [`post`](Self::post) with the failure kept, so `claim` can classify a
+    /// writer rate limit (#13746) instead of dropping it through
+    /// `ok_output()`.
+    pub(crate) fn post_detail(&self, pr: u64, body: &str) -> Result<u64, PostFailure> {
+        let nwo = self
+            .write_repo
+            .as_ref()
+            .map_err(|_| PostFailure::Other("no vetted write target".to_string()))?;
         let out = self
             .inv("pr_lease.comment", AccessIntent::Write, ops::COMMENT_CREATE)
             .args([
@@ -774,10 +807,34 @@ impl Gh {
                 ".id",
             ])
             .run();
-        String::from_utf8_lossy(&out.ok_output()?.stdout)
-            .trim()
-            .parse()
-            .ok()
+        match out.into_result() {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.trim().parse().map_err(|_| {
+                    PostFailure::Other(bounded_reason(&format!(
+                        "the comment id was not a number ({})",
+                        bounded_reason(stdout.trim())
+                    )))
+                })
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let line = stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                match crate::writer_limit::WriterLimited::classify(
+                    crate::writer_limit::WriterStage::LeasePost,
+                    None,
+                    line,
+                ) {
+                    Some(limited) => Err(PostFailure::WriterLimited(limited)),
+                    None => Err(PostFailure::Other(bounded_reason(line))),
+                }
+            }
+            Err(u) => Err(PostFailure::Other(bounded_reason(&u.to_string()))),
+        }
     }
 
     /// Replace a comment's body. `Err(true)` = the comment is gone (404).
@@ -1142,11 +1199,37 @@ impl Ctx {
         eprintln!("lease pr {} #{}: {line}", self.me.role.as_str(), self.pr());
     }
 
+    /// The stand-down of a confirmed writer rate limit (#13746): confirm the
+    /// reset from the scoped budget evidence — the persisted bucket book,
+    /// else one bounded free probe of the writer directory, never a poll per
+    /// candidate — put the bounded facts on the final stderr line (the last
+    /// line, so `loom.dispatch.claim_stderr_tail` keeps them), and print the
+    /// typed handoff the daemon's preclaim parses. The public exit contract
+    /// is unchanged: unverified, nothing written.
+    fn writer_limited_exit(&self, limited: &mut crate::writer_limit::WriterLimited) -> i32 {
+        limited.confirm_reset(Some(&self.gh.root), None);
+        self.say(&limited.stderr_line());
+        println!("{}", limited.handoff_line());
+        EXIT_UNVERIFIED
+    }
+
     /// `claim`: pre-check, publish, verify order, start renewal. With
     /// `--step`, an ordering that stays unverifiable is refused (exit 5)
     /// rather than held ([`verify_claim_order`](Self::verify_claim_order)).
     pub(crate) fn claim(&self) -> i32 {
         if let Err(why) = &self.gh.write_repo {
+            // The write-scope probe could not verify the write: a confirmed
+            // rate limit of the writer it probed is named as such (#13746);
+            // every other refusal keeps its own diagnostic.
+            if let Some(mut limited) = crate::writer_limit::WriterLimited::classify(
+                crate::writer_limit::WriterStage::PermissionProbe,
+                None,
+                why,
+            ) {
+                let nwo = self.gh.read_slug().unwrap_or_default();
+                limited = limited.with_identity(writer_dir_from_env().as_deref(), &nwo);
+                return self.writer_limited_exit(&mut limited);
+            }
             self.say(&format!("refusing to write here (#9548): {why} — stand down"));
             return EXIT_UNVERIFIED;
         }
@@ -1195,9 +1278,21 @@ impl Ctx {
         // Before the post, so the renewer's guard never overestimates the
         // lease's remaining life.
         let leased_at = (self.now)();
-        let Some(own_id) = self.gh.post(self.pr(), &body) else {
-            self.say("could not post the lease comment; no claim taken — stand down");
-            return EXIT_UNVERIFIED;
+        let own_id = match self.gh.post_detail(self.pr(), &body) {
+            Ok(id) => id,
+            Err(PostFailure::WriterLimited(mut limited)) => {
+                // The POST named the writer rate-limited: say so, hand the
+                // facts to the preclaim, and stand down (#13746).
+                let nwo = self.gh.write_repo.clone().unwrap_or_default();
+                limited = limited.with_identity(writer_dir_from_env().as_deref(), &nwo);
+                return self.writer_limited_exit(&mut limited);
+            }
+            Err(PostFailure::Other(why)) => {
+                self.say(&format!(
+                    "could not post the lease comment; no claim taken — stand down: {why}"
+                ));
+                return EXIT_UNVERIFIED;
+            }
         };
         match self.verify_claim_order() {
             Ordering::Unverified if self.common.step.is_some() => {

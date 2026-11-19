@@ -161,6 +161,11 @@ pub struct StepRefusal {
     /// Seconds the captain says its hold lasts (`retry_after_s`), for a
     /// `captain_cooldown` refusal that carried one (#12704).
     pub hold_secs: Option<u32>,
+    /// The confirmed writer rate limit behind a `writer_rate_limited`
+    /// refusal (#13746): the typed handoff the claim child emitted, with the
+    /// facts the spawn records as a route hold. `None` for every other
+    /// refusal.
+    pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
 }
 
 impl StepRefusal {
@@ -172,6 +177,7 @@ impl StepRefusal {
             assignment_id: None,
             captain: None,
             hold_secs: None,
+            writer_limit: None,
         }
     }
 
