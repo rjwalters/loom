@@ -84,7 +84,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -1877,10 +1877,25 @@ pub fn spawn_multi_work_finder_task(
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         let mut was_rate_limited = false;
         let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
+        let host_id = crate::sweep_registry::host_identity();
+        let process_id = crate::observability::ops::busy_slots::reporting_process_id();
+        let mut previous_published = None;
         loop {
+            let wait_started = Instant::now();
             ticker.tick().await;
-            // #12074: one INFO line per tick body, and its wall-clock deadline.
-            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
+            let began = Instant::now();
+            let (number, tick_budget) =
+                crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
+            let timing = tick_line::TickTiming {
+                number,
+                host_id: &host_id,
+                process_id,
+                began,
+            };
+            log::info!(
+                "{}",
+                timing.start_line(tick_budget, wait_started, previous_published.take())
+            );
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -1923,6 +1938,7 @@ pub fn spawn_multi_work_finder_task(
                     }
                     was_rate_limited = true;
                     tick_summary::publish_rate_limit_skip(now); // #12083
+                    log::info!("{}", timing.rate_limit_skip_line(now, Instant::now()));
                     continue;
                 }
                 was_rate_limited = false;
@@ -2122,6 +2138,7 @@ pub fn spawn_multi_work_finder_task(
                 log::debug!("{axis_line}");
             }
 
+            let span_started = Instant::now();
             let tick_started = chrono::Utc::now();
             // #12256: the tick's forge calls are children of its span.
             let tick_parent = crate::gh_invocation::telemetry::enter_parent(Some(
@@ -2152,7 +2169,20 @@ pub fn spawn_multi_work_finder_task(
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
             let plan = dispatch_plan::PlanInputs::new(max_concurrent, interval, &shard_decisions);
-            publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
+            let (completed_at, span_completed) =
+                publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
+            let published = Instant::now();
+            previous_published = Some(published);
+            log::info!(
+                "{}",
+                timing.completion_line(
+                    tick_started,
+                    completed_at,
+                    span_started,
+                    span_completed,
+                    published,
+                )
+            );
 
             if report.halted && !was_halted {
                 // #9591: name the hold(s) actually active — a drain is not a red main.
