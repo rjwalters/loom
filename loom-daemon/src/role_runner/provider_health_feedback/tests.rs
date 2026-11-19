@@ -158,7 +158,7 @@ fn codex_role_tick_refuses_an_untrusted_profile_before_spawning() {
     let marker = workspace.path().join("spawned");
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
     );
     let ws = crate::write_scope_test_support::WritableRoot::register(workspace.path());
     let outcome = judge_runner(workspace.path())
