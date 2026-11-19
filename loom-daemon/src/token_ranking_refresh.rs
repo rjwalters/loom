@@ -731,6 +731,10 @@ mod tests {
 
     #[test]
     fn test_refresh_success_on_zero_exit() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "echo ok; exit 0");
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf()).with_bin(bin);
@@ -739,6 +743,10 @@ mod tests {
 
     #[test]
     fn test_refresh_failure_on_nonzero_exit_includes_output_tail() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin =
             write_fake_bin(tmp.path(), "fake-daemon.sh", "echo tokens directory missing; exit 1");
@@ -752,6 +760,10 @@ mod tests {
 
     #[test]
     fn test_refresh_invokes_tokens_check_ranking_argv() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let repo_root = tmp.path().to_path_buf();
         let expected_workspace = repo_root.display().to_string();
@@ -769,6 +781,10 @@ mod tests {
 
     #[test]
     fn test_refresh_times_out_on_hung_bin() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         let bin = write_fake_bin(tmp.path(), "fake-daemon.sh", "sleep 30");
         let mut runner = ScriptRankingRefreshRunner::new(tmp.path().to_path_buf())
@@ -783,6 +799,10 @@ mod tests {
 
     #[test]
     fn test_refresh_spawn_failure_is_reported() {
+        // Pin a profile root: `refresh()` now folds Codex snapshots in, and the
+        // #9964 guard panics under cfg(test) when it is unset (#14584).
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root = ProfileRootEnv::set(profiles.path());
         let tmp = tempfile::tempdir().unwrap();
         // A binary path that does not exist and was never `.exists()`-checked
         // because it's an explicit override — spawn itself must fail cleanly.
