@@ -21,6 +21,8 @@
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
 #                              (forwarded to scripts/install-loom.sh)
+#   --repo-only                Write only the target repo's files; skip the machine-level daemon
+#                              binary and user-scope hooks (env: LOOM_INSTALL_REPO_ONLY=1)
 #   --tools-only [ARGS]        Install only loom-tools (no loom-daemon); see scripts/install/provision-tools.sh
 #   -h, --help                 Show this help message
 #
@@ -188,16 +190,21 @@ print_what_will_be_installed() {
   echo "  • .gitattributes            - install-metadata.json merge=ours driver appended"
   echo "  • .claude/settings.json     - project-level guard-hook entries wired in after the initial copy"
   echo ""
-  warning "Outside the target repository (user-level, written on this machine):"
-  echo "  • ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon"
-  echo "                              - user-level daemon binary built, signed and replaced;"
-  echo "                                the previous one is kept as loom-daemon.previous"
-  echo "  • ${LOOM_DAEMON_DEFAULTS_DIR:-$HOME/.local/share/loom-daemon/defaults}/"
-  echo "                              - defaults payload mirrored for the daemon"
-  echo "  • $HOME/.claude/settings.json"
-  echo "                              - user-scope guard hooks re-wired; the file is first backed up"
-  echo "                                as settings.json.loom-backup-<timestamp>"
-  echo ""
+  if [[ "${REPO_ONLY:-false}" == "true" ]]; then
+    info "Outside the target repository: nothing (--repo-only skips the machine-level daemon binary and user-scope hooks)."
+    echo ""
+  else
+    warning "Outside the target repository (user-level, written on this machine):"
+    echo "  • ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon"
+    echo "                              - user-level daemon binary built, signed and replaced;"
+    echo "                                the previous one is kept as loom-daemon.previous"
+    echo "  • ${LOOM_DAEMON_DEFAULTS_DIR:-$HOME/.local/share/loom-daemon/defaults}/"
+    echo "                              - defaults payload mirrored for the daemon"
+    echo "  • $HOME/.claude/settings.json"
+    echo "                              - user-scope guard hooks re-wired; the file is first backed up"
+    echo "                                as settings.json.loom-backup-<timestamp>"
+    echo ""
+  fi
   info "GitHub Changes (if using Full Install):"
   echo "  • Creates GitHub labels for workflow coordination"
   echo "  • Creates tracking issue with 'loom:building' label"
@@ -478,9 +485,13 @@ install_hooks_and_cli() {
 wire_quick_install_guard_hooks() {
   local target="$1"
 
-  info "Provisioning user-scope loom guard hooks..."
-  provision_loom_hooks || \
-    warning "User-scope loom guard hooks not fully provisioned; guards still fire from the per-repo .loom/hooks/ copies + project-level settings entries asserted below."
+  if [[ "$REPO_ONLY" == "true" ]]; then
+    info "Skipping user-scope loom guard hooks provisioning (--repo-only)"
+  else
+    info "Provisioning user-scope loom guard hooks..."
+    provision_loom_hooks || \
+      warning "User-scope loom guard hooks not fully provisioned; guards still fire from the per-repo .loom/hooks/ copies + project-level settings entries asserted below."
+  fi
 
   info "Asserting project-level guard-hook entries for per-repo .loom/hooks/ copies..."
   ensure_project_hook_wiring "$target" || \
@@ -1187,6 +1198,13 @@ DRY_RUN=false
 # installer), but it must accept and forward them so the flags it suggests
 # actually work. See issue #3650.
 SOURCE_OVERRIDE_FLAGS=()
+# --repo-only / LOOM_INSTALL_REPO_ONLY=1 (issue #14570): write only the target
+# repository's files; skip the machine-level daemon binary and user-scope hook
+# provisioning. Also forwarded to scripts/install-loom.sh (which skips its own
+# machine-level steps) -- the env var is inherited by the exec, and the flag is
+# appended to SOURCE_OVERRIDE_FLAGS below so the delegation is explicit.
+REPO_ONLY=false
+case "${LOOM_INSTALL_REPO_ONLY:-}" in 1|true|yes) REPO_ONLY=true ;; esac
 # Install-time workspace mode (--mode session, issue #8884). Held as the literal
 # `loom-daemon init` argv pair so it can be spliced into both the direct init
 # calls below and the Full-Install delegation exec without re-deriving anything.
@@ -1230,6 +1248,7 @@ while [[ "${1:-}" == -* ]]; do
     # Pass-through: accepted here so the wrapper's own suggestion works, then
     # forwarded to scripts/install-loom.sh at the Full-Install delegation execs.
     --allow-non-main-source|--allow-stale-target) SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
+    --repo-only) REPO_ONLY=true; SOURCE_OVERRIDE_FLAGS+=("$1"); shift ;;
     -h|--help)
       echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
       echo ""
@@ -1265,6 +1284,14 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             Loom source (forwarded to scripts/install-loom.sh)"
       echo "  --allow-stale-target       Permit installing over a newer/stale target"
       echo "                             (forwarded to scripts/install-loom.sh)"
+      echo "  --repo-only                Write only the target repository's files (env:"
+      echo "                             LOOM_INSTALL_REPO_ONLY=1; forwarded to scripts/install-loom.sh)."
+      echo "                             Skips the machine-level steps and prints one line per skip:"
+      echo "                               - loom-daemon binary + defaults mirror (~/.local/bin, ~/.local/share)"
+      echo "                               - user-scope guard hooks (~/.claude/settings.json)"
+      echo "                             (a Full Install also skips the 'loom' dispatcher, user-scope"
+      echo "                             skills/agents and user-scope MCP registration)."
+      echo "                             Without it, those steps run and change this machine."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Examples:"
@@ -1994,7 +2021,11 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
     # host has a working recovery path even without an on-host `loom` git
     # checkout to find it via cwd/git-root search (#5389).
-    provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    if [[ "$REPO_ONLY" == "true" ]]; then
+      info "Skipping machine-level loom-daemon provisioning (--repo-only)"
+    else
+      provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    fi
 
     # Guard-hook wiring (#4401). MUST run after install_hooks_and_cli (which
     # writes the .loom/hooks/ copies the project-level entries point at) and
@@ -2498,7 +2529,11 @@ case "$METHOD" in
     # Also mirror $LOOM_ROOT/defaults so a later `loom-daemon init` on THIS
     # host has a working recovery path even without an on-host `loom` git
     # checkout to find it via cwd/git-root search (#5389).
-    provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    if [[ "$REPO_ONLY" == "true" ]]; then
+      info "Skipping machine-level loom-daemon provisioning (--repo-only)"
+    else
+      provision_machine_daemon "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || true
+    fi
 
     # Guard-hook wiring (#4401) — same call as the --confirm-reinstall branch
     # above. Without it a brand-new `--quick` install ends up with .loom/hooks/

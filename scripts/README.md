@@ -38,7 +38,7 @@ the same set CI's `Structural Checks` job runs.
 | `setup-mcp.sh` | Demoted MCP bundle-rebuild / legacy-migration tool |
 | `version.sh` | Keep all version-bearing files in sync (release path only; never in a PR) |
 | `changelog.sh` | Generate/verify Keep-a-Changelog entries |
-| `test-installer.sh`, `test-install-local-mode.sh`, `test-migrate-consumer.sh`, `test-changelog.sh`, `test-daemon-liveness.sh` | Tests for the above |
+| `test-installer.sh`, `test-install-local-mode.sh`, `test-install-repo-only.sh`, `test-migrate-consumer.sh`, `test-changelog.sh`, `test-daemon-liveness.sh` | Tests for the above |
 
 ### Development / maintenance
 
