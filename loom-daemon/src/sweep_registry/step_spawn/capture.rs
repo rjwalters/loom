@@ -178,6 +178,24 @@ pub(crate) fn release_class_of_line(line: &StepOutcomeLine) -> &'static str {
     release_token(line.class.as_str(), &line.reason)
 }
 
+/// A late account refusal is tied to this launch's exit and outcome line.
+pub(crate) fn seat_busy_exit_reason(
+    role: StepRole,
+    item: u32,
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+) -> Option<&'static str> {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    (end == StepEnd::Exited(Some(REFUSAL_EXIT_CODE))
+        && line.is_some_and(|outcome| {
+            outcome.role == role.role_name()
+                && outcome.target == item
+                && outcome.class == StepOutcomeClass::Refused
+                && outcome.reason == SEAT_BUSY_REASON
+        }))
+    .then_some(SEAT_BUSY_REASON)
+}
+
 /// The release class of a step that wrote no `LOOM_STEP_OUTCOME` line: a
 /// Champion step's `CHAMPION-STEP` outcome folded onto the four classes
 /// ([`crate::step_dispatch::outcome_ledger::parse_outcome_line`]), read after
@@ -503,7 +521,10 @@ impl SweepRegistry {
         // carve-out, unlike `step_failure`: a cancelled step never reaches
         // the provider feedback that sets the flag (`reaper::finish_cancel`
         // does not run it), so it keeps its own release.
-        let release_class = if provider_exhausted {
+        let seat_busy = seat_busy_exit_reason(role, item, end, line.as_ref());
+        let release_class = if let Some(reason) = seat_busy {
+            reason
+        } else if provider_exhausted {
             crate::fleet_dispatch::table::PROVIDER_EXHAUSTED_OUTCOME
         } else {
             line.as_ref().map_or_else(
@@ -526,11 +547,11 @@ impl SweepRegistry {
         );
         crate::fleet_dispatch::worker::release(sweep_id, release_class);
         if !self.config.skip_label_flip {
-            let reason = match end {
+            let reason = seat_busy.unwrap_or(match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
                 StepEnd::Cancelled => "cancelled",
                 StepEnd::Exited(_) => "exited",
-            };
+            });
             if role == StepRole::Builder {
                 self.yield_finished_builder_lease(item, sweep_id, reason);
             }
