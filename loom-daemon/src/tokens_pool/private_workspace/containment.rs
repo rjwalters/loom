@@ -305,7 +305,18 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = match dispatch::Selection::prepare(root, "codex", model, kind, issue, owner) {
+    let selection = dispatch::Selection::prepare(root, "codex", model, kind, issue, owner);
+    admit_selection(root, role, explicit, rejection, selection)
+}
+
+fn admit_selection(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    rejection: RuntimeRejection,
+    selection: Result<Option<dispatch::Selection>>,
+) -> Result<(ResolvedRuntime, dispatch::Selection, ContainmentProof), RuntimeRejection> {
+    let selection = match selection {
         Ok(Some(selection)) => selection,
         Ok(None) => {
             return Err(rejection.with_containment_failure(
@@ -385,6 +396,7 @@ pub struct Preparer<'a> {
     owner: String,
     model_for: ModelFor<'a>,
     held: Option<(dispatch::Selection, Option<ContainmentProof>, Option<String>)>,
+    seat_unavailable: bool,
 }
 
 impl<'a> Preparer<'a> {
@@ -403,7 +415,20 @@ impl<'a> Preparer<'a> {
             owner,
             model_for,
             held: None,
+            seat_unavailable: false,
         }
+    }
+
+    /// Whether a candidate could not reserve a seat on this host during the draw.
+    pub(crate) fn seat_unavailable(&self) -> bool {
+        self.seat_unavailable
+    }
+
+    fn note_seat_availability(&mut self, selection: &Result<Option<dispatch::Selection>>) {
+        self.seat_unavailable |= selection.as_ref().is_err_and(|error| {
+            error.is::<super::AccountBusy>()
+                || error.is::<super::super::health::NoHealthyAccountError>()
+        });
     }
 
     /// Hand the prepared selection — and the model it was selected for — to
@@ -441,16 +466,17 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             }
         }
         self.held = None;
-        let (admitted, selection, proof) = admit_new(
+        let selection = dispatch::Selection::prepare(
             &self.root,
-            role,
-            explicit,
-            rejection,
+            "codex",
             model.as_deref(),
             self.kind,
             self.issue,
             &self.owner,
-        )?;
+        );
+        self.note_seat_availability(&selection);
+        let (admitted, selection, proof) =
+            admit_selection(&self.root, role, explicit, rejection, selection)?;
         self.held = Some((selection, Some(proof), model));
         Ok(admitted)
     }
@@ -472,8 +498,9 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.issue,
             &self.owner,
             crate::runtime_preference::codex_guard::guarded(&admitted.role),
-        )
-        .map_err(|error| RuntimeRejection {
+        );
+        self.note_seat_availability(&selection);
+        let selection = selection.map_err(|error| RuntimeRejection {
             role: admitted.role.clone(),
             runtime: admitted.runtime.clone(),
             source: admitted.source.clone(),

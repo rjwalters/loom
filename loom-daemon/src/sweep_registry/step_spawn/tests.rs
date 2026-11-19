@@ -1317,6 +1317,22 @@ mod captain {
     }
 }
 
+#[test]
+fn the_late_seat_busy_release_requires_the_matching_exit_and_outcome() {
+    use super::capture::seat_busy_exit_reason;
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+
+    let busy =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy");
+    let refused = StepEnd::Exited(Some(REFUSAL_EXIT_CODE));
+    let classified = |role, item, end| seat_busy_exit_reason(role, item, end, busy.as_ref());
+    assert_eq!(classified(StepRole::Judge, 7, refused), Some(SEAT_BUSY_REASON));
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::Exited(Some(1))), None);
+    assert_eq!(classified(StepRole::Judge, 7, StepEnd::TimedOut), None);
+    assert_eq!(classified(StepRole::Judge, 8, refused), None);
+    assert_eq!(classified(StepRole::Curator, 7, refused), None);
+}
+
 /// #12551: a step that ended waiting on CI releases as `ci_wait`, not `noop`.
 #[test]
 fn a_ci_pending_noop_line_releases_as_ci_wait() {

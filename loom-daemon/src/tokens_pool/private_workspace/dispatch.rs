@@ -224,7 +224,7 @@ impl Selection {
                     if try_idle_seats
                         && error.is::<super::super::health::NoHealthyAccountError>() =>
                 {
-                    bail!("no idle seat");
+                    return Err(error.context("no idle seat"));
                 }
                 other => other?,
             };

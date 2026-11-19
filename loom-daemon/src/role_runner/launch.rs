@@ -710,7 +710,12 @@ mod tests {
         let script = root.path().join("spawn.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\n[ -e /proc/self/fd/198 ] && touch '{}'\n", marker.display()),
+            format!(
+                "#!/bin/sh\n[ \"$LOOM_PRIVATE_LEASE_FD\" = '{}' ] && \
+                 [ -e \"/dev/fd/$LOOM_PRIVATE_LEASE_FD\" ] && touch '{}'\n",
+                crate::tokens_pool::private_workspace::dispatch::LEASE_FD,
+                marker.display()
+            ),
         )
         .unwrap();
         {
