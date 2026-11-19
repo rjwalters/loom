@@ -1272,6 +1272,147 @@ fn session_mode_with_inherited_fleet_variables_writes_through_the_local_credenti
     }
 }
 
+/// Fleet issue reads have a gateway profile. Body, label and resolution
+/// writes have no corresponding fleet broker operation. An otherwise writable
+/// checkout must never send those operations to its ambient gh credential.
+#[test]
+fn fleet_park_and_decision_writes_stop_before_the_local_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = managed_checkout(tmp.path(), "git@github.com:acme/widgets.git");
+    let (shim, local_log) = recording_gh_allowed(tmp.path(), PARKED_BODY, None);
+    let gh = shim.join("gh");
+    let gateway = tmp.path().join("gateway/.loom/gh-config-gateway");
+    let reader = gateway.join("acme");
+    std::fs::create_dir_all(&reader).unwrap();
+    std::fs::write(reader.join("hosts.yml"), "github.com: {}\n").unwrap();
+    std::fs::write(gateway.join("gh-ok"), gh.to_str().unwrap()).unwrap();
+    let state = tmp.path().join("issue.json");
+    let initial = std::fs::read(&state).unwrap();
+
+    // Record routed reads separately from every command using the local
+    // writer, including failed attempts. The permission fixture grants push.
+    let reader_log = tmp.path().join("reader.log");
+    let writer_gh = shim.join("local-gh");
+    std::fs::rename(&gh, &writer_gh).unwrap();
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+if [ "${GH_CONFIG_DIR:-}" = "$FLEET_READER" ]; then
+    echo "$@" >> "$READER_LOG"
+    [ "$*" = 'api repos/acme/widgets/issues/7' ]
+    if [ -f "$FLEET_READER/unavailable" ]; then
+        echo 'gh: Service Unavailable (HTTP 503)' >&2
+        exit 1
+    fi
+    cat "$ISSUE_STATE"
+    exit 0
+fi
+if [ "${2:-}" = -X ] && [ "${3:-}" = PATCH ]; then
+    cp "$6" "$ISSUE_STATE"
+fi
+exec "$LOCAL_GH" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::metadata(&writer_gh).unwrap().permissions()).unwrap();
+
+    let invoke = |args: &[&str], stdin: Option<&str>| {
+        let mut c = base(TOOLS, tmp.path(), &cwd);
+        c.env("LOOM_MODE", "fleet")
+            .env("LOOM_GH_BIN", &gh)
+            .env("PATH", format!("{}:/usr/bin:/bin", shim.display()))
+            .env("LOOM_GH_GATEWAY_DIR", &gateway)
+            .env("LOCAL_GH", &writer_gh)
+            .env("FLEET_READER", &reader)
+            .env("READER_LOG", &reader_log)
+            .env("ISSUE_STATE", &state)
+            .env("LOOM_WRITE_SCOPE_CACHE_DIR", tmp.path().join("scope"))
+            .env("LOOM_LISTING_CACHE_DIR", tmp.path().join("listing"))
+            .args(args)
+            .args(["--repo", "acme/widgets"]);
+        run(c, stdin)
+    };
+    let preview = invoke(
+        &[
+            "operator-decision",
+            "apply",
+            "7",
+            "--input",
+            "-",
+            "--dry-run",
+        ],
+        Some(DECISION),
+    );
+    assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&reader_log).unwrap().trim(),
+        "api repos/acme/widgets/issues/7"
+    );
+
+    for (args, stdin) in [
+        (vec!["park-record", "apply", "--pr", "7", "--reason", "waiting"], None),
+        (
+            vec![
+                "park-record",
+                "retract",
+                "--issue",
+                "7",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "landed",
+            ],
+            None,
+        ),
+        (vec!["operator-decision", "apply", "7", "--input", "-"], Some(DECISION)),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "--new",
+                "--title",
+                "Question",
+                "--input",
+                "-",
+            ],
+            Some(DECISION),
+        ),
+    ] {
+        let result = invoke(&args, stdin);
+        let err = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(4), "{args:?}: {err}");
+        assert!(err.contains("scoped fleet write broker"), "{args:?}: {err}");
+        assert_eq!(std::fs::read(&state).unwrap(), initial, "{args:?}");
+        assert!(
+            !local_log.exists(),
+            "ambient gh received {:?}",
+            std::fs::read_to_string(&local_log)
+        );
+    }
+
+    // An outage on the configured reader must also stop the workflow.
+    std::fs::write(&reader_log, "").unwrap();
+    std::fs::write(reader.join("unavailable"), "").unwrap();
+    let result = invoke(
+        &[
+            "park-record",
+            "apply",
+            "--issue",
+            "7",
+            "--reason",
+            "waiting",
+        ],
+        None,
+    );
+    assert_eq!(result.status.code(), Some(4), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(std::fs::read_to_string(&reader_log)
+        .unwrap()
+        .contains("api repos/acme/widgets/issues/7"));
+    assert!(!local_log.exists());
+    assert_eq!(std::fs::read(&state).unwrap(), initial);
+}
+
 /// `apply --new` files through the workspace's real `create-issue.sh`, which
 /// calls `$LOOM_DAEMON_BIN forge create-issue`: on the daemon root that
 /// nested create runs and the URL comes back (`CREATED=`, exit 0); on the
