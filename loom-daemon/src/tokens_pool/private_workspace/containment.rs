@@ -384,7 +384,7 @@ pub struct Preparer<'a> {
     issue: Option<u64>,
     owner: String,
     model_for: ModelFor<'a>,
-    held: Option<(dispatch::Selection, ContainmentProof, Option<String>)>,
+    held: Option<(dispatch::Selection, Option<ContainmentProof>, Option<String>)>,
 }
 
 impl<'a> Preparer<'a> {
@@ -407,7 +407,7 @@ impl<'a> Preparer<'a> {
     }
 
     /// Hand the prepared selection — and the model it was selected for — to
-    /// the launch path. `None` when no contained candidate was admitted.
+    /// the launch path. `None` when the launch uses no managed seat.
     pub fn take(&mut self) -> Option<(dispatch::Selection, Option<String>)> {
         self.held
             .take()
@@ -432,15 +432,15 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
         // already prepared instead of selecting a second account — but only
         // for the same model: account selection is model-aware, so a draw
         // naming a different model gets its own selection (#12748).
-        if let Some((_, proof, held_model)) = &self.held {
+        if let Some((_, Some(proof), held_model)) = &self.held {
             if *held_model == model {
                 if let Err(error) = require_workspace_repository(&self.root, proof) {
                     return Err(rejection.with_containment_failure(&error.to_string()));
                 }
                 return admit_with(&self.root, role, explicit, proof);
             }
-            self.held = None;
         }
+        self.held = None;
         let (admitted, selection, proof) = admit_new(
             &self.root,
             role,
@@ -451,8 +451,42 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.issue,
             &self.owner,
         )?;
-        self.held = Some((selection, proof, model));
+        self.held = Some((selection, Some(proof), model));
         Ok(admitted)
+    }
+
+    fn reserve_seat(
+        &mut self,
+        admitted: &ResolvedRuntime,
+        drawn_model: Option<&str>,
+    ) -> Result<(), RuntimeRejection> {
+        if admitted.runtime != "codex" || admitted.execution.is_some() {
+            return Ok(());
+        }
+        self.release();
+        let model = (self.model_for)("codex", drawn_model);
+        let selection = dispatch::Selection::prepare_idle(
+            &self.root,
+            model.as_deref(),
+            self.kind,
+            self.issue,
+            &self.owner,
+            crate::runtime_preference::codex_guard::guarded(&admitted.role),
+        )
+        .map_err(|error| RuntimeRejection {
+            role: admitted.role.clone(),
+            runtime: admitted.runtime.clone(),
+            source: admitted.source.clone(),
+            unmet_capabilities: vec![],
+            reason: if error.is::<super::AccountBusy>() {
+                "no idle seat".to_string()
+            } else {
+                error.to_string()
+            },
+            exhausted_summary_line: None,
+        })?;
+        self.held = selection.map(|selection| (selection, None, model));
+        Ok(())
     }
 
     fn release(&mut self) {

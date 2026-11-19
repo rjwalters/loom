@@ -529,6 +529,16 @@ impl SweepRegistry {
             let reason = match end {
                 StepEnd::TimedOut => crate::pr_lease_reap::REASON_TIMEOUT,
                 StepEnd::Cancelled => "cancelled",
+                StepEnd::Exited(Some(crate::session_exec::refusal::REFUSAL_EXIT_CODE))
+                    if line.as_ref().is_some_and(|outcome| {
+                        outcome.role == role.role_name()
+                            && outcome.target == item
+                            && outcome.class == StepOutcomeClass::Refused
+                            && outcome.reason == crate::session_exec::refusal::SEAT_BUSY_REASON
+                    }) =>
+                {
+                    crate::session_exec::refusal::SEAT_BUSY_REASON
+                }
                 StepEnd::Exited(_) => "exited",
             };
             self.reap_step_leases(sweep_id, reason);

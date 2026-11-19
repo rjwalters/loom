@@ -26,7 +26,7 @@ const OTHER_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
 /// One fake engine: containers and volumes as `docker inspect` would report
 /// them, the local images, and every call made against it.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Engine {
     id: String,
     containers: BTreeMap<String, Value>,
@@ -199,7 +199,7 @@ impl Engine {
                 Ok(serde_json::to_string(&report)?)
             }
             ["exec", rest @ ..] if rest.contains(&"prepare") => {
-                Ok(json!({"protocol": PROTOCOL, "revision": "deadbeef"}).to_string())
+                Ok(json!({"protocol": PROTOCOL, "revision": "a".repeat(40)}).to_string())
             }
             ["exec", rest @ ..] if rest.contains(&"rebind") => self
                 .rebind_response
@@ -1851,4 +1851,176 @@ fn without_the_configuration_a_private_start_is_unchanged() {
     assert!(status.extra_mounts.is_empty());
     let text = std::fs::read_to_string(env.dir.join("workspace.json")).unwrap();
     assert!(!text.contains("extra_mounts") && !text.contains("session_image"), "{text}");
+}
+
+#[test]
+#[serial]
+fn concurrent_judge_draws_share_one_idle_seat() {
+    use crate::runtime_preference::{
+        resolve_runtime_contained, role_draw, Decision, DispatchContext, Intent,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Barrier;
+
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_JUDGE",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    super::super::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    env.seed_container(CONTAINER_ID, true);
+    env.seed_volume();
+    let root = env.workspace.path();
+    crate::test_git_helpers::run(root, &["init", "-q"]);
+    crate::test_git_helpers::run(root, &["remote", "add", "origin", &env.config.repository]);
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("defaults");
+    for file in [
+        "roles/judge.json",
+        "runtimes/codex.json",
+        "runtimes/claude.json",
+    ] {
+        let dest = root.join(".loom").join(file);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(shipped.join(file), dest).unwrap();
+    }
+    for runtime in ["codex", "claude"] {
+        let dest = root.join(format!(".loom/scripts/spawn-{runtime}.sh"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+
+    save(
+        &root.join(".loom/config.json"),
+        &json!({"runtimes":{"roleDraw":{"judge":{"1":{"codex":1000,"claude":1}}}}}),
+    )
+    .unwrap();
+
+    let draw = |owner: String| {
+        let mut preparer =
+            containment::Preparer::new(root, JobKind::Role, None, owner, Box::new(|_, _| None));
+        let result = role_draw::with_seed(1, || {
+            resolve_runtime_contained(
+                root,
+                "judge",
+                None,
+                1_800_000_000,
+                DispatchContext {
+                    intent: Intent::Dispatch,
+                    role_tick: true,
+                },
+                &mut preparer,
+            )
+        });
+        let Decision::Preference {
+            resolution, draw, ..
+        } = result.unwrap()
+        else {
+            panic!("expected the role draw");
+        };
+        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), preparer.take())
+    };
+    let assert_falls_through = |case: &str| {
+        let (runtime, record, selection) = draw(case.to_owned());
+        assert_eq!(runtime, "claude", "{case}: {record:?}");
+        assert!(selection.is_none(), "{case}");
+        assert!(
+            record
+                .passed_over
+                .iter()
+                .any(|reason| reason == "codex: not-admitted(no idle seat)"),
+            "{record:?}"
+        );
+    };
+
+    assert_falls_through("hook trust unproven");
+    let controls = tempfile::tempdir().unwrap();
+    let trusted = super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
+    for name in bundle::PROFILE_CONTROLS {
+        std::fs::copy(trusted.join(name), env.config.profile.join(name)).unwrap();
+    }
+
+    crate::test_git_helpers::run(
+        root,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://forge.example/other/repo",
+        ],
+    );
+    assert_falls_through("repository unregistered");
+    crate::test_git_helpers::run(root, &["remote", "set-url", "origin", &env.config.repository]);
+
+    env.seed_container(CONTAINER_ID, false);
+    assert_falls_through("container stopped");
+    env.seed_container(CONTAINER_ID, true);
+
+    let barrier = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles = (0..2)
+            .map(|index| {
+                let mut engine = env.engine().clone();
+                let barrier = &barrier;
+                let draw = &draw;
+                scope.spawn(move || {
+                    let _docker = docker::fake::install(Box::new(move |args| engine.handle(args)));
+                    barrier.wait();
+                    let (runtime, draw, selection) = draw(format!("judge-fixture-{index}"));
+                    // Keep the winning reservation open until both draws finish.
+                    barrier.wait();
+                    (runtime, draw, selection.is_some())
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(
+        results
+            .iter()
+            .filter(|(runtime, _, _)| runtime == "codex")
+            .count(),
+        1,
+        "{results:?}"
+    );
+    for (runtime, draw, reserved) in &results {
+        match runtime.as_str() {
+            "codex" => assert!(reserved),
+            "claude" => {
+                assert!(!reserved);
+                assert!(
+                    draw.passed_over
+                        .iter()
+                        .any(|reason| reason == "codex: not-admitted(no idle seat)"),
+                    "{draw:?}"
+                );
+            }
+            other => panic!("unexpected runtime {other}"),
+        }
+    }
+    assert!(lease::Lease::acquire(&env.dir).is_ok(), "the abandoned selection is released");
 }
