@@ -93,12 +93,17 @@ impl DispatchModel<'_> {
             // killed by a model limit there is a step-down to honour, which
             // needs a model to step down FROM, so resolve one as a fresh
             // dispatch would. No pending kill: unchanged.
+            // Only an issue sweep can carry a kill memo; a step or PR-set
+            // sweep has none, so it keeps its literal argument.
             let resume_after_kill = model.is_none()
-                && matches!(kind, SweepKind::Issue(n) if super::model_limit_kill::step_down_pending(
-                    root,
-                    *n,
-                    super::model_limit_kill::ISSUE_SWEEP_ROLE,
-                ));
+                && match kind {
+                    SweepKind::Issue(n) => super::model_limit_kill::step_down_pending(
+                        root,
+                        *n,
+                        super::model_limit_kill::ISSUE_SWEEP_ROLE,
+                    ),
+                    SweepKind::Step { .. } | SweepKind::PrSet(_) => false,
+                };
             if !resume_after_kill {
                 return model.map(str::to_owned);
             }
