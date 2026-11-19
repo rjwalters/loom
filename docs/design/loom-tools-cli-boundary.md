@@ -750,9 +750,9 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
-| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
-| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree operations and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). Checkout-local claims are available through `loom-tools claim` (#14487, §13.7). |
+| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
+| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
+| Worktree operations and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). Checkout-local claims are available through `loom-tools claim` (#14487, §13.8). |
 
 ### 13.4 Gitea decision
 
@@ -790,7 +790,61 @@ to the original claim. On Gitea, agent-facing leases return success with
 the label-only diagnostic and perform no forge lease operations. Scheduled
 `attach` and `reap` remain daemon service commands. Tools return 64 for them.
 
-### 13.7 Local claim commands (#14487)
+### 13.7 Top-level reads and config inspection (#14429)
+
+The Phase 3a follow-up (epic #12708): the remaining top-level read commands
+and the config-inspection commands, the same story one level up from §13.1.
+`loom-tools <cmd>` parses the same clap tree and runs the same handler
+`loom-daemon <cmd>` runs (`cli/pr_queue.rs`, `cli/premise_check.rs`,
+`cli/duplicate_scan.rs`, `cli/points_marker_check.rs`,
+`cli/label_duplicates.rs`, `cli/forge_probe_cmd.rs`,
+`cli/forge_inventory_cmd.rs`, `cli/affected_files_check.rs`,
+`cli/stale_blocked.rs`, `cli/labels_cmd.rs`, `cli/skip_labels.rs`,
+`cli/roles_draw_cmd.rs`, `cli/guards_status.rs`,
+`cli/install_compat_cli.rs`, `cli/hooks_home_cmd.rs`); no handler was copied
+or moved, and every `loom-daemon` entry point is unchanged.
+
+Migrated: `labels`, `pr-queue`, `premise-check`, `duplicate-scan`,
+`check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`,
+`affected-files`, `check-stale-blocked` (top-level reads); `skip-labels`,
+`roles`, `guards`, `install-compat`, `hooks-home` (config inspection).
+`fleet-config` stays in `loom-daemon`: it reaches the workspace registry
+(§3.6) and does not degrade cleanly with an empty one.
+
+Each handler was read before migrating (#14396 holds everything that
+writes), which moved three commands onto the refusal pattern rather than
+onto the plain passthrough:
+
+| Command | Refused form (exit `EX_WRITE_VERB_NOT_MIGRATED` = 64) | Why |
+| --- | --- | --- |
+| `labels` | `generate --write`, `undeclared --prune`, `migrate --apply` | rewrite the `labels.yml` copies / the forge's labels; the dry-run and report forms are served |
+| `forge-probe` | `--live-write` | executes the probe manifest's write cases; the read-only run is served |
+| `forge-inventory` | `gate --update` | rewrites the change-gate baseline; every other verb is served |
+
+The classifiers (`LabelsArgs::is_read`, `ForgeProbeArgs::is_read`,
+`ForgeInventoryCommand::is_read`) are exhaustive `match`es with no wildcard
+arm, so a new form does not compile until its author says which side it is
+on — the §13.1 rule at flag granularity.
+
+Mode: only the invocations that can reach the forge pass the gate
+(`reaches_forge`): `pr-queue` without `--input`, `premise-check --issue`,
+`forge-probe`, `check-stale-blocked`, and `labels undeclared` / `migrate`
+(whose dry runs read the repo's labels). The rest — the whole config-
+inspection family, `duplicate-scan`, `check-points-marker`,
+`label-duplicates`, `affected-files`, `forge-inventory`, `labels`' registry
+forms — touch nothing but argv, stdin, local git objects or local files and
+skip the gate. `install-compat` is ungated like `release-fetch` (#12940):
+its `check --fetch-old-daemon` fetches a release artifact, not a forge read.
+
+Capability source unchanged: `install_compat::TOOLS_COMMANDS` is the one
+list; `capabilities --json` and `install-compat show --json` both print
+these fifteen entries as `tools_commands` (`CAPABILITIES_SCHEMA_VERSION`
+unchanged — an added key would be the only reason to bump), and the
+`bin/loom_tools.rs` unit test still fails when the list and the clap tree
+disagree. The Gitea stance is §13.4's: these commands' forge reads (their
+`gh` calls) keep whatever the facade and the shell adapter already do.
+
+### 13.8 Local claim commands (#14487)
 
 Part of #14475. `loom-tools claim <verb>` serves `claim`, `extend`, `check`,
 `release`, `list` and `cleanup` through the same `script_helpers::claim::run`

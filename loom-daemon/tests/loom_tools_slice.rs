@@ -924,6 +924,397 @@ fn capabilities_list_park_record_and_operator_decision() {
 #[path = "loom_tools_slice/pr_lease.rs"]
 mod pr_lease;
 
+// ---- #14429: top-level reads and config inspection -------------------------
+//
+// `base()` gives a clean install: no `loom-daemon` on PATH, no fleet routing,
+// no forge credential. Every command runs through the same handler
+// `loom-daemon` runs, so `parity` (identical stdout and exit code) is the
+// contract; the handlers were read before migrating and none of the served
+// forms writes (#14396 holds the writes).
+
+#[test]
+fn top_level_reads_match_loom_daemon_with_no_daemon_or_forge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // `labels`: the registry is embedded, so every read form is deterministic
+    // and offline; `check` in a dir with no labels.yml exits 2 on both sides.
+    parity(&["labels", "list"], None, cwd, cwd);
+    parity(&["labels", "list", "--property", "skip"], None, cwd, cwd);
+    let unknown = parity(&["labels", "list", "--property", "bogus"], None, cwd, cwd);
+    assert_eq!(unknown.status.code(), Some(2));
+    let got = parity(&["labels", "get", "loom:issue"], None, cwd, cwd);
+    assert_eq!(got.status.code(), Some(0));
+    let missed = parity(&["labels", "get", "no-such-label"], None, cwd, cwd);
+    assert_eq!(missed.status.code(), Some(1));
+    parity(&["labels", "aliases", "loom:issue"], None, cwd, cwd);
+    parity(&["labels", "generate"], None, cwd, cwd);
+    let unchecked = parity(&["labels", "check"], None, cwd, cwd);
+    assert_eq!(unchecked.status.code(), Some(2));
+
+    // `check-points-marker`: stdin in, exit code is the verdict.
+    let ok = parity(
+        &["check-points-marker", "--issue", "42"],
+        Some("x\n<!-- loom:points=3 -->\n"),
+        cwd,
+        cwd,
+    );
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("is pointed 3"));
+    let blocked =
+        parity(&["check-points-marker", "--issue", "42"], Some("no marker here\n"), cwd, cwd);
+    assert_eq!(blocked.status.code(), Some(1));
+
+    // `label-duplicates`: one file in, the count on stdout.
+    let labels = cwd.join("labels.yml");
+    std::fs::write(&labels, "- name: a\n- name: b\n- name: a\n").unwrap();
+    let dup = parity(&["label-duplicates", labels.to_str().unwrap()], None, cwd, cwd);
+    assert_eq!(dup.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&dup.stdout).trim(), "1");
+
+    // `duplicate-scan`: the pool is stdin; no forge call.
+    parity(
+        &[
+            "duplicate-scan",
+            "--pool",
+            "open-issues",
+            "--title",
+            "Fix the widget",
+        ],
+        Some("[]"),
+        cwd,
+        cwd,
+    );
+
+    // `affected-files`: not a git checkout -> "could not run" (3), not a verdict.
+    let body = cwd.join("body.md");
+    std::fs::write(&body, "A report.\n").unwrap();
+    let could_not = parity(
+        &[
+            "affected-files",
+            "check",
+            "--body-file",
+            body.to_str().unwrap(),
+        ],
+        None,
+        cwd,
+        cwd,
+    );
+    assert_eq!(could_not.status.code(), Some(3));
+
+    // `pr-queue`: the offline REST pull array needs no forge.
+    let prs = cwd.join("prs.json");
+    std::fs::write(&prs, "[]").unwrap();
+    parity(
+        &[
+            "pr-queue",
+            "--role",
+            "judge",
+            "--input",
+            prs.to_str().unwrap(),
+        ],
+        None,
+        cwd,
+        cwd,
+    );
+
+    // `premise-check`: hermetic mode is forge-free; out of scope is exit 0.
+    let out = parity(
+        &[
+            "premise-check",
+            "--body-file",
+            body.to_str().unwrap(),
+            "--title",
+            "T",
+        ],
+        None,
+        cwd,
+        cwd,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("SCOPE=out"));
+}
+
+/// Commands whose read path reaches the forge fail identically with no
+/// credential (the daemon's route is shed by the clean env, so both roots
+/// speak to the same absent `gh`), and `check-stale-blocked` keeps its
+/// always-exit-0 advisory contract.
+#[test]
+fn forge_reaching_reads_fail_identically_without_a_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // `check-stale-blocked` reports unevaluated and exits 0 — it never
+    // guesses, and never relabels.
+    let stale = parity(&["check-stale-blocked", "--json"], None, cwd, cwd);
+    assert_eq!(stale.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&stale.stdout).contains("unevaluated"));
+
+    // `pr-queue` without `--input` fetches with the person's own `gh`.
+    parity(&["pr-queue", "--role", "judge"], None, cwd, cwd);
+    // `premise-check --issue` is forge mode.
+    parity(&["premise-check", "--issue", "7"], None, cwd, cwd);
+    // `labels undeclared` / `migrate`'s dry runs read the repo's labels.
+    parity(
+        &[
+            "labels",
+            "undeclared",
+            "--repo",
+            "acme/widgets",
+            "--labels-file",
+            "missing.yml",
+        ],
+        None,
+        cwd,
+        cwd,
+    );
+    parity(&["labels", "migrate", "--repo", "acme/widgets", "--json"], None, cwd, cwd);
+    // `forge-probe` without config or credential is "could not run" (2).
+    let probe = parity(&["forge-probe"], None, cwd, cwd);
+    assert_eq!(probe.status.code(), Some(2));
+}
+
+#[test]
+fn config_inspection_matches_loom_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+
+    // `skip-labels`: the four renderings, offline.
+    parity(&["skip-labels"], None, cwd, cwd);
+    parity(&["skip-labels", "--json"], None, cwd, cwd);
+    parity(&["skip-labels", "--jq-not"], None, cwd, cwd);
+    parity(&["skip-labels", "--search"], None, cwd, cwd);
+
+    // `hooks-home`: same HOME, so both roots unpack the same payload and
+    // print the same directory.
+    let home = parity(&["hooks-home"], None, cwd, cwd);
+    assert_eq!(home.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&home.stdout).contains("hooks-home"));
+
+    // `guards`: the status report (a diagnostic, always exit 0) and the
+    // remote-exec classifier agree byte for byte.
+    parity(&["guards", "status", "--json"], None, cwd, cwd);
+    parity(
+        &[
+            "guards",
+            "remote-exec",
+            "--for-command",
+            "ssh deploy-host rm -rf /srv/app",
+        ],
+        None,
+        cwd,
+        cwd,
+    );
+
+    // `roles draw`: config resolution over the same workspace root.
+    parity(&["roles", "draw", "--json"], None, cwd, cwd);
+
+    // `install-compat show`: the same contract object from both binaries.
+    parity(&["install-compat", "show", "--json"], None, cwd, cwd);
+
+    // `forge-inventory`: the embedded manifest, no forge call.
+    parity(&["forge-inventory", "validate"], None, cwd, cwd);
+    parity(&["forge-inventory", "report"], None, cwd, cwd);
+    parity(&["forge-inventory", "probe-manifest", "--profile", "delivery"], None, cwd, cwd);
+}
+
+/// A write form is refused before any handler runs, with a status no read
+/// form uses as data (the writes are #14396). `loom-daemon` still serves
+/// them, so this runs the tools binary only.
+#[test]
+fn write_forms_of_the_new_commands_are_refused_with_exit_64() {
+    let tmp = tempfile::tempdir().unwrap();
+    for args in [
+        &["labels", "generate", "--write"][..],
+        &[
+            "labels",
+            "undeclared",
+            "--repo",
+            "acme/widgets",
+            "--labels-file",
+            "labels.yml",
+            "--prune",
+        ],
+        &["labels", "migrate", "--apply"],
+        &[
+            "forge-probe",
+            "--live-write",
+            "--origin",
+            "https://gitea.example.com",
+        ],
+        &["forge-inventory", "gate", "--update"],
+    ] {
+        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        c.args(args);
+        let o = run(c, None);
+        assert_eq!(o.status.code(), Some(64), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(o.stdout.is_empty(), "{args:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("#14396"), "{args:?}: {err}");
+    }
+}
+
+#[test]
+fn label_writes_are_refused_before_mode_resolution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let gh = tmp.path().join("gh");
+    let marker = tmp.path().join("gh-called");
+    std::fs::write(&gh, "#!/bin/sh\n: > gh-called\nexit 97\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    for (mode, read_error) in [
+        (None, "LOOM_GH_GATEWAY_DIR"),
+        (Some("invalid-test-mode"), "invalid mode"),
+    ] {
+        for (args, write_flag) in [
+            (
+                &[
+                    "labels",
+                    "undeclared",
+                    "--repo",
+                    "acme/widgets",
+                    "--labels-file",
+                    "f",
+                ][..],
+                "--prune",
+            ),
+            (&["labels", "migrate"][..], "--apply"),
+        ] {
+            let command = || {
+                let mut c = base(TOOLS, tmp.path(), tmp.path());
+                c.env_remove("LOOM_MODE")
+                    .env("LOOM_GH_GATEWAY_DIR", tmp.path())
+                    .env("LOOM_GH_BIN", &gh)
+                    .args(args);
+                if let Some(mode) = mode {
+                    c.env("LOOM_MODE", mode);
+                }
+                c
+            };
+            let mut write = command();
+            write.arg(write_flag);
+            let refused = run(write, None);
+            let err = String::from_utf8_lossy(&refused.stderr);
+            assert_eq!(refused.status.code(), Some(64), "{mode:?} {args:?} {write_flag}: {err}");
+            assert!(refused.stdout.is_empty() && err.contains("#14396"), "{err}");
+
+            let read = run(command(), None);
+            let err = String::from_utf8_lossy(&read.stderr);
+            assert_eq!(read.status.code(), Some(1), "{mode:?} {args:?}: {err}");
+            assert!(read.stdout.is_empty() && err.contains(read_error), "{err}");
+        }
+    }
+    assert!(!marker.exists(), "mode validation or refusal reached the fake forge");
+}
+
+/// Design §7.3 / §10.3: a forge-reaching form resolves `mode` first; an
+/// inherited gateway variable with `mode` unset is the actionable error, and
+/// an offline form with the same environment is not gated at all.
+#[test]
+fn forge_reaching_new_commands_resolve_mode_first() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let gated = |args: &[&str], stdin: Option<&str>| {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .args(args);
+        run(c, stdin)
+    };
+    for args in [
+        &["check-stale-blocked", "--json"][..],
+        &["pr-queue", "--role", "judge"],
+        &["premise-check", "--issue", "7"],
+        &[
+            "labels",
+            "undeclared",
+            "--repo",
+            "acme/widgets",
+            "--labels-file",
+            "f",
+        ],
+        &["labels", "migrate"],
+        &["forge-probe", "--origin", "https://gitea.example.com"],
+    ] {
+        let o = gated(args, None);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("LOOM_GH_GATEWAY_DIR") && err.contains("LOOM_MODE=session"),
+            "{args:?}: {err}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+    // Offline forms with the same environment just run.
+    std::fs::write(wt.path().join("body.md"), "A report.\n").unwrap();
+    std::fs::write(wt.path().join("prs.json"), "[]").unwrap();
+    for (args, stdin, want) in [
+        (&["labels", "list"][..], None, 0),
+        (&["skip-labels", "--json"], None, 0),
+        (&["duplicate-scan", "--pool", "open-issues", "--title", "t"], Some("[]"), 0),
+        (&["premise-check", "--body-file", "body.md", "--title", "T"], None, 0),
+        (&["pr-queue", "--role", "judge", "--input", "prs.json"], None, 0),
+    ] {
+        let o = gated(args, stdin);
+        assert_eq!(o.status.code(), Some(want), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+/// `capabilities --json` lists the new families, and `loom-daemon
+/// install-compat show --json` prints the same list.
+#[test]
+fn capabilities_list_the_new_reads_and_config_inspection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let t = run(
+        {
+            let mut c = base(TOOLS, tmp.path(), tmp.path());
+            c.args(["capabilities", "--json"]);
+            c
+        },
+        None,
+    );
+    assert_eq!(t.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&t.stdout).unwrap();
+    let cmds: Vec<&str> = v["tools_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    for want in [
+        "labels",
+        "pr-queue",
+        "premise-check",
+        "duplicate-scan",
+        "check-points-marker",
+        "label-duplicates",
+        "forge-probe",
+        "forge-inventory",
+        "affected-files",
+        "check-stale-blocked",
+        "skip-labels",
+        "roles",
+        "guards",
+        "install-compat",
+        "hooks-home",
+    ] {
+        assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
+    }
+    let d = run(
+        {
+            let mut c = base(DAEMON, tmp.path(), tmp.path());
+            c.args(["install-compat", "show", "--json"]);
+            c
+        },
+        None,
+    );
+    let dv: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
+    assert_eq!(dv["tools_commands"], v["tools_commands"]);
+}
+
 // ---------------------------------------------------------------------------
 // `claim` family (#14487): the checkout-local claim commands, served by the
 // same `script_helpers::claim::run` handler from both binaries.
