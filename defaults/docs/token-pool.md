@@ -394,8 +394,11 @@ precedence env > `.loom/config.json` > default, same as
 `buildGate.loadThreshold`); once at/above threshold, filing is deferred until
 either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
 (default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
-— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
-data fails open (proceeds as if there is no pressure). Full mechanism:
+— the "never starves permanently" ceiling. Absent or unparseable ranking
+data is a valid numeric `0` (no pressure), but a read that produces no
+number at all — a denied or failed call, empty or non-numeric output —
+reports `unavailable` and is treated as pressure-UNKNOWN: deferred, bounded
+by the same ceiling, never a silent proceed (#14162). Full mechanism:
 `defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
 Pressure".
 

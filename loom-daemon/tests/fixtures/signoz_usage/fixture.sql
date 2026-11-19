@@ -175,3 +175,40 @@ VALUES
   'loom.tokens.cache_write_1h': '0', 'loom.tokens.total': '999',
   'loom.daemon.version': '0.19.562'},
  {'host.id': 'loom-usage-fixture'});
+
+-- Run spans are self-contained and use traces with no usage or sweep spans.
+-- Two runs in T3 and one in T4 share a cohort but span two repositories.
+-- The remaining rows cover a different pool, a missing launched model and
+-- effort, and a matching run outside the requested window.
+INSERT INTO signoz_traces.signoz_index_v3
+    (timestamp, trace_id, span_id, name, duration_nano, attributes_string)
+VALUES
+('2026-09-21 10:00:00', 'T3', 'RUN1', 'loom.runtime.run', 1000000000,
+ {'loom.runtime': 'codex', 'loom.model': 'gpt-5.4', 'loom.effort': 'high',
+  'loom.role': 'builder', 'loom.repo': 'org/alpha', 'loom.result': 'success',
+  'llm.credential.kind': 'chatgpt-seat'}),
+('2026-09-21 10:00:02', 'T3', 'RUN2', 'loom.runtime.run', 2500000000,
+ {'loom.runtime': 'codex', 'loom.model': 'gpt-5.4', 'loom.effort': 'high',
+  'loom.role': 'builder', 'loom.repo': 'org/alpha', 'loom.result': 'spawn_failed',
+  'llm.credential.kind': 'chatgpt-seat'}),
+('2026-09-21 11:00:00', 'T4', 'RUN1', 'loom.runtime.run', 8000000000,
+ {'loom.runtime': 'codex', 'loom.model': 'gpt-5.4', 'loom.effort': 'high',
+  'loom.role': 'builder', 'loom.repo': 'org/beta', 'loom.result': 'success',
+  'llm.credential.kind': 'chatgpt-seat'}),
+('2026-09-21 11:00:09', 'T4', 'RUN3', 'loom.runtime.run', 5000000000,
+ {'loom.runtime': 'codex', 'loom.model': 'gpt-5.4', 'loom.effort': 'high',
+  'loom.role': 'builder', 'loom.repo': 'org/beta', 'loom.result': 'success',
+  'llm.credential.kind': 'api-key'}),
+('2026-09-21 11:00:15', 'T4', 'RUN4', 'loom.runtime.run', 4000000000,
+ {'loom.runtime': 'codex', 'loom.configured_model': 'gpt-5.4',
+  'loom.role': 'builder', 'loom.repo': 'org/beta', 'loom.result': 'success',
+  'llm.credential.kind': 'chatgpt-seat'}),
+('2026-08-31 23:59:59', 'T0', 'RUN0', 'loom.runtime.run', 100000000000,
+ {'loom.runtime': 'codex', 'loom.model': 'gpt-5.4', 'loom.effort': 'high',
+  'loom.role': 'builder', 'loom.repo': 'org/before-window', 'loom.result': 'success',
+  'llm.credential.kind': 'chatgpt-seat'});
+
+-- A second delivery of T3/RUN1 must collapse without discarding T4/RUN1.
+INSERT INTO signoz_traces.signoz_index_v3
+SELECT * FROM signoz_traces.signoz_index_v3
+WHERE trace_id = 'T3' AND span_id = 'RUN1';
