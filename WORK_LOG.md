@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14646**: fix(tests): derive the config-restart fixture's release from the running version
+- **PR #14644**: chore: remove stale quickstart worktree.sh copies
+- **Issue #14643** (closed): Fix config-restart test fixtures that assume the running version is below 0.19.999999
+- **Issue #14641** (closed): Remove quickstart worktree.sh copies: stale duplicates of the installer-provided script
 - **PR #14297**: ci: forbid the current owner's repo URL in installed templates
 - **PR #14276**: ci: gate .agents/skills mirrors on generate-agent-skills --check in lint
 - **PR #14171**: ci: add named nextest discovery step with stall diagnostics
