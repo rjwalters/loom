@@ -1235,7 +1235,13 @@ while [[ "${1:-}" == -* ]]; do
       shift
       ;;
     --confirm-reinstall) CONFIRM_REINSTALL=true; shift ;;
-    --tools-only) shift; exec "$LOOM_ROOT/scripts/install/provision-tools.sh" "$@" ;;  # #12940: no daemon needed
+    --tools-only)
+      if [[ "$REPO_ONLY" == "true" ]]; then
+        error "--tools-only provisions loom-tools on this machine and cannot be combined with --repo-only."
+      fi
+      shift
+      exec "$LOOM_ROOT/scripts/install/provision-tools.sh" "$@"  # #12940: no daemon needed
+      ;;
     --dry-run) DRY_RUN=true; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op so a caller can be explicit;
@@ -1290,7 +1296,9 @@ while [[ "${1:-}" == -* ]]; do
       echo "                               - loom-daemon binary + defaults mirror (~/.local/bin, ~/.local/share)"
       echo "                               - user-scope guard hooks (~/.claude/settings.json)"
       echo "                             (a Full Install also skips the 'loom' dispatcher, user-scope"
-      echo "                             skills/agents and user-scope MCP registration)."
+      echo "                             skills/agents, the user-served MCP bundle build,"
+      echo "                             source config migration and user-scope MCP registration)."
+      echo "                             Cannot be combined with --tools-only."
       echo "                             Without it, those steps run and change this machine."
       echo "  -h, --help                 Show this help message"
       echo ""

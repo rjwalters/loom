@@ -327,6 +327,7 @@ dispatcher or `~/.claude` settings should stay as they are.
 | `loom` dispatcher (Full Install only) | the machine (`~/.local/bin/loom`, `~/.local/share/loom`) | provisioned | skipped |
 | User-scope skills and agents (Full Install only) | the machine (`~/.claude/commands/loom`, `~/.claude/agents/loom-*.md`) | linked | skipped |
 | User-scope guard hooks | the machine (`~/.claude/settings.json`, backed up first) | re-wired | skipped |
+| Loom MCP bundle build and legacy MCP config migration (Full Install only) | the Loom source checkout, which can serve the machine's registered MCP server | refreshed | skipped |
 | User-scope `loom` MCP registration (Full Install only) | the machine (`claude mcp add --scope user`) | re-registered | skipped |
 
 The flag does not change what the default install does, and it does not affect

@@ -164,6 +164,7 @@ while [[ $# -gt 0 ]]; do
       echo "                               - 'loom' dispatcher (~/.local/bin/loom, ~/.local/share/loom)"
       echo "                               - user-scope skills + agents (~/.claude/commands, ~/.claude/agents)"
       echo "                               - user-scope guard hooks (~/.claude/settings.json)"
+      echo "                               - user-served MCP bundle build and source config migration"
       echo "                               - user-scope 'loom' MCP registration (claude mcp add --scope user)"
       echo "                             Without it, those steps run and change this machine."
       echo "  -h, --help                 Show this help message"
@@ -2147,44 +2148,48 @@ echo ""
 # — a single instance serves every repo (it resolves the invoking repo from its
 # CWD), which kills the #3803 per-repo stale-dist drift class.
 #
-# setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
-# (what the user-scope server serves), strips any legacy project-scope `loom`
-# entry so it cannot shadow the user-scope server, and emits a safehouse-only
-# .mcp.json when safehouse is enabled.
-info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
-if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
-  success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
-else
-  warning "setup-mcp.sh failed - the served bundle may be missing"
-  info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
-fi
-
-# Register the loom MCP server at USER scope, pointing at the machine-level
-# checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
-# source checkout if the machine checkout's bundle is not present yet.
-MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
-if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
-  MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
-fi
 if [[ "$REPO_ONLY" == "true" ]]; then
-  # --repo-only (#14570): `claude mcp add --scope user` writes the machine's
-  # user-scope Claude config, so it is skipped with the other machine-level steps.
+  # The source checkout may serve the existing machine registration. Its
+  # bundle and project config are both outside the consumer worktree.
+  info "Skipping machine-level loom MCP bundle build and source config migration (--repo-only)"
   info "Skipping user-scope 'loom' MCP registration (--repo-only)"
-elif command -v claude >/dev/null 2>&1; then
-  info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
-  # Idempotent: drop any existing user-scope entry before re-adding.
-  claude mcp remove --scope user loom >/dev/null 2>&1 || true
-  if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
-    success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
-    info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+else
+  # setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
+  # (what the user-scope server serves), strips any legacy project-scope `loom`
+  # entry so it cannot shadow the user-scope server, and emits a safehouse-only
+  # .mcp.json when safehouse is enabled.
+  info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
+  if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
+    success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
   else
-    warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+    warning "setup-mcp.sh failed - the served bundle may be missing"
+    info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
+  fi
+
+  # Register the loom MCP server at USER scope, pointing at the machine-level
+  # checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
+  # source checkout if the machine checkout's bundle is not present yet.
+  MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
+  if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
+    MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
+    # Idempotent: drop any existing user-scope entry before re-adding.
+    claude mcp remove --scope user loom >/dev/null 2>&1 || true
+    if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
+      success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
+      info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+    else
+      warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+      info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+    fi
+  else
+    warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
+    info "Once 'claude' is available, register it manually (one time, per machine):"
     info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
   fi
-else
-  warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
-  info "Once 'claude' is available, register it manually (one time, per machine):"
-  info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+
 fi
 
 echo ""

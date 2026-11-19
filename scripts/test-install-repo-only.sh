@@ -14,7 +14,9 @@
 #      skips provision_loom_hooks under --repo-only but still asserts the
 #      project-level wiring (ensure_project_hook_wiring); and unset, does both;
 #   4. install.sh --dry-run preview states nothing is written outside the repo,
-#      and leaves the temp HOME empty.
+#      and leaves the temp HOME empty;
+#   5. Full Install's MCP phase leaves the user-served bundle and source
+#      config intact in repo-only mode and preserves the staged target tree.
 #
 # Usage: bash scripts/test-install-repo-only.sh
 
@@ -73,10 +75,10 @@ else
 fi
 
 skips="$(grep -c 'Skipping .*(--repo-only)' "$FULL")"
-if [[ "$skips" -ge 5 ]]; then
-  pass "install-loom.sh prints a skip line for each of the 5 machine-level steps ($skips found)"
+if [[ "$skips" -ge 6 ]]; then
+  pass "install-loom.sh prints a skip line for each of the 6 machine-level steps ($skips found)"
 else
-  fail "install-loom.sh has only $skips '--repo-only' skip lines (expected >= 5)"
+  fail "install-loom.sh has only $skips '--repo-only' skip lines (expected >= 6)"
 fi
 
 if grep -q 'LOOM_INSTALL_REPO_ONLY' "$FULL" && grep -q -- '--repo-only) REPO_ONLY=true' "$FULL"; then
@@ -140,7 +142,7 @@ else
   fail "install.sh provision_machine_daemon gate scan unexpected: $ungated_daemon"
 fi
 
-# --- 4. install.sh --dry-run preview under --repo-only ----------------------
+# --- 4. install.sh preview and mode validation under --repo-only ----------------------
 REPO="$TEST_DIR/target"; mkdir -p "$REPO"
 git -C "$REPO" init --quiet
 git -C "$REPO" config user.email t@example.com
@@ -170,6 +172,92 @@ if [[ -z "$(ls -A "$H3")" ]]; then
   pass "temp HOME is still empty after the dry-runs"
 else
   fail "dry-run wrote into HOME: $(ls -A "$H3")"
+fi
+
+if combo="$(bash "$QUICK" --repo-only --tools-only --help 2>&1)" ||
+   ! grep -q -- 'cannot be combined with --repo-only' <<<"$combo"; then
+  fail "install.sh must reject mixing --repo-only with machine tools provisioning"
+else
+  pass "install.sh rejects --repo-only with --tools-only before delegation"
+fi
+
+# --- 5. Real Full Install MCP phase in isolated staged worktrees ------------
+MCP_PHASE="$TEST_DIR/full-mcp-phase.sh"
+cat > "$MCP_PHASE" <<'PHASE'
+set -eu
+header() { :; }
+info() { printf '%s\n' "$*"; }
+success() { info "$@"; }
+warning() { info "$@"; }
+PHASE
+awk '
+  /^CURRENT_STEP="MCP Setup"/ { active=1 }
+  /^# STEP 5: Configure Branch Rulesets/ { exit }
+  active { print }
+' "$FULL" >> "$MCP_PHASE"
+
+MCP_STUBS="$TEST_DIR/mcp-stubs"
+mkdir -p "$MCP_STUBS"
+cat > "$MCP_STUBS/node" <<'STUB'
+#!/bin/bash
+exit 1
+STUB
+cat > "$MCP_STUBS/npm" <<'STUB'
+#!/bin/bash
+printf '%s\n' "npm $*" >> "$MCP_CALLS"
+case "$*" in
+  'install --silent') ;;
+  'run build') printf '%s\n' 'rebuilt bundle' > dist/index.js ;;
+  *) exit 1 ;;
+esac
+STUB
+cat > "$MCP_STUBS/claude" <<'STUB'
+#!/bin/bash
+printf '%s\n' "claude $*" >> "$MCP_CALLS"
+STUB
+chmod +x "$MCP_STUBS/node" "$MCP_STUBS/npm" "$MCP_STUBS/claude"
+
+mcp_config='{"mcpServers":{"loom":{"command":"old"},"other":{"command":"keep"}}}'
+run_full_mcp() {
+  local fixture="$1" repo_only="$2"
+  local source="$fixture/source" target="$fixture/target"
+  mkdir -p "$source/scripts" "$source/mcp-loom/"{dist,src} "$target" || return
+  cp "$LOOM_ROOT/scripts/setup-mcp.sh" "$source/scripts/setup-mcp.sh" || return
+  ln -s "$source" "$fixture/machine-checkout" || return
+  printf '%s\n' 'current user bundle' > "$source/mcp-loom/dist/index.js"
+  touch -t 200001010000 "$source/mcp-loom/dist/index.js"
+  printf '%s\n' 'new source' > "$source/mcp-loom/src/main.ts"
+  printf '%s\n' "$mcp_config" > "$source/.mcp.json"
+  printf '%s\n' "$mcp_config" > "$target/.mcp.json"
+  (
+    cd "$target" || exit
+    PATH="$MCP_STUBS:$PATH" LOOM_ROOT="$source" LOOM_HOME="$fixture/machine-checkout" \
+      REPO_ONLY="$repo_only" MCP_CALLS="$fixture/calls" bash "$MCP_PHASE" > "$fixture/output" 2>&1
+  )
+}
+
+repo_only_mcp="$TEST_DIR/mcp-repo-only"
+default_mcp="$TEST_DIR/mcp-default"
+if run_full_mcp "$repo_only_mcp" true && [[ ! -e "$repo_only_mcp/calls" ]] &&
+   [[ "$(cat "$repo_only_mcp/machine-checkout/mcp-loom/dist/index.js")" == 'current user bundle' ]] &&
+   [[ "$(cat "$repo_only_mcp/source/.mcp.json")" == "$mcp_config" ]]; then
+  pass "Full Install --repo-only leaves the user-served MCP bundle and source config untouched"
+else
+  fail "Full Install --repo-only touched machine MCP state or source configuration"
+fi
+if run_full_mcp "$default_mcp" false &&
+   grep -Fxq 'npm run build' "$default_mcp/calls" &&
+   grep -Fq 'claude mcp add --scope user loom ' "$default_mcp/calls" &&
+   [[ "$(cat "$default_mcp/machine-checkout/mcp-loom/dist/index.js")" == 'rebuilt bundle' ]] &&
+   ! grep -q '"loom"' "$default_mcp/source/.mcp.json"; then
+  pass "default Full Install still refreshes and registers the machine MCP bundle"
+else
+  fail "default Full Install MCP behavior changed"
+fi
+if diff -r "$repo_only_mcp/target" "$default_mcp/target"; then
+  pass "Full Install MCP phase preserves identical staged target files in both modes"
+else
+  fail "Full Install changed staged target file content between modes"
 fi
 
 echo ""
