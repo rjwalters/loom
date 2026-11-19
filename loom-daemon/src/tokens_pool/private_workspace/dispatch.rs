@@ -65,8 +65,76 @@ pub fn uses_private(root: &Path) -> Result<bool> {
 }
 
 enum SeatPolicy {
+    /// Containment admission (#8787): every eligible seat is tried at most
+    /// once, and a candidate only wins when a containment proof can be taken
+    /// for it — the winning lease, proof and launch stay bound to one seat.
+    Contained,
+    /// Launch through the admitted runtime's own preparation: a busy seat is
+    /// passed over for the next eligible one, with no containment requirement
+    /// of its own.
     Existing,
-    Idle { guarded: bool },
+    Idle {
+        guarded: bool,
+    },
+}
+
+/// Why the bounded seat walk passed one candidate over.
+enum SeatOutcome {
+    /// Another holder owns the seat's exclusive lease, or its session is
+    /// already running work.
+    Busy,
+    /// The seat was idle but could not be prepared — a containment proof that
+    /// could not be taken, a stopped session, an expired credential. Carries
+    /// that refusal's own text, so an idle seat is never counted as busy.
+    Failed(String),
+}
+
+/// Every eligible seat was tried once and none could be prepared. Names each
+/// seat and why it was passed over, so a refusal can be read (#14578).
+#[derive(Debug)]
+pub(super) struct NoEligibleSeat {
+    summary: String,
+    /// Every tried seat was busy: the pool has no idle seat at all. A seat
+    /// that failed for any other reason never turns this on.
+    pub(super) all_busy: bool,
+}
+
+impl std::fmt::Display for NoEligibleSeat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl std::error::Error for NoEligibleSeat {}
+
+/// One line: refusal texts ride host logs and draw rows, never multi-line.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The error for a walk that exhausted every eligible seat.
+fn exhausted_error(passed_over: &[(String, SeatOutcome)]) -> NoEligibleSeat {
+    let busy = passed_over
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, SeatOutcome::Busy))
+        .count();
+    let detail = passed_over
+        .iter()
+        .map(|(name, outcome)| match outcome {
+            SeatOutcome::Busy => format!("{name} busy"),
+            SeatOutcome::Failed(error) => format!("{name} failed: {error}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    NoEligibleSeat {
+        summary: format!(
+            "no eligible seat could be prepared ({} of {} eligible seats idle): {}",
+            passed_over.len() - busy,
+            passed_over.len(),
+            detail
+        ),
+        all_busy: busy == passed_over.len(),
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +209,21 @@ impl Selection {
         Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Idle { guarded })
     }
 
+    /// Prepare a selection for containment admission (#8787, #14578): the
+    /// bounded walk tries each eligible seat at most once, and a candidate
+    /// only wins when its OWN containment can be proven — so one busy seat
+    /// never refuses a draw another idle seat could serve. Explicit profile
+    /// pins keep binding: they never walk.
+    pub(super) fn prepare_contained(
+        root: &Path,
+        model: Option<&str>,
+        kind: JobKind,
+        issue: Option<u64>,
+        owner: &str,
+    ) -> Result<Option<Self>> {
+        Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained)
+    }
+
     fn prepare_with(
         root: &Path,
         runtime: &str,
@@ -184,8 +267,25 @@ impl Selection {
         let try_idle_seats = matches!(policy, SeatPolicy::Idle { .. });
         let prepare = |name, profile| -> Result<Self> {
             let selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
-            if matches!(policy, SeatPolicy::Idle { guarded: true }) && selection.lease().is_some() {
-                selection.contain(root)?;
+            match policy {
+                // A guarded read-only reservation must already prove
+                // containment for its own seat (#14481).
+                SeatPolicy::Idle { guarded: true } => {
+                    if selection.lease().is_some() {
+                        selection.contain(root)?;
+                    }
+                }
+                // Containment admission: an account with no private clone,
+                // and a clone whose boundary cannot be re-proven, cannot win.
+                // The walk reports each refusal with its own reason and tries
+                // the next eligible seat (#14578).
+                SeatPolicy::Contained => {
+                    if selection.lease().is_none() {
+                        bail!("selected Codex account holds no private-clone workspace");
+                    }
+                    selection.contain(root)?;
+                }
+                _ => {}
             }
             Ok(selection)
         };
@@ -221,6 +321,7 @@ impl Selection {
 
         let logical = logical_repository(root);
         let mut tried = std::collections::BTreeSet::new();
+        let mut passed_over: Vec<(String, SeatOutcome)> = Vec::new();
         loop {
             // A previous preparation establishes a match even if that
             // account disappears from a later selection snapshot. Unknown
@@ -237,18 +338,24 @@ impl Selection {
                 route == Some(true)
             });
             let account = match account {
-                Err(error)
-                    if try_idle_seats
-                        && error.is::<super::super::health::NoHealthyAccountError>() =>
-                {
-                    // Use the selector's snapshot, before health/model
-                    // filtering. The original error still drives host-local
-                    // refusal classification even if inventory has changed.
-                    return Err(error.context(if routing_miss.get() {
-                        NO_SEAT_SERVES_REPOSITORY
-                    } else {
-                        NO_IDLE_SEAT
-                    }));
+                Err(error) if error.is::<super::super::health::NoHealthyAccountError>() => {
+                    // A routing miss (no eligible seat serves this repository)
+                    // is neither "busy" nor a failed proof, so it keeps its
+                    // own diagnosis on every policy. It is judged from the
+                    // selector's snapshot, before health/model filtering, and
+                    // can only hold while nothing has been tried yet.
+                    if routing_miss.get() {
+                        return Err(error.context(NO_SEAT_SERVES_REPOSITORY));
+                    }
+                    if try_idle_seats {
+                        return Err(error.context(NO_IDLE_SEAT));
+                    }
+                    if passed_over.is_empty() {
+                        // Nothing eligible was ever offered: keep the pool's
+                        // own diagnosis (no healthy account, no model match).
+                        return Err(error);
+                    }
+                    return Err(exhausted_error(&passed_over).into());
                 }
                 other => other?,
             };
@@ -256,11 +363,17 @@ impl Selection {
                 unreachable!()
             };
             match prepare(account.id.name.clone(), directory) {
-                Err(error) if try_idle_seats => {
+                Ok(selection) => return Ok(Some(selection)),
+                Err(error) => {
                     log::debug!("Codex seat {} could not be prepared: {error}", account.id.name);
+                    let outcome = if error.is::<super::AccountBusy>() {
+                        SeatOutcome::Busy
+                    } else {
+                        SeatOutcome::Failed(one_line(&error.to_string()))
+                    };
+                    passed_over.push((account.id.name.clone(), outcome));
                     tried.insert(account.id.name);
                 }
-                result => return result.map(Some),
             }
         }
     }
@@ -712,6 +825,68 @@ mod tests {
             "{drawn:?}"
         );
         assert!(none.is_err());
+    }
+    /// #14585: among equally healthy seats that serve this repository, the one
+    /// with the most weekly headroom is drawn first and exclusions reveal the
+    /// next-best seat. An account bound to another repository stays excluded.
+    #[test]
+    #[serial_test::serial]
+    fn pool_selection_orders_weekly_headroom_within_repository() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
+        let ws = workspace_with_origin("https://github.com/2AMLogic/gf180-parasynth.git");
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let usage = [("agent-3", 10.0), ("agent-4", 30.0), ("agent-5", 49.0)];
+        for (name, weekly) in usage {
+            let sessions = profiles.path().join(name).join("sessions");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let line = serde_json::json!({"rate_limits": {"secondary": {
+                "used_percent": weekly, "window_minutes": 10_080, "resets_in_seconds": 400_000,
+            }}});
+            std::fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+        }
+        // The emptiest seat of all, but a private clone of another repository.
+        private_profile(profiles.path(), "agent-1", "https://github.com/2AMLogic/vibesql");
+        let sessions = profiles.path().join("agent-1").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-fixture.jsonl"),
+            r#"{"rate_limits":{"secondary":{"used_percent":0,"window_minutes":10080,"resets_in_seconds":400000}}}
+"#,
+        )
+        .unwrap();
+        let accounts = ["agent-1", "agent-3", "agent-4", "agent-5"]
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let logical = logical_repository(ws.path());
+        let mut tried = std::collections::BTreeSet::new();
+        let mut order = Vec::new();
+        while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
+            !tried.contains(&account.id.name)
+                && serves_repository(&account.credential_reference, logical.as_deref())
+        }) {
+            tried.insert(account.id.name.clone());
+            order.push(account.id.name);
+        }
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+        assert_eq!(order, ["agent-3", "agent-4", "agent-5"]);
     }
     fn fixture_config() -> Config {
         Config {

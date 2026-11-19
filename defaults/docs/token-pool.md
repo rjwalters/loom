@@ -1994,9 +1994,18 @@ under a sibling `mkdir` lock.
 For managed headless runs, `spawn-codex.sh` asks the native selector for an
 eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
-then prefers fewer recent transient failures and round-robins equal candidates.
-If none are healthy, selection exits closed rather than using ambient
-`~/.codex`.
+then prefers fewer recent transient failures. Within that group it prefers the
+seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
+among seats tied for the lowest. Ranking reads the provider's weekly window
+from the seat's own rollout logs because provisioned profiles can share session
+history. A reading expires at its reported reset or after one known window
+from the observation when a reset is unavailable.
+If **any** candidate in the group lacks a live weekly reading, the whole group
+falls back to plain round-robin. A measured `0%` is a reading. Live-session
+preference, repository and model eligibility, and explicit profile pins apply
+first. A seat that turns out busy at lease time is skipped and the next-best
+eligible seat is tried. If none are healthy, selection exits closed rather than using
+ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:
 
@@ -2014,8 +2023,8 @@ Terminal policy is intentionally conservative:
   the tick's working directory) do not poison account health. Those three also
   record no freshness, because nothing ran.
 
-Codex exposes no trustworthy quota-headroom percentage here. Status/capacity
-therefore reports raw, enabled, healthy, cooldown, and reauth-required counts;
+Capacity reporting makes no use of utilization: Status/capacity
+reports raw, enabled, healthy, cooldown, and reauth-required counts;
 transcript token totals remain observability and are never presented as
 remaining quota. Claude's existing global daemon concurrency cap is unchanged.
 
