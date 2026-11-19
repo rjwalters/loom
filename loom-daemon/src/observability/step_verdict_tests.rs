@@ -334,17 +334,34 @@ fn a_real_step_line_wins_over_the_released_lease() {
         outcome: "skipped".to_string(),
         reason: Some("guard_refused".to_string()),
     }]);
-    let Source::Step(mut s) = step(StepRole::ChampionMerge, 9, Some("requeued")) else {
-        unreachable!()
-    };
-    s.log_text = Some(
+    for (prior, fields, expected, detail) in [
+        (
+            None,
+            "outcome=requeued reason=pin_missing",
+            ("noop", "pin_missing"),
+            Some("pin_missing"),
+        ),
+        (None, "outcome=requeued", ("noop", "unspecified"), None),
+        (
+            Some("skipped reason=ci_pending"),
+            "outcome=requeued",
+            ("noop", "unspecified"),
+            None,
+        ),
+        (None, "outcome=skipped reason=bogus", ("noop", "unspecified"), Some("bogus")),
+        (None, "reason=ci_pending", ("failed", "unclassified"), None),
+    ] {
+        let Source::Step(mut s) = step(StepRole::ChampionMerge, 9, prior) else {
+            unreachable!()
+        };
         s.log_text
-            .take()
+            .as_mut()
             .unwrap()
-            .replace("outcome=requeued", "outcome=requeued reason=pin_missing"),
-    );
-    let r = one(&Source::Step(s), Some(&j), &mut RefusalStore::default(), t(5));
-    assert_eq!(class_reason(&r), ("noop", "pin_missing"));
+            .push_str(&format!("CHAMPION-STEP mode=pr item=9 {fields}\n"));
+        let r = one(&Source::Step(s), Some(&j), &mut RefusalStore::default(), t(5));
+        assert_eq!(class_reason(&r), expected, "{fields}");
+        assert_eq!(r.detail.as_deref(), detail);
+    }
 }
 
 /// A release that recorded no usable outcome (`none`, or a word the reason

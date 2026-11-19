@@ -728,23 +728,30 @@ pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_
     }
 }
 
-/// Journal a PR lease release this run made (`lease pr release`, #14639):
-/// the typed outcome Champion's release records. Called only after the
-/// release's own PATCH landed, and never for a reap, so the entry is the
-/// trusted record of the step's own release. A no-op outside a journaled
-/// run.
-pub fn record_released(pr: u64, outcome: &str, reason: Option<&str>) {
-    if journal_path().is_none() {
+/// Journal a successful Champion merge lease release only in the journal
+/// assigned to that merge step. An explicit `--sweep-id` can release an
+/// owned lease while the caller has inherited a different step's journal.
+pub fn record_released(pr: u64, sweep_id: &str, outcome: &str, reason: Option<&str>) {
+    use crate::step_role::StepRole;
+    let (Some(path), Ok(number)) = (journal_path(), u32::try_from(pr)) else {
+        return;
+    };
+    // attach_step names its journal after the full sweep, including retries.
+    let name = format!("step-{sweep_id}.jsonl");
+    if path.file_name() != Some(std::ffi::OsStr::new(&name))
+        || StepRole::parse_sweep_id(sweep_id) != Some((StepRole::ChampionMerge, number))
+    {
         return;
     }
-    if let Ok(number) = u32::try_from(pr) {
-        append(&JournalEntry::Released {
+    append_to(
+        &path,
+        &JournalEntry::Released {
             at: Utc::now(),
             number,
             outcome: outcome.to_string(),
             reason: reason.filter(|s| !s.is_empty()).map(str::to_string),
-        });
-    }
+        },
+    );
 }
 
 /// Journal a hold-label transition on PR `number` (#12665). A no-op outside a

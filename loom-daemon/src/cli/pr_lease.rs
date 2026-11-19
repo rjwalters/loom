@@ -1683,15 +1683,17 @@ impl Ctx {
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
-                // #14639: this release verified the lease was its own
-                // (`holder == self.me`: role, host, sweep and step) and its
-                // PATCH landed, so its typed outcome is trusted fallback
-                // evidence for the step's projection. A reap journals
-                // nothing — it is not the step's own word.
-                if reaped.is_none() {
+                // Ownership ignores step tags so older leases can still be
+                // released. Telemetry requires a confirmed merge step on
+                // both sides, and a journal belonging to that exact sweep.
+                if reaped.is_none()
+                    && holder.step == Some(StepRole::ChampionMerge)
+                    && self.me.step == holder.step
+                {
                     if let Some((word, reason)) = &typed {
                         crate::observability::pick_journal::record_released(
                             self.pr(),
+                            &holder.sweep,
                             word,
                             reason.as_deref(),
                         );

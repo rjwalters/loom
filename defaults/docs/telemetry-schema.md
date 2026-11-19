@@ -2919,10 +2919,11 @@ champion` and `operator-decision apply` journal appends, and the step's last
 (`step_verdict::records_for`). For a Champion merge step whose log has no
 `CHAMPION-STEP` line, the typed outcome of its own successful PR lease
 release (`lease pr release --outcome … --reason …`, journaled by the
-release itself after its PATCH landed, #14639) is the fallback — a step a
-guard refused mid-flight can end released with its outcome recorded there.
-A release marker read off the forge is untrusted (#9548) and never one; the
-step log line keeps precedence. The outcome ledger's `classify` /
+release itself after its PATCH landed, #14639) supplies the outcome and
+optional reason. The lease and caller must both name the merge step, and
+the journal must belong to that exact sweep and PR. A release marker read
+off the forge is untrusted (#9548). A matching step line supplies the outcome
+and its optional reason together. The outcome ledger's `classify` /
 `champion_outcome` run **record-only** for `ledger_class` / `ledger_reason`;
 `effect_of` and `OutcomeLedger::record` are never called, so nothing changes in
 routing, cooldowns, labels or claims. Runs with no daemon (attended sessions,
