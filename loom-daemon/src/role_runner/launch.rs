@@ -167,6 +167,11 @@ pub(super) fn run_role_with_timeout(
     // crate writes — `tick_anchor` is used purely as an opaque string anchor
     // (never re-parsed as a datetime), so this is a pure formatting change.
     let tick_anchor = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let service_tier = model_resolution::resolve_role_runner_service_tier_for_runtime(
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
 
     {
         use std::io::Write;
@@ -175,8 +180,7 @@ pub(super) fn run_role_with_timeout(
             .append(true)
             .open(&log_path)
         {
-            // Rendered by `model_resolution::role_log_header` (#4501/#8054) —
-            // the module that resolved the pair owns how it is reported.
+            // Keep the header and the child environment on the same tier resolution.
             let _ = writeln!(
                 f,
                 "\n{}",
@@ -187,6 +191,9 @@ pub(super) fn run_role_with_timeout(
                     model_source,
                     effort,
                     effort_source,
+                    service_tier
+                        .as_ref()
+                        .map(|(tier, source)| (tier.as_str(), source.as_str())),
                 )
             );
         }
@@ -250,6 +257,16 @@ pub(super) fn run_role_with_timeout(
         cmd.arg("--effort").arg(effort);
     }
     cmd.arg("--dangerously-skip-permissions");
+    // Service tier (#14454, producer for #14141): a tier has no CLI flag, so the
+    // resolved value rides the child's environment as `LOOM_SERVICE_TIER`, which
+    // the `spawn-*.sh` adapters map per runtime. Unset exports nothing — an
+    // operator-exported value in the daemon's own environment is inherited as-is.
+    if let Some((tier, tier_source)) = service_tier {
+        log::info!(
+            "role_runner: {role} service_tier={tier} (source={tier_source}) -> LOOM_SERVICE_TIER"
+        );
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     // Transient-error recovery (issue #4255): scheduled role spawns are the
     // same unattended class as daemon-dispatched sweeps, so route them through
     // `claude-wrapper.sh` (retry/backoff/classification, bounded by

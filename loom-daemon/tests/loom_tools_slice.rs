@@ -374,3 +374,559 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
 #[cfg(unix)]
 #[path = "loom_tools_slice/workflow.rs"]
 mod workflow;
+
+// ---- #14464: park records and operator decisions --------------------------
+//
+// Both roots parse the one clap family and run the one in-process handler, so
+// these compare the real binaries on stdin/file/argv inputs. `base()` carries
+// no forge credential and no `gh` route, which is the point for the offline
+// forms: they must not need one.
+
+const DECISION: &str = r#"{"question":"Ship now or wait?","context":"CI is green.","options":[{"id":"a","label":"Ship","why":"wins a week"},{"id":"b","label":"Wait","why":"gives up the week; worst because nothing is gained"}],"recommended":"a"}"#;
+
+const PARKED_BODY: &str =
+    "Some report.\n\n<!-- loom:park Blocked by: #5 by=builder at=2026-11-05T12:00:00Z -->\n";
+
+/// `parity` with every `at=<timestamp>` token masked: `retract` stamps "now",
+/// and the two runs can straddle a second.
+fn parity_masked(args: &[&str], stdin: Option<&str>, cwd: &Path, home: &Path) -> (i32, String) {
+    let mask = |o: &Output| {
+        String::from_utf8_lossy(&o.stdout)
+            .split_inclusive(char::is_whitespace)
+            .map(|w| if w.starts_with("at=") { "at=<T> " } else { w })
+            .collect::<String>()
+    };
+    let go = |bin: &str| {
+        let mut c = base(bin, home, cwd);
+        c.args(args);
+        run(c, stdin)
+    };
+    let (t, d) = (go(TOOLS), go(DAEMON));
+    assert_eq!(t.status.code(), d.status.code(), "exit code differs for {args:?}");
+    assert_eq!(mask(&t), mask(&d), "stdout differs for {args:?}");
+    (t.status.code().unwrap_or(-1), mask(&t))
+}
+
+#[test]
+fn park_record_offline_forms_match_loom_daemon_with_no_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cwd, home) = (tmp.path(), tmp.path());
+
+    let render = parity(
+        &[
+            "park-record",
+            "render",
+            "--blocked-by",
+            "5,#6",
+            "--by",
+            "doctor",
+            "--at",
+            "2026-11-05T12:00:00Z",
+            "--reason",
+            "waits on CI",
+        ],
+        None,
+        cwd,
+        home,
+    );
+    assert_eq!(render.status.code(), Some(0));
+    let rendered = String::from_utf8_lossy(&render.stdout).to_string();
+    assert!(rendered.contains("Blocked by: #5") && rendered.contains("#6"), "{rendered}");
+
+    // parse from stdin (omitted path and `-`), from a file, plain and --json.
+    let found = parity(&["park-record", "parse"], Some(&rendered), cwd, home);
+    assert_eq!(found.status.code(), Some(0));
+    parity(&["park-record", "parse", "--file", "-", "--json"], Some(&rendered), cwd, home);
+    let f = tmp.path().join("body.md");
+    std::fs::write(&f, PARKED_BODY).unwrap();
+    let file_out =
+        parity(&["park-record", "parse", "--file", f.to_str().unwrap()], None, cwd, home);
+    assert_eq!(String::from_utf8_lossy(&file_out.stdout).trim(), "5");
+    // No record is exit 1 as data.
+    let none = parity(&["park-record", "parse"], Some("no record here\n"), cwd, home);
+    assert_eq!(none.status.code(), Some(1));
+
+    // retract --file composes offline from stdin or a path; nothing is written.
+    let (code, out) = parity_masked(
+        &[
+            "park-record",
+            "retract",
+            "--file",
+            "-",
+            "--blocked-by",
+            "5",
+            "--reason",
+            "not a gate",
+        ],
+        Some(PARKED_BODY),
+        cwd,
+        home,
+    );
+    assert_eq!(code, 0);
+    assert!(out.contains("DRY_RUN=true") && out.contains("Park withdrawn:"), "{out}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), PARKED_BODY);
+    // A refusal (blank reason) is exit 1 from both, with nothing composed.
+    let (code, _) = parity_masked(
+        &[
+            "park-record",
+            "retract",
+            "--file",
+            f.to_str().unwrap(),
+            "--blocked-by",
+            "5",
+            "--reason",
+            " ",
+        ],
+        None,
+        cwd,
+        home,
+    );
+    assert_eq!(code, 1);
+
+    // Journal-only actions: exit 0, no output, no forge.
+    for args in [
+        &["park-record", "released", "--pr", "7"][..],
+        &[
+            "park-record",
+            "decision",
+            "--pr",
+            "7",
+            "--outcome",
+            "pass",
+            "--confidence",
+            "0.9",
+        ],
+    ] {
+        let o = parity(args, None, cwd, home);
+        assert_eq!(o.status.code(), Some(0), "{args:?}");
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn operator_decision_offline_forms_match_loom_daemon_with_no_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cwd, home) = (tmp.path(), tmp.path());
+
+    let ok = parity(&["operator-decision", "validate", "--input", "-"], Some(DECISION), cwd, home);
+    assert_eq!(ok.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ok.stdout).contains("VALID=true"));
+    let f = tmp.path().join("d.json");
+    std::fs::write(&f, DECISION).unwrap();
+    parity(
+        &[
+            "operator-decision",
+            "validate",
+            "--input",
+            f.to_str().unwrap(),
+        ],
+        None,
+        cwd,
+        home,
+    );
+    // Refusals: contract failure is 1 with reasons on stderr; unreadable is 2.
+    let bad = parity(&["operator-decision", "validate", "--input", "-"], Some("{}"), cwd, home);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("REASON="));
+    let missing =
+        parity(&["operator-decision", "validate", "--input", "/nonexistent/x"], None, cwd, home);
+    assert_eq!(missing.status.code(), Some(2));
+
+    // New-issue preview renders offline: no read, no filing.
+    let dry = parity(
+        &[
+            "operator-decision",
+            "apply",
+            "--new",
+            "--title",
+            "T",
+            "--input",
+            "-",
+            "--dry-run",
+        ],
+        Some(DECISION),
+        cwd,
+        home,
+    );
+    assert_eq!(dry.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        out.contains("ACTION=create") && out.contains("LABELS_ADD=loom:operator"),
+        "{out}"
+    );
+}
+
+/// The online forms need a forge. With none, both roots fail on the first read
+/// with the handler's own forge-failure code (4) and nothing is written; an
+/// invalid decision is still refused (1) before any forge call.
+#[test]
+fn online_forms_without_a_forge_fail_identically_and_write_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cwd, home) = (tmp.path(), tmp.path());
+    for (args, stdin, want) in [
+        (
+            &[
+                "park-record",
+                "apply",
+                "--issue",
+                "7",
+                "--reason",
+                "operator",
+                "--repo",
+                "acme/widgets",
+                "--dry-run",
+            ][..],
+            None,
+            4,
+        ),
+        (
+            &[
+                "park-record",
+                "retract",
+                "--issue",
+                "7",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "r",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+            4,
+        ),
+        (
+            &[
+                "operator-decision",
+                "apply",
+                "7",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some(DECISION),
+            4,
+        ),
+        (
+            &[
+                "operator-decision",
+                "apply",
+                "7",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some("{}"),
+            1,
+        ),
+        (
+            &[
+                "operator-decision",
+                "resolve",
+                "7",
+                "--option",
+                "a",
+                "--dry-run",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+            4,
+        ),
+    ] {
+        let o = parity(args, stdin, cwd, home);
+        assert_eq!(o.status.code(), Some(want), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains("APPLIED=true"),
+            "{args:?} must not report a write"
+        );
+    }
+}
+
+/// A recording of an operator resolution is attended-only: stdin is not a
+/// terminal here, so both roots refuse with exit 5 before any forge read, and
+/// the tools root does not turn that into a mode error first.
+#[test]
+fn unattended_resolve_is_refused_with_exit_5_even_with_mode_unset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let args = [
+        "operator-decision",
+        "resolve",
+        "7",
+        "--option",
+        "a",
+        "--repo",
+        "acme/widgets",
+    ];
+    let d = {
+        let mut c = base(DAEMON, tmp.path(), tmp.path());
+        c.args(args);
+        run(c, None)
+    };
+    let t = {
+        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .args(args);
+        run(c, None)
+    };
+    assert_eq!(d.status.code(), Some(5), "{}", String::from_utf8_lossy(&d.stderr));
+    assert_eq!(t.status.code(), Some(5), "{}", String::from_utf8_lossy(&t.stderr));
+    assert!(String::from_utf8_lossy(&t.stderr).contains("attended"));
+}
+
+/// Mode is resolved from the parsed invocation (design §10.3): a form that
+/// reaches the forge with `mode` unset and a leaked fleet route is the
+/// actionable error before any read or write; an offline form is not gated.
+#[test]
+fn mode_gate_follows_the_invocation_not_the_verb() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let gated = |args: &[&str], stdin: Option<&str>| {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .args(args);
+        run(c, stdin)
+    };
+    for (args, stdin) in [
+        (
+            vec![
+                "park-record",
+                "apply",
+                "--issue",
+                "7",
+                "--reason",
+                "x",
+                "--repo",
+                "a/b",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "park-record",
+                "retract",
+                "--issue",
+                "7",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "r",
+            ],
+            None,
+        ),
+        (vec!["operator-decision", "apply", "7", "--input", "-"], Some(DECISION)),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "--new",
+                "--title",
+                "T",
+                "--input",
+                "-",
+            ],
+            Some(DECISION),
+        ),
+        (
+            vec![
+                "operator-decision",
+                "resolve",
+                "7",
+                "--option",
+                "a",
+                "--dry-run",
+            ],
+            None,
+        ),
+    ] {
+        let o = gated(&args, stdin);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}");
+        assert!(
+            err.contains("LOOM_GH_GATEWAY_DIR") && err.contains("LOOM_MODE=session"),
+            "{err}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?}");
+    }
+    for (args, stdin, want) in [
+        (vec!["park-record", "render", "--at", "2026-11-05T12:00:00Z"], None, 0),
+        (vec!["park-record", "parse"], Some("x"), 1),
+        (vec!["park-record", "released", "--pr", "7"], None, 0),
+        (vec!["operator-decision", "validate", "--input", "-"], Some(DECISION), 0),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "--new",
+                "--title",
+                "T",
+                "--input",
+                "-",
+                "--dry-run",
+            ],
+            Some(DECISION),
+            0,
+        ),
+    ] {
+        let o = gated(&args, stdin);
+        assert_eq!(o.status.code(), Some(want), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+}
+
+/// A recording `gh`: appends each argv to `gh.log` and answers an issue read
+/// with a parked body, anything else with `{}`. Returns the directory holding
+/// the `gh` shim (to put first on `PATH`) and the log path.
+fn recording_gh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("gh.log");
+    let issue = dir.join("issue.json");
+    let json = serde_json::json!({
+        "body": PARKED_BODY,
+        "labels": [{ "name": "loom:building" }],
+        "state": "open",
+    });
+    std::fs::write(&issue, json.to_string()).unwrap();
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n  \
+         *issues/7|*pulls/7) cat '{}';;\n  *) echo '{{}}';;\nesac\n",
+        log.display(),
+        issue.display()
+    );
+    let gh = bin.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
+/// An unmanaged target (#9548) is read but never written, on every online form
+/// that can mutate, including the nested filing of `apply --new`: the write
+/// scope is checked before `create-issue.sh` runs, so a denied target gets no
+/// duplicate scan, no filing lock and no forge write. Asserted on the recorded
+/// `gh` argv, not on the exit code alone.
+#[test]
+fn a_denied_target_is_read_but_never_written_on_any_online_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (shim, log) = recording_gh(tmp.path());
+    let path = format!("{}:/usr/bin:/bin", shim.display());
+    for (args, stdin) in [
+        (
+            vec![
+                "park-record",
+                "apply",
+                "--issue",
+                "7",
+                "--reason",
+                "operator",
+                "--repo",
+                "acme/widgets",
+                "--remove-label",
+                "loom:building",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "park-record",
+                "retract",
+                "--issue",
+                "7",
+                "--blocked-by",
+                "5",
+                "--reason",
+                "r",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "7",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some(DECISION),
+        ),
+        (
+            vec![
+                "operator-decision",
+                "apply",
+                "--new",
+                "--title",
+                "Ship or wait",
+                "--input",
+                "-",
+                "--repo",
+                "acme/widgets",
+            ],
+            Some(DECISION),
+        ),
+    ] {
+        let _ = std::fs::remove_file(&log);
+        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        c.env("PATH", &path).args(&args);
+        let o = run(c, stdin);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(o.status.code(), Some(4), "{args:?}: {err}");
+        assert!(err.contains("#9548"), "{args:?} must name the write-scope refusal: {err}");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        if !args.contains(&"--new") {
+            assert!(
+                calls
+                    .lines()
+                    .any(|call| call == "api repos/acme/widgets/issues/7"),
+                "{args:?} did not read the denied issue before the write was refused:\n{calls}"
+            );
+        }
+        for mutation in ["-X", "--input", "issue create", "issue edit"] {
+            assert!(
+                !calls.contains(mutation),
+                "{args:?} issued a forge mutation ({mutation}):\n{calls}"
+            );
+        }
+        assert!(
+            !String::from_utf8_lossy(&o.stdout).contains("APPLIED=true"),
+            "{args:?} must not report a write"
+        );
+    }
+}
+
+/// `capabilities --json` lists exactly the nine served subcommands.
+#[test]
+fn capabilities_list_park_record_and_operator_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = base(TOOLS, tmp.path(), tmp.path());
+    c.args(["capabilities", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&run(c, None).stdout).unwrap();
+    let cmds: Vec<&str> = v["tools_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    for want in [
+        "park-record render",
+        "park-record parse",
+        "park-record apply",
+        "park-record released",
+        "park-record decision",
+        "park-record retract",
+        "operator-decision validate",
+        "operator-decision apply",
+        "operator-decision resolve",
+    ] {
+        assert!(cmds.contains(&want), "{want} missing from {cmds:?}");
+    }
+}
