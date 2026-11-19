@@ -1239,6 +1239,10 @@ or routed to Doctor.
 # Resolve the conflict (e.g., keep both additions), `git add <resolved-files>`, then finish
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase --continue; else git commit --no-edit; fi
 
+# Lint changed workflows after hand-resolving conflicts (#14156, as Doctor's #13896).
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Cannot list touched workflow files - not pushing" >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "workflow-lint failed - not pushing" >&2; exit 1; }
+
 # Version gate before this push too.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after update (see BLOCKER:/Fix: above) - aborting push"
