@@ -30,6 +30,11 @@
 #      was queried), and distinct numbers are read once each.
 #   7. update_work_log() actually wires the gate: the call sites exist in the
 #      shipped prompt, after the debounce gate and before the write.
+#   8. A repeated number's LATER records are verified against the cached
+#      fetch — a conflicting-title or wrong-kind duplicate is rejected in
+#      both orders, not skipped as a duplicate (#14532 review).
+#   9. State: only a merged PR and a closed issue pass; an open PR, a
+#      closed-unmerged PR, and an open issue are all rejected.
 
 set -uo pipefail
 
@@ -62,8 +67,11 @@ cat >"$GH_STUB" <<EOF
 printf '%s\n' "\$2" >> "$GH_CALL_LOG"
 [[ "\${FAIL_LOOKUP:-}" == 1 ]] && exit 1
 case "\$2" in
-  repos/owner/mine/issues/5) printf 'Add widget\ttrue' ;;
-  repos/owner/mine/issues/7) printf 'Fix gizmo\tfalse' ;;
+  repos/owner/mine/issues/5) printf 'Add widget\ttrue\tclosed\ttrue' ;;
+  repos/owner/mine/issues/7) printf 'Fix gizmo\tfalse\tclosed\tfalse' ;;
+  repos/owner/mine/issues/10) printf 'Draft thing\ttrue\topen\tfalse' ;;
+  repos/owner/mine/issues/11) printf 'Open thing\tfalse\topen\tfalse' ;;
+  repos/owner/mine/issues/12) printf 'Closed unmerged\ttrue\tclosed\tfalse' ;;
   *) exit 1 ;;
 esac
 EOF
@@ -138,6 +146,29 @@ if grep -q 'owner/other' "$GH_CALL_LOG"; then
 else
   pass "the gate never queried the foreign repository"
 fi
+
+echo "Test 8b: a duplicate number's LATER record is verified, not skipped (#14532)"
+# Conflicting-title duplicate: the first record verifies, and the second record
+# for the SAME number must be checked against the cached fetch — accepted unread
+# is the hole this closes. Both orders.
+verify_work_log_provenance $'- **PR #5**: Add widget\n- **PR #5**: sim: probe the Row 4b band-edge kickback rejects' 2>/dev/null \
+  && fail "conflicting duplicate title accepted (valid record first)" || pass "conflicting duplicate title rejected (valid record first)"
+verify_work_log_provenance $'- **PR #5**: sim: probe the Row 4b band-edge kickback rejects\n- **PR #5**: Add widget' 2>/dev/null \
+  && fail "conflicting duplicate title accepted (foreign record first)" || pass "conflicting duplicate title rejected (foreign record first)"
+# Wrong-kind duplicate: a PR record and an issue record for the SAME number,
+# both orders.
+verify_work_log_provenance $'- **PR #5**: Add widget\n- **Issue #5** (closed): Add widget' 2>/dev/null \
+  && fail "wrong-kind duplicate accepted (PR then issue)" || pass "wrong-kind duplicate rejected (PR then issue)"
+verify_work_log_provenance $'- **Issue #5** (closed): Add widget\n- **PR #5**: Add widget' 2>/dev/null \
+  && fail "wrong-kind duplicate accepted (issue then PR)" || pass "wrong-kind duplicate rejected (issue then PR)"
+
+echo "Test 8c: state checks — merged PRs and closed issues only"
+verify_work_log_provenance $'- **PR #10**: Draft thing' 2>/dev/null \
+  && fail "open PR accepted" || pass "open PR rejected (not merged)"
+verify_work_log_provenance $'- **PR #12**: Closed unmerged' 2>/dev/null \
+  && fail "closed-unmerged PR accepted" || pass "closed-unmerged PR rejected (not merged)"
+verify_work_log_provenance $'- **Issue #11** (closed): Open thing' 2>/dev/null \
+  && fail "open issue accepted" || pass "open issue rejected (not closed)"
 
 echo "Test 9: update_work_log() wires the gate before the write"
 AWK_OUT="$(awk '/^update_work_log\(\) \{/{f=1} f{print} f && /^\}$/{exit}' "$GUIDE_MD")"

@@ -1784,25 +1784,28 @@ its receipts, or anything the PR body claims:
 # or WORK_PLAN-only change, or an exact archive rotation — every added record
 # is matched by an identical removal in the same diff, so a move to a monthly
 # archive is not "new") or when every added record checks out: the number
-# exists in the base repository, with the recorded kind (PR vs issue), under
-# exactly the recorded title. Any foreign/missing/wrong-kind/mismatched or
-# unreadable record echoes "NOT ELIGIBLE: <reason>" naming it — the caller
-# must then take the normal review flow and report the reason. Distinct
-# numbers are read once each; ordinary prose references (anything not a
+# exists in the base repository, with the recorded kind (PR vs issue), in the
+# right state (a PR merged, an issue closed), under exactly the recorded
+# title. Any foreign/missing/wrong-kind/wrong-state/mismatched or unreadable
+# record echoes "NOT ELIGIBLE: <reason>" naming it — the caller must then take
+# the normal review flow and report the reason. Distinct numbers are READ once
+# each, but every record is VERIFIED: a repeated number's later records (a
+# duplicate with a different title or kind included) are checked against the
+# cached fetch, not skipped; ordinary prose references (anything not a
 # canonical `- **PR #N**` / `- **Issue #N**` bullet) are never read.
 docs_only_fast_path_worklog_check() {
   # $1 = PR number. The target is the PR's BASE repository (read from the
   # forge, never the cwd's remote and never a receipt); the additions are the
   # exact reviewed base..head diff (never Guide's own account of them).
-  local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr
-  local -A seen=()
+  local pr="$1" out raw line body mid num stated kind rest got got_title got_is_pr got_state got_merged
+  local -A fetched=()
   local -a new_records=()
   if ! out=$(gh pr view "$pr" --json baseRepository --jq '.baseRepository.nameWithOwner' 2>/dev/null) || [ -z "$out" ]; then
     echo "NOT ELIGIBLE: base repository read failed"
     return 0
   fi
   local repo="$out"
-  if ! raw=$(gh pr diff "$pr" 2>/dev/null); then
+  if ! raw=$(gh pr diff --repo "$repo" "$pr" 2>/dev/null); then
     echo "NOT ELIGIBLE: PR diff read failed"
     return 0
   fi
@@ -1838,24 +1841,36 @@ docs_only_fast_path_worklog_check() {
       echo "NOT ELIGIBLE: WORK_LOG record claims repository $stated, not the base $repo: $line"
       return 0
     fi
-    [ -n "${seen[$num]:-}" ] && continue
-    seen[$num]=1
-    if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)"' 2>/dev/null) || [ -z "$got" ]; then
-      echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
-      return 0
+    # One forge read per DISTINCT number, cached as the fetched tuple; every
+    # record for that number — including a later duplicate with a different
+    # title or kind — is still verified against the cached tuple (#14532).
+    if [ -z "${fetched[$num]:-}" ]; then
+      if ! got=$(gh api "repos/$repo/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null) || [ -z "$got" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num does not exist in $repo (or the read failed)"
+        return 0
+      fi
+      fetched[$num]="$got"
     fi
-    got_title="${got%$'\t'*}"
-    got_is_pr="${got##*$'\t'}"
+    got="${fetched[$num]}"
+    IFS=$'\t' read -r got_title got_is_pr got_state got_merged <<<"$got"
     if [ "$kind" = pr ]; then
       rest="${body#*\*\*: }"
       if [ "$got_is_pr" != "true" ]; then
         echo "NOT ELIGIBLE: WORK_LOG record #$num is not a PR in $repo: $line"
         return 0
       fi
+      if [ "$got_merged" != "true" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a merged PR in $repo (open or closed unmerged): $line"
+        return 0
+      fi
     else
       rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
       if [ "$got_is_pr" != "false" ]; then
         echo "NOT ELIGIBLE: WORK_LOG record #$num is not an issue in $repo: $line"
+        return 0
+      fi
+      if [ "$got_state" != "closed" ]; then
+        echo "NOT ELIGIBLE: WORK_LOG record #$num is not a closed issue in $repo: $line"
         return 0
       fi
     fi
@@ -1878,7 +1893,8 @@ anything else — a source file, a nested README, `.github/workflows/*.yml`,
 `.loom/config.json`, or any other path — a PR whose body carries a closing
 reference such as `Closes #N`, a PR whose closing-reference read failed, or
 a PR whose new WORK_LOG records failed the base-repository verification:
-missing number, wrong kind, title mismatch, foreign repository identity, or
+missing number, wrong kind, wrong state (an unmerged PR or an open issue),
+title mismatch, foreign repository identity, or
 an unreadable diff/target read) — **do not use this fast path.** Report the
 `NOT ELIGIBLE` reason verbatim in the verdict comment, and proceed with the
 normal Primary Queue steps 5-11 (checkout, quality checks, test plan

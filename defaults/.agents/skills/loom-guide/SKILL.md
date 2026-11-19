@@ -1770,13 +1770,17 @@ compose_work_log_delta() {
 # entries above that repo's highest number, verbatim titles from
 # sg13g2-comparator). Every canonical entry line in $1 — the exact lines this
 # tick is about to publish — must match the pinned repo's own forge state:
-# the number must exist there, with the right kind (merged PR vs issue), under
-# exactly the title the renderer emits. A foreign listing's numbers can all
-# exist under unrelated titles, so existence alone is NOT enough; a wrong kind
-# (an issue recorded as a PR) and a title mismatch fail the same way. An
-# unreadable item fails closed. One foreign/missing/wrong-kind/mismatched
-# entry refuses the WHOLE delta (no partial writes). Distinct numbers are read
-# once each. Zero entries passes (nothing to verify — a no-op tick).
+# the number must exist there, with the right kind (merged PR vs issue), in
+# the right state (a PR merged, an issue closed), under exactly the title the
+# renderer emits. A foreign listing's numbers can all exist under unrelated
+# titles, so existence alone is NOT enough; a wrong kind (an issue recorded as
+# a PR), a wrong state (an open PR, an open issue), and a title mismatch fail
+# the same way. An unreadable item fails closed. One
+# foreign/missing/wrong-kind/wrong-state/mismatched entry refuses the WHOLE
+# delta (no partial writes). Distinct numbers are READ once each, but every
+# record is VERIFIED: a repeated number's later records (a duplicate with a
+# different title or kind included) are checked against the cached fetch, not
+# skipped. Zero entries passes (nothing to verify — a no-op tick).
 #
 # TITLE ESCAPING LOCKSTEP: the renderer emits titles verbatim from the
 # listing JSON's `.title`, so this gate compares verbatim too. If the renderer
@@ -1789,8 +1793,8 @@ compose_work_log_delta() {
 # pinned `$GUIDE_REPO` — refused even when the number and title coincide with
 # a real target item.
 verify_work_log_provenance() {
-  local delta="$1" line body mid num stated kind rest got got_title got_is_pr bad=0
-  local -A seen=()
+  local delta="$1" line body mid num stated kind rest got got_title got_is_pr got_state got_merged bad=0
+  local -A fetched=()
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$line" in
@@ -1809,24 +1813,36 @@ verify_work_log_provenance() {
       echo "provenance: entry claims repository $stated, not the pinned $GUIDE_REPO: $line" >&2
       bad=1; continue
     fi
-    [ -n "${seen[$num]:-}" ] && continue
-    seen[$num]=1
-    got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '"\(.title)\t\(.pull_request != null)"' 2>/dev/null)" || got=""
-    if [ -z "$got" ]; then
-      echo "provenance: cannot fetch #$num from $GUIDE_REPO" >&2; bad=1; continue
+    # One forge read per DISTINCT number, cached as the fetched tuple; every
+    # record for that number — including a later duplicate with a different
+    # title or kind — is still verified against the cached tuple (#14532).
+    if [ -z "${fetched[$num]:-}" ]; then
+      got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null)" || got=""
+      if [ -z "$got" ]; then
+        echo "provenance: cannot fetch #$num from $GUIDE_REPO" >&2; bad=1; continue
+      fi
+      fetched[$num]="$got"
     fi
-    got_title="${got%$'\t'*}"
-    got_is_pr="${got##*$'\t'}"
+    got="${fetched[$num]}"
+    IFS=$'\t' read -r got_title got_is_pr got_state got_merged <<<"$got"
     if [ "$kind" = pr ]; then
       rest="${body#*\*\*: }"
       if [ "$got_is_pr" != "true" ]; then
         echo "provenance: #$num in $GUIDE_REPO is not a PR but the entry records one: $line" >&2
         bad=1; continue
       fi
+      if [ "$got_merged" != "true" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not a merged PR (open or closed unmerged) but the entry records one: $line" >&2
+        bad=1; continue
+      fi
     else
       rest="${body#*\*\* }"; rest="${rest#*\(closed\): }"
       if [ "$got_is_pr" != "false" ]; then
         echo "provenance: #$num in $GUIDE_REPO is not an issue but the entry records one: $line" >&2
+        bad=1; continue
+      fi
+      if [ "$got_state" != "closed" ]; then
+        echo "provenance: #$num in $GUIDE_REPO is not closed but the entry records a closed issue: $line" >&2
         bad=1; continue
       fi
     fi

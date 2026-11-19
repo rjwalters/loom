@@ -425,8 +425,11 @@ gh() {
             printf '%s\n' "$2" >> "$WL_CALL_LOG"
             [[ "${FAIL_LOOKUP:-}" == 1 ]] && return 1
             case "$2" in
-                repos/owner/mine/issues/5) printf 'Add widget\ttrue'; return 0 ;;
-                repos/owner/mine/issues/7) printf 'Fix gizmo\tfalse'; return 0 ;;
+                repos/owner/mine/issues/5) printf 'Add widget\ttrue\tclosed\ttrue'; return 0 ;;
+                repos/owner/mine/issues/7) printf 'Fix gizmo\tfalse\tclosed\tfalse'; return 0 ;;
+                repos/owner/mine/issues/10) printf 'Draft thing\ttrue\topen\tfalse'; return 0 ;;
+                repos/owner/mine/issues/11) printf 'Open thing\tfalse\topen\tfalse'; return 0 ;;
+                repos/owner/mine/issues/12) printf 'Closed unmerged\ttrue\tclosed\tfalse'; return 0 ;;
                 *) return 1 ;;
             esac ;;
     esac
@@ -533,6 +536,71 @@ UNPARSEABLE_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
 +
 +- **PR #zz**: Garbage'
 
+# #14532 review: a duplicate number's LATER record must be verified against
+# the cached fetch, not skipped — conflicting title and wrong kind, in both
+# orders.
+DUP_TITLE_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,6 @@
++### 2026-11-19
++
++- **PR #5**: Add widget
++- **PR #5**: sim: probe the Row 4b band-edge kickback rejects'
+
+DUP_TITLE_REVERSED_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,6 @@
++### 2026-11-19
++
++- **PR #5**: sim: probe the Row 4b band-edge kickback rejects
++- **PR #5**: Add widget'
+
+DUP_KIND_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,6 @@
++### 2026-11-19
++
++- **PR #5**: Add widget
++- **Issue #5** (closed): Add widget'
+
+DUP_KIND_REVERSED_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,6 @@
++### 2026-11-19
++
++- **Issue #5** (closed): Add widget
++- **PR #5**: Add widget'
+
+# State fixtures: an open PR, a closed-unmerged PR, and an open issue — the
+# target set is the base repository's merged PRs and closed issues (#14532).
+OPEN_PR_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,5 @@
++### 2026-11-19
++
++- **PR #10**: Draft thing'
+
+UNMERGED_PR_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,5 @@
++### 2026-11-19
++
++- **PR #12**: Closed unmerged'
+
+OPEN_ISSUE_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,5 @@
++### 2026-11-19
++
++- **Issue #11** (closed): Open thing'
+
 : >"$WL_CALL_LOG"
 out="$(WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "ELIGIBLE" "$out" "a diff adding a matching PR and closed issue is eligible"
@@ -595,6 +663,45 @@ out="$(WL_DIFF="$UNPARSEABLE_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: unparseable WORK_LOG record: - **PR #zz**: Garbage" "$out" \
     "a canonical-shaped line with a non-numeric number fails closed"
 
+echo
+echo "--- duplicate-number records are each verified, not skipped (#14532) ---"
+
+# Conflicting-title duplicate, both orders: the LATER record for a seen number
+# must be checked against the cached fetch instead of accepted unread.
+: >"$WL_CALL_LOG"
+out="$(WL_DIFF="$DUP_TITLE_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #5 title mismatch in owner/mine (record 'sim: probe the Row 4b band-edge kickback rejects', forge 'Add widget')" "$out" \
+    "a conflicting-title duplicate after a valid record is not eligible"
+assert_eq "repos/owner/mine/issues/5" "$(cat "$WL_CALL_LOG")" \
+    "the duplicate-number diff still reads the distinct number exactly once"
+
+out="$(WL_DIFF="$DUP_TITLE_REVERSED_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #5 title mismatch in owner/mine (record 'sim: probe the Row 4b band-edge kickback rejects', forge 'Add widget')" "$out" \
+    "a conflicting-title duplicate before the valid record is not eligible either"
+
+# Wrong-kind duplicate, both orders.
+out="$(WL_DIFF="$DUP_KIND_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #5 is not an issue in owner/mine: - **Issue #5** (closed): Add widget" "$out" \
+    "a wrong-kind duplicate (PR then issue, same number) is not eligible"
+out="$(WL_DIFF="$DUP_KIND_REVERSED_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #5 is not an issue in owner/mine: - **Issue #5** (closed): Add widget" "$out" \
+    "a wrong-kind duplicate (issue then PR, same number) is not eligible"
+
+echo
+echo "--- state: only merged PRs and closed issues are eligible (#14532) ---"
+
+out="$(WL_DIFF="$OPEN_PR_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #10 is not a merged PR in owner/mine (open or closed unmerged): - **PR #10**: Draft thing" "$out" \
+    "an open PR recorded as a merged-PR record is not eligible"
+
+out="$(WL_DIFF="$UNMERGED_PR_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #12 is not a merged PR in owner/mine (open or closed unmerged): - **PR #12**: Closed unmerged" "$out" \
+    "a closed-unmerged PR is not eligible"
+
+out="$(WL_DIFF="$OPEN_ISSUE_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #11 is not a closed issue in owner/mine: - **Issue #11** (closed): Open thing" "$out" \
+    "an open issue recorded as a closed-issue record is not eligible"
+
 # Reads that fail must not read as eligible: the target and the diff.
 out="$(WL_BASE_RC=1 WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "NOT ELIGIBLE: base repository read failed" "$out" "a failed base-repository read is not eligible"
@@ -621,8 +728,8 @@ assert_doc_contains "$JUDGE_MD" \
     "and every WORK_LOG record the diff adds verifies against the base repository" \
     "judge.md Primary Queue step 4b states the record-verification condition"
 assert_doc_contains "$JUDGE_MD" \
-    'gh pr diff "$pr"' \
-    "judge.md reads the exact reviewed diff (not Guide's receipts or the PR prose)"
+    'gh pr diff --repo "$repo" "$pr"' \
+    "judge.md reads the exact reviewed diff against the PR's base repository (not the cwd remote, not Guide's receipts or the PR prose)"
 assert_doc_contains "$JUDGE_MD" \
     "baseRepository" \
     "judge.md derives the target from the PR's base repository"
