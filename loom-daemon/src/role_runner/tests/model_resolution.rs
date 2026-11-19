@@ -918,3 +918,74 @@ fn autonomous_role_overrides_interactive_parent_origin_body() {
     assert_eq!(result, RoleTickOutcome::Success);
     assert_eq!(fs::read_to_string(tmp.path().join("origin.txt")).unwrap(), "autonomous");
 }
+
+/// Issue #14454: `serviceTier` / `roleServiceTiers` parse with `roleEfforts`'s
+/// contract and resolve `<role>@<runtime>` > `<role>` > global > unset.
+#[test]
+#[serial(loom_config_env)]
+fn test_resolve_role_runner_service_tier_precedence_and_unset() {
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    let at = |root: &Path, role: &str, rt: Option<&str>| {
+        resolve_role_runner_service_tier_for_runtime(root, role, rt)
+    };
+    let src = |k: &str| format!("autonomous.roleRunner.{k}");
+
+    // Unset at every tier resolves to nothing: no export, not even for Codex.
+    let none = tempfile::tempdir().unwrap();
+    write_config(none.path(), r#"{"autonomous": {"roleRunner": {"effort": "low"}}}"#);
+    assert_eq!(at(none.path(), "builder", Some("codex")), None);
+    assert_eq!(at(none.path(), "builder", None), None);
+
+    let full = tempfile::tempdir().unwrap();
+    write_config(
+        full.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": " flex ",
+            "roleServiceTiers": {"Builder": "default", " Builder@Codex ": "priority"}}}}"#,
+    );
+    assert_eq!(
+        at(full.path(), "builder", Some("codex")),
+        Some(("priority".into(), src("roleServiceTiers.builder@codex")))
+    );
+    assert_eq!(at(full.path(), "builder", Some(" CODEX ")).unwrap().0, "priority");
+    assert_eq!(
+        at(full.path(), "builder", Some("claude")),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "builder", None),
+        Some(("default".into(), src("roleServiceTiers.builder")))
+    );
+    assert_eq!(
+        at(full.path(), "judge", Some("codex")),
+        Some(("flex".into(), src("serviceTier")))
+    );
+
+    // Malformed keys and blank values drop per entry; siblings and the global hold.
+    let bad = tempfile::tempdir().unwrap();
+    write_config(
+        bad.path(),
+        r#"{"autonomous": {"roleRunner": {"serviceTier": "  ",
+            "roleServiceTiers": {"builder": "fast", "builder@": "x", "@codex": "x",
+            "a@b@c": "x", "judge": "  ", "doctor": 7, "curator@ghost": "slow"}}}}"#,
+    );
+    let cfg = read_role_runner_config(bad.path());
+    assert_eq!(cfg.service_tier, None);
+    assert_eq!(
+        cfg.role_service_tiers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["builder", "curator@ghost"]
+    );
+    assert_eq!(at(bad.path(), "judge", Some("codex")), None);
+
+    // A non-object map soft-fails to empty.
+    let odd = tempfile::tempdir().unwrap();
+    write_config(
+        odd.path(),
+        r#"{"autonomous": {"roleRunner": {"roleServiceTiers": "priority"}}}"#,
+    );
+    assert!(read_role_runner_config(odd.path())
+        .role_service_tiers
+        .is_empty());
+}
