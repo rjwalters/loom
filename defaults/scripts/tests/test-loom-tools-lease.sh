@@ -107,6 +107,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$body" == "@-" ]] && body="$(cat)"
 echo "$method $path" >> "$D/calls.log"
+echo "gateway=${LOOM_GH_GATEWAY_DIR-<unset>}" >> "$D/env.log"
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 if [[ "$method" == "GET" && "$path" == repos/*/issues/*/comments ]]; then
   [[ ! -f "$D/comments-fail" ]] || { echo "stub gh: comments read failed" >&2; exit 1; }
@@ -171,7 +172,7 @@ assert_eq "" "$(command -v loom-daemon || true)" "the host really has no loom-da
 ISSUE=4242
 reset_forge() {
     rm -f "$FORGE"/comments.json "$FORGE"/comments-fail "$FORGE"/posts.log "$FORGE"/patches.log \
-        "$FORGE"/calls.log "$FORGE"/issue-state
+        "$FORGE"/calls.log "$FORGE"/env.log "$FORGE"/issue-state
     rm -rf "$LOOM_LEASE_RENEW_STATE_DIR" "$CO/.loom/logs" 2> /dev/null || true
 }
 count_lines() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
@@ -343,10 +344,38 @@ OUT="$(env -u LOOM_MODE LOOM_GH_GATEWAY_DIR=/nonexistent loom-tools lease releas
 assert_eq 1 "$?" "(i) release with mode unset exits 1"
 OUT="$(env -u LOOM_MODE LOOM_GH_GATEWAY_DIR=/nonexistent loom-tools lease renewer sanitize-exec --check 2>&1)"
 assert_eq 0 "$?" "(i) offline renewer actions work with mode unset"
-# Session mode drops the inherited fleet variables before a child sees them.
-SEEN="$(LOOM_GH_GATEWAY_DIR=/nonexistent LOOM_MODE=session CLAUDE_PID=$$ \
-    loom-tools lease ensure "$ISSUE" --watch-pid $$ 2>&1 | grep -c 'ignoring inherited' || true)"
-assert_eq 1 "$SEEN" "(i) mode=session names and ignores the inherited fleet routing"
+# The inherited fleet routing is dropped on a session route and kept on the
+# fleet route, observed from the `gh` the children actually run.
+GW="$T/gateway"
+mkdir -p "$GW"
+reset_forge
+OUT="$(LOOM_GH_GATEWAY_DIR=$GW LOOM_MODE=session CLAUDE_PID=$$ loom-tools lease ensure "$ISSUE" --watch-pid $$ 2>&1)"
+assert_match "ignoring inherited" "$OUT" "(i) mode=session names and ignores the inherited fleet routing"
+assert_eq 1 "$(posts)" "(i) ...and still publishes on the person's own credential"
+assert_eq 0 "$(grep -c "gateway=$GW" "$FORGE/env.log")" "(i) no child saw the inherited gateway on the session route"
+pkill -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null || true
+reset_forge
+OUT="$(LOOM_GH_GATEWAY_DIR=$GW LOOM_MODE=fleet CLAUDE_PID=$$ loom-tools lease ensure "$ISSUE" --watch-pid $$ 2>&1)"
+assert_eq 1 "$(posts)" "(i) the fleet route publishes too"
+assert_eq 1 "$([[ "$(grep -c "gateway=$GW" "$FORGE/env.log")" -ge 1 ]] && echo 1 || echo 0)" "(i) ...with the exported gateway still visible to its children"
+pkill -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null || true
+
+echo "(k) a write the credential cannot make is refused on the tools-only route"
+write_scope_register "$CO" acme/widget pull
+rm -rf "$LOOM_WRITE_SCOPE_CACHE_DIR" # the earlier push verdict is cached per repo
+reset_forge
+session
+OUT="$(ensure)"
+assert_eq 0 "$(posts)" "(k) read-only credential: no lease was posted"
+# publish exits 2 when `forge may-write` (answered by loom-tools) refuses the repo.
+assert_match "exited Some(2)" "$OUT" "(k) ...and the declined publish is reported, not swallowed"
+stale_peer "$(printf 'host-%s' "$(printf 'tools-host' | sha256sum | cut -c1-8)")" own-old-sweep 5
+loom-tools lease release "$ISSUE" > "$T/rel.out" 2>&1
+assert_eq 0 "$(posts)" "(k) read-only credential: release posts no yield"
+kill "$SESSION_PID" 2> /dev/null
+pkill -f "$CO/.loom/scripts/sweep-lease-renew.sh start $ISSUE " 2> /dev/null || true
+write_scope_register "$CO" acme/widget push
+rm -rf "$LOOM_WRITE_SCOPE_CACHE_DIR"
 
 echo "(j) lease pr is not served"
 OUT="$(loom-tools lease pr check 7 --role judge 2>&1)"

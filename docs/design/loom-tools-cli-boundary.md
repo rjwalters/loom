@@ -902,7 +902,7 @@ deferred retry, renew, release, co-occupancy and fence paths: one owner and one
 renewer for a repeated `ensure`; a live peer's record kept and never posted
 over; renewal and the deferred publisher stopping when the watched process
 ends; `release` idempotent and refusing a live peer; the fence's branch probe
-answered by `loom-tools` against a local origin. The existing
+answered by `loom-tools` against a local origin; an inherited gateway visible to the children on the `fleet` route and dropped on a `session` route; and a read-only credential refused by `forge may-write` (no lease posted, no yield posted). The existing
 `test-sweep-lease-{publish,renew,renew-lifecycle,renew-fd-hygiene,fence,
 fence-race,convergence}.sh` and `test-worktree-lease-co-occupancy.sh` suites
 run unchanged.
