@@ -307,6 +307,7 @@ fn admit(
         .map_err(|r| LaunchError {
             code: rejection_exit_code(&r.reason),
             message: r.diagnostic(),
+            stage: None,
         })?;
     let backstop = admission.backstop.take();
     let admitted = admission
@@ -559,6 +560,7 @@ fn run(args: &RunArgs, role: Role) -> Result<i32, LaunchError> {
         other => Some(other.map_err(|e| LaunchError {
             code: 126,
             message: format!("cannot launch worker: {e}"),
+            stage: None,
         })?),
     };
     let completion = match completion {

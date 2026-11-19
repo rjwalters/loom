@@ -2172,6 +2172,7 @@ impl SweepRegistry {
             // `poll_liveness` already, but drop any lingering handle so a
             // GC'd sweep never leaks a `Child` (Issue #3801).
             let _ = self.children.remove(&id);
+            self.launch_rejections.remove(&id);
             // Prune the per-SweepId progress latch so it cannot grow unbounded
             // across many dispatches (Issue #4088). Safe because a GC'd entry is
             // terminal — the watchdog only ever consults the latch for

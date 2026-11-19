@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, parse_outcome_line, read_outcome_line, release_class_fallback,
-    release_class_of_line, step_failure, step_outcome_projection, tick_outcome, StepCapture,
-    StepEnd, StepOutcomeClass, StepOutcomeLine,
+    emit_step_capture, launch_rejection_of, parse_outcome_line, read_outcome_line,
+    release_class_fallback, release_class_of_line, step_failure, step_outcome_projection,
+    tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -521,6 +521,25 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
         "the earlier run's anchor reads to the end of the log"
     );
     assert!(read_outcome_line(&log, "step-judge-4-3").is_none());
+}
+
+#[test]
+fn a_launch_rejection_is_spent_only_on_a_genuine_exit_78_without_a_line() {
+    let reported = Some("preflight_role_admission");
+    let end = StepEnd::Exited(Some(78));
+    assert_eq!(launch_rejection_of(end, None, reported), reported);
+    let line =
+        parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=2 class=failed reason=no_pr");
+    assert_eq!(launch_rejection_of(end, line.as_ref(), reported), None);
+    assert_eq!(launch_rejection_of(end, None, None), None);
+    for other in [
+        StepEnd::TimedOut,
+        StepEnd::Cancelled,
+        StepEnd::Exited(None),
+        StepEnd::Exited(Some(1)),
+    ] {
+        assert_eq!(launch_rejection_of(other, None, reported), None);
+    }
 }
 
 #[test]
