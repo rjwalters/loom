@@ -445,6 +445,73 @@ pub fn load(dir: &Path, now: i64) -> Vec<(BucketKey, Reading)> {
 }
 
 // ---------------------------------------------------------------------------
+// Confirmed writer-exhaustion holds (#13746)
+// ---------------------------------------------------------------------------
+
+/// The confirmed-exhaustion hold of each bucket (`writer_limit`): the reset
+/// epoch a confirmed primary rate-limit refusal of that writer installation
+/// carried, retained here — independently of the ordinary reading going
+/// stale ([`MAX_AGE_SECS`]) — until the reset passes. Keyed by
+/// [`BucketKey`], so a route is held for the exact account, owner and
+/// installation the refused write would spend, and a changed effective
+/// writer simply has a different, unheld key.
+fn holds() -> &'static Mutex<HashMap<BucketKey, i64>> {
+    static HOLDS: OnceLock<Mutex<HashMap<BucketKey, i64>>> = OnceLock::new();
+    HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Arm `key`'s route hold until `reset_epoch`, at `now`: only a future reset
+/// for an attributable account holds a route (an unknown ambient identity —
+/// `app-unknown` — never does, and a reset that already passed is refused).
+/// `false` when nothing was armed.
+pub fn arm_writer_hold(key: BucketKey, reset_epoch: i64, now: i64) -> bool {
+    if reset_epoch <= now || key.account == "app-unknown" {
+        return false;
+    }
+    let Ok(mut holds) = holds().lock() else {
+        return false;
+    };
+    holds.insert(key, reset_epoch);
+    true
+}
+
+/// `key`'s active hold at `now`: the reset epoch while it stands, `None`
+/// once the reset has passed (the route is reconsidered) or was never armed.
+#[must_use]
+pub fn writer_hold(key: &BucketKey, now: i64) -> Option<i64> {
+    holds()
+        .lock()
+        .ok()?
+        .get(key)
+        .copied()
+        .filter(|&reset| reset > now)
+}
+
+/// Every active hold at `now`, for the status surface.
+#[must_use]
+pub fn writer_holds_snapshot(now: i64) -> Vec<(BucketKey, i64)> {
+    let mut out: Vec<(BucketKey, i64)> = holds()
+        .lock()
+        .map(|h| {
+            h.iter()
+                .filter(|(_, &reset)| reset > now)
+                .map(|(k, &reset)| (k.clone(), reset))
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Test builds: drop every hold, so cases isolate the store.
+#[cfg(test)]
+pub fn clear_writer_holds_for_test() {
+    if let Ok(mut holds) = holds().lock() {
+        holds.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Which bucket a credential directory spends
 // ---------------------------------------------------------------------------
 

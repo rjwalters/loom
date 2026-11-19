@@ -514,6 +514,15 @@ until mkdir "$D/lock" 2>/dev/null; do sleep 0.01; done
 trap 'rmdir "$D/lock"' EXIT
 case " $* " in
   *" POST "*)
+    [ -f "$D/fail_post_ratelimit" ] && {{
+      echo 'gh: API rate limit exceeded for installation ID 151241341 (HTTP 403)' >&2
+      exit 1
+    }}
+    [ -f "$D/fail_post_secondary" ] && {{
+      echo 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' >&2
+      exit 1
+    }}
+    [ -f "$D/fail_post_auth" ] && {{ echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; }}
     prev=""; body=""
     for a in "$@"; do [ "$prev" = "-f" ] && body="${{a#body=}}"; prev="$a"; done
     first="${{body%%$'\n'*}}"
@@ -652,6 +661,98 @@ fn claim_refuses_without_writing_when_the_list_is_unreadable() {
     fs::write(dir.path().join("fail"), "").unwrap();
     assert_eq!(ctx(dir.path(), who(Role::Judge, "s")).claim(), EXIT_UNVERIFIED);
     assert!(posted(dir.path()).is_empty());
+}
+
+// ---- a writer rate limit is named, not misreported (#13746) -----------------
+
+/// The context with the write target refused for `why` (the write-scope
+/// probe's answer, as `with_context` builds it).
+fn ctx_probe_denied(dir: &Path, me: Identity, why: &str) -> Ctx {
+    let mut c = ctx(dir, me);
+    c.gh.write_repo = Err(why.to_string());
+    c
+}
+
+#[test]
+fn a_ratelimited_post_is_a_writer_refusal_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_post_ratelimit"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    assert_eq!(c.claim(), EXIT_UNVERIFIED, "the exit contract is unchanged");
+    assert!(posted(dir.path()).is_empty(), "no claim taken");
+    // The POST's failure classifies, with the bounded facts.
+    let err = c.gh.post_detail(77, "x").unwrap_err();
+    let limited = match err {
+        PostFailure::WriterLimited(l) => l,
+        PostFailure::Other(why) => panic!("not classified: {why}"),
+    };
+    assert_eq!(limited.stage, crate::writer_limit::WriterStage::LeasePost);
+    assert_eq!(limited.status, Some(403));
+    assert_eq!(limited.installation.as_deref(), Some("151241341"));
+    let line = limited.stderr_line();
+    assert!(line.contains("stage=comment_post"), "{line}");
+    assert!(line.contains("status=403"), "{line}");
+    assert!(line.contains("resource=core"), "{line}");
+    assert!(line.ends_with("— no claim taken; stand down"), "{line}");
+}
+
+#[test]
+fn a_secondary_or_auth_post_refusal_keeps_its_own_diagnostic() {
+    for fixture in ["fail_post_secondary", "fail_post_auth"] {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        fs::write(dir.path().join(fixture), "").unwrap();
+        let c = ctx(dir.path(), who(Role::Judge, "s"));
+        assert_eq!(c.claim(), EXIT_UNVERIFIED);
+        assert!(posted(dir.path()).is_empty(), "{fixture}: no claim taken");
+        match c.gh.post_detail(77, "x") {
+            Err(PostFailure::Other(why)) => {
+                assert!(!why.contains("writer rate-limited"), "{fixture}: {why}");
+                assert!(!why.is_empty(), "{fixture} names its cause");
+            }
+            Err(PostFailure::WriterLimited(_)) => panic!("{fixture} must not classify"),
+            Ok(_) => panic!("{fixture} must fail"),
+        }
+    }
+}
+
+#[test]
+fn a_ratelimited_write_scope_probe_is_named_at_the_probe_stage() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let why = "the credential in use cannot write to acme/widgets (gh api exited with 1: \
+               gh: API rate limit exceeded for installation ID 151241341 (HTTP 403))";
+    let c = ctx_probe_denied(dir.path(), who(Role::Judge, "s"), why);
+    assert_eq!(c.claim(), EXIT_UNVERIFIED, "the exit contract is unchanged");
+    assert!(posted(dir.path()).is_empty());
+    let limited = crate::writer_limit::WriterLimited::classify(
+        crate::writer_limit::WriterStage::PermissionProbe,
+        None,
+        why,
+    )
+    .unwrap();
+    assert_eq!(limited.stage, crate::writer_limit::WriterStage::PermissionProbe);
+    assert_eq!(limited.status, Some(403));
+}
+
+#[test]
+fn an_ordinary_permission_denial_keeps_its_own_diagnostic() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let why = "the credential in use cannot write to acme/widgets (repository role `triage`)";
+    let c = ctx_probe_denied(dir.path(), who(Role::Judge, "s"), why);
+    assert_eq!(c.claim(), EXIT_UNVERIFIED);
+    assert!(posted(dir.path()).is_empty());
+    assert!(
+        crate::writer_limit::WriterLimited::classify(
+            crate::writer_limit::WriterStage::PermissionProbe,
+            None,
+            why,
+        )
+        .is_none(),
+        "an ordinary denial is not a writer rate limit"
+    );
 }
 
 // ---- the cause of an unreadable list is named (#13743) ---------------------
