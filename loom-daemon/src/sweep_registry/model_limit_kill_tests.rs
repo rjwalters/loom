@@ -281,19 +281,19 @@ mod issue_sweep {
     #[test]
     #[serial(loom_config_env)]
     fn the_reaper_resume_redispatch_also_steps_down() {
-        // `Resolved(None)` is what the reaper's resume passes: no `--model`
-        // today. With a kill pending it resolves a model and steps it down.
-        let (_tmp, mut registry) = registry(CONFIG);
-        let resume = |r: &SweepRegistry| {
-            DispatchModel::Resolved(None).resolve_for_runtime(
-                &r.config,
-                &SweepKind::Issue(ISSUE),
-                Some("claude"),
-            )
+        let (tmp, mut registry) = registry(CONFIG);
+        let resolve = |r: &SweepRegistry, model: DispatchModel<'_>| {
+            model.resolve_for_runtime(&r.config, &SweepKind::Issue(ISSUE), Some("claude"))
         };
-        assert_eq!(resume(&registry), None, "no kill pending: the literal None stands");
+        assert_eq!(resolve(&registry, DispatchModel::Retry(None)), None);
         die(&mut registry, 0, FABLE_DEATH);
-        assert_eq!(resume(&registry).as_deref(), Some("opus"));
+        assert_eq!(resolve(&registry, DispatchModel::Retry(None)).as_deref(), Some("opus"));
+        assert_eq!(resolve(&registry, DispatchModel::Resolved(None)), None);
+        write_config(
+            tmp.path(),
+            r#"{"autonomous": {"model": "fable", "modelFallback": {"enabled": false}}}"#,
+        );
+        assert_eq!(resolve(&registry, DispatchModel::Retry(None)), None);
     }
 
     #[test]

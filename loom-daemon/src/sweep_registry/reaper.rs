@@ -1658,7 +1658,7 @@ impl SweepRegistry {
                                             match self.begin_issue_dispatch_with_model(
                                                 &SweepKind::Issue(issue),
                                                 None,
-                                                DispatchModel::Resolved(None),
+                                                DispatchModel::Retry(None),
                                                 None,
                                                 None,
                                                 Some(pr),
