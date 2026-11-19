@@ -26,6 +26,7 @@ use std::path::Path;
 
 use super::clean::{self, PrStatus};
 use crate::forge_repo_facts::{self as facts, GhRepoEnv, Lookup, OwnerFact};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation, ReadClass};
 
 /// One row of `GET repos/{o}/{r}/pulls…` (or `pulls/<n>`).
 #[derive(Debug, serde::Deserialize)]
@@ -154,48 +155,45 @@ pub(crate) fn finished_pr_at_head(
     branch: &str,
     tip: &str,
 ) -> bool {
-    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation, ReadClass};
+    finished_pr_request(repo_root, host, slug, branch)
+        .and_then(super::gh::bounded_via)
+        .filter(|out| out.status.success())
+        .and_then(|out| serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).ok())
+        .is_some_and(|rows| finished_pr_in_rows(&rows, slug, branch, tip))
+}
 
-    let Ok(target) = GhTarget::repo(slug) else {
-        return false;
-    };
-    let Some((owner, _)) = slug.split_once('/') else {
-        return false;
-    };
-    let head = format!("head={owner}:{branch}");
-    let endpoint = format!("repos/{slug}/pulls");
-    let out = super::gh::bounded_via(
+fn finished_pr_request(
+    repo_root: &Path,
+    host: &str,
+    slug: &str,
+    branch: &str,
+) -> Option<GhInvocation> {
+    let target = GhTarget::repo(slug).ok()?;
+    let (owner, name) = slug.split_once('/')?;
+    let mut url = reqwest::Url::parse(&format!("https://{host}/")).ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .extend(["repos", owner, name, "pulls"]);
+    url.query_pairs_mut()
+        .append_pair("state", "all")
+        .append_pair("head", &format!("{owner}:{branch}"))
+        .append_pair("per_page", "100");
+    let endpoint = format!("{}?{}", url.path().trim_start_matches('/'), url.query()?);
+
+    // Parameters are already in the URL. gh api defaults to GET with
+    // this argv and would pick POST if given form-field arguments.
+    Some(
         GhInvocation::new(
             Operation::new("clean.pr_status_rest"),
             AccessIntent::Read,
             target,
             super::gh::GH_PROBE_TIMEOUT,
         )
-        .args([
-            "api",
-            "--hostname",
-            host,
-            "--method",
-            "GET",
-            &endpoint,
-            "--raw-field",
-            "state=all",
-            "--raw-field",
-            &head,
-            "--raw-field",
-            "per_page=100",
-        ])
+        .args(["api", "--hostname", host, &endpoint])
         .current_dir(repo_root)
         .read_class(ReadClass::Hygiene)
         .strip_env("GH_REPO"),
-    );
-    let Some(rows) = out
-        .filter(|out| out.status.success())
-        .and_then(|out| serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).ok())
-    else {
-        return false;
-    };
-    finished_pr_in_rows(&rows, slug, branch, tip)
+    )
 }
 
 fn finished_pr_in_rows(rows: &[PrRowRest], slug: &str, branch: &str, tip: &str) -> bool {
@@ -348,6 +346,33 @@ pub(crate) fn pr_status_confirmed(repo_root: &Path, owner: &OwnerFact, branch: &
 mod private_clone_tests {
     use super::*;
     use serde_json::{json, Value};
+
+    #[test]
+    fn finished_pr_lookup_sends_encoded_query_only_get() {
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("fake-gh");
+        crate::exec_test_support::write_executable(
+            &gh,
+            r#"#!/bin/sh
+set -eu
+test "$#" -eq 4
+test "$1" = api
+test "$2" = --hostname
+test "$3" = forge.example
+test "$4" = 'repos/Owner/Repo/pulls?state=all&head=Owner%3Afeature%2Fa%26b%23c%2B%25d%3De&per_page=100'
+test -z "${GH_REPO+x}"
+printf '%s\n' '[{"state":"closed","closed_at":"2026-11-18T21:12:00Z","base":{"repo":{"full_name":"Owner/Repo"}},"head":{"ref":"feature/a&b#c+%d=e","sha":"abc","repo":{"full_name":"Owner/Repo"}}}]'
+"#,
+        );
+        let request =
+            finished_pr_request(dir.path(), "forge.example", "Owner/Repo", "feature/a&b#c+%d=e")
+                .unwrap()
+                .program(&gh);
+        let output = crate::worktree_ops::gh::bounded_via(request).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let rows: Vec<PrRowRest> = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(finished_pr_in_rows(&rows, "Owner/Repo", "feature/a&b#c+%d=e", "abc"));
+    }
 
     fn row(state: &str, repository: &str, branch: &str, tip: &str) -> Value {
         json!({
