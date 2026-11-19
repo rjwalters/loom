@@ -57,7 +57,7 @@ pub struct EndedStep {
     /// The launcher's own typed preflight-rejection reason for THIS attempt
     /// (#14634), read off the step log after this sweep's dispatch header
     /// when the worker exited 78 and wrote no outcome line: a
-    /// `preflight_<stage>` token from `worker_spawn::launch_rejection_reason`
+    /// `preflight_<stage>` token from the worker launcher's per-spawn socket
     /// (or the coarse `preflight_rejected`). The classifier spends it only
     /// where it would otherwise have recorded `unclassified`; ownership
     /// release, the `failed` class and the fast-fail ladder are unchanged.

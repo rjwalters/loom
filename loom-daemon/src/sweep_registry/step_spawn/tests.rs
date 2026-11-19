@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::capture::{
-    emit_step_capture, launch_rejection_of, parse_outcome_line, read_launch_rejection,
-    read_outcome_line, release_class_fallback, release_class_of_line, step_failure,
-    step_outcome_projection, tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
+    emit_step_capture, launch_rejection_of, parse_outcome_line, read_outcome_line,
+    release_class_fallback, release_class_of_line, step_failure, step_outcome_projection,
+    tick_outcome, StepCapture, StepEnd, StepOutcomeClass, StepOutcomeLine,
 };
 use super::lease::{claim_args, claim_verdict, ClaimRun};
 use super::timeout::timed_out;
@@ -524,60 +524,22 @@ fn the_outcome_line_is_read_after_this_steps_own_header_only() {
 }
 
 #[test]
-fn the_launch_rejection_marker_is_read_after_this_steps_own_header_only() {
-    let dir = tempdir().unwrap();
-    let log = dir.path().join("step.log");
-    std::fs::write(
-        &log,
-        "==== loom-daemon dispatch: t sweep_id=step-builder-1-1 item=1 step=builder ====\n\
-         LOOM_STEP_OUTCOME role=builder target=1 class=failed reason=no_pr\n\
-         ==== loom-daemon dispatch: t sweep_id=step-builder-1-2 item=1 step=builder ====\n\
-         spawn-worker: runtime=opencode (from env (LOOM_RUNTIME))\n\
-         # LOOM_RUNTIME_RESOLVED runtime=opencode\n\
-         cannot resolve credential for profile \"zai-flash\"\n\
-         # LOOM_LAUNCH_REJECTED code=78 stage=credential\n",
-    )
-    .unwrap();
-    // The launcher's free-form diagnostic line above is not the marker: only
-    // the marker names the boundary.
-    assert_eq!(read_launch_rejection(&log, "step-builder-1-2"), Some("preflight_credential"));
-    // An earlier attempt's region is bounded at the next dispatch header: no
-    // marker of its own, no rejection.
-    assert_eq!(read_launch_rejection(&log, "step-builder-1-1"), None);
-    assert_eq!(read_launch_rejection(&log, "step-builder-1-3"), None);
-}
-
-#[test]
 fn a_launch_rejection_is_spent_only_on_a_genuine_exit_78_without_a_line() {
-    let dir = tempdir().unwrap();
-    let log = dir.path().join("step.log");
-    std::fs::write(
-        &log,
-        "==== loom-daemon dispatch: t sweep_id=step-builder-2-1 item=2 step=builder ====\n\
-         # LOOM_LAUNCH_REJECTED code=78 stage=role_admission\n",
-    )
-    .unwrap();
-    let genuine = |line: Option<StepOutcomeLine>| {
-        launch_rejection_of(StepEnd::Exited(Some(78)), line.as_ref(), &log, "step-builder-2-1")
-    };
-    assert_eq!(genuine(None), Some("preflight_role_admission"));
-    // An agent that ran always outranks the launcher's marker.
+    let reported = Some("preflight_role_admission");
+    let end = StepEnd::Exited(Some(78));
+    assert_eq!(launch_rejection_of(end, None, reported), reported);
     let line =
         parse_outcome_line("LOOM_STEP_OUTCOME role=builder target=2 class=failed reason=no_pr");
-    assert_eq!(genuine(line), None);
-    // A timed-out, cancelled, status-unknown or non-78 end is never one.
-    assert_eq!(launch_rejection_of(StepEnd::TimedOut, None, &log, "step-builder-2-1"), None);
-    assert_eq!(launch_rejection_of(StepEnd::Cancelled, None, &log, "step-builder-2-1"), None);
-    assert_eq!(launch_rejection_of(StepEnd::Exited(None), None, &log, "step-builder-2-1"), None);
-    assert_eq!(
-        launch_rejection_of(StepEnd::Exited(Some(1)), None, &log, "step-builder-2-1"),
-        None
-    );
-    // Nor is a foreign sweep's log region.
-    assert_eq!(
-        launch_rejection_of(StepEnd::Exited(Some(78)), None, &log, "step-builder-2-2"),
-        None
-    );
+    assert_eq!(launch_rejection_of(end, line.as_ref(), reported), None);
+    assert_eq!(launch_rejection_of(end, None, None), None);
+    for other in [
+        StepEnd::TimedOut,
+        StepEnd::Cancelled,
+        StepEnd::Exited(None),
+        StepEnd::Exited(Some(1)),
+    ] {
+        assert_eq!(launch_rejection_of(other, None, reported), None);
+    }
 }
 
 #[test]

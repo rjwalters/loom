@@ -20,6 +20,7 @@ mod phase_run;
 mod profile_check;
 pub(crate) mod profiles;
 mod prompt;
+pub(crate) mod rejection;
 
 pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 // #11360: the mixed-sweep accounting fixture builds its escalated-Doctor log
@@ -27,6 +28,7 @@ pub use profile_check::{cli as profile_cli, WorkerArgs as WorkerCommand};
 #[cfg(test)]
 pub(crate) use phase_run::escalation_report;
 
+use crate::runtime_admission::RuntimeSource;
 use harness::Harness;
 use std::{
     fs,
@@ -261,8 +263,9 @@ impl LaunchStage {
 }
 
 /// The launcher's own typed rejection marker (#14634), written to the launch
-/// log the moment a preflight rejection reaches the launcher's exit: the one
-/// bounded signal a step end may classify on. Fields are `code=` (the
+/// log the moment a preflight rejection reaches the launcher's exit. This
+/// is for operators; step classification uses the separate per-spawn socket.
+/// Fields are `code=` (the
 /// numeric exit, always `78` here) and, when the failing boundary is typed,
 /// `stage=` (a [`LaunchStage`] token). Never the error message: raw
 /// diagnostics stay on local stderr and out of receipts and telemetry.
@@ -297,37 +300,6 @@ fn stage_reason(stage: LaunchStage) -> &'static str {
     }
 }
 
-/// One `key=value` token of a marker line, its value cut at the first
-/// non-value character (a marker line never contains spaces in a value).
-fn marker_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|t| t.strip_prefix(key)?.strip_prefix('='))
-}
-
-/// The ledger outcome reason a launch-rejection region establishes
-/// (#14634): scan `region` (the step log from this sweep's dispatch header
-/// on) for the launcher's own [`LAUNCH_REJECTED_MARKER`], and name the
-/// typed boundary when the launcher proved one. `None` when the region
-/// carries no such marker, its `code` is not the preflight class `78`, or
-/// its stage token is not in the closed vocabulary (that last case still
-/// yields the coarse [`PREFLIGHT_REJECTED`] when the marker and code are
-/// genuine — a newer launcher's stage must not fall back to
-/// `unclassified`).
-#[must_use]
-pub fn launch_rejection_reason(region: &str) -> Option<&'static str> {
-    let line = region
-        .lines()
-        .rev()
-        .find_map(|l| l.trim().strip_prefix(LAUNCH_REJECTED_MARKER))?;
-    if marker_field(line, "code") != Some("78") {
-        return None;
-    }
-    Some(
-        marker_field(line, "stage")
-            .and_then(LaunchStage::parse)
-            .map_or(PREFLIGHT_REJECTED, stage_reason),
-    )
-}
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
@@ -604,7 +576,7 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         .as_ref()
         .and_then(|a| a.child(SpanName::RuntimePreflight, Default::default()))
         .or_else(|| lifecycle::inherited(&root, SpanName::RuntimePreflight, Default::default()));
-    let mut resolved_runtime: Option<(String, String)> = None;
+    let mut resolved_runtime = None;
     let result = run_preflight(
         args,
         &root,
@@ -623,15 +595,8 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         // runtime the launcher resolved before rejecting
         // (`loom.launch.runtime` / `loom.launch.source`) ride along as the
         // bounded facts the launcher could prove at this boundary.
-        let mut attributes = lifecycle::attributes(&[("loom.result", "rejected")]);
-        attributes.insert("loom.admission.reason".into(), "preflight-rejected".into());
-        if let Some(stage) = result.as_ref().err().and_then(|error| error.stage) {
-            attributes.insert("loom.admission.stage".into(), stage.as_str().into());
-        }
-        if let Some((runtime, source)) = &resolved_runtime {
-            attributes.insert("loom.launch.runtime".into(), runtime.clone());
-            attributes.insert("loom.launch.source".into(), source.clone());
-        }
+        let stage = result.as_ref().err().and_then(|error| error.stage);
+        let mut attributes = rejection_attributes(stage, resolved_runtime.as_ref());
         attributes.extend(lifecycle::host_attributes());
         span.finish_attributes(SpanStatus::Error, attributes);
     }
@@ -650,6 +615,31 @@ pub fn run(args: WorkerArgs) -> Result<(), LaunchError> {
         span.finish_attempt(outcome, SpanStatus::Error, Some(false));
     }
     result
+}
+
+fn rejection_attributes(
+    stage: Option<LaunchStage>,
+    resolution: Option<&LaunchRuntime>,
+) -> crate::telemetry::trace::TraceAttributes {
+    let mut attributes = crate::observability::lifecycle::attributes(&[
+        ("loom.result", "rejected"),
+        ("loom.admission.reason", "preflight-rejected"),
+    ]);
+    if let Some(stage) = stage {
+        attributes.insert("loom.admission.stage".into(), stage.as_str().into());
+    }
+    if let Some(resolution) = resolution {
+        let runtime = match resolution.runtime.as_str() {
+            "aider" => "aider",
+            "claude" => "claude",
+            "codex" => "codex",
+            "gemini" => "gemini",
+            name => Harness::parse(name).map_or("other", Harness::name),
+        };
+        attributes.insert("loom.launch.runtime".into(), runtime.into());
+        attributes.insert("loom.launch.source".into(), resolution.source.as_str().into());
+    }
+    attributes
 }
 
 /// The billing class of a native-harness launch (#10749). The profile is
@@ -681,26 +671,37 @@ fn native_llm_billing(
 /// single source of truth for the launch's runtime — downstream attribution
 /// (e.g. the egress proxy's observe tags, #11300) takes this value rather than
 /// rereading the environment.
+pub(crate) struct LaunchRuntime {
+    pub(crate) runtime: String,
+    source: RuntimeSource,
+    source_label: &'static str,
+}
+
 pub(crate) fn resolve_launch_runtime(
     root: &Path,
     config: &serde_json::Value,
-) -> Result<(String, String), LaunchError> {
-    if let Some(role) = nonempty_env("LOOM_ROLE") {
+) -> Result<LaunchRuntime, LaunchError> {
+    let (runtime, source, source_label) = if let Some(role) = nonempty_env("LOOM_ROLE") {
         let (runtime, source) = crate::runtime_admission::resolve_binding(root, &role, None)
             .map_err(|e| LaunchError::config(e.diagnostic()))?;
-        return Ok((runtime, source.to_string()));
-    }
-    if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
-        return Ok((runtime, "env (LOOM_RUNTIME)".to_string()));
-    }
-    if let Some(runtime) = config
+        let source_label = source.as_str();
+        (runtime, source, source_label)
+    } else if let Some(runtime) = nonempty_env("LOOM_RUNTIME") {
+        (runtime, RuntimeSource::GlobalEnvironment, "env (LOOM_RUNTIME)")
+    } else if let Some(runtime) = config
         .pointer("/runtimes/default")
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.trim().is_empty())
     {
-        return Ok((runtime.into(), "config (runtimes.default)".to_string()));
-    }
-    Ok(("claude".into(), "default".to_string()))
+        (runtime.into(), RuntimeSource::DefaultConfig, "config (runtimes.default)")
+    } else {
+        ("claude".into(), RuntimeSource::BuiltIn, "default")
+    };
+    Ok(LaunchRuntime {
+        runtime,
+        source,
+        source_label,
+    })
 }
 
 /// Open the launch's own log sink: the `--log` file the launch declares
@@ -745,12 +746,14 @@ fn run_preflight(
     invocation_role: Option<&str>,
     preflight: Option<&crate::observability::lifecycle::Span>,
     attempt: Option<&crate::observability::lifecycle::Span>,
-    resolved_runtime: &mut Option<(String, String)>,
+    resolved_runtime: &mut Option<LaunchRuntime>,
 ) -> Result<(), LaunchError> {
     let mut trace_identity = crate::telemetry::trace::TraceAttributes::new();
     let config = crate::config_resolver::resolve_effective_config(root);
-    let (runtime, source) = resolve_launch_runtime(root, &config)
+    let resolution = resolve_launch_runtime(root, &config)
         .map_err(|e| e.or_stage(LaunchStage::RuntimeResolution))?;
+    let runtime = resolution.runtime.clone();
+    let source = resolution.source_label;
     if runtime.is_empty()
         || !runtime
             .bytes()
@@ -770,7 +773,7 @@ fn run_preflight(
     // post-check write had; only the position moved ahead of the checks, and
     // every consumer anchors on the line's content, not the launch's
     // success.
-    *resolved_runtime = Some((runtime.clone(), source.clone()));
+    *resolved_runtime = Some(resolution);
     let mut log: Box<dyn Write> = Box::new(std::io::stderr());
     // #14167: identity facts ride every runtime span, for every runtime —
     // the repo/item scope the inherited execution root carries, plus the
@@ -796,9 +799,11 @@ fn run_preflight(
         let options =
             Options::parse(&args.args).map_err(|e| e.or_stage(LaunchStage::WorkerOptions))?;
         record_resolved_runtime(
-            open_launch_log(options.log.as_deref())?.as_mut(),
+            open_launch_log(options.log.as_deref())
+                .map_err(|e| e.or_stage(LaunchStage::LogWrite))?
+                .as_mut(),
             &runtime,
-            &source,
+            source,
         )?;
         // A role-tagged invocation must meet the same capabilities as daemon dispatch.
         // Free-form prompts remain available for controlled, isolated experiments.
@@ -1037,7 +1042,7 @@ fn run_preflight(
         native_prepared = prepared.map(|(prepared, _)| prepared);
         command
     } else {
-        record_resolved_runtime(log.as_mut(), &runtime, &source)?;
+        record_resolved_runtime(log.as_mut(), &runtime, source)?;
         let runner = scripts.join(format!("spawn-{runtime}.sh"));
         if !runner.is_file() {
             let available = fs::read_dir(&scripts)
@@ -1308,6 +1313,7 @@ fn run_preflight(
             runtime_span = Some(run);
         }
     }
+    rejection::Reporter::scrub(&mut command);
     let result = if let Some(prepared) = native_prepared {
         // #11300 slice 3, item 5: this launcher stays alive as the harness's
         // parent for exactly the launch's lifetime — the one native path that
@@ -1362,15 +1368,19 @@ fn exec(mut command: Command) -> Result<(), LaunchError> {
 }
 
 pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
+    let reporter = rejection::Reporter::from_environment();
     if let Err(error) = run(args) {
         eprintln!("{}", error.message);
-        // #14634: the launcher's own typed rejection marker — the one
-        // bounded signal a step end may classify on. Preflight-class
+        // #14634: report before writing the diagnostic log marker. The
+        // ledger consumes only the launcher's per-spawn socket. Preflight-class
         // rejections (78) only: post-exec mechanics failures (126/127) are
         // not preflight outcomes and must never read as one. The marker
         // carries the exit code and, when the failing boundary is typed, its
         // stage token — never the free-form message above.
         if error.code == 78 {
+            if let Some(reporter) = reporter {
+                reporter.report(error.stage);
+            }
             match error.stage {
                 Some(stage) => {
                     eprintln!(
@@ -1390,7 +1400,7 @@ pub fn cli(args: WorkerArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod launch_rejection_tests {
-    use super::{launch_rejection_reason, LaunchStage, LAUNCH_REJECTED_MARKER, PREFLIGHT_REJECTED};
+    use super::{stage_reason, LaunchStage};
 
     #[test]
     fn the_stage_vocabulary_is_closed_and_round_trips() {
@@ -1417,56 +1427,13 @@ mod launch_rejection_tests {
             // Ledger-reason shape: the marker token prefixed, never the raw
             // token alone (a stage name must never collide with an existing
             // outcome reason).
-            let reason = crate::worker_spawn::launch_rejection_reason(&format!(
-                "{LAUNCH_REJECTED_MARKER}code=78 stage={}",
-                stage.as_str()
-            ))
-            .unwrap();
+            let reason = stage_reason(stage);
             assert!(reason.starts_with("preflight_"));
             assert_eq!(reason.strip_prefix("preflight_"), Some(stage.as_str()));
         }
         assert_eq!(LaunchStage::parse("credential "), None, "exact tokens only");
         assert_eq!(LaunchStage::parse("Credential"), None);
         assert_eq!(LaunchStage::parse(""), None);
-    }
-
-    #[test]
-    fn a_typed_marker_names_the_boundary_and_a_coarse_one_the_boundary_class() {
-        assert_eq!(
-            launch_rejection_reason("# LOOM_LAUNCH_REJECTED code=78 stage=credential"),
-            Some("preflight_credential")
-        );
-        assert_eq!(
-            launch_rejection_reason("# LOOM_LAUNCH_REJECTED code=78"),
-            Some(PREFLIGHT_REJECTED),
-            "boundary proven, subcause unknown"
-        );
-        // A stage this build does not know (a newer launcher) still proves
-        // the boundary; the unknown token is never carried through.
-        assert_eq!(
-            launch_rejection_reason("# LOOM_LAUNCH_REJECTED code=78 stage=brand_new_stage"),
-            Some(PREFLIGHT_REJECTED)
-        );
-    }
-
-    #[test]
-    fn anything_that_is_not_the_launchers_marker_is_no_evidence() {
-        // No marker at all.
-        assert_eq!(launch_rejection_reason("exit 78: cannot resolve credential"), None);
-        assert_eq!(launch_rejection_reason(""), None);
-        // A forged or wrong-code marker line is refused.
-        assert_eq!(launch_rejection_reason("# LOOM_LAUNCH_REJECTED code=1 stage=credential"), None);
-        assert_eq!(launch_rejection_reason("# LOOM_LAUNCH_REJECTED stage=credential"), None);
-        assert_eq!(launch_rejection_reason("LOOM_LAUNCH_REJECTED code=78"), None);
-        // Free-form diagnostic text never reaches the reason: the last
-        // genuine marker wins, and its stage is the only content read.
-        let region = "cannot resolve credential for \"zai-flash\"\n\
-                      # LOOM_LAUNCH_REJECTED code=78 stage=credential\n";
-        assert_eq!(launch_rejection_reason(region), Some("preflight_credential"));
-        // The LAST marker is the attempt's own word.
-        let two = "# LOOM_LAUNCH_REJECTED code=78 stage=credential\n\
-                   # LOOM_LAUNCH_REJECTED code=78 stage=prompt_expansion\n";
-        assert_eq!(launch_rejection_reason(two), Some("preflight_prompt_expansion"));
     }
 }
 
