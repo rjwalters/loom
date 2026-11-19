@@ -225,7 +225,7 @@ Pick the right path before any `gh pr checkout` mutation:
   cd .loom/worktrees/pr-<PR_NUMBER>
   # pr-worktree.sh already ran `gh pr checkout` inside the worktree
   ```
-  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
+  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. If the **primary clone** holds the branch (an attended author left it checked out), the helper itself creates `pr-<N>` **detached** at the PR head sha, says so, and exits `0`: that detached worktree is sanctioned for review (no `git archive` export). Record `reviewed at detached worktree <sha>` in the verdict, and never commit or push from it. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
 
 `pr-worktree.sh` writes a `.loom-managed` sentinel; `merge-pr.sh` auto-cleans it on merge. Every "no worktree exists" branch in this document routes through it, mirroring `doctor.md`.
 
