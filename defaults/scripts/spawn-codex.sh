@@ -468,8 +468,16 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -c=*|--config=*)
-            case "$1" in
-                *model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true; EXPLICIT_EFFORT_VALUE="${1##*model_reasoning_effort=}" ;;
+            config_assignment="${1#*=}"
+            case "$config_assignment" in
+                *model_reasoning_effort=*)
+                    # Keep mixed-key text out of the legacy service_tier arm below.
+                    # Only the assignment key itself can override effort.
+                    if [[ "$config_assignment" == model_reasoning_effort=* ]]; then
+                        HAS_EFFORT_OVERRIDE=true
+                        EXPLICIT_EFFORT_VALUE="${config_assignment#model_reasoning_effort=}"
+                    fi
+                    ;;
                 *service_tier=*) HAS_TIER_OVERRIDE=true; EXPLICIT_TIER_VALUE="${1##*service_tier=}" ;;
             esac
             PASSTHROUGH_ARGS+=("$1")
