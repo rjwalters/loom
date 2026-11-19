@@ -597,15 +597,16 @@ pub fn sweep_tokens_by_window(
 ///
 /// - **OpenCode**: the id is the whole key — no directory, no window — because
 ///   the id cannot name another launch's session.
-/// - **Codex**: the ids are ANDed with the workspace directory and the window
-///   (`SessionFilter::matches` in `codex_usage`), so an id-named rollout whose
-///   `cwd` is not the workspace root, or that started outside the window, is
-///   not attributed. The window is kept deliberately: it bounds the rollout
-///   scan to the window's date directories, where dropping it would read
-///   every rollout in the store. A step child's cwd is pinned to the workspace
-///   root, so the directory constraint holds for every step dispatch today; a
-///   launch path that runs Codex from a worktree would need an ids-only
-///   filter here.
+/// - **Codex**: the key depends on the caller. A **step**
+///   ([`step_tokens_by_model`], #14540) with ids and a bounded window reads by
+///   id + window only, since a private-clone seat's rollout reports the
+///   container path as `cwd`. A **role tick** ANDs the ids with the workspace
+///   directory and the window (`SessionFilter::matches` in `codex_usage`), so
+///   an id-named rollout whose `cwd` is not the workspace root is not
+///   attributed. The window is kept deliberately in both: it bounds the
+///   rollout scan to the window's date directories and the rollout's
+///   `session_meta.timestamp`, where dropping it would read every rollout in
+///   the store.
 ///
 /// The Kimi arm has no id source yet (see `crate::kimi_usage`'s module doc)
 /// and keeps the directory+window key.
@@ -635,6 +636,16 @@ pub fn role_tick_tokens_by_model(
 /// the transcript's own command) and Pi (which reads the step's own log) are
 /// exact per step. `None` for [`UsageSource::ClaudeTranscripts`], like the
 /// tick reader.
+///
+/// **Codex is the exception (#14540).** A step that captured exact Codex
+/// session ids from its own dispatch region AND has a bounded window reads
+/// Codex by those ids alone, with no directory constraint: a step in a
+/// private-clone seat runs inside the session container, so its rollout's
+/// `session_meta.cwd` is the container path (`/workspace/work/…`) and never
+/// equals the host workspace root. The id names this step's own session, and
+/// the window still bounds the date-directory scan and the rollout's
+/// `session_meta.timestamp`. An exact-id miss stays unknown: attribution is
+/// NOT retried by directory, which could fold a sibling's spend in.
 #[must_use]
 pub fn step_tokens_by_model(
     runtime: Option<&str>,
@@ -644,6 +655,19 @@ pub fn step_tokens_by_model(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     session_ids: &NativeSessionIds,
 ) -> Option<Vec<ModelUsageTotals>> {
+    if UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts
+        && !session_ids.codex.is_empty()
+        && window.is_some()
+    {
+        return crate::codex_usage::tokens_by_model(
+            &crate::codex_usage::SessionFilter {
+                directories: Vec::new(),
+                ids: session_ids.codex.clone(),
+            },
+            window,
+            None,
+        );
+    }
     let (number, acts_on_pr) = item;
     let directories = if acts_on_pr {
         role_tick_directories(root)

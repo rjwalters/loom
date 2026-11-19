@@ -2310,20 +2310,23 @@ traces.
 Every ready-queue row the work finder ranked on its most recent tick
 (`WorkFinderTickSummary::queue`, #8852) gets its own `loom.dispatch.disposition`
 span whenever its disposition changes (including first sight), on a periodic
-refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s), or once as a
-terminal record when it leaves a successfully-listed repo's queue. Unlike
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 150 seconds of
+source time), or once as a terminal record when it leaves a successfully-listed
+repo's queue. Unlike
 `loom.dispatch.admission`, this covers every candidate the tick evaluated —
 including one filtered out before `dispatch()` was ever attempted
 (`workspace_halted`, `parked`, `host_constraint`,
 …) — so a per-issue "why" is answerable for the entire `QueueDisposition`
 vocabulary, not just the subset that reached an admission attempt.
 
-Sampled from the collector's periodic pass (the same cadence as
-`queue.snapshot`), never from the tick loop
-itself, so a disposition that lasts less than one collector interval can be
-missed — only the last-tick state per interval is exported. Parented to the
-tick's own `loom.dispatch.tick` span when the sampled summary is that exact
-tick; otherwise a root of its own. Attributes:
+The collector checks for a newer completed tick every 30 seconds using
+cached identities. The five-minute host snapshot pass resolves repo identities
+and counts unresolved rows. Only the latest eligible summary at a poll can
+enter the tracker, so short-lived dispositions can be missed. The span start
+and end equal the source tick completion time. The envelope records the
+separate collector emission time. A span is parented to the exact source
+`loom.dispatch.tick` span when its context is available. Otherwise it has
+its own root. Attributes:
 
 | Attribute | Value |
 |---|---|

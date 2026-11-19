@@ -38,6 +38,10 @@ pub(crate) enum SessionAction {
         private_clone: Option<String>,
         #[arg(long, default_value = "main", requires = "private_clone")]
         base: String,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -52,6 +56,10 @@ pub(crate) enum SessionAction {
         /// Stop even if an in-flight `docker exec` is detected.
         #[arg(long)]
         force: bool,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -60,6 +68,10 @@ pub(crate) enum SessionAction {
     Status {
         #[arg(value_name = "NAME")]
         name: String,
+        /// Account provider whose session container this addresses: `codex`
+        /// (default) or `claude` (a per-seat Claude container, issue #14371).
+        #[arg(long, value_name = "PROVIDER", default_value = "codex")]
+        provider: String,
         #[arg(long)]
         json: bool,
     },
@@ -362,8 +374,23 @@ pub(crate) fn handle_session_command(
             mount_workspace: workspace_arg,
             private_clone,
             base,
+            provider,
             json,
         } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                if private_clone.is_some() {
+                    anyhow::bail!("--private-clone is Codex-only; a Claude seat mounts its own state directory");
+                }
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Start {
+                        name,
+                        image,
+                        mount_workspace: workspace_arg,
+                    },
+                    workspace,
+                    json,
+                );
+            }
             if let Some(repository) = private_clone {
                 return print_private(
                     &private::start(&workspace, &name, &repository, &base, image.as_deref())?,
@@ -448,7 +475,19 @@ pub(crate) fn handle_session_command(
             }
             Ok(())
         }
-        SessionAction::Stop { name, force, json } => {
+        SessionAction::Stop {
+            name,
+            force,
+            provider,
+            json,
+        } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Stop { name, force },
+                    workspace,
+                    json,
+                );
+            }
             if private::configured(&workspace, &name)? {
                 return print_private(&private::stop(&workspace, &name, force)?, json);
             }
@@ -483,7 +522,18 @@ pub(crate) fn handle_session_command(
             };
             print_session_status(&lifecycle.stop(&name, force)?, json)
         }
-        SessionAction::Status { name, json } => {
+        SessionAction::Status {
+            name,
+            provider,
+            json,
+        } => {
+            if super::accounts_session_claude::is_claude(&provider)? {
+                return super::accounts_session_claude::run(
+                    super::accounts_session_claude::Op::Status { name },
+                    workspace,
+                    json,
+                );
+            }
             if private::configured(&workspace, &name)? {
                 return print_private(&private::status(&workspace, &name)?, json);
             }
