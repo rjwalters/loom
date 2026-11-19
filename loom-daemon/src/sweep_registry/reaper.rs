@@ -1058,6 +1058,36 @@ impl SweepRegistry {
                     changes += 1;
                     let now = Utc::now();
                     let duration_sec = (now - started_at).num_seconds();
+                    // #14443: a legacy issue sweep ends here whatever its
+                    // phase, so this is the one place a model-limit kill (the
+                    // child's log tail names `hit your Fable limit`) is
+                    // recorded for the next launch's step-down — the sweep
+                    // analogue of `end_step`'s observation (#13905). Any other
+                    // end clears the memo, so a step-down never outlives the
+                    // re-dispatch it was made for. The quarantine-tally
+                    // exemption for the banner is separate and unchanged.
+                    if let Some(issue) = issue {
+                        let log_path = self.entries.get(&sweep_id).map(|i| i.log_path.clone());
+                        if let Some(log_path) = log_path {
+                            let end = if exit_code == Some(0) {
+                                super::model_limit_kill::EndKind::Clean
+                            } else {
+                                super::model_limit_kill::EndKind::Died
+                            };
+                            if super::model_limit_kill::observe_step_end(
+                                &self.config.workspace_root,
+                                issue,
+                                super::model_limit_kill::ISSUE_SWEEP_ROLE,
+                                &log_path,
+                                end,
+                            ) {
+                                log::info!(
+                                    "sweep_registry: issue sweep {sweep_id} on #{issue} died on a \
+                                     model limit; its next launch steps down a rung (#14443)"
+                                );
+                            }
+                        }
+                    }
                     // Release lock and decide between Exited vs Crashed.
                     if let Some(issue) = issue {
                         // Ownership-checked release (#4463): a reaper tick (in
@@ -1563,7 +1593,7 @@ impl SweepRegistry {
                                             match self.begin_issue_dispatch_with_model(
                                                 &SweepKind::Issue(issue),
                                                 None,
-                                                DispatchModel::Resolved(None),
+                                                DispatchModel::Retry(None),
                                                 None,
                                                 None,
                                                 Some(pr),

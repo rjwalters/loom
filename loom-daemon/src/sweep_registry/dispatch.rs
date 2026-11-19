@@ -1285,22 +1285,17 @@ impl SweepRegistry {
     /// or mismatched caller can never silently disable the guard. The bypass
     /// (`resume_bypass_pr: Some(_)`, threaded through to
     /// [`Self::begin_issue_dispatch`]) is **only** reachable from
-    /// [`Self::reap_once`]'s own dispatch decision — either via this
-    /// synchronous wrapper (direct/test callers, e.g.
-    /// `reaper_resume_dispatch_bypasses_the_backoff`) or, in production,
-    /// via `reap_once_impl`'s own inlined `begin_issue_dispatch` call
-    /// (Issue #6691, which needs the intermediate [`BeginIssueDispatch`]
-    /// value to defer the poll — see `reaper.rs::reap_once_releasing_poll_lock`).
+    /// [`Self::reap_once`]'s own dispatch decision. Reap-on-read callers use
+    /// this synchronous wrapper. The background reaper calls
+    /// `begin_issue_dispatch_with_model` directly so it can defer the poll
+    /// (Issue #6691, see `reaper.rs::reap_once_releasing_poll_lock`).
     /// No other call site (work-finder, IPC/CLI dispatch, epic supervisor,
     /// watchdogs) can pass a bypass, so the anti-duplicate property of
     /// #4123 is unchanged for every other dispatch path.
     ///
-    /// Kept as this fully synchronous, self-contained wrapper — unlike its
-    /// production reaper call site, this composes `dispatch_inner` end to
-    /// end and so holds `&mut self` (and, behind a `Mutex`, the lock)
-    /// across the whole account-selection poll — for direct callers with no
-    /// `Arc<Mutex<Self>>` to release, chiefly unit tests exercising the
-    /// resume decision in isolation.
+    /// This wrapper composes `dispatch_inner` end to end. It holds
+    /// `&mut self` and any surrounding lock across the account-selection
+    /// poll. Both resume paths resolve the model as a retry.
     pub(crate) fn dispatch_resume_after_crash(
         &mut self,
         issue: u32,
@@ -1309,7 +1304,7 @@ impl SweepRegistry {
         self.dispatch_inner(
             &SweepKind::Issue(issue),
             None,
-            DispatchModel::Resolved(None),
+            DispatchModel::Retry(None),
             None,
             None,
             Some(resume_pr),
