@@ -471,13 +471,13 @@ pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
     let mut named = Vec::new();
     if state.unprovisioned > 0 {
         named.push(format!(
-            "{}/{} not-admitted(sessionSeat: bare-metal profile on a host whose other seats              run in session containers; never `loom-daemon accounts session start`ed, so its              sandbox is unprovisioned; #14455)",
+            "{}/{} not-admitted(sessionSeat: bare-metal profile on a host whose other seats run in session containers; never `loom-daemon accounts session start`ed, so its sandbox is unprovisioned; #14455)",
             state.unprovisioned, state.enabled
         ));
     }
     if state.sandbox_held > 0 {
         named.push(format!(
-            "{}/{} held(sandbox-unavailable: its last step ran no tool call; re-tested when the              hold ages out; #14455)",
+            "{}/{} held(sandbox-unavailable: its last step ran no tool call; re-tested when the hold ages out; #14455)",
             state.sandbox_held, state.enabled
         ));
     }
