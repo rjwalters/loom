@@ -287,6 +287,62 @@ GOT="$(env -u LOOM_HOST_ID HOSTNAME=some-distinct-hostname LOOM_DAEMON_BIN="$HID
 rm -rf "$HID_DIR"
 
 echo ""
+echo "=== captain acquire: subcommand stderr reaches the caller (#14422) ==="
+
+CAP_DIR="$(mktemp -d "$TMPROOT/captain.XXXXXX")"
+# Grants: warn line on stderr, holder id on stdout, rc 0.
+printf '#!/usr/bin/env bash\necho "WARN stub-fail-open-line" >&2\necho holder-xyz\nexit 0\n' > "$CAP_DIR/warn-grant"
+# Deferred: the subcommand's EXIT_DEFERRED (75) with its reason on stderr.
+printf '#!/usr/bin/env bash\necho "filing-lock: deferred: stub-held" >&2\nexit 75\n' > "$CAP_DIR/defer"
+# An older binary / crash: an unrelated rc with a message on stderr.
+printf '#!/usr/bin/env bash\necho "error: unrecognized subcommand" >&2\nexit 2\n' > "$CAP_DIR/older"
+chmod +x "$CAP_DIR"/warn-grant "$CAP_DIR"/defer "$CAP_DIR"/older
+
+# Run in a subshell (the helper sets a global) and report "<rc>|<holder>"; the
+# helper's own stderr lands in $2.
+captain_case() {
+    local stub="$1" errfile="$2"
+    (
+        export LOOM_DAEMON_BIN="$stub"
+        rc=0
+        _loom_filing_lock_captain_acquire "t" 5 2>"$errfile" || rc=$?
+        printf '%s|%s' "$rc" "$LOOM_FILING_LOCK_CAPTAIN_HOLDER"
+    )
+}
+
+GOT="$(captain_case "$CAP_DIR/warn-grant" "$CAP_DIR/err.grant")"
+assert_eq "$GOT" "0|holder-xyz" "a grant still captures stdout as the holder id"
+if grep -q "WARN stub-fail-open-line" "$CAP_DIR/err.grant"; then
+    pass "the subcommand's stderr warn line reaches the caller's stderr"
+else
+    fail "the subcommand's stderr warn line was swallowed (got: $(cat "$CAP_DIR/err.grant"))"
+fi
+if grep -q "holder-xyz" "$CAP_DIR/err.grant"; then
+    fail "the holder id leaked onto stderr (stdout/stderr were mixed)"
+else
+    pass "the holder id stays on stdout, off stderr"
+fi
+
+GOT="$(captain_case "$CAP_DIR/defer" "$CAP_DIR/err.defer")"
+assert_eq "$GOT" "$LOOM_FILING_LOCK_DEFER_RC|" "an rc-75 answer still returns LOOM_FILING_LOCK_DEFER_RC with no holder"
+if grep -q "deferred: stub-held" "$CAP_DIR/err.defer"; then
+    pass "the defer reason reaches the caller's stderr"
+else
+    fail "the defer reason was swallowed (got: $(cat "$CAP_DIR/err.defer"))"
+fi
+
+GOT="$(captain_case "$CAP_DIR/older" "$CAP_DIR/err.older")"
+assert_eq "$GOT" "0|" "any other failure still fails open (rc 0, no holder)"
+
+# Release stays quiet (out of scope for #14422): best effort, its output is discarded.
+GOT="$(
+    LOOM_DAEMON_BIN="$CAP_DIR/warn-grant" LOOM_FILING_LOCK_CAPTAIN_HOLDER=holder-xyz \
+        _loom_filing_lock_captain_release 2>&1
+)"
+assert_eq "$GOT" "" "the captain release stays silent"
+rm -rf "$CAP_DIR"
+
+echo ""
 echo "==============================================="
 echo "  Tests run:    $TESTS_RUN"
 echo -e "  ${GREEN}Passed:${NC}       $TESTS_PASSED"

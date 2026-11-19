@@ -70,6 +70,12 @@
 #                          the sweep escalation ladder's per-rung `@effort`
 #                          cannot be threaded here because the in-session Task
 #                          tool exposes no effort parameter (see sweep.md).
+#   LOOM_SERVICE_TIER      Runtime-neutral speed tier (issue #14141). `fast` (or
+#                          `priority`) turns on Claude fast mode via an inline
+#                          `--settings '{"fastMode":true}'`; `standard`/
+#                          `default` emit nothing; any other value is ignored
+#                          with one warning. Empty = unset. An existing
+#                          `--settings` is merged (inline JSON + jq) or wins.
 #   LOOM_SWEEP_NICENESS    Scheduling niceness applied to this process (and
 #                          everything it execs/forks — claude, claude-wrapper,
 #                          cargo, rustc, test binaries) via a `nice -n N exec`
@@ -1332,6 +1338,54 @@ if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
     while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
     rm -f "$_resume_args_file"
 fi
+# --- Service-tier / speed selection (issue #14141) ---
+# `LOOM_SERVICE_TIER` is Loom's one runtime-neutral speed knob. Claude's
+# equivalent is fast mode, a settings key (`fastMode`) with no dedicated CLI
+# flag, so it is delivered as an inline `--settings '{"fastMode":true}'`.
+#   fast | priority      -> fast mode on (priority is Codex's id for the same tier)
+#   standard | default   -> the runtime default; nothing is emitted
+#   anything else        -> one warning, ignored (never a failure)
+# An empty value is unset. Placed AFTER the resume block above because that
+# block may already have appended its own inline `--settings` (roll-pause hook,
+# #11049): two `--settings` flags would not reliably compose, so an existing
+# inline-JSON `--settings` is MERGED with fastMode (needs jq) and any other
+# existing `--settings` (a file path, or no jq) WINS with one log line.
+# Exactly one `spawn-claude: service_tier=<v>` line reports what was applied;
+# unset logs nothing and changes no argument.
+if [[ -n "${LOOM_SERVICE_TIER:-}" ]]; then
+    _tier_norm="$(printf '%s' "$LOOM_SERVICE_TIER" | tr '[:upper:]' '[:lower:]')"
+    case "$_tier_norm" in
+        fast|priority)
+            _tier_settings_idx=-1
+            _tier_i=0
+            for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+                if [[ "$_tier_i" -gt 0 && "${PASSTHROUGH_ARGS[$((_tier_i - 1))]}" == "--settings" ]]; then
+                    _tier_settings_idx="$_tier_i"
+                fi
+                _tier_i=$((_tier_i + 1))
+            done
+            if [[ "$_tier_settings_idx" -lt 0 ]]; then
+                PASSTHROUGH_ARGS+=(--settings '{"fastMode":true}')
+                log_info "spawn-claude: service_tier=fast (fastMode via --settings, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            elif [[ "${PASSTHROUGH_ARGS[$_tier_settings_idx]}" == "{"* ]] \
+                && command -v jq >/dev/null 2>&1 \
+                && _tier_merged="$(printf '%s' "${PASSTHROUGH_ARGS[$_tier_settings_idx]}" | jq -c '. + {fastMode: true}' 2>/dev/null)" \
+                && [[ -n "$_tier_merged" ]]; then
+                PASSTHROUGH_ARGS[_tier_settings_idx]="$_tier_merged"
+                log_info "spawn-claude: service_tier=fast (fastMode merged into the existing --settings, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            else
+                log_warn "spawn-claude: explicit --settings in args wins over LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER'; fast mode not applied (set fastMode there, or pass inline JSON with jq available)"
+            fi
+            ;;
+        standard|default)
+            log_info "spawn-claude: service_tier=standard (runtime default; no flag emitted, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            ;;
+        *)
+            log_warn "spawn-claude: LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER' is not a Claude tier (fast|priority|standard|default); ignoring it"
+            ;;
+    esac
+fi
+
 # The dispatch identity is consumed: left exported it would reach the agent's own
 # Bash calls, and a nested spawn-claude.sh would reuse the parent's session id and
 # collide on its scope unit (the scope was named at the systemd-run probe above).

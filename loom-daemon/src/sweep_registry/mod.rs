@@ -129,6 +129,7 @@ mod model;
 // `pub(crate)` for the pool preflights (role runner, work finder, preference
 // availability) that read it from outside `sweep_registry`.
 pub(crate) mod model_fallback;
+pub(crate) mod model_limit_kill;
 mod noop_cooldown;
 mod outcome_journal;
 pub(crate) mod published_repo;

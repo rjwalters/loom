@@ -308,6 +308,9 @@ pub mod live_claim;
 /// run on any spawn of the real `gh` (#10138).
 #[cfg(test)]
 mod live_gh_guard;
+/// Test-only gate for the `loom_config_env` outer-lock invariant (#14404).
+#[cfg(test)]
+mod lock_order_tests;
 pub mod main_health_gate;
 pub mod mcp_tool_guard;
 pub mod merge_group_ci;

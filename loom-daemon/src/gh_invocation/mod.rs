@@ -67,13 +67,14 @@
 //! `PRIVATE_DEFAULTS_ENV` / `LOOM_WORKTREE_ROOT`) — e.g. `role_collision`'s
 //! `rest_queue_source_parses_the_live_listing_shape`, the
 //! `forge_repo_facts::tests_sites` bodies, `worktree_root`'s config-tier
-//! tests, and the `role_runner` / `orphan_recovery` suites (the set is open;
-//! list it with `grep -rn -A1 'serial(loom_config_env)' loom-daemon/src`) —
+//! tests, and the `role_runner` / `orphan_recovery` suites (the set is open) —
 //! hold **both** locks by nesting a `#[serial]` body
 //! inside the `#[serial(loom_config_env)]` test, because multi-key
 //! `#[serial(a, b)]` cannot name the default group (its key is the empty
 //! string; attribute keys are parsed as identifiers). See role_collision's
-//! lock-order doc for the mandatory order.
+//! lock-order doc for the mandatory order;
+//! `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock` (#14404)
+//! fails if a non-test function ever takes `loom_config_env`.
 //!
 //! # `gh api` has no `--repo` flag (#8263)
 //!

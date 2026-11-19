@@ -26,6 +26,7 @@
 use super::*;
 use crate::observability::lifecycle::RoleFailure;
 use crate::role_runner::RoleTickOutcome;
+use crate::telemetry::trace::TraceContext;
 
 /// The four outcome classes of a targeted step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +373,7 @@ pub(crate) struct StepCapture {
     pub(crate) role: StepRole,
     pub(crate) item: u32,
     pub(crate) sweep_id: SweepId,
+    pub(crate) trace_context: Option<TraceContext>,
     pub(crate) started_at: DateTime<Utc>,
     pub(crate) outcome: RoleTickOutcome,
     /// The advisory `LOOM_STEP_OUTCOME` class and reason (#12362), which
@@ -406,6 +408,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
         crate::role_tick_telemetry::StepTelemetry {
             failure: capture.failure.clone(),
             sweep_id: &capture.sweep_id,
+            trace_context: capture.trace_context.as_ref(),
             step_outcome: capture.step_outcome.clone(),
             item: (capture.item, capture.role.acts_on_pr()),
             stage: &capture.stage,
@@ -415,6 +418,39 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
 }
 
 impl SweepRegistry {
+    /// Whether a step's death was a model-limit kill with a rung left to step
+    /// down to (#13905, `model_limit_kill`), updating that module's memo. The
+    /// kill is only possible for an exit that is not a clean zero, not a
+    /// timeout or cancel (the operator's or the clock's act, not the
+    /// provider's), and that wrote no verdict line.
+    fn observe_model_limit_kill(
+        &self,
+        sweep_id: &str,
+        item: u32,
+        role: StepRole,
+        log_path: &Path,
+        end: StepEnd,
+        line: Option<&StepOutcomeLine>,
+    ) -> bool {
+        use super::super::model_limit_kill::{observe_step_end, EndKind};
+        let died = matches!(end, StepEnd::Exited(code) if code != Some(0))
+            && !line.is_some_and(|l| l.class == StepOutcomeClass::Verdict);
+        let killed = observe_step_end(
+            &self.config.workspace_root,
+            item,
+            role.role_name(),
+            log_path,
+            if died { EndKind::Died } else { EndKind::Clean },
+        );
+        if killed {
+            log::info!(
+                "sweep_registry: {role} step {sweep_id} on #{item} died on a model limit; \
+                 charged to the provider, not the item (#13905)"
+            );
+        }
+        killed
+    }
+
     /// A step ended (`release_dead_step`, or found dead at startup with no
     /// entry): reap the leases it still listed, then emit its capture off the
     /// lock. Returns its outcome line.
@@ -439,7 +475,8 @@ impl SweepRegistry {
         // before this) said the seat was exhausted — the launch died on an
         // empty credential, so the release says so instead of `failed`, and
         // the item is charged nothing.
-        let provider_exhausted = take_step_provider_exhaustion(sweep_id);
+        let provider_exhausted = take_step_provider_exhaustion(sweep_id)
+            | self.observe_model_limit_kill(sweep_id, item, role, &log_path, end, line.as_ref());
         log::info!(
             "sweep_registry: {role} step {sweep_id} ended ({end:?}), outcome {}{} (#11906)",
             line.as_ref().map_or("none".to_string(), |l| format!(
@@ -494,6 +531,9 @@ impl SweepRegistry {
                 StepEnd::Cancelled => "cancelled",
                 StepEnd::Exited(_) => "exited",
             };
+            if role == StepRole::Builder {
+                self.yield_finished_builder_lease(item, sweep_id, reason);
+            }
             self.reap_step_leases(sweep_id, reason);
         }
         if !self.config.skip_label_flip {
@@ -525,20 +565,7 @@ impl SweepRegistry {
         if pr_number.is_some() {
             failure = failure.map(no_outcome_line_with_pr);
         }
-        let capture = StepCapture {
-            root: self.config.workspace_root.clone(),
-            role,
-            item,
-            sweep_id: sweep_id.to_string(),
-            started_at,
-            outcome: tick_outcome(role, end, line.as_ref()),
-            step_outcome: Some(step_outcome_projection(line.as_ref())),
-            failure,
-            model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
-            effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
-            stage: role.as_str().to_string(),
-            log_path: log_path.clone(),
-        };
+        let outcome = tick_outcome(role, end, line.as_ref());
         // #12253: the step's `loom.sweep` span ends here, with the outcome
         // its `role_tick.outcome` reports, not at the next restart's orphan
         // recovery. Local journal writes only, so it runs under the lock.
@@ -549,7 +576,7 @@ impl SweepRegistry {
         let (result, close) = super::span::sweep_close(
             end,
             line.as_ref(),
-            &capture.outcome,
+            &outcome,
             role,
             info.map(|i| i.runtime.as_str()),
             info.and_then(|i| i.model.as_deref()),
@@ -559,10 +586,25 @@ impl SweepRegistry {
             provider_exhausted,
             post,
         );
-        self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
+        let trace_context = self.close_step_span(sweep_id, info.map(|i| i.pid), result, close);
         // Hermetic fixtures (no forge) keep their tests free of the detached
         // transcript scan; the capture itself is tested directly.
         if !self.config.skip_label_flip {
+            let capture = StepCapture {
+                root: self.config.workspace_root.clone(),
+                role,
+                item,
+                sweep_id: sweep_id.to_string(),
+                trace_context,
+                started_at,
+                outcome,
+                step_outcome: Some(step_outcome_projection(line.as_ref())),
+                failure,
+                model: info.and_then(|i| i.model.clone()).unwrap_or_default(),
+                effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
+                stage: role.as_str().to_string(),
+                log_path: log_path.clone(),
+            };
             // #12027: the step's verdict record reads its log at the drain.
             let staged = crate::observability::step_verdict::StagedStep {
                 sweep_id: sweep_id.to_string(),

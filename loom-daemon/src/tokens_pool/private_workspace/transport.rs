@@ -348,6 +348,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "sweep-7".into(),
@@ -405,6 +407,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "step-builder-20-1".into(),
@@ -469,6 +473,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let id = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -510,6 +516,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     }
 
@@ -646,6 +654,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "o".into(),
