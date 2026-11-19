@@ -272,18 +272,8 @@ fn run() -> Result<()> {
             }
             handle_forge_read_command(cli)
         }
-        ToolsCommands::ParkRecord(cli) => {
-            // Classified by effect, from the parsed invocation: the offline
-            // forms never resolve `mode`, so they work with `mode` unset.
-            if cli.reaches_forge() {
-                mode_gate()?;
-            }
-            handle_park_record_command(cli)
-        }
+        ToolsCommands::ParkRecord(cli) => handle_park_record_command(cli),
         ToolsCommands::OperatorDecision(cli) => {
-            if cli.reaches_forge() {
-                mode_gate()?;
-            }
             if cli.files_new_issue() {
                 use_this_binary_for_nested_filing();
             }
