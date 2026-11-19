@@ -435,37 +435,49 @@ fn rescue_stash_ts(subject: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%SZ").ok()
 }
 
-/// `loom-rescue-<ts>` stash entries older than `keep` at `now`, as their
-/// `stash@{N}` selectors sorted highest index first, so the caller can drop
-/// in this order and no drop shifts an entry still to be dropped (#13977).
-/// A subject that does not carry a readable stamp is kept
-/// ([`rescue_stash_ts`]), and so is every entry outside the prefix. An empty
-/// stack, or a failed read, lists nothing.
+/// An expired `loom-rescue-<ts>` stash entry: its commit sha, the durable
+/// handle, and the `stash@{N}` selector it had when it was listed, which is
+/// not durable and is only a sort key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RescueStash {
+    sha: String,
+    selector: String,
+}
+
+/// `loom-rescue-<ts>` stash entries older than `keep` at `now`, highest
+/// listed index first (belt-and-braces: [`prune_rescue_stashes`] re-resolves
+/// each selector from the sha, #13977). A subject that does not carry a
+/// readable stamp is kept ([`rescue_stash_ts`]), and so is every entry outside
+/// the prefix. An empty stack, or a failed read, lists nothing.
 fn expired_rescue_stashes(
     root: &Path,
     now: DateTime<Utc>,
     keep: Duration,
     timeout: Duration,
-) -> Vec<String> {
-    let args = ["stash", "list", "--format=%gd%x00%gs"];
+) -> Vec<RescueStash> {
+    let args = ["stash", "list", "--format=%gd%x00%H%x00%gs"];
     let Ok(listed) = git::ok(root, &args, timeout) else {
         return Vec::new();
     };
-    let mut expired: Vec<String> = listed
+    let mut expired: Vec<RescueStash> = listed
         .lines()
-        .filter_map(|line| line.split_once('\x00'))
-        .filter(|(_, subject)| {
+        .filter_map(|line| {
+            let mut f = line.splitn(3, '\x00');
+            Some((f.next()?, f.next()?, f.next()?))
+        })
+        .filter(|(_, _, subject)| {
             rescue_stash_ts(subject).is_some_and(|ts| {
                 now.signed_duration_since(ts.and_utc())
                     .to_std()
                     .is_ok_and(|age| age > keep)
             })
         })
-        .map(|(selector, _)| selector.to_string())
+        .map(|(selector, sha, _)| RescueStash {
+            sha: sha.to_string(),
+            selector: selector.to_string(),
+        })
         .collect();
-    // `git stash list` prints the newest entry (`stash@{0}`) first, and a
-    // drop shifts every entry above it down one, so drop highest index first.
-    expired.sort_by_key(|selector| std::cmp::Reverse(stash_index(selector)));
+    expired.sort_by_key(|e| std::cmp::Reverse(stash_index(&e.selector)));
     expired
 }
 
@@ -478,13 +490,39 @@ fn stash_index(selector: &str) -> Option<u32> {
         .ok()
 }
 
-/// Drop the listed stash entries. A failed drop only warns: the entry
-/// outlives this pass and the next pass re-lists and tries again. The rescue
-/// ref at that timestamp stays until its own expiry, so only the working-tree
-/// diff is lost — the same trade the rescue ref's expiry already makes.
-fn prune_rescue_stashes(root: &Path, expired: &[String], timeout: Duration, net: &mut Net) {
-    for selector in expired {
-        let args = ["stash", "drop", "--quiet", selector];
+/// The entry's current selector, re-read from the live stack by commit sha: a
+/// concurrent push to the shared `refs/stash` shifts every index, so a
+/// selector captured at list time is not an identity (the convention in
+/// `stash_retirement::current_stash_ref_for_commit`). `Ok(None)`: the entry is
+/// already gone.
+fn current_selector(root: &Path, sha: &str, timeout: Duration) -> Result<Option<String>, String> {
+    let listed = git::ok(root, &["stash", "list", "--format=%gd%x00%H"], timeout)
+        .map_err(|e| e.to_string())?;
+    Ok(listed.lines().find_map(|l| {
+        let (sel, h) = l.split_once('\x00')?;
+        (h == sha).then(|| sel.to_string())
+    }))
+}
+
+/// Drop the listed stash entries, each addressed by its sha: the selector is
+/// re-resolved immediately before its drop. An entry no longer listed is
+/// already gone (a no-op). A failed drop only warns: the entry outlives this
+/// pass and the next pass re-lists and tries again. A push landing in the
+/// instant between the re-resolve and the drop can still shift the index; git
+/// offers no expected-sha precondition on `stash drop`, so that window is
+/// narrowed to two spawns, not closed. The rescue ref at that timestamp stays
+/// until its own expiry, so only the working-tree diff is lost.
+fn prune_rescue_stashes(root: &Path, expired: &[RescueStash], timeout: Duration, net: &mut Net) {
+    for entry in expired {
+        let selector = match current_selector(root, &entry.sha, timeout) {
+            Ok(Some(selector)) => selector,
+            Ok(None) => continue,
+            Err(e) => {
+                log::warn!("checkout_ff: {}: could not re-list stashes: {e}", root.display());
+                continue;
+            }
+        };
+        let args = ["stash", "drop", "--quiet", selector.as_str()];
         match git::ok(root, &args, timeout) {
             Ok(_) => {
                 say(net, root, "rescue-pruned", Level::Info, format!("pruned stash {selector}"))
@@ -715,10 +753,11 @@ mod tests {
         ]);
         // Pushed first, so the old rescue sits at the highest index; every
         // other entry — young rescue, quarantine, foreign — is left.
-        assert_eq!(
-            expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT),
-            vec!["stash@{3}".to_string()],
-        );
+        let selectors: Vec<String> = expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT)
+            .into_iter()
+            .map(|e| e.selector)
+            .collect();
+        assert_eq!(selectors, vec!["stash@{3}".to_string()]);
         drop(tmp);
     }
 
@@ -728,11 +767,51 @@ mod tests {
         let (tmp, root) = repo_with_stashes(&[rescue(40), rescue(30), rescue(1)]);
         let mut net = Net::default();
         let expired = expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT);
-        assert_eq!(expired, vec!["stash@{2}".to_string(), "stash@{1}".to_string()]);
+        let selectors: Vec<&str> = expired.iter().map(|e| e.selector.as_str()).collect();
+        assert_eq!(selectors, vec!["stash@{2}", "stash@{1}"]);
         prune_rescue_stashes(&root, &expired, git::LOCAL_TIMEOUT, &mut net);
         let left = git::ok(&root, &["stash", "list", "--format=%gs"], git::LOCAL_TIMEOUT).unwrap();
         assert_eq!(left.lines().count(), 1);
         assert!(left.contains(&rescue(1)));
+        drop(tmp);
+    }
+
+    fn head_stash_sha(root: &Path) -> String {
+        git::ok(root, &["rev-parse", "stash@{0}"], git::LOCAL_TIMEOUT)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn a_push_between_list_and_prune_does_not_redirect_the_drop() {
+        let keep = retain();
+        let (tmp, root) = repo_with_stashes(&[
+            rescue(40),
+            rescue(1),
+            "loom-quarantine: issue=1".to_string(),
+        ]);
+        let mut net = Net::default();
+        let expired = expired_rescue_stashes(&root, now(), keep, git::LOCAL_TIMEOUT);
+        assert_eq!(expired.len(), 1);
+        // Two concurrent pushes land after the list: `stash@{2}` now names
+        // the young rescue, and the old selector is stale.
+        let mut body = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        for msg in ["loom-quarantine: issue=777", "loom-quarantine: issue=778"] {
+            body.push_str("x\n");
+            std::fs::write(root.join("f.txt"), &body).unwrap();
+            git::ok(&root, &["stash", "push", "--quiet", "-m", msg], git::LOCAL_TIMEOUT).unwrap();
+        }
+        prune_rescue_stashes(&root, &expired, git::LOCAL_TIMEOUT, &mut net);
+        let left = git::ok(&root, &["stash", "list", "--format=%gs"], git::LOCAL_TIMEOUT).unwrap();
+        assert_eq!(left.lines().count(), 4);
+        assert!(!left.contains(&rescue(40)));
+        assert!(left.contains(&rescue(1)));
+        assert!(left.contains("loom-quarantine: issue=1"));
+        // Already gone: a second prune is a silent no-op.
+        let before = net.repairs.len();
+        prune_rescue_stashes(&root, &expired, git::LOCAL_TIMEOUT, &mut net);
+        assert_eq!(net.repairs.len(), before);
         drop(tmp);
     }
 
@@ -743,7 +822,16 @@ mod tests {
         // `stash@{9}` does not exist: a failed drop is a warning, not a step.
         prune_rescue_stashes(
             &root,
-            &["stash@{0}".to_string(), "stash@{9}".to_string()],
+            &[
+                RescueStash {
+                    sha: head_stash_sha(&root),
+                    selector: "stash@{0}".to_string(),
+                },
+                RescueStash {
+                    sha: "0".repeat(40),
+                    selector: "stash@{9}".to_string(),
+                },
+            ],
             git::LOCAL_TIMEOUT,
             &mut net,
         );
