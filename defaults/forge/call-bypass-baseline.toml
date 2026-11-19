@@ -87,7 +87,7 @@ removal_issue = 9799
 
 [[bypass]]
 path = "defaults/scripts/pr-worktree.sh"
-calls = 5
+calls = 8
 owner = "role-scripts"
 removal_issue = 9799
 
