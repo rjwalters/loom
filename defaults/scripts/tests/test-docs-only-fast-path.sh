@@ -601,6 +601,39 @@ OPEN_ISSUE_DIFF='diff --git a/WORK_LOG.md b/WORK_LOG.md
 +
 +- **Issue #11** (closed): Open thing'
 
+# Realistic no-op diffs (#14532 review): WORK_PLAN.md's generated region
+# renders backlog bullets as `- **#N**: Title` and README prose carries
+# plain bold bullets — the same bold-bullet SHAPE as WORK_LOG records but in
+# different files. The scan is scoped to WORK_LOG.md / work_log/WORK_LOG_*.md
+# (AC 3), so these must stay no-ops, not "unparseable WORK_LOG record".
+WORKPLAN_ONLY_DIFF='diff --git a/WORK_PLAN.md b/WORK_PLAN.md
+--- a/WORK_PLAN.md
++++ b/WORK_PLAN.md
+@@ -1,3 +1,7 @@
++## Backlog
++
++- **#13816**: fix(hooks): treat >(cmd) process substitution as non-target in vendored guard
++- **#14301**: Add the thing'
+
+README_BOLD_DIFF='diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,4 @@
++## Notes
++
++- **Status**: green'
+
+# File scoping must not skip real records: WORK_PLAN bullets ignored, the
+# WORK_LOG record in the same diff still verified.
+WORKPLAN_PLUS_RECORD_DIFF="$WORKPLAN_ONLY_DIFF
+diff --git a/WORK_LOG.md b/WORK_LOG.md
+--- a/WORK_LOG.md
++++ b/WORK_LOG.md
+@@ -1,2 +1,4 @@
++### 2026-11-19
++
++- **PR #99**: Not there"
+
 : >"$WL_CALL_LOG"
 out="$(WL_DIFF="$GOOD_DIFF" docs_only_fast_path_worklog_check 1)"
 assert_eq "ELIGIBLE" "$out" "a diff adding a matching PR and closed issue is eligible"
@@ -618,7 +651,19 @@ assert_eq "NOT ELIGIBLE: WORK_LOG record #5 does not exist in owner/mine (or the
     "a temporary forge failure on the target read is not eligible (fails closed)"
 
 out="$(WL_DIFF="" docs_only_fast_path_worklog_check 1)"
-assert_eq "ELIGIBLE" "$out" "a WORK_PLAN/README-only diff (no canonical records) is eligible — no-op preserved"
+assert_eq "ELIGIBLE" "$out" "an empty diff (no canonical records) is eligible"
+
+: >"$WL_CALL_LOG"
+out="$(WL_DIFF="$WORKPLAN_ONLY_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "ELIGIBLE" "$out" "a WORK_PLAN-only diff with bold backlog bullets is eligible — no-op preserved (AC 3)"
+[[ -s "$WL_CALL_LOG" ]] && fail "a WORK_PLAN-only diff queried the forge" || pass "a WORK_PLAN-only diff made zero forge reads"
+
+out="$(WL_DIFF="$README_BOLD_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "ELIGIBLE" "$out" "a README bold prose bullet is never read as a WORK_LOG record"
+
+out="$(WL_DIFF="$WORKPLAN_PLUS_RECORD_DIFF" docs_only_fast_path_worklog_check 1)"
+assert_eq "NOT ELIGIBLE: WORK_LOG record #99 does not exist in owner/mine (or the read failed)" "$out" \
+    "file scoping ignores WORK_PLAN bullets but still verifies a WORK_LOG record in the same diff"
 
 : >"$WL_CALL_LOG"
 out="$(WL_DIFF="$ROTATION_DIFF" docs_only_fast_path_worklog_check 1)"

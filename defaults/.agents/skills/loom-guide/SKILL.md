@@ -1816,6 +1816,9 @@ verify_work_log_provenance() {
     # One forge read per DISTINCT number, cached as the fetched tuple; every
     # record for that number — including a later duplicate with a different
     # title or kind — is still verified against the cached tuple (#14532).
+    # $GH_READ (the 30 s-TTL cache) is deliberate here, unlike judge.md's
+    # live reads: the cache key includes the repo path, so it cannot cross
+    # repositories, and the read doubles as the per-number dedup.
     if [ -z "${fetched[$num]:-}" ]; then
       got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '"\(.title)\t\(.pull_request != null)\t\(.state)\t\((.pull_request.merged_at != null))"' 2>/dev/null)" || got=""
       if [ -z "$got" ]; then

@@ -1791,8 +1791,10 @@ its receipts, or anything the PR body claims:
 # the normal review flow and report the reason. Distinct numbers are READ once
 # each, but every record is VERIFIED: a repeated number's later records (a
 # duplicate with a different title or kind included) are checked against the
-# cached fetch, not skipped; ordinary prose references (anything not a
-# canonical `- **PR #N**` / `- **Issue #N**` bullet) are never read.
+# cached fetch, not skipped; bullets outside WORK_LOG.md and its monthly
+# archives (WORK_PLAN/README prose, `- **#N**: …` backlog rows included) and
+# anything not a canonical `- **PR #N**` / `- **Issue #N**` bullet are never
+# read.
 docs_only_fast_path_worklog_check() {
   # $1 = PR number. The target is the PR's BASE repository (read from the
   # forge, never the cwd's remote and never a receipt); the additions are the
@@ -1809,12 +1811,31 @@ docs_only_fast_path_worklog_check() {
     echo "NOT ELIGIBLE: PR diff read failed"
     return 0
   fi
-  # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines.
-  # Removed ones: `-`-prefixed. A record both added and removed in the same
-  # diff is a move (archive rotation), not a new record.
-  local added removed
-  added="$(printf '%s\n' "$raw" | grep -E '^\+- \*\*' | sed 's/^+//')"
-  removed="$(printf '%s\n' "$raw" | grep -E '^-- \*\*' | sed 's/^-//')"
+  # Added canonical records: `+`-prefixed `- **PR/Issue ...` bullet lines,
+  # collected ONLY from WORK_LOG.md and its monthly archives — a
+  # WORK_PLAN/README bullet (`- **#N**: …` or any other bold prose) is not a
+  # WORK_LOG record and must not be read as one (AC 3: WORK_PLAN/README-only
+  # diffs stay no-ops). Removed ones: `-`-prefixed. A record both added and
+  # removed in the same diff is a move (archive rotation), not a new record.
+  # The current file is tracked from the `diff --git` headers so a
+  # non-WORK_LOG hunk can neither produce a record nor trigger a refusal.
+  local in_worklog=0 added="" removed="" l
+  while IFS= read -r l; do
+    case "$l" in
+      'diff --git '*)
+        case "$l" in
+          *' b/WORK_LOG.md') in_worklog=1 ;;
+          *' b/work_log/WORK_LOG_'*.md) in_worklog=1 ;;
+          *) in_worklog=0 ;;
+        esac
+        continue ;;
+    esac
+    [ "$in_worklog" = 1 ] || continue
+    case "$l" in
+      '+- **'*) added+="${l#+}"$'\n' ;;
+      '-- **'*) removed+="${l#-}"$'\n' ;;
+    esac
+  done < <(printf '%s\n' "$raw")
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     if printf '%s\n' "$removed" | grep -Fxq -- "$line"; then continue; fi
