@@ -626,6 +626,14 @@ behavior is byte-for-byte unchanged from before #6850.
   whatever its name. This classifies by capability, so a class can drop the
   `*deploy*` / `*release*` / `*publish*` name excludes. It does not replace
   `forbiddenDiffPatterns`, which still catches a PR that *adds* a privilege.
+- `checkWorkflowWriteAll` (#14648, optional boolean) — for a class covering
+  only GitHub workflow YAML, `true` checks the workflow and its jobs for an
+  actual `permissions: write-all` setting. Keep exactly one literal
+  `write-all` entry in `privilegedContentPatterns` as a fallback for older
+  Champions. An upgraded Champion substitutes the YAML check for that entry
+  only after explicit opt-in. Other patterns retain their regex semantics.
+  An unsupported checker, unreadable workflow or missing fallback entry
+  disqualifies the class.
   **Fail closed**: unreadable or empty content, a file the contents API cannot
   serve (too large), a `removed` file, an invalid regex, a head SHA that moved
   while the files were read, or a value that is not an array of non-empty
@@ -754,13 +762,13 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
-# standing_auth_content_clear <files-json> <regexes>   (#12954)
+# standing_auth_content_clear <files-json> <regexes> [<check-write-all>]  (#12954, #14648)
 # 0 = every file in <files-json> was read at the PR head SHA and no line of it
 # matches any privilegedContentPatterns regex. Anything else (a removed or
 # unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
 standing_auth_content_clear() {
-  local files_json="$1" regexes="$2" sha1 sha2 path enc body rx rc
-  [ -n "$regexes" ] || return 0
+  local files_json="$1" regexes="$2" check_write_all="${3:-false}" sha1 sha2 path enc body rx rc
+  [ -n "$regexes" ] || [ "$check_write_all" = true ] || return 0
   printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
   while IFS= read -r rx; do
     [ -z "$rx" ] && continue
@@ -775,6 +783,10 @@ standing_auth_content_clear() {
     enc=$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")') || return 1
     body=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${enc}?ref=$sha1" 2>/dev/null) || return 1
     [ -n "$body" ] || return 1
+    if [ "$check_write_all" = true ]; then
+      case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
+      printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-write-all-check >/dev/null 2>&1 || return 1
+    fi
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
       # A whole-line YAML comment grants nothing, so it is not scanned: the
@@ -849,7 +861,7 @@ standing_auth_class_hits() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
@@ -906,7 +918,16 @@ standing_auth_eval() {
     # but an array of non-empty strings is malformed and skips the entry (a
     # silently ignored key would read as "no privilege found").
     jq -e ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | type == \"array\" and all(.[]; type == \"string\" and length > 0)" "$CONFIG_FILE" >/dev/null 2>&1 || continue
-    PRIVILEGED=$(jq -r ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | .[]" "$CONFIG_FILE")
+    CHECK_WORKFLOW_WRITE_ALL=$(jq -r --argjson i "$i" '
+      .champion.standingAuthorizations[$i]
+      | if has("checkWorkflowWriteAll") then
+          .checkWorkflowWriteAll | if type == "boolean" then . else error("invalid workflow check") end
+        else false end' "$CONFIG_FILE" 2>/dev/null) || continue
+    PRIVILEGED=$(jq -r --argjson i "$i" --arg typed "$CHECK_WORKFLOW_WRITE_ALL" '
+      .champion.standingAuthorizations[$i].privilegedContentPatterns // []
+      | if $typed != "true" then .[]
+        elif ([.[] | select(. == "write-all")] | length) == 1 then .[] | select(. != "write-all")
+        else error("workflow check needs one legacy write-all guard") end' "$CONFIG_FILE" 2>/dev/null) || continue
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives the critical-files criterion for the critical-file hits
@@ -1084,10 +1105,10 @@ standing_auth_eval() {
     # privilegedContentPatterns (#12954): capability, read from each covered
     # file's full contents at the PR head SHA rather than from its name or its
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
-    if [ -n "$PRIVILEGED" ]; then
+    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -1321,12 +1342,12 @@ is red.
 ```bash
 # PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
 # regexes, one per element) a workflow's full head contents must not match.
-# Same list as #12954's privilegedContentPatterns; operators copy it into a
-# class, and test-champion-ci-workflow-blast.sh and
-# test-champion-standing-authorization.sh both extract it from here.
+# Both Champion workflow suites extract this list. For a standing class,
+# keep the legacy `write-all` regex alongside this list and set
+# `checkWorkflowWriteAll: true` to use the same structural permission check.
 PRIVILEGED_CONTENT_PATTERNS=(
   'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
-  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  ':\s*write\b' 'id-token' 'pull_request_target' 'workflow_run'
   '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
   'gh\s+release'
 )
@@ -1376,7 +1397,7 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
     || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
   if [ "$CONTENT_FILES" != "[]" ]; then
-    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
   # permissions (#13291): direction-aware. A removed line naming it is red (it
