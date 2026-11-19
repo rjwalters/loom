@@ -509,26 +509,6 @@ Environment:
                                seam for the default macOS no-`timeout` shape).
   LOOM_DAEMON_BIN               Explicit loom-daemon binary for the IPC probe
                                (same resolution order as loom-daemon-start.sh).
-  LOOM_WATCHDOG_PEER_COORD_CHECK  #6222 (Layer 3 of #6157): 0/false/no disables
-                               the peer-coordination alert entirely (default: on).
-                               Only ever attempted on a tick whose own IPC
-                               round-trip already succeeded (`probe_verdict ==
-                               healthy`) — never adds a new hang surface.
-  LOOM_WATCHDOG_PEER_COORD_TIMEOUT_SECS  #6222: hard external budget for the
-                               `loom-daemon peer-claims --json` query (default:
-                               same as LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS).
-  LOOM_WATCHDOG_PEER_COORD_SENTINEL  #6222/#12818: retired. Peer-coordination
-                               no longer files, comments on, reopens or closes
-                               a GitHub issue; it reports DEGRADED (DIVERGENCE)
-                               and healthy (OK) to the watchdog log only. A
-                               sentinel/cooldown file left by the old lifecycle
-                               (default <loom dir>/.watchdog-peer-coord-
-                               escalated and .watchdog-peer-coord-cooldown) is
-                               never read or written and is safe to delete.
-                               The path survives only as the key for the
-                               loom-ui alert record (#11295). The
-                               PEER_COORD_COOLDOWN_SECS, _COOLDOWN_STATE and
-                               _DEDUP_WINDOW_SECS knobs are likewise ignored.
   LOOM_WATCHDOG_CREATE_ISSUE_FALLBACK_DIR  #6272: test seam ONLY — overrides
                                the third (production-intent) branch of the
                                create-issue.sh resolution shared by
