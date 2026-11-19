@@ -495,6 +495,7 @@ pub mod weighted_draw;
 pub mod work_finder;
 pub mod work_finder_guard;
 pub mod worker_spawn;
+pub mod workflow_lint;
 pub mod workspace_hold;
 pub mod workspace_pool;
 pub mod workspace_registry;
