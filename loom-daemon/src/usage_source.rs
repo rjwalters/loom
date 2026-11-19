@@ -306,12 +306,7 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
         let Some(at) = line.find("session id:") else {
             continue;
         };
-        let token = line[at + "session id:".len()..]
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
-            .collect::<String>();
-        if token.len() >= 8 {
+        if let Some(token) = codex_session_token(&line[at + "session id:".len()..]) {
             ids.codex.push(token);
         }
     }
@@ -322,24 +317,31 @@ pub fn native_session_ids(log_region: &str) -> NativeSessionIds {
     ids
 }
 
-/// The native session ids a **role tick's** own launch named (#14664).
-///
-/// A role tick appends to a per-role log shared with every earlier tick of
-/// that role, so the whole file cannot be parsed: the tick's own slice is
-/// the region after the LAST role-runner invocation header
-/// ([`crate::role_runner::last_invocation_region`]) — the per-role-log
-/// counterpart of a step's `sweep_id=` dispatch-region anchor. Ids printed
-/// above the header belong to an earlier tick and are never attributed to
-/// this one. `Default` (no ids) for an unreadable log or one that predates
-/// the header, leaving the directory + window key in force.
-#[must_use]
-pub fn role_tick_session_ids(log_path: &Path) -> NativeSessionIds {
-    std::fs::read_to_string(log_path)
-        .ok()
-        .and_then(|contents| {
-            crate::role_runner::last_invocation_region(&contents).map(native_session_ids)
+/// The first Codex banner from the bytes this role invocation appended (#14664).
+/// The runner's own first header opens the slice. A later quoted header and
+/// its body cannot displace the launch banner. Pre-launch notes have no
+/// invocation header and contribute no session id.
+pub(crate) fn role_tick_codex_session_id(output: &str) -> Option<String> {
+    const HEADER: &str = "==== loom-daemon role_runner:";
+    output
+        .lines()
+        .skip_while(|line| !line.starts_with(HEADER))
+        .skip(1)
+        .take_while(|line| !line.contains(HEADER))
+        .find_map(|line| {
+            line.trim_start()
+                .strip_prefix("session id:")
+                .and_then(codex_session_token)
         })
-        .unwrap_or_default()
+}
+
+fn codex_session_token(after_prefix: &str) -> Option<String> {
+    let token: String = after_prefix
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+        .collect();
+    (token.len() >= 8).then_some(token)
 }
 
 /// Per-`(model, speed, service_tier)` token totals for one sweep, read from
@@ -611,8 +613,8 @@ pub fn sweep_tokens_by_window(
 /// step's own log, not the per-role one.
 ///
 /// `session_ids` (#14048) are the exact native session ids parsed from the
-/// launch's own log slice — a step's dispatch region, or a role tick's
-/// latest per-role-log slice ([`role_tick_session_ids`], #14664). The arms
+/// launch's own output — a step's dispatch region, or a role tick's
+/// invocation-owned banner (#14664). The arms
 /// fall back to the directory+window key when empty. The two arms are NOT
 /// symmetric:
 ///
@@ -647,14 +649,14 @@ pub fn role_tick_tokens_by_model(
     // on an id miss: it could fold a sibling's spend in.
     if UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts
         && !session_ids.codex.is_empty()
-        && window.is_some()
     {
+        let window = window?;
         return crate::codex_usage::tokens_by_model(
             &crate::codex_usage::SessionFilter {
                 directories: Vec::new(),
                 ids: session_ids.codex.clone(),
             },
-            window,
+            Some(window),
             None,
         );
     }
@@ -746,6 +748,7 @@ pub(crate) fn native_close_usage(
     // id + window (no directory retry; see `codex_usage::lookup_ids`).
     let codex = UsageSource::for_runtime(runtime) == UsageSource::CodexSessionRollouts;
     if codex && !session_ids.codex.is_empty() {
+        let window = window.ok_or(UsageMissing::NoWindow)?;
         return match crate::codex_usage::lookup_ids(&session_ids.codex, window, None) {
             crate::codex_usage::IdLookup::Found(rows) => Ok(rows),
             crate::codex_usage::IdLookup::NoStore => Err(UsageMissing::StoreUnreadable),
@@ -962,12 +965,26 @@ mod tests {
         assert_eq!(close(&ids("99999999-8888-7777-6666-555555555555")), Err(M::NoUsageTokens));
 
         // The id-named rollout is attributed across the directory mismatch.
-        let rows = close(&ids("11111111-2222-3333-4444-555555555555")).unwrap();
+        let selected = ids("11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            native_close_usage(Some("codex"), tmp.path(), Some((42, false)), &log, None, &selected),
+            Err(M::NoWindow),
+        );
+        let rows = close(&selected).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "gpt-5");
         assert_eq!(rows[0].input, 600);
         assert_eq!(rows[0].cache_read, 400);
         assert_eq!(rows[0].output, 100);
+
+        // A readable prefix cannot confirm an absent session or zero tokens.
+        let file = home.join("sessions/2026/09/20/rollout-real.jsonl");
+        let complete = std::fs::read(&file).unwrap();
+        let line_end = complete.iter().position(|&byte| byte == b'\n').unwrap() + 1;
+        let interrupted = [&complete[..line_end], &[0xff, b'\n'], &complete[line_end..]].concat();
+        std::fs::write(file, interrupted).unwrap();
+        assert_eq!(close(&selected), Err(M::StoreUnreadable));
+        assert_eq!(close(&ids("00000000-0000-0000-0000-000000000000")), Err(M::StoreUnreadable));
 
         // A store that does not exist at all.
         let absent = tmp.path().join("no-such-codex-home");
@@ -1008,6 +1025,7 @@ mod tests {
         // The id key attributes the rollout although its cwd is not the
         // workspace root.
         let rows = role_tick_tokens_by_model(Some("codex"), tmp.path(), &log, window, &ids);
+        assert!(role_tick_tokens_by_model(Some("codex"), tmp.path(), &log, None, &ids).is_none());
         assert_eq!(rows.as_ref().map(|r| r.len()), Some(1));
         assert_eq!(rows.unwrap()[0].output, 50);
 
@@ -1021,41 +1039,6 @@ mod tests {
                 &NativeSessionIds::default()
             ),
             None
-        );
-    }
-
-    /// #14664: a role tick's ids are parsed from ITS OWN slice of the shared
-    /// per-role log — the region after the last invocation header — so an
-    /// earlier tick's `session id:` banner is never attributed to a later
-    /// tick, and a log without the header contributes no ids at all.
-    #[test]
-    fn a_role_ticks_ids_come_from_its_own_log_region_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("role-guide.log");
-        std::fs::write(
-            &log,
-            concat!(
-                "==== loom-daemon role_runner: 2026-11-19T16:42:39Z role=guide model=gpt ====\n",
-                "session id: 11111111-2222-3333-4444-555555555555\n",
-                "==== loom-daemon role_runner: 2026-11-19T17:12:37Z role=guide model=gpt ====\n",
-                "session id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n",
-            ),
-        )
-        .unwrap();
-        let ids = role_tick_session_ids(&log);
-        assert_eq!(ids.codex, vec!["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()]);
-        assert!(ids.opencode.is_empty());
-
-        // A pre-header log has no region: no ids, so the directory + window
-        // key stays in force rather than reading a stale banner.
-        let old = tmp.path().join("role-old.log");
-        std::fs::write(&old, "session id: 11111111-2222-3333-4444-555555555555\n").unwrap();
-        assert_eq!(role_tick_session_ids(&old), NativeSessionIds::default());
-
-        // So does an unreadable log.
-        assert_eq!(
-            role_tick_session_ids(&tmp.path().join("absent.log")),
-            NativeSessionIds::default()
         );
     }
 

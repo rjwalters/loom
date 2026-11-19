@@ -42,7 +42,7 @@ pub enum UsageMissing {
     NoUsageTokens,
     /// A runtime whose reader cannot say more than "nothing attributable".
     NoAttributableUsage,
-    /// The sweep's start instant was unknown, so no window bounded the read.
+    /// No bounded usage window was available for this read.
     NoWindow,
 }
 

@@ -531,6 +531,11 @@ impl Counters {
     }
 }
 
+struct RolloutRead {
+    lines: Vec<String>,
+    complete: bool,
+}
+
 /// Read one rollout file's lines. **The whole file-open surface of this
 /// module** (see the module doc's "Security" section): it refuses any path
 /// [`is_rollout_path`] does not accept, so no credential-bearing sibling of
@@ -544,17 +549,28 @@ impl Counters {
 /// `None`, so a rollout that grew past a caller's size check between its
 /// `stat` and this read is still never loaded whole. `u64::MAX` is no ceiling
 /// (the usage path, which streams one file at a time).
-fn read_rollout(codex_home: &Path, path: &Path, max_bytes: u64) -> Option<Vec<String>> {
+fn read_rollout(codex_home: &Path, path: &Path, max_bytes: u64) -> Option<RolloutRead> {
     if !is_rollout_path(codex_home, path) {
         return None;
     }
     let mut reader = BufReader::new(File::open(path).ok()?.take(max_bytes.saturating_add(1)));
-    let lines: Vec<String> = reader.by_ref().lines().map_while(Result::ok).collect();
+    let mut complete = true;
+    let lines = reader
+        .by_ref()
+        .lines()
+        .map_while(|line| match line {
+            Ok(line) => Some(line),
+            Err(_) => {
+                complete = false;
+                None
+            }
+        })
+        .collect();
     if max_bytes != u64::MAX && reader.into_inner().limit() == 0 {
         // `max_bytes + 1` bytes were read: the file is over the ceiling.
         return None;
     }
-    Some(lines)
+    Some(RolloutRead { lines, complete })
 }
 
 /// One authorized rollout path, paired with the home whose
@@ -578,7 +594,7 @@ impl RolloutPath {
     /// `max_bytes`.
     #[must_use]
     pub fn read_capped(&self, max_bytes: u64) -> Option<Vec<String>> {
-        read_rollout(&self.home, &self.path, max_bytes)
+        read_rollout(&self.home, &self.path, max_bytes).map(|read| read.lines)
     }
 }
 
@@ -767,7 +783,7 @@ pub fn sessions(
     let mut all: Vec<CodexSessionUsage> = discover_home_rollouts(home, window)
         .into_iter()
         .filter_map(|(root, path)| read_rollout(&root, &path, u64::MAX))
-        .flat_map(|lines| fold_rollout(&lines, filter, window))
+        .flat_map(|read| fold_rollout(&read.lines, filter, window))
         .collect();
     all.sort_by(|a, b| {
         a.created_at
@@ -829,7 +845,7 @@ pub enum IdLookup {
 #[must_use]
 pub fn lookup_ids(
     ids: &[String],
-    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    window: (DateTime<Utc>, DateTime<Utc>),
     home: Option<&Path>,
 ) -> IdLookup {
     if ids.is_empty() {
@@ -843,13 +859,13 @@ pub fn lookup_ids(
     let mut selected = false;
     let mut read_any = false;
     let mut unreadable = false;
-    for (root, path) in discover_home_rollouts(home, window) {
-        let Some(lines) = read_rollout(&root, &path, u64::MAX) else {
+    for (root, path) in discover_home_rollouts(home, Some(window)) {
+        let Some(read) = read_rollout(&root, &path, u64::MAX).filter(|read| read.complete) else {
             unreadable = true;
             continue;
         };
         read_any = true;
-        let (matched, folded) = fold_rollout_selected(&lines, &filter, window);
+        let (matched, folded) = fold_rollout_selected(&read.lines, &filter, Some(window));
         selected |= matched;
         rows.extend(folded);
     }

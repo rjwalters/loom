@@ -1033,24 +1033,6 @@ pub fn role_log_path(logs_dir: &Path, role: &str) -> PathBuf {
     logs_dir.join(format!("role-{role}.log"))
 }
 
-/// This tick's own slice of the append-only per-role log: everything after
-/// the LAST `==== loom-daemon role_runner: … ====` invocation header
-/// ([`model_resolution::role_log_header`]'s line), or `None` when the log
-/// predates the header.
-///
-/// The per-role-log counterpart of `api_keys_pool::ingest::region_after`'s
-/// `sweep_id=` anchor: a fresh line above the anchor never leaks into an
-/// older tick's region, and this tick's region never reads a stale record
-/// left by a previous one. #14664: a role tick's native session ids are
-/// parsed out of exactly this slice, so an earlier tick's `session id:`
-/// banner is never attributed to a later tick.
-#[must_use]
-pub fn last_invocation_region(contents: &str) -> Option<&str> {
-    contents
-        .rfind("==== loom-daemon role_runner:")
-        .map(|at| &contents[at..])
-}
-
 /// Append a one-line **pre-spawn skip marker** to the role's own log file
 /// (issue #6201, confirmed root cause).
 ///
@@ -2936,7 +2918,7 @@ pub fn observe_and_fire_idle(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut runner = ScriptRoleInvocationRunner::new(run_root.clone());
                 // Cross-host collision detection (#4623) — detection only.
-                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval)
+                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval).outcome
             })
             .await;
             let elapsed = tick_start.elapsed();
@@ -2993,17 +2975,16 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     role: &'static str,
     prompt: &str,
     interval: Duration,
-) -> RoleTickOutcome {
+) -> invocation::InvocationOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
     let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
-    // Ratification reviewer lane (#13345): a no-op unless `ratificationLane`
-    // is enabled for this root. Runs on the champion tick's blocking thread.
+    let invocation = invocation::InvocationOutcome::capture(outcome, runner);
     if role == "champion" {
         ratification_lane::tick_for_root(root, runner);
     }
-    outcome
+    invocation
 }
 
 /// Render a caught panic payload (`Box<dyn Any + Send>`, as produced by

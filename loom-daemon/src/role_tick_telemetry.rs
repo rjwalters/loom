@@ -214,6 +214,8 @@ pub struct ResolvedLaunch {
     /// The checkout the session's prompts are read from, as it stood
     /// immediately before the spawn (#11989).
     pub prompt: Option<prompt_tree::PromptTree>,
+    /// The Codex banner captured from this invocation's own output.
+    pub(crate) codex_session_id: Option<String>,
 }
 
 impl ResolvedLaunch {
@@ -226,6 +228,7 @@ impl ResolvedLaunch {
             effort: effort.to_string(),
             preference: None,
             prompt: None,
+            codex_session_id: None,
         }
     }
 
@@ -468,6 +471,9 @@ fn emit_tick(
     let prompt = resolved
         .as_ref()
         .and_then(|resolved| resolved.prompt.clone());
+    let codex_session_id = resolved
+        .as_ref()
+        .and_then(|launch| launch.codex_session_id.clone());
     let preference = resolved.and_then(|resolved| resolved.preference);
     let role_draw = preference
         .as_ref()
@@ -510,6 +516,7 @@ fn emit_tick(
         trace,
         step_context,
         step_runtime,
+        codex_session_id,
     );
 }
 
@@ -968,7 +975,7 @@ fn apply_runtime_attribution(
 /// `append_outcome_telemetry_journal`: any failure is logged and swallowed,
 /// because a telemetry write must never change whether a role keeps ticking.
 pub fn emit(tick: &RoleTickTelemetry) {
-    emit_correlated(tick, None, None, None);
+    emit_correlated(tick, None, None, None, None);
 }
 
 fn emit_correlated(
@@ -976,6 +983,7 @@ fn emit_correlated(
     trace: Option<crate::observability::lifecycle::RoleTrace>,
     step_context: Option<&TraceContext>,
     step_runtime: Option<&str>,
+    codex_session_id: Option<String>,
 ) {
     let (repo, visibility) = resolve_repo(&tick.root);
     // #14048: a step's launch facts live in ITS OWN per-item log
@@ -1055,22 +1063,14 @@ fn emit_correlated(
         })
         .flatten();
     let source = crate::usage_source::UsageSource::for_runtime(usage_runtime_name.as_deref());
-    // #14048: the exact native session ids this step's own log names — the
-    // strictly-more-precise attribution key for the OpenCode (event-stream
-    // `sessionID`) and Codex (`session id: <uuid>` banner) stores. A role
-    // tick's ids come from its own per-role log slice instead (#14664): the
-    // region after the last invocation header, so an earlier tick's banner is
-    // never attributed to a later one. Only the Codex arm keys a role tick on
-    // its ids today; OpenCode role ticks keep the directory + window key
-    // (OpenCode attribution is out of scope for #14664). An unreadable native
-    // step log has no attribution key.
+    // Steps retain their dispatch-region parser. Role ticks have a single
+    // Codex launch whose banner was captured by the runner (#14664).
     let session_ids = match step_log.as_ref() {
         Some((_, region)) => crate::usage_source::native_session_ids(region),
-        None if source.is_native_store() => {
-            let mut ids = crate::usage_source::role_tick_session_ids(&role_log);
-            ids.opencode.clear();
-            ids
-        }
+        None if tick.step_log.is_none() => crate::usage_source::NativeSessionIds {
+            opencode: Vec::new(),
+            codex: codex_session_id.into_iter().collect(),
+        },
         None => crate::usage_source::NativeSessionIds::default(),
     };
     use crate::observability::runtime_usage::missing::UsageMissing;

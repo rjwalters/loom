@@ -310,7 +310,7 @@ fn read_rollout_refuses_an_unauthorized_path_even_when_handed_one_directly() {
         home.join(SESSIONS_DIR).join("auth.json"),
     ] {
         assert!(path.is_file(), "fixture must exist: {}", path.display());
-        assert_eq!(read_rollout(&home, &path, u64::MAX), None, "{}", path.display());
+        assert!(read_rollout(&home, &path, u64::MAX).is_none(), "{}", path.display());
     }
 }
 
@@ -673,14 +673,14 @@ fn lookup_ids_says_why_no_rows_came_back() {
             ),
         ],
     );
-    let window = Some((instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z")));
+    let window = (instant("2026-09-21T01:00:00Z"), instant("2026-09-21T03:00:00Z"));
 
     // An empty id set is no key at all.
     assert_eq!(with_codex_home(&home, || lookup_ids(&[], window, None)), IdLookup::NotFound);
 
     // No rollout in the window's date directories anywhere: candidate data
     // absent, so nothing follows about the ids.
-    let far = Some((instant("2026-01-01T00:00:00Z"), instant("2026-01-02T00:00:00Z")));
+    let far = (instant("2026-01-01T00:00:00Z"), instant("2026-01-02T00:00:00Z"));
     assert_eq!(
         with_codex_home(&home, || lookup_ids(
             &["11111111-2222-3333-4444-555555555555".to_string()],
@@ -724,7 +724,7 @@ fn lookup_ids_says_why_no_rows_came_back() {
 
     // …and the window still applies: an id-named rollout outside it is NOT
     // selected, so the id + window key never degrades to id-alone.
-    let later = Some((instant("2026-09-21T03:00:01Z"), instant("2026-09-21T04:00:00Z")));
+    let later = (instant("2026-09-21T03:00:01Z"), instant("2026-09-21T04:00:00Z"));
     assert_eq!(
         with_codex_home(&home, || lookup_ids(
             &["11111111-2222-3333-4444-555555555555".to_string()],
