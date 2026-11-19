@@ -1,15 +1,14 @@
-//! Pure-tracker and row/span-building tests for `ops::disposition` (Issue
-//! #9222). `record`'s own impure wrapper is exercised only for its early
-//! return (no ops sink is ever registered in this test binary), exactly like
-//! `ops::dwell`'s `record_tick_without_sink_is_a_noop`.
+//! Tracker, sample and row/span-building tests for `ops::disposition`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 
 use super::*;
+use crate::observability::queue::QueueSink;
 use crate::telemetry::queue_repo::QueueRepoRef;
-use crate::telemetry::RepoVisibility;
+use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 use crate::types::{QueueDisposition as Qd, ReadyQueueRow, WorkFinderTickSummary};
 
 fn at(secs: i64) -> chrono::DateTime<Utc> {
@@ -757,7 +756,245 @@ async fn record_without_sink_is_a_noop() {
     // No ops sink is registered in this test binary: nothing panics, nothing
     // emits — mirrors `ops::dwell::record_tick_without_sink_is_a_noop`.
     let mut slug_cache = HashMap::new();
-    record(&mut slug_cache).await;
+    let mut sampler = Sampler::default();
+    record(&mut sampler, Some(&mut slug_cache)).await;
+    record(&mut sampler, None).await;
+    assert_eq!(sampler.last_sampled_tick, None);
+    assert_eq!(sampler.last_resolved_tick, None);
+}
+
+fn quiet_deliveries(poll_secs: u64, refresh_secs: i64) -> Vec<(i64, DateTime<Utc>)> {
+    let mut sampler = Sampler::default();
+    let rows = [row("acme/quiet", 7, 1, Qd::DeferredCapacity)];
+    let refresh = Duration::seconds(refresh_secs);
+    let source_period = crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS as i64;
+    (0..=3600)
+        .step_by(poll_secs as usize)
+        .filter_map(|poll| {
+            let source = at(poll / source_period * source_period);
+            let sample = sampler.consume(source, &rows, &[], refresh)?;
+            if sample.emissions.is_empty() {
+                return None;
+            }
+            assert_eq!(sample.emissions.len(), 1);
+            assert_eq!(sample.source_at, source);
+            // Polls run 25s out of phase with the whole source listings;
+            // delivery and the page read add 45s after the collector poll.
+            Some((poll + 25 + 45, sample.source_at))
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_rows_keep_positive_delivery_headroom_and_a_bounded_span_rate() {
+    let old = quiet_deliveries(300, 600);
+    assert_eq!(&old[..2], &[(70, at(0)), (670, at(600))]);
+    assert!(at(old[1].0 - 1) - old[0].1 > Duration::seconds(300));
+    assert_eq!(old.len() - 1, 6);
+
+    // Even a shorter threshold leaves a gap when the slow poll can see
+    // newer summaries only 300s apart and there is delivery latency.
+    let threshold_only = quiet_deliveries(300, 300);
+    assert_eq!(threshold_only[1], (370, at(300)));
+    assert!(at(threshold_only[1].0 - 1) - threshold_only[0].1 > Duration::seconds(300));
+
+    let fast_poll = crate::observability::collector::DISPOSITION_INTERVAL.as_secs();
+    let actual = quiet_deliveries(fast_poll, refresh_secs(None));
+    assert_eq!(&actual[..2], &[(70, at(0)), (250, at(180))]);
+    assert_eq!(actual.len() - 1, 20);
+    for window in actual.windows(2) {
+        let previous_observation = window[0].1;
+        let next_delivery = at(window[1].0);
+        assert!(next_delivery - previous_observation < Duration::seconds(300));
+    }
+
+    let overridden = quiet_deliveries(fast_poll, refresh_secs(Some("600")));
+    assert_eq!(overridden[1], (670, at(600)));
+}
+
+#[derive(Default)]
+struct RecordingQueue(Mutex<Vec<TelemetryEnvelope>>);
+
+impl QueueSink for RecordingQueue {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        self.0.lock().unwrap().push(envelope);
+    }
+
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+#[test]
+fn delayed_new_source_stays_old_and_both_paths_share_one_watermark() {
+    let queue = Arc::new(RecordingQueue::default());
+    let sink = super::super::OpsSink::new(queue.clone(), "host-quiet");
+    let mut sampler = Sampler::default();
+    let rows = [row("acme/quiet", 7, 1, Qd::DeferredCapacity)];
+    let refresh = Duration::seconds(refresh_secs(None));
+    let parent = TraceContext::derived("work-finder-tick", &["quiet-fixture"]);
+    let now = Utc::now();
+    let first_source = now - Duration::seconds(720);
+    let delayed_source = now - Duration::seconds(360);
+    sampler.consume(first_source, &rows, &[], refresh).unwrap();
+    sampler
+        .consume(delayed_source, &rows, &[], refresh)
+        .unwrap()
+        .offer(&sink, Some(&parent), &HashMap::new());
+    assert!(sampler
+        .consume(delayed_source, &rows, &[], refresh)
+        .is_none());
+    assert!(sampler.consume(first_source, &rows, &[], refresh).is_none());
+
+    let captured = queue.0.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let envelope = &captured[0];
+    let TelemetryRecord::Span(span) = &envelope.record else {
+        panic!("expected a disposition span");
+    };
+    assert_eq!(span.started_at, delayed_source);
+    assert_eq!(span.ended_at, delayed_source);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&parent.span_id));
+    assert_eq!(span.attributes["loom.queue.transition"], "refresh");
+    assert!(envelope.emitted_at >= now);
+    assert!(envelope.emitted_at - span.started_at > Duration::seconds(300));
+}
+
+#[test]
+fn missing_identity_partial_and_failed_keep_rows_until_a_whole_departure() {
+    let known = repos_with_repo();
+    let cache = |root: &str| known.get(root).cloned();
+    let unknown = HashMap::new();
+    let queued = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    let refresh = Duration::seconds(refresh_secs(None));
+    let mut sampler = Sampler::default();
+    let sample = |sampler: &mut Sampler, summary: WorkFinderTickSummary, repos: &HashMap<_, _>| {
+        let roots = summary_roots(&summary);
+        let failed = failed_slugs(&summary, &roots, repos, cache);
+        let (rows, _) = build_rows(&summary, repos);
+        sampler
+            .consume(summary.at, &rows, &failed, refresh)
+            .unwrap()
+            .emissions
+    };
+    let whole = |seconds| WorkFinderTickSummary {
+        at: at(seconds),
+        queue: vec![queued.clone()],
+        ..Default::default()
+    };
+    let summary = whole(0);
+    let roots = summary_roots(&summary);
+    assert!(sampler.cached_repos(&roots, |_| None).is_empty());
+    assert_eq!(sampler.cached_repos(&roots, cache), known);
+    assert_eq!(sample(&mut sampler, summary, &known)[0].transition, Transition::Changed);
+    let unresolved = whole(180);
+    let roots = summary_roots(&unresolved);
+    sampler.note_resolution(&roots, &unknown);
+    assert!(sampler.cached_repos(&roots, cache).is_empty());
+    assert!(sample(&mut sampler, whole(180), &unknown).is_empty());
+    assert!(sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(240),
+            listing_incomplete: vec!["/repo".into()],
+            ..Default::default()
+        },
+        &known
+    )
+    .is_empty());
+    assert!(sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(300),
+            listing_failed: vec!["/repo".into()],
+            ..Default::default()
+        },
+        &unknown
+    )
+    .is_empty());
+    sampler.note_resolution(&roots, &known);
+    assert_eq!(sampler.cached_repos(&roots, cache), known);
+    assert_eq!(sample(&mut sampler, whole(360), &known)[0].transition, Transition::Refresh);
+    let empty = |seconds| WorkFinderTickSummary {
+        at: at(seconds),
+        ..Default::default()
+    };
+    assert_eq!(sample(&mut sampler, empty(420), &known)[0].transition, Transition::LeftQueue);
+    assert!(sample(&mut sampler, empty(480), &known).is_empty());
+}
+
+#[test]
+fn a_persistent_cold_root_does_not_stall_warm_repo_heartbeats() {
+    let known = HashMap::from([
+        ("/warm".to_string(), repo_ref("acme/warm")),
+        ("/failed".to_string(), repo_ref("acme/failed")),
+    ]);
+    let warm_only = HashMap::from([("/warm".to_string(), known["/warm"].clone())]);
+    let cache = |root: &str| known.get(root).cloned();
+    let refresh = Duration::seconds(refresh_secs(None));
+    let warm = summary_row("/warm", 1, 1, Qd::DeferredCapacity, None);
+    let failed = summary_row("/failed", 2, 2, Qd::DeferredCapacity, None);
+    let unknown = summary_row("/cold", 3, 3, Qd::DeferredCapacity, None);
+    let mut sampler = Sampler::default();
+
+    let first = WorkFinderTickSummary {
+        at: at(0),
+        queue: vec![warm.clone(), failed],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&first, &known);
+    assert_eq!(
+        sampler
+            .consume(first.at, &rows, &[], refresh)
+            .unwrap()
+            .emissions
+            .len(),
+        2
+    );
+    sampler.note_resolution(&HashSet::from(["/failed"]), &HashMap::new());
+
+    for second in [180, 360] {
+        let mixed = WorkFinderTickSummary {
+            at: at(second),
+            queue: vec![warm.clone(), unknown.clone()],
+            listing_failed: vec!["/failed".into()],
+            ..Default::default()
+        };
+        let roots = summary_roots(&mixed);
+        let repos = sampler.cached_repos(&roots, cache);
+        assert_eq!(repos, warm_only);
+        let (rows, _) = build_rows(&mixed, &repos);
+        let protected = failed_slugs(&mixed, &roots, &repos, cache);
+        assert_eq!(protected, ["acme/failed"]);
+        let sample = sampler
+            .consume(mixed.at, &rows, &protected, refresh)
+            .unwrap();
+        assert_eq!(sample.emissions.len(), 1);
+        assert_eq!(sample.emissions[0].slug, "acme/warm");
+        assert_eq!(sample.emissions[0].transition, Transition::Refresh);
+        assert!(sampler
+            .consume(mixed.at, &rows, &protected, refresh)
+            .is_none());
+    }
+
+    // The cached identity stops protecting the old key once a whole source
+    // listing confirms it departed, while the unrelated cold root remains.
+    let whole = WorkFinderTickSummary {
+        at: at(420),
+        queue: vec![warm, unknown],
+        ..Default::default()
+    };
+    let roots = summary_roots(&whole);
+    let repos = sampler.cached_repos(&roots, cache);
+    let (rows, _) = build_rows(&whole, &repos);
+    let protected = failed_slugs(&whole, &roots, &repos, cache);
+    let sample = sampler
+        .consume(whole.at, &rows, &protected, refresh)
+        .unwrap();
+    assert_eq!(sample.emissions.len(), 1);
+    assert_eq!(sample.emissions[0].slug, "acme/failed");
+    assert_eq!(sample.emissions[0].transition, Transition::LeftQueue);
 }
 
 #[test]
