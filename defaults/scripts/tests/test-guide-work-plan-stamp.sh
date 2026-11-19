@@ -52,7 +52,8 @@
 #           rendered body (round-trip).
 #        d. changed render INSIDE the debounce window => no write -- the
 #           stamp must not offer a side door around the #5890 gate.
-#        e. first-ever generation (no markers at all) => write-worthy.
+#        e. first-ever generation (no plan file) => create a plan.
+#        f. existing plan missing either marker => failed splice, no output.
 #   6. The stamp prepend sits AFTER the debounce gate inside
 #      update_work_plan() (byte-offset order check on the extracted function
 #      body, comments included -- the splice step is a comment there).
@@ -93,11 +94,16 @@ if [[ ! -f "$GUIDE_MD" ]]; then
     exit 1
 fi
 
-# Extract the two #13909 helpers VERBATIM from guide.md and define them in
+# Extract the write helpers verbatim from guide.md and define them in
 # this shell, so the test executes exactly what the prompt ships (same
 # extraction discipline as test-guide-work-plan-debounce.sh's jq filter).
 plan_stamp_line_def="$(awk '/^plan_stamp_line\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
 strip_plan_stamp_def="$(awk '/^strip_plan_stamp\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+splice_plan_body_def="$(awk '/^splice_plan_body\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+if [[ -z "$splice_plan_body_def" ]] || ! eval "$splice_plan_body_def"; then
+    fail "could not load splice_plan_body() from guide.md"
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Test 1: guide.md defines the helpers and wires strip_plan_stamp into the
@@ -217,13 +223,17 @@ assert_eq "$OUT" "$(printf '%s\n%s' "## Ready" "$STALE_STAMP")" \
 # it (extraction pipeline verbatim, debounce arithmetic as in
 # test-guide-work-plan-debounce.sh). $1 = rendered body, $2 = plan file,
 # $3 = last_merged_epoch, $4 = now_epoch, $5 = debounce_secs,
-# $6 = output file (written only on a WRITE decision, mimicking "a
-# suppressed or unchanged tick writes nothing").
+# $6 = output file, published only after a successful existing-file splice.
+# CREATE models the separate first-file decision and publishes no fixture.
 # ---------------------------------------------------------------------------
 work_plan_tick() {
     local rendered="$1" plan_file="$2" last_merged_epoch="$3" now_epoch="$4" debounce_secs="$5" out_file="$6"
     local new_body old_body
     new_body="$rendered"
+    if [[ ! -e "$plan_file" ]]; then
+        echo "CREATE"
+        return 0
+    fi
     old_body="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
         "$plan_file" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
@@ -239,15 +249,13 @@ work_plan_tick() {
         return 0
     fi
 
-    # The #13909 splice: region first line is a fresh "$(plan_stamp_line)",
-    # directly above the new body, markers and everything outside untouched.
-    local stamp
-    stamp="$(plan_stamp_line)"
-    awk -v stamp="$stamp" -v body="$new_body" '
-        /^<!-- guide:plan-body:start -->$/ { print; print stamp; print body; skip=1; next }
-        /^<!-- guide:plan-body:end -->$/   { skip=0; print; next }
-        !skip { print }
-    ' "$plan_file" > "$out_file"
+    # Run the shipped splice on a copy, then expose the result to assertions.
+    local stamp DOCS_WT
+    stamp="$(plan_stamp_line)" || return 1
+    DOCS_WT="$(mktemp -d "$FIXTURE_DIR/splice.XXXXXX")" || return 1
+    cp "$plan_file" "$DOCS_WT/WORK_PLAN.md" || return 1
+    splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
+    mv "$DOCS_WT/WORK_PLAN.md" "$out_file" || return 1
     echo "WRITE"
 }
 
@@ -266,13 +274,14 @@ trap cleanup_fixtures EXIT
 
 PLAN_STAMPED="$FIXTURE_DIR/WORK_PLAN.stamped.md"
 PLAN_LEGACY="$FIXTURE_DIR/WORK_PLAN.legacy.md"
-PLAN_UNMARKED="$FIXTURE_DIR/WORK_PLAN.unmarked.md"
+PLAN_ABSENT="$FIXTURE_DIR/WORK_PLAN.absent.md"
 
 {   printf '%s\n\n' "$PLAN_HEADER"
     printf '<!-- guide:plan-body:start -->\n'
     printf '%s\n' "$STALE_STAMP"
     printf '%s\n' "$REGION_BODY"
     printf '<!-- guide:plan-body:end -->\n'
+    printf '\nNotes below the generated plan.\n'
 } > "$PLAN_STAMPED"
 
 {   printf '%s\n\n' "$PLAN_HEADER"
@@ -281,14 +290,15 @@ PLAN_UNMARKED="$FIXTURE_DIR/WORK_PLAN.unmarked.md"
     printf '<!-- guide:plan-body:end -->\n'
 } > "$PLAN_LEGACY"
 
-printf '%s\n' "$PLAN_HEADER" > "$PLAN_UNMARKED"
+cp "$PLAN_STAMPED" "$FIXTURE_DIR/stamped-before.md" || exit 1
+cp "$PLAN_LEGACY" "$FIXTURE_DIR/legacy-before.md" || exit 1
 
 CHANGED_BODY='## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
 - **#42**: demo fixture issue
-- **#43**: a second issue merged since the last snapshot'
+- **#43**: a second issue merged from `C:\new\work` since the last snapshot'
 
 DEBOUNCE=3600
 LAST_MERGE=1000000
@@ -303,10 +313,10 @@ rm -f "$OUT_FILE"
 DECISION="$(work_plan_tick "$REGION_BODY" "$PLAN_STAMPED" "$LAST_MERGE" "$ELAPSED_TICK" "$DEBOUNCE" "$OUT_FILE")"
 assert_eq "$DECISION" "SKIP-current" \
     "a stale stamp with unchanged label-derived content is 'current'"
-if [[ ! -e "$OUT_FILE" ]]; then
-    pass "the no-change tick with a stale stamp wrote nothing (worktree stays clean)"
+if [[ ! -e "$OUT_FILE" ]] && cmp -s "$PLAN_STAMPED" "$FIXTURE_DIR/stamped-before.md"; then
+    pass "the unchanged tick with a stale stamp left its input intact and wrote no output"
 else
-    fail "the no-change tick with a stale stamp wrote a file -- a stamp-only diff PR"
+    fail "the unchanged tick with a stale stamp changed its input or produced output"
 fi
 
 echo ""
@@ -317,13 +327,21 @@ rm -f "$OUT_FILE"
 DECISION="$(work_plan_tick "$REGION_BODY" "$PLAN_LEGACY" "$LAST_MERGE" "$ELAPSED_TICK" "$DEBOUNCE" "$OUT_FILE")"
 assert_eq "$DECISION" "SKIP-current" \
     "a pre-#13909 region with unchanged content compares equal after normalization"
+if [[ ! -e "$OUT_FILE" ]] && cmp -s "$PLAN_LEGACY" "$FIXTURE_DIR/legacy-before.md"; then
+    pass "the unchanged legacy tick left its input intact and wrote no output"
+else
+    fail "the unchanged legacy tick changed its input or produced output"
+fi
 
 echo ""
 echo "Test 5c: a changed render (debounce elapsed) writes a fresh-stamped region"
 
 OUT_FILE="$FIXTURE_DIR/out-5c.md"
 rm -f "$OUT_FILE"
-DECISION="$(work_plan_tick "$CHANGED_BODY" "$PLAN_STAMPED" "$LAST_MERGE" "$ELAPSED_TICK" "$DEBOUNCE" "$OUT_FILE")"
+if ! DECISION="$(work_plan_tick "$CHANGED_BODY" "$PLAN_STAMPED" "$LAST_MERGE" "$ELAPSED_TICK" "$DEBOUNCE" "$OUT_FILE")"; then
+    fail "the shipped splice failed for a marked plan"
+    exit 1
+fi
 assert_eq "$DECISION" "WRITE" \
     "a genuine label-state change past the debounce window writes"
 
@@ -342,10 +360,13 @@ fi
 # Round-trip: re-extracting + re-stripping the spliced region must yield
 # exactly the rendered body -- the normalization and the splice are inverse
 # operations, or the NEXT tick would manufactured a phantom diff.
-ROUNDTRIP="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
-    "$OUT_FILE" | sed '1d;$d' | strip_plan_stamp)"
-assert_eq "$ROUNDTRIP" "$CHANGED_BODY" \
-    "re-extract + re-strip the spliced region yields exactly the rendered body (round-trip)"
+if cmp -s <(printf '%s\n' "$CHANGED_BODY") \
+          <(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
+              "$OUT_FILE" | sed '1d;$d' | strip_plan_stamp); then
+    pass "re-extracting and stripping the stamp yields the exact rendered body bytes"
+else
+    fail "the spliced body differs from the rendered body"
+fi
 
 # The header and markers survived the splice untouched.
 if cmp -s <(sed -n '1,/^<!-- guide:plan-body:start -->$/p' "$PLAN_STAMPED") \
@@ -353,6 +374,12 @@ if cmp -s <(sed -n '1,/^<!-- guide:plan-body:start -->$/p' "$PLAN_STAMPED") \
     pass "everything above the start marker is byte-identical after the splice"
 else
     fail "the splice touched content above the start marker"
+fi
+if cmp -s <(sed -n '/^<!-- guide:plan-body:end -->$/,$p' "$PLAN_STAMPED") \
+          <(sed -n '/^<!-- guide:plan-body:end -->$/,$p' "$OUT_FILE"); then
+    pass "the end marker and footer are byte-identical after the splice"
+else
+    fail "the splice touched the end marker or footer"
 fi
 
 echo ""
@@ -363,20 +390,43 @@ rm -f "$OUT_FILE"
 DECISION="$(work_plan_tick "$CHANGED_BODY" "$PLAN_STAMPED" "$LAST_MERGE" "$INSIDE_TICK" "$DEBOUNCE" "$OUT_FILE")"
 assert_eq "$DECISION" "SKIP-debounce" \
     "a genuine diff inside the debounce window is suppressed (the stamp adds no side door around #5890)"
-if [[ ! -e "$OUT_FILE" ]]; then
-    pass "the debounce-suppressed tick wrote nothing"
+if [[ ! -e "$OUT_FILE" ]] && cmp -s "$PLAN_STAMPED" "$FIXTURE_DIR/stamped-before.md"; then
+    pass "the stamped input stayed intact and the debounce-suppressed tick wrote no output"
 else
-    fail "the debounce-suppressed tick wrote a file"
+    fail "the stamped input changed or the debounce-suppressed tick produced output"
 fi
 
 echo ""
-echo "Test 5e: first-ever generation (no markers at all) is write-worthy"
+echo "Test 5e: first-ever generation takes the create path"
 
 OUT_FILE="$FIXTURE_DIR/out-5e.md"
 rm -f "$OUT_FILE"
-DECISION="$(work_plan_tick "$REGION_BODY" "$PLAN_UNMARKED" 0 1000000 "$DEBOUNCE" "$OUT_FILE")"
-assert_eq "$DECISION" "WRITE" \
-    "an empty extraction (no committed region) never compares equal, so the first generation writes"
+DECISION="$(work_plan_tick "$REGION_BODY" "$PLAN_ABSENT" 0 1000000 "$DEBOUNCE" "$OUT_FILE")"
+assert_eq "$DECISION" "CREATE" "the first generation calls for creation without a splice"
+if [[ -e "$OUT_FILE" ]]; then
+    fail "the first-generation decision produced a splice output"
+fi
+
+echo ""
+echo "Test 5f: an existing plan missing either marker refuses the splice"
+
+for missing_marker in start end; do
+    plan_file="$FIXTURE_DIR/missing-$missing_marker.md"
+    OUT_FILE="$FIXTURE_DIR/out-missing-$missing_marker.md"
+    sed "/^<!-- guide:plan-body:$missing_marker -->$/d" "$PLAN_STAMPED" > "$plan_file" || exit 1
+    cp "$plan_file" "$plan_file.before" || exit 1
+    if DECISION="$(work_plan_tick "$CHANGED_BODY" "$plan_file" "$LAST_MERGE" "$ELAPSED_TICK" "$DEBOUNCE" "$OUT_FILE")"; then
+        fail "a plan without its $missing_marker marker appeared to succeed: $DECISION"
+    else
+        pass "a plan without its $missing_marker marker returns a failure"
+    fi
+    assert_eq "$DECISION" "" "no successful write reported without the $missing_marker marker"
+    if [[ ! -e "$OUT_FILE" ]] && cmp -s "$plan_file" "$plan_file.before"; then
+        pass "missing $missing_marker marker left the input intact and wrote no output"
+    else
+        fail "missing $missing_marker marker changed the input or produced output"
+    fi
+done
 
 trap - EXIT
 cleanup_fixtures
