@@ -1073,7 +1073,7 @@ fn an_allowed_target_is_written_in_order_by_both_binaries() {
         "--remove-label",
         "loom:building",
     ];
-    let mut park_out = None;
+    let mut park_outs: Vec<String> = Vec::new();
     for bin in [TOOLS, DAEMON] {
         let _ = std::fs::remove_file(&log);
         let o = shim_run(bin, tmp.path(), &cwd, &shim, &park_args, None);
@@ -1084,21 +1084,13 @@ fn an_allowed_target_is_written_in_order_by_both_binaries() {
         assert!(out.contains("LABELS_ADD=loom:blocked"), "{bin}: {out}");
         assert!(out.contains("LABELS_REMOVE=loom:building"), "{bin}: {out}");
         assert_write_order(&log, true, true, true);
-        if bin == TOOLS {
-            park_out = Some(out.to_string());
-        }
+        park_outs.push(out.to_string());
     }
     // The daemon handler prints the same APPLIED block (parity on the write).
-    let mut d = base(DAEMON, tmp.path(), &cwd);
-    d.env("PATH", format!("{}:/usr/bin:/bin", shim.display()))
-        .args(park_args);
-    let d_run = run(d, None);
-    let d_out = String::from_utf8_lossy(&d_run.stdout);
-    assert_eq!(
-        park_out.as_deref().map(str::trim_end),
-        Some(d_out.trim_end()),
-        "park apply stdout differs"
-    );
+    // Both outputs come from the isolated `shim_run` runs above: a third,
+    // unisolated daemon run would write host-global cache entries.
+    assert_eq!(park_outs.len(), 2, "one park apply per binary");
+    assert_eq!(park_outs[0].trim_end(), park_outs[1].trim_end(), "park apply stdout differs");
 
     // operator-decision apply on the same issue: body first, then the
     // loom:operator label; no removal (nothing to remove).
@@ -1285,13 +1277,13 @@ fn nested_filing_runs_create_issue_sh_and_surfaces_the_refusal_in_tools_only() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = managed_checkout(tmp.path(), "git@github.com:acme/widgets.git");
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
-    let status = Command::new("cp")
+    let copy = Command::new("cp")
         .args(["-r"])
         .arg(&src)
         .arg(cwd.join(".loom").join("scripts"))
         .output()
         .unwrap();
-    assert!(status.status.success(), "cp -r defaults/scripts failed");
+    assert!(copy.status.success(), "cp -r defaults/scripts failed");
     let (shim, log) = recording_gh_allowed(tmp.path(), "hello", None);
     let path = format!("{}:/usr/bin:/bin", shim.display());
     let args = [
@@ -1309,8 +1301,8 @@ fn nested_filing_runs_create_issue_sh_and_surfaces_the_refusal_in_tools_only() {
     // Tools-only root: vetted, then refused at the nested call. No write of
     // its own, no fallback create. This runs FIRST: the probe's snapshot
     // cache (a shared on-disk store) must be cold here, so the vetting is
-    // visible as recorded gh calls; the daemon run below may then answer the
-    // same probe from that cache.
+    // visible as recorded gh calls. The daemon run below uses its own cache
+    // directory (`nested-daemon`), so it cannot reuse this run's cache.
     let _ = std::fs::remove_file(&log);
     {
         let mut c = base(TOOLS, tmp.path(), &cwd);
