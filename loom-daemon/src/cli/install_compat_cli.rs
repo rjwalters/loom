@@ -21,7 +21,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
-pub(crate) enum InstallCompatCommand {
+pub enum InstallCompatCommand {
     /// Print this daemon's side of the contract; with `--repo`, also the
     /// repo's recorded side and the classification.
     Show(ShowArgs),
@@ -30,7 +30,7 @@ pub(crate) enum InstallCompatCommand {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct ShowArgs {
+pub struct ShowArgs {
     /// A repo clone whose default-branch `.loom/install-metadata.json` to
     /// classify against this daemon.
     #[arg(long, value_name = "PATH")]
@@ -41,7 +41,7 @@ pub(crate) struct ShowArgs {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct CheckArgs {
+pub struct CheckArgs {
     /// The checkout under test. Defaults to the current directory.
     #[arg(long, value_name = "PATH", default_value = ".")]
     repo_root: PathBuf,
@@ -75,7 +75,7 @@ pub(crate) struct CheckArgs {
 }
 
 impl InstallCompatCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         match self {
             Self::Show(args) => args.run(),
             Self::Check(args) => args.run(),

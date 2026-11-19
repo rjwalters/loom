@@ -100,6 +100,47 @@ fn hold_diagnostics_read_only_parity() {
 }
 
 #[test]
+fn ratification_walks_files_and_trusted_comments_and_refuses_partial_listings() {
+    const ARGV: &[&str] = &[
+        "champion-hold",
+        "ratification",
+        "--pr",
+        "12",
+        "--repo",
+        "acme/role-probe",
+    ];
+    const WALK: &[(&str, &str)] = &[("LOOM_GH_PAGE_WALK", "1")];
+    compare(|f, bin| {
+        f.set("paginated-ratification", "");
+        let legacy = f.call(bin, ARGV, &[]);
+        let walked = f.call(bin, ARGV, WALK);
+        assert_eq!(walked, legacy);
+        assert!(walked.status.success(), "{walked:?}");
+        let stdout = String::from_utf8_lossy(&walked.stdout);
+        assert!(stdout.contains("verdict=hold action=stands"));
+        assert!(stdout.contains("files=spec/workflow.md"));
+        let calls = f.get("calls");
+        for endpoint in ["pulls/12/files", "issues/12/comments"] {
+            assert!(calls.contains(&format!("{endpoint}?per_page=100&page=2")), "{calls}");
+        }
+        let mut outputs = vec![walked];
+        for (failure, diagnostic) in [
+            ("fail-files", "file list"),
+            ("fail-comments", "trusted comments"),
+        ] {
+            f.set(failure, "");
+            let out = f.call(bin, ARGV, WALK);
+            assert_eq!(out.status.code(), Some(3), "{out:?}");
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains(diagnostic), "{out:?}");
+            fs::remove_file(f.root().join(failure)).unwrap();
+            outputs.push(out);
+        }
+        outputs
+    });
+}
+
+#[test]
 fn curation_retries_complete_stale_cleanup() {
     compare(|f, bin| {
         f.set("labels", r#"["points:2","important"]"#);
@@ -204,7 +245,12 @@ fn implicit_notification_cannot_follow_a_different_gh_repo() {
     f.set("body", PARK);
     f.set("labels", r#"["loom:blocked"]"#);
     let out = f.call(TOOLS, NOTIFY, &[("GH_REPO", "other/project")]);
-    assert!(out.status.success() && !out.stderr.is_empty(), "{out:?}");
+    assert!(out.status.success(), "{out:?}");
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        diagnostic.contains("other/project") && diagnostic.contains("acme/role-probe"),
+        "{out:?}"
+    );
     assert!(f.get("comments").is_empty());
     assert_eq!(f.get("labels"), r#"["loom:blocked"]"#);
 }

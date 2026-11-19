@@ -747,12 +747,12 @@ still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
 | Verb or family | Reason |
 | --- | --- |
 | `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link`, `merge-queue enqueue\|dequeue\|reconcile\|handoff\|step\|revoke\|group-check\|authorize-check` | write the forge, a local journal or lock, or were not shown to be read-only (`authorize-check` and `group-check` post or compute merge-authorization state). #14396 |
-| `merge-pr*` | merge integration is #14396 / #8191 |
+| `merge-pr*` | merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
-| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
-| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree, claim and lease commands | #14397 |
+| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
+| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
+| Worktree operations, checkout claims and issue leases | #14397 and its child issues. Role-keyed PR leases are available through `loom-tools lease pr` (#14489, §13.6). |
 
 ### 13.4 Gitea decision
 
@@ -772,7 +772,79 @@ No wrapper or locator changed. `loom_tools_serves` in
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
 which can now read the served list from `capabilities --json`.
 
-### 13.6 Hold evidence, curation and blocker notification (#14465)
+### 13.6 Role-keyed PR leases (#14489)
+
+`loom-tools lease pr claim|check|fence|release` shares the daemon CLI's
+arguments, handlers, lease states and result codes. GitHub actions resolve
+mode from the same canonical checkout selected by `--workspace`. Fleet
+reads use the configured gateway or reader pool. If neither can serve the
+request, the lease handler keeps its unreadable-state behavior. Writes use
+the existing repository scope and writer. In session and local-daemon modes, the local
+credential serves both and inherited fleet read routing is discarded.
+
+A successful claim starts the internal `renew-loop` in the same executable.
+The child receives the canonical workspace and the selected mode, then
+initializes its own read route before any forge operations. The watcher PID,
+process start identity and lease ownership guard keep detached renewal tied
+to the original claim. On Gitea, agent-facing leases return success with
+the label-only diagnostic and perform no forge lease operations. Scheduled
+`attach` and `reap` remain daemon service commands. Tools return 64 for them.
+
+### 13.7 Top-level reads and config inspection (#14429)
+
+The Phase 3a follow-up (epic #12708): the remaining top-level read commands
+and the config-inspection commands, the same story one level up from §13.1.
+`loom-tools <cmd>` parses the same clap tree and runs the same handler
+`loom-daemon <cmd>` runs (`cli/pr_queue.rs`, `cli/premise_check.rs`,
+`cli/duplicate_scan.rs`, `cli/points_marker_check.rs`,
+`cli/label_duplicates.rs`, `cli/forge_probe_cmd.rs`,
+`cli/forge_inventory_cmd.rs`, `cli/affected_files_check.rs`,
+`cli/stale_blocked.rs`, `cli/labels_cmd.rs`, `cli/skip_labels.rs`,
+`cli/roles_draw_cmd.rs`, `cli/guards_status.rs`,
+`cli/install_compat_cli.rs`, `cli/hooks_home_cmd.rs`); no handler was copied
+or moved, and every `loom-daemon` entry point is unchanged.
+
+Migrated: `labels`, `pr-queue`, `premise-check`, `duplicate-scan`,
+`check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`,
+`affected-files`, `check-stale-blocked` (top-level reads); `skip-labels`,
+`roles`, `guards`, `install-compat`, `hooks-home` (config inspection).
+`fleet-config` stays in `loom-daemon`: it reaches the workspace registry
+(§3.6) and does not degrade cleanly with an empty one.
+
+Each handler was read before migrating (#14396 holds everything that
+writes), which moved three commands onto the refusal pattern rather than
+onto the plain passthrough:
+
+| Command | Refused form (exit `EX_WRITE_VERB_NOT_MIGRATED` = 64) | Why |
+| --- | --- | --- |
+| `labels` | `generate --write`, `undeclared --prune`, `migrate --apply` | rewrite the `labels.yml` copies / the forge's labels; the dry-run and report forms are served |
+| `forge-probe` | `--live-write` | executes the probe manifest's write cases; the read-only run is served |
+| `forge-inventory` | `gate --update` | rewrites the change-gate baseline; every other verb is served |
+
+The classifiers (`LabelsArgs::is_read`, `ForgeProbeArgs::is_read`,
+`ForgeInventoryCommand::is_read`) are exhaustive `match`es with no wildcard
+arm, so a new form does not compile until its author says which side it is
+on — the §13.1 rule at flag granularity.
+
+Mode: only the invocations that can reach the forge pass the gate
+(`reaches_forge`): `pr-queue` without `--input`, `premise-check --issue`,
+`forge-probe`, `check-stale-blocked`, and `labels undeclared` / `migrate`
+(whose dry runs read the repo's labels). The rest — the whole config-
+inspection family, `duplicate-scan`, `check-points-marker`,
+`label-duplicates`, `affected-files`, `forge-inventory`, `labels`' registry
+forms — touch nothing but argv, stdin, local git objects or local files and
+skip the gate. `install-compat` is ungated like `release-fetch` (#12940):
+its `check --fetch-old-daemon` fetches a release artifact, not a forge read.
+
+Capability source unchanged: `install_compat::TOOLS_COMMANDS` is the one
+list; `capabilities --json` and `install-compat show --json` both print
+these fifteen entries as `tools_commands` (`CAPABILITIES_SCHEMA_VERSION`
+unchanged — an added key would be the only reason to bump), and the
+`bin/loom_tools.rs` unit test still fails when the list and the clap tree
+disagree. The Gitea stance is §13.4's: these commands' forge reads (their
+`gh` calls) keep whatever the facade and the shell adapter already do.
+
+### 13.8 Hold evidence, curation and blocker notification (#14465)
 
 Both binaries dispatch these commands to the same Rust handlers. All four
 `champion-hold` verbs read evidence. The caller posts the marker printed by

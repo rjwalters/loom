@@ -14,9 +14,12 @@ with (root / "calls").open("a") as log:
     print(json.dumps(args), file=log)
 
 
-def reply(value):
+def reply(value, next_page=None):
     if "--include" in args or "-i" in args:
-        sys.stdout.write("HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n")
+        sys.stdout.write("HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n")
+        if next_page:
+            sys.stdout.write(f'Link: <{next_page}>; rel="next"\r\n')
+        sys.stdout.write("\r\n")
     print(json.dumps(value))
     sys.exit(0)
 
@@ -68,7 +71,26 @@ if "graphql" in args:
             }
         }
     )
-path = next((a.split("?")[0] for a in args if a.startswith("repos/")), "")
+endpoint = next(
+    (a.removeprefix("https://api.github.com/") for a in args
+     if a.startswith(("repos/", "https://api.github.com/repos/"))),
+    "",
+)
+path, _, query = endpoint.partition("?")
+paginated_ratification = (root / "paginated-ratification").exists()
+
+
+def ratification_pages(second_page):
+    assert "--jq" not in args
+    if "--paginate" in args:
+        reply(second_page)
+    assert "--include" in args and "per_page=100" in query
+    if "page=2" in query.split("&"):
+        if (root / f"fail-{path.rsplit('/', 1)[1]}").exists():
+            sys.exit(1)
+        reply(second_page)
+    reply([], f"https://api.github.com/{path}?per_page=100&page=2")
+
 if path == prefix:
     if "--jq" in args:
         if os.getenv("PERMISSION") == "unknown":
@@ -105,6 +127,14 @@ if path == f"{prefix}/issues/12":
         }
     )
 if path == f"{prefix}/issues/12/comments":
+    if paginated_ratification:
+        ratification_pages([
+            {
+                "body": "<!-- champion:ratification-hold -->\n<!-- champion:hold-state head=abc -->",
+                "user": {"login": "maintainer"},
+                "author_association": "OWNER",
+            }
+        ])
     reply(
         [
             {"body": b, "user": {"login": "maintainer"}, "author_association": "OWNER"}
@@ -130,5 +160,11 @@ if path == f"{prefix}/issues/12/labels/points%3A2":
 if path == f"{prefix}/pulls/12":
     reply({"head": {"sha": "abc"}, "base": {"ref": "main"}})
 if path == f"{prefix}/pulls/12/files":
+    if paginated_ratification:
+        ratification_pages([{"filename": "spec/workflow.md", "status": "modified"}])
+    reply([])
+if path == f"{prefix}/contents/spec/workflow.md":
+    assert query == "ref=abc"
+    print("Ratified only by the operator.")
     sys.exit(0)
 sys.exit(2)

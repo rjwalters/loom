@@ -28,9 +28,11 @@ use crate::champion_hold::classify::{
     stray_operator_candidate, with_stacked_base, PrClass,
 };
 use crate::cmd_out::{CmdOutcome, DEFAULT_TIMEOUT};
+use crate::comment_trust::records::parse_records;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use anyhow::Result;
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(clap::Subcommand)]
 pub enum ChampionHoldCommand {
@@ -96,7 +98,7 @@ pub struct TargetArgs {
 }
 
 /// Use the same reader routing for the evidence and its trusted comment listing.
-fn read(repo: &str, args: &[&str], root: &std::path::Path) -> CmdOutcome {
+fn read(repo: &str, args: &[&str], root: &Path) -> CmdOutcome {
     let target = if repo == "{owner}/{repo}" {
         GhTarget::None
     } else {
@@ -113,7 +115,7 @@ fn read(repo: &str, args: &[&str], root: &std::path::Path) -> CmdOutcome {
     .run()
 }
 
-fn trusted_comments(repo: &str, pr: u64, root: &std::path::Path) -> Option<Vec<Value>> {
+fn trusted_comments(repo: &str, pr: u64, root: &Path) -> Option<Vec<Value>> {
     let path = format!("repos/{repo}/issues/{pr}/comments");
     let listing = crate::comment_trust::records::fetch_comment_listing_with(
         || {
@@ -132,7 +134,7 @@ impl TargetArgs {
     }
 
     /// The PR's trusted comment bodies, oldest first. `None` when unreadable.
-    fn trusted_bodies(&self, root: &std::path::Path) -> Option<Vec<String>> {
+    fn trusted_bodies(&self, root: &Path) -> Option<Vec<String>> {
         let comments = trusted_comments(self.repo(), self.pr, root)?;
         Some(
             comments
@@ -143,7 +145,7 @@ impl TargetArgs {
     }
 
     /// The PR's label names, live. `None` when unreadable.
-    fn labels(&self, root: &std::path::Path) -> Option<Vec<String>> {
+    fn labels(&self, root: &Path) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{}/labels?per_page=100", self.repo(), self.pr);
         let out = read(self.repo(), &["api", &path], root);
         let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
@@ -151,7 +153,7 @@ impl TargetArgs {
     }
 
     /// A live REST read of `path`, decoded. `None` when unreadable.
-    fn read_json(repo: &str, path: &str, root: &std::path::Path) -> Option<Value> {
+    fn read_json(repo: &str, path: &str, root: &Path) -> Option<Value> {
         let out = read(repo, &["api", path], root);
         serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()
     }
@@ -160,7 +162,7 @@ impl TargetArgs {
     /// One read of the PR for `base.ref`; the parent is not looked up (an
     /// open, merged or closed parent all mean "do not merge here"). `Err`
     /// when the base could not be read.
-    fn loom_stack_base(&self, root: &std::path::Path) -> Result<Option<String>, &'static str> {
+    fn loom_stack_base(&self, root: &Path) -> Result<Option<String>, &'static str> {
         let pull =
             Self::read_json(self.repo(), &format!("repos/{}/pulls/{}", self.repo(), self.pr), root)
                 .ok_or("base")?;
@@ -175,7 +177,14 @@ fn unreadable(verb: &str, pr: u64, what: &str) -> ! {
 
 impl ChampionHoldCommand {
     pub fn run(self) -> Result<()> {
+        self.run_with_gate(|_| Ok(()))
+    }
+
+    /// Let the tools entry point configure its read route for this workspace
+    /// before the handler reads from it.
+    pub fn run_with_gate(self, gate: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         let root = super::forge_identity_cmd::workspace();
+        gate(&root)?;
         crate::forge_cmd::decline_gitea(Some(&root));
         match self {
             ChampionHoldCommand::Classify(t) => {
@@ -257,7 +266,7 @@ impl ChampionHoldCommand {
 }
 
 /// The ratification verb's stdout line; exits 3 on any failed read.
-fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
+fn ratification_line(t: &TargetArgs, root: &Path) -> String {
     use crate::champion_hold::ratification::{
         decide, scan, unreadable_candidates, ChangedFile, Comment, Config, Verdict,
     };
@@ -270,25 +279,13 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| fail("head"))
         .to_string();
-    let listing = read(
-        repo,
-        &[
-            "api",
-            &format!("repos/{repo}/pulls/{}/files", t.pr),
-            "--paginate",
-            "--jq",
-            ".[]",
-        ],
-        root,
-    );
+    let path = format!("repos/{repo}/pulls/{}/files", t.pr);
+    let listing = read(repo, &["api", &path, "--paginate"], root);
     let listing = listing.ok_output().unwrap_or_else(|| fail("file list"));
+    let records = parse_records(&listing.stdout).unwrap_or_else(|| fail("file list"));
     let cfg = Config::from_effective(&crate::config_resolver::resolve_effective_config(root));
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-    {
-        let v: Value = serde_json::from_str(line).unwrap_or_else(|_| fail("file list"));
+    for v in records {
         let name = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         let mut f = ChangedFile {
             filename: name("filename").unwrap_or_else(|| fail("file list")),
@@ -361,7 +358,7 @@ fn calibration_report(
     repo: &str,
     min_age_days: i64,
     limit: u32,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<String, String> {
     use crate::champion_hold::calibration::{
         is_mature, recorded_confidence, summarize, Row, REVERT_WINDOW_DAYS,
@@ -459,7 +456,7 @@ fn revert_in_window(
     pr: u64,
     sha: &str,
     window_end: chrono::DateTime<chrono::Utc>,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<bool, String> {
     let out = std::process::Command::new("git")
         .current_dir(root)
@@ -496,7 +493,7 @@ fn reverts_by_pr(
     pr: u64,
     sha: &str,
     window_end: chrono::DateTime<chrono::Utc>,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<bool, String> {
     let q = format!("\"Reverts {repo}#{pr}\" in:body");
     let out = read(

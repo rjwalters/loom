@@ -1052,7 +1052,7 @@ impl Table {
     /// release ([`FAST_FAIL_OUTCOME`]) adds to the item's fleet-wide streak,
     /// whichever host sent it; the [`FAST_FAIL_PARK_THRESHOLD`]-th orders the
     /// park, once. A progressing release, or any other non-progress outcome
-    /// (not `ci_wait`, `host_lost` or `provider_exhausted`, which are neither),
+    /// (excluding neutral releases such as `ci_wait` and `seat_busy`),
     /// ends the streak.
     pub fn release_ordered(
         &mut self,
@@ -1081,12 +1081,12 @@ impl Table {
     /// Fold `outcome` into `key`'s fast-fail streak; whether it orders the park.
     fn note_fast_fail(&mut self, key: &(String, u64), now: Mono, outcome: &str) -> bool {
         let outcome = outcome.trim();
-        // Neither the item's failure nor its progress: `host_lost`, `ci_wait`,
-        // and a provider seat that ran out (#13966).
+        // These outcomes leave the item's failure history intact.
         if [
             HOST_LOST_OUTCOME,
             CI_WAIT_OUTCOME,
             PROVIDER_EXHAUSTED_OUTCOME,
+            crate::session_exec::refusal::SEAT_BUSY_REASON,
         ]
         .contains(&outcome)
         {
@@ -1154,10 +1154,12 @@ impl Table {
         };
         self.note_ended(&key, &row, end, now);
         let (repo, item) = key;
-        // A lost host and an exhausted provider seat are both not the item's
-        // fault: the row ends and nothing is held, so the next draw may take
-        // it (`host_lost`, #12876; `provider_exhausted`, #13966).
-        if host_lost || exhausted {
+        // Host or seat failures end the row without a fleet-wide hold, so
+        // another worker can pick the item on its next draw.
+        if host_lost
+            || exhausted
+            || outcome.trim() == crate::session_exec::refusal::SEAT_BUSY_REASON
+        {
             return true;
         }
         if outcome.trim() == CI_WAIT_OUTCOME {

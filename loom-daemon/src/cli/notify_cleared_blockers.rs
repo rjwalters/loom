@@ -229,9 +229,10 @@ impl NotifyClearedBlockersArgs {
                     {
                         Some(nwo.as_str())
                     }
-                    Scope::Allow(_) => {
+                    Scope::Allow(nwo) => {
+                        let scanned = scanned.as_deref().unwrap_or("unresolved");
                         unread.push(format!(
-                            "{} #{}: write target differs from scanned repository",
+                            "{} #{}: write target {nwo} differs from scanned repository {scanned}",
                             g.kind.label(),
                             g.number
                         ));
