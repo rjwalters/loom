@@ -628,8 +628,11 @@ impl SweepRegistry {
         if claimed && !self.config.skip_label_flip {
             match role {
                 StepRole::Builder => {
-                    let _ = self.restore_label_to_ready(item);
+                    if let Err(e) = self.restore_step_claim(item, role, sweep_id) {
+                        log::warn!("Builder spawn failure on #{item}: claim restore failed: {e:#}");
+                    }
                     self.note_label_flip(item);
+                    self.yield_finished_builder_lease(item, sweep_id, "spawn_failed");
                 }
                 _ => self.reap_step_leases(sweep_id, "spawn_failed"),
             }
