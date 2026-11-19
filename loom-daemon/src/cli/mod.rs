@@ -150,7 +150,6 @@ pub(crate) mod orphan_replace;
 pub(crate) mod overlap_replay;
 mod park_record;
 pub use park_record::{handle_park_record_command, ParkRecordCli};
-pub mod peer_claims_cmd;
 pub(crate) mod pi_usage_cli;
 mod points_marker_check;
 mod pr_latency_cmd;
