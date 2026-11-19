@@ -16,6 +16,18 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14490**: fix: yield finished Builder issue leases
+- **PR #14513**: fix: apply service tiers to named sweep steps
+- **PR #12639**: test: create registered roots before registering their gh config dir
+- **Issue #14482** (closed): Ended Builder step leaves its Forge issue lease blocking a new claim
+- **Issue #14504** (closed): Sweep-worker spawns do not read serviceTier / roleServiceTiers (LOOM_SERVICE_TIER producer gap)
+- **Issue #12638** (closed): Test: lease_refresh_child_carries_the_root_owners_gh_config_dir fails on main (child sees no GH_CONFIG_DIR)
+- **PR #14511**: fix(role-runner): log configured service tier and source
+- **PR #14503**: docs: make doctor's detached pr-<N> rule observable on the unlabeled-PR path
+- **PR #14501**: fix(forge-inventory): re-baseline pr-worktree.sh to 8 direct forge calls
+- **Issue #14505** (closed): role-<role>.log header omits the resolved service tier and its source (the one artifact an operator inspects)
+- **Issue #14495** (closed): doctor.md's new detached pr-<N> rule is unobservable on its own unlabeled-PR recipe (`pr-worktree.sh ... >/dev/null`)
+- **Issue #14493** (closed): main red: forge_inventory gate — defaults/scripts/pr-worktree.sh grew 5 -> 8 direct forge calls (#14391)
 - **PR #14491**: docs(doctor): treat detached pr-<N> worktree as read-only
 - **PR #14477**: feat: export per-role/runtime serviceTier as LOOM_SERVICE_TIER from role runner
 - **PR #14466**: fix: dedupe OpenCode id sessions over usage-bearing rows and skip discovery for empty ids

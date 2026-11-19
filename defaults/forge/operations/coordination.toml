@@ -446,6 +446,10 @@ path = "loom-daemon/src/intake_reconcile/demote.rs"
 kind = "rust"
 path = "loom-daemon/src/epic_supervisor.rs"
 
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
+
 [[operation]]
 id = "comment.list"
 group = "issue-pr-conversation"
@@ -488,6 +492,9 @@ path = "loom-daemon/src/forge_cached_view.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/work_finder/main_red_autofile.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
 
 [[operation]]
 id = "comment.edit-delete"

@@ -552,6 +552,9 @@ impl SweepRegistry {
                 StepEnd::Cancelled => "cancelled",
                 StepEnd::Exited(_) => "exited",
             });
+            if role == StepRole::Builder {
+                self.yield_finished_builder_lease(item, sweep_id, reason);
+            }
             self.reap_step_leases(sweep_id, reason);
         }
         if !self.config.skip_label_flip {

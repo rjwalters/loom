@@ -1008,6 +1008,44 @@ pub(crate) struct ReapArgs {
 }
 
 impl PrLeaseAction {
+    /// Tools-only dispatch. The daemon runs the same actions without consulting
+    /// tools mode, and retains its scheduled attach/reap entry points.
+    pub(crate) fn run_tools(mut self) -> Result<()> {
+        use crate::forge_cmd::{detect_forge, ForgeType};
+        use crate::tools_mode::{configure_forge_read_route, MODE_ENV};
+
+        let workspace = match &mut self {
+            Self::Claim(common) | Self::Check(common) | Self::Fence(common) => {
+                &mut common.workspace
+            }
+            Self::Release(args) => &mut args.common.workspace,
+            Self::RenewLoop(args) => &mut args.workspace,
+            Self::Attach(_) | Self::Reap(_) => {
+                eprintln!("loom-tools lease pr: attach and reap are daemon service operations; use loom-daemon");
+                std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+            }
+        };
+        let root = match crate::repo_root::resolve_repo_root(&workspace.to_string_lossy()) {
+            Ok(root) => root,
+            Err(error) if matches!(self, Self::RenewLoop(_)) => return Err(error),
+            // Retain each agent-facing verb's no-checkout result.
+            Err(_) => return self.run(),
+        };
+        *workspace = root;
+        if detect_forge(Some(workspace)) == ForgeType::GitHub {
+            let mode = configure_forge_read_route(workspace).map_err(anyhow::Error::msg)?;
+            if mode == "fleet" {
+                crate::forge_gateway::require_cli_read_route();
+            }
+            // The existing self-spawn passes the canonical workspace and inherits
+            // this validated mode. Its fresh process resolves the route again.
+            std::env::set_var(MODE_ENV, mode);
+        } else if matches!(self, Self::RenewLoop(_)) {
+            return Ok(());
+        }
+        self.run()
+    }
+
     pub(crate) fn run(self) -> Result<()> {
         let code = match self {
             Self::RenewLoop(args) => {
