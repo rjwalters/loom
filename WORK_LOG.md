@@ -16,6 +16,17 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **Issue #14580** (closed): Reuse the claim guard’s issue-lease parser in the worktree co-occupancy guard
+- **PR #14606**: refactor: reuse the claim guard's lease-comment parsers in lease co-occupancy
+- **Issue #14572** (closed): accounts.session.extraMounts host sources are not denied for ~/.loom/tokens, ~/.ssh or a session profile/seat directory
+- **PR #14600**: fix: refuse session extra mounts overlapping host credentials
+- **Issue #14512** (closed): private_dispatch prepares a Codex seat twice after reserve_seat (#14481)
+- **PR #14599**: fix: consume held Codex seat, name repo-routing misses, count seat_busy refusals
+- **PR #14589**: feat: journal a loom.runtime.usage_missing span when a run's usage is unreadable
+- **Issue #14601** (closed): Test flake: grace_fails_open_without_touching_the_hysteresis fails on Rust Unit Tests (2/5)
+- **PR #14605**: test: keep the failing endpoint bound in the fleet grace test
+- **Issue #14584** (closed): Codex pool: an account's exhaustion horizon is learned per host, so each host must fail a real step to find it
+- **PR #14594**: feat: fold Codex rollout snapshots into account health on the ranking-refresh tick
 - **Issue #14607** (closed): Main CI red: Guide Approved provenance query includes frozen PRs
 - **PR #14609**: fix(guide): exclude frozen PRs from plan provenance
 - **Issue #14602** (closed): daemon-reference: self-heal now prunes loom-rescue stash entries, not just rescue refs
