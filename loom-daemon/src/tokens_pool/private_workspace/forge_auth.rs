@@ -253,7 +253,7 @@ fn config_dir_for(
             .then_some(dir)
     };
     let candidates: [&dyn Fn() -> Option<PathBuf>; 5] = [
-        &|| creds::gh_config_dir_for_owner_slug(slug),
+        &|| creds::gh_config_dir_for_owner_slug(slug).filter(|dir| dir.join("hosts.yml").is_file()),
         &|| primary.and_then(published),
         &|| published(workspace),
         &|| primary.and_then(root_owned),
@@ -603,6 +603,61 @@ mod tests {
         assert!(!auth.resolved());
         assert!(auth.names().is_empty());
         assert!(auth.child_env().is_empty());
+    }
+
+    #[test]
+    fn a_reaped_registration_falls_back_only_to_a_matching_root() {
+        use crate::credential_preflight as creds;
+        use crate::test_git_helpers::run;
+
+        let owner = "registered-owner-14523";
+        let repo = format!("https://github.com/{owner}/widget");
+        let ws = tempfile::tempdir().unwrap();
+        run(ws.path(), &["init", "-q"]);
+        run(ws.path(), &["remote", "add", "origin", &repo]);
+        let published = published_owner_workspace(owner);
+        let registered = creds::github_app_gh_config_dir_for_owner(published.path(), owner);
+        creds::register_owner_gh_config_dir(owner, &registered);
+        let root = creds::github_app_gh_config_dir(ws.path());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("hosts.yml"), "github.com: {}\n").unwrap();
+
+        let env = env_of(&[("GH_CONFIG_DIR", root.to_str().unwrap())]);
+        let expect_read = |expected: &Path| {
+            let auth = ExecAuth::resolve_with_root(
+                ws.path(),
+                &repo,
+                &env,
+                &|dir| {
+                    assert_eq!(dir, expected);
+                    Some(SECRET.into())
+                },
+                None,
+            );
+            assert!(auth.resolved());
+            assert!(!auth.expired());
+        };
+        expect_read(&registered);
+        std::fs::remove_file(registered.join("hosts.yml")).unwrap();
+        expect_read(&root);
+        std::fs::remove_dir(&registered).unwrap();
+        expect_read(&root);
+
+        for origin in [
+            "https://github.com/other-owner-14523/widget",
+            "https://ghe.example/registered-owner-14523/widget",
+        ] {
+            run(ws.path(), &["remote", "set-url", "origin", origin]);
+            let auth = ExecAuth::resolve_with_root(
+                ws.path(),
+                &repo,
+                &env,
+                &|_| panic!("read a credential without a matching owner and host"),
+                None,
+            );
+            assert!(auth.child_env().is_empty());
+            assert!(!auth.expired());
+        }
     }
 
     /// Publish an `identity.json` sidecar beside `dir`'s `hosts.yml`.
