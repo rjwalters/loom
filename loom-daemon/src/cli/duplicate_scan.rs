@@ -90,6 +90,7 @@
 //! answer; the script then fetches its recency list and calls again without
 //! the flag, so a failed search never costs a verdict.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -319,6 +320,65 @@ pub(crate) fn extract_keywords(text: &str) -> Vec<String> {
     out
 }
 
+// Narrow recognition of the rendered Epic skill phase-issue template.
+fn duplicate_text<'a>(pool: Pool, title: &'a str, body: &'a str) -> (&'a str, Cow<'a, str>) {
+    if pool != Pool::OpenIssues {
+        return (title, Cow::Borrowed(body));
+    }
+    let mut lines = body.trim_start().lines();
+    let Some((epic, _)) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("**Epic**: #"))
+        .and_then(|line| line.split_once(" - "))
+        .filter(|(number, _)| number.parse::<u64>().is_ok_and(|n| n > 0))
+    else {
+        return (title, Cow::Borrowed(body));
+    };
+    if !lines
+        .next()
+        .is_some_and(|line| line.starts_with("**Phase**: "))
+        || !lines
+            .next()
+            .is_some_and(|line| line.starts_with("**Phase Goal**: "))
+    {
+        return (title, Cow::Borrowed(body));
+    }
+    let footer = format!("*Created by Epic skill from Epic #{epic}*");
+    let remaining: Vec<_> = lines.collect();
+    let Some(footer_at) = remaining.iter().position(|line| *line == footer) else {
+        return (title, Cow::Borrowed(body));
+    };
+
+    let title_prefix = format!("[Epic #{epic}]");
+    let title = title
+        .strip_prefix(&title_prefix)
+        .map_or(title, str::trim_start);
+    let generated_dependency =
+        format!("Part of Epic #{epic}. This is a Phase 1 issue with no blocking dependencies.");
+    let mut section = "";
+    let kept = remaining[..footer_at]
+        .iter()
+        .copied()
+        .filter(|&line| {
+            if line.starts_with("## ") {
+                section = line;
+                return !matches!(
+                    line,
+                    "## Description" | "## Acceptance Criteria" | "## Dependencies"
+                );
+            }
+            match section {
+                "## Acceptance Criteria" => line != "- [ ] Tests pass for new functionality",
+                "## Dependencies" => line != generated_dependency,
+                _ => true,
+            }
+        })
+        .chain(remaining[footer_at + 1..].iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (title, Cow::Owned(kept))
+}
+
 /// True Jaccard similarity as a truncated integer percentage:
 /// `matches * 100 / |union|` where `union = |a| + |b| - matches` — the exact
 /// arithmetic `check-duplicate.sh`'s `calculate_similarity` performed in
@@ -438,7 +498,8 @@ pub(crate) fn scan(
             continue;
         }
         scanned += 1;
-        let existing = extract_keywords(&format!("{} {}", c.title, c.body));
+        let (title, body) = duplicate_text(pool, &c.title, &c.body);
+        let existing = extract_keywords(&format!("{title} {body}"));
         let similarity = jaccard_percent(query_keywords, &existing);
         if similarity >= threshold {
             // #8591: a block from the low-confidence region needs the title
@@ -446,7 +507,7 @@ pub(crate) fn scan(
             // cannot answer the question, so it keeps its block (fail-closed,
             // as above).
             if corroboration_active && similarity < corroborate_below {
-                let candidate_title_keywords = extract_keywords(&c.title);
+                let candidate_title_keywords = extract_keywords(title);
                 if !candidate_title_keywords.is_empty() {
                     let title_similarity =
                         jaccard_percent(query_title_keywords, &candidate_title_keywords);
@@ -595,11 +656,12 @@ impl DuplicateScanArgs {
             None => read_pool_from_stdin(),
         };
 
-        let query_keywords = extract_keywords(&format!("{} {}", self.title, self.body));
+        let (title, body) = duplicate_text(self.pool, &self.title, &self.body);
+        let query_keywords = extract_keywords(&format!("{title} {body}"));
         // The title alone is the corroborating signal (#8591) — scored
         // against candidate titles, never against their bodies, so a long
         // body cannot dilute or manufacture the agreement.
-        let query_title_keywords = extract_keywords(&self.title);
+        let query_title_keywords = extract_keywords(title);
         let outcome = scan(
             self.pool,
             &query_keywords,
@@ -666,6 +728,95 @@ mod tests {
             title: title.to_string(),
             body: body.to_string(),
         }
+    }
+
+    fn render_phase_body(description: &str, criteria: [&str; 2]) -> String {
+        format!(
+            "**Epic**: #2468 - Operator dashboard navigation and reporting\n\
+             **Phase**: 1 of 3\n\
+             **Phase Goal**: Improve issue triage for release operators across repositories\n\n\
+             ## Description\n\n{description}\n\n\
+             ## Acceptance Criteria\n\n- [ ] {}\n- [ ] {}\n- [ ] Tests pass for new functionality\n\n\
+             ## Dependencies\n\nPart of Epic #2468. This is a Phase 1 issue with no blocking dependencies.\n\n\
+             ---\n*Created by Epic skill from Epic #2468*\n",
+            criteria[0], criteria[1]
+        )
+    }
+
+    #[test]
+    fn applies_epic_scoring_symmetrically_and_still_blocks_a_duplicate() {
+        let first_title = "[Epic #2468] Export job timing";
+        let first = render_phase_body(
+            "Generate CSV from elapsed runner records.",
+            ["Escape commas", "Sort timestamps"],
+        );
+        let filed_first = format!("{first}\n[loom dashboard](https://dashboard.example.test/github.com/acme/project/issues/60001)\n<!-- loom:dashboard-link -->\n");
+        let previous = cand(60001, first_title, &filed_first);
+        let second = render_phase_body(
+            "Dismiss a branch selector and restore focused control.",
+            ["Tab reaches inputs", "Close on Escape"],
+        );
+        let thresholds = thr(DEFAULT_THRESHOLD, Some(13));
+        let score = |query_title, query_body| {
+            let (title, body) = duplicate_text(Pool::OpenIssues, query_title, query_body);
+            scan(
+                Pool::OpenIssues,
+                &extract_keywords(&format!("{title} {body}")),
+                &extract_keywords(title),
+                std::slice::from_ref(&previous),
+                thresholds,
+                None,
+                false,
+            )
+        };
+        let unrelated = score("[Epic #2468] Restore keyboard focus", &second);
+        assert_eq!(unrelated.exit_code, 0);
+        assert!(unrelated.near_matches.is_empty());
+        let duplicate = score(first_title, &first);
+        assert_eq!(duplicate.exit_code, 1);
+        assert!(duplicate
+            .stdout_lines
+            .iter()
+            .any(|line| line.contains("#60001")));
+    }
+
+    #[test]
+    fn preserves_epic_prose_documentation_and_custom_dependencies() {
+        let ordinary = "An Epic mention in prose\n\n## Description\n\nLeave this unchanged.";
+        let title = "[Epic #2468] Review old naming";
+        assert_eq!(
+            duplicate_text(Pool::OpenIssues, title, ordinary),
+            (title, Cow::Borrowed(ordinary))
+        );
+        let phase =
+            render_phase_body("Keep the parser diagnostics.", ["Report details", "Keep context"])
+                .replace(
+                    "This is a Phase 1 issue with no blocking dependencies.",
+                    "Wait for parser migration #6999.",
+                );
+        let (normalized_title, normalized_body) =
+            duplicate_text(Pool::OpenIssues, "Review diagnostics", &phase);
+        assert_eq!(normalized_title, "Review diagnostics");
+        assert!(normalized_body.contains("Keep the parser diagnostics."));
+        assert!(normalized_body.contains("- [ ] Report details"));
+        assert!(normalized_body.contains("Wait for parser migration #6999."));
+        assert!(!normalized_body.contains("Tests pass for new functionality"));
+        let with_filing_suffix = format!("{phase}\n## Description\nAdditional filed context.\n");
+        assert!(duplicate_text(Pool::OpenIssues, title, &with_filing_suffix)
+            .1
+            .contains("## Description\nAdditional filed context."));
+        let boilerplate = render_phase_body("", ["", ""]);
+        let (bare_title, bare_body) =
+            duplicate_text(Pool::OpenIssues, "[Epic #2468]", &boilerplate);
+        assert!(extract_keywords(&format!("{bare_title} {bare_body}")).is_empty());
+        let wrong_footer = phase.replace(
+            "*Created by Epic skill from Epic #2468*",
+            "*Created by Epic skill from Epic #2469*",
+        );
+        assert_eq!(
+            duplicate_text(Pool::OpenIssues, title, &wrong_footer),
+            (title, Cow::Borrowed(wrong_footer.as_str()))
+        );
     }
 
     /// The block/warn edges under test, with #8591's corroboration constants
