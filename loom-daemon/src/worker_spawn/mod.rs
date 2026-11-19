@@ -178,26 +178,46 @@ fn codex_adapter_model(args: &[std::ffi::OsString]) -> Option<String> {
 /// Beyond that tier the adapter picks its own, so an absent value stays
 /// absent rather than being filled with a configured guess. `--` ends
 /// adapter flags, and a prompt or config value that looks like a flag is
-/// data, mirroring `codex_adapter_model`'s scan.
+/// data, mirroring `codex_adapter_model`'s scan. For codex an explicit
+/// `-c model_reasoning_effort=` is the highest-precedence effort (#14414).
 fn adapter_launch_facts(
     runtime: &str,
     args: &[std::ffi::OsString],
 ) -> (Option<String>, Option<String>) {
     let (model, effort) = adapter_flag_facts(args);
     let env_effort = nonempty_env("LOOM_EFFORT");
-    if runtime == "codex" && model.is_none() {
-        // #14302: spawn-codex.sh splits the env-tier model on its first `@`
-        // (`model@effort`, #8387) when no `-m` is present; record the base
-        // and the suffix it actually launches with, not the raw string.
-        let sources = [nonempty_env("LOOM_MODEL"), nonempty_env("LOOM_CODEX_MODEL")];
-        let (model, suffix) = codex_env_model_split(sources.each_ref().map(Option::as_deref));
-        // The suffix is the lowest-precedence effort source: an explicit
-        // `--effort`, `LOOM_EFFORT` or `-c model_reasoning_effort=` beats it.
-        let suffix = suffix.filter(|_| !adapter_has_effort_config(args));
-        return (model, effort.or(env_effort).or(suffix));
+    if runtime == "codex" {
+        let config = adapter_effort_config(args);
+        if model.is_none() {
+            // #14302: spawn-codex.sh splits the env-tier model on its first `@`
+            // (`model@effort`, #8387) when no `-m` is present; record the base
+            // and the suffix it actually launches with, not the raw string.
+            let sources = [nonempty_env("LOOM_MODEL"), nonempty_env("LOOM_CODEX_MODEL")];
+            let (model, suffix) = codex_env_model_split(sources.each_ref().map(Option::as_deref));
+            return (model, codex_effort(config, effort, env_effort, suffix));
+        }
+        return (model, codex_effort(config, effort, env_effort, None));
     }
     let model = model.or_else(|| nonempty_env("LOOM_MODEL"));
     (model, effort.or(env_effort))
+}
+
+/// spawn-codex.sh's effort precedence, highest first: explicit
+/// `-c model_reasoning_effort=`, `--effort`, `LOOM_EFFORT`, then the
+/// `model@effort` suffix. An explicit config key is what codex launches with
+/// even when its value is blank, so a blank one reports absent rather than
+/// falling through to a lower tier the adapter would not have used.
+fn codex_effort(
+    config: CodexEffortConfig<'_>,
+    flag: Option<String>,
+    env: Option<String>,
+    suffix: Option<String>,
+) -> Option<String> {
+    match config {
+        CodexEffortConfig::Explicit(value) if !value.trim().is_empty() => Some(value.to_owned()),
+        CodexEffortConfig::Explicit(_) | CodexEffortConfig::Suppressed => None,
+        CodexEffortConfig::Unset => flag.or(env).or(suffix),
+    }
 }
 
 /// spawn-codex.sh's `model@effort` split over the env tier (`LOOM_MODEL`,
@@ -217,34 +237,49 @@ fn codex_env_model_split(sources: [Option<&str>; 2]) -> (Option<String>, Option<
     (None, None)
 }
 
-/// Whether argv carries an explicit `-c model_reasoning_effort=...`, which
-/// spawn-codex.sh lets win over every other effort source.
-fn adapter_has_effort_config(args: &[std::ffi::OsString]) -> bool {
-    let mut args = args.iter().filter_map(|a| a.to_str());
+enum CodexEffortConfig<'a> {
+    Unset,
+    Suppressed,
+    Explicit(&'a str),
+}
+
+/// Read the last genuine config assignment. The launcher also suppresses its
+/// fallback for any inline config containing this text, even inside another
+/// key's value. In that case alone there is no effort assignment to report.
+fn adapter_effort_config(args: &[std::ffi::OsString]) -> CodexEffortConfig<'_> {
+    const KEY: &[u8] = b"model_reasoning_effort=";
+    let mut explicit = None;
+    let mut suppress_fallback = false;
+    let mut args = args.iter().map(|arg| arg.as_encoded_bytes());
     while let Some(arg) = args.next() {
-        match arg {
-            "--" => break,
-            "-c" | "--config" => {
-                if args
-                    .next()
-                    .is_some_and(|v| v.starts_with("model_reasoning_effort="))
-                {
-                    return true;
-                }
-            }
-            "-p" | "--prompt" | "-m" | "--model" | "--effort" | "-s" | "--sandbox" | "--log"
-            | "--profile" => {
+        let config = match arg {
+            b"--" => break,
+            b"-c" | b"--config" => args.next(),
+            b"-p" | b"--prompt" | b"-m" | b"--model" | b"--effort" | b"-s" | b"--sandbox"
+            | b"--log" | b"--profile" => {
                 args.next();
+                continue;
             }
-            _ if (arg.starts_with("-c=") || arg.starts_with("--config="))
-                && arg.contains("model_reasoning_effort=") =>
-            {
-                return true;
+            _ => {
+                let inline = arg
+                    .strip_prefix(b"-c=")
+                    .or_else(|| arg.strip_prefix(b"--config="));
+                suppress_fallback |=
+                    inline.is_some_and(|kv| kv.windows(KEY.len()).any(|w| w == KEY));
+                inline
             }
-            _ => {}
+        };
+        if let Some(value) = config.and_then(|kv| kv.strip_prefix(KEY)) {
+            explicit = Some(value);
         }
     }
-    false
+    match explicit {
+        Some(value) => std::str::from_utf8(value).map_or(CodexEffortConfig::Suppressed, |value| {
+            CodexEffortConfig::Explicit(value.trim_matches(['"', '\'']))
+        }),
+        None if suppress_fallback => CodexEffortConfig::Suppressed,
+        None => CodexEffortConfig::Unset,
+    }
 }
 
 /// The argv-only half of [`adapter_launch_facts`]: the explicit
@@ -1053,6 +1088,8 @@ mod codex_adapter_tests {
 
 #[cfg(test)]
 mod adapter_launch_facts_tests {
+    use super::CodexEffortConfig::{Explicit, Suppressed, Unset};
+
     fn facts(args: &[&str]) -> (Option<String>, Option<String>) {
         let args = args
             .iter()
@@ -1134,18 +1171,96 @@ mod adapter_launch_facts_tests {
     }
 
     #[test]
-    fn a_config_effort_override_is_detected_only_outside_data() {
-        let has = |args: &[&str]| {
+    fn a_config_effort_override_is_read_only_outside_data() {
+        let get = |args: &[&str]| {
             let args = args
                 .iter()
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>();
-            super::adapter_has_effort_config(&args)
+            match super::adapter_effort_config(&args) {
+                Explicit(value) => Some(value.to_owned()),
+                Suppressed | Unset => None,
+            }
         };
-        assert!(has(&["-c", "model_reasoning_effort=low"]));
-        assert!(has(&["--config=model_reasoning_effort=low"]));
-        assert!(!has(&["-p", "-c model_reasoning_effort=low"]));
-        assert!(!has(&["--", "-c", "model_reasoning_effort=low"]));
-        assert!(!has(&["-c", "foo=bar"]));
+        assert_eq!(get(&["-c", "model_reasoning_effort=low"]).as_deref(), Some("low"));
+        assert_eq!(get(&["--config", "model_reasoning_effort=\"low\""]).as_deref(), Some("low"));
+        assert_eq!(get(&["--config=model_reasoning_effort=low"]).as_deref(), Some("low"));
+        assert_eq!(get(&["-c=model_reasoning_effort=high"]).as_deref(), Some("high"));
+        assert_eq!(get(&["-c", "model_reasoning_effort="]).as_deref(), Some(""));
+        assert_eq!(
+            get(&[
+                "-c",
+                "model_reasoning_effort=low",
+                "-c",
+                "model_reasoning_effort=high"
+            ])
+            .as_deref(),
+            Some("high")
+        );
+        assert_eq!(get(&["-p", "-c model_reasoning_effort=low"]), None);
+        assert_eq!(get(&["--", "-c", "model_reasoning_effort=low"]), None);
+        assert_eq!(get(&["-c", "foo=bar"]), None);
+        assert_eq!(get(&["--effort", "-c", "model_reasoning_effort=low"]), None);
+    }
+
+    fn some(v: &str) -> Option<String> {
+        Some(v.to_owned())
+    }
+
+    #[test]
+    fn codex_effort_precedence_is_config_then_flag_then_env_then_suffix() {
+        // The three rows of #14414 (explicit config beside --effort / env / suffix).
+        assert_eq!(super::codex_effort(Explicit("low"), some("high"), None, None), some("low"));
+        assert_eq!(super::codex_effort(Explicit("low"), None, some("high"), None), some("low"));
+        assert_eq!(super::codex_effort(Explicit("low"), None, None, some("high")), some("low"));
+        // Without an explicit config the pre-existing order is unchanged.
+        assert_eq!(super::codex_effort(Unset, some("a"), some("b"), some("c")), some("a"));
+        assert_eq!(super::codex_effort(Unset, None, some("b"), some("c")), some("b"));
+        assert_eq!(super::codex_effort(Unset, None, None, some("c")), some("c"));
+        assert_eq!(super::codex_effort(Unset, None, None, None), None);
+        // A blank explicit value is what codex launches with: absent, not a fallthrough.
+        assert_eq!(super::codex_effort(Explicit(""), some("high"), None, some("c")), None);
+        assert_eq!(super::codex_effort(Suppressed, some("a"), some("b"), some("c")), None);
+    }
+
+    #[test]
+    fn unrelated_config_data_never_supplies_a_codex_effort() {
+        let effort = |tail: &[&str]| {
+            let args: Vec<_> = ["--effort", "high"]
+                .into_iter()
+                .chain(tail.iter().copied())
+                .map(std::ffi::OsString::from)
+                .collect();
+            super::adapter_launch_facts("codex", &args).1
+        };
+        let unrelated = r#"developer_instructions="model_reasoning_effort=low""#;
+        let real = "model_reasoning_effort=medium";
+        for flag in ["-c=", "--config="] {
+            let inline = format!("{flag}{unrelated}");
+            assert_eq!(effort(&[&inline]), None);
+            assert_eq!(effort(&["-c", real, &inline]), some("medium"));
+            assert_eq!(effort(&[&inline, "--config", real]), some("medium"));
+            assert_eq!(effort(&["--prompt", &inline]), some("high"));
+            assert_eq!(effort(&["--", &inline]), some("high"));
+        }
+        assert_eq!(effort(&["--config", unrelated]), some("high"));
+    }
+
+    #[test]
+    fn a_config_effort_wins_for_codex_with_or_without_a_model_flag() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let with_model = args(&[
+            "-m",
+            "gpt-5",
+            "--effort",
+            "high",
+            "-c",
+            "model_reasoning_effort=low",
+        ]);
+        assert_eq!(super::adapter_launch_facts("codex", &with_model).1, some("low"));
+        let no_model = args(&["--effort", "high", "-c", "model_reasoning_effort=low"]);
+        assert_eq!(super::adapter_launch_facts("codex", &no_model).1, some("low"));
+        // Non-codex runtimes are unchanged: the config key is not read.
+        assert_eq!(super::adapter_launch_facts("claude", &no_model).1, some("high"));
     }
 }
