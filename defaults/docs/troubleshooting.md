@@ -2405,14 +2405,10 @@ coordination problems, not a general-purpose external-mutex library):
   scheduled" half of the pattern above, which is exactly why a resource nobody
   else ever tries to (re-)claim can stay stale-held indefinitely under this
   model alone.
-- `PeerClaimView` (`loom-daemon/src/peer_claims.rs`) is the scheduled-reaper
-  half: it expires a peer's soft claim once local receipt time exceeds a fixed
-  TTL since the *last* observed heartbeat ad (`is_claimed_at` /
-  `claimed_issues_at`), and a periodic re-advertisement
-  (`sweep_registry::readvertise_peer_claims`) refreshes that clock well inside
-  the TTL for a still-live holder — see the module doc comment's "TTL is
-  measured against LOCAL receipt, never the advertiser's clock" section for why
-  wall-clock skew across hosts rules out comparing timestamps directly.
+- The scheduled-reaper half is now the forge lease record
+  ([`lease-record.md`](lease-record.md)): a lease expires by its own
+  forge-assigned `updated_at`, and a still-live holder renews it. (The safehouse
+  peer-claim soft claim that once played this role was retired in #13945.)
 
 **Prior art establishing this as Loom's actual mitigation pattern** (both
 resolved without a kill-time hook, because none is available):

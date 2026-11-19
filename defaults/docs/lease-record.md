@@ -45,7 +45,7 @@ A lease record is an ordinary issue (or PR) **comment**, posted on the
 number a dispatch just claimed, at the moment `loom-daemon`'s dispatch path
 successfully flips that issue's label from `loom:issue` to `loom:building`.
 It follows the same HTML-comment-marker idiom already used elsewhere in this
-repo — `<!-- loom:standdown claim=… -->` (peer-claim standdown),
+repo — `<!-- loom:standdown claim=… -->` (standdown),
 `<!-- champion:hold-state head=… -->` (Champion's merge-risk hold) — so it
 is grep/dedup-detectable the same way those markers are, without needing a
 dedicated forge field.
@@ -81,7 +81,7 @@ The comment body's literal **first line** is the marker:
     derives the exact same value from the exact same salt, so "recognize my
     own claim" keeps working unchanged.
   - **It is NOT directly comparable** to the raw host identity used by
-    peer-claim advertisements (#4028) or cross-host collision-detection log
+    the safehouse completion ad or cross-host collision-detection log
     lines (#4085) — those are internal channels (the safehouse room, this
     daemon's own log file), not a public forge comment, so they are
     unaffected by #6322 and remain raw.
@@ -117,8 +117,8 @@ This is the load-bearing design decision, so it is worth stating plainly:
 `updated_at` timestamp — never from a timestamp written into the marker or
 prose text.**
 
-This differs deliberately from `peer_claims.rs`'s existing TTL approach,
-which timestamps a claim at local receipt and corrects for clock skew
+This differs deliberately from the TTL approach of the retired safehouse
+peer-claim channel (#13945), which timestamped a claim at local receipt and corrects for clock skew
 between hosts because there is no shared clock in that channel. A forge
 comment does not have that problem: every host reads the *same* `updated_at`
 value, assigned by the forge server itself, for the same comment. Using it
@@ -434,8 +434,7 @@ lease comment on the issue via `gh api .../issues/N/comments`, and
 `id`s (never a locally-recorded timestamp) to decide whether *this*
 dispatcher's own comment is the earliest. A dispatcher that loses — a peer's
 lease comment has an earlier `id` — yields before spawning a builder or
-touching a worktree: it retracts its own peer-claim advertisement, releases
-its own claim lock, and posts a `<!-- loom:lease-yield ... -->` standdown
+touching a worktree: it releases its own claim lock, and posts a `<!-- loom:lease-yield ... -->` standdown
 annotation, but deliberately leaves the shared `loom:building` label alone
 (it is already correct — idempotent across both racing flips, and reverting
 it would destroy the winning claimant's only cross-host mutex out from under

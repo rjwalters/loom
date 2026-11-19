@@ -98,8 +98,7 @@ pub const GENERATED_PREFIX: &str = "loom-host-";
 const MAX_ID_LEN: usize = 128;
 
 /// Sentinel returned when no identity can be resolved or persisted. Exported
-/// so callers that reason about self-claim recognition (e.g.
-/// [`crate::peer_claims::PeerClaimView`]) can special-case it without
+/// so callers that reason about self-claim recognition can special-case it without
 /// duplicating the literal string (Issue #5063).
 ///
 /// **This value must never participate in self-claim recognition.** Two
@@ -150,6 +149,31 @@ pub struct ResolvedHostId {
 #[must_use]
 pub fn host_identity() -> String {
     resolve().id
+}
+
+/// A **cross-host-stable** repo identity, for keying anything that must agree
+/// across hosts (moved here from the retired peer-claim module, #13945).
+///
+/// A local absolute `workspace_root` differs per host for the same logical repo
+/// (`/Users/a/loom` vs `/home/b/loom`). This resolves, in order: `$LOOM_REPO`
+/// (the forge `owner/repo` slug the daemon already threads through `gh
+/// --repo`), else the final path component, else the full path.
+///
+/// Two *different* repos sharing a directory basename can collide; set
+/// `$LOOM_REPO` to the `owner/repo` slug to make the key precise.
+#[must_use]
+pub fn repo_slug(workspace_root: &Path) -> String {
+    if let Ok(v) = std::env::var("LOOM_REPO") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_owned();
+        }
+    }
+    workspace_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| workspace_root.display().to_string())
 }
 
 /// Resolve this host's identity with its provenance.
@@ -619,3 +643,7 @@ pub fn lease_host_identity() -> String {
 #[cfg(test)]
 #[path = "host_identity_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[path = "host_identity_repo_slug_tests.rs"]
+mod repo_slug_tests;

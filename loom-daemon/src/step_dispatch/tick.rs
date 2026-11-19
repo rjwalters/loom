@@ -435,7 +435,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "peer_active"
         | "backstop_hold"
         | REFUSAL_CAPTAIN_HELD
-        | REFUSAL_CAPTAIN_COOLDOWN => Qd::PeerClaim,
+        | REFUSAL_CAPTAIN_COOLDOWN => Qd::LeaseHeld,
         "captain_not_eligible" => Qd::HostConstraint,
         REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
         // #13746: a writer rate limit is a waiting state, not an error — the
@@ -450,7 +450,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         "roll_paused" => Qd::DeferredCapacity,
         "workspace_commands_missing" => Qd::WorkspaceCommandsMissing,
         crate::sweep_registry::ALREADY_LANDED_REASON => Qd::AlreadyLanded,
-        PASS_MERGE => Qd::PeerClaim,
+        PASS_MERGE => Qd::LeaseHeld,
         _ => Qd::DispatchError,
     }
 }
@@ -555,7 +555,7 @@ pub fn exclude_builders(w: &mut Weighing) -> usize {
 /// The closed-set skip reason a spawn refusal reads as on `pick.decision`.
 fn refusal_skip(reason: &str) -> PickSkipReason {
     match disposition_of(reason) {
-        Qd::PeerClaim => PickSkipReason::InFlight,
+        Qd::LeaseHeld => PickSkipReason::InFlight,
         Qd::HostConstraint => PickSkipReason::Quota,
         Qd::DeferredCapacity => PickSkipReason::Cap,
         Qd::AlreadyLanded => PickSkipReason::AlreadyLanded,
@@ -792,7 +792,7 @@ pub fn run_with_offers(
         let merge = is_merge_step(c.step);
         if merge && merging.get(&idx).copied().unwrap_or(0) >= ws.merge_slots {
             merge_deferred += 1;
-            resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+            resolve(&mut report.queue, &key, Qd::LeaseHeld, Some(PASS_MERGE.to_string()));
             continue;
         }
         if let Some(hold) = spawner.held() {
@@ -825,7 +825,7 @@ pub fn run_with_offers(
                         resolve(
                             &mut report.queue,
                             &key_of(ws, &other),
-                            Qd::PeerClaim,
+                            Qd::LeaseHeld,
                             Some(PASS_MERGE.to_string()),
                         );
                         merge_deferred += 1;
@@ -955,7 +955,7 @@ pub fn run_with_offers(
                 if merge && merging.get(&idx).copied().unwrap_or(0) >= ws.merge_slots {
                     merge_deferred += 1;
                     draws_unspawned += 1;
-                    resolve(&mut report.queue, &key, Qd::PeerClaim, Some(PASS_MERGE.to_string()));
+                    resolve(&mut report.queue, &key, Qd::LeaseHeld, Some(PASS_MERGE.to_string()));
                     *deferred.entry(idx).or_default() += 1;
                     continue;
                 }
@@ -1047,7 +1047,7 @@ pub fn run_with_offers(
                                 resolve(
                                     &mut report.queue,
                                     &key_of(ws, &c),
-                                    Qd::PeerClaim,
+                                    Qd::LeaseHeld,
                                     Some(PASS_MERGE.to_string()),
                                 );
                             }
