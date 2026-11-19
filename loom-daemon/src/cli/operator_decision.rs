@@ -4,7 +4,7 @@
 //! `PremiseCheckArgs` gives.
 
 use crate::operator_decision::cli::{
-    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, GhForge, Target,
+    self, apply, default_repo_root, read_input, validate_cmd, ApplyRequest, Target, WorkflowWriter,
 };
 use anyhow::Result;
 use std::path::PathBuf;
@@ -90,9 +90,71 @@ pub(crate) enum OperatorDecisionCommand {
     },
 }
 
+/// `loom-tools operator-decision <action>`: the [`OperatorDecisionCommand`]
+/// tree, unchanged (#14464, epic #12708 Phase 3b); see
+/// [`ParkRecordCli`](super::park_record::ParkRecordCli).
+#[derive(clap::Args)]
+pub struct OperatorDecisionCli {
+    #[command(subcommand)]
+    command: OperatorDecisionCommand,
+}
+
+impl OperatorDecisionCli {
+    /// Whether this invocation can reach the forge, and so must pass the mode
+    /// gate (design §10.3) before it runs. See
+    /// [`OperatorDecisionCommand::reaches_forge`].
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.command.reaches_forge()
+    }
+
+    /// Whether this invocation files a new issue, which runs
+    /// `create-issue.sh` (duplicate check, filing lock) and a nested
+    /// `forge create-issue`.
+    #[must_use]
+    pub fn files_new_issue(&self) -> bool {
+        matches!(
+            self.command,
+            OperatorDecisionCommand::Apply {
+                new: true,
+                dry_run: false,
+                ..
+            }
+        )
+    }
+}
+
+/// Run the operator-decision action through the one shared handler.
+///
+/// # Errors
+/// Whatever the handler returns; it exits the process with its own code.
+pub fn handle_operator_decision_command(cli: OperatorDecisionCli) -> Result<()> {
+    let writer = WorkflowWriter::for_tools(cli.reaches_forge())?;
+    cli.command.run(writer)
+}
+
 impl OperatorDecisionCommand {
+    /// Whether this invocation can reach the forge. `validate` and
+    /// `apply --new --dry-run` render offline; an existing-issue `apply`
+    /// (including its preview) reads the body and labels; `apply --new` files.
+    /// `resolve` reads the decision even as a preview, but a recording run that
+    /// is not attended, or names an unknown effect, refuses before any forge
+    /// call, so it must not be turned into a mode error first (exit 5/2 stay).
+    pub(crate) fn reaches_forge(&self) -> bool {
+        match self {
+            OperatorDecisionCommand::Validate { .. } => false,
+            OperatorDecisionCommand::Apply { new, dry_run, .. } => !(*new && *dry_run),
+            OperatorDecisionCommand::Resolve {
+                effect, dry_run, ..
+            } => {
+                crate::operator_decision::resolution::Effect::parse(effect).is_ok()
+                    && (*dry_run || crate::operator_decision::resolve::require_attended().is_ok())
+            }
+        }
+    }
+
     /// Never returns: exits with the command's own code.
-    pub(crate) fn run(self) -> Result<()> {
+    pub(crate) fn run(self, writer: WorkflowWriter) -> Result<()> {
         let mut out = std::io::stdout();
         let mut err = std::io::stderr();
         let code = match self {
@@ -123,7 +185,7 @@ impl OperatorDecisionCommand {
                 };
                 match read_input(&input) {
                     Ok(text) => {
-                        let mut forge = GhForge::new(default_repo_root(), repo);
+                        let mut forge = writer.forge(default_repo_root(), repo);
                         let req = ApplyRequest {
                             target,
                             also_labels: also_label,
@@ -148,7 +210,9 @@ impl OperatorDecisionCommand {
                 release,
                 dry_run,
                 repo,
-            } => run_resolve(issue, option, &effect, release, dry_run, repo, &mut out, &mut err),
+            } => run_resolve(
+                writer, issue, option, &effect, release, dry_run, repo, &mut out, &mut err,
+            ),
         };
         std::process::exit(code)
     }
@@ -159,6 +223,7 @@ impl OperatorDecisionCommand {
 /// option id.
 #[allow(clippy::too_many_arguments)]
 fn run_resolve(
+    writer: WorkflowWriter,
     issue: u64,
     option: String,
     effect: &str,
@@ -186,7 +251,9 @@ fn run_resolve(
     }
     let root = default_repo_root();
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
-    let mut forge = GhForge::new(root, repo).with_call_site("operator_decision.resolve");
+    let mut forge = writer
+        .forge(root, repo)
+        .with_call_site("operator_decision.resolve");
     let req = resolve::ResolveRequest {
         issue,
         option,

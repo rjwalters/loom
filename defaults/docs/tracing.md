@@ -154,7 +154,14 @@ Phase timing has three explicit forms, distinguished by `loom.timing_source`
   so parallel builders in one wave each complete their own. A re-dispatch of
   the same phase closes the earlier still-open begin as `loom.result=superseded`
   (`worked` absent); a begin never followed by its checkpoint is closed at
-  execution end as `exit_unobserved` / `terminal_observed` (`worked` absent).
+  execution end with `loom.timing_source=terminal_observed` (`worked` absent).
+  When that close saw the step end (a step-dispatched attempt closed by
+  `SweepRegistry::close_step_span`, #14407) the phase and attempt mirror it:
+  the same `loom.result` as the step's `loom.sweep` root, plus the launch's
+  `loom.runtime` and, for a known engine, `loom.engine`. When the close saw
+  nothing (a kill, orphan recovery, host loss), a step a roll stopped, or a step
+  that exited with no observed status and no outcome line, the result is
+  `exit_unobserved` and no runtime is stamped.
 - **Completion only** (`checkpoint_write_observed` / `checkpoint_poll_observed`):
   a checkpoint with no observed start — an older orchestrator prompt or binary
   without `begin`, a phase skipped without a dispatch (e.g. an already-curated
@@ -368,7 +375,10 @@ rows; count distinct execution/trace identities when comparing accepted issues.
 
 Parent process completion, cancellation and reaping close observed work. An exit
 that Loom could not observe stays `exit_unobserved`; it does not inherit a
-successful sweep result. A separately persisted supervisor identity protects
+successful sweep result. The one exception is a step's own end (#14407): the
+close that records the step's `loom.sweep` result also sets the same result and
+the launch's `loom.runtime` / `loom.engine` on that step's phase and attempt
+spans, since the step's end *was* observed. A separately persisted supervisor identity protects
 execution results between worker exit, reaping, and independent verification.
 Lock-based restart adoption renews that supervisor using the authoritative sweep
 ID before exposing the registry to telemetry. Recovery checks identities and

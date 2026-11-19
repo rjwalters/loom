@@ -394,8 +394,11 @@ precedence env > `.loom/config.json` > default, same as
 `buildGate.loadThreshold`); once at/above threshold, filing is deferred until
 either pressure clears or `guide.docsMaintenance.poolPressureMaxDeferSecs`
 (default `14400` = 4h) has elapsed since the last docs-maintenance PR merged
-— the "never starves permanently" ceiling. Missing/empty/unparseable ranking
-data fails open (proceeds as if there is no pressure). Full mechanism:
+— the "never starves permanently" ceiling. Absent or unparseable ranking
+data is a valid numeric `0` (no pressure), but a read that produces no
+number at all — a denied or failed call, empty or non-numeric output —
+reports `unavailable` and is treated as pressure-UNKNOWN: deferred, bounded
+by the same ceiling, never a silent proceed (#14162). Full mechanism:
 `defaults/.claude/commands/loom/guide.md` → "Step 4b: Check Token-Pool
 Pressure".
 
@@ -1363,25 +1366,10 @@ dispatch for that pool when `total > 0 && usable == 0`
 - A hold outranks #5030's half-open recovery probe: a probe dispatched into a
   pool with zero spawnable accounts tests nothing and costs exactly the label
   flip and lease comment this exists to prevent.
-- **Broadcast to peers, keyed by account set (#8001).** The arm/clear *edge* is
-  advertised over the peer-claim room (`ClaimKind::PoolHoldArmed` /
-  `PoolHoldCleared`), so a peer does not have to rediscover a dead pool the
-  expensive way — one doomed dispatch, one label flip and one permanent lease
-  comment at a time. The original "do not broadcast" caution is preserved as the
-  **key**, not as abstinence: each host resolves its *own* pool (repo-local
-  shadow if it holds `.token` files, else shared — #3938/#7527), so the ad is
-  keyed by `pool_account_fingerprint` — a hash of the pool's sorted account
-  names — never by the pool directory. A path key is wrong in both directions
-  (two hosts sharing accounts resolve different absolute paths; two hosts with
-  genuinely different repo-local shadow pools resolve the *same* relative path),
-  and the second failure is exactly the "suppress a peer whose pool is healthy"
-  hazard. Exhaustion is a property of the **accounts** — a `.bad_tokens` mark or
-  a `.ranking` hard exclusion records an upstream rate-limit state every host
-  holding that credential shares — so an account-set key matches precisely when
-  suppression is correct. Fail-open throughout: a dropped ad, a peer without
-  safehouse, or a host that has not received the ad yet degrades byte-for-byte
-  to the local-only pre-flight, which still stops that host on its own next
-  tick. See [`safehouse.md` → "Fleet-wide token-pool exhaustion hold"](safehouse.md).
+- **Not broadcast to peers (#13945).** The arm/clear edge was once advertised
+  over the safehouse claims room, keyed by account-set fingerprint (#8001); that
+  channel was retired, so the hold is this host's own.
+
 - `total == 0` (no pool provisioned at all) is a *different* condition with a
   different remedy (`loom-daemon tokens bootstrap`) and its own detection
   (#4642). It never arms this hold.

@@ -52,9 +52,6 @@ pub struct StateFiles {
     pub probe_window: PathBuf,
     pub recovery: PathBuf,
     pub escalation_sentinel: PathBuf,
-    /// #12818: no longer read or written; kept only as the loom-ui alert's
-    /// record key (#11295).
-    pub peer_coord_sentinel: PathBuf,
     /// #7855: per-pid dual-signal streak (`<pid> <count>`).
     pub hang_streak: PathBuf,
     /// #7855: durable hang-recovery cooldown/attempt record. NOT keyed by pid:
@@ -75,10 +72,6 @@ impl StateFiles {
             escalation_sentinel: at(
                 "LOOM_WATCHDOG_ESCALATION_SENTINEL",
                 ".watchdog-outage-escalated",
-            ),
-            peer_coord_sentinel: at(
-                "LOOM_WATCHDOG_PEER_COORD_SENTINEL",
-                ".watchdog-peer-coord-escalated",
             ),
             hang_streak: at("LOOM_WATCHDOG_HANG_RECOVER_STREAK_STATE", ".watchdog-hang-streak"),
             hang_state: at("LOOM_WATCHDOG_HANG_RECOVER_STATE", ".watchdog-hang-recover-state"),

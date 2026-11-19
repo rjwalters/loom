@@ -242,6 +242,9 @@ fn renewer_argv_matches_only_this_toolings_renewers() {
     )));
     assert!(is_renewer_argv(&argv("/bin/bash sweep-lease-renew.sh start 7")));
     assert!(is_renewer_argv(&argv("/usr/bin/loom-daemon lease renewer claim 7")));
+    assert!(is_renewer_argv(&argv("/usr/bin/loom-tools lease renewer claim 7")));
+    assert!(!is_renewer_argv(&argv("/usr/bin/loom-tools lease ensure 7")));
+    assert!(!is_renewer_argv(&argv("/usr/bin/loom-tools forge lease renewer")));
     assert!(!is_renewer_argv(&argv("sleep 30")));
     assert!(!is_renewer_argv(&argv("claude --resume start")));
     assert!(!is_renewer_argv(&argv("bash sweep-lease-renew.sh renew-once 7")));

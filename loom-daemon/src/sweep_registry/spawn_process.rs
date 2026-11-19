@@ -457,3 +457,6 @@ impl SweepRegistry {
         Ok((child, header_anchor))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 #[derive(clap::Args)]
-pub(crate) struct LabelDuplicatesArgs {
+pub struct LabelDuplicatesArgs {
     /// Path to the `labels.yml` file to scan.
     #[arg(value_name = "PATH")]
     labels_file: PathBuf,
@@ -67,7 +67,7 @@ fn report_line(labels_file: &std::path::Path, name: &str) -> String {
 }
 
 impl LabelDuplicatesArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let content = std::fs::read_to_string(&self.labels_file)
             .with_context(|| format!("reading {}", self.labels_file.display()))?;
         let duplicates = find_duplicates(&content);

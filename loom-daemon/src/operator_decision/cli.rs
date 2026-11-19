@@ -295,6 +295,42 @@ pub struct GhForge {
     call_site: &'static str,
 }
 
+/// Writer available to the shared park and decision handlers. The tools
+/// fleet route can read through the gateway, but the scoped write broker
+/// has no operation for editing an existing issue body.
+#[derive(Clone, Copy)]
+pub(crate) enum WorkflowWriter {
+    Gh,
+    FleetBrokerUnavailable,
+}
+
+impl WorkflowWriter {
+    pub(crate) fn for_tools(reaches_forge: bool) -> anyhow::Result<Self> {
+        if reaches_forge {
+            let mode = crate::tools_mode::configure_forge_read_route(&default_repo_root())
+                .map_err(anyhow::Error::msg)?;
+            if mode == "fleet" {
+                crate::forge_gateway::require_cli_read_route();
+                return Ok(Self::FleetBrokerUnavailable);
+            }
+        }
+        Ok(Self::Gh)
+    }
+
+    pub(crate) fn forge(self, root: PathBuf, repo: Option<String>) -> GhForge {
+        let mut forge = GhForge::new(root, repo);
+        if matches!(self, Self::FleetBrokerUnavailable) {
+            // Every mutation, including create-issue.sh, consults check_write
+            // before its first side effect. Previews and no-ops can still run.
+            forge.write_ok = Some(Err(
+                "the scoped fleet write broker has no route for this park or decision write"
+                    .to_owned(),
+            ));
+        }
+        forge
+    }
+}
+
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 /// `create-issue.sh` may wait on the machine-wide filing lock and run the
 /// duplicate scan, so it gets a longer deadline.
@@ -485,6 +521,10 @@ impl Forge for GhForge {
         body: &str,
         labels: &[String],
     ) -> Result<String, (i32, String)> {
+        // The target's write scope is checked here, before `create-issue.sh`
+        // runs its duplicate scan and takes the filing lock (#14464): a denied
+        // or unverifiable target is refused with no nested call at all.
+        self.check_write().map_err(|e| (exit::FORGE, e))?;
         let script = self
             .repo_root
             .join(".loom")

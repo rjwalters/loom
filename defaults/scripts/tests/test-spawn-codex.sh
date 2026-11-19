@@ -1761,6 +1761,57 @@ else
 fi
 
 # ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER maps to `-c service_tier=<id>` (fast -> priority)
+#   2. explicit `-c service_tier=` wins; standard/unset/empty emit nothing
+#   3. the terminal record carries effort= and tier= on a v4 record, and an
+#      unset launch keeps the v2 record unchanged
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh service tier (#14141)..."
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "-c service_tier=priority" "$out" "LOOM_SERVICE_TIER=fast maps to -c service_tier=priority"
+out="$(run_argv LOOM_SERVICE_TIER=Ultrafast -- -p x)"
+assert_contains "-c service_tier=ultrafast" "$out" "a catalog id passes through (lower-cased)"
+err="$(run_argv_stderr LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "spawn-codex: service_tier=priority" "$err" "the applied tier is logged"
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x -c service_tier=flex)"
+assert_contains "service_tier=flex" "$out" "an explicit -c service_tier= is kept"
+assert_not_contains "service_tier=priority" "$out" "an explicit -c service_tier= wins over LOOM_SERVICE_TIER"
+
+out="$(run_argv LOOM_SERVICE_TIER=standard -- -p x)"
+assert_not_contains "service_tier" "$out" "standard emits no override"
+out="$(run_argv LOOM_SERVICE_TIER= -- -p x)"
+assert_not_contains "service_tier" "$out" "an empty LOOM_SERVICE_TIER is unset"
+out="$(run_argv -- -p x)"
+assert_not_contains "service_tier" "$out" "no tier configured emits no override"
+err="$(run_argv_stderr LOOM_SERVICE_TIER='bad value!' -- -p x)"
+assert_contains "not a valid tier id" "$err" "a malformed tier warns and is ignored"
+
+# Terminal record (v4): effort + tier applied.
+_tr4() { printf '# LOOM_TERMINAL_RESULT v=4 provider=codex account=%s category=%s exit_code=%s model=%s effort=%s tier=%s' "$1" "$2" "$3" "$4" "$5" "$6"; }
+mk_authmode_codex "Logged in using an API key"
+out="$(run_authmode LOOM_SERVICE_TIER=fast LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high priority)" "$out" \
+    "the record names the applied model, effort and tier (v4)"
+out="$(run_authmode LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high none)" "$out" \
+    "an unset tier is recorded as tier=none"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" \
+    "nothing applied keeps the v2 record unchanged"
+# The dropped-pin behaviour is unchanged: model=none plus requested_model=, now
+# with the applied settings appended.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
+assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
+    "a dropped pin still reports model=none (+ requested_model) alongside the tier"
+
+# ============================================================
 # Summary
 # ============================================================
 
