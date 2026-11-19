@@ -1281,7 +1281,7 @@ if [[ "$_has_seats" == true ]]; then
         case "${LOOM_SWEEP_CREDENTIAL_PROXY:-$(_containment_cfg claudeCredentialProxy)}" in
             1|true|yes) log_error "Claude seats require process-environment OAuth; refusing a credential-proxied dispatch"; exit 78 ;;
         esac
-        # requires-daemon: session-exec >= 0.19.1316   #14371 — only an adopted seat requires this verb.
+        # requires-daemon: session-exec >= 0.19.1318   #14371 — only an adopted seat requires this verb.
         _seat_bin="$(loom_resolve_self_daemon_bin)"
         if [[ -z "$_seat_bin" ]] || ! "$_seat_bin" session-exec claude-seat --help >/dev/null 2>&1; then
             log_error "The selected Claude seat requires an updated loom-daemon with session-exec claude-seat"
