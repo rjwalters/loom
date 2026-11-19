@@ -715,6 +715,34 @@ mod tests {
         assert!(error.message.contains("LOOM_TEST_9473_NEVER_SET"), "{}", error.message);
     }
 
+    /// The bundled `zai-full` profile is `zai-flash` with the full-strength
+    /// model: same providers, credentials, proxy and effort, and the same
+    /// Judge/Curator exclusion (GLM never runs those roles). `zai-flash` stays
+    /// the built-in fallback; a deployment opts in with
+    /// `runtimes.defaultModelProfile: zai-full`.
+    #[test]
+    fn the_bundled_zai_full_profile_is_zai_flash_with_glm_5_3() {
+        let _g = env_lock();
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../../defaults/model-profiles.json")).unwrap();
+        let mut flash = raw["zai-flash"].clone();
+        let full = raw["zai-full"].clone();
+        assert_eq!(full["model"], "glm-5.3");
+        assert_eq!(full["excludedRoles"], serde_json::json!(["judge", "curator"]));
+        flash["model"] = serde_json::json!("glm-5.3");
+        assert_eq!(full, flash, "zai-full differs from zai-flash only in its model");
+
+        let saved = std::env::var_os("LOOM_MODEL_PROFILE");
+        std::env::remove_var("LOOM_MODEL_PROFILE");
+        let config = serde_json::json!({"runtimes":{"defaultModelProfile":"zai-full"}});
+        let (name, profile) = lookup(None, &config).expect("zai-full resolves as a default");
+        assert_eq!(name, "zai-full");
+        assert_eq!(profile.model, "glm-5.3");
+        if let Some(v) = saved {
+            std::env::set_var("LOOM_MODEL_PROFILE", v);
+        }
+    }
+
     /// #11714: the bundled `zai-flash` profile binds BOTH `pi` and `opencode`,
     /// and its `credentialProxy` block declares `baseUrlConfig` — an OpenCode
     /// config contract. Selection must not refuse the `pi` binding for that:
