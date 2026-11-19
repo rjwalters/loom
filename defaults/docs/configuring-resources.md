@@ -510,6 +510,12 @@ majority on flash. (If you do pin it, pin something the native runtime
 accepts — a qualified `provider/model` or the profile's model name. A Claude
 alias trips the #5028 mismatch preflight: Recipe 1's trap, same shape.)
 
+To run full-strength GLM instead, set `runtimes.defaultModelProfile` to the
+shipped `zai-full`: `zai-flash` with `glm-5.3` in place of `glm-5.3-flash`,
+the same providers, credential pool and Judge/Curator exclusion. Loom can scope
+bad marks by model class. Both profiles draw on the same seat's five-hour and
+weekly Z.ai GLM Coding Plan credit windows.
+
 ### Promotion: the native pin rule, and the judge-independence trap
 
 The per-role pins work exactly as in Recipe 1; two things differ on a native

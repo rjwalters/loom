@@ -6,6 +6,22 @@ use super::*;
 use crate::health;
 use serial_test::serial;
 
+#[test]
+fn disposition_poll_preserves_snapshot_cadence_and_leaves_delivery_headroom() {
+    use crate::observability::ops::disposition::DEFAULT_REFRESH_SECS;
+    use crate::observability::{DEFAULT_FLUSH_INTERVAL_SECS, SNAPSHOT_INTERVAL};
+    use crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS;
+
+    let poll = DISPOSITION_INTERVAL.as_secs();
+    let refresh = u64::try_from(DEFAULT_REFRESH_SECS).unwrap();
+    let ideal_period = refresh.div_ceil(poll) * poll;
+    let worst_assumed_age =
+        refresh + DEFAULT_WORK_FINDER_INTERVAL_SECS + poll + DEFAULT_FLUSH_INTERVAL_SECS;
+    assert_eq!(SNAPSHOT_INTERVAL.as_secs(), 300);
+    assert_eq!(ideal_period, 150);
+    assert_eq!(300 - worst_assumed_age, 30);
+}
+
 fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
         story_points: None,
