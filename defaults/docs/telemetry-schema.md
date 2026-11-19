@@ -2921,8 +2921,12 @@ champion` and `operator-decision apply` journal appends, and the step's last
 release (`lease pr release --outcome … --reason …`, journaled by the
 release itself after its PATCH landed, #14639) supplies the outcome and
 optional reason. The lease and caller must both name the merge step, and
-the journal must belong to that exact sweep and PR. A release marker read
-off the forge is untrusted (#9548). A matching step line supplies the outcome
+the journal must belong to that repository workspace, sweep and PR. Workspaces
+use separate step journal names even when they generate the same sweep ID.
+Steps launched before the upgrade can still use their own log lines. The old
+shared journal names cannot establish workspace ownership, so new drains
+leave those files for normal cleanup. A release marker read off the forge is
+untrusted (#9548). A matching step line supplies the outcome
 and its optional reason together. The outcome ledger's `classify` /
 `champion_outcome` run **record-only** for `ledger_class` / `ledger_reason`;
 `effect_of` and `OutcomeLedger::record` are never called, so nothing changes in

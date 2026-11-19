@@ -1685,13 +1685,15 @@ impl Ctx {
                 released += 1;
                 // Ownership ignores step tags so older leases can still be
                 // released. Telemetry requires a confirmed merge step on
-                // both sides, and a journal belonging to that exact sweep.
+                // both sides, and a journal belonging to that repository
+                // and exact sweep.
                 if reaped.is_none()
                     && holder.step == Some(StepRole::ChampionMerge)
                     && self.me.step == holder.step
                 {
                     if let Some((word, reason)) = &typed {
                         crate::observability::pick_journal::record_released(
+                            &self.gh.root,
                             self.pr(),
                             &holder.sweep,
                             word,

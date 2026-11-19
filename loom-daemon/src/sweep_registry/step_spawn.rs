@@ -1132,7 +1132,7 @@ pub(crate) fn apply_step_env(
         crate::host_identity::LEASE_HOST_ID_ENV,
         crate::host_identity::lease_host_identity(),
     );
-    crate::observability::pick_journal::attach_step(cmd, sweep_id);
+    crate::observability::pick_journal::attach_step(cmd, root, sweep_id);
     // The admitted runtime can differ from the configured preference. Leave
     // an inherited tier in place when there is no matching configuration.
     if let Some((tier, _)) = runtime.and_then(|runtime| {

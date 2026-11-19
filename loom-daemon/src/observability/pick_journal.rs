@@ -220,23 +220,34 @@ fn attach_in(command: &mut Command, root: &Path, role: &str, dir: &Path) {
 
 /// A step's journal file (#11906). A step runs detached from the tick that
 /// drew it, not on a role tick's blocking thread, so its journal is named by
-/// its sweep id rather than held thread-locally until the step ends.
+/// its repository root and sweep id rather than held thread-locally until
+/// the step ends. Different workspaces can generate the same sweep id.
 #[must_use]
-pub fn step_path(sweep_id: &str) -> PathBuf {
+pub fn step_path(root: &Path, sweep_id: &str) -> PathBuf {
+    journal_dir().join(step_file_name(root, sweep_id))
+}
+
+fn step_file_name(root: &Path, sweep_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // A release from a linked worktree uses the shared checkout root too.
+    let resolved = crate::repo_root::find_repo_root(root).or_else(|| root.canonicalize().ok());
+    let root = resolved.as_deref().unwrap_or(root);
+    let workspace = hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let name: String = sweep_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    journal_dir().join(format!("step-{name}.jsonl"))
+    format!("step-{workspace}-{name}.jsonl")
 }
 
 /// Give a step's launch its journal ([`step_path`]). A no-op without an
 /// OTLP exporter, like [`attach`].
-pub fn attach_step(command: &mut Command, sweep_id: &str) {
+pub fn attach_step(command: &mut Command, root: &Path, sweep_id: &str) {
     if super::ops::global_ops_sink().is_some()
         && crate::forge_etag_store::private_dir(&journal_dir(), true)
     {
-        command.env(PICK_JOURNAL_ENV, step_path(sweep_id));
+        command.env(PICK_JOURNAL_ENV, step_path(root, sweep_id));
     }
 }
 
@@ -730,16 +741,15 @@ pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_
 
 /// Journal a successful Champion merge lease release only in the journal
 /// assigned to that merge step. An explicit `--sweep-id` can release an
-/// owned lease while the caller has inherited a different step's journal.
-pub fn record_released(pr: u64, sweep_id: &str, outcome: &str, reason: Option<&str>) {
+/// owned lease while the caller has inherited a different step's journal,
+/// even one with the same sweep id in another workspace.
+pub fn record_released(root: &Path, pr: u64, sweep_id: &str, outcome: &str, reason: Option<&str>) {
     use crate::step_role::StepRole;
     let (Some(path), Ok(number)) = (journal_path(), u32::try_from(pr)) else {
         return;
     };
-    // attach_step names its journal after the full sweep, including retries.
-    let name = format!("step-{sweep_id}.jsonl");
-    if path.file_name() != Some(std::ffi::OsStr::new(&name))
-        || StepRole::parse_sweep_id(sweep_id) != Some((StepRole::ChampionMerge, number))
+    if StepRole::parse_sweep_id(sweep_id) != Some((StepRole::ChampionMerge, number))
+        || path.file_name() != Some(std::ffi::OsStr::new(&step_file_name(root, sweep_id)))
     {
         return;
     }
