@@ -374,9 +374,13 @@ fails closed on anything else, so an older daemon reading a v4 record records no
 account-health mutation for that step: roll the daemon before the scripts, or accept
 that gap.
 
-Not covered here: reading a `serviceTier` key out of the role config and exporting
-`LOOM_SERVICE_TIER` per role/runtime (like `roleEfforts`) is daemon-side plumbing
-that this env-var contract leaves to a follow-up.
+The daemon's role runner is the producer (#14454): it reads
+`autonomous.roleRunner.serviceTier` and `autonomous.roleRunner.roleServiceTiers`
+(`"<role>"` or `"<role>@<runtime>"` keys, resolved `<role>@<runtime>` > `<role>` >
+global, like `roleEfforts`) and exports the result as `LOOM_SERVICE_TIER` on the
+role child. Unset exports nothing, so a value in the daemon's own environment is
+inherited as before. Scheduled role ticks only: sweep-worker (`dispatch_sweep`)
+spawns do not read these keys yet.
 
 ### 3. Error classification
 
