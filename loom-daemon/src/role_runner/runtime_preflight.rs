@@ -178,8 +178,17 @@ pub(crate) fn check(
     else {
         // No preference list applies to this role, an operator pin is in
         // force (a pin disables fall-through by design), or the preference
-        // config itself is malformed: byte-identical to before #8554.
+        // config itself is malformed. There is no fall-through, but a
+        // host-admitted Codex launch still needs to reserve its seat.
         gate(admission)?;
+        if let Some(Ok(admitted)) = admission {
+            containment
+                .reserve_seat(admitted, None)
+                .map_err(|rejection| {
+                    note_pre_spawn_skip(logs, role, rejection.refusal_line());
+                    RoleTickOutcome::RuntimeRejected(rejection)
+                })?;
+        }
         return Ok(crate::runtime_preference::DispatchAdmission::none());
     };
     // #11726: a role draw's record rides on the marker, the diagnostic and

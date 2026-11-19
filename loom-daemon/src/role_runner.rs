@@ -1316,6 +1316,18 @@ pub struct RoleRunnerConfig {
     /// only; a malformed qualified key is dropped with a warning. Resolved by
     /// [`resolve_role_runner_effort_for_runtime`].
     pub role_efforts: BTreeMap<String, String>,
+    /// `autonomous.roleRunner.serviceTier` — the runtime-neutral service tier
+    /// (speed setting, #14141) every role child is launched with, exported to
+    /// the spawn scripts as `LOOM_SERVICE_TIER` (#14454). `None` (absent, blank
+    /// or non-string) means **unset**: nothing is exported and an operator's own
+    /// inherited `LOOM_SERVICE_TIER` is left alone. Resolved by
+    /// [`resolve_role_runner_service_tier_for_runtime`].
+    pub service_tier: Option<String>,
+    /// `autonomous.roleRunner.roleServiceTiers` — per-role service-tier
+    /// overrides, keyed exactly like [`role_efforts`](Self::role_efforts)
+    /// (`"<role>"` or runtime-qualified `"<role>@<runtime>"`, #14017) and parsed
+    /// with the same per-entry soft-fail contract.
+    pub role_service_tiers: BTreeMap<String, String>,
     /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
     /// cap on how many proposal issues one architect dispatch may file
     /// (#5656). `None` (key absent, zero, or non-integer) falls through to
@@ -1482,6 +1494,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
     // them (`role_runner/model_resolution.rs`), with the identical
     // trim/blank-is-unset/per-entry-soft-fail contract `roleModels` uses above.
     let (effort, role_efforts) = model_resolution::parse_effort_config(block);
+    // `serviceTier` / `roleServiceTiers` (#14454) — same contract, same module.
+    let (service_tier, role_service_tiers) = model_resolution::parse_service_tier_config(block);
 
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
@@ -1496,6 +1510,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         role_models,
         effort,
         role_efforts,
+        service_tier,
+        role_service_tiers,
         // `architectMaxProposals` (#5656): a zero / negative / non-integer
         // value soft-fails to `None` — a cap of 0 would mean "dispatch
         // architect, forbid it from filing anything", which is a pure waste of
@@ -3820,9 +3836,9 @@ pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort,
-    resolve_role_runner_effort_for_runtime, resolve_role_runner_model, ModelRuntimeMismatch,
-    CLI_DEFAULT_MODEL_SENTINEL, CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE,
-    UNSET_EFFORT_SOURCE,
+    resolve_role_runner_effort_for_runtime, resolve_role_runner_model,
+    resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL,
+    CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE, UNSET_EFFORT_SOURCE,
 };
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for

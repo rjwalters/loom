@@ -160,7 +160,10 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     // required to be distinct AND to match one of those exact roles, an exact
     // count is also a proof that none of them is MISSING — which is what makes
     // this the host-side half of the control-file protection (issue #8839).
-    let expected = 2 + bundle::PROFILE_CONTROLS.len() + usize::from(config.gh_config.is_some());
+    let expected = 2
+        + bundle::PROFILE_CONTROLS.len()
+        + usize::from(config.gh_config.is_some())
+        + config.extra_mounts.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -190,12 +193,24 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
             // receipt, each bound READ-ONLY over its own canonical path. The
             // mount point is what makes them unremovable and unrenameable from
             // inside the session while `auth.json` beside them stays writable.
-            other => bundle::PROFILE_CONTROLS.iter().any(|name| {
-                other == bundle::control_destination(name)
-                    && mount["Type"] == "bind"
-                    && bind_source_matches(config, mount, &config.profile.join(name))
-                    && mount["RW"] == false
-            }),
+            other => {
+                bundle::PROFILE_CONTROLS.iter().any(|name| {
+                    other == bundle::control_destination(name)
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &config.profile.join(name))
+                        && mount["RW"] == false
+                })
+                // The recorded `accounts.session.extraMounts` (#14451): data
+                // only, so each must be a read-only bind of exactly its
+                // recorded host path. One that is not recorded, or recorded
+                // and missing, breaks the exact count above.
+                || config.extra_mounts.iter().any(|extra| {
+                    Path::new(other) == extra.container
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &extra.host)
+                        && mount["RW"] == false
+                })
+            }
         };
         if !valid {
             bail!("private session mount does not match its account-owned configuration");
@@ -361,6 +376,29 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             format!("GH_CONFIG_DIR={GH_CONFIG}"),
         ]);
     }
+    // The configured extra mounts, always read-only (#14451). Their JSON is
+    // labelled only when there are any, so an unconfigured create is
+    // byte-identical to what it has always been.
+    for extra in &config.extra_mounts {
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},readonly",
+                extra.host.display(),
+                extra.container.display()
+            ),
+        ]);
+    }
+    if !config.extra_mounts.is_empty() {
+        args.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                super::super::session_lifecycle::EXTRA_MOUNTS_LABEL,
+                super::super::session_image::extra_mounts_label_json(&config.extra_mounts)
+            ),
+        ]);
+    }
     args.extend([
         "--entrypoint".into(),
         "/usr/bin/tini".into(),
@@ -371,6 +409,42 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     ]);
     command(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
+}
+
+/// The sealed-bundle probe of [`super::super::session_image::verify_override_bundle`]
+/// routed through [`command`], so it shares this module's engine seam (and its
+/// test fake) rather than spawning its own `docker`.
+struct ImageProbe;
+
+impl super::super::session_image::BundleProbe for ImageProbe {
+    fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
+        command_with(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                script,
+            ],
+            docker_cli::DOCKER_RUN_TIMEOUT,
+        )
+    }
+}
+
+/// Prove the configured override `image` carries the sealed control bundle
+/// this daemon enforces, before any container is created from it (#14451).
+pub(super) fn verify_image(image: &str) -> Result<()> {
+    super::super::session_image::verify_override_bundle(image, &ImageProbe)
+        .context("refusing to create a private session from the configured override image")
 }
 
 pub(super) fn setup(config: &Config) -> Result<()> {

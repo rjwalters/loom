@@ -1,8 +1,6 @@
-//! [`super::repo_slug`] coverage, kept out of `peer_claims.rs` for two
-//! reasons: the test mutates the process-global `LOOM_REPO`, so it must carry
-//! that variable's crate-wide `#[serial]` key (#8496 — see
-//! the `gh_invocation` module docs' test-isolation invariant), and
-//! `peer_claims.rs` keeps its tests in sibling modules.
+//! [`super::repo_slug`] coverage. The test mutates the process-global
+//! `LOOM_REPO`, so it carries that variable's crate-wide `#[serial]` key (#8496 —
+//! see the `gh_invocation` module docs' test-isolation invariant).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

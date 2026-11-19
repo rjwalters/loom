@@ -267,31 +267,37 @@ fn a_step_dispatched_opencode_run_yields_an_opencode_usage_span() {
 // ---------------------------------------------------------------------------
 
 use crate::role_runner::RoleTickOutcome;
-use crate::role_tick_telemetry::{emit_for_step, ResolvedLaunch, StepTelemetry};
+use crate::step_role::StepRole;
+use crate::sweep_registry::step_spawn::capture::{emit_step_capture, StepCapture};
 use crate::telemetry::trace::journal::Journal;
-use crate::telemetry::trace::SpanRecord;
+use crate::telemetry::trace::{SpanRecord, TraceContext};
 
-/// The step's own end, as `emit_step_capture` calls it.
-fn end_step(root: &Path, role: &str, sweep_id: &str, item: (u32, bool)) {
+/// Run the capture thread's entry point for a finished step.
+fn end_step(
+    root: &Path,
+    role: StepRole,
+    sweep_id: &str,
+    item: u32,
+    trace_context: Option<TraceContext>,
+) {
     let log_path = root
-        .join(".loom")
-        .join("logs")
-        .join(format!("step-{role}-{}.log", item.0));
-    emit_for_step(
-        root,
+        .join(".loom/logs")
+        .join(format!("step-{role}-{item}.log"));
+    emit_step_capture(&StepCapture {
+        root: root.to_owned(),
         role,
-        Utc::now() - Duration::hours(1),
-        &RoleTickOutcome::Success,
-        Some(ResolvedLaunch::new("fixture-model", "high")),
-        StepTelemetry {
-            failure: None,
-            sweep_id,
-            step_outcome: None,
-            item,
-            stage: role,
-            log_path: &log_path,
-        },
-    );
+        sweep_id: sweep_id.to_owned(),
+        item,
+        trace_context,
+        started_at: Utc::now() - Duration::hours(1),
+        outcome: RoleTickOutcome::Success,
+        model: "fixture-model".into(),
+        effort: "high".into(),
+        step_outcome: None,
+        failure: None,
+        stage: role.as_str().to_owned(),
+        log_path,
+    });
 }
 
 /// Every `loom.runtime.usage` span in the step's own trace journal.
@@ -355,7 +361,7 @@ fn a_step_dispatched_claude_builder_yields_a_usage_span_for_its_own_issue_only()
         .unwrap();
 
     std::env::set_var("CLAUDE_CONFIG_DIR", &config);
-    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    end_step(&root, StepRole::Builder, SWEEP_ID, ISSUE, None);
     std::env::remove_var("CLAUDE_CONFIG_DIR");
 
     let spans = usage_spans(&root, SWEEP_ID);
@@ -388,7 +394,7 @@ fn a_step_dispatched_pr_role_matches_its_pr_not_a_sibling() {
         .unwrap();
 
     std::env::set_var("CLAUDE_CONFIG_DIR", &config);
-    end_step(&root, "judge", judge_id, (14407, true));
+    end_step(&root, StepRole::Judge, judge_id, 14407, None);
     std::env::remove_var("CLAUDE_CONFIG_DIR");
 
     let spans = usage_spans(&root, judge_id);
@@ -402,26 +408,44 @@ fn a_step_dispatched_pr_role_matches_its_pr_not_a_sibling() {
 
 #[test]
 #[serial_test::serial(codex_home_env)]
-fn a_step_dispatched_codex_builder_yields_a_codex_usage_span_at_its_end() {
+#[serial]
+fn a_codex_steps_usage_survives_journal_retirement_after_close() {
+    use crate::observability::lifecycle;
+    use crate::telemetry::trace::SpanName;
+
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
     let home = tmp.path().join(".codex");
-    let worktree = root
-        .join(".loom")
-        .join("worktrees")
-        .join(format!("issue-{ISSUE}"));
-    std::fs::create_dir_all(&worktree).unwrap();
-    write_rollout(&home, &worktree, "gpt-unpriced-fixture");
+    std::fs::create_dir_all(&root).unwrap();
+    write_rollout(&home, &root, "gpt-unpriced-fixture");
     // The step's OWN log names the runtime. The role runner's
     // `role-builder.log`, which the tick reader used to consult, does not exist.
     step_log(&root);
-    TraceStore::new(&root)
-        .load_or_create(&root, SWEEP_ID)
-        .unwrap();
+    std::fs::write(
+        root.join(".loom/config.json"),
+        r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+    )
+    .unwrap();
+    let sweep = lifecycle::begin(&root, SWEEP_ID, SpanName::Sweep, Default::default()).unwrap();
+    let (registry, _) = crate::sweep_registry::test_support::fixture_registry(&root);
+    let closed_context =
+        registry.close_step_span(SWEEP_ID, None, "success".into(), Default::default());
+
+    let sidecar = TraceStore::new(&root).path(&root, SWEEP_ID);
+    let journal = Journal::for_context(&sidecar);
+    assert_eq!(journal.drain(|_| Ok(())).unwrap(), 1);
+    assert!(journal.retire_if_drained().unwrap());
+    assert!(!sidecar.exists());
 
     std::env::set_var(crate::codex_usage::CODEX_HOME_ENV, &home);
-    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    end_step(&root, StepRole::Builder, SWEEP_ID, ISSUE, closed_context);
     std::env::remove_var(crate::codex_usage::CODEX_HOME_ENV);
+
+    let records = crate::sweep_outcomes::read_all_role_tick_outcomes(
+        &crate::sweep_outcomes::default_role_tick_telemetry_path(&root),
+    );
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].tokens_by_model.as_ref().unwrap()[0].input, 600);
 
     let spans = usage_spans(&root, SWEEP_ID);
     let [span] = spans.as_slice() else {
@@ -431,6 +455,8 @@ fn a_step_dispatched_codex_builder_yields_a_codex_usage_span_at_its_end() {
     assert_eq!(attr("loom.role"), Some("builder"));
     assert_eq!(attr("loom.runtime"), Some("codex"));
     assert_eq!(attr("loom.model"), Some("gpt-unpriced-fixture"));
+    assert_eq!(span.context.trace_id, sweep.context().trace_id);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&sweep.context().span_id));
     assert_eq!(attr("loom.tokens.input"), Some("600"));
     assert_eq!(attr("loom.tokens.cache_read"), Some("400"));
     assert_eq!(attr("loom.tokens.output"), Some("100"));
@@ -449,14 +475,14 @@ fn a_step_with_no_session_or_no_trace_journals_no_usage_span() {
     TraceStore::new(&root)
         .load_or_create(&root, SWEEP_ID)
         .unwrap();
-    end_step(&root, "builder", SWEEP_ID, (ISSUE, false));
+    end_step(&root, StepRole::Builder, SWEEP_ID, ISSUE, None);
     assert!(usage_spans(&root, SWEEP_ID).is_empty());
 
     // A transcript exists but the step has no persisted trace (tracing off):
     // nothing to parent a span to, and no span, no panic.
     write_claude_session(&config, &root, "mine.jsonl", "builder", &ISSUE.to_string(), 10, 1);
     let untraced = "step-builder-14166-2";
-    end_step(&root, "builder", untraced, (ISSUE, false));
+    end_step(&root, StepRole::Builder, untraced, ISSUE, None);
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     assert!(usage_spans(&root, untraced).is_empty());
 }
