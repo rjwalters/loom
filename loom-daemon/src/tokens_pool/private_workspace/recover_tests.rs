@@ -1080,6 +1080,145 @@ fn session_recover_follows_the_job_guard_policy_and_scopes_every_clone() {
     drop(lease::Lease::acquire(&env.dir).unwrap());
 }
 
+/// #14433: `recover --publish` for a GitHub clone with no write credential
+/// (no env token, no published owner App directory, no `gh` login) is refused
+/// before any docker exec, naming what to provide and carrying no secret. List
+/// and discard push nothing and are not refused; a process token lets the
+/// publish through to the worker.
+#[test]
+#[serial]
+fn session_recover_publish_without_a_github_credential_is_refused_before_exec() {
+    use crate::env_test_support::EnvGuard;
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    // The primary (a non-GitHub forge) is fine; the registered GitHub clone is
+    // what lacks a credential, and it must stop the walk before the primary's
+    // exec too.
+    let mut config = env.config.clone();
+    let github = identify("https://github.com/acme/widget").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: github.url.clone(),
+        base: "main".into(),
+        slug: github.slug.clone(),
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    let reported = json!({
+        "protocol": PROTOCOL,
+        "outcome": {
+            "repository": "https://github.com/acme/widget",
+            "cloned": true,
+            "branches": [],
+            "published": ["feature/issue-7"],
+            "discarded": [],
+            "ignored": [],
+            "detached": []
+        }
+    })
+    .to_string();
+    env.with(|e| e.recover_response = Some(reported.clone()));
+    let recover_calls = |env: &Env| {
+        env.engine()
+            .calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "recover"))
+            .count()
+    };
+
+    let guard = EnvGuard::set("GH_HOST", "github.com")
+        .and_set("GH_TOKEN", None)
+        .and_set("GITHUB_TOKEN", None)
+        .and_set("LOOM_MACHINE_CHECKOUT", None);
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, Some(7), &[])
+            .unwrap_err();
+    let text = message(&error);
+    assert!(text.contains("no GitHub write credential"), "{text}");
+    assert!(text.contains("GH_TOKEN") && text.contains("gh-config-by-owner"), "{text}");
+    assert_eq!(recover_calls(&env), 0, "refused before any exec");
+
+    // Listing pushes nothing: it still reaches the worker (both clones).
+    recover_session(env.workspace.path(), "alice", RecoverAction::List, None, &[]).unwrap();
+    assert_eq!(recover_calls(&env), 2);
+
+    // A process token is a credential: the publish is forwarded (bare name).
+    drop(guard);
+    let _token = EnvGuard::set("GH_TOKEN", "ghs_TESTONLY_14433")
+        .and_set("GH_HOST", Some("github.com".as_ref()));
+    let report =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, Some(7), &[])
+            .unwrap();
+    assert_eq!(report.clones.len(), 2);
+    assert_eq!(report.clones[1].published, ["feature/issue-7"]);
+    let engine = env.engine();
+    let call = engine
+        .calls
+        .iter()
+        .rfind(|c| c.iter().any(|a| a == "recover"))
+        .unwrap();
+    assert!(call
+        .windows(2)
+        .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"));
+    assert!(!call.iter().any(|a| a.contains("ghs_TESTONLY_14433")));
+}
+
+/// #14469: when the only published credential for a GitHub clone's owner is
+/// provably expired, the publish preflight refuses with the expired message
+/// (#14435) — not with advice to publish an App config that is already
+/// published — and still before any docker exec.
+#[test]
+#[serial]
+fn session_recover_publish_with_only_an_expired_credential_names_the_expiry() {
+    use crate::env_test_support::EnvGuard;
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mut config = env.config.clone();
+    let github = identify("https://github.com/acme/widget").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: github.url.clone(),
+        base: "main".into(),
+        slug: github.slug.clone(),
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+    // The workspace fallback holds the owner's published App config, but its
+    // token sidecar expired in 2020 and nothing fresher exists.
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(
+        env.workspace.path(),
+        "acme",
+    );
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("hosts.yml"), "github.com: {}\n").unwrap();
+    std::fs::write(
+        dir.join("identity.json"),
+        r#"{"appId":"1","slug":null,"installationId":"2","owner":"acme","role":"writer","expiresAt":"2020-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let guard = EnvGuard::set("GH_HOST", "github.com")
+        .and_set("GH_TOKEN", None)
+        .and_set("GITHUB_TOKEN", None)
+        .and_set("LOOM_MACHINE_CHECKOUT", None);
+    let error =
+        recover_session(env.workspace.path(), "alice", RecoverAction::Publish, Some(7), &[])
+            .unwrap_err();
+    let text = message(&error);
+    assert!(text.contains("expired and no fresher one is published"), "{text}");
+    assert!(text.contains("credential refresh has not renewed it"), "{text}");
+    assert!(!text.contains("provide the repository owner's published"), "{text}");
+    assert_eq!(
+        env.engine()
+            .calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "recover"))
+            .count(),
+        0,
+        "refused before any exec"
+    );
+    drop(guard);
+}
+
 #[test]
 #[serial]
 fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
