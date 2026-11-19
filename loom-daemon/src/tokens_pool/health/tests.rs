@@ -1291,6 +1291,75 @@ fn a_rolled_over_weekly_window_is_unknown() {
 }
 
 #[test]
+fn weekly_preference_does_not_borrow_shared_rollouts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = seat_with_usage(tmp.path(), "a", None, None);
+    let b = seat_with_usage(tmp.path(), "b", None, Some(5.0));
+    let a_sessions = a.credential_reference.join("sessions");
+    fs::remove_dir_all(&a_sessions).unwrap();
+    let accounts = [a, b];
+    for shared_usage in [1.0, 80.0] {
+        let default = seat_with_usage(tmp.path(), "default", None, Some(shared_usage));
+        let shared = default.credential_reference.join("sessions");
+        std::os::unix::fs::symlink(&shared, &a_sessions).unwrap();
+        let picks: HashSet<_> = (0..4).map(|_| pick(tmp.path(), &accounts)).collect();
+        assert_eq!(picks, HashSet::from(["a".to_owned(), "b".to_owned()]));
+        fs::remove_file(&a_sessions).unwrap();
+
+        fs::create_dir(&a_sessions).unwrap();
+        std::os::unix::fs::symlink(
+            shared.join("rollout-fixture.jsonl"),
+            a_sessions.join("rollout-linked.jsonl"),
+        )
+        .unwrap();
+        let picks: HashSet<_> = (0..4).map(|_| pick(tmp.path(), &accounts)).collect();
+        assert_eq!(picks, HashSet::from(["a".to_owned(), "b".to_owned()]));
+        fs::remove_dir_all(&a_sessions).unwrap();
+    }
+}
+
+#[test]
+fn weekly_preference_ages_out_a_malformed_reset_using_its_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let accounts = [
+        seat_with_usage(tmp.path(), "a", None, None),
+        seat_with_usage(tmp.path(), "b", None, Some(5.0)),
+    ];
+    let now = now_epoch_secs();
+    let week = 7 * 24 * 60 * 60;
+    let rollout = accounts[0]
+        .credential_reference
+        .join("sessions/rollout-fixture.jsonl");
+    for (age, expected) in [
+        (week - 1, HashSet::from(["a".to_owned()])),
+        (week, HashSet::from(["a".to_owned(), "b".to_owned()])),
+        (week + 86_400, HashSet::from(["a".to_owned(), "b".to_owned()])),
+    ] {
+        let observed_at = chrono::DateTime::from_timestamp((now - age) as i64, 0).unwrap();
+        let line = serde_json::json!({
+            "timestamp": observed_at.to_rfc3339(),
+            "rate_limits": {
+                "secondary": {
+                    "used_percent": 1.0,
+                    "window_minutes": 10_080,
+                    "resets_at": "malformed"
+                },
+            },
+        });
+        fs::write(&rollout, format!("{line}\n")).unwrap();
+        let picks: HashSet<_> = (0..4)
+            .map(|_| {
+                select_healthy_at(tmp.path(), AccountProvider::Codex, &accounts, now)
+                    .unwrap()
+                    .id
+                    .name
+            })
+            .collect();
+        assert_eq!(picks, expected, "snapshot age {age}");
+    }
+}
+
+#[test]
 fn weekly_preference_stays_inside_the_fewest_transient_failures_group() {
     let tmp = tempfile::tempdir().unwrap();
     let accounts = vec![

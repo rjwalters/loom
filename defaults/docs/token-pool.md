@@ -1996,16 +1996,15 @@ eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
 then prefers fewer recent transient failures. Within that group it prefers the
 seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
-among seats tied for the lowest. The figure is the same live weekly reading
-`accounts check --ranking` reports as `s7d_utilization`, read from the profile's
-own rollout log (`codex_check::weekly_utilization_at`); the 5h window is never
-used. Ranking needs comparable evidence: if **any** candidate in the group has
-no live weekly reading (no rollout log, malformed, 5h-only, or a window whose
-reset has passed), the whole group falls back to plain round-robin. A measured
-`0%` is a reading, not an unknown. Live-session preference, repository and
-model eligibility, and explicit profile pins are applied first and unchanged; a
-seat that turns out busy at lease time is skipped and the next-best eligible
-seat is tried. If none are healthy, selection exits closed rather than using
+among seats tied for the lowest. Ranking reads the provider's weekly window
+from the seat's own rollout logs because provisioned profiles can share session
+history. A reading expires at its reported reset or after one known window
+from the observation when a reset is unavailable.
+If **any** candidate in the group lacks a live weekly reading, the whole group
+falls back to plain round-robin. A measured `0%` is a reading. Live-session
+preference, repository and model eligibility, and explicit profile pins apply
+first. A seat that turns out busy at lease time is skipped and the next-best
+eligible seat is tried. If none are healthy, selection exits closed rather than using
 ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:

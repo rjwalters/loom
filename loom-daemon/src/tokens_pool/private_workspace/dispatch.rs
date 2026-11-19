@@ -692,13 +692,11 @@ mod tests {
         assert!(none.is_err());
     }
     /// #14585: among equally healthy seats that serve this repository, the one
-    /// with the most weekly headroom is drawn first; when it is busy (the idle
-    /// reservation retry excludes it via `tried`) the next-best eligible seat
-    /// is drawn; and a lower-utilization seat that is bound to another
-    /// repository can never win.
+    /// with the most weekly headroom is drawn first and exclusions reveal the
+    /// next-best seat. An account bound to another repository stays excluded.
     #[test]
     #[serial_test::serial]
-    fn pool_selection_prefers_weekly_headroom_and_yields_when_busy() {
+    fn pool_selection_orders_weekly_headroom_within_repository() {
         use super::super::super::account_registry::select_codex_account_where;
         use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
         let _fork = super::super::tests::fork_guard();
@@ -743,7 +741,6 @@ mod tests {
         let _profile_root =
             crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
         let logical = logical_repository(ws.path());
-        // The loop in `prepare_with`: each busy seat joins `tried`.
         let mut tried = std::collections::BTreeSet::new();
         let mut order = Vec::new();
         while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
