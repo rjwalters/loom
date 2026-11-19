@@ -184,7 +184,7 @@ impl TrustPolicy {
 
 /// Every trusted comment on issue/PR `number` of `repo` (`owner/name`), oldest
 /// first, from the REST listing (whose `user.login` names an App as `x[bot]`).
-/// Bounded through [`crate::script_helpers::run_gh`]. `None` on any failure.
+/// Bounded through [`crate::script_helpers::gh_read`]. `None` on any failure.
 #[must_use]
 pub fn fetch_trusted_comments(
     repo: &str,
@@ -215,9 +215,14 @@ pub fn fetch_comment_listing(
     let path = format!("repos/{repo}/issues/{number}/comments");
     fetch_comment_listing_with(
         || {
-            crate::script_helpers::run_gh(&["api", &path, "--paginate"], repo_root, use_cache)
-                .ok_output()
-                .map(|o| o.stdout.clone())
+            crate::script_helpers::gh_read(
+                "trust.comment_listing",
+                &["api", &path, "--paginate"],
+                repo_root,
+                use_cache,
+            )
+            .ok_output()
+            .map(|o| o.stdout.clone())
         },
         crate::forge_retry::thread_sleep,
     )
@@ -243,7 +248,8 @@ pub fn fetch_issue_object(
     use_cache: bool,
 ) -> Option<Value> {
     let path = format!("repos/{repo}/issues/{number}");
-    let out = crate::script_helpers::run_gh(&["api", &path], repo_root, use_cache);
+    let out =
+        crate::script_helpers::gh_read("trust.issue_object", &["api", &path], repo_root, use_cache);
     serde_json::from_slice::<Value>(&out.ok_output()?.stdout)
         .ok()
         .filter(Value::is_object)

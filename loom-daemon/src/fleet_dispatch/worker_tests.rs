@@ -563,3 +563,103 @@ fn the_resolved_mode_is_announced_on_each_change() {
     assert_eq!(host_endpoint(repo.path()), None);
     assert_eq!(state().announced, None);
 }
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer's token-probe snapshot lands as the
+// worker's fleet sidecar.
+// -----------------------------------------------------------------
+
+/// A captain that publishes one snapshot row on every heartbeat answer.
+fn probing() -> TestServer {
+    TestServer::start(|path, _| match path {
+        proto::HEARTBEAT_PATH => (
+            200,
+            json!({
+                "server_epoch": "e1",
+                "grace": false,
+                "token_probe": {
+                    "probed_at": "2026-11-18T12:00:00Z",
+                    "accounts": [
+                        {"name": "agent-1", "status": "exhausted",
+                         "limit_reset": "2026-11-20T03:00:00Z"}
+                    ]
+                }
+            }),
+        ),
+        _ => (200, json!({"server_epoch": "e1"})),
+    })
+}
+
+/// A root whose per-repo pool holds a token, so the snapshot resolves and
+/// lands beside it deterministically (never the host's real shared pool).
+fn rooted_pool() -> tempfile::TempDir {
+    let root = tempdir().unwrap();
+    let pool = root.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&pool).unwrap();
+    std::fs::write(pool.join("seed.token"), "sk-ant-oat01-fake").unwrap();
+    root
+}
+
+#[test]
+#[serial]
+fn a_snapshot_on_the_heartbeat_answer_becomes_the_fleet_sidecar() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = probing();
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &BTreeSet::new());
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+
+    // The answer is applied on the client's runtime thread; the sidecar
+    // appears within one heartbeat round-trip.
+    let sidecar = root
+        .path()
+        .join(".loom")
+        .join("tokens")
+        .join(".fleet_probe.json");
+    let mut seen = None;
+    for _ in 0..50 {
+        if let Some(snapshot) = crate::tokens_pool::fleet_probe::read_sidecar(
+            root.path().join(".loom").join("tokens").as_path(),
+        ) {
+            seen = Some(snapshot);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snapshot = seen.unwrap_or_else(|| {
+        panic!("the fleet sidecar never landed at {}", sidecar.display());
+    });
+    assert_eq!(
+        snapshot.probed_at,
+        "2026-11-18T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(snapshot.account("agent-1").map(|a| a.status.as_str()), Some("exhausted"));
+}
+
+/// An old captain's answer (no `token_probe` field) writes nothing: worker
+/// behaviour with the field absent is byte-for-byte today's.
+#[test]
+#[serial]
+fn an_answer_without_the_snapshot_writes_nothing() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = granting(); // answers carry no token_probe field
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &BTreeSet::new());
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !root
+            .path()
+            .join(".loom")
+            .join("tokens")
+            .join(".fleet_probe.json")
+            .exists(),
+        "no snapshot on the wire, no sidecar on disk"
+    );
+}
