@@ -671,7 +671,7 @@ mod tests {
             repository: repository.into(),
             base: "main".into(),
             repositories: vec![],
-            volume: format!("loom-codex-workspace-{name}"),
+            volume: workspace_volume_name(name),
             profile: profile.canonicalize().unwrap(),
             gh_config: None,
             session_image: None,
