@@ -15,6 +15,7 @@
 //! | [`PARK_ENDED_PATH`] | [`ParkEndedRequest`] | [`AckResponse`] |
 //! | [`FILING_LOCK_PATH`] | [`FilingLockRequest`] | [`FilingLockResponse`] |
 //! | [`FILING_UNLOCK_PATH`] | [`FilingUnlockRequest`] | [`AckResponse`] |
+//! | [`TOKENS_REFRESH_PATH`] | [`TokensRefreshRequest`] | [`TokensRefreshResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -50,8 +51,12 @@ pub const FILING_LOCK_PATH: &str = "/v1/filing-lock";
 /// `POST` path of an issue-filing unlock (#13918).
 pub const FILING_UNLOCK_PATH: &str = "/v1/filing-unlock";
 
+/// `POST` path of an on-demand token-pool probe (#13943, part 3 of #13893):
+/// `loom-daemon tokens refresh --fleet`.
+pub const TOKENS_REFRESH_PATH: &str = "/v1/tokens-refresh";
+
 /// Every path.
-pub const PATHS: [&str; 8] = [
+pub const PATHS: [&str; 9] = [
     HEARTBEAT_PATH,
     CLAIM_PATH,
     REFUSE_PATH,
@@ -60,6 +65,7 @@ pub const PATHS: [&str; 8] = [
     PARK_ENDED_PATH,
     FILING_LOCK_PATH,
     FILING_UNLOCK_PATH,
+    TOKENS_REFRESH_PATH,
 ];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
@@ -416,6 +422,37 @@ pub struct FilingLockResponse {
 pub struct FilingUnlockRequest {
     pub host_id: String,
     pub holder: String,
+}
+
+/// `POST /v1/tokens-refresh`: "run your token-pool probe now" (#13943, part
+/// 3 of #13893). Sent by `loom-daemon tokens refresh --fleet` after an
+/// operator buys account resets, so the fleet learns of them at the next
+/// heartbeat instead of at the captain's next scheduled probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokensRefreshRequest {
+    pub host_id: String,
+}
+
+/// The refresh answer: the probe the captain ran (or joined), not a mere
+/// acceptance — `probed_at` is the probe instant the fleet's snapshots
+/// carry after their next heartbeat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokensRefreshResponse {
+    pub server_epoch: String,
+    /// When the probe the captain ran measured the pool (its fresh
+    /// `.ranking` mtime, the same freshness fact the heartbeat snapshot
+    /// publishes). `None` when the probe succeeded but its result could not
+    /// be read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed_at: Option<DateTime<Utc>>,
+    /// `true` when a probe was already running when this request arrived
+    /// and this request joined it: no second probe was started.
+    pub coalesced: bool,
+    /// Why the probe failed, when it ran and failed. The request itself was
+    /// served — a failed probe is the probe's outcome, not a protocol
+    /// error, so it rides the answer instead of an HTTP error status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The longest `holder` the captain accepts.

@@ -71,7 +71,23 @@ fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     let text = String::from_utf8_lossy(&std::fs::read(&step.log_path).ok()?).into_owned();
     let anchor = format!("sweep_id={} ", step.sweep_id);
     let from = text.rfind(&anchor).unwrap_or(0);
-    outcome_ledger::parse_outcome_line(&text[from..], step.role, step.item)
+    let text = &text[from..];
+    outcome_ledger::parse_outcome_line(text, step.role, step.item).or_else(|| seat_dirty_line(text))
+}
+
+/// A step that never ran because its seat's private clone refused preparation
+/// over a dirty leftover worktree wrote no outcome line (#14458): name the
+/// failure `seat_dirty` instead of leaving it `unclassified`. Only the
+/// refusal's own prefix counts, so a transcript that merely mentions the
+/// word does not.
+fn seat_dirty_line(text: &str) -> Option<outcome_ledger::StepOutcome> {
+    let marker = format!("preparation refused: {}", outcome_ledger::SEAT_DIRTY);
+    text.contains(&marker).then(|| {
+        outcome_ledger::StepOutcome::new(
+            outcome_ledger::OutcomeClass::Failed,
+            outcome_ledger::SEAT_DIRTY,
+        )
+    })
 }
 
 /// The run the ledger records for `step`, given its post-state read. A step
@@ -347,6 +363,29 @@ mod tests {
         assert_eq!(ledger_reason("runtime_rejected"), Some("admission"));
         assert_eq!(ledger_reason("model_runtime_mismatch"), Some("admission"));
         assert_eq!(ledger_reason("admission_refused"), Some("admission"));
+    }
+
+    /// #14458: a step that died on its seat's dirty leftover worktree wrote no
+    /// outcome line; its log's refusal names the reason instead of leaving it
+    /// `unclassified`, and a real outcome line still wins.
+    #[test]
+    fn a_dirty_seat_refusal_in_the_log_classifies_as_seat_dirty() {
+        let refusal = "Error: private workspace preparation refused: seat_dirty: private \
+                       clone/worktree is dirty; retain and recover its work before reuse";
+        let line = seat_dirty_line(refusal).expect("the refusal names seat_dirty");
+        assert_eq!(line.class, OutcomeClass::Failed);
+        assert_eq!(line.reason, "seat_dirty");
+        let run = classify_with(Some(&line));
+        assert_eq!(run.reason, "seat_dirty");
+        // Prose that merely mentions the word is not the refusal.
+        assert!(seat_dirty_line("the seat_dirty reason is documented").is_none());
+        assert!(seat_dirty_line("private workspace preparation refused: base is missing").is_none());
+    }
+
+    fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {
+        // An unchanged item whose claim is still held: the dead step's shape.
+        let post = post_state(StepRole::Curator, &labels(&["loom:curating"]), false);
+        outcome_ledger::classify(line, Some(post))
     }
 
     /// #13966: a step whose provider feedback said its api-key seat was

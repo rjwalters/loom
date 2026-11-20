@@ -1061,6 +1061,22 @@ fn carries_forward(status: &str, carried: &str, now: DateTime<Utc>) -> bool {
     })
 }
 
+/// Whether a permanent (`auth` / `malformed-timestamp`) `.bad_tokens` mark
+/// stands against `a` (issue #14317).
+///
+/// Such an account is never carried: its `blocked` row comes from the mark
+/// (an empty-token round, or a `--source probe` round whose `status` the mark
+/// pins), not from a probe that failed, so it is not the "inconclusive probe"
+/// case [`carries_forward`] protects. Carrying an earlier `exhausted` row over
+/// it would freeze that row — `auto`/`monitor` never re-probe the account —
+/// and mislabel an auth-dead account `exhausted`. A self-clearing `exhaustion`
+/// mark is probed live and keeps the carry-forward.
+fn has_permanent_mark(a: &AccountResult) -> bool {
+    a.bad_mark
+        .as_ref()
+        .is_some_and(|mark| mark.class != super::bad_tokens::BadReasonClass::Exhaustion)
+}
+
 /// Read the current `.ranking` and keep its `exhausted` rows (keyed by
 /// account name, line text trimmed) for [`format_ranking_lines_with_preserve`]
 /// to carry forward. An unreadable file simply preserves nothing — the write
@@ -1108,6 +1124,7 @@ fn format_ranking_lines_with_preserve(
         }
         match preserve
             .get(a.name.as_str())
+            .filter(|_| !has_permanent_mark(a))
             .filter(|carried| carries_forward(&a.status, carried, now))
         {
             Some(carried) => out.push_str(carried),
@@ -2174,6 +2191,60 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
             "a-1|exhausted|0.02|2026-11-24T08:00:00Z\nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        );
+    }
+
+    /// #14317: an account with a standing permanent mark reports `blocked`
+    /// because of the mark, not because a probe failed, so a previous
+    /// `exhausted` row must not be carried over it — in the empty-token
+    /// shape (`probed: false`) and in the `--source probe` shape (`probed:
+    /// true`, `status` pinned `blocked`). An `exhaustion` mark, a markless
+    /// account, and an account whose previous row was not `exhausted` are
+    /// unchanged.
+    #[test]
+    fn a_permanent_mark_does_not_carry_an_earlier_exhausted_row() {
+        use crate::tokens_pool::bad_tokens::BadReasonClass;
+        use crate::tokens_pool::check::marked_probe::BadMark;
+        fn marked(name: &str, class: BadReasonClass, probed: bool) -> AccountResult {
+            let mut r = AccountResult::new(name, "blocked");
+            r.probed = probed;
+            r.bad_mark = Some(BadMark {
+                class,
+                reason: "401".into(),
+                marked_at: "2026-11-18T00:00:00Z".into(),
+            });
+            r
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "auth-dead|exhausted||2026-11-24T08:00:00Z
+             auth-probed|exhausted||2026-11-24T08:00:00Z
+             malformed|exhausted||2026-11-24T08:00:00Z
+             cooling|exhausted||2026-11-24T08:00:00Z
+             plain|exhausted||2026-11-24T08:00:00Z
+",
+        )
+        .unwrap();
+        let mut auth_probed = marked("auth-probed", BadReasonClass::Auth, true);
+        auth_probed.probe_status = Some("exhausted".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                marked("auth-dead", BadReasonClass::Auth, false),
+                auth_probed,
+                marked("malformed", BadReasonClass::MalformedTimestamp, false),
+                // An exhaustion mark is probed live; a failed round keeps the hold.
+                marked("cooling", BadReasonClass::Exhaustion, true),
+                AccountResult::new("plain", "blocked"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "auth-dead|blocked\nauth-probed|blocked\nmalformed|blocked\n\
+             cooling|exhausted||2026-11-24T08:00:00Z\nplain|exhausted||2026-11-24T08:00:00Z\n",
         );
     }
 
