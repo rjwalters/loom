@@ -16,6 +16,11 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **PR #14780**: test: remove unused isTelemetryProblem, cover misconfigured relay at the renderer
+- **Issue #14719** (closed): Remove the test-only isTelemetryProblem classifier and test the daemon_status warning directly
+- **PR #14778**: refactor(cli): share usage time-window resolution
+- **Issue #14774** (closed): Share time-window parsing across the Codex, OpenCode, and Pi usage commands
+- **PR #14772**: Price GPT-6.2 Astra usage in Loom
 - **PR #14770**: test: share the terminal ID rejection fixture
 - **Issue #14768** (closed): Collapse seven copy-pasted injection tests in integration_security.rs into the table-driven test
 - **PR #14764**: chore(harness): track latest CLIs — codex 0.170.0→0.171.0
