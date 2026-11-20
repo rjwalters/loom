@@ -32,17 +32,7 @@ pub(super) fn command_env(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<String> {
-    // Every Docker call of this module goes through here, so a fake installed
-    // on this thread (`fake`, tests only) stands in for the whole engine.
-    #[cfg(test)]
-    if let Some(result) = fake::dispatch(args, env) {
-        return result;
-    }
-    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
-        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
-            Ok(timed_out) => anyhow::Error::new(timed_out),
-            Err(error) => error.context("Docker unavailable"),
-        })?;
+    let (success, stdout) = command_status_env(args, env, timeout)?;
     if !success {
         bail!(
             "Docker {} failed; inspect the session with Docker locally",
@@ -50,6 +40,37 @@ pub(super) fn command_env(
         );
     }
     Ok(stdout)
+}
+
+/// Batch volume inspect can report found volumes on stdout after an ordinary
+/// nonzero exit. Only the sampler reconciles those per-volume results.
+pub(super) fn inspect_volume_batch(
+    volumes: &[String],
+    format: &str,
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    let mut args = vec!["volume", "inspect", "--format", format];
+    args.extend(volumes.iter().map(String::as_str));
+    command_status_env(&args, &[], timeout)
+}
+
+fn command_status_env(
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> Result<(bool, String)> {
+    // Every Docker call of this module goes through here, so a fake installed
+    // on this thread (`fake`, tests only) stands in for the whole engine.
+    #[cfg(test)]
+    if let Some(result) = fake::dispatch(args, env, timeout) {
+        return result;
+    }
+    let (success, stdout, _stderr) = docker_cli::run_bounded_env("docker", args, env, timeout)
+        .map_err(|error| match error.downcast::<docker_cli::DockerTimedOut>() {
+            Ok(timed_out) => anyhow::Error::new(timed_out),
+            Err(error) => error.context("Docker unavailable"),
+        })?;
+    Ok((success, stdout))
 }
 
 pub(super) fn desktop() -> Result<bool> {
@@ -273,7 +294,11 @@ pub(super) fn volume_exists(volume: &str) -> Result<bool> {
 
 /// The recorded image must already be local: recovery never pulls or swaps one.
 pub(super) fn image_present(image: &str) -> Result<()> {
-    command(&["image", "inspect", "--format", "{{.Id}}", image])
+    image_present_with(image, docker_cli::DOCKER_CALL_TIMEOUT)
+}
+
+pub(super) fn image_present_with(image: &str, timeout: Duration) -> Result<()> {
+    command_with(&["image", "inspect", "--format", "{{.Id}}", image], timeout)
         .map(drop)
         .with_context(|| format!("recorded session image {image} is not available locally"))
 }
@@ -412,9 +437,9 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
 }
 
 /// The sealed-bundle probe of [`super::super::session_image::verify_override_bundle`]
-/// routed through [`command`], so it shares this module's engine seam (and its
+/// routed through [`command_with`], so it shares this module's engine seam (and its
 /// test fake) rather than spawning its own `docker`.
-struct ImageProbe;
+struct ImageProbe(Duration);
 
 impl super::super::session_image::BundleProbe for ImageProbe {
     fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
@@ -435,7 +460,7 @@ impl super::super::session_image::BundleProbe for ImageProbe {
                 "-c",
                 script,
             ],
-            docker_cli::DOCKER_RUN_TIMEOUT,
+            self.0,
         )
     }
 }
@@ -443,7 +468,11 @@ impl super::super::session_image::BundleProbe for ImageProbe {
 /// Prove the configured override `image` carries the sealed control bundle
 /// this daemon enforces, before any container is created from it (#14451).
 pub(super) fn verify_image(image: &str) -> Result<()> {
-    super::super::session_image::verify_override_bundle(image, &ImageProbe)
+    verify_image_with(image, docker_cli::DOCKER_RUN_TIMEOUT)
+}
+
+pub(super) fn verify_image_with(image: &str, timeout: Duration) -> Result<()> {
+    super::super::session_image::verify_override_bundle(image, &ImageProbe(timeout))
         .context("refusing to create a private session from the configured override image")
 }
 
@@ -789,11 +818,13 @@ fn bind_source_matches(config: &Config, mount: &Value, expected: &Path) -> bool 
 #[cfg(test)]
 pub(super) mod fake {
     use std::cell::RefCell;
+    use std::time::Duration;
 
     pub(in super::super) type Handler = Box<dyn FnMut(&[&str]) -> anyhow::Result<String>>;
+    type TimedHandler = Box<dyn FnMut(&[&str], Duration) -> anyhow::Result<(bool, String)>>;
 
     thread_local! {
-        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+        static HANDLER: RefCell<Option<TimedHandler>> = const { RefCell::new(None) };
         /// The child environment each faked call would have carried (#13916).
         static ENVS: RefCell<Vec<Vec<(String, String)>>> = const { RefCell::new(Vec::new()) };
     }
@@ -804,7 +835,11 @@ pub(super) mod fake {
     }
 
     /// Route this thread's Docker calls to `handler` until the guard drops.
-    pub(in super::super) fn install(handler: Handler) -> Guard {
+    pub(in super::super) fn install(mut handler: Handler) -> Guard {
+        install_timed(Box::new(move |args, _| handler(args).map(|stdout| (true, stdout))))
+    }
+
+    pub(in super::super) fn install_timed(handler: TimedHandler) -> Guard {
         HANDLER.with(|h| *h.borrow_mut() = Some(handler));
         ENVS.with(|e| e.borrow_mut().clear());
         Guard
@@ -822,11 +857,12 @@ pub(super) mod fake {
     pub(super) fn dispatch(
         args: &[&str],
         env: &[(String, String)],
-    ) -> Option<anyhow::Result<String>> {
+        timeout: Duration,
+    ) -> Option<anyhow::Result<(bool, String)>> {
         HANDLER.with(|h| {
             h.borrow_mut().as_mut().map(|handler| {
                 ENVS.with(|e| e.borrow_mut().push(env.to_vec()));
-                handler(args)
+                handler(args, timeout)
             })
         })
     }
