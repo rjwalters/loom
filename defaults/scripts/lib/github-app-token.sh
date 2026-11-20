@@ -517,7 +517,7 @@ github_app_get_token() {
 
 # github_app_get_scoped_token <nwo> -> echoes the raw scoped mint response
 # JSON for ONE repository with Contents read, then the installation id it
-# minted from, on a second line (#14716). Always fresh: a scoped read mint
+# minted from, on the final line (#14716). Always fresh: a scoped read mint
 # is per-operation and never touches the writer token cache. On failure
 # returns 1 with _GH_APP_LAST_ERROR set in THIS shell (the CLI reads it
 # back through the #5401 ok/err tail).
@@ -626,22 +626,19 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         jq -cn --arg message "${_gh_app_msg#err$'\n'}" '{status:"error", message:$message}'
         exit 0
       fi
-      _gh_app_resp="${_gh_app_out%%$'\n'*}"
-      _gh_app_rest="${_gh_app_out#*$'\n'}"
-      _gh_app_installation_id="${_gh_app_rest%%$'\n'*}"
-      _gh_app_token=$(echo "$_gh_app_resp" | jq -r '.token')
-      _gh_app_expires_at=$(echo "$_gh_app_resp" | jq -r '.expires_at')
-      _gh_app_repo_ids=$(echo "$_gh_app_resp" | jq -c '[.repositories[]?.id]')
-      if [[ -z "$_gh_app_token" || "$_gh_app_token" == "null" \
-        || -z "$_gh_app_repo_ids" || "$_gh_app_repo_ids" == "null" || "$_gh_app_repo_ids" == "[]" ]]; then
-        jq -cn --arg installation_id "$_gh_app_installation_id" \
+      # Only the last two lines are ours. The issuer's JSON can span many lines.
+      _gh_app_out="${_gh_app_out%$'\nok'}"
+      _gh_app_installation_id="${_gh_app_out##*$'\n'}"
+      _gh_app_resp="${_gh_app_out%$'\n'*}"
+      printf '%s\n' "$_gh_app_resp" | jq -ces --arg installation_id "$_gh_app_installation_id" \
+        --arg app_id "$_GH_APP_ID" '
+        select(length == 1) | .[0]
+        | select((.token | type) == "string" and .token != "" and .token != "null")
+        | [.repositories[]?.id] as $ids | select($ids != [])
+        | {status:"ok", token, installation_id:$installation_id, app_id:$app_id,
+           expires_at, repository_ids:$ids, permissions:(.permissions // {})}
+        ' 2>/dev/null || jq -cn --arg installation_id "$_gh_app_installation_id" \
           '{status:"error", message:("scoped mint response for installation " + $installation_id + " did not include a token and repository ids")}'
-        exit 0
-      fi
-      jq -cn --arg token "$_gh_app_token" --arg installation_id "$_gh_app_installation_id" \
-        --arg app_id "$_GH_APP_ID" --arg expires_at "$_gh_app_expires_at" \
-        --argjson repository_ids "$_gh_app_repo_ids" \
-        '{status:"ok", token:$token, installation_id:$installation_id, app_id:$app_id, expires_at:$expires_at, repository_ids:$repository_ids, permissions:{contents:"read"}}'
       ;;
     *)
       echo "Usage: github-app-token.sh {status|get-token [--force] OWNER/REPO|scoped-token OWNER/REPO}" >&2

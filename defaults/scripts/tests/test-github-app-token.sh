@@ -441,7 +441,13 @@ echo "Testing scoped-token narrow issuance (#14716)..."
 # The scoped stub answers the access_tokens route with repository-bound
 # evidence; a response naming no repository must refuse, never patch up.
 # Exported like STUB_INSTALL_BODY: the curl stub runs in the CHILD shell.
-export scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z","repository_selection":"selected","repositories":[{"id":907216439,"full_name":"cliowner/repo"}]}'
+export scoped_curl_body='{
+    "token": "ghs_scopedvalue",
+    "expires_at": "2099-01-01T00:00:00Z",
+    "repository_selection": "selected",
+    "repositories": [{"id": 907216439, "full_name": "cliowner/repo"}],
+    "permissions": {"contents": "read", "metadata": "read"}
+}'
 curl() {
     local url=""
     printf '%s\n' "$*" >> "$STUB_CURL_ARGV_LOG"
@@ -454,16 +460,15 @@ curl() {
 }
 export -f curl
 : > "$STUB_CURL_ARGV_LOG"
-cli_scoped_output=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
-cli_scoped_status=$(echo "$cli_scoped_output" | jq -r '.status')
-cli_scoped_ids=$(echo "$cli_scoped_output" | jq -c '.repository_ids')
-cli_scoped_perms=$(echo "$cli_scoped_output" | jq -c '.permissions')
-if [[ "$cli_scoped_status" == "ok" \
-    && "$cli_scoped_ids" == '[907216439]' \
-    && "$cli_scoped_perms" == '{"contents":"read"}' ]]; then
-    pass "\`scoped-token\` CLI envelope pairs the token with its repository ids and Contents read (#14716)"
+if cli_scoped_output=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo) && \
+    jq -e '. == {
+        status:"ok", token:"ghs_scopedvalue", installation_id:"55", app_id:"424242",
+        expires_at:"2099-01-01T00:00:00Z", repository_ids:[907216439],
+        permissions:{contents:"read", metadata:"read"}
+    }' <<< "$cli_scoped_output" >/dev/null; then
+    pass "\`scoped-token\` pairs the credential and issuer evidence from a multiline response"
 else
-    fail "\`scoped-token\` CLI envelope should carry paired evidence" "$cli_scoped_output"
+    fail "multiline scoped mint should return the complete envelope" "got: $cli_scoped_output"
 fi
 if [[ -s "$STUB_CURL_ARGV_LOG" ]] && ! grep -q 'Authorization:\|fake\.jwt' "$STUB_CURL_ARGV_LOG"; then
     pass "scoped mint keeps credentials off curl's argv (#10463)"
@@ -478,6 +483,24 @@ if grep -q '"repositories":\["repo"\]' "$STUB_CURL_ARGV_LOG" \
     pass "scoped mint request names the bare repository, not owner/repo (#14726)"
 else
     fail "the scoped mint request must send repositories:[\"repo\"]" "$(cat "$STUB_CURL_ARGV_LOG")"
+fi
+
+# The verifier decides Contents read from the issuer's answer, even if it
+# differs from the requested permissions.
+scoped_curl_body=$(jq -c 'del(.permissions.contents)' <<< "$scoped_curl_body")
+cli_scoped_output=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+if jq -e '.status == "ok" and .permissions == {"metadata":"read"}' <<< "$cli_scoped_output" >/dev/null; then
+    pass "metadata-only scoped mint carries only the granted permission"
+else
+    fail "metadata-only scoped mint reported the wrong permissions" "$cli_scoped_output"
+fi
+
+scoped_curl_body=$(jq -c 'del(.permissions)' <<< "$scoped_curl_body")
+cli_scoped_output=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+if jq -e '.status == "ok" and .permissions == {}' <<< "$cli_scoped_output" >/dev/null; then
+    pass "scoped mint with omitted permissions carries an empty permission map"
+else
+    fail "missing permissions must supply no scope evidence" "$cli_scoped_output"
 fi
 
 # A scoped mint whose response names no repository is refused.
