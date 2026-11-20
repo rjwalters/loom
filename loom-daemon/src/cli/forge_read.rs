@@ -8,8 +8,8 @@
 //! that is not served is refused with [`EX_WRITE_VERB_NOT_MIGRATED`] before
 //! any handler runs, so no second implementation exists and no write can slip
 //! onto the tools path ahead of its own slice. #14519 added the shared writes
-//! and #14520 added the remaining merge-queue verbs. The whole declared
-//! forge family is now served.
+//! and #14520 added the remaining merge-queue verbs. The attended
+//! `operator-holds` audit stays on `loom-daemon`.
 //!
 //! [`ForgeAction::is_served`] is an exhaustive `match` with no wildcard:
 //! adding a verb to `ForgeAction` does not compile until its author has said
@@ -125,8 +125,8 @@ impl ForgeAction {
     #[must_use]
     pub(crate) fn is_served(&self) -> bool {
         match self {
-            Self::OperatorHolds(_)
-            | Self::Issue { .. }
+            Self::OperatorHolds(_) => false,
+            Self::Issue { .. }
             | Self::Pr { .. }
             | Self::Auth { .. }
             | Self::CheckOpenPr { .. }
