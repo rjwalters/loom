@@ -182,7 +182,8 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
             "journal-ci-refusal",
             "rebase-guard",
             "verdict-body-check",
-            "verdict-lock"
+            "verdict-lock",
+            "workflow-write-all-check"
         ]
     );
 }

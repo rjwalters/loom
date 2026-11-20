@@ -1035,24 +1035,73 @@ from a single `cd`'d `git status` (#6373). `-C` makes the target directory
 explicit in the command itself, so it can't be hijacked by a stale `cd`:
 
 ```bash
-WORKTREE_ABS="$(pwd)"   # already inside the worktree from the `cd` above
-PR_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
-WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
-WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
+WORKTREE_ABS="$(pwd -P)"   # already in the isolated worktree; PR_NUMBER names the PR
+PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,isCrossRepository) || exit 1
+PR_HEAD_REF=$(jq -er '.headRefName | strings | select(length > 0)' <<<"$PR_HEAD") || exit 1
+PR_HEAD_SHA=$(jq -er '.headRefOid | strings | select(test("^[0-9a-f]{40}$"))' <<<"$PR_HEAD") || exit 1
+[ "${REVIEW_HEAD_SHA:-$PR_HEAD_SHA}" = "$PR_HEAD_SHA" ] || { echo 'PR head moved. Re-evaluate the PR.'; exit 1; }
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+WT_BRANCH=$(git -C "$WORKTREE_ABS" symbolic-ref --quiet --short HEAD || true)
 
-if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
-    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
-    # Preserve any uncommitted WIP first (never a bare `git stash` — see
-    # "Never use bare `git stash` for ad-hoc WIP" in doctor.md):
-    if [ -n "$WT_STATUS" ]; then
-        ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked
-        git -C "$WORKTREE_ABS" checkout -- .
-    fi
-    git -C "$WORKTREE_ABS" pull --ff-only
+ISSUE_NUM=
+if jq -e '.isCrossRepository == false' <<<"$PR_HEAD" >/dev/null &&
+   [[ "$PR_HEAD_REF" =~ ^feature/issue-([0-9]+)$ ]] && [ -n "$WT_BRANCH" ]; then
+    [ "$WT_BRANCH" = "$PR_HEAD_REF" ] || { echo 'Unexpected local branch. Stop recovery.'; exit 1; }
+    ISSUE_NUM="${PR_HEAD_REF#feature/issue-}"
 fi
+if [ -n "$WT_STATUS" ]; then
+    if [ -n "$ISSUE_NUM" ]; then
+        (cd "$WORKTREE_ABS" && ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked) || exit 1
+    fi
+    echo 'Preserve the dirty worktree and stop recovery.'
+    exit 1
+fi
+
+if [ -n "$ISSUE_NUM" ]; then
+    PR_TRACKING_REF="refs/remotes/origin/$PR_HEAD_REF"
+    WT_UPSTREAM=$(git -C "$WORKTREE_ABS" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ "$WT_UPSTREAM" != "$PR_TRACKING_REF" ]; then
+        git -C "$WORKTREE_ABS" fetch --no-tags origin "+refs/heads/$PR_HEAD_REF:$PR_TRACKING_REF" || exit 1
+        FETCHED_SHA=$(git -C "$WORKTREE_ABS" rev-parse --verify 'FETCH_HEAD^{commit}') || exit 1
+        CURRENT_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid') || exit 1
+        [ "$FETCHED_SHA" = "$PR_HEAD_SHA" ] && [ "$CURRENT_SHA" = "$PR_HEAD_SHA" ] || {
+            echo 'Fetched branch or current PR head differs from the pinned head. Stop recovery.'
+            exit 1
+        }
+        git -C "$WORKTREE_ABS" merge-base --is-ancestor HEAD "$FETCHED_SHA" || {
+            echo 'Preserve the local commits before recovery.'
+            exit 1
+        }
+        WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+        [ -z "$WT_STATUS" ] || exit 1
+        git -C "$WORKTREE_ABS" merge --ff-only "$FETCHED_SHA" || exit 1
+        [ "$(git -C "$WORKTREE_ABS" rev-parse --verify "$PR_TRACKING_REF")" = "$FETCHED_SHA" ] || exit 1
+        git -C "$WORKTREE_ABS" branch --set-upstream-to="$PR_TRACKING_REF" "$PR_HEAD_REF" || exit 1
+    fi
+fi
+
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+[ "$WT_HEAD_SHA" = "$PR_HEAD_SHA" ] && [ -z "$WT_STATUS" ] || exit 1
 ```
 
-Only proceed to evaluation once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and `WT_STATUS` is empty. If `git pull --ff-only` fails (local history has actually diverged, not just fallen behind), do not force anything — fall back to `git fetch && git reset --hard origin/feature/issue-${ISSUE_NUM}` then re-point the upstream (`git branch --set-upstream-to=origin/feature/issue-${ISSUE_NUM}`), same as the manual recovery `doctor.md` documents under "Expected worktree state after setup".
+Proceed with reviewing once the final checks pass. The recovery uses the fetched
+commit object that matches both forge reads and sets tracking only after a
+successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
+cache is stale. The local branch advances by fast-forward after verification.
+
+For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
+check the exact head and clean state there. The named `origin` recovery
+applies only to the matching same-repository issue branch. If the dedicated
+checkout already has local changes or commits, preserve it before refreshing.
+The detached-checkout rules above still apply.
+
+For divergence, leave the local tip in place and report it. In a separately
+authorized manual recovery, preserve the old tip under a named backup ref and
+save any worktree changes first. Fetch and verify the named remote branch
+against the current forge head again before using `git reset --hard` to that
+verified commit and setting its upstream.
 
 If your evaluation also needs to state that the main checkout is clean (e.g.
 confirming a contamination scare is resolved), name `$WORKTREE_ABS` and the
@@ -1175,6 +1224,13 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
     if [ "$GATE_OK" = true ]; then
         if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Judge: resolve conflicts)" origin/main; fi || GATE_OK=false
     fi
+    # Workflow-lint gate (#14156, as Doctor's #13896): a conflict union can leave a touched workflow with a duplicate step id / mapping key; GitHub then runs zero jobs and every rollup reads green. Fail closed: a lint defect, or lint unable to run, falls back to the change request below.
+    if [ "$GATE_OK" = true ]; then
+        WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Cannot list touched workflow files - not pushing" >&2; GATE_OK=false; }
+    fi
+    if [ "$GATE_OK" = true ] && [ -n "$WL_FILES" ]; then
+        loom-daemon workflow-lint $WL_FILES || { echo "workflow-lint failed - not pushing" >&2; GATE_OK=false; }
+    fi
     # Version gate before the push; on failure never hand-patch the version-bearing files yourself or run `version.sh bump`.
     if [ "$GATE_OK" = true ] && [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
         GATE_OK=false
@@ -1246,6 +1302,10 @@ or routed to Doctor.
 ```bash
 # Resolve the conflict (e.g., keep both additions), `git add <resolved-files>`, then finish
 if [ "$BRANCH_UPDATE" = rebase ]; then git rebase --continue; else git commit --no-edit; fi
+
+# Lint changed workflows after hand-resolving conflicts (#14156, as Doctor's #13896).
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Cannot list touched workflow files - not pushing" >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "workflow-lint failed - not pushing" >&2; exit 1; }
 
 # Version gate before this push too.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
