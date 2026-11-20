@@ -3069,3 +3069,93 @@ fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
     drop(held);
     drop(super::tests::reacquire(&env.dir));
 }
+
+#[test]
+#[serial]
+fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
+    use crate::env_test_support::EnvGuard;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+
+    let _runtime_env = EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_MACHINE_CHECKOUT",
+        "LOOM_PRIVATE_LEASE_FD",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+        "LOOM_WORKSPACE",
+    ]);
+    let _probe = EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let _name = EnvGuard::set("LOOM_ACCOUNT_NAME", "alice");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let bob_config = load(&bob.dir).unwrap();
+    let root = env.workspace.path();
+    // Even a regression into the legacy host transport must use no real
+    // engine. Preparation itself runs through the fake installed by setup.
+    let bin = tempfile::tempdir().unwrap();
+    let docker = bin.path().join("docker");
+    std::fs::write(&docker, "#!/bin/sh\nexit 91\n").unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_owned()).chain(std::env::split_paths(&path)),
+    )
+    .unwrap();
+    let _path = EnvGuard::set("PATH", path);
+    // The named account's seat is exclusively held; Bob's is idle.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let run = || {
+        transport::run(crate::session_exec::HostArgs {
+            owner_pid: None,
+            container: env.config.container.clone(),
+            workdir: REPO.into(),
+            env: vec![format!("LOOM_WORKSPACE={}", root.display())],
+            child_env: vec![],
+            stderr_file: None,
+            command: vec!["true".into()],
+        })
+        .expect_err("the manual launch must be refused")
+    };
+
+    assert!(run().is::<AccountBusy>());
+    for (key, matching) in [
+        ("LOOM_CODEX_PROFILE", OsStr::new("alice")),
+        ("LOOM_CODEX_HOME", env.config.profile.as_os_str()),
+        ("CODEX_HOME", env.config.profile.as_os_str()),
+    ] {
+        let _pin = EnvGuard::set(key, matching);
+        let error = run();
+        assert!(error.is::<AccountBusy>(), "matching {key}: {error:#}");
+    }
+    let conflicts = [
+        ("LOOM_CODEX_PROFILE", OsStr::new("bob")),
+        ("LOOM_CODEX_HOME", bob_config.profile.as_os_str()),
+        ("CODEX_HOME", bob_config.profile.as_os_str()),
+    ];
+    let errors: Vec<_> = conflicts
+        .iter()
+        .map(|(key, profile)| {
+            let _pin = EnvGuard::set(key, profile);
+            run().to_string()
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        ["private dispatch account or profile does not match the named account"; 3]
+    );
+    assert!(env.engine().calls.iter().flatten().all(|arg| {
+        arg != &bob_config.container && arg != &bob_config.volume && arg != OTHER_ID
+    }));
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+    assert!(lease::read(&bob.dir).unwrap().is_none());
+    assert!(!bob.dir.join("last-job.json").exists());
+    assert!(!bob.dir.join(lease::ADMISSION).exists());
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}

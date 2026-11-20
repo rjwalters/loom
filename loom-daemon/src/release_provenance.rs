@@ -228,19 +228,30 @@ impl Checker {
         interval: Duration,
         lookup: &TagLookup<'_>,
     ) -> Provenance {
+        self.ensure_with_attempt(now, interval, lookup).0
+    }
+
+    fn ensure_with_attempt(
+        &mut self,
+        now: DateTime<Utc>,
+        interval: Duration,
+        lookup: &TagLookup<'_>,
+    ) -> (Provenance, Option<u32>) {
         let Ok(tag) = &self.stamp else {
-            return self.current();
+            return (self.current(), None);
         };
         if self.outcome.is_some() || self.retry_at.is_some_and(|at| now < at) {
-            return self.current();
+            return (self.current(), None);
         }
+        // Only failures can precede another lookup in this process.
+        let attempt = self.failures.saturating_add(1);
         match lookup(RELEASE_REPO, tag) {
             Ok(commit) if commit.eq_ignore_ascii_case(&self.built) => {
                 self.outcome = Some(Provenance::Verified);
             }
             Ok(commit) => self.outcome = Some(Provenance::Mismatch { tag_commit: commit }),
             Err(why) => {
-                self.failures = self.failures.saturating_add(1);
+                self.failures = attempt;
                 let doublings = self.failures.saturating_sub(1).min(20);
                 let wait = interval.saturating_mul(1u32 << doublings).min(RETRY_CAP);
                 self.why = why;
@@ -248,7 +259,7 @@ impl Checker {
                     Some(now + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::MAX));
             }
         }
-        self.current()
+        (self.current(), Some(attempt))
     }
 }
 
@@ -289,6 +300,16 @@ pub fn is_verified() -> bool {
 /// open and due. Blocking for as long as `lookup` is.
 pub fn ensure(now: DateTime<Utc>, interval: Duration, lookup: &TagLookup<'_>) -> Provenance {
     with(|c| c.ensure(now, interval, lookup))
+}
+
+/// Return the one-based attempt count only when this call actually looked
+/// up the release tag. Cached or not-yet-due outcomes carry no attempt.
+pub(crate) fn ensure_with_attempt(
+    now: DateTime<Utc>,
+    interval: Duration,
+    lookup: &TagLookup<'_>,
+) -> (Provenance, Option<u32>) {
+    with(|c| c.ensure_with_attempt(now, interval, lookup))
 }
 
 #[cfg(test)]

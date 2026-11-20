@@ -16,6 +16,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **PR #14743**: fix: preserve seat volume readings across sampling failures
+- **PR #14695**: fix: manual private-session exec refuses on its own busy seat
+- **PR #14243**: fix: stamp the forge's canonical repo name into loom_source_remote
+- **PR #14723**: feat: report reaped finished-PR worktrees from private seat preparation
+- **Issue #14725** (closed): Seat-volume host total has four single points of failure in its completeness gate
+- **Issue #14627** (closed): transport.rs reports WRONG_CLONE instead of the busy seat's own reason once Existing walks
+- **Issue #14222** (closed): resync-installed.sh records the canonical source remote when the clone's origin is a stale redirect
+- **Issue #14721** (closed): private seat: the automatic finished-PR worktree reap leaves no record of what it removed
 - **PR #12637**: refactor: split status_render inline tests into per-module files
 - **PR #13582**: fix: honour a trusted loom:issue adoption in the promotion author gate
 - **PR #14181**: feat: seal the hook registration for private-clone Codex sessions
