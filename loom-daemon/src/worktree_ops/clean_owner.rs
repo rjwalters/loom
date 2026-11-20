@@ -145,6 +145,104 @@ pub(crate) fn fetch_pr_rows(
     serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).map_err(|_| RowsError::Failed)
 }
 
+/// One private-workspace seat pass's reading of a branch's PR state at an
+/// exact tip (#14678): merged-only, and distinct from
+/// [`finished_pr_at_head`], which also accepts a closed-unmerged PR because
+/// preparation-time force-removal (#14483) treats both as finished. The
+/// periodic seat pass preserves a closed-unmerged worktree, so it needs the
+/// distinction, plus the merge timestamp the grace gate measures from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PrAtHead {
+    /// A PR whose head is exactly this tip merged; carries `merged_at`.
+    Merged(String),
+    /// An open PR on this branch (any tip): an open PR always wins over a
+    /// historical merge, mirroring [`finished_pr_in_rows`'s] precedence.
+    Open,
+    /// A PR on this branch closed without merging.
+    ClosedNoMerge,
+    /// No PR row matched this branch at all.
+    NoPr,
+    /// The record could not be trusted (truncated, foreign, unparseable).
+    Unknown,
+}
+
+/// Fresh GitHub PR evidence for the periodic private-workspace seat pass
+/// (#14678): the PR state of `branch` at `tip`, merged-only semantics. Uses
+/// the same request and row-validation strictness as
+/// [`finished_pr_at_head`]; only the classification of the matched rows
+/// differs.
+pub(crate) fn pr_at_head(
+    repo_root: &Path,
+    host: &str,
+    slug: &str,
+    branch: &str,
+    tip: &str,
+) -> PrAtHead {
+    finished_pr_request(repo_root, host, slug, branch)
+        .and_then(super::gh::bounded_via)
+        .filter(|out| out.status.success())
+        .and_then(|out| serde_json::from_slice::<Vec<PrRowRest>>(&out.stdout).ok())
+        .map_or(PrAtHead::Unknown, |rows| pr_at_head_in_rows(&rows, slug, branch, tip))
+}
+
+/// [`pr_at_head`]'s row classification, pure for tests. The same strict shape
+/// [`finished_pr_in_rows`] enforces: a truncated listing, a foreign base or a
+/// head-branch mismatch makes the whole record unusable ([`PrAtHead::Unknown`]).
+pub(crate) fn pr_at_head_in_rows(
+    rows: &[PrRowRest],
+    slug: &str,
+    branch: &str,
+    tip: &str,
+) -> PrAtHead {
+    if rows.len() >= 100 {
+        return PrAtHead::Unknown;
+    }
+    let mut at_tip = PrAtHead::NoPr;
+    for row in rows {
+        if !row
+            .base_full_name()
+            .is_some_and(|base| base.eq_ignore_ascii_case(slug))
+        {
+            return PrAtHead::Unknown;
+        }
+        let Some(head) = row.head.as_ref() else {
+            return PrAtHead::Unknown;
+        };
+        let Some(head_repository) = head
+            .repo
+            .as_ref()
+            .and_then(|repo| repo.full_name.as_deref())
+        else {
+            return PrAtHead::Unknown;
+        };
+        if !head_repository.eq_ignore_ascii_case(slug) {
+            continue;
+        }
+        if head.branch.as_deref() != Some(branch) {
+            return PrAtHead::Unknown;
+        }
+        let status =
+            clean::classify_pr_row(&row.state, row.merged_at.as_deref(), row.closed_at.as_deref());
+        match status {
+            PrStatus::Open => return PrAtHead::Open,
+            PrStatus::Merged { .. } if head.sha.as_deref() == Some(tip) => {
+                let PrStatus::Merged { merged_at } = status else {
+                    unreachable!("classify_pr_row returned Merged with merged_at");
+                };
+                at_tip = PrAtHead::Merged(merged_at);
+            }
+            PrStatus::Merged { .. } => {}
+            PrStatus::ClosedNoMerge { .. } => {
+                if at_tip == PrAtHead::NoPr {
+                    at_tip = PrAtHead::ClosedNoMerge;
+                }
+            }
+            PrStatus::NoPr | PrStatus::Unknown => return PrAtHead::Unknown,
+        }
+    }
+    at_tip
+}
+
 /// Fresh GitHub PR evidence for an independent clone. Use the clone's
 /// verified origin rather than resolving a base from its Git config. One
 /// complete page suffices; if it could be truncated, preserve the worktree.

@@ -237,6 +237,7 @@ mod tests {
             deep_clean: None,
             docker: None,
             scratch: None,
+            seats: None,
             target_orphans: None,
             at: Utc::now(),
             git_tmp: None,

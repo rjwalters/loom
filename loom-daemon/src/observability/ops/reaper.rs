@@ -227,10 +227,58 @@ mod tests {
                 "backup_failed",
             ),
             ("something nobody categorised", "other"),
+            // #14678: the in-volume seat pass's preserve wordings, so the
+            // seat spans land in the same fixed categories.
+            ("uncommitted changes in worktree", "uncommitted"),
+            ("unpushed commits on HEAD", "not_merged"),
+            ("PR closed without merging (not merged)", "not_merged"),
+            ("no merged PR for the branch at this tip", "not_merged"),
+            ("merged PR grace period not passed", "grace"),
+            ("worktree locked (in use)", "in_use"),
         ] {
             assert_eq!(preserve_reason(wording), want, "{wording}");
             assert!(PRESERVE_REASONS.contains(&preserve_reason(wording)));
         }
+    }
+
+    /// #14678: a seat pass's span names the seat (never a host path) and
+    /// carries the seat class beside the workspace classes.
+    #[test]
+    fn a_seat_pass_span_names_the_seat_and_its_class() {
+        let p = Pass {
+            class: "seat",
+            phase: PHASE_REAP,
+            scanned: 6,
+            removed: 1,
+            failed: 0,
+            preserved: vec![
+                "uncommitted changes in worktree",
+                "unpushed commits on HEAD",
+                "PR still open",
+                "PR closed without merging (not merged)",
+                "merged PR grace period not passed",
+            ],
+            bytes: 2048,
+            backed_up: 0,
+            backup_refs: Vec::new(),
+        };
+        let span = pass_span(Path::new("/private-workspace-seats/agent-1"), &p, at());
+        assert!(span.validate().is_ok());
+        let bounded = span.clone().bounded();
+        for (key, want) in [
+            ("loom.repo", "agent-1"),
+            ("loom.reaper.class", "seat"),
+            ("loom.reaper.preserved.uncommitted", "1"),
+            ("loom.reaper.preserved.not_merged", "2"),
+            ("loom.reaper.preserved.pr_open", "1"),
+            ("loom.reaper.preserved.grace", "1"),
+        ] {
+            assert_eq!(bounded.attributes.get(key).map(String::as_str), Some(want), "{key}");
+        }
+        assert!(!span
+            .attributes
+            .values()
+            .any(|v| v.contains("/private-workspace-seats")));
     }
 
     #[test]

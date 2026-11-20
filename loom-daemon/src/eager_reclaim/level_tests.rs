@@ -141,11 +141,17 @@ impl Sim {
             };
             let idle =
                 |root: &Path| run_idle_targets_if_due(root, FLOOR, now, COOLDOWN, &idle_body);
+            let stub_seats =
+                |_: &Path| crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
+                    skipped: None,
+                    seats: Vec::new(),
+                };
             let passes = SubPasses {
                 reap_worktrees: &reap,
                 deep_clean: &deep,
                 docker: &docker,
                 scratch: &scratch,
+                seats: &stub_seats,
                 target_orphans: &orphans,
                 free_gb: &free_gb,
                 git_tmp: &git_tmp,
@@ -227,6 +233,13 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
         order.borrow_mut().push("scratch");
         scratch_report(root, now, 0)
     };
+    let seats = |_: &Path| {
+        order.borrow_mut().push("seats");
+        crate::tokens_pool::private_workspace::seat_reclaim::SeatReclaimReport {
+            skipped: None,
+            seats: Vec::new(),
+        }
+    };
     let orphans = |root: &Path| {
         order.borrow_mut().push("target_orphans");
         orphan_report(root)
@@ -248,6 +261,7 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
         deep_clean: &deep,
         docker: &docker,
         scratch: &scratch,
+        seats: &seats,
         target_orphans: &orphans,
         free_gb: &free_gb,
         git_tmp: &git_tmp,
@@ -265,7 +279,7 @@ fn run_tiered(probes: &[Option<u64>]) -> (EagerReclaimReport, Vec<&'static str>)
     (report, called)
 }
 
-const TIER1: [&str; 4] = ["worktrees", "git_tmp", "scratch", "target_orphans"];
+const TIER1: [&str; 5] = ["worktrees", "git_tmp", "scratch", "seats", "target_orphans"];
 
 #[test]
 fn test_tier_one_only_when_already_above_the_floor() {

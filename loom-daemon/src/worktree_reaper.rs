@@ -1584,6 +1584,24 @@ mod tests {
         assert!(removed.is_empty());
     }
 
+    /// #14678: the host reaper keeps skipping a host `issue-N` checkout a
+    /// private-workspace job owns (`private-jobs` record present), even while
+    /// the in-volume seat pass owns the seat's own clones — the unrelated
+    /// host checkout is never touched by either side.
+    #[test]
+    #[serial]
+    fn test_private_workspace_owned_host_worktree_is_never_reaped() {
+        let repo = make_repo(&[(310, true), (311, true)]);
+        fs::create_dir_all(repo.path().join(".loom/private-jobs")).unwrap();
+        fs::write(repo.path().join(".loom/private-jobs/issue-310.json"), "{}").unwrap();
+        let (report, removed) = run_pass(repo.path(), &ProbeSpec::default(), &default_opts());
+        assert_eq!(removed, vec![311], "only the unrelated checkout is removed");
+        assert!(report.skipped.iter().any(|(num, why)| *num == 310
+            && why.contains("private workspace ownership")
+            && why.contains("unrelated")));
+        assert!(repo.path().join(".loom/worktrees/issue-310").exists());
+    }
+
     // ===================================================================
     // Safety gates — the reaper must never out-delete `clean --safe`
     // ===================================================================
