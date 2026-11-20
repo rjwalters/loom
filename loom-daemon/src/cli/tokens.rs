@@ -753,6 +753,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             shared: _,
             db,
             force,
+            exclude_names,
             prune,
             dry_run,
             json,
@@ -775,6 +776,7 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
                 force,
                 dry_run,
                 prune,
+                exclude_names: &exclude_names,
             };
 
             let result = match import_from_monitor(&opts) {
