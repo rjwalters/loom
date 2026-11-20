@@ -1254,3 +1254,6 @@ exit 0
         }
     }
 }
+
+#[cfg(test)]
+mod held_recovery_e2e;

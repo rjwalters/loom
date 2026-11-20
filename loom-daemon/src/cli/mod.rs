@@ -94,7 +94,7 @@ pub use premise_check::PremiseCheckArgs;
 pub use roles_draw_cmd::RolesCommand;
 pub use skip_labels::SkipLabelsArgs;
 pub use stale_blocked::StaleBlockedArgs;
-mod forge_verdict_cmd;
+pub(crate) mod forge_verdict_cmd;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;

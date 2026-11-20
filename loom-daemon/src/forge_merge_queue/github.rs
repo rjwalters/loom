@@ -285,8 +285,8 @@ pub fn parse_status(pr: u32, data: &serde_json::Value) -> Result<PrQueueStatus, 
     })
 }
 
-impl QueueApi for GhQueueApi {
-    fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+impl GhQueueApi {
+    fn status_data(&self, pr: u32) -> Result<serde_json::Value, QueueError> {
         let args = vec![
             "-f".to_string(),
             format!("query={STATUS_QUERY}"),
@@ -297,10 +297,25 @@ impl QueueApi for GhQueueApi {
             "-F".to_string(),
             format!("number={pr}"),
         ];
-        match self.run("merge_queue.status", AccessIntent::Read, &args, pr) {
-            Ok(data) => parse_status(pr, &data),
-            Err(text) => Err(error_for(classify_failure(&text), &text, pr, None)),
-        }
+        self.run("merge_queue.status", AccessIntent::Read, &args, pr)
+            .map_err(|text| error_for(classify_failure(&text), &text, pr, None))
+    }
+
+    /// Require an explicit empty queue entry for this exact open head. A
+    /// partial GraphQL object omitting the entry is insufficient evidence.
+    pub(crate) fn known_unqueued(&self, pr: u32, head: &str) -> bool {
+        self.status_data(pr).is_ok_and(|data| {
+            data.pointer("/repository/pullRequest/mergeQueueEntry")
+                .is_some_and(serde_json::Value::is_null)
+                && parse_status(pr, &data)
+                    .is_ok_and(|status| status.state == PrState::Open && status.head_oid == head)
+        })
+    }
+}
+
+impl QueueApi for GhQueueApi {
+    fn status(&self, pr: u32) -> Result<PrQueueStatus, QueueError> {
+        parse_status(pr, &self.status_data(pr)?)
     }
 
     fn enqueue(

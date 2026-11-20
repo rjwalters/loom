@@ -550,9 +550,11 @@ gh pr list --state=open --label=loom:merge-conflict --json number,labels,comment
 `loom:blocked` PR under Champion's ratification or merge-risk hold goes
 CONFLICTING when siblings merge, and the shared queue hides it (hold exclusion),
 so nothing else would fix it. It is Doctor work: resolve the conflict, push, and
-**leave the hold alone**. Never remove `loom:blocked` or `loom:pr`, never add
-`loom:changes-requested`; the hold stays for the operator, and Judge re-reviews
-the new head through the Stale-Verdict Check. Admit a PR only when it carries
+**leave the hold alone**. Keep both labels during repair and use the ordinary
+native handback with the pushed SHA and the same Doctor lease identity. The
+native handback can replace a verified stale approval with a fresh review
+request while preserving `loom:blocked` (#14714). Do not change either label
+by hand or add `loom:changes-requested`. Admit a PR only when it carries
 `loom:pr` and `loom:blocked`, no `loom:operator` / `loom:frozen` /
 `loom:treating`, is CONFLICTING, and the **latest trusted** marker comment is a
 hold (`<!-- champion:ratification-hold -->` or
@@ -1023,7 +1025,7 @@ and withdraws its add if a verdict landed meanwhile. Act on the exit:
 
 | Exit | Line | Action |
 |------|------|--------|
-| 0 | `HANDED-BACK` | Post the notifying comment. |
+| 0 | `HANDED-BACK` or `HELD-REVIEW` | Post the notifying comment. A held review retains the Champion hold. |
 | 10 | `ALREADY-ADVANCED` | Already re-queued/reviewed/approved; only your claim was released. Success — comment, assert no transition. |
 | 13 | `RACED` | A verdict landed mid-write; it withdrew its add. Done — write nothing more. |
 | 11 | `CLAIM-LOST` | `loom:treating` was gone; nothing written. Stand down (comment, exit). |

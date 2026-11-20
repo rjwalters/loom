@@ -994,6 +994,9 @@ pub(crate) enum ForgeAction {
         /// fails with a named reason — inside it (#14165).
         #[arg(long)]
         deadline_secs: Option<u64>,
+        /// Recover a recorded held Doctor handback without claiming a new one.
+        #[arg(long)]
+        recover_held: bool,
     },
 
     /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
@@ -1318,12 +1321,14 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             expected_head_sha,
             repo,
             deadline_secs,
+            recover_held,
         } => {
             return super::forge_verdict_cmd::doctor_handback(
                 pr,
                 repo.as_deref(),
                 &expected_head_sha,
                 deadline_secs,
+                recover_held,
             );
         }
         ForgeAction::VerdictStaleNotice {
@@ -1718,6 +1723,7 @@ mod write_target_tests {
             expected_head_sha: "a".repeat(40),
             repo: Some("unmanaged/repo".into()),
             deadline_secs: None,
+            recover_held: false,
         };
         assert_eq!(write_target(&explicit), Some(Some("unmanaged/repo".into())));
         let implicit = ForgeAction::DoctorHandback {
@@ -1725,6 +1731,7 @@ mod write_target_tests {
             expected_head_sha: "a".repeat(40),
             repo: None,
             deadline_secs: None,
+            recover_held: false,
         };
         assert_eq!(write_target(&implicit), Some(None));
     }
