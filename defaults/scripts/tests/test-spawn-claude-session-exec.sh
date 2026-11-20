@@ -141,7 +141,10 @@ rm fail
 printf 'beta|available\nalpha|available\n' > "$LOOM_SHARED_TOKENS_DIR/.ranking"
 run 0
 grep -q 'name=alpha' log
-rm "$LOOM_SHARED_TOKENS_DIR/.bad_tokens" "$LOOM_SHARED_TOKENS_DIR/.ranking"
+# Pin selection to beta: every case below puts its fixture marker on beta, so
+# an unranked (random) draw of alpha would skip the violation under test.
+rm "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
+printf 'beta|available\nalpha|available\n' > "$LOOM_SHARED_TOKENS_DIR/.ranking"
 touch "$LOOM_CLAUDE_SEAT_ROOT/beta/wrong-home"
 run 78
 grep -q 'registered home' log
@@ -167,7 +170,7 @@ rm -f "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
 touch fail
 run 42 --use-wrapper
 grep -q '^[^ ]* [a-z]* auth-dead' "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
-rm fail "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
+rm fail "$LOOM_SHARED_TOKENS_DIR/.bad_tokens" "$LOOM_SHARED_TOKENS_DIR/.ranking"
 rm "$LOOM_SHARED_TOKENS_DIR/"*.token
 run 78
 grep -q 'Token selection failed' log
