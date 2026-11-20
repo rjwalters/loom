@@ -60,6 +60,11 @@ pub(super) fn run(request: Args) -> Result<i32> {
                         | "LOOM_RUNTIME"
                         | "LOOM_TERMINAL_ID"
                         | "LOOM_SWEEP_ID"
+                        | "LOOM_SWEEP_NICE"
+                        | "LOOM_SWEEP_NICENESS"
+                        | "LOOM_SWEEP_CPU_QUOTA"
+                        | "LOOM_SWEEP_CPU_BUDGET_CORES"
+                        | "LOOM_SWEEP_RESERVED_CORES"
                         | "LOOM_SWEEP_CLAIM_OWNED"
                         | "LOOM_SWEEP_LEASE_RENEW_DISPATCHED"
                         | "LOOM_LEASE_HOST_ID"
@@ -112,7 +117,8 @@ pub(super) fn run(request: Args) -> Result<i32> {
         .display()
         .to_string()];
     command.extend(request.args);
-    host::run_with_seat(
+    let home = seat::home_dir(&root, &name);
+    let code = host::run_with_seat(
         HostArgs {
             owner_pid: None,
             container: seat::container_name(&name),
@@ -122,13 +128,42 @@ pub(super) fn run(request: Args) -> Result<i32> {
             stderr_file: None,
             command,
         },
-        Some(&seat::home_dir(&root, &name)),
-    )
+        Some((&home, &request.workspace)),
+    );
+    apply_account_failure(&home, &request.workspace, &name);
+    code
+}
+
+/// The wrapper inside a seat cannot reach the host pool, so it leaves
+/// `kind<TAB>phrase` in the seat's mounted home. Apply it as the host would
+/// have: a dead or exhausted login is marked bad before the next selection.
+fn apply_account_failure(home: &Path, workspace: &Path, name: &str) {
+    let record = home.join(".loom-account-failure");
+    let Ok(text) = std::fs::read_to_string(&record) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&record);
+    let (kind, phrase) = text.trim().split_once('\t').unwrap_or((text.trim(), ""));
+    if matches!(kind, "auth-dead" | "exhausted") {
+        let reason = format!("{kind}: {}", phrase.chars().take(200).collect::<String>());
+        if let Err(error) = crate::tokens_pool::bad_tokens::mark_bad_in_dir(
+            &paths::resolve_tokens_dir(workspace),
+            name,
+            &reason,
+        ) {
+            eprintln!("session-exec: could not mark Claude account {name} bad: {error}");
+        }
+    }
 }
 
 /// Bind both the log record and the exec to the same inspected instance.
 /// A container recreated under the same name cannot receive this launch.
-pub(super) fn bind_launch(args: &mut HostArgs, state: &Value, home: &Path) -> Result<()> {
+pub(super) fn bind_launch(
+    args: &mut HostArgs,
+    state: &Value,
+    home: &Path,
+    workspace: &Path,
+) -> Result<()> {
     let labels = &state["Config"]["Labels"];
     ensure!(
         labels[seat::RUNTIME_LABEL] == seat::RUNTIME
@@ -154,6 +189,7 @@ pub(super) fn bind_launch(args: &mut HostArgs, state: &Value, home: &Path) -> Re
     );
     seat::check_mount_sources(
         home,
+        workspace,
         mounts
             .iter()
             .filter(|m| !is_home(m))

@@ -197,6 +197,7 @@ pub fn claude_seat_run_args(
 /// The private home is the only allowed bind from the seat-state tree.
 pub(crate) fn check_mount_sources<'a>(
     home: &Path,
+    workspace: &Path,
     others: impl Iterator<Item = &'a Path>,
 ) -> Result<()> {
     use crate::workspace_registry::normalize_path;
@@ -207,17 +208,21 @@ pub(crate) fn check_mount_sources<'a>(
     let root = normalize_path(seat_root);
     let registered_home = root.join(home.strip_prefix(seat_root)?);
     let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-    let pool = super::paths::shared_tokens_dir().map(|path| normalize_path(&path));
+    // The pool that supplies the credential is protected, not only the shared
+    // one: a populated legacy pool in a workspace outside Git resolves there.
+    let pools: Vec<PathBuf> = super::paths::shared_tokens_dir()
+        .into_iter()
+        .chain(std::iter::once(super::paths::resolve_tokens_dir(workspace)))
+        .map(|path| normalize_path(&path))
+        .collect();
     if normalize_path(home) != registered_home
-        || pool
-            .as_ref()
-            .is_some_and(|dir| overlaps(dir, &registered_home))
+        || pools.iter().any(|dir| overlaps(dir, &registered_home))
     {
         bail!("Claude seat home aliases another directory or overlaps the token pool");
     }
     for source in others {
         let source = normalize_path(source);
-        if overlaps(&source, &root) || pool.as_ref().is_some_and(|dir| overlaps(&source, dir)) {
+        if overlaps(&source, &root) || pools.iter().any(|dir| overlaps(&source, dir)) {
             bail!(
                 "refusing Claude seat mount {} overlapping seat state or the token pool",
                 source.display()
@@ -249,6 +254,7 @@ pub fn docker_create_seat(
     super::session_mount_gate::check_extra_mounts(extra_mounts, workspace, &roots, &credentials)?;
     check_mount_sources(
         claude_home,
+        workspace,
         roots
             .iter()
             .chain(&credentials)

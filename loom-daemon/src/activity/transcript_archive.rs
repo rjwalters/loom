@@ -78,7 +78,7 @@ use sha2::{Digest, Sha256};
 
 use super::db::ActivityDb;
 use super::transcript_ingest::{collect_transcripts, ledger_key};
-use crate::transcript_tokens::claude_projects_dir;
+use crate::transcript_tokens::{claude_projects_dir, claude_seat_projects_dirs};
 
 /// Mirrors [`super::transcript_ingest::MAX_TRANSCRIPT_BYTES`]: a pathological
 /// transcript must not be read into memory wholesale by a maintenance pass.
@@ -206,8 +206,22 @@ fn collect_candidates(
     let cutoff = opts.min_age_hours.checked_mul(3600).unwrap_or(i64::MAX);
 
     let mut out = Vec::new();
-    for path in collect_transcripts(&opts.projects_dir, opts.workspace.as_deref()) {
-        let key = ledger_key(&opts.projects_dir, &path);
+    // The host store, plus each persistent Claude seat's own store when
+    // archiving the default store (an explicit `projects_dir` is exact).
+    let mut roots = vec![opts.projects_dir.clone()];
+    if claude_projects_dir().as_ref() == Some(&opts.projects_dir) {
+        roots.extend(claude_seat_projects_dirs());
+    }
+    let found: Vec<(PathBuf, PathBuf)> = roots
+        .iter()
+        .flat_map(|root| {
+            collect_transcripts(root, opts.workspace.as_deref())
+                .into_iter()
+                .map(move |path| (root.clone(), path))
+        })
+        .collect();
+    for (root, path) in found {
+        let key = ledger_key(&root, &path);
 
         // Defence in depth: `collect_transcripts` structurally cannot yield a
         // `memory/` path, so this should never fire -- but the exclusion is a

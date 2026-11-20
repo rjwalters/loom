@@ -211,7 +211,7 @@ pub fn run(args: HostArgs) -> Result<i32> {
 
 pub(super) fn run_with_seat(
     mut args: HostArgs,
-    seat_home: Option<&std::path::Path>,
+    seat_home: Option<(&std::path::Path, &std::path::Path)>,
 ) -> Result<i32> {
     signals();
     let parent = unsafe { libc::getppid() };
@@ -273,8 +273,8 @@ pub(super) fn run_with_seat(
     };
     match preflight {
         Preflight::Ready(state) => {
-            if let Some(home) = seat_home {
-                claude::bind_launch(&mut args, &state, home)?;
+            if let Some((home, workspace)) = seat_home {
+                claude::bind_launch(&mut args, &state, home, workspace)?;
             }
         }
         not_ready @ (Preflight::NotRunning | Preflight::Unknown) => {

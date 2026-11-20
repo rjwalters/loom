@@ -332,3 +332,20 @@ fn a_runner_without_seat_support_refuses_rather_than_building_a_codex_container(
     assert!(error.contains("cannot create a Claude seat"), "{error}");
     assert!(!is_seat(root.path(), "alice"), "a failed create must not register the seat");
 }
+
+#[test]
+#[serial_test::serial]
+fn a_mount_over_the_effective_legacy_pool_is_refused() {
+    // A populated pool in a workspace outside Git is the effective pool, so
+    // a mount of that workspace would expose every account's credential.
+    let (workspace, seats) = fixture(&["alpha", "beta"]);
+    let home = home_dir(seats.path(), "alpha");
+    std::fs::create_dir_all(&home).unwrap();
+    let ws = workspace.path();
+    let unrelated = tempfile::tempdir().unwrap();
+    assert!(check_mount_sources(&home, ws, [unrelated.path()].into_iter()).is_ok());
+    let err = check_mount_sources(&home, ws, [ws].into_iter()).unwrap_err();
+    assert!(err.to_string().contains("token pool"), "{err}");
+    let inner = ws.join(".loom");
+    assert!(check_mount_sources(&home, ws, [inner.as_path()].into_iter()).is_err());
+}

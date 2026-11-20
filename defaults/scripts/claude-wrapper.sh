@@ -2083,6 +2083,31 @@ rotate_auth_dead_account() {
     return 0
 }
 
+# Persistent-seat dispatch (#14371): the host selected this account and owns
+# the pool. Mark a dead/exhausted account bad so the next host selection picks
+# a healthy one. On the host this calls `tokens mark-bad` directly; inside a
+# seat the pool is unreachable, so leave a one-line record in the seat's
+# mounted home for the host adapter to apply after the step exits.
+record_host_account_failure() {
+    local kind="$1" phrase="${2//[$'\n\r\t']/ }"
+    [[ "${kind}" == "session-limit" ]] && return 0
+    if [[ -n "${LOOM_CLAUDE_SEAT_ACTIVE:-}" ]]; then
+        printf '%s\t%s\n' "${kind}" "${phrase}" > "${HOME:-/nonexistent}/.loom-account-failure" 2>/dev/null || true
+        return 0
+    fi
+    local ws daemon_bin name="${ACTIVE_TOKEN_NAME:-${LOOM_TOKEN_NAME:-}}"
+    ws="$(_resolve_token_workspace)"
+    daemon_bin="$(declare -F loom_locate_daemon_bin >/dev/null 2>&1 && loom_locate_daemon_bin "${ws}" || true)"
+    if [[ -z "${name}" || -z "${daemon_bin}" ]]; then
+        log_warn "Cannot record ${kind} failure: account or loom-daemon unknown"
+        return 0
+    fi
+    "${daemon_bin}" tokens mark-bad "${name}" --reason "${kind}: ${phrase}" --workspace "${ws}" >/dev/null 2>&1 \
+        && log_info "Marked account '${name}' ${kind} in .bad_tokens (${phrase})" \
+        || log_warn "Could not record '${name}' in .bad_tokens"
+    return 0
+}
+
 # Check if error output specifically indicates an MCP/plugin failure.
 # Used to map exhausted-retry exits to exit code 7 so the Python retry
 # layer can recognize MCP failures even when the wrapper's own retries
@@ -2747,13 +2772,23 @@ run_with_retry() {
 
         # A persistent seat owns one login. Let the dispatcher classify the
         # original failure and choose the next seat; its pool is host-only.
-        if [[ -n "${LOOM_CLAUDE_HOST_SELECTS_ACCOUNT:-}" ]] && {
-            is_account_session_limit "${output}" "${exit_code}" ||
-                is_account_exhaustion "${output}" "${exit_code}" ||
-                is_account_auth_dead "${output}" "${exit_code}"
-        }; then
-            clear_retry_state
-            return "${exit_code}"
+        # The host still must record the failure (bad-account mark) so its
+        # next selection skips this account; a session-limit is capacity, not
+        # account health, so it is not marked.
+        if [[ -n "${LOOM_CLAUDE_HOST_SELECTS_ACCOUNT:-}" ]]; then
+            local _host_kind="" _host_phrase=""
+            if is_account_session_limit "${output}" "${exit_code}"; then
+                _host_kind=session-limit
+            elif is_account_exhaustion "${output}" "${exit_code}"; then
+                _host_kind=exhausted _host_phrase="$(_exhaustion_phrase "${output}")"
+            elif is_account_auth_dead "${output}" "${exit_code}"; then
+                _host_kind=auth-dead _host_phrase="$(_auth_dead_phrase "${output}")"
+            fi
+            if [[ -n "${_host_kind}" ]]; then
+                record_host_account_failure "${_host_kind}" "${_host_phrase}"
+                clear_retry_state
+                return "${exit_code}"
+            fi
         fi
 
         # Concurrent-session-limit fault (#3947) → the active account is healthy

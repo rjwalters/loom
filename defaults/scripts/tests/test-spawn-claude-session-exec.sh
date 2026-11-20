@@ -112,6 +112,8 @@ check_seat() {
     cmp out expected
     grep -qx after result.txt
     grep -q "containment=claude-session.*container_id=$2.*image_digest=sha256:" log
+    # Explicit scheduling opt-outs hold inside the seat too.
+    ! grep -q 're-exec at nice' log
     grep -qx '/loom:builder 42' "$LOOM_CLAUDE_SEAT_ROOT/$1/home/transcript"
 }
 printf 'beta|available\nalpha|available\n' > "$LOOM_SHARED_TOKENS_DIR/.ranking"
@@ -128,7 +130,15 @@ source "$scripts/lib/classify-error.sh"
 [[ "$(classify_error "$(cat log)" 42 claude)" = TOKEN_EXPIRED ]]
 run 42 --use-wrapper
 grep -q '401 Invalid bearer token' out
+# The host, not the seat, records the dead login: the seat's pool is unreachable.
+grep -q '^[^ ]* beta auth-dead' "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
+[[ ! -e "$LOOM_CLAUDE_SEAT_ROOT/beta/home/.loom-account-failure" ]]
 rm fail
+# Both accounts rank available; the next dispatch skips the marked account.
+printf 'beta|available\nalpha|available\n' > "$LOOM_SHARED_TOKENS_DIR/.ranking"
+run 0
+grep -q 'name=alpha' log
+rm "$LOOM_SHARED_TOKENS_DIR/.bad_tokens" "$LOOM_SHARED_TOKENS_DIR/.ranking"
 touch "$LOOM_CLAUDE_SEAT_ROOT/beta/wrong-home"
 run 78
 grep -q 'registered home' log
