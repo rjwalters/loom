@@ -53,7 +53,8 @@ enum FleetConfigCommand {
     /// fleet/hosts/<H>/defaults.json)`) and host-local tier
     /// (`fleet/hosts/<H>/local.json`) and write them where the daemon reads
     /// them. Falls back to the cached snapshot (with a warning) if the forge
-    /// is unreachable.
+    /// is unreachable; refuses (exit 2) when the store cannot be confirmed
+    /// because no reader can be minted on a never-started host (#14730).
     ///
     /// Every changed key is classified live-reloadable or restart-required
     /// (#9597, [`crate::fleet_store::reload`]). A live-reloadable
@@ -342,6 +343,20 @@ fn cmd_render(
 ) -> Result<i32> {
     let host = resolve_host(host)?;
     let loaded = ctx.load(policy(offline))?;
+    // #14730: an online render is what advances the cache the daemon's start
+    // gate trusts. When the store could not be confirmed because this host's
+    // reader pool has no published credential and minting one failed, the
+    // cached snapshot must not silently decide the host's run state — refuse
+    // (exit 2, the CLI's error class) with the recovery step instead of
+    // rendering from it.
+    if !offline {
+        if let (Freshness::Cached { .. }, Some(reason)) =
+            (&loaded.freshness, ctx.transport.bootstrap_failure())
+        {
+            eprintln!("{}", render_block_message(&reason, &loaded, &host, Utc::now()));
+            return Ok(2);
+        }
+    }
     let machine_path = crate::config_resolver::private_defaults_path().ok_or_else(|| {
         anyhow!(
             "the machine tier is disabled ({} is set to the empty string)",
@@ -423,6 +438,46 @@ fn cmd_render(
         super::fleet_config_reload::report(&ctx.workspace, &live, &restart_required);
     }
     Ok(0)
+}
+
+/// The refusal an online `render` prints when the store could not be
+/// confirmed on a never-started host (#14730): the bootstrap mint of a
+/// reader failed, so nothing reliable advances the cache the daemon's
+/// start-time state check reads. Names the recovery step, the cached commit
+/// and its age, and — when the cache records the host as stopped — that the
+/// stop stays in effect.
+fn render_block_message(
+    reason: &str,
+    loaded: &Loaded,
+    host: &str,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    let m = &loaded.snapshot.manifest;
+    let mut out = format!(
+        "REFUSED — could not confirm the fleet store {} @ {}: no reader can serve it and \
+         minting a bootstrap reader failed: {reason}.\n  before starting the daemon: fix the \
+         reader setup — a reader GitHub App installed on the store with `contents: read`, its \
+         private key readable at the configured path, and the workspace's \
+         `.loom/scripts/lib/github-app-token.sh` able to mint — then re-run `loom-daemon \
+         fleet-config render`.",
+        m.repo, m.reference
+    );
+    out.push_str(&format!(
+        "\n  the CACHED snapshot (commit {}, confirmed {} ago) was NOT used for this render",
+        loaded.snapshot.short_commit(),
+        fetch::human_age(now - m.confirmed_at),
+    ));
+    match state::resolve_snapshot(&loaded.snapshot, host) {
+        Ok(Some(hs)) if hs.state == state::RunState::Stopped => out.push_str(&format!(
+            "\n  it still records host `{host}` as stopped; that stop stays in effect at daemon \
+             start until a render the forge confirms advances it",
+        )),
+        _ => out.push_str(
+            "\n  the daemon's start-time state check still reads that cached snapshot until a \
+             render the forge confirms advances it",
+        ),
+    }
+    out
 }
 
 /// [`Reloadability`](reload::Reloadability)-classify every path each target's
@@ -746,4 +801,71 @@ fn submit_or_print(
         _ => println!("opened the PR (the forge did not echo its number/URL back)"),
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::fleet_store::fetch::{Freshness, Manifest, Snapshot};
+    use std::collections::BTreeMap;
+
+    /// A cached snapshot of `commit` whose `fleet.json` records `boot-h` as
+    /// `state`, confirmed `age` hours ago.
+    fn cached_snapshot(commit: &str, state: &str, age_hours: i64) -> Loaded {
+        let fleet_json = format!(
+            r#"{{"_generated":{{"schema_version":1}},"root":"/srv","repos":[],"config":{{"defaults":{{}}}},"state":{{"hosts":{{"boot-h":{{"state":"{state}"}}}}}}}}"#
+        );
+        let files = [(crate::fleet_store::FLEET_JSON_PATH.to_string(), fleet_json.into_bytes())]
+            .into_iter()
+            .collect();
+        Loaded {
+            snapshot: Snapshot {
+                manifest: Manifest {
+                    version: 1,
+                    repo: "o/fleet-14730".into(),
+                    reference: "main".into(),
+                    commit: commit.into(),
+                    etag: None,
+                    confirmed_at: Utc::now() - chrono::Duration::hours(age_hours),
+                    files: BTreeMap::new(),
+                },
+                files,
+            },
+            freshness: Freshness::Cached { why: "test".into() },
+        }
+    }
+
+    #[test]
+    fn a_blocked_render_names_the_recovery_step_the_cache_age_and_the_stop() {
+        let loaded = cached_snapshot(&"1".repeat(40), "stopped", 3);
+        let msg = render_block_message(
+            "reader app 147001: private key not readable",
+            &loaded,
+            "boot-h",
+            Utc::now(),
+        );
+        for expected in [
+            "no reader can serve it",
+            "reader app 147001: private key not readable",
+            "before starting the daemon",
+            "re-run `loom-daemon fleet-config render`",
+            "commit 111111111111",
+            "3h ago",
+            "was NOT used for this render",
+            "still records host `boot-h` as stopped",
+            "stays in effect at daemon start",
+        ] {
+            assert!(msg.contains(expected), "missing `{expected}` in:\n{msg}");
+        }
+    }
+
+    #[test]
+    fn a_blocked_render_without_a_cached_stop_keeps_the_generic_line() {
+        let loaded = cached_snapshot(&"2".repeat(40), "running", 30);
+        let msg = render_block_message("no reader serves owner o", &loaded, "boot-h", Utc::now());
+        assert!(msg.contains("start-time state check still reads that cached snapshot"), "{msg}");
+        assert!(!msg.contains("as stopped"), "{msg}");
+        assert!(msg.contains("30h ago"), "{msg}");
+    }
 }

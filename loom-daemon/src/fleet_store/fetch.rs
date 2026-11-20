@@ -160,7 +160,9 @@ impl Loaded {
     }
 }
 
-fn human_age(d: chrono::Duration) -> String {
+/// An age as `30s` / `45m` / `3h` / `12d`, for cache-age messages (shared by
+/// the CLI's bootstrap refusal, #14730).
+pub(crate) fn human_age(d: chrono::Duration) -> String {
     let s = d.num_seconds().max(0);
     match s {
         0..=119 => format!("{s}s"),

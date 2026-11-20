@@ -13,6 +13,15 @@
 //!   can see the repository (it served the repository recently, or answers
 //!   `GET repos/OWNER/REPO`) is the item's own answer — "this ref does not
 //!   exist" — not a coverage gap (#10718's concern).
+//! - **A pooled host with no published reader token** — a freshly provisioned
+//!   one whose daemon has never refreshed one — mints a reader installation
+//!   token for the store before the read is shed (#14730):
+//!   [`crate::forge_identity::provision_bootstrap_reader`] through the
+//!   workspace's own `github-app-token.sh`, published where the routing
+//!   looks, so the standalone `fleet-config render` that must advance the
+//!   cache past a stale `stopped` can. The read stays reader-only whatever
+//!   happens: a mint that cannot be provisioned fails the read with the
+//!   setup step named ([`GhTransport::bootstrap_failure`]), never the writer.
 //! - **On a host with no reader pool at all** the writer is the only
 //!   credential there is, and reads use it: the writer App (`forge.githubApp`)
 //!   installation token for the store, minted through the workspace's
@@ -56,6 +65,13 @@ type NextReader = dyn Fn() -> Option<(PathBuf, String)>;
 
 /// `(app id, owner/repo, failure, why)` → withdraw that reader.
 type WithdrawReader = dyn Fn(&str, &str, Failure, &str);
+
+/// Provision a bootstrap reader for the transport's repository (#14730):
+/// mint-and-publish one through the workspace's own `github-app-token.sh`.
+/// `Err(reason)` names the reader setup to fix before starting the daemon.
+/// Wired only by the production constructor; test transports shed exactly as
+/// they did before.
+type BootstrapReader = dyn Fn() -> std::result::Result<(), String>;
 
 /// Which credential a request ran under, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +128,10 @@ pub struct GhTransport {
     reader: RefCell<Option<(PathBuf, String)>>,
     next_reader: Box<NextReader>,
     withdraw: Box<WithdrawReader>,
+    /// The #14730 bootstrap mint, when the workspace has a minting seam.
+    bootstrap: Option<Box<BootstrapReader>>,
+    /// Why the last bootstrap mint failed, for the caller's recovery message.
+    bootstrap_error: RefCell<Option<String>>,
     writer: RefCell<Option<Credential>>,
     last_used: RefCell<Option<Credential>>,
 }
@@ -147,27 +167,38 @@ impl GhTransport {
         repo: &str,
         roster_of: fn(&Path) -> crate::forge_identity::Roster,
     ) -> Self {
-        let (pooled, next_reader) = reader_pool(
-            crate::forge_identity::reader_root_with(workspace_root, published),
-            repo,
-            roster_of,
-        );
+        let reader_root = crate::forge_identity::reader_root_with(workspace_root, published);
+        let (pooled, next_reader) = reader_pool(reader_root.clone(), repo, roster_of);
+        // #14730: a pooled host whose daemon never published a reader token
+        // mints one through the workspace's own minting seam, at the same
+        // root the pool resolves against, before its first store read sheds.
+        let bootstrap = crate::forge_identity::real_minter_factory(&reader_root).map(|factory| {
+            let root = reader_root.clone();
+            let nwo = repo.to_string();
+            Box::new(move || {
+                let roster = roster_of(&root);
+                crate::forge_identity::provision_bootstrap_reader(&root, &roster, &nwo, &factory)
+            }) as Box<BootstrapReader>
+        });
         Self::with_readers(
             workspace_root,
             repo,
             pooled,
             next_reader,
+            bootstrap,
             Box::new(crate::forge_identity::withdraw_after),
         )
     }
 
     /// [`GhTransport::new`] with the reader pool injected: whether there is
     /// one (`pooled`), the reader lookup, and the withdrawal.
+    #[allow(clippy::type_complexity)]
     fn with_readers(
         workspace_root: &Path,
         repo: &str,
         pooled: bool,
         next_reader: Box<NextReader>,
+        bootstrap: Option<Box<BootstrapReader>>,
         withdraw: Box<WithdrawReader>,
     ) -> Self {
         let reader = if pooled { next_reader() } else { None };
@@ -178,6 +209,8 @@ impl GhTransport {
             pooled,
             reader: RefCell::new(reader),
             next_reader,
+            bootstrap,
+            bootstrap_error: RefCell::new(None),
             withdraw,
             writer: RefCell::new(None),
             last_used: RefCell::new(None),
@@ -194,13 +227,22 @@ impl GhTransport {
         next_reader: Box<NextReader>,
         withdraw: Box<WithdrawReader>,
     ) -> Self {
-        Self::with_readers(workspace_root, repo, pooled, next_reader, withdraw)
+        Self::with_readers(workspace_root, repo, pooled, next_reader, None, withdraw)
     }
 
     /// The credential the most recent request ran under.
     #[must_use]
     pub fn last_credential(&self) -> Option<Credential> {
         self.last_used.borrow().clone()
+    }
+
+    /// Why the #14730 bootstrap mint last failed, when it was tried and did
+    /// not succeed: the recovery step a standalone `fleet-config` command
+    /// reports to the operator. `None` when it was never needed, or it
+    /// succeeded and the read was served.
+    #[must_use]
+    pub fn bootstrap_failure(&self) -> Option<String> {
+        self.bootstrap_error.borrow().clone()
     }
 
     fn writer(&self) -> Credential {
@@ -330,9 +372,38 @@ impl GhTransport {
         }
         let family = served::endpoint_family(api_path);
         let mut tried: Vec<String> = Vec::new();
+        let mut bootstrapped = false;
         loop {
             let Some((dir, app_id)) = self.reader.borrow().clone() else {
-                break;
+                // #14730: the pool has no usable reader — on a host whose
+                // daemon never published one, mint it before shedding. The
+                // read stays reader-only whatever happens.
+                if bootstrapped {
+                    break;
+                }
+                bootstrapped = true;
+                let Some(bootstrap) = &self.bootstrap else {
+                    break;
+                };
+                match bootstrap() {
+                    Ok(()) => {
+                        *self.bootstrap_error.borrow_mut() = None;
+                        *self.reader.borrow_mut() = (self.next_reader)();
+                        continue;
+                    }
+                    Err(reason) => {
+                        *self.bootstrap_error.borrow_mut() = Some(reason.clone());
+                        anyhow::bail!(
+                            "gh api {api_path} was shed: no reader can serve {} and minting a \
+                             bootstrap reader failed: {reason} — fix the reader setup (a reader \
+                             GitHub App installed on the store with contents: read, its private \
+                             key readable at the configured path, and the workspace's \
+                             github-app-token.sh able to mint) before starting the daemon; the \
+                             writer is never used for reads, #12394 (#14730)",
+                            self.repo
+                        );
+                    }
+                }
             };
             if tried.contains(&app_id) || tried.len() >= MAX_READERS_TRIED {
                 break;
