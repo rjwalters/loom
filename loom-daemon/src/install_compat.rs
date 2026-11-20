@@ -440,6 +440,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "park-record apply",
     "park-record released",
     "park-record decision",
+    "park-record guide-conflict-route",
     "park-record retract",
     "operator-decision validate",
     "operator-decision apply",

@@ -36,8 +36,10 @@ set_labels() {
 labels_of() { jq -c --argjson n "$1" '.[] | select(.number == $n) | .labels' rows.json; }
 expect_label() { labels_of "$1" | jq -e --arg name "$2" 'index($name) != null' >/dev/null; }
 must_fail() {
-  if "$@"; then
-    printf 'Expected failure: %s\n' "$*" >&2
+  local result=0
+  "$@" || result=$?
+  if [ "$result" -ne 1 ]; then
+    printf 'Expected exit 1 but got %s for %s\n' "$result" "$*" >&2
     exit 1
   fi
 }
@@ -67,7 +69,7 @@ gh() {
       status=DIRTY; mergeable=CONFLICTING; base_ref=main
       if [ "$n" = 8 ]; then status=UNKNOWN; mergeable=UNKNOWN; fi
       base_ref=${FIXTURE_BASE_REF-$base_ref}
-      if [ "${STACK_AFTER_ADD:-}" = "$n" ] && rg -q "^$n --add-label" edits; then
+      if [ "${STACK_AFTER_ADD:-}" = "$n" ] && grep -Eq "^$n --add-label" edits; then
         base_ref=feature/issue-42
       fi
       jq -c --arg head "$fixture_head" --arg base "$fixture_base" --arg branch "$base_ref" --arg ms "$status" --arg m "$mergeable" '
@@ -169,8 +171,8 @@ for n in 1 2 9; do
 done
 expect_label 1 loom:ci-failure
 for n in 3 4 5 6 7 8 10 11 12 13; do expect_label "$n" loom:blocked; done
-must_fail rg -q '^(3|4|5|6|7|8|12|13) ' edits
-must_fail rg -q '^11 --remove-label' edits
+must_fail grep -Eq '^(3|4|5|6|7|8|12|13) ' edits
+must_fail grep -Eq '^11 --remove-label' edits
 jq -es 'all(.[]; .pr != 6)' "$COMMENTS" >/dev/null
 
 check_and_unblock_prs
@@ -220,13 +222,13 @@ must_fail expect_label 9 loom:blocked
 reset_rows
 RECREATE_FOR=9 check_and_unblock_prs 9
 expect_label 9 loom:blocked
-rg -q '^9 --add-label' edits
-must_fail rg -q '^9 --remove-label' edits
+grep -Eq '^9 --add-label' edits
+must_fail grep -Eq '^9 --remove-label' edits
 
 reset_rows
 STACK_AFTER_ADD=9 check_and_unblock_prs 9
 expect_label 9 loom:blocked
-must_fail rg -q '^9 --remove-label' edits
+must_fail grep -Eq '^9 --remove-label' edits
 
 for policy in disabled unreadable recheck; do
   reset_rows
@@ -239,7 +241,7 @@ for policy in disabled unreadable recheck; do
   fi
   FIXTURE_POLICY="$policy" check_and_unblock_prs 9
   expect_label 9 loom:blocked
-  must_fail rg -q '^9 --remove-label' edits
+  must_fail grep -Eq '^9 --remove-label' edits
   if [ "$policy" != recheck ]; then test ! -s edits; fi
 done
 
