@@ -959,6 +959,23 @@ pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>)
     body
 }
 
+/// The visible prose `release_with` leaves on a row it releases (#14807):
+/// the live record's text says the claim "is held", and a human reading the
+/// PR must not keep seeing that behind a released marker. `reaped` words it
+/// as the role runner's reap of a claimant that ended without releasing.
+pub(crate) fn released_body(holder: &Identity, pr: u64, reaped: bool) -> String {
+    format!(
+        "PR #{pr}'s `{label}` lease for the {role} of sweep `{sweep}` on host `{host}` was {verb}. \
+         This **PR lease record** (#9401) is no longer live. \
+         See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
+        verb = if reaped { "reaped" } else { "released" },
+        label = holder.claim_label_text(),
+        role = holder.role.as_str(),
+        sweep = holder.sweep,
+        host = holder.host,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -1683,9 +1700,6 @@ impl Ctx {
                     Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
                 }
             });
-            let mut lines = row.body.lines();
-            lines.next();
-            let rest: Vec<&str> = lines.collect();
             // The released marker keeps the lease's own step.
             // A Champion merge step's release records its outcome (#12616);
             // a reaped one died without releasing, so it has none.
@@ -1699,10 +1713,14 @@ impl Ctx {
                 Some((word, reason)) => backstop::format_champion_outcome(word, reason.as_deref()),
                 None => String::new(),
             };
+            // #14807: the prose is rewritten too — the live record's text
+            // says the claim "is held", and no reader of the PR should keep
+            // seeing that behind a released marker. The renewal line, if
+            // any, goes with it: no reader parses it on a released row.
             let body = format!(
                 "{}\n{}",
                 holder.released_marker_with(&format!("{extra}{champion}")),
-                rest.join("\n")
+                released_body(&holder, self.pr(), reaped.is_some())
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
