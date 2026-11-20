@@ -341,8 +341,10 @@ fn import_from_monitor_cli_accepts_repeated_exclude_names_and_rejects_empty() {
                 "--exclude-name",
                 "one-example",
                 "--exclude-name=two-example",
+                "--exclude-name",
+                " exact-name ",
             ],
-            &["one-example", "two-example"],
+            &["one-example", "two-example", " exact-name "],
         ),
     ] {
         let cli = parse(args).unwrap();
@@ -353,11 +355,13 @@ fn import_from_monitor_cli_accepts_repeated_exclude_names_and_rejects_empty() {
             _ => panic!("expected tokens import-from-monitor"),
         }
     }
-    for empty in [
+    for invalid in [
         &["--exclude-name", ""][..],
         &["--exclude-name="][..],
         &["--exclude-name"][..],
+        &["--exclude-name", "   "][..],
+        &["--exclude-name", "\t"][..],
     ] {
-        assert!(parse(empty).is_err());
+        assert!(parse(invalid).is_err(), "accepted {invalid:?}");
     }
 }

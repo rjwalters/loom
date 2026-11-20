@@ -1780,6 +1780,13 @@ pub enum StashesAction {
     BuildTrees(super::stashes::BuildTreesArgs),
 }
 
+fn parse_excluded_pool_name(value: &str) -> Result<String, &'static str> {
+    if value.trim().is_empty() {
+        return Err("expected a nonblank pool name");
+    }
+    Ok(value.to_owned())
+}
+
 /// Sub-actions for `loom-daemon tokens`.
 #[derive(Subcommand)]
 pub enum TokensAction {
@@ -1938,7 +1945,7 @@ pub enum TokensAction {
 
         /// Skip a Claude account by its exact derived pool name, without the
         /// `.token` suffix. Repeat for more names. Existing files are preserved.
-        #[arg(long = "exclude-name", value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        #[arg(long = "exclude-name", value_name = "NAME", value_parser = parse_excluded_pool_name)]
         exclude_names: Vec<String>,
 
         /// Delete `*.token` files for accounts claude-monitor no longer
