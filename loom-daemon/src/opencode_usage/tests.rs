@@ -934,3 +934,210 @@ fn session_id_selection_counts_only_the_named_sessions_not_their_directory_neigh
 fn no_session_ids_yield_no_totals() {
     assert_eq!(tokens_by_session_ids(&[], None), None);
 }
+
+// --- Id branch is the whole key (#14278) ---------------------------------
+
+fn raw_row(id: &str, directory: &str, time_created: Option<i64>) -> RawSessionRow {
+    RawSessionRow {
+        id: Some(id.to_string()),
+        model: Some(model_json("zai-org/GLM-5.3", "friendli")),
+        input: Some(5),
+        output: Some(1),
+        reasoning: None,
+        cache_read: None,
+        cache_write: None,
+        directory: Some(directory.to_string()),
+        time_created,
+    }
+}
+
+/// An id-keyed decode attributes a row whose `time_created` is NULL or out of
+/// range — the id is the whole key, so the window-only column must not drop
+/// it. The directory+window branch still drops it (an unattributable instant
+/// is never assumed to be inside the window).
+#[test]
+fn an_id_keyed_row_without_a_decodable_time_created_is_still_attributed() {
+    let ids = SessionFilter::ids(&["ses_a".to_string()]);
+    for time_created in [None, Some(i64::MAX)] {
+        let decoded = raw_row("ses_a", "/repo", time_created)
+            .decode(&ids, None)
+            .unwrap_or_else(|| panic!("id-matched row dropped for time_created={time_created:?}"));
+        assert_eq!(decoded.session_id.as_deref(), Some("ses_a"));
+        assert_eq!(decoded.input, 5);
+    }
+    // Pin the sibling branch so the asymmetry stays deliberate.
+    let dirs_only = SessionFilter::directories(&dirs(&["/repo"]));
+    assert!(raw_row("ses_a", "/repo", None)
+        .decode(&dirs_only, None)
+        .is_none());
+}
+
+/// One session id held by two installed stores (a cross-version copy) is one
+/// session: BOTH id-keyed entry points count it once.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn one_id_in_two_stores_is_counted_once_by_both_id_entry_points() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    for version in ["opencode-1.18.31", "opencode-2.0.10"] {
+        let dir = tmp
+            .path()
+            .join(".loom")
+            .join("opt")
+            .join(version)
+            .join("xdg")
+            .join("data")
+            .join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_db(
+            &dir.join("opencode.db"),
+            &[id_row(
+                "ses_dup",
+                &model_json("zai-org/GLM-5.3", "friendli"),
+                "/repo/a",
+                10,
+            )],
+        );
+    }
+    let ids = ["ses_dup".to_string()];
+
+    assert_eq!(sessions_for_ids(&ids, Some(tmp.path())).len(), 1);
+    for totals in [
+        tokens_by_model_for_ids(&ids, Some(tmp.path())),
+        tokens_by_session_ids(&ids, Some(tmp.path())),
+    ] {
+        let totals = totals.unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].input, 10, "the duplicated id must not be summed twice");
+    }
+
+    // Directory-keyed reads are unchanged: they are not id-deduped.
+    let listed = sessions(&dirs(&["/repo/a"]), None, Some(tmp.path()));
+    assert_eq!(listed.len(), 2);
+}
+
+/// The cross-store dedupe runs over usage-bearing rows only: when the
+/// first-discovered copy of an id is the all-zero creation row OpenCode writes
+/// before any usage lands, it must not claim the id slot and shadow the other
+/// store's copy that holds the usage (#14440). Both id-keyed entry points report
+/// that usage exactly once. The seeded store names sort so the zero row is
+/// discovered first (loom-managed stores are visited in sorted order).
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn an_all_zero_first_copy_does_not_shadow_the_usage_bearing_copy() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let model = model_json("zai-org/GLM-5.3", "friendli");
+    for (version, input) in [("opencode-1.18.31", 0), ("opencode-2.0.10", 10)] {
+        let dir = tmp
+            .path()
+            .join(".loom")
+            .join("opt")
+            .join(version)
+            .join("xdg")
+            .join("data")
+            .join("opencode");
+        std::fs::create_dir_all(&dir).unwrap();
+        seed_db(&dir.join("opencode.db"), &[id_row("ses_dup", &model, "/repo/a", input)]);
+    }
+    let ids = ["ses_dup".to_string()];
+    let dbs = discover_opencode_dbs(Some(tmp.path()));
+    assert!(
+        dbs[0].to_string_lossy().contains("opencode-1.18.31"),
+        "fixture precondition: the all-zero store must be discovered first, got {dbs:?}"
+    );
+
+    let listed = sessions_for_ids(&ids, Some(tmp.path()));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].input, 10);
+    for totals in [
+        tokens_by_model_for_ids(&ids, Some(tmp.path())),
+        tokens_by_session_ids(&ids, Some(tmp.path())),
+    ] {
+        let totals = totals.expect("the usage-bearing copy must be counted, not shadowed");
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0].input, 10);
+    }
+}
+
+/// An empty id set matches nothing through every id-keyed entry point, even
+/// when a store holding sessions is installed.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn an_empty_id_set_selects_nothing_even_with_a_populated_store() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp
+        .path()
+        .join(".loom")
+        .join("opt")
+        .join("opencode-1.18.31")
+        .join("xdg")
+        .join("data")
+        .join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    seed_db(
+        &dir.join("opencode.db"),
+        &[id_row(
+            "ses_a",
+            &model_json("zai-org/GLM-5.3", "friendli"),
+            "/repo/a",
+            10,
+        )],
+    );
+    assert_eq!(sessions_for_ids(&[], Some(tmp.path())), Vec::new());
+    assert_eq!(tokens_by_model_for_ids(&[], Some(tmp.path())), None);
+    assert_eq!(tokens_by_session_ids(&[], Some(tmp.path())), None);
+}
+
+/// #14566: `lookup_ids` says why a by-id read came back empty: no store at
+/// all, a store without the id, or a session that recorded no tokens.
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn lookup_ids_tells_no_store_from_not_found_from_no_usage_from_found() {
+    std::env::remove_var(OPENCODE_DB_ENV);
+    std::env::remove_var("XDG_DATA_HOME");
+    let tmp = tempfile::tempdir().unwrap();
+    let ids = |id: &str| [id.to_string()];
+
+    assert_eq!(lookup_ids(&ids("ses_a"), Some(tmp.path())), IdLookup::NoStore, "no store");
+
+    let dir = tmp
+        .path()
+        .join(".loom")
+        .join("opt")
+        .join("opencode-1.18.31")
+        .join("xdg")
+        .join("data")
+        .join("opencode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = model_json("zai-org/GLM-5.3", "friendli");
+    seed_db(
+        &dir.join("opencode.db"),
+        &[
+            id_row("ses_used", &model, "/repo", 7),
+            id_row("ses_zero", &model, "/repo", 0),
+            id_row("ses_bad_model", &model, "/repo", 10),
+        ],
+    );
+    Connection::open(dir.join("opencode.db"))
+        .unwrap()
+        .execute("UPDATE session SET model = NULL WHERE id = 'ses_bad_model'", [])
+        .unwrap();
+    let IdLookup::Found(rows) = lookup_ids(&ids("ses_used"), Some(tmp.path())) else {
+        panic!("known session must return its model totals");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].input, 7);
+    assert_eq!(lookup_ids(&ids("ses_bad_model"), Some(tmp.path())), IdLookup::Unattributable);
+    assert_eq!(lookup_ids(&ids("ses_zero"), Some(tmp.path())), IdLookup::NoUsage);
+    assert_eq!(lookup_ids(&ids("ses_absent"), Some(tmp.path())), IdLookup::NotFound);
+    let corrupt = tmp.path().join(".local/share/opencode");
+    std::fs::create_dir_all(&corrupt).unwrap();
+    std::fs::write(corrupt.join("opencode.db"), "not a database").unwrap();
+    assert_eq!(lookup_ids(&ids("ses_absent"), Some(tmp.path())), IdLookup::NoStore);
+    assert_eq!(lookup_ids(&[], Some(tmp.path())), IdLookup::NotFound, "no ids names nothing");
+}

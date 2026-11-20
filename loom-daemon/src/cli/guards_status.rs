@@ -10,7 +10,7 @@ use anyhow::Result;
 use crate::guards_status::{self, Inputs, DEFAULT_ASK_THRESHOLD};
 
 #[derive(clap::Subcommand)]
-pub(crate) enum GuardsCommand {
+pub enum GuardsCommand {
     /// Show every guard category's effective value and source (env, config or
     /// default), hook wiring in repo and `~/.claude` settings, a per-rule
     /// ask/deny summary of the decision log, and warnings for known
@@ -24,7 +24,7 @@ pub(crate) enum GuardsCommand {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct RemoteExecArgs {
+pub struct RemoteExecArgs {
     /// The Bash command to classify (as the hook masked it).
     #[arg(long, value_name = "COMMAND")]
     for_command: String,
@@ -36,7 +36,7 @@ pub(crate) struct RemoteExecArgs {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct StatusArgs {
+pub struct StatusArgs {
     /// Repository root. Defaults to the current directory.
     #[arg(long, value_name = "PATH")]
     repo: Option<PathBuf>,
@@ -51,7 +51,7 @@ pub(crate) struct StatusArgs {
 }
 
 impl GuardsCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         match self {
             GuardsCommand::Status(args) => args.run(),
             GuardsCommand::RemoteExec(args) => {

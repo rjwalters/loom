@@ -102,7 +102,6 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         observability_export: None,
         observability_exports: std::collections::BTreeMap::new(),
         otlp_export: None,
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: None,
         stuck_worktree_reclaims: Vec::new(),

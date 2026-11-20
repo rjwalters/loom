@@ -140,8 +140,8 @@ pub struct DispatchEligibilityRecord {
     pub eligibility: Eligibility,
     /// The dispatcher's own reason token — the
     /// [`crate::types::QueueDisposition::as_str`] value (e.g.
-    /// `deferred_capacity`, `deferred_repo_cap`, `open_pr`, `parked`,
-    /// `workspace_halted`, `quarantined`, `peer_claim`, `host_constraint`, …).
+    /// `deferred_capacity`, `open_pr`, `parked`, `workspace_halted`,
+    /// `quarantined`, `lease_held`, `host_constraint`, …).
     pub reason: String,
     /// The coarse [`crate::types::QueueDisposition::state`] token (`ready` or
     /// `blocked` — a `running` row is never emitted here).

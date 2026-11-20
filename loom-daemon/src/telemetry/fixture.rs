@@ -336,6 +336,7 @@ pub fn build(run_id: &str, start: DateTime<Utc>) -> Result<FixtureBundle> {
         start,
         TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
             captured_at: start,
+            fleet_probe_age_secs: None,
             accounts: vec![
                 TokenAccountState {
                     account: "synthetic-zero".into(),

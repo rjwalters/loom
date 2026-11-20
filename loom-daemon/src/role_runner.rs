@@ -1316,6 +1316,18 @@ pub struct RoleRunnerConfig {
     /// only; a malformed qualified key is dropped with a warning. Resolved by
     /// [`resolve_role_runner_effort_for_runtime`].
     pub role_efforts: BTreeMap<String, String>,
+    /// `autonomous.roleRunner.serviceTier` — the runtime-neutral service tier
+    /// (speed setting, #14141) every role child is launched with, exported to
+    /// the spawn scripts as `LOOM_SERVICE_TIER` (#14454). `None` (absent, blank
+    /// or non-string) means **unset**: nothing is exported and an operator's own
+    /// inherited `LOOM_SERVICE_TIER` is left alone. Resolved by
+    /// [`resolve_role_runner_service_tier_for_runtime`].
+    pub service_tier: Option<String>,
+    /// `autonomous.roleRunner.roleServiceTiers` — per-role service-tier
+    /// overrides, keyed exactly like [`role_efforts`](Self::role_efforts)
+    /// (`"<role>"` or runtime-qualified `"<role>@<runtime>"`, #14017) and parsed
+    /// with the same per-entry soft-fail contract.
+    pub role_service_tiers: BTreeMap<String, String>,
     /// `autonomous.roleRunner.architectMaxProposals` — the **per-invocation**
     /// cap on how many proposal issues one architect dispatch may file
     /// (#5656). `None` (key absent, zero, or non-integer) falls through to
@@ -1482,6 +1494,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
     // them (`role_runner/model_resolution.rs`), with the identical
     // trim/blank-is-unset/per-entry-soft-fail contract `roleModels` uses above.
     let (effort, role_efforts) = model_resolution::parse_effort_config(block);
+    // `serviceTier` / `roleServiceTiers` (#14454) — same contract, same module.
+    let (service_tier, role_service_tiers) = model_resolution::parse_service_tier_config(block);
 
     RoleRunnerConfig {
         enabled: block.get("enabled").and_then(serde_json::Value::as_bool),
@@ -1496,6 +1510,8 @@ pub fn read_role_runner_config(repo_root: &Path) -> RoleRunnerConfig {
         role_models,
         effort,
         role_efforts,
+        service_tier,
+        role_service_tiers,
         // `architectMaxProposals` (#5656): a zero / negative / non-integer
         // value soft-fails to `None` — a cap of 0 would mean "dispatch
         // architect, forbid it from filing anything", which is a pure waste of
@@ -2902,7 +2918,7 @@ pub fn observe_and_fire_idle(
             let joined = tokio::task::spawn_blocking(move || {
                 let mut runner = ScriptRoleInvocationRunner::new(run_root.clone());
                 // Cross-host collision detection (#4623) — detection only.
-                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval)
+                invoke_with_collision_probe(&mut runner, &run_root, name, &prompt, interval).outcome
             })
             .await;
             let elapsed = tick_start.elapsed();
@@ -2959,17 +2975,16 @@ fn invoke_with_collision_probe<R: RoleInvocationRunner + ?Sized>(
     role: &'static str,
     prompt: &str,
     interval: Duration,
-) -> RoleTickOutcome {
+) -> invocation::InvocationOutcome {
     crate::role_collision::probe_before_tick(root, role, interval);
     crate::role_collision::record_run_started(root, role, chrono::Utc::now());
     let outcome = runner.invoke(role, prompt);
     crate::role_collision::record_run_finished(root, role, chrono::Utc::now());
-    // Ratification reviewer lane (#13345): a no-op unless `ratificationLane`
-    // is enabled for this root. Runs on the champion tick's blocking thread.
+    let invocation = invocation::InvocationOutcome::capture(outcome, runner);
     if role == "champion" {
         ratification_lane::tick_for_root(root, runner);
     }
-    outcome
+    invocation
 }
 
 /// Render a caught panic payload (`Box<dyn Any + Send>`, as produced by
@@ -3820,9 +3835,9 @@ pub(crate) mod model_resolution;
 use model_resolution::reconcile_unpinned_model_with_runtime;
 pub use model_resolution::{
     is_cli_default_model_sentinel, resolve_role_runner_effort,
-    resolve_role_runner_effort_for_runtime, resolve_role_runner_model, ModelRuntimeMismatch,
-    CLI_DEFAULT_MODEL_SENTINEL, CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE,
-    UNSET_EFFORT_SOURCE,
+    resolve_role_runner_effort_for_runtime, resolve_role_runner_model,
+    resolve_role_runner_service_tier_for_runtime, ModelRuntimeMismatch, CLI_DEFAULT_MODEL_SENTINEL,
+    CODEX_DEFAULT_EFFORT, CODEX_DEFAULT_EFFORT_SOURCE, UNSET_EFFORT_SOURCE,
 };
 
 // Per-reason skipped-tick tallies, with a race-free per-thread view for

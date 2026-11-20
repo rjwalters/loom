@@ -42,11 +42,12 @@ use super::*;
 use crate::runtime_admission::{
     AdmissionContext, ExecutionProvenance, ResolvedRuntime, RuntimeRejection,
 };
+use crate::tokens_pool::codex_hooks::seal;
 use std::collections::BTreeMap;
 
 /// What a proof certifies, recorded verbatim in
 /// [`ExecutionProvenance::policy`] so a reader never has to infer it.
-pub const POLICY: &str = "clone-isolation+sealed-control-bundle+ro-profile-controls+forced-guard-policy+managed-hook-trusted";
+pub const POLICY: &str = "clone-isolation+sealed-control-bundle+ro-profile-controls+forced-guard-policy+managed-hook-trusted-or-sealed";
 
 /// Precise unmet obligations. Fixed text only: a refusal is copied into host
 /// logs and operator diagnostics, so it must never carry worker output,
@@ -54,7 +55,20 @@ pub const POLICY: &str = "clone-isolation+sealed-control-bundle+ro-profile-contr
 pub(super) const UNPREPARED: &str = "exclusive writer: this launch holds no prepared private-clone selection (owned account lease plus durable job identity), so no containment can be proven for it";
 pub(super) const DRIFTED: &str = "exclusive writer and stale-context refusal: the bound private session container was replaced, renamed, stopped or re-attached between preparation and admission; recover the session before dispatch";
 const UNMANAGED: &str = "protected remote operations and Loom lifecycle controls: this private clone ships no Loom hook provisioner, so no managed pre_tool_use bridge is registered for the session; container isolation alone does not prevent an authenticated force-push or a Loom lifecycle mutation";
-const UNTRUSTED: &str = "protected remote operations and Loom lifecycle controls: the account profile has not established Codex hook trust since Loom's managed registration was installed, and an untrusted hook fails OPEN on the pinned CLI; accept the hook-trust prompt once for this profile with CODEX_HOME at the session's mount point (Codex keys trust by that hooks.json path, so trust accepted on the host does not count), then stop and start the session (a private-clone session never uses the trust waiver; #10102 applies to host-mode sessions only)";
+/// The refusal for a profile whose hook trust is neither recorded nor
+/// sealable (#14105). `why` is one of the sealed check's fixed, pathless,
+/// secret-free reasons.
+fn untrusted(why: &str) -> String {
+    format!(
+        "protected remote operations and Loom lifecycle controls: the account profile has not \
+         established Codex hook trust since Loom's managed registration was installed, and an \
+         untrusted hook fails OPEN on the pinned CLI; Loom could not seal the registration \
+         instead ({why}). Fix what that names and restart the session, or accept the hook-trust \
+         prompt once for this profile with CODEX_HOME at the session's mount point (Codex keys \
+         trust by that hooks.json path, so trust accepted on the host does not count), then stop \
+         and start the session"
+    )
+}
 const NOT_IN_CONTAINER: &str = "container identity: this process is not running inside the bound private session container, or the clone's identity record does not match the bound job; refusing to claim containment";
 const NOT_OWNED_CLONE: &str = "host, sibling and peer repository isolation: the selected clone is not an owned, independent Git root (missing, symlinked, or carrying object alternates)";
 const MALFORMED: &str = "container identity: the bound container, control identity or base revision is malformed, absent, or predates loom-private-control-v1";
@@ -204,6 +218,18 @@ pub fn mutable(role: &str) -> bool {
 // The obligations containment does NOT cover, proven per launch.
 // ---------------------------------------------------------------------------
 
+/// How the profile's Codex hook trust is satisfied (#14105).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trust {
+    /// A `trusted_hash` is recorded for Loom's entry at the session key.
+    Recorded,
+    /// None is, but the registration vets as Loom's one entry (profile
+    /// controls and nothing else a profile can add). The launch passes the
+    /// waiver after the clone's own project layers are vetted from inside
+    /// the container ([`waiver_args`], [`in_container`]).
+    Sealed,
+}
+
 /// Every control-boundary obligation a mutable role needs beyond repository
 /// isolation, checked against one observed [`bundle::Report`] and the
 /// canonical account profile.
@@ -217,21 +243,37 @@ pub fn mutable(role: &str) -> bool {
 ///
 /// 1. the clone ships Loom's hook provisioner, so a managed registration is
 ///    mandatory rather than absent-and-acceptable (`Report::managed`), and
-/// 2. Codex hook trust has been established for the profile — without it the
-///    registration is read and then ignored, silently, by the pinned CLI.
+/// 2. Codex will run the registration: hook trust is recorded for it, or the
+///    registration is vetted as the only hook source the trust waiver could
+///    let run (#10102, [`seal`]). Without either the registration is read
+///    and then ignored, silently, by the pinned CLI.
 ///
 /// Both inputs — `hooks.json`, `config.toml` and `loom-codex-hooks.json` — are
 /// members of [`bundle::PROFILE_CONTROLS`] and therefore part of the bound
 /// control identity, so a verdict taken here is pinned by the same recheck
-/// that pins the rest of the boundary at spawn and at exec.
-pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<()> {
+/// that pins the rest of the boundary at spawn and at exec. Any vetting
+/// failure keeps the refusal: the seal only ever adds an admission path.
+pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<Trust> {
     if !report.managed {
         bail!("{UNMANAGED}");
     }
-    if !hook_trust_established(profile) {
-        bail!("{UNTRUSTED}");
+    if hook_trust_established(profile) {
+        return Ok(Trust::Recorded);
     }
-    Ok(())
+    seal::vet_profile(profile, Path::new(PROFILE), &seal_request(Vec::new(), None))
+        .map(|_| Trust::Sealed)
+        .map_err(|why| anyhow::anyhow!(untrusted(&why)))
+}
+
+/// What the sealed check is asked about a private launch: the image-owned
+/// bridge registration, not the host-mode workspace-independent command.
+fn seal_request(codex_args: Vec<String>, launch_dir: Option<PathBuf>) -> seal::Request {
+    seal::Request {
+        launch_dir,
+        codex_args,
+        container: None,
+        command: Some(bundle::registration()),
+    }
 }
 
 /// The trust rule of `provision-codex-hooks.sh verify`
@@ -242,6 +284,66 @@ pub(super) fn enforcing(report: &bundle::Report, profile: &Path) -> Result<()> {
 /// profile, or for another hook is trust for a hook Codex will not run here.
 fn hook_trust_established(profile: &Path) -> bool {
     super::super::codex_hooks::trust_at(profile, Path::new(PROFILE)).0
+}
+
+/// The arguments the exec in the container adds ahead of Codex's own: the
+/// trust waiver and plugins off, only when a guarded role runs on a profile
+/// with no recorded trust and everything Codex could load as a hook source
+/// vets as Loom's one entry — the profile controls, this launch's argv, and
+/// the project layers of `clone` (which only a process inside the container
+/// can see). Anything else is a refusal, never a launch without the hook.
+///
+/// # Errors
+/// [`untrusted`] with the vetting failure.
+pub(super) fn waiver_args(role: &str, args: &[String], clone: &Path) -> Result<Vec<String>> {
+    waiver_for(Path::new(PROFILE), role, args, clone)
+}
+
+/// [`waiver_args`] against the profile files at `profile` (the container's
+/// mount point in production; Codex's trust is always keyed to [`PROFILE`]).
+pub(super) fn waiver_for(
+    profile: &Path,
+    role: &str,
+    args: &[String],
+    clone: &Path,
+) -> Result<Vec<String>> {
+    if !(mutable(role) || crate::runtime_preference::codex_guard::guarded(role)) {
+        return Ok(Vec::new());
+    }
+    if hook_trust_established(profile) {
+        return Ok(Vec::new());
+    }
+    let request = seal_request(args.to_vec(), Some(clone.to_owned()));
+    seal::vet(profile, Path::new(PROFILE), &request)
+        .map_err(|why| anyhow::anyhow!(untrusted(&why)))?;
+    Ok([
+        seal::BYPASS_FLAG,
+        seal::PLUGINS_OFF[0],
+        seal::PLUGINS_OFF[1],
+    ]
+    .map(str::to_owned)
+    .to_vec())
+}
+
+/// `waiver` placed where `spawn-codex.sh` puts it: right after `exec` (and
+/// `resume`), ahead of every other flag.
+pub(super) fn with_waiver(args: &[String], waiver: Vec<String>) -> Vec<String> {
+    let at = match args.first().map(String::as_str) {
+        Some("exec") => 1 + usize::from(args.get(1).map(String::as_str) == Some("resume")),
+        _ => 0,
+    };
+    let mut out = args.to_vec();
+    out.splice(at..at, waiver);
+    out
+}
+
+/// What the status commands show for a profile's hook trust (#14105):
+/// `recorded` (Codex has a trust decision for Loom's entry), `sealed` (none,
+/// but the registration vets, so a launch passes the waiver) or `missing`.
+/// Profile-level only: a clone's project layers are vetted at launch.
+#[must_use]
+pub fn trust_state(profile: &Path) -> &'static str {
+    super::super::codex_hooks::trust_state(profile, &bundle::registration())
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +407,18 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = match dispatch::Selection::prepare(root, "codex", model, kind, issue, owner) {
+    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner);
+    admit_selection(root, role, explicit, rejection, selection)
+}
+
+fn admit_selection(
+    root: &Path,
+    role: &str,
+    explicit: Option<&str>,
+    rejection: RuntimeRejection,
+    selection: Result<Option<dispatch::Selection>>,
+) -> Result<(ResolvedRuntime, dispatch::Selection, ContainmentProof), RuntimeRejection> {
+    let selection = match selection {
         Ok(Some(selection)) => selection,
         Ok(None) => {
             return Err(rejection.with_containment_failure(
@@ -384,7 +497,8 @@ pub struct Preparer<'a> {
     issue: Option<u64>,
     owner: String,
     model_for: ModelFor<'a>,
-    held: Option<(dispatch::Selection, ContainmentProof, Option<String>)>,
+    held: Option<(dispatch::Selection, Option<ContainmentProof>, Option<String>)>,
+    seat_unavailable: bool,
 }
 
 impl<'a> Preparer<'a> {
@@ -403,11 +517,31 @@ impl<'a> Preparer<'a> {
             owner,
             model_for,
             held: None,
+            seat_unavailable: false,
         }
     }
 
+    /// Whether a candidate could not reserve a seat on this host during the draw.
+    pub(crate) fn seat_unavailable(&self) -> bool {
+        self.seat_unavailable
+    }
+
+    fn note_seat_availability(&mut self, selection: &Result<Option<dispatch::Selection>>) {
+        self.seat_unavailable |= selection.as_ref().is_err_and(|error| {
+            error.is::<super::AccountBusy>()
+                || error.is::<super::super::health::NoHealthyAccountError>()
+                // #14578: only a walk where EVERY tried seat was busy means
+                // the pool has no idle seat. A seat that failed for any other
+                // reason (a containment proof that could not be taken) is
+                // reported with its own reason, never counted as busy.
+                || error
+                    .downcast_ref::<dispatch::NoEligibleSeat>()
+                    .is_some_and(|exhausted| exhausted.all_busy)
+        });
+    }
+
     /// Hand the prepared selection — and the model it was selected for — to
-    /// the launch path. `None` when no contained candidate was admitted.
+    /// the launch path. `None` when the launch uses no managed seat.
     pub fn take(&mut self) -> Option<(dispatch::Selection, Option<String>)> {
         self.held
             .take()
@@ -432,27 +566,62 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
         // already prepared instead of selecting a second account — but only
         // for the same model: account selection is model-aware, so a draw
         // naming a different model gets its own selection (#12748).
-        if let Some((_, proof, held_model)) = &self.held {
+        if let Some((_, Some(proof), held_model)) = &self.held {
             if *held_model == model {
                 if let Err(error) = require_workspace_repository(&self.root, proof) {
                     return Err(rejection.with_containment_failure(&error.to_string()));
                 }
                 return admit_with(&self.root, role, explicit, proof);
             }
-            self.held = None;
         }
-        let (admitted, selection, proof) = admit_new(
+        self.held = None;
+        let selection = dispatch::Selection::prepare_contained(
             &self.root,
-            role,
-            explicit,
-            rejection,
             model.as_deref(),
             self.kind,
             self.issue,
             &self.owner,
-        )?;
-        self.held = Some((selection, proof, model));
+        );
+        self.note_seat_availability(&selection);
+        let (admitted, selection, proof) =
+            admit_selection(&self.root, role, explicit, rejection, selection)?;
+        self.held = Some((selection, Some(proof), model));
         Ok(admitted)
+    }
+
+    fn reserve_seat(
+        &mut self,
+        admitted: &ResolvedRuntime,
+        drawn_model: Option<&str>,
+    ) -> Result<(), RuntimeRejection> {
+        if admitted.runtime != "codex" || admitted.execution.is_some() {
+            return Ok(());
+        }
+        self.release();
+        let model = (self.model_for)("codex", drawn_model);
+        let selection = dispatch::Selection::prepare_idle(
+            &self.root,
+            model.as_deref(),
+            self.kind,
+            self.issue,
+            &self.owner,
+            crate::runtime_preference::codex_guard::guarded(&admitted.role),
+        );
+        self.note_seat_availability(&selection);
+        let selection = selection.map_err(|error| RuntimeRejection {
+            role: admitted.role.clone(),
+            runtime: admitted.runtime.clone(),
+            source: admitted.source.clone(),
+            unmet_capabilities: vec![],
+            reason: if error.is::<super::AccountBusy>() {
+                dispatch::NO_IDLE_SEAT.to_string()
+            } else {
+                error.to_string()
+            },
+            exhausted_summary_line: None,
+        })?;
+        self.held = selection.map(|selection| (selection, None, model));
+        Ok(())
     }
 
     fn release(&mut self) {
@@ -481,7 +650,12 @@ pub(super) fn in_container(
     let profile = Path::new(PROFILE);
     let report = bundle::observe(Path::new(bundle::CONTROL_ROOT), profile);
     bundle::rebind(&report, profile, bound)?;
-    enforcing(&report, profile)?;
+    let trust = enforcing(&report, profile)?;
+    // The profile vetted; what the host could not see is the clone Codex starts in.
+    if trust == Trust::Sealed {
+        seal::vet_project_layers(Path::new(clone))
+            .map_err(|why| anyhow::anyhow!(untrusted(&why)))?;
+    }
     let id = in_bound_container(revision, repository, clone)?;
     ContainmentProof::new(account, &id, bound, revision, repository, clone)
 }

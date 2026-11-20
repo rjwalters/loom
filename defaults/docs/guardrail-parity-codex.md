@@ -519,8 +519,10 @@ spawn-codex: hooks=<ready|not-ready|unavailable|verified-in-private-session> rol
   when this launch inherited a private account lease **and** session-exec mode
   is active, and the identical obligation is then proven inside the session by
   `loom-daemon private-workspace execute`, against the image-owned bridge and
-  the read-only-bound profile controls. The trust waiver is never used for a
-  private-clone session.
+  the read-only-bound profile controls. This script never passes the waiver for
+  a private-clone session; `private-workspace execute` adds it itself, inside
+  the container, only for a sealed registration (#14105, "Sealed registration
+  in a private clone" below).
 - **Merging roles (`champion`, `judge`)** do not write the repository and keep
   the read-only sandbox, but they merge or issue the verdict a merge relies on,
   which is what `guard-loom-workflow.sh` and `guard-destructive.sh` police. They
@@ -686,7 +688,7 @@ own trust prompts. Both "Trust this folder?" for a folder not yet in
 not suppress the folder prompt. Already-trusted folders open normally. For now,
 take both decisions in a throwaway container with the profile writable
 (procedure above), then restart the session. Private sessions need the same
-step. This is the current procedure for as long as hook trust is an
+step only when their registration cannot be sealed (#14105). This is the current procedure for as long as hook trust is an
 interactive step. The in-container hash comparison above is meant to let a
 later change prove the frozen files are Loom's own registration without that
 step.
@@ -1050,7 +1052,7 @@ silently waived.
 |---|---|---|
 | Host, sibling and peer repository isolation | Account-private named volume, independent Git root with no object alternates, no host repository/Docker socket/daemon socket mounted; Docker's own mount and ownership inventory re-validated by container ID | `docker::validate` at preparation **and** again in `Selection::contain`; the worker re-checks `/workspace/repo` is an owned clone |
 | Exclusive writer, stale-context refusal | `flock`-owned account lease carried to the child as an inherited file descriptor, plus the durable job identity (container ID + control identity) | `lease::Lease`, `dispatch::inherited_lease`, `Selection::contain`, `transport::run` |
-| **Protected remote operations** | The managed `pre_tool_use` bridge, executed from the **image-owned sealed bundle**, with the forced guard policy (`LOOM_FORCE_SCOPE=protected`, …) applied by the host to the Codex process itself. Admission additionally requires the clone to *have* a managed registration (`Report::managed`) **and** the profile to have established Codex hook trust — an untrusted hook is read and then silently ignored by the pinned CLI, so "registered" is not "enforcing" | `bundle::accept` / `bundle::rebind`, `containment::enforcing`, `bundle::apply_policy` |
+| **Protected remote operations** | The managed `pre_tool_use` bridge, executed from the **image-owned sealed bundle**, with the forced guard policy (`LOOM_FORCE_SCOPE=protected`, …) applied by the host to the Codex process itself. Admission additionally requires the clone to *have* a managed registration (`Report::managed`) **and** Codex to run it: hook trust recorded for the profile, or a registration Loom has sealed (#14105) — an untrusted hook is read and then silently ignored by the pinned CLI, so "registered" is not "enforcing" | `bundle::accept` / `bundle::rebind`, `containment::enforcing`, `bundle::apply_policy` |
 | Loom lifecycle controls | Same bridge (`guard-loom-workflow.sh` in the sealed bundle); `private-workspace` refuses the SSH/host/Docker `run-job` executor; MCP/plugin/alternate-profile/agent config audit and argv audit before exec | `control::audit`, `control::audit_args`, `worker_setup::check_host_job` |
 | Credential boundary | Per-account external profile, narrow fixed child environment (host model/cache/control/executor locations are never forwarded), redacted durable records; no credential byte enters the bundle, the manifest, the clone or an export | `transport::child_env`, `export`, asserted by the integration tests |
 | Control/guard integrity | #8839's boundary: guard code root-owned and `chmod a-w` on a read-only rootfs, effective policy forced through `docker exec --env` (unreachable from any config tier), the three profile control files bound **read-only over their own paths**, all hashed into one identity that is rechecked at admission, at spawn and in-container before exec | `bundle.rs`, `docker::recheck_control`, `worker_setup::control_boundary` |
@@ -1065,7 +1067,7 @@ silently waived.
 | Session image | `ghcr.io/2amlogic/loom-worker-session:<version>` built from `docker/session/Dockerfile`, bundle sealed and digest-intact |
 | Codex CLI | as pinned by `CODEX_VERSION` (tracks upstream latest via `harness-pins.yml`; 0.160.0 at 2026-10-02); floor `0.146.0`, recorded by `seal-control` from the CLI observed in the image |
 | Codex hook schema | `pre_tool_use`, pinned at `0.146.0` in `guard-codex-bridge.sh`; the 0.149.1 wire evidence is in [private-control-bundle.md](private-control-bundle.md) |
-| Hook trust | Operator-attested, once per profile (#5005), measured by the install-time trust-baseline diff |
+| Hook trust | Recorded once per profile (#5005, measured by the install-time trust-baseline diff), **or** a registration Loom seals (#14105, below) |
 
 The hook-trust rule is implemented twice — in
 `provision-codex-hooks.sh verify` (shell, host sessions) and in
@@ -1079,6 +1081,68 @@ of the bound control identity, the trust verdict is a pure function of state
 that is already re-hashed at spawn and at exec. It therefore needs no separate
 recheck: an identity that still matches is a trust decision that still holds.
 
+### Sealed registration in a private clone (issue #14105)
+
+Until #14105 a private-clone session was the one place that still needed the
+interactive hook-trust prompt, although it is the only kind of session on which
+a mutating contained role (Builder) is admitted. The sealed-registration vetting
+of #10102 ([Sealed registration](#sealed-registration-no-trust-prompt-in-a-session-container-issue-10102))
+now applies to it too. Nothing in containment ever depended on the prompt: the
+private layout uses the same `CODEX_HOME` (`/home/loom/.codex-profile`) and the
+same three read-only profile controls the seal already vets.
+
+**Why the hook is still required in a private clone.** Each layer protects
+something the others do not:
+
+| Layer | Protects | Does not protect |
+|---|---|---|
+| **Container** (private volume, no host mounts, read-only rootfs) | The host filesystem, sibling worktrees, peer accounts' repositories and the operator's subscription | Anything done with the credential the step carries: an authenticated force-push, a merge, a Loom lifecycle mutation |
+| **Hook** (the managed `pre_tool_use` bridge, image-owned and sealed) | Protected remote operations and Loom lifecycle controls made with that credential: it denies them before the call runs | Files or processes outside the clone (that is the container's job) |
+| **Transport** (`loom-private-control-v1`, `control::audit*`, no SSH/Docker executor) | Which control routes exist at all (no MCP, plugin, alternate profile or remote executor), and that the boundary measured at admission is the one exec'd | Which forge operations the credential may perform through a route that does exist |
+
+So the hook stays and the *trust step* goes: a hook-free private mode is not
+offered, and a profile whose registration cannot be proven is refused as before.
+
+**What changes.** Admission accepts either recorded trust (unchanged, and it
+wins) or a proven seal (`containment::enforcing` returns `Trust::Recorded` or
+`Trust::Sealed`):
+
+- **On the host**, at admission, `codex_hooks::seal::vet_profile` vets the
+  profile controls: `hooks.json` is exactly Loom's one `PreToolUse` entry
+  carrying the image-owned bridge command (`bundle::registration()`), the
+  receipt pins that command, `config.toml` adds no hook source and does not
+  disable Loom's. The host cannot see the clone (it lives on a docker volume),
+  so it does not vet project layers.
+- **In the container**, immediately before the model is exec'd,
+  `containment::waiver_args` runs the full `seal::vet` from the clone: the same
+  profile checks, plus the launch's own argv (no `-c hooks…`, `--enable`,
+  `--profile`, `-C`, or a caller's own waiver) and every project layer Codex
+  would load from the clone upward (`.codex/hooks.json`, a `.codex/config.toml`
+  touching hooks, features or plugins). Only then does it add
+  `--dangerously-bypass-hook-trust -c features.plugins=false` to the Codex
+  argv, after the argv audit so Loom's own flags never pass through it.
+  `containment::in_container` runs the same project-layer vetting when it is
+  the seal, rather than recorded trust, that admits the role.
+
+**Fail closed.** Any clause that cannot be proven (an extra hook source, a
+project-layer `.codex/` entry, an unreadable control, a byte mismatch against
+the bound identity) keeps the `UNTRUSTED` refusal, now naming the clause that
+failed; the manual procedure below is then the fallback. The waiver is only
+ever added for a guarded role (`builder`, `doctor`, `sweep-lifecycle`,
+`champion`, `judge`), and never when trust is already recorded.
+
+**What an operator sees.** `loom-daemon accounts list` and `accounts session status` (host-mode and
+private-clone alike) report each profile's
+`hook_trust` as `recorded` (Codex has a trust decision for Loom's entry at the
+session key), `sealed` (none, but the registration vets, so launches pass the
+waiver) or `missing` (neither: run the manual procedure above, with
+`--entrypoint codex` as shown). `sealed` is profile-level: a clone's project
+layers are vetted when a session launches.
+
+A seat refused for missing trust is no longer re-attempted every tick (#14032,
+PR #14053), so `accounts session stop` does not race the daemon while you fix
+trust.
+
 ### Remaining limitations
 
 - **`worktreeIsolation` inside the clone is coarser than Claude's.** The proof
@@ -1086,10 +1150,12 @@ recheck: an identity that still matches is a trust decision that still holds.
   Issue branches and worktrees remain the workflow, but a local edit to the
   clone's own base checkout is not a host-main edit and is not denied as one.
   This is deliberate and is exactly why the native capability stays `partial`.
-- **Hook trust is still operator-attested per profile.** It must be established
-  on the host *before* `session start`, because `config.toml` is bound by inode:
-  a trust step taken while a session runs is invisible inside it and the next
-  admission refuses on the profile digest. Stop and start the session.
+- **A profile that cannot be sealed still needs operator-attested trust.** A
+  registration that vets (#14105) needs no trust step. For one that does not,
+  trust must be established on the host *before* `session start`, because
+  `config.toml` is bound by inode: a trust step taken while a session runs is
+  invisible inside it and the next admission refuses on the profile digest.
+  Stop and start the session.
 - **A clone that ships no Loom surface is refused for mutable roles.** With no
   hook provisioner there is no managed bridge to enforce with; such a session
   keeps its pre-#8787 behaviour (read-only roles only).

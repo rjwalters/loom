@@ -123,8 +123,10 @@
 #
 #   --reviews-reconciled TEXT   Explicit disposition of the outstanding formal
 #       reviews / inline threads that check-review-feedback.sh reported. Must
-#       cite every blocking review id it named. Ignored for
-#       `changes-requested` (the gate only guards approvals).
+#       cite every blocking review id it named. On `changes-requested` the
+#       gate does not run, so the text is not checked; it is appended to the
+#       posted comment as a "Review reconciliation" note (#14392) rather than
+#       silently dropped.
 #
 #   --overrules-prior TEXT   Approvals only: why each point of a changes-requested
 #       verdict at this SAME head no longer blocks (at least 40 chars). Without
@@ -476,6 +478,24 @@ if [[ "$VERDICT" == "approved" && "${GATE_SKIPPED:-false}" != "true" ]]; then
 
 $RECONCILED"
   fi
+elif [[ -n "$RECONCILED" ]]; then
+  # changes-requested (#14392): no review-feedback gate runs for this verdict, but
+  # a re-review still needs its per-finding disposition on the forge. Append the
+  # caller's text as a note instead of accepting the flag and dropping it. No
+  # loom:review-reconciliation marker: that marker records a gate result and
+  # nothing was gated here. This branch is also reached by an approval whose gate
+  # was skipped (check-review-feedback.sh missing): say so rather than claiming
+  # that no gate runs for the verdict.
+  if [[ "$VERDICT" == "approved" ]]; then
+    NOT_GATED_REASON="check-review-feedback.sh was unavailable — see the gate-unavailable marker and warning above"
+  else
+    NOT_GATED_REASON="no gate runs for a changes-requested verdict"
+  fi
+  RECONCILIATION_NOTE="---
+
+**Review reconciliation (#14392)** — disposition of earlier findings, supplied by the reviewer (not gate-checked: $NOT_GATED_REASON):
+
+$RECONCILED"
 fi
 
 # --- Exact-head all-CI gate (#10485) ---------------------------------------

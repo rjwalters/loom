@@ -44,14 +44,47 @@ CNT="$(extract _work_log_search_total_count)"
 if grep -q 'git remote get-url origin' <<<"$CNT"; then fail "_work_log_search_total_count still reads the cwd remote"; else pass "_work_log_search_total_count does not read the cwd remote"; fi
 
 # Stub: forge titles for the pinned repo; FAIL_LOOKUP=1 simulates an API failure.
-GH_STUB="$(mktemp -d)/gh"
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$STUB_DIR"' EXIT
+GH_STUB="$STUB_DIR/gh"
+: > "$GH_STUB.calls"
 cat >"$GH_STUB" <<'EOF'
 #!/usr/bin/env bash
 [[ "${FAIL_LOOKUP:-}" == 1 ]] && exit 1
+if [[ "$2" == list ]]; then
+  if [[ "$1 $3 $4" == "pr --label loom:pr" ]]; then
+    fields="${!#}"
+    filter='.'
+    if [[ "${*: -2:1}" == --jq ]]; then
+      fields="${*: -3:1}"
+      filter="${!#}"
+    fi
+    rows="$APPROVED_PRS"
+    if [[ ",$fields," != *,title,* ]]; then
+      echo lookup >> "$0.calls"
+      [[ "${FAIL_REFS:-}" == 1 ]] && exit 1
+      # #14575: a successful lookup that emits no JSON value (jq 1.6 exits 0
+      # on empty input without consuming a value) must not pass a bare title.
+      [[ "${EMPTY_REFS:-}" == 1 ]] && exit 0
+      [[ "${WS_REFS:-}" == 1 ]] && { printf '  \n\t '; exit 0; }
+      rows="${VERIFY_PRS:-$APPROVED_PRS}"
+    fi
+    # Apply the requested field projection before the actual gh --jq filter.
+    jq -r --arg fields "$fields" \
+      'map(with_entries(select(.key as $key | ($fields | split(",") | index($key))))) | '"$filter" \
+      <<< "$rows"
+  else
+    jq -r "${!#}" <<< '[]'
+  fi
+  exit $?
+fi
 case "$2" in
   repos/owner/mine/issues/1) echo "Add widget" ;;
   repos/owner/mine/issues/2) echo "Fix gizmo" ;;
   repos/owner/mine/issues/3) echo "Odd title *(held)*" ;;
+  repos/owner/mine/issues/4) echo "Title — closes #42" ;;
+  repos/owner/mine/issues/5) echo "Frozen pull request" ;;
+  repos/owner/mine/issues/13582) echo "fix: honour a trusted loom:issue adoption in the promotion author gate" ;;
   *) exit 1 ;;
 esac
 EOF
@@ -70,8 +103,8 @@ verify_plan_provenance $'## None\n\n_None._' 2>/dev/null \
   && pass "body with zero #N accepted" || fail "zero-#N body rejected"
 
 echo "Test 2b: every suffix render_plan_body() emits is accepted (#13908 lockstep)"
-ok() { verify_plan_provenance "$1" 2>/dev/null && pass "accepted: $1" || fail "rejected: $1"; }
-no() { verify_plan_provenance "$1" 2>/dev/null && fail "accepted: $1" || pass "rejected: $1"; }
+ok() { verify_plan_provenance "$1" 2>/dev/null && pass "accepted: ${2:-$1}" || fail "rejected: ${2:-$1}"; }
+no() { verify_plan_provenance "$1" 2>/dev/null && fail "accepted: ${2:-$1}" || pass "rejected: ${2:-$1}"; }
 # The suffix set comes from render_plan_body()'s own source, never a list kept
 # here: a suffix added to the render without teaching the gate fails this test.
 RPB="$(extract render_plan_body)"
@@ -100,9 +133,67 @@ no '- **#1**: Add'
 FAIL_LOOKUP=1 verify_plan_provenance '- **#1**: Add widget *(held)*' 2>/dev/null \
   && fail "failed lookup accepted for a held bullet" || pass "failed lookup still fails closed for a held bullet"
 
+echo "Test 2c: verify the rendered Approved section against forge closing refs"
+# #13582 is the reported PR (title and closing ref captured with gh pr view).
+# The other rows exercise unsorted refs and a literal title with no annotation.
+export APPROVED_PRS='[
+  {"number":13582,"title":"fix: honour a trusted loom:issue adoption in the promotion author gate","closingIssuesReferences":[{"number":13578}]},
+  {"number":1,"title":"Add widget","closingIssuesReferences":[{"number":42},{"number":7}]},
+  {"number":4,"title":"Title — closes #42","closingIssuesReferences":[]},
+  {"number":5,"title":"Frozen pull request","labels":[{"name":"loom:pr"},{"name":"loom:frozen"}],"closingIssuesReferences":[{"number":12}]}
+]'
+eval "$RPB"
+approved_body="$(render_plan_body | awk '/^## / {approved=($0 == "## Approved (Awaiting Merge)")} approved')"
+assert_contains "$approved_body" 'Add widget — closes #7, #42' "rendered both refs in numeric order"
+assert_contains "$approved_body" 'gate — closes #13578' "rendered the reported single-ref row"
+assert_contains "$approved_body" '- **#4**: Title — closes #42' "rendered literal closes title"
+ok "$approved_body" "genuine Approved rows"
+assert_eq 1 "$(wc -l < "$GH_STUB.calls" | tr -d ' ')" "one refs lookup for all Approved rows"
+if [[ "$approved_body" == *"Frozen pull request"* ]]; then
+  fail "renderer included a frozen PR in Approved"
+else
+  pass "renderer omits a frozen PR from Approved"
+fi
+no "$approved_body"$'\n- **#5**: Frozen pull request — closes #12' \
+  "frozen Approved row with matching title and closing ref"
+for changed in ' — closes #7, #43' ' — closes #7' '' ' — closes #7, #42, #43' ' — closes #7 #42' ' *(bogus)*'; do
+  no "${approved_body/Add widget — closes #7, #42/Add widget$changed}" "altered closing annotation [$changed]"
+done
+no "${approved_body/Add widget/Foreign title}" "wrong title with correct refs"
+FAIL_REFS=1 no "$approved_body" "unavailable refs"
+VERIFY_PRS='[]' no "$approved_body" "missing PRs"
+VERIFY_PRS="$(jq 'map(if .number == 4 then del(.closingIssuesReferences) else . end)' <<<"$APPROVED_PRS")" \
+  no "$approved_body" "missing refs field on a plain-title row"
+# #14575: a single bare Approved row needs closing-reference evidence even when
+# the forge lookup succeeds — a zero-byte or whitespace-only response carries no
+# JSON value for the matching PR (jq 1.6 exits 0 on it). A jq 1.6 emulator on
+# PATH makes the regression real on hosts whose jq >= 1.7 already exits 4.
+JQ16_DIR="$STUB_DIR/jq16"
+mkdir -p "$JQ16_DIR"
+REAL_JQ="$(command -v jq)"
+cat >"$JQ16_DIR/jq" <<EOF
+#!/usr/bin/env bash
+# Emulate jq 1.6: a filter over stdin that carries no JSON value exits 0 with
+# no output instead of 4 ("no valid result was ever produced").
+input="\$(cat)"
+if [[ -z "\${input//[[:space:]]/}" ]]; then exit 0; fi
+exec "$REAL_JQ" "\$@" <<<"\$input"
+EOF
+chmod +x "$JQ16_DIR/jq"
+BARE_ROW=$'## Approved (Awaiting Merge)\n\n- **#1**: Add widget'
+PATH="$JQ16_DIR:$PATH" EMPTY_REFS=1 no "$BARE_ROW" "zero-byte refs lookup accepted for a bare row (jq 1.6)"
+PATH="$JQ16_DIR:$PATH" WS_REFS=1 no "$BARE_ROW" "whitespace-only refs lookup accepted for a bare row (jq 1.6)"
+# Positive: the forge explicitly returns an empty closingIssuesReferences array
+# for the PR — the bare row is correct and must pass.
+VERIFY_PRS="$(jq -c 'map(if .number == 1 then .closingIssuesReferences = [] else . end)' <<<"$APPROVED_PRS")" \
+  ok "$BARE_ROW" "explicit empty closingIssuesReferences accepted for a bare row"
+# A held PR may appear in both sections, with refs only in Approved.
+ok "$approved_body"$'\n## Operator Attention: Merge-Risk-Hold Pileup\n- **#1**: Add widget' "same PR in Approved and operator hold sections"
+no $'## Ready\n- **#1**: Add widget — closes #7, #42'
+
 echo "Test 3: splice_plan_body"
 eval "$SPB"
-DOCS_WT="$(mktemp -d)"
+DOCS_WT="$STUB_DIR"
 printf 'head\n<!-- guide:plan-body:start -->\nOLD\n<!-- guide:plan-body:end -->\ntail\n' >"$DOCS_WT/WORK_PLAN.md"
 BEFORE="$(ls -d "${TMPDIR:-/tmp}"/guide-plan.* 2>/dev/null | wc -l)"
 splice_plan_body $'NEW1\nNEW2' && pass "splice succeeded" || fail "splice failed"

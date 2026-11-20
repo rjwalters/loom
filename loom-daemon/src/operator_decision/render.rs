@@ -106,7 +106,7 @@ pub fn parse_block(body: &str) -> Option<Decision> {
 
 /// `body` with the managed section removed, plus any stray (hand-written)
 /// ```` ```decision ```` fenced blocks — the new section supersedes them.
-fn strip_prior_decision(body: &str) -> String {
+pub(crate) fn strip_prior_decision(body: &str) -> String {
     let mut text = body.to_string();
     while let Some(start) = text.find(SECTION_START) {
         let Some(rel_end) = text[start..].find(SECTION_END) else {

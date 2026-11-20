@@ -44,6 +44,23 @@ pub(crate) struct TerminalResult {
     /// informational: the health path keys on `model`, which stays `None`
     /// for a dropped pin so a class that never ran is never held.
     pub(crate) requested_model: Option<String>,
+    /// The reasoning effort the adapter actually applied, named by `effort=`
+    /// on a v4 record (#14141). `None` for a v1-v3 record and for a v4 record
+    /// whose value is the `none` sentinel. Informational only: it never
+    /// feeds account health.
+    pub(crate) effort: Option<String>,
+    /// The service tier (speed setting) the adapter actually applied, named
+    /// by `tier=` on a v4 record (#14141). `None` for a v1-v3 record and for
+    /// a v4 record whose value is the `none` sentinel. Informational only.
+    pub(crate) tier: Option<String>,
+}
+
+/// A record value, with the `none` sentinel and an empty value read as absent.
+fn record_value(fields: &HashMap<&str, &str>, key: &str) -> Option<String> {
+    match fields.get(key) {
+        Some(&"none") | Some(&"") | None => None,
+        Some(value) => Some((*value).to_string()),
+    }
 }
 
 /// Parse the adapter's terminal record from only the current dispatch region.
@@ -65,6 +82,12 @@ pub(crate) struct TerminalResult {
 ///   accepted only when the `requested_model` key is present, so a v2 record
 ///   carrying some other unknown 7th field still fails closed.
 ///
+/// - `v=4`, exactly 8 fields (9 with `requested_model=`), adding `effort=` and
+///   `tier=` (#14141) — the reasoning effort and service tier the adapter
+///   actually applied. Both keys must be present (each `none` when unset); an
+///   adapter that applied neither keeps emitting v2/v3. A v4 record missing
+///   either key fails closed.
+///
 /// Any other arity or `v=` value fails closed like everything else this
 /// parser rejects.
 pub(crate) fn parse_terminal_result_after(
@@ -83,28 +106,33 @@ pub(crate) fn parse_terminal_result_after(
         .split_ascii_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect();
-    let (model, requested_model) = match fields.get("v") {
-        Some(&"1") if fields.len() == 5 => (None, None),
-        Some(&"2") if fields.len() == 6 => (
-            match fields.get("model") {
-                Some(&"none") | Some(&"") | None => None,
-                Some(model) => Some((*model).to_string()),
-            },
-            None,
-        ),
+    let (model, requested_model, effort, tier) = match fields.get("v") {
+        Some(&"1") if fields.len() == 5 => (None, None, None, None),
+        Some(&"2") if fields.len() == 6 => (record_value(&fields, "model"), None, None, None),
         // #14121: the 7-field v3 arity is only valid because of its extra
         // `requested_model=` field — a 7-field record carrying any OTHER
         // unknown key still fails closed.
         Some(&"3") if fields.len() == 7 && fields.contains_key("requested_model") => (
-            match fields.get("model") {
-                Some(&"none") | Some(&"") | None => None,
-                Some(model) => Some((*model).to_string()),
-            },
-            match fields.get("requested_model") {
-                Some(&"none") | Some(&"") | None => None,
-                Some(requested) => Some((*requested).to_string()),
-            },
+            record_value(&fields, "model"),
+            record_value(&fields, "requested_model"),
+            None,
+            None,
         ),
+        // #14141: v4 is valid only because of its `effort=`/`tier=` pair; the
+        // optional `requested_model=` adds a ninth field. Any other unknown
+        // key still fails closed.
+        Some(&"4")
+            if fields.contains_key("effort")
+                && fields.contains_key("tier")
+                && fields.len() == 8 + usize::from(fields.contains_key("requested_model")) =>
+        {
+            (
+                record_value(&fields, "model"),
+                record_value(&fields, "requested_model"),
+                record_value(&fields, "effort"),
+                record_value(&fields, "tier"),
+            )
+        }
         _ => return None,
     };
     let provider = match *fields.get("provider")? {
@@ -129,6 +157,8 @@ pub(crate) fn parse_terminal_result_after(
         exit_code: fields.get("exit_code")?.parse().ok()?,
         model,
         requested_model,
+        effort,
+        tier,
     })
 }
 
@@ -1615,6 +1645,8 @@ sweep_id=current
                 exit_code: 42,
                 model: None,
                 requested_model: None,
+                effort: None,
+                tier: None,
             })
         );
         assert!(parse_terminal_result_after(
@@ -1652,6 +1684,8 @@ sweep_id=current
                 exit_code: 0,
                 model: None,
                 requested_model: Some("gpt-5-codex".into()),
+                effort: None,
+                tier: None,
             })
         );
         // `requested_model=none` parses to None like the other sentinels.
@@ -1683,6 +1717,66 @@ sweep_id=current
             .and_then(|result| result.requested_model),
             None
         );
+    }
+
+    #[test]
+    fn terminal_result_parser_accepts_v4_effort_and_tier_and_stays_strict() {
+        // #14141: v=4 adds `effort=` and `tier=` — the launch settings the
+        // adapter actually applied. `none` reads as absent.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=4 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=gpt-5-codex effort=high tier=priority",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: Some("gpt-5-codex".into()),
+                requested_model: None,
+                effort: Some("high".into()),
+                tier: Some("priority".into()),
+            })
+        );
+        // An unset tier is `none` -> None; the dropped-pin field rides along
+        // as the optional ninth field and `model=` keeps its `none`.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=4 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=gpt-5-codex \
+                 effort=low tier=none",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: None,
+                requested_model: Some("gpt-5-codex".into()),
+                effort: Some("low".into()),
+                tier: None,
+            })
+        );
+        // Fail closed: a v4 record missing `tier=`, one with an unknown extra
+        // key, and a v2/v3 record smuggling the v4 pair all parse to nothing.
+        for bad in [
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low",
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low bogus=1",
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low tier=none bogus=1",
+            "v=2 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low tier=none",
+        ] {
+            assert!(
+                parse_terminal_result_after(
+                    &format!("sweep_id=current\n# LOOM_TERMINAL_RESULT {bad}"),
+                    "sweep_id=current"
+                )
+                .is_none(),
+                "{bad}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------------

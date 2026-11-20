@@ -208,7 +208,6 @@ fn test_daemon_status_request_response_round_trip() {
             since: None,
             kinds: Vec::new(),
         }),
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {
             enabled: true,

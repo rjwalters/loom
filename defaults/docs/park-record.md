@@ -311,6 +311,10 @@ population; the three functions below are its full definition, read on demand
 from `guide.md`'s "Unblocking Pull Requests (#8925)" section rather than
 inlined there (the role-prompt size ratchet: guide.md is installed at two
 depths and its whole prompt prefix is frozen at its current size).
+Dependency states come from `guide.md`'s shared `resolve_dep_states` (#14710)
+— the same `loom-daemon dep-recheck-fingerprint dep-states` resolver the
+issue side uses, so the two sweeps cannot disagree about whether a dependency
+is terminal.
 
 A parked PR's "restore to the queue" differs from an issue's in two ways:
 there is no `loom:issue` to restore (a PR was never curated), and the
@@ -343,22 +347,14 @@ check_and_unblock_prs() {
       continue
     fi
 
-    local all_resolved=true
-    local resolved_deps=""
-
-    for dep in $deps; do
-      # A declared blocker can itself be an issue or a PR — try both reads.
-      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
-      local state
-      state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
-        || state=$(gh pr view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
-        || state="UNKNOWN"
-      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
-        all_resolved=false
-        break
-      fi
-      resolved_deps="$resolved_deps $dr#$dn"
-    done
+    # #14710: the same binding-verified, fail-closed resolver the issue side
+    # uses — guide.md's `resolve_dep_states` (read on demand with these
+    # functions). An open cross-repo draft PR among the deps answers false
+    # here; the hold survives.
+    local dep_verdict
+    dep_verdict=$(resolve_dep_states "$deps")
+    local all_resolved=$(printf '%s\n' "$dep_verdict" | sed -n '1p')
+    local resolved_deps=$(printf '%s\n' "$dep_verdict" | sed -n '2p')
 
     if [ "$all_resolved" = true ]; then
       # #4634/#7267 gate, transposed (#8925): the parked PR's OWN state can

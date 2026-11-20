@@ -134,12 +134,12 @@ fn attributed_transcripts_filters_by_role_and_window() {
 
     // The window is anchored on "now" because the fixtures' mtimes are now.
     let now = Utc::now();
-    let found = attributed_transcripts(&projects, &root, "judge", now, now);
+    let found = attributed_transcripts(&projects, &root, "judge", None, now, now);
     assert_eq!(found, vec![mine.clone()]);
 
     // A window far in the past excludes everything, even the right role —
     // the mtime half of the key is load-bearing.
-    let stale = attributed_transcripts(&projects, &root, "judge", at(0), at(1));
+    let stale = attributed_transcripts(&projects, &root, "judge", None, at(0), at(1));
     assert!(stale.is_empty(), "out-of-window transcript must not attribute");
 }
 
@@ -994,7 +994,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
     let failed = RoleTickOutcome::Failure("free-form detail".into());
     let site = RoleFailure::new("resume-refused", None, "m");
     assert_eq!(
-        failure_class_of(&failed, None, Some(site.clone()), false).as_deref(),
+        failure_class_of(&failed, None, Some(&site), false).as_deref(),
         Some("resume-refused")
     );
     assert_eq!(
@@ -1002,7 +1002,7 @@ fn failure_class_of_prefers_the_span_then_the_site_then_the_fallback() {
         Some(UNCLASSIFIED_PRE_LAUNCH)
     );
     assert_eq!(failure_class_of(&failed, None, None, true).as_deref(), Some(UNCLASSIFIED_STEP));
-    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(site), false), None);
+    assert_eq!(failure_class_of(&RoleTickOutcome::Success, None, Some(&site), false), None);
 }
 
 #[test]
@@ -1056,6 +1056,8 @@ fn emit_one_step(
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("zai-org/GLM-5.3", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
             failure: None,
             sweep_id,
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1322,7 +1324,9 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     fs::create_dir_all(&root).unwrap();
     // The transcript scan needs a fresh window; the usage line stamps itself
     // ten seconds after the fixture epoch, so re-stamp it into this step's.
-    let mut transcript = role_head("builder");
+    // #14406: a step's transcript must name its own item (`/loom:builder 42`).
+    let mut transcript = role_head("builder")
+        .replace("<command-args></command-args>", "<command-args>42</command-args>");
     transcript.push_str(
         &"{\"type\":\"assistant\",\"timestamp\":\"REPLACED\",\"message\":{\"model\":\
          \"claude-sonnet-5\",\"usage\":{\"input_tokens\":120,\"output_tokens\":34,\
@@ -1340,6 +1344,8 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
         &RoleTickOutcome::Success,
         Some(ResolvedLaunch::new("claude-sonnet-5", "high")),
         crate::role_tick_telemetry::StepTelemetry {
+            runtime: None,
+            trace_context: None,
             failure: None,
             sweep_id: "step-builder-42-4",
             step_outcome: Some(("verdict".to_string(), "pr_opened".to_string())),
@@ -1369,4 +1375,102 @@ fn a_claude_step_keeps_the_transcript_scan_and_carries_its_stage() {
     assert_eq!(rows[0].cache_read, 40);
     assert_eq!(rows[0].cache_write_5m, 9);
     assert_eq!(rows[0].cache_write_1h, 4);
+}
+
+#[test]
+#[serial_test::serial(opencode_db_env)]
+fn opencode_step_close_preserves_launch_runtime_and_writes_newly_available_tokens() {
+    use crate::telemetry::trace::journal::Journal;
+    use crate::telemetry::trace::store::TraceStore;
+    use crate::telemetry::trace::{SpanName, SpanStatus, TraceAttributes};
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir_all(&root).unwrap();
+    let db = dir.path().join("opencode.db");
+    let _db = crate::env_test_support::EnvGuard::set(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+    let _tick_journal = crate::env_test_support::EnvGuard::set(
+        crate::sweep_outcomes::ROLE_TICK_TELEMETRY_JOURNAL_PATH_ENV,
+        dir.path().join("ticks.jsonl"),
+    );
+    let started = Utc::now() - chrono::Duration::seconds(30);
+    let emit = |sweep_id, log: &Path| {
+        let store = TraceStore::new(&root);
+        let saved = store.load_or_create(&root, sweep_id).unwrap();
+        let journal = Journal::for_context(&store.path(&root, sweep_id));
+        let run = journal
+            .start(
+                saved.context.child(),
+                Some(&saved.context),
+                SpanName::RuntimeRun,
+                started,
+                TraceAttributes::new(),
+            )
+            .unwrap();
+        journal
+            .finish(&run, Utc::now(), SpanStatus::Ok, TraceAttributes::new())
+            .unwrap();
+        emit_for_step(
+            &root,
+            "builder",
+            started,
+            &RoleTickOutcome::Failure("fixture".to_string()),
+            None,
+            StepTelemetry {
+                runtime: Some("opencode"),
+                trace_context: Some(&saved.context),
+                failure: None,
+                sweep_id,
+                step_outcome: None,
+                item: (42, false),
+                stage: "builder",
+                log_path: log,
+            },
+        );
+        journal
+            .completed()
+            .unwrap()
+            .into_iter()
+            .filter(|span| {
+                matches!(span.name, SpanName::RuntimeUsage | SpanName::RuntimeUsageMissing)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let absent = dir.path().join("absent.log");
+    let header = write_step_log(dir.path(), "header", "");
+    for (id, log, reason) in [
+        ("missing", &absent, "no_step_log"),
+        ("header", &header, "no_session_id"),
+    ] {
+        let spans = emit(id, log);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name, SpanName::RuntimeUsageMissing);
+        assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+        assert_eq!(spans[0].attributes["loom.usage.missing_reason"], reason);
+    }
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT, tokens_input INTEGER,
+         tokens_output INTEGER, tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+         tokens_cache_write INTEGER, directory TEXT NOT NULL, time_created INTEGER NOT NULL);
+         INSERT INTO session VALUES ('ses_fixture', '{\"id\":\"glm-fixture\",\"providerID\":\"fixture\"}',
+         0, 0, 0, 0, 0, '/unrelated-directory', 1);",
+    )
+    .unwrap();
+    let ids = vec!["ses_fixture".to_string()];
+    assert_eq!(crate::opencode_usage::tokens_by_model_for_ids(&ids, None), None);
+    conn.execute("UPDATE session SET tokens_input = 10 WHERE id = 'ses_fixture'", [])
+        .unwrap();
+    let log = write_step_log(
+        dir.path(),
+        "available",
+        "{\"type\":\"step_finish\",\"sessionID\":\"ses_fixture\"}\n",
+    );
+    let spans = emit("available", &log);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].name, SpanName::RuntimeUsage);
+    assert_eq!(spans[0].attributes["loom.runtime"], "opencode");
+    assert_eq!(spans[0].attributes["loom.tokens.input"], "10");
 }

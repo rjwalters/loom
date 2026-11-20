@@ -351,9 +351,6 @@ pub fn merge_runtime_attribution(
     }
 }
 
-/// The prefix every dispatch writes at the head of its region of a step log.
-const DISPATCH_HEADER_PREFIX: &str = "==== loom-daemon dispatch: ";
-
 /// The part of an append-mode step log that belongs to its **last** dispatch
 /// (#14210): from the last line that starts with the dispatch header onward,
 /// or all of `contents` when no such line exists.
@@ -364,7 +361,7 @@ fn last_dispatch_region(contents: &str) -> &str {
     let mut offset = 0;
     let mut start = 0;
     for line in contents.split_inclusive('\n') {
-        if line.starts_with(DISPATCH_HEADER_PREFIX) {
+        if line.starts_with(crate::sweep_registry::DISPATCH_HEADER_MARKER) {
             start = offset;
         }
         offset += line.len();

@@ -7,7 +7,8 @@
 //! Evidence, strongest first: the write the gh front journaled (`merged`,
 //! `promoted`), then the markers Champion's comments opened with, then the
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
-//! the step's `CHAMPION-STEP … outcome=` word.
+//! the step's `CHAMPION-STEP … outcome=` word — and, when its log has no
+//! such line, the typed outcome of the step's own released lease (#14639).
 
 use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
@@ -119,41 +120,31 @@ fn step_name(is_pr: bool) -> &'static str {
     }
 }
 
-/// The `outcome=` word of the last `CHAMPION-STEP` line in `text` for this
-/// mode and item, verbatim (`head-moved`, `not-eligible`, …).
+/// Outcome and optional reason from the same, last matching step line.
+fn step_words(text: &str, is_pr: bool, item: u32) -> Option<(&str, Option<&str>)> {
+    let mode = if is_pr { "pr" } else { "issue" };
+    text.lines().rev().find_map(|line| {
+        let mut words = line.split_whitespace();
+        if words.next()? != STEP_LINE {
+            return None;
+        }
+        let field = |key: &str| {
+            words
+                .clone()
+                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+        };
+        // A matching line with a missing outcome stays unclassified.
+        (field("mode")? == mode && field("item")?.parse::<u32>().ok()? == item)
+            .then(|| (field("outcome").unwrap_or_default(), field("reason")))
+    })
+}
+
 fn outcome_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
-    let mode = if is_pr { "pr" } else { "issue" };
-    text.lines().rev().find_map(|line| {
-        let rest = line.trim().strip_prefix(STEP_LINE)?;
-        let field = |key: &str| {
-            rest.split_whitespace()
-                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-        };
-        (field("mode")? == mode && field("item")?.parse::<u32>().ok()? == item)
-            .then(|| field("outcome").map(str::to_string))
-            .flatten()
-    })
+    step_words(text, is_pr, item).map(|(outcome, _)| outcome.to_string())
 }
 
-/// The `reason=` word of the last `CHAMPION-STEP` line for this mode and
-/// item, verbatim.
 fn reason_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
-    step_field(text, is_pr, item, "reason")
-}
-
-/// `key=` of the last `CHAMPION-STEP` line for this mode and item.
-fn step_field(text: &str, is_pr: bool, item: u32, key: &str) -> Option<String> {
-    let mode = if is_pr { "pr" } else { "issue" };
-    text.lines().rev().find_map(|line| {
-        let rest = line.trim().strip_prefix(STEP_LINE)?;
-        let field = |key: &str| {
-            rest.split_whitespace()
-                .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
-        };
-        (field("mode")? == mode && field("item")?.parse::<u32>().ok()? == item)
-            .then(|| field(key).map(str::to_string))
-            .flatten()
-    })
+    step_words(text, is_pr, item)?.1.map(str::to_string)
 }
 
 /// The merge-gate reason a stop names (`requeued` / `skipped`): a
@@ -271,8 +262,28 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             });
         }
     }
+    // #14639: a step a guard refused mid-flight can end with its lease
+    // released and its typed outcome recorded there, its `CHAMPION-STEP`
+    // line never written. The run's own journaled release is the fallback
+    // for exactly that gap — the step log still wins, and only the release
+    // the daemon itself made and vetted counts, never a marker read off
+    // the forge (#9548).
+    let (outcome, reason) = if e.step_path && e.outcome.is_none() {
+        e.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Released {
+                    outcome, reason, ..
+                } => Some((Some(outcome.as_str()), reason.as_deref())),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        (e.outcome.as_deref(), e.reason.as_deref())
+    };
     let triage = TRIAGE_REASON_SET;
-    let p = match e.outcome.as_deref() {
+    let p = match outcome {
         Some("triaged") => projection("verdict", "review_requested", triage),
         Some("triage-blocked") => projection("refused", "blocked", triage),
         Some("triage-operator") => projection("refused", "operator", triage),
@@ -285,8 +296,8 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             ..projection("refused", "unknown", set)
         },
         Some("requeued" | "skipped") => Projection {
-            detail: e.reason.as_deref().map(sanitize_detail),
-            ..projection("noop", &stop_reason(e.reason.as_deref()), set)
+            detail: reason.map(sanitize_detail),
+            ..projection("noop", &stop_reason(reason), set)
         },
         Some("held") => projection("noop", "held", set),
         Some("head-moved") => Projection {
@@ -338,7 +349,7 @@ fn project_promotion(e: &Evidence) -> Option<Projection> {
                 ("escalated", "operator_decision") => (at, "needs_operator"),
                 _ => continue,
             },
-            Event::Act { .. } => continue,
+            Event::Act { .. } | Event::Released { .. } => continue,
         };
         return Some(with_hash(Projection {
             wrote: true,

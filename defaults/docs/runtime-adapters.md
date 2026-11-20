@@ -268,6 +268,7 @@ Claude-specific internals):
 | **Prompt delivery** | `-p "…"` / `--prompt` is passed through to `claude -p`. | Deliver the prompt to the runtime's own headless/print-mode flag. |
 | **Model tier env** | `LOOM_MODEL` → `claude --model <v>` unless an explicit `--model` is already present (explicit arg wins). See [model mapping](#2-model-mapping). | Map the logical model tier to the runtime's own model-selection flag with the same precedence. |
 | **Effort tier env** | `LOOM_EFFORT` → `claude --effort <v>` unless an explicit `--effort` is present. This is a **session-default** effort; the in-session Task tool exposes no per-rung effort knob. | Map to the runtime's reasoning-effort knob if it has one; otherwise omit (no error). |
+| **Service tier env** | `LOOM_SERVICE_TIER` → Claude fast mode via an inline `--settings '{"fastMode":true}'`. See [service tier](#service-tier-loom_service_tier-issue-14141). | Map to the runtime's speed/service-tier knob if it has one; otherwise ignore it with one warning (never a failure). |
 | **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-daemon tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
 | **Runtime-missing failure** | Exits `127` when the `claude` CLI is not on `PATH`. | Fail cleanly when the runtime binary is absent. |
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
@@ -347,6 +348,41 @@ effort maps to a config override (`-c model_reasoning_effort=<v>`) because
 > tracked separately (epic #4167, Phase 4 "pool + tiering integration") and is
 > **out of scope for this contract doc**. An adapter author should be aware the
 > single-source model map is not yet single-source across both runtimes.
+
+#### Service tier (`LOOM_SERVICE_TIER`, issue #14141)
+
+One runtime-neutral speed setting, delivered as the env var `LOOM_SERVICE_TIER`
+(empty = unset), beside `LOOM_MODEL` / `LOOM_EFFORT`. Each adapter maps it to its
+own knob:
+
+| Adapter | `LOOM_SERVICE_TIER=fast` (or `priority`) | `standard` / `default` | Any other value |
+|---------|------------------------------------------|------------------------|-----------------|
+| `spawn-claude.sh` | inline `--settings '{"fastMode":true}'`. An existing inline-JSON `--settings` (e.g. the daemon's roll-pause hook) is **merged** (needs `jq`); any other existing `--settings` wins, with a warning | no flag, logged | one warning, ignored |
+| `spawn-codex.sh` | `-c service_tier=priority` (`fast` is shorthand for the catalog id `priority`) | no override, logged | passed through lower-cased as a catalog id from `codex debug models` (`service_tiers[].id`); a malformed id warns and is ignored |
+| `spawn-generic.sh` (aider, gemini, templates) | no equivalent: one warning, ignored | same | same |
+
+An explicit `-c service_tier=` (Codex) or `--settings` (Claude) in the passthrough
+args wins over the env var. `spawn-claude.sh` and `spawn-codex.sh` log one
+`service_tier=<v>` line naming what was applied.
+
+**Terminal record.** `spawn-codex.sh` appends `effort=<v|none> tier=<v|none>` to its
+`LOOM_TERMINAL_RESULT` record as **`v=4`** (after `model=` and, on a dropped pin,
+`requested_model=`) whenever it applied an effort or a tier. A launch that applied
+neither keeps the v2/v3 record byte-for-byte. `model=` keeps its meaning (`none` when
+a pinned model was dropped). The daemon parser requires both keys on a v4 record and
+fails closed on anything else, so an older daemon reading a v4 record records no
+account-health mutation for that step: roll the daemon before the scripts, or accept
+that gap.
+
+Scheduled role ticks (#14454) and named sweep steps (#14504) use
+`autonomous.roleRunner.serviceTier` and `autonomous.roleRunner.roleServiceTiers`.
+For a fresh or resumed step, the daemon selects the first configured value from
+`<role>@<runtime>` using the admitted runtime, the bare `<role>`, and the global
+`serviceTier`. It exports that value as `LOOM_SERVICE_TIER`. If no tier matches,
+the child inherits the daemon's environment, including an absent value.
+Whole-issue and PR-set sweeps invoke `/loom:sweep` and inherit the environment
+because they span multiple roles. Claude and Codex use the adapter mappings
+above. Native harnesses use their own provider settings.
 
 ### 3. Error classification
 
@@ -551,8 +587,8 @@ instruction-file set (e.g. Codex reads `AGENTS.md` + `.codex/` config); it must
   `defaults/.agents/skills/loom-<name>/SKILL.md` for every
   `defaults/roles/<name>.md`, each carrying `name: loom-<name>` /
   `description:` frontmatter plus a `<!-- loom-managed-skill -->` ownership
-  marker (CI `scripts/check-agent-skills-sync.sh` fails if a checked-in file is
-  stale). Install/resync tooling gates every overwrite on that marker's
+  marker (CI `loom-daemon generate-agent-skills --check` fails if a checked-in
+  file is stale). Install/resync tooling gates every overwrite on that marker's
   presence in the destination file, so a consumer-authored or hand-detached
   `SKILL.md` at the same path is left alone and logged, never silently reaped.
 

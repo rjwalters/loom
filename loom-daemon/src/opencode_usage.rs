@@ -444,6 +444,22 @@ pub fn sessions_in(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<OpencodeSessionUsage>> {
+    read_sessions_in(db_path, filter, window).map(|read| read.rows)
+}
+
+#[derive(Default)]
+struct SessionRead {
+    rows: Vec<OpencodeSessionUsage>,
+    matched: bool,
+    undecodable_match: bool,
+    unreadable: bool,
+}
+
+fn read_sessions_in(
+    db_path: &Path,
+    filter: &SessionFilter,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<SessionRead> {
     if !db_path.is_file() {
         return None;
     }
@@ -458,23 +474,37 @@ pub fn sessions_in(
     let mut stmt = conn.prepare(SESSION_QUERY).ok()?;
     let rows = stmt
         .query_map([], |row| {
-            Ok(RawSessionRow {
-                id: row.get(0)?,
-                model: row.get(1)?,
-                input: row.get(2)?,
-                output: row.get(3)?,
-                reasoning: row.get(4)?,
-                cache_read: row.get(5)?,
-                cache_write: row.get(6)?,
-                directory: row.get(7)?,
-                time_created: row.get(8)?,
-            })
+            let id: Option<String> = row.get(0)?;
+            let matched = id.as_ref().is_some_and(|id| filter.ids.contains(id));
+            let raw = || -> rusqlite::Result<RawSessionRow> {
+                Ok(RawSessionRow {
+                    id,
+                    model: row.get(1)?,
+                    input: row.get(2)?,
+                    output: row.get(3)?,
+                    reasoning: row.get(4)?,
+                    cache_read: row.get(5)?,
+                    cache_write: row.get(6)?,
+                    directory: row.get(7)?,
+                    time_created: row.get(8)?,
+                })
+            };
+            Ok((matched, raw().ok().and_then(|raw| raw.decode(filter, window))))
         })
-        .ok()?
-        .flatten()
-        .filter_map(|raw| raw.decode(filter, window))
-        .collect();
-    Some(rows)
+        .ok()?;
+    let mut read = SessionRead::default();
+    for row in rows {
+        match row {
+            Ok((_, Some(row))) => {
+                read.matched = true;
+                read.rows.push(row);
+            }
+            Ok((true, None)) => read.undecodable_match = true,
+            Ok((false, None)) => {}
+            Err(_) => read.unreadable = true,
+        }
+    }
+    Some(read)
 }
 
 /// [`sessions_in`] keyed on **session id** instead of directory + window
@@ -531,7 +561,12 @@ impl RawSessionRow {
             }
             created_at
         } else {
-            DateTime::<Utc>::from_timestamp_millis(self.time_created?).unwrap_or_else(Utc::now)
+            // The id is the whole key, so a NULL or undecodable `time_created`
+            // must not drop the row: `created_at` is only an ordering hint
+            // here, and `Utc::now()` stands in for it.
+            self.time_created
+                .and_then(DateTime::<Utc>::from_timestamp_millis)
+                .unwrap_or_else(Utc::now)
         };
         let model_json = self.model?;
         let model = parse_model_id(&model_json)?;
@@ -576,25 +611,64 @@ pub fn sessions_for_ids(ids: &[String], home: Option<&Path>) -> Vec<OpencodeSess
     sessions_selected(&SessionFilter::ids(ids), None, home)
 }
 
-/// The one selector both public listings route through: filter every
-/// discovered store with `filter`, drop usage-free rows, sort oldest-first.
+/// The one selector every public listing and by-id total routes through:
+/// filter every discovered store with `filter`, drop usage-free rows, sort
+/// oldest-first.
+///
+/// An id-keyed `filter` also dedupes by session id across stores — a session
+/// reachable through two stores (a cross-version store copy) is one session,
+/// not two, so its tokens are never counted twice. A directory-keyed filter is
+/// not deduped: its rows are not identified by id alone. The dedupe runs over
+/// usage-bearing rows only: an all-zero creation row (see
+/// [`OpencodeSessionUsage::is_empty`]) in the first-discovered store must not
+/// claim the id and shadow the copy that holds the usage.
+///
+/// An empty `filter` (no directories and no ids) matches nothing, so this
+/// returns before [`discover_opencode_dbs`] walks the native-tools base and
+/// before any store is opened — the common case for a PR whose steps all ran on
+/// Claude, where no OpenCode session id exists.
 fn sessions_selected(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     home: Option<&Path>,
 ) -> Vec<OpencodeSessionUsage> {
-    let mut all: Vec<OpencodeSessionUsage> = discover_opencode_dbs(home)
-        .into_iter()
-        .filter_map(|db| sessions_in(&db, filter, window))
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect();
-    all.sort_by(|a, b| {
+    read_selected_sessions(filter, window, home).rows
+}
+
+fn read_selected_sessions(
+    filter: &SessionFilter,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    home: Option<&Path>,
+) -> SessionRead {
+    if filter.directories.is_empty() && filter.ids.is_empty() {
+        return SessionRead::default();
+    }
+    let stores = discover_opencode_dbs(home);
+    let mut read = SessionRead {
+        unreadable: stores.is_empty(),
+        ..SessionRead::default()
+    };
+    for db in stores {
+        if let Some(store) = read_sessions_in(&db, filter, window) {
+            read.matched |= store.matched;
+            read.undecodable_match |= store.undecodable_match;
+            read.unreadable |= store.unreadable;
+            read.rows.extend(store.rows);
+        } else {
+            read.unreadable = true;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let by_id = !filter.ids.is_empty();
+    read.rows.retain(|s| {
+        !s.is_empty() && (!by_id || seen.insert(s.session_id.clone().unwrap_or_default()))
+    });
+    read.rows.sort_by(|a, b| {
         a.created_at
             .cmp(&b.created_at)
             .then_with(|| a.model.cmp(&b.model))
     });
-    all
+    read
 }
 
 /// Per-`(model, speed, service_tier)` token totals for `directories` across
@@ -647,17 +721,46 @@ pub fn tokens_by_model_for_ids(
 /// session recorded usage.
 #[must_use]
 pub fn tokens_by_session_ids(ids: &[String], home: Option<&Path>) -> Option<Vec<ModelUsageTotals>> {
+    // An empty id set is the empty filter: [`sessions_selected`] returns for it
+    // before any store discovery, so this is `None` without a separate guard,
+    // and shares that function's cross-store dedupe with
+    // [`tokens_by_model_for_ids`].
+    tokens_by_model_for_ids(ids, home)
+}
+
+/// The usage rows or the reason a by-id read could not produce them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdLookup {
+    /// The named sessions' attributable per-model rows, deduplicated by id.
+    Found(Vec<ModelUsageTotals>),
+    /// The search had no stores or some candidate data could not be read.
+    NoStore,
+    /// Every candidate store was read and none held any of the ids.
+    NotFound,
+    /// A named session recorded no tokens.
+    NoUsage,
+    /// A named session was present but could not be decoded for attribution.
+    Unattributable,
+}
+
+/// Read named sessions once and preserve the evidence for a missing result.
+#[must_use]
+pub fn lookup_ids(ids: &[String], home: Option<&Path>) -> IdLookup {
     if ids.is_empty() {
-        return None;
+        return IdLookup::NotFound;
     }
-    let mut seen = std::collections::HashSet::new();
-    let sessions = discover_opencode_dbs(home)
-        .into_iter()
-        .filter_map(|db| sessions_in(&db, &SessionFilter::ids(ids), None))
-        .flatten()
-        // A session reachable through two stores is one session, not two.
-        .filter(|s| seen.insert(s.session_id.clone().unwrap_or_default()));
-    fold_sessions(sessions)
+    let read = read_selected_sessions(&SessionFilter::ids(ids), None, home);
+    if let Some(rows) = fold_sessions(read.rows) {
+        IdLookup::Found(rows)
+    } else if read.unreadable {
+        IdLookup::NoStore
+    } else if read.undecodable_match {
+        IdLookup::Unattributable
+    } else if read.matched {
+        IdLookup::NoUsage
+    } else {
+        IdLookup::NotFound
+    }
 }
 
 /// Fold already-selected sessions into per-model totals — the whole of

@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
+use super::claude_seat::{seat_root, CONTAINER_CLAUDE_HOME};
+use super::paths::{codex_profile_root, per_repo_tokens_dir, shared_tokens_dir};
 use super::private_workspace::bundle::CONTROL_ROOT;
 use super::session_image::ExtraMount;
 use super::session_lifecycle::{
@@ -83,18 +85,34 @@ pub fn create_roots(workspace: &Path) -> Result<Vec<PathBuf>> {
     accepted_roots(workspace, &registered)
 }
 
+/// Compare host paths in the same namespace even when a credential directory
+/// or a child of a symlinked directory has not been created yet.
+fn normalize_source(path: &Path) -> Result<PathBuf> {
+    let mut resolved = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        if component == std::path::Component::ParentDir {
+            resolved.pop();
+        } else {
+            resolved.push(component);
+            resolved = crate::workspace_registry::normalize_path(&resolved);
+        }
+    }
+    Ok(resolved)
+}
+
 /// Refuse the configured extra read-only mounts (issue #14019) a session
 /// container must never receive, extending the one mount denylist
 /// ([`check_mount_denials`]) rather than adding a second:
 ///
 /// * **Host source** — passes the same denials the workspace roots do
 ///   ([`check_mount_denials`]): never `/`, the home directory, an ancestor
-///   of it, or anything overlapping a `firewall: true` repository. The bind
-///   is read-only, but a read-only copy of `~/.ssh` is still a copy.
+///   of it, or anything overlapping a `firewall: true` repository. Extra
+///   sources also must not overlap credential directories or account state.
 /// * **Container target** — never shadows, and is never shadowed-by-or-
 ///   nested-in, the workspace mounts (path parity), the `CODEX_HOME`
 ///   profile (whose three control files are read-only mount points), the
-///   sealed control bundle ([`CONTROL_ROOT`]), or a credential path.
+///   Claude seat home ([`CONTAINER_CLAUDE_HOME`]), the sealed control
+///   bundle ([`CONTROL_ROOT`]), or a credential path.
 /// * **Among themselves** — no two extra mounts overlap: Docker mounts
 ///   them in argv order, so a nested pair would make one of the two
 ///   silently not what the operator asked for.
@@ -105,11 +123,31 @@ pub fn check_extra_mount_denials(
     mounts: &[ExtraMount],
     home: Option<&Path>,
     firewalled: &[PathBuf],
+    account_sources: &[PathBuf],
     workspace_roots: &[PathBuf],
     credential_dirs: &[PathBuf],
 ) -> Result<()> {
     let normalize = crate::workspace_registry::normalize_path;
-    let sources: Vec<PathBuf> = mounts.iter().map(|mount| mount.host.clone()).collect();
+    let mut protected = account_sources.to_vec();
+    if let Some(home) = home {
+        protected.extend([".ssh", ".aws", ".config/gh"].map(|dir| home.join(dir)));
+    }
+    let sources = mounts
+        .iter()
+        .map(|mount| normalize_source(&mount.host))
+        .collect::<Result<Vec<_>>>()?;
+    for shield in &protected {
+        let shield_path = normalize_source(shield)?;
+        for source in &sources {
+            if source.starts_with(&shield_path) || shield_path.starts_with(source) {
+                bail!(
+                    "refusing the extra read-only mount from {}: it overlaps protected host path {}",
+                    source.display(),
+                    shield.display()
+                );
+            }
+        }
+    }
     check_mount_denials(&sources, home, firewalled)?;
     let mut forbidden: Vec<PathBuf> = workspace_roots
         .iter()
@@ -117,6 +155,7 @@ pub fn check_extra_mount_denials(
         .map(|root| normalize(root))
         .collect();
     forbidden.push(PathBuf::from(CONTAINER_CODEX_HOME));
+    forbidden.push(PathBuf::from(CONTAINER_CLAUDE_HOME));
     forbidden.push(PathBuf::from(CONTROL_ROOT));
     let mut destinations: Vec<PathBuf> = Vec::with_capacity(mounts.len());
     for mount in mounts {
@@ -183,12 +222,55 @@ pub fn check_extra_mounts(
     roots: &[PathBuf],
     credentials: &[PathBuf],
 ) -> Result<()> {
+    // The mounted workspace label is shielded as well as the registered
+    // roots (issue #14420): in the "parent of repositories" shape a target
+    // under the label but outside every root would otherwise pass here and
+    // then read as `MountDrift::extra` to the reconciler, churning one idle
+    // recreate before `DriftUnachievable`.
+    let mut shielded: Vec<PathBuf> = roots.to_vec();
+    shielded.push(workspace.to_path_buf());
+    check_configured_extra_mounts(mounts, workspace, &shielded, credentials)
+}
+
+/// [`check_extra_mounts`] for a private-clone seat (#14451): the host source
+/// passes the same denials, and the container target may not shadow or nest
+/// inside any of `reserved_targets` — the seat's own `/workspace`, `CODEX_HOME`
+/// profile and forge-configuration mounts (the sealed bundle root is always
+/// reserved). A private seat mounts none of the host-mode workspace roots or
+/// credential directories, so those do not apply.
+///
+/// # Errors
+/// See [`check_extra_mount_denials`]; also when the cached fleet roster exists
+/// but cannot be read (fail closed).
+pub fn check_private_extra_mounts(
+    mounts: &[ExtraMount],
+    workspace: &Path,
+    reserved_targets: &[PathBuf],
+) -> Result<()> {
+    check_configured_extra_mounts(mounts, workspace, reserved_targets, &[])
+}
+
+fn check_configured_extra_mounts(
+    mounts: &[ExtraMount],
+    workspace: &Path,
+    reserved_targets: &[PathBuf],
+    credentials: &[PathBuf],
+) -> Result<()> {
     let denials = Denials::load(workspace)?;
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    // Shield both possible pool locations regardless of which currently holds tokens.
+    let mut accounts = vec![per_repo_tokens_dir(workspace)];
+    accounts.extend(shared_tokens_dir());
+    accounts.extend(codex_profile_root());
+    accounts.extend(seat_root());
     check_extra_mount_denials(
         mounts,
         denials.home.as_deref(),
         &denials.firewalled,
-        roots,
+        &accounts,
+        reserved_targets,
         credentials,
     )
 }

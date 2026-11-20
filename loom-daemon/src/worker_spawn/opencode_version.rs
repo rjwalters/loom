@@ -4,7 +4,7 @@
 //! This probe is therefore the last point at which an unsupported CLI can be
 //! refused: the `run` argv differs per major, and a guarded launch is admitted
 //! only on a major whose guard was verified by a live canary.
-use super::LaunchError;
+use super::{LaunchError, LaunchStage};
 use crate::proc_exec::{Completion, ExecError};
 use std::{
     path::Path,
@@ -70,18 +70,21 @@ fn admit(probe: Result<Completion, ExecError>, guarded: bool) -> Result<Major, L
                     126
                 },
                 message: format!("cannot execute worker harness: {error}"),
+                stage: None,
             })
         }
         Err(ExecError::Collect(error)) => {
             return Err(LaunchError::config(format!(
                 "`opencode --version` could not be read ({error}); {SUPPORTED}"
-            )))
+            ))
+            .with_stage(LaunchStage::CliQualification))
         }
         Ok(Completion::TimedOut { .. }) => {
             return Err(LaunchError::config(format!(
                 "`opencode --version` did not answer within {}s; {SUPPORTED}",
                 PROBE_TIMEOUT.as_secs()
-            )))
+            ))
+            .with_stage(LaunchStage::CliQualification))
         }
         Ok(Completion::Exited(output)) => output,
     };
@@ -90,18 +93,21 @@ fn admit(probe: Result<Completion, ExecError>, guarded: bool) -> Result<Major, L
     if !output.status.success() {
         return Err(LaunchError::config(format!(
             "`opencode --version` exited unsuccessfully; {SUPPORTED}"
-        )));
+        ))
+        .with_stage(LaunchStage::CliQualification));
     }
     let Some(number) = parse_major(&stdout) else {
         return Err(LaunchError::config(format!(
             "cannot read an OpenCode version from `opencode --version` output {reported:?}; {SUPPORTED}"
-        )));
+        ))
+        .with_stage(LaunchStage::CliQualification));
     };
     let Some(major) = Major::from_number(number) else {
         return Err(LaunchError::config(format!(
             "unsupported OpenCode version {reported:?}; {SUPPORTED}. Refusing to guess a launch \
              shape: install a supported release or point LOOM_OPENCODE_BIN at one"
-        )));
+        ))
+        .with_stage(LaunchStage::CliQualification));
     };
     if guarded && !major.guard_verified() {
         return Err(LaunchError::config(format!(
@@ -110,7 +116,8 @@ fn admit(probe: Result<Completion, ExecError>, guarded: bool) -> Result<Major, L
              explicitly denied, and Loom's deny-by-default tool surface is unverified on this \
              major (see .loom/docs/guardrail-parity-native.md). Unguarded free-form launches on \
              this version are unaffected"
-        )));
+        ))
+        .with_stage(LaunchStage::CliQualification));
     }
     Ok(major)
 }

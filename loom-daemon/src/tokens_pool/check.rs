@@ -1037,11 +1037,14 @@ fn is_evidence_free_status(status: &str) -> bool {
 ///
 /// - `error` / `blocked` ([`is_evidence_free_status`]) always yield.
 /// - `unknown` yields **only while the carried hold is still running**: the
-///   previous row's `limit_reset` parses and is strictly after `now`. A past,
-///   missing, or unparseable reset means no credible hold is in force, so the
-///   fresh fail-open `unknown` row is written as before (#8539) and the
-///   fail-open contract is bounded to the hold window instead of being made
-///   permanently exclusionary.
+///   previous row's `limit_reset` parses and satisfies
+///   `now < reset <= now + MAX_WEEKLY_RESET_HORIZON_SECS` — the same
+///   credibility horizon the reader applies (`bad_tokens`, #13893). A past,
+///   missing, unparseable, or beyond-horizon reset means no credible hold is
+///   in force, so the fresh fail-open `unknown` row is written as before
+///   (#8539) and the fail-open contract is bounded to the hold window instead
+///   of being made permanently exclusionary (an implausible far-future reset
+///   would otherwise be re-carried every round and never self-heal, #14349).
 /// - Everything else is positive evidence and overwrites.
 fn carries_forward(status: &str, carried: &str, now: DateTime<Utc>) -> bool {
     if is_evidence_free_status(status) {
@@ -1051,7 +1054,27 @@ fn carries_forward(status: &str, carried: &str, now: DateTime<Utc>) -> bool {
         return false;
     }
     let reset = super::select::parse_ranking_line(carried).and_then(|row| row.limit_reset);
-    super::monitor::parse_iso8601(reset.as_deref()).is_some_and(|reset| reset > now)
+    super::monitor::parse_iso8601(reset.as_deref()).is_some_and(|reset| {
+        reset > now
+            && reset - now
+                <= chrono::Duration::seconds(super::bad_tokens::MAX_WEEKLY_RESET_HORIZON_SECS)
+    })
+}
+
+/// Whether a permanent (`auth` / `malformed-timestamp`) `.bad_tokens` mark
+/// stands against `a` (issue #14317).
+///
+/// Such an account is never carried: its `blocked` row comes from the mark
+/// (an empty-token round, or a `--source probe` round whose `status` the mark
+/// pins), not from a probe that failed, so it is not the "inconclusive probe"
+/// case [`carries_forward`] protects. Carrying an earlier `exhausted` row over
+/// it would freeze that row — `auto`/`monitor` never re-probe the account —
+/// and mislabel an auth-dead account `exhausted`. A self-clearing `exhaustion`
+/// mark is probed live and keeps the carry-forward.
+fn has_permanent_mark(a: &AccountResult) -> bool {
+    a.bad_mark
+        .as_ref()
+        .is_some_and(|mark| mark.class != super::bad_tokens::BadReasonClass::Exhaustion)
 }
 
 /// Read the current `.ranking` and keep its `exhausted` rows (keyed by
@@ -1084,8 +1107,9 @@ fn previous_exhausted_rows(ranking_path: &Path) -> HashMap<String, String> {
 /// days to run. The carry-forward applies only when the previous row is
 /// `exhausted` **and** the fresh row is evidence-free per [`carries_forward`]
 /// (`error` / `blocked`, or a codex `unknown` while the hold's recorded reset
-/// is still in the future, #14265) — anything else is positive evidence this
-/// round and overwrites as before — and the reader's own credibility gates
+/// is still in the future **and** within `MAX_WEEKLY_RESET_HORIZON_SECS`,
+/// #14265 / #14349) — anything else is positive evidence this round and
+/// overwrites as before — and the reader's own credibility gates
 /// (parseability, `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants) still
 /// bound whatever is carried forward.
 fn format_ranking_lines_with_preserve(
@@ -1100,6 +1124,7 @@ fn format_ranking_lines_with_preserve(
         }
         match preserve
             .get(a.name.as_str())
+            .filter(|_| !has_permanent_mark(a))
             .filter(|carried| carries_forward(&a.status, carried, now))
         {
             Some(carried) => out.push_str(carried),
@@ -2169,6 +2194,60 @@ mod tests {
         );
     }
 
+    /// #14317: an account with a standing permanent mark reports `blocked`
+    /// because of the mark, not because a probe failed, so a previous
+    /// `exhausted` row must not be carried over it — in the empty-token
+    /// shape (`probed: false`) and in the `--source probe` shape (`probed:
+    /// true`, `status` pinned `blocked`). An `exhaustion` mark, a markless
+    /// account, and an account whose previous row was not `exhausted` are
+    /// unchanged.
+    #[test]
+    fn a_permanent_mark_does_not_carry_an_earlier_exhausted_row() {
+        use crate::tokens_pool::bad_tokens::BadReasonClass;
+        use crate::tokens_pool::check::marked_probe::BadMark;
+        fn marked(name: &str, class: BadReasonClass, probed: bool) -> AccountResult {
+            let mut r = AccountResult::new(name, "blocked");
+            r.probed = probed;
+            r.bad_mark = Some(BadMark {
+                class,
+                reason: "401".into(),
+                marked_at: "2026-11-18T00:00:00Z".into(),
+            });
+            r
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "auth-dead|exhausted||2026-11-24T08:00:00Z
+             auth-probed|exhausted||2026-11-24T08:00:00Z
+             malformed|exhausted||2026-11-24T08:00:00Z
+             cooling|exhausted||2026-11-24T08:00:00Z
+             plain|exhausted||2026-11-24T08:00:00Z
+",
+        )
+        .unwrap();
+        let mut auth_probed = marked("auth-probed", BadReasonClass::Auth, true);
+        auth_probed.probe_status = Some("exhausted".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                marked("auth-dead", BadReasonClass::Auth, false),
+                auth_probed,
+                marked("malformed", BadReasonClass::MalformedTimestamp, false),
+                // An exhaustion mark is probed live; a failed round keeps the hold.
+                marked("cooling", BadReasonClass::Exhaustion, true),
+                AccountResult::new("plain", "blocked"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "auth-dead|blocked\nauth-probed|blocked\nmalformed|blocked\n\
+             cooling|exhausted||2026-11-24T08:00:00Z\nplain|exhausted||2026-11-24T08:00:00Z\n",
+        );
+    }
+
     // ---- #14265: a codex `unknown` round must not shorten a running hold ----
 
     fn prev_exhausted(line: &str) -> HashMap<String, String> {
@@ -2255,28 +2334,80 @@ mod tests {
         );
     }
 
-    /// #14265 end-to-end through the on-disk writer with the real clock: a far
-    /// future hold survives an `unknown` round, a far past one does not.
+    /// #14349: the hold window is bounded above by the reader's credibility
+    /// horizon (`MAX_WEEKLY_RESET_HORIZON_SECS`, 8 d). A reset ~7 d out is
+    /// carried; exactly at the horizon is carried; one second past, or an
+    /// implausible far-future instant, is not (the fail-open `unknown` row is
+    /// written so the profile self-heals).
+    #[test]
+    fn unknown_round_carries_only_within_the_weekly_reset_horizon() {
+        let now = instant("2026-11-20T00:00:00Z");
+        let cases = [
+            ("2026-11-27T00:00:00Z", true),  // 7 d
+            ("2026-11-28T00:00:00Z", true),  // exactly now + 8 d
+            ("2026-11-28T00:00:01Z", false), // now + 8 d + 1 s
+            ("2999-01-01T00:00:00Z", false), // implausible far future
+        ];
+        for (reset, carried) in cases {
+            let line = format!("codex-1|exhausted||{reset}");
+            let out =
+                format_ranking_lines_with_preserve(&unknown_report(), &prev_exhausted(&line), now);
+            let want = if carried {
+                format!("{line}\n")
+            } else {
+                "codex-1|unknown\n".to_string()
+            };
+            assert_eq!(out, want, "reset={reset}");
+        }
+    }
+
+    /// #14349: `error` / `blocked` carry-forward stays unconditional by design
+    /// — the horizon bound applies only to the `unknown` hold window.
+    #[test]
+    fn error_round_still_carries_a_beyond_horizon_reset() {
+        let line = "codex-1|exhausted||2999-01-01T00:00:00Z";
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("codex-1", "error")],
+        };
+        let out = format_ranking_lines_with_preserve(
+            &report,
+            &prev_exhausted(line),
+            instant("2026-11-20T00:00:00Z"),
+        );
+        assert_eq!(out, format!("{line}\n"));
+    }
+
+    /// #14265 end-to-end through the on-disk writer with the real clock: an
+    /// in-horizon hold survives an `unknown` round; a far-past one does not,
+    /// and (#14349) neither does an implausible far-future one.
     #[test]
     fn write_ranking_atomic_applies_the_unknown_hold_window_against_the_real_clock() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join(".ranking");
+        let in_horizon = (Utc::now() + chrono::Duration::days(3))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let held = format!("held|exhausted||{in_horizon}");
         fs::write(
             &target,
-            "future|exhausted||2999-01-01T00:00:00Z\npast|exhausted||2000-01-01T00:00:00Z\n",
+            format!(
+                "{held}\nimplausible|exhausted||2999-01-01T00:00:00Z\npast|exhausted||2000-01-01T00:00:00Z\n"
+            ),
         )
         .unwrap();
         let report = ProbeReport {
             ranked_at: "x".into(),
             accounts: vec![
-                AccountResult::new("future", "unknown"),
+                AccountResult::new("held", "unknown"),
+                AccountResult::new("implausible", "unknown"),
                 AccountResult::new("past", "unknown"),
             ],
         };
         write_ranking_atomic(&report, &target).unwrap();
         assert_eq!(
             fs::read_to_string(&target).unwrap(),
-            "future|exhausted||2999-01-01T00:00:00Z\npast|unknown\n",
+            format!("{held}\nimplausible|unknown\npast|unknown\n"),
         );
     }
 
