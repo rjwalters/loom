@@ -386,6 +386,65 @@ pub fn claude_transcript_size(config_dir: &Path, session_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Where a Claude session's transcript lives (#14371): the host config dir, or
+/// the private home of the persistent seat whose Claude wrote it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocatedSession {
+    /// The seat home holding the transcript. `None` for the host config dir,
+    /// which is where an unrecorded store is already looked for.
+    pub store: Option<PathBuf>,
+    /// The seat's name, when `store` is a seat home.
+    pub account: Option<String>,
+    /// Bytes of the transcript, `0` when none was found.
+    pub size: u64,
+}
+
+/// Find `session_id`'s transcript under `host_dir`, else under each registered
+/// seat of `seat_root` (sorted, so the answer is deterministic). The session id
+/// is the key: a seat's Claude has its own `CLAUDE_CONFIG_DIR`, so the host's
+/// `projects/` never holds a seat step's transcript.
+#[must_use]
+pub fn locate_claude_session(
+    host_dir: Option<&Path>,
+    seat_root: Option<&Path>,
+    session_id: &str,
+) -> LocatedSession {
+    use crate::tokens_pool::claude_seat as seat;
+    if let Some(size) = host_dir
+        .map(|d| claude_transcript_size(d, session_id))
+        .filter(|s| *s > 0)
+    {
+        return LocatedSession {
+            size,
+            ..LocatedSession::default()
+        };
+    }
+    let Some(root) = seat_root else {
+        return LocatedSession::default();
+    };
+    let mut names: Vec<String> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| seat::is_seat(root, n))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    for name in names {
+        let home = seat::home_dir(root, &name);
+        let size = claude_transcript_size(&home, session_id);
+        if size > 0 {
+            return LocatedSession {
+                store: Some(home),
+                account: Some(name),
+                size,
+            };
+        }
+    }
+    LocatedSession::default()
+}
+
 /// Record the session of a step that ended (`step_end::settle`). A no-op when
 /// the feature is off or the role resumes nothing. Best effort: a failed
 /// write only costs a fresh step later.
@@ -404,10 +463,14 @@ pub fn record_ended(
     if !crate::roll_pause::resume::valid_session_id(&session_id) {
         return;
     }
-    let context_size = std::env::var_os("CLAUDE_CONFIG_DIR")
+    let host_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))
-        .map_or(0, |d| claude_transcript_size(&d, &session_id));
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude")));
+    let located = locate_claude_session(
+        host_dir.as_deref(),
+        crate::tokens_pool::claude_seat::seat_root().as_deref(),
+        &session_id,
+    );
     let mut ledger = load(root);
     ledger.prune(ended_at, cfg.ttl);
     ledger.upsert(SessionRecord {
@@ -416,10 +479,10 @@ pub fn record_ended(
         host: crate::host_identity::lease_host_identity(),
         runtime: "claude".to_string(),
         session_id,
-        account: None,
-        session_store: None,
+        account: located.account,
+        session_store: located.store.map(|p| p.display().to_string()),
         ended_at,
-        context_size,
+        context_size: located.size,
     });
     if let Err(e) = save(root, &ledger) {
         log::warn!("step_dispatch: session ledger not written: {e}");

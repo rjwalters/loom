@@ -51,14 +51,15 @@ pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 /// 0.19.1312 is the first release with the `resolve-role-model` subcommand
 /// (#13956; 0.19.1311 was cut before the merge and lacks it), called by the
 /// `resolve-role-model.sh` script-helper, whose hard
-/// floor is the same release. 0.20.4 is the release this change ships as
-/// (#14371): the first with `session-exec claude-seat`, called by
-/// `spawn-claude.sh` for an adopted Claude seat, whose hard floor is the same.
+/// floor is the same release. 0.20.5 is the first release after this change
+/// merges (#14371; `v0.20.4` was published from a `main` without it): the first
+/// with `session-exec claude-seat`, called by `spawn-claude.sh` for an adopted
+/// Claude seat, whose hard floor is the same.
 ///
 /// Keep this on one line in exactly this shape: the installer
 /// (`scripts/install/loom-source-path.sh`) reads it from this file with
 /// `sed`, because the tree it installs can be newer than any binary it has.
-pub const REQUIRES_DAEMON: &str = "0.20.4";
+pub const REQUIRES_DAEMON: &str = "0.20.5";
 
 // compat:invoked-files:begin
 /// The installed files this daemon executes in a workspace. An installed tree
