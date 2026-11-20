@@ -442,8 +442,8 @@ if [[ "$REMOTE14" == "https://github.com/NewOrg/loom.git" ]]; then
 else
     fail "(#14222) redirected remote stamped '$REMOTE14'"
 fi
-if grep -q "api repos/OldOrg/loom" <<<"$CALLS14"; then
-    pass "(#14222) the lookup is a REST 'gh api repos/<o>/<r>' call"
+if [[ "$CALLS14" == "api repos/OldOrg/loom --jq .full_name" ]]; then
+    pass "(#14222) the real resync makes exactly one canonical remote lookup"
 else
     fail "(#14222) unexpected gh calls: $CALLS14"
 fi
@@ -451,6 +451,37 @@ if [[ "$(grep -c 'origin remote is stale' <<<"$OUT14")" == 1 ]]; then
     pass "(#14222) exactly one stale-remote warning is printed"
 else
     fail "(#14222) expected one stale-remote warning; out=$OUT14"
+fi
+
+# Keep the synchronized surface and valid stamp from the real-write control,
+# but restore the previously recorded URL while the source origin still redirects.
+META14="$WORKDIR/remote-moved/.loom/install-metadata.json"
+STALE14="$WORKDIR/remote-moved-stale-metadata.json"
+BIN14="$WORKDIR/gh-remote-moved"
+sed 's|https://github.com/NewOrg/loom.git|https://github.com/OldOrg/loom.git|' "$META14" > "$STALE14"
+cp "$STALE14" "$META14"
+: > "$BIN14/gh.calls"
+OUT14_NOOP="$(cd "$WORKDIR/remote-moved" && PATH="$BIN14:$PATH" bash "$SCRIPT" 2>&1)"
+RC14_NOOP=$?
+if [[ "$RC14_NOOP" == 0 ]] && grep -qF 'nothing to re-stamp (#11680)' <<<"$OUT14_NOOP"; then
+    pass "(#14712) the stale URL fixture takes the no-op stamp path"
+else
+    fail "(#14712) expected a no-op resync (rc=$RC14_NOOP); out=$OUT14_NOOP"
+fi
+if cmp -s "$STALE14" "$META14"; then
+    pass "(#14712) a no-op leaves the stale stamp byte-identical"
+else
+    fail "(#14712) a no-op rewrote install-metadata.json"
+fi
+if [[ ! -s "$BIN14/gh.calls" ]]; then
+    pass "(#14712) a no-op skips the canonical remote lookup"
+else
+    fail "(#14712) a no-op called gh: $(cat "$BIN14/gh.calls")"
+fi
+if ! grep -qE 'origin remote is stale|Stamping the canonical URL' <<<"$OUT14_NOOP"; then
+    pass "(#14712) a no-op does not claim to stamp the canonical remote"
+else
+    fail "(#14712) a no-op claimed to stamp the canonical remote"
 fi
 
 run_remote_case remote-same "https://github.com/o/r.git" "o/r" 0

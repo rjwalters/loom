@@ -3231,9 +3231,6 @@ restamp_metadata() {
     # freezing whatever was recorded at install time. Best-effort: empty when
     # SOURCE_ROOT isn't a git checkout or has no `origin` configured.
     remote="$(normalize_source_remote "$(git -C "$SOURCE_ROOT" remote get-url origin 2>/dev/null || true)")"
-    # #14222: a clone whose origin predates the org transfer names the old
-    # owner; stamp the forge's canonical name instead (fail-open, GitHub only).
-    remote="$(canonicalize_source_remote "$remote")"
     # #10717: requires_daemon (the compatibility contract, #10716) travels with
     # the files, so it is read from the tree they came from, the same way
     # scripts/install/loom-source-path.sh reads it at install time. A source
@@ -3269,6 +3266,10 @@ restamp_metadata() {
           && "$prev_version" == "$version" \
           && "$prev_commit" =~ ^[0-9a-f]{40}$ ]]; then
         noop=1
+    else
+        # #14222: resolve a transferred origin only when refreshing the stamp.
+        # The no-op path preserves loom_source_remote and needs no forge lookup.
+        remote="$(canonicalize_source_remote "$remote")"
     fi
 
     local stamped_note="${GREEN}re-stamped${NC} install-metadata.json (loom_version=$version, loom_commit=$commit, last_resync=$today)"
