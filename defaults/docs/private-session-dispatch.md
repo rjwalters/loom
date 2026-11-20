@@ -177,9 +177,11 @@ removal is forced (`git worktree remove --force`): those uncommitted and
 untracked files are deleted with the worktree, while the branch ref and its
 commits are kept. Locked worktrees, the primary clone, and worktrees with
 unpublished commits are never reaped; when such a worktree is dirty, the
-refusal above still applies. Every path the reap removes is reported to the
-host, which logs it with the account and repository, so a forced removal
-always leaves a trace naming the directory.
+refusal above still applies. On a successful preparation, every path the reap
+removes is reported to the host, which logs it with the account and
+repository. When preparation then refuses (for example `seat_dirty` on a
+different worktree), the removal is not reported: the refusal names only the
+worktree that caused it.
 
 ## Rebinding a registration after a repository transfer
 
