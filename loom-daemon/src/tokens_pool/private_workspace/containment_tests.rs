@@ -95,7 +95,7 @@ fn recorded(report: &bundle::Report, profile: &Path) -> bool {
 /// Make the registration something the seal refuses (an extra event), without
 /// touching the `PreToolUse` entry Codex's trust is keyed to, so a test can
 /// exercise admission on recorded trust alone.
-fn unsealable(profile: &Path) {
+pub(super) fn unsealable(profile: &Path) {
     let path = profile.join("hooks.json");
     let mut hooks: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

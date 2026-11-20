@@ -2172,7 +2172,8 @@ mod tests {
                 "owner_valid": true
             },
             "login_state": "not_checked",
-            "session_managed": false
+            "session_managed": false,
+            "hook_trust": "missing"
         }))
         .unwrap();
         assert_eq!(
