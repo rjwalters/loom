@@ -211,19 +211,7 @@ fn start_with(
         register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
-        let gh_config = std::env::var_os("GH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config/gh")))
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize())
-            .transpose()?;
-        if let Some(path) = &gh_config {
-            for parent in path.ancestors() {
-                if parent.join(".git").exists() {
-                    bail!("forge credentials must be outside every repository/worktree");
-                }
-            }
-        }
+        let gh_config = resolve_gh_config(workspace)?;
         Config {
             schema_version: 1,
             account: account.id.name.clone(),
@@ -330,6 +318,72 @@ fn start_with(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// The forge configuration directory a NEW private workspace records and
+/// binds read-only at [`GH_CONFIG`], or `None` when none may be mounted.
+///
+/// The daemon-owned GitHub App directories under the workspace root's own
+/// `.loom/` are deliberately not recorded ([`daemon_owned_gh_config`]): an
+/// App-only host delivers its installation token per exec as `GH_TOKEN`
+/// (`forge_auth`, #13916), so binding the directory would only re-expose
+/// the credential inside the seat — and it lives inside the daemon's own
+/// checkout, which the ancestor check below rightly refuses. Before #14744
+/// that refusal kept unattended `session_reconcile` from ever creating a
+/// seat on an App-only host, because the daemon activates that directory
+/// as its process-global `GH_CONFIG_DIR` at startup. Every other directory
+/// at or under a git checkout keeps the refusal.
+fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
+    resolve_gh_config_with(
+        workspace,
+        std::env::var_os("GH_CONFIG_DIR"),
+        dirs::home_dir().map(|home| home.join(".config/gh")),
+    )
+}
+
+/// [`resolve_gh_config`] over an injected `GH_CONFIG_DIR` value and
+/// home-default directory (tests): the same resolution and the same
+/// ancestor refusal for every directory the daemon does not own.
+pub(super) fn resolve_gh_config_with(
+    workspace: &Path,
+    gh_config_dir: Option<std::ffi::OsString>,
+    home_default: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let resolved = gh_config_dir
+        .map(PathBuf::from)
+        .or(home_default)
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize())
+        .transpose()?
+        .filter(|path| !daemon_owned_gh_config(workspace, path));
+    if let Some(path) = &resolved {
+        for parent in path.ancestors() {
+            if parent.join(".git").exists() {
+                bail!("forge credentials must be outside every repository/worktree");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `true` when `path` (already canonicalized) is one of the daemon-owned
+/// GitHub App credential directories under `workspace`'s own `.loom/`: the
+/// process-global `GH_CONFIG_DIR` the daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a
+/// per-owner sibling ([`github_app_gh_config_dir_for_owner`]). A symlinked
+/// spelling of either resolves to the same canonical path and matches; a
+/// workspace that cannot be resolved owns nothing, so the caller's refusal
+/// stands.
+fn daemon_owned_gh_config(workspace: &Path, path: &Path) -> bool {
+    let Some(root) = workspace.canonicalize().ok() else {
+        return false;
+    };
+    if path == crate::credential_preflight::github_app_gh_config_dir(&root) {
+        return true;
+    }
+    let owners = root.join(".loom").join("gh-config-by-owner");
+    path.strip_prefix(&owners)
+        .is_ok_and(|rest| rest.components().count() == 1)
 }
 
 /// Unattended recovery of an already-configured private session whose

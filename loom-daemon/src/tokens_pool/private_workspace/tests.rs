@@ -728,6 +728,83 @@ fn https_remote_rejects_credentials_and_unsupported_transports() {
     }
 }
 
+#[test]
+fn daemon_owned_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_per_owner_daemon_gh_config_dir_under_a_checkout_is_not_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir_for_owner(ws.path(), "org");
+    std::fs::create_dir_all(&dir).expect("owner dir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_symlinked_spelling_of_the_daemon_owned_gh_config_dir_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    symlink(&dir, ws.path().join("linked-gh-config")).expect("symlink");
+    let linked = ws.path().join("linked-gh-config");
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(linked.into_os_string()), None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn a_gh_config_dir_under_a_checkout_the_daemon_does_not_own_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = ws.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    let error = lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None)
+        .expect_err("a foreign dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_home_default_gh_dir_under_a_checkout_is_refused() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let home_default = ws.path().join(".config/gh");
+    std::fs::create_dir_all(&home_default).expect("gh dir");
+    let error = lifecycle::resolve_gh_config_with(ws.path(), None, Some(home_default))
+        .expect_err("the home-default dir under a checkout must be refused");
+    assert!(error
+        .to_string()
+        .contains("forge credentials must be outside every repository/worktree"));
+}
+
+#[test]
+fn a_gh_config_dir_outside_every_checkout_is_recorded() {
+    let ws = tempfile::tempdir().expect("tempdir");
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    let dir = elsewhere.path().join("gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert_eq!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.clone().into_os_string()), None)
+            .expect("an ordinary dir is recorded"),
+        Some(dir.canonicalize().expect("canonical"))
+    );
+}
+
 fn config() -> Config {
     Config {
         schema_version: 1,
