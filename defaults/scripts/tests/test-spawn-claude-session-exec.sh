@@ -63,7 +63,10 @@ while args[0].startswith('-'):
 target = args.pop(0)
 seat = next(k for k, v in seats.items() if target in (v, 'loom-claude-session-'+k))
 home = str(root / seat / 'home')
-env.update(HOME=home, CLAUDE_CONFIG_DIR=home)
+# Like the real image: HOME is the user's home, the mounted seat home is only
+# the Claude config dir (/home/loom/.claude), never HOME itself.
+env.update(HOME=str(root.parent / 'image-home' / seat), CLAUDE_CONFIG_DIR=home)
+os.makedirs(env['HOME'], exist_ok=True)
 os.execve(os.environ['LOOM_DAEMON_SELF_BIN'], args, env)
 PY
 cat > bin/claude <<'CLI'
@@ -158,6 +161,13 @@ grep -q 'category=SESSION_DOWN' log
 rm "$LOOM_CLAUDE_SEAT_ROOT/beta/.session-managed.json"
 run 0
 grep -q 'mode=bare-metal' log
+# Unadopted account on a seat-bearing host: the wrapper marks it bad directly
+# (host branch of record_host_account_failure, no seat record involved).
+rm -f "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
+touch fail
+run 42 --use-wrapper
+grep -q '^[^ ]* [a-z]* auth-dead' "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
+rm fail "$LOOM_SHARED_TOKENS_DIR/.bad_tokens"
 rm "$LOOM_SHARED_TOKENS_DIR/"*.token
 run 78
 grep -q 'Token selection failed' log

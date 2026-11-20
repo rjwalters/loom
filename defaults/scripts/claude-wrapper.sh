@@ -2092,7 +2092,9 @@ record_host_account_failure() {
     local kind="$1" phrase="${2//[$'\n\r\t']/ }"
     [[ "${kind}" == "session-limit" ]] && return 0
     if [[ -n "${LOOM_CLAUDE_SEAT_ACTIVE:-}" ]]; then
-        printf '%s\t%s\n' "${kind}" "${phrase}" > "${HOME:-/nonexistent}/.loom-account-failure" 2>/dev/null || true
+        # The seat's mounted home is its Claude config dir ($CLAUDE_CONFIG_DIR),
+        # not $HOME (the image user's home, outside the mount).
+        printf '%s\t%s\n' "${kind}" "${phrase}" > "${CLAUDE_CONFIG_DIR:-${HOME:-/nonexistent}/.claude}/.loom-account-failure" 2>/dev/null || true
         return 0
     fi
     local ws daemon_bin name="${ACTIVE_TOKEN_NAME:-${LOOM_TOKEN_NAME:-}}"
