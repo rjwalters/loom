@@ -71,6 +71,7 @@ mod forge_calls_cmd;
 mod forge_identity_cmd;
 pub(crate) mod forge_inventory_cmd;
 mod forge_merge_queue_cmd;
+mod forge_operator_holds;
 mod forge_parent_cmd;
 pub(crate) mod forge_probe_cmd;
 mod forge_read;

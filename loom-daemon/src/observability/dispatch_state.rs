@@ -112,6 +112,8 @@ pub struct StateRow {
     /// The issue a PR row closes, for locating its sweep checkpoint. Never
     /// emitted.
     pub issue: Option<u32>,
+    /// The open issue that supplied a binding operator hold on the PR.
+    pub operator_hold_issue: Option<u32>,
     /// Qualifying Judge rejections of this Doctor PR's GLM attempts, from the
     /// sweep checkpoint; `None` when no escalation state was read for this PR.
     pub doctor_rejections: Option<u32>,
@@ -135,6 +137,7 @@ struct Signature {
     exclusion: Option<String>,
     gate_until: Option<DateTime<Utc>>,
     rung: Option<u32>,
+    operator_hold_issue: Option<u32>,
 }
 
 impl Signature {
@@ -144,6 +147,7 @@ impl Signature {
             exclusion: row.exclusion.clone(),
             gate_until: row.gate_until,
             rung: row.reeval_rung,
+            operator_hold_issue: row.operator_hold_issue,
         }
     }
 }
@@ -264,6 +268,7 @@ pub fn build_record(
         step: row.step.clone(),
         in_pool: row.in_pool,
         exclusion: row.exclusion.clone(),
+        operator_hold_issue: row.operator_hold_issue,
         gate_until: row.gate_until,
         reeval_rung: row.reeval_rung,
         reeval_next: row.reeval_next,
