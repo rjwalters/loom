@@ -224,22 +224,21 @@ impl SeatVolumeSampler {
         };
         // The task is finished here, so awaiting it only recovers the rolling samples.
         let mut samples = match self.active.take() {
-            Some(task) => task.await.unwrap_or_default(),
+            Some(task) => task.await.unwrap_or_else(|_| {
+                log::warn!(
+                    "private workspace volume sampling task failed and lost its retained readings"
+                );
+                SeatVolumeSamples::default()
+            }),
             None => SeatVolumeSamples::default(),
         };
         let workspace_root = workspace_root.to_path_buf();
         self.active = Some(tokio::task::spawn_blocking(move || {
-            match session_image::read_session_image_config(&workspace_root) {
-                Ok(config) => {
-                    let usage = samples.sample(|| reader_image(config.image.as_deref()));
-                    sink.emit_metrics(seat_volume_points(usage));
-                    samples
-                }
-                Err(_) => {
-                    log::debug!("private workspace volume sampling skipped: invalid session image configuration");
-                    SeatVolumeSamples::default()
-                }
+            let config = session_image::read_session_image_config(&workspace_root);
+            if let Some(usage) = samples.sample_configured(config, reader_image) {
+                sink.emit_metrics(seat_volume_points(usage));
             }
+            samples
         }));
     }
 }
