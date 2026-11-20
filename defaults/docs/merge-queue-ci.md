@@ -110,11 +110,14 @@ protected Git objects, independent of the candidate checkout's files.
 
 Use a read-only job named `docs_only`, with Actions and Contents read access.
 Use the approved Loom binary at a pinned revision and a full-history,
-credential-free checkout of the exact event SHA. Do not build or source the
+credential-free checkout of the exact event SHA. A dirty or unreadable index
+or tracked worktree runs the full suites. Do not build or source the
 classifier from that checkout. With the job's scoped token in `GH_TOKEN`,
 the step named `classify` runs the native command below. The installed thin
 entry point `.loom/scripts/ci-docs-only.sh` forwards the same arguments to
-`LOOM_DAEMON_BIN` or `loom-daemon`. Use only a protected copy of that entry
+`LOOM_DAEMON_BIN` or `loom-daemon`. With a supported older daemon that lacks
+the command, this entry point returns `docs_only=false`. Other invocation
+failures retain their exit status. Use only a protected copy of that entry
 point and the pinned binary in CI.
 
 ```bash

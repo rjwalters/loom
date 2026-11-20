@@ -401,3 +401,91 @@ fn a_partial_or_ambiguous_diff_never_classifies_as_docs_only() {
     let newline = good.replace("WORK_LOG.md", "WORK_LOG.md\napp.rs");
     assert!(super::tree::check_diff(newline.as_bytes(), &policy).is_err());
 }
+
+#[test]
+fn only_the_clean_event_checkout_can_reuse_the_green_push() {
+    let f = Fixture::new();
+    let head = f.docs_edit();
+    assert_eq!(f.push(&head, &f.seed, Some(&f.seed)), Ok(()));
+
+    let event = f.args(Event::Push, &head, json!({"ref": "refs/heads/main", "after": head}));
+    let unavailable = f.forge(|_| panic!("an unverified checkout does not consult the forge"));
+    f.write("app.rs", "modified worktree code\n");
+    assert_eq!(classify(&event, &unavailable), Err("checkout_unverified"));
+    f.git(&["add", "app.rs"]);
+    assert_eq!(classify(&event, &unavailable), Err("checkout_unverified"));
+
+    f.git(&[
+        "restore",
+        "--staged",
+        "--worktree",
+        "--source=HEAD",
+        "app.rs",
+    ]);
+    assert_eq!(f.push(&head, &f.seed, Some(&f.seed)), Ok(()));
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        f.git(&["update-index", flag, "app.rs"]);
+        f.write("app.rs", "hidden worktree change\n");
+        assert_eq!(classify(&event, &unavailable), Err("checkout_unverified"));
+        let clear_flag = format!("--no-{}", &flag[2..]);
+        f.git(&["update-index", &clear_flag, "app.rs"]);
+        f.git(&["restore", "app.rs"]);
+    }
+
+    std::fs::write(f.repo.path().join(".git/index"), b"unreadable index").unwrap();
+    assert_eq!(classify(&event, &unavailable), Err("checkout_unverified"));
+}
+
+#[cfg(unix)]
+#[test]
+fn launcher_degrades_only_for_the_older_daemons_unsupported_command() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempfile::tempdir().unwrap();
+    let daemon = scratch.path().join("loom-daemon-fixture");
+    let launcher =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts/ci-docs-only.sh");
+    for (body, code, stdout, diagnostic) in [
+        (
+            "printf '%s\\n' docs_only=true; printf '%s\\n' allowed_docs >&2",
+            0,
+            "docs_only=true\n",
+            "allowed_docs",
+        ),
+        (
+            "printf '%s\\n' \"error: unrecognized subcommand 'ci-docs-only'\" >&2; exit 2",
+            0,
+            "docs_only=false\n",
+            "reason=command_unavailable",
+        ),
+        (
+            "printf '%s\\n' 'error: unexpected argument' >&2; exit 2",
+            2,
+            "",
+            "error: unexpected argument",
+        ),
+        (
+            "printf '%s\\n' \"error: unrecognized subcommand 'other'\" >&2; exit 2",
+            2,
+            "",
+            "error: unrecognized subcommand 'other'",
+        ),
+        (
+            "printf '%s\\n' 'error: classifier crashed' >&2; exit 1",
+            1,
+            "",
+            "error: classifier crashed",
+        ),
+    ] {
+        std::fs::write(&daemon, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new("bash")
+            .arg(&launcher)
+            .env("LOOM_DAEMON_BIN", &daemon)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{body}");
+        assert_eq!(output.stdout, stdout.as_bytes(), "{body}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic), "{body}");
+    }
+}

@@ -32,7 +32,9 @@ impl<'a> Forge<'a> {
                 .current_dir(root)
                 .identity_scope(Some("github.com"), Some(repo))
                 .reader_only()
-                .args(["api", "--hostname", "github.com", "--method", "GET", path])
+                // A field-free gh api call is the standard GET route. The
+                // invocation is also pinned to the reader by intent.
+                .args(["api", "--hostname", "github.com", path])
                 .run();
                 serde_json::from_slice(&result.ok_output()?.stdout).ok()
             }),

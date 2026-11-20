@@ -20,16 +20,55 @@ pub(super) struct Tree<'a>(&'a Path);
 impl<'a> Tree<'a> {
     pub(super) fn new(root: &'a Path, head: &str) -> Option<Self> {
         let tree = Self(root);
-        (tree.text(&["rev-parse", "--show-prefix"])?.is_empty()
+        let top = tree.text(&["rev-parse", "--show-toplevel"])?;
+        (std::fs::canonicalize(top).ok()? == root.canonicalize().ok()?
             && tree.text(&["rev-parse", "--is-shallow-repository"])? == "false"
             && tree.text(&["rev-parse", "--verify", "HEAD^{commit}"])? == head)
             .then_some(tree)
     }
 
+    /// Verify the staged tree and every tracked path. An index that hides
+    /// paths from Git's normal worktree comparison cannot prove the checkout.
+    pub(super) fn matches_checkout(&self, head: &str) -> bool {
+        let Some(index) = self.git(&["ls-files", "-v", "-z"]) else {
+            return false;
+        };
+        if !index.strip_suffix(b"\0").is_some_and(|files| {
+            files
+                .split(|byte| *byte == 0)
+                .all(|entry| entry.starts_with(b"H "))
+        }) {
+            return false;
+        }
+        let quiet_diff = [
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+        ];
+        self.git(&[&quiet_diff[..], &["--cached", head, "--"]].concat())
+            .as_deref()
+            == Some(b"")
+            && self.git(&[&quiet_diff[..], &["--"]].concat()).as_deref() == Some(b"")
+    }
+
     fn git(&self, args: &[&str]) -> Option<Vec<u8>> {
         let mut cmd = Command::new("git");
         cmd.current_dir(self.0)
-            .args(["--no-replace-objects", "--no-pager"])
+            .args([
+                "--no-replace-objects",
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.trustctime=true",
+                "-c",
+                "core.checkStat=default",
+                "-c",
+                "core.filemode=true",
+            ])
             .args(args)
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(Stdio::null());

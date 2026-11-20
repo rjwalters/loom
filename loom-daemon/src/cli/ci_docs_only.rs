@@ -83,6 +83,9 @@ fn classify(args: &CiDocsOnlyArgs, forge: &Forge<'_>) -> Result<(), &'static str
         return Err("event_mismatch");
     }
     let tree = Tree::new(&args.root, &args.head).ok_or("history_unavailable")?;
+    if !tree.matches_checkout(&args.head) {
+        return Err("checkout_unverified");
+    }
     let (base, protected) = match args.event {
         Event::PullRequest => {
             let target = sha(&payload, "/pull_request/base/sha").ok_or("event_mismatch")?;
