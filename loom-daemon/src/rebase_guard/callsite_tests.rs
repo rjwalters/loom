@@ -8,6 +8,11 @@
 
 use std::path::PathBuf;
 
+/// The always-read Judge prompt.
+const JUDGE_CORE: &str = "defaults/.claude/commands/loom/judge.md";
+/// Where the Judge's DIRTY update recipes live since the #13957 split.
+const JUDGE_MERGE_CONFLICTS: &str = "defaults/.claude/commands/loom/judge-merge-conflicts.md";
+
 fn shipped(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -55,7 +60,12 @@ fn guarded_paths(rel: &str, text: &str) -> usize {
 fn all_paths_call_the_guard_before_the_force_push() {
     for (rel, expected) in [
         // 2: the BEHIND path no longer updates the branch at all (#12063 D6).
-        ("defaults/.claude/commands/loom/judge.md", 2),
+        // Judge's update recipes run only on a DIRTY PR, so #13957 moved them
+        // out of the always-read `judge.md` into this on-demand sub-skill.
+        (JUDGE_MERGE_CONFLICTS, 2),
+        // The core keeps none: a push recipe re-added there would sit outside
+        // the sub-skill this test counts.
+        (JUDGE_CORE, 0),
         // 2, not 3: the unlabeled-queue block no longer pushes itself; it defers to
         // "PR Has Merge Conflicts" (#10771), so it has no gate-then-push path of its own.
         ("defaults/.claude/commands/loom/doctor.md", 2),
@@ -69,9 +79,11 @@ fn all_paths_call_the_guard_before_the_force_push() {
 
 #[test]
 fn judge_no_longer_carries_its_own_empty_diff_predicate() {
-    let judge = shipped("defaults/.claude/commands/loom/judge.md");
-    assert!(!judge.contains("PRE_REBASE_AHEAD"));
-    assert!(!judge.contains("git diff --quiet origin/main HEAD"));
+    for rel in [JUDGE_CORE, JUDGE_MERGE_CONFLICTS] {
+        let judge = shipped(rel);
+        assert!(!judge.contains("PRE_REBASE_AHEAD"), "{rel}");
+        assert!(!judge.contains("git diff --quiet origin/main HEAD"), "{rel}");
+    }
 }
 
 /// An unanswered guard must be loud at every prompt call site: a daemon that
@@ -79,7 +91,8 @@ fn judge_no_longer_carries_its_own_empty_diff_predicate() {
 #[test]
 fn every_prompt_call_site_warns_when_the_guard_gives_no_answer() {
     for (rel, expected) in [
-        ("defaults/.claude/commands/loom/judge.md", 2),
+        (JUDGE_MERGE_CONFLICTS, 2),
+        (JUDGE_CORE, 0),
         ("defaults/.claude/commands/loom/doctor.md", 2),
     ] {
         let text = shipped(rel);

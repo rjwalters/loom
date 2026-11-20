@@ -2182,7 +2182,7 @@ contamination, preserved for investigation." The pop happened to conflict, so
 nothing was lost this time (the Judge ran `git reset --hard` to discard the
 partial application and verified the stash stack was intact afterward) — but a
 **clean** pop would have silently dropped the preserved entry with no recovery
-path. See `defaults/roles/judge.md`'s "Rebase Check" section for the
+path. See `defaults/.claude/commands/loom/judge-merge-conflicts.md` (ex-`judge.md`'s "Rebase Check" section, issue #13957) for the
 prescribed alternative (merge `origin/main` into the PR branch inside an
 isolated worktree, never a main-checkout test-merge).
 

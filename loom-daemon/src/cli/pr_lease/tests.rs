@@ -1496,7 +1496,11 @@ fn two_hosts_reclaiming_one_stale_judge_claim_produce_one_winner() {
 #[test]
 fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
     const GATE: &str = "[[ $? =~ ^[02]$ ]]";
-    let prompts: [(&str, &str, usize); 4] = [
+    // #13957 split judge.md into an always-read core plus on-demand
+    // sub-skills, so its seven gates are counted where each now lives. The
+    // total is unchanged: 2 (core) + 2 (claims) + 2 (merge conflicts) + 1
+    // (trivial fixes).
+    let prompts: [(&str, &str, usize); 10] = [
         (
             "doctor.md",
             include_str!("../../../../defaults/.claude/commands/loom/doctor.md"),
@@ -1505,7 +1509,22 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "judge.md",
             include_str!("../../../../defaults/.claude/commands/loom/judge.md"),
-            7, // the BEHIND push and its fence are gone (#12063 D6)
+            2,
+        ),
+        (
+            "judge-claims.md",
+            include_str!("../../../../defaults/.claude/commands/loom/judge-claims.md"),
+            2,
+        ),
+        (
+            "judge-merge-conflicts.md",
+            include_str!("../../../../defaults/.claude/commands/loom/judge-merge-conflicts.md"),
+            2, // the BEHIND push and its fence are gone (#12063 D6)
+        ),
+        (
+            "judge-trivial-fixes.md",
+            include_str!("../../../../defaults/.claude/commands/loom/judge-trivial-fixes.md"),
+            1,
         ),
         (
             "loom-doctor/SKILL.md",
@@ -1515,7 +1534,22 @@ fn prompt_lease_gates_proceed_only_on_exit_0_or_2() {
         (
             "loom-judge/SKILL.md",
             include_str!("../../../../defaults/.agents/skills/loom-judge/SKILL.md"),
-            7, // the BEHIND push and its fence are gone (#12063 D6)
+            2,
+        ),
+        (
+            "loom-judge-claims/SKILL.md",
+            include_str!("../../../../defaults/.agents/skills/loom-judge-claims/SKILL.md"),
+            2,
+        ),
+        (
+            "loom-judge-merge-conflicts/SKILL.md",
+            include_str!("../../../../defaults/.agents/skills/loom-judge-merge-conflicts/SKILL.md"),
+            2, // the BEHIND push and its fence are gone (#12063 D6)
+        ),
+        (
+            "loom-judge-trivial-fixes/SKILL.md",
+            include_str!("../../../../defaults/.agents/skills/loom-judge-trivial-fixes/SKILL.md"),
+            1,
         ),
     ];
     for (name, text, gates) in prompts {

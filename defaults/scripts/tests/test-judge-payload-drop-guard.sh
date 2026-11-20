@@ -3,7 +3,8 @@
 #
 # THE FAILURE MODE THIS GUARDS AGAINST
 #
-# judge.md's "If DIRTY: Attempt Automated Rebase" workflow runs
+# The Judge's "If DIRTY: Attempt Automated Rebase" workflow (in
+# judge-merge-conflicts.md since the #13957 split; see below) runs
 # `git rebase origin/main` and, on exit 0, proceeds straight to
 # `git push --force-with-lease`. The incident: two independent single-line
 # edits on adjacent lines with no separating context in the same file
@@ -18,7 +19,7 @@
 # Deliberately NOT a prose-existence assertion (see
 # test-judge-tdd-merge-base.sh's header for the citation). EXTRACTS the real
 # fenced ```bash``` block shipped under "If DIRTY: Attempt Automated Rebase"
-# in judge.md and RUNS it (real `git`, stubbed `gh`/`post-verdict.sh`)
+# in judge-merge-conflicts.md and RUNS it (real `git`, stubbed `gh`/`post-verdict.sh`)
 # against purpose-built git fixtures:
 #
 #   1. The exact repro shape (#8298): a rebase that git silently drops via
@@ -59,11 +60,27 @@ if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
 else
     PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
 fi
-JUDGE_MD="$PROMPT_DIR/judge.md"
+# #13957 split judge.md into an always-read core plus on-demand sub-skills.
+# The DIRTY update recipe is trigger-gated (it runs only when mergeStateStatus
+# is DIRTY), so it ships in judge-merge-conflicts.md and THAT is the file the
+# fence is extracted from. The core is checked separately, below, for the
+# pointer that sends a Judge there -- without it the recipe (and this guard)
+# would be unreachable from the workflow.
+JUDGE_CORE_MD="$PROMPT_DIR/judge.md"
+JUDGE_MD="$PROMPT_DIR/judge-merge-conflicts.md"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 [[ -f "$JUDGE_MD" ]] || { echo "FATAL: subject not found: $JUDGE_MD" >&2; exit 1; }
+[[ -f "$JUDGE_CORE_MD" ]] || { echo "FATAL: subject not found: $JUDGE_CORE_MD" >&2; exit 1; }
+
+# The core must still route a DIRTY PR to the sub-skill that holds the fence.
+CORE_DIRTY_ROUTE="$(grep -F 'mergeStateStatus` is `DIRTY`' "$JUDGE_CORE_MD" | grep -F '[judge-merge-conflicts.md](judge-merge-conflicts.md)' || true)"
+if [[ -n "$CORE_DIRTY_ROUTE" ]]; then
+    pass "judge.md routes a DIRTY PR to judge-merge-conflicts.md"
+else
+    fail "judge.md routes a DIRTY PR to judge-merge-conflicts.md (the gated update recipe is unreachable from the core)"
+fi
 
 # =====================================================================
 # Extract the shipped ```bash``` fence under "If DIRTY: Attempt Automated
@@ -86,7 +103,7 @@ if [[ -z "$FENCE_SRC" || "$FENCE_SRC" != *"forge rebase-guard --base origin/main
     echo "FATAL: could not extract the DIRTY-rebase fence (with the #9282 rebase-guard call) from $JUDGE_MD" >&2
     exit 1
 fi
-pass "extracted the shipped DIRTY-rebase block (with the rebase-guard call) from judge.md"
+pass "extracted the shipped DIRTY-rebase block (with the rebase-guard call) from judge-merge-conflicts.md"
 assert_not_contains "$FENCE_SRC" "PRE_REBASE_AHEAD" \
     "the block no longer carries its own inline empty-diff predicate (#9282)"
 
@@ -95,7 +112,7 @@ assert_not_contains "$FENCE_SRC" "PRE_REBASE_AHEAD" \
 # leaving everything else byte-for-byte as shipped.
 FENCE_SRC="$(printf '%s\n' "$FENCE_SRC" | sed '1s/^PR_NUMBER=<number>$/PR_NUMBER=999/')"
 if [[ "${FENCE_SRC%%$'\n'*}" != "PR_NUMBER=999" ]]; then
-    echo "FATAL: judge.md's DIRTY-rebase fence no longer starts with 'PR_NUMBER=<number>' -- update this test's substitution" >&2
+    echo "FATAL: judge-merge-conflicts.md's DIRTY-rebase fence no longer starts with 'PR_NUMBER=<number>' -- update this test's substitution" >&2
     exit 1
 fi
 

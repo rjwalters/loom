@@ -61,12 +61,20 @@ resolve_role_md() {
     fi
 }
 JUDGE_MD="$(resolve_role_md judge)"
+# #13957 split judge.md into an always-read core plus on-demand sub-skills. The
+# claim-arbitration DETAIL (stand-down command, marker rules, bounded fallback,
+# env vars) is trigger-gated -- it applies only when the candidate PR already
+# carries loom:reviewing -- and ships in judge-claims.md. The core keeps the
+# entry point: the `claim-staleness.sh check` call, the CLAIM_STATE decision,
+# and the pointer. So the judge lane is checked across both files, each for
+# what it must hold, and the "no private re-implementation" bans apply to both.
+JUDGE_CLAIMS_MD="$(resolve_role_md judge-claims)"
 DOCTOR_MD="$(resolve_role_md doctor)"
 CURATOR_MD="$(resolve_role_md curator)"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-for f in "$JUDGE_MD" "$DOCTOR_MD" "$CURATOR_MD"; do
+for f in "$JUDGE_MD" "$JUDGE_CLAIMS_MD" "$DOCTOR_MD" "$CURATOR_MD"; do
     [[ -f "$f" ]] || {
         echo "FATAL: missing $f"
         exit 1
@@ -99,11 +107,28 @@ assert_file_lacks() { # <label> <file> <substring>
 
 echo "Part A: role prompts drive claim-staleness.sh (no private re-implementation)"
 
-check_lane() { # <lane> <file> <claim-label>
-    local lane="$1" file="$2" label="$3"
+check_lane() { # <lane> <entry-file> <claim-label> [<detail-file>]
+    # <entry-file> is the always-read prompt: it must make the `check` call
+    # itself. <detail-file> (default: the entry file) holds the stand-down /
+    # marker / bounded-fallback detail; a lane that load-gates that detail
+    # passes its sub-skill here.
+    local lane="$1" entry="$2" label="$3" file="${4:-$2}"
 
     assert_file_contains "$lane: runs \`claim-staleness.sh check --label $label\`" \
-        "$file" "claim-staleness.sh check --number \"\$N\" --label $label"
+        "$entry" "claim-staleness.sh check --number \"\$N\" --label $label"
+    if [[ "$file" != "$entry" ]]; then
+        local detail
+        detail="$(basename "$file")"
+        assert_file_contains "$lane: the always-read prompt points at $detail for the claim detail" \
+            "$entry" "[$detail]($detail)"
+        # The bans below must hold in the always-read prompt too.
+        assert_file_lacks "$lane: no hand-rolled COMMENTS_AFTER computation (always-read prompt)" \
+            "$entry" 'COMMENTS_AFTER=$(printf'
+        assert_file_lacks "$lane: no hand-rolled duplicate-suppression block (always-read prompt)" \
+            "$entry" "LATEST_COMMENT_BODY="
+        assert_file_lacks "$lane: no 'any comment means fresh' decision row (always-read prompt)" \
+            "$entry" 'OR `COMMENTS_AFTER > 0`'
+    fi
     assert_file_contains "$lane: runs \`claim-staleness.sh standdown --label $label\`" \
         "$file" "claim-staleness.sh standdown --number \"\$N\" --label $label"
     assert_file_contains "$lane: documents the claim-activity marker (#6514)" \
@@ -124,7 +149,7 @@ check_lane() { # <lane> <file> <claim-label>
         "$file" 'OR `COMMENTS_AFTER > 0`'
 }
 
-check_lane "judge" "$JUDGE_MD" "loom:reviewing"
+check_lane "judge" "$JUDGE_MD" "loom:reviewing" "$JUDGE_CLAIMS_MD"
 check_lane "doctor" "$DOCTOR_MD" "loom:treating"
 check_lane "curator" "$CURATOR_MD" "loom:curating"
 
@@ -169,10 +194,10 @@ done < <(grep -oE 'CLAIM_STATE="[a-z-]+"' "$CLAIM_STALENESS" | sed 's/CLAIM_STAT
 
 # The three lanes must keep their distinct thresholds (a Doctor fix cycle
 # legitimately outruns a Judge review pass).
-assert_file_contains "judge: keeps LOOM_STALE_REVIEWING_MINUTES" "$JUDGE_MD" "LOOM_STALE_REVIEWING_MINUTES"
+assert_file_contains "judge: keeps LOOM_STALE_REVIEWING_MINUTES" "$JUDGE_CLAIMS_MD" "LOOM_STALE_REVIEWING_MINUTES"
 assert_file_contains "doctor: keeps LOOM_STALE_TREATING_MINUTES" "$DOCTOR_MD" "LOOM_STALE_TREATING_MINUTES"
 assert_file_contains "curator: keeps LOOM_STALE_CURATING_MINUTES" "$CURATOR_MD" "LOOM_STALE_CURATING_MINUTES"
-for f in "$JUDGE_MD" "$DOCTOR_MD" "$CURATOR_MD"; do
+for f in "$JUDGE_CLAIMS_MD" "$DOCTOR_MD" "$CURATOR_MD"; do
     assert_file_contains "$(basename "$f" .md): keeps LOOM_MAX_STANDDOWN_STREAK" \
         "$f" "LOOM_MAX_STANDDOWN_STREAK"
 done

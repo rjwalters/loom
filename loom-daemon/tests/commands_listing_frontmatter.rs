@@ -95,6 +95,21 @@ const REFERENCE_SUBDOCS: &[&str] = &[
     // curator helpers
     "curator-estimate",
     "curator-rate-budget",
+    // judge-* on-demand sub-skills (#13957; everything but `judge` itself —
+    // `judge-reference` and `judge-ci-red` are listed in their own groups)
+    "judge-ci-pending",
+    "judge-claims",
+    "judge-env-gap",
+    "judge-fallback",
+    "judge-fast-paths",
+    "judge-followups",
+    "judge-forge-api",
+    "judge-live-verification",
+    "judge-merge-conflicts",
+    "judge-pr-linking",
+    "judge-review-reconciliation",
+    "judge-trivial-fixes",
+    "judge-verdicts",
     // sweep-* detail pages (the `sweep` / `sweep-arguments` entry points
     // excepted)
     "sweep-backend-detection",
