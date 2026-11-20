@@ -940,7 +940,7 @@ fn recover_session(
 ) -> Result<RecoverReport> {
     let mut attempt = 0;
     loop {
-        match session_recover(workspace, name, action, issue, branches) {
+        match session_recover(workspace, name, action, issue, branches, &[]) {
             Err(error) if attempt < 20 && error.to_string().contains("busy") => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1287,6 +1287,66 @@ fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
     let report =
         recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
     assert!(report.clones[0].published.is_empty());
+}
+
+#[test]
+#[serial]
+fn a_worktree_refusal_in_a_second_clone_prevents_any_discard_exec() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mut config = env.config.clone();
+    let second = identify("https://forge.example/a/c").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: second.url,
+        base: "main".into(),
+        slug: second.slug,
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+
+    let engine = env.engine.clone();
+    let _wrap = docker::fake::install(Box::new(move |args| {
+        let mut engine = engine.borrow_mut();
+        if args.contains(&"recover") {
+            assert!(args.contains(&"--validate-worktrees"), "removal ran before validation");
+            engine.recover_response = Some(
+                if args.contains(&"--slug") {
+                    json!({"protocol": PROTOCOL, "error": "the main checkout is ineligible"})
+                } else {
+                    json!({
+                        "protocol": PROTOCOL,
+                        "outcome": {
+                            "repository": "https://forge.example/a/b", "cloned": true,
+                            "ignored": ["/workspace/work/second"], "branches": [],
+                            "published": [], "discarded": [], "detached": []
+                        }
+                    })
+                }
+                .to_string(),
+            );
+        }
+        engine.handle(args)
+    }));
+
+    let result = session_recover(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        None,
+        &[],
+        &[
+            PathBuf::from("/workspace/leftover"),
+            PathBuf::from("/workspace/work/second"),
+        ],
+    );
+    assert!(result.unwrap_err().to_string().contains("main checkout"));
+    let engine = env.engine();
+    let validations = engine
+        .calls
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "--validate-worktrees"));
+    assert_eq!(validations.count(), 2);
 }
 
 // ---------------------------------------------------------------------------
