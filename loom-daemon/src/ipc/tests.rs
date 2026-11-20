@@ -319,6 +319,26 @@ fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
     }
 }
 
+/// Build an issue-kind [`Request::DispatchSweep`] carrying the repeated
+/// per-test option set (`idempotency_key`, `model`, `effort`, `depends_on`
+/// and `dispatch_origin` all `None`, `force: false`). Only the issue number
+/// and the workspace root — the routing inputs each test actually varies —
+/// are parameters; a supplied path keeps the lossy string conversion the
+/// replaced literals used. Tests exercising other contracts (PR-set kind,
+/// wire-format serde) keep their explicit request shapes.
+fn issue_dispatch(issue: u32, workspace_root: Option<&std::path::Path>) -> Request {
+    Request::DispatchSweep {
+        kind: SweepKind::Issue(issue),
+        idempotency_key: None,
+        model: None,
+        effort: None,
+        depends_on: None,
+        workspace_root: workspace_root.map(|root| root.to_string_lossy().into_owned()),
+        force: false,
+        dispatch_origin: None,
+    }
+}
+
 #[test]
 fn dispatch_headroom_predicate_boundary() {
     assert!(
@@ -427,25 +447,8 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
     std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, "1");
 
-    let dispatch_issue = |n: u32| {
-        handle_request(
-            Request::DispatchSweep {
-                kind: SweepKind::Issue(n),
-                idempotency_key: None,
-                model: None,
-                effort: None,
-                depends_on: None,
-                workspace_root: None,
-                force: false,
-                dispatch_origin: None,
-            },
-            &tm,
-            &db,
-            &sr,
-            &bus,
-            &test_pool(),
-        )
-    };
+    let dispatch_issue =
+        |n: u32| handle_request(issue_dispatch(n, None), &tm, &db, &sr, &bus, &test_pool());
 
     // First dispatch always succeeds regardless of computed headroom.
     match dispatch_issue(90_001) {
@@ -520,23 +523,8 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
     // Dispatch issue #42 into repo B explicitly.
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(42),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched =
+        handle_request(issue_dispatch(42, Some(dir_b.path())), &tm, &db, &sr_default, &bus, &pool);
     let sweep_id = match dispatched {
         Response::SweepDispatched { sweep_id, .. } => sweep_id,
         other => panic!("Expected SweepDispatched, got: {other:?}"),
@@ -653,16 +641,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
     let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
 
     let dispatched_a = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_060),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_060, Some(dir_a.path())),
         &tm,
         &db,
         &sr_default,
@@ -675,16 +654,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
     );
 
     let dispatched_b = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_061),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_061, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -752,16 +722,7 @@ fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
 
     // Dispatch into repo B only.
     let dispatched_b = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_062),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_062, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -835,16 +796,7 @@ fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
     let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
 
     let dispatched_a = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_063),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_063, Some(dir_a.path())),
         &tm,
         &db,
         &sr_default,
@@ -932,23 +884,7 @@ fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
     // registered product repo.
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     assert!(
         matches!(dispatched, Response::SweepDispatched { .. }),
         "expected SweepDispatched, got: {dispatched:?}"
@@ -1018,23 +954,7 @@ fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
 
     let _guard = seed_temp_registry(&[dir_b.path(), dir_c.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     match dispatched {
         Response::StructuredError(err) => {
             assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_AMBIGUOUS);
@@ -1070,16 +990,7 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
     let _guard = seed_temp_registry(&[dir_a.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5210),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5210, Some(dir_unregistered.path())),
         &tm,
         &db,
         &sr_default,
@@ -1143,16 +1054,7 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
     let _guard = seed_temp_registry(&[dir_a.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5345),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5345, Some(dir_unregistered.path())),
         &tm,
         &db,
         &sr_default,
@@ -1200,16 +1102,7 @@ fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5345),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5345, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -1249,23 +1142,8 @@ fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_err
     // Isolate from a stray real `LOOM_SWEEP_SPAWN_BIN` in the test env.
     std::env::remove_var(crate::sweep_registry::SPAWN_BIN_ENV);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5210),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &pool,
-    );
+    let dispatched =
+        handle_request(issue_dispatch(5210, Some(dir.path())), &tm, &db, &sr, &bus, &pool);
     match dispatched {
         Response::Error { message } => {
             assert!(
@@ -1321,23 +1199,7 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
 
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     match dispatched {
         Response::Error { message } => {
             // The guard message embeds `SweepRegistryConfig::workspace_root`
@@ -1388,23 +1250,7 @@ fn test_handle_request_dispatch_sweep_happy_path() {
     // is deterministic regardless of the host's real registry.
     let _registry_guard = seed_temp_registry(&[]);
 
-    let response = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(2024),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let response = handle_request(issue_dispatch(2024, None), &tm, &db, &sr, &bus, &test_pool());
     match response {
         Response::SweepDispatched {
             sweep_id,
@@ -1472,23 +1318,7 @@ fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
     // is deterministic regardless of the host's real registry.
     let _registry_guard = seed_temp_registry(&[]);
 
-    let response = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(3964),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let response = handle_request(issue_dispatch(3964, None), &tm, &db, &sr, &bus, &test_pool());
     assert!(
         matches!(response, Response::SweepDispatched { .. }),
         "expected SweepDispatched, got: {response:?}"
@@ -3226,18 +3056,9 @@ fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
     let _registry_guard = seed_temp_registry(&[]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4980),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            // `None` resolves to the default registry `sr` — the same
-            // tempdir-rooted registry the cancel below targets.
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
+        // `None` resolves to the default registry `sr` — the same
+        // tempdir-rooted registry the cancel below targets.
+        issue_dispatch(4980, None),
         &tm,
         &db,
         &sr,
@@ -3297,23 +3118,7 @@ fn test_handle_request_get_sweep_status_returns_existing() {
     let _registry_guard = seed_temp_registry(&[]);
 
     // Dispatch a sweep to get a real entry in the registry.
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(444),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let dispatched = handle_request(issue_dispatch(444, None), &tm, &db, &sr, &bus, &test_pool());
     let sweep_id = match dispatched {
         Response::SweepDispatched { sweep_id, .. } => sweep_id,
         other => panic!("Expected SweepDispatched, got: {other:?}"),
