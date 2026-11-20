@@ -26,8 +26,9 @@ pub(crate) struct CommonArgs {
     #[arg(long, value_name = "OWNER/NAME")]
     pub(crate) repo: Option<String>,
 
-    /// `operator-premise` live mode: the already-extracted reference numbers,
-    /// space-separated (typically `extract-refs`'s own REFS output).
+    /// Live mode: the already-extracted reference numbers, space-separated
+    /// (typically `extract-refs`'s own REFS output). For `dep-states` the
+    /// dependency refs, each `N` or `OWNER/REPO#N`, whitespace-separated.
     #[arg(long, value_name = "N1 N2 ...")]
     pub(crate) refs: Option<String>,
 
@@ -132,6 +133,17 @@ pub(crate) enum DepRecheckCommand {
         #[arg(long = "heartbeat-hours", value_name = "N")]
         heartbeat_hours: Option<String>,
     },
+
+    /// Terminal-state resolution for the Guide's unblock sweep (#14710):
+    /// `ALL_RESOLVED` plus the resolved/open/unknown split of `--refs`, each
+    /// state read live and verified to name the exact `OWNER/REPO#N` it was
+    /// asked about. An open draft, an unreadable read, or a mismatched answer
+    /// all fail closed. Live-only — there is no `--stdin` mode, because the
+    /// binding-verified read IS the check this subcommand exists to perform.
+    DepStates {
+        #[command(flatten)]
+        common: CommonArgs,
+    },
 }
 
 impl DepRecheckCommand {
@@ -190,6 +202,9 @@ impl DepRecheckCommand {
                     ..Default::default()
                 },
             ),
+            DepRecheckCommand::DepStates { common } => {
+                (cli::Sub::DepStates, common, cli::Opts::default())
+            }
         };
 
         opts.number = common.number;
