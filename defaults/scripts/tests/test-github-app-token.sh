@@ -441,8 +441,7 @@ echo "Testing scoped-token narrow issuance (#14716)..."
 # The scoped stub answers the access_tokens route with repository-bound
 # evidence; a response naming no repository must refuse, never patch up.
 # Exported like STUB_INSTALL_BODY: the curl stub runs in the CHILD shell.
-scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z","repository_selection":"selected","repositories":[{"id":907216439,"full_name":"cliowner/repo"}]}'
-export scoped_curl_body
+export scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z","repository_selection":"selected","repositories":[{"id":907216439,"full_name":"cliowner/repo"}]}'
 curl() {
     local url=""
     printf '%s\n' "$*" >> "$STUB_CURL_ARGV_LOG"
