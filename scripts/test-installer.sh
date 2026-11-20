@@ -4007,6 +4007,88 @@ else
 fi
 echo ""
 
+# Run the installers' actual metadata writers on fresh targets without running
+# dependency builds, host provisioning, or Full Install's forge workflow.
+echo "Test: Quick Install, Full Install and resync record the source compatibility floor (#14740)"
+if command -v jq >/dev/null 2>&1; then
+  stamp_source="$TEST_DIR/stamp-source"
+  create_temp_repo "$stamp_source"
+  mkdir -p "$stamp_source/loom-daemon/src" "$stamp_source/scripts/install" "$stamp_source/defaults/hooks"
+  cp "$LOOM_ROOT/loom-daemon/src/install_compat.rs" "$stamp_source/loom-daemon/src/"
+  cp "$LOOM_ROOT/scripts/install/loom-source-path.sh" "$stamp_source/scripts/install/"
+  jq '{version}' "$LOOM_ROOT/package.json" > "$stamp_source/package.json"
+  printf '#!/bin/sh\nexit 0\n' > "$stamp_source/defaults/hooks/guard-stamp-test.sh"
+  git -C "$stamp_source" add .
+  git -C "$stamp_source" commit -qm "Add the install source fixture"
+  stamp_floor=$(sed -n 's/^pub const REQUIRES_DAEMON: &str = "\([0-9.]*\)";$/\1/p' "$LOOM_ROOT/loom-daemon/src/install_compat.rs")
+  stamp_version=$(jq -r '.version' "$stamp_source/package.json")
+  stamp_commit=$(git -C "$stamp_source" rev-parse HEAD)
+
+  quick_target="$TEST_DIR/stamp-quick"
+  full_target="$TEST_DIR/stamp-full"
+  resync_target="$TEST_DIR/stamp-resync"
+  for target in "$quick_target" "$full_target" "$resync_target"; do
+    create_temp_repo "$target"
+    mkdir -p "$target/.loom"
+  done
+
+  # The Quick metadata write must also work without jq on PATH.
+  stamp_tools="$TEST_DIR/stamp-tools"
+  mkdir "$stamp_tools"
+  for tool in cat date git sed; do
+    ln -s "$(command -v "$tool")" "$stamp_tools/$tool"
+  done
+  write_quick_metadata() (
+    export PATH="$stamp_tools"
+    info() { :; }
+    success() { :; }
+    warning() { :; }
+    source <(sed -n '/^finalize_quick_install() {/,/^# Verify critical installation files/p' "$WRAPPER_SCRIPT")
+    LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" finalize_quick_install "$stamp_source" "$1"
+  )
+  write_quick_metadata "$quick_target"
+  (
+    cd "$full_target"
+    LOOM_ROOT="$stamp_source" LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" INSTALLED_FILES_JSON='[]'
+    source <(sed -n '/^LOOM_SOURCE_REMOTE=""$/,/^METADATA$/p' "$INSTALL_SCRIPT")
+  )
+
+  jq 'del(.requires_daemon)' "$full_target/.loom/install-metadata.json" > "$resync_target/.loom/install-metadata.json"
+  printf '%s\n' "$stamp_source" > "$resync_target/.loom/loom-source-path"
+  git -C "$resync_target" add -f .loom/install-metadata.json
+  git -C "$resync_target" commit -qm "Install before resync"
+  (cd "$resync_target" && bash "$DEFAULTS_DIR/scripts/resync-installed.sh" > "$TEST_DIR/stamp-resync.log" 2>&1)
+
+  for target in "$quick_target" "$full_target" "$resync_target"; do
+    if jq -e --arg floor "$stamp_floor" '$floor != "" and .requires_daemon == $floor' \
+      "$target/.loom/install-metadata.json" >/dev/null; then
+      pass "${target##*/} records the current source floor (#14740)"
+    else
+      fail "${target##*/} did not record the current source floor (#14740)"
+    fi
+  done
+  if jq -ne --slurpfile quick "$quick_target/.loom/install-metadata.json" \
+    --slurpfile full "$full_target/.loom/install-metadata.json" \
+    --slurpfile resync "$resync_target/.loom/install-metadata.json" \
+    '($quick[0] | keys) == ($full[0] | keys) and
+     ($quick[0] | keys) == ($resync[0] | del(.last_resync) | keys)' >/dev/null; then
+    pass "fresh install and resync have the same install metadata keys (#14740)"
+  else
+    fail "install metadata keys differ across install and resync (#14740)"
+  fi
+
+  legacy_target="$TEST_DIR/stamp-legacy"
+  mkdir -p "$legacy_target/.loom"
+  mv "$stamp_source/loom-daemon/src/install_compat.rs" "$TEST_DIR/pre-contract-floor.rs"
+  write_quick_metadata "$legacy_target"
+  if jq -e 'has("requires_daemon") | not' "$legacy_target/.loom/install-metadata.json" >/dev/null; then
+    pass "Quick Install omits an unknown compatibility floor (#14740)"
+  else
+    fail "Quick Install stamped a floor for a pre-contract source (#14740)"
+  fi
+fi
+echo ""
+
 # ==========================================================================
 # Summary
 # ==========================================================================
