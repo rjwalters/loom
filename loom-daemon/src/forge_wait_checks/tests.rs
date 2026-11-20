@@ -1042,6 +1042,211 @@ fn superseded_twin_run_residue_is_dropped() {
 }
 
 // ---------------------------------------------------------------------------
+// #14571: a later skipped run must not resurrect a replaced cancellation
+// ---------------------------------------------------------------------------
+
+/// A check-run row owned by run `run_id`'s suite `suite`, with its own job
+/// URL, so a failure's stderr detail identifies exactly which row it came from.
+fn job(name: &str, conclusion: &str, suite: u64, run_id: u64, job_id: u64) -> Value {
+    let url = format!("https://github.com/o/r/actions/runs/{run_id}/job/{job_id}");
+    json!({"name": name, "status": "completed", "conclusion": conclusion, "id": job_id,
+           "check_suite": {"id": suite}, "html_url": url, "details_url": url})
+}
+
+fn flow(id: u64, suite: u64, created: &str, status: &str, conclusion: Option<&str>) -> Value {
+    json!({"id": id, "workflow_id": 7, "check_suite_id": suite, "event": "pull_request",
+           "head_sha": SHA, "created_at": created, "name": "Changelog", "status": status,
+           "conclusion": conclusion, "pull_requests": [{"number": 42}]})
+}
+
+const CHANGELOG: &str = "Changelog Fragment Check";
+
+/// The kicad-tools#9396 records: cancelled run 100, successful run 101 (both
+/// report the required job), then run 102, skipped, whose only job is named
+/// differently.
+fn three_runs() -> Vec<Value> {
+    vec![
+        flow(100, 1, "2026-11-18T12:00:12Z", "completed", Some("cancelled")),
+        flow(101, 2, "2026-11-18T12:00:19Z", "completed", Some("success")),
+        flow(102, 3, "2026-11-18T12:58:31Z", "completed", Some("skipped")),
+    ]
+}
+
+fn three_rows() -> Vec<Value> {
+    vec![
+        job(CHANGELOG, "cancelled", 1, 100, 1000),
+        job(CHANGELOG, "success", 2, 101, 1010),
+        job("Changelog Gate", "skipped", 3, 102, 1020),
+    ]
+}
+
+fn serve_flows(f: &Forge, flows: Vec<Value>) {
+    f.serve(
+        &actions_runs_url(SHA),
+        &json!({"total_count": flows.len(), "workflow_runs": flows}),
+    );
+}
+
+fn settled(timeout: u64) -> Opts {
+    Opts {
+        settle_red: true,
+        ..opts(timeout)
+    }
+}
+
+/// Both snapshots read GREEN for the same SHA, in either row order, with the
+/// default and `--settle-red` reads.
+#[test]
+fn a_skipped_run_with_other_job_names_does_not_flip_green_to_red() {
+    let two = (three_rows()[..2].to_vec(), three_runs()[..2].to_vec());
+    let three = (three_rows(), three_runs());
+    for (rows, flows) in [two, three] {
+        for flip in [false, true] {
+            for o in [opts(0), settled(0)] {
+                let (mut rows, mut flows) = (rows.clone(), flows.clone());
+                if flip {
+                    rows.reverse();
+                    flows.reverse();
+                }
+                let f = Forge::new();
+                f.runs(SHA, &rows);
+                serve_flows(&f, flows);
+                let got = go(&f, Selector::Pr(42), &o, &mut FakeClock::new());
+                assert_eq!(got, Outcome::Green { sha: SHA.into() }, "flip={flip}");
+            }
+        }
+    }
+}
+
+/// A cancellation nothing replaced is neither GREEN nor RED — also when the
+/// run metadata is missing or incomplete, which cannot establish a
+/// replacement.
+#[test]
+fn an_unreplaced_cancellation_is_pending_never_green_or_red() {
+    let only = || vec![job(CHANGELOG, "cancelled", 1, 100, 1000)];
+    let incomplete = {
+        let mut flows = three_runs();
+        flows[1].as_object_mut().unwrap().remove("created_at");
+        flows
+    };
+    let cases = [
+        ("no runs fixture", only(), None),
+        (
+            "lone cancelled run",
+            only(),
+            Some(vec![flow(
+                100,
+                1,
+                "2026-11-18T12:00:12Z",
+                "completed",
+                Some("cancelled"),
+            )]),
+        ),
+        ("incomplete metadata", three_rows(), Some(incomplete)),
+        (
+            "replacement still running",
+            three_rows()[..2].to_vec(),
+            Some(vec![
+                flow(100, 1, "2026-11-18T12:00:12Z", "completed", Some("cancelled")),
+                flow(101, 2, "2026-11-18T12:00:19Z", "in_progress", None),
+            ]),
+        ),
+    ];
+    for (why, rows, flows) in cases {
+        for o in [opts(0), settled(0)] {
+            let f = Forge::new();
+            f.runs(SHA, &rows);
+            if let Some(flows) = flows.clone() {
+                serve_flows(&f, flows);
+            }
+            let got = go(&f, Selector::Pr(42), &o, &mut FakeClock::new());
+            assert!(matches!(got, Outcome::Timeout { .. }), "{why}: {got:?}");
+        }
+    }
+}
+
+/// An unreplaced genuine failure still reads RED once settled: one in another
+/// workflow with the same job name, and one in a job later suites omit. The
+/// stderr detail names the failing row, not its green sibling, in either
+/// row order.
+#[test]
+fn genuine_failures_stay_red_and_name_the_failing_job() {
+    // Same job name in two workflows: the later green run is not a twin.
+    let mut other = flow(101, 2, "2026-11-18T12:00:19Z", "completed", Some("success"));
+    other["workflow_id"] = json!(8);
+    let cases = [
+        (
+            vec![
+                job(CHANGELOG, "failure", 1, 100, 1000),
+                job(CHANGELOG, "success", 2, 101, 1010),
+            ],
+            vec![
+                flow(100, 1, "2026-11-18T12:00:12Z", "completed", Some("failure")),
+                other,
+            ],
+            ("100", 1000),
+        ),
+        // A failing job that no later suite reports, beside a replaced cancellation.
+        (
+            vec![
+                job(CHANGELOG, "cancelled", 1, 100, 1000),
+                job("Unit Tests", "failure", 1, 100, 1001),
+                job(CHANGELOG, "success", 2, 101, 1010),
+                job("Changelog Gate", "skipped", 3, 102, 1020),
+            ],
+            three_runs(),
+            ("100", 1001),
+        ),
+    ];
+    for (rows, flows, (run_id, job_id)) in cases {
+        for flip in [false, true] {
+            let (mut rows, mut flows) = (rows.clone(), flows.clone());
+            if flip {
+                rows.reverse();
+                flows.reverse();
+            }
+            let f = Forge::new();
+            f.runs(SHA, &rows);
+            serve_flows(&f, flows);
+            let got = go(&f, Selector::Pr(42), &settled(0), &mut FakeClock::new());
+            let Outcome::Red { failed, .. } = got else {
+                panic!("expected RED, got {got:?}");
+            };
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert_eq!(failed[0].run_id, run_id);
+            assert!(failed[0].url.ends_with(&format!("/job/{job_id}")), "{failed:?}");
+        }
+    }
+}
+
+/// An outstanding run keeps the wait pending even beside a replaced cancellation.
+#[test]
+fn an_outstanding_run_keeps_the_wait_pending() {
+    let f = Forge::new();
+    f.runs(
+        SHA,
+        &[
+            job(CHANGELOG, "cancelled", 1, 100, 1000),
+            job(CHANGELOG, "success", 2, 101, 1010),
+            json!({"name": "Changelog Gate", "status": "in_progress", "conclusion": null,
+                   "check_suite": {"id": 3}}),
+        ],
+    );
+    let mut flows = three_runs();
+    flows[2]["status"] = json!("in_progress");
+    flows[2]["conclusion"] = Value::Null;
+    serve_flows(&f, flows);
+    let got = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+    assert_eq!(
+        got,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["Changelog Gate".into()]
+        }
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #13940: a startup-failed run owns no check runs — RED, not an absence
 // ---------------------------------------------------------------------------
 
@@ -1250,6 +1455,181 @@ fn vanished_failed_classification_and_attribution() {
     assert!(vanished_failed_workflows(&elsewhere, &empty, SHA).is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// #14128: a terminal-failed run whose check runs are stranded non-terminal
+// ---------------------------------------------------------------------------
+
+/// A check-run row owned by check suite `suite`.
+fn in_suite(name: &str, status: &str, conclusion: Option<&str>, suite: u64) -> Value {
+    let mut row = run(name, status, conclusion);
+    row["check_suite"] = json!({"id": suite});
+    row
+}
+
+fn serve_runs(f: &Forge, runs: &[Value]) {
+    f.serve(
+        &actions_runs_url(SHA),
+        &json!({"total_count": runs.len(), "workflow_runs": runs}),
+    );
+}
+
+/// The measured payload (this repo, a `startup_failure` run): jobs `queued`
+/// with a null conclusion under a run that is long terminal, beside skipped
+/// rows. RED naming the stranded jobs on the first poll — never TIMEOUT.
+#[test]
+fn stranded_queued_rows_under_a_startup_failed_run_are_red() {
+    let f = Forge::new();
+    f.runs(
+        SHA,
+        &[
+            in_suite("build", "queued", None, 9),
+            in_suite("lint", "queued", None, 9),
+            in_suite("docs", "completed", Some("skipped"), 9),
+        ],
+    );
+    serve_runs(&f, &[wrun(300, 9, "completed", Some("startup_failure"))]);
+    let o = go(&f, Selector::Pr(42), &opts(1800), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} build,lint"));
+    assert_eq!(f.polls(), 1);
+}
+
+/// `--settle-red` waits for nothing observed to be pending; stranded rows
+/// are not pending, so a finished red is RED rather than a perpetual TIMEOUT.
+#[test]
+fn stranded_queued_rows_do_not_hold_settle_red() {
+    let f = Forge::new();
+    f.runs(SHA, &[in_suite("build", "queued", None, 9)]);
+    serve_runs(&f, &[wrun(300, 9, "completed", Some("failure"))]);
+    let o = go(&f, Selector::Pr(42), &settle(1800), &mut FakeClock::new());
+    assert_eq!(o.sentinel(), format!("LOOM-CHECKS-RED {SHA} build"));
+}
+
+/// A required context whose job is stranded is reported under its own name,
+/// so `--required-only` fails it instead of waiting on it (or reading it as
+/// informational).
+#[test]
+fn required_only_reports_a_stranded_required_job_red() {
+    let f = Forge::new();
+    f.required(&["build"]);
+    f.runs(
+        SHA,
+        &[
+            in_suite("build", "queued", None, 9),
+            in_suite("other", "completed", Some("success"), 2),
+        ],
+    );
+    // A different workflow (not a twin of run 300) that passed.
+    let mut other = wrun(301, 2, "completed", Some("success"));
+    other["workflow_id"] = json!(8);
+    serve_runs(&f, &[wrun(300, 9, "completed", Some("startup_failure")), other]);
+    let mut o = opts(1800);
+    o.required_only = true;
+    let out = go(&f, Selector::Pr(42), &o, &mut FakeClock::new());
+    assert_eq!(out.sentinel(), format!("LOOM-CHECKS-RED {SHA} build"));
+}
+
+/// A queued check run under a run that has not failed is still pending —
+/// queued, in progress (including a re-run of failed jobs), or a terminal
+/// run that is not a failure verdict.
+#[test]
+fn queued_rows_under_a_run_that_has_not_failed_stay_pending() {
+    for (status, conclusion) in [
+        ("queued", None),
+        ("in_progress", None),
+        ("completed", Some("cancelled")),
+        ("completed", Some("action_required")),
+    ] {
+        let f = Forge::new();
+        f.runs(SHA, &[in_suite("build", "queued", None, 9)]);
+        serve_runs(&f, &[wrun(300, 9, status, conclusion)]);
+        let o = go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new());
+        assert_eq!(
+            o,
+            Outcome::Timeout {
+                sha: SHA.into(),
+                pending: vec!["build".into()]
+            },
+            "{status} {conclusion:?}"
+        );
+    }
+}
+
+/// Only the failed run's own suite is stranded: a queued row under a live
+/// run beside it stays pending, and a failure elsewhere does not turn it RED.
+#[test]
+fn a_queued_row_in_another_suite_is_not_stranded_by_a_failed_run() {
+    let f = Forge::new();
+    f.runs(
+        SHA,
+        &[
+            in_suite("build", "queued", None, 2),
+            in_suite("lint", "queued", None, 9),
+        ],
+    );
+    let mut live = wrun(301, 2, "in_progress", None);
+    live["workflow_id"] = json!(8);
+    serve_runs(&f, &[wrun(300, 9, "completed", Some("startup_failure")), live]);
+    let o = go(&f, Selector::Pr(42), &settle(0), &mut FakeClock::new());
+    assert_eq!(
+        o,
+        Outcome::Timeout {
+            sha: SHA.into(),
+            pending: vec!["build".into()]
+        }
+    );
+}
+
+/// Doubt leaves the row pending (the safe direction is unchanged): an
+/// unanswered or truncated runs read, a row with no suite id (and then no
+/// runs read at all), and a failed twin superseded by a newer success.
+#[test]
+fn doubt_leaves_stranded_candidates_pending() {
+    let pending = |o: Outcome, name: &str| {
+        assert_eq!(
+            o,
+            Outcome::Timeout {
+                sha: SHA.into(),
+                pending: vec![name.into()]
+            }
+        );
+    };
+    // No answer (404).
+    let f = Forge::new();
+    f.runs(SHA, &[in_suite("build", "queued", None, 9)]);
+    pending(go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new()), "build");
+    // Truncated.
+    let f = Forge::new();
+    f.runs(SHA, &[in_suite("build", "queued", None, 9)]);
+    f.serve(
+        &actions_runs_url(SHA),
+        &json!({"total_count": 5, "workflow_runs": [wrun(300, 9, "completed", Some("startup_failure"))]}),
+    );
+    pending(go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new()), "build");
+    // No suite id: nothing to attribute, and no extra read.
+    let f = Forge::new();
+    f.runs(SHA, &[run("build", "queued", None)]);
+    serve_runs(&f, &[wrun(300, 9, "completed", Some("startup_failure"))]);
+    pending(go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new()), "build");
+    assert!(!f.calls().iter().any(|c| c.contains("actions/runs")), "{:?}", f.calls());
+    // A failed twin (suite 1) superseded by a newer success (suite 2).
+    let f = Forge::new();
+    f.runs(
+        SHA,
+        &[
+            in_suite("Daemon Checks", "queued", None, 1),
+            in_suite("Daemon Checks", "completed", Some("success"), 2),
+        ],
+    );
+    serve_runs(
+        &f,
+        &[
+            wrun(100, 1, "completed", Some("startup_failure")),
+            wrun(101, 2, "completed", Some("success")),
+        ],
+    );
+    pending(go(&f, Selector::Pr(42), &opts(0), &mut FakeClock::new()), "Daemon Checks");
+}
+
 fn settle(timeout: u64) -> Opts {
     Opts {
         settle_red: true,
@@ -1383,6 +1763,7 @@ mod authorization_context {
             total: seen.len() as u64,
             failing: v(failing),
             pending: v(pending),
+            cancelled: Vec::new(),
             seen: seen.iter().map(|s| (*s).to_string()).collect(),
             failed_detail: Vec::new(),
         }

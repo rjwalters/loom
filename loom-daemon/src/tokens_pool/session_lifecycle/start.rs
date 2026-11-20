@@ -115,6 +115,10 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                 if is_held() {
                     return Err(session_hold::OperatorHeld.into());
                 }
+                // The configured override image is bundle-verified before
+                // anything is created from it (issue #14019); a refusal
+                // leaves any existing state untouched.
+                self.verify_session_config_image()?;
                 ensure_profile_controls(&profile)?;
                 self.runner.create(
                     &container,
@@ -122,6 +126,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
                     &profile,
                     &requested_workspace,
                     &self.workspace,
+                    &self.extra_mounts(),
                 )?;
                 self.recheck_hold_after_start(name, &container, held)?;
             }

@@ -3935,7 +3935,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
+    // start_completion_dedup still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse
@@ -5177,14 +5177,11 @@ fn test_abort_supersedes_running_supervisor_generation() {
 mod status_round_trip;
 
 // The #9194 burst-calibration helper lives in its own sibling module rather
-// than being appended here: this module is over the 1000-line ratchet
-// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
-// — "put the new code in a NEW sibling module").
+// than being appended here.
 mod dispatch_burst_calibration;
 
 // The #4666 rate-limit dispatch-refusal tests live in their own sibling
-// module (moved out of this over-threshold, frozen file, #9855):
-// `.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling module".
+// module (moved out of this file, #9855).
 mod rate_limit_dispatch_refusal_tests;
 
 /// #13350: the removed `runtime` / `model_profile` fields are gone from the

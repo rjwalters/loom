@@ -123,7 +123,8 @@ fn resolve_repo(cwd: &Path) -> Option<String> {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
     }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_query(
+    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
+        "dep.repo_view",
         &["repo", "view", "--json", "nameWithOwner"],
         cwd,
         false,

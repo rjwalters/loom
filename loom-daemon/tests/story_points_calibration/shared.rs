@@ -1,7 +1,6 @@
 //! Shared fixtures for the story-points calibration contract tests
-//! (`static_contracts` + `execution`). Split from a single 1096-line file to
-//! stay under the file-size ratchet (`check-file-size-budget.sh`); nothing
-//! here changes the contracts — see the two sibling modules.
+//! (`static_contracts` + `execution`). Split from a single 1096-line file;
+//! nothing here changes the contracts — see the two sibling modules.
 #![allow(clippy::unwrap_used)]
 
 pub const QUERIES: &str =

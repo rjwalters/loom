@@ -1,9 +1,8 @@
 //! Native worker seam x API-key account pool (issue #8401): explicit env >
 //! pool > fail-closed 78, driven through the real `spawn-worker` path.
 //!
-//! A sibling of `worker_spawn.rs` rather than a section of it: that file sits
-//! just under the 1000-line file-size ratchet, and these tests would carry it
-//! over. The `worker` / `config` helpers below are therefore deliberate copies of
+//! A sibling of `worker_spawn.rs` rather than a section of it: these tests
+//! get their own file. The `worker` / `config` helpers below are therefore deliberate copies of
 //! that file's (`fixture` is shared via `support/worker_cli.rs`). Keep `worker` in step with it — in
 //! particular the `FIXTURE_VERSION` line, without which the OpenCode adapter's
 //! pre-exec `--version` probe (#8438) refuses the fixture.
@@ -257,7 +256,14 @@ fn an_unreadable_pool_fails_closed_at_78_instead_of_launching() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(78), "{stderr}");
     assert!(out.stdout.is_empty(), "the harness must not have launched");
-    assert!(!stderr.contains("# LOOM_LAUNCH"), "{stderr}");
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("# LOOM_LAUNCH ")),
+        "the harness must not have launched: {stderr}"
+    );
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=credential"),
+        "must classify the typed rejection boundary: {stderr}"
+    );
     assert!(stderr.contains(&dir.display().to_string()), "must name the path: {stderr}");
     assert!(stderr.contains("PermissionDenied"), "must name the error: {stderr}");
     assert!(!stderr.contains(ALPHA_KEY), "{stderr}");

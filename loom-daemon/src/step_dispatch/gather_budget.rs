@@ -336,18 +336,13 @@ pub fn tick_deadline(root: &std::path::Path) -> Duration {
     tick_deadline_from(&crate::config_resolver::resolve_effective_config(root))
 }
 
-/// Start one work-finder tick body: log it at INFO, so a tick that never
-/// reaches its dispatch line can be placed, and return its read budget
-/// (#12074). The clock starts when the loop enters its read scope, after the
-/// local pre-tick work (the eager reclaim, the CPU sample), so slow local work
-/// never turns into forge shedding.
+/// Number a work-finder tick and resolve its read budget (#12074).
+/// The budget starts when the loop enters its read scope, after local work.
 #[must_use]
-pub fn begin_tick(root: &std::path::Path) -> Duration {
+pub fn begin_tick(root: &std::path::Path) -> (u64, Duration) {
     static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let budget = tick_deadline(root);
-    log::info!("work_finder: tick {n} start (deadline {}s, #12074)", budget.as_secs());
-    budget
+    (n, tick_deadline(root))
 }
 
 /// The read budget the one repo a tick always gathers gets, however late it

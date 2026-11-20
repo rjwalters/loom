@@ -84,14 +84,16 @@ candidate (set a candidate to `0` to switch it off on that host).
    `w / Σw` over the available ones.
 3. With no table, `rolePreference` / `preference` / static resolution decide,
    unchanged.
-4. A table that is **empty after exclusions** logs a non-blocking warning
-   (daemon log and the explain view) but does not stall the tick: the draw
-   falls through to the next configured attempt's table, and the first
-   non-empty one decides (#11782's no-stall guarantee). Only when every
-   remaining table is empty too does the stage have nothing to run on: the
-   tick is then a pre-spawn skip whose diagnostic says so, like a wholly
-   unavailable list, carried on the originally configured (empty) table so
-   the skip still has its record and EMPTY diagnostic.
+4. A table that is **empty after exclusions** does not stall the tick: the
+   draw falls through to the next configured attempt's table, and the first
+   non-empty one decides (#11782's no-stall guarantee). The explain view
+   flags every configured empty table with a non-blocking warning, whether
+   or not a later table serves the tick; the daemon log stays quiet in that
+   case. Only when every remaining table is empty too does the stage have
+   nothing to run on: the tick is then a pre-spawn skip whose diagnostic says
+   so and which logs the daemon-log warning, like a wholly unavailable list,
+   carried on the originally configured (empty) table so the skip still has
+   its record and EMPTY diagnostic.
 
 An empty table is not a pilot lock. Pilots, and per-host provider
 restrictions generally, are enforced upstream of the draw:
@@ -120,7 +122,15 @@ toolless launch, a non-zero exit and a timeout. A success resets it to 1. A
 pre-spawn skip counts neither way. The count lives in daemon memory, so a
 restart starts every role at attempt 1.
 
-Sweep dispatch and `worker run` phases draw attempt 1.
+Sweep dispatch and `worker run` phases draw attempt 1. So do stage steps
+(Curator, Builder, Judge, Doctor, Champion): nothing feeds a step's failure
+into the count today, so `loom.role_draw.attempt` on a `loom.dispatch.step`
+span reads `1`. Only role ticks feed it, and the count is keyed by workspace
+and role. A step failure feed is a separate design (#14235).
+
+Do not confuse it with `loom.step.draw_attempt` on the same span: that is the
+1-based count of item redraws within one dispatch slot, and has nothing to do
+with the role draw's attempt.
 
 ### Which launch paths honor the drawn `/<model>` (#12748)
 

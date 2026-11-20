@@ -218,7 +218,7 @@ pub(crate) struct SessionEnv {
 }
 
 impl SessionEnv {
-    fn from_process() -> Self {
+    pub(crate) fn from_process() -> Self {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 
@@ -425,8 +425,9 @@ impl LeaseEnsureArgs {
         Ok(())
     }
 
-    /// The whole decision, with the environment injected so it is testable.
-    pub(crate) fn ensure(&self, env: &SessionEnv) -> Outcome {
+    /// The two outcomes settled from the environment alone, before any script
+    /// runs or the forge is touched. Neither starts a publisher or a renewer.
+    fn settled_early(&self, env: &SessionEnv) -> Option<Outcome> {
         // #8193 finding 2: when `LOOM_SWEEP_LEASE_RENEW_DISPATCHED` already
         // names THIS issue, the daemon published the lease
         // (`SweepRegistry::dispatch` -> `write_lease_comment`, #6179) and
@@ -438,11 +439,27 @@ impl LeaseEnsureArgs {
             .as_deref()
             .is_some_and(|d| d == self.issue.to_string())
         {
-            return Outcome::AlreadyDispatched;
+            return Some(Outcome::AlreadyDispatched);
         }
 
         if !env.session_present && !self.force {
-            return Outcome::NoAgentSession;
+            return Some(Outcome::NoAgentSession);
+        }
+        None
+    }
+
+    /// Whether this run can reach the forge, and so must pass `loom-tools`'s
+    /// mode gate first (#14488). The no-session and already-dispatched answers
+    /// are printed by [`Self::ensure`] without touching it, so a plain shell
+    /// (`worktree.sh` calls this unconditionally) gets them with `mode` unset.
+    pub(crate) fn reaches_forge(&self, env: &SessionEnv) -> bool {
+        self.deferred || self.settled_early(env).is_none()
+    }
+
+    /// The whole decision, with the environment injected so it is testable.
+    pub(crate) fn ensure(&self, env: &SessionEnv) -> Outcome {
+        if let Some(outcome) = self.settled_early(env) {
+            return outcome;
         }
 
         let root = match crate::repo_root::resolve_repo_root(&self.workspace) {
@@ -488,6 +505,7 @@ impl LeaseEnsureArgs {
     ) -> Result<(String, String), Outcome> {
         let mut command = Command::new(publish_script);
         command.arg("publish").arg(self.issue.to_string());
+        pin_running_binary(&mut command);
         // An in-session sweep's `LOOM_SWEEP_RUN_ID` wins inside the script.
         if let Some(id) = (!env.run_id_set)
             .then(|| session_sweep_id(self.watch_pid))
@@ -535,7 +553,9 @@ impl LeaseEnsureArgs {
         sweep_id: &str,
     ) -> Outcome {
         mark_inherited_fds_cloexec();
-        let result = Command::new(renew_script)
+        let mut command = Command::new(renew_script);
+        pin_running_binary(&mut command);
+        let result = command
             .arg("start")
             .arg(self.issue.to_string())
             .arg("--watch-pid")
@@ -564,6 +584,22 @@ impl LeaseEnsureArgs {
             Ok(o) => Outcome::RenewalFailed(o.status.code()),
             Err(_) => Outcome::RenewalFailed(None),
         }
+    }
+}
+
+/// Keep the publish/renew script chain on the binary that is running it
+/// (#14488). The scripts call `${LOOM_DAEMON_BIN:-loom-daemon}` for
+/// `forge may-write`, `forge trusted-comments` and `lease renewer`, so when
+/// `loom-tools lease ensure` runs on a host with no `loom-daemon` they would
+/// otherwise reach for a binary that is not there, and lose the write-scope
+/// vetting that only the binary can do. A value the caller already exported
+/// is theirs to choose and is left alone.
+fn pin_running_binary(command: &mut Command) {
+    if std::env::var_os("LOOM_DAEMON_BIN").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Ok(me) = std::env::current_exe() {
+        command.env("LOOM_DAEMON_BIN", me);
     }
 }
 

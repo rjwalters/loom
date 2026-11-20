@@ -24,7 +24,7 @@ curator=claude-opus-5 builder=claude-sonnet-5 judge=claude-opus-5 | claude/- | e
 | `curator=` / `builder=` / `judge=` | The model with the most tokens in that role's phases (`phase_durations[].tokens_by_model`) — what ran, not what was dispatched | Role not observed in this sweep (never guessed) |
 | `model=` | Dispatched `model`, only when no phase carries per-model usage | `default` |
 | `runtime/provider` | `runtime` / `provider` (launch record), then `config.runtime` | `-` for that half |
-| `effort=` | Sweep-level `effort` | `default` (the runtime's own) |
+| `effort=` | Each role's phases' own `effort` stamp (`phase_durations[].effort`, #14242), falling back to the sweep-level `effort`; agreeing values render one `effort=<v>`, differing values render per role (`effort=curator:high builder:medium`) | `default` (the runtime's own) |
 
 `doctor` is deliberately **not** in the key: it runs only when a review bounced, so
 keying on it would split one mix into "needed a Doctor" and "did not". That outcome
@@ -41,7 +41,9 @@ unreachable forge, never `0`), `WTOK_USD` (cost-weighted tokens, at the rate car
 report names — provisional), `MERGE/USD`, `JDG1%` / `JDG_N` (first-pass Judge
 approval over judged sweeps), `REJ` (Judge `fail` verdicts), `DR_CYC` (completed
 Doctor cycles), `BNC_N` (sweeps whose PR timeline was read — the denominator for
-`REJ`/`DR_CYC`; unread is unknown, not zero), `DOCTOR%`.
+`REJ`; unread is unknown, not zero), `DOCTOR%`. `DR_CYC` is summed over every
+sweep carrying `doctor_cycles`, which is `BNC_N` plus any pre-#8222 sweep that has
+the cycle count but no Judge verdicts; on a recent window the two sets coincide.
 
 ## What is queryable per role step (inventory, #14067 AC1)
 
@@ -51,7 +53,7 @@ Counts are from one host's real journal (435 `sweep.outcome` records, 2026-11-17
 |---|---|---|
 | Model per role | `phase_durations[].tokens_by_model` | 263 / 435 — only sweeps with attributable transcripts |
 | Model (dispatched) | `model` | 434 / 435 |
-| Reasoning effort | `effort` — **sweep-level only**, not per role | 65 / 435 |
+| Reasoning effort per role | `phase_durations[].effort` (since #14242; sweep-level `effort` before it) | stamped on every phase a launch could name an effort for; records before #14242 carry only the sweep-level `effort` |
 | Runtime | `config.runtime` (`runtime` for native-harness launches) | 435 / 435 |
 | Provider | `provider` — launch record, native harnesses only | **0 / 435** (a Claude launch writes none) |
 | Outcome / merged | `result`, `disposition`, `pr_number` + forge merge join | 179 / 435 opened a PR |
@@ -59,10 +61,17 @@ Counts are from one host's real journal (435 `sweep.outcome` records, 2026-11-17
 | Cost | `tokens_by_model` | 434 / 435 |
 | Mix label | not stamped; derived above | — |
 
-**Not recorded** (so not in the mix key): per-role reasoning effort, and a provider
-for Claude launches. They need a launch-time stamp per phase; until then the key
-carries the sweep-level effort and a `-` provider, never a fabricated value. Role
-ticks (`role_tick.outcome`) carry `role`, `model`, `effort`, `provider` and
+**Not recorded** (so not in the mix key): a provider for Claude launches. That
+is structural, not a gap to close: a Claude/legacy-adapter spawn writes no
+`# LOOM_LAUNCH` record at all, so there is no launch-time provider to stamp —
+`-` in the key is the honest rendering, and fabricating one (say, hard-coding
+`anthropic`) would break the "absent, never invented" contract. Native-harness
+launches (pi/opencode) do record theirs. Per-role reasoning effort **is**
+recorded now (#14242): each `phase_durations` entry carries the effort its
+launch ran at — a sweep session's phases all inherit the session-default effort
+(the in-session Task tool exposes no effort parameter), and a step sweep's
+single phase carries its role's own resolved effort. Role ticks
+(`role_tick.outcome`) carry `role`, `model`, `effort`, `provider` and
 `tokens_by_model` per tick, but are a separate journal and are not joined here.
 
 ## Recipe: compare two mixes
@@ -76,7 +85,9 @@ ticks (`role_tick.outcome`) carry `role`, `model`, `effort`, `provider` and
 4. Compare **cost per merge** (`MERGE/USD`, or `WTOK_USD` ÷ `MERGED`), not cost
    alone: a cheap mix that bounces twice per PR can cost more per merged PR.
 5. Check `REJ` ÷ `BNC_N` and `DR_CYC` ÷ `BNC_N` for rework, and `DOCTOR%` for how
-   often the Doctor was needed.
+   often the Doctor was needed. `DR_CYC` ÷ `BNC_N` is only exact when the window
+   holds no pre-#8222 sweeps (those carry `doctor_cycles` without Judge verdicts
+   and inflate the ratio), so keep `--since` after that change.
 
 ### The opposite-mix hypothesis
 

@@ -16,6 +16,8 @@ use crate::tokens_pool::account_registry::account_inventory;
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::profile_root_env::ProfileRootEnv;
 use crate::tokens_pool::session_hold;
+use crate::tokens_pool::session_image;
+use crate::tokens_pool::session_image::ExtraMount;
 use crate::tokens_pool::session_lifecycle::{
     check_mount_denials, mark_session_managed, parse_inspect_line, workspace_mount_roots,
     ExecOutput, WORKSPACE_LABEL,
@@ -119,6 +121,7 @@ impl FakeState {
                 started_at: None,
                 image: Some("example/session:pinned".into()),
                 workspace: workspace.map(Path::to_path_buf),
+                extra_mounts: Vec::new(),
             },
         );
     }
@@ -223,6 +226,8 @@ fn inspect_json(name: &str, state: &ContainerState, mounts: &[PathBuf]) -> Value
     })
 }
 
+impl session_image::BundleProbe for Fake {}
+
 impl ContainerRunner for Fake {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         if let Some(error) = self.fail_inspect.lock().unwrap().clone() {
@@ -240,6 +245,7 @@ impl ContainerRunner for Fake {
         _codex_home: &Path,
         workspace: &Path,
         _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         self.log("create");
         self.hold_if_racing_a_stop();
@@ -448,6 +454,7 @@ fn fake_inputs<'a>(
         dispatch_locks: Some(Box::leak(fake.lock_dir().into_boxed_path())),
         class: None,
         host_version: None,
+        session_config: None,
     }
 }
 
@@ -486,6 +493,42 @@ fn pass_named(
     reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
 }
 
+/// [`pass_named`] with the resolved `accounts.session` settings in the
+/// inputs (issue #14019).
+fn pass_named_with_session_config(
+    lifecycle: &mut SessionLifecycle<Fake>,
+    accounts: &[AccountDescriptor],
+    private: &dyn Fn(&AccountDescriptor) -> anyhow::Result<bool>,
+    fallback: &Path,
+    state: &mut ReconcileState,
+    now: u64,
+    session_config: &SessionImageConfig,
+) -> Vec<AccountOutcome> {
+    let index = AccountIndex::from_inventories(&[accounts, &[]]);
+    let fake = lifecycle.runner().clone();
+    let registered = fake.registered.lock().unwrap().clone();
+    let mut take = || fake.snapshot(&registered);
+    let mut observe = PassSnapshot::new(&mut take);
+    let inputs = fake_inputs(&fake, &index, private, fallback, &registered);
+    let inputs = PassInputs {
+        host_version: fake.host_version.lock().unwrap().clone(),
+        registered: (!*fake.registry_unreadable.lock().unwrap()).then_some(&registered[..]),
+        denials_for: &|_| {
+            if *fake.roster_unreadable.lock().unwrap() {
+                bail!("fleet roster (firewall input): unreadable");
+            }
+            Ok(fake.denials())
+        },
+        would_create_accept: &|workspace| {
+            let walls = fake.firewalled.lock().unwrap().clone();
+            fake.create_accepts(workspace, &walls).map(drop)
+        },
+        session_config: Some(session_config),
+        ..inputs
+    };
+    reconcile_accounts(lifecycle, accounts, &inputs, &mut observe, state, now)
+}
+
 // ---- decision function ------------------------------------------------------
 
 fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerState {
@@ -496,6 +539,7 @@ fn st(running: bool, restarting: bool, workspace: Option<&str>) -> ContainerStat
         started_at: None,
         image: None,
         workspace: workspace.map(PathBuf::from),
+        extra_mounts: Vec::new(),
     }
 }
 
@@ -678,6 +722,52 @@ fn a_removed_host_mounted_container_is_recreated_with_its_last_workspace_and_ima
         creates,
         vec![(container, "example/session:pinned".into(), "/home/u/GitHub".into())]
     );
+}
+
+#[test]
+#[serial]
+fn a_missing_container_is_recreated_on_the_configured_image_not_the_recorded_pin() {
+    // Issue #14421 (regression guard for #14019): the configured
+    // `accounts.session.image` beats the image recorded for the seat.
+    let env = setup(&["alice"], &["alice"]);
+    let container = container_name("alice");
+    let mut lifecycle = SessionLifecycle::new(env.workspace.path(), Fake::default(), None);
+    lifecycle
+        .runner()
+        .seed(&container, true, false, Some(Path::new("/home/u/GitHub")));
+    let config = SessionImageConfig {
+        image: Some("ghcr.io/example/session-mine@sha256:aa55".into()),
+        extra_mounts: Vec::new(),
+    };
+    let mut state = ReconcileState::default();
+    let pass_cfg = |lifecycle: &mut SessionLifecycle<Fake>, state: &mut ReconcileState, now| {
+        pass_named_with_session_config(
+            lifecycle,
+            &env.accounts,
+            &host,
+            Path::new("/srv/checkouts"),
+            state,
+            now,
+            &config,
+        )
+        .into_iter()
+        .map(|o| o.outcome)
+        .collect::<Vec<_>>()
+    };
+    // Observed running first, so the pass records the stale image pin.
+    assert_eq!(pass_cfg(&mut lifecycle, &mut state, 0), vec![Outcome::Running]);
+    // `docker rm -f`
+    lifecycle.runner().containers.lock().unwrap().clear();
+    assert_eq!(
+        pass_cfg(&mut lifecycle, &mut state, 60),
+        vec![Outcome::Recreated {
+            workspace: "/home/u/GitHub".into()
+        }]
+    );
+    let creates = lifecycle.runner().creates.lock().unwrap().clone();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0].1, "ghcr.io/example/session-mine@sha256:aa55");
+    assert_ne!(creates[0].1, "example/session:pinned", "not the recorded pin");
 }
 
 #[test]

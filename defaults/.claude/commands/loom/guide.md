@@ -1115,7 +1115,8 @@ citing this subsection):
    Duplicate Checks") and must **never edit or generate** one.
 2. **First creation is create-by-default.** When `WORK_LOG.md` /
    `WORK_PLAN.md` do not exist yet (a repo that has never tracked them), a
-   pass **creates them without asking** — Steps 2 and 3 below say how. Both
+   pass **creates them without asking** (unless the file is listed in
+   `skipDocs` — rule 3) — Steps 2 and 3 below say how. Both
    files land as a reviewable docs PR that already passes Judge and
    Champion, so **the PR itself is the ask**. Never defer first creation as
    an "operator scope" decision: on `2AMLogic/pdks` two Guide passes (#78,
@@ -1125,16 +1126,22 @@ citing this subsection):
    these documents (or want them generated differently)" is the
    `guide.docsMaintenance` namespace in `.loom/config.json` (where
    `workLogDebounceSecs` / `workPlanDebounceSecs` / `poolPressure*` already
-   live). No per-file or on/off key exists yet — tracked separately in
-   #14116. Until one lands, having one file without the other is NOT an
-   opt-out signal: create-by-default applies to each missing file
-   independently.
+   live). The key is `guide.docsMaintenance.skipDocs` (#14116): a JSON array
+   of file names, allowed values `"WORK_LOG.md"` / `"WORK_PLAN.md"` (e.g.
+   `"skipDocs": ["WORK_PLAN.md"]`); absent or `[]` means both are generated,
+   and unrecognised entries are ignored. A listed file is **neither created
+   nor updated** (first creation included), and no docs PR is opened for it;
+   the other file is unaffected. The entry is the recorded answer — a pass
+   that sees it proceeds without deferring or asking. Absent a `skipDocs`
+   entry, having one file without the other is NOT an opt-out signal:
+   create-by-default applies to each missing file independently. No `LOOM_*`
+   env override exists for this key.
 4. **Declining anything must be visible.** A pass that declines any part of
    this phase (suppresses a README refresh, skips a link, archives nothing)
    says so **in its docs PR body, citing this subsection**, so the next pass
    reads the recorded answer instead of deciding afresh. With creation as
    the default there is no deferral to remember; the recorded answers that
-   exist are the config key (once #14116 lands) and these PR-body notes.
+   exist are the `skipDocs` config key and these PR-body notes.
 5. **Cross-links and layout.** The static preamble outside the
    `guide:plan-body` markers is where a WORK_PLAN.md points at the repo's
    roadmap when one exists — Step 3's first-creation preamble does this
@@ -1416,6 +1423,12 @@ phase unless a future regression run of `test-guide-docs-pr-race.sh` actually
 finds the lock+recheck insufficient.
 
 ### Step 2: Update WORK_LOG.md
+
+**Opt-out (#14116).** If `WORK_LOG.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_log()` returns before doing
+anything — no create, no update, no rotation (Step 2b), no PR for that file —
+and this pass proceeds without deferring. See "WORK_PLAN.md vs a hand-written
+ROADMAP.md", rule 3.
 
 Append entries for newly merged PRs and newly closed issues not yet recorded
 (presence checks, not number watermarks — see #5516 and #5539 below). Only
@@ -1700,7 +1713,25 @@ fetch_merged_prs_complete() {
   _fetch_complete pr "$@"
 }
 
+# #14116: per-file opt-out. `guide.docsMaintenance.skipDocs` is a JSON array of
+# file names ("WORK_LOG.md" / "WORK_PLAN.md"); a listed file is neither created
+# nor updated. Absent/`[]`/non-array/unreadable config = nothing skipped (today's
+# behaviour); entries other than the two document names never match. No env
+# override. $1 = the document name; returns 0 when it is skipped.
+docs_maintenance_skipped() {
+  jq -r '(.guide.docsMaintenance.skipDocs // []) | if type == "array" then .[] | strings else empty end' \
+    .loom/config.json 2>/dev/null | grep -Fxq -- "$1"
+}
+
 update_work_log() {
+  # #14116: a repo that opted out of WORK_LOG.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update, so return
+  # before any forge query. Non-zero = "nothing written", like the debounce.
+  if docs_maintenance_skipped WORK_LOG.md; then
+    echo "WORK_LOG.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
   # `work_log_max_pr()` are not called here at all; presence checks against
@@ -1847,7 +1878,7 @@ update_work_log() {
   # shape, plus an entry-count escape hatch WORK_PLAN has no equivalent of,
   # since a "diff" is binary for WORK_PLAN but WORK_LOG has a natural
   # "how much is pending" signal):
-  #   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): once the pending delta
+  #   - `workLogMinEntries` (default 5): once the pending delta
   #     reaches this size, write IMMEDIATELY, debounce window or not — this
   #     is the "no starvation" guarantee for a large accumulated delta from
   #     the acceptance criteria: a burst of activity must never sit
@@ -1880,7 +1911,38 @@ update_work_log() {
   local debounce_secs min_entries
   debounce_secs="${LOOM_WORK_LOG_DEBOUNCE_SECS:-$(jq -r '.guide.docsMaintenance.workLogDebounceSecs // 1800' .loom/config.json 2>/dev/null)}"
   [ -n "$debounce_secs" ] || debounce_secs=1800
-  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-5}"
+  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-}"
+  if [ -z "$min_entries" ]; then
+    min_entries="$(jq -Rrs '
+      . as $config
+      | fromjson
+      | select(.guide.docsMaintenance.workLogMinEntries | type == "number")
+      # Preserve JSON string tokens while quoting raw numeric lexemes. jq 1.6
+      # otherwise rounds numbers before we can check for a fraction.
+      | $config
+      | gsub("(?<quoted>\"(?:[^\"\\\\]|\\\\.)*\")|(?<number>-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)";
+          if .number then (.number | tojson) else .quoted end)
+      | fromjson
+      | .guide.docsMaintenance.workLogMinEntries
+      | strings
+      | capture("^(?<whole>[0-9]+)(?:\\.(?<fraction>[0-9]+))?(?:[eE](?<exponent>[+-]?[0-9]+))?$")
+      | (.fraction // "") as $fraction
+      | (.whole + $fraction | sub("^0+"; "")) as $digits
+      | select($digits != "")
+      | ((.exponent // "0" | sub("^\\+"; "") | tonumber) - ($fraction | length)) as $shift
+      | (($digits | length) + $shift) as $width
+      # Bash compares signed integers. Bound the decimal width before padding.
+      | select($width > 0 and $width <= 19)
+      | if $shift >= 0 then
+          $digits + ("0" * $shift // "")
+        else
+          select($digits[$width:] | test("^0+$")) | $digits[:$width]
+        end
+    ' .loom/config.json 2>/dev/null)" || min_entries=""
+    if ! [ "$min_entries" -gt 0 ] 2>/dev/null; then
+      min_entries=5
+    fi
+  fi
 
   if [ "$total_new" -lt "$min_entries" ]; then
     local last_merged_epoch now_epoch elapsed
@@ -1918,6 +1980,16 @@ update_work_log() {
 }
 ```
 
+Set `guide.docsMaintenance.workLogMinEntries` in `.loom/config.json` to a
+positive JSON integer that the shell can compare. An absent or invalid setting
+falls back to 5. A nonempty `LOOM_WORK_LOG_MIN_ENTRIES` still takes precedence.
+
+For example, loom-ui could set `workLogMinEntries` to 12 and
+`workLogDebounceSecs` to 7200. Thirty minutes after a known Guide merge that
+touched WORK_LOG, six pending records would wait, and 12 would be eligible.
+A smaller delta becomes eligible two hours after that merge, on the next
+eligible Guide pass. WORK_PLAN keeps its independent publication window.
+
 **Entry format** (grouped by date, newest first):
 
 ```markdown
@@ -1944,6 +2016,9 @@ WORK_LOG_ARCHIVE_GLOB='work_log/WORK_LOG_[0-9][0-9][0-9][0-9]-[0-9][0-9].md'
 # Returns 0 only when it moved sections; every other path leaves $DOCS_WT as it was.
 rotate_work_log() {
   local wrote="${1:-0}" report moved
+
+  # #14116: rotation rewrites WORK_LOG.md, so a skipped file is left untouched.
+  docs_maintenance_skipped WORK_LOG.md && return 1
 
   # Fail-safe invariant (see the note above work_log_has_pr()): the cutoff must
   # stay older than the lookback by the margin, or archived entries would be
@@ -2004,6 +2079,12 @@ the next tick recomputes the same rotation from the committed documents. No
 gitignored sidecar holds any state.
 
 ### Step 3: Update WORK_PLAN.md
+
+**Opt-out (#14116).** If `WORK_PLAN.md` is listed in
+`guide.docsMaintenance.skipDocs`, `update_work_plan()` returns before doing
+anything — no create (first creation included), no update, no PR for that
+file — and this pass proceeds without deferring. See "WORK_PLAN.md vs a
+hand-written ROADMAP.md", rule 3.
 
 Regenerate the backlog snapshot from current GitHub label state. Only rewrite if labels
 have changed **and** that change has survived a debounce window since the last
@@ -2337,7 +2418,45 @@ strip_plan_stamp() {
   sed -e '1{/^_Generated: .* (snapshot; compare against live labels)_$/d;}'
 }
 
+# #14259 FILE-BACKED RECEIPT: the two WORK_PLAN_* globals below are process-local
+# shell state, so a tick that runs Step 3 and Step 5 as two separate shell
+# invocations would lose them and render `NOT RUN` on a tick that DID run the
+# check. Mirror them into `$DOCS_WT/.loom-work-plan-receipt` (`key=value`, one
+# per line) so Step 5 can recover them. The file is never staged:
+# stage_docs_paths() / the archive loop add by EXACT path, and
+# docs-worktree.sh's `clean -fd` removes it on the next reset.
+WORK_PLAN_RECEIPT_FILE_NAME=".loom-work-plan-receipt"
+
+# Record outcome $1 (the classification) in the global AND the file. The render
+# hash is read from the global update_work_plan() set earlier in the same call.
+record_work_plan_receipt() {
+  WORK_PLAN_RECEIPT="$1"
+  printf 'receipt=%s\nrender_hash=%s\n' "$WORK_PLAN_RECEIPT" "${WORK_PLAN_RENDER_HASH:-}" \
+    > "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME" 2>/dev/null || true
+}
+
+# Read one key from the receipt file; prints nothing when the file or key is
+# absent. Never `source`d: the file is data, not code.
+read_work_plan_receipt_field() {
+  sed -n "s/^$1=//p" "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME" 2>/dev/null | head -n1
+}
+
 update_work_plan() {
+  # #14116: a repo that opted out of WORK_PLAN.md via
+  # `guide.docsMaintenance.skipDocs` gets no create and no update (first
+  # creation included), so return before rendering anything.
+  if docs_maintenance_skipped WORK_PLAN.md; then
+    # #14259: even this early return must not leave a previous tick's receipt
+    # file behind to be read as this tick's outcome.
+    rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"
+    echo "WORK_PLAN.md is listed in guide.docsMaintenance.skipDocs — skipping (no create, no update)."
+    return 1
+  fi
+
+  # #14259: drop any receipt left by a previous tick before this tick's gates
+  # run, so every path below either records a fresh receipt or leaves none.
+  rm -f "$DOCS_WT/$WORK_PLAN_RECEIPT_FILE_NAME"
+
   # Change detection: compare the freshly-rendered body against the body already
   # committed between the markers. No gitignored side-car (which resets to "" on
   # every fresh checkout) — the committed file IS the state.
@@ -2352,6 +2471,12 @@ update_work_plan() {
   # a hash buys nothing here, so compare the strings directly.
   local new_body old_body stamp
   new_body="$(render_plan_body)"
+  # #14204 RECEIPT: fingerprint the rendered body once, up front, so EVERY
+  # outcome below carries the same content hash into Step 5's `WORK_PLAN
+  # check:` PR-body line — including the ones that refuse to write. Same
+  # portability fallback the park-record hash uses (sha256sum on Linux,
+  # shasum on macOS). Deliberately NOT local: it must survive into Step 5.
+  WORK_PLAN_RENDER_HASH="$(printf '%s\n' "$new_body" | { sha256sum 2>/dev/null || shasum -a 256; } 2>/dev/null | cut -c1-12)"
   # `sed '1d;$d'` drops the two marker lines, leaving only the generated region;
   # `strip_plan_stamp` (#13909) then drops the region's generated-at stamp line
   # so the comparison below sees ONLY label-derived content on both sides.
@@ -2363,6 +2488,7 @@ update_work_plan() {
     "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d' | strip_plan_stamp)"
 
   if [ "$new_body" = "$old_body" ]; then
+    record_work_plan_receipt "current"
     echo "WORK_PLAN.md is current (no label changes detected)."
     return 1
   fi
@@ -2392,6 +2518,7 @@ update_work_plan() {
   elapsed=$(( now_epoch - last_merged_epoch ))
 
   if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+    record_work_plan_receipt "debounced (elapsed ${elapsed}s < window ${debounce_secs}s)"
     echo "WORK_PLAN.md differs, but only ${elapsed}s since WORK_PLAN.md was last written by a merged docs-maintenance PR (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
     return 1
   fi
@@ -2402,6 +2529,7 @@ update_work_plan() {
   # title the pinned repo gives it. Checks the OUTPUT, so it bites whatever the
   # cause (guard denial, wrong cwd, stale scratch, unfaithful execution).
   if ! verify_plan_provenance "$new_body"; then
+    record_work_plan_receipt "provenance-refused"
     echo "WORK_PLAN.md NOT written: provenance check failed (fail closed)." >&2
     return 1
   fi
@@ -2428,8 +2556,12 @@ update_work_plan() {
   # a literal repo-independent path (`/tmp/body.md`, `/tmp/plan.new`): sibling
   # repos' ticks share /tmp, and a tick whose own write was denied then consumes
   # another repo's stale file. Never read a scratch file this tick did not write.
+  # A failed splice must not leave a stale receipt implying a write happened;
+  # classify it too (#14204).
   stamp="$(plan_stamp_line)"
-  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || return 1
+  splice_plan_body "$(printf '%s\n%s\n' "$stamp" "$new_body")" || { record_work_plan_receipt "write-failed"; return 1; }
+
+  record_work_plan_receipt "written"
 
   return 0
 }
@@ -2439,23 +2571,45 @@ update_work_plan() {
 # is NOT enough — a foreign render's numbers can all exist, closed, under
 # unrelated titles. Zero bullets passes; a failed lookup fails closed.
 #
-# SUFFIX LOCKSTEP, DO NOT LET THIS DRIFT: `render_plan_body()` appends at most
-# one section tag (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) and then,
-# for a held issue, ` *(held)*` (#13908) — in that order. The bullet must be the
-# forge title followed by exactly one of those combinations, so a title is
-# never guessed by stripping (a title that itself ends in ` *(held)*` still
-# matches). A new ` *(x)*` suffix in the render MUST be added here in the same
-# change: an unknown suffix fails closed and WORK_PLAN.md stops updating.
-# `test-guide-work-plan-provenance.sh` reads the render's suffix literals and
-# fails if this gate rejects any of them.
+# SUFFIX LOCKSTEP: Approved rows append ` — closes #A, #B` for the PR's
+# sorted closing refs. Other sections may append one section tag
+# (` *(curated)*` / ` *(architect)*` / ` *(hermit)*`) then ` *(held)*`.
+# Compare the complete title and suffix literally: either can be title text.
+# Keep these rules paired with the render in test-guide-work-plan-provenance.sh.
 verify_plan_provenance() {
-  local body="$1" line num rest got tag ok bad=0
+  local body="$1" line num rest got tag ok bad=0 approved=0 approved_json="" refs
   while IFS= read -r line; do
+    case "$line" in
+      '## Approved (Awaiting Merge)') approved=1; continue ;;
+      '## '*) approved=0; continue ;;
+    esac
     num="${line#- **#}"; num="${num%%\**}"
     rest="${line#*\*\*: }"
     got="$("$GH_READ" api "repos/$GUIDE_REPO/issues/$num" --jq '.title' 2>/dev/null)" || got=""
     if [ -z "$got" ]; then
       echo "provenance: cannot fetch title of #$num from $GUIDE_REPO" >&2; bad=1
+      continue
+    fi
+    if [ "$approved" -eq 1 ]; then
+      # Fetch once on the first Approved row, even a plain one: omitting
+      # every ref must fail just as changing a single number does.
+      if [ -z "$approved_json" ]; then
+        approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,labels,closingIssuesReferences \
+          --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not)]') || return 1
+      fi
+      # jq 1.6 exits 0 on zero-byte or whitespace-only input without consuming
+      # a JSON value, which would leave refs empty and accept a bare title:
+      # require an actual JSON value for the matching PR first (#14575).
+      [ -n "${approved_json//[[:space:]]/}" ] || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      refs=$(jq -er --argjson n "$num" '.[] | select(.number == $n) | .closingIssuesReferences
+        | arrays | select(all(.[]; .number | type == "number")) | map(.number) | sort | map("#" + tostring) | join(", ")' <<<"$approved_json") || {
+        echo "provenance: cannot verify closing refs of #$num in $GUIDE_REPO" >&2; return 1
+      }
+      if [ "$rest" != "$got${refs:+ — closes $refs}" ]; then
+        echo "provenance: #$num Approved title or closing refs differ from $GUIDE_REPO" >&2; bad=1
+      fi
       continue
     fi
     # Plain string equality only: a `${var% \*(x)\*}` strip is a no-op under
@@ -2467,7 +2621,7 @@ verify_plan_provenance() {
     if [ "$ok" -ne 1 ]; then
       echo "provenance: #$num title mismatch in $GUIDE_REPO (rendered '$rest', forge '$got')" >&2; bad=1
     fi
-  done < <(printf '%s\n' "$body" | grep -E '^- \*\*#[0-9]+\*\*: ')
+  done < <(printf '%s\n' "$body" | grep -E '^(## |- \*\*#[0-9]+\*\*: )')
   return "$bad"
 }
 
@@ -2496,6 +2650,27 @@ The section set rendered above must stay in lockstep with the committed
 that section is silently deleted on the next tick (and vice versa, the
 comparison mismatches until the file catches up). Adding a section means editing
 `render_plan_body` **and** the committed file in the same change.
+
+**Receipt (#14204, file-backed by #14259).** `update_work_plan()` records its
+outcome for Step 5 in two globals — machine-recorded state, never prose — and
+mirrors both into `$DOCS_WT/.loom-work-plan-receipt` (`receipt=` and
+`render_hash=` lines) through `record_work_plan_receipt`, because shell globals
+do not survive when Step 3 and Step 5 run as separate shell invocations (the
+usual shape for an LLM-driven multi-step bash phase). `WORK_PLAN_RECEIPT` is the
+outcome classification: `written`, `current`, `debounced (elapsed <X>s <
+window <Y>s)`, `provenance-refused`, or `write-failed` (a splice that failed —
+leaving a stale value there would read as a write that never happened).
+`WORK_PLAN_RENDER_HASH` is the first 12 hex of the rendered body's sha256, so
+the PR body can identify *which* render an outcome refers to. The function
+deletes the file on entry, before any early return (the `skipDocs` one
+included), so a previous tick's file can never be read as this tick's outcome;
+the file is never staged (staging is by exact path, and the docs worktree reset
+removes it). Initialize `WORK_PLAN_RECEIPT="NOT RUN"` before calling the
+function: a tick that never reaches it must surface as NOT RUN in the docs PR
+body instead of silently reading as a successful no-op. Step 5 uses a global
+that carries a real outcome, otherwise the file, otherwise `NOT RUN` /
+`none`, and renders the result verbatim as the PR body's `WORK_PLAN check:`
+line; nothing else in that body may state WORK_PLAN's status (see Step 5).
 
 ### Step 4: Check README.md Staleness
 
@@ -2559,49 +2734,54 @@ its own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
 invoking `loom-daemon tokens check --ranking`, which would trigger a fresh
 per-account probe (a real, if minimal, request against the very pool this
 check exists to protect) on every dry-queue tick. The verb is filesystem-only
-and costs nothing. Missing/empty/unparseable ranking data fails **open**
-(prints `0`, so this proceeds as if there is no pressure) — the same
-fail-open posture the rest of this phase uses for best-effort forge probes; a
-missing telemetry file is not evidence of pressure, and starving doc
-maintenance because the ranking file happens to be absent would be worse than
-occasionally filing without one.
+and costs nothing. Two different answers must not be confused (#14162): when
+the ranking data is absent or unparseable the verb *succeeds* and prints `0`
+— a valid no-pressure reading, and starving doc maintenance over a missing
+telemetry file would be worse than occasionally filing without one. But a
+read that never produces a number at all — a denied or failed call, empty
+output, or non-numeric output — is not a reading:
+`pool_pressure_fraction()` reports it as `unavailable`, and
+`should_defer_for_pool_pressure()` fail-**closes**, treating
+pressure-unknown like pressure (defer, bounded by the max-defer ceiling
+below), so a denied or broken read can never silently become "proceed".
 
-**Why a verb and not a file read (#13839):** do **not** open the pool
-directory yourself. Reading a path under `.loom/tokens` fails twice over.
-First, the role-tool-policy hook (#8256) treats that directory as a
-credential store, and `guide`'s `toolPolicy.allowedCapabilities` is empty, so
-a Bash call naming the path is denied *at the harness* — and the denial takes
-down the whole call, not just the one read, so a Guide that batches this with
-other commands loses all of them. Second, the path would be wrong anyway: the
-pool usually resolves to the shared machine-level directory
-(`~/.loom/tokens`, `$LOOM_SHARED_TOKENS_DIR`), not to a repo-local one, so a
-hardcoded `<repo>/.loom/tokens/.ranking` silently reports "no pressure" on
-every shared-pool host. The verb resolves the same directory the ranking
-writer targets and prints only a number — no account names, no statuses, no
-token material — which is precisely why a role without the
-`credential-store` capability may call it. `guide.json` stays unchanged.
+**Why a verb (#13839):** pool pressure is read only through
+`loom-daemon tokens pressure`. The verb resolves the same pool the ranking
+writer targets — repo-local, else the shared machine-level pool — so the
+number it prints is correct on every host shape, and it prints only that
+number: no account names, no statuses, no token material. That narrow
+output is precisely why a role whose `toolPolicy.allowedCapabilities` is
+empty may call it: the verb needs no `credential-store` capability.
+`guide.json` stays unchanged.
 
 ```bash
 # Fraction of pool accounts NOT `available` (0.0-1.0), obtained from
 # `loom-daemon tokens pressure` -- a filesystem-only read of the ranking the
 # daemon already refreshes (token-pool.md "Account health probe + ranking"),
 # never a fresh probe. The verb resolves the pool the SAME way the ranking
-# writer does (repo-local, else the shared machine-level pool), which a
-# hardcoded path here could not, and it prints only this number, so no
-# `credential-store` capability is needed (#13839).
+# writer does, and it prints only this number, so no `credential-store`
+# capability is needed (#13839).
 #
-# Fails open to "0" on anything unexpected: a daemon too old to know the verb
-# (exit != 0), a verb that printed nothing, or output that is not a bare
-# number. The verb itself already prints "0" for an absent, unreadable, or
-# unparseable ranking, so the no-data and no-pressure cases agree.
+# Prints the fraction verbatim whenever the verb succeeds with a bare
+# decimal number -- including "0", the verb's own (valid) answer for an
+# absent or unparseable ranking and for a healthy pool. Prints
+# "unavailable" for anything that is not a reading (#14162): a daemon too
+# old to know the verb (exit != 0), a verb that printed nothing, or output
+# that is not a well-formed number (a warning line, a malformed decimal
+# like "0.7.5"). The caller MUST treat "unavailable" as pressure-UNKNOWN,
+# never as "no pressure" -- see should_defer_for_pool_pressure().
 pool_pressure_fraction() {
   local out
   out="$(loom-daemon tokens pressure --workspace "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" 2>/dev/null)" \
-    || { echo "0"; return; }
-  case "$out" in
-    '' | *[!0-9.]*) echo "0" ;;
-    *) echo "$out" ;;
-  esac
+    || { echo "unavailable"; return; }
+  # A reading is a bare decimal number: digits with at most one embedded
+  # "." followed by digits ("0", "0.7500"). Empty output, stray text, or a
+  # malformed decimal ("0.7.5", ".5", "5.") is not a reading.
+  if [[ ! "$out" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "unavailable"
+    return
+  fi
+  echo "$out"
 }
 
 # Epoch seconds of the most recently MERGED docs-maintenance PR of ANY kind
@@ -2633,6 +2813,13 @@ last_docs_maintenance_merge_epoch() {
 #     (AC3, the "never starves permanently" guarantee).
 # `LOOM_GUIDE_POOL_PRESSURE_NOW` is a test seam only (mirrors
 # `LOOM_WORK_LOG_DEBOUNCE_NOW`) -- never set it in normal operation.
+#
+# #14162: a pressure read that fails or is denied never reads as "no
+# pressure". An `unavailable` result from pool_pressure_fraction() is
+# pressure-UNKNOWN and fail-CLOSES into the same bounded backoff as a real
+# at/above-threshold reading: defer now, file once the max-defer ceiling
+# elapses. The deferral/filing messages name the cause, so the skip is
+# visible in the tick's output rather than only in a PR body.
 should_defer_for_pool_pressure() {
   local threshold max_defer
   threshold="${LOOM_GUIDE_POOL_PRESSURE_THRESHOLD:-$(jq -r '.guide.docsMaintenance.poolPressureThreshold // 0.7' .loom/config.json 2>/dev/null)}"
@@ -2643,26 +2830,35 @@ should_defer_for_pool_pressure() {
   local fraction
   fraction="$(pool_pressure_fraction)"
 
-  # Below threshold -- proceed exactly as today (no pressure signal, or not
-  # enough of one to act on).
-  if awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+  # Split a real reading from no reading (#14162). A valid number below
+  # threshold proceeds exactly as before; an `unavailable` read is NOT "no
+  # pressure" and joins the at/above-threshold path below so the bounded
+  # ceiling decides.
+  local pressure_reason
+  if [ "$fraction" = "unavailable" ]; then
+    pressure_reason="Pool pressure UNAVAILABLE ('loom-daemon tokens pressure' failed, was denied, or printed no number) -- treating the unknown as pressure (#14162)"
+  elif awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+    # Valid reading below threshold -- proceed exactly as before.
     return 1
+  else
+    pressure_reason="Token pool pressure ${fraction} >= threshold ${threshold}"
   fi
 
-  # At/above threshold -- bounded backoff. The max-defer ceiling ALWAYS wins
-  # once it has elapsed, so doc maintenance never starves permanently no
-  # matter how long the pool stays under pressure (AC3).
+  # At/above threshold, or pressure-unknown -- bounded backoff. The
+  # max-defer ceiling ALWAYS wins once it has elapsed, so doc maintenance
+  # never starves permanently no matter how long the pool stays under
+  # pressure -- or unreadable (AC3).
   local last_merged_epoch now_epoch elapsed
   last_merged_epoch="$(last_docs_maintenance_merge_epoch)"
   now_epoch="${LOOM_GUIDE_POOL_PRESSURE_NOW:-$(date -u +%s)}"
   elapsed=$(( now_epoch - last_merged_epoch ))
 
   if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$max_defer" ]; then
-    echo "Token pool pressure ${fraction} >= threshold ${threshold}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
+    echo "${pressure_reason}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
     return 0
   fi
 
-  echo "Token pool pressure ${fraction} >= threshold ${threshold}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
+  echo "${pressure_reason}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
   return 1
 }
 ```
@@ -2884,18 +3080,21 @@ Automated document maintenance by Guide triage agent."
   # (the PR URL, `gh pr create`'s normal success output) so the doc-
   # maintenance telemetry record below (issue #6136) can be tagged with the
   # PR number instead of just "a docs PR happened".
-  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
-    --title "docs: Guide document maintenance update" \
-    --label "loom:review-requested" \
-    --body "$(cat <<'PRBODY'
+  # #14204: the body is assembled into a variable first (heredoc delimiter
+  # quoted, so nothing inside expands) and the WORK_PLAN receipt line is
+  # spliced in afterwards — the quoted delimiter would not interpolate the
+  # receipt in place. The receipt is machine-recorded by update_work_plan()
+  # (Step 3); this body never free-texts a plan-status claim of its own.
+  DOCS_PR_BODY="$(cat <<'PRBODY'
 <!-- loom:docs-only-fast-path -->
 ## Summary
 
 Automated document maintenance by the Guide triage agent.
 
 ### Changes
+<!-- Keyword safety (#14176): never put a closing keyword (close, closes, or the fix/resolve families in any tense) immediately before an issue or PR reference — GitHub parses `<keyword> #N` as a closing link, and merging this docs-only PR would then close the referenced issue. Describe dropped or merged items as "drops completed <refs>" or "drops <refs>"; the intervening word breaks the link. -->
 - **WORK_LOG.md**: Appended entries for recently merged PRs and closed issues
-- **WORK_PLAN.md**: Regenerated backlog snapshot from current GitHub label state (a repo's hand-written ROADMAP.md, if any, remains the direction document)
+@@WORK_PLAN_RECEIPT_LINE@@
 - **README.md**: Updated if architectural changes were detected
 - Plus any files reported by the repo's `.loom/docs-post-stage.sh` hook, if installed (e.g. a regenerated freshness envelope)
 
@@ -2918,7 +3117,34 @@ before taking the fast path.
 ---
 *Automated by Guide role - document maintenance phase*
 PRBODY
-)")
+)"
+  # #14204 WORK_PLAN receipt: the ONLY plan-status claim this PR body makes.
+  # Splice update_work_plan()'s machine-recorded outcome (Step 3) in place of
+  # the placeholder above; when the tick never ran Step 3's check the
+  # fallbacks read NOT RUN / none, so a missing run is visible instead of
+  # silent. Never move this claim into prose elsewhere in the body, and never
+  # reintroduce a fixed bullet asserting a regeneration that may not have
+  # happened.
+  # #14259: a global that carries a real outcome wins (single-shell execution is
+  # unchanged); when Step 3 and Step 5 ran as separate shell invocations the
+  # globals are unset (or still hold the tick's `NOT RUN` initialization, which
+  # carries no information), so recover the receipt from the file
+  # update_work_plan() wrote. No file => the NOT RUN / none fallbacks below.
+  local wp_receipt="${WORK_PLAN_RECEIPT:-}" wp_hash="${WORK_PLAN_RENDER_HASH:-}" wp_file_val
+  if [ -z "$wp_receipt" ] || [ "$wp_receipt" = "NOT RUN" ]; then
+    wp_file_val="$(read_work_plan_receipt_field receipt)"
+    if [ -n "$wp_file_val" ]; then
+      wp_receipt="$wp_file_val"
+      wp_hash="$(read_work_plan_receipt_field render_hash)"
+    fi
+  fi
+  WORK_PLAN_CHECK_LINE="- **WORK_PLAN check**: ${wp_receipt:-NOT RUN} (render-hash ${wp_hash:-none}, $(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+  DOCS_PR_BODY="${DOCS_PR_BODY/"@@WORK_PLAN_RECEIPT_LINE@@"/$WORK_PLAN_CHECK_LINE}"
+
+  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
+    --title "docs: Guide document maintenance update" \
+    --label "loom:review-requested" \
+    --body "$DOCS_PR_BODY")
   echo "$DOCS_PR_URL"
   DOCS_PR_NUMBER="${DOCS_PR_URL##*/}"
 
@@ -2940,6 +3166,26 @@ PRBODY
       || echo "guide-docs-telemetry.sh record failed — non-fatal, PR #$DOCS_PR_NUMBER already exists"
   fi
 
+  # Keyword-safety backstop (issue #14176): a docs-only PR must never close
+  # an issue. If the model rewrote a `### Changes` bullet into a closing
+  # keyword sitting directly before an issue reference, GitHub parsed it as
+  # a closing link and merging would close an unrelated issue. Comment
+  # naming the numbers and close the PR — the next tick regenerates it with
+  # reworded bullets. Non-fatal to the tick: the telemetry above and the
+  # lock release below still run. A failed read is reported, NOT treated as
+  # clean.
+  if [[ "$DOCS_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    if ! DOCS_CLOSING_REFS="$(gh pr view "$DOCS_PR_NUMBER" --json closingIssuesReferences --jq '[.closingIssuesReferences[].number]' 2>/dev/null)"; then
+      echo "guide: WARNING (#14176) — could not read closingIssuesReferences for PR #$DOCS_PR_NUMBER; closing-link check inconclusive, not treated as clean."
+    elif [[ "$DOCS_CLOSING_REFS" != "[]" ]]; then
+      echo "guide: WARNING (#14176) — docs PR #$DOCS_PR_NUMBER would close issue(s) $DOCS_CLOSING_REFS via a closing keyword in its body. Commenting and closing it; the next tick regenerates."
+      gh pr comment "$DOCS_PR_NUMBER" --body "Closing this docs-only PR: its body has a closing keyword directly before an issue reference, so merging it would close unrelated issue(s) $DOCS_CLOSING_REFS. The next Guide tick regenerates it with reworded \`### Changes\` bullets (no closing keyword immediately before a reference)." >/dev/null 2>&1 \
+        || echo "guide: comment on PR #$DOCS_PR_NUMBER failed — non-fatal"
+      gh pr close "$DOCS_PR_NUMBER" >/dev/null 2>&1 \
+        || echo "guide: closing PR #$DOCS_PR_NUMBER failed — non-fatal"
+    fi
+  fi
+
   # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
   # open-docs-PR check — not this lock — is what prevents the NEXT tick from
   # creating another one while this PR is still open; this lock's only job
@@ -2953,6 +3199,22 @@ PRBODY
   # and the docs worktree is a persistent slot that the next tick resets.
 }
 ```
+
+**The `WORK_PLAN check:` line (#14204) is the PR body's only plan-status
+claim.** `update_work_plan()` (Step 3) machine-records its outcome into
+`WORK_PLAN_RECEIPT` and fingerprints the rendered body into
+`WORK_PLAN_RENDER_HASH` (mirrored into `$DOCS_WT/.loom-work-plan-receipt`, #14259,
+so it survives Step 3 and Step 5 running in separate shells);
+`create_docs_pr()` renders them verbatim as
+`- **WORK_PLAN check**: <receipt> (render-hash <hash>, <UTC time>)`. A tick
+that never ran Step 3's check renders `NOT RUN` — visible, not silent — and a
+debounced or provenance-refused tick says so by classification, with the
+elapsed/window figures and the refused render's hash, instead of a confident
+sentence an LLM wrote. Never assert WORK_PLAN is "regenerated", "current",
+"unchanged" (or any other status) anywhere else in the body; that free text is
+exactly the unverifiable claim this line exists to replace, and it replaced a
+fixed bullet that claimed "Regenerated backlog snapshot from current GitHub
+label state" on every PR regardless of what actually happened.
 
 #### Post-stage hook (optional, repo-provided) — #13892
 
@@ -3115,6 +3377,20 @@ Document Maintenance Phase
   the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
   that persists past the window still produces exactly one PR; a change that
   reverts before the window elapses produces none (see Step 3)
+- **A docs-maintenance PR body states WORK_PLAN's status only through the
+  machine-recorded `WORK_PLAN check:` receipt line** (#14204) —
+  `update_work_plan()` (Step 3) classifies its own outcome into
+  `WORK_PLAN_RECEIPT` (written / current / debounced / provenance-refused /
+  write-failed) and hashes the rendered body into `WORK_PLAN_RENDER_HASH`;
+  mirrors both into `$DOCS_WT/.loom-work-plan-receipt` (#14259) so a Step 3 /
+  Step 5 split across shell invocations still renders them; Step 5 renders
+  those verbatim. Never free-text a claim like "WORK_PLAN.md is
+  unchanged/current" anywhere else in the body, and never reintroduce a fixed
+  bullet asserting a regeneration that may not have happened (a debounced or
+  provenance-refused tick used to file PRs whose body still claimed
+  "Regenerated backlog snapshot from current GitHub label state"). A tick that
+  never reached Step 3's check renders `NOT RUN`, so a missing run is visible
+  instead of silent
 - **A pending WORK_LOG.md delta is batched, not written on every tick that
   finds one** (#6133) — WORK_LOG is append-only/event-driven (unlike
   WORK_PLAN's periodic full-regenerate), so the gate combines two knobs
@@ -3151,11 +3427,12 @@ Document Maintenance Phase
   scarcest capacity at exactly the moment other roles are retrying against
   a shrinking set of available accounts. Gated on `pool_pressure_fraction()`
   (`loom-daemon tokens pressure`: a filesystem-only read of the
-  already-refreshed ranking, never a fresh probe — and never a direct read
-  inside the token pool, which `guide`'s tool policy denies, #13839) against
+  already-refreshed ranking, never a fresh probe — it prints only a number,
+  so it needs no `credential-store` capability, #13839) against
   `guide.docsMaintenance.poolPressureThreshold`
   (default 0.70), and bounded by an absolute
   `guide.docsMaintenance.poolPressureMaxDeferSecs` ceiling (default 14400 =
   4h) so doc maintenance never starves permanently even if pressure never
-  clears
+  clears — or a pressure read fails, which is treated as pressure-unknown
+  and deferred the same way (#14162)
 - All changes go through the standard PR review pipeline

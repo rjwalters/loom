@@ -85,7 +85,7 @@ use crate::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdic
 pub(super) const DEFAULT_LIMIT: u32 = 100;
 
 #[derive(clap::Args)]
-pub(crate) struct StaleBlockedArgs {
+pub struct StaleBlockedArgs {
     /// Suppress the one-line stdout confirmation when nothing is found.
     /// Warnings still go to stderr. Matches `check-host-sleep.sh --quiet`.
     #[arg(long, short = 'q')]
@@ -152,7 +152,7 @@ impl Finding {
 
 impl StaleBlockedArgs {
     /// Always `Ok(())`. See the module doc: the exit code is contract.
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let root = match &self.repo_root {
             Some(r) => r.clone(),
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

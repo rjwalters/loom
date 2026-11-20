@@ -329,6 +329,26 @@ pub(super) fn reconcile_skew<R: ContainerRunner>(
         log::debug!("session_reconcile: {container}: skew unchanged since the last recreate");
         return Ok(None);
     }
+    // An override seat is never recreated for skew (issue #14019): its
+    // digest-pinned image carries the daemon it was built on, so recreating
+    // from it would reproduce the same skew, and re-pinning its repository
+    // to the host version would fabricate a tag the operator's repository
+    // does not have. The seat stays on its running container; the fix is
+    // rebuilding the derived image on the new base and updating the digest
+    // pin, then a stop and start. Never a silent fall back to the stock tag.
+    if inputs
+        .session_config
+        .is_some_and(crate::tokens_pool::session_image::SessionImageConfig::has_image_override)
+    {
+        log::warn!(
+            "session_reconcile: {container}: its loom-daemon {have} is older than the host's \
+             {host}, but the seat is configured for an override image (accounts.session.image); \
+             not recreating it. Rebuild the derived image FROM the base session image for \
+             {host}, update the digest pin, then stop and start the seat."
+        );
+        mem.attempted = Some((have, host.clone()));
+        return Ok(None);
+    }
     if !pull_due(mem, &(have.clone(), host.clone())) {
         log::debug!(
             "session_reconcile: {container}: pinned image still backing off after a failed pull"

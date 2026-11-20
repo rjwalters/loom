@@ -12,6 +12,8 @@
 //! - [`backoff`]: when a worker asks the captain for work: capacity-driven,
 //!   with capped jittered backoff on empty answers, pure (#12817).
 //! - [`fallback`]: the worker's fail-open hysteresis, pure (#12450).
+//! - [`filing_slot`]: the captain's fleet-wide issue-filing slot, pure
+//!   (#13918); [`filing`]: the worker's side of it.
 //! - [`worker`]: the worker's claim, refuse, release and heartbeat, behind
 //!   the per-host `fleetDispatch.enabled` flag (#12450).
 //! - [`table`]: the soft assignment table and its policy, pure, on an
@@ -29,6 +31,8 @@
 pub mod backoff;
 pub mod client;
 pub mod fallback;
+pub mod filing;
+pub mod filing_slot;
 pub mod identity;
 pub mod proto;
 pub mod queue;
@@ -39,6 +43,7 @@ pub mod table;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_server;
+pub mod tokens_refresh;
 pub mod worker;
 
 /// A fresh server epoch: changes on every start, so a worker can tell its

@@ -109,25 +109,19 @@
 //! # Durability
 //!
 //! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
-//! landed cooldown's own ceiling), and the registry broadcasts each one but a
-//! refusal's (host-local, #11909) on
-//! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
-//! a window after this host restarts. A host never gets its own windows back
-//! from peers (they never re-send them, and a host ignores its own ads), so
-//! the registry mirrors each pair's runs and window to a file in the
+//! landed cooldown's own ceiling), and the registry mirrors each pair's runs and
+//! window to a file in the
 //! workspace's logs directory after every change and reloads it when it is
 //! built (#12251): the restarted host keeps its own windows and its repeat-cap
 //! history. Lapsed runs and windows are dropped on reload. The refusal and
-//! fast-fail streaks and the counters stay in memory. Nothing
-//! longer rides the broadcast: the Champion ladder's
+//! fast-fail streaks and the counters stay in memory. The Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
 //! rollback those parks stay parked until a role or a human clears them.
 //!
 //! # The draw's query
 //!
 //! [`StepCooldowns`] is the pure answer to "is `(item, step)` cooling down at
-//! time T?". The registry builds one per tick from this ledger plus the peers'
-//! broadcasts; the cutover adds the forge ladder's due times
+//! time T?". The registry builds one per tick from this ledger; the cutover adds the forge ladder's due times
 //! ([`super::reeval_ladder::due`], which reads a marker from the pre-#12513
 //! ladder as due now); the draw reads it as part of `actionable`
 //! (`item_draw::WeighContext::cooldowns`).
@@ -169,6 +163,11 @@ pub const CHAMPION_LINE_PREFIX: &str = "CHAMPION-STEP";
 /// The reason a step's outcome carries when nothing said one: a missing
 /// outcome line on an unchanged item, or a verdict the forge does not show.
 pub const UNCLASSIFIED: &str = "unclassified";
+
+/// The reason of a step whose seat refused preparation over a dirty leftover
+/// worktree (#14458). Synthesized from the step's log, like the spawn-time
+/// refusals; the text names it so the failure is not `unclassified`.
+pub const SEAT_DIRTY: &str = crate::tokens_pool::private_workspace::SEAT_DIRTY_REASON;
 
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";

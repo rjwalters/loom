@@ -129,19 +129,37 @@ fn environmental_reaper_classes_stay_at_900s() {
 #[serial_test::serial]
 fn repeated_lease_order_losses_stay_at_900s() {
     let dir = tempdir().unwrap();
-    let (mut reg, _gh, _spawn, _comments) =
+    let (mut reg, _gh, spawn, comments) =
         crate::sweep_registry::test_support::lease_order_dispatch_registry(
             dir.path(),
             &["<!-- loom:lease host=peer-host sweep=sweep-issue-9823-peer -->"],
         );
-    for _ in 0..12 {
-        let _ = reg.dispatch(&SweepKind::Issue(9823), None, None, None, None);
-        expire_window(&mut reg, 9823);
+    let standing_peer = std::fs::read(&comments).unwrap();
+    let attempts = 12;
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            // The fixture skips the real backoff, so consecutive attempts may
+            // share a whole-second sweep ID. Give each an independent forge
+            // history while keeping the local backoff streak.
+            expire_window(&mut reg, 9823);
+            std::fs::write(&comments, &standing_peer).unwrap();
+        }
+        let error = reg
+            .dispatch(&SweepKind::Issue(9823), None, None, None, None)
+            .expect_err("each dispatch must lose to the earlier peer");
+        let loss = error
+            .downcast_ref::<LeaseOrderDispatchError>()
+            .unwrap_or_else(|| {
+                panic!("attempt {attempt}: expected an earlier-peer loss, got {error:#}")
+            });
+        assert_eq!(loss.issue, 9823);
+        assert_eq!(loss.earliest_host, "peer-host");
+        assert_eq!(loss.earliest_sweep_id, "sweep-issue-9823-peer");
+        assert_eq!(reg.dispatch_failure_count(9823), attempt);
     }
-    assert_eq!(reg.dispatch_failure_count(9823), 12);
-    reg.record_dispatch_failure(9823);
+    assert!(!spawn.exists());
     let left = reg.dispatch_backoff_remaining(9823, Utc::now()).unwrap();
-    assert!(left <= CAP, "{left:?}");
+    assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{left:?}");
 }
 
 /// End to end: repeated synchronous token-selection deaths stay at 900 s.

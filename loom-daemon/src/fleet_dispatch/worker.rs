@@ -51,7 +51,11 @@
 //! ([`on_reaper_tick`]); at most one heartbeat per [`HEARTBEAT_GAP`] goes out
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
-//! fallback the heartbeat is the probe that ends it.
+//! fallback the heartbeat is the probe that ends it. The answer may carry the
+//! captain's token-pool probe snapshot (#13942), which the worker stores
+//! beside its pool as the fleet sidecar for the evidence readers
+//! ([`crate::tokens_pool::fleet_probe`]) — absent on an old captain or an
+//! unreachable one, where the worker keeps its own evidence untouched.
 //!
 //! A repo whose live set has not been refreshed for [`live_stale_after`]
 //! (its workspace was deregistered and its reaper aborted, so neither its
@@ -286,7 +290,7 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 /// is a failure like any other, and it is logged at ERROR: the server does
 /// not map this host's tailnet node to its `host_id`, a fleet config error
 /// that must be loud (#12450 refinement 7).
-fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
+pub(super) fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
     if let Some(CallError::Status(403)) = failure {
         log::error!(
             "fleet_dispatch: the captain refused this host's identity (HTTP 403): its tailnet \
@@ -320,14 +324,14 @@ pub fn mode() -> Mode {
     state().hysteresis.mode()
 }
 
-fn host_id() -> String {
+pub(super) fn host_id() -> String {
     crate::host_identity::host_identity()
 }
 
 /// `owner/name` of `root`, without a forge call.
 fn repo_of(root: &Path) -> String {
     crate::observability::ops::dispatch_facts::repo_for_root(root)
-        .unwrap_or_else(|| crate::peer_claims::repo_slug(root))
+        .unwrap_or_else(|| crate::host_identity::repo_slug(root))
 }
 
 /// A claim answer, typed.
@@ -736,7 +740,27 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        send_detached::<_, HeartbeatResponse>(&url, proto::HEARTBEAT_PATH, request, facts);
+        // #13942: the pool the snapshot lands in is a host-level fact, so it
+        // resolves from the daemon workspace (`host_root`) the same way the
+        // endpoint does, falling back to the ticking repo's root before one
+        // is named.
+        let probe_root = state()
+            .host_root
+            .clone()
+            .unwrap_or_else(|| root.to_path_buf());
+        send_detached_then::<_, HeartbeatResponse>(
+            &url,
+            proto::HEARTBEAT_PATH,
+            request,
+            facts,
+            move |resp| {
+                let Some(snapshot) = &resp.token_probe else {
+                    return;
+                };
+                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+            },
+        );
     }
 }
 

@@ -140,7 +140,7 @@ const KNOWN_KEYS: &[&str] = &[
     "sha",
 ];
 
-const MARKER_OPEN: &str = "loom:premise-check";
+pub(crate) const MARKER_OPEN: &str = "loom:premise-check";
 
 /// The last chunk (body or comment) that carries a well-formed marker opener.
 ///

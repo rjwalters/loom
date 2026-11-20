@@ -401,8 +401,16 @@ pub fn extract_usage_snapshot(
 
 /// Every `rollout-*.jsonl` under `<profile>/sessions/`, newest first, as
 /// `(path, mtime)`. The walk is bounded by depth and entry count, like before.
-fn rollout_logs_newest_first(profile: &Path) -> Vec<(PathBuf, DateTime<Utc>)> {
+fn rollout_logs_newest_first(
+    profile: &Path,
+    account_local_only: bool,
+) -> Vec<(PathBuf, DateTime<Utc>)> {
     let sessions = profile.join("sessions");
+    // Provisioning links the default profile's sessions for resuming work.
+    // Those rollouts cannot establish which account consumed the quota.
+    if account_local_only && !sessions.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return Vec::new();
+    }
     let mut stack = vec![(sessions, 0usize)];
     let mut visited = 0usize;
     let mut found: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
@@ -424,6 +432,9 @@ fn rollout_logs_newest_first(profile: &Path) -> Vec<(PathBuf, DateTime<Utc>)> {
             };
             if file_type.is_dir() {
                 stack.push((path, depth + 1));
+                continue;
+            }
+            if account_local_only && !file_type.is_file() {
                 continue;
             }
             let name = entry.file_name();
@@ -476,10 +487,17 @@ fn read_tail(path: &Path) -> Option<String> {
 /// `None` when the profile carries no usable one.
 #[must_use]
 pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
+    latest_usage_snapshot_with_scope(profile, false)
+}
+
+fn latest_usage_snapshot_with_scope(
+    profile: &Path,
+    account_local_only: bool,
+) -> Option<UsageSnapshot> {
     // The newest session often carries no `rate_limits` line at all (it ended
     // before its first model turn), which used to hide every older snapshot
     // (#8963). Walk newest-first until a file yields a reading.
-    rollout_logs_newest_first(profile)
+    rollout_logs_newest_first(profile, account_local_only)
         .into_iter()
         .take(MAX_ROLLOUT_FILES_EXAMINED)
         .find_map(|(path, mtime)| {
@@ -489,6 +507,29 @@ pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
 
 /// How many rollout files, newest first, `latest_usage_snapshot` examines.
 const MAX_ROLLOUT_FILES_EXAMINED: usize = 8;
+
+/// The **weekly** (long-window) utilization in the freshest account-local
+/// snapshot at `now_epoch`, as a 0..1 fraction when usable (#14585).
+///
+/// Ranking uses the same window normalization as [`assess_account`]. It
+/// requires account-local history and a future reported reset or a reading
+/// younger than its known window. A measured `0.0` is a reading.
+#[must_use]
+pub fn weekly_utilization_at(profile: &Path, now_epoch: u64) -> Option<f64> {
+    let now = epoch_to_utc(now_epoch)?;
+    let snapshot = latest_usage_snapshot_with_scope(profile, true)?;
+    let weekly = snapshot.secondary?;
+    let expiry = weekly.resets_at.or_else(|| {
+        if snapshot.observed_at > now {
+            return None;
+        }
+        let minutes = i64::try_from(weekly.window_minutes?).ok()?;
+        snapshot
+            .observed_at
+            .checked_add_signed(chrono::Duration::try_minutes(minutes)?)
+    })?;
+    (expiry > now && weekly.used_fraction.is_finite()).then_some(weekly.used_fraction)
+}
 
 // ---------------------------------------------------------------------------
 // Assessment
@@ -864,6 +905,17 @@ pub fn format_table_for(report: &ProbeReport, live: bool) -> String {
 /// simply has not written a rollout log yet — the fail-*closed* direction this
 /// module's header rules out. The honesty the issue asked for lives in the
 /// status word and the table footer, not in this exit code.
+///
+/// One divergence is accepted (issue #14349): this predicate reads the
+/// in-memory probe round, not the written `.ranking`. A round whose fresh
+/// status is `unknown` over a still-running weekly hold is **written** as the
+/// carried `exhausted` row (`check::carries_forward`, #14265), which
+/// `select::is_hard_excluded` refuses unconditionally — yet the in-memory
+/// report still says `unknown`, so this returns `true` for it. If every
+/// account is in that state, `accounts check` exits `0` while a codex dispatch
+/// finds nothing selectable. The predicate deliberately does not read the
+/// persisted row (no file I/O in an exit-code predicate), and the dangerous
+/// direction — readmitting a held account — is what the carry-forward fixes.
 #[must_use]
 pub fn has_usable_account(report: &ProbeReport) -> bool {
     report
