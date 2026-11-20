@@ -128,7 +128,7 @@ pub struct GhTransport {
     reader: RefCell<Option<(PathBuf, String)>>,
     next_reader: Box<NextReader>,
     withdraw: Box<WithdrawReader>,
-    /// The #14730 bootstrap mint, when the workspace has a minting seam.
+    /// The production bootstrap attempt, including reporting missing mint helpers (#14730).
     bootstrap: Option<Box<BootstrapReader>>,
     /// Why the last bootstrap mint failed, for the caller's recovery message.
     bootstrap_error: RefCell<Option<String>>,
@@ -172,20 +172,23 @@ impl GhTransport {
         // #14730: a pooled host whose daemon never published a reader token
         // mints one through the workspace's own minting seam, at the same
         // root the pool resolves against, before its first store read sheds.
-        let bootstrap = crate::forge_identity::real_minter_factory(&reader_root).map(|factory| {
-            let root = reader_root.clone();
-            let nwo = repo.to_string();
-            Box::new(move || {
-                let roster = roster_of(&root);
-                crate::forge_identity::provision_bootstrap_reader(&root, &roster, &nwo, &factory)
-            }) as Box<BootstrapReader>
+        let factory = crate::forge_identity::real_minter_factory(&reader_root);
+        let nwo = repo.to_string();
+        let bootstrap = Box::new(move || {
+            let roster = roster_of(&reader_root);
+            crate::forge_identity::provision_bootstrap_reader(
+                &reader_root,
+                &roster,
+                &nwo,
+                factory.as_ref(),
+            )
         });
         Self::with_readers(
             workspace_root,
             repo,
             pooled,
             next_reader,
-            bootstrap,
+            Some(bootstrap),
             Box::new(crate::forge_identity::withdraw_after),
         )
     }

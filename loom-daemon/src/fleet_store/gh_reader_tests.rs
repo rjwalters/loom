@@ -520,6 +520,25 @@ fn a_failed_bootstrap_mint_fails_the_read_naming_the_step_without_any_request() 
 }
 
 #[test]
+fn a_missing_bootstrap_helper_reports_the_recovery_step_without_a_request() {
+    let b = Boot::new();
+    std::fs::remove_file(b.tmp.path().join(".loom/scripts/lib/github-app-token.sh")).unwrap();
+    let t = b.transport();
+    let err = t
+        .get(&format!("repos/{BOOT_REPO}/commits/main"), None, None)
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("before starting the daemon"), "{msg}");
+    let reason = t
+        .bootstrap_failure()
+        .expect("the failure is available to render");
+    assert!(reason.contains("github-app-token.sh"), "{reason}");
+    assert!(reason.contains("missing"), "{reason}");
+    assert!(b.calls().is_empty());
+    assert!(b.mints().is_empty());
+}
+
+#[test]
 fn a_bootstrap_fetch_advances_a_cached_stop_and_lets_the_host_run() {
     let b = Boot::new();
     let cache = tempfile::tempdir().unwrap();
@@ -621,6 +640,8 @@ fn a_withdrawn_reader_keeps_the_ordinary_cached_fallback() {
     };
     expect_cached(&transport);
     expect_cached(&transport);
+    expect_cached(&b.transport_for(REPO, roster));
+    std::fs::remove_file(b.tmp.path().join(".loom/scripts/lib/github-app-token.sh")).unwrap();
     expect_cached(&b.transport_for(REPO, roster));
     let calls = b.calls();
     never_the_writer(&calls);

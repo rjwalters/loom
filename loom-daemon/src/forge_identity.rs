@@ -1265,14 +1265,14 @@ fn refresh_pass(ws: &Path, primary: Option<String>) {
 /// `Ok(())` asks the caller to retry routing. If a credential was already
 /// published for an eligible reader, skip minting and let routing decide
 /// whether it can serve the read. `Err` names the reader setup to fix before
-/// starting the daemon. A mint failure
+/// starting the daemon, including when the workspace has no mint helper. A mint failure
 /// never withdraws the reader (owner-level coverage, exactly as in
 /// [`refresh_reader_credentials`]).
 pub fn provision_bootstrap_reader(
     workspace_root: &Path,
     roster: &Roster,
     owner_repo: &str,
-    make_minter: &dyn Fn(&Identity) -> Box<dyn GithubAppMinter>,
+    make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
 ) -> std::result::Result<(), String> {
     let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
     if owner.is_empty() {
@@ -1292,6 +1292,14 @@ pub fn provision_bootstrap_reader(
     }) {
         return Ok(());
     }
+
+    let Some(make_minter) = make_minter else {
+        return Err(
+            "the workspace's github-app-token.sh is missing (installed and source paths). \
+             Restore the Loom helper and retry"
+                .to_string(),
+        );
+    };
 
     let mut failures: Vec<String> = Vec::new();
     for reader in eligible {
