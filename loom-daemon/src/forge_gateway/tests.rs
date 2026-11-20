@@ -19,6 +19,28 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// #14775: a fixture that moves the process-global gateway state
+/// ([`set_active`] through `Refresher::pass_with`) runs its body in a child
+/// copy of this test binary. The `serial` mutex above only orders publishers
+/// inside this module; the synthetic gateway leaks past it to every other
+/// fixture of this process — an unscoped reader-only read elsewhere answers
+/// `host_has_read_pool()` with it and sheds before its fake CLI can answer.
+/// The public test names stay as wrappers, so the default suite and focused
+/// filters still exercise each body.
+fn in_a_child_process(child: &str) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("forge_gateway::tests::{child}"),
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the gateway fixture child `{child}` failed: {status}");
+}
+
 fn cfg(owners: &[(&str, &str)]) -> Value {
     let refs: serde_json::Map<String, Value> = owners
         .iter()
@@ -210,6 +232,15 @@ fn a_profile_carries_the_key_and_api_host_privately() {
 
 #[test]
 fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish() {
+    in_a_child_process("a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish_child");
+}
+
+/// The body of
+/// [`a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish`],
+/// in its own process: it publishes into the shared `DAEMON` singleton.
+#[test]
+#[ignore = "run in a child process by a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish"]
+fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish_child() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
@@ -233,6 +264,25 @@ fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish() {
     assert_eq!(profile_for("gwt-b"), None);
     let env = agent_env();
     assert_eq!(env[1], (DIR_ENV, Some(base.clone().into_os_string())));
+
+    // #14775: with this synthetic gateway live, the production reader-only
+    // guard sheds an unscoped claim-label read (`Unknown`) and never
+    // consults the CLI — the exact interference running this body in a
+    // child keeps out of every unrelated fixture of the parent process.
+    assert!(any_live());
+    let inert = ws.join("gh-inert");
+    let ran = ws.join("inert-ran");
+    std::fs::write(&inert, format!("#!/bin/sh\necho ran > '{}'\n", ran.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&inert, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(
+        crate::forge_check_claim::read_claim_labels(&inert, ws, 42),
+        crate::forge_check_claim::LabelLeg::Unknown,
+        "a live gateway sheds an unscoped reader-only read"
+    );
+    assert!(!ran.exists(), "the inert CLI never ran: the read was shed, not sent");
 
     // Nothing due within the republish interval.
     assert_eq!(
@@ -261,6 +311,14 @@ fn a_pass_publishes_each_owner_and_rewrites_api_host_on_every_publish() {
 /// on disk is picked up without a daemon restart.
 #[test]
 fn a_replaced_gh_is_reported_on_the_next_refresh() {
+    in_a_child_process("a_replaced_gh_is_reported_on_the_next_refresh_child");
+}
+
+/// The body of [`a_replaced_gh_is_reported_on_the_next_refresh`], in its own
+/// process: it publishes into the shared `DAEMON` singleton (#14775).
+#[test]
+#[ignore = "run in a child process by a_replaced_gh_is_reported_on_the_next_refresh"]
+fn a_replaced_gh_is_reported_on_the_next_refresh_child() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
@@ -287,6 +345,14 @@ fn a_replaced_gh_is_reported_on_the_next_refresh() {
 
 #[test]
 fn an_old_gh_publishes_nothing_and_removes_what_was_there() {
+    in_a_child_process("an_old_gh_publishes_nothing_and_removes_what_was_there_child");
+}
+
+/// The body of [`an_old_gh_publishes_nothing_and_removes_what_was_there`],
+/// in its own process: it moves the shared `DAEMON` singleton (#14775).
+#[test]
+#[ignore = "run in a child process by an_old_gh_publishes_nothing_and_removes_what_was_there"]
+fn an_old_gh_publishes_nothing_and_removes_what_was_there_child() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
@@ -305,6 +371,14 @@ fn an_old_gh_publishes_nothing_and_removes_what_was_there() {
 
 #[test]
 fn a_dropped_owner_s_profile_is_removed() {
+    in_a_child_process("a_dropped_owner_s_profile_is_removed_child");
+}
+
+/// The body of [`a_dropped_owner_s_profile_is_removed`], in its own process:
+/// it publishes into the shared `DAEMON` singleton (#14775).
+#[test]
+#[ignore = "run in a child process by a_dropped_owner_s_profile_is_removed"]
+fn a_dropped_owner_s_profile_is_removed_child() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();
@@ -361,6 +435,14 @@ fn a_live_profile_routes_reads_as_the_gateway_reader() {
 /// agent is told about a gateway.
 #[test]
 fn with_the_gateway_unset_routing_is_byte_identical_to_today() {
+    in_a_child_process("with_the_gateway_unset_routing_is_byte_identical_to_today_child");
+}
+
+/// The body of [`with_the_gateway_unset_routing_is_byte_identical_to_today`],
+/// in its own process: it moves the shared `DAEMON` singleton (#14775).
+#[test]
+#[ignore = "run in a child process by with_the_gateway_unset_routing_is_byte_identical_to_today"]
+fn with_the_gateway_unset_routing_is_byte_identical_to_today_child() {
     let _serial = serial();
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path();

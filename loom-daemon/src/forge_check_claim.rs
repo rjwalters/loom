@@ -1838,6 +1838,22 @@ mod tests {
 
         let garbage = write_exec(dir.path(), "gh-garbage.sh", "echo 'not json'");
         assert_eq!(read_claim_labels(&garbage, dir.path(), 42), LabelLeg::Unknown);
+
+        // #14775: direct stub-execution evidence — the classifications above
+        // came from a CLI that actually ran, not from a shed answering
+        // `Unknown` before any invocation (the parallel-fixture interference
+        // this test pins down).
+        let ran = dir.path().join("stub-ran");
+        let counting = write_exec(
+            dir.path(),
+            "gh-counting.sh",
+            &format!(
+                r#"echo ran >> '{}'; echo '{{"labels":[{{"name":"loom:issue"}}]}}'"#,
+                ran.display()
+            ),
+        );
+        assert_eq!(read_claim_labels(&counting, dir.path(), 42), LabelLeg::Clean);
+        assert!(ran.is_file(), "the stub itself executed");
     }
 
     #[test]
