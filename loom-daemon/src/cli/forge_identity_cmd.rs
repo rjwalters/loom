@@ -476,13 +476,7 @@ fn adopter(
         if let Some(known) = seen.borrow().get(login) {
             return known.clone();
         }
-        let path = format!("repos/{repo}/collaborators/{login}/permission");
-        let out = crate::script_helpers::gh_read(
-            "promotion_author.permission",
-            &["api", &path, "--jq", ".permission"],
-            root,
-            false,
-        );
+        let out = promotion_permission_invocation(repo, login, root)?.run();
         let access = out.ok_output().and_then(|out| {
             matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
                 .then(|| "COLLABORATOR".to_string())
@@ -490,6 +484,28 @@ fn adopter(
         seen.borrow_mut().insert(login.to_string(), access.clone());
         access
     })
+}
+
+/// GitHub evaluates this endpoint under the asking credential. Keep only
+/// this permission probe on the writer, following `write_scope::GhProbe`.
+fn promotion_permission_invocation(
+    repo: &str,
+    login: &str,
+    root: &Path,
+) -> Option<crate::gh_invocation::GhInvocation> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let path = format!("repos/{repo}/collaborators/{login}/permission");
+    Some(
+        GhInvocation::new(
+            Operation::new("promotion_author.permission"),
+            AccessIntent::Read,
+            GhTarget::repo(repo).ok()?,
+            crate::cmd_out::DEFAULT_TIMEOUT,
+        )
+        .current_dir(root)
+        .writer_identity()
+        .args(["api", &path, "--jq", ".permission"]),
+    )
 }
 
 const BODY_EDITS_QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
@@ -547,8 +563,43 @@ fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Va
 
 #[cfg(test)]
 mod tests {
-    use super::{body_edits_args, gh_comment, real_repo};
+    use super::{body_edits_args, gh_comment, promotion_permission_invocation, real_repo};
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_author_pins_the_exact_permission_read() {
+        use crate::gh_invocation::AccessIntent;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary fake credential and program");
+        let writer = temp.path().join("writer");
+        fs::create_dir(&writer).expect("fake writer directory");
+        let gh = temp.path().join("gh");
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+test "$*" = 'api repos/acme/widget/collaborators/maintainer/permission --jq .permission' || exit 3
+test "${GH_CONFIG_DIR##*/}" = writer || exit 4
+test -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" || exit 5
+printf 'write\n'
+"#,
+        )
+        .expect("write stub");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("executable stub");
+        let inv = promotion_permission_invocation("acme/widget", "maintainer", temp.path())
+            .expect("valid repository target");
+        assert_eq!(inv.intent(), AccessIntent::Read);
+        assert_eq!(inv.target().slug().as_deref(), Some("acme/widget"));
+        assert!(!inv.is_reader_only(), "the asker's permission would be shed");
+        let out = inv
+            .program(&gh)
+            .gh_config_dir(Some(&writer))
+            .without_token_env()
+            .run();
+        assert_eq!(out.ok_stdout_trimmed().as_deref(), Some("write"));
+    }
 
     /// Finding A (20261116-r15 q48): with no `--repo` the repository is the
     /// `gh` placeholder, and the GraphQL call must still name a real one.
