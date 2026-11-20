@@ -939,6 +939,57 @@ pub(crate) fn handle_tokens_command(action: TokensAction) -> Result<()> {
             Ok(())
         }
 
+        TokensAction::Refresh { workspace, .. } => {
+            use crate::fleet_dispatch::tokens_refresh::{refresh as refresh_fleet, FleetRefresh};
+
+            let root = resolve_tokens_workspace(&workspace)?;
+            // A one-shot captain caller registers the standalone ops sink so
+            // the `loom.fleet_dispatch.call` span it records exports instead
+            // of vanishing with the process (#14129, the filing-lock path's
+            // precedent), then drains its queue once before exiting.
+            const REFRESH_QUEUE_TAG: &str = "tokens-refresh";
+            let config = crate::observability::read_config(&root);
+            let export_in_process = crate::observability::standalone_ops::register_sink(
+                &config,
+                &root,
+                REFRESH_QUEUE_TAG,
+            );
+            let answer = refresh_fleet(&root);
+            if export_in_process {
+                let _ = crate::observability::standalone_ops::flush_pending(
+                    &config,
+                    &root,
+                    REFRESH_QUEUE_TAG,
+                    std::time::Duration::from_secs(10),
+                );
+            }
+            match answer {
+                FleetRefresh::Acked {
+                    probed_at,
+                    coalesced,
+                } => {
+                    let when = probed_at.map_or_else(
+                        || "an instant the captain could not read back".to_string(),
+                        |at| at.to_rfc3339(),
+                    );
+                    println!(
+                        "Captain probed the pool at {when}; every worker applies it on its next \
+                         heartbeat (at most ~25 s){}",
+                        if coalesced {
+                            " — coalesced into a probe that was already running"
+                        } else {
+                            ""
+                        }
+                    );
+                    Ok(())
+                }
+                FleetRefresh::Refused { reason } => {
+                    eprintln!("tokens refresh --fleet: {reason}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         TokensAction::Pin { action, workspace } => {
             let ws = resolve_tokens_workspace(&workspace)?;
             handle_pin_action(action, &ws)
