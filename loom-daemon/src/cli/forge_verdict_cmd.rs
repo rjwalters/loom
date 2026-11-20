@@ -358,6 +358,9 @@ struct GhHandback<'a> {
     pull: String,
     root: &'a Path,
     held_gh: std::path::PathBuf,
+    /// The claim's `--watch-pid`, so the held route resolves the claim's lease
+    /// identity even when the session PID is not exported.
+    watch_pid: Option<u32>,
     /// #14165: which forge call failed and why (a 401 classed as
     /// `[github_auth]`), so a `FAILED` outcome names the call instead of a
     /// generic "could not be read".
@@ -575,6 +578,7 @@ pub(crate) fn doctor_handback(
     expected_head: &str,
     deadline_secs: Option<u64>,
     recover_held: bool,
+    watch_pid: Option<u32>,
 ) -> Result<()> {
     use crate::doctor_handback as hb;
     if expected_head.trim().is_empty() {
@@ -605,6 +609,7 @@ pub(crate) fn doctor_handback(
         Ok(()) => {
             publish_held_lock(&lock);
             let mut forge = GhHandback::new(repo, pr, &root);
+            forge.watch_pid = watch_pid;
             let outcome = if recover_held {
                 held_review::recover_cli(&mut forge, expected_head)
             } else {

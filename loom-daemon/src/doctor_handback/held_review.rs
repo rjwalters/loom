@@ -162,8 +162,18 @@ pub(crate) fn route(forge: &mut impl Forge, mode: Mode, expected: &str) -> Outco
             Outcome::Ineligible
         };
     };
+    // A qualifying repair this caller does not own is retryable, not
+    // ineligible: the ordinary path would release another Doctor's claim.
+    let not_owner = mode == Mode::Doctor
+        && !obs.can_act
+        && obs.snapshot.has(CLAIM)
+        && classify(&obs.snapshot, &obs.park_body, &obs.trusted, expected).is_some();
     let Some((intent, recorded, _)) = eligible(obs, mode, expected) else {
-        return Outcome::Ineligible;
+        return if not_owner {
+            Outcome::Interrupted
+        } else {
+            Outcome::Ineligible
+        };
     };
     if !recorded {
         if mode == Mode::Recover {

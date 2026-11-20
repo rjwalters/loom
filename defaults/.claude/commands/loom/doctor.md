@@ -682,7 +682,7 @@ fi
 
 # Complete normally (hand-back: see "Verdict-Time CAS Recheck")
 git push
-loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)"
+loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 ./.loom/scripts/post-comment.sh 588 --pr --body "Per-finding handoff (see Communicate Clearly): <fixed at file:line / still open / disputed + reason, per finding>. Ready for re-review"
 ```
 
@@ -1016,7 +1016,7 @@ Recheck"). A prose re-read plus a separate `gh pr edit` did not hold, so the
 read-decide-write is one verb. **Never hand-write the completion labels:**
 
 ```bash
-loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"  # the SHA you pushed
+loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"  # the SHA you pushed
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
@@ -1400,7 +1400,7 @@ git push
 
 # Signal completion and unclaim — one verified write; act on its exit code
 # (see "Verdict-Time CAS Recheck" above): 0/10 comment, 13 done, 11/12 stand down
-loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)"
+loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 ./.loom/scripts/post-comment.sh 42 --pr --body "🩺 Doctor handoff — per-finding status at $(git rev-parse --short HEAD):
 - Reviewer A, null handling: **fixed** at foo.ts:15
 - Reviewer A, missing error-case test: **fixed** at foo.test.ts:40

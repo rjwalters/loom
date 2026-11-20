@@ -997,6 +997,10 @@ pub(crate) enum ForgeAction {
         /// Recover a recorded held Doctor handback without claiming a new one.
         #[arg(long)]
         recover_held: bool,
+        /// The process the Doctor's `lease pr claim --watch-pid` named, so the
+        /// held-repair route resolves the same lease identity as the claim.
+        #[arg(long)]
+        watch_pid: Option<u32>,
     },
 
     /// `forge verdict-reconcile <pr> --repo R --verdict V --sha S
@@ -1322,6 +1326,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             repo,
             deadline_secs,
             recover_held,
+            watch_pid,
         } => {
             return super::forge_verdict_cmd::doctor_handback(
                 pr,
@@ -1329,6 +1334,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
                 &expected_head_sha,
                 deadline_secs,
                 recover_held,
+                watch_pid,
             );
         }
         ForgeAction::VerdictStaleNotice {
@@ -1724,6 +1730,7 @@ mod write_target_tests {
             repo: Some("unmanaged/repo".into()),
             deadline_secs: None,
             recover_held: false,
+            watch_pid: None,
         };
         assert_eq!(write_target(&explicit), Some(Some("unmanaged/repo".into())));
         let implicit = ForgeAction::DoctorHandback {
@@ -1732,6 +1739,7 @@ mod write_target_tests {
             repo: None,
             deadline_secs: None,
             recover_held: false,
+            watch_pid: None,
         };
         assert_eq!(write_target(&implicit), Some(None));
     }

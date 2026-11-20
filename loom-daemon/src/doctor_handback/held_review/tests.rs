@@ -165,7 +165,6 @@ fn released_foreign_equivalent_parked_moved_and_unauthorized_repairs_are_inert()
         "operator",
         "frozen",
         "moved",
-        "peer",
         "no-claim",
         "unanchored",
     ] {
@@ -182,7 +181,6 @@ fn released_foreign_equivalent_parked_moved_and_unauthorized_repairs_are_inert()
             "operator" => forge.labels.push("loom:operator".into()),
             "frozen" => forge.labels.push("loom:frozen".into()),
             "moved" => forge.head = C.into(),
-            "peer" => forge.owner = false,
             "no-claim" => forge.labels.retain(|label| label != CLAIM),
             "unanchored" => {
                 forge.trusted.pop();
@@ -192,6 +190,14 @@ fn released_foreign_equivalent_parked_moved_and_unauthorized_repairs_are_inert()
         assert_eq!(route(&mut forge, Mode::Doctor, B), Outcome::Ineligible, "{case}");
         assert!(forge.writes.is_empty(), "{case}");
     }
+}
+
+#[test]
+fn losing_ownership_of_a_qualifying_repair_is_retryable_and_writes_nothing() {
+    let mut forge = Fixture::new(HoldKind::CriticalFile);
+    forge.owner = false;
+    assert_eq!(route(&mut forge, Mode::Doctor, B), Outcome::Interrupted);
+    assert!(forge.writes.is_empty(), "another Doctor's claim must not be touched");
 }
 
 #[test]

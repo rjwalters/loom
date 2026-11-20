@@ -20,6 +20,7 @@ impl<'a> GhHandback<'a> {
             repo,
             root,
             held_gh: crate::gh_invocation::gh_bin().into(),
+            watch_pid: None,
             failure: None,
         }
     }
@@ -46,7 +47,7 @@ impl<'a> GhHandback<'a> {
     }
 }
 
-fn can_act(comments: &[Value], mode: Mode) -> Option<bool> {
+fn can_act(comments: &[Value], mode: Mode, explicit_pid: Option<u32>) -> Option<bool> {
     let mut listing = String::new();
     let mut count = 0;
     for row in comments {
@@ -74,10 +75,12 @@ fn can_act(comments: &[Value], mode: Mode) -> Option<bool> {
     if peer || mode == Mode::Recover {
         return Some(!peer && doctor.is_empty());
     }
-    let watch_pid = ["LOOM_AGENT_SESSION_PID", "CLAUDE_PID"]
-        .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
-        .find_map(|pid| pid.parse().ok());
+    let watch_pid = explicit_pid.or_else(|| {
+        ["LOOM_AGENT_SESSION_PID", "CLAUDE_PID"]
+            .into_iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .find_map(|pid| pid.parse().ok())
+    });
     let sweep = pr_lease::resolve_sweep(None, watch_pid, |key| std::env::var(key).ok());
     let host = pr_lease::published_host();
     Some(
@@ -100,7 +103,7 @@ impl Forge for GhHandback<'_> {
         let listing = self.held_read("verdict.pr_comments", &["api", &path, "--paginate"])?;
         let trusted =
             crate::comment_trust::TrustPolicy::for_root(self.root).trusted_listing(&listing)?;
-        let can_act = can_act(&trusted, mode)?;
+        let can_act = can_act(&trusted, mode, self.watch_pid)?;
         let park_body = match doc.get("body")? {
             Value::Null => String::new(),
             Value::String(body) => body.clone(),
