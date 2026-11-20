@@ -16,6 +16,13 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14545**: feat: route script-helper gh calls through GhInvocation with a declared intent
+- **PR #14597**: feat: prefer the Codex seat with the most weekly headroom among healthy seats
+- **PR #14690**: fix: build main again after #14597 met #14599's serves_repository removal
+- **Issue #13744** (closed): Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
+- **Issue #14585** (closed): Codex seat selection does not prefer the account with the most 7d headroom among idle, eligible seats
+- **Issue #14684** (closed): Rust tests fail to compile on main after #14597
+- **Issue #14698** (closed): codex_guard::GUARDED_ROLES doc comment claims an exact mirror of spawn-codex.sh's role lists, but adds sweep-lifecycle
 - **PR #14267**: fix: clear recycled-pid claim locks in loom-clean's stale-lock pass
 - **PR #14283**: docs: drop retired claude-md-budget and docs-defaults-parity CI jobs from judge prompt
 - **PR #14289**: feat(daemon): publish the captain's token probe to fleet workers
