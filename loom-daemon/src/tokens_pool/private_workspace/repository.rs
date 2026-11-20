@@ -164,19 +164,7 @@ impl WorkerCommand {
             Self::Execute { command } => worker_setup::execute(command)?,
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
-                match prepare(Path::new(ROOT), &args) {
-                    Ok(outcome) => println!(
-                        "{}",
-                        json!({
-                            "protocol": PROTOCOL,
-                            "revision": outcome.revision,
-                            "reaped_worktrees": outcome.reaped,
-                        })
-                    ),
-                    Err(error) => {
-                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
-                    }
-                }
+                println!("{}", prepare_response(prepare(Path::new(ROOT), &args)));
             }
             Self::Recover(args) => {
                 repository_url(&args.repository)?;
@@ -262,7 +250,42 @@ pub(super) struct PrepareOutcome {
     pub(super) reaped: Vec<String>,
 }
 
-pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome> {
+#[derive(Debug)]
+pub(super) struct PrepareFailure {
+    error: anyhow::Error,
+    reaped: Vec<String>,
+}
+
+impl std::fmt::Display for PrepareFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for PrepareFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+pub(super) fn prepare_response(
+    outcome: Result<PrepareOutcome, PrepareFailure>,
+) -> serde_json::Value {
+    match outcome {
+        Ok(outcome) => json!({
+            "protocol": PROTOCOL,
+            "revision": outcome.revision,
+            "reaped_worktrees": outcome.reaped,
+        }),
+        Err(failure) => json!({
+            "protocol": PROTOCOL,
+            "error": failure.to_string(),
+            "reaped_worktrees": failure.reaped,
+        }),
+    }
+}
+
+pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome, PrepareFailure> {
     prepare_with_pr_lookup(root, args, &finished_pr)
 }
 
@@ -272,7 +295,20 @@ pub(super) fn prepare_with_pr_lookup(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<PrepareOutcome> {
+) -> Result<PrepareOutcome, PrepareFailure> {
+    let mut reaped = Vec::new();
+    match prepare_revision(root, args, has_finished_pr, &mut reaped) {
+        Ok(revision) => Ok(PrepareOutcome { revision, reaped }),
+        Err(error) => Err(PrepareFailure { error, reaped }),
+    }
+}
+
+fn prepare_revision(
+    root: &Path,
+    args: &PrepareArgs,
+    has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
+    reaped: &mut Vec<String>,
+) -> Result<String> {
     valid_base(&args.base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
@@ -361,7 +397,7 @@ pub(super) fn prepare_with_pr_lookup(
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
     git(&repo, &["fetch", "--prune", "origin"])?;
-    let reaped = reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr)?;
+    reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr, reaped)?;
     clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:
     // preparation never moves a branch (a resumed one keeps its local tip)
@@ -454,7 +490,7 @@ pub(super) fn prepare_with_pr_lookup(
     identity.container_id = args.container_id.clone();
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
-    Ok(PrepareOutcome { revision, reaped })
+    Ok(revision)
 }
 
 /// Worktree HEADs (the main checkout included) whose detached HEAD carries
@@ -1304,8 +1340,8 @@ fn reap_finished_worktrees(
     repo: &Path,
     repository: &str,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<Vec<String>> {
-    let mut reaped = Vec::new();
+    reaped: &mut Vec<String>,
+) -> Result<()> {
     for WorktreeEntry { path, locked } in worktree_entries(repo)? {
         let canonical = path.canonicalize()?;
         if locked || canonical == repo || !canonical.starts_with(root) {
@@ -1318,11 +1354,12 @@ fn reap_finished_worktrees(
         }
         let tip = git(&path, &["rev-parse", "HEAD"])?;
         if has_finished_pr(repo, repository, branch, tip.trim()) {
-            git(repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
-            reaped.push(path.display().to_string());
+            let display_path = path.display().to_string();
+            git(repo, &["worktree", "remove", "--force", &display_path])?;
+            reaped.push(display_path);
         }
     }
-    Ok(reaped)
+    Ok(())
 }
 
 fn credential(operation: &str) -> Result<()> {
