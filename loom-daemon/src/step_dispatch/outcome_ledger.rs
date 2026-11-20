@@ -164,6 +164,11 @@ pub const CHAMPION_LINE_PREFIX: &str = "CHAMPION-STEP";
 /// outcome line on an unchanged item, or a verdict the forge does not show.
 pub const UNCLASSIFIED: &str = "unclassified";
 
+/// The reason of a step whose seat refused preparation over a dirty leftover
+/// worktree (#14458). Synthesized from the step's log, like the spawn-time
+/// refusals; the text names it so the failure is not `unclassified`.
+pub const SEAT_DIRTY: &str = crate::tokens_pool::private_workspace::SEAT_DIRTY_REASON;
+
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
 
