@@ -123,8 +123,8 @@ fn release_parses_an_optional_skip_reason() {
     assert_eq!(parse(&skipped), (12, Some("ci-pending".to_string())));
 }
 
-/// The Judge prompt's pending-CI skip releases its lease with the pass's own
-/// reason.
+/// The shared pending-CI handback releases the Judge lease with the pass's
+/// own reason.
 #[test]
 fn the_judge_prompt_releases_a_pending_ci_skip_with_its_reason() {
     let prompts = [
@@ -136,20 +136,24 @@ fn the_judge_prompt_releases_a_pending_ci_skip_with_its_reason() {
     ];
     let flag = format!("--skip-reason {SKIP_CI_PENDING}");
     for (name, text) in prompts {
-        let lines: Vec<&str> = text.lines().collect();
-        let case = lines
-            .iter()
-            .position(|l| l.trim_start().starts_with("LOOM-CHECKS-TIMEOUT*)"))
-            .unwrap_or_else(|| panic!("{name}: no pending-CI skip case"));
-        let arm: Vec<&str> = lines[case..]
-            .iter()
-            .copied()
-            .take_while(|l| l.trim() != ";;")
-            .collect();
+        let (_, pending) = text
+            .split_once("\n### When CI is Pending\n")
+            .unwrap_or_else(|| panic!("{name}: no pending-CI handback section"));
+        let pending = pending
+            .split_once("\n### ")
+            .map_or(pending, |(section, _)| section);
+        let handback = pending
+            .split_once("\n```bash\n")
+            .and_then(|(_, code)| code.split_once("\n```"))
+            .map(|(code, _)| code)
+            .unwrap_or_else(|| panic!("{name}: no pending-CI handback commands"));
         assert!(
-            arm.iter()
-                .any(|l| l.contains("loom-daemon lease pr release") && l.contains(&flag)),
-            "{name}: the pending-CI skip must release with `{flag}`: {arm:?}"
+            handback.lines().any(|line| {
+                line.trim_start()
+                    .starts_with("loom-daemon lease pr release ")
+                    && line.contains(&flag)
+            }),
+            "{name}: the pending-CI handback must release with `{flag}`: {handback:?}"
         );
     }
 }
