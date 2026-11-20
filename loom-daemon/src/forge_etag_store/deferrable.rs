@@ -126,6 +126,7 @@ pub(super) fn fetch(
         resource: Resource::Core,
         affinity_key: Some(&affinity),
         class: site.class,
+        reader_cooldowns: &[],
     };
     let family = served::endpoint_family(url);
     let answered = |r: &FetchResult| {

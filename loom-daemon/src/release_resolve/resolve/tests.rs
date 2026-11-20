@@ -561,31 +561,19 @@ fn an_empty_version_file_yields_none() {
 }
 
 #[test]
-fn the_asset_scratch_directory_does_not_outlive_the_call() {
-    // Resolution runs on every auto-update tick; a leaked directory per tick
-    // is a real leak. The call fails (no such release) but must still clean up.
-    let before = count_scratch_dirs();
-    let _ = fetch_asset_sha256(
-        "v0.0.0-nonexistent",
-        "no-such-owner/no-such-repo",
-        "loom-daemon-x.sha256",
-        &std::env::temp_dir(),
-    );
-    assert_eq!(count_scratch_dirs(), before, "scratch directory leaked");
+fn checksum_paths_are_relative_and_encode_the_release_tag_as_one_segment() {
+    let (releases, tag) = checksum_paths("acme", "widget", "snapshots/v1.2.3").unwrap();
+    assert_eq!(releases, "repos/acme/widget/releases");
+    assert_eq!(tag, "repos/acme/widget/releases/tags/snapshots%2Fv1.2.3");
+    assert!(checksum_paths("acme", "..", "tag").is_none());
 }
 
-fn count_scratch_dirs() -> usize {
-    std::fs::read_dir(std::env::temp_dir())
-        .map(|d| {
-            d.filter_map(Result::ok)
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with("loom-daemon-resolve-")
-                })
-                .count()
-        })
-        .unwrap_or(0)
+#[test]
+fn checksum_accepts_a_digest_line_and_refuses_an_asset_json_response() {
+    let digest = "A1".repeat(32);
+    assert_eq!(checksum_digest(&format!("{digest}  loom-daemon\n")), Some(digest.as_str()));
+    assert_eq!(checksum_digest(r#"{"name":"loom-daemon.sha256"}"#), None);
+    assert_eq!(checksum_digest(&format!("short\n{digest}")), None);
 }
 
 #[test]

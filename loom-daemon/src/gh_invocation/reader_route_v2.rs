@@ -148,27 +148,41 @@ impl GhInvocation {
             resource,
             affinity_key: Some(&affinity),
             class,
+            reader_cooldowns: &[],
         };
         let owner = crate::credential_preflight::owner_of_nwo(&slug).to_ascii_lowercase();
         let why = format!("{} via the gh choke point", self.operation.as_str());
         // W6 coverage evidence: the REST path's endpoint family, and whether
         // it names one item. Not a `gh api` call: no family, no evidence.
         let endpoint = super::super::accounting::api_endpoint(&self.args).unwrap_or_default();
+        let checksum_asset = self.operation.as_str() == "release.checksum";
+        let mut cooldowns = if checksum_asset {
+            checksum_retry::cooling(&slug, &endpoint, now)
+        } else {
+            Vec::new()
+        };
         let family = served::endpoint_family(&endpoint);
         let item_scoped = served::is_item_path(&endpoint);
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
         let mut last_failure: Option<Failure> = None;
-        let mut decision = lookup(&request);
+        let mut decision = lookup(&RouteRequest {
+            reader_cooldowns: &cooldowns,
+            ..request
+        });
         loop {
             let (dir, app_id) = match decision {
-                RouteDecision::NoPool if tried.is_empty() => {
+                RouteDecision::NoPool if tried.is_empty() && cooldowns.is_empty() => {
                     // No reader pool at all: the writer is the only
                     // credential there is (the one allow-listed read on it).
                     return self.writer_only_read();
                 }
                 RouteDecision::NoPool => {
-                    let until = now + crate::forge_read_pool::DEFAULT_WITHDRAWAL;
+                    let until = cooldowns
+                        .iter()
+                        .map(|(_, until)| *until)
+                        .min()
+                        .unwrap_or(now + crate::forge_read_pool::DEFAULT_WITHDRAWAL);
                     let why = ShedWhy::Router("the reader pool went away");
                     return Ok(self.shed_read(
                         class,
@@ -234,8 +248,15 @@ impl GhInvocation {
                 tried.insert(app_id.clone());
                 last_app = Some(app_id);
                 last_failure = None;
-                decision = match crate::forge_gateway::past_gateway(lookup(&request), &request, now)
-                {
+                let fresh_request = RouteRequest {
+                    reader_cooldowns: &cooldowns,
+                    ..request
+                };
+                decision = match crate::forge_gateway::past_gateway(
+                    lookup(&fresh_request),
+                    &fresh_request,
+                    now,
+                ) {
                     RouteDecision::NoPool => RouteDecision::Exhausted {
                         until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
                         cause: ExhaustCause::Unavailable,
@@ -249,6 +270,18 @@ impl GhInvocation {
                 // another reader would not help.
                 return Ok(first);
             };
+            if checksum_asset && checksum_retry::is_asset_refusal(&first, failure) {
+                let until = checksum_retry::hold(&slug, &endpoint, &app_id, now);
+                cooldowns.push((app_id.clone(), until));
+                tried.insert(app_id.clone());
+                last_app = Some(app_id);
+                last_failure = None;
+                decision = lookup(&RouteRequest {
+                    reader_cooldowns: &cooldowns,
+                    ..request
+                });
+                continue;
+            }
             if failure == Failure::Coverage {
                 match judge_refusal(&first, &app_id, &slug, family, item_scoped, now) {
                     // W6: this reader covers the repo's `family`, so its 404
@@ -282,7 +315,11 @@ impl GhInvocation {
             tried.insert(app_id.clone());
             last_app = Some(app_id);
             last_failure = Some(failure);
-            decision = self.next_after(lookup, &request, &tried, failure, now);
+            let fresh_request = RouteRequest {
+                reader_cooldowns: &cooldowns,
+                ..request
+            };
+            decision = self.next_after(lookup, &fresh_request, &tried, failure, now);
         }
     }
 
@@ -361,6 +398,7 @@ impl GhInvocation {
                     resource,
                     affinity_key: Some(&affinity),
                     class: self.read_class,
+                    reader_cooldowns: &[],
                 };
                 !matches!(lookup(&request), RouteDecision::NoPool)
             }
@@ -509,5 +547,93 @@ pub fn class_str(class: ReadClass) -> &'static str {
         ReadClass::Gate => "gate",
         ReadClass::Hygiene => "hygiene",
         ReadClass::Observability => "observability",
+    }
+}
+
+// Relative release-asset requests can be answered by the API itself or by
+// unauthenticated asset storage after a redirect. A storage refusal is no
+// evidence about the selected API credential. Keep its retry local to the asset.
+pub(super) mod checksum_retry {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, SystemTime};
+
+    use super::{Completion, Failure, GhCompletion};
+
+    pub(in crate::gh_invocation::reader_route) const DELAY: Duration = Duration::from_secs(30);
+    type Key = (String, String, String);
+
+    fn table() -> &'static Mutex<HashMap<Key, SystemTime>> {
+        static HOLDS: OnceLock<Mutex<HashMap<Key, SystemTime>>> = OnceLock::new();
+        HOLDS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(in crate::gh_invocation::reader_route) fn cooling(
+        repo: &str,
+        endpoint: &str,
+        now: SystemTime,
+    ) -> Vec<(String, SystemTime)> {
+        let Ok(mut holds) = table().lock() else {
+            return Vec::new();
+        };
+        holds.retain(|_, until| *until > now);
+        holds
+            .iter()
+            .filter(|((key_repo, key_endpoint, _), _)| key_repo == repo && key_endpoint == endpoint)
+            .map(|((_, _, app), until)| (app.clone(), *until))
+            .collect()
+    }
+
+    pub(in crate::gh_invocation::reader_route) fn hold(
+        repo: &str,
+        endpoint: &str,
+        app: &str,
+        now: SystemTime,
+    ) -> SystemTime {
+        let until = now + DELAY;
+        if let Ok(mut holds) = table().lock() {
+            let stored = holds
+                .entry((repo.into(), endpoint.into(), app.into()))
+                .or_insert(until);
+            *stored = (*stored).max(until);
+            return *stored;
+        }
+        until
+    }
+
+    pub(in crate::gh_invocation::reader_route) fn is_asset_refusal(
+        completion: &GhCompletion,
+        failure: Failure,
+    ) -> bool {
+        let GhCompletion::Captured(Completion::Exited(output)) = completion else {
+            return false;
+        };
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let Some(response) = crate::forge_listing::parse_http_response(&raw) else {
+            return false;
+        };
+        if response.gateway.refusal.is_some() {
+            return false;
+        }
+        match (failure, response.status) {
+            (Failure::Coverage, 403 | 404) => true,
+            (Failure::Credential, 401) => {
+                // gh api --include prints only the final response. A 401 from
+                // GitHub's API or the gateway is still an API credential
+                // failure. The delivery response carries neither API marker.
+                !response.gateway.answered
+                    && !raw
+                        .lines()
+                        .skip(1)
+                        .take_while(|line| !line.trim().is_empty())
+                        .any(|line| {
+                            line.split_once(':').is_some_and(|(name, value)| {
+                                name.eq_ignore_ascii_case("x-github-request-id")
+                                    && !value.trim().is_empty()
+                            })
+                        })
+            }
+            _ => false,
+        }
     }
 }

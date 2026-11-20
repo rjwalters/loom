@@ -518,6 +518,17 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     } else {
         withdrawn_until(&owner, req, now)
     };
+    match (req.cooldown(GATEWAY_APP_ID, now), gateway_until, &pool) {
+        (Some(_), Some(gateway_until), RouteDecision::Exhausted { until, .. })
+            if gateway_until < *until =>
+        {
+            return RouteDecision::Exhausted {
+                until: gateway_until,
+                cause: ExhaustCause::Withdrawn,
+            };
+        }
+        _ => {}
+    }
     match past_withdrawn_gateway(pool, gateway_until) {
         RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {
             until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
@@ -548,6 +559,7 @@ pub fn past_withdrawn_gateway(
 /// is live (a coverage withdrawal from one repo is not counted).
 fn withdrawn_until(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> Option<SystemTime> {
     [
+        req.cooldown(GATEWAY_APP_ID, now),
         crate::forge_read_pool::withdrawn_until(GATEWAY_APP_ID, now),
         crate::forge_read_pool::scoped_withdrawal_until(GATEWAY_APP_ID, owner, req.resource, now),
     ]
@@ -602,7 +614,8 @@ pub fn past_gateway(
 /// A gateway failure withdraws it through the reader tables
 /// ([`crate::forge_identity::withdraw_after`]); honour every scope.
 fn is_withdrawn(owner: &str, req: &RouteRequest<'_>, now: SystemTime) -> bool {
-    crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+    req.cooldown(GATEWAY_APP_ID, now).is_some()
+        || crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
         || crate::forge_identity::repo_withdrawn_at(GATEWAY_APP_ID, req.owner_repo, now)
         || crate::forge_read_pool::is_withdrawn_scoped_at(GATEWAY_APP_ID, owner, req.resource, now)
 }

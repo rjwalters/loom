@@ -917,55 +917,80 @@ fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, Read
 /// detect "same version, different bytes": a host that built this version from
 /// source before the release existed.
 fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Option<String> {
-    // A scratch directory of our own, removed before returning on every path —
-    // the shell's `mktemp -d` plus its `_cleanup_fetch_tmpdirs` trap. Resolution
-    // runs on every tick, so a leaked directory per tick is a real leak.
-    let dir = std::env::temp_dir().join(format!(
-        "loom-daemon-resolve-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).ok()?;
-    let digest = (|| {
-        let dir_str = dir.to_str()?;
-        let out = GhInvocation::new(
-            Operation::new("release.checksum"),
-            AccessIntent::Read,
-            GhTarget::repo(repo).unwrap_or(GhTarget::None),
-            GH_TIMEOUT,
-        )
-        .program(crate::gh_invocation::gh_bin())
-        .current_dir(root)
-        .args([
-            "release",
-            "download",
-            tag,
-            "-R",
-            repo,
-            "-p",
-            sha_name,
-            "-D",
-            dir_str,
-            "--clobber",
-        ])
-        .reader_only()
-        .run();
-        if !out.succeeded() {
-            return None;
-        }
-        let text = std::fs::read_to_string(dir.join(sha_name)).ok()?;
-        // `awk 'NR==1{print $1}'` — first field of the first line.
-        text.lines()
-            .next()?
-            .split_whitespace()
-            .next()
-            .map(str::to_string)
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    digest
+    #[derive(Deserialize)]
+    struct ChecksumAsset {
+        id: u64,
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct Release {
+        assets: Vec<ChecksumAsset>,
+    }
+
+    // `gh release download` uses the asset's absolute URL, bypassing the
+    // reader profile's api_host. Look up its numeric ID and route both API
+    // calls by relative path so the credential is sent to its own endpoint.
+    let target = GhTarget::repo(repo).ok()?;
+    let GhTarget::Repo { owner, repo: name } = &target else {
+        return None;
+    };
+    let (releases, tag_lookup) = checksum_paths(owner, name, tag)?;
+    let Query::Populated(release) =
+        gh_read::<Release, _>("release.checksum_lookup", repo, &["api", &tag_lookup], root, |_| {
+            false
+        })
+    else {
+        return None;
+    };
+    let id = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == sha_name && asset.id > 0)?
+        .id;
+    let asset_path = format!("{releases}/assets/{id}");
+    let out = GhInvocation::new(
+        Operation::new("release.checksum"),
+        AccessIntent::Read,
+        target,
+        GH_TIMEOUT,
+    )
+    .program(crate::gh_invocation::gh_bin())
+    .current_dir(root)
+    .args([
+        "api",
+        &asset_path,
+        "--include",
+        "-H",
+        "Accept: application/octet-stream",
+    ])
+    .reader_only()
+    .run();
+    let parsed = crate::forge_listing::parse_http_response(&String::from_utf8_lossy(
+        &out.ok_output()?.stdout,
+    ))?;
+    checksum_digest(&parsed.body).map(str::to_string)
+}
+
+fn checksum_paths(owner: &str, repo: &str, tag: &str) -> Option<(String, String)> {
+    if [owner, repo, tag]
+        .iter()
+        .any(|part| matches!(*part, "." | ".."))
+    {
+        return None;
+    }
+    let mut url = reqwest::Url::parse("https://api.github.com/").ok()?;
+    url.path_segments_mut()
+        .ok()?
+        .pop_if_empty()
+        .extend(["repos", owner, repo, "releases"]);
+    let releases = url.path().strip_prefix('/')?.to_string();
+    url.path_segments_mut().ok()?.extend(["tags", tag]);
+    Some((releases, url.path().strip_prefix('/')?.to_string()))
+}
+
+fn checksum_digest(body: &str) -> Option<&str> {
+    let digest = body.lines().next()?.split_whitespace().next()?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
 /// The installed binary's version and commit, from its own `--version`.
