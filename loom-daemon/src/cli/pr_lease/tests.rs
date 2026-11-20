@@ -957,6 +957,67 @@ fn a_second_release_reports_already_released_not_zero() {
     );
 }
 
+/// #14807: after the verdict step's release and the role's own second
+/// release, no row keeps the live prefix, `check` reports the claim free,
+/// and the released row's visible prose no longer says the claim "is held
+/// by" — a human reading the PR must not see a live-looking claim behind a
+/// released marker.
+#[test]
+fn a_released_row_no_longer_reads_as_a_held_claim() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let a = who(Role::Judge, "sweep-j");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+
+    // The fake `gh` keeps only a row's first line; restore the full body
+    // the real forge holds (claim prose plus a renewal line) so the release
+    // is observed against a live-shaped row. The claim's post took id 500.
+    let live = lease_body(&a, 77, Some(Utc::now()));
+    let json = live
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    fs::write(
+        dir.path().join("rows"),
+        format!(
+            r#"{{"id":500,"updated_at":"{}","body":"{json}",{AUTHOR}}}"#,
+            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ) + "\n",
+    )
+    .unwrap();
+
+    // The verdict step's release rewrites the row it posted…
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    let first_patch = patched(dir.path());
+    assert!(first_patch.contains(&a.released_marker()), "{first_patch}");
+    assert!(first_patch.contains("was released"), "{first_patch}");
+    assert!(!first_patch.contains("is held by"), "{first_patch}");
+
+    // …and the role's own second release patches nothing (#14392).
+    fs::remove_file(dir.path().join("patched")).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty(), "an already-released row is not rewritten");
+
+    // No row keeps the live prefix; with no live lease at all, the exit 0
+    // from `check` is the free state, not held-self.
+    let rows = fs::read_to_string(dir.path().join("rows")).unwrap();
+    assert!(!rows.contains(LEASE_PREFIX), "{rows}");
+    assert_eq!(ctx(dir.path(), a).check(), EXIT_HELD);
+}
+
+/// #14807: a reap words the rewritten prose as reaped, not released.
+#[test]
+fn a_reaped_row_names_the_reap_in_its_prose() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let dead = who(Role::Judge, "sweep-j");
+    fs::write(dir.path().join("rows"), live_row(100, &dead)).unwrap();
+    assert_eq!(ctx(dir.path(), dead).reap("timeout"), EXIT_HELD);
+    let patched = patched(dir.path());
+    assert!(patched.contains("was reaped"), "{patched}");
+    assert!(!patched.contains("is held by"), "{patched}");
+}
+
 /// #13132: a release missing the claim's identity names the claimant and
 /// exits nonzero, leaving the lease untouched; the right identity releases.
 #[test]

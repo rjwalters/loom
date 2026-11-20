@@ -812,9 +812,12 @@ the same lease semantics, **keyed by role**:
   earliest live lease, or if there is no evidence either way (an unreadable
   list, or a claimant on an older prompt that never leased). Exit 3 if its own
   lease is no longer live. Exit 4 if a peer's live lease is earliest.
-- **`release`** tombstones and signals the renewer, then rewrites the lease's
-  first line to `loom:pr-lease-released`. The claim frees at once, without
-  waiting out the TTL.
+- **`release`** tombstones and signals the renewer, then rewrites the lease
+  comment: its first line to `loom:pr-lease-released`, and its prose to the
+  released wording (#14807) — `reaped` when the role runner released it for a
+  claimant that ended without releasing — so a human reading the PR never sees
+  a live-looking claim behind a released marker. The claim frees at once,
+  without waiting out the TTL.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
 - **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
