@@ -124,6 +124,11 @@ pub(crate) enum SessionAction {
         /// Scope the action to a named branch (repeatable).
         #[arg(long, value_name = "BRANCH")]
         branch: Vec<String>,
+        /// With `--discard`: remove a leftover worktree (repeatable) and its
+        /// uncommitted files; refused while commits on it are unpublished.
+        /// The listing form names every dirty worktree and its path.
+        #[arg(long, value_name = "PATH", requires = "discard", conflicts_with_all = ["branch", "issue"])]
+        worktree: Vec<std::path::PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -290,7 +295,7 @@ pub(crate) fn handle_session_command(
             println!(
                 "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
                 status.config.account,
-                if status.running { "running" } else { "stopped" },
+                status.state_label(),
                 status.workspace_mode,
                 status.private_root,
                 status.config.volume,
@@ -357,10 +362,27 @@ pub(crate) fn handle_session_command(
                     report.account, head.path, head.revision, head.ahead
                 );
             }
+            for path in &clone.removed_worktrees {
+                println!("{}: removed worktree {}", report.account, path);
+            }
+            for dirty in &clone.dirty_worktrees {
+                println!(
+                    "{}: dirty worktree {} ({}): {} tracked, {} untracked, {} unpublished; {}",
+                    report.account,
+                    dirty.path,
+                    dirty.branch.as_deref().unwrap_or("detached HEAD"),
+                    dirty.tracked,
+                    dirty.untracked,
+                    dirty.unpublished,
+                    dirty.recovery_guidance(&report.account)
+                );
+            }
             if clone.published.is_empty()
                 && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
                 && clone.branches.is_empty()
                 && clone.detached.is_empty()
+                && clone.dirty_worktrees.is_empty()
             {
                 println!("{}: {} has no unpublished work", report.account, clone.repository);
             }
@@ -420,6 +442,7 @@ pub(crate) fn handle_session_command(
             discard,
             issue,
             branch,
+            worktree,
             json,
         } => {
             if !private::configured(&workspace, &name)? {
@@ -433,7 +456,7 @@ pub(crate) fn handle_session_command(
                 private::RecoverAction::List
             };
             print_recover(
-                &private::session_recover(&workspace, &name, action, issue, &branch)?,
+                &private::session_recover(&workspace, &name, action, issue, &branch, &worktree)?,
                 json,
             )
         }

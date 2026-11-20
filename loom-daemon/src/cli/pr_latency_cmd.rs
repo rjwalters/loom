@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::cmd_out::Query;
 use crate::pr_latency::timeline::parse_timeline;
 use crate::pr_latency::{LatencyReport, PrEvent, PrHistory, PrState};
-use crate::script_helpers::gh_query;
+use crate::script_helpers::gh_read_json;
 
 use super::pr_latency_render as render;
 
@@ -221,7 +221,8 @@ fn list_prs(
         &limit,
     ]);
 
-    let q: Query<Vec<PrRow>> = gh_query(&args, root, false, |v: &Vec<PrRow>| v.is_empty());
+    let q: Query<Vec<PrRow>> =
+        gh_read_json("latency.pr_list", &args, root, false, |v: &Vec<PrRow>| v.is_empty());
     match q {
         Query::Populated(rows) => (rows, None),
         Query::Empty => (Vec::new(), None),
@@ -261,7 +262,12 @@ fn fetch_timeline(pr: u32, repo: Option<&str>, root: &Path) -> (Vec<PrEvent>, bo
         Some(r) => format!("repos/{r}/issues/{pr}/timeline"),
         None => format!("repos/{{owner}}/{{repo}}/issues/{pr}/timeline"),
     };
-    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+    let out = crate::script_helpers::gh_read(
+        "latency.timeline",
+        &["api", &path, "--paginate"],
+        root,
+        false,
+    );
     let bytes = match &out {
         crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => o.stdout.clone(),
         _ => return (Vec::new(), false),

@@ -74,16 +74,18 @@ struct Flag<'a> {
     value: Option<&'a str>,
 }
 
+const API_FIELD_FLAGS: &[&str] = &["-f", "--raw-field", "-F", "--field"];
+
 /// gh's argv as positionals and named flags (gh-shim's `splitArgs`).
-fn split(args: &[String]) -> (Vec<&str>, Vec<Flag<'_>>) {
+fn split(args: &[impl AsRef<str>]) -> (Vec<&str>, Vec<Flag<'_>>) {
     let mut pos = Vec::new();
     let mut flags = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let tok = args[i].as_str();
+        let tok = args[i].as_ref();
         i += 1;
         if tok == "--" {
-            pos.extend(args[i..].iter().map(String::as_str));
+            pos.extend(args[i..].iter().map(AsRef::as_ref));
             break;
         }
         if tok.len() < 2 || !tok.starts_with('-') {
@@ -103,7 +105,7 @@ fn split(args: &[String]) -> (Vec<&str>, Vec<Flag<'_>>) {
             } else if !long && tok.len() > 2 {
                 value = tok.get(2..).map(|v| v.strip_prefix('=').unwrap_or(v));
             } else if i < args.len() {
-                value = Some(args[i].as_str());
+                value = Some(args[i].as_ref());
                 i += 1;
             }
         }
@@ -161,11 +163,39 @@ fn api_method(flags: &[Flag<'_>]) -> &'static str {
             .copied()
             .unwrap_or("_OTHER");
     }
-    let fields = ["-f", "--raw-field", "-F", "--field", "--input"];
-    if flags.iter().any(|f| fields.contains(&f.name)) {
+    if flags
+        .iter()
+        .any(|f| API_FIELD_FLAGS.contains(&f.name) || f.name == "--input")
+    {
         "POST"
     } else {
         "GET"
+    }
+}
+
+/// The parts of `gh api` argv needed to check its declared access intent.
+pub(crate) struct ApiRequest<'a> {
+    pub(crate) method: &'static str,
+    pub(crate) graphql: bool,
+    pub(crate) query: Option<&'a str>,
+}
+
+/// Parse the same option forms as the facade's route and method telemetry.
+pub(crate) fn api_request<'a>(args: &'a [&'a str]) -> ApiRequest<'a> {
+    let (pos, flags) = split(args);
+    let graphql = pos
+        .first()
+        .and_then(|endpoint| endpoint_segments(endpoint))
+        .is_some_and(|segments| segments == ["graphql"]);
+    let query = flags
+        .iter()
+        .filter(|flag| API_FIELD_FLAGS.contains(&flag.name))
+        .filter_map(|flag| flag.value?.strip_prefix("query="))
+        .next_back();
+    ApiRequest {
+        method: api_method(&flags),
+        graphql,
+        query,
     }
 }
 

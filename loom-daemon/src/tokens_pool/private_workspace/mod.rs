@@ -218,12 +218,26 @@ pub struct Status {
     /// Also under `config.extra_mounts`; empty without the setting.
     pub extra_mounts: Vec<ExtraMount>,
     pub running: bool,
+    /// An operator hold on this seat's private profile, even if still running.
+    pub held: bool,
     pub lease: Option<lease::Job>,
     /// Secret-free containment-admission provenance for the CURRENT job
     /// (#8787), so `session status` reports what an execution-specific
     /// admission actually relied on. Absent on every ordinary session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<serde_json::Value>,
+}
+
+impl Status {
+    pub(crate) fn state_label(&self) -> &'static str {
+        if self.running {
+            "running"
+        } else if self.held {
+            "stopped, held (operator stop)"
+        } else {
+            "stopped"
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -262,6 +276,8 @@ pub enum RecoverAction {
     List,
     Publish,
     Discard,
+    #[doc(hidden)]
+    ValidateWorktrees,
 }
 
 /// One branch whose tip is not reachable from `origin`.
@@ -282,6 +298,47 @@ pub struct DetachedWork {
     pub ahead: u64,
 }
 
+/// The step-outcome reason of a preparation the seat's own dirty worktree
+/// refused (#14458). The refusal message carries it verbatim so the step's
+/// end can classify the failure by it instead of `unclassified`.
+pub const SEAT_DIRTY_REASON: &str = "seat_dirty";
+
+/// One worktree of a clone (the main checkout included) with uncommitted or
+/// untracked files, as the recover listing reports it (#14458). Counted over
+/// the same `git status` preparation refuses on, so the two cannot disagree.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DirtyWorktree {
+    pub path: String,
+    /// The checked-out branch; `None` on a detached HEAD.
+    pub branch: Option<String>,
+    /// Paths with tracked changes (modified, staged, merge state).
+    pub tracked: usize,
+    /// Untracked paths.
+    pub untracked: usize,
+    /// Commits at this worktree's HEAD that no ref of `origin` reaches.
+    pub unpublished: u64,
+    /// An in-volume linked worktree with no unpublished commits. Older
+    /// workers may omit this proof, so default to in-place advice.
+    #[serde(default)]
+    pub discardable: bool,
+}
+
+impl DirtyWorktree {
+    pub(crate) fn recovery_guidance(&self, account: &str) -> String {
+        recovery_guidance(account, &self.path, self.discardable)
+    }
+}
+
+fn recovery_guidance(account: &str, path: &str, discardable: bool) -> String {
+    if discardable {
+        let account = crate::shell_quote::shell_quote(account);
+        let path = crate::shell_quote::shell_quote(path);
+        format!("if the local changes can be discarded, run `loom-daemon accounts session recover {account} --discard --worktree {path}`")
+    } else {
+        "save or resolve its changes in place".into()
+    }
+}
+
 /// One clone's recover outcome, as the in-container
 /// `private-workspace recover` verb reports it (#14030).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -300,6 +357,13 @@ pub struct RecoverOutcome {
     /// Detached HEADs still holding unreferenced unpublished work
     /// (report-only: recover never touches them).
     pub detached: Vec<DetachedWork>,
+    /// Worktrees still dirty after the action, whether or not anything is
+    /// unpublished (#14458).
+    #[serde(default)]
+    pub dirty_worktrees: Vec<DirtyWorktree>,
+    /// Worktrees this call removed (`--discard --worktree`, #14458).
+    #[serde(default)]
+    pub removed_worktrees: Vec<String>,
 }
 
 /// What one `accounts session recover` call did across the account's clones.
