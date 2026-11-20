@@ -19,13 +19,20 @@ known flake.
 
 ## 1. The run must be finished
 
+Reuse a settled snapshot and its stderr from the same head when available.
+If you came here from a raw RED or an approval refusal without that evidence,
+take one bounded snapshot:
+
 ```bash
 err="$(mktemp)"; first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>"$err" | head -n1)"
 ```
 
+Treat a snapshot stamped for a different head as `LOOM-CHECKS-HEAD-MOVED`.
+
 | First line | Action |
 |---|---|
-| `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` | The run has not finished. Follow judge.md "When CI is Pending". No CI-failing verdict on a partial run. In single-PR mode you may instead wait in the foreground with `--timeout 1800 --settle-red`. |
+| `LOOM-CHECKS-HEAD-MOVED*` | Hand back per judge.md "When CI is Pending" so a later Judge reviews the new head. |
+| `LOOM-CHECKS-TIMEOUT*` | CI is pending. A CI-failing verdict requires a finished run. Hand back per judge.md "When CI is Pending" in a daemon Judge step (`step-judge-*` sweep id) or a batch. Only an attended/manual single-PR invocation without a `step-judge-*` sweep id may instead wait in the foreground with `--timeout 1800 --settle-red`. |
 | `LOOM-CHECKS-GREEN*` / `-NONE*` | The red was superseded. Continue the review. |
 | `LOOM-CHECKS-RED*` | Finished red. `$err` holds `<name>\t<url>\t<run_id>` per failing check. Go to step 2. |
 | `-ERROR*` or empty (older binary without `--settle-red`, or Gitea) | Run `gh pr checks <number>` once. If any check is still pending, treat it as TIMEOUT. |
@@ -92,10 +99,11 @@ the normal verdict, and the tracker comment keeps attempt 1 on record.
    <!-- loom:ci-flake-note -->
    ```
 
-   Add no end-state label and no `loom:ci-failure`. Release the claim
-   exactly as "When CI is Pending" does
-   (`gh pr edit <number> --remove-label "loom:reviewing"`; `loom:review-requested` stays).
-   In single-PR mode you may instead wait for the rerun with
+   Add no end-state label and no `loom:ci-failure`. In a daemon Judge step
+   (`step-judge-*` sweep id) or a batch, hand back per judge.md "When CI is
+   Pending", leaving `loom:review-requested` in place and releasing the claim.
+   Only an attended/manual single-PR invocation without a `step-judge-*`
+   sweep id may instead wait for the rerun with
    `wait-checks --settle-red --timeout 1800` and continue from step 1.
 
 ## 5. The CI-failing verdict
