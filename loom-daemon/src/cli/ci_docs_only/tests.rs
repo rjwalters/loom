@@ -358,6 +358,7 @@ fn mixed_diffs_mode_changes_renames_and_policy_edits_run_full_suites() {
     let unchanged = f.commit("same tree");
     assert_eq!(f.push(&unchanged, &f.seed, Some(&f.seed)), Err("empty_diff"));
     f.git(&["update-index", "--chmod=+x", "WORK_LOG.md"]);
+    f.git(&["checkout-index", "--force", "WORK_LOG.md"]);
     f.git(&["commit", "-qm", "mode change"]);
     let exec = f.git(&["rev-parse", "HEAD"]);
     assert_eq!(f.push(&exec, &f.seed, Some(&f.seed)), Err("nonregular_or_nonmodify"));
