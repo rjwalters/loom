@@ -731,6 +731,20 @@ pub(super) fn prepare_with(
     if let Some(error) = result["error"].as_str() {
         bail!("private workspace preparation refused: {error}");
     }
+    // Optional since the reap-reporting field: an older session image omits
+    // it, and a non-array or non-string entry is skipped, never fatal.
+    for path in result["reaped_worktrees"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        log::info!(
+            "private session {}: reaped finished-PR worktree {path} in {}",
+            config.account,
+            target.repository
+        );
+    }
     result["revision"]
         .as_str()
         .map(str::to_owned)

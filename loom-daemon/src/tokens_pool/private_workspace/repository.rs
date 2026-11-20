@@ -165,9 +165,14 @@ impl WorkerCommand {
             Self::Prepare(args) => {
                 repository_url(&args.repository)?;
                 match prepare(Path::new(ROOT), &args) {
-                    Ok(revision) => {
-                        println!("{}", json!({"protocol": PROTOCOL, "revision": revision}))
-                    }
+                    Ok(outcome) => println!(
+                        "{}",
+                        json!({
+                            "protocol": PROTOCOL,
+                            "revision": outcome.revision,
+                            "reaped_worktrees": outcome.reaped,
+                        })
+                    ),
                     Err(error) => {
                         println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
                     }
@@ -248,7 +253,16 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(result.stdout).context("workspace Git returned invalid text")
 }
 
-pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<String> {
+/// What one `prepare` resolved, plus the finished-PR linked worktrees its
+/// automatic reap removed (display paths, same form as
+/// `RecoverOutcome::removed_worktrees`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PrepareOutcome {
+    pub(super) revision: String,
+    pub(super) reaped: Vec<String>,
+}
+
+pub(super) fn prepare(root: &Path, args: &PrepareArgs) -> Result<PrepareOutcome> {
     prepare_with_pr_lookup(root, args, &finished_pr)
 }
 
@@ -258,7 +272,7 @@ pub(super) fn prepare_with_pr_lookup(
     root: &Path,
     args: &PrepareArgs,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<String> {
+) -> Result<PrepareOutcome> {
     valid_base(&args.base)?;
     if args.account.is_empty() || args.container_id.is_empty() {
         bail!("workspace account and container identity are required");
@@ -347,7 +361,7 @@ pub(super) fn prepare_with_pr_lookup(
         bail!("private clone origin changed; preserve work and restore its verified identity");
     }
     git(&repo, &["fetch", "--prune", "origin"])?;
-    reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr)?;
+    let reaped = reap_finished_worktrees(&root, &repo, &args.repository, has_finished_pr)?;
     clean_worktrees(&root, &repo, &args.account)?;
     // Unpublished commits are only stranded when no branch names them:
     // preparation never moves a branch (a resumed one keeps its local tip)
@@ -440,7 +454,7 @@ pub(super) fn prepare_with_pr_lookup(
     identity.container_id = args.container_id.clone();
     identity.revision.clone_from(&revision);
     save(&record, &identity)?;
-    Ok(revision)
+    Ok(PrepareOutcome { revision, reaped })
 }
 
 /// Worktree HEADs (the main checkout included) whose detached HEAD carries
@@ -1290,7 +1304,8 @@ fn reap_finished_worktrees(
     repo: &Path,
     repository: &str,
     has_finished_pr: &dyn Fn(&Path, &str, &str, &str) -> bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut reaped = Vec::new();
     for WorktreeEntry { path, locked } in worktree_entries(repo)? {
         let canonical = path.canonicalize()?;
         if locked || canonical == repo || !canonical.starts_with(root) {
@@ -1304,9 +1319,10 @@ fn reap_finished_worktrees(
         let tip = git(&path, &["rev-parse", "HEAD"])?;
         if has_finished_pr(repo, repository, branch, tip.trim()) {
             git(repo, &["worktree", "remove", "--force", &path.display().to_string()])?;
+            reaped.push(path.display().to_string());
         }
     }
-    Ok(())
+    Ok(reaped)
 }
 
 fn credential(operation: &str) -> Result<()> {
