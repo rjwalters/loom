@@ -531,6 +531,7 @@ mod dispatch_tests {
                 source: crate::runtime_admission::RuntimeSource::DefaultConfig,
                 unmet_capabilities: vec!["worktreeIsolation".to_string()],
                 reason: "unmet capabilities: worktreeIsolation".to_string(),
+                exhausted_summary_line: None,
             });
             let json = serde_json::to_string(&response).expect("serialize");
             writer.write_all(json.as_bytes()).await.expect("write");

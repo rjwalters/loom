@@ -1,5 +1,5 @@
 //! Unit tests for [`crate::forge_listing`], extracted to a sibling file
-//! (#9251/#9252) so the production module stays under its file-size ratchet.
+//! (#9251/#9252) from the production module.
 
 use super::*;
 use crate::forge_etag_store::{

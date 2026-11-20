@@ -755,6 +755,32 @@ fn execution_scope(active: &[ActiveSpan], root: &TraceContext, repo: &str) -> Tr
     scope
 }
 
+/// The execution scope a spawned child can stamp on its own runtime span
+/// (#14167): the repo, sweep id and item (`loom.issue` / `loom.pr_number`)
+/// its inherited execution root carries, with the repo resolved locally when
+/// tracing is enabled but there is no inherited context, or the root names
+/// none. An unknown item stays absent rather than guessed. With tracing
+/// disabled nothing consumes the attributes (the run span is never created),
+/// so this returns empty without paying the repo-facts resolution cost.
+#[must_use]
+pub fn inherited_scope(root: &Path) -> TraceAttributes {
+    if !super::tracing::enabled(root) {
+        return TraceAttributes::new();
+    }
+    let repo = TraceStore::repo_attribute(root);
+    let Some((journal, root_context, _)) = inherited_context(root) else {
+        let mut attrs = TraceAttributes::new();
+        if !repo.is_empty() {
+            attrs.insert("loom.repo".into(), repo);
+        }
+        return attrs;
+    };
+    let Ok(active) = journal.active() else {
+        return TraceAttributes::new();
+    };
+    execution_scope(&active, &root_context, &repo)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checkpoint_observation(
     journal: &Journal,
@@ -973,6 +999,19 @@ pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, ke
     }
 }
 
+/// What a step's end observed about its own `loom.phase` / `loom.role_attempt`
+/// spans (#14407). A step-dispatched attempt is opened by `sweep-checkpoint
+/// begin` and nothing closes it with a result, so the execution's close sweeps
+/// it. When that close *did* observe the step's end, the swept phase and
+/// attempt mirror it instead of reading `exit_unobserved`: the same
+/// `loom.result` as the step's `loom.sweep` root, plus the launch's
+/// `loom.runtime` / `loom.engine`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepEndObserved {
+    pub result: String,
+    pub runtime: Option<String>,
+}
+
 /// Reaper closes persisted unfinished work at the time its termination is seen.
 /// Child exit details unavailable after exec/restart remain explicitly unknown.
 pub fn finish_execution(
@@ -980,6 +1019,20 @@ pub fn finish_execution(
     execution: &str,
     result: &str,
     metadata: TraceAttributes,
+) -> Option<TraceContext> {
+    finish_execution_observing(root, execution, result, metadata, None)
+}
+
+/// [`finish_execution`] for a close that observed the step's end (#14407):
+/// `step_end` is what the swept phase/attempt spans mirror. `None` is a close
+/// that observed nothing (a kill, orphan recovery, host loss), which keeps
+/// them `exit_unobserved`, so an unobserved exit never inherits a result.
+pub fn finish_execution_observing(
+    root: &Path,
+    execution: &str,
+    result: &str,
+    metadata: TraceAttributes,
+    step_end: Option<&StepEndObserved>,
 ) -> Option<TraceContext> {
     // #10964: the execution is over, so its relay token stops working —
     // before the tracing gate, which the relay does not depend on.
@@ -999,7 +1052,6 @@ pub fn finish_execution(
     let host = host_attributes();
     for active in journal.active().ok()? {
         let root_span = active.record.context == saved.context;
-        let observed = root_span;
         let mut attrs = if root_span {
             metadata.clone()
         } else {
@@ -1018,9 +1070,33 @@ pub fn finish_execution(
                 attrs.insert(git_facts::HEAD_SHA.into(), head);
             }
         }
+        // #14407: a phase/attempt swept by a close that observed the step's end
+        // mirrors that end; every other swept span stays unobserved.
+        let mirrored = step_end.filter(|_| {
+            !root_span && matches!(active.record.name, SpanName::Phase | SpanName::RoleAttempt)
+        });
+        let (observed, result) = match mirrored {
+            Some(end) => (true, end.result.as_str()),
+            None => (root_span, result),
+        };
+        if let Some(runtime) = mirrored
+            .and_then(|end| end.runtime.clone())
+            .filter(|r| !r.is_empty())
+        {
+            // The launch's runtime and engine, never over a span's own.
+            let launch = role_runtime::attributes(&role_runtime::Launch {
+                runtime: Some(runtime),
+                ..Default::default()
+            });
+            for (key, value) in launch {
+                if !active.record.attributes.contains_key(&key) {
+                    attrs.insert(key, value);
+                }
+            }
+        }
         attrs
             .insert("loom.result".into(), if observed { result } else { "exit_unobserved" }.into());
-        if !observed {
+        if !root_span {
             attrs.insert("loom.timing_source".into(), "terminal_observed".into());
         }
         let status = if !observed || result == roll_interruption::RESULT {

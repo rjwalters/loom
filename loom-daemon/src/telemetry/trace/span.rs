@@ -52,6 +52,10 @@ pub enum SpanName {
     /// `loom.runtime.run` span, journalled once usage is known.
     #[serde(rename = "loom.runtime.usage")]
     RuntimeUsage,
+    /// A run whose usage could not be read (Issue #14566): no counters, only
+    /// `loom.usage.missing_reason`, so the gap is countable.
+    #[serde(rename = "loom.runtime.usage_missing")]
+    RuntimeUsageMissing,
     /// One pool dispatch hold, from arming to clearing (Issue #8931) — its own
     /// root trace.
     #[serde(rename = "loom.pool.hold")]
@@ -161,6 +165,7 @@ impl SpanName {
             Self::CiTest => "loom.ci.test",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
+            Self::RuntimeUsageMissing => "loom.runtime.usage_missing",
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
@@ -278,6 +283,9 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.host.cpu_budget_cores"
                     | "loom.host.sweeps_in_flight"
                     | "loom.admission.reason"
+                    | "loom.admission.stage"
+                    | "loom.launch.runtime"
+                    | "loom.launch.source"
                     | "loom.admission.load_per_core"
                     | "loom.admission.load_threshold"
                     | "loom.admission.pool"
@@ -289,6 +297,12 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     // #12362: a Judge tick's found-work split.
                     | "loom.found_work"
                     | "loom.noop_reason"
+                    // #14168: a step's outcome line, countable per
+                    // runtime/model/role from the `loom.sweep` close.
+                    | "loom.step.outcome.class"
+                    | "loom.step.outcome.reason"
+                    // #14234: whether the forge post-state agreed with it.
+                    | "loom.step.outcome.agrees"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"

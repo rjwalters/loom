@@ -143,6 +143,124 @@ fn is_settled_obj(run: &Map<String, Value>) -> bool {
             && run.get("completed_at").is_some_and(|v| !v.is_null()))
 }
 
+/// Terminal workflow-run conclusions that are NOT a failure verdict about
+/// the commit: the pass bucket, a `cancelled` run (not a verdict about the
+/// commit — [`super::superseded_runs`]), `action_required` (a fork run
+/// awaiting a human's approval, #9257) and `stale` (stopped, not failed).
+/// Anything else terminal — `failure`, `startup_failure`, `timed_out`, and
+/// any conclusion a future API adds — fails closed, mirroring the check-run
+/// rule in [`FAILING_CONCLUSIONS`].
+const NOT_A_RUN_FAILURE: [&str; 6] = [
+    "success",
+    "neutral",
+    "skipped",
+    "cancelled",
+    "action_required",
+    "stale",
+];
+
+/// Whether a workflow-runs row is a completed failure verdict about its
+/// head. An absent conclusion is payload doubt, not a positive verdict,
+/// and fails nothing.
+#[must_use]
+pub fn run_failed(run: &Value) -> bool {
+    let Some(conclusion) = run.get("conclusion").and_then(Value::as_str) else {
+        return false;
+    };
+    run.get("status").and_then(Value::as_str) == Some("completed")
+        && !NOT_A_RUN_FAILURE.contains(&conclusion)
+}
+
+/// The check-suite id a check-run row belongs to: GitHub's raw
+/// `check_suite.id`, or the flat `check_suite_id` some projections use —
+/// the same rule as [`super::superseded_runs`].
+#[must_use]
+pub fn check_suite_id(row: &Value) -> Option<u64> {
+    row.pointer("/check_suite/id")
+        .and_then(Value::as_u64)
+        .or_else(|| row.get("check_suite_id").and_then(Value::as_u64))
+}
+
+/// The terminal-failed workflow runs on `sha` as `(check_suite_id, run)`
+/// pairs — the verdict-bearing runs a failing attribution reads from.
+///
+/// Doubt answers empty: an unreadable or truncated payload may hide the
+/// newer authority run that superseded a visible failed one, and the
+/// superseded suites of [`super::superseded_runs::superseded_suites`] are
+/// excluded — a run a newer verdict replaced is not this commit's verdict
+/// either.
+#[must_use]
+pub fn failed_runs<'a>(payload: &'a Value, sha: &str) -> Vec<(u64, &'a Value)> {
+    let Some(runs) = payload.get("workflow_runs").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    match payload.get("total_count").and_then(Value::as_u64) {
+        Some(n) if n as usize <= runs.len() => {}
+        _ => return Vec::new(),
+    }
+    let Ok(superseded) = super::superseded_runs::superseded_suites(payload, sha) else {
+        return Vec::new();
+    };
+    runs.iter()
+        .filter(|run| run.get("head_sha").and_then(Value::as_str) == Some(sha))
+        .filter(|run| run_failed(run))
+        .filter_map(|run| {
+            let suite = run.get("check_suite_id").and_then(Value::as_u64)?;
+            (!superseded.contains_key(&suite)).then_some((suite, run))
+        })
+        .collect()
+}
+
+/// Whether a check-run row could be stranded under a failed run: it is not
+/// terminal and carries a check-suite id to attribute by. The workflow-runs
+/// read is only worth making when some row is.
+#[must_use]
+pub fn is_stranded_candidate(row: &Value) -> bool {
+    !is_settled(row) && check_suite_id(row).is_some()
+}
+
+/// Settle the check runs a terminal-failed workflow run left non-terminal
+/// (#14128, #14415): `startup_failure` (and kin) concludes the run while its
+/// jobs stay `queued` with a null conclusion — measured on this repo, a
+/// `startup_failure` run from 2026-08-26 still owned 19 queued rows months
+/// later, so they never settle.
+///
+/// `runs` is a `check_runs` payload and `workflow_runs` the head's
+/// `actions/runs?head_sha=` payload. A non-terminal row whose check-suite id
+/// equals a terminal-failed run's `check_suite_id` is rewritten as terminal
+/// with that run's conclusion, so every classifier reads it failing under
+/// its own name — the same name a required context carries. Returns how
+/// many rows were rewritten.
+///
+/// Only positive attribution acts (the failing direction); a row without a
+/// suite id, a run that has not failed (queued, in progress, a re-run of its
+/// failed jobs), a superseded twin, and an unreadable or truncated runs
+/// payload leave the row pending as before.
+pub fn fail_stranded_rows(runs: &mut Value, workflow_runs: &Value, sha: &str) -> usize {
+    let failed = failed_runs(workflow_runs, sha);
+    if failed.is_empty() {
+        return 0;
+    }
+    let Some(rows) = runs.get_mut("check_runs").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut rewritten = 0;
+    for row in rows.iter_mut().filter(|r| is_stranded_candidate(r)) {
+        let Some(suite) = check_suite_id(row) else {
+            continue;
+        };
+        let Some((_, run)) = failed.iter().find(|(s, _)| *s == suite) else {
+            continue;
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("status".into(), Value::String("completed".into()));
+            obj.insert("conclusion".into(), run.get("conclusion").cloned().unwrap_or(Value::Null));
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
 /// Classify one `forge_get_check_runs` payload. See the module docs.
 ///
 /// # Errors

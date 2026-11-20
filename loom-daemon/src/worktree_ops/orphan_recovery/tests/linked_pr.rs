@@ -2,8 +2,7 @@
 //! evidence (#5511), lease-record freshness (#6286) and stale PR-side claim
 //! recovery (#6167). Split out of `orphan_recovery.rs` when #9548 registered
 //! these fixtures as writable checkouts (the label writers run the real
-//! write-scope check), so the over-threshold parent shrinks rather than grows
-//! (`.loom/docs/file-size-policy.md`).
+//! write-scope check).
 
 use super::*;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
@@ -660,10 +659,8 @@ fn format_result_json_round_trips_totals() {
         kind: "untracked_building",
         issue: Some(1),
         pr: None,
-        pid: None,
         title: Some("t".to_string()),
         reason: "no_spawn_loop_entry".to_string(),
-        age_seconds: None,
     });
     let json = format_result_json(&result);
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

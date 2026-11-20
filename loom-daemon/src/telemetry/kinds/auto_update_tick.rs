@@ -58,8 +58,12 @@ pub enum TickDecisionKind {
     /// A newer target exists, but a gate held the roll this tick (settle
     /// window, backoff, terminal failure, in-flight sweeps, roll window).
     Defer,
-    /// The artifact resolved from a repo other than the one this binary was
-    /// built from (#8513): no progress is possible until that is fixed.
+    /// A WARN-level "nothing to roll onto" tick: the artifact resolved from
+    /// a repo other than the one this binary was built from (#8513), or a
+    /// below-floor host with no release resolved (#11029, #14224). No
+    /// progress is possible either way until that is fixed. Tell the two
+    /// causes apart with `floor_not_rolling` (`no_release`, set only for the
+    /// below-floor cause) or the `reason` text — the kind alone does not.
     StaleRepo,
     /// A release artifact fetch ran.
     Fetch,

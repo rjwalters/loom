@@ -310,6 +310,9 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     // NOT ignored — it is an optional, committable per-repo profile allowlist.
     ".loom/account-health.json",
     ".loom/account-health.lock",
+    // Codex ranking file `accounts check --ranking` writes; the ranking-refresh
+    // tick now rewrites it every cycle in every workspace (#14584).
+    ".loom/account-ranking.codex",
     // Uncommitted canary confirmation sentinel (#3731). Its guardrail power comes
     // from being uncommitted, so it must never be tracked.
     ".loom/CANARY",

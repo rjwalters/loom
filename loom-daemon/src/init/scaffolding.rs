@@ -1042,7 +1042,7 @@ pub fn setup_repository_scaffolding(
     // markerless branches further down.
     //
     // `defaults/.loom/AGENTS.md` is itself a generated artifact
-    // (defaults/scripts/generate-agents-md.sh, kept in sync by
+    // (scripts/generate-agents-md.sh, kept in sync by
     // scripts/check-agents-md-sync.sh); this code reads it exactly like the
     // CLAUDE.md template.
     //

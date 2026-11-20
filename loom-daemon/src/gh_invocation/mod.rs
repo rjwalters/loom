@@ -44,7 +44,7 @@
 //! # Crate-wide test-isolation invariant for `LOOM_REPO` (#8496)
 //!
 //! `LOOM_REPO` is process-global, and roughly a dozen test modules mutate it
-//! (`peer_claims::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
+//! (`host_identity::repo_slug_tests`, `claim_reconciliation::repo_env_tests`,
 //! `quarantine_reconciliation`, and the `sweep_registry` guards / dispatch /
 //! reaper / watchdog / outcome-journal test modules). **Every one of those
 //! tests MUST use the crate-default, unnamed `#[serial]` key** — `serial_test`
@@ -63,12 +63,18 @@
 //! group. The variable with exactly one writer group (`LOOM_GH_BIN`) is the
 //! one that can afford a private key; this one cannot.
 //!
-//! The one test that also needs `loom_config_env` (for `LOOM_GH_BIN`) —
-//! `role_collision::tests::rest_queue_source_parses_the_live_listing_shape` —
-//! holds **both** locks by nesting a `#[serial]` body inside the
-//! `#[serial(loom_config_env)]` test, because multi-key `#[serial(a, b)]` cannot
-//! name the default group (its key is the empty string; attribute keys are
-//! parsed as identifiers). See that test's own doc comment for the lock order.
+//! The tests that also need `loom_config_env` (for `LOOM_GH_BIN` /
+//! `PRIVATE_DEFAULTS_ENV` / `LOOM_WORKTREE_ROOT`) — e.g. `role_collision`'s
+//! `rest_queue_source_parses_the_live_listing_shape`, the
+//! `forge_repo_facts::tests_sites` bodies, `worktree_root`'s config-tier
+//! tests, and the `role_runner` / `orphan_recovery` suites (the set is open) —
+//! hold **both** locks by nesting a `#[serial]` body
+//! inside the `#[serial(loom_config_env)]` test, because multi-key
+//! `#[serial(a, b)]` cannot name the default group (its key is the empty
+//! string; attribute keys are parsed as identifiers). See role_collision's
+//! lock-order doc for the mandatory order;
+//! `lock_order_tests::loom_config_env_is_only_ever_the_outer_lock` (#14404)
+//! fails if a non-test function ever takes `loom_config_env`.
 //!
 //! # `gh api` has no `--repo` flag (#8263)
 //!

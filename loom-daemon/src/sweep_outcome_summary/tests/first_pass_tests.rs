@@ -1,6 +1,5 @@
 //! Issue #8542: the first-pass Judge approval rate every grouping carries. Extracted
-//! to a sibling of `tests.rs` to keep it under the file-size ratchet
-//! threshold (`scripts/check-file-size-budget.sh`, #7711).
+//! to a sibling of `tests.rs` (#7711).
 
 use super::*;
 

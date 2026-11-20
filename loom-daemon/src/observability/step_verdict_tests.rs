@@ -295,6 +295,146 @@ fn a_moved_head_clears_the_standing_refusal() {
     assert_eq!(r.step.first_refused_at, None);
 }
 
+/// #14639: a step a guard refused mid-flight can end with its lease
+/// released (`outcome=skipped reason=guard_refused`) and no
+/// `CHAMPION-STEP` line in its log. The daemon's own journaled release is
+/// the fallback, so the typed run keeps the reason instead of projecting
+/// `unclassified` — the two 0.19.1316 receipts (sky130-comparator #347,
+/// loom-ui #6934).
+#[test]
+fn a_released_leases_typed_outcome_backs_a_missing_step_line() {
+    let released = |number: u32, outcome: &str, reason: Option<&str>| JournalEntry::Released {
+        at: t(3),
+        number,
+        outcome: outcome.to_string(),
+        reason: reason.map(str::to_string),
+    };
+    let mut store = RefusalStore::default();
+    let j = journal(vec![released(9, "skipped", Some("guard_refused"))]);
+    let r = one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut store, t(5));
+    assert_eq!(class_reason(&r), ("noop", "guard_refused"));
+    assert_eq!(r.detail.as_deref(), Some("guard_refused"));
+    assert_eq!(r.step.sweep_id.as_deref(), Some("step-champion_merge-9-1"));
+    assert_ne!(r.step.ledger_class.as_deref(), Some("failed"));
+    // The reason is a closed token, not an echo of anything else.
+    assert!(champion::MERGE_REASONS.contains(&"guard_refused"));
+    // Another item's release never speaks for this one.
+    let j = journal(vec![released(8, "skipped", Some("guard_refused"))]);
+    let r = one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut store, t(5));
+    assert_eq!(class_reason(&r), ("failed", "unclassified"));
+}
+
+/// The recognized step line keeps precedence (#14639): a release recording a
+/// different outcome never overrides what the step itself said.
+#[test]
+fn a_real_step_line_wins_over_the_released_lease() {
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("guard_refused".to_string()),
+    }]);
+    for (prior, fields, expected, detail) in [
+        (
+            None,
+            "outcome=requeued reason=pin_missing",
+            ("noop", "pin_missing"),
+            Some("pin_missing"),
+        ),
+        (None, "outcome=requeued", ("noop", "unspecified"), None),
+        (
+            Some("skipped reason=ci_pending"),
+            "outcome=requeued",
+            ("noop", "unspecified"),
+            None,
+        ),
+        (None, "outcome=skipped reason=bogus", ("noop", "unspecified"), Some("bogus")),
+        (None, "reason=ci_pending", ("failed", "unclassified"), None),
+    ] {
+        let Source::Step(mut s) = step(StepRole::ChampionMerge, 9, prior) else {
+            unreachable!()
+        };
+        s.log_text
+            .as_mut()
+            .unwrap()
+            .push_str(&format!("CHAMPION-STEP mode=pr item=9 {fields}\n"));
+        let r = one(&Source::Step(s), Some(&j), &mut RefusalStore::default(), t(5));
+        assert_eq!(class_reason(&r), expected, "{fields}");
+        assert_eq!(r.detail.as_deref(), detail);
+    }
+}
+
+/// A release that recorded no usable outcome (`none`, or a word the reason
+/// set does not know) leaves the projection as it was (#14639); an unknown
+/// `reason=` token still stops at `unspecified`, like the log line's own.
+#[test]
+fn a_release_without_a_usable_outcome_stays_unclassified() {
+    for outcome in ["none", "bogus"] {
+        let j = journal(vec![JournalEntry::Released {
+            at: t(3),
+            number: 9,
+            outcome: outcome.to_string(),
+            reason: Some("guard_refused".to_string()),
+        }]);
+        let r = one(
+            &step(StepRole::ChampionMerge, 9, None),
+            Some(&j),
+            &mut RefusalStore::default(),
+            t(5),
+        );
+        assert_eq!(class_reason(&r), ("failed", "unclassified"), "{outcome}");
+    }
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("bogus".to_string()),
+    }]);
+    let r = one(
+        &step(StepRole::ChampionMerge, 9, None),
+        Some(&j),
+        &mut RefusalStore::default(),
+        t(5),
+    );
+    assert_eq!(class_reason(&r), ("noop", "unspecified"));
+}
+
+/// #9548, #14639: a release marker read off the forge is untrusted prose.
+/// Only the daemon's own journaled release (`JournalEntry::Released`) is
+/// fallback evidence — a posted marker comment, however it is shaped,
+/// never supplies the outcome or the reason.
+#[test]
+fn an_untrusted_release_marker_comment_never_supplies_the_reason() {
+    for body in [
+        "<!-- loom:pr-lease-released role=champion host=h sweep=s step=champion_merge outcome=skipped reason=guard_refused -->",
+        "<!-- champion:released outcome=skipped reason=guard_refused -->",
+    ] {
+        let j = journal(vec![marker(3, 9, true, body, None)]);
+        let r =
+            one(&step(StepRole::ChampionMerge, 9, None), Some(&j), &mut RefusalStore::default(), t(5));
+        assert_eq!(class_reason(&r), ("failed", "unclassified"), "{body}");
+    }
+}
+
+/// A role tick has no step log to lose; its records stay write-driven, so a
+/// release alone projects nothing (#14639).
+#[test]
+fn a_tick_release_alone_projects_nothing() {
+    let j = journal(vec![JournalEntry::Released {
+        at: t(3),
+        number: 9,
+        outcome: "skipped".to_string(),
+        reason: Some("guard_refused".to_string()),
+    }]);
+    let records = records_for(
+        &ctx(t(9)),
+        &Source::Tick { started_at: t(0) },
+        Some(&j),
+        &mut RefusalStore::default(),
+    );
+    assert!(records.is_empty());
+}
+
 #[test]
 fn every_promotion_row_projects_its_reason() {
     let issue = |entries: Vec<JournalEntry>, outcome: Option<&str>| {
@@ -534,7 +674,6 @@ fn the_exporter_calls_no_ledger_effect_forge_write_or_command() {
             "forge_comment",
             "add_labels",
             "forge_mirror",
-            "peer_claims",
         ] {
             assert!(!code.contains(forbidden), "{name} uses {forbidden}");
         }

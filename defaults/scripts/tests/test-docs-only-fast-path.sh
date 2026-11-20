@@ -198,6 +198,68 @@ out="$(printf 'work_log/WORK_LOG_2026-08.md\nsrc/main.rs\n' | docs_only_fast_pat
 assert_eq "NOT ELIGIBLE: src/main.rs" "$out" "an archive file mixed with a non-docs file is ineligible"
 
 echo
+echo "--- closing-reference condition (#14182): a docs-only diff that closes an issue is ineligible ---"
+
+# Mirror of the shipped docs_only_fast_path_closing_check(), extracted from
+# judge.md so this suite exercises the documented code, not a hand copy. `gh`
+# is stubbed: GH_STUB_OUT is its stdout, GH_STUB_RC its exit status.
+gh() { printf '%s' "${GH_STUB_OUT-}"; return "${GH_STUB_RC:-0}"; }
+closing_fn_block() {
+    awk '/^docs_only_fast_path_closing_check\(\) \{/{p=1} p{print} p && /^}$/{exit}' "$1"
+}
+eval "$(closing_fn_block "$JUDGE_MD")"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "ELIGIBLE" "$out" "a PR with an empty closing set stays eligible"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=42' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closes #42" "$out" "a PR closing one issue is ineligible"
+
+GH_STUB_RC=0 GH_STUB_OUT='closers=42,77' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closes #42, #77" "$out" "a PR closing several issues is ineligible"
+
+GH_STUB_RC=1 GH_STUB_OUT='' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read failed" "$out" \
+    "a failed read fails closed (not treated as 'no closers')"
+
+GH_STUB_RC=1 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read failed" "$out" \
+    "a non-zero exit fails closed even when stdout looks like an empty set"
+
+GH_STUB_RC=0 GH_STUB_OUT='' out="$(docs_only_fast_path_closing_check 1)"
+assert_eq "NOT ELIGIBLE: closing-reference read returned no proof" "$out" \
+    "an empty-because-errored read (exit 0, no 'closers=' proof) fails closed"
+
+unset -f gh
+
+JUDGE_CLOSING="$(closing_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')"
+CHAMPION_CLOSING="$(closing_fn_block "$CHAMPION_MD" | grep -v '^[[:space:]]*#')"
+assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge.md ships docs_only_fast_path_closing_check()"
+assert_eq "$JUDGE_CLOSING" "$CHAMPION_CLOSING" \
+    "judge.md and champion-pr-merge.md closing-check code is identical (comments aside)"
+
+assert_doc_contains "$JUDGE_MD" \
+    'ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
+    "judge.md folds the closing check into ELIGIBILITY"
+assert_doc_contains "$CHAMPION_MD" \
+    'FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
+    "champion-pr-merge.md folds the closing check into FAST_PATH_RESULT"
+assert_doc_contains "$JUDGE_MD" "closingIssuesReferences" "judge.md reads closingIssuesReferences"
+assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.md reads closingIssuesReferences"
+
+# Inline PROSE restatements of the eligibility condition (#14321). The LLM
+# executing these prompts reads the lead-in / dispatch step before the code
+# block, so prose narrower than the code block's gate (file list only) would
+# grant a fast path the code refuses. Pin the closing-issue clause so adding a
+# condition to the code block without updating its prose turns this red.
+assert_doc_contains "$CHAMPION_MD" \
+    "and the PR has no closing-issue" \
+    "champion-pr-merge.md fast-path lead-in states the no-closing-issue condition (#14182)"
+assert_doc_contains "$JUDGE_MD" \
+    "and the PR has no closing-issue reference" \
+    "judge.md Primary Queue step 4b states the no-closing-issue condition (#14182)"
+
+echo
 echo "--- Judge and Champion allowlist + archive pattern are byte-identical (#12636) ---"
 
 fast_path_block() {
@@ -304,6 +366,58 @@ assert_doc_contains "$GUIDE_MD" \
 assert_doc_contains "$GUIDE_MD" \
     "Judge and Champion never trust it" \
     "guide.md documents that the marker is informational, not authoritative"
+
+# Regression guard for #14176: a closing keyword sitting directly before an
+# issue reference in the docs-PR body (`drops closed #286`) makes GitHub
+# parse it as a closing link, so merging a docs-only PR would close an
+# unrelated issue. The heredoc must carry the keyword-safety note, the
+# post-create backstop must read closingIssuesReferences and close the PR
+# when it is non-empty, and the heredoc itself must stay free of
+# closing-keyword adjacency — the note included, since it is posted
+# verbatim (its examples use "<keyword> #N" placeholders instead).
+echo
+echo "--- Doc pins: docs-PR body keyword safety (#14176) ---"
+
+# Mirror of the PROMPT_DIR probe above (#6725): installed layout keeps
+# .agents/skills at the repo root, source-tree layout under defaults/.
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    GUIDE_SKILL_MD="$SCRIPTS_DIR/../../.agents/skills/loom-guide/SKILL.md"
+else
+    GUIDE_SKILL_MD="$SCRIPTS_DIR/../.agents/skills/loom-guide/SKILL.md"
+fi
+
+heredoc_free_of_closing_keyword() { # file description
+    local region
+    region="$(sed -n "/cat <<'PRBODY'/,/^PRBODY$/p" "$1")"
+    if grep -Eq '(close[sd]?|fix(es|ed)?|resolve[sd]?) #[0-9]' <<<"$region"; then
+        fail "$2 (found closing-keyword adjacency in $1's PRBODY heredoc)"
+    else
+        pass "$2"
+    fi
+}
+
+for f in "$GUIDE_MD" "$GUIDE_SKILL_MD"; do
+    assert_doc_contains "$f" \
+        "Keyword safety (#14176)" \
+        "$(basename "$f") PRBODY heredoc carries the closing-keyword-safety note"
+    assert_doc_contains "$f" \
+        "closingIssuesReferences" \
+        "$(basename "$f") post-create backstop reads closingIssuesReferences"
+    heredoc_free_of_closing_keyword "$f" \
+        "$(basename "$f") PRBODY heredoc is free of closing-keyword adjacency"
+done
+
+# Both shipped mirrors must stay byte-identical across the hunks #14176
+# touches: the PRBODY heredoc (with the note) through the post-create
+# backstop and the lock release that must still run afterward.
+extract_docs_pr_region() {
+    awk '/cat <<'"'"'PRBODY'"'"'/{inregion=1}
+         inregion {print}
+         inregion && /docs-guide-lock\.sh release/{exit}' "$1"
+}
+assert_eq "$(extract_docs_pr_region "$GUIDE_MD")" \
+          "$(extract_docs_pr_region "$GUIDE_SKILL_MD")" \
+          "guide.md and SKILL.md docs-PR hunks stay byte-identical"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -15,10 +15,10 @@
 //! format this module cannot parse).
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::runtime_admission::{ResolvedRuntime, RuntimeSource};
 use serial_test::serial;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 /// The exact stream shape #8448's live OpenCode 2.0.10 receipt recorded: one
 /// `step_start`, one `text` event in which the model says it has no `loom_*`
@@ -62,11 +62,6 @@ fn log_with(anchor: &str, stream: &str) -> String {
 // End-to-end: the role runner's own verdict for a real, exit-0 invocation.
 // ---------------------------------------------------------------------------
 
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// Every env var that can override which runtime the `judge` role resolves
 /// to, cleared for the scope of a test and restored on drop — mirrors
 /// `provider_health_feedback::tests::EnvGuard`. A daemon-dispatched test
@@ -109,7 +104,7 @@ fn opencode_judge_workspace(root: &Path, stream: &str) {
     // metacharacters, and this keeps the fixture's output byte-exact.
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\nprintf '%s\\n' '{stream}'\nexit 0\n"),
+        format!("#!/bin/sh\nprintf '%s\\n' '{stream}'\nexit 0\n"),
     );
 }
 

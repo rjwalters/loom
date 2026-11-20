@@ -268,6 +268,7 @@ Claude-specific internals):
 | **Prompt delivery** | `-p "…"` / `--prompt` is passed through to `claude -p`. | Deliver the prompt to the runtime's own headless/print-mode flag. |
 | **Model tier env** | `LOOM_MODEL` → `claude --model <v>` unless an explicit `--model` is already present (explicit arg wins). See [model mapping](#2-model-mapping). | Map the logical model tier to the runtime's own model-selection flag with the same precedence. |
 | **Effort tier env** | `LOOM_EFFORT` → `claude --effort <v>` unless an explicit `--effort` is present. This is a **session-default** effort; the in-session Task tool exposes no per-rung effort knob. | Map to the runtime's reasoning-effort knob if it has one; otherwise omit (no error). |
+| **Service tier env** | `LOOM_SERVICE_TIER` → Claude fast mode via an inline `--settings '{"fastMode":true}'`. See [service tier](#service-tier-loom_service_tier-issue-14141). | Map to the runtime's speed/service-tier knob if it has one; otherwise ignore it with one warning (never a failure). |
 | **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-daemon tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
 | **Runtime-missing failure** | Exits `127` when the `claude` CLI is not on `PATH`. | Fail cleanly when the runtime binary is absent. |
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
@@ -318,7 +319,18 @@ model a tier maps to.
 the suffix becomes `-c model_reasoning_effort=<suffix>` at the lowest precedence:
 explicit `-c` > `--effort` > `LOOM_EFFORT` > suffix; an empty base falls through to
 `LOOM_CODEX_MODEL`/no `-m`, an empty suffix is ignored; the same split applies to
-`LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged), an
+`LOOM_CODEX_MODEL`, and an explicit `-m foo@high` arg is passed through unchanged). One
+reachability caveat (#14320): on a **role-runner or sweep-step** Codex launch the
+suffix rung can no longer take effect — the daemon emits its resolved effort as an explicit
+`--effort` arg (second tier of this chain), and since #14017 its resolver supplies
+`medium` (source `codex-default`) for every Codex launch with no configured effort
+tier, so `--effort` is always populated and shadows the suffix. A `roleDraw`
+candidate written `codex/<model>@high` therefore yields `medium`; the supported way
+to raise a Codex role's effort from config is `roleEfforts.<role>@codex`
+([daemon-reference.md](daemon-reference.md) § role-runner effort). The suffix still
+applies on manual launches where no `--effort`/`LOOM_EFFORT` is supplied, and on the
+sweep orchestrator launch (it never calls that resolver): an ad-hoc
+`dispatch_sweep --model <m>@<e>` with no effort still reaches the suffix rung. An
 explicit `-m`/`--model` wins, `LOOM_CODEX_MODEL` supplies an optional static
 adapter default, and with none of those set **no `-m` flag is emitted at all** so
 the Codex CLI/profile default is preserved (exactly `spawn-claude.sh`'s
@@ -336,6 +348,41 @@ effort maps to a config override (`-c model_reasoning_effort=<v>`) because
 > tracked separately (epic #4167, Phase 4 "pool + tiering integration") and is
 > **out of scope for this contract doc**. An adapter author should be aware the
 > single-source model map is not yet single-source across both runtimes.
+
+#### Service tier (`LOOM_SERVICE_TIER`, issue #14141)
+
+One runtime-neutral speed setting, delivered as the env var `LOOM_SERVICE_TIER`
+(empty = unset), beside `LOOM_MODEL` / `LOOM_EFFORT`. Each adapter maps it to its
+own knob:
+
+| Adapter | `LOOM_SERVICE_TIER=fast` (or `priority`) | `standard` / `default` | Any other value |
+|---------|------------------------------------------|------------------------|-----------------|
+| `spawn-claude.sh` | inline `--settings '{"fastMode":true}'`. An existing inline-JSON `--settings` (e.g. the daemon's roll-pause hook) is **merged** (needs `jq`); any other existing `--settings` wins, with a warning | no flag, logged | one warning, ignored |
+| `spawn-codex.sh` | `-c service_tier=priority` (`fast` is shorthand for the catalog id `priority`) | no override, logged | passed through lower-cased as a catalog id from `codex debug models` (`service_tiers[].id`); a malformed id warns and is ignored |
+| `spawn-generic.sh` (aider, gemini, templates) | no equivalent: one warning, ignored | same | same |
+
+An explicit `-c service_tier=` (Codex) or `--settings` (Claude) in the passthrough
+args wins over the env var. `spawn-claude.sh` and `spawn-codex.sh` log one
+`service_tier=<v>` line naming what was applied.
+
+**Terminal record.** `spawn-codex.sh` appends `effort=<v|none> tier=<v|none>` to its
+`LOOM_TERMINAL_RESULT` record as **`v=4`** (after `model=` and, on a dropped pin,
+`requested_model=`) whenever it applied an effort or a tier. A launch that applied
+neither keeps the v2/v3 record byte-for-byte. `model=` keeps its meaning (`none` when
+a pinned model was dropped). The daemon parser requires both keys on a v4 record and
+fails closed on anything else, so an older daemon reading a v4 record records no
+account-health mutation for that step: roll the daemon before the scripts, or accept
+that gap.
+
+Scheduled role ticks (#14454) and named sweep steps (#14504) use
+`autonomous.roleRunner.serviceTier` and `autonomous.roleRunner.roleServiceTiers`.
+For a fresh or resumed step, the daemon selects the first configured value from
+`<role>@<runtime>` using the admitted runtime, the bare `<role>`, and the global
+`serviceTier`. It exports that value as `LOOM_SERVICE_TIER`. If no tier matches,
+the child inherits the daemon's environment, including an absent value.
+Whole-issue and PR-set sweeps invoke `/loom:sweep` and inherit the environment
+because they span multiple roles. Claude and Codex use the adapter mappings
+above. Native harnesses use their own provider settings.
 
 ### 3. Error classification
 
@@ -515,7 +562,7 @@ them from a single source so role/repo instructions never fork per-runtime.
   `AGENTS.md`, but `CLAUDE.md` carries the full operating surface.
 
 Both derive from one source (#4479, seeded by the fork's `AGENTS.md` codegen,
-fork PR #8): `defaults/scripts/generate-agents-md.sh` extracts the
+fork PR #8): `scripts/generate-agents-md.sh` extracts the
 `agents-md:include` marker ranges from `defaults/.loom/CLAUDE.md` and wraps them
 with dual-runtime framing, writing the checked-in `defaults/.loom/AGENTS.md`
 (CI `scripts/check-agents-md-sync.sh` fails if it is stale). So a new runtime
@@ -540,8 +587,8 @@ instruction-file set (e.g. Codex reads `AGENTS.md` + `.codex/` config); it must
   `defaults/.agents/skills/loom-<name>/SKILL.md` for every
   `defaults/roles/<name>.md`, each carrying `name: loom-<name>` /
   `description:` frontmatter plus a `<!-- loom-managed-skill -->` ownership
-  marker (CI `scripts/check-agent-skills-sync.sh` fails if a checked-in file is
-  stale). Install/resync tooling gates every overwrite on that marker's
+  marker (CI `loom-daemon generate-agent-skills --check` fails if a checked-in
+  file is stale). Install/resync tooling gates every overwrite on that marker's
   presence in the destination file, so a consumer-authored or hand-detached
   `SKILL.md` at the same path is left alone and logged, never silently reaped.
 
@@ -808,8 +855,9 @@ never falls through to a lower tier, and it is never run through the
 
 Here Curator runs on Codex with whatever model that Codex seat defaults to,
 while every other role keeps `sonnet` on Claude. **This is not a stylistic
-option** — it is the only configuration a ChatGPT-plan Codex seat accepts (see
-"ChatGPT-plan seats cannot serve a pinned model at all" below), and before
+option** — it is the only configuration a ChatGPT-plan Codex seat reliably
+accepts (see "ChatGPT-plan seats and pinned models: the account catalog
+decides" below), and before
 #7894 there was no way to express it: omitting the pin fell through to the
 Claude-shaped shipped default and made the #5028 preflight below skip the tick
 forever. The per-role log header records the pass-through explicitly:
@@ -898,41 +946,54 @@ the daemon log, and `role_tick.outcome`'s `gated_pool` key. Full contract,
 including when the codex gate deliberately stands down:
 [token-pool.md § The gate follows the admitted runtime](token-pool.md#the-gate-follows-the-admitted-runtime-8408).
 
-#### ChatGPT-plan seats cannot serve a pinned model at all (#5499)
+#### ChatGPT-plan seats and pinned models: the account catalog decides (#5499, #14121)
 
 The family-level checks above only catch a Claude-shaped model on a Codex
-runtime. They cannot catch a **Codex-family** model — e.g. `gpt-5-codex` — that
-still fails, because the real incompatibility is model vs the profile's **auth
-mode**, not model vs runtime family: a Codex profile authenticated via a
-ChatGPT plan (interactive `codex login`, as opposed to `codex login
---with-api-key`) only accepts the account's own default model. Pinning
-anything else — including a perfectly valid Codex model name — gets rejected
-on the wire with a 400 `invalid_request_error`:
+runtime. They cannot catch a **Codex-family** model — e.g. `gpt-5-codex` —
+that still fails, because the real gate on a Codex profile authenticated via
+a ChatGPT plan (interactive `codex login`, as opposed to `codex login
+--with-api-key`) is the **account's own model catalog**, not the runtime
+family: current codex-cli (0.168+) runs a pinned model only when the catalog
+`codex debug models` exposes for that account lists it — each entry with its
+own reasoning levels and service tiers. A pin the catalog does not list is
+rejected on the wire with a 400 `invalid_request_error`:
 
 ```
 The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account.
 ```
 
-**If the Codex profile a role/runtime binding points at is authenticated via a
-ChatGPT plan, set `roleModels.<role>` to `"default"`** (the #7894 pass-through
-sentinel above) **and omit `LOOM_MODEL`/`LOOM_CODEX_MODEL` for that role**, so
-the CLI uses the account's own default — this is the single most likely
-first-run misconfiguration for a Codex-bound role, and the error text otherwise
-only ever surfaces in the role's own log (`role-<role>.log` or a sweep's
-per-issue log), never in `loom-daemon health`. Omitting `roleModels.<role>`
-entirely now works too (an unpinned conflict degrades to the same pass-through
-rather than skipping the tick, #7894) — the explicit `"default"` is preferred
-because it says *why* no model is pinned, in the config an operator reads.
+(Before #14121 the guard treated *every* pin this way — the plan's catalog
+was not consulted, so even a listed model was dropped. Issue #5499 predates
+the catalog-aware CLI behaviour and observed exactly that 400; the drop
+remains the fallback for a pin the catalog does not list or a catalog that
+cannot be read.)
 
-`spawn-codex.sh` now guards against it directly: once CODEX_HOME is resolved
-and an explicit model is about to be forwarded, it runs `codex login status`
-(bounded, 10s) and checks the CLI's own wording — "Logged in using ChatGPT" vs
-"Logged in using an API key" — never `auth.json`'s contents, which Loom treats
-as opaque. A ChatGPT-plan match **drops** the pinned model (warning logged,
-invocation still runs on the account's default) rather than launching a
-doomed invocation. Escape hatch: `LOOM_CODEX_AUTH_MODE_CHECK=0`. Because this
-runs in the adapter every caller passes through — role runner, sweep dispatch,
-or a hand-run `LOOM_RUNTIME=codex` — it needs no daemon-side counterpart the
+**If the Codex profile a role/runtime binding points at is authenticated via
+a ChatGPT plan, set `roleModels.<role>` either to `"default"`** (the #7894
+pass-through sentinel above) **or to a model the account's catalog lists**
+(`codex debug models` on that profile lists them) **and omit
+`LOOM_MODEL`/`LOOM_CODEX_MODEL` for other roles**. Omitting
+`roleModels.<role>` entirely now works too (an unpinned conflict degrades to
+the same pass-through rather than skipping the tick, #7894) — the explicit
+`"default"` is preferred because it says *why* no model is pinned, in the
+config an operator reads.
+
+`spawn-codex.sh` guards against the mismatch directly: once CODEX_HOME is
+resolved and an explicit model is about to be forwarded, it runs `codex
+login status` (bounded, 10s) and checks the CLI's own wording — "Logged in
+using ChatGPT" vs "Logged in using an API key" — never `auth.json`'s
+contents, which Loom treats as opaque. On a ChatGPT-plan match it then reads
+the account's catalog (`codex debug models`, bounded 10s, cached ~1h per
+profile in the profile's `CODEX_HOME`; a failed read is never cached) and
+**keeps** the pin when the catalog lists it (#14121), **drops** it — warning
+logged, invocation still runs on the account's default — when the catalog
+does not list it or cannot be read, rather than launching a doomed
+invocation. A dropped pin is reported on the step's terminal record as
+`requested_model=` (v3, below), so a configured-but-ignored model is visible
+without reading the adapter's WARN lines. Escape hatch:
+`LOOM_CODEX_AUTH_MODE_CHECK=0`. Because this runs in the adapter every caller
+passes through — role runner, sweep dispatch, or a hand-run
+`LOOM_RUNTIME=codex` — it needs no daemon-side counterpart the
 way the family-level check above does.
 
 As defense in depth, `classify-error.sh`'s `codex` provider table now
@@ -1098,9 +1159,10 @@ module's header comment).
 ```text
 # LOOM_TERMINAL_RESULT v=1 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n>
 # LOOM_TERMINAL_RESULT v=2 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n> model=<model-or-none>
+# LOOM_TERMINAL_RESULT v=3 provider=<provider> account=<account> category=<CATEGORY> exit_code=<n> model=<model-or-none> requested_model=<model>
 ```
 
-Both versions are strict: the parser requires the exact field count for the
+All versions are strict: the parser requires the exact field count for the
 declared `v=` and fails closed (mutates no account health) on any other
 arity, an unrecognized `v=`, a duplicate record in the current dispatch
 region, or an `account=unknown`/malformed identity. `category` is one of the
@@ -1124,6 +1186,16 @@ region, or an `account=unknown`/malformed identity. `category` is one of the
   classifier has been taught) degrades to the same class-less, account-wide
   health write a v1 record produces — selection must never fail closed on an
   unrecognized model name.
+- **`v=3`** (7 fields) adds `requested_model=` (#14121), emitted only when a
+  pin was resolved but then *dropped before exec* — `model=` stays `none`
+  (the fail-safe above) and the requested-but-ignored pin rides in its own
+  field, so a configured model the #5499 catalog guard dropped is visible in
+  the record without reading the adapter's WARN lines; the daemon logs the
+  same on the role-runner health path. The 7-field arity parses only when
+  the `requested_model` key is present, so a v2-shaped record carrying any
+  other unknown 7th field still fails closed; an older daemon that knows
+  only v1/v2 fails closed on a v3 record too — the same no-health-mutation
+  direction a dropped pin already takes.
 - **A `model@…` suffix is stripped before classification** (#8380), so
   `gpt-5-codex@high` (Loom's own `model@effort` rung grammar, #3702) and
   `gpt-5-codex@2026-01-01` (a pinned dated ID — why `@` is in `model=`'s
@@ -1156,10 +1228,12 @@ historical logs) that already do.
 `spawn-codex.sh` narrows account selection to the model about to be dispatched
 (`tokens select --model "$EFFECTIVE_MODEL"`, #8277) so an account held only for
 a *different* class stays selectable. But the [#5499 ChatGPT-plan
-guard](#chatgpt-plan-seats-cannot-serve-a-pinned-model-at-all-5499) that decides
+guard](#chatgpt-plan-seats-and-pinned-models-the-account-catalog-decides-5499-14121) that decides
 whether the pin actually survives runs **after** selection — it has to, because
 it shells out to `codex login status` against the profile selection just chose,
-and nothing before that point knows the profile's auth mode.
+and nothing before that point knows the profile's auth mode. (Since #14121 the
+guard keeps a pin the account catalog lists, so this window now applies only to
+a pin the catalog does not list, or to a catalog that cannot be read.)
 
 So when the pin is dropped, selection was narrowed to class X while class Y —
 the account's own default — is what really runs. An account holding a live
@@ -2499,7 +2573,7 @@ collaboration:
 | #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
 | #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | **landed for the pooled case** (#8672) as `loom-daemon accounts provision`: a pooled `CODEX_HOME` is populated from the operator's own `~/.codex` per a per-provider sharing table (symlink capability/session trees, copy `AGENTS.md`, key-merge `config.toml` under a credential/identity denylist, never touch `auth.json` or per-project trust state), with a `<profile>/.loom-profile.json` ledger so a local edit inside a profile wins forever. See [`codex-profile-provisioning.md`](codex-profile-provisioning.md). Generating a repo's `.codex/` config from single source (the `AGENTS.md` codegen analogue) is still a separate issue. |
 | #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
-| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
+| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
 | #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |
 | #14 | Reusable CI role workflow (`loom-role.yml`) parameterized by runtime | Cross-cutting — the tier-2 CI gate every non-Claude adapter must pass | partially landed: Codex has its own `codex-adapter-smoke` leg in `ci.yml` (#4468); the parameterized reusable workflow is not adopted |
 | #59 | Finding: native Codex agents prohibited for Loom lifecycles | **6/7. Constraint** — encoded in the parity doc + capability matrix | **landed** — recorded as residual gap 9 in the parity doc; `codex.json` declares `subagents: "no"` |

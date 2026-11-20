@@ -18,6 +18,13 @@
 //! `gh pr checks` buckets each row as pass / fail / pending / skipping /
 //! cancel. The rollup classifier treats `failure`, `timed_out`, `cancelled`
 //! and `action_required` as failing and any non-`completed` status as pending.
+//! One deliberate difference, in the not-green direction (#14571): a
+//! `cancelled` check-run is no verdict about the commit, so it is never read
+//! as failing here. A cancellation that no completed run replaced (the
+//! superseded-run drop has already removed every replaced one) is
+//! [`Rollup::cancelled`]: the wait holds on it (never `GREEN`, never `RED`),
+//! so a genuinely unreplaced cancellation ends `TIMEOUT` and the approval
+//! stays pending instead of being refused as red forever.
 //! One addition, in the fail-closed direction: a `completed` run whose
 //! conclusion is none of `success` / `neutral` / `skipped` (e.g.
 //! `startup_failure`, `stale`) is also failing here, so `GREEN` only ever
@@ -55,6 +62,10 @@ pub struct Rollup {
     pub failing: Vec<String>,
     /// Still-running check names, sorted and de-duplicated.
     pub pending: Vec<String>,
+    /// Names whose only terminal evidence is a `cancelled` check-run with no
+    /// replacement (#14571): neither a pass nor a failure. A name that also
+    /// has a genuine failing row is in [`Rollup::failing`], not here.
+    pub cancelled: Vec<String>,
     /// Every check name seen, for the required-context presence test.
     pub seen: BTreeSet<String>,
     /// Detail rows for [`Rollup::failing`], for the stderr listing.
@@ -75,6 +86,14 @@ impl Rollup {
     #[must_use]
     pub fn blocking_failing(&self) -> Vec<String> {
         without_authorization(&self.failing)
+    }
+}
+
+impl Rollup {
+    /// [`Rollup::cancelled`] without [`REQUIRED_CHECK_CONTEXT`].
+    #[must_use]
+    pub fn blocking_cancelled(&self) -> Vec<String> {
+        without_authorization(&self.cancelled)
     }
 }
 
@@ -130,15 +149,28 @@ pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
     let rollup =
         check_runs_rollup::classify(&doc.to_string()).map_err(|r| format!("unreadable: {r}"))?;
 
-    let mut failing: BTreeSet<String> = lines(&rollup.failing);
-    // Fail-closed extension (module docs): an unknown terminal conclusion.
-    for row in &rows {
-        let done = check_runs_rollup::is_settled(row);
-        let conclusion = row.get("conclusion").and_then(Value::as_str);
-        if done && !conclusion.is_some_and(|c| SUCCESS_CONCLUSIONS.contains(&c)) {
-            failing.insert(name_of(row));
-        }
-    }
+    // A `cancelled` row is no verdict (#14571): the classifier's failing list
+    // minus the names that ONLY cancelled rows account for, plus every
+    // genuinely failing row (including an unknown terminal conclusion, the
+    // fail-closed extension in the module docs).
+    let cancelled_names: BTreeSet<String> = rows
+        .iter()
+        .filter(|r| conclusion_of(r) == Some("cancelled"))
+        .flat_map(|r| lines(&name_of(r)))
+        .collect();
+    let mut failing: BTreeSet<String> = lines(&rollup.failing)
+        .into_iter()
+        .filter(|n| !cancelled_names.contains(n))
+        .collect();
+    failing.extend(rows.iter().filter(|r| genuinely_failing(r)).map(name_of));
+    let cancelled: Vec<String> = rows
+        .iter()
+        .filter(|r| conclusion_of(r) == Some("cancelled"))
+        .map(name_of)
+        .filter(|n| !failing.contains(n))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let seen: BTreeSet<String> = rows.iter().map(name_of).collect();
     let failed_detail = failing
         .iter()
@@ -148,9 +180,29 @@ pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
         total,
         failing: failing.into_iter().collect(),
         pending: lines(&rollup.pending).into_iter().collect(),
+        cancelled,
         seen,
         failed_detail,
     })
+}
+
+fn conclusion_of(row: &Value) -> Option<&str> {
+    row.get("conclusion").and_then(Value::as_str)
+}
+
+/// A row that is a failure verdict about the commit: `failure` /
+/// `timed_out` / `action_required` (as the classifier reads them, settled or
+/// not), or a settled row with any other non-success conclusion except
+/// `cancelled`.
+fn genuinely_failing(row: &Value) -> bool {
+    match conclusion_of(row) {
+        Some("cancelled") => false,
+        Some("failure" | "timed_out" | "action_required") => true,
+        c => {
+            check_runs_rollup::is_settled(row)
+                && !c.is_some_and(|c| SUCCESS_CONCLUSIONS.contains(&c))
+        }
+    }
 }
 
 /// What a non-empty rollup means for the wait.
@@ -162,6 +214,14 @@ pub enum Decision {
     Pending(Vec<String>),
     /// Every relevant check is terminal-success.
     Green,
+}
+
+/// `pending` plus the unreplaced-cancelled names, de-duplicated: a name the
+/// wait holds on, as opposed to one it may settle past.
+fn held(pending: &[String], cancelled: &[String]) -> Vec<String> {
+    let mut out = pending.to_vec();
+    out.extend(cancelled.iter().filter(|c| !pending.contains(c)).cloned());
+    out
 }
 
 /// The pending name reported while the base branch's required-context set
@@ -205,7 +265,7 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
         let mut waiting = if required_only {
             Vec::new()
         } else {
-            r.pending.clone()
+            held(&r.pending, &r.blocking_cancelled())
         };
         waiting.push(REQUIRED_UNKNOWN.to_string());
         return Decision::Pending(waiting);
@@ -222,6 +282,11 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
             .filter(|p| req.contains(p))
             .cloned()
             .collect();
+        waiting.extend(
+            r.blocking_cancelled()
+                .into_iter()
+                .filter(|c| req.contains(c)),
+        );
         waiting.extend(missing);
         return match checks_failure::classify(&failing, req, !waiting.is_empty()) {
             RequiredVerdict::RequiredFailed(names) => Decision::Red(names),
@@ -232,6 +297,8 @@ pub fn decide(r: &Rollup, required: Option<&[String]>, required_only: bool) -> D
     if !failing.is_empty() {
         return Decision::Red(failing);
     }
+    // A cancellation nothing replaced holds the wait too (#14571).
+    let pending = held(&pending, &r.blocking_cancelled());
     if !pending.is_empty() {
         return Decision::Pending(pending);
     }
@@ -354,7 +421,12 @@ fn name_of(row: &Value) -> String {
 }
 
 fn detail(name: &str, rows: &[Value]) -> Failed {
-    let row = rows.iter().find(|r| name_of(r) == name);
+    // The row that actually failed (#14571): a same-named passing sibling
+    // must not donate its URL and run id to a failure it did not cause.
+    let named = || rows.iter().filter(|r| name_of(r) == name);
+    let row = named()
+        .find(|r| genuinely_failing(r))
+        .or_else(|| named().next());
     let field = |k: &str| row.and_then(|r| r.get(k)).and_then(Value::as_str);
     let details = field("details_url").unwrap_or("");
     Failed {
@@ -404,7 +476,8 @@ mod tests {
     }
 
     /// Each conclusion lands where `gh pr checks`' bucket would put it:
-    /// pass/skipping → GREEN, fail/cancel → RED, pending → wait.
+    /// pass/skipping → GREEN, fail → RED, pending → wait. `cancel` differs
+    /// on purpose (#14571): it is a wait, never RED or GREEN.
     #[test]
     fn conclusion_table_matches_gh_pr_checks_buckets() {
         for (status, conclusion, want) in [
@@ -413,7 +486,8 @@ mod tests {
             ("completed", Some("skipped"), "green"),
             ("completed", Some("failure"), "red"),
             ("completed", Some("timed_out"), "red"),
-            ("completed", Some("cancelled"), "red"),
+            // No verdict about the commit (#14571): held, never RED or GREEN.
+            ("completed", Some("cancelled"), "pending"),
             ("completed", Some("action_required"), "red"),
             ("completed", Some("startup_failure"), "red"),
             ("completed", Some("stale"), "red"),
@@ -602,6 +676,115 @@ mod tests {
             decide_settled(&ok, None, false),
             Decision::Pending(vec![REQUIRED_UNKNOWN.into()])
         );
+    }
+
+    fn url_run(name: &str, conclusion: &str, job: u64, run: u64) -> Value {
+        json!({"name": name, "status": "completed", "conclusion": conclusion,
+               "html_url": format!("https://github.com/o/r/actions/runs/{run}/job/{job}"),
+               "details_url": format!("https://github.com/o/r/actions/runs/{run}/job/{job}")})
+    }
+
+    /// #14571: a lone cancellation is neither GREEN nor RED, in every mode.
+    #[test]
+    fn a_lone_cancellation_is_pending_in_every_mode() {
+        let r = fold(&runs(vec![run("ci", "completed", Some("cancelled"))]), &no_status()).unwrap();
+        assert!(r.failing.is_empty());
+        assert_eq!(r.cancelled, vec!["ci"]);
+        let none: &[String] = &[];
+        let req = vec!["ci".to_string()];
+        for required in [Some(none), Some(req.as_slice()), None] {
+            for required_only in [false, true] {
+                for settled in [false, true] {
+                    let d = if settled {
+                        decide_settled(&r, required, required_only)
+                    } else {
+                        decide(&r, required, required_only)
+                    };
+                    assert!(
+                        matches!(d, Decision::Pending(_)),
+                        "{required:?} {required_only} {settled}: {d:?}"
+                    );
+                }
+            }
+        }
+        // Under --required-only an unrequired cancellation is informational.
+        let other = vec!["Backend".to_string()];
+        let r = fold(
+            &runs(vec![
+                run("Backend", "completed", Some("success")),
+                run("lint", "completed", Some("cancelled")),
+            ]),
+            &no_status(),
+        )
+        .unwrap();
+        assert_eq!(decide(&r, Some(other.as_slice()), true), Decision::Green);
+        assert_eq!(
+            decide(&r, Some(other.as_slice()), false),
+            Decision::Pending(vec!["lint".into()])
+        );
+    }
+
+    /// A required cancellation holds `--required-only` too.
+    #[test]
+    fn a_required_cancellation_holds_required_only() {
+        let r = fold(&runs(vec![run("Backend", "completed", Some("cancelled"))]), &no_status())
+            .unwrap();
+        let req = vec!["Backend".to_string()];
+        assert_eq!(
+            decide(&r, Some(req.as_slice()), true),
+            Decision::Pending(vec!["Backend".into()])
+        );
+    }
+
+    /// An unrelated cancellation neither makes a genuine failure pending nor
+    /// hides it; a same-named genuine failure is failing, not cancelled.
+    #[test]
+    fn a_cancellation_does_not_mask_or_hold_a_genuine_failure() {
+        let none: &[String] = &[];
+        let rows = vec![
+            run("lint", "completed", Some("cancelled")),
+            run("build", "completed", Some("failure")),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(decide(&r, Some(none), false), Decision::Red(vec!["build".into()]));
+        assert_eq!(decide_settled(&r, Some(none), false), Decision::Red(vec!["build".into()]));
+        let rows = vec![
+            run("build", "completed", Some("cancelled")),
+            run("build", "completed", Some("failure")),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(r.failing, vec!["build"]);
+        assert!(r.cancelled.is_empty());
+    }
+
+    /// An outstanding same-named run keeps the wait pending (listed once).
+    #[test]
+    fn a_cancellation_beside_an_outstanding_twin_stays_pending() {
+        let rows = vec![
+            run("ci", "completed", Some("cancelled")),
+            run("ci", "in_progress", None),
+        ];
+        let r = fold(&runs(rows), &no_status()).unwrap();
+        assert_eq!(decide(&r, Some(&[][..]), false), Decision::Pending(vec!["ci".into()]));
+    }
+
+    /// #14571: the RED detail names the failing row even when a passing
+    /// sibling shares its name, whatever the row order.
+    #[test]
+    fn red_detail_comes_from_the_failing_row_in_either_order() {
+        for flip in [false, true] {
+            let mut rows = vec![
+                url_run("Gate", "success", 111, 11),
+                url_run("Gate", "failure", 222, 22),
+            ];
+            if flip {
+                rows.reverse();
+            }
+            let r = fold(&runs(rows), &no_status()).unwrap();
+            assert_eq!(r.failed_detail.len(), 1);
+            assert_eq!(r.failed_detail[0].url, "https://github.com/o/r/actions/runs/22/job/222");
+            assert_eq!(r.failed_detail[0].run_id, "22");
+        }
     }
 
     #[test]

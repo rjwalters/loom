@@ -2,9 +2,8 @@
 //! (#7860, and its pool-level death class + host hold, #7708).
 //!
 //! Lives in its own sibling module rather than inside `quarantine.rs`'s
-//! `mod tests`: that file is over the file-size ratchet's threshold and is
-//! therefore frozen at its current size (see `.loom/docs/file-size-policy.md`),
-//! and this mirrors the existing `guards_union_tests.rs` precedent.
+//! `mod tests`: that file is already large, and this mirrors the existing
+//! `guards_union_tests.rs` precedent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use crate::sweep_registry::test_support::{

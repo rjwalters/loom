@@ -20,7 +20,7 @@ use super::*;
 /// managed registration naming the image-owned bridge, Loom's receipt pinning
 /// it, and a `config.toml` carrying `trusted` hashes plus the receipt's
 /// install-time `baseline`.
-fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
+pub(super) fn profile(dir: &Path, baseline: Option<&[&str]>, trusted: &[&str]) -> PathBuf {
     let profile = dir.join("profile");
     std::fs::create_dir_all(&profile).unwrap();
     let command = bundle::registration();
@@ -85,6 +85,24 @@ fn report(managed: bool, profile: &Path) -> bundle::Report {
     }
 }
 
+/// Whether the profile passes on a RECORDED trust decision — the rule the
+/// shipped `verify` shares. A sealable profile is also admitted (#14105), so
+/// the trust-rule tests ask for the recorded kind, not for any admission.
+fn recorded(report: &bundle::Report, profile: &Path) -> bool {
+    matches!(enforcing(report, profile), Ok(Trust::Recorded))
+}
+
+/// Make the registration something the seal refuses (an extra event), without
+/// touching the `PreToolUse` entry Codex's trust is keyed to, so a test can
+/// exercise admission on recorded trust alone.
+pub(super) fn unsealable(profile: &Path) {
+    let path = profile.join("hooks.json");
+    let mut hooks: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    hooks["hooks"]["PostToolUse"] = serde_json::json!([]);
+    std::fs::write(path, hooks.to_string()).unwrap();
+}
+
 /// `(description, install-time baseline, current trusted hashes, is trusted)`.
 /// A `None` baseline is a legacy receipt from before the field existed.
 type TrustCase = (&'static str, Option<&'static [&'static str]>, &'static [&'static str], bool);
@@ -128,11 +146,11 @@ fn trust_counts_only_under_the_key_codex_looks_loom_up_under() {
         let dir = tempfile::tempdir().unwrap();
         let profile = profile(dir.path(), Some(&[]), &[]);
         std::fs::write(profile.join("config.toml"), config).unwrap();
-        assert!(enforcing(&report(true, &profile), &profile).is_err(), "{what}");
+        assert!(!recorded(&report(true, &profile), &profile), "{what}");
     }
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(dir.path(), Some(&[]), &["fresh"]);
-    assert!(enforcing(&report(true, &profile), &profile).is_ok());
+    assert!(recorded(&report(true, &profile), &profile));
 }
 
 #[test]
@@ -140,13 +158,13 @@ fn hook_trust_follows_the_install_time_baseline_diff() {
     for (what, baseline, trusted, expected) in TRUST_CASES {
         let dir = tempfile::tempdir().unwrap();
         let profile = profile(dir.path(), *baseline, trusted);
-        assert_eq!(enforcing(&report(true, &profile), &profile).is_ok(), *expected, "{what}");
+        assert_eq!(recorded(&report(true, &profile), &profile), *expected, "{what}");
     }
     // A profile with no config.toml at all carries no trust.
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(dir.path(), Some(&[]), &["fresh"]);
     std::fs::remove_file(profile.join("config.toml")).unwrap();
-    assert!(enforcing(&report(true, &profile), &profile).is_err());
+    assert!(!recorded(&report(true, &profile), &profile));
 }
 
 /// Private admission and `provision-codex-hooks.sh verify` (since #9390 the
@@ -177,7 +195,7 @@ fn the_rust_trust_gate_agrees_with_the_shipped_provisioner() {
         .verify();
         assert_eq!(verdict.trusted, *expected, "{what}: verify verdict {verdict:?}");
         assert_eq!(
-            enforcing(&report(true, &profile), &profile).is_ok(),
+            recorded(&report(true, &profile), &profile),
             verdict.trusted,
             "{what}: the admission gate disagrees with verify"
         );
@@ -201,6 +219,7 @@ fn an_unmanaged_clone_is_refused_even_when_the_boundary_is_ready() {
 fn refusals_are_fixed_secret_free_obligation_text() {
     let dir = tempfile::tempdir().unwrap();
     let untrusted = profile(dir.path(), Some(&["old"]), &["old"]);
+    unsealable(&untrusted);
     for error in [
         enforcing(&report(false, &untrusted), &untrusted).unwrap_err(),
         enforcing(&report(true, &untrusted), &untrusted).unwrap_err(),
@@ -293,6 +312,8 @@ fn malformed_or_absent_identity_is_refused() {
         volume: "v".into(),
         profile: profile.clone(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let ok = report(true, &profile);
     for (what, job) in [
@@ -348,6 +369,8 @@ fn a_proof_is_bound_to_the_clone_it_was_measured_against() {
         volume: "v".into(),
         profile: profile.clone(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let second = identify("https://example.invalid/o/second").unwrap();
     config.repositories.push(Registered {
@@ -451,6 +474,8 @@ fn multi_clone_config(profile: &Path) -> (Config, RepoId) {
         volume: "v".into(),
         profile: profile.to_owned(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     let second = identify("https://example.invalid/o/second").unwrap();
     config.repositories.push(Registered {
@@ -475,6 +500,8 @@ fn multi_clone_config(profile: &Path) -> (Config, RepoId) {
 fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
     let dir = tempfile::tempdir().unwrap();
     let profile = profile(dir.path(), Some(&[]), &[]);
+    // The seal is exercised on its own below; here only recorded trust admits.
+    unsealable(&profile);
     let (config, second) = multi_clone_config(&profile);
     let primary = config.primary();
     let other = config.target(Some(&second.url)).unwrap();
@@ -549,4 +576,215 @@ fn hook_trust_is_proven_at_the_session_key_for_every_selected_clone() {
         let error = host_proof(&config, &unmanaged, &job(target), target).unwrap_err();
         assert!(error.to_string().contains("no Loom hook provisioner"), "{error}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed registration instead of recorded trust (#14105).
+// ---------------------------------------------------------------------------
+
+/// A profile with no trust decision at all, whose registration is exactly
+/// Loom's one entry: the shape a freshly provisioned seat has.
+fn sealable(dir: &Path) -> PathBuf {
+    profile(dir, Some(&[]), &[])
+}
+
+/// The enforcing refusal, whichever way it was reached.
+fn refused(profile: &Path) -> String {
+    let error = enforcing(&report(true, profile), profile)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("protected remote operations"), "{error}");
+    assert!(!error.contains(&*profile.to_string_lossy()), "{error}");
+    error
+}
+
+#[test]
+fn a_sealable_profile_is_admitted_without_recorded_trust() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    assert_eq!(enforcing(&report(true, &profile), &profile).unwrap(), Trust::Sealed);
+    // Recorded trust keeps working, and wins.
+    let trusted = self::profile(&dir.path().join("t"), Some(&[]), &["fresh"]);
+    assert_eq!(enforcing(&report(true, &trusted), &trusted).unwrap(), Trust::Recorded);
+    // The seal only adds a path to the managed registration, never replaces it.
+    let error = enforcing(&report(false, &profile), &profile).unwrap_err();
+    assert!(error.to_string().contains("no Loom hook provisioner"), "{error}");
+    assert!(POLICY.contains("sealed"), "{POLICY}");
+}
+
+/// Each way the registration can hold something Loom did not write refuses,
+/// with the vetting reason in the text.
+#[test]
+fn every_failed_vet_clause_keeps_the_untrusted_refusal() {
+    type Spoil = fn(&Path);
+    let cases: [(&str, Spoil, &str); 5] = [
+        ("an extra hook event", unsealable, "extra event"),
+        (
+            "a hook of the profile's own in config.toml",
+            |p| {
+                let mut text = std::fs::read_to_string(p.join("config.toml")).unwrap();
+                text.push_str("\n[hooks]\nPostToolUse = []\n");
+                std::fs::write(p.join("config.toml"), text).unwrap();
+            },
+            "defines hooks of its own",
+        ),
+        (
+            "a receipt that does not pin Loom's command",
+            |p| {
+                let path = p.join("loom-codex-hooks.json");
+                let mut receipt: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                receipt["loomManagedHook"]["commandSha256"] = "0".repeat(64).into();
+                std::fs::write(path, receipt.to_string()).unwrap();
+            },
+            "receipt does not pin",
+        ),
+        (
+            "a control the host cannot read",
+            |p| std::fs::remove_file(p.join("config.toml")).unwrap(),
+            "missing or unreadable",
+        ),
+        (
+            "the host-mode command in a private registration",
+            |p| {
+                let path = p.join("hooks.json");
+                let mut hooks: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"] =
+                    "echo not the image-owned bridge".into();
+                std::fs::write(path, hooks.to_string()).unwrap();
+            },
+            "not Loom's registered command",
+        ),
+    ];
+    for (what, spoil, why) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = sealable(dir.path());
+        spoil(&profile);
+        let text = refused(&profile);
+        assert!(text.contains(why), "{what}: {text}");
+    }
+}
+
+#[test]
+fn the_host_proof_admits_a_sealed_clone_and_names_the_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    let (config, _) = multi_clone_config(&profile);
+    let primary = config.primary();
+    let job = lease::Job {
+        owner: "fixture".into(),
+        kind: JobKind::Role,
+        issue: None,
+        branch: None,
+        container_id: "a".repeat(64),
+        base_revision: "b".repeat(40),
+        host_pid: 1,
+        control: "c".repeat(64),
+        repository: dispatch::job_repository(&primary),
+    };
+    let proof = host_proof(&config, &report(true, &profile), &job, &primary).unwrap();
+    assert!(proof
+        .provenance(vec![], Default::default())
+        .policy
+        .contains("sealed"));
+    unsealable(&profile);
+    assert!(host_proof(&config, &report(true, &profile), &job, &primary).is_err());
+}
+
+fn args(list: &[&str]) -> Vec<String> {
+    list.iter().map(|a| (*a).to_owned()).collect()
+}
+
+/// A bare clone: a Git root with no `.codex/` anywhere above it.
+fn clone_dir(dir: &Path) -> PathBuf {
+    let clone = dir.join("clone");
+    std::fs::create_dir_all(clone.join(".git")).unwrap();
+    std::fs::write(clone.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    clone
+}
+
+#[test]
+fn the_waiver_is_added_only_for_a_sealed_guarded_role_with_a_clean_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    let clone = clone_dir(dir.path());
+    let exec = args(&["exec", "-m", "gpt"]);
+
+    let waiver = waiver_for(&profile, "builder", &exec, &clone).unwrap();
+    assert_eq!(
+        waiver,
+        args(&[
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            "features.plugins=false"
+        ])
+    );
+    assert_eq!(
+        with_waiver(&exec, waiver.clone()),
+        args(&[
+            "exec",
+            "--dangerously-bypass-hook-trust",
+            "-c",
+            "features.plugins=false",
+            "-m",
+            "gpt"
+        ])
+    );
+    assert_eq!(
+        with_waiver(&args(&["exec", "resume", "id", "prompt"]), waiver.clone())[..3],
+        args(&["exec", "resume", "--dangerously-bypass-hook-trust"])[..]
+    );
+    assert_eq!(with_waiver(&args(&["-m", "gpt"]), waiver)[0], "--dangerously-bypass-hook-trust");
+
+    // A role that neither mutates nor merges runs as before.
+    assert!(waiver_for(&profile, "curator", &exec, &clone)
+        .unwrap()
+        .is_empty());
+    // Recorded trust: nothing to waive.
+    let trusted = self::profile(&dir.path().join("t"), Some(&[]), &["fresh"]);
+    assert!(waiver_for(&trusted, "builder", &exec, &clone)
+        .unwrap()
+        .is_empty());
+}
+
+/// What only the container can see, and what the launch itself carries, refuse
+/// the waiver for the same profile.
+#[test]
+fn the_waiver_is_refused_for_a_hook_source_the_profile_alone_does_not_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = sealable(dir.path());
+    let clone = clone_dir(dir.path());
+    let exec = args(&["exec"]);
+
+    for flags in [
+        args(&["exec", "--dangerously-bypass-hook-trust"]),
+        args(&["exec", "-c", "hooks.state.x.enabled=true"]),
+        args(&["exec", "--enable", "hooks"]),
+    ] {
+        let error = waiver_for(&profile, "builder", &flags, &clone).unwrap_err();
+        assert!(error.to_string().contains("protected remote operations"), "{flags:?}: {error}");
+    }
+
+    std::fs::create_dir_all(clone.join(".codex")).unwrap();
+    std::fs::write(clone.join(".codex/hooks.json"), "{}").unwrap();
+    let error = waiver_for(&profile, "builder", &exec, &clone).unwrap_err();
+    assert!(error.to_string().contains("project .codex/hooks.json"), "{error}");
+    std::fs::remove_file(clone.join(".codex/hooks.json")).unwrap();
+    std::fs::write(clone.join(".codex/config.toml"), "[hooks]\nx = 1\n").unwrap();
+    assert!(waiver_for(&profile, "doctor", &exec, &clone).is_err());
+    std::fs::write(clone.join(".codex/config.toml"), "model = \"m\"\n").unwrap();
+    assert!(waiver_for(&profile, "doctor", &exec, &clone).is_ok());
+}
+
+#[test]
+fn trust_state_reads_recorded_sealed_or_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let trusted = self::profile(&dir.path().join("a"), Some(&[]), &["fresh"]);
+    assert_eq!(trust_state(&trusted), "recorded");
+    let sealed = sealable(&dir.path().join("b"));
+    assert_eq!(trust_state(&sealed), "sealed");
+    unsealable(&sealed);
+    assert_eq!(trust_state(&sealed), "missing");
+    assert_eq!(trust_state(&dir.path().join("absent")), "missing");
 }

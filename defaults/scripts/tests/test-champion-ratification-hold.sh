@@ -53,7 +53,10 @@ S="$T"
 case "\$1 \$2" in
   "pr edit")
     if [ "\$4" = --add-label ]; then echo "LABEL+:\$5" >>"\$S/writes"; else echo "LABEL-:\$5" >>"\$S/writes"; fi ;;
-  "pr view") cat "\$S/other_hold" ;;
+  "pr view") # run the tick's own --jq over the fixture comments, as gh does
+    [ -e "\$S/read_fail" ] && exit 1
+    [ -e "\$S/read_silent" ] && exit 0
+    while [ \$# -gt 0 ]; do [ "\$1" = --jq ] && { jq -r "\$2" "\$S/pr_json"; break; }; shift; done ;;
 esac
 exit 0
 EOF
@@ -76,11 +79,17 @@ printf '%s\n' "\$body" >"\$S/last_body"
 EOF
 chmod +x "$T/bin/gh" "$T/bin/loom-daemon" "$T/w/.loom/scripts/"*.sh
 
-tick() { # <action|-> <rc> [files] [other_hold]
+tick() { # <action|-> <rc> [files] [comment markers, comma-separated in posting order] [read mode: fail|silent]
     if [[ "$1" == "-" ]]; then : >"$T/verb_out"; else
         echo "LOOM-CHAMPION-RATIFICATION verdict=hold action=$1 pr=$PR head=$HEAD_SHA files=${3:-spec/spec.md,spec/decisions/0001.md}" >"$T/verb_out"
     fi
-    echo "$2" >"$T/verb_rc"; echo "${4:-false}" >"$T/other_hold"
+    echo "$2" >"$T/verb_rc"
+    jq -cn --arg m "${4:-}" '{comments: [($m | split(",") | map(select(. != "")) | .[] | {body: ("<!-- champion:" + . + " -->\nbody")})]}' >"$T/pr_json"
+    case "${5:-}" in # other-holds read mode: fail = exit non-zero; silent = exit 0 with no stdout
+      fail) : >"$T/read_fail"; rm -f "$T/read_silent" ;;
+      silent) : >"$T/read_silent"; rm -f "$T/read_fail" ;;
+      *) rm -f "$T/read_fail" "$T/read_silent" ;;
+    esac
     : >"$T/writes"; rm -f "$T/last_body"
     OUT=$(cd "$T/w" && env -u LOOM_DAEMON_BIN PATH="$T/bin:$PATH" bash -c 'source "$1"; echo "SKIP=${SKIP_REMAINING:-false}"' _ "$T/tick.sh" 2>&1)
     SKIP=$(sed -n 's/^SKIP=//p' <<<"$OUT")
@@ -93,12 +102,37 @@ tick none 0;    check "" "$WRITES" "none: no writes";                       chec
 tick hold 0;    check "COMMENT:ratification-hold;$PARK" "$WRITES" "hold: notice and park record (apply adds loom:blocked)"
 check true "$SKIP" "hold: ends this PR's pass"
 check 1 "$(grep -c 'merging ratifies; the operator approves' "$T/last_body" || true)" "hold: notice says merging ratifies; the operator approves"
-check 1 "$(grep -c 'clear the hold' "$T/last_body" || true)" "hold: notice names the release comment"
+check 2 "$(grep -c 'clear the hold' "$T/last_body" || true)" "hold: notice names the release comment (reason bullet and To-release block)"
 check 1 "$(grep -c 'spec/spec.md' "$T/last_body" || true)" "hold: notice lists the declaring files"
+check 1 "$(grep -cE '^- \*\*.+\*\*: ' "$T/last_body" || true)" "hold: notice's first bullet is a '**kind**: reason' line the digest extractor reads (#13875)"
+check "<!-- champion:ratification-hold -->" "$(sed -n 1p "$T/last_body")" "hold: the marker stays the first line (daemon startswith depends on it)"
+check "<!-- champion:hold-state head=$HEAD_SHA -->" "$(sed -n 2p "$T/last_body")" "hold: hold-state stays the second line (recorded_head depends on it)"
 tick stands 0;  check "$PARK" "$WRITES" "stands: park re-asserted via apply, no comment"; check true "$SKIP" "stands: ends this PR's pass"
 tick release 0; check "COMMENT:ratification-release-respected;LABEL-:loom:blocked" "$WRITES" "release: marker, label removed"; check false "$SKIP" "release: continues to the other criteria"
-tick clear 0 - false; check "COMMENT:ratification-hold-cleared;LABEL-:loom:blocked" "$WRITES" "clear: marker, label removed"
-tick clear 0 - true;  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept while another Champion hold stands"
+# #14249: the shared label moves only when no other Champion hold still stands.
+tick release 0 - "merge-risk-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while a merge-risk hold stands"
+tick release 0 - "critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while a critical-file hold stands"
+tick release 0 - "merge-risk-hold,merge-risk-hold-cleared";  check "COMMENT:ratification-release-respected;LABEL-:loom:blocked" "$WRITES" "release: label removed after a merge-risk hold was cleared"
+tick release 0 - "critical-file-hold,critical-file-hold-cleared,critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept when a hold is re-posted after its cleared notice"
+tick release 0 - "merge-risk-hold,critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while both other kinds stand"
+CLR="COMMENT:ratification-hold-cleared;LABEL-:loom:blocked"
+tick clear 0 - "";  check "$CLR" "$WRITES" "clear: marker, label removed (no other hold markers at all)"
+tick clear 0 - "merge-risk-hold";  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept while a merge-risk hold stands"
+tick clear 0 - "critical-file-hold";  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept while a critical-file hold stands"
+# #14185: a cleared notice must un-match its hold, or loom:blocked is stranded with no standing hold.
+tick clear 0 - "critical-file-hold,critical-file-hold-cleared,ratification-hold,ratification-hold-cleared"
+check "$CLR" "$WRITES" "clear: label removed when every other hold is already cleared (#14185 fixture)"
+tick clear 0 - "merge-risk-hold,merge-risk-hold-cleared";  check "$CLR" "$WRITES" "clear: label removed after a merge-risk hold was cleared"
+tick clear 0 - "critical-file-hold,critical-file-hold-cleared,critical-file-hold";  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept when a hold is re-posted after its cleared notice"
+tick clear 0 - "merge-risk-hold,merge-risk-hold-cleared,critical-file-hold";  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept when one kind is cleared but the other still stands"
+# #14307: a failed or empty other-holds read is not a "no holds" answer — the
+# shared label moves only on an explicit `false` (fail closed).
+tick release 0 - "" fail;  check "COMMENT:ratification-release-respected" "$WRITES" "release: failed read keeps loom:blocked (fail closed)"
+tick release 0 - "" silent;  check "COMMENT:ratification-release-respected" "$WRITES" "release: empty stdout, exit 0 keeps loom:blocked (fail closed)"
+tick release 0 - "merge-risk-hold" fail;  check "COMMENT:ratification-release-respected" "$WRITES" "release: failed read keeps the label even when markers would clear it"
+tick clear 0 - "" fail;  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: failed read keeps loom:blocked (fail closed)"
+tick clear 0 - "" silent;  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: empty stdout, exit 0 keeps loom:blocked (fail closed)"
+tick clear 0 - "critical-file-hold" fail;  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: failed read keeps the label even when markers would clear it"
 tick defer 0;   check "" "$WRITES" "defer: no writes"; check true "$SKIP" "defer: ends this PR's pass (no merge)"
 
 echo "--- a failed verb fails closed ---"

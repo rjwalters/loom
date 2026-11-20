@@ -496,7 +496,8 @@ impl ShedWhy {
 /// picks its own credentials (#12584).
 #[must_use]
 pub fn host_has_read_pool() -> bool {
-    crate::forge_gateway::any_live()
+    crate::forge_gateway::cli_read_route_required()
+        || crate::forge_gateway::any_live()
         || crate::forge_identity::workspace_root()
             .is_some_and(|ws| !crate::forge_identity::cached(ws).readers.is_empty())
 }

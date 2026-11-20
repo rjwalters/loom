@@ -208,10 +208,49 @@ docs_only_fast_path_check() {
 ELIGIBILITY=$(printf '%s\n' "$FILES" | docs_only_fast_path_check)
 ```
 
+**Step 3: Require an empty closing-issue set (#14182).** The file list answers
+"what could this diff break?"; it says nothing about the PR **body**, and a
+closing keyword in the body mutates repository state on merge (GitHub
+auto-closes the linked issue). A docs-only diff that closes an issue is a
+contradiction in terms, so a PR with any closing reference is not eligible,
+however clean its file list. This check is hardcoded like the allowlist — no
+config key, no judgment axis — and fails closed: a read that errored, or
+returned nothing recognisable, is NOT ELIGIBLE, never "no closers".
+
+```bash
+docs_only_fast_path_closing_check() {
+  # $1 = PR number. Echoes "ELIGIBLE" only when the closing-reference read
+  # SUCCEEDED (positively proven by the "closers=" prefix) and returned an
+  # empty set. A failed or malformed read is NOT ELIGIBLE, never "no closers"
+  # (fail closed, #14182). Deliberately not forge_pr_close_targets: that helper
+  # swallows read errors into an empty list, which would read as "no closers".
+  local out refs
+  if ! out=$(gh pr view "$1" --json closingIssuesReferences \
+      --jq '"closers=" + ([.closingIssuesReferences[].number | tostring] | join(","))' 2>/dev/null); then
+    echo "NOT ELIGIBLE: closing-reference read failed"
+    return 0
+  fi
+  case "$out" in
+    closers=*) refs="${out#closers=}" ;;
+    *) echo "NOT ELIGIBLE: closing-reference read returned no proof"; return 0 ;;
+  esac
+  if [ -n "$refs" ]; then
+    echo "NOT ELIGIBLE: closes #${refs//,/, #}"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
+  ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")
+fi
+```
+
 If `$ELIGIBILITY` is anything other than the literal string `ELIGIBLE`
-(including an empty diff, or a diff that mixes an allowlisted file with
+(including an empty diff, a diff that mixes an allowlisted file with
 anything else — a source file, a nested README, `.github/workflows/*.yml`,
-`.loom/config.json`, or any other path) — **do not use this fast path.**
+`.loom/config.json`, or any other path — or a PR whose body carries a closing
+reference such as `Closes #N`, or whose closing-reference read failed) — **do not use this fast path.**
 Proceed with the normal Primary Queue steps 5-11 (checkout, quality checks,
 test plan execution, full code evaluation).
 
@@ -232,8 +271,7 @@ code evaluation, never review reconciliation. `post-verdict.sh` enforces it on
 the approval write below regardless (#7647).
 
 **2. Still verify CI status** (step 8, "CI Status Check" above) — a docs-only
-diff can still fail a structural CI job (`claude-md-budget`,
-`agents-md-sync`, `docs-defaults-parity`, `dangling-links`,
+diff can still fail a structural CI job (`agents-md-sync`, `dangling-links`,
 `gitignore-convergence`) even though the build/test matrix is skipped by the
 path filter. Apply the same When CI Fails / When CI is Pending handling as
 the normal flow — this fast path shortcuts code review, not CI verification.
@@ -248,6 +286,9 @@ immediately before the `gh pr edit` below):
 This PR's entire changed-file list was verified — via the paginated files
 API, not the PR's stated intent or any marker — to be an exact match against
 {WORK_LOG.md, WORK_PLAN.md, README.md}: $FILES
+
+The closing-issue set was verified empty via the closing-reference read
+(no closing references, #14182).
 
 A diff confined to this exact set needs no full code evaluation (no lint,
 type-check, tests, or functional review apply). All CI checks pass.
@@ -268,6 +309,9 @@ EOF
   same check against its own fresh paginated-files read — it never trusts
   this comment's claim, so a compromised or buggy Judge pass cannot smuggle a
   non-docs change through Champion.
+- **No closing links**: a PR that would auto-close any issue on merge is
+  ineligible (Step 3), so a free-form generated body cannot close an unrelated
+  issue past a review that never reads it. Champion re-checks this itself.
 - **Narrowly scoped**: the allowlist is three exact root-level filenames — no
   glob, no directory prefix, no "looks like docs" heuristic. A diff that adds
   a fourth file of any kind, anywhere, including another `.md` file, is

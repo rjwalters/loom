@@ -43,7 +43,7 @@ use crate::hard_exclusion::HARD_EXCLUSION_LABELS;
 use crate::work_finder::{read_work_finder_config, resolve_extra_skip_labels_with_config};
 
 #[derive(clap::Args)]
-pub(crate) struct SkipLabelsArgs {
+pub struct SkipLabelsArgs {
     /// One label name per line (the default when no rendering flag is given).
     #[arg(long)]
     pub lines: bool,
@@ -124,7 +124,7 @@ pub(crate) fn render_search(labels: &[String]) -> String {
 }
 
 impl SkipLabelsArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let root = match self.repo_root {
             Some(r) => r,
             None => std::env::current_dir()?,
