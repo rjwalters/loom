@@ -630,6 +630,125 @@ fn partial_key_retry_runs_and_posts_only_the_missing_key() {
 }
 
 #[test]
+fn unreadable_forge_comment_rows_stop_dispatch() {
+    use crate::comment_trust::TrustPolicy;
+    use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::{test_routing, test_support};
+    use crate::role_runner::ratification_lane::{marker_body, run_lane_stats, GhPrSource};
+
+    struct CommentReader<'a> {
+        prs: Prs,
+        forge: GhPrSource<'a>,
+    }
+
+    impl PrSource for CommentReader<'_> {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.prs.open_prs()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            self.prs.files(pr, hold)
+        }
+        fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+            self.forge.trusted_comments(pr)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("reader");
+    std::fs::create_dir(&reader).unwrap();
+    let program = test_support::stub(
+        dir.path(),
+        "gh-comments",
+        r#"test "$1" = api && test "$2" = 'repos/o/r/issues/7/comments?per_page=100' && test "$3" = --paginate || exit 64
+cat "${0%/*}/reply"
+test ! -f "${0%/*}/failed""#,
+    );
+    let _routing = test_routing::install_with_program(
+        test_routing::TestRouting {
+            decision: RouteDecision::Reader {
+                dir: reader,
+                app_id: "fixture-reader".into(),
+                placement: Placement::Home,
+            },
+            env: DeriveEnv::default(),
+            checkout: CwdAnswer::Unresolved,
+        },
+        program,
+    );
+    let cfg = cfg();
+    let policy = TrustPolicy::new(FleetLogins::single("fleet-bot"), None, Vec::new());
+    let source = CommentReader {
+        prs: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        forge: GhPrSource::new(dir.path(), "o/r", &policy),
+    };
+    let marker =
+        marker_body(Key::Market, HEAD, "ratification-market", Some(&valid_review(Key::Market)));
+    let marked = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":marker
+    }]);
+    let ordinary = json!([
+        {"user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":"ordinary discussion"},
+        {"user":{"login":"unknown[bot]","type":"Bot"}, "author_association":"NONE", "body":marker},
+        {"user":null, "author_association":"NONE", "body":marker}
+    ]);
+    let missing_body = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":null
+    }]);
+    let bare_row = json!([{"message":"incomplete comment record"}]);
+    let run =
+        |label, listing: String, failed: bool, expected_pins: &[&str], expected_unreadable| {
+            std::fs::write(dir.path().join("reply"), listing).unwrap();
+            let failure = dir.path().join("failed");
+            if failed {
+                std::fs::write(&failure, "").unwrap();
+            }
+            let instructions = CountingInstr {
+                private: Some(true),
+                ..Default::default()
+            };
+            let sink = Sink::default();
+            let mut runner = ok_runner();
+            let (_, _, unreadable) =
+                run_lane_stats(&cfg, None, "o/r", &source, &instructions, &sink, &mut runner);
+            if failed {
+                std::fs::remove_file(failure).unwrap();
+            }
+            assert_eq!(unreadable, expected_unreadable, "{label}: unreadable PRs");
+            assert_eq!(*instructions.fetches.borrow(), expected_pins, "{label}: instructions");
+            assert_eq!(
+                *instructions.visibility.borrow(),
+                u32::from(expected_pins.contains(&"market.md")),
+                "{label}: visibility reads"
+            );
+            assert_eq!(runner.calls as usize, expected_pins.len(), "{label}: sessions");
+            assert_eq!(sink.posted.borrow().len(), expected_pins.len(), "{label}: marker posts");
+        };
+    let both = ["ee.md", "market.md"];
+    run("empty listing", "[]".into(), false, &both, 0);
+    run("readable ordinary and untrusted rows", ordinary.to_string(), false, &both, 0);
+    run("trusted marker", marked.to_string(), false, &["ee.md"], 0);
+    run("failed read", marked.to_string(), true, &[], 1);
+    run("invalid later page", format!("{marked}\n[{{"), false, &[], 1);
+    run("malformed row", bare_row.to_string(), false, &[], 1);
+    run("trusted row without a readable body", missing_body.to_string(), false, &[], 1);
+    run(
+        "valid marker before malformed row",
+        format!("{marked}\n{missing_body}"),
+        false,
+        &[],
+        1,
+    );
+}
+
+#[test]
 fn partial_key_retry_reads_only_the_missing_keys_instructions() {
     let sink = Sink::default();
     let live = Live {

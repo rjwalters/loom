@@ -117,10 +117,9 @@ pub trait PrSource {
     /// The PR's change list with head content, as the hold's [`ratification::scan`]
     /// reads it.
     fn files(&self, pr: u64, hold: &ratification::Config) -> Vec<ChangedFile>;
-    /// The PR's comments by trusted authors only. `Err` when the comment
-    /// list could not be read (or did not parse): an unreadable list is
-    /// never "no markers" — fail closed, it must not authorize a rerun
-    /// (#14797). A successfully read empty list is `Ok(vec![])`.
+    /// The PR's comments by trusted authors only. `Err` when the listing
+    /// or any record is unreadable, so incomplete history cannot authorize
+    /// a rerun (#14797). A successfully read empty list is `Ok(vec![])`.
     fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String>;
     /// Why the head content of `path` on `pr` could not be read (the `gh`
     /// exit status and bounded stderr), when the last [`PrSource::files`] call
@@ -298,7 +297,7 @@ pub fn find_candidates(
 }
 
 /// [`find_candidates`] plus the number of PRs not selected because a candidate
-/// file was unreadable.
+/// file or comment history was unreadable.
 #[must_use]
 pub fn find_candidates_counted(
     cfg: &Config,
@@ -640,7 +639,7 @@ pub fn run_lane_counted(
 }
 
 /// [`run_lane_counted`] plus the number of PRs left unselected because a
-/// candidate file was unreadable.
+/// candidate file or comment history was unreadable.
 pub fn run_lane_stats(
     cfg: &Config,
     lane_session: Option<&str>,
@@ -975,11 +974,26 @@ impl PrSource for GhPrSource<'_> {
         let Value::Array(list) = list else {
             return Err("comments could not be read: listing was not an array".to_string());
         };
-        Ok(list
-            .iter()
-            .filter(|c| self.policy.trusts_json(c))
-            .filter_map(Comment::from_record)
-            .collect())
+        // Incomplete history cannot prove a marker is absent. Check every
+        // record before filtering by trust, even on later pages.
+        const MALFORMED: &str = "comments could not be read: malformed comment record";
+        let mut comments = Vec::new();
+        for row in &list {
+            let body = row.get("body").and_then(Value::as_str).ok_or(MALFORMED)?;
+            if row.get("user") == Some(&Value::Null) {
+                // A deleted author is a readable record with no marker authority.
+                continue;
+            }
+            let author = row
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .filter(|login| !login.trim().is_empty())
+                .ok_or(MALFORMED)?;
+            if self.policy.trusts_json(row) {
+                comments.push(Comment::new(author, body));
+            }
+        }
+        Ok(comments)
     }
 }
 
