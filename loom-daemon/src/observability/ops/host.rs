@@ -17,9 +17,8 @@
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
 use crate::tokens_pool::private_workspace::{SeatVolumeSamples, SeatVolumeUsage};
-use std::time::Duration;
-
-pub(crate) const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
+use crate::tokens_pool::{session_image, session_lifecycle::DEFAULT_SESSION_IMAGE};
+use std::path::Path;
 
 /// One host resource sample, in bytes. `None` = unmeasurable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -216,7 +215,7 @@ pub(crate) struct SeatVolumeSampler {
 }
 
 impl SeatVolumeSampler {
-    pub(crate) async fn record_if_due(&mut self) {
+    pub(crate) async fn record_if_due(&mut self, workspace_root: &Path) {
         if self.active.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
@@ -228,9 +227,19 @@ impl SeatVolumeSampler {
             Some(task) => task.await.unwrap_or_default(),
             None => SeatVolumeSamples::default(),
         };
+        let workspace_root = workspace_root.to_path_buf();
         self.active = Some(tokio::task::spawn_blocking(move || {
-            sink.emit_metrics(seat_volume_points(samples.sample()));
-            samples
+            match session_image::read_session_image_config(&workspace_root) {
+                Ok(config) => {
+                    let image = config.image.as_deref().unwrap_or(DEFAULT_SESSION_IMAGE);
+                    sink.emit_metrics(seat_volume_points(samples.sample(image)));
+                    samples
+                }
+                Err(_) => {
+                    log::debug!("private workspace volume sampling skipped: invalid session image configuration");
+                    SeatVolumeSamples::default()
+                }
+            }
         }));
     }
 }

@@ -3,24 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use super::{docker, MODE, ROOT, VOLUME_PREFIX};
+use super::{docker, ROOT, VOLUME_PREFIX};
 use crate::telemetry::ops::MAX_LABEL_VALUE_BYTES;
-use crate::tokens_pool::{account_registry::validate_name, session_lifecycle::container_name};
+use crate::tokens_pool::account_registry::validate_name;
 
-const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
-const MAX_SAMPLE_AGE: Duration = Duration::from_secs(15 * 60);
+pub(crate) const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(180);
 const METADATA_BUDGET: Duration = Duration::from_secs(3);
-// The observed cold scan of a 39.8 GB seat took 32.815 s (#14678).
-const MAX_DU_SECS: u64 = 50;
-// Docker may serialize an ordinary local volume's options as null. Use the
-// template's truth test and report a bit without disclosing option values.
-const VOLUME_FORMAT: &str = r#"{{.Name}}{{"\t"}}{{.Driver}}{{"\t"}}{{index .Labels "loom.account"}}{{"\t"}}{{if .Options}}1{{else}}0{{end}}"#;
-// Keep inspect scoped to mount identities and state. Full inspect includes env
-// and profile metadata that the disk sampler does not need.
-const CONTAINER_FORMAT: &str = concat!(
-    r#"{{.Id}}{{"\t"}}{{.State.Running}}{{"\t"}}{{.State.Paused}}"#,
-    r#"{{"\t"}}{{index .Config.Labels "loom.workspace-mode"}}{{"\t"}}{{index .Config.Labels "loom.account"}}"#,
-    r#"{{range .Mounts}}{{"\n"}}{{json .Destination}}{{"\t"}}{{.Type}}{{"\t"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}"#,
+// The observed cold scans ran from 32.815 to 147.2 seconds (#14678).
+const MAX_DU_SECS: u64 = 175;
+// Return the ownership witness and backing path without inspecting credentials
+// or exposing a local driver's option values.
+const VOLUME_FORMAT: &str = concat!(
+    r#"{{.Name}}{{"\t"}}{{.Driver}}{{"\t"}}{{index .Labels "loom.account"}}"#,
+    r#"{{"\t"}}{{if .Options}}1{{else}}0{{end}}{{"\t"}}{{.Mountpoint}}{{"\t"}}{{.CreatedAt}}"#,
 );
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -38,11 +33,16 @@ pub(crate) struct SeatVolumeSamples {
 }
 
 impl SeatVolumeSamples {
-    pub(crate) fn sample(&mut self) -> SeatVolumeUsage {
-        self.sample_until(Instant::now() + SAMPLE_BUDGET, Instant::now)
+    pub(crate) fn sample(&mut self, image: &str) -> SeatVolumeUsage {
+        self.sample_until(Instant::now() + SEAT_VOLUME_SAMPLE_INTERVAL, Instant::now, image)
     }
 
-    fn sample_until(&mut self, deadline: Instant, clock: impl Fn() -> Instant) -> SeatVolumeUsage {
+    fn sample_until(
+        &mut self,
+        deadline: Instant,
+        clock: impl Fn() -> Instant,
+        image: &str,
+    ) -> SeatVolumeUsage {
         let filter = format!("name={VOLUME_PREFIX}");
         let Some(inventory) = metadata(
             deadline,
@@ -72,7 +72,7 @@ impl SeatVolumeSamples {
         let mut seats = Vec::new();
         if account.len() <= MAX_LABEL_VALUE_BYTES && validate_name(account).is_ok() {
             let volume = super::workspace_volume_name(account);
-            match seat_bytes(deadline, &clock, account, &volume) {
+            match seat_bytes(deadline, &clock, account, &volume, image) {
                 Ok(bytes) => {
                     self.readings.insert(account.to_owned(), (clock(), bytes));
                     seats.push((account.to_owned(), bytes));
@@ -89,8 +89,11 @@ impl SeatVolumeSamples {
         }
 
         let now = clock();
+        // Budget for a complete roster rotation even when more seats are added.
+        let maximum_age = SEAT_VOLUME_SAMPLE_INTERVAL
+            .saturating_mul(u32::try_from(roster.len()).unwrap_or(u32::MAX));
         self.readings
-            .retain(|_, (measured, _)| now.duration_since(*measured) < MAX_SAMPLE_AGE);
+            .retain(|_, (measured, _)| now.duration_since(*measured) < maximum_age);
         let total = if self.readings.len() == roster.len() {
             self.readings
                 .values()
@@ -117,38 +120,23 @@ fn seat_bytes(
     clock: &impl Fn() -> Instant,
     account: &str,
     volume: &str,
+    image: &str,
 ) -> Result<i64, &'static str> {
-    let volume_info =
-        metadata(deadline, clock, &["volume", "inspect", "--format", VOLUME_FORMAT, volume])
-            .ok_or("volume inspection failed")?;
-    if !volume_info
-        .trim_end_matches(['\r', '\n'])
-        .split('\t')
-        .eq([volume, "local", account, "0"])
-    {
-        return Err("unverified volume");
-    }
-    let container = container_name(account);
-    let inspect = metadata(
-        deadline,
-        clock,
-        &[
-            "container",
-            "inspect",
-            "--format",
-            CONTAINER_FORMAT,
-            &container,
-        ],
-    )
-    .ok_or("container inspection failed")?;
-    let id = verified_container(&inspect, account, volume).ok_or("unverified running mount")?;
+    let volume_args = ["volume", "inspect", "--format", VOLUME_FORMAT, volume];
+    let before = metadata(deadline, clock, &volume_args).ok_or("volume inspection failed")?;
+    let root = metadata(deadline, clock, &["info", "--format", "{{.DockerRootDir}}"])
+        .ok_or("Docker root unavailable")?;
+    let backing_path =
+        verified_volume(&before, volume, account, &root).ok_or("unverified volume")?;
+    let mount = format!("type=bind,src={backing_path},dst={ROOT},readonly,bind-recursive=disabled");
 
-    // Killing a Docker client does not necessarily stop an in-container exec.
-    // Bound the child too and leave room for timeout's kill grace and the CLI.
+    // The same isolated reader works whether the seat has a session or not.
+    // A bind mount of the verified backing directory cannot implicitly create
+    // a replacement Docker volume if the inspected one disappears.
     let seconds = deadline
         .saturating_duration_since(clock())
         .as_secs()
-        .saturating_sub(2)
+        .saturating_sub(METADATA_BUDGET.as_secs() + 2)
         .min(MAX_DU_SECS);
     if seconds == 0 {
         return Err("read budget exhausted");
@@ -156,11 +144,29 @@ fn seat_bytes(
     let duration = format!("{seconds}s");
     let output = docker::command_with(
         &[
-            "exec",
+            "run",
+            "--rm",
+            "--pull",
+            "never",
+            "--network",
+            "none",
             "--user",
             "1000:1000",
-            id,
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--log-driver",
+            "none",
+            "--workdir",
+            "/",
+            "--mount",
+            &mount,
+            "--entrypoint",
             "/usr/bin/timeout",
+            "--",
+            image,
             "--kill-after=1s",
             &duration,
             "/usr/bin/du",
@@ -171,37 +177,40 @@ fn seat_bytes(
         Duration::from_secs(seconds + 2),
     )
     .map_err(|_| "du failed or timed out")?;
+    if metadata(deadline, clock, &volume_args).as_deref() != Some(before.as_str()) {
+        return Err("volume identity changed during read");
+    }
     parse_du(&output).ok_or("unusable du measurement")
 }
 
-fn verified_container<'a>(inspect: &'a str, account: &str, volume: &str) -> Option<&'a str> {
-    let mut lines = inspect.lines();
-    let mut identity = lines.next()?.split('\t');
-    let id = identity.next()?;
-    if id.len() != 64
-        || !id.bytes().all(|b| b.is_ascii_hexdigit())
-        || !identity.eq(["true", "false", MODE, account])
-    {
-        return None;
-    }
-    let mut mounted = false;
-    for line in lines {
-        let mut fields = line.split('\t');
-        let path: String = serde_json::from_str(fields.next()?).ok()?;
-        if path == ROOT {
-            if mounted || !fields.eq(["volume", volume]) {
-                return None;
-            }
-            mounted = true;
-        } else if path
-            .strip_prefix(ROOT)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-        {
-            // Same-filesystem bind mounts can slip past `du -x`.
+fn verified_volume<'a>(
+    inspect: &'a str,
+    volume: &str,
+    account: &str,
+    root: &str,
+) -> Option<&'a str> {
+    let mut fields = inspect.trim_end_matches(['\r', '\n']).split('\t');
+    for expected in [volume, "local", account, "0"] {
+        if fields.next()? != expected {
             return None;
         }
     }
-    mounted.then_some(id)
+    let backing_path = fields.next()?;
+    let created = fields.next()?;
+    if created.is_empty() || created.contains(['\r', '\n']) || fields.next().is_some() {
+        return None;
+    }
+    let root = root.trim_end_matches(['\r', '\n']);
+    let components = root.strip_prefix('/')?.split('/');
+    if !components.into_iter().all(|part| {
+        !matches!(part, "" | "." | "..")
+            && part
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'-' | b'_'))
+    }) {
+        return None;
+    }
+    (backing_path == format!("{root}/volumes/{volume}/_data")).then_some(backing_path)
 }
 
 fn parse_du(output: &str) -> Option<i64> {

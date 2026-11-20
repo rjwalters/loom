@@ -154,7 +154,7 @@ async fn run_collector(
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seat_volume_sampler = super::ops::host::SeatVolumeSampler::default();
     let mut seat_volume_timer =
-        tokio::time::interval(super::ops::host::SEAT_VOLUME_SAMPLE_INTERVAL);
+        tokio::time::interval(crate::tokens_pool::private_workspace::SEAT_VOLUME_SAMPLE_INTERVAL);
     seat_volume_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut disposition_sampler = super::ops::disposition::Sampler::default();
     let mut disposition_timer = tokio::time::interval(DISPOSITION_INTERVAL);
@@ -251,7 +251,7 @@ async fn run_collector(
             }
 
             _ = seat_volume_timer.tick() => {
-                seat_volume_sampler.record_if_due().await;
+                seat_volume_sampler.record_if_due(&workspace_root).await;
             }
 
             _ = disposition_timer.tick() => {

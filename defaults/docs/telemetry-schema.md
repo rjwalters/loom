@@ -1905,7 +1905,7 @@ Every other name is a **`Gauge`**:
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
 | `loom.agent_scope.peak_memory_bytes` (`repo`) | bytes | once per finished agent scope, sweep or role agent (cgroup `memory.peak`, #11094); `repo` is `(unattributed)` for a scope outside every workspace; absent without cgroup v2 |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
-| `loom.host.codex_workspace_volume.used_bytes` (`account` = seat name) | bytes | when that seat is measured, one seat attempted per minute |
+| `loom.host.codex_workspace_volume.used_bytes` (`account` = seat name) | bytes | when that seat is measured, one seat attempted every three minutes |
 | `loom.host.codex_workspace_volume.total_used_bytes` | bytes | after a pass with fresh readings for the complete inventory |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
@@ -1919,22 +1919,22 @@ Every other name is a **`Gauge`**:
 | `loom.dispatch.running_by_points` (`role`, `pool="step"`, `points`), #12957 | count | every work-finder tick (default 60 s) once a registry has published its steps, `0` included |
 
 The Codex workspace volume gauges (#14678) report allocated bytes on the
-worker's discovered private workspace volumes. A minute tick advances through
-the inventory one seat at a time, including after failed attempts. These reads
-run off the host-health loop with no overlapping passes and export through
-the ops sink. The sampler verifies
-the volume's ownership and its running seat's `/workspace` mount before reading
-it as the seat user. Each pass has a 60-second budget, including a read cap of
-50 seconds to accommodate the observed 33-second cold walk.
+worker's discovered private workspace volumes. Each three-minute tick advances
+one seat, including after a failed attempt. Reads run off the host-health loop
+with no overlapping passes. The sampler verifies volume ownership and the
+Docker-managed backing path, then mounts just that directory read-only in a
+short-lived container. It uses the local session image and never pulls an
+image during a sample. Volumes can be measured with or without a live seat.
+Each read has up to 175 seconds, covering the observed 33–147-second cold scans
+while leaving time to verify the volume identity again before reporting.
 
-A failed or stopped seat probe, an unverified mount, a timeout, or nonzero
-`du` exit (for example, when files vanish during a walk) yields no seat point
-and invalidates that seat's previous reading. A successful empty measurement
-can report zero. A host total uses readings less than 15 minutes old for every
-volume in the latest available inventory. Removed volumes are discarded and
-new volumes need their own reading. An unknown or empty inventory, or any
-missing or expired reading, suppresses the total. The rolling total describes
-that set of recent reads, taken at different times.
+An unavailable image, an unverified or replaced volume, a timeout or nonzero
+du exit yields no point and invalidates the previous reading. A successful
+empty measurement can report zero. The host total requires a successful
+reading from every volume in the latest inventory and expires readings at one
+full inventory rotation. Removed volumes are dropped and new volumes need
+their own readings. The rolling total combines readings taken at different
+times.
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,
