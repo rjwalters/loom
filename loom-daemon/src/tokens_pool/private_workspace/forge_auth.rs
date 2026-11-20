@@ -377,6 +377,93 @@ pub(super) fn read_token(dir: &Path, program: Option<&Path>) -> Option<String> {
         .then(|| token.to_owned())
 }
 
+/// A mirror fetch's proved reader (#14716): the exact canonical route and
+/// the exact credential one [`read_authority::ReadProof`] verified.
+///
+/// There is no ambient fallback BY CONSTRUCTION — a `ProvedReader` exists
+/// only when a proof supplied the credential — and the fetch environment
+/// disables every ambient source: credential helpers are cleared, URL
+/// rewriting and system/global config are not read, and HTTP redirects are
+/// refused, so the fetch cannot drift to another origin or credential. The
+/// credential travels as a git config value in the CHILD'S ENVIRONMENT
+/// (`GIT_CONFIG_*`, git ≥ 2.31), never in argv, never in a log.
+///
+/// Legacy private clones and seat writer selection keep
+/// [`ExecAuth::resolve`] untouched: an unproved route never constructs one
+/// of these and stays on the legacy path.
+///
+/// `dead_code` is allowed deliberately until #14680 lands the host mirror
+/// store that fetches through it: the contract is complete, and the store
+/// is its first and only constructor.
+#[allow(dead_code)]
+pub(super) struct ProvedReader {
+    url: String,
+    /// The full `Authorization` header value. Private on purpose: never
+    /// argv, never logged, never serialized.
+    header: String,
+}
+
+#[allow(dead_code)]
+impl ProvedReader {
+    /// The reader for `proof` fetching from the registered canonical `url`.
+    /// `None` unless `url` names the exact repository the proof verified on
+    /// the same forge base — a proof for another origin or another
+    /// repository cannot authorize this fetch, and the caller stays on the
+    /// legacy path.
+    pub(super) fn new(proof: &super::read_authority::ReadProof, url: &str) -> Option<Self> {
+        let base = super::read_authority::ForgeBase::of_repository_url(url)?;
+        (proof.grant().identity.base == base && super::same_repository(proof.origin(), url)).then(
+            || Self {
+                url: url.to_owned(),
+                header: auth_header(proof),
+            },
+        )
+    }
+
+    /// The credential-free canonical URL the fetch must use.
+    pub(super) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Environment for the `git fetch` child: the proved credential rides
+    /// as an `http.extraHeader` config value in the environment, and every
+    /// ambient credential source is disabled (#14716).
+    pub(super) fn fetch_env(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("GIT_TERMINAL_PROMPT".to_owned(), "0".to_owned()),
+            ("GIT_CONFIG_NOSYSTEM".to_owned(), "1".to_owned()),
+            ("GIT_CONFIG_GLOBAL".to_owned(), "/dev/null".to_owned()),
+            ("GIT_CONFIG_COUNT".to_owned(), "3".to_owned()),
+            ("GIT_CONFIG_KEY_0".to_owned(), "credential.helper".to_owned()),
+            ("GIT_CONFIG_VALUE_0".to_owned(), String::new()),
+            ("GIT_CONFIG_KEY_1".to_owned(), "http.followRedirects".to_owned()),
+            ("GIT_CONFIG_VALUE_1".to_owned(), "false".to_owned()),
+            ("GIT_CONFIG_KEY_2".to_owned(), "http.extraHeader".to_owned()),
+        ];
+        env.push(("GIT_CONFIG_VALUE_2".to_owned(), self.header.clone()));
+        env
+    }
+}
+
+/// The Authorization header a proved fetch carries: HTTP Basic for git's
+/// smart protocol, the username carrying the credential per provider
+/// convention (GitHub: `x-access-token:<token>`; Gitea: `<token>:`).
+// #14680's mirror store constructs the reader that carries this header.
+#[allow(dead_code)]
+fn auth_header(proof: &super::read_authority::ReadProof) -> String {
+    use base64::Engine as _;
+    let pair = match proof.grant().identity.provider {
+        super::read_authority::Provider::GitHub => {
+            format!("x-access-token:{}", proof.credential().value())
+        }
+        super::read_authority::Provider::Gitea => format!("{}:", proof.credential().value()),
+    };
+    format!(
+        "Authorization: Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(pair)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

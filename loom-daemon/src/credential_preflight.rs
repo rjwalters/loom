@@ -1709,7 +1709,7 @@ pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
-pub use minted::{publish_minted, publish_outcome, Minted};
+pub use minted::{publish_minted, publish_outcome, Minted, ScopedIssuance};
 
 #[cfg(test)]
 mod tests {

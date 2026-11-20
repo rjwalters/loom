@@ -431,6 +431,64 @@ else
     fail "\`get-token\` CLI envelope should carry a non-empty, correct installation_id" "$cli_get_token_output"
 fi
 
+# ============================================================================
+# `scoped-token` narrow issuance (#14716): ONE repository, Contents read,
+# the repository ids and permissions the issuer bound PAIRED with the token
+# in the envelope. The writer mint (`get-token`) is untouched by this mode.
+# ============================================================================
+echo "Testing scoped-token narrow issuance (#14716)..."
+
+# The scoped stub answers the access_tokens route with repository-bound
+# evidence; a response naming no repository must refuse, never patch up.
+# Exported like STUB_INSTALL_BODY: the curl stub runs in the CHILD shell.
+scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z","repository_selection":"selected","repositories":[{"id":907216439,"full_name":"cliowner/repo"}]}'
+export scoped_curl_body
+curl() {
+    local url=""
+    printf '%s\n' "$*" >> "$STUB_CURL_ARGV_LOG"
+    for _a in "$@"; do url="$_a"; done
+    case "$url" in
+        */installation) printf '%s\n%s' "$STUB_INSTALL_BODY" "$STUB_INSTALL_CODE" ;;
+        */access_tokens) printf '%s\n%s' "$scoped_curl_body" '200' ;;
+        *) printf '%s\n%s' '{}' '404' ;;
+    esac
+}
+export -f curl
+: > "$STUB_CURL_ARGV_LOG"
+cli_scoped_output=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+cli_scoped_status=$(echo "$cli_scoped_output" | jq -r '.status')
+cli_scoped_ids=$(echo "$cli_scoped_output" | jq -c '.repository_ids')
+cli_scoped_perms=$(echo "$cli_scoped_output" | jq -c '.permissions')
+if [[ "$cli_scoped_status" == "ok" \
+    && "$cli_scoped_ids" == '[907216439]' \
+    && "$cli_scoped_perms" == '{"contents":"read"}' ]]; then
+    pass "\`scoped-token\` CLI envelope pairs the token with its repository ids and Contents read (#14716)"
+else
+    fail "\`scoped-token\` CLI envelope should carry paired evidence" "$cli_scoped_output"
+fi
+if [[ -s "$STUB_CURL_ARGV_LOG" ]] && ! grep -q 'Authorization:\|fake\.jwt' "$STUB_CURL_ARGV_LOG"; then
+    pass "scoped mint keeps credentials off curl's argv (#10463)"
+else
+    fail "the scoped mint must not put Authorization or the JWT on argv" "$(cat "$STUB_CURL_ARGV_LOG")"
+fi
+
+# A scoped mint whose response names no repository is refused.
+scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z"}'
+cli_scoped_bad=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+if [[ "$(echo "$cli_scoped_bad" | jq -r '.status')" == "error" ]]; then
+    pass "\`scoped-token\` refuses a mint response with no repository ids"
+else
+    fail "a repository-less scoped mint must be an error envelope" "$cli_scoped_bad"
+fi
+# A scoped mint whose response names no token is refused.
+scoped_curl_body='{"expires_at":"2099-01-01T00:00:00Z","repositories":[{"id":1}]}'
+cli_scoped_notok=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+if [[ "$(echo "$cli_scoped_notok" | jq -r '.status')" == "error" ]]; then
+    pass "\`scoped-token\` refuses a mint response with no token"
+else
+    fail "a token-less scoped mint must be an error envelope" "$cli_scoped_notok"
+fi
+
 unset -f curl github_app_jwt
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH
 
