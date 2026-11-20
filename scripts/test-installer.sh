@@ -4049,6 +4049,7 @@ if command -v jq >/dev/null 2>&1; then
   write_quick_metadata "$quick_target"
   (
     cd "$full_target"
+    # shellcheck disable=SC2034  # consumed by the sourced METADATA block below (shellcheck cannot follow process-substitution source)
     LOOM_ROOT="$stamp_source" LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" INSTALLED_FILES_JSON='[]'
     source <(sed -n '/^LOOM_SOURCE_REMOTE=""$/,/^METADATA$/p' "$INSTALL_SCRIPT")
   )
