@@ -40,7 +40,6 @@ use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
-use crate::sweep_registry::step_spawn::StepRefusal;
 use crate::sweep_registry::SweepRegistry;
 
 /// The role's post-state from one read of the item: the claim release's own
@@ -189,23 +188,25 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
-fn refusal_ledger_reason(refusal: &StepRefusal) -> Option<&'static str> {
+fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'static str> {
     // Match the start of the static Codex containment rejection and its
     // preparation cause. A path, diagnostic excerpt or preference summary
     // that mentions the marker is still an ordinary admission refusal.
-    let cause = refusal.detail.strip_prefix(concat!(
-        "unmet capabilities: worktreeIsolation; ",
-        "verified private-clone containment could not satisfy it: ",
-        "private workspace preparation refused: ",
-    ));
-    if refusal.reason == "runtime_rejected"
-        && cause
+    if spawn_reason == "runtime_rejected"
+        && detail
+            .and_then(|detail| {
+                detail.strip_prefix(concat!(
+                    "unmet capabilities: worktreeIsolation; ",
+                    "verified private-clone containment could not satisfy it: ",
+                    "private workspace preparation refused: ",
+                ))
+            })
             .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
             .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
     {
         return Some(outcome_ledger::SEAT_DIRTY);
     }
-    ledger_reason(refusal.reason)
+    ledger_reason(spawn_reason)
 }
 
 /// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
@@ -216,12 +217,10 @@ pub fn record_refusal(
     registry: &Arc<Mutex<SweepRegistry>>,
     item: u32,
     role: StepRole,
-    error: &anyhow::Error,
+    spawn_reason: &str,
+    detail: Option<&str>,
 ) {
-    let Some(reason) = error
-        .downcast_ref::<StepRefusal>()
-        .and_then(refusal_ledger_reason)
-    else {
+    let Some(reason) = refusal_ledger_reason(spawn_reason, detail) else {
         return;
     };
     let run = StepRun {
@@ -394,7 +393,7 @@ mod tests {
                          containment could not satisfy it: ";
         let dirty = "private workspace preparation refused: seat_dirty: private \
                      clone/worktree is dirty; retain and recover its work before reuse\n  M file";
-        let refusal = |reason, detail| refusal_ledger_reason(&StepRefusal::new(reason, detail));
+        let refusal = |reason, detail: String| refusal_ledger_reason(reason, Some(&detail));
         assert_eq!(
             refusal("runtime_rejected", format!("{isolation}{dirty}")),
             Some(outcome_ledger::SEAT_DIRTY)
@@ -408,6 +407,7 @@ mod tests {
             Some("admission")
         );
         assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
+        assert_eq!(refusal_ledger_reason("spawn_failed", None), Some("pool_gate"));
     }
 
     /// #14458: a step that died on its seat's dirty leftover worktree wrote no
