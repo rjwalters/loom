@@ -41,6 +41,15 @@ thread_local! {
 /// Installs `routing` for this thread until dropped.
 pub(crate) struct Guard;
 
+impl Guard {
+    /// Use the caller's inert Forge fixture for requests the test router admits.
+    #[must_use]
+    pub(crate) fn with_program(self, program: &Path) -> Self {
+        PROGRAM.with(|p| *p.borrow_mut() = Some(program.to_path_buf()));
+        self
+    }
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         ROUTING.with(|r| *r.borrow_mut() = None);
