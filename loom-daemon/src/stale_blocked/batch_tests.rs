@@ -9,11 +9,11 @@ use anyhow::{anyhow, Result};
 
 use super::batch::{
     closing_refs_query, gather_all, gather_pr_resweep, parse_closing_refs, parse_comments,
-    parse_pr_merge_state, parse_rate_limit, parse_ref_state, ClosingRef, Gathered, Options,
-    RefState, StaleBlockedForge, CLOSING_BATCH,
+    parse_pr_merge_state, parse_pr_resweep_state, parse_rate_limit, parse_ref_state, ClosingRef,
+    Gathered, Options, RefState, StaleBlockedForge, CLOSING_BATCH,
 };
 use super::budget::{Budget, Floor, Meter};
-use super::{classify, park_self_block, undeclared, Artifact, Verdict};
+use super::{classify, park_self_block, undeclared, Artifact, PrResweepState, Verdict};
 use crate::dep_recheck::{extract, recheck};
 use crate::forge_identity::FleetLogins;
 use crate::forge_listing::RestIssue;
@@ -30,6 +30,7 @@ pub(super) struct Fake {
     pub(super) comments: HashMap<u32, Vec<extract::Comment>>,
     pub(super) states: HashMap<Key, RefState>,
     pub(super) merge: HashMap<u32, (String, String)>,
+    pub(super) resweep: HashMap<u32, PrResweepState>,
     pub(super) closing: HashMap<u32, Vec<ClosingRef>>,
     /// Issues the closing query leaves out (a `null` alias / truncated list).
     pub(super) closing_missing: HashSet<u32>,
@@ -47,6 +48,7 @@ pub(super) struct Fake {
     pub(super) comment_calls: Vec<u32>,
     pub(super) state_calls: Vec<Key>,
     pub(super) merge_calls: Vec<u32>,
+    pub(super) resweep_calls: Vec<u32>,
     pub(super) closing_calls: Vec<usize>,
     pub(super) budget_calls: usize,
 }
@@ -89,6 +91,16 @@ impl StaleBlockedForge for Fake {
             .get(&number)
             .cloned()
             .ok_or_else(|| anyhow!("no merge fixture for #{number}"))
+    }
+
+    fn pr_resweep_state(&mut self, number: u32, _body: &str) -> Result<PrResweepState> {
+        self.resweep_calls.push(number);
+        self.meter
+            .graphql(Some(1), self.graphql_remaining.pop_front());
+        self.resweep
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| anyhow!("no direct PR fixture for #{number}"))
     }
 
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>> {
@@ -217,7 +229,7 @@ fn named_pr_resweep_reads_only_exact_park_dependencies() {
             ((None, 6348), state("MERGED")),
             ((None, 6354), state("MERGED")),
         ]),
-        merge: HashMap::from([(5991, ("MERGEABLE".into(), "BLOCKED".into()))]),
+        resweep: HashMap::from([(5991, PrResweepState::Mergeable)]),
         ..Fake::default()
     };
     let report = gather_pr_resweep(
@@ -235,7 +247,7 @@ fn named_pr_resweep_reads_only_exact_park_dependencies() {
         .as_ref()
         .expect("all three named blockers are readable");
     assert_eq!(evidence.declared.len(), 3);
-    assert!(evidence.mergeability_confirmed);
+    assert_eq!(evidence.pr_resweep_state, Some(PrResweepState::Mergeable));
     assert!(find(&report.items, 6242)
         .evidence
         .as_ref()
@@ -246,7 +258,49 @@ fn named_pr_resweep_reads_only_exact_park_dependencies() {
     assert_eq!(fake.state_calls, vec![(None, 6343), (None, 6348), (None, 6354)]);
     assert!(fake.comment_calls.is_empty());
     assert!(fake.closing_calls.is_empty());
-    assert_eq!(fake.merge_calls, vec![5991]);
+    assert!(fake.merge_calls.is_empty());
+    assert_eq!(fake.resweep_calls, vec![5991]);
+}
+
+#[test]
+fn named_pr_resweep_requires_bound_current_state_labels_and_formal_review() {
+    use serde_json::json;
+    let body = "<!-- loom:park Blocked by: #1 by=judge -->";
+    let eligible = json!({"number": 12, "state": "OPEN", "body": body,
+        "labels": {"totalCount": 1, "nodes": [{"name": "loom:blocked"}]},
+        "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED", "reviewDecision": null});
+    let check = |pr: serde_json::Value| {
+        parse_pr_resweep_state(
+            &json!({"data":{"repository":{"nameWithOwner":"fixture/loom","pullRequest":pr}}})
+                .to_string(),
+            "fixture/loom",
+            12,
+            body,
+        )
+    };
+    assert_eq!(check(eligible.clone()).unwrap(), PrResweepState::Mergeable);
+    let mut changed = eligible.clone();
+    changed["reviewDecision"] = json!("CHANGES_REQUESTED");
+    assert_eq!(
+        check(changed).unwrap(),
+        PrResweepState::Held("formal review requests changes".into())
+    );
+    for (field, unreadable) in [
+        ("state", json!("CLOSED")),
+        ("labels", json!({"totalCount": 0, "nodes": []})),
+        ("labels", json!({"totalCount": 3, "nodes": [{"name":"loom:blocked"}]})),
+        ("reviewDecision", json!("UNRECOGNIZED")),
+        ("body", json!("different named blocker")),
+        ("number", json!(999)),
+        ("mergeable", json!("UNKNOWN")),
+    ] {
+        let mut candidate = eligible.clone();
+        candidate[field] = unreadable;
+        assert!(check(candidate).is_err(), "{field} must fail closed");
+    }
+    let mut missing = eligible;
+    missing.as_object_mut().unwrap().remove("reviewDecision");
+    assert!(check(missing).is_err());
 }
 
 // --- call counts --------------------------------------------------------------

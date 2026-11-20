@@ -107,8 +107,10 @@ jq -nc --argjson number "$1" --arg body "$4" '{number:$number,body:$body}' >> "$
 STUB
     chmod +x .loom/scripts/post-comment.sh
 
-    fixture=$(jq -nc '[range(1;116) | {number:.,title:"t",body:(. | tostring)}]')
-    GH_READ=gh
+    fixture=$(jq -nc '[range(1;116) | {number:.,title:"t",body:(. | tostring),
+      labels:(if . == 102 then [{name:"loom:blocked"},{name:"loom:frozen"}] else [{name:"loom:blocked"}] end)}]')
+    export GH_READ=gh
+    VIEWS="$PWD/views"
     own_diff='defect in the diff'
     gh() {
         case "$1 $2" in
@@ -125,6 +127,7 @@ STUB
                 fi ;;
             'pr view')
                 local number="$3" extra='' mergeable=MERGEABLE status=BLOCKED review='' body="$3"
+                printf '%s\n' "$number" >> "$VIEWS"
                 case "$number" in
                     91) extra=loom:changes-requested ;;
                     92) extra=loom:operator ;;
@@ -133,8 +136,9 @@ STUB
                     99) mergeable=CONFLICTING; status=DIRTY ;;
                     100) review=CHANGES_REQUESTED ;;
                     101) body='new park added since listing' ;;
-                    102) extra=loom:frozen ;;
                     103) extra=loom:operator-blocked ;;
+                    105) extra=loom:frozen ;;
+                    106) review='FUTURE_UNRECOGNIZED_VALUE' ;;
                 esac
                 jq -nc --arg body "$body" --arg extra "$extra" --arg mergeable "$mergeable" \
                     --arg status "$status" --arg review "$review" '
@@ -156,7 +160,7 @@ STUB
                     95) jq -nc --arg reason "$own_diff" '{records:[{blocker:6343},{blocker:null,reason:$reason}]}' ;;
                     96) echo '{"records":[{"blocker":6343},{"blocker":7000,"blocker_repo":"example-org/other"}]}' ;;
                     104) echo '{"records":[{"blocker":null,"reason":"ci-gate"}]}' ;;
-                    92|93|94|97|98|99|100|101|102|103) echo '{"records":[{"blocker":6343}]}' ;;
+                    92|93|94|97|98|99|100|101|102|103|105|106) echo '{"records":[{"blocker":6343}]}' ;;
                     *) echo '{"records":[]}' ;;
                 esac ;;
             'forge trusted-comments') jq -sc --argjson pr "$4" '[.[] | select(.number == $pr)]' "$COMMENTS" ;;
@@ -184,9 +188,11 @@ STUB
     own_diff='a different defect still needs attention'
     check_and_unblock_prs >/dev/null
     [[ $(wc -l < "$WRITES") -eq 1 ]] || exit 1
+    if grep -Eq '^102$' "$VIEWS"; then exit 1; fi
+    grep -Eq '^105$' "$VIEWS" || exit 1
     jq -es '
       [.[] | select(.body | startswith("<!-- loom:guide-pr-superseding:")) | .number] | sort
-      == [92,93,94,95,95,99,100,102,103]' "$COMMENTS" >/dev/null
+      == [92,93,94,95,95,99,100,103]' "$COMMENTS" >/dev/null
 )
 if [[ $? -eq 0 ]]; then pass "PR beyond the default limit re-enters Doctor once eligible, held rows keep their labels and one notice";
 else fail "PR sweep missed the older eligible PR, released a held row, or duplicated a notice"; fi

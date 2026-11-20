@@ -316,6 +316,9 @@ Dependency states come from `guide.md`'s shared `resolve_dep_states` (#14710)
 issue side uses, so the two sweeps cannot disagree about whether a dependency
 is terminal.
 
+A frozen PR is skipped during listing. The final PR read checks again for a
+freeze before any notice or label edit.
+
 A parked PR's "restore to the queue" differs from an issue's in two ways:
 there is no `loom:issue` to restore (a PR was never curated), and the
 superseding check reads the PR's OWN state rather than a *linked* PR's — the
@@ -324,11 +327,11 @@ parked PR **is** the implementation, so there is nothing else to look up.
 ```bash
 check_and_unblock_prs() {
   local listing limit=1000
-  listing=$("$GH_READ" pr list --label "loom:blocked" --state open --limit "$limit" --json number,body) || return
+  listing=$("$GH_READ" pr list --label "loom:blocked" --state open --limit "$limit" --json number,body,labels) || return
   if [ "$(jq 'length' <<<"$listing")" = "$limit" ]; then
     echo "WARNING: blocked PR listing reached its $limit limit; additional PRs may be unexamined" >&2
   fi
-  jq -c '.[]' <<<"$listing" | while read -r pr_row; do
+  jq -c '.[] | select(.labels | type == "array" and all(.[]; .name != "loom:frozen"))' <<<"$listing" | while read -r pr_row; do
     local number body records deps dep_verdict resolved_deps pr_json trusted hold reason marker detail restore_label
     number=$(jq -r '.number' <<<"$pr_row")
     body=$(jq -r '.body' <<<"$pr_row")
@@ -345,11 +348,13 @@ check_and_unblock_prs() {
     jq -e 'type == "array"' <<<"$trusted" >/dev/null || continue
     hold=$(loom-daemon champion-hold classify --pr "$number") || continue
     # Read the PR directly immediately before acting. A new park body, a missing
-    # label, or a closed PR invalidates the listing snapshot.
+    # label, a freeze, or a closed PR invalidates the listing snapshot.
     pr_json=$(gh pr view "$number" --json state,body,labels,mergeable,mergeStateStatus,reviewDecision) || continue
     jq -e --arg body "$body" '
       .state == "OPEN" and ((.body | sub("\\n+$"; "")) == $body)
-      and any(.labels[]; .name == "loom:blocked")' <<<"$pr_json" >/dev/null || continue
+      and any(.labels[]; .name == "loom:blocked") and all(.labels[]; .name != "loom:frozen")
+      and has("reviewDecision")
+      and (.reviewDecision | IN(null, "", "APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"))' <<<"$pr_json" >/dev/null || continue
     reason=$(pr_has_superseding_block "$hold" "$records" "$trusted" "$pr_json") || continue
     case "$reason" in
       unknown) continue ;;
@@ -413,8 +418,7 @@ pr_has_superseding_block() {
   fi
   jq -r '
     [ .labels[].name ] as $labels
-    | if $labels | any(. == "loom:frozen") then "frozen-hold"
-      elif $labels | any(. == "loom:operator" or . == "loom:operator-only" or . == "loom:operator-decision"
+    | if $labels | any(. == "loom:operator" or . == "loom:operator-only" or . == "loom:operator-decision"
                     or . == "loom:operator-mechanical" or . == "loom:operator-blocked") then "operator-hold"
       elif ($labels | index("loom:changes-requested")) and ($labels | index("loom:review-requested")) then "contradictory-verdict"
       elif .reviewDecision == "CHANGES_REQUESTED" then "review-changes-requested"
@@ -469,7 +473,9 @@ for a one-off, read-only report. Add `--json` for the namespaced resweep rows.
 It distinguishes releasable named parks, a current conflict whose repair is a
 separate step, still-open dependencies, held parks and unreadable data. Unnamed
 parks are outside this sweep. A releasable snapshot still goes through Guide's
-fresh PR and review checks. The report performs only forge reads.
+fresh PR and review checks. The report reads the current PR state, labels and
+formal review decision before reporting an eligible park. Incomplete state is
+reported as unevaluated. The report performs only forge reads.
 
 ## What this format does not do
 

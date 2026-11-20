@@ -74,7 +74,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::park_record;
-use crate::stale_blocked::{batch, budget, classify, resolved, undeclared, Artifact, Verdict};
+use crate::stale_blocked::{
+    batch, budget, classify, resolved, undeclared, Artifact, PrResweepState, Verdict,
+};
 
 /// How many open `loom:blocked` issues to examine by default.
 ///
@@ -309,23 +311,16 @@ fn pr_resweep_row(pr: &batch::Gathered) -> PrResweepRow {
     {
         return row("held", "additional park record without a named blocker".into());
     }
-    // The standard advisory already checks permanent and trusted newer holds.
-    // Remove the live merge block so those reasons can take priority here too.
-    let mut without_merge_block = e.clone();
-    without_merge_block.self_block = None;
-    if let Verdict::Superseded { block, .. } = classify(&without_merge_block) {
+    if let Verdict::Superseded { block, .. } = classify(e) {
         return row("held", block);
     }
-    if let Some(conflict) = &e.self_block {
-        return row(
-            "routable-to-doctor",
-            format!("{conflict}; separate conflict recovery required"),
-        );
-    }
-    if e.mergeability_confirmed {
-        row("releasable", "all named blockers resolved".into())
-    } else {
-        row("unevaluated", "the PR has no confirmed mergeability".into())
+    match &e.pr_resweep_state {
+        Some(PrResweepState::Held(reason)) => row("held", reason.clone()),
+        Some(PrResweepState::Conflict(conflict)) => {
+            row("routable-to-doctor", format!("{conflict}; separate conflict recovery required"))
+        }
+        Some(PrResweepState::Mergeable) => row("releasable", "all named blockers resolved".into()),
+        None => row("unevaluated", "the PR has no confirmed mergeability".into()),
     }
 }
 
@@ -764,7 +759,7 @@ mod tests {
                         state: state.into(),
                     })
                     .collect(),
-                mergeability_confirmed: true,
+                pr_resweep_state: Some(PrResweepState::Mergeable),
                 ..Evidence::default()
             }),
             cause: None,
@@ -790,9 +785,10 @@ mod tests {
             assert_eq!(pr_resweep_row(&pr).disposition, disposition);
         }
         pr.evidence = eligible;
-        pr.evidence.as_mut().unwrap().mergeability_confirmed = false;
+        pr.evidence.as_mut().unwrap().pr_resweep_state = None;
         assert_eq!(pr_resweep_row(&pr).disposition, "unevaluated");
-        pr.evidence.as_mut().unwrap().self_block = Some("merge conflict".into());
+        pr.evidence.as_mut().unwrap().pr_resweep_state =
+            Some(PrResweepState::Conflict("merge conflict".into()));
         assert_eq!(pr_resweep_row(&pr).disposition, "routable-to-doctor");
         for hold in [
             HoldKind::Ratification,
