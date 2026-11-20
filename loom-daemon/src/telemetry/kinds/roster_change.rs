@@ -10,9 +10,10 @@
 //! emits one record per change it applied and per desired repo it could not
 //! register, whatever the queue holds.
 //!
-//! `skip:not-cloned` repeats every timer pass while the repo stays uncloned: a
-//! repeating row is the proof the repo is still unregistered. The volume is one
-//! row per missing repo per pass.
+//! `skip:not-cloned` is emitted when a repo enters the uncloned set, not on
+//! every timer pass while it stays there (#12910: the repeat was ~132k rows/day
+//! on one host). The dedupe is in-process, so a daemon restart re-emits the set
+//! once, and a repo that leaves the set and re-enters emits again.
 //!
 //! **OTLP only.** The scalars ride as `loom.roster.*` attributes
 //! ([`ROSTER_CHANGE_LOG_ATTRIBUTE_KEYS`], which the collector's log `keep_keys`

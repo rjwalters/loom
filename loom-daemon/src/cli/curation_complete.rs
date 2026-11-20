@@ -6,12 +6,12 @@
 //! projects `points:N` (removing any other `points:*` label) and applies
 //! `loom:curated`. It writes no telemetry: the daemon emits `issue.estimate`
 //! from the curated issue it observes (#12118).
+use crate::comment_trust::TrustPolicy;
+use crate::forge_call_stats::ops::{self, ForgeOp};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::points_marker::resolve_points;
+use crate::story_points::POINTS_LABEL_PREFIX;
 use anyhow::{Context, Result};
-use loom_daemon::comment_trust::TrustPolicy;
-use loom_daemon::forge_call_stats::ops::{self, ForgeOp};
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::points_marker::resolve_points;
-use loom_daemon::story_points::POINTS_LABEL_PREFIX;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -42,9 +42,9 @@ impl CurationCompleteArgs {
         let policy = TrustPolicy::for_root(&self.workspace_root);
         // The label writes go to the explicit --repo; vet it first (#9548).
         let (root, repo) = (self.workspace_root.clone(), self.repo.clone());
-        let may_write = move || match loom_daemon::write_scope::may_write_from(&root, Some(&repo)) {
-            loom_daemon::write_scope::Verdict::Allow(_) => Ok(()),
-            loom_daemon::write_scope::Verdict::Deny(why) => Err(why),
+        let may_write = move || match crate::write_scope::may_write_from(&root, Some(&repo)) {
+            crate::write_scope::Verdict::Allow(_) => Ok(()),
+            crate::write_scope::Verdict::Deny(why) => Err(why),
         };
         self.run_with(std::ffi::OsStr::new("gh"), &policy, &may_write)
     }

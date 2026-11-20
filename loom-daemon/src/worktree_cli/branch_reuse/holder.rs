@@ -74,7 +74,7 @@ fn classify(repo: &Path, path: &Path) -> Kind {
 /// a rule with no "safe character" list has no list to get wrong.
 #[must_use]
 pub fn shell_word(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+    crate::shell_quote::shell_quote(&path.to_string_lossy())
 }
 
 impl Holder {

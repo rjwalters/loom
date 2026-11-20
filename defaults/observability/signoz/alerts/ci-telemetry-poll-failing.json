@@ -1,0 +1,35 @@
+{
+  "alert": "CI telemetry poll failing",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "120m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  toInt64({{.start_timestamp_ms}}) AS start_ms,\n  toInt64({{.end_timestamp_ms}}) AS end_ms,\n  series AS (\n    SELECT fingerprint,\n           any(if(JSONExtractString(labels, 'host.name') != '', JSONExtractString(labels, 'host.name'), JSONExtractString(labels, 'host.id'))) AS host,\n           any(JSONExtractString(labels, 'outcome')) AS outcome\n    FROM signoz_metrics.time_series_v4\n    WHERE metric_name = 'loom.ci_telemetry.cycles'\n    GROUP BY fingerprint\n  ),\n  per_host AS (\n    SELECT series.host AS host,\n           count() AS cycles,\n           countIf(series.outcome = 'ok') AS ok_cycles,\n           min(s.unix_milli) AS first_ms,\n           max(s.unix_milli) AS last_ms\n    FROM signoz_metrics.samples_v4 AS s\n    INNER JOIN series USING (fingerprint)\n    WHERE s.metric_name = 'loom.ci_telemetry.cycles'\n      AND s.unix_milli >= start_ms\n      AND s.unix_milli < end_ms\n    GROUP BY host\n  )\nSELECT toDateTime(intDiv(end_ms, 1000)) AS ts,\n       host,\n       toFloat64(1) AS value\nFROM per_host\nWHERE ok_cycles = 0\n  AND first_ms <= start_ms + 600000\n  AND last_ms >= end_ms - 1800000\nORDER BY host",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "1",
+    "target": 0
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "ci_telemetry_poll_failing",
+    "state": "poll_failing"
+  },
+  "annotations": {
+    "summary": "CI telemetry poll failing",
+    "description": "Host {{$labels.host}} ran CI telemetry poll cycles throughout the last 2 h (loom.ci_telemetry.cycles, latest within 30 min) and none finished with outcome=ok: every cycle was busy, rate-limited, credential-rejected, discovery_failed, io_failed or panicked. A host with no cycles at all (no poller) is never judged, and a poller started inside the window is not judged until it has failed for the whole window. Look at the outcome label of the failing cycles and `status.json` consecutive failures (478 since 2026-10-17 went unseen). Issues #12908, #12792."
+  },
+  "disabled": false
+}

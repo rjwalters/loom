@@ -22,6 +22,7 @@ const listUsersRoute = createRoute({
   tags: ["Users"],
   summary: "List all users",
   security: [{ bearerAuth: [] }],
+  middleware: [requireRole("admin")] as const,
   request: {
     query: z.object({
       limit: z.string().optional().default("50"),
@@ -48,7 +49,7 @@ const listUsersRoute = createRoute({
   },
 });
 
-userRoutes.openapi(listUsersRoute, requireRole("admin"), async (c) => {
+userRoutes.openapi(listUsersRoute, async (c) => {
   const { limit, offset } = c.req.valid("query");
 
   const [countResult, usersResult] = await Promise.all([
@@ -62,10 +63,13 @@ userRoutes.openapi(listUsersRoute, requireRole("admin"), async (c) => {
       .all<User>(),
   ]);
 
-  return c.json({
-    users: usersResult.results,
-    total: countResult?.count || 0,
-  });
+  return c.json(
+    {
+      users: usersResult.results,
+      total: countResult?.count || 0,
+    },
+    200,
+  );
 });
 
 // GET /users/:id - Get user by ID
@@ -117,7 +121,7 @@ userRoutes.openapi(getUserRoute, async (c) => {
     throw new HTTPException(404, { message: "User not found" });
   }
 
-  return c.json({ user });
+  return c.json({ user }, 200);
 });
 
 // PUT /users/:id - Update user
@@ -209,7 +213,7 @@ userRoutes.openapi(updateUserRoute, async (c) => {
     throw new HTTPException(404, { message: "User not found" });
   }
 
-  return c.json({ user });
+  return c.json({ user }, 200);
 });
 
 // DELETE /users/:id - Delete user (admin only)
@@ -219,6 +223,7 @@ const deleteUserRoute = createRoute({
   tags: ["Users"],
   summary: "Delete user",
   security: [{ bearerAuth: [] }],
+  middleware: [requireRole("admin")] as const,
   request: {
     params: UserParamsSchema,
   },
@@ -250,7 +255,7 @@ const deleteUserRoute = createRoute({
   },
 });
 
-userRoutes.openapi(deleteUserRoute, requireRole("admin"), async (c) => {
+userRoutes.openapi(deleteUserRoute, async (c) => {
   const { id } = c.req.valid("param");
 
   const result = await c.env.DB.prepare("DELETE FROM users WHERE id = ?")
@@ -261,5 +266,5 @@ userRoutes.openapi(deleteUserRoute, requireRole("admin"), async (c) => {
     throw new HTTPException(404, { message: "User not found" });
   }
 
-  return c.json({ success: true });
+  return c.json({ success: true }, 200);
 });

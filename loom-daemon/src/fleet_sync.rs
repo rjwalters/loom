@@ -61,7 +61,7 @@
 //!   [`Policy::FailClosed`]: the snapshot must have been confirmed current by
 //!   the forge in this pass (a `304` counts), there is no cached fallback, and
 //!   a both-flags (`fleet: true` + `firewall: true`) record is a hard error for
-//!   the whole roster — [`crate::fleet_store::roster::parse`]'s behaviour,
+//!   the whole roster — [`crate::fleet_store::roster::from_snapshot`]'s behaviour,
 //!   reused verbatim rather than re-implemented.
 //! - **Writes are opt-in on the timer.** The startup pass renders (that is what
 //!   "the process that starts is the one the store configured" means). Every
@@ -121,6 +121,24 @@ pub const SYNC_INTERVAL_ENV: &str = "LOOM_FLEET_SYNC_INTERVAL_SECS";
 pub const AUTO_APPLY_KEY: &str = "fleet.autoApply";
 /// Env override for the opt-in write path.
 pub const AUTO_APPLY_ENV: &str = "LOOM_FLEET_AUTO_APPLY";
+/// Per-write keys under the `fleet.autoApply` umbrella (#13228): an explicit
+/// value beats the umbrella, env beats config, and each falls back to the
+/// umbrella when unset.
+pub const AUTO_APPLY_ROSTER_KEY: &str = "fleet.autoApplyRoster";
+/// Env override for [`AUTO_APPLY_ROSTER_KEY`].
+pub const AUTO_APPLY_ROSTER_ENV: &str = "LOOM_FLEET_AUTO_APPLY_ROSTER";
+/// Config key: the machine / host-local / per-repo tiers and the restart they demand.
+pub const AUTO_APPLY_CONFIG_KEY: &str = "fleet.autoApplyConfig";
+/// Env override for [`AUTO_APPLY_CONFIG_KEY`].
+pub const AUTO_APPLY_CONFIG_ENV: &str = "LOOM_FLEET_AUTO_APPLY_CONFIG";
+/// Config key: the workspace resync push (#10718).
+pub const AUTO_APPLY_RESYNC_KEY: &str = "fleet.autoApplyResync";
+/// Env override for [`AUTO_APPLY_RESYNC_KEY`].
+pub const AUTO_APPLY_RESYNC_ENV: &str = "LOOM_FLEET_AUTO_APPLY_RESYNC";
+/// Config key: the checkout fast-forward (#10869).
+pub const AUTO_APPLY_CHECKOUT_KEY: &str = "fleet.autoApplyCheckout";
+/// Env override for [`AUTO_APPLY_CHECKOUT_KEY`].
+pub const AUTO_APPLY_CHECKOUT_ENV: &str = "LOOM_FLEET_AUTO_APPLY_CHECKOUT";
 /// Env override for the startup pass's wall-clock cap.
 pub const STARTUP_TIMEOUT_ENV: &str = "LOOM_FLEET_SYNC_STARTUP_TIMEOUT_SECS";
 
@@ -146,6 +164,51 @@ pub const STATE_TOPIC: &str = "fleet.sync.state";
 // Configuration
 // ============================================================================
 
+/// Which unattended writes are armed (#13228). `fleet.autoApply` turns on all
+/// four; each `fleet.autoApply<Write>` key overrides it for one write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoApply {
+    /// Roster register / deregister, and the missing-clone clone.
+    pub roster: bool,
+    /// The machine, host-local and per-repo tiers, and the restart they demand.
+    pub config: bool,
+    /// The workspace resync push.
+    pub resync: bool,
+    /// The checkout fast-forward.
+    pub checkout: bool,
+}
+
+impl AutoApply {
+    /// Every write armed.
+    pub const ALL: Self = Self {
+        roster: true,
+        config: true,
+        resync: true,
+        checkout: true,
+    };
+
+    /// Whether any write is armed.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.roster || self.config || self.resync || self.checkout
+    }
+
+    /// The armed writes by name, in a fixed order.
+    #[must_use]
+    pub fn names(self) -> Vec<&'static str> {
+        [
+            (self.roster, "roster"),
+            (self.config, "config"),
+            (self.resync, "resync"),
+            (self.checkout, "checkout"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+}
+
 /// The resolved sync configuration for this host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncConfig {
@@ -153,8 +216,8 @@ pub struct SyncConfig {
     pub location: StoreLocation,
     /// Timer cadence.
     pub interval: Duration,
-    /// Whether a pass may write (render) / apply (roster) on its own.
-    pub auto_apply: bool,
+    /// Which writes a pass may make on its own.
+    pub auto_apply: AutoApply,
 }
 
 /// Resolve the sync configuration from `effective_config`, with `env` (a
@@ -171,7 +234,7 @@ pub fn resolve_config(
     Ok(Some(SyncConfig {
         location,
         interval: resolve_interval(effective_config, env),
-        auto_apply: resolve_auto_apply(effective_config, env),
+        auto_apply: resolve_auto_apply_writes(effective_config, env),
     }))
 }
 
@@ -205,6 +268,31 @@ pub fn resolve_auto_apply(effective_config: &Value, env: &dyn Fn(&str) -> Option
     crate::config_resolver::get_path(effective_config, AUTO_APPLY_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// Each write's flag (#13228): its own env over its own config key, else the
+/// `fleet.autoApply` umbrella, else off. A non-boolean config value reads as
+/// unset; a non-truthy env value reads as off, as for the umbrella.
+#[must_use]
+pub fn resolve_auto_apply_writes(
+    effective_config: &Value,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> AutoApply {
+    let umbrella = resolve_auto_apply(effective_config, env);
+    let one = |env_key: &str, key: &str| {
+        if let Some(raw) = env(env_key) {
+            return matches!(raw.trim(), "1" | "true" | "TRUE" | "yes" | "on");
+        }
+        crate::config_resolver::get_path(effective_config, key)
+            .and_then(Value::as_bool)
+            .unwrap_or(umbrella)
+    };
+    AutoApply {
+        roster: one(AUTO_APPLY_ROSTER_ENV, AUTO_APPLY_ROSTER_KEY),
+        config: one(AUTO_APPLY_CONFIG_ENV, AUTO_APPLY_CONFIG_KEY),
+        resync: one(AUTO_APPLY_RESYNC_ENV, AUTO_APPLY_RESYNC_KEY),
+        checkout: one(AUTO_APPLY_CHECKOUT_ENV, AUTO_APPLY_CHECKOUT_KEY),
+    }
 }
 
 /// Wall-clock cap on the startup pass, from [`STARTUP_TIMEOUT_ENV`] over
@@ -327,14 +415,12 @@ pub fn config_pass(
         let drifted = drift != Drift::InSync;
         let mut wrote = false;
         let mut detail = describe_drift(&drift);
-        let keys = crate::config_journal::restart_keys(target, mode == Mode::Write && drifted);
         if mode == Mode::Write && drifted {
             let lost = render::lost_top_level_keys(target);
             if lost.is_empty() {
                 match render::write(target, &stamp) {
-                    Ok((w, backup)) => {
+                    Ok((w, _backup)) => {
                         wrote = w;
-                        crate::config_journal::record_rendered(w, target, backup, &commit, &keys);
                     }
                     Err(e) => {
                         error = Some(format!("writing {}: {e:#}", target.path.display()));
@@ -490,7 +576,7 @@ pub fn apply_change(registry_path: &Path, change: &Change) -> Result<()> {
             maintain_only,
             ..
         } => {
-            let claude_state = crate::terminal::claude_config_state_path();
+            let claude_state = crate::claude_config::default_state_file();
             registry.add_and_trust(path, None, *weight, &claude_state)?;
             registry.set_maintain_only(path, mode(*maintain_only), Utc::now());
             true
@@ -605,6 +691,31 @@ fn floor_cell() -> &'static Mutex<Option<Option<String>>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// What [`refresh_floor`] needs to reach the store: set once by [`start`].
+fn fresh_floor_inputs() -> &'static OnceLock<(PathBuf, StoreLocation, PathBuf)> {
+    static INPUTS: OnceLock<(PathBuf, StoreLocation, PathBuf)> = OnceLock::new();
+    &INPUTS
+}
+
+/// Re-read the floor from the store now (#12610), not from the last timer
+/// pass, and publish it like a pass would. A roll about to stop agents calls
+/// this so a floor rolled back since the roll was armed is seen before work is
+/// stopped. A store that cannot be reached keeps the last good floor
+/// ([`resolve_floor`]); a host with no fleet store just answers
+/// [`floor_knowledge`]. Blocking (it shells out to `gh`).
+#[must_use]
+pub fn refresh_floor() -> FloorKnowledge {
+    if let Some((workspace, location, cache)) = fresh_floor_inputs().get() {
+        let transport = crate::fleet_store::gh::GhTransport::new(workspace, &location.repo);
+        let read = fetch::load(&transport, cache, location, Policy::AllowStale, Utc::now())
+            .map(|loaded| floor::read(&loaded.snapshot))
+            .map_err(|e| format!("{e:#}"));
+        let pass = resolve_floor(read, last_good_floor().as_deref());
+        floor_knowledge::record_floor(&pass);
+    }
+    floor_knowledge()
+}
+
 #[cfg(test)]
 fn set_floor(floor: Option<String>) {
     if let Ok(mut guard) = floor_cell().lock() {
@@ -624,7 +735,7 @@ pub fn loom_min_version() -> Option<String> {
 
 /// #12424: restart-required config changes since this process booted, beside
 /// the floor. See [`config_restart`].
-pub use config_restart::config_restart_demand;
+pub use config_restart::{armable_demand, config_restart_demand};
 
 /// #10719: the `repo_ahead_target` roll demand, beside the floor. The highest
 /// daemon version a registered workspace NEEDS and this host does not run.
@@ -670,8 +781,12 @@ pub struct FleetSyncStatus {
     pub at: DateTime<Utc>,
     /// Timer cadence in force.
     pub interval_secs: u64,
-    /// Whether the write path is armed.
+    /// Whether any write is armed (`autoApply`, kept for compatibility).
     pub auto_apply: bool,
+    /// Which writes are armed (#13228). `#[serde(default)]` so a snapshot from
+    /// an older daemon reads back as none armed.
+    #[serde(default)]
+    pub auto_apply_writes: AutoApply,
     /// The config tiers.
     pub config: ConfigPass,
     /// The roster diff.
@@ -746,21 +861,10 @@ fn cell() -> &'static Mutex<Option<FleetSyncStatus>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
-/// Resolve `<loom_dir>` the same way [`crate::daemon_heartbeat`] and
-/// [`crate::autonomy_marker`] do: the parent of `LOOM_SOCKET_PATH` when set (so
-/// a test daemon pointed at a tempdir socket never writes into the operator's
-/// real `~/.loom`), else `~/.loom`.
-fn resolve_loom_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        return PathBuf::from(path).parent().map(Path::to_path_buf);
-    }
-    dirs::home_dir().map(|h| h.join(".loom"))
-}
-
 /// Path of the host-level snapshot, or `None` when no loom dir resolves.
 #[must_use]
 pub fn status_path() -> Option<PathBuf> {
-    resolve_loom_dir().map(|d| d.join(STATUS_FILENAME))
+    crate::autonomy_marker::resolve_loom_dir().map(|d| d.join(STATUS_FILENAME))
 }
 
 /// Record `status` in process memory and in the host-level snapshot file.
@@ -820,7 +924,6 @@ fn write_status(path: &Path, status: &FleetSyncStatus) -> Result<()> {
     let mut body = serde_json::to_vec_pretty(status)?;
     body.push(b'\n');
     fetch::write_atomic(path, &body)?;
-    crate::config_journal::record_sync(status); // J3 shadow, after the legacy write
     Ok(())
 }
 
@@ -878,7 +981,6 @@ pub fn clear_status() {
                 "fleet_sync: no fleet store configured — removed the stale snapshot {}",
                 path.display()
             );
-            crate::config_journal::record_sync_cleared();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => log::debug!("fleet_sync: could not remove {}: {e:#}", path.display()),
@@ -904,7 +1006,12 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
         head.push_str(", CACHED snapshot");
     }
     if s.auto_apply {
-        head.push_str(", autoApply on");
+        let writes = s.auto_apply_writes;
+        if writes == AutoApply::ALL || writes == AutoApply::default() {
+            head.push_str(", autoApply on");
+        } else {
+            head.push_str(&format!(", autoApply on: {}", writes.names().join("+")));
+        }
     }
     head.push(')');
     let mut lines = vec![head];
@@ -961,7 +1068,7 @@ pub fn render_line(status: Option<&FleetSyncStatus>, now: DateTime<Utc>) -> Opti
     lines.extend(repo_config::lines(&s.repo_config));
     if !s.drifted() && !s.errored() {
         lines.push("  host matches the store".to_string());
-    } else if !s.auto_apply && s.drifted() {
+    } else if !s.auto_apply_writes.config && s.drifted() {
         lines.push(
             "  nothing was written — set fleet.autoApply=true (or run `loom-daemon fleet-config \
              render` / `roster --apply`) to converge"
@@ -983,7 +1090,7 @@ struct PassInputs {
     host: String,
     cache: PathBuf,
     interval: Duration,
-    auto_apply: bool,
+    auto_apply: AutoApply,
     clones: roster_clone::CloneConfig,
 }
 
@@ -1009,6 +1116,13 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         now,
     );
     let enforced = state.enforcement();
+    // #13228: the startup pass renders regardless of the flags (as it always
+    // has); the timer renders only when the config write is armed.
+    let config_mode = if mode == Mode::Write && (pass == "startup" || inputs.auto_apply.config) {
+        Mode::Write
+    } else {
+        Mode::Check
+    };
     let local_path = inputs
         .workspace
         .join(crate::config_resolver::LOCAL_CONFIG_REL);
@@ -1020,7 +1134,7 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
             &host,
             &machine_path,
             &local_path,
-            mode,
+            config_mode,
             now,
         ),
         None => ConfigPass {
@@ -1033,7 +1147,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     };
     // #11218: only a timer pass on a host free to dispatch clones.
     let clone = pass == "timer" && enforced == Enforcement::Proceed;
-    let (roster, repo_config) = roster_half(inputs, &transport, &config, (mode, clone), now);
+    let (roster, repo_config) =
+        roster_half(inputs, &transport, &config, (mode, config_mode, clone), now);
     // #10711: the floor, from the snapshot the halves above just refreshed,
     // into the process-wide value — never the config tiers, whose
     // `autonomous.autoUpdate` changes need a restart.
@@ -1041,8 +1156,6 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
     // #10885: a floor that differs from the previous pass's wakes the
     // self-update loop, so it acts now and not at its next interval.
     floor_knowledge::record_floor(&floor);
-    // J3 shadow (#11349): config as resolved after this pass (deduplicated).
-    crate::config_journal::record_resolved(&inputs.workspace);
     FleetSyncStatus {
         repo: inputs.location.repo.clone(),
         reference: inputs.location.reference.clone(),
@@ -1050,7 +1163,8 @@ fn run_pass(inputs: &PassInputs, pass: &str, mode: Mode, now: DateTime<Utc>) -> 
         pass: pass.to_string(),
         at: now,
         interval_secs: inputs.interval.as_secs(),
-        auto_apply: inputs.auto_apply,
+        auto_apply: inputs.auto_apply.any(),
+        auto_apply_writes: inputs.auto_apply,
         config,
         roster,
         state,
@@ -1085,7 +1199,7 @@ fn roster_half(
     inputs: &PassInputs,
     transport: &dyn Transport,
     config: &ConfigPass,
-    (mode, clone): (Mode, bool),
+    (mode, config_mode, clone): (Mode, Mode, bool),
     now: DateTime<Utc>,
 ) -> (RosterPass, repo_config::RepoConfigPass) {
     let failed = |error: String| {
@@ -1143,11 +1257,11 @@ fn roster_half(
     } else {
         roster_clone::Clones::off()
     };
-    let write = mode == Mode::Write && inputs.auto_apply;
+    let write = mode == Mode::Write && inputs.auto_apply.roster;
     let roster =
         roster_clone::summarize(&plan, write, &clones, &mut |c| apply_change(&registry_path, c));
     // After the roster, so a repo cloned this pass gets its tier this pass.
-    let repos = repo_config::pass(&loaded.snapshot, &home, &is_cloned, mode, now);
+    let repos = repo_config::pass(&loaded.snapshot, &home, &is_cloned, config_mode, now);
     (roster, repos)
 }
 
@@ -1299,12 +1413,12 @@ pub async fn start(
     // `loom-daemon workspace add/remove/set-weight` makes (#5345), applied to
     // the unattended path.
     let auto_apply = match crate::config_resolver::daemon_delegated_to(workspace) {
-        Some(delegate) if config.auto_apply => {
+        Some(delegate) if config.auto_apply.any() => {
             log::warn!(
                 "fleet_sync: {AUTO_APPLY_KEY} is on but daemon admin is delegated to {delegate} — \
                  syncing read-only from here"
             );
-            false
+            AutoApply::default()
         }
         _ => config.auto_apply,
     };
@@ -1317,12 +1431,18 @@ pub async fn start(
         auto_apply,
         clones: roster_clone::resolve_config(&effective, &|k| std::env::var(k).ok()),
     };
+    let _ = fresh_floor_inputs().set((
+        inputs.workspace.clone(),
+        inputs.location.clone(),
+        inputs.cache.clone(),
+    ));
     log::info!(
-        "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={auto_apply}",
+        "fleet_sync: enabled — store {} @ {}, host {}, every {}s, autoApply={}",
         inputs.location.repo,
         inputs.location.reference,
         inputs.host,
-        inputs.interval.as_secs()
+        inputs.interval.as_secs(),
+        auto_apply.names().join("+")
     );
     workspace_resync::mark_boot();
     let mut inputs = inputs;
@@ -1404,7 +1524,14 @@ fn spawn_timer(
     enforcer: Option<std::sync::Arc<dyn Enforcer>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mode = if inputs.auto_apply {
+        // #13228: each half narrows this to its own flag.
+        let mode = Mode::Write;
+        let resync_mode = if inputs.auto_apply.resync {
+            Mode::Write
+        } else {
+            Mode::Check
+        };
+        let config_mode = if inputs.auto_apply.config {
             Mode::Write
         } else {
             Mode::Check
@@ -1418,7 +1545,7 @@ fn spawn_timer(
         // in the same pass and the two never run at once.
         let then = || checkout_ff::after_resync(&inputs, &enforcer, &bus);
         let (step, after) = then();
-        workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
+        workspace_resync::spawn_pass(&inputs, resync_mode, &enforcer, &bus, step, after);
         loop {
             tokio::time::sleep(inputs.interval).await;
             let owned = inputs.clone();
@@ -1437,13 +1564,20 @@ fn spawn_timer(
                     publish(&status);
                     report(&status, bus.as_deref());
                     // #12424: refresh the since-boot restart-required demand.
-                    config_restart::check(mode, Utc::now());
+                    config_restart::check(config_mode, Utc::now());
                     // #10718: last, so the floor is current and a hold this
                     // pass just placed is already in the drain flag. Not
                     // awaited: see `workspace_resync::host`.
                     workspace_resync::mark_verified();
                     let (step, after) = then();
-                    workspace_resync::spawn_pass(&inputs, mode, &enforcer, &bus, step, after);
+                    workspace_resync::spawn_pass(
+                        &inputs,
+                        resync_mode,
+                        &enforcer,
+                        &bus,
+                        step,
+                        after,
+                    );
                 }
                 Err(e) => log::warn!("fleet_sync: a timer pass panicked: {e}"),
             }

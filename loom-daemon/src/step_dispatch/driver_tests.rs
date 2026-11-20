@@ -141,3 +141,29 @@ fn a_fixes_only_listing_keeps_the_steps_that_add_no_code() {
     let _ = shape_pool(&mut fix, &DrawClaims::default(), held);
     assert_eq!(steps(&fix), before, "red-main fixes keep every step");
 }
+
+/// #13367: a direct-mode repo keeps its configured merge limit, whatever its
+/// eligible debt; only queue mode applies the demand rule.
+#[test]
+fn a_direct_mode_repo_keeps_the_configured_merge_limit() {
+    for eligible in [0, 1, 11, 60] {
+        assert_eq!(effective_merge_limit(false, 1, eligible, 10), 1, "{eligible}");
+        assert_eq!(effective_merge_limit(false, 3, eligible, 10), 3, "{eligible}");
+    }
+    assert_eq!(effective_merge_limit(true, 1, 60, 10), DEFAULT_QUEUE_BUILD_CAP);
+}
+
+/// #13367: a queue-mode repo's merge limit scales with its eligible debt
+/// (`laneK` 10), is bounded by the queue's build cap, and never drops below
+/// the configured floor.
+#[test]
+fn the_queue_merge_limit_follows_the_eligible_debt() {
+    assert_eq!(demand_merge_limit(1, 0, 10), 1);
+    assert_eq!(demand_merge_limit(1, 1, 10), 1);
+    assert_eq!(demand_merge_limit(1, 10, 10), 1);
+    assert_eq!(demand_merge_limit(1, 11, 10), 2);
+    assert_eq!(demand_merge_limit(1, 60, 10), DEFAULT_QUEUE_BUILD_CAP);
+    assert_eq!(demand_merge_limit(3, 1, 10), 3, "the configured floor holds");
+    assert_eq!(demand_merge_limit(8, 60, 10), 8, "an explicit value above the cap is kept");
+    assert_eq!(demand_merge_limit(0, 5, 0), DEFAULT_QUEUE_BUILD_CAP, "zeros fail safe");
+}

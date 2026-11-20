@@ -251,6 +251,12 @@ pub struct CleanOptions {
     /// remover must honor CLAUDE.md's "user-provisioned worktrees are never
     /// removed" contract, because nobody is there to say no.
     pub require_managed_sentinel: bool,
+    /// Idle period (seconds) after which an `issue-<N>` / `pr-<N>` worktree of
+    /// an **open** item becomes reapable (issue #12458). `None` disables the
+    /// decision — the historical behaviour, and what the interactive CLI keeps.
+    /// Only consulted when [`Self::safe`] is set. The unattended reaper sets it
+    /// from `autonomous.worktreeReaper.idleOpenSecs`.
+    pub idle_open_secs: Option<i64>,
 }
 
 impl Default for CleanOptions {
@@ -265,6 +271,7 @@ impl Default for CleanOptions {
             branches_only: false,
             tmux_only: false,
             require_managed_sentinel: false,
+            idle_open_secs: None,
         }
     }
 }
@@ -719,6 +726,15 @@ pub enum WorktreeDecision {
     /// see `worktree_ops::clean::quarantine_dirty_worktree` and
     /// `worktree_reaper`'s reap loop.
     RemoveWithQuarantine,
+    /// The idle-open decision (issue #12458): every gate passed for the
+    /// worktree of an **open** issue / PR, but because the item is open the
+    /// caller MUST first push a snapshot of the worktree's whole state to a
+    /// remote backup ref and verify the remote holds it
+    /// (`worktree_ops::open_backup::backup_to_remote`), log that ref, and
+    /// only then remove — a failed or unverifiable backup keeps the worktree.
+    /// Distinct from [`Self::Remove`] so no remover can reach an open item's
+    /// worktree without the backup having happened first.
+    RemoveWithBackup,
     /// Closed issue whose PR did not merge, or that has no PR at all
     /// (payload: which). Also covers a closed-without-merge PR whose branch
     /// could not be proven safe to delete — no `closed_at` timestamp, or its
@@ -780,6 +796,16 @@ pub struct WorktreeProbes<'a> {
     pub branch_reachable_from_remotes: &'a dyn Fn(u32) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// Whether the worktree holds anything `git worktree remove --force` would
+    /// destroy and a remote cannot restore: tracked changes **or** untracked
+    /// user files (issue #12458). Wider than [`Self::uncommitted`], which is
+    /// blind to untracked files — acceptable there only because a closed issue
+    /// bounds the gap. Consulted only by the idle-open decision.
+    pub unsaved_work: &'a dyn Fn(&Path) -> bool,
+    /// Whether nothing in the worktree has been written for at least the given
+    /// number of seconds (issue #12458) — the `worktree_activity` gate with the
+    /// idle period as its window. `false` when the probe cannot answer.
+    pub idle_for: &'a dyn Fn(&Path, i64) -> bool,
     /// Wall clock the grace-period gate measures against.
     pub now: DateTime<Utc>,
 }
@@ -860,6 +886,18 @@ pub fn classify_worktree(
     }
 
     let issue_state = (probes.issue_state)(issue_num);
+    if issue_state == "OPEN" && opts.safe && !opts.force {
+        if let Some(idle_secs) = opts.idle_open_secs {
+            return classify_idle_open(
+                worktree_path,
+                idle_secs,
+                probes.idle_for,
+                probes.unsaved_work,
+                &|| (probes.branch_reachable_from_remotes)(issue_num),
+                SkipOpen::Issue(issue_state),
+            );
+        }
+    }
     if issue_state != "CLOSED" {
         return WorktreeDecision::SkipIssueNotClosed(issue_state);
     }
@@ -974,6 +1012,69 @@ pub fn classify_worktree(
     }
 }
 
+/// What an open item's worktree decision falls back to when it is kept — the
+/// skip the classifier produced before #12458 existed, so a kept worktree logs
+/// exactly what it always did.
+enum SkipOpen {
+    /// `issue-<N>`: the observed (non-`CLOSED`) issue state.
+    Issue(String),
+    /// `pr-<N>`: the PR is open.
+    Pr,
+}
+
+impl SkipOpen {
+    fn into_decision(self) -> WorktreeDecision {
+        match self {
+            Self::Issue(state) => WorktreeDecision::SkipIssueNotClosed(state),
+            Self::Pr => WorktreeDecision::SkipPrOpen,
+        }
+    }
+}
+
+/// The idle-open decision (issue #12458): may the worktree of an **open**
+/// issue / PR be removed to reclaim its disk?
+///
+/// It may be *offered* for removal when all three hold, and the next step for
+/// the item recreates it through the normal `worktree.sh` path:
+///
+/// 1. nothing was written in it for `idle_secs` (the `worktree_activity` gate);
+/// 2. it holds no tracked changes and no untracked user files (`unsaved_work`);
+/// 3. its branch is fully on a remote — or has no commits beyond base, which
+///    `git rev-list <branch> --not --remotes` also reports as reachable.
+///
+/// The answer is never a bare [`WorktreeDecision::Remove`]: every one of those
+/// three is an inference, the item is still open, and `git worktree remove
+/// --force` is one-way, so the decision is
+/// [`WorktreeDecision::RemoveWithBackup`] — the remover must first push a
+/// verified snapshot of the worktree to a remote backup ref
+/// (`open_backup::backup_to_remote`) and keeps the worktree if it cannot.
+///
+/// Cheapest gate first: a worktree touched recently exits on the root `stat`
+/// without a `git` subprocess. A kept worktree reports the skip the open item
+/// always produced ([`SkipOpen`]), except where a *named* gate explains why a
+/// stale worktree is still kept.
+fn classify_idle_open(
+    worktree_path: &Path,
+    idle_secs: i64,
+    idle_for: &dyn Fn(&Path, i64) -> bool,
+    unsaved_work: &dyn Fn(&Path) -> bool,
+    branch_reachable: &dyn Fn() -> bool,
+    open: SkipOpen,
+) -> WorktreeDecision {
+    if idle_secs <= 0 || !idle_for(worktree_path, idle_secs) {
+        return open.into_decision();
+    }
+    if unsaved_work(worktree_path) {
+        return WorktreeDecision::SkipUncommitted;
+    }
+    if !branch_reachable() {
+        return WorktreeDecision::SkipNotMerged(
+            "open item idle, but its branch is not fully pushed to a remote".to_string(),
+        );
+    }
+    WorktreeDecision::RemoveWithBackup
+}
+
 /// The canonicalized path of every currently-registered git worktree for
 /// `repo_root` (including the primary checkout itself), parsed from `git
 /// worktree list --porcelain`.
@@ -1033,8 +1134,22 @@ pub fn production_probes<'a>(
         pr_status: pr_status_fn,
         branch_reachable_from_remotes: branch_reachable_fn,
         uncommitted: &check_uncommitted_changes,
+        unsaved_work: &check_uncommitted_or_unproven_untracked_changes,
+        idle_for: &worktree_idle_for,
         now,
     }
+}
+
+/// Production [`WorktreeProbes::idle_for`]: the `worktree_activity` gate with
+/// the idle period as its window. Anything but a verified `Idle` — recent
+/// writes, or an unreadable root — answers `false`, so the worktree is kept.
+#[must_use]
+pub fn worktree_idle_for(worktree_path: &Path, idle_secs: i64) -> bool {
+    let window = Duration::from_secs(u64::try_from(idle_secs).unwrap_or(0));
+    matches!(
+        crate::worktree_activity::probe_worktree_activity(worktree_path, SystemTime::now(), window),
+        crate::worktree_activity::ActivityProbe::Idle
+    ) && !window.is_zero()
 }
 
 /// Build the `is_registered_worktree` probe closure for [`production_probes`]
@@ -1093,6 +1208,8 @@ pub struct PrWorktreeProbes<'a> {
     pub branch_reachable_from_remotes: &'a dyn Fn(&Path) -> bool,
     /// Whether the worktree has uncommitted changes.
     pub uncommitted: &'a dyn Fn(&Path) -> bool,
+    /// See [`WorktreeProbes::idle_for`] (issue #12458).
+    pub idle_for: &'a dyn Fn(&Path, i64) -> bool,
     /// Wall clock the grace-period gate measures against.
     pub now: DateTime<Utc>,
 }
@@ -1202,7 +1319,18 @@ pub fn classify_pr_worktree(
             }
             WorktreeDecision::Remove
         }
-        PrStatus::Open => WorktreeDecision::SkipPrOpen,
+        PrStatus::Open => match opts.idle_open_secs {
+            Some(idle_secs) if !opts.force => classify_idle_open(
+                worktree_path,
+                idle_secs,
+                probes.idle_for,
+                // `uncommitted` is already the wide probe on the `pr-<N>` side.
+                probes.uncommitted,
+                &|| (probes.branch_reachable_from_remotes)(worktree_path),
+                SkipOpen::Pr,
+            ),
+            _ => WorktreeDecision::SkipPrOpen,
+        },
         PrStatus::NoPr => WorktreeDecision::SkipNotMerged("PR not found".to_string()),
         PrStatus::Unknown => WorktreeDecision::SkipUnknownPrStatus,
     }
@@ -1234,6 +1362,7 @@ pub fn production_pr_probes<'a>(
         // so it does not get the closed-issue gate that bounds that gap on the
         // `issue-<N>` side. Proven cargo output is not user work (#11193).
         uncommitted: &check_uncommitted_or_unproven_untracked_changes,
+        idle_for: &worktree_idle_for,
         now,
     }
 }
@@ -1946,6 +2075,18 @@ pub fn clean_worktrees(repo_root: &Path, stats: &mut CleanupStats, opts: &CleanO
                 let result =
                     cleanup_worktree(repo_root, &worktree_path, issue_num, opts.dry_run, "clean");
                 record_cleanup_result(stats, &worktree_path, result);
+            }
+            WorktreeDecision::RemoveWithBackup => {
+                // #12458: unreachable here — the interactive pass never sets
+                // `idle_open_secs` — and kept that way on purpose: the
+                // backup-then-remove route for an OPEN item's worktree is the
+                // daemon reaper's alone, so a non-reaper caller that somehow
+                // produces this decision preserves the worktree.
+                println!(
+                    "  Issue #{issue_num} is OPEN - preserving (idle-open backup-then-remove is \
+                     only run by the daemon reaper)"
+                );
+                stats.skipped_open += 1;
             }
             WorktreeDecision::RemoveWithQuarantine => {
                 if opts.dry_run {
@@ -2813,6 +2954,15 @@ pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 30;
 /// default**, matching every other Loom knob.
 pub const LOG_RETENTION_DAYS_ENV: &str = "LOOM_LOGS_RETENTION_DAYS";
 
+/// Env var: `1` enables archive-gated step-log retention (`step-<role>-<item>.log`,
+/// #14177). Unset — the default — the step-log branch of
+/// [`clean_log_files_with`] never fires: step logs are the only durable
+/// source of per-step `LOOM_STEP_OUTCOME` history, so they are deliberately
+/// never deleted until the off-host preserver (2AMLogic/2am#7548) is rolled
+/// out. Mirrors the daemon-log day-file gate's shape
+/// ([`crate::daily_log::REQUIRE_ARCHIVE_ENV`], #13917).
+pub const STEP_LOG_REQUIRE_ARCHIVE_ENV: &str = "LOOM_STEP_LOG_REQUIRE_ARCHIVE";
+
 /// Resolve the `.loom/logs/*.log` retention window (days) — env
 /// (`LOOM_LOGS_RETENTION_DAYS`) > config (`logs.retentionDays`) > default
 /// (#6655). A non-positive or unparseable value at a tier is treated as
@@ -2855,6 +3005,68 @@ fn log_file_issue_number(filename: &str) -> Option<u32> {
     }
 }
 
+/// Extract the item number from a step log name `step-<role>-<item>.log`
+/// (#11898's [`crate::sweep_registry::log_paths`] naming), where `<role>` is
+/// one of the known step-role wire names
+/// ([`crate::step_role::StepRole::as_str`]).
+///
+/// Returns `None` for anything else — an unknown role, a non-numeric item,
+/// or a name that is not a step log at all. Strict on purpose: this feeds a
+/// deletion gate, so a name the pass cannot positively identify is never a
+/// candidate. Disjoint from [`log_file_issue_number`]: a step-log name never
+/// embeds `issue-`, so the two passes can never claim the same file.
+fn step_log_file_item(filename: &str) -> Option<u32> {
+    let stem = filename.strip_prefix("step-")?.strip_suffix(".log")?;
+    let (role, item) = stem.rsplit_once('-')?;
+    if !crate::step_role::StepRole::ALL
+        .iter()
+        .any(|r| r.as_str() == role)
+    {
+        return None;
+    }
+    item.parse().ok()
+}
+
+/// `<log>.archived` — the archiver's proof sidecar, the same convention as
+/// the daemon-log day-file gate (#13917). Shares
+/// [`crate::daily_log::ARCHIVED_SUFFIX`] so the two gates can never drift on
+/// the marker's spelling.
+fn archived_sidecar_path(log: &Path) -> PathBuf {
+    let mut s = log.as_os_str().to_os_string();
+    s.push(crate::daily_log::ARCHIVED_SUFFIX);
+    PathBuf::from(s)
+}
+
+/// Modification time of `path`; `None` when unreadable (callers keep).
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Whether a step log's most recent dispatch attempt is known to have ended:
+/// the region after the last dispatch header
+/// ([`crate::sweep_registry::DISPATCH_HEADER_MARKER`]) contains a terminal
+/// `LOOM_STEP_OUTCOME` line, parsed by the same line parser the outcome
+/// ledger's reader uses (`read_outcome_line`'s own, #11900). This is the
+/// content-side active-vs-completed signal — no file-age heuristic (#14177).
+///
+/// Fail-safe in every ambiguous shape: an unreadable log, a log with no
+/// dispatch header, or a last attempt that has not written its outcome line
+/// (a re-dispatch with a fresh sweep id re-anchors the region, so an earlier
+/// attempt's line never reads as completed) is *not* completed — keep.
+fn step_log_completed(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Some(start) = text.rfind(crate::sweep_registry::DISPATCH_HEADER_MARKER) else {
+        return false;
+    };
+    text[start..]
+        .lines()
+        .rev()
+        .any(|line| crate::sweep_registry::step_spawn::capture::parse_outcome_line(line).is_some())
+}
+
 /// Runtime dependencies of [`clean_log_files_with`], injected so the decision
 /// logic is unit-testable without a real clock or live daemon state.
 struct LogRetentionEnv<'a> {
@@ -2866,6 +3078,10 @@ struct LogRetentionEnv<'a> {
     /// Whether `.loom/sweep-checkpoint/issue-<N>.json` exists — a resumable
     /// (possibly crashed-but-not-abandoned) sweep for that issue.
     checkpoint_exists: &'a dyn Fn(u32) -> bool,
+    /// Whether step-log retention is enabled (`LOOM_STEP_LOG_REQUIRE_ARCHIVE=1`,
+    /// #14177). Unset: `step-<role>-<item>.log` files are untouched — the
+    /// gate is inert until the off-host preserver exists.
+    step_log_retention: bool,
 }
 
 /// Bulk prune of stale per-issue `.loom/logs/*.log` files (#6655).
@@ -2885,6 +3101,11 @@ struct LogRetentionEnv<'a> {
 /// checkpoint all mean *keep*. A `.log` file with no embedded issue number,
 /// and anything that is not a `.log` file (JSON/JSONL state, directories), is
 /// never touched by this pass.
+///
+/// Step logs (`step-<role>-<item>.log`, #14177) carry no `issue-` substring
+/// and so never match branch 1; they flow to the archive-gated step branch
+/// ([`clean_step_log_file`]) instead, which without
+/// `LOOM_STEP_LOG_REQUIRE_ARCHIVE=1` never deletes anything.
 fn clean_log_files_with(
     repo_root: &Path,
     stats: &mut CleanupStats,
@@ -2907,10 +3128,15 @@ fn clean_log_files_with(
         if !name.ends_with(".log") {
             continue;
         }
+        let path = entry.path();
         let Some(issue) = log_file_issue_number(&name) else {
+            if env.step_log_retention {
+                if let Some(item) = step_log_file_item(&name) {
+                    clean_step_log_file(&path, item, env, stats, dry_run);
+                }
+            }
             continue;
         };
-        let path = entry.path();
 
         if env.live_issues.contains(&issue) {
             println!("  Keeping log of in-flight sweep: {name}");
@@ -2937,6 +3163,101 @@ fn clean_log_files_with(
     }
 }
 
+/// One archive-gated `step-<role>-<item>.log` candidate (#14177).
+///
+/// Requires everything the issue-log branch above requires (no live sweep for
+/// the item, no `.loom/sweep-checkpoint/issue-<item>.json`, mtime past the
+/// retention window) PLUS the two archive-gate proofs, so a completed step's
+/// durable outcome history can never be discarded before confirmed off-host
+/// archival:
+///
+/// - the `.archived` sidecar ([`archived_sidecar_path`], the preserver's
+///   checksum-confirmed proof — a missing or unstat-able sidecar means keep)
+///   that is **at least as new as the log** (#14228): a step log is
+///   append-only across re-dispatched attempts, so its bytes can grow after
+///   the sidecar was written and a sidecar older than the log proves only
+///   the earlier bytes were archived, not the appended tail (any stat
+///   failure on either file means keep),
+/// - a terminal outcome line for the last dispatch attempt
+///   ([`step_log_completed`]).
+///
+/// Deleting removes the pair (log + sidecar). Every unreadable or ambiguous
+/// case means keep.
+fn clean_step_log_file(
+    path: &Path,
+    item: u32,
+    env: &LogRetentionEnv,
+    stats: &mut CleanupStats,
+    dry_run: bool,
+) {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    if env.live_issues.contains(&item) {
+        println!("  Keeping log of in-flight sweep: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    if (env.checkpoint_exists)(item) {
+        println!("  Keeping log with a live checkpoint: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    let sidecar = archived_sidecar_path(path);
+    if !sidecar.exists() {
+        println!("  Keeping unarchived step log: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+    // The sidecar is a point-in-time proof (#14228): the log is append-only
+    // across re-dispatched attempts, so bytes can arrive after archival.
+    // Delete only when the sidecar is at least as new as the log; a sidecar
+    // older than the log means the appended tail was never archived — keep.
+    // Any unreadable mtime is ambiguous — keep.
+    match (modified_time(path), modified_time(&sidecar)) {
+        (Some(log_mtime), Some(sidecar_mtime)) if sidecar_mtime >= log_mtime => {}
+        (Some(_), Some(_)) => {
+            println!("  Keeping step log appended after its archival: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
+        _ => {
+            println!("  Keeping step log with an unreadable mtime: {name}");
+            stats.kept_log_files += 1;
+            return;
+        }
+    }
+    if !step_log_completed(path) {
+        println!("  Keeping step log without a terminal outcome: {name}");
+        stats.kept_log_files += 1;
+        return;
+    }
+
+    match file_age(path, env.now) {
+        Some(age) if age >= env.retention => {
+            match remove_transient(path, "stale step log", dry_run) {
+                Ok(()) => {
+                    if !dry_run {
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                    stats.cleaned_log_files += 1;
+                }
+                Err(cause) => {
+                    stats.record_error(
+                        &path.display().to_string(),
+                        "remove stale step log",
+                        &cause,
+                    );
+                }
+            }
+        }
+        _ => stats.kept_log_files += 1,
+    }
+}
+
 /// Production entry point for [`clean_log_files_with`]: real clock,
 /// [`resolve_log_retention_days`], [`active_spawn_loop_issues`] liveness, and
 /// a direct `.loom/sweep-checkpoint/issue-<N>.json` existence check.
@@ -2949,6 +3270,8 @@ pub fn clean_log_files(repo_root: &Path, stats: &mut CleanupStats, dry_run: bool
         retention: Duration::from_secs(resolve_log_retention_days(repo_root) * 24 * 60 * 60),
         live_issues: &live_issues,
         checkpoint_exists: &checkpoint_exists,
+        step_log_retention: std::env::var(STEP_LOG_REQUIRE_ARCHIVE_ENV)
+            .is_ok_and(|v| v.trim() == "1"),
     };
     clean_log_files_with(repo_root, stats, dry_run, &env);
 }
@@ -3038,6 +3361,24 @@ pub enum ArtifactOutcome {
     /// The directory exists and was deliberately **kept**: a live process is
     /// executing a binary inside it (issue #6127).
     Protected(ProtectedArtifact),
+    /// The directory exists and was deliberately **kept** because the workspace
+    /// sets `clean.keepBuildArtifacts` (issue #12694): the primary checkout is
+    /// itself a runtime dependency (e.g. other agents load its `node_modules/`
+    /// by absolute path), so reclaiming it breaks them.
+    Kept(ReclaimedArtifact),
+}
+
+/// Config key (`.loom/config.json`) that opts a workspace's primary checkout
+/// out of [`sweep_primary_checkout_artifacts`] — boolean, default `false`.
+pub const KEEP_BUILD_ARTIFACTS_KEY: &str = "clean.keepBuildArtifacts";
+
+/// Whether `repo_root` opted out of artifact sweeps. Anything but a literal
+/// JSON `true` (absent, non-boolean) is `false`.
+fn keep_build_artifacts(repo_root: &Path) -> bool {
+    let effective = crate::config_resolver::resolve_effective_config(repo_root);
+    crate::config_resolver::get_path(&effective, KEEP_BUILD_ARTIFACTS_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Remove [`PRIMARY_CHECKOUT_ARTIFACTS`] from `repo_root` **itself** (not from a
@@ -3070,6 +3411,14 @@ pub enum ArtifactOutcome {
 /// escape hatch a scheduled job could set would reintroduce exactly the bug.
 /// The reclaim is not lost, only deferred until the program is stopped.
 ///
+/// # The opt-out (issue #12694)
+///
+/// A workspace whose primary checkout is a runtime dependency sets
+/// `clean.keepBuildArtifacts: true`; every existing artifact directory is then
+/// reported as [`ArtifactOutcome::Kept`] (under `dry_run` too, so a preview
+/// matches reality). It lives here, in the shared engine, so the CLI and the
+/// daemon's disk-pressure pass can never disagree about it.
+///
 /// Whole-directory granularity is deliberate too — a partial sweep that deleted
 /// everything under `target/` *except* the live binary would leave a build tree
 /// in a state neither cargo nor the operator can reason about, to save disk in
@@ -3077,10 +3426,18 @@ pub enum ArtifactOutcome {
 #[must_use]
 pub fn sweep_primary_checkout_artifacts(repo_root: &Path, dry_run: bool) -> Vec<ArtifactOutcome> {
     let mut outcomes = Vec::with_capacity(PRIMARY_CHECKOUT_ARTIFACTS.len());
+    let keep = keep_build_artifacts(repo_root);
     for name in PRIMARY_CHECKOUT_ARTIFACTS {
         let dir = repo_root.join(name);
         if !dir.is_dir() {
             outcomes.push(ArtifactOutcome::Absent((*name).to_string()));
+            continue;
+        }
+        if keep {
+            outcomes.push(ArtifactOutcome::Kept(ReclaimedArtifact {
+                name: (*name).to_string(),
+                size_human: dir_size_human(&dir),
+            }));
             continue;
         }
         // Checked under `dry_run` too: a preview that claims it "would remove"
@@ -3121,6 +3478,9 @@ pub fn clean_build_artifacts(repo_root: &Path, dry_run: bool) {
             // an unexpectedly small reclaim, and it belongs in the same log the
             // scheduled `--deep --safe -y` job already captures.
             ArtifactOutcome::Protected(p) => println!("SKIPPED {}", p.reason()),
+            ArtifactOutcome::Kept(a) => {
+                println!("SKIPPED {}/ kept (keepBuildArtifacts, {})", a.name, a.size_human);
+            }
         }
         println!();
     }
@@ -3183,21 +3543,58 @@ fn spawn_loop_locks_dir(repo_root: &Path) -> std::path::PathBuf {
     super::liveness::locks_dir(repo_root)
 }
 
-/// Remove `.loom/locks/issue-<N>/` dirs not backed by a live spawn-loop task.
-/// Mirrors `clean.py::_clear_stale_spawn_loop_locks`.
+/// Read-side view of a claim lock's `owner.json` for
+/// [`clear_stale_spawn_loop_locks`]: `owner_pid` plus the `acquired_at`
+/// stamp the identity-paired liveness probe needs — neither more nor less.
+///
+/// Deliberately local (mirroring [`crate::live_claim`]'s private
+/// `LockOwnerView`) rather than a re-export of `sweep_registry`'s private
+/// `LockOwner`: unknown writer-side fields are ignored, and a lock stamped
+/// before the field existed deserialises with an empty `acquired_at`,
+/// which `owner_pid_alive_since` treats as "no opinion" (bare liveness).
+#[derive(serde::Deserialize)]
+struct LockOwnerLivenessView {
+    owner_pid: u32,
+    #[serde(default)]
+    acquired_at: String,
+}
+
+/// Remove `.loom/locks/issue-<N>/` claim-lock dirs with no live owner.
+///
+/// Staleness is judged from the lock itself: a lock is kept only while
+/// [`pid_identity::owner_pid_alive_since`] — bare liveness **plus** the
+/// #7935 recycled-pid identity guard — vouches for its `owner_pid`
+/// relative to the lock's `acquired_at`, so this pass and the registry's
+/// `reconstruct` agree on what "live owner" means (#14056). A lock whose
+/// pid number was recycled onto an unrelated live process (started after
+/// `acquired_at` + [`RECYCLED_PID_SKEW_SECS`]) is therefore stale here
+/// too, not just on daemon startup. A missing or unparseable `acquired_at`
+/// degrades to bare liveness rather than guessing.
+///
+/// Deliberately NOT the argv-verified
+/// [`crate::live_claim::pid_is_live_claim_for`]: `acquire_lock`
+/// provisionally stamps the *dispatching daemon's own pid* and only
+/// rewrites it to the child's pid after spawn; a cleanup pass running in
+/// that window must not delete a mid-flight lock. The identity-paired
+/// probe keeps it — the daemon's own process started before the stamp —
+/// so PR #14044's rationale for rejecting argv verification still stands.
+/// Everything else — dead owner, missing or unparseable `owner.json` — is
+/// stale and removed.
+///
+/// These directories are the daemon's live claim locks
+/// (`SweepRegistry::acquire_lock`), so over-removal double-dispatches;
+/// historically this function consulted the retired
+/// `spawn-loop-state.json` whose `running` list was always empty and
+/// therefore removed **every** lock (#13818).
+///
+/// [`pid_identity::owner_pid_alive_since`]: crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since
+/// [`RECYCLED_PID_SKEW_SECS`]: crate::sweep_registry::reaper::pid_identity::RECYCLED_PID_SKEW_SECS
 pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
     let locks_dir = spawn_loop_locks_dir(repo_root);
     if !locks_dir.is_dir() {
         println!("  No `.loom/locks/` directory");
         return 0;
     }
-    let state = super::spawn_loop_state::read_spawn_loop_state(repo_root);
-    let live_issues: std::collections::HashSet<u32> = state
-        .running
-        .iter()
-        .filter(|t| t.issue != 0)
-        .map(|t| t.issue)
-        .collect();
 
     let mut removed = 0usize;
     let mut found_any = false;
@@ -3219,7 +3616,23 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
             eprintln!("  Skipping malformed lock dir: {name}");
             continue;
         };
-        if live_issues.contains(&issue_num) {
+        // Owner read is local rather than via `live_lock_owner_in`: its
+        // `is_live` closure sees only the pid, so the lock's `acquired_at`
+        // (the other half of the identity-paired probe) never reaches it.
+        let live = std::fs::read_to_string(
+            locks_dir
+                .join(format!("issue-{issue_num}"))
+                .join("owner.json"),
+        )
+        .ok()
+        .and_then(|raw| serde_json::from_str::<LockOwnerLivenessView>(&raw).ok())
+        .is_some_and(|owner| {
+            crate::sweep_registry::reaper::pid_identity::owner_pid_alive_since(
+                owner.owner_pid,
+                &owner.acquired_at,
+            )
+        });
+        if live {
             println!("  Keeping lock for live task: {name}");
             continue;
         }
@@ -3240,11 +3653,10 @@ pub fn clear_stale_spawn_loop_locks(repo_root: &Path, dry_run: bool) -> usize {
 }
 
 fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> usize {
-    let state_present = super::spawn_loop_state::read_spawn_loop_state(repo_root).present;
     let locked_issues = super::liveness::active_locked_issues(repo_root);
-    if !state_present && locked_issues.is_empty() {
+    if locked_issues.is_empty() {
         println!(
-            "  No authoritative liveness source (no spawn-loop-state.json, no \
+            "  No authoritative liveness source (no \
              .loom/locks/issue-<N>/ locks) — skipping loom:building revert \
              (fail-safe: absent liveness data means treat claims as ALIVE, \
              not orphaned). See issue #3651."
@@ -3271,13 +3683,34 @@ fn revert_stale_building_labels_spawn_loop(repo_root: &Path, dry_run: bool) -> u
         return 0;
     }
 
+    revert_orphan_building_labels(
+        orphans,
+        dry_run,
+        |n| super::orphan_recovery::open_linked_pr_blocks_reset(repo_root, n),
+        |n| gh::edit_labels(repo_root, n, "loom:building", "loom:issue"),
+    )
+}
+
+/// Revert `loom:building` -> `loom:issue` on each orphan unless an open linked
+/// PR (or an unverifiable probe) vetoes it (issue #12733). The probe and the
+/// label write are injected so the veto is testable without a forge.
+fn revert_orphan_building_labels(
+    orphans: Vec<u32>,
+    dry_run: bool,
+    open_pr_blocks: impl Fn(u32) -> bool,
+    mut edit_labels: impl FnMut(u32) -> anyhow::Result<()>,
+) -> usize {
     let mut reverted = 0usize;
     for issue_num in orphans {
+        if open_pr_blocks(issue_num) {
+            println!("  Keeping `loom:building` on #{issue_num}: open linked PR (#12733)");
+            continue;
+        }
         if dry_run {
             println!("  Would revert label on #{issue_num}: building -> issue");
             continue;
         }
-        match gh::edit_labels(repo_root, issue_num, "loom:building", "loom:issue") {
+        match edit_labels(issue_num) {
             Ok(()) => {
                 println!("  Reverted #{issue_num}: building -> issue");
                 reverted += 1;

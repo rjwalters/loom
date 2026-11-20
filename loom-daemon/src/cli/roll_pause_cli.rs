@@ -1,6 +1,6 @@
 //! `loom-daemon roll-pause …` and `loom-daemon agent-resume …` (issue #10830):
 //! the agent-side half of pause-and-roll. The logic lives in
-//! [`loom_daemon::roll_pause`]; the hooks and spawn scripts only call it.
+//! [`crate::roll_pause`]; the hooks and spawn scripts only call it.
 //!
 //! Every subcommand a hook or spawn script calls is safe against an older
 //! binary that lacks it: the callers read stdout and treat clap's
@@ -10,8 +10,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::roll_pause::{self, resume, HookEnv, HookOutcome, PauseRequest};
 use anyhow::Result;
-use loom_daemon::roll_pause::{self, resume, HookEnv, HookOutcome, PauseRequest};
 
 /// Pause-hook and pause-state subcommands.
 #[derive(clap::Subcommand)]

@@ -1,7 +1,6 @@
 //! Tests for the runtime-aware pre-spawn credential-pool gate (Issue #8408).
 //!
-//! Kept beside the module they cover rather than in `role_runner/tests.rs`,
-//! which is at its `scripts/file-size-baseline.txt` ceiling.
+//! Kept beside the module they cover rather than in `role_runner/tests.rs`.
 //!
 //! Every test that reaches `invoke()` leaves `spawn_bin` unset so runtime
 //! admission — and with it the gate — runs for real against an on-disk
@@ -9,6 +8,7 @@
 //! before_spawn` in the parent test module.
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::tokens_pool::health::record_terminal_at;
 use crate::tokens_pool::{record_terminal_for_class_at, AccountId, TerminalClassification};
 use serial_test::serial;
@@ -35,44 +35,22 @@ const GUARDED_ENV: [&str; 9] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The shared env guard plus the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock
+/// (#9964). Field order matters: the env is restored before the lock is released.
 struct EnvGuard(
-    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] crate::env_test_support::EnvGuard,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
 );
 
 impl EnvGuard {
-    /// Clear every guarded var, then point the codex profile root at
-    /// `profile_root` so no test ever reads the host's real
+    /// Clear, then point the codex profile root at `profile_root` so no test ever reads the host's real
     /// `~/.loom/codex-profiles`.
     fn new(profile_root: &Path) -> Self {
         let lock = crate::tokens_pool::profile_root_env::lock();
-        let prior = GUARDED_ENV
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect();
-        for key in GUARDED_ENV {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior, lock)
+        let env = crate::env_test_support::EnvGuard::clear(&GUARDED_ENV)
+            .and_set("LOOM_CODEX_PROFILE_ROOT", Some(profile_root.as_os_str()));
+        Self(env, lock)
     }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// The installed `codex.json` shape: `accountProvider` is what makes
@@ -119,7 +97,7 @@ fn codex_judge_workspace(
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
     (marker, pool)
 }
@@ -683,7 +661,7 @@ fn claude_runtime_pool_exhausted_skip_is_byte_identical() {
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
 
     let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
@@ -839,7 +817,7 @@ fn preference_judge_workspace(
     let marker = root.join("script-ran");
     write_executable(
         &root.join(".loom/scripts/spawn-worker.sh"),
-        &format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
+        format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" >'{}'\nexit 0\n", marker.display()),
     );
     // Judge is a merging role: Codex is available to it only while every
     // shared seat runs Loom's guard hook (#9390 follow-up). These tests are
@@ -1298,6 +1276,102 @@ fn every_session_down_sends_judge_to_the_next_tap_body() {
         .invoke("judge", "/loom:judge");
     assert_eq!(outcome, RoleTickOutcome::Success, "{outcome:?}");
     assert_eq!(fs::read_to_string(&marker).unwrap_or_default(), "claude");
+}
+
+// ---- #13873: the fallback-aware Claude pool gate ---------------------------
+
+/// A shared pool whose every account is fable-class-marked: fable has
+/// nothing to select, every lower rung still does. Returned so the test
+/// outlives its own env pin (`SharedTokenPool` restores on drop).
+fn fable_exhausted_shared_pool() -> crate::write_scope_test_support::SharedTokenPool {
+    let pool = crate::write_scope_test_support::SharedTokenPool::one_account();
+    fs::remove_file(pool.path().join("fake.token")).unwrap();
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+    let mut marks = String::new();
+    for account in ["alpha", "beta"] {
+        fs::write(pool.path().join(format!("{account}.token")), "sk-ant-oat01-fake").unwrap();
+        marks.push_str(&format!(
+            "{now} {account} exhausted: hit your Fable limit [model-class:fable]\n"
+        ));
+    }
+    fs::write(pool.path().join(".bad_tokens"), marks).unwrap();
+    pool
+}
+
+/// #13873: with every account fable-class-marked and the block absent, the
+/// gate skips exactly as before (the class-scoped marks still block the
+/// account-wide read). With `modelFallback.enabled`, the same pool must not
+/// skip a tick whose configured model can fall back to a healthy rung.
+#[test]
+#[serial(loom_shared_tokens_dir_env)]
+fn claude_gate_honours_the_selection_time_model_fallback() {
+    claude_gate_honours_the_selection_time_model_fallback_body();
+}
+
+#[serial]
+fn claude_gate_honours_the_selection_time_model_fallback_body() {
+    let workspace = tempfile::tempdir().unwrap();
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::new(profiles.path());
+    for sub in [".loom/roles", ".loom/runtimes", ".loom/scripts"] {
+        fs::create_dir_all(workspace.path().join(sub)).unwrap();
+    }
+    let pool = fable_exhausted_shared_pool();
+    let logs = workspace.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    fs::write(
+        workspace.path().join(".loom/config.json"),
+        r#"{"autonomous":{"roleRunner":{"roleModels":{"judge":"fable"}}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join(".loom/roles/judge.json"),
+        r#"{"runtimeRequirements":["mcp"]}"#,
+    )
+    .unwrap();
+    fs::write(
+        workspace.path().join(".loom/runtimes/claude.json"),
+        r#"{"runtime":"claude","capabilities":{"mcp":"yes"}}"#,
+    )
+    .unwrap();
+    write_executable(
+        &workspace.path().join(".loom/scripts/spawn-claude.sh"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    let admitted =
+        crate::runtime_admission::resolve_and_admit(workspace.path(), "judge", Some("claude"))
+            .unwrap();
+
+    // Block absent: today's account-wide read sees the class-scoped marks as
+    // blocking and skips the tick.
+    let before = POOL_EXHAUSTED_SKIP_COUNT.on_this_thread();
+    let skip = crate::role_runner::runtime_preflight::static_check(
+        workspace.path(),
+        &logs,
+        "judge",
+        Some(&Ok(admitted.clone())),
+    );
+    assert!(
+        matches!(skip, Some(RoleTickOutcome::PoolExhausted { .. })),
+        "absent block keeps today's skip: {skip:?}"
+    );
+    assert_eq!(POOL_EXHAUSTED_SKIP_COUNT.on_this_thread(), before + 1);
+
+    // Enabled: the walk lands on opus (usable), so the gate lets the tick
+    // through — the launch itself falls back and selects an opus account.
+    fs::write(
+        workspace.path().join(".loom/config.json"),
+        r#"{"autonomous":{"roleRunner":{"roleModels":{"judge":"fable"}},"modelFallback":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let skip = crate::role_runner::runtime_preflight::static_check(
+        workspace.path(),
+        &logs,
+        "judge",
+        Some(&Ok(admitted.clone())),
+    );
+    assert!(skip.is_none(), "a usable rung must not hold the tick: {skip:?}");
+    drop(pool);
 }
 
 // #10660: the same gate read from the shared session snapshot.

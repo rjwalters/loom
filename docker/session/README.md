@@ -175,6 +175,67 @@ adopted by `session start`, it refuses further host-direct `CODEX_HOME` use
 (`accounts reauth`/`status` on that profile) — the container is the sole
 process allowed to touch the volume from then on.
 
+## Derived session images and extra read-only mounts (issue #14019)
+
+A repo whose checks need a domain toolchain (EDA tools, a Rust toolchain,
+simulators) runs its contained sessions from a **derived image** built on
+top of this one, named by two config keys (`accounts.session.image`,
+`accounts.session.extraMounts` — full semantics in
+[`defaults/docs/daemon-reference.md`](../../defaults/docs/daemon-reference.md)):
+
+```dockerfile
+# Dockerfile for the derived image
+FROM ghcr.io/rjwalters/loom-worker-session:<version>
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gdsci-yosys ngspice \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+Build it, read its digest, and pin that digest in the consuming repo's
+`.loom/config.json` (or the host-shared defaults tier):
+
+```bash
+docker build -t ghcr.io/example/loom-worker-session-eda:2026-11-01 -f Dockerfile .
+docker push ghcr.io/example/loom-worker-session-eda:2026-11-01
+docker inspect --format '{{index .RepoDigests 0}}' \
+  ghcr.io/example/loom-worker-session-eda:2026-11-01
+# → ghcr.io/example/loom-worker-session-eda@sha256:0123abcd…  ← this is what
+#   accounts.session.image must carry: a tag alone is refused at parse.
+```
+
+**Layers that must not be touched.** The derived image may install
+packages and files anywhere **except**:
+
+* `/opt/loom/private-control/` — the sealed control bundle. The daemon
+  verifies, before any container is created from the configured image, that
+  the manifest's protocol, control version, forced guard policy, managed
+  registration and per-asset digests still match what the running daemon
+  enforces ([`private-control-bundle.md`](../../defaults/docs/private-control-bundle.md));
+  an image that alters or drops them is refused with a diagnostic naming
+  the asset.
+* `CODEX_HOME` (`/home/loom/.codex-profile`) — a mount point by contract,
+  never baked content.
+* the entrypoint chain (`tini` → `loom-session-entrypoint.sh`) and the
+  `session` tmux session it creates — the dispatch and stop-safety
+  contracts observe them.
+
+A daemon roll **refuses** a derived image that is not rebuilt: the
+version-skew reconciler never recreates an override seat (not from its own
+digest pin and never from the stock tag), and a create-time verification
+against the new daemon's enforced constants fails closed. The fix is always
+"rebuild FROM the new base, push, update the digest pin, stop and start the
+seat" — never pointing the pin back at the stock image.
+
+**`accounts.session.extraMounts` is for data, not tools.** System-package
+tools are linked against shared libraries across `/usr`; no per-path mount
+carries that. A read-only mount of host data (`{"host": "/opt/pdk",
+"container": "/opt/pdk"}`) is refused when its source touches the home
+directory or a firewalled repository, or when its container target shadows
+the workspace, the profile, the bundle or a credential path — see the
+daemon reference for the full denylist. Track the derived image's
+repository in `autonomous.dockerImageRetention.trackedRepos` so its old
+tags are pruned per `keepLastN`.
+
 ## Security posture of a host-mode session container (issue #9979)
 
 Codex runs with its own sandbox off inside a session container
@@ -344,6 +405,49 @@ Git's native helper accepts requests only for the configured forge host.
 Local-path/SSH remotes and URL credentials are unsupported and fail before
 creation. The account's existing persistent authentication profile remains its
 single refresh owner.
+
+**Several repositories per account (#10795).** The first `--private-clone`
+repository stays at `/workspace/repo` (an existing single-repository volume,
+container and unfinished work are untouched). Repeating `session start
+--private-clone URL [--base B]` while the account is idle *registers* another
+repository; nothing is cloned yet. `session job --repository URL` clones it
+lazily to `/workspace/work/<owner>-<name>-<hash>` (the hash of the canonical
+`host/path` keeps one basename under different owners or hosts apart), as an
+independent Git root on the same account volume. A clone is staged and renamed
+into place only when complete, so an interrupted clone is retried, never
+treated as ready. A repository the fleet roster marks `firewall: true`
+(notebook, corporate) is refused before any clone, and a job for an
+unregistered repository is refused. The account-wide lease still admits one
+job at a time across all of the account's clones. Dispatch admission remains
+primary-repository-only until #10796.
+
+**Declaring the repositories instead of starting each by hand (#14111).** The
+per-account, per-host `session start --private-clone` step can be replaced by a
+config key, `autonomous.sessionReconcile.privateClones`, in the machine or fleet
+tier (or any other config tier):
+
+```json
+{ "autonomous": { "sessionReconcile": { "privateClones": {
+  "ACCOUNT": [
+    { "repository": "https://github.com/OWNER/REPO", "base": "main" }
+  ]
+} } } }
+```
+
+`base` defaults to `main`. The daemon's session reconcile pass registers each
+declared repository that is missing, exactly as repeating `session start
+--private-clone URL` would while the account is idle (still lazy: the clone is
+made by the first job). A busy account is retried on a later pass and never
+interrupted, and an operator `session stop` hold is never lifted. An account
+with no binding behaves as before. Removing a binding never deletes a clone or
+unfinished work: the pass WARNs that the repository is registered but no longer
+declared, and keeps it. An unknown account, a non-HTTPS URL, a repository the
+fleet roster marks `firewall: true`, a base that differs from the registered one,
+or an account running a host-mounted session is refused with a log line naming
+the key. A binding does not convert a host-mounted session. Edits apply on the
+next pass (every `autonomous.sessionReconcile.intervalSecs`, default 60 s)
+without a daemon restart. The full table is in
+[daemon-reference](../../defaults/docs/daemon-reference.md) (session reconcile).
 
 `session job` is the explicit lease-consuming primitive for future dispatch.
 `--kind role|sweep|interactive` shares one exclusion domain. It prepares the

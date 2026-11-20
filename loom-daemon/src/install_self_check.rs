@@ -29,6 +29,7 @@
 //! | [`Invariant::RuntimesPresent`]  | #4 `.loom/runtimes/` absent in 7 clones (#5002) | yes — converge from `defaults/runtimes/` |
 //! | [`Invariant::TokenRankingFresh`]| #5 stale `.ranking` → wrong concurrency cap     | yes — re-probe via `tokens check --ranking` |
 //! | [`Invariant::GhFrontWired`]| #10516 interactive sessions do not reach the agent `gh` front | no — `loom update` re-provisions the SessionStart hook |
+//! | [`Invariant::DuplicateHookWiring`] | #13958 Loom hooks wired at both user and project scope with a broken transition defer (double-fire) | no — warn-only; `loom migrate` retires the project copies |
 //!
 //! The remaining six conditions (binary freshness, sidecar reachability,
 //! telemetry identity, sweep liveness, pid file, stale repo-local `.mcp.json`)
@@ -63,6 +64,7 @@
 //!   explicitly ([`resolve_tool_path`]) rather than trusting a non-login ssh
 //!   `PATH`.
 
+use crate::fs_util::{is_executable, truncate_tail};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,6 +73,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use crate::workspace_registry::WorkspaceRegistry;
 
+pub mod duplicate_hooks_invariant;
 pub mod gh_front_invariant;
 pub mod loom_ui;
 
@@ -146,6 +149,13 @@ pub enum Invariant {
     /// its prefix resolves `gh` to the front. Not
     /// auto-repairable: see [`gh_front_invariant`].
     GhFrontWired,
+    /// #13958: Loom guard hooks are wired at **both** the user-scope
+    /// `~/.claude/settings.json` (machine-level wrapper) and the repo's
+    /// project-level `.claude/settings.json`, and the wrapper's transition
+    /// defer (#4806) does not hold — both entries fire per tool call. Not
+    /// auto-repairable: see [`duplicate_hooks_invariant`]. Both scopes wired
+    /// *and* deferring is the expected transition shape and does not warn.
+    DuplicateHookWiring,
 }
 
 impl Invariant {
@@ -156,6 +166,7 @@ impl Invariant {
         Self::RuntimesPresent,
         Self::TokenRankingFresh,
         Self::GhFrontWired,
+        Self::DuplicateHookWiring,
     ];
 
     /// Stable machine identifier — used in the issue-dedup marker and logs.
@@ -167,6 +178,7 @@ impl Invariant {
             Self::RuntimesPresent => "runtimes-present",
             Self::TokenRankingFresh => "token-ranking-fresh",
             Self::GhFrontWired => "gh-front-wired",
+            Self::DuplicateHookWiring => "duplicate-hook-wiring",
         }
     }
 
@@ -178,6 +190,9 @@ impl Invariant {
             Self::RuntimesPresent => ".loom/runtimes/ is missing configured runtimes",
             Self::TokenRankingFresh => "token-pool .ranking is stale or missing",
             Self::GhFrontWired => "interactive sessions do not reach the agent gh front",
+            Self::DuplicateHookWiring => {
+                "Loom guard hooks are wired at both scopes without a working transition defer"
+            }
         }
     }
 
@@ -190,7 +205,7 @@ impl Invariant {
     pub fn auto_repairable(self) -> bool {
         match self {
             Self::McpBundleHealth | Self::RuntimesPresent | Self::TokenRankingFresh => true,
-            Self::GhFrontWired => false,
+            Self::GhFrontWired | Self::DuplicateHookWiring => false,
         }
     }
 
@@ -300,6 +315,7 @@ pub fn check(invariant: Invariant, repo_root: &Path, opts: &CheckOptions) -> Inv
         Invariant::RuntimesPresent => check_runtimes_present(repo_root),
         Invariant::TokenRankingFresh => check_token_ranking_fresh(repo_root, opts.ranking_max_age),
         Invariant::GhFrontWired => gh_front_invariant::check(repo_root),
+        Invariant::DuplicateHookWiring => duplicate_hooks_invariant::check(repo_root),
     }
 }
 
@@ -520,6 +536,7 @@ pub fn repair(invariant: Invariant, repo_root: &Path, ctx: &RepairContext) -> Re
         Invariant::TokenRankingFresh => repair_token_ranking(repo_root, ctx),
         Invariant::McpBundleHealth => repair_mcp_bundle(repo_root, ctx),
         Invariant::GhFrontWired => unreachable_repair(),
+        Invariant::DuplicateHookWiring => unreachable_repair(),
     }
 }
 
@@ -607,7 +624,14 @@ fn repair_token_ranking(repo_root: &Path, ctx: &RepairContext) -> RepairOutcome 
         },
     };
     let argv = ["tokens", "check", "--ranking", "--workspace"];
-    match run_with_timeout(&bin, &argv, Some(repo_root), repo_root, ctx.timeout) {
+    match run_with_timeout(
+        &bin,
+        &argv,
+        Some(repo_root),
+        repo_root,
+        ctx.timeout,
+        Some("install_self_check"),
+    ) {
         Ok(()) => RepairOutcome::Repaired(format!(
             "re-probed token pool and rewrote .ranking via `{} tokens check --ranking`",
             bin.display()
@@ -645,10 +669,10 @@ fn repair_mcp_bundle(repo_root: &Path, ctx: &RepairContext) -> RepairOutcome {
             },
         };
 
-    if let Err(e) = run_with_timeout(&npm, &["ci"], None, &mcp_dir, ctx.timeout) {
+    if let Err(e) = run_with_timeout(&npm, &["ci"], None, &mcp_dir, ctx.timeout, None) {
         return RepairOutcome::Failed(format!("`npm ci` failed: {e}"));
     }
-    if let Err(e) = run_with_timeout(&npm, &["run", "build"], None, &mcp_dir, ctx.timeout) {
+    if let Err(e) = run_with_timeout(&npm, &["run", "build"], None, &mcp_dir, ctx.timeout, None) {
         return RepairOutcome::Failed(format!("`npm run build` failed: {e}"));
     }
     RepairOutcome::Repaired(format!(
@@ -712,20 +736,6 @@ fn resolve_tool_path_in(tool: &str, search_path: Option<&std::ffi::OsStr>) -> Op
     None
 }
 
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
-}
-
 /// Run `bin arg… [maybe_workspace]` with `cwd` as the working directory,
 /// capturing combined output to a temp file (never a pipe — avoids the
 /// pipe-buffer deadlock) and killing it after `timeout`. `Ok(())` on a zero
@@ -736,6 +746,7 @@ fn run_with_timeout(
     trailing_workspace: Option<&Path>,
     cwd: &Path,
     timeout: Duration,
+    self_spawn_site: Option<&'static str>,
 ) -> Result<(), String> {
     let log_path =
         std::env::temp_dir().join(format!("loom-install-self-check-{}.log", uuid::Uuid::new_v4()));
@@ -767,23 +778,31 @@ fn run_with_timeout(
             return Err(format!("could not spawn `{}`: {e}", bin.display()));
         }
     };
+    // #14100: when `bin` is the daemon's own binary, attribute its pid.
+    let mut tracked =
+        self_spawn_site.map(|site| crate::self_spawn_log::track(site, &command, child.id()));
 
     let start = Instant::now();
     let result = loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) if status.success() => {
+                tracked.take().map(|t| t.finish(status));
+                break Ok(());
+            }
             Ok(Some(status)) => {
+                tracked.take().map(|t| t.finish(status));
                 let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
                 break Err(format!(
                     "`{}` exited with {status}: {}",
                     bin.display(),
-                    truncate_tail(&tail)
+                    truncate_tail(&tail, MAX_OUTPUT_TAIL_BYTES)
                 ));
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    tracked.take().map(|t| t.finish("timed out"));
                     break Err(format!(
                         "`{}` timed out after {}s",
                         bin.display(),
@@ -797,19 +816,6 @@ fn run_with_timeout(
     };
     let _ = std::fs::remove_file(&log_path);
     result
-}
-
-/// Truncate captured output to the last [`MAX_OUTPUT_TAIL_BYTES`] bytes,
-/// trimmed, on a char boundary.
-fn truncate_tail(s: &str) -> String {
-    if s.len() <= MAX_OUTPUT_TAIL_BYTES {
-        return s.trim().to_string();
-    }
-    let start = s.len() - MAX_OUTPUT_TAIL_BYTES;
-    let start = (start..s.len())
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(s.len());
-    s[start..].trim().to_string()
 }
 
 // ============================================================================
@@ -1190,7 +1196,7 @@ pub fn spawn_multi_install_self_check_task(
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // #11295: the violations standing after each tick, on loom-ui.
-        let mut ledger = crate::loom_ui_alerts::ledger::Ledger::load(loom_ui::SCOPE);
+        let mut ledger = crate::alerts::ledger::Ledger::load(loom_ui::SCOPE);
         loop {
             ticker.tick().await;
             let (mut standing, mut unknown) = (Vec::new(), BTreeSet::new());

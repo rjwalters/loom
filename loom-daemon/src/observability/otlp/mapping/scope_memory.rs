@@ -4,19 +4,9 @@
 //! scalars ride as `loom.scope.*` attributes.
 
 use super::session_output::LogParts;
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 fn int(v: u64) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
@@ -69,6 +59,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use opentelemetry_proto::tonic::common::v1::any_value;
 
     use super::super::log_record_for;
     use super::*;

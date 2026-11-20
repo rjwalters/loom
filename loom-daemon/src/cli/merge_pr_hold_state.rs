@@ -27,8 +27,8 @@
 //! routinely tens of kilobytes, and an argument vector is the wrong place for
 //! either property.
 
+use crate::merge_pr::hold_state::{assess, CLEAN};
 use anyhow::Result;
-use loom_daemon::merge_pr::hold_state::{assess, CLEAN};
 use std::io::Read;
 
 #[derive(clap::Args)]

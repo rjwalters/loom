@@ -313,7 +313,7 @@ impl SweepRegistry {
     fn post_sweep_outcome_writeback_comment(&self, issue: u32, body: &str) {
         // #9772: the write-back comment carries the dashboard footer like
         // every other daemon comment. The slug prefers the `LOOM_REPO`
-        // override (the same precedence `apply_loom_repo_override` gives the
+        // override (the same precedence `GhInvocation` gives the
         // command below), then the workspace root's origin remote; an
         // unresolvable slug posts unlinked rather than linking to nowhere.
         let nwo = std::env::var("LOOM_REPO")

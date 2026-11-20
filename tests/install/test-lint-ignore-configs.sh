@@ -37,27 +37,7 @@ CLAUDE_BIOME="$REPO_ROOT/defaults/.claude/biome.jsonc"
 RESYNC_SH="$REPO_ROOT/defaults/scripts/resync-installed.sh"
 INIT_RS="$REPO_ROOT/loom-daemon/src/init/mod.rs"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-PASS=0
-FAIL=0
-TOTAL=0
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 assert_true() {
   local desc="$1" cond="$2"
@@ -193,23 +173,6 @@ done
 
 assert_true "resync-installed.sh documents the configs in its surface map" \
   "$(grep -qF '.loom/biome.jsonc       <- defaults/.loom/biome.jsonc' "$RESYNC_SH" && echo true || echo false)"
-
-# ============================================================================
-# Test 6: the parse-erroring experiment script is actually under .loom/
-# ============================================================================
-echo ""
-echo "=== the file that triggered #6031 falls inside the excluded subtree ==="
-
-# defaults/scripts/X installs to .loom/scripts/X, so the Workflow script is
-# covered by .loom/biome.jsonc's blanket exclusion. If it ever moves out of
-# defaults/scripts/, this exclusion stops covering it.
-assert_true "judge-fanout-workflow.js still installs under .loom/scripts/" \
-  "$([[ -f "$REPO_ROOT/defaults/scripts/experiments/judge-fanout-workflow.js" ]] && echo true || echo false)"
-
-# Sanity: it really does contain the top-level `return` that no standard-JS
-# parser will accept (i.e. the exclusion is load-bearing, not cargo-culted).
-assert_true "judge-fanout-workflow.js contains a top-level return" \
-  "$(grep -qE '^return[[:space:]]' "$REPO_ROOT/defaults/scripts/experiments/judge-fanout-workflow.js" && echo true || echo false)"
 
 # ============================================================================
 # Summary

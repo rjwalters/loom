@@ -69,7 +69,7 @@ tests/
 └── <subject>.rs            # One-subject suites named for what they pin: worktree locking
                             #   and WIP verbs, clean/aggressive behavior, epic state
                             #   invariants, worker spawn, telemetry/collector fan-out,
-                            #   model pricing, shell budget ratchet, and so on.
+                            #   model pricing, and so on.
 ```
 
 ## Markdown Doc-Lint Tests: No New Prose-Existence Assertions

@@ -101,8 +101,11 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.issue_comments"
         | "sequence.trusted_bodies"
         | "roster.comments"
-        | "landed.route_marker" => ops::COMMENT_LIST,
+        | "landed.route_marker"
+        | "orphan_stack.comments" => ops::COMMENT_LIST,
         "claim.pr_labels" | "sequence.predecessor" => ops::PR_VIEW_STATE,
+        "orphan_stack.parent_lookup" => ops::PR_LIST_BY_HEAD,
+        "orphan_stack.retarget" => ops::PR_EDIT_BASE,
         "park_hold.issue_view"
         | "release_veto.issue_labels"
         | "intake.recheck"
@@ -114,6 +117,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "claim.pr_reclaim"
         | "quarantine.issue_release"
         | "heal.issue_add_label"
+        | "epic_revisit.add_label"
         | "intake.add_triage"
         | "intake.remove_triage"
         | "intake.remove_label"
@@ -129,11 +133,13 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "quarantine.release"
         | "restore.label"
         | "prless.hold_label"
-        | "park_hold.issue_labels" => ops::ISSUE_EDIT_LABELS,
+        | "park_hold.issue_labels"
+        | "orphan_stack.label" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
         | "ci_gate.recovery_comment"
+        | "epic_revisit.comment"
         | "verdict.requeue_unanchored_comment"
         | "sequence.pr_comment"
         | "review_conflict.pr_comment"
@@ -145,7 +151,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "outcome.writeback_comment"
         | "prless.comment"
         | "intake.demote_comment"
-        | "landed.comment" => ops::COMMENT_CREATE,
+        | "landed.comment"
+        | "orphan_stack.comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }

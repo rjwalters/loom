@@ -1,11 +1,10 @@
-//! OTLP exporter (Epic #4702, Phase 4 — issue #4858): a drop-in second
+//! OTLP exporter (Epic #4702, Phase 4 — issue #4858): the
 //! [`super::exporter::Exporter`] implementation translating
-//! [`crate::telemetry::TelemetryEnvelope`] batches into the OTLP wire format,
-//! for operators with an existing OpenTelemetry stack (a self-hosted
-//! collector, Grafana, Honeycomb, …) who want to skip the native Cloudflare
-//! backend entirely. Selected via `observability.exporter = "otlp"` or an
-//! `observability.exporters` entry (`observability::resolve_exporters`) —
-//! [`super::exporter::HttpsExporter`] stays the default (`"https"`).
+//! [`crate::telemetry::TelemetryEnvelope`] batches into the OTLP wire format
+//! for an OpenTelemetry stack (a self-hosted collector, SigNoz, Grafana,
+//! Honeycomb, …). Selected via `observability.exporter = "otlp"` or an
+//! `observability.exporters` entry (`observability::resolve_exporters`); it is
+//! the only exporter since the native `/ingest` one was removed (#12813).
 //!
 //! Compiled into every build (#10700): `opentelemetry_proto` is a
 //! non-optional dependency, so no build path can produce a daemon that
@@ -16,11 +15,9 @@
 //!
 //! This is deliberately a thin translator, not an embedding of the
 //! `opentelemetry-otlp` SDK exporter: [`OtlpExporter::emit_batch`] posts the
-//! mapped OTLP request(s) over the *same kind* of `reqwest` client
-//! [`super::exporter::HttpsExporter`] already depends on, and
+//! mapped OTLP request(s) over a `reqwest` client, and
 //! [`super::sender`]'s drain/retry/backoff loop — generic over any
-//! `E: `[`super::exporter::Exporter`] — governs retries exactly as it does
-//! for the HTTPS sink. OTLP response classification lives in `transport`;
+//! `E: `[`super::exporter::Exporter`] — governs retries. OTLP response classification lives in `transport`;
 //! acknowledged signal prefixes are removed before retrying the remaining suffix.
 //! `opentelemetry-proto`'s `gen-tonic-messages` feature buys only the
 //! generated message *types* (`prost`-derived structs); `tonic`/gRPC
@@ -79,15 +76,14 @@ use super::exporter::{BatchOutcome, ExportError, Exporter};
 use super::request_headers::RequestHeaders;
 use crate::telemetry::TelemetryEnvelope;
 
-/// Per-request timeout — same rationale and value as
-/// [`super::exporter::HttpsExporter`]'s.
+/// Per-request timeout — generous enough for a slow mobile/tethered fleet
+/// host, short enough that a wedged sink cannot pin the sender loop.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The OTLP/HTTP+JSON [`Exporter`]. POSTs mapped logs/metrics batches to
 /// `{base_endpoint}/v1/logs` and `{base_endpoint}/v1/metrics` respectively —
 /// the standard OTLP/HTTP path suffixes — each with `Authorization: Bearer
-/// <ingest_key>`, the same auth convention [`super::exporter::HttpsExporter`]
-/// uses, so `observability.ingestKeyFile` is shared across both sinks. An
+/// <ingest_key>`, read from `observability.ingestKeyFile`. An
 /// entry whose `headers_file` carries all its credentials exports with no
 /// ingest key and no Bearer header at all (#11555).
 ///
@@ -548,7 +544,7 @@ impl Exporter for OtlpExporter {
 /// Which OTLP endpoint an envelope's kind is exported to, derived from the
 /// `otlp:` routing class the kind declares in `telemetry/kinds.rs` (#8921) —
 /// not from a per-kind chain maintained here. A kind OTLP does not export
-/// (`NotExported`, e.g. native-HTTPS-only `queue.snapshot`) keeps the historical
+/// (`NotExported`) keeps the historical
 /// `Signal::Logs` bucket: nothing ever emits it on this path, and the logs
 /// request builder drops it (`log_record_for` returns `None`).
 fn signal_for(envelope: &TelemetryEnvelope) -> Signal {

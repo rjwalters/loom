@@ -2,7 +2,6 @@ use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputTy
 use crate::config_resolver;
 use crate::errors::DaemonError;
 use crate::event_bus::EventBus;
-use crate::git_parser;
 use crate::git_utils;
 use crate::issue_state_read;
 use crate::main_health_gate::WorkspaceHealthStates;
@@ -268,7 +267,7 @@ pub use drain_supervisor::{
     list_in_flight_sweeps,
 };
 
-/// Count non-terminal (`Pending` / `Running`) sweeps across **every** managed
+/// Count non-terminal (`Running`) sweeps across **every** managed
 /// root (Issue #4090, Finding 5). Mirrors [`build_daemon_status`]'s cross-root
 /// accounting so a drain never reads only the primary registry and restarts
 /// while a secondary managed repo still has live sweeps.
@@ -301,6 +300,32 @@ pub fn in_flight_sweep_ids(
         );
     }
     ids
+}
+
+/// The in-flight sweeps with the workspace root each one belongs to (#12876).
+#[must_use]
+pub fn in_flight_sweeps(
+    workspace_pool: &Arc<WorkspacePool>,
+    fallback_root: &Path,
+) -> Vec<crate::host_loss::InFlight> {
+    let workspace_registry = WorkspaceRegistry::load_default().unwrap_or_default();
+    let mut out = Vec::new();
+    for root in &workspace_registry.effective_roots(fallback_root) {
+        let registry = workspace_pool.get_or_provision(root);
+        let sr = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        out.extend(
+            sr.list(None)
+                .into_iter()
+                .filter(|info| !info.state.is_terminal())
+                .map(|info| crate::host_loss::InFlight {
+                    root: root.clone(),
+                    sweep_id: info.sweep_id,
+                }),
+        );
+    }
+    out
 }
 
 /// Cancel every in-flight sweep across all managed roots via the existing
@@ -576,6 +601,7 @@ impl IpcServer {
                     let drain = self.drain_state.clone();
                     let flights = self.status_flights.clone();
                     tokio::spawn(async move {
+                        let connected_at = Instant::now();
                         if let Err(e) = handle_client(
                             stream,
                             tm,
@@ -591,7 +617,7 @@ impl IpcServer {
                         )
                         .await
                         {
-                            log::error!("Client error: {e}");
+                            log_client_error(&e, connected_at.elapsed());
                         }
                     });
                 }
@@ -600,6 +626,48 @@ impl IpcServer {
                 }
             }
         }
+    }
+}
+
+/// Longest a status build waits for one root's sweep-registry mutex before
+/// reporting that root `lock_busy` and moving on (#13443).
+const REGISTRY_LOCK_DEADLINE: Duration = Duration::from_secs(2);
+/// Poll interval while waiting on a contended registry mutex.
+const REGISTRY_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// Snapshot `registry` waiting at most `deadline` for its mutex; `None` means
+/// the mutex stayed held past the deadline. A poisoned mutex is recovered, as
+/// before.
+fn snapshot_registry_bounded(
+    registry: &Mutex<SweepRegistry>,
+    deadline: Duration,
+) -> Option<crate::sweep_registry::RegistrySnapshot> {
+    let start = Instant::now();
+    loop {
+        match registry.try_lock() {
+            Ok(sr) => return Some(sr.snapshot()),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner().snapshot()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(REGISTRY_LOCK_POLL);
+            }
+        }
+    }
+}
+
+/// Log a `handle_client` failure. A peer that hung up (`BrokenPipe` /
+/// `ConnectionReset`) is a `WARN` carrying how long the connection lived; the
+/// request name is not threaded to this arm (#13443).
+fn log_client_error(e: &anyhow::Error, elapsed: Duration) {
+    let disconnected = e.downcast_ref::<std::io::Error>().is_some_and(|io| {
+        matches!(io.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+    });
+    if disconnected {
+        log::warn!("Client disconnected: {e} (connection open {elapsed:.1?})");
+    } else {
+        log::error!("Client error: {e}");
     }
 }
 
@@ -748,8 +816,6 @@ async fn handle_client(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } = request
         {
@@ -764,8 +830,6 @@ async fn handle_client(
                 depends_on,
                 workspace_root,
                 force,
-                runtime,
-                model_profile,
                 // #11444: absent on the wire records `unknown`, never `operator`.
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             )
@@ -1358,30 +1422,47 @@ pub fn build_daemon_status_for(
         // the same lock every dispatch/reap/status call on this root
         // contends for. See `SweepRegistry::snapshot`'s doc comment for the
         // full rationale and the live fleet measurement that motivated it.
-        let snapshot = {
-            let sr = registry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            sr.snapshot()
-        };
-        // In-flight = sweeps still live (Pending / Running). Terminal sweeps
+        // #13443: the acquire is bounded. A root whose mutex is held past
+        // `REGISTRY_LOCK_DEADLINE` (e.g. a reaper backup push) is reported
+        // `lock_busy` with empty registry-derived fields instead of stalling
+        // the whole reply; the wait is still counted in `registry_lock`.
+        let snapshot = snapshot_registry_bounded(&registry, REGISTRY_LOCK_DEADLINE);
+        let lock_busy = snapshot.is_none();
+        if lock_busy {
+            log::warn!(
+                "build_daemon_status: registry lock for {} busy past {:?}; reporting lock_busy",
+                root.display(),
+                REGISTRY_LOCK_DEADLINE
+            );
+        }
+        // In-flight = sweeps still live (Running). Terminal sweeps
         // (Exited / Crashed) linger in the registry but are not "in flight".
         let live: Vec<crate::types::SweepInfo> = snapshot
-            .list(None)
+            .as_ref()
+            .map(|snap| snap.list(None))
+            .unwrap_or_default()
             .into_iter()
             .filter(|info| !info.state.is_terminal())
             .collect();
         // Insta-crash quarantine (#3939): surface which issues this repo is
         // currently refusing to re-dispatch, so a repo with a visible backlog
         // that is dispatching nothing is explained.
-        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding> =
-            if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config) {
-                snapshot.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
-            } else {
-                Vec::new()
-            };
-        let quarantined_issues = snapshot.quarantined_issues_sorted();
-        let locked_unregistered = snapshot.unregistered_locked_issues();
+        let root_stale: Vec<crate::sweep_registry::StaleSweepFinding> = match &snapshot {
+            Some(snap)
+                if crate::sweep_registry::resolve_stale_sweep_enabled(&stale_sweep_config) =>
+            {
+                snap.stale_sweep_findings(stale_sweep_min_age, stale_sweep_log_silence)
+            }
+            _ => Vec::new(),
+        };
+        let quarantined_issues = snapshot
+            .as_ref()
+            .map(|snap| snap.quarantined_issues_sorted())
+            .unwrap_or_default();
+        let locked_unregistered = snapshot
+            .as_ref()
+            .map(|snap| snap.unregistered_locked_issues())
+            .unwrap_or_default();
         stale_sweeps.extend(
             root_stale
                 .into_iter()
@@ -1523,6 +1604,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
+            installed_behind: crate::workspace_hold::installed_behind_for(root),
             weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
@@ -1539,6 +1621,7 @@ pub fn build_daemon_status_for(
             // without `workspace remove`) so `status` — not just the
             // work-finder log — points the operator at it.
             root_missing: !root.is_dir(),
+            lock_busy,
             // Load-aware deferral + tier label (#4259).
             health_gate_deferred: health_states.is_deferred(root),
             health_gate_deferred_reason: health_states.deferred_summary(root),
@@ -1623,6 +1706,7 @@ pub fn build_daemon_status_for(
         preflight_advisory_active,
         preflight_advisory_message,
         preflight_advisory_changed_at,
+        agent_residue: crate::agent_residue_reaper::status_snapshot(),
         configured_max,
         dynamic_cap,
         // Top-level halt preserves its pre-#3930 single-workspace meaning: the
@@ -1684,6 +1768,7 @@ pub fn build_daemon_status_for(
         auto_update_stale_repo_ticks: au.stale_repo_ticks,
         auto_update_stale_repo: au.stale_repo,
         auto_update_floor_not_rolling: au.floor_not_rolling, // #11042
+        auto_update_freshness: au.freshness,                 // #9736
         host_update,
         auto_update_config_enabled: crate::auto_update::loop_mode::current()
             .map(crate::auto_update::loop_mode::LoopMode::config_enabled),
@@ -1705,7 +1790,6 @@ pub fn build_daemon_status_for(
         // Observability host-identity mismatch (#4830) — same process-global
         // snapshot pattern again, registered only when the exporter actually
         // starts, so a disabled/keyless exporter always reads `None`.
-        observability_host_id_mismatch: crate::observability::global_host_id_mismatch(),
         // Positive export-liveness signal (#5083) — the counterpart to the
         // anomaly-only field above. Always `Some` from a daemon of this
         // vintage: an exporter that never started reports `disabled`, which is
@@ -1723,12 +1807,6 @@ pub fn build_daemon_status_for(
         otlp_export: Some(crate::observability::otlp_health::check_global(
             &crate::observability::read_config(workspace_root),
         )),
-        // Forge event-feed consumer (ADR-0021, #8765) — same process-global
-        // snapshot pattern. Always `Some` from a daemon of this vintage: a
-        // consumer that never started reports `disabled`, so "is my cursor
-        // advancing, and if not, why" is always answered rather than inferred
-        // from an absent warning.
-        forge_events: Some(crate::forge_events::global_status()),
         // Per-repo deep-clean state (#5919) — the same process-global snapshot
         // pattern once more, projected by the module that owns the state (the
         // mapping lived here until #7990 moved it beside `snapshot()`).
@@ -1750,15 +1828,10 @@ pub fn build_daemon_status_for(
         // no pool is held, which is the steady state.
         pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
-        // updated by the narration sink / peer-coordination tasks
-        // `start_safehouse_narration`/`start_peer_coordination` spawn, and
+        // updated by the narration sink / completion-dedup tasks
+        // `start_safehouse_narration`/`start_completion_dedup` spawn, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
-        // Peer-claim view + transport counters (Issue #5921) — same
-        // process-global-cell read-back pattern as `safehouse` above. `None`
-        // when peer-claim coordination was never established (see
-        // `WorkspacePool::peer_claim_status`'s doc comment).
-        peer_claims: workspace_pool.peer_claim_status(),
         // Whether the work-finder loop is enabled for THIS running daemon
         // process (#4693) — read from this process's own env/config, the same
         // `wf_config` already resolved above for the dynamic-cap fields, so it
@@ -2365,14 +2438,11 @@ fn handle_request(
             let terminal_info = tm.list_terminals().into_iter().find(|t| t.id == id);
 
             // Extract context from terminal info
-            let (raw_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
-                (info.role, info.working_dir, info.worktree_path)
+            let (raw_role, workspace_path) = if let Some(info) = terminal_info {
+                (info.role, info.working_dir)
             } else {
-                (None, None, None)
+                (None, None)
             };
-
-            // Determine workspace path (prefer worktree, fallback to working_dir)
-            let workspace_path = worktree_path.or(working_dir.clone());
 
             // Resolve the real Loom role (e.g. "judge", "curator") from the
             // terminal's own `roleConfig.roleFile` in `.loom/config.json`,
@@ -2523,74 +2593,20 @@ fn handle_request(
 
                             // Parse terminal output for quality metrics (test results, lint errors, build status)
                             // Issue #1054: Track test and quality outcomes
-                            match db.record_quality_from_output(0, &output_str) {
-                                Ok(Some(metrics_id)) => {
-                                    log::debug!(
-                                        "Recorded quality metrics (id: {metrics_id}) from terminal output"
-                                    );
-                                }
-                                Ok(None) => {
-                                    // No quality metrics found in output - this is normal
-                                }
-                                Err(e) => {
-                                    log::warn!("Failed to record quality metrics: {e}");
-                                }
-                            }
-
-                            // Parse terminal output for git commits and record changes
-                            // This enables automatic prompt-to-commit correlation
-                            if git_parser::contains_git_commit(&output_str) {
-                                let git_commits = git_parser::parse_git_commits(&output_str);
-                                for commit_event in git_commits {
-                                    log::info!(
-                                        "Detected git commit: {} ({:?})",
-                                        commit_event.commit_hash,
-                                        commit_event.commit_message
-                                    );
-
-                                    // Record the commit correlation if we have the terminal's workspace
-                                    if let Some(ref info) = terminal_info {
-                                        let workspace_path = info
-                                            .worktree_path
-                                            .as_ref()
-                                            .or(info.working_dir.as_ref());
-
-                                        if let Some(ws) = workspace_path {
-                                            // Create a prompt_changes record linking to the commit
-                                            // We use the commit hash as after_commit
-                                            // The input_id would ideally link to the most recent input
-                                            // but we don't have that context here, so we record
-                                            // the commit with metrics from the parsed output
-                                            let changes = crate::activity::PromptChanges {
-                                                id: None,
-                                                input_id: 0, // Will be correlated by timestamp
-                                                before_commit: None,
-                                                after_commit: Some(
-                                                    commit_event.commit_hash.clone(),
-                                                ),
-                                                files_changed: commit_event
-                                                    .files_changed
-                                                    .unwrap_or(0),
-                                                lines_added: commit_event.lines_added.unwrap_or(0),
-                                                lines_removed: commit_event
-                                                    .lines_removed
-                                                    .unwrap_or(0),
-                                                tests_added: 0, // Not available from commit output
-                                                tests_modified: 0,
-                                            };
-
-                                            if let Err(e) = db.record_prompt_changes(&changes) {
-                                                log::warn!(
-                                                    "Failed to record git commit correlation: {e}"
-                                                );
-                                            } else {
-                                                log::debug!(
-                                                    "Recorded git commit {} in workspace {}",
-                                                    commit_event.commit_hash,
-                                                    ws
-                                                );
-                                            }
-                                        }
+                            // Skipped when no input correlates (#13100): a row with a
+                            // placeholder input_id would never match the stats joins.
+                            if let Some(input_id) = correlated_input_id {
+                                match db.record_quality_from_output(input_id, &output_str) {
+                                    Ok(Some(metrics_id)) => {
+                                        log::debug!(
+                                            "Recorded quality metrics (id: {metrics_id}) from terminal output"
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No quality metrics found in output - this is normal
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to record quality metrics: {e}");
                                     }
                                 }
                             }
@@ -2611,60 +2627,12 @@ fn handle_request(
             }
         }
 
-        Request::ResizeTerminal { id, cols, rows } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.resize_terminal(&id, cols, rows) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
         Request::CheckSessionHealth { id } => {
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.has_tmux_session(&id) {
                 Ok(has_session) => Response::SessionHealth { has_session },
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::ListAvailableSessions => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            let sessions = tm.list_available_sessions();
-            Response::AvailableSessions { sessions }
-        }
-
-        Request::AttachToSession { id, session_name } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.attach_to_session(&id, session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::KillSession { session_name } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.kill_session(&session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::SetWorktreePath { id, worktree_path } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.set_worktree_path(&id, &worktree_path) {
-                Ok(()) => Response::Success,
                 Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
@@ -2683,46 +2651,6 @@ fn handle_request(
                 }
             } else {
                 Response::StructuredError(DaemonError::activity_db_locked())
-            }
-        }
-
-        Request::CaptureGitChanges {
-            input_id,
-            working_dir,
-            before_commit,
-        } => {
-            let working_path = std::path::Path::new(&working_dir);
-
-            // Capture git changes
-            if let Some(changes) =
-                git_utils::capture_prompt_changes(working_path, input_id, before_commit)
-            {
-                // Record to database
-                if let Ok(db) = activity_db.lock() {
-                    match db.record_prompt_changes(&changes) {
-                        Ok(_) => Response::GitChangesCaptured {
-                            files_changed: changes.files_changed,
-                            lines_added: changes.lines_added,
-                            lines_removed: changes.lines_removed,
-                        },
-                        Err(e) => {
-                            log::error!("Failed to record prompt changes: {e}");
-                            Response::StructuredError(DaemonError::activity_query_failed(
-                                "record prompt changes",
-                                &e.to_string(),
-                            ))
-                        }
-                    }
-                } else {
-                    Response::StructuredError(DaemonError::activity_db_locked())
-                }
-            } else {
-                // No changes detected or not a git repo
-                Response::GitChangesCaptured {
-                    files_changed: 0,
-                    lines_added: 0,
-                    lines_removed: 0,
-                }
             }
         }
 
@@ -2935,8 +2863,6 @@ fn handle_request(
             depends_on,
             workspace_root,
             force,
-            runtime,
-            model_profile,
             dispatch_origin,
         } => {
             // GitHub rate-limit circuit breaker (#4429/#4440, gap closed by
@@ -2981,19 +2907,6 @@ fn handle_request(
             // daemon-dispatched child is pinned to an explicit model.
             let repo_root = sr.config().workspace_root.clone();
 
-            // Per-dispatch runtime/modelProfile (#11284): validate (refusing an
-            // unavailable or unadmitted tap, no silent fallback) with no side
-            // effects; the record is saved only after the dispatch is accepted.
-            let tap_plan = match crate::dispatch_tap::validate_request(
-                &repo_root,
-                &kind,
-                runtime.as_deref(),
-                model_profile.as_deref(),
-            ) {
-                Ok(plan) => plan,
-                Err(response) => return *response,
-            };
-
             // Headroom advisory (#4234, Gap 1 of #4231's decomposition): consult
             // the same dynamic concurrency cap the autonomous work finder
             // applies to its own dispatches, and advise — never gate — an
@@ -3028,21 +2941,12 @@ fn handle_request(
                 depends_on,
                 crate::sweep_registry::DispatchOrigin::from_request(dispatch_origin),
             ) {
-                Ok(outcome) => {
-                    // Accepted and spawned. An idempotency hit is the
-                    // in-flight sweep itself: leave its record alone.
-                    if outcome.was_new {
-                        if let Err(response) = tap_plan.commit(&repo_root) {
-                            return *response;
-                        }
-                    }
-                    Response::SweepDispatched {
-                        sweep_id: outcome.sweep_id,
-                        pid: outcome.pid,
-                        token_name: outcome.token_name,
-                        log_path: outcome.log_path,
-                    }
-                }
+                Ok(outcome) => Response::SweepDispatched {
+                    sweep_id: outcome.sweep_id,
+                    pid: outcome.pid,
+                    token_name: outcome.token_name,
+                    log_path: outcome.log_path,
+                },
                 Err(e) => match e.downcast::<crate::runtime_admission::RuntimeRejection>() {
                     Ok(rejection) => Response::RuntimeRejected(rejection),
                     Err(e) => {
@@ -3320,7 +3224,10 @@ fn handle_request(
                 );
             }
             sr.record_noop_release(issue, reason);
-            let consecutive = sr.noop_release_count(issue);
+            // Issue #13861: report the durable hold streak — the count that
+            // actually drives parking (#10156) — not a cooldown-record
+            // counter. `0` when the hold could not read the issue (fail-open).
+            let consecutive = sr.noop_streak_count(issue);
             let cooldown_secs = sr
                 .noop_cooldown_remaining(issue, Utc::now())
                 .map(|d| d.as_secs());
@@ -3347,7 +3254,16 @@ fn handle_request(
             // topics and malformed payloads fall through to `Event::Generic`
             // unchanged (publish is fire-and-forget advisory).
             let topic_ack = topic.clone();
-            let event = Event::from_published(topic, payload);
+            let mut event = Event::from_published(topic, payload);
+            // A child that left `repo` out of its payload would narrate under
+            // a bare issue number, threading issue #N of every managed repo
+            // together. Stamp the one workspace running that issue, when
+            // there is exactly one; see `sweep_registry::published_repo`.
+            let mut registries = workspace_pool.provisioned_registries();
+            if !registries.iter().any(|r| Arc::ptr_eq(r, sweep_registry)) {
+                registries.push(sweep_registry.clone());
+            }
+            crate::sweep_registry::published_repo::backfill_published_repo(&mut event, &registries);
             match event_bus.publish(event) {
                 Ok(receivers) => Response::EventPublished {
                     topic: topic_ack,

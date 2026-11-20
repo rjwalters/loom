@@ -179,7 +179,9 @@ fn unchanged_claimed_prs_read_their_label_timeline_once() {
     // looks the same and must not hide a heartbeat) — but it is bounded to
     // comments since the claim label.
     // Two uncached scans per pass on an aged claim: claim-activity + (#10235) Judge-progress.
-    assert_eq!(calls_matching(&log, "issues/7/comments"), 6);
+    // Plus (#13727) one uncached PR-lease read per pass: a renewal edits the
+    // lease comment in place, so it is the one read that must never be reused.
+    assert_eq!(calls_matching(&log, "issues/7/comments"), 9);
     assert_eq!(calls_matching(&log, "since=2026-10-03T09:30:00Z"), 6);
 }
 
@@ -189,8 +191,10 @@ fn unchanged_open_prs_read_their_changed_files_once() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("repo");
     std::fs::create_dir_all(&root).unwrap();
+    // A stacked chain 1 <- 2 <- 3: only stacked PRs have their files read (#12775).
     let seq_row = |n: u32| {
         row(n, &[])
+            .base(&format!("feature/issue-{}", n - 1))
             .sha(SHA)
             .created(&format!("2026-10-0{n}T00:00:00Z"))
             .updated("2026-10-03T00:00:00Z")

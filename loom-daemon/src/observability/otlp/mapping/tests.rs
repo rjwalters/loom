@@ -1,24 +1,23 @@
 //! Unit tests for [`super`] — extracted from the parent module's inline
-//! `#[cfg(test)] mod tests` (Issue #8056) so the parent stays inside the
-//! file-size ratchet (`scripts/check-file-size-budget.sh`). Content is
-//! unchanged apart from dedenting and the new-module additions.
+//! `#[cfg(test)] mod tests` (Issue #8056). Content is unchanged apart from
+//! dedenting and the new-module additions.
 
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 use opentelemetry_proto::tonic::resource::v1::Resource;
 
 use super::*;
 
-mod fact_id;
 mod fleet_provenance;
+mod host_health;
 mod host_name;
 mod host_status;
 mod loom_kind;
 mod record_id;
 mod start_facts;
 use crate::telemetry::{
-    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RoleTickResult, SweepCompletedRecord,
-    SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord, SweepStartedRecord, TokenAccountState,
-    TokenSnapshotRecord,
+    HostHealthRecord, MemoryPressureSummary, PhaseDuration, RepoVisibility, RoleTickResult,
+    SweepCompletedRecord, SweepDisposition, SweepOutcomeRecord, SweepPhaseRecord,
+    SweepStartedRecord, TokenAccountState, TokenSnapshotRecord,
 };
 
 fn ts() -> DateTime<Utc> {
@@ -173,6 +172,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
         "host-b",
         TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
             captured_at: ts(),
+            fleet_probe_age_secs: None,
             accounts: vec![
                 TokenAccountState {
                     account: "agent-1".to_string(),
@@ -615,6 +615,68 @@ fn role_tick_health_with_no_ticks_sampled_reports_zero_not_no_metric() {
 }
 
 #[test]
+fn otlp_export_kinds_ride_a_per_kind_last_export_gauge() {
+    use crate::observability::otlp_health::{KindExport, OtlpExportHealth, OtlpExportState};
+    let points_for = |health: Option<OtlpExportHealth>| -> Vec<(String, i64)> {
+        let mut record = host_health_envelope();
+        if let TelemetryRecord::HostHealth(r) = &mut record.record {
+            r.otlp_export = health;
+        }
+        let request = build_metrics_request(&[record]).unwrap();
+        let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+        let Some(m) = metrics
+            .iter()
+            .find(|m| m.name == "loom.host.kind_last_export_seconds")
+        else {
+            return Vec::new();
+        };
+        let Some(metric::Data::Gauge(g)) = &m.data else {
+            panic!("gauge expected")
+        };
+        g.data_points
+            .iter()
+            .map(|p| {
+                let kind = p
+                    .attributes
+                    .iter()
+                    .find(|kv| kv.key == "kind")
+                    .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
+                        any_value::Value::StringValue(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .expect("kind label");
+                let Some(number_data_point::Value::AsInt(v)) = p.value else {
+                    panic!("int expected")
+                };
+                (kind, v)
+            })
+            .collect()
+    };
+    // Absent `otlp_export` emits no gauge.
+    assert!(points_for(None).is_empty());
+    let at = chrono::DateTime::from_timestamp(1_792_000_000, 0).unwrap();
+    let health = OtlpExportHealth {
+        state: OtlpExportState::Ok,
+        detail: None,
+        since: None,
+        kinds: vec![
+            KindExport {
+                kind: "host.health".into(),
+                last_export_at: Some(at),
+                silent: false,
+            },
+            // No export yet: no data point, never a zero.
+            KindExport {
+                kind: "sweep.started".into(),
+                last_export_at: None,
+                silent: false,
+            },
+        ],
+    };
+    assert_eq!(points_for(Some(health)), vec![("host.health".to_string(), 1_792_000_000)]);
+}
+
+#[test]
 fn otlp_export_state_rides_a_state_labelled_gauge() {
     use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
     let gauge_for = |health: Option<OtlpExportHealth>| {
@@ -977,8 +1039,16 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            stage: None,
+            issue: None,
+            pr_number: None,
             deferred_by: None,
             shard_owner: None,
+            found_work: None,
+            noop_reason: None,
+            verdicts: None,
+            step_class: None,
+            step_reason: None,
         }),
     )
 }
@@ -1009,6 +1079,137 @@ fn a_steps_role_tick_outcome_is_marked_as_a_step() {
     assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
     assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
     assert_eq!(attr(&records[1], "loom.sweep_id"), None);
+}
+
+/// #14048: a step's `role_tick.outcome` carries its launch identity
+/// (`loom.runtime` / `loom.provider` / `loom.profile`, from the step's own
+/// `# LOOM_LAUNCH` record) and its `loom.stage` — finer than `loom.role`,
+/// which folds Champion's two stages. Each absent when unobserved, so the
+/// per-stage cross-host join keys never read a guessed value.
+#[test]
+fn a_steps_outcome_maps_stage_and_launch_identity_and_each_stays_absent_when_unobserved() {
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.source = Some(crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string());
+        r.stage = Some("champion_merge".to_string());
+        r.runtime = Some("opencode".to_string());
+        r.provider = Some("friendli".to_string());
+        r.profile = Some("glm-flash".to_string());
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.stage"), s("champion_merge"));
+    assert_eq!(attr(&records[0], "loom.runtime"), s("opencode"));
+    assert_eq!(attr(&records[0], "loom.provider"), s("friendli"));
+    assert_eq!(attr(&records[0], "loom.profile"), s("glm-flash"));
+    for key in [
+        "loom.stage",
+        "loom.runtime",
+        "loom.provider",
+        "loom.profile",
+    ] {
+        assert_eq!(attr(&records[1], key), None, "a tick with no launch record carries no {key}");
+    }
+}
+
+/// #12362: a Judge tick's found-work split reaches the wire, explicit `false`
+/// included, and a tick that observed nothing leaves every key absent.
+#[test]
+fn role_tick_outcome_maps_the_judge_found_work_split_only_when_observed() {
+    let mut judged = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut judged.record {
+        r.found_work = Some(false);
+        r.noop_reason = Some("no_claim_no_verdict".to_string());
+        r.verdicts = Some(vec![crate::telemetry::JudgeVerdictRecord {
+            pr_number: 4,
+            head_sha: Some("abc".to_string()),
+            verdict: "approved".to_string(),
+        }]);
+        r.step_class = Some("noop".to_string());
+        r.step_reason = Some("already_judged".to_string());
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[judged, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.found_work"), s("false"));
+    assert_eq!(attr(&records[0], "loom.noop_reason"), s("no_claim_no_verdict"));
+    assert_eq!(attr(&records[0], "loom.role_tick.step_class"), s("noop"));
+    assert_eq!(attr(&records[0], "loom.role_tick.step_reason"), s("already_judged"));
+    assert_eq!(
+        attr(&records[0], "loom.role_tick.verdicts"),
+        s(r#"[{"pr_number":4,"head_sha":"abc","verdict":"approved"}]"#)
+    );
+    for key in [
+        "loom.found_work",
+        "loom.noop_reason",
+        "loom.role_tick.verdicts",
+    ] {
+        assert_eq!(attr(&records[1], key), None, "{key}");
+    }
+}
+
+/// #13563: a step's record names its item and flat token totals that equal the
+/// sum of its per-model rows; without usage the totals are absent, never zero.
+#[test]
+fn a_steps_role_tick_outcome_carries_its_item_and_token_totals() {
+    use crate::script_helpers::sweep_experiment::ModelUsageTotals;
+    let row = |model: &str, i, cr, w5, w1, o| ModelUsageTotals {
+        model: model.to_string(),
+        speed: String::new(),
+        service_tier: String::new(),
+        input: i,
+        cache_read: cr,
+        cache_write_5m: w5,
+        cache_write_1h: w1,
+        output: o,
+    };
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.pr_number = Some(42);
+        r.tokens_by_model = Some(vec![
+            row("claude-opus-5", 10, 100, 5, 1, 20),
+            row("claude-sonnet-5", 1, 2, 3, 4, 5),
+        ]);
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let n = |v: i64| Some(any_value::Value::IntValue(v));
+    assert_eq!(attr(&records[0], "loom.pr_number"), n(42));
+    assert_eq!(attr(&records[0], "loom.issue"), None);
+    assert_eq!(attr(&records[0], "loom.tokens.input"), n(11));
+    assert_eq!(attr(&records[0], "loom.tokens.output"), n(25));
+    assert_eq!(attr(&records[0], "loom.tokens.cache_read"), n(102));
+    assert_eq!(attr(&records[0], "loom.tokens.cache_write"), n(13));
+    assert_eq!(attr(&records[1], "loom.tokens.input"), None);
+    assert_eq!(attr(&records[1], "loom.pr_number"), None);
 }
 
 /// Issue #8408 shipped `loom.gated_pool` with no assertion behind it (#8444):
@@ -1166,5 +1367,43 @@ fn sweep_started_exports_story_points_numerically_when_sized() {
     assert_eq!(
         story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
         Some(any_value::Value::IntValue(13))
+    );
+}
+
+/// #13942: the applied-snapshot-age gauge is a host-level series beside the
+/// per-account ones, emitted only when the host has a fleet sidecar.
+#[test]
+fn tokens_snapshot_fleet_probe_age_is_a_host_gauge_absent_when_unknown() {
+    let mut envelope = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(record) = &mut envelope.record else {
+        unreachable!();
+    };
+    record.fleet_probe_age_secs = Some(311);
+    let request = build_metrics_request(&[envelope]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let age = metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.fleet_probe_age")
+        .expect("fleet_probe_age metric must exist");
+    let points = match &age.data {
+        Some(metric::Data::Gauge(gauge)) => &gauge.data_points,
+        other => panic!("expected Gauge, got {other:?}"),
+    };
+    assert_eq!(points.len(), 1);
+    assert!(
+        points[0].attributes.is_empty(),
+        "host-level: no account attribute, so it compares across hosts"
+    );
+    assert_eq!(points[0].value, Some(number_data_point::Value::AsInt(311)));
+
+    // The default record carries no sidecar age: no series, per the
+    // absent-not-zero rule.
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    assert!(
+        metrics
+            .iter()
+            .all(|m| m.name != "loom.tokens.fleet_probe_age"),
+        "unknown age must not fabricate a zero series"
     );
 }

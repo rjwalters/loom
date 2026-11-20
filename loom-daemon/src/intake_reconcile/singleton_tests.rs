@@ -186,6 +186,7 @@ struct Fake {
     listing: Vec<IntakeRow>,
     listing_fails: bool,
     listing_shed: bool,
+    listing_deadline: bool,
     /// Issue number → what the re-read answers (absent = read failure).
     current: std::collections::BTreeMap<u32, Option<Vec<String>>>,
     write_denied: bool,
@@ -208,6 +209,9 @@ impl IntakeForge for Fake {
             return Err(anyhow::Error::new(store::ReadShed {
                 until: std::time::SystemTime::now(),
             }));
+        }
+        if self.listing_deadline {
+            return Err(anyhow::Error::new(store::TickDeadlineReached));
         }
         if self.listing_fails {
             return Err(anyhow!("listing changed mid-walk"));
@@ -398,108 +402,6 @@ fn the_pass_covers_every_repo_and_stops_while_the_breaker_is_open() {
     let mut forge = Fake::default();
     run_pass(&mut forge, &repos, now(), 50, &|| true);
     assert!(forge.calls.is_empty());
-}
-
-// ===== the completed-pass heartbeat (#10924) =====
-
-fn t(mins: i64) -> DateTime<Utc> {
-    now() + chrono::Duration::minutes(mins)
-}
-
-/// A pass that walks every repo and reads every listing stamps the success
-/// heartbeat even when it labels nothing: a quiet fleet is not a dead one.
-#[test]
-fn a_completed_quiet_pass_stamps_the_success_heartbeat() {
-    let repos = [repo("acme/a"), repo("acme/b")];
-    let mut forge = Fake {
-        listing: vec![row(1, &["loom:triage"])], // nothing to label
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!(pass.completed_scan(repos.len()));
-    let hb = next_heartbeat(None, "cap", t(0), &pass, repos.len());
-    assert_eq!(hb.success_at(), Some(t(0)));
-    assert_eq!((hb.repos, hb.labelled), (2, 0));
-}
-
-/// The write-scope gate refusing a repo does not undo a completed scan:
-/// listing outcomes are the scan, labels retry next pass by design.
-#[test]
-fn a_denied_write_does_not_undo_a_completed_scan() {
-    let repos = [repo("acme/a")];
-    let mut forge = Fake {
-        listing: vec![row(1, &[])], // something to label
-        write_denied: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!(pass.completed_scan(repos.len()));
-    assert_eq!(next_heartbeat(None, "cap", t(0), &pass, repos.len()).success_at(), Some(t(0)));
-}
-
-/// A shed, failed or early-stopped pass cannot refresh the success stamp:
-/// the previous completed pass's timestamp is kept.
-#[test]
-fn shed_failed_and_stopped_early_passes_keep_the_previous_stamp() {
-    let repos = [repo("acme/a"), repo("acme/b")];
-    let stamped = next_heartbeat(
-        None,
-        "cap",
-        t(0),
-        &PassReport {
-            repos: 2,
-            ..PassReport::default()
-        },
-        2,
-    );
-    // Shed: every reader out of budget.
-    let mut forge = Fake {
-        listing_shed: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert!((pass.listing_failed, pass.shed) == (2, 2));
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // Failed listing.
-    let mut forge = Fake {
-        listing_fails: true,
-        ..Fake::default()
-    };
-    let pass = run_pass(&mut forge, &repos, now(), 50, &|| false);
-    assert_eq!(pass.listing_failed, 2);
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // Stopped early by the breaker after the first repo.
-    let mut forge = Fake::default();
-    let seen = std::cell::Cell::new(0);
-    let tripped = || seen.replace(seen.get() + 1) >= 1;
-    let pass = run_pass(&mut forge, &repos, now(), 50, &tripped);
-    assert!(pass.stopped_early && pass.repos == 1);
-    assert_eq!(next_heartbeat(Some(&stamped), "cap", t(5), &pass, 2).success_at(), Some(t(0)));
-    // And with no previous stamp at all: never completed.
-    assert_eq!(next_heartbeat(None, "cap", t(5), &pass, 2).success_at(), None);
-}
-
-/// The heartbeat file: round trip, and a record of another schema proves
-/// nothing (a foreign file is not a success stamp).
-#[test]
-fn the_heartbeat_file_round_trips_and_rejects_other_schemas() {
-    let dir = tempfile::tempdir().unwrap();
-    assert!(read_heartbeat(dir.path()).is_none());
-    let hb = next_heartbeat(
-        None,
-        "cap",
-        t(0),
-        &PassReport {
-            repos: 1,
-            ..PassReport::default()
-        },
-        1,
-    );
-    write_heartbeat(dir.path(), &hb);
-    assert_eq!(read_heartbeat(dir.path()), Some(hb));
-    let foreign = br#"{"schema": "intake-reconcile/pass/v0", "host": "cap"}"#;
-    std::fs::write(heartbeat_path(dir.path()), foreign).unwrap();
-    assert!(read_heartbeat(dir.path()).is_none());
 }
 
 // ===== the live forge, against a stub =====
@@ -766,6 +668,22 @@ fn a_shed_listing_skips_the_repo_and_is_counted() {
     assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before + 2);
 }
 
+/// A tick-deadline stop is a failed listing, but not a budget shed.
+#[test]
+fn a_tick_deadline_listing_is_failed_but_not_counted_as_shed() {
+    let before = crate::forge_call_stats::counters::get(LISTING_SHED);
+    let mut forge = Fake {
+        listing: vec![row(1, &[])],
+        listing_deadline: true,
+        ..Fake::default()
+    };
+    let report = run_repo(&mut forge, &repo("acme/a"), now(), 50);
+    assert!(report.listing_failed);
+    assert!(!report.listing_shed);
+    assert_eq!(forge.calls, ["list acme/a"]);
+    assert_eq!(crate::forge_call_stats::counters::get(LISTING_SHED), before);
+}
+
 /// End to end with every reader withdrawn for budget: the captain's walk
 /// makes no call at all (so none on the writer) and the repo is skipped.
 #[test]
@@ -1002,21 +920,4 @@ fn demotion_fails_closed() {
     let report = run_repo(&mut denied, &repo("acme/demote-denied"), now(), 50);
     assert!(report.denied);
     assert_eq!(denied.calls, ["list acme/demote-denied", "scope"]);
-}
-
-/// The heartbeat carries the count and still reads a record written before
-/// the field existed.
-#[test]
-fn the_heartbeat_counts_demotions_and_reads_old_records() {
-    let pass = PassReport {
-        repos: 1,
-        demoted: 2,
-        ..PassReport::default()
-    };
-    let hb = next_heartbeat(None, "cap", now(), &pass, 1);
-    assert_eq!(hb.demoted, 2);
-    let mut old = serde_json::to_value(&hb).unwrap();
-    old.as_object_mut().unwrap().remove("demoted");
-    let back: PassHeartbeat = serde_json::from_value(old).unwrap();
-    assert_eq!(back.demoted, 0);
 }

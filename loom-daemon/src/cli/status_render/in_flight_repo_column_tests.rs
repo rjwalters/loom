@@ -5,8 +5,8 @@
 //! already carried the owning workspace root (`repo`, Issue #3929).
 use super::{format_repo_column, render_in_flight_table};
 use crate::cli::status::sample_report::sample_report;
+use crate::types::{SweepInfo, SweepKind, SweepState};
 use chrono::Utc;
-use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
 use std::path::PathBuf;
 
 /// A minimal in-flight entry for a given issue/repo pair, mirroring the
@@ -30,7 +30,6 @@ fn mk(issue: u32, repo: Option<&str>) -> SweepInfo {
         effort: None,
         depends_on: None,
         repo: repo.map(str::to_string),
-        overflow: false,
     }
 }
 
@@ -53,23 +52,6 @@ fn format_repo_column_leaves_bare_value_as_is() {
 #[test]
 fn format_repo_column_falls_back_to_dash_when_none() {
     assert_eq!(format_repo_column(None), "-");
-}
-
-#[test]
-fn overflow_sweep_is_marked_in_the_table() {
-    // #9244: an over-limit starred sweep must be visible in `status`.
-    let mut report = sample_report();
-    let mut over = mk(5, Some("/repos/loom"));
-    over.overflow = true;
-    report.in_flight = vec![mk(3, Some("/repos/loom")), over];
-    let table = render_in_flight_table(&report);
-    assert_eq!(table.matches("[overflow]").count(), 1, "{table}");
-    assert!(
-        table
-            .lines()
-            .any(|l| l.contains("#5") && l.contains("[overflow]")),
-        "{table}"
-    );
 }
 
 #[test]

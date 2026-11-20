@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Builder: Worktree Workflows
 
 This document covers git worktree management for the Builder role. For the core builder workflow, see `builder.md`.

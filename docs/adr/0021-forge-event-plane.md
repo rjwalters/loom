@@ -8,6 +8,16 @@ below, which supersedes invariant 2's "never stretches" clause and the
 considered*. The goal of the feed is now **fewer forge calls**, not only lower
 latency.
 
+**Superseded 2026-10-19 (#12809, operator ruling under #12807): the daemon never
+talks to the dashboard.** The per-host feed client, the early-tick consumers
+(`forgeEvents.events.*`), feed-based poll gating (`forgeEvents.pollGating`), the
+`forge.event` prompt publication and the `forge_events` status block were
+removed; every loop polls at its configured cadence. What this ADR decided for
+the Cloudflare state mirror survives as plain reads: discovery listings served
+within the watermark bound, and the `/v1/changes` pull with its cursors
+(recorded as telemetry; it wakes nothing). Invariant 3 (decision reads are never
+served from a mirror) is unchanged. The text below is the historical record.
+
 ## Context
 
 [ADR-0014](0014-forge-coordination-decoupling.md) enumerated the levers for

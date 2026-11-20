@@ -8,6 +8,7 @@ use super::test_support::{listing, mergeable_arm, pulls_arm, pulls_arm_cmd, row}
 use super::*;
 use crate::claim_reconciliation::pass_loop::run_reconciliation_pass_over_roots;
 use crate::claim_reconciliation::STALE_REVIEWING_MINUTES_ENV;
+use crate::exec_test_support::write_executable;
 use crate::write_scope_test_support::WritableRoot;
 use serial_test::serial;
 use std::path::PathBuf;
@@ -45,32 +46,7 @@ fn with_label_filters_client_side_and_keeps_the_old_limit() {
     assert_eq!(with_label(many, "loom:pr").len(), MAX_ISSUES_PER_WORKSPACE as usize);
 }
 
-fn write_script(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-/// Restore an env var on drop.
-struct EnvGuard(&'static str, Option<String>);
-impl EnvGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let prev = std::env::var(key).ok();
-        std::env::set_var(key, value);
-        Self(key, prev)
-    }
-}
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.1 {
-            Some(v) => std::env::set_var(self.0, v),
-            None => std::env::remove_var(self.0),
-        }
-    }
-}
+use crate::env_test_support::EnvGuard;
 
 fn run_pass(root: &Path, gh: &Path) {
     let stats = run_reconciliation_pass_over_roots(&[root.to_path_buf()], gh, false, || false);
@@ -122,7 +98,7 @@ exit 0
         merge = mergeable_arm("false"),
     );
     let inner = dir.path().join("fake-gh.sh");
-    write_script(&inner, &script);
+    write_executable(&inner, &script);
     let ws = WritableRoot::register_with_gh(&root, &inner);
 
     run_pass(&root, &ws.gh);
@@ -194,7 +170,7 @@ exit 0
         body = listing(&rows),
     );
     let bin = dir.join("fake-gh-etag.sh");
-    write_script(&bin, &script);
+    write_executable(&bin, &script);
     (bin, log, oks)
 }
 
@@ -276,7 +252,7 @@ fn each_pass_sees_the_current_listing() {
         pulls_arm_cmd(&format!("cat '{}'", body.display()))
     );
     let gh = dir.path().join("fake-gh.sh");
-    write_script(&gh, &script);
+    write_executable(&gh, &script);
     let first = list_with_label(&gh, &root, "loom:pr").unwrap();
     std::fs::write(&body, listing(&[row(1, &[]), row(2, &["loom:pr"])])).unwrap();
     let second = list_with_label(&gh, &root, "loom:pr").unwrap();
@@ -323,7 +299,7 @@ fn failing_mergeable_stub(dir: &Path, stderr: &str) -> (PathBuf, PathBuf) {
         reads = reads.display(),
     );
     let gh = dir.join("fake-gh-ratelimited.sh");
-    write_script(&gh, &script);
+    write_executable(&gh, &script);
     (gh, reads)
 }
 

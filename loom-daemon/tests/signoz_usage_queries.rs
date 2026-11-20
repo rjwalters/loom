@@ -31,17 +31,17 @@
 //! `(trace_id, span_id)`, and no section may count it twice.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 /// Same pin as the SigNoz trial's telemetry store (`signoz/casting.yaml`) and
 /// as `cycle_time_clickhouse.rs`, so no proof in this repo can drift from the
 /// deployment on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 const QUERIES: &str = include_str!("../../defaults/observability/signoz/usage-queries.sql");
 const FIXTURE: &str = include_str!("fixtures/signoz_usage/fixture.sql");
@@ -56,39 +56,15 @@ type Row = BTreeMap<String, serde_json::Value>;
 /// stdout. Panics with the engine's own stderr on failure — a query that does
 /// not parse must fail this test, not be silently skipped.
 fn clickhouse(script: &str, format: &str) -> String {
-    let mut child = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "-i",
-            "--entrypoint",
-            "clickhouse",
-            &hub_image::resolve(CLICKHOUSE_IMAGE),
-            "local",
-            "--multiquery",
-            &format!("--param_since={SINCE}"),
-            "--param_repo=",
-            "--param_top=50",
-            &format!("--format={format}"),
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("docker is required for this test");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "clickhouse rejected the script:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    clickhouse_local::clickhouse_with(
+        script,
+        &[
+            format!("--param_since={SINCE}"),
+            "--param_repo=".to_string(),
+            "--param_top=50".to_string(),
+            format!("--format={format}"),
+        ],
+    )
 }
 
 /// The committed file's statements. Line comments are stripped **before** the
@@ -176,7 +152,7 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
     clickhouse(&verbatim, "TSV");
 
     let sections = sections();
-    assert_eq!(sections.len(), 7, "usage-queries.sql is documented as sections 0 through 6");
+    assert_eq!(sections.len(), 8, "usage-queries.sql is documented as sections 0 through 7");
 
     // ---- 0. arrival and shape ---------------------------------------------
     let preflight = &sections[0];
@@ -302,6 +278,40 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
         "the two cache-write horizons are priced differently and must not be \
          collapsed into one column"
     );
+
+    // ---- 7. per-run comparison --------------------------------------------
+    let runs = &sections[7];
+    assert_eq!(runs.len(), 3, "subscription, API-key and missing launched identity");
+
+    let seat = runs
+        .iter()
+        .find(|row| {
+            text(row, "credential_kind") == "chatgpt-seat" && text(row, "model") == "gpt-5.4"
+        })
+        .expect("subscription run cohort");
+    assert_eq!(text(seat, "runtime"), "codex");
+    assert_eq!(text(seat, "effort"), "high");
+    assert_eq!(text(seat, "role"), "builder");
+    assert_eq!(
+        num(seat, "runs"),
+        3,
+        "count the shared span id in distinct traces once each, and exclude old runs"
+    );
+    assert_eq!(num(seat, "repos"), 2);
+    assert_eq!(num(seat, "traces"), 2);
+    assert_eq!(seat["duration_p50_s"], serde_json::json!(2.5));
+    assert_eq!(num(seat, "success"), 2);
+    assert_eq!(num(seat, "not_success"), 1);
+
+    let api = by(runs, "credential_kind", "api-key");
+    assert_eq!(text(api, "model"), "gpt-5.4");
+    assert_eq!(text(api, "effort"), "high");
+    assert_eq!(num(api, "runs"), 1, "the account pool is part of the cohort");
+
+    let missing = by(runs, "model", "");
+    assert_eq!(text(missing, "effort"), "");
+    assert_eq!(text(missing, "credential_kind"), "chatgpt-seat");
+    assert_eq!(num(missing, "runs"), 1, "configured model does not fill launched identity");
 }
 
 /// The negative control for the artifact's first documented trap. Reading a

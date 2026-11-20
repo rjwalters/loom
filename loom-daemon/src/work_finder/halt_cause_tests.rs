@@ -1,6 +1,6 @@
 //! Coverage for the closed hold-cause vocabulary (Issue #9017). Its own file
-//! with its own minimal fakes, for the file-size-ratchet reason
-//! `ready_queue_tests.rs` gives: `work_finder/tests.rs` is frozen.
+//! with its own minimal fakes, for the reason `ready_queue_tests.rs` gives:
+//! it stays independent of the shared `work_finder/tests.rs` harness.
 
 #![allow(clippy::unwrap_used)]
 
@@ -179,7 +179,7 @@ fn a_cause_at_a_not_held_index_never_halts_the_workspace() {
 /// `workspace_halted` row's detail through (closed vocabulary, #9017).
 #[test]
 fn exportable_detail_passes_the_cause_through() {
-    use crate::telemetry::queue_snapshot::exportable_detail;
+    use crate::telemetry::queue_repo::exportable_detail;
     assert_eq!(
         exportable_detail(QueueDisposition::WorkspaceHalted, Some("token_pool")),
         Some("token_pool".to_string())

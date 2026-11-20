@@ -1,3 +1,6 @@
+---
+disable-model-invocation: true
+---
 # Champion: Held-PR Base-Staleness Tick (#8552)
 
 A sub-step of [`champion-pr-merge.md`](champion-pr-merge.md) → "Held-PR Census"
@@ -194,7 +197,7 @@ the other.
   tick reopens it.
 - **Never gate a merge decision on it.** Like the rest of the census, if any
   part of it fails (fetch declined, no git checkout, rate limit), log and
-  continue — criteria #1-6 are unaffected, and the digest still writes with
+  continue — the `judge-approval`, `merge-risk`, `critical-files`, `mergeable`, `recency` and `ci-green` criteria are unaffected, and the digest still writes with
   `overlap unknown` for that PR.
 - **Never state a class more specific than the two above** from file names and
   line counts alone.

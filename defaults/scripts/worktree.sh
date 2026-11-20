@@ -26,7 +26,6 @@
 #     # land "in between" push and pop (#5217, extended to `main` by #6076).
 #   pnpm worktree --check                              # Check if currently in a worktree
 #   pnpm worktree --json <issue-number>                # Machine-readable output
-#   pnpm worktree --return-to <dir> <issue-number>     # Store return directory
 #   pnpm worktree --help                               # Show help
 
 set -e
@@ -837,7 +836,7 @@ _worktree_base() {
 #
 #   - `worktree.sh --check` reported the primary clone as a worktree and exited
 #     0; its "Not currently in a worktree" arm and its exit 1 were dead code,
-#     while `worktree-return.sh` tells operators to run it.
+#     while the docs told operators to run it.
 #   - every `worktree.sh <N>` from the primary clone printed four spurious
 #     lines ("Currently in a worktree, auto-navigating…", a `Current worktree:`
 #     block naming the primary clone, "Found main workspace: .", "Switched to
@@ -941,7 +940,6 @@ Usage:
   pnpm worktree stash-pop <N|main> [--json]             Restore WIP captured by stash-push
   pnpm worktree --check                                 Check if in a worktree
   pnpm worktree --json <issue-number>                   Machine-readable JSON output
-  pnpm worktree --return-to <dir> <issue-number>        Store return directory
   pnpm worktree --help                                  Show this help
 
 Examples:
@@ -1052,9 +1050,6 @@ Examples:
 
   pnpm worktree --json 42
     Output: {"success": true, "worktreePath": "/path/to/.loom/worktrees/issue-42", ...}
-
-  pnpm worktree --return-to $(pwd) 42
-    Creates worktree and stores current directory for later return
 
 Sparse-Mode Notes:
   - --sparse and --full are mutually exclusive
@@ -1200,7 +1195,6 @@ fi
 
 # Check for --json flag
 JSON_OUTPUT=false
-RETURN_TO_DIR=""
 
 if [[ "$1" == "--json" ]]; then
     JSON_OUTPUT=true
@@ -1229,21 +1223,6 @@ if [[ "$JSON_OUTPUT" == "true" ]]; then
     trap '' PIPE
 else
     exec 3>&1
-fi
-
-# Check for --return-to flag
-if [[ "$1" == "--return-to" ]]; then
-    RETURN_TO_DIR="$2"
-    shift 2
-    # Validate return directory exists
-    if [[ ! -d "$RETURN_TO_DIR" ]]; then
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Return directory does not exist", "returnTo": "'"$RETURN_TO_DIR"'"}' >&3
-        else
-            print_error "Return directory does not exist: $RETURN_TO_DIR"
-        fi
-        exit 1
-    fi
 fi
 
 # Main worktree creation logic
@@ -1491,6 +1470,12 @@ if [[ -x "$GIT_IDENTITY_CHECK" ]]; then
             echo '{"success": false, "error": "corrupted-git-identity", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
         fi
         exit 1
+    elif [[ "$GIT_IDENTITY_RC" -eq 4 ]]; then
+        # Missing identity (#13088): warn, don't hard-fail. Workers spawned via
+        # spawn-claude.sh set user.useConfigOnly, so a commit will refuse loudly
+        # and name the fix; a hard-fail here would strand read-only uses too.
+        print_warning "No explicit git identity — commits from this worktree will be refused (user.useConfigOnly)."
+        echo "$GIT_IDENTITY_OUTPUT"
     elif [[ "$GIT_IDENTITY_RC" -eq 1 ]]; then
         print_warning "Stacked local git identity values detected (non-fatal — see details below)."
         echo "$GIT_IDENTITY_OUTPUT"
@@ -1838,15 +1823,6 @@ if _try_worktree_add; then
         git -C "$ABS_WORKTREE_PATH" config core.hooksPath .githooks
     fi
 
-    # Store return-to directory if provided
-    if [[ -n "$RETURN_TO_DIR" ]]; then
-        ABS_RETURN_TO=$(cd "$RETURN_TO_DIR" && pwd)
-        echo "$ABS_RETURN_TO" > "$ABS_WORKTREE_PATH/.loom-return-to"
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Stored return directory: $ABS_RETURN_TO"
-        fi
-    fi
-
     # --------------------------------------------------------------------
     # Submodule initialization
     # --------------------------------------------------------------------
@@ -2007,7 +1983,7 @@ if _try_worktree_add; then
         # Machine-readable JSON output. Sparse mode sets "sparse": true and the
         # "cone": [...] worktree-sparse returned; full mode keeps "sparse":
         # false with the empty cone $CONE_JSON is initialized to.
-        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'", "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
+        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "sparse": '"$SPARSE_MODE"', "cone": '"$CONE_JSON"'}' >&3
     else
         # Human-readable output
         print_success "Worktree created successfully!"

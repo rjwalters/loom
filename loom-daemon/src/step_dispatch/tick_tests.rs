@@ -59,6 +59,16 @@ pub(crate) fn forge() -> Vec<RestIssue> {
 }
 
 pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorkspace {
+    workspace_cooling(idx, repo, rows, Default::default())
+}
+
+/// [`workspace`] weighed against `cooldowns`, as the draw's query returns them.
+fn workspace_cooling(
+    idx: usize,
+    repo: &str,
+    rows: &[RestIssue],
+    cooldowns: crate::step_dispatch::outcome_ledger::StepCooldowns,
+) -> StepWorkspace {
     let pulls = rows
         .iter()
         .filter(|r| r.is_pull_request)
@@ -77,7 +87,7 @@ pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorks
         build_backoff_engaged: false,
         pool_exhausted_roles: BTreeSet::new(),
         workspace_idx: idx,
-        cooldowns: Default::default(),
+        cooldowns,
     };
     StepWorkspace {
         idx,
@@ -87,6 +97,11 @@ pub(crate) fn workspace(idx: usize, repo: &str, rows: &[RestIssue]) -> StepWorks
         weighing: weigh(&items, &ctx, &ItemWeights::default()),
         halted: false,
         created_at: HashMap::new(),
+        merge_slots: 1,
+        merge_concurrency: 1,
+        merge_eligible: 0,
+        merges_in_flight: 0,
+        writer_hold: None,
     }
 }
 
@@ -97,6 +112,8 @@ struct FakeSpawner {
     refuse_all: Option<&'static str>,
     asked: Vec<(usize, u32, StepRole, u32)>,
     terms: Vec<Option<StepDrawTerms>>,
+    /// Each request's `(item, story_points)` (#12957).
+    points: Vec<(u32, Option<u32>)>,
     /// Each round's batch, as `(workspace, item)` (#12298).
     batches: Vec<Vec<(usize, u32)>>,
     /// Hold the spawns once this many batches ran (#12298).
@@ -110,6 +127,7 @@ impl StepSpawner for FakeSpawner {
         self.asked
             .push((idx, request.item, request.role, request.draw_attempt));
         self.terms.push(request.draw);
+        self.points.push((request.item, request.story_points));
         if let Some(reason) = self.refuse_all {
             return SpawnResult::Refused(reason.to_string());
         }
@@ -209,7 +227,7 @@ fn every_stage_gets_its_step_and_claimed_and_parked_items_are_skipped() {
         .iter()
         .find(|r| r.key.number == 3)
         .unwrap();
-    assert_eq!(row3.disposition, Some(Qd::PeerClaim));
+    assert_eq!(row3.disposition, Some(Qd::LeaseHeld));
     // Claimed (7, 100), parked (8) and operator-held (9) items never reach
     // the spawner and are counted by reason; every pooled row names its step.
     assert!(tick.report.skipped_in_flight >= 2);
@@ -286,7 +304,8 @@ fn live_claims_leave_the_pool_as_claimed_and_a_peer_merge_as_merge_in_flight() {
     let before = ws.weighing.pool.len();
     let claims = DrawClaims {
         items: std::collections::HashSet::from([1, 40]),
-        merge_in_flight: Some((61, "peer".to_string())),
+        merges_in_flight: vec![(61, "peer".to_string())],
+        ..DrawClaims::default()
     };
     let claimed_before = ws
         .weighing
@@ -339,7 +358,8 @@ fn a_repo_with_a_merge_in_flight_spends_no_draw_or_pass_on_its_merges() {
     assert_eq!(merge_steps(&busy), 6);
     let claims = DrawClaims {
         items: std::collections::HashSet::new(),
-        merge_in_flight: Some((999, "peer".to_string())),
+        merges_in_flight: vec![(999, "peer".to_string())],
+        ..DrawClaims::default()
     };
     exclude_claimed(&mut busy.weighing, &claims);
     assert_eq!(merge_steps(&busy), 0);
@@ -428,7 +448,7 @@ fn a_merge_spawned_mid_tick_defers_the_repos_other_merges() {
         .queue
         .iter()
         .filter(|r| r.detail.as_deref() == Some(PASS_MERGE))
-        .all(|r| r.disposition == Some(Qd::PeerClaim)));
+        .all(|r| r.disposition == Some(Qd::LeaseHeld)));
     // The record names the partial closure and still replays.
     let record = tick.report.item_draw.as_ref().unwrap();
     assert_eq!(record.closures.len(), 1);
@@ -446,6 +466,85 @@ fn a_merge_spawned_mid_tick_defers_the_repos_other_merges() {
         .unwrap();
     assert_eq!(deferred.count, 4);
     assert_eq!(replay_record(record).unwrap().len(), 2);
+}
+
+/// `ws` allowed `n` merges at once with `in_flight` already running.
+fn merge_lane(mut ws: StepWorkspace, n: usize, in_flight: usize) -> StepWorkspace {
+    ws.merge_concurrency = n;
+    ws.merges_in_flight = in_flight;
+    ws.merge_slots = n.saturating_sub(in_flight);
+    ws
+}
+
+#[test]
+fn a_merge_concurrency_of_two_spawns_two_merges_then_defers_the_rest() {
+    // #13026: with `champion.mergeConcurrencyPerRepo = 2` the repo's merge
+    // steps close only once the second merge is spawned.
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            0,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 2, "{:?}", spawner.asked);
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.merge_deferred, 3);
+    assert_eq!(tick.merge_concurrency, 2);
+    assert_eq!(tick.merges_in_flight, 2);
+    assert!(tick.passes.is_empty(), "{:?}", tick.passes);
+}
+
+#[test]
+fn a_merge_already_in_flight_leaves_one_slot_at_a_concurrency_of_two() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(
+        vec![merge_lane(
+            workspace(0, "acme/one", &merges_and_a_curator(5)),
+            2,
+            1,
+        )],
+        limits(10),
+        &mut spawner,
+    );
+    let merges = spawner
+        .asked
+        .iter()
+        .filter(|a| a.2 == StepRole::ChampionMerge)
+        .count();
+    assert_eq!(merges, 1, "{:?}", spawner.asked);
+    assert_eq!(tick.merges_in_flight, 2);
+}
+
+#[test]
+fn exclude_claimed_defers_merges_only_when_the_lane_is_full() {
+    let in_flight = |n: usize, limit: usize| DrawClaims {
+        items: std::collections::HashSet::new(),
+        merges_in_flight: (0..n)
+            .map(|i| (900 + i as u32, "peer".to_string()))
+            .collect(),
+        merge_concurrency: limit,
+    };
+    let merges_left = |claims: DrawClaims| {
+        let mut ws = workspace(0, "acme/one", &merges_and_a_curator(3));
+        exclude_claimed(&mut ws.weighing, &claims);
+        merge_steps(&ws)
+    };
+    // Unset (0) reads as 1: one merge in flight fills the lane.
+    assert_eq!(merges_left(in_flight(1, 0)), 0);
+    assert_eq!(merges_left(in_flight(1, 1)), 0);
+    // Two allowed: one in flight leaves the lane open, two fill it.
+    assert_eq!(merges_left(in_flight(1, 2)), 3);
+    assert_eq!(merges_left(in_flight(2, 2)), 0);
+    assert_eq!(merges_left(in_flight(0, 1)), 3);
 }
 
 #[test]
@@ -471,7 +570,8 @@ fn a_hold_reevaluation_stays_serialised_behind_the_repos_merge() {
         &mut ws.weighing,
         &DrawClaims {
             items: std::collections::HashSet::new(),
-            merge_in_flight: Some((101, "peer".to_string())),
+            merges_in_flight: vec![(101, "peer".to_string())],
+            ..DrawClaims::default()
         },
     );
     assert!(ws
@@ -675,11 +775,11 @@ fn a_landed_refusal_reads_as_already_landed() {
 
 /// #12105: a Doctor that stands down because another actor is working the PR
 /// (`peer_active`), and a step the Judge backstop holds (`backstop_hold`),
-/// read as a peer's claim: not a dispatch error, an in-flight skip.
+/// report a held lease and count as in-flight skips.
 #[test]
-fn peer_active_and_backstop_hold_read_as_a_peer_claim() {
+fn peer_active_and_backstop_hold_report_lease_held() {
     for reason in ["peer_active", "backstop_hold"] {
-        assert_eq!(disposition_of(reason), Qd::PeerClaim, "{reason}");
+        assert_eq!(disposition_of(reason), Qd::LeaseHeld, "{reason}");
     }
     let mut spawner = FakeSpawner {
         refuse: vec![(3, "peer_active")],
@@ -852,7 +952,7 @@ fn refusals_in_a_round_are_counted_in_draw_order() {
         .report
         .queue
         .iter()
-        .filter(|r| r.disposition == Some(Qd::PeerClaim))
+        .filter(|r| r.disposition == Some(Qd::LeaseHeld))
         .all(|r| r.detail.as_deref() == Some("claimed")));
 
     // Some refused: the dispatched count, the passes and the rows agree with
@@ -987,6 +1087,138 @@ fn an_unverified_claim_ends_the_owners_draws_for_the_tick() {
     assert_eq!(tick.report.dispatched, 4);
 }
 
+/// #13746: a workspace whose writer route is confirmed exhausted waits
+/// before the draw — no claim attempt, no slot, no refusal span — its rows
+/// name the wait and the reset, and a captain's offer for it is not taken.
+#[test]
+fn a_pre_held_writer_route_waits_before_the_draw() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut held = workspace(0, "acme/one", &rows);
+    let reset = now().timestamp() + 600;
+    held.writer_hold = Some(WriterHold::from_reset(reset, now().timestamp()).unwrap());
+    let healthy = workspace(1, "other/two", &rows);
+    let mut spawner = FakeSpawner::default();
+    // A captain's offer for the held workspace is not taken; the healthy
+    // one is.
+    let offers = vec![
+        Offer {
+            repo: "acme/one".to_string(),
+            item: 1,
+            role: StepRole::Curator,
+        },
+        Offer {
+            repo: "other/two".to_string(),
+            item: 1,
+            role: StepRole::Curator,
+        },
+    ];
+    let tick = run_with_offers(
+        vec![held, healthy],
+        limits(4),
+        &seed(),
+        &PoolKnobs::default(),
+        &mut spawner,
+        &offers,
+    );
+    // Only the healthy workspace was ever asked to spawn.
+    assert!(spawner.asked.iter().all(|a| a.0 == 1), "{:?}", spawner.asked);
+    assert!(spawner.asked.iter().any(|a| a.1 == 1), "the healthy offer spawned");
+    // Every held candidate's row waits, with the reason and the reset.
+    let held_rows: Vec<_> = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.key.workspace_idx == 0)
+        .collect();
+    assert!(!held_rows.is_empty());
+    for r in &held_rows {
+        assert_eq!(r.disposition, Some(Qd::DeferredCapacity), "{}", r.key.number);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some("writer_rate_limited until 2026-10-14T12:10:00Z"),
+            "{}",
+            r.key.number
+        );
+        assert_eq!(r.held_until, Some(chrono::DateTime::from_timestamp(reset, 0).unwrap()));
+    }
+    // The held candidates count as capacity-waiting, not as draws or passes.
+    assert!(!tick.passes.contains_key(REFUSAL_WRITER_LIMITED));
+    assert_eq!(held_rows.len(), 10);
+    assert!(
+        tick.report.deferred_capacity >= held_rows.len(),
+        "{}",
+        tick.report.deferred_capacity
+    );
+    // The held workspace never entered the draw at all: absent from the
+    // record's repos and pools, so it has no draw or refusal span (#13746).
+    let record = tick.report.item_draw.as_ref().unwrap();
+    let held_repo = record.repos.iter().any(|r| r.repo == "acme/one");
+    let held_pool = record.pools.iter().any(|p| p.repo == "acme/one");
+    assert!(!held_repo, "acme/one in the draw: {:?}", record.repos);
+    assert!(!held_pool, "acme/one in the pool: {:?}", record.pools);
+}
+
+/// #13746: the first `writer_rate_limited` refusal in a tick closes the
+/// owner's other workspaces for the rest of the tick — no further claim or
+/// write attempt on that route — while another owner's work proceeds; the
+/// closed rows carry the reason.
+#[test]
+fn a_writer_limited_refusal_closes_the_owner_for_the_tick() {
+    let rows: Vec<RestIssue> = (1..=10)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((1, REFUSAL_WRITER_LIMITED)),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(
+        vec![
+            workspace(0, "acme/one", &rows),
+            workspace(1, "ACME/two", &rows),
+            workspace(2, "other/three", &rows),
+        ],
+        limits(6),
+        &mut spawner,
+    );
+    // Exactly one acme spawn attempt (the refused one); other/three fills
+    // the rest.
+    let acme_attempts = spawner.asked.iter().filter(|a| a.0 != 2).count();
+    assert_eq!(acme_attempts, 1, "{:?}", spawner.asked);
+    assert_eq!(tick.passes.get(REFUSAL_WRITER_LIMITED), Some(&1));
+    assert_eq!(tick.report.dispatched, 6, "every slot filled by other/three");
+    // The still-open acme rows name the reason (resolved mid-tick).
+    let closed: Vec<_> = tick
+        .report
+        .queue
+        .iter()
+        .filter(|r| r.key.workspace_idx != 2 && r.key.number != 1)
+        .collect();
+    assert!(!closed.is_empty());
+    for r in closed {
+        assert_eq!(r.disposition, Some(Qd::DeferredCapacity), "{}", r.key.number);
+        assert_eq!(r.detail.as_deref(), Some(REFUSAL_WRITER_LIMITED), "{}", r.key.number);
+    }
+}
+
+/// #13746: the waiting disposition of a writer rate limit is a capacity
+/// wait, not a dispatch error.
+#[test]
+fn a_writer_limited_refusal_is_a_capacity_wait() {
+    assert_eq!(disposition_of(REFUSAL_WRITER_LIMITED), Qd::DeferredCapacity);
+    let skipped = refusal_skip(REFUSAL_WRITER_LIMITED);
+    assert_eq!(skipped, PickSkipReason::Cap);
+    // The reset-bound hold names itself.
+    let hold = WriterHold::from_reset(now().timestamp() + 600, now().timestamp()).unwrap();
+    assert!(hold.detail.starts_with("writer_rate_limited until "));
+    assert!(
+        WriterHold::from_reset(now().timestamp() - 1, now().timestamp()).is_none(),
+        "a past reset is no hold"
+    );
+    assert!(WriterHold::from_reset(now().timestamp() + 600, now().timestamp()).is_some(),);
+}
+
 #[test]
 fn other_refusals_still_redraw_in_the_same_owner() {
     let rows: Vec<RestIssue> = (1..=10)
@@ -1037,7 +1269,7 @@ fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
         .report
         .queue
         .iter()
-        .find(|r| r.disposition == Some(Qd::PeerClaim));
+        .find(|r| r.disposition == Some(Qd::LeaseHeld));
     assert!(row.is_some(), "a held item reads as a peer's claim");
 
     for reason in ["claim_lost", "captain_held"] {
@@ -1054,6 +1286,105 @@ fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
         assert_eq!(tick.stop, TickStop::SlotDraws, "{reason}");
         assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize, "{reason}");
     }
+}
+
+/// #12700: `captain_cooldown` (the no-progress hold) is a cheap pass like
+/// `captain_held`, on the captain bound, so a tick whose heaviest items are
+/// all cooled down still fills its slot past `MAX_PASSES_PER_TICK`.
+#[test]
+fn a_captain_cooldown_refusal_is_free_and_does_not_end_the_tick() {
+    let n = MAX_PASSES_PER_TICK + 8;
+    let rows: Vec<RestIssue> = (1..=n + 5)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((n as usize, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
+    assert_eq!(tick.report.dispatched, 1, "the cooled-down draws cost no pass");
+    assert_ne!(tick.stop, TickStop::PassLimit);
+    assert_eq!(tick.passes.get("captain_cooldown"), Some(&(n as usize)));
+    assert_eq!(tick.report.errors, 0, "a cooldown is not a dispatch error");
+    assert!(tick
+        .report
+        .queue
+        .iter()
+        .any(|r| r.disposition == Some(Qd::LeaseHeld)));
+}
+
+/// #12704: the pairs a tick's captain refused as cooling down are armed on
+/// the host (`arm_captain_hold`), so the next tick's draw drops them before
+/// any captain call, and counts them.
+#[test]
+fn a_tick_after_captain_cooldown_refusals_does_not_ask_about_them_again() {
+    let rows: Vec<RestIssue> = (1..=6)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut first = FakeSpawner {
+        refuse_first: Some((5, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut first);
+    let refused: Vec<(u32, StepRole)> = first
+        .asked
+        .iter()
+        .take(5)
+        .map(|(_, item, role, _)| (*item, *role))
+        .collect();
+    assert_eq!(refused.len(), 5, "tick 1 asked about five cooled-down items");
+    assert_eq!(tick.report.dispatched, 1);
+
+    // What `arm_captain_hold` leaves for the next draw's query.
+    let mut cooldowns = crate::step_dispatch::outcome_ledger::StepCooldowns::default();
+    for (item, role) in &refused {
+        cooldowns.insert(*item, *role, now() + chrono::Duration::seconds(300));
+    }
+    let mut second = FakeSpawner::default();
+    let ws = workspace_cooling(0, "acme/one", &rows, cooldowns);
+    let tick = run_with(vec![ws], limits(1), &mut second);
+    assert!(
+        second
+            .asked
+            .iter()
+            .all(|(_, item, role, _)| !refused.contains(&(*item, *role))),
+        "no captain call for a cooled-down item: {:?}",
+        second.asked
+    );
+    assert_eq!(tick.report.dispatched, 1);
+    assert_eq!(tick.report.skipped_noop_cooldown, 5, "counted as cooling down");
+}
+
+/// #12700: captain refusals have their own bound; past it they spend passes,
+/// and the lost-claim bound is untouched by them.
+#[test]
+fn captain_refusals_are_bounded_separately_from_lost_claims() {
+    assert_eq!(MAX_FREE_CLAIM_LOST_PER_TICK, 16, "the writer-read bound is unchanged");
+    let cap = MAX_FREE_CAPTAIN_REFUSALS_PER_TICK as usize;
+    let rows: Vec<RestIssue> = (1..=MAX_FREE_CAPTAIN_REFUSALS_PER_TICK + 200)
+        .map(|n| row(n, &["loom:triage"], "", false))
+        .collect();
+    let mut spawner = FakeSpawner {
+        refuse_all: Some("captain_cooldown"),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    // The free ones, then the slot's own draws, then it gives up.
+    assert_eq!(spawner.asked.len(), cap + MAX_DRAWS_PER_SLOT as usize);
+
+    // In fallback no captain refusal is free.
+    let mut spawner = FakeSpawner {
+        refuse_first: Some((10, "captain_cooldown")),
+        ..FakeSpawner::default()
+    };
+    let fallback = StepTickLimits {
+        fallback: true,
+        ..limits(1)
+    };
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], fallback, &mut spawner);
+    assert_eq!(tick.report.dispatched, 0);
+    assert_eq!(spawner.asked.len(), MAX_DRAWS_PER_SLOT as usize);
 }
 
 /// `captain_cap` ends every repo's draws for the tick: the captain would
@@ -1081,4 +1412,292 @@ fn a_captain_cap_refusal_ends_the_ticks_draws() {
     assert_eq!(TickStop::CaptainCap.as_str(), "captain_cap");
     assert_eq!(disposition_of("captain_cap"), Qd::DeferredCapacity);
     assert_eq!(disposition_of("captain_not_eligible"), Qd::HostConstraint);
+}
+
+/// The draw works on a Gitea forge (#12312): rows listed through the direct
+/// backend from recorded Gitea shapes (no `labels_at`, sub-issue counts,
+/// `author_association` or check summary) classify and draw a Curator, a
+/// Champion, a Builder, a Judge and a merge step.
+#[test]
+fn a_gitea_listing_classifies_and_draws_every_stage() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::AtomicU64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gh = dir.path().join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+printf 'HTTP/1.1 200 OK\r\nETag: "g"\r\n\r\n'
+case "$*" in
+  *'/pulls?'*)
+    echo '[{"number": 40, "state": "open", "labels": [{"name": "loom:review-requested"}], "head": {"ref": "feature/issue-30", "sha": "abc"}, "base": {"ref": "main"}}, {"number": 60, "state": "open", "labels": [{"name": "loom:pr"}], "head": {"ref": "feature/issue-60", "sha": "def"}, "base": {"ref": "main"}}]' ;;
+  *'type=pulls'*)
+    echo '[{"number": 40, "state": "open", "body": "Closes #30", "labels": [{"name": "loom:review-requested"}], "pull_request": {}}, {"number": 60, "state": "open", "body": "Closes #60", "labels": [{"name": "loom:pr"}], "pull_request": {}}]' ;;
+  *)
+    echo '[{"number": 1, "state": "open", "labels": [{"name": "loom:triage"}]}, {"number": 2, "state": "open", "labels": [{"name": "loom:curated"}]}, {"number": 3, "state": "open", "labels": [{"name": "loom:issue"}]}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = crate::discovery::Target {
+        slug: format!("acme/gitea-tick-{}", std::process::id()),
+        gh_bin: gh,
+        root_dir: dir.path().to_path_buf(),
+    };
+    let snap = crate::discovery::direct::list_repo(
+        crate::forge_cmd::ForgeType::Gitea,
+        &target,
+        &AtomicU64::new(0),
+        crate::discovery::Tier::Gh,
+    )
+    .unwrap();
+    assert!(snap.rows.iter().all(|r| r.labels_at.is_none()));
+
+    let mut spawner = FakeSpawner::default();
+    run_with(vec![workspace(0, "acme/gitea", &snap.rows)], limits(10), &mut spawner);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert_eq!(
+        asked,
+        BTreeSet::from([
+            (1, StepRole::Curator),
+            (2, StepRole::ChampionPromote),
+            (3, StepRole::Builder),
+            (40, StepRole::Judge),
+            (60, StepRole::ChampionMerge),
+        ])
+    );
+}
+
+/// An events source that records every read (#12312).
+#[derive(Default)]
+struct RecordingEvents {
+    reads: Vec<u32>,
+}
+
+impl crate::step_dispatch::stage_entry::EventsSource for RecordingEvents {
+    fn label_times(
+        &mut self,
+        _root: &std::path::Path,
+        _slug: &str,
+        number: u32,
+        _label: &str,
+        _max_pages: usize,
+    ) -> crate::observability::ops::stage_events::LabelTimes {
+        self.reads.push(number);
+        crate::observability::ops::stage_events::LabelTimes {
+            times: Some(Default::default()),
+            pages: 1,
+        }
+    }
+}
+
+/// The stage-entry sources a tick's lookups reach (#12312): a mirror
+/// snapshot (every labelled row carries `labels_at`) answers every stepped
+/// item from the mirror and makes no events read; the same rows without
+/// `labels_at` (the direct shape) read events; a mixed snapshot reads events
+/// only for the rows lacking `labels_at`.
+#[test]
+fn only_the_direct_backend_reaches_the_events_and_created_sources() {
+    use crate::step_dispatch::stage_entry::{Source, StageEntryProvider};
+
+    fn lookups(rows: &[RestIssue]) -> (Vec<u32>, Vec<Source>) {
+        let pulls = rows
+            .iter()
+            .filter(|r| r.is_pull_request)
+            .map(|r| pull_from_row(r, PullMarkers::default()))
+            .collect();
+        let inputs = build_inputs(
+            rows,
+            pulls,
+            &IssueFacts::default(),
+            RepoInput::default(),
+            HostInput::default(),
+        );
+        let items = step_item::classify(&inputs);
+        let mut events = RecordingEvents::default();
+        let mut provider = StageEntryProvider::load(None, 100);
+        let mut sources = Vec::new();
+        let drawn = draw_inputs(items, rows, |r, label| {
+            let e = provider.entry(
+                &mut events,
+                std::path::Path::new("/nonexistent"),
+                "acme/widgets",
+                r,
+                label,
+                now(),
+            );
+            sources.extend(e.map(|e| e.source));
+            e
+        });
+        assert!(drawn.iter().any(|d| d.stage_entry.is_some()));
+        (events.reads, sources)
+    }
+
+    fn mirrored(mut r: RestIssue) -> RestIssue {
+        r.labels_at = Some(
+            r.labels
+                .iter()
+                .map(|l| (l.clone(), "2026-10-05T00:00:00Z".to_string()))
+                .collect(),
+        );
+        r
+    }
+
+    let direct = forge();
+    let mirror: Vec<RestIssue> = direct.iter().cloned().map(mirrored).collect();
+
+    let (reads, sources) = lookups(&mirror);
+    assert!(reads.is_empty(), "a mirror snapshot reads no events: {reads:?}");
+    assert!(!sources.is_empty() && sources.iter().all(|s| *s == Source::Mirror));
+
+    let (reads, sources) = lookups(&direct);
+    assert!(!reads.is_empty(), "the direct shape reads events");
+    assert!(sources.iter().all(|s| *s != Source::Mirror));
+
+    // Mixed: only rows without `labels_at` are read.
+    let mixed: Vec<RestIssue> = direct
+        .iter()
+        .cloned()
+        .map(|r| if r.number % 2 == 0 { mirrored(r) } else { r })
+        .collect();
+    let (reads, _) = lookups(&mixed);
+    assert!(!reads.is_empty());
+    assert!(reads.iter().all(|n| n % 2 == 1), "even rows are mirrored: {reads:?}");
+}
+
+// ---- #12817: items the captain offered ----------------------------------
+
+fn offer(repo: &str, item: u32, role: StepRole) -> Offer {
+    Offer {
+        repo: repo.to_string(),
+        item,
+        role,
+    }
+}
+
+fn run_offered(
+    workspaces: Vec<StepWorkspace>,
+    free_slots: usize,
+    spawner: &mut FakeSpawner,
+    offers: &[Offer],
+) -> StepTick {
+    run_with_offers(workspaces, limits(free_slots), &seed(), &PoolKnobs::default(), spawner, offers)
+}
+
+/// An offer in the gated pool spawns first, holds its slot and is not a draw.
+#[test]
+fn an_offer_in_the_pool_spawns_first_and_holds_its_slot() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("ACME/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(spawner.asked.len(), 1);
+    assert_eq!((spawner.asked[0].1, spawner.asked[0].2), (3, StepRole::Builder));
+    assert_eq!(tick.report.dispatched, 1);
+    // No draw was spent on it, and no slot is left for one.
+    assert_eq!(tick.draws, 0);
+    assert_eq!(tick.stop, TickStop::NoSlots);
+    assert_eq!(spawner.terms, vec![None]);
+}
+
+/// The rest of the slots draw as before, never drawing the offered item twice.
+#[test]
+fn the_slots_an_offer_leaves_still_draw() {
+    let mut spawner = FakeSpawner::default();
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        3,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.report.dispatched, 3);
+    assert_eq!(tick.draws, 2);
+    let threes = spawner.asked.iter().filter(|a| a.1 == 3).count();
+    assert_eq!(threes, 1);
+}
+
+/// An offer for an item the gates left out never reaches the spawner: the
+/// captain's queue is not authority to skip a gate.
+#[test]
+fn an_offer_cannot_skip_a_gate() {
+    let mut spawner = FakeSpawner::default();
+    // 7 is claimed (`loom:building`), 8 blocked, 9 operator-held; 999 is
+    // unknown; item 3 is a Builder item, not a Judge one; the repo differs.
+    let offers = [
+        offer("acme/one", 7, StepRole::Builder),
+        offer("acme/one", 8, StepRole::Builder),
+        offer("acme/one", 9, StepRole::Builder),
+        offer("acme/one", 999, StepRole::Builder),
+        offer("acme/one", 3, StepRole::Judge),
+        offer("acme/other", 3, StepRole::Builder),
+    ];
+    run_offered(vec![workspace(0, "acme/one", &forge())], 0, &mut spawner, &offers);
+    assert!(spawner.asked.is_empty());
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![workspace(0, "acme/one", &forge())], 10, &mut spawner, &offers);
+    let asked: BTreeSet<(u32, StepRole)> = spawner.asked.iter().map(|a| (a.1, a.2)).collect();
+    assert!(!asked.contains(&(7, StepRole::Builder)));
+    assert!(!asked.contains(&(8, StepRole::Builder)));
+    assert!(!asked.contains(&(9, StepRole::Builder)));
+    assert!(!asked.contains(&(999, StepRole::Builder)));
+}
+
+/// A held workspace offers nothing.
+#[test]
+fn an_offer_in_a_held_workspace_is_not_spawned() {
+    let mut ws = workspace(0, "acme/one", &forge());
+    ws.halted = true;
+    let mut spawner = FakeSpawner::default();
+    run_offered(vec![ws], 5, &mut spawner, &[offer("acme/one", 3, StepRole::Builder)]);
+    assert!(spawner.asked.is_empty());
+}
+
+/// A refused offer is counted by reason like a draw's, and spends no pass.
+#[test]
+fn a_refused_offer_is_counted_and_spends_no_pass() {
+    let mut spawner = FakeSpawner {
+        refuse: vec![(3, "captain_not_eligible")],
+        ..FakeSpawner::default()
+    };
+    let tick = run_offered(
+        vec![workspace(0, "acme/one", &forge())],
+        1,
+        &mut spawner,
+        &[offer("acme/one", 3, StepRole::Builder)],
+    );
+    assert_eq!(tick.passes.get("captain_not_eligible"), Some(&1));
+    assert_eq!(tick.passes.values().sum::<usize>(), 1);
+    // The slot it did not fill is drawn for, and that draw spawned.
+    assert_eq!(spawner.asked.len(), 2);
+    assert_eq!(tick.report.dispatched, 1);
+}
+
+/// #12957: the tick's queue rows and spawn requests carry each item's story
+/// points from the labels the listing already returned (no forge call); a PR
+/// step carries its closing issue's, an unsized item none.
+#[test]
+fn queue_rows_and_spawn_requests_carry_story_points() {
+    let rows = vec![
+        row(3, &["loom:issue", "points:8"], "", false),
+        row(4, &["loom:building", "points:3"], "", false),
+        row(40, &["loom:review-requested"], "Closes #4", true),
+        row(10, &["loom:issue"], "", false),
+    ];
+    let mut spawner = FakeSpawner::default();
+    let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(10), &mut spawner);
+    let row_points: BTreeMap<u32, Option<u32>> = tick
+        .report
+        .queue
+        .iter()
+        .map(|r| (r.key.number, r.story_points))
+        .collect();
+    let expected = BTreeMap::from([(3, Some(8)), (40, Some(3)), (10, None)]);
+    assert_eq!(row_points, expected);
+    let asked: BTreeMap<u32, Option<u32>> = spawner.points.into_iter().collect();
+    assert_eq!(asked, expected);
 }

@@ -44,27 +44,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UNINSTALL_SH="$REPO_ROOT/scripts/uninstall-loom.sh"
 LOOM_DEFAULTS_SETTINGS="$REPO_ROOT/defaults/.claude/settings.json"
 
-PASS=0
-FAIL=0
-TOTAL=0
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"
-    echo "  expected: '$expected'"
-    echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 if ! command -v jq &> /dev/null; then
   echo "SKIP: jq not available, uninstall-loom.sh's settings.json cleanup is a no-op without it" >&2

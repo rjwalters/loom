@@ -114,6 +114,45 @@ pub enum JournalEntry {
         is_pr: bool,
         action: String,
         by: String,
+        /// The head the write was made against, when the caller knew it
+        /// (`forge verdict-labels --sha`, #12362).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha: Option<String>,
+    },
+    /// A PR lease release a daemon subcommand made (`lease pr release`,
+    /// #14639): the typed outcome Champion's release records on its marker.
+    /// Written only after the release's own PATCH landed and never for a
+    /// reap, so it is the trusted record of the step's own release — a
+    /// release marker read back off the forge is untrusted prose (#9548)
+    /// and never becomes one.
+    Released {
+        at: DateTime<Utc>,
+        number: u32,
+        /// The outcome word the release recorded (`none` when it passed
+        /// none).
+        outcome: String,
+        /// The `reason=` gate a requeue or skip named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A hold-label transition a daemon subcommand or the Champion prompt
+    /// made on a PR (#12665): the source of `hold.transition`. `confirmed` is
+    /// `false` for a write that was attempted and failed.
+    Hold {
+        at: DateTime<Utc>,
+        number: u32,
+        /// `add` or `remove`.
+        transition: String,
+        reason_code: String,
+        trigger: String,
+        confirmed: bool,
+        /// When the hold began, when the caller knows it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entered_at: Option<DateTime<Utc>>,
+        /// Champion's merge-risk confidence in whole percent (#12950), on a
+        /// `decision`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence_pct: Option<u8>,
     },
 }
 
@@ -181,23 +220,34 @@ fn attach_in(command: &mut Command, root: &Path, role: &str, dir: &Path) {
 
 /// A step's journal file (#11906). A step runs detached from the tick that
 /// drew it, not on a role tick's blocking thread, so its journal is named by
-/// its sweep id rather than held thread-locally until the step ends.
+/// its repository root and sweep id rather than held thread-locally until
+/// the step ends. Different workspaces can generate the same sweep id.
 #[must_use]
-pub fn step_path(sweep_id: &str) -> PathBuf {
+pub fn step_path(root: &Path, sweep_id: &str) -> PathBuf {
+    journal_dir().join(step_file_name(root, sweep_id))
+}
+
+fn step_file_name(root: &Path, sweep_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // A release from a linked worktree uses the shared checkout root too.
+    let resolved = crate::repo_root::find_repo_root(root).or_else(|| root.canonicalize().ok());
+    let root = resolved.as_deref().unwrap_or(root);
+    let workspace = hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let name: String = sweep_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    journal_dir().join(format!("step-{name}.jsonl"))
+    format!("step-{workspace}-{name}.jsonl")
 }
 
 /// Give a step's launch its journal ([`step_path`]). A no-op without an
 /// OTLP exporter, like [`attach`].
-pub fn attach_step(command: &mut Command, sweep_id: &str) {
+pub fn attach_step(command: &mut Command, root: &Path, sweep_id: &str) {
     if super::ops::global_ops_sink().is_some()
         && crate::forge_etag_store::private_dir(&journal_dir(), true)
     {
-        command.env(PICK_JOURNAL_ENV, step_path(sweep_id));
+        command.env(PICK_JOURNAL_ENV, step_path(root, sweep_id));
     }
 }
 
@@ -250,11 +300,29 @@ pub fn take(root: &Path) -> Option<Journal> {
     if owner != root {
         return None;
     }
-    Some(Journal {
+    Some(journal_of(raw))
+}
+
+/// Read this thread's journal for `root` without consuming it (#12362): the
+/// `role_attempt` span closes before the drain, which still needs the file.
+/// `None` when no journal is attached for `root`.
+#[must_use]
+pub fn peek(root: &Path) -> Option<Journal> {
+    let path = ACTIVE.with(|a| {
+        a.borrow()
+            .as_ref()
+            .filter(|(owner, _)| owner == root)
+            .map(|(_, path)| path.clone())
+    })?;
+    Some(journal_of(std::fs::read_to_string(path)))
+}
+
+fn journal_of(raw: std::io::Result<String>) -> Journal {
+    Journal {
         read: raw.is_ok(),
         entries: parse(raw.as_deref().unwrap_or_default()),
         front_expected: front_expected(),
-    })
+    }
 }
 
 /// Parse journal lines, skipping any that do not decode.
@@ -567,16 +635,25 @@ fn is_marker(line: &str) -> bool {
 }
 
 /// The head Champion pinned for PR `number`, from its pin file
-/// (`$(git rev-parse --git-common-dir)/loom-champion-pin-pr-N`, first token;
-/// `champion-targeted.md` step 1). A local read; `None` when there is none.
+/// (`/tmp/loom-champion/<sha256(git common dir)[..12]>/pin-pr-N`, first
+/// token; `champion-targeted.md` step 1, #13200). A local read; `None` when
+/// there is none.
 fn champion_pin_head(number: u32) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--git-common-dir"])
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
-    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-    let text = std::fs::read_to_string(dir.join(format!("loom-champion-pin-pr-{number}"))).ok()?;
+    // The shell side hashes `git rev-parse ... | sha256sum`: the path plus a newline.
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let key = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(format!("{common}\n").as_bytes()))[..12].to_string()
+    };
+    let path = PathBuf::from("/tmp/loom-champion")
+        .join(key)
+        .join(format!("pin-pr-{number}"));
+    let text = std::fs::read_to_string(path).ok()?;
     let sha = text.split_whitespace().next()?;
     (sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then(|| sha.to_string())
 }
@@ -610,9 +687,43 @@ pub fn record_marker(number: u64, is_pr: bool, body: &str) {
     }
 }
 
+/// Journal a Judge approval refused by the exact-head CI gate (#13274):
+/// `class` is `ci_red` (exit 6) or `ci_incomplete` (exit 5). A marker entry
+/// carrying the head, so the Judge projection reads it. A no-op outside a
+/// journaled run.
+pub fn record_ci_refusal(number: u64, class: &str, head_sha: Option<&str>) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Marker {
+            at: Utc::now(),
+            number,
+            is_pr: true,
+            marker: format!("<!-- judge:ci-refused:{class} -->"),
+            head_sha: head_sha.map(str::to_string),
+        });
+    }
+}
+
 /// Journal a write a daemon subcommand made on `number` (#12027). A no-op
 /// outside a journaled run.
 pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
+    record_applied_at(number, is_pr, action, by, None);
+}
+
+/// The `by` of the verdict write `forge verdict-labels` journals (#12362).
+pub const VERDICT_LABELS_BY: &str = "verdict-labels";
+
+/// Journal a verdict's label transition on PR `pr` (`approved` or
+/// `changes_requested`, #12362), after it held. A no-op outside a journaled
+/// run; makes no forge call.
+pub fn record_verdict(pr: u64, action: &str, head_sha: Option<&str>) {
+    record_applied_at(pr, true, action, VERDICT_LABELS_BY, head_sha);
+}
+
+/// [`record_applied`] with the head the write was made against (#12362).
+pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_sha: Option<&str>) {
     if journal_path().is_none() {
         return;
     }
@@ -623,6 +734,60 @@ pub fn record_applied(number: u64, is_pr: bool, action: &str, by: &str) {
             is_pr,
             action: action.to_string(),
             by: by.to_string(),
+            head_sha: head_sha.filter(|s| !s.is_empty()).map(str::to_string),
+        });
+    }
+}
+
+/// Journal a successful Champion merge lease release only in the journal
+/// assigned to that merge step. An explicit `--sweep-id` can release an
+/// owned lease while the caller has inherited a different step's journal,
+/// even one with the same sweep id in another workspace.
+pub fn record_released(root: &Path, pr: u64, sweep_id: &str, outcome: &str, reason: Option<&str>) {
+    use crate::step_role::StepRole;
+    let (Some(path), Ok(number)) = (journal_path(), u32::try_from(pr)) else {
+        return;
+    };
+    if StepRole::parse_sweep_id(sweep_id) != Some((StepRole::ChampionMerge, number))
+        || path.file_name() != Some(std::ffi::OsStr::new(&step_file_name(root, sweep_id)))
+    {
+        return;
+    }
+    append_to(
+        &path,
+        &JournalEntry::Released {
+            at: Utc::now(),
+            number,
+            outcome: outcome.to_string(),
+            reason: reason.filter(|s| !s.is_empty()).map(str::to_string),
+        },
+    );
+}
+
+/// Journal a hold-label transition on PR `number` (#12665). A no-op outside a
+/// journaled run.
+pub fn record_hold(
+    number: u64,
+    transition: &str,
+    reason_code: &str,
+    trigger: &str,
+    confirmed: bool,
+    entered_at: Option<DateTime<Utc>>,
+    confidence_pct: Option<u8>,
+) {
+    if journal_path().is_none() {
+        return;
+    }
+    if let Ok(number) = u32::try_from(number) {
+        append(&JournalEntry::Hold {
+            at: Utc::now(),
+            number,
+            transition: transition.to_string(),
+            reason_code: reason_code.to_string(),
+            trigger: trigger.to_string(),
+            confirmed,
+            entered_at,
+            confidence_pct,
         });
     }
 }

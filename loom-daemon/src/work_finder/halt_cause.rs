@@ -119,31 +119,6 @@ impl HaltCause {
             Self::WeightZero => "weight_zero",
         }
     }
-
-    /// The short phrase naming this cause in a `workspace_halted` row's
-    /// human-readable `reason` (#11417).
-    #[must_use]
-    pub fn phrase(self) -> &'static str {
-        match self {
-            Self::MainRed => "main red",
-            Self::GatePending => "build gate running",
-            Self::TokenPool => "token pool exhausted",
-            Self::PreflightAdvisory => "pre-flight advisory tripped",
-            Self::Drain => "scheduled drain",
-            Self::WriteScope => "no write access to this repo",
-            Self::CiBilling => "CI billing failure",
-            Self::InstallIncompatible => "installed Loom incompatible",
-            Self::DaemonTooOld => "daemon too old for installed Loom",
-            Self::MaintainOnly => "maintain-only workspace",
-            Self::WeightZero => "draw weight 0",
-        }
-    }
-
-    /// The `reason` sentence for a `workspace_halted` row held by `self`.
-    #[must_use]
-    pub fn halted_reason(self) -> String {
-        format!("blocked: repo dispatch held — {}", self.phrase())
-    }
 }
 
 /// `2 token_pool, 1 daemon_too_old`: how many roots each cause holds, in
@@ -163,14 +138,12 @@ pub fn held_summary(causes: &[Option<HaltCause>]) -> String {
     parts.join(", ")
 }
 
-/// The per-root cause fold — the named-cause counterpart of
-/// [`super::dispatch_held_per_root_with_preflight`] plus the daemon-global
-/// `draining` term the production loop OR's on top (#9017).
+/// The per-root cause fold — [`super::dispatch_held_per_root`]'s holds plus the
+/// pre-flight causes and the daemon-global `draining` term (#9017).
 ///
 /// `preflight_causes` is parallel to `roots`, as computed by
 /// [`crate::work_finder::pool_preflight::preflight_held_causes_per_root`];
-/// a missing entry defaults to *not held*, mirroring the bool fold's
-/// `preflight_held.get(i).unwrap_or(false)`.
+/// a missing entry defaults to *not held*.
 ///
 /// **Precedence** — when several causes are true at once for the same root,
 /// the first of these wins, so the row always names one cause:

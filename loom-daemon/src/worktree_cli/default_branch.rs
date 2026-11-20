@@ -28,6 +28,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use super::wip::git_stdout;
+
 /// Resolve `repo`'s default branch name (`main`, `master`, …).
 ///
 /// Ladder, first match wins — the shell's, step for step:
@@ -59,7 +61,9 @@ pub fn resolve_for_remote(repo: &Path, remote: &str) -> Option<String> {
             "--short",
             &format!("refs/remotes/{remote}/HEAD"),
         ],
-    ) {
+    )
+    .filter(|s| !s.is_empty())
+    {
         return Some(
             sref.strip_prefix(&format!("{remote}/"))
                 .unwrap_or(&sref)
@@ -67,7 +71,9 @@ pub fn resolve_for_remote(repo: &Path, remote: &str) -> Option<String> {
         );
     }
 
-    if let Some(out) = git_stdout(repo, &["ls-remote", "--symref", remote, "HEAD"]) {
+    if let Some(out) =
+        git_stdout(repo, &["ls-remote", "--symref", remote, "HEAD"]).filter(|s| !s.is_empty())
+    {
         // `ref: refs/heads/main\tHEAD` — the shell takes field 2 of the first
         // `^ref:` line.
         if let Some(name) = out
@@ -100,24 +106,6 @@ pub fn resolve_for_remote(repo: &Path, remote: &str) -> Option<String> {
     }
 
     None
-}
-
-fn git_stdout(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
 }
 
 #[cfg(test)]

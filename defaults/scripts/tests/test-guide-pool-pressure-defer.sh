@@ -14,10 +14,14 @@
 # The #6135 fix adds a pool-pressure backoff to Guide's Document Maintenance
 # Step 5 (create_docs_pr()), gated by a new Step 4b:
 #   - pool_pressure_fraction(): a CHEAP read of the already-refreshed
-#     `.loom/tokens/.ranking` file (never a fresh `tokens check --ranking`
-#     probe, which would itself burn a real request against the pool this
-#     check exists to protect) -- reduced to "fraction of accounts NOT
-#     `available`".
+#     ranking (never a fresh `tokens check --ranking` probe, which would
+#     itself burn a real request against the pool this check exists to
+#     protect) -- reduced to "fraction of accounts NOT `available`".
+#     Since #13839 it goes through `loom-daemon tokens pressure` rather than
+#     opening the pool directory itself: `guide` declares no
+#     `credential-store` capability, so the role-tool-policy hook (#8256)
+#     DENIES any Bash call naming a path under `.loom/tokens`, and the
+#     hardcoded repo-local path was wrong anyway on a shared-pool host.
 #   - last_docs_maintenance_merge_epoch(): epoch of the most recently merged
 #     docs-maintenance PR of ANY kind (WORK_LOG, WORK_PLAN, or README) --
 #     deliberately NOT filtered to a specific file the way
@@ -29,7 +33,11 @@
 #     env > config > default, mirroring buildGate.loadThreshold); at/above
 #     threshold, defers UNLESS guide.docsMaintenance.poolPressureMaxDeferSecs
 #     (default 14400 = 4h) has elapsed since the last docs-maintenance PR
-#     merged -- the "never starves permanently" ceiling (AC3).
+#     merged -- the "never starves permanently" ceiling (AC3). An
+#     `unavailable` reading (denied/failed verb, empty or non-numeric
+#     output, #14162) is pressure-UNKNOWN and fails CLOSED into the same
+#     bounded backoff -- defer within the ceiling, file past it -- never a
+#     silent "proceed".
 #
 # Verifies that:
 #   1. guide.md defines pool_pressure_fraction(), last_docs_maintenance_merge_
@@ -39,8 +47,15 @@
 #      reads both config knobs with the documented env-var + default names.
 #   2. THE REGRESSION, executed rather than grepped:
 #      a. pool_pressure_fraction() itself, sourced verbatim from guide.md and
-#         run against real `.ranking` fixtures in a throwaway git repo --
-#         mixed statuses, an empty file, and a missing file.
+#         run against a STUB `loom-daemon` on PATH -- a real fraction, "0",
+#         no output at all, non-numeric output, malformed decimals, and a
+#         stub that exits non-zero (an older daemon with no `pressure` verb).
+#         A successful numeric read (including "0") passes through; every
+#         non-reading shape (#14162) reports "unavailable", which the caller
+#         must treat as pressure-UNKNOWN -- never "no pressure".
+#      a'. #13839: the function body names no path under `.loom/tokens`, and
+#         `loom-daemon role-tool-policy check guide` ALLOWS the command it
+#         actually runs (the regression that made the whole check dead code).
 #      b. last_docs_maintenance_merge_epoch()'s jq filter, executed against a
 #         fixture that proves it is NOT restricted to a specific file (a
 #         README-only docs PR still anchors the clock -- the opposite of
@@ -48,11 +63,20 @@
 #      c. A reconstruction of should_defer_for_pool_pressure()'s decision
 #         arithmetic, run against fixture threshold/epoch values -- below
 #         threshold, at/above threshold within the max-defer ceiling,
-#         at/above threshold past the ceiling, and an empty merge history.
+#         at/above threshold past the ceiling, an empty merge history, and
+#         the #14162 unavailable-reading rows (defer within the ceiling,
+#         file past it and at epoch 0).
+#      d. The REAL Step 4b functions executed end-to-end against stub
+#         `loom-daemon` / forge readers (#14162 AC case): the outcome is the
+#         HELPER'S value -- a high fraction defers, an unavailable read
+#         defers within the ceiling and files past it with the cause named,
+#         a valid "0" proceeds -- with no direct read anywhere in the
+#         function set (Test 3a/3d) and a direct read still denied by
+#         policy (Test 3b's control).
 #
-# Hermetic: throwaway git repo under mktemp -d for the ranking-file test,
-# pure jq/arithmetic against fixture values for the rest. No forge, network,
-# or `gh` calls.
+# Hermetic: a throwaway git repo under mktemp -d with a stub `loom-daemon`
+# first on PATH for the fraction test, pure jq/arithmetic against fixture
+# values for the rest. No forge, network, `gh`, or real-daemon calls.
 
 set -uo pipefail
 
@@ -69,25 +93,12 @@ else
     GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
 fi
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     local actual="$1" expected="$2" msg="$3"
     if [[ "$actual" == "$expected" ]]; then pass "$msg"; else fail "$msg (got '$actual', expected '$expected')"; fi
-}
-
-assert_grep() {
-    local pattern="$1" file="$2" msg="$3"
-    if grep -qE "$pattern" "$file"; then pass "$msg"; else fail "$msg (missing pattern: $pattern)"; fi
 }
 
 if [[ ! -f "$GUIDE_MD" ]]; then
@@ -102,8 +113,8 @@ echo "Test 1: guide.md defines and wires the pool-pressure backoff"
 
 assert_grep 'pool_pressure_fraction\(\) \{' "$GUIDE_MD" \
     "pool_pressure_fraction() is defined"
-assert_grep '\.loom/tokens/\.ranking' "$GUIDE_MD" \
-    "pool_pressure_fraction() reads .loom/tokens/.ranking"
+assert_grep 'loom-daemon tokens pressure' "$GUIDE_MD" \
+    "pool_pressure_fraction() goes through the loom-daemon tokens pressure verb (#13839)"
 assert_grep 'last_docs_maintenance_merge_epoch\(\) \{' "$GUIDE_MD" \
     "last_docs_maintenance_merge_epoch() is defined"
 assert_grep 'should_defer_for_pool_pressure\(\) \{' "$GUIDE_MD" \
@@ -174,10 +185,17 @@ fi
 
 # ---------------------------------------------------------------------------
 # Test 3: THE REGRESSION (a) -- pool_pressure_fraction() sourced verbatim and
-# executed against real `.ranking` fixtures in a throwaway git repo.
+# executed against a STUB `loom-daemon tokens pressure` on PATH.
+#
+# Before #13839 this function opened `<repo>/.loom/tokens/.ranking` itself,
+# which the role-tool-policy hook denies for `guide` (no `credential-store`
+# capability) and which points at the wrong directory on a shared-pool host.
+# It now shells out to the verb, so what has to be executed here is the
+# function's handling of what the verb prints -- including every way an older
+# or broken daemon can answer.
 # ---------------------------------------------------------------------------
 echo ""
-echo "Test 3: pool_pressure_fraction(), executed against real .ranking fixtures"
+echo "Test 3: pool_pressure_fraction(), executed against a stub loom-daemon"
 
 PPF_SRC="$(awk '/^pool_pressure_fraction\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
 
@@ -185,6 +203,21 @@ if [[ -z "$PPF_SRC" ]]; then
     fail "could not extract pool_pressure_fraction() from guide.md"
 else
     pass "extracted pool_pressure_fraction() from guide.md"
+
+    # #13839: the body must not name the credential-store path at all. A
+    # single occurrence anywhere in the function is enough for the hook to
+    # deny the entire Bash call it appears in.
+    if [[ "$PPF_SRC" == *'.loom/tokens'* ]]; then
+        fail "pool_pressure_fraction() still names a path under .loom/tokens -- the role-tool-policy hook denies that for 'guide' (#13839)"
+    else
+        pass "pool_pressure_fraction() names no path under .loom/tokens (#13839)"
+    fi
+
+    if [[ "$PPF_SRC" == *'loom-daemon tokens pressure'* ]]; then
+        pass "pool_pressure_fraction() obtains the fraction from 'loom-daemon tokens pressure'"
+    else
+        fail "pool_pressure_fraction() does not call 'loom-daemon tokens pressure' (#13839)"
+    fi
 
     SANDBOX="$(mktemp -d)"
     cleanup_sandbox() { rm -rf "$SANDBOX"; }
@@ -194,45 +227,142 @@ else
     printf '%s\n' "$PPF_SRC" > "$PPF_SCRIPT"
 
     (cd "$SANDBOX" && git init -q)
-    mkdir -p "$SANDBOX/.loom/tokens"
 
-    # Fixture: 3 of 5 accounts NOT `available` (exhausted x2, rate_limited x1)
-    # -- mirrors the #6135 incident shape (a majority-unavailable pool).
-    cat > "$SANDBOX/.loom/tokens/.ranking" <<'EOF'
-alice|available|0.20|
-bob|exhausted|0.99|2026-08-20T00:00:00Z
-carol|exhausted|0.99|2026-08-20T00:00:00Z
-dave|rate_limited|0.85|2026-08-13T10:00:00Z
-eve|available|0.10|
-EOF
+    # A stub `loom-daemon` first on PATH. It echoes whatever
+    # $STUB_OUT holds and exits with $STUB_RC, so one stub covers every
+    # answer shape the real verb (or an older daemon) can produce.
+    mkdir -p "$SANDBOX/bin"
+    cat > "$SANDBOX/bin/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${STUB_OUT:-}" ]] && printf '%s\n' "$STUB_OUT"
+exit "${STUB_RC:-0}"
+STUB
+    chmod +x "$SANDBOX/bin/loom-daemon"
 
-    RESULT="$(cd "$SANDBOX" && source "$PPF_SCRIPT" && pool_pressure_fraction)"
-    assert_eq "$RESULT" "0.6000" "3 of 5 unavailable accounts -> fraction 0.6000"
+    # Run the function with the stub shadowing any real loom-daemon.
+    run_ppf() {
+        (cd "$SANDBOX" && PATH="$SANDBOX/bin:$PATH" \
+            STUB_OUT="${1-}" STUB_RC="${2:-0}" \
+            bash -c "source '$PPF_SCRIPT'; pool_pressure_fraction")
+    }
 
-    # A healthy pool -- 1 of 5 unavailable.
-    cat > "$SANDBOX/.loom/tokens/.ranking" <<'EOF'
-alice|available|0.20|
-bob|available|0.30|
-carol|available|0.15|
-dave|rate_limited|0.85|2026-08-13T10:00:00Z
-eve|available|0.10|
-EOF
-    RESULT="$(cd "$SANDBOX" && source "$PPF_SCRIPT" && pool_pressure_fraction)"
-    assert_eq "$RESULT" "0.2000" "1 of 5 unavailable accounts -> fraction 0.2000"
+    # The verb reports real pressure -- passed through verbatim.
+    RESULT="$(run_ppf "0.7500" 0)"
+    assert_eq "$RESULT" "0.7500" "a 0.7500 reading from the verb is passed through verbatim"
 
-    # Empty ranking file -- fails open (0 pressure), never a divide-by-zero
-    # or a corrupted multi-line capture.
-    : > "$SANDBOX/.loom/tokens/.ranking"
-    RESULT="$(cd "$SANDBOX" && source "$PPF_SCRIPT" && pool_pressure_fraction)"
-    assert_eq "$RESULT" "0" "an empty .ranking file fails open (fraction 0, not an error)"
+    RESULT="$(run_ppf "0.0000" 0)"
+    assert_eq "$RESULT" "0.0000" "a fully healthy pool (0.0000) is passed through verbatim"
 
-    # Missing ranking file -- fails open.
-    rm -f "$SANDBOX/.loom/tokens/.ranking"
-    RESULT="$(cd "$SANDBOX" && source "$PPF_SCRIPT" && pool_pressure_fraction)"
-    assert_eq "$RESULT" "0" "a missing .ranking file fails open (fraction 0)"
+    # The verb's own (valid) answer for absent/unparseable ranking data: a
+    # successful numeric "0" is a real no-pressure reading, NOT a failure.
+    RESULT="$(run_ppf "0" 0)"
+    assert_eq "$RESULT" "0" "the verb's valid no-data answer ('0') is passed through"
+
+    # An older daemon that does not know the `pressure` verb: clap exits
+    # non-zero. Not a reading -- "unavailable", never a number (#14162).
+    RESULT="$(run_ppf "error: unrecognized subcommand 'pressure'" 2)"
+    assert_eq "$RESULT" "unavailable" "a daemon too old for the verb (non-zero exit) reports 'unavailable' (#14162)"
+
+    # Exit 0 but nothing on stdout -- also not a reading (#14162).
+    RESULT="$(run_ppf "" 0)"
+    assert_eq "$RESULT" "unavailable" "empty output with exit 0 reports 'unavailable' (#14162)"
+
+    # Non-numeric output (a warning line leaking onto stdout, say) must never
+    # reach the awk comparison in should_defer_for_pool_pressure().
+    RESULT="$(run_ppf "warning: no pool found" 0)"
+    assert_eq "$RESULT" "unavailable" "non-numeric output reports 'unavailable' (#14162)"
+
+    # Malformed decimals are not readings either (#14162).
+    RESULT="$(run_ppf "0.7.5" 0)"
+    assert_eq "$RESULT" "unavailable" "a malformed decimal ('0.7.5') reports 'unavailable' (#14162)"
+
+    RESULT="$(run_ppf ".5" 0)"
+    assert_eq "$RESULT" "unavailable" "a leading-dot decimal ('.5') reports 'unavailable' (#14162)"
+
+    RESULT="$(run_ppf "5." 0)"
+    assert_eq "$RESULT" "unavailable" "a trailing-dot decimal ('5.') reports 'unavailable' (#14162)"
+
+    RESULT="$(run_ppf "." 0)"
+    assert_eq "$RESULT" "unavailable" "a bare dot ('.') reports 'unavailable' (#14162)"
 
     trap - EXIT
     cleanup_sandbox
+fi
+
+# ---------------------------------------------------------------------------
+# Test 3b: #13839 -- the command pool_pressure_fraction() runs is ALLOWED by
+# the role-tool-policy hook for role `guide`. This is the actual reported
+# regression: the prescribed read was refused at the harness, so the whole
+# #6135 backoff was dead code for any Guide that followed its prompt.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 3b: role-tool-policy allows the command for role 'guide' (#13839)"
+
+if ! command -v loom-daemon >/dev/null 2>&1; then
+    echo "SKIP: loom-daemon not on PATH"
+elif ! loom-daemon role-tool-policy check --help >/dev/null 2>&1; then
+    echo "SKIP: this loom-daemon has no 'role-tool-policy check' subcommand"
+else
+    # The exact command line the function runs, with the command
+    # substitution left intact -- the hook judges raw command text.
+    PPF_CMD='loom-daemon tokens pressure --workspace "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"'
+    if loom-daemon role-tool-policy check guide --workspace "$REPO_ROOT" --command "$PPF_CMD" >/dev/null 2>&1; then
+        pass "role-tool-policy ALLOWS the pool-pressure command for role 'guide'"
+    else
+        fail "role-tool-policy DENIES the pool-pressure command for role 'guide' (#13839 regression)"
+    fi
+
+    # Control: the pre-#13839 direct read is still denied, which is what makes
+    # the assertion above meaningful rather than vacuously true.
+    if loom-daemon role-tool-policy check guide --workspace "$REPO_ROOT" \
+        --command 'awk -F"|" "{print}" .loom/tokens/.ranking' >/dev/null 2>&1; then
+        fail "control: a direct read of .loom/tokens/.ranking should be DENIED for 'guide' -- the matcher is not exercising the capability"
+    else
+        pass "control: a direct read of .loom/tokens/.ranking is still denied for 'guide'"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Test 3c: #13839 -- guide.json keeps an EMPTY capability allowlist. The fix
+# must not have widened the role's capabilities to make the read legal.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 3c: guide.json still declares no capabilities (#13839)"
+
+GUIDE_JSON=""
+for candidate in "$REPO_ROOT/.loom/roles/guide.json" "$REPO_ROOT/defaults/roles/guide.json"; do
+    [[ -f "$candidate" ]] && { GUIDE_JSON="$candidate"; break; }
+done
+
+if [[ -z "$GUIDE_JSON" ]]; then
+    fail "could not locate guide.json"
+elif ! command -v jq >/dev/null 2>&1; then
+    echo "SKIP: jq not available"
+else
+    CAPS="$(jq -c '.toolPolicy.allowedCapabilities // []' "$GUIDE_JSON")"
+    assert_eq "$CAPS" "[]" "guide.json's allowedCapabilities is still empty (the fix did not grant credential-store)"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 3d: #14162 -- Step 4b prose and code describe ONLY the verb. A
+# surviving description of a direct pool-directory / ranking-file read is a
+# path an agent can follow even when the helper works, which is one of the
+# two suspected causes of the reported skip.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 3d: Step 4b prose and code name no direct pool/ranking read (#14162)"
+
+STEP4B="$(awk '/^### Step 4b/{flag=1} /^### Step 5/{flag=0} flag' "$GUIDE_MD")"
+if [[ -z "$STEP4B" ]]; then
+    fail "could not extract the Step 4b section from guide.md"
+else
+    for BANNED in '.loom/tokens' '.ranking' 'pool directory' 'directory yourself' 'LOOM_SHARED_TOKENS_DIR'; do
+        if grep -qF -- "$BANNED" <<<"$STEP4B"; then
+            fail "Step 4b still mentions '$BANNED' -- a direct read an agent could follow (#14162)"
+        else
+            pass "Step 4b names no '$BANNED' (helper is the only described read)"
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -292,7 +422,10 @@ pool_pressure_decision() {
     local fraction="$1" threshold="$2" last_merged_epoch="$3" now_epoch="$4" max_defer="$5"
     local elapsed
 
-    if awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+    if [ "$fraction" = "unavailable" ]; then
+        : # #14162: pressure-UNKNOWN fails CLOSED into the ceiling below --
+          # never a silent "proceed".
+    elif awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
         echo "FILE"
         return
     fi
@@ -363,6 +496,159 @@ echo "Test 8: an empty docs-maintenance history never defers indefinitely"
 
 DECISION="$(pool_pressure_decision 0.9 "$THRESHOLD" 0 1000000 "$MAX_DEFER")"
 assert_eq "$DECISION" "FILE" "last_merged_epoch == 0 (no prior docs-maintenance PR) files immediately, even under high pressure"
+
+# ---------------------------------------------------------------------------
+# Test 9: an UNAVAILABLE pressure read (#14162) is pressure-UNKNOWN: it
+# fails CLOSED into the same bounded backoff as a real high reading --
+# defers within the ceiling, files past it (never a silent "proceed").
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 9: an unavailable pressure read defers within the ceiling, files past it (#14162)"
+
+DECISION="$(pool_pressure_decision "unavailable" "$THRESHOLD" "$LAST_MERGE" "$INSIDE_CEILING" "$MAX_DEFER")"
+assert_eq "$DECISION" "DEFER" "an unavailable read (denied/failed verb) defers within the max-defer ceiling -- never a silent proceed (#14162)"
+
+DECISION="$(pool_pressure_decision "unavailable" "$THRESHOLD" "$LAST_MERGE" "$PAST_CEILING" "$MAX_DEFER")"
+assert_eq "$DECISION" "FILE" "an unavailable read still files once the max-defer ceiling has elapsed (no permanent starvation, #14162)"
+
+DECISION="$(pool_pressure_decision "unavailable" "$THRESHOLD" 0 1000000 "$MAX_DEFER")"
+assert_eq "$DECISION" "FILE" "an unavailable read with no prior docs-maintenance merge (epoch 0) files -- the ceiling rule treats it as elapsed (#14162)"
+
+# ---------------------------------------------------------------------------
+# Test 10: the REAL Step 4b functions, executed end-to-end (#14162 AC case):
+# with the helper available (a stub verb), the decision uses the HELPER'S
+# value -- a high fraction defers, an unavailable read defers within the
+# ceiling and files past it with the cause named, and a valid "0" proceeds.
+# The function set contains no direct read (Tests 3a/3d) and a direct read
+# is still denied by policy (Test 3b's control), so the outcome here IS the
+# helper's value, not a skip.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 10: real should_defer_for_pool_pressure() executed end-to-end (#14162)"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "SKIP: jq not available"
+else
+    PPF_SRC="$(awk '/^pool_pressure_fraction\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+    SDFPP_SRC="$(awk '/^should_defer_for_pool_pressure\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+    LDME_SRC="$(awk '/^last_docs_maintenance_merge_epoch\(\) \{/{flag=1} flag{print} /^\}/{if(flag){exit}}' "$GUIDE_MD")"
+    EXCLUDE_LINE="$(grep -m1 '^GUIDE_DOCS_PR_EXCLUDE=' "$GUIDE_MD")"
+    GUIDE_DOCS_PR_EXCLUDE="${EXCLUDE_LINE#GUIDE_DOCS_PR_EXCLUDE=}"
+    GUIDE_DOCS_PR_EXCLUDE="${GUIDE_DOCS_PR_EXCLUDE#\'}"
+    GUIDE_DOCS_PR_EXCLUDE="${GUIDE_DOCS_PR_EXCLUDE%\'}"
+
+    if [[ -z "$PPF_SRC" || -z "$SDFPP_SRC" || -z "$LDME_SRC" ]]; then
+        fail "could not extract the Step 4b functions from guide.md"
+    else
+        E2E_SANDBOX="$(mktemp -d)"
+        mkdir -p "$E2E_SANDBOX/bin"
+        (cd "$E2E_SANDBOX" && git init -q)
+
+        # Stub `loom-daemon`: echoes $STUB_OUT and exits $STUB_RC (same
+        # shape as Test 3's stub).
+        cat > "$E2E_SANDBOX/bin/loom-daemon" <<'STUB'
+#!/usr/bin/env bash
+[[ -n "${STUB_OUT:-}" ]] && printf '%s\n' "$STUB_OUT"
+exit "${STUB_RC:-0}"
+STUB
+        chmod +x "$E2E_SANDBOX/bin/loom-daemon"
+
+        # Stub forge reader for last_docs_maintenance_merge_epoch(): prints
+        # a one-PR merged list anchored at $GH_STUB_MERGED_AT, else no PRs.
+        # Honours `--jq <expr>` the way `gh pr list` does (the filter is a
+        # gh-CLI behaviour, applied client-side).
+        cat > "$E2E_SANDBOX/bin/forge-read" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "pr" && "${2:-}" == "list" ]]; then
+    payload="[]"
+    if [[ -n "${GH_STUB_MERGED_AT:-}" ]]; then
+        payload="$(printf '[{"number":1,"title":"docs: Guide document maintenance update","mergedAt":"%s","headRefName":"docs/guide-update-20260101-000000"}]\n' "$GH_STUB_MERGED_AT")"
+    fi
+    expr=""
+    prev=""
+    for arg in "$@"; do
+        if [[ "$prev" == "--jq" ]]; then
+            expr="$arg"
+        fi
+        prev="$arg"
+    done
+    if [[ -n "$expr" ]]; then
+        printf '%s\n' "$payload" | jq -r "$expr"
+    else
+        printf '%s\n' "$payload"
+    fi
+fi
+exit 0
+STUB
+        chmod +x "$E2E_SANDBOX/bin/forge-read"
+
+        printf '%s\n' "$PPF_SRC" > "$E2E_SANDBOX/ppf.sh"
+        printf '%s\n' "$LDME_SRC" > "$E2E_SANDBOX/ldme.sh"
+        printf '%s\n' "$SDFPP_SRC" > "$E2E_SANDBOX/sdfpp.sh"
+
+        # Run the real functions with the stubs. $1 = stub stdout, $2 = stub
+        # rc, $3 = seconds since the last docs-maintenance merge ("" = none).
+        # Prints the function's message, then "rc=<exit>" as the last line.
+        run_step4b() {
+            local out="$1" rc="$2" offset="${3:-}" now=1000000 merged_at=""
+            if [[ -n "$offset" ]]; then
+                merged_at="$(jq -rn --argjson e "$((now - offset))" '$e | strftime("%Y-%m-%dT%H:%M:%SZ")')"
+            fi
+            (cd "$E2E_SANDBOX" && PATH="$E2E_SANDBOX/bin:$PATH" \
+                STUB_OUT="$out" STUB_RC="$rc" \
+                GH_READ="$E2E_SANDBOX/bin/forge-read" \
+                GH_STUB_MERGED_AT="$merged_at" \
+                GUIDE_DOCS_PR_EXCLUDE="$GUIDE_DOCS_PR_EXCLUDE" \
+                LOOM_GUIDE_POOL_PRESSURE_THRESHOLD=0.7 \
+                LOOM_GUIDE_POOL_PRESSURE_MAX_DEFER_SECS=14400 \
+                LOOM_GUIDE_POOL_PRESSURE_NOW="$now" \
+                bash -c "source '$E2E_SANDBOX/ppf.sh'; source '$E2E_SANDBOX/ldme.sh'; source '$E2E_SANDBOX/sdfpp.sh'; should_defer_for_pool_pressure; echo \"rc=\$?\"")
+        }
+
+        OUT="$(run_step4b "0.85" 0 3600)"
+        RC="$(tail -n1 <<<"$OUT")"
+        RC="${RC#rc=}"
+        assert_eq "$RC" "0" "a 0.85 helper reading, 1h past the last merge, DEFERS (rc=0) -- the helper's value is used, not a skip"
+        if grep -qF "0.85" <<<"$OUT"; then
+            pass "the deferral message reports the helper's fraction (0.85)"
+        else
+            fail "the deferral message should name the helper's fraction, got: $OUT"
+        fi
+
+        # AC case: a denied/failed read is pressure-UNKNOWN -- defers within
+        # the ceiling (bounded), with the cause named in the message.
+        OUT="$(run_step4b "" 2 3600)"
+        RC="$(tail -n1 <<<"$OUT")"
+        RC="${RC#rc=}"
+        assert_eq "$RC" "0" "a DENIED/failed pressure read defers within the ceiling (rc=0), never a silent proceed (#14162)"
+        if grep -qi "unavailable" <<<"$OUT"; then
+            pass "the deferral message names the cause (unavailable)"
+        else
+            fail "the deferral message for an unavailable read should name the cause, got: $OUT"
+        fi
+
+        # Past the ceiling the file-anyway branch still wins (no starvation).
+        OUT="$(run_step4b "" 2 15000)"
+        RC="$(tail -n1 <<<"$OUT")"
+        RC="${RC#rc=}"
+        assert_eq "$RC" "1" "an unavailable read past the 14400s ceiling files anyway (rc=1) -- no permanent starvation (#14162)"
+
+        # No prior docs-maintenance merge (epoch 0): the ceiling rule treats
+        # it as elapsed, so an unavailable read files.
+        OUT="$(run_step4b "" 2 "")"
+        RC="$(tail -n1 <<<"$OUT")"
+        RC="${RC#rc=}"
+        assert_eq "$RC" "1" "an unavailable read with no prior docs-maintenance merge (epoch 0) files (rc=1) (#14162)"
+
+        # A valid "0" below threshold proceeds exactly as before (AC2).
+        OUT="$(run_step4b "0" 0 3600)"
+        RC="$(tail -n1 <<<"$OUT")"
+        RC="${RC#rc=}"
+        assert_eq "$RC" "1" "a valid '0' reading below threshold still proceeds (rc=1) -- behaviour unchanged for real readings (#14162)"
+
+        rm -rf "$E2E_SANDBOX"
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 echo ""

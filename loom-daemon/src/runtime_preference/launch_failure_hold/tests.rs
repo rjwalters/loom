@@ -168,6 +168,7 @@ fn the_fingerprint_follows_the_runtimes_block_and_the_tap() {
     let tap = Tap {
         runtime: "opencode".into(),
         model_profile: Some("zai-flash".into()),
+        model: None,
     };
     let base = serde_json::json!({"runtimes": {"rolePreference": {"doctor": ["claude"]}}});
     let same = serde_json::json!({

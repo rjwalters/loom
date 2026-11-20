@@ -32,7 +32,7 @@
 //! decision, rather than a flag buried in a command line.
 //!
 //! That transition has to actually be available, and for one hold kind it was
-//! not: Champion's critical-file hold (criterion #3) re-applied `loom:operator`
+//! not: Champion's critical-file hold (the `critical-files` criterion) re-applied `loom:operator`
 //! on its next tick, so clearing the label bought the operator ~90 seconds
 //! before this guard refused again (#9016, merge train #8996). The fix is on
 //! Champion's side, not this guard's — `champion-critical-file-hold.md` now
@@ -113,6 +113,18 @@ pub fn contradiction(labels: &str) -> Option<&'static str> {
     BLOCKING.iter().copied().find(|b| present(b))
 }
 
+/// Whether the labels are exactly Champion's human-merge hold shape (#13517):
+/// `loom:pr` + `loom:blocked`, with no other contradicting label and no
+/// `loom:frozen`. Only this shape is releasable by `merge-pr.sh --release-hold`.
+#[must_use]
+pub fn hold_shape(labels: &str) -> bool {
+    let present = |want: &str| labels.lines().any(|l| l.trim() == want);
+    present("loom:pr")
+        && present("loom:blocked")
+        && !present(crate::work_finder::FROZEN_LABEL)
+        && BLOCKING.iter().all(|b| *b == "loom:blocked" || !present(b))
+}
+
 /// The sequencing-hold label (#9378).
 pub const SEQUENCED: &str = "loom:sequenced";
 
@@ -165,6 +177,16 @@ pub fn message(pr: &str, blocker: &str, labels: &str, head_sha: &str) -> String 
             "Merge blocked: PR #{pr} is `loom:frozen` (#11743): not now, don't touch. Only a \
              human removes the label; there is no override.\n\nCurrent labels: {shown}\n\
              Current head SHA: {head_sha}"
+        );
+    }
+    if hold_shape(labels) {
+        return format!(
+            "Merge blocked: PR #{pr} carries `loom:pr` + `loom:blocked`: Champion's \
+             human-merge hold (merge-risk / critical-file). If you are the human it is waiting \
+             for, release it and merge in one audited step: `merge-pr.sh {pr} --release-hold` \
+             (it verifies the head still matches Champion's hold and the Judge approval, and \
+             records who released it). A bare label removal records nothing.\n\nCurrent \
+             labels: {shown}\nCurrent head SHA: {head_sha}"
         );
     }
     format!(

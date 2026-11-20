@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use super::tests::{stub_server, SafehouseTestPaths};
+use super::tests::{reconcile_merges_unwatermarked, stub_server, SafehouseTestPaths};
 use super::*;
 use crate::rate_limit_breaker::evidence::ResetEvidence;
 use crate::rate_limit_breaker::report::{BreakerHandle, BudgetProbe, FailureContext, ProbeMode};
@@ -201,7 +201,7 @@ async fn a_merged_step_narrates_once_and_reconciliation_then_posts_nothing() {
         .await;
         assert!(again.is_none());
         // The backstop sees the same (workspace, issue, PR) and posts nothing.
-        let reconciled = reconcile_recent_merges(
+        let reconciled = reconcile_merges_unwatermarked(
             "loom_daemon",
             &root,
             &mut slug_cache,
@@ -456,4 +456,293 @@ fn watermarks_never_move_backwards_and_carry_the_slack() {
     assert!(args
         .windows(2)
         .any(|w| w[0] == "--search" && w[1].starts_with("merged:>=")));
+}
+
+/// #13481: a full page is only "saturated" (may hide an in-window merge)
+/// when every row on it is inside the lookback window. A long-lived repo's
+/// unwatermarked page is full of history older than the window and must not
+/// warn "filled its page (0 rows)".
+#[test]
+fn a_full_page_of_out_of_window_history_is_not_saturated() {
+    let cutoff = Utc::now() - chrono::Duration::days(7);
+    let row = |merged_at: DateTime<Utc>| serde_json::json!({ "mergedAt": merged_at.to_rfc3339_opts(SecondsFormat::Secs, true) });
+    let limit = RECONCILE_PR_LIMIT;
+    let old: Vec<Value> = (0..limit)
+        .map(|_| row(cutoff - chrono::Duration::days(30)))
+        .collect();
+    assert!(!page_may_hide_in_window_merges(&old, limit, cutoff));
+    let fresh: Vec<Value> = (0..limit).map(|_| row(Utc::now())).collect();
+    assert!(page_may_hide_in_window_merges(&fresh, limit, cutoff));
+    // Short of a full page: never saturated, whatever the dates.
+    assert!(!page_may_hide_in_window_merges(&fresh[..3], limit, cutoff));
+    // One out-of-window row anywhere on a full page: the page reached past
+    // the window, so it cannot hide an in-window merge.
+    let mut mixed = fresh.clone();
+    mixed[limit as usize - 1] = row(cutoff - chrono::Duration::hours(1));
+    assert!(!page_may_hide_in_window_merges(&mixed, limit, cutoff));
+    // An undated row counts as in-window (errs towards the warning).
+    let undated: Vec<Value> = (0..limit).map(|_| serde_json::json!({})).collect();
+    assert!(page_may_hide_in_window_merges(&undated, limit, cutoff));
+}
+
+/// Seed the transcript a dispatched **step** leaves behind (#13287): a
+/// `/loom:builder <issue>` session, not `/loom:sweep`, with one model's usage.
+fn seed_step_transcript(config: &Path, workspace: &str, command: &str, args: &str) {
+    let project = config
+        .join("projects")
+        .join(crate::transcript_tokens::project_slug(Path::new(workspace)));
+    std::fs::create_dir_all(&project).unwrap();
+    let body = format!(
+        "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\
+         \"<command-name>/loom:{command}</command-name>\\n\
+         <command-args>{args}</command-args>\"}}}}\n\
+         {{\"type\":\"assistant\",\"message\":{{\"model\":\"claude-sonnet-4-5\",\
+         \"usage\":{{\"input_tokens\":10,\"output_tokens\":20,\
+         \"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":40}}}}}}\n"
+    );
+    std::fs::write(project.join(format!("{command}-{args}.jsonl").replace([' ', '-'], "_")), body)
+        .unwrap();
+}
+
+/// #13287: every trigger path carries `tokens` and `tokens_by_model` for a
+/// completion whose sessions are step-launched role commands, and emits one
+/// `completion.narrated` record naming the trigger, with `seeded` distinct.
+#[test]
+#[serial]
+fn each_trigger_path_carries_step_session_tokens_and_emits_a_narration_record() {
+    use crate::telemetry::TelemetryRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let root = ws.to_string_lossy().into_owned();
+    let config = dir.path().join("claude-config");
+    std::fs::create_dir_all(config.join("projects")).unwrap();
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    // Issue 11 merges via sweep exit, 12 via a champion step, 13 and 14 via
+    // reconciliation (14 as a seeding pass), 15 has no sessions on disk.
+    seed_step_transcript(&config, &root, "builder", "11");
+    seed_step_transcript(&config, &root, "curator", "12");
+    seed_step_transcript(&config, &root, "champion", "--issue 13");
+    seed_step_transcript(&config, &root, "builder", "14");
+    let gh = FakeGh::new(dir.path());
+    gh.serve_view(&pr_row(602, 12, Some(1)));
+    gh.serve_list(&format!(
+        "[{},{},{},{}]",
+        pr_row(601, 11, Some(2)),
+        pr_row(603, 13, Some(2)),
+        pr_row(604, 14, Some(2)),
+        pr_row(605, 15, Some(2)),
+    ));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut slug_cache = HashMap::new();
+    let mut completed = std::collections::HashSet::new();
+    let ((exit, step, rows), captured) = crate::observability::ops::capture::capture(|| {
+        rt.block_on(forge_gate::scoped(None, async {
+            let exit = completion_for_exit(
+                "loom_daemon",
+                &root,
+                11,
+                120,
+                Utc::now(),
+                &mut slug_cache,
+                &mut completed,
+                None,
+                None,
+            )
+            .await;
+            let step = completion_for_merged_step(
+                "loom_daemon",
+                &root,
+                602,
+                &mut slug_cache,
+                &mut completed,
+                None,
+                None,
+            )
+            .await;
+            let n = completion_runtime::Narration::new(
+                crate::observability::ops::feed::Trigger::Reconcile,
+                false,
+            );
+            let s = completion_runtime::Narration::new(
+                crate::observability::ops::feed::Trigger::Reconcile,
+                true,
+            );
+            let rows = fetch_merged_prs_since(Path::new(&root), None)
+                .await
+                .unwrap()
+                .0;
+            let mut out = Vec::new();
+            for row in rows {
+                let narration = if row.issue == 14 { s } else { n };
+                out.push(
+                    build_and_narrate_completion(
+                        "loom_daemon",
+                        &root,
+                        row.issue,
+                        row.merged,
+                        60,
+                        row.merged_at,
+                        &mut slug_cache,
+                        &mut completed,
+                        None,
+                        None,
+                        narration,
+                    )
+                    .await,
+                );
+            }
+            (exit, step, out)
+        }))
+    });
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let has_tokens = |e: &Option<Envelope>| {
+        let meta = e.as_ref().expect("a completion").meta.as_ref().unwrap();
+        meta["tokens"] == serde_json::json!(370)
+            && meta["tokens_by_model"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+    };
+    assert!(has_tokens(&exit), "sweep_exit path: {exit:?}");
+    assert!(has_tokens(&step), "step path: {step:?}");
+    // Row 0 is issue 11's PR, already narrated by the exit path (dedup).
+    assert!(rows[0].is_none(), "the exit path's merge is not re-narrated");
+    assert!(has_tokens(&rows[1]), "reconcile path");
+    assert!(has_tokens(&rows[2]), "seeded reconcile row");
+    // Issue 15 has no sessions: the payload omits tokens, the record says so.
+    let bare = rows[3]
+        .as_ref()
+        .expect("a completion")
+        .meta
+        .as_ref()
+        .unwrap();
+    assert!(bare.get("tokens").is_none());
+
+    let mut got: Vec<(u32, String, String, bool, u32)> = captured
+        .records
+        .iter()
+        .filter_map(|r| match r {
+            TelemetryRecord::CompletionNarrated(c) => Some((
+                c.issue,
+                c.trigger.clone(),
+                c.outcome.clone(),
+                c.tokens_present,
+                c.tokens_by_model_rows,
+            )),
+            _ => None,
+        })
+        .collect();
+    got.sort();
+    let want = |i: u32, t: &str, o: &str, p: bool, n: u32| (i, t.to_owned(), o.to_owned(), p, n);
+    assert_eq!(
+        got,
+        vec![
+            want(11, "sweep_exit", "narrated", true, 1),
+            want(12, "champion_merge_step", "narrated", true, 1),
+            want(13, "reconcile", "narrated", true, 1),
+            want(14, "reconcile", "seeded", true, 1),
+            want(15, "reconcile", "narrated", false, 0),
+        ]
+    );
+}
+
+/// A step log as `worker run` writes it: the dispatch header, the launch
+/// record, and an OpenCode event stream naming `session_id` (#14018).
+fn write_opencode_step_log(root: &Path, role: &str, item: u32, session_id: &str) {
+    let logs = root.join(".loom").join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let body = format!(
+        "==== loom-daemon dispatch: 2026-11-16T23:20:57+00:00 sweep_id=step-{role}-{item}-1 \
+         item={item} step={role} ====\n\
+         # LOOM_LAUNCH {{\"schema\":1,\"runtime\":\"opencode\",\"provider\":\"zai-coding-plan\",\
+         \"model\":\"glm-5.3-flash\",\"profile\":\"zai-flash\"}}\n\
+         # LOOM_RUNTIME_RESOLVED runtime=opencode\n\
+         {{\"type\":\"step_start\",\"timestamp\":1,\"sessionID\":\"{session_id}\",\"part\":{{}}}}\n"
+    );
+    std::fs::write(logs.join(format!("step-{role}-{item}.log")), body).unwrap();
+}
+
+/// #14018: a step-dispatched merge — OpenCode Builder, Claude Judge, both on
+/// the narrating host — publishes the Builder's runtime labels and a token
+/// total and per-model breakdown covering BOTH. The OpenCode side is keyed on
+/// the session id in the step log, so a neighbouring session in the same
+/// (workspace-root) directory is not counted.
+#[test]
+#[serial]
+fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let root = ws.to_string_lossy().into_owned();
+    let config = dir.path().join("claude-config");
+    std::fs::create_dir_all(config.join("projects")).unwrap();
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    // Claude Judge for PR 700: 10 + 20 + 300 + 40 = 370 tokens.
+    seed_step_transcript(&config, &root, "judge", "700");
+    write_opencode_step_log(&ws, "builder", 14018, "ses_mine");
+
+    let db = dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+                 id TEXT
+             );",
+        )
+        .unwrap();
+        let model = serde_json::json!({"id": "glm-5.3-flash", "providerID": "zai"}).to_string();
+        let now = Utc::now().timestamp_millis();
+        // Mine: 1000 + 200 + 50 + 10 = 1260. The neighbour shares the
+        // directory AND the window, and must contribute nothing.
+        for (id, input) in [("ses_mine", 1000), ("ses_neighbour", 9_000_000)] {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 200, 0, 50, 10, ?3, ?4, ?5)",
+                rusqlite::params![model, input, root, now, id],
+            )
+            .unwrap();
+        }
+    }
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+
+    let gh = FakeGh::new(dir.path());
+    gh.serve_view(&pr_row(700, 14018, Some(1)));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut slug_cache = HashMap::new();
+    let mut completed = std::collections::HashSet::new();
+    let envelope = rt.block_on(forge_gate::scoped(None, async {
+        completion_for_merged_step(
+            "loom_daemon",
+            &root,
+            700,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await
+    }));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+    let meta = envelope.expect("a completion").meta.unwrap();
+    assert_eq!(meta["runtime"], "opencode");
+    assert_eq!(meta["provider"], "zai-coding-plan");
+    assert_eq!(meta["profile"], "zai-flash");
+    assert_eq!(meta["tokens"], serde_json::json!(370 + 1260), "{meta}");
+    let models: Vec<&str> = meta["tokens_by_model"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["model"].as_str())
+        .collect();
+    assert_eq!(models, vec!["claude-sonnet-4-5", "glm-5.3-flash"], "{meta}");
 }

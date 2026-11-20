@@ -75,6 +75,9 @@ fn lying_logs() -> serde_json::Value {
         {"key": "loom.relay.redaction", "value": {"stringValue": "none"}},
         {"key": "loom.fleet.config_sha", "value": {"stringValue": "forged-fedcba"}},
         {"key": "loom.daemon.revision", "value": {"stringValue": "forged-revision"}},
+        {"key": "cloud.provider", "value": {"stringValue": "forged-cloud"}},
+        {"key": "cloud.region", "value": {"stringValue": "forged-region"}},
+        {"key": "host.type", "value": {"stringValue": "forged-type"}},
         {"key": "service.version", "value": {"stringValue": "9.9.9-fixture"}},
         {"key": "os.type", "value": {"stringValue": "fixture-os"}}
     ]);
@@ -153,6 +156,32 @@ fn identity_comes_from_the_daemon_whatever_the_sender_claimed() {
     assert!(!exported.contains("champion"), "{exported}");
 }
 
+/// #12874: `cloud.*` is daemon-owned — a sender's `cloud.region` is stripped
+/// and the daemon's own (from the IMDS cell) is the only one left.
+#[test]
+#[serial(loom_socket_path_env)]
+fn a_senders_cloud_keys_are_replaced_by_the_daemons() {
+    pin_config_sha_unknown();
+    crate::host_shape::set_cloud_for_test(Some(crate::host_shape::CloudShape {
+        provider: "aws",
+        instance_type: "c7i.2xlarge".to_string(),
+        region: "us-east-1".to_string(),
+    }));
+    let mut payload = decode_json(Signal::Logs, &lying_logs());
+    let bound_count = bind_and_scrub(&mut payload, &bound());
+    crate::host_shape::set_cloud_for_test(None);
+    assert_eq!(bound_count, 1);
+    let Payload::Logs(request) = &payload else {
+        panic!("logs in, logs out")
+    };
+    let pairs = resource_pairs(request.resource_logs[0].resource.as_ref().unwrap());
+    assert_eq!(one(&pairs, "cloud.region"), "us-east-1");
+    assert_eq!(one(&pairs, "cloud.provider"), "aws");
+    assert_eq!(one(&pairs, "host.type"), "c7i.2xlarge");
+    let exported = serde_json::to_string(request).unwrap();
+    assert!(!exported.contains("forged"), "{exported}");
+}
+
 #[test]
 fn a_role_tick_is_bound_to_its_role_and_execution() {
     let mut identity = bound();
@@ -226,6 +255,40 @@ fn identity_is_bound_on_metrics_and_traces_too() {
     assert_eq!(hex::encode(&span.trace_id), "0af7651916cd43dd8448eb211c80319c");
     assert_eq!(hex::encode(&span.parent_span_id), "00f067aa0ba902b7");
     assert_eq!(span.name, "fixture.span");
+}
+
+#[test]
+fn a_harness_cannot_supply_the_step_occupancy_process_identity() {
+    let metrics = json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [
+        {"name": "loom.dispatch.busy_slots", "gauge": {"dataPoints": [
+            {"asInt": "0", "attributes": [
+                {"key": "role", "value": {"stringValue": "judge"}},
+                {"key": "pool", "value": {"stringValue": "step"}},
+                {"key": "loom.daemon.process_instance_id",
+                    "value": {"stringValue": "aaaaaaaa-0000-4000-8000-000000000001"}},
+                {"key": " LoOm.DaEmOn.PrOcEsS_InStAnCe_Id ",
+                    "value": {"stringValue": "bbbbbbbb-0000-4000-8000-000000000002"}}
+            ]}
+        ]}}
+    ]}]}]});
+    for mut payload in both_encodings(Signal::Metrics, &metrics) {
+        assert_eq!(bind_and_scrub(&mut payload, &bound()), 1);
+        let Payload::Metrics(request) = &payload else {
+            panic!("expected metrics");
+        };
+        let metric = &request.resource_metrics[0].scope_metrics[0].metrics[0];
+        let Some(metric::Data::Gauge(gauge)) = &metric.data else {
+            panic!("expected gauge");
+        };
+        let attrs = &gauge.data_points[0].attributes;
+        assert_eq!(
+            attrs
+                .iter()
+                .map(|attr| attr.key.as_str())
+                .collect::<Vec<_>>(),
+            ["role", "pool"]
+        );
+    }
 }
 
 /// Synthetic, shape-only secrets: each matches one redaction class.
@@ -632,6 +695,8 @@ fn the_daemon_owned_filter_ignores_case() {
         "Host.Name",
         "HOST.ID",
         " host.id",
+        "cloud.region",
+        "Cloud.Provider",
     ] {
         assert!(daemon_owned(key), "{key}");
     }

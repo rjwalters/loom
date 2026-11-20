@@ -3,10 +3,8 @@
 //! process-global `GH_TOKEN`, so it neither races nor adds to the
 //! test-env-mutation hazard tracked by #4385.
 //!
-//! A sibling file rather than an inline `mod` in `daemon_service.rs` (#9596):
-//! that file is a frozen over-threshold ratchet entry, and extracting a test
-//! module is the path `.loom/docs/file-size-policy.md` names for making room
-//! in one. The tests below are unchanged from their inline form.
+//! A sibling file rather than an inline `mod` in `daemon_service.rs` (#9596).
+//! The tests below are unchanged from their inline form.
 
 use super::gh_token_needs_update;
 

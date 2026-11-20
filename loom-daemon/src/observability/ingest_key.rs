@@ -102,15 +102,14 @@ pub(super) fn read_ingest_key(path: &str) -> Result<String, String> {
     }
 }
 
-/// Whether `entry` authenticates with the shared ingest key (#11555): the
-/// native HTTPS sink always does, and so does an `otlp` entry without a
-/// `headers_file`. An `otlp` entry with one carries its own credentials — a
+/// Whether `entry` authenticates with the shared ingest key (#11555): an
+/// `otlp` entry without a `headers_file` does. An `otlp` entry with one
+/// carries its own credentials — a
 /// file-supplied `Authorization`, or headers an identity-aware proxy accepts
 /// in place of a Bearer — and can start with no ingest key configured at
 /// all.
 pub(super) fn entry_needs_key(entry: &ExporterEntry) -> bool {
     match entry.kind {
-        ExporterKind::Https => true,
         ExporterKind::Otlp => entry.headers_file.is_none(),
     }
 }
@@ -213,9 +212,9 @@ mod tests {
         clear_env();
     }
 
-    fn https_entry() -> ExporterEntry {
+    fn bearer_entry() -> ExporterEntry {
         ExporterEntry {
-            kind: ExporterKind::Https,
+            kind: ExporterKind::Otlp,
             endpoint: None,
             headers_file: None,
         }
@@ -243,7 +242,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn resolve_for_planned_reads_the_key_when_an_https_entry_survives() {
+    fn resolve_for_planned_reads_the_key_when_a_bearer_entry_survives() {
         clear_env();
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("ingest.key");
@@ -252,10 +251,10 @@ mod tests {
             ingest_key_file: Some(key_path.to_string_lossy().into_owned()),
             ..Default::default()
         };
-        let https = https_entry();
+        let bearer = bearer_entry();
         let otlp = otlp_entry_with_headers_file();
         let planned = vec![
-            (&https, "https://ingest.test-fixture.internal".to_string()),
+            (&bearer, "https://ingest.test-fixture.internal".to_string()),
             (&otlp, "https://otlp.test-fixture.internal".to_string()),
         ];
         match resolve_for_planned(&config, &planned) {
@@ -268,7 +267,7 @@ mod tests {
     #[serial]
     fn resolve_for_planned_reports_the_not_configured_detail() {
         clear_env();
-        let entry = https_entry();
+        let entry = bearer_entry();
         let planned = vec![(&entry, "https://ingest.test-fixture.internal".to_string())];
         match resolve_for_planned(&ObservabilityConfig::default(), &planned) {
             PlannedKey::Missing(detail) => assert_eq!(detail, NOT_CONFIGURED_DETAIL),
@@ -284,7 +283,7 @@ mod tests {
             ingest_key_file: Some("/nonexistent/ingest.key".to_string()),
             ..Default::default()
         };
-        let entry = https_entry();
+        let entry = bearer_entry();
         let planned = vec![(&entry, "https://ingest.test-fixture.internal".to_string())];
         match resolve_for_planned(&config, &planned) {
             PlannedKey::Missing(detail) => {

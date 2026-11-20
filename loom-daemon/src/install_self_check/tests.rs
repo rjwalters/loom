@@ -1,5 +1,4 @@
-//! Unit tests for `install_self_check` — a sibling file so the frozen parent
-//! stays under its file-size ratchet.
+//! Unit tests for `install_self_check`, kept in a sibling file beside the parent module.
 
 #![allow(clippy::unwrap_used)]
 
@@ -300,9 +299,7 @@ fn test_ranking_ok_when_fresh() {
 fn test_ranking_violation_when_stale() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("LOOM_SHARED_TOKENS_DIR", "");
-    // `bootstrap_pool`'s return is joined inline rather than bound: this
-    // file is at its `scripts/check-file-size-budget.sh` ratchet ceiling,
-    // so the `#[serial(...)]` line added above had to be paid for here.
+    // `bootstrap_pool`'s return is joined inline rather than bound.
     let ranking = bootstrap_pool(tmp.path()).join(".ranking");
     fs::write(&ranking, "agent-1\n").unwrap();
     // Backdate mtime by two hours.
@@ -685,4 +682,181 @@ fn test_gh_front_wired_check_with() {
     assert!(check_with(wired, None, dir(&plain)).is_violation());
     // The live check never reads this host's ~/.claude in a unit-test build.
     assert!(skipped(&check(Invariant::GhFrontWired, tmp.path(), &CheckOptions::default())));
+}
+
+// ===================================================================
+// #13958 — duplicate Loom hook wiring across scopes
+// ===================================================================
+
+/// Executable `.loom/hooks/<name>` copy (the transition artifact the wrapper
+/// defers to), created under `root`.
+#[cfg(unix)]
+fn write_hook_copy(root: &Path, name: &str) {
+    write_fake_bin(&root.join(".loom").join("hooks"), name, "exit 0");
+}
+
+#[cfg(unix)]
+fn duplicate_user_text(names: &[&str]) -> Option<String> {
+    Some(
+        names
+            .iter()
+            .map(|n| format!(r#"{{"command": "bash -c '… defaults/hooks/{n} …'"}}"#))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+    .map(|s| format!(r#"{{"hooks":{{"PreToolUse":[{{"matcher":"Bash","hooks":[{s}]}}]}}}}"#))
+}
+
+#[cfg(unix)]
+fn duplicate_project_text(names: &[&str]) -> Option<String> {
+    Some(
+        names
+            .iter()
+            .map(|n| format!(r#"{{"command": "\"${{CLAUDE_PROJECT_DIR}}/.loom/hooks/{n}\""}}"#))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+    .map(|s| format!(r#"{{"hooks":{{"PreToolUse":[{{"matcher":"Bash","hooks":[{s}]}}]}}}}"#))
+}
+
+/// Single-scope wiring (either scope alone) cannot double-fire: not a
+/// violation (acceptance fixture "user-only (ok)").
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_single_scope_is_not_a_violation() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    let skipped = |s: &InvariantStatus| matches!(s, InvariantStatus::Skipped(_));
+    let user = duplicate_user_text(&["guard-destructive.sh"]);
+    let project = duplicate_project_text(&["guard-destructive.sh"]);
+    // No wiring at all.
+    assert!(skipped(&check_with(Some("{}"), Some("{}"), tmp.path())));
+    // User scope only.
+    assert!(skipped(&check_with(user.as_deref(), None, tmp.path())));
+    // Project scope only.
+    assert!(skipped(&check_with(None, project.as_deref(), tmp.path())));
+}
+
+/// Both scopes wired and the wrapper defers (executable `.loom/hooks/<name>`
+/// copy present): the expected transition shape — Ok, no warning
+/// (acceptance fixture "both + deferring (ok)").
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_both_scopes_deferring_is_ok() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    write_hook_copy(tmp.path(), "guard-destructive.sh");
+    let user = duplicate_user_text(&["guard-destructive.sh"]);
+    let project = duplicate_project_text(&["guard-destructive.sh"]);
+    assert_eq!(check_with(user.as_deref(), project.as_deref(), tmp.path()), InvariantStatus::Ok);
+}
+
+/// Both scopes wired but the defer does not hold (no executable copy): the
+/// genuine double-fire — warns naming the hook, both files, and the fix
+/// (acceptance fixture "both + non-deferring (warns)").
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_both_scopes_non_deferring_warns() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    let user = duplicate_user_text(&["guard-destructive.sh"]);
+    let project = duplicate_project_text(&["guard-destructive.sh"]);
+    let status = check_with(user.as_deref(), project.as_deref(), tmp.path());
+    let InvariantStatus::Violation(detail) = status else {
+        panic!("expected violation, got {status:?}");
+    };
+    assert!(detail.contains("guard-destructive.sh"), "{detail}");
+    assert!(detail.contains(".claude/settings.json"), "{detail}");
+    assert!(detail.contains(".loom/hooks/guard-destructive.sh"), "{detail}");
+    assert!(detail.contains("Fix"), "{detail}");
+
+    // A copy that exists but lost its exec bit is just as broken.
+    let non_exec = tmp.path().join(".loom").join("hooks");
+    fs::create_dir_all(&non_exec).unwrap();
+    fs::write(non_exec.join("guard-destructive.sh"), "#!/bin/sh\n").unwrap();
+    let status = check_with(user.as_deref(), project.as_deref(), tmp.path());
+    assert!(status.is_violation(), "{status:?}");
+}
+
+/// A non-Loom root cannot double-fire: the wrapper's workspace gate exits
+/// before its defer check, so the invariant does not apply.
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_skipped_outside_a_loom_workspace() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    // Deliberately NO .loom/config.json / .loom-project/project.json.
+    let user = duplicate_user_text(&["guard-destructive.sh"]);
+    let project = duplicate_project_text(&["guard-destructive.sh"]);
+    let status = check_with(user.as_deref(), project.as_deref(), tmp.path());
+    let InvariantStatus::Skipped(reason) = status else {
+        panic!("expected skip, got {status:?}");
+    };
+    assert!(reason.contains("workspace gate"), "{reason}");
+}
+
+/// A project file carrying a machine-level wrapper (paste) is not project
+/// wiring: the wrapper's own defer probe embeds `.loom/hooks/<name>` (the
+/// #4806 trap), so the `defaults/hooks/<name>` exclusion applies.
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_machine_wrapper_in_project_file_is_not_project_wiring() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    let user = duplicate_user_text(&["guard-destructive.sh"]);
+    let pasted_wrapper = Some(
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"command":
+            "bash -c '… defaults/hooks/guard-destructive.sh … [ -x …/.loom/hooks/guard-destructive.sh ] …'"}]}]}}"#,
+    );
+    let status = check_with(user.as_deref(), pasted_wrapper, tmp.path());
+    assert!(
+        matches!(status, InvariantStatus::Skipped(_)),
+        "a pasted machine wrapper must not read as project wiring: {status:?}"
+    );
+}
+
+/// Detection covers every hook in the wiring table: two both-wired hooks, one
+/// deferring and one broken, aggregate into a single violation naming only the
+/// broken one.
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hooks_aggregates_only_broken_hooks() {
+    use duplicate_hooks_invariant::check_with;
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    write_hook_copy(tmp.path(), "guard-destructive.sh");
+    let names = ["guard-destructive.sh", "skill-router.sh"];
+    let user = duplicate_user_text(&names);
+    let project = duplicate_project_text(&names);
+    let status = check_with(user.as_deref(), project.as_deref(), tmp.path());
+    let InvariantStatus::Violation(detail) = status else {
+        panic!("expected violation, got {status:?}");
+    };
+    assert!(detail.contains("skill-router.sh"), "{detail}");
+    assert!(!detail.contains("guard-destructive.sh"), "{detail}");
+}
+
+/// Registry wiring: stable id, warn-only (never auto-repaired).
+#[test]
+fn test_duplicate_hook_wiring_invariant_is_warn_only() {
+    let inv = Invariant::DuplicateHookWiring;
+    assert_eq!(inv.id(), "duplicate-hook-wiring");
+    assert!(!inv.auto_repairable());
+    assert!(inv.issue_marker().contains("duplicate-hook-wiring"));
+}
+
+/// The live check never reads this host's ~/.claude in a unit-test build.
+#[cfg(unix)]
+#[test]
+fn test_duplicate_hook_wiring_live_check_skips_in_unit_tests() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), "{}");
+    assert!(matches!(
+        check(Invariant::DuplicateHookWiring, tmp.path(), &CheckOptions::default()),
+        InvariantStatus::Skipped(_)
+    ));
 }

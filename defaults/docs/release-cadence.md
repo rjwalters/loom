@@ -21,7 +21,9 @@ direction (2026-10-09) is **at most one release a day**.
   `VERSION`, timed by its **committer** time (PRs cannot change `VERSION`, so
   only bump commits match; tags and Release dates are never read). A run bumps
   only when `now - last_bump >= RELEASE_MIN_INTERVAL` **and** something under
-  `defaults/` changed since that bump. Otherwise it exits green and changes
+  a release path changed since that bump: `defaults/`, `loom-daemon/` or
+  `loom-api/` (the gate's `RELEASE_PATHS`; the two crates are what compiles
+  into the `loom-daemon-*` release assets, #13452). Otherwise it exits green and changes
   nothing, with `deferred: last bump <sha> at <UTC>; next bump eligible at
   <UTC>` (or `nothing to release`) in the job summary. The gate is re-checked
   after every `git fetch` in the publish-retry loop, so a bump that lands
@@ -43,7 +45,9 @@ direction (2026-10-09) is **at most one release a day**.
   never falls back to "always bump". `0` explicitly disables the limit. A
   missing bump commit or a shallow checkout also fails red: a gate wrong in
   the "defer" direction would silently stop releases.
-- **Triggers.** A `defaults/**` push to `main` (as before); an **hourly**
+- **Triggers.** A push to `main` under `defaults/**`, `loom-daemon/**` or
+  `loom-api/**` (the release paths; a bump commit touches none of them, both
+  crates inherit `version.workspace = true`); an **hourly**
   `schedule` catch-up, which is what ships a quiet day's merges; and
   `workflow_dispatch`. Worst-case delay from the first unreleased merge to its
   bump is `RELEASE_MIN_INTERVAL` + about 1 h, plus GitHub's own schedule delay
@@ -52,11 +56,18 @@ direction (2026-10-09) is **at most one release a day**.
   time it can stretch the wait to about 48 h.
 - **Hotfix path.** Dispatch the workflow with `force: true` and a `reason`
   (required) to bump now. `force` skips only the interval: there must still be
-  an unreleased `defaults/` change, so no no-op version is cut. The commit body
+  an unreleased change under a release path, so no no-op version is cut. The commit body
   records `Forced-by: <actor>` and `Reason: <reason>`; a bot actor is refused.
   Anyone with `workflow_dispatch` (write) access can force; it is the operator
   path. A forced bump starts a new window. `force: false` runs the normal gate,
   which is useful for checking what the next run would do.
+- **Minor releases.** Bumps are patch steps. A minor release (`X.Y.Z` →
+  `X.(Y+1).0`) is a forced dispatch with `level: minor`; the push and
+  schedule paths never take it. The fleet publisher refuses any minor step it
+  does not list, so the release is first named in 2am's `github-write`
+  (`src/publish/target.js` `LOOM_MINOR_RELEASES`, the widening that
+  2am#4617 Q26 requires), and that Worker deployed. 0.20.0, the multi-runtime
+  release, was the first.
 - **Fleet floors wait for the daily release.** A `loom_min_version` floor can
   only name a published release, so a fix the fleet needs now waits for the
   next eligible bump unless it is forced. To ship it now: dispatch `force` with
@@ -348,9 +359,9 @@ genuinely unbuilt platform — the window changes only the **wording** of a
 refusal, never its outcome.
 
 `loom-daemon-update.sh`'s own resolver (the shell twin `--fetch` uses) still
-emits the flat, pre-#8515 wording: it is a `contract`-category script, frozen by
-the portable shell budget, so the classification
-cannot be added there without first porting the resolution behind the daemon.
+emits the flat, pre-#8515 wording: it is a `contract`-category script, so the
+classification cannot be added there without first porting the resolution
+behind the daemon.
 Tracked separately in
 [#8654](https://github.com/rjwalters/loom/issues/8654).
 
@@ -381,6 +392,14 @@ it, never at release time:
   installed files: it starts executing an installed file that older releases
   do not ship, or relies on a changed argument contract. Add any newly
   executed file to `DAEMON_INVOKED_INSTALLED_FILES` in the same PR.
+  The same goes for a fix that spans the daemon binary and `defaults/scripts`
+  (#14015): raise `SUPPORTS_INSTALLED` in that same release. It is the one
+  hard-break lever. A repo one release behind but at or above
+  `SUPPORTS_INSTALLED` is not held while it waits for its workspace resync
+  (#11052), so it runs the new daemon against the old scripts and the fix is
+  half applied (a `claim_lost` is how that showed). Raising the value holds
+  such a repo until its resync lands. `loom-daemon status` and a once-per-repo
+  INFO line show which repos are in that state, but nothing holds them.
 
 The `Compatibility contract across adjacent releases` step of CI's
 `Install Surface Checks` job (`loom-daemon install-compat check`) proves both

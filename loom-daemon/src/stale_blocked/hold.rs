@@ -3,22 +3,13 @@
 //! Park records are append-only: a release flips labels and leaves the record
 //! in the body. So "the body has a reason-only record" does not mean the
 //! current `loom:blocked` is documented — an issue once held with a reason and
-//! later re-blocked bare still carries the old record. Two rules:
-//!
-//! - [`latest`]: of several records, the one with the newest `at=` (undated
-//!   records sort oldest; ties keep body order) is the current one.
-//! - [`documents_current_block`]: a dated record documents the block only if it
-//!   is not older than the latest `loom:blocked` application, less
-//!   [`WRITE_SLACK_SECS`] — every writer writes the record *before* the label
-//!   (`park-record apply`, `park_hold.rs`), so a current record is a few
-//!   seconds older than its label.
+//! later re-blocked bare still carries the old record. [`latest`] picks the
+//! current one: of several records, the one with the newest `at=` (undated
+//! records sort oldest; ties keep body order).
 
-use chrono::{DateTime, Duration, FixedOffset};
+use chrono::{DateTime, FixedOffset};
 
 use crate::park_record::ParkRecord;
-
-/// Allowed gap between a record's `at=` and the label write that follows it.
-pub const WRITE_SLACK_SECS: i64 = 600;
 
 fn when(at: Option<&str>) -> Option<DateTime<FixedOffset>> {
     at.and_then(|a| DateTime::parse_from_rfc3339(a.trim()).ok())
@@ -47,27 +38,55 @@ pub fn latest_reasoned(body: &str) -> Option<ParkRecord> {
     latest(&records).cloned()
 }
 
-/// Whether a record written at `record_at` documents a `loom:blocked` last
-/// applied at `labeled_at`. Fails toward "documented" (no write) when either
-/// time is missing or unreadable: an undatable record cannot be shown stale.
-#[must_use]
-pub fn documents_current_block(record_at: Option<&str>, labeled_at: Option<&str>) -> bool {
-    match (when(record_at), when(labeled_at)) {
-        (Some(r), Some(l)) => r + Duration::seconds(WRITE_SLACK_SECS) >= l,
-        _ => true,
-    }
+/// The own-line permanent-block marker (#8742, #13889).
+pub const PERMANENT_BLOCK_MARKER: &str = "<!-- loom:permanent-block -->";
+
+/// Own-line prefixes that make a trusted comment a *hold* comment (#13889): a
+/// park record, an operator decision, a Champion/operator hold-restore note.
+const HOLD_MARKERS: &[&str] = &["loom:park ", "loom:operator-decision", "loom:hold-restored"];
+
+fn own_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .map(|l| l.trim_matches(|c| c == ' ' || c == '\t' || c == '\r'))
 }
 
-/// Whether a Curator review comment posted at `posted_at` reviewed the
-/// `loom:blocked` last applied at `labeled_at`: posted at or after it (a
-/// review follows the label, so no slack). Fails toward "reviewed" (no write)
-/// when either time is missing or unreadable.
+/// Whether `text` carries the permanent-block marker alone on a line — the
+/// same own-line rule as `guide.md`'s `has_permanent_block()`, so a marker
+/// quoted mid-sentence does not count.
 #[must_use]
-pub fn reviews_current_block(posted_at: Option<&str>, labeled_at: Option<&str>) -> bool {
-    match (when(posted_at), when(labeled_at)) {
-        (Some(p), Some(l)) => p >= l,
-        _ => true,
-    }
+pub fn has_permanent_block(text: &str) -> bool {
+    own_lines(text).any(|l| l == PERMANENT_BLOCK_MARKER)
+}
+
+/// Which hold marker opens a line of `text`, if any (the marker name, without
+/// the `<!-- ` opener).
+#[must_use]
+pub fn hold_marker(text: &str) -> Option<&'static str> {
+    own_lines(text).find_map(|l| {
+        let rest = l.strip_prefix("<!-- ")?;
+        HOLD_MARKERS
+            .iter()
+            .find(|m| rest.starts_with(**m))
+            .map(|m| m.trim_end())
+    })
+}
+
+/// The newest trusted hold comment among `comments` (listing order breaks
+/// ties and orders undated ones).
+#[must_use]
+pub fn newest_hold(
+    comments: &[crate::dep_recheck::extract::Comment],
+) -> Option<super::HoldComment> {
+    comments
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.trusted)
+        .filter_map(|(i, c)| Some((i, c, hold_marker(&c.body)?)))
+        .max_by_key(|(i, c, _)| (when(c.created_at.as_deref()), *i))
+        .map(|(_, c, marker)| super::HoldComment {
+            at: c.created_at.clone(),
+            marker: marker.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -85,29 +104,52 @@ mod tests {
         );
         assert_eq!(latest_reasoned(&body).unwrap().reason.as_deref(), Some("new"));
     }
+}
 
-    #[test]
-    fn a_record_older_than_the_label_does_not_document_it() {
-        let rec = Some("2026-01-01T00:00:00Z");
-        assert!(!documents_current_block(rec, Some("2026-10-06T00:00:00Z")));
-        // Record written seconds before its own label write: current.
-        assert!(documents_current_block(
-            Some("2026-10-06T00:00:00Z"),
-            Some("2026-10-06T00:00:30Z")
-        ));
-        // Undatable: fail toward documented.
-        assert!(documents_current_block(None, Some("2026-10-06T00:00:00Z")));
-        assert!(documents_current_block(rec, None));
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    use crate::dep_recheck::extract::Comment;
+
+    fn c(body: &str, at: &str, trusted: bool) -> Comment {
+        Comment {
+            body: body.to_string(),
+            created_at: Some(at.to_string()),
+            trusted,
+            ..Comment::default()
+        }
     }
 
     #[test]
-    fn only_a_review_posted_since_the_label_reviews_the_current_block() {
-        let label = Some("2026-10-06T00:00:00Z");
-        assert!(reviews_current_block(Some("2026-10-06T00:00:00Z"), label));
-        assert!(reviews_current_block(Some("2026-10-06T01:00:00Z"), label));
-        assert!(!reviews_current_block(Some("2026-10-05T23:59:59Z"), label));
-        // Undatable: fail toward reviewed (no write).
-        assert!(reviews_current_block(None, label));
-        assert!(reviews_current_block(Some("2026-10-05T00:00:00Z"), None));
+    fn permanent_block_marker_must_stand_on_its_own_line() {
+        assert!(has_permanent_block("note\n  <!-- loom:permanent-block -->\t\r\nmore"));
+        assert!(has_permanent_block("<!-- loom:permanent-block -->"));
+        assert!(!has_permanent_block("see the `<!-- loom:permanent-block -->` marker"));
+        assert!(!has_permanent_block("<!-- loom:permanent-block --> trailing"));
+    }
+
+    #[test]
+    fn hold_marker_names_the_opening_marker() {
+        assert_eq!(
+            hold_marker("x\n<!-- loom:operator-decision v=1 -->"),
+            Some("loom:operator-decision")
+        );
+        assert_eq!(hold_marker("<!-- loom:hold-restored -->"), Some("loom:hold-restored"));
+        assert_eq!(hold_marker("<!-- loom:park Blocked by: #1 -->"), Some("loom:park"));
+        assert_eq!(hold_marker("quoting <!-- loom:hold-restored --> inline"), None);
+        assert_eq!(hold_marker("just a comment"), None);
+    }
+
+    #[test]
+    fn newest_hold_ignores_untrusted_and_plain_comments() {
+        let comments = vec![
+            c("<!-- loom:hold-restored -->", "2026-11-01T00:00:00Z", true),
+            c("<!-- loom:operator-decision -->", "2026-11-09T00:00:00Z", false),
+            c("hello", "2026-11-10T00:00:00Z", true),
+        ];
+        let h = newest_hold(&comments).unwrap();
+        assert_eq!(h.marker, "loom:hold-restored");
+        assert_eq!(h.at.as_deref(), Some("2026-11-01T00:00:00Z"));
+        assert!(newest_hold(&comments[1..]).is_none());
     }
 }

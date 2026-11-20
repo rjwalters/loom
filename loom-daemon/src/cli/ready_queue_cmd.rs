@@ -10,7 +10,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
-use loom_daemon::types::{
+use crate::types::{
     DaemonStatusReport, DispatchPlanContext, PlanState, ReadyQueueRow, WorkFinderTickSummary,
 };
 
@@ -30,7 +30,7 @@ pub(crate) fn stale_after_secs(report: &DaemonStatusReport) -> i64 {
     let interval = report
         .work_finder_interval_secs
         .filter(|s| *s > 0)
-        .unwrap_or(loom_daemon::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS);
+        .unwrap_or(crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS);
     let secs = interval
         .saturating_mul(STALE_AFTER_INTERVALS)
         .max(STALE_FLOOR_SECS);
@@ -39,7 +39,7 @@ pub(crate) fn stale_after_secs(report: &DaemonStatusReport) -> i64 {
 
 /// Handle `loom-daemon queue [--json]`. Exits 1 only when the daemon is
 /// unreachable; an empty queue is a normal answer.
-pub(crate) async fn handle_queue_command(json: bool) -> Result<()> {
+pub async fn handle_queue_command(json: bool) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     let timeout_info = resolve_status_timeout(None);
     let report = match query_daemon_status(&socket_path, &timeout_info).await {
@@ -228,7 +228,7 @@ fn render_row(row: &ReadyQueueRow) -> String {
         .map_or_else(|| row.repo.clone(), |n| n.to_string_lossy().into_owned());
     let mut flags = Vec::new();
     // The priority level (#11510), when it is not the default.
-    if row.level != loom_daemon::priority_pick::Level::Default {
+    if row.level != crate::priority_pick::Level::Default {
         flags.push(row.level.as_str().to_string());
     }
     if row.main_red_fix {
@@ -258,7 +258,7 @@ fn render_row(row: &ReadyQueueRow) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use loom_daemon::types::{PlanGate, PlanKey, PlanSlots, QueueDisposition, RowPlan};
+    use crate::types::{PlanGate, PlanKey, PlanSlots, QueueDisposition, RowPlan};
 
     fn report_with(queue: Vec<ReadyQueueRow>, at: DateTime<Utc>) -> DaemonStatusReport {
         DaemonStatusReport {
@@ -282,9 +282,9 @@ mod tests {
             workspace_weight: 100,
             urgent: false,
             level: if rank == 1 {
-                loom_daemon::priority_pick::Level::VeryImportant
+                crate::priority_pick::Level::VeryImportant
             } else {
-                loom_daemon::priority_pick::Level::Default
+                crate::priority_pick::Level::Default
             },
             main_red_fix: false,
             created_at: None,

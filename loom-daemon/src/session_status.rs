@@ -248,6 +248,7 @@ pub fn action_of(outcome: &Outcome) -> Option<String> {
         Outcome::Resumed => "started".into(),
         Outcome::Recreated { .. } => "recreated".into(),
         Outcome::PrivateCloneSkipped => "skipped (private-clone)".into(),
+        Outcome::PrivateRecovered => "recovered (private-clone)".into(),
         Outcome::DriftRecreated { .. } => "recreated (mount drift)".into(),
         Outcome::DriftDeferred { reason } => format!(
             "deferred ({})",

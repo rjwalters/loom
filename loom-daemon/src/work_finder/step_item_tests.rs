@@ -6,7 +6,9 @@
 //! trusted-comment markers, that every table row has a case) is tested here.
 
 use super::*;
-use crate::champion_hold::{CRITICAL_FILE_HOLD_MARKER, DOCTOR_CYCLE_CAP_MARKER};
+use crate::champion_hold::{
+    CRITICAL_FILE_HOLD_MARKER, DOCTOR_CYCLE_CAP_MARKER, MERGE_RISK_HOLD_MARKER,
+};
 use crate::sweep_registry::park_hold::{
     render_hold_record, PRLESS_HOLD_REASON, QUARANTINE_HOLD_REASON,
 };
@@ -91,6 +93,7 @@ fn the_fixture_covers_every_step_pass_and_park_kind() {
         PassReason::Frozen,
         PassReason::Operator,
         PassReason::HardExclusion,
+        PassReason::HostSkipLabel,
         PassReason::Claimed,
         PassReason::Queued,
         PassReason::SharedPr,
@@ -217,6 +220,15 @@ fn pull_markers_come_from_trusted_comments() {
 }
 
 #[test]
+fn pull_markers_record_the_hold_head_until_a_release() {
+    let hold = format!("{MERGE_RISK_HOLD_MARKER}\n<!-- champion:hold-state head=abc1234 -->");
+    let m = PullMarkers::from_trusted(&trusted(&[&hold]));
+    assert_eq!(m.hold_head.as_deref(), Some("abc1234"));
+    let released = PullMarkers::from_trusted(&trusted(&[&hold, "clear the hold \u{2014} ok"]));
+    assert_eq!(released.hold_head, None);
+}
+
+#[test]
 fn trusted_comments_drop_untrusted_authors() {
     let policy = crate::comment_trust::TrustPolicy::new(
         crate::forge_identity::FleetLogins::of(&crate::forge_identity::Roster::default()),
@@ -262,4 +274,193 @@ fn retired_labels_fold_through_the_registry() {
         canonical_labels(&labels(&["loom:urgent", "loom:issue"])),
         labels(&["loom:issue"])
     );
+}
+
+/// #12957: an item carries its issue's story points; a PR item its closing
+/// issue's; an unsized item, a stacked label or a PR that only links by
+/// `Part of` carries none (absent, never 0). Points never change a verdict.
+#[test]
+fn items_carry_their_story_points_from_the_labels_in_hand() {
+    let issue = |number: u32, l: &[&str]| IssueInput {
+        number,
+        labels: labels(l),
+        ..IssueInput::default()
+    };
+    let pull = |number: u32, body: &str| PullInput {
+        number,
+        labels: labels(&["loom:review-requested"]),
+        body: Some(body.into()),
+        same_repo: true,
+        ..PullInput::default()
+    };
+    let items = classify(&Inputs {
+        issues: vec![
+            issue(1, &["loom:issue", "points:5"]),
+            issue(2, &["loom:issue"]),
+            issue(3, &["loom:issue", "points:3", "points:8"]),
+            issue(4, &["loom:building", "points:13"]),
+            issue(5, &["loom:epic", "points:8"]),
+        ],
+        pulls: vec![pull(40, "Closes #4"), pull(50, "Part of #5")],
+        ..Inputs::default()
+    });
+    let by_issue = |n: u32| items.iter().find(|i| i.issue == Some(n)).unwrap();
+    assert_eq!(by_issue(1).step(), Some(Step::Builder));
+    assert_eq!(by_issue(1).story_points, Some(5));
+    assert_eq!(by_issue(2).story_points, None, "unsized is absent, not 0");
+    assert_eq!(by_issue(3).story_points, None, "a stacked label is omitted");
+    // A Judge step on PR 40 carries the points of #4, the issue it closes.
+    let judge = by_issue(4);
+    assert_eq!((judge.step(), judge.pr), (Some(Step::Judge), Some(40)));
+    assert_eq!(judge.story_points, Some(13));
+    // PR 50 joins the epic only through `Part of`: no closing issue, no size.
+    let part_of = by_issue(5);
+    assert_eq!(part_of.pr, Some(50));
+    assert_eq!(part_of.story_points, None);
+
+    // A PR-only item (a second PR closing an issue another PR joined) reads
+    // the issue it closes too.
+    let items = classify(&Inputs {
+        issues: vec![issue(6, &["loom:building", "points:2"])],
+        pulls: vec![pull(60, "Closes #6"), pull(61, "Closes #6")],
+        ..Inputs::default()
+    });
+    let second = items.iter().find(|i| i.pr == Some(61)).unwrap();
+    assert_eq!(second.issue, None);
+    assert_eq!(second.story_points, Some(2));
+}
+
+/// #13244: a body-marked tracker passes `tracker` for every audited label
+/// shape, and the same labels without the marker keep their normal step.
+#[test]
+fn a_tracker_marker_passes_whatever_the_labels() {
+    let shapes: [&[&str]; 3] = [
+        &["loom:issue", "loom:curated", "loom:blocked"],
+        &["loom:issue"],
+        &["loom:triage"],
+    ];
+    for l in shapes {
+        let issue = |tracker: bool| IssueInput {
+            number: 4,
+            labels: labels(l),
+            tracker,
+            ..IssueInput::default()
+        };
+        let marked = classify(&Inputs {
+            issues: vec![issue(true)],
+            ..Inputs::default()
+        });
+        assert_eq!(marked[0].step(), None, "{l:?}");
+        assert_eq!(marked[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+        assert_eq!(PassReason::Tracker.as_str(), "tracker");
+        let plain = classify(&Inputs {
+            issues: vec![issue(false)],
+            ..Inputs::default()
+        });
+        assert_ne!(plain[0].verdict, Verdict::Pass(PassReason::Tracker), "{l:?}");
+    }
+    let plain_ready = classify(&Inputs {
+        issues: vec![IssueInput {
+            number: 5,
+            labels: labels(&["loom:issue"]),
+            ..IssueInput::default()
+        }],
+        ..Inputs::default()
+    });
+    assert_eq!(plain_ready[0].target(), Some(5));
+}
+
+/// #13367: an approved PR flagged `loom:merge-conflict` is a pass, not a
+/// `champion_merge` step; the same PR without the flag is still merged.
+#[test]
+fn an_approved_conflicting_pr_is_not_a_merge_step() {
+    let pr = |labels: &[&str]| Inputs {
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let conflicting = classify(&pr(&["loom:pr", "loom:merge-conflict"]));
+    assert_eq!(conflicting[0].step(), None);
+    assert_eq!(conflicting[0].verdict, Verdict::Pass(PassReason::Conflicting));
+    assert_eq!(PassReason::Conflicting.as_str(), "conflicting");
+    let clean = classify(&pr(&["loom:pr"]));
+    assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
+}
+
+/// #13737: an approved, unheld PR on a Loom stack branch is a pass (the janitor
+/// would only skip it); any other base, and any held/contradictory/conflicting
+/// stacked PR, keeps its existing verdict.
+#[test]
+fn an_approved_stacked_pr_is_not_a_merge_step() {
+    let pr = |labels: &[&str], base: Option<&str>| Inputs {
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            base_ref: base.map(str::to_string),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    for base in ["feature/issue-371", "feature/harness-ops-350"] {
+        let stacked = classify(&pr(&["loom:pr"], Some(base)));
+        assert_eq!(stacked[0].step(), None, "{base}");
+        assert_eq!(stacked[0].verdict, Verdict::Pass(PassReason::Stacked));
+    }
+    assert_eq!(PassReason::Stacked.as_str(), "stacked");
+    for base in [
+        Some("main"),
+        Some("release/x"),
+        Some("feature/issue-371-x"),
+        None,
+    ] {
+        let c = classify(&pr(&["loom:pr"], base));
+        assert_eq!(c[0].step(), Some(Step::ChampionMerge), "{base:?}");
+    }
+    let conflicting = classify(&pr(&["loom:pr", "loom:merge-conflict"], Some("feature/issue-371")));
+    assert_eq!(conflicting[0].verdict, Verdict::Pass(PassReason::Conflicting));
+    let contradictory =
+        classify(&pr(&["loom:pr", "loom:changes-requested"], Some("feature/issue-371")));
+    assert_eq!(contradictory[0].step(), Some(Step::Doctor));
+    let blocked = classify(&pr(&["loom:pr", "loom:blocked"], Some("feature/issue-371")));
+    assert_eq!(blocked[0].verdict, Verdict::Pass(PassReason::Blocked));
+}
+
+/// #13891: a host's `extraSkipLabels` veto reaches every issue row and a PR's
+/// linked issue; an empty list changes nothing.
+#[test]
+fn host_skip_label_passes_issue_triage_and_linked_pr() {
+    let host = HostInput {
+        extra_skip_labels: vec!["codex-pilot".into()],
+        ..HostInput::default()
+    };
+    let issue = |n: u32, l: &[&str]| IssueInput {
+        number: n,
+        labels: labels(l),
+        ..IssueInput::default()
+    };
+    let inputs = |host: &HostInput| Inputs {
+        issues: vec![
+            issue(1, &["loom:issue", "codex-pilot"]),
+            issue(2, &["loom:triage", "codex-pilot"]),
+            issue(3, &["loom:issue", "codex-pilot"]),
+        ],
+        pulls: vec![PullInput {
+            number: 70,
+            labels: labels(&["loom:review-requested"]),
+            body: Some("Closes #3".into()),
+            same_repo: true,
+            ..PullInput::default()
+        }],
+        host: host.clone(),
+        ..Inputs::default()
+    };
+    for item in classify(&inputs(&host)) {
+        assert_eq!(item.verdict, Verdict::Pass(PassReason::HostSkipLabel), "{item:?}");
+    }
+    let open = classify(&inputs(&HostInput::default()));
+    assert!(open.iter().all(|i| i.step().is_some()), "{open:?}");
+    assert_eq!(PassReason::HostSkipLabel.as_str(), "host_skip_label");
 }

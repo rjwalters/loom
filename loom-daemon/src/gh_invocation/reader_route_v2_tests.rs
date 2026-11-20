@@ -521,7 +521,13 @@ fn an_uncovered_or_refusing_reader_is_withdrawn_for_the_repo_and_the_next_serves
         assert_eq!(withdrawn.len(), 1, "{name}: {withdrawn:?}");
         assert_eq!(withdrawn[0].0, "app-2", "{name}");
         assert_eq!(withdrawn[0].1, format!("acme/{name}"), "{name}");
-        assert_eq!(withdrawn[0].2, Failure::Coverage, "{name}");
+        // A plain 404 with no evidence is withdrawn briefly (#12511).
+        let want = if name == "blind-c" {
+            Failure::CoverageUnproven
+        } else {
+            Failure::Coverage
+        };
+        assert_eq!(withdrawn[0].2, want, "{name}");
     }
 }
 
@@ -541,7 +547,12 @@ fn every_reader_refusing_the_repo_sheds_never_absent_and_never_the_writer() {
         );
         assert!(matches!(out, GhCompletion::Shed { .. }), "{name}: {out:?}");
         assert_eq!(p.who(), vec![Who::R2, Who::R1], "{name}: writer stub NOT invoked");
-        assert!(withdrawn.iter().all(|w| w.2 == Failure::Coverage), "{name}: {withdrawn:?}");
+        assert!(
+            withdrawn
+                .iter()
+                .all(|w| matches!(w.2, Failure::Coverage | Failure::CoverageUnproven)),
+            "{name}: {withdrawn:?}"
+        );
         // The caller sees "no answer", never a 404 it would read as absent.
         let outcome = super::super::outcome::classify(Ok(out), Duration::from_secs(10));
         assert!(
@@ -566,6 +577,15 @@ fn a_shed_never_reads_as_a_rate_limit() {
     // The way most consumers see it: wrapped in their own error.
     let wrapped = format!("failed to invoke gh (worktree.issue_state): {text}");
     assert!(!crate::rate_limit_breaker::indicates_rate_limit(&wrapped));
+}
+
+/// #12641: the tick-deadline deferral reads as what it is, never as a
+/// reader-budget shed.
+#[test]
+fn the_tick_deadline_deferral_has_its_own_wording() {
+    let text = Unavailable::DeadlineReached.to_string();
+    assert_eq!(text, "deferred: tick deadline reached");
+    assert!(!text.contains("loom-shed") && !text.contains("reader budget"), "{text}");
 }
 
 // ===== accounting =====

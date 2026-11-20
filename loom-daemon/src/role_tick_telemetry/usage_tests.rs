@@ -34,6 +34,7 @@ fn facts() -> Facts {
             execution,
             started_at,
             failure: None,
+            judge: None,
         },
         ended_at: started_at + chrono::Duration::seconds(60),
     }
@@ -126,4 +127,35 @@ fn a_transcript_sourced_tick_reads_as_claude_and_a_named_runtime_wins() {
     assert_eq!(span_runtime(Some("codex"), UsageSource::CodexSessionRollouts), Some("codex"));
     assert_eq!(span_runtime(Some("opencode"), UsageSource::OpenCodeSessionDb), Some("opencode"));
     assert_eq!(span_runtime(None, UsageSource::PiLaunchStream), None, "never guessed");
+}
+
+/// #14566: a step whose usage was unreadable journals one `usage_missing` span
+/// under the tick root, once however often it is emitted.
+#[test]
+fn missing_usage_is_journalled_once_under_the_tick_root_with_its_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let facts = facts();
+    for _ in 0..2 {
+        journal_missing(
+            root,
+            &facts.trace,
+            "builder",
+            facts.ended_at,
+            Some("opencode"),
+            UsageMissing::SessionNotFound,
+        );
+    }
+    let store = TraceStore::new(root);
+    let spans = Journal::for_context(&store.path(root, &facts.trace.execution))
+        .completed()
+        .unwrap();
+    let [span] = spans.as_slice() else {
+        panic!("one span: {spans:?}");
+    };
+    assert_eq!(span.name, crate::telemetry::trace::SpanName::RuntimeUsageMissing);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&facts.trace.context.span_id));
+    assert_eq!(span.attributes["loom.usage.missing_reason"], "session_not_found");
+    assert_eq!(span.attributes["loom.role"], "builder");
+    assert_eq!(span.attributes["loom.runtime"], "opencode");
 }

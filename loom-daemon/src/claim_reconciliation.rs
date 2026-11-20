@@ -27,12 +27,11 @@
 //! host-scoped rules below concluded. This is the SOLE fleet-scoped gate as
 //! of Epic #6165 Phase 4 (#6317) — an earlier, now-removed gate additionally
 //! consulted whether the peer-claim/safehouse advertisement channel itself
-//! looked healthy (Issue #6157); that channel is fleet-scoped in principle
-//! but only *eventually consistent* (`peer_claims.rs`'s own "soft claim, not
-//! a mutex" framing), so treating its silence — degraded or otherwise — as
-//! reclamation-relevant evidence was itself the drift Epic #6165 set out to
-//! fix. The lease's forge-assigned `updated_at` needs no receipt at all,
-//! which is strictly stronger.
+//! looked healthy (Issue #6157); that channel (retired entirely in #13945) was
+//! fleet-scoped in principle but only *eventually consistent*, so treating its
+//! silence — degraded or otherwise — as reclamation-relevant evidence was
+//! itself the drift Epic #6165 set out to fix. The lease's forge-assigned
+//! `updated_at` needs no receipt at all, which is strictly stronger.
 //!
 //! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
@@ -98,7 +97,7 @@
 //! differences driven by the weaker evidence available on the PR side:
 //!
 //! - **The join is heuristic, not authoritative.** A PR has no `loom:building`
-//!   issue number of its own — [`parse_issue_from_branch`] recovers one only
+//!   issue number of its own — [`naming::issue_from_branch`](crate::worktree_ops::naming::issue_from_branch) recovers one only
 //!   when `headRefName` matches `feature/issue-<N>` (the convention
 //!   `worktree.sh` establishes); any other branch name has no evidence to
 //!   join, and [`decide_pr`] falls straight through to the age rule below.
@@ -332,13 +331,11 @@ pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 600;
 /// (e.g. `5` meaning "5 minutes") cannot turn this into a `gh`-API busy loop.
 pub const MIN_RECONCILE_INTERVAL_SECS: u64 = 60;
 
-/// Default periodic reconciliation interval when safehouse peer-claims are
-/// live (Issue #4431): 30 minutes. With claims advertised at dispatch and
-/// re-advertised every reaper tick (`sweep_registry::readvertise_peer_claims`),
-/// the fleet room — not the `loom:building` label — is the fast in-flight
-/// claim signal, and this pass demotes to a slow *healing* sweep for the
-/// divergence cases safehouse cannot see (a host that crashed without
-/// retracting, a stranded label from a pre-safehouse dispatch). Hosts without
+/// Default periodic reconciliation interval on a `safehouse.enabled` host
+/// (Issue #4431): 30 minutes. It was chosen while peer claims, re-advertised
+/// every reaper tick, were the fast in-flight signal and this pass was only a
+/// *healing* sweep. That channel was retired in #13945 (the lease record is the
+/// fast signal now), but the cadence is unchanged. Hosts without
 /// `safehouse.enabled` keep [`DEFAULT_RECONCILE_INTERVAL_SECS`] unchanged.
 pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
 
@@ -368,8 +365,7 @@ pub fn resolve_reconcile_interval() -> Duration {
 /// 2. `.loom/config.json → safehouse.claimReconcileIntervalSecs` — a per-repo
 ///    override of the safehouse-mode cadence (zero/invalid ignored).
 /// 3. [`DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`] when `safehouse.enabled`
-///    resolves true for `root` — peer-claims carry the fast signal, labels
-///    demote to a healing cadence.
+///    resolves true for `root` (see that constant for the history).
 /// 4. [`DEFAULT_RECONCILE_INTERVAL_SECS`] otherwise — byte-for-byte the
 ///    pre-#4431 behavior for hosts without safehouse (e.g. robb-pro).
 ///
@@ -1053,8 +1049,13 @@ pub struct ClaimedPr {
     /// (Issue #10235), per [`most_recent_head_push_at`]. `None` on fetch
     /// failure or no such push.
     pub most_recent_head_push_at: Option<DateTime<Utc>>,
+    /// `updated_at` of the claim role's live, renewed `loom:pr-lease`
+    /// (#13727), per [`live_pr_lease_at`]. A Judge silent inside a long test
+    /// run still renews its lease while its watched PID lives. `None` on
+    /// fetch failure, a released/yielded or TTL-stale lease (fail-open).
+    pub most_recent_pr_lease_at: Option<DateTime<Utc>>,
     /// The PR's head branch name, when available — the only join key to an
-    /// issue number this pass has (see [`parse_issue_from_branch`]).
+    /// issue number this pass has (see [`crate::worktree_ops::naming::issue_from_branch`]).
     pub head_ref_name: Option<String>,
 }
 
@@ -1104,18 +1105,6 @@ pub struct PrClaimOutcome {
     /// call failed (already logged at `warn` by
     /// [`forge::reconcile_pr_claims_report`]).
     pub reclaimed: bool,
-}
-
-/// Recover the `loom:building` issue number a PR's head branch encodes, when
-/// it follows the `feature/issue-<N>` convention `worktree.sh` establishes.
-/// `None` for any other branch shape — the caller then has no join key at
-/// all and [`decide_pr`] falls straight through to the age rule.
-#[must_use]
-pub fn parse_issue_from_branch(head_ref_name: &str) -> Option<u32> {
-    head_ref_name
-        .strip_prefix("feature/issue-")?
-        .parse::<u32>()
-        .ok()
 }
 
 /// Pure decision function for one PR-side claim label — no I/O, fully
@@ -1256,7 +1245,7 @@ pub fn plan_pr(
             let issue_number = pr
                 .head_ref_name
                 .as_deref()
-                .and_then(parse_issue_from_branch);
+                .and_then(crate::worktree_ops::naming::issue_from_branch);
             let (entry, run_registry_pid) = match issue_number {
                 Some(n) => {
                     let entry = sweep_journal::find(journal, repo, n);
@@ -1909,24 +1898,8 @@ pub fn run_reconciliation_pass(fallback_root: &Path, is_startup: bool) {
 /// be redundant. Each tick's `gh` calls block, so it runs on a blocking
 /// thread (`tokio::task::spawn_blocking`), mirroring
 /// [`crate::token_ranking_refresh::spawn_multi_token_ranking_refresh_task`].
-///
-/// **Claim-reconcile wake (#8766, renamed in #8995).** A `loom:building` claim
-/// whose sweep is gone is what *holds* the dispatch queue's head, and this loop
-/// is what releases it — but releasing it does not by itself move the head, so
-/// this is not the head-mover: the work finder still has to tick before the
-/// freed issue is dispatched, which is why the flag names this pass rather than
-/// that effect. `event_bus` lets a `forge.event` prompt of a claim-relevant
-/// shape (a comment on a claimed issue, a PR reaching terminal state) run the
-/// *next ordinary pass now*
-/// instead of at the multi-minute cadence above — and nothing else. The pass
-/// body is untouched: it re-lists `loom:building` issues and re-decides from
-/// the same host-scoped evidence and the same lease gate it always did, so an
-/// early tick can only change *when* that happens. Disabled unless
-/// `forgeEvents.events.claimReconcileWake` is on for `fallback_root`;
-/// otherwise the ticker holds no bus subscription at all.
 pub fn spawn_periodic_reconciliation_task(
     fallback_root: std::path::PathBuf,
-    event_bus: std::sync::Arc<crate::event_bus::EventBus>,
 ) -> tokio::task::JoinHandle<()> {
     // Safehouse-aware cadence (#4431): with live peer-claims carrying the
     // fast in-flight signal (re-advertised each reaper tick), a
@@ -1937,15 +1910,7 @@ pub fn spawn_periodic_reconciliation_task(
         interval.as_secs()
     );
     tokio::spawn(async move {
-        // An `Interval` a claim-relevant `forge.event` prompt may also tick
-        // early (#8766). Disarmed unless
-        // `forgeEvents.events.claimReconcileWake` is on; otherwise it is
-        // exactly `tokio::time::interval(interval)`.
-        let mut ticker = crate::forge_events::wake::EarlyTicker::for_claim_reconcile(
-            interval,
-            &event_bus,
-            &fallback_root,
-        );
+        let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Consume the immediate first fire: the startup pass already ran
         // moments ago in `main.rs`, so re-running instantly is redundant.
@@ -1974,7 +1939,7 @@ pub fn spawn_periodic_reconciliation_task(
 /// rather than growing `forge` inline.
 mod liveness;
 pub use liveness::{
-    claim_activity_marker, extra_liveness_at, most_recent_claim_activity_at,
+    claim_activity_marker, extra_liveness_at, live_pr_lease_at, most_recent_claim_activity_at,
     most_recent_head_push_at, most_recent_judge_activity_at, pr_liveness, LivenessSignal,
     PrComment, TimelineEvent, CLAIM_ACTIVITY_MARKER_PREFIX, JUDGE_ACTIVITY_MARKER_PREFIXES,
     STANDDOWN_MARKER_PREFIX,
@@ -2014,6 +1979,11 @@ pub mod merge_sequence;
 /// file per the file-size ratchet, run on the same tick right after
 /// [`forge::reconcile_pr_verdicts`].
 pub mod review_conflict;
+
+/// Retarget open PRs stacked on a parent closed unmerged (#12760) — and its
+/// scratch-worktree git mechanics — sibling files per the file-size ratchet.
+pub mod orphan_stack;
+pub(crate) mod orphan_stack_git;
 
 /// The per-repo loop of one reconciliation pass, plus the #8953 mid-pass
 /// rate-limit-breaker re-check that stops it early — a sibling file per the
@@ -2270,11 +2240,8 @@ pub mod forge {
     /// while peer coordination looked DEGRADED (sustained advertising with
     /// no receive); that gate has been removed, because a healthy-vs-
     /// degraded *advertisement channel* was never meant to be load-bearing
-    /// for correctness in the first place (`peer_claims.rs`'s own "soft
-    /// claim, not a mutex" framing, and this epic's own root-cause finding).
-    /// The peer-claim channel keeps its #4028 fast-backoff role at dispatch
-    /// time ([`crate::sweep_registry::SweepRegistry::dispatch`]'s
-    /// `peer_claimed_issues` check) — advisory only, never consulted here.
+    /// for correctness in the first place (this epic's own root-cause finding).
+    /// That channel was retired in #13945.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         let repo = root.display().to_string();
 
@@ -2575,26 +2542,29 @@ pub mod forge {
                 let aged = |since: DateTime<Utc>| {
                     (chrono::Utc::now() - since).num_seconds() as f64 / 60.0 >= stale_after
                 };
-                let (most_recent_judge_activity_at, most_recent_head_push_at) =
-                    match claim_labeled_at.filter(|s| aged(*s)) {
-                        Some(since) => (
-                            if is_reviewing {
-                                super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
-                                    fetch_most_recent_judge_activity_at(
-                                        gh_bin, root, r.number, since, None,
-                                    )
-                                })
-                            } else {
-                                None
-                            },
-                            super::read_cache::HEAD_PUSH.get_or(key2, || {
-                                fetch_most_recent_head_push_at(
-                                    gh_bin, root, r.number, label, since, None,
+                let aged_since = claim_labeled_at.filter(|s| aged(*s));
+                let most_recent_pr_lease_at = aged_since.and_then(|_| {
+                    super::liveness::fetch_live_pr_lease_at(gh_bin, root, r.number, label, None)
+                });
+                let (most_recent_judge_activity_at, most_recent_head_push_at) = match aged_since {
+                    Some(since) => (
+                        if is_reviewing {
+                            super::read_cache::JUDGE_ACTIVITY.get_or(key2.clone(), || {
+                                fetch_most_recent_judge_activity_at(
+                                    gh_bin, root, r.number, since, None,
                                 )
-                            }),
-                        ),
-                        None => (None, None),
-                    };
+                            })
+                        } else {
+                            None
+                        },
+                        super::read_cache::HEAD_PUSH.get_or(key2, || {
+                            fetch_most_recent_head_push_at(
+                                gh_bin, root, r.number, label, since, None,
+                            )
+                        }),
+                    ),
+                    None => (None, None),
+                };
                 ClaimedPr {
                     number: r.number,
                     updated_at: r
@@ -2606,6 +2576,7 @@ pub mod forge {
                     most_recent_claim_activity_at,
                     most_recent_judge_activity_at,
                     most_recent_head_push_at,
+                    most_recent_pr_lease_at,
                     head_ref_name: r.head_ref,
                 }
             })

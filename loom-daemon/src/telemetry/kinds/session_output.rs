@@ -30,10 +30,10 @@
 //!    carries the applied policy name in
 //!    [`redaction`](SessionOutputRecord::redaction) so a consumer can tell
 //!    which version produced a row.
-//! 3. **OTLP only.** The row is declared `native: false` in
-//!    [`telemetry_kind_table!`](crate::telemetry_kind_table): the native HTTPS
-//!    `/ingest` backend — the managed-cloud sink — never receives it, on any
-//!    configuration. Enabling live output cannot, by construction, start
+//! 3. **OTLP only.** The row is declared `otlp: Logs` in
+//!    [`telemetry_kind_table!`](crate::telemetry_kind_table): the retired native
+//!    HTTPS `/ingest` backend — the managed-cloud sink — never received it, on
+//!    any configuration. Enabling live output cannot, by construction, start
 //!    shipping session text to a managed sink; the collector's
 //!    `transform/session_output_redaction` stage then re-scrubs the body at
 //!    the gateway as defence in depth.

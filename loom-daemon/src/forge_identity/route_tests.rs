@@ -25,6 +25,7 @@ fn roster(readers: Vec<Identity>) -> Roster {
         readers,
         legacy_logins: vec![],
         writers: Vec::new(),
+        load_failed: false,
     }
 }
 
@@ -941,4 +942,116 @@ fn the_front_uses_a_reader_only_when_its_directory_is_private() {
     assert_eq!(trusted_in_front(reader.clone(), &|_| true), reader);
     assert_eq!(trusted_in_front(reader, &|_| false), RouteDecision::NoPool);
     assert_eq!(trusted_in_front(RouteDecision::NoPool, &|_| false), RouteDecision::NoPool);
+}
+
+// ---- roster load failure fails closed (#12511) -------------------------------
+
+#[test]
+fn a_roster_that_failed_to_load_sheds_instead_of_routing_to_the_writer() {
+    let mut r = roster(vec![]);
+    r.load_failed = true;
+    let cfg = RoutingConfig::default();
+    let before = crate::forge_call_stats::counters::get(ROSTER_LOAD_FAILED);
+    let d = route_read_in(
+        std::path::Path::new("/nonexistent"),
+        &r,
+        &req("acme/widgets", None),
+        &v2(&cfg),
+        SystemTime::now(),
+    );
+    assert!(
+        matches!(
+            d,
+            RouteDecision::Exhausted {
+                cause: ExhaustCause::Unavailable,
+                ..
+            }
+        ),
+        "{d:?}"
+    );
+    assert!(crate::forge_call_stats::counters::get(ROSTER_LOAD_FAILED) > before);
+}
+
+#[test]
+fn a_host_with_no_readers_configured_still_gets_no_pool() {
+    let r = roster(vec![]);
+    assert!(!r.load_failed);
+    let cfg = RoutingConfig::default();
+    let d = route_read_in(
+        std::path::Path::new("/nonexistent"),
+        &r,
+        &req("acme/widgets", None),
+        &v2(&cfg),
+        SystemTime::now(),
+    );
+    assert_eq!(d, RouteDecision::NoPool);
+}
+
+/// #12630: a shed's log line names, per reader, what the router saw — the
+/// withdrawal and its kind, a stale token directory, and the bucket-book
+/// reading with its source — so a "no reader can serve" run can be traced
+/// to the entry that caused it.
+#[test]
+fn describe_readers_names_each_readers_withdrawal_directory_and_book_reading() {
+    let now = SystemTime::now();
+    let (limited, stale, fine) = ("963001", "963002", "963003");
+    let r = roster(vec![
+        reader(limited, None),
+        reader(stale, None),
+        reader(fine, None),
+    ]);
+    let ws = workspace(&roster(vec![reader(limited, None), reader(fine, None)]), &["descr"]);
+    let at = epoch(now);
+    forge_read_pool::withdraw_scoped_budget_until(
+        limited,
+        "descr",
+        forge_read_pool::ResourceScope::Core,
+        now + Duration::from_secs(900),
+    );
+    forge_bucket_book::insert(
+        BucketKey::new("app-963001", "descr", Resource::Core),
+        Reading {
+            limit: Some(5000),
+            remaining: Some(0),
+            used: Some(5000),
+            reset_epoch: at + 900,
+            observed_at: at,
+            source: Source::Refusal,
+        },
+    );
+    forge_bucket_book::insert(
+        BucketKey::new("app-963003", "descr", Resource::Core),
+        Reading {
+            limit: Some(5000),
+            remaining: Some(4100),
+            used: Some(900),
+            reset_epoch: at + 1800,
+            observed_at: at,
+            source: Source::Header,
+        },
+    );
+    let line = describe_readers_in(ws.path(), &r, "descr/app", Resource::Core, now).unwrap();
+    let part = |app: &str| {
+        line.split("; ")
+            .find(|p| p.starts_with(&format!("app {app}:")))
+            .unwrap_or_else(|| panic!("{app} missing from {line}"))
+            .to_string()
+    };
+    let l = part(limited);
+    assert!(l.contains("withdrawn from descr core until"), "{l}");
+    assert!(l.contains("(rate limit)"), "{l}");
+    assert!(l.contains("book 0/5000") && l.ends_with("from refusal"), "{l}");
+    let s = part(stale);
+    assert!(s.contains("token directory stale or unpublished"), "{s}");
+    assert!(s.contains("no book reading"), "{s}");
+    let f = part(fine);
+    assert!(
+        f.contains("usable") && f.contains("book 4100/5000") && f.ends_with("from header"),
+        "{f}"
+    );
+
+    assert_eq!(
+        describe_readers_in(ws.path(), &roster(vec![]), "descr/app", Resource::Core, now),
+        None
+    );
 }

@@ -3,7 +3,7 @@
 //!
 //! A sibling module rather than more lines in `status_render.rs` (an
 //! over-threshold ledger entry — `.loom/docs/file-size-policy.md`), matching
-//! how [`super::forge_events_line`], [`super::holds`] and
+//! how [`super::holds`] and
 //! [`super::model_class`] already live here. Moved verbatim apart from the
 //! #9015 annotation described below.
 //!
@@ -17,9 +17,9 @@
 //! SigNoz. So the `OK` line names its scope, and when the endpoint is on this
 //! machine it says outright that delivery past that hop is unverified here.
 
+use crate::health::format_window;
+use crate::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 use chrono::{DateTime, Utc};
-use loom_daemon::health::format_window;
-use loom_daemon::types::{ObservabilityExportState as State, ObservabilityExportStatus};
 
 /// Render the one-line export summary as of `now` (passed in, so the tests are
 /// deterministic).
@@ -91,12 +91,6 @@ fn render_state(status: Option<&ObservabilityExportStatus>, now: DateTime<Utc>) 
             s.records_exported,
             downstream_caveat(s),
         ),
-        State::HostIdMismatch => format!(
-            "Observability: HOST-ID MISMATCH — telemetry is landing under host_id={}, not {host} \
-             (last export {last_success}, {} record(s)) → {endpoint}",
-            s.ingest_host_id.as_deref().unwrap_or("unknown"),
-            s.records_exported
-        ),
         State::Failing => format!(
             "Observability: FAILING — {} consecutive failed flush(es) as host_id={host}, last \
              success {last_success} → {endpoint}{} — fix: check this host's OTel egress (edge \
@@ -138,8 +132,8 @@ fn downstream_caveat(s: &ObservabilityExportStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
+    use crate::types::{ObservabilityExportState, ObservabilityExportStatus};
     use chrono::{DateTime, Utc};
-    use loom_daemon::types::{ObservabilityExportState, ObservabilityExportStatus};
 
     fn render_now() -> DateTime<Utc> {
         "2026-08-03T12:00:00Z".parse().unwrap()
@@ -153,7 +147,6 @@ mod tests {
         let mut status = ObservabilityExportStatus {
             state: ObservabilityExportState::Starting,
             host_id: Some("robb-studio".to_string()),
-            ingest_host_id: None,
             endpoint: Some("https://dashboard.example/ingest".to_string()),
             exporter: Some("https".to_string()),
             started_at: Some(render_now() - chrono::Duration::hours(4)),
@@ -296,18 +289,6 @@ mod tests {
         // wrong — an operator reading it cold should not need a second run.
         assert!(line.contains("fix: check this host's OTel egress"), "{line}");
         assert!(line.contains("loom-daemon health"), "{line}");
-    }
-
-    #[test]
-    fn observability_line_names_both_identities_on_a_mismatch() {
-        let status = export_status(|e| {
-            e.last_success_at = Some(render_now() - chrono::Duration::seconds(12));
-            e.ingest_host_id = Some("robb-pro".to_string());
-            e.records_exported = 77;
-        });
-        let line = render(Some(&status), render_now());
-        assert!(line.contains("HOST-ID MISMATCH"), "{line}");
-        assert!(line.contains("robb-pro") && line.contains("robb-studio"), "{line}");
     }
 
     #[test]

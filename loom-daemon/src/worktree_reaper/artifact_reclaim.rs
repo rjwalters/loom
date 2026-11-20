@@ -48,8 +48,9 @@ use chrono::Utc;
 
 use crate::generated_artifact::build_tree::{self, BuildRoot};
 
+use crate::fs_util::newest_mtime_and_size;
 use crate::target_orphan_reclaim::{
-    current_euid, newest_mtime_and_size, owned_by_us, production_open_handles, vet_path_inside,
+    current_euid, owned_by_us, production_open_handles, vet_path_inside,
 };
 use crate::worktree_activity::{reclaim_skip_reason, resolve_activity_window};
 use crate::worktree_ops::clean::{self, PrStatus, ProtectedArtifact, WorktreeDecision};

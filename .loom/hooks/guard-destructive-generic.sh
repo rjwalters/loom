@@ -175,6 +175,48 @@ fi
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null) || COMMAND=""
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null) || CWD=""
 
+# Champion state files (#13180). `/loom:champion --pr N` keeps a pin file and a
+# PR-facts file directly under the git common dir. The shell would expand
+# `$(git rev-parse --git-common-dir)/loom-champion-{pin,facts}-pr-<digits>` to
+# exactly that directory, but this guard cannot evaluate a substitution and
+# fails closed on it. Rewrite ONLY that exact, anchored spelling (literal PR
+# digits, fixed basename) to the resolved absolute path so the ordinary
+# containment logic judges a literal path; _champion_state_path_ok() below then
+# admits that one shape. Any other `$(…)` target stays unresolvable and denied.
+_CHAMPION_STATE_RE='\$\(git rev-parse --git-common-dir\)/(loom-champion-(pin|facts)-pr-[0-9]+(\.json)?)([^A-Za-z0-9._/-]|$)'
+_CHAMPION_COMMON_DIR=""
+if [[ -n "$CWD" && -d "$CWD" ]]; then
+    _CHAMPION_COMMON_DIR=$(cd "$CWD" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || _CHAMPION_COMMON_DIR=""
+fi
+if [[ -n "$_CHAMPION_COMMON_DIR" && "$COMMAND" == *'$(git rev-parse --git-common-dir)/loom-champion-'* ]]; then
+    _cs_rest="$COMMAND"
+    _cs_out=""
+    while [[ "$_cs_rest" =~ $_CHAMPION_STATE_RE ]]; do
+        _cs_whole="${BASH_REMATCH[0]}"
+        _cs_name="${BASH_REMATCH[1]}"
+        _cs_term="${BASH_REMATCH[4]}"
+        _cs_out+="${_cs_rest%%"$_cs_whole"*}${_CHAMPION_COMMON_DIR}/${_cs_name}${_cs_term}"
+        _cs_rest="${_cs_rest#*"$_cs_whole"}"
+    done
+    COMMAND="${_cs_out}${_cs_rest}"
+fi
+
+# True if $1 (an absolute, normalized path) is exactly one of the Champion
+# state files, a DIRECT child of the git common dir. Anchored on the basename
+# pattern and the resolved directory, so `.git/config`, a sibling file, a
+# `..` traversal or a nested path never matches.
+_champion_state_path_ok() {
+    local p="$1"
+    [[ -n "$_CHAMPION_COMMON_DIR" && -n "$p" ]] || return 1
+    [[ "$p" =~ ^(.*)/(loom-champion-(pin|facts)-pr-[0-9]+(\.json)?)$ ]] || return 1
+    local dir="${BASH_REMATCH[1]}"
+    [[ "$dir" == *"/../"* || "$dir" == */.. || "$dir" == *"/./"* ]] && return 1
+    [[ "$dir" == "$_CHAMPION_COMMON_DIR" ]] && return 0
+    local phys
+    phys=$(cd "$dir" 2>/dev/null && pwd -P) || return 1
+    [[ "$phys" == "$_CHAMPION_COMMON_DIR" ]]
+}
+
 # If no command to check, allow
 if [[ -z "$COMMAND" ]]; then
     exit 0
@@ -1358,6 +1400,30 @@ stash_scope_guard_enabled() {
         _STASH_SCOPE_CACHE="$enabled"
     fi
     [[ "$_STASH_SCOPE_CACHE" == "true" ]]
+}
+
+# =============================================================================
+# Primary-checkout mutation guard toggle (#13589)
+#
+#   1. LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION env var (0/false/no disables)
+#   2. guards.primaryCheckoutMutation in .loom/config.json (default true)
+# Invoked lazily, only after a git checkout/switch/commit segment matched.
+# =============================================================================
+_PCM_CACHE=""
+primary_checkout_mutation_guard_enabled() {
+    if [[ -z "$_PCM_CACHE" ]]; then
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            raw=$(loom_config_get "$REPO_ROOT" "guards.primaryCheckoutMutation" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
+        fi
+        case "${LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _PCM_CACHE="$enabled"
+    fi
+    [[ "$_PCM_CACHE" == "true" ]]
 }
 
 # True if $1 (the ask-scan form of a command) contains at least one stash
@@ -5040,6 +5106,62 @@ resolve_stash_cwd() {
     END { if (!found) print curcwd }'
 }
 
+# List every `git checkout|switch|commit` segment of a command with the cwd it
+# would run in (#13589). One line per segment: "<cwd>\x1f<subcmd>\x1f<args>".
+# Threads `cd <dir>` across segments (same as resolve_stash_cwd) and a
+# `git -C <dir>` global option (relative -C joins the running cwd). Leading
+# `(`/`{`, `sudo`, and `VAR=val` env prefixes are stripped; only a segment that
+# STARTS with `git` counts, so quoted text mentioning `git commit` is inert.
+resolve_primary_mutations() {
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
+    BEGIN { curcwd = startcwd }
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t(){]+/, "", seg)
+            sub(/^sudo[ \t]+/, "", seg)
+            while (seg ~ /^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/) sub(/^[A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+/, "", seg)
+            if (seg == "") continue
+            wseg = mask_ws(seg)
+            m = split(wseg, toks, /[ \t]+/)
+            if (m == 0) continue
+            for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
+            if (toks[1] == "cd") {
+                if (m >= 2 && toks[2] != "" && toks[2] != "-") {
+                    cdarg = expand_cd_arg(toks[2], home)
+                    cdclass = strip_cd_quoting(cdarg)
+                    if (cdclass ~ /^\//) curcwd = cdarg
+                    else if (curcwd != "") curcwd = curcwd "/" cdarg
+                }
+                continue
+            }
+            if (toks[1] != "git") continue
+            gcwd = curcwd
+            k = 2
+            while (k <= m && toks[k] ~ /^-/) {
+                if (toks[k] == "-C" && k < m) {
+                    carg = expand_cd_arg(toks[k+1], home)
+                    if (strip_cd_quoting(carg) ~ /^\//) gcwd = carg
+                    else if (gcwd != "") gcwd = gcwd "/" carg
+                    k += 2
+                } else if ((toks[k] == "-c" || toks[k] == "--git-dir" || toks[k] == "--work-tree" || toks[k] == "--namespace") && k < m) {
+                    k += 2
+                } else {
+                    k++
+                }
+            }
+            if (k > m) continue
+            sub_ = toks[k]
+            if (sub_ != "checkout" && sub_ != "switch" && sub_ != "commit") continue
+            args = ""
+            for (j = k + 1; j <= m; j++) args = args (j > k + 1 ? " " : "") toks[j]
+            printf "%s\037%s\037%s\n", gcwd, sub_, args
+        }
+    }'
+}
+
 # Redact the quoted VALUES of known text-carrying flags (--body, -m/--message,
 # --title, --notes, --comment, --search) so a dangerous-looking phrase quoted
 # INSIDE such a value no longer trips the raw ALWAYS_BLOCK_PATTERNS substring
@@ -6471,6 +6593,7 @@ toggle_hint_for_tag() {
         rm-scope-unresolved-var|rm-scope-outside-repo) env="LOOM_RM_SCOPE=off"; key='"guards.rmScope": "off"' ;;
         force-op:*)                   env="LOOM_FORCE_SCOPE=off";           key='"guards.forceScope": "off"' ;;
         stash-scope:*)                env="LOOM_GUARD_STASH_SCOPE=0";       key='"guards.stashScope": false' ;;
+        primary-checkout-mutation:*)  env="LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0"; key='"guards.primaryCheckoutMutation": false' ;;
         worktree-write-confinement*)  env="LOOM_GUARD_WORKTREE_ISOLATION=0"; key='"guards.worktreeIsolation": false' ;;
         *) return 0 ;;
     esac
@@ -8734,6 +8857,7 @@ _extract_write_targets_scan() {
     BEGIN {
         SEP = sprintf("%c", 31)
         curcwd = startcwd
+        sw_depth = 0; sw_pending = 0; pd_depth = 0   # #12082 subshell / pushd stacks
     }
     # Slurp the whole (possibly multi-line) command into ONE buffer,
     # preserving embedded newlines (mirrors the #3898 multi-line
@@ -8818,6 +8942,38 @@ _extract_write_targets_scan() {
             sub(/^[ \t]+/, "", seg)
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
+
+            # GROUPING OPENERS AND CLOSERS AROUND A `cd` (#12082). The cd
+            # tracker below only fires when the segment WORD is `cd`, so
+            # `( cd /tmp/x && echo hi > a.txt )` and `{ cd /tmp/x; ...; }` were
+            # never tracked: the relative write resolved against the hook cwd
+            # (the main checkout) and was denied although it lands in /tmp/x.
+            #   * A subshell `(` saves curcwd on a stack and its matching `)`
+            #     restores it, because a cd inside a subshell never leaks out.
+            #     Restoring on an unmatched `)` can only RESTORE the pre-group
+            #     cwd, so a miscount errs toward more denials, not fewer.
+            #   * A brace group `{ ` runs in the current shell, so it is only
+            #     stripped; its cd correctly persists.
+            # Quoted spans are blanked before counting parens so a `(` or `)`
+            # inside a string can neither open nor close a group.
+            if (sw_pending > 0) {
+                while (sw_pending > 0 && sw_depth > 0) { curcwd = sw_stack[sw_depth]; sw_depth--; sw_pending-- }
+                sw_pending = 0
+            }
+            while (seg ~ /^\{[ \t]/) sub(/^\{[ \t]+/, "", seg)
+            while (seg ~ /^\(/ && seg !~ /^\(\(/) {
+                sw_depth++
+                sw_stack[sw_depth] = curcwd
+                sub(/^\([ \t]*/, "", seg)
+            }
+            if (sw_depth > 0) {
+                _pq = seg
+                gsub(/"[^"]*"/, "", _pq)
+                gsub(/'"'"'[^'"'"']*'"'"'/, "", _pq)
+                _po = gsub(/\(/, "", _pq)
+                _pc = gsub(/\)/, "", _pq)
+                if (_pc > _po) sw_pending = _pc - _po
+            }
             if (seg == "") continue
 
             # `NAME=value` assignments in any ordinary shell assignment
@@ -8884,7 +9040,13 @@ _extract_write_targets_scan() {
             mseg = substr(gsegs[i], stripped + 1)
             mm = split(mseg, mtoks, /[ \t]+/)
 
-            if (toks[1] == "cd") {
+            # `popd` undoes the most recent `pushd` of THIS command (#12082).
+            if (toks[1] == "popd") {
+                if (pd_depth > 0) { curcwd = pd_stack[pd_depth]; pd_depth-- }
+                continue
+            }
+            if (toks[1] == "cd" || (toks[1] == "pushd" && m >= 2 && toks[2] !~ /^-/)) {
+                if (toks[1] == "pushd") { pd_depth++; pd_stack[pd_depth] = curcwd }
                 if (m >= 2 && toks[2] != "" && toks[2] != "-") {
                     # SAME-COMMAND VARIABLE RESOLUTION FOR THE cd ARGUMENT
                     # ITSELF (#7294, mirrors parse_force_ops'"'"' identical
@@ -9110,7 +9272,7 @@ _extract_write_targets_scan() {
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
                         numfd_redir[j+1] = 1
                     }
-                } else if (mtoks[j] ~ /^[0-9]+>>?[^ \t&]/) {
+                } else if (mtoks[j] ~ /^[0-9]+>>?[^ \t&(>]/) {
                     numfd_redir[j] = 1
                 }
             }
@@ -9328,8 +9490,23 @@ _extract_write_targets_scan() {
                     }
                     continue
                 }
-                if (mt ~ /^[0-9]*>>?[^ \t&]/) {
-                    # Attached form (`>file`, `2>file`, `>>file`).
+                if (mt ~ /^[0-9]*>>?\(tee$/) {
+                    # Output process substitution into tee (`>(tee F ...)`,
+                    # #13814): not a file named `(tee`, but its operands ARE
+                    # write targets, so emit them to keep nested writes judged.
+                    for (k = j + 1; k <= m; k++) {
+                        if (toks[k] == "") continue
+                        op = toks[k]
+                        closed = (op ~ /\)$/)
+                        sub(/\)+$/, "", op)
+                        if (op != "" && op !~ /^-/) print curcwd SEP resolve_var_q(op)
+                        if (closed) break
+                    }
+                    continue
+                }
+                if (mt ~ /^[0-9]*>>?[^ \t&(>]/) {
+                    # Attached form (`>file`, `2>file`, `>>file`). `>(` is
+                    # process substitution, not an attached target (#13814).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
                     if (op != "") print curcwd SEP resolve_var_q(op)
@@ -10463,6 +10640,10 @@ if worktree_isolation_guard_enabled && \
         fi
         _wabs=$(normalize_abs_path "$_wabs")
 
+        # (a0) The Champion pin / PR-facts file, a direct child of the git
+        # common dir (#13180) -> allow. Exactly those two name patterns.
+        _champion_state_path_ok "$_wabs" && continue
+
         # (a) Already inside some managed worktree -> allow. This is exactly
         # where a builder is supposed to write.
         _in_any_managed_worktree "$_wabs" && continue
@@ -10538,7 +10719,7 @@ if worktree_isolation_guard_enabled && \
         # base is resolved off the same main-checkout root so the "a managed
         # worktree exists" gate stays consistent with the containment test.
         if _wt_isolation_in_play; then
-            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv/mkdir — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_WT_MKTEMP_SCAN
+            deny "BLOCKED: Bash-tool write to '${_wabs}' resolves to the main repository checkout ('${_WT_MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). This is a worktree-isolation bypass via Bash redirection/tee/sed -i/cp/mv/mkdir — do NOT retry the write through Bash. cd into your issue worktree ($(_wt_worktree_hint)) and write there instead. Gitignored status does not exempt a path: Edit/Write and Bash writes are confined by the same rule. For repo-local scratch/notes/journal files, write under your issue worktree or under /tmp (session scratch) instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4178)" "worktree-write-confinement"  # scan-reads: COMMAND_ASK_SCAN,COMMAND_WT_MKTEMP_SCAN
         fi
     done <<< "$WRITE_TARGETS"
 fi
@@ -11998,6 +12179,91 @@ index_mutation_unisolated() {
     fi
     return 1
 }
+
+# =============================================================================
+# PRIMARY-CHECKOUT MUTATION (#13589) — deny `git commit`, `git switch`,
+# `git checkout -b/-B/--detach`, and `git checkout <branch|sha>` when the
+# resolved cwd (honouring `cd X &&` and `git -C X`) is a workspace's PRIMARY
+# checkout during an AGENT STEP. Builder/Doctor work in worktrees; a stray
+# commit or branch switch in the primary clone parks it off the default branch
+# (rjwalters/repo, loom-worker-4, 2026-11-04) and holds fleet sync.
+#
+# Agent step = LOOM_SWEEP_ID or LOOM_WORKTREE_PATH is exported (the dispatcher
+# sets them; an operator's interactive session has neither, so is untouched).
+# Deny, not ask: headless fleet runs have nobody to answer an ask.
+#
+# Allowed shapes (legitimate primary-clone callers):
+#   - checkout/switch whose target is main or master (Auditor's
+#     `git checkout -B main origin/main`, `git checkout main`)
+#   - `git checkout -- <path>` / `git checkout <path>` (file restore) and -h
+#   - anything inside a linked worktree, and all of worktree.sh,
+#     check-main-clean.sh, resync-installed.sh, merge-pr.sh, version.sh (their
+#     internal git calls are invisible to this hook; only the top-level command
+#     text is scanned).
+# Gated by primary_checkout_mutation_guard_enabled(), evaluated lazily.
+# =============================================================================
+if [[ -n "${LOOM_SWEEP_ID:-}${LOOM_WORKTREE_PATH:-}" ]] \
+   && echo "$COMMAND_NO_COMMENT" | grep -qE '(^|[;&|(`{]|[[:space:]])git[[:space:]].*(checkout|switch|commit)' \
+   && primary_checkout_mutation_guard_enabled; then
+    while IFS=$'\037' read -r _pcm_cwd _pcm_sub _pcm_args; do
+        [[ -z "$_pcm_sub" ]] && continue
+        if [[ "$_pcm_cwd" == *"'"* || "$_pcm_cwd" == *'"'* ]]; then
+            strip_target_quoting "$_pcm_cwd" && _pcm_cwd="$_UNQUOTED_TARGET"
+        fi
+        [[ -n "$_pcm_cwd" && -d "$_pcm_cwd" ]] || continue
+        _pcm_top=$(cd "$_pcm_cwd" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null) || continue
+        _pcm_top=$(cd "$_pcm_top" 2>/dev/null && pwd -P) || continue
+        _pcm_common=$(cd "$_pcm_cwd" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null) || continue
+        _pcm_parent=$(cd "$_pcm_cwd" 2>/dev/null && cd "$_pcm_common/.." 2>/dev/null && pwd -P) || continue
+        [[ "$_pcm_top" == "$_pcm_parent" ]] || continue   # linked worktree: unaffected
+
+        read -r -a _pcm_t <<< "$_pcm_args"
+        _pcm_deny=false
+        _pcm_help=false
+        _pcm_dashdash=false
+        _pcm_new=""        # branch named by -b/-B/-c/-C
+        _pcm_makes=false   # creates/detaches
+        _pcm_pos=""        # first positional
+        _pcm_prev=""
+        for _pcm_a in "${_pcm_t[@]}"; do
+            if [[ "$_pcm_prev" == "-b" || "$_pcm_prev" == "-B" || "$_pcm_prev" == "-c" || "$_pcm_prev" == "-C" ]]; then
+                _pcm_new="$_pcm_a"; _pcm_prev=""; continue
+            fi
+            case "$_pcm_a" in
+                -h|--help) _pcm_help=true ;;
+                --) _pcm_dashdash=true; break ;;
+                -b|-B|-c|-C) _pcm_makes=true; _pcm_prev="$_pcm_a" ;;
+                --orphan|--detach|-d|--create|--force-create) _pcm_makes=true ;;
+                -*) ;;
+                *) [[ -z "$_pcm_pos" ]] && _pcm_pos="$_pcm_a" ;;
+            esac
+        done
+        [[ "$_pcm_help" == true ]] && continue
+        _pcm_target="${_pcm_new:-$_pcm_pos}"
+        case "$_pcm_sub" in
+            commit) _pcm_deny=true ;;
+            switch)
+                if [[ "$_pcm_target" == "main" || "$_pcm_target" == "master" ]]; then
+                    [[ "$_pcm_makes" == true && -z "$_pcm_new" ]] && _pcm_deny=true
+                else
+                    _pcm_deny=true
+                fi ;;
+            checkout)
+                [[ "$_pcm_dashdash" == true && -z "$_pcm_new" && "$_pcm_makes" != true ]] && continue
+                if [[ "$_pcm_target" == "main" || "$_pcm_target" == "master" ]]; then
+                    :   # return to / refresh the default branch
+                elif [[ "$_pcm_makes" == true ]]; then
+                    _pcm_deny=true
+                elif [[ -n "$_pcm_pos" ]] \
+                     && (cd "$_pcm_cwd" 2>/dev/null && git rev-parse --verify --quiet "${_pcm_pos}^{commit}" >/dev/null 2>&1); then
+                    _pcm_deny=true   # a branch / sha, not a path
+                fi ;;
+        esac
+        if [[ "$_pcm_deny" == true ]]; then
+            deny "Blocked: $COMMAND (git $_pcm_sub in the PRIMARY checkout $_pcm_top during an agent step — this moves the workspace off the default branch or commits onto it, which holds fleet sync (wrong-branch). Builder/Doctor work happens in a worktree: run './.loom/scripts/worktree.sh <issue-number>' and work in .loom/worktrees/issue-<N>. Switching back to main/master and file restores ('git checkout -- <path>') remain allowed. To opt out repo-wide set guards.primaryCheckoutMutation:false in .loom/config.json, or export LOOM_GUARD_PRIMARY_CHECKOUT_MUTATION=0 in the agent's OWN environment before the session — an inline prefix does not reach this hook, which runs as a separate process)" "primary-checkout-mutation:$_pcm_sub"  # scan-reads: COMMAND_NO_COMMENT
+        fi
+    done < <(resolve_primary_mutations "$COMMAND_NO_COMMENT" "$CWD")
+fi
 
 # =============================================================================
 # git read-tree WITHOUT an isolating GIT_INDEX_FILE assignment

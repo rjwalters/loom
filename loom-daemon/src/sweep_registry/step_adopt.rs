@@ -19,7 +19,6 @@
 //! this module adds the `pr-<N>` scan. A `pr-<N>` lock owned by a PR set is
 //! left exactly as before (PR sets are not reconstructed).
 
-use super::journal_shadow::LockNs;
 use super::*;
 use crate::step_role::StepRole;
 
@@ -37,7 +36,6 @@ impl SweepRegistry {
         sweep_id: &str,
         started_at: DateTime<Utc>,
     ) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         // The step's end, as the reaper runs it for a step it saw die
         // (#11906): its listed leases reaped (a Judge's no-verdict record
         // included, and the lease file removed), its capture emitted.
@@ -128,9 +126,7 @@ impl SweepRegistry {
                 if let Some(pgid) = owner.pgid {
                     self.reap_orphaned_group(&owner.sweep_id, Some(pr), pgid);
                 }
-                if std::fs::remove_dir_all(&path).is_ok() {
-                    self.shadow_owner_released(LockNs::Pr, pr, Some(&owner.sweep_id));
-                }
+                let _ = std::fs::remove_dir_all(&path);
                 let started_at = Self::lock_started_at(&owner);
                 self.restore_dead_step_at_startup(item, role, &owner.sweep_id, started_at);
                 continue;
@@ -161,7 +157,6 @@ impl SweepRegistry {
                     effort: owner.effort.clone(),
                     depends_on: None,
                     repo: Some(self.config.workspace_root.display().to_string()),
-                    overflow: owner.overflow,
                 },
             );
             crate::observability::lifecycle::execution_adopted(

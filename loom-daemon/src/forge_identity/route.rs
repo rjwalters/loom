@@ -711,6 +711,33 @@ fn log_owner_uncovered(owner: &str, now: SystemTime) {
     }
 }
 
+/// Counter bumped per read shed because the reader roster failed to load.
+pub(crate) const ROSTER_LOAD_FAILED: &str = "forge_identity.roster_load_failed";
+
+/// How often a roster load failure is logged at `error`.
+const LOAD_FAILED_LOG_EVERY: Duration = Duration::from_secs(300);
+
+/// Count (always) and log (at most every [`LOAD_FAILED_LOG_EVERY`]) a read
+/// shed because the reader roster failed to load.
+fn note_roster_load_failed(now: SystemTime) {
+    static LAST: OnceLock<Mutex<Option<SystemTime>>> = OnceLock::new();
+    let n = crate::forge_call_stats::counters::bump(ROSTER_LOAD_FAILED);
+    let Ok(mut last) = LAST.get_or_init(|| Mutex::new(None)).lock() else {
+        return;
+    };
+    let due = last.is_none_or(|at| {
+        now.duration_since(at)
+            .is_ok_and(|d| d >= LOAD_FAILED_LOG_EVERY)
+    });
+    if due {
+        *last = Some(now);
+        log::error!(
+            "forge_identity: the reader roster failed to load (a config tier is unreadable or              malformed), so reads are shed, never sent to the writer, until it loads              ({ROSTER_LOAD_FAILED}={n}; logged at most every {}s)",
+            LOAD_FAILED_LOG_EVERY.as_secs()
+        );
+    }
+}
+
 /// What [`route_read_in`] needs beyond the roster.
 #[derive(Debug, Clone, Copy)]
 pub struct RouteEnv<'a> {
@@ -773,6 +800,16 @@ pub fn route_read_in(
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo);
     if owner.is_empty() {
         return RouteDecision::NoPool;
+    }
+    if roster.load_failed && roster.readers.is_empty() {
+        // A broken config looks like "no readers configured", and `NoPool`
+        // sends the read to the writer, which never serves reads (#12394):
+        // shed it instead (#12511).
+        note_roster_load_failed(now);
+        return RouteDecision::Exhausted {
+            until: now + forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        };
     }
     // Legacy: the pre-W4 walk exactly — every reader, no owners filter.
     let readers: Vec<&Identity> = if legacy {
@@ -1055,6 +1092,79 @@ fn exhausted_until(
         })
         .min()
         .unwrap_or(refresh)
+}
+
+/// What this daemon's router sees for each reader that could serve a
+/// `resource` read of `owner_repo` at `now`, for a shed's log line (#12630):
+/// a withdrawal (its scope, end and kind), a stale or unpublished token
+/// directory, or "usable", each with the bucket book's reading (remaining,
+/// limit, reset and source: header, probe or refusal). `None` when there is
+/// no reader root or no reader for the owner.
+#[must_use]
+pub fn describe_readers(owner_repo: &str, resource: Resource, now: SystemTime) -> Option<String> {
+    let ws = super::workspace_root().or_else(super::front_root)?;
+    describe_readers_in(ws, &super::cached(ws), owner_repo, resource, now)
+}
+
+/// [`describe_readers`] against an explicit workspace and roster.
+#[must_use]
+pub fn describe_readers_in(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    resource: Resource,
+    now: SystemTime,
+) -> Option<String> {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    let readers = eligible_readers(roster, owner);
+    if owner.is_empty() || readers.is_empty() {
+        return None;
+    }
+    let at = |t: SystemTime| {
+        chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let parts: Vec<String> = readers
+        .iter()
+        .map(|r| {
+            let state = if let Some(t) = forge_read_pool::withdrawn_until(&r.app_id, now) {
+                format!("withdrawn app-wide until {}", at(t))
+            } else if let Some(t) = super::repo_withdrawn_until(&r.app_id, owner_repo, now) {
+                format!("withdrawn from {owner_repo} (coverage) until {}", at(t))
+            } else if let Some(t) =
+                forge_read_pool::scoped_withdrawal_until(&r.app_id, owner, resource, now)
+            {
+                let kind =
+                    if forge_read_pool::is_budget_withdrawn_at(&r.app_id, owner, resource, now) {
+                        "rate limit"
+                    } else {
+                        "credential"
+                    };
+                format!("withdrawn from {} {} until {} ({kind})", owner, resource.as_str(), at(t))
+            } else if !super::dir_is_fresh(&super::reader_dir(workspace_root, owner, r), now) {
+                "token directory stale or unpublished".to_string()
+            } else {
+                "usable".to_string()
+            };
+            let book = bucket_key(&r.app_id, owner, resource)
+                .and_then(|k| forge_bucket_book::reading(&k, epoch(now)))
+                .map_or_else(
+                    || "no book reading".to_string(),
+                    |b| {
+                        let n =
+                            |v: Option<u64>| v.map_or_else(|| "?".to_string(), |v| v.to_string());
+                        format!(
+                            "book {}/{} reset {} from {}",
+                            n(b.remaining),
+                            n(b.limit),
+                            system_time(b.reset_epoch).map_or_else(|| "?".to_string(), at),
+                            b.source.as_str()
+                        )
+                    },
+                );
+            format!("app {}: {state}, {book}", r.app_id)
+        })
+        .collect();
+    Some(parts.join("; "))
 }
 
 /// The bucket a reader's reads of `owner`'s `resource` spend; `None` for an

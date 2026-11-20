@@ -33,49 +33,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/check-stale-blocked.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
-
-assert_contains() { # <haystack> <needle> <msg>
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected to contain: '$2'"
-        echo "    actual: $(printf '%s' "$1" | head -40)"
-    fi
-}
-
-assert_not_contains() { # <haystack> <needle> <msg>
-    if [[ "$1" != *"$2"* ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected NOT to contain: '$2'"
-        echo "    actual: $(printf '%s' "$1" | head -40)"
-    fi
-}
-
-assert_eq() { # <expected> <actual> <msg>
-    if [[ "$1" == "$2" ]]; then pass "$3"; else
-        fail "$3"
-        echo "    expected: '$1'"
-        echo "    actual:   '$2'"
-    fi
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 [[ -x "$SCRIPT" ]] || {
     echo -e "${RED}FATAL${NC}: $SCRIPT missing or not executable"

@@ -43,10 +43,10 @@
 //!
 //! [`is_bad`]: super::bad_tokens::is_bad
 
+use crate::script_helpers::now_epoch_secs;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -420,13 +420,6 @@ impl std::fmt::Display for NoHealthyAccountError {
 
 impl std::error::Error for NoHealthyAccountError {}
 
-fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 fn state_path(workspace: &Path) -> PathBuf {
     workspace.join(".loom").join("account-health.json")
 }
@@ -515,7 +508,7 @@ pub fn record_terminal(
     classification: TerminalClassification,
     provenance: &str,
 ) -> Result<()> {
-    record_terminal_at(workspace, id, classification, provenance, now_epoch())
+    record_terminal_at(workspace, id, classification, provenance, now_epoch_secs())
 }
 
 /// [`record_terminal`], telling it which **model** was in flight (#8058 Phase
@@ -528,7 +521,7 @@ pub fn record_terminal_for_model(
     model: Option<&str>,
     provenance: &str,
 ) -> Result<()> {
-    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch())
+    record_terminal_for_model_at(workspace, id, classification, model, provenance, now_epoch_secs())
 }
 
 /// [`record_terminal_for_model`], carrying the **provider-reported reset
@@ -556,7 +549,7 @@ pub fn record_terminal_for_model_with_reset(
         class.as_deref(),
         reset_at,
         provenance,
-        now_epoch(),
+        now_epoch_secs(),
     )
 }
 
@@ -1019,7 +1012,7 @@ pub fn clear_reauth(workspace: &Path, id: &AccountId, provenance: &str) -> Resul
         entry.reason = HealthReason::Healthy;
         entry.cooldown_until = None;
         entry.consecutive_transient_failures = 0;
-        entry.updated_at = now_epoch();
+        entry.updated_at = now_epoch_secs();
         entry.signal_provenance = provenance.to_string();
         Ok(())
     })
@@ -1080,6 +1073,71 @@ pub fn select_healthy_for_model_at(
     select_healthy_for_class_at(workspace, provider, inventory, class.as_deref(), now)
 }
 
+/// Two weekly readings closer than this are the same reading — a float
+/// artifact of `used_percent / 100`, not a real difference in headroom.
+const WEEKLY_TIE_EPSILON: f64 = 1e-9;
+
+/// The live weekly utilization (0..1) of each enabled Codex account in
+/// `inventory`, keyed by account. An account with no usable weekly reading is
+/// simply absent: absent means *unknown*, never zero (#14585).
+///
+/// Only Codex has a locally recorded weekly window; every other provider gets
+/// an empty map and keeps its existing selection order.
+fn weekly_utilization_by_account(
+    provider: AccountProvider,
+    inventory: &[AccountDescriptor],
+    now: u64,
+) -> HashMap<AccountId, f64> {
+    if provider != AccountProvider::Codex {
+        return HashMap::new();
+    }
+    let enabled = || {
+        inventory
+            .iter()
+            .filter(|account| account.id.provider == provider && account.enabled)
+    };
+    // A lone seat has nothing to be ranked against; skip the reads.
+    if enabled().nth(1).is_none() {
+        return HashMap::new();
+    }
+    enabled()
+        .filter_map(|account| {
+            super::codex_check::weekly_utilization_at(&account.credential_reference, now)
+                .map(|fraction| (account.id.clone(), fraction))
+        })
+        .collect()
+}
+
+/// Narrow `candidates` — already reduced to one health group — to the seats
+/// tied for the lowest measured weekly utilization, so the round-robin cursor
+/// then rotates among *those* (#14585).
+///
+/// Ranking needs comparable evidence: unless **every** candidate has a weekly
+/// reading the group is left untouched and the existing round-robin applies.
+/// Preferring the measured seats over unmeasured ones would starve a seat on
+/// the strength of someone else's data; a lone unknown is not evidence of
+/// headroom *or* of a wall.
+fn narrow_to_lowest_weekly_utilization(
+    candidates: &mut Vec<AccountDescriptor>,
+    weekly: &HashMap<AccountId, f64>,
+) {
+    if candidates.len() < 2 {
+        return;
+    }
+    let Some(readings) = candidates
+        .iter()
+        .map(|account| weekly.get(&account.id).copied())
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return;
+    };
+    let lowest = readings.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut keep = readings
+        .iter()
+        .map(|reading| reading - lowest <= WEEKLY_TIE_EPSILON);
+    candidates.retain(|_| keep.next().unwrap_or(false));
+}
+
 /// [`select_healthy_for_model_at`] with an **already-normalized** class (see
 /// [`model_class_of`]).
 ///
@@ -1095,6 +1153,9 @@ pub fn select_healthy_for_class_at(
 ) -> Result<AccountDescriptor> {
     let model_class = model_class.and_then(normalize_class);
     let model_class = model_class.as_deref();
+    // Bounded, read-only rollout reads (#14585) — done before the health-state
+    // lock is taken so file I/O never extends the critical section.
+    let weekly = weekly_utilization_by_account(provider, inventory, now);
     with_state(workspace, |state| {
         for entry in &mut state.accounts {
             if entry.reason == HealthReason::TransientFailure
@@ -1187,6 +1248,7 @@ pub fn select_healthy_for_class_at(
                 .map_or(0, |entry| entry.consecutive_transient_failures)
                 == fewest
         });
+        narrow_to_lowest_weekly_utilization(&mut candidates, &weekly);
         let cursor_key = format!("{provider:?}").to_ascii_lowercase();
         let cursor = state.cursors.entry(cursor_key).or_default();
         let chosen = candidates[*cursor as usize % candidates.len()].clone();

@@ -38,6 +38,8 @@ fn sink() -> (Arc<RecordingQueue>, OpsSink) {
     (queue.clone(), OpsSink::new(queue, "host-a"))
 }
 
+const CAPTURE_PROCESS_KEY: &str = "loom.daemon.process_instance_id";
+
 fn at(secs: i64) -> chrono::DateTime<Utc> {
     Utc.timestamp_opt(1_790_000_000 + secs, 0).unwrap()
 }
@@ -81,6 +83,108 @@ fn emit_applies_policy_before_the_queue() {
     assert_eq!(record.points.len(), 1, "the NaN point never reaches the queue");
     assert!(record.points[0].labels.is_empty(), "oversize and unallowlisted labels dropped");
     assert!(!serde_json::to_string(&queued[0]).unwrap().contains("null"));
+}
+
+#[test]
+fn capture_retains_the_canonical_step_occupancy_process_identity() {
+    const PROCESS: &str = "00000000-0000-4000-8000-000000000001";
+    let (queue, sink) = sink();
+    let mut point = MetricPoint::int(MetricName::DispatchBusySlots, 0)
+        .label("role", "judge")
+        .label("pool", "step");
+    point
+        .labels
+        .insert(CAPTURE_PROCESS_KEY.into(), PROCESS.into());
+
+    sink.emit_metrics(vec![point.clone()]);
+
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.points, vec![point]);
+}
+
+#[test]
+fn capture_strips_unadmitted_process_identity_without_displacing_labels() {
+    const TOKEN: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    let (queue, sink) = sink();
+    let slots = |pool: Option<&str>| {
+        let point = MetricPoint::int(MetricName::DispatchBusySlots, 0).label("role", "judge");
+        match pool {
+            Some(pool) => point.label("pool", pool),
+            None => point,
+        }
+    };
+    let standard = slots(Some("step"));
+    let mut full = standard.clone();
+    for key in [
+        "account",
+        "age",
+        "agent",
+        "artifact",
+        "basis",
+        "caller",
+        "container",
+        "cred_owner",
+        "hold",
+        "host",
+    ] {
+        full = full.label(key, "fixture");
+    }
+    let mut pool_evicted = full
+        .clone()
+        .label("installation", "fixture")
+        .label("kind", "fixture");
+    assert!(!bounded_labels(&pool_evicted.labels).contains_key("pool"));
+    pool_evicted
+        .labels
+        .insert("unrelated-restored-key".to_string(), "fixture".to_string());
+    let mut cases = vec![
+        (slots(None), TOKEN.to_owned()),
+        (slots(Some("STEP")), TOKEN.to_owned()),
+        (slots(Some("step ")), TOKEN.to_owned()),
+        (
+            MetricPoint::int(MetricName::DispatchCandidates, 1).label("pool", "step"),
+            TOKEN.to_owned(),
+        ),
+        (full, TOKEN.to_owned()),
+        (pool_evicted, TOKEN.to_owned()),
+    ];
+    for invalid in [
+        "not-uuid".to_owned(),
+        "a".repeat(129),
+        TOKEN.to_ascii_uppercase(),
+        TOKEN.replace('-', ""),
+        TOKEN.replace("-4000-", "-1000-"),
+        TOKEN.replace("-8000-", "-0000-"),
+        format!(" {TOKEN}"),
+    ] {
+        cases.push((standard.clone(), invalid));
+    }
+    let expected: Vec<_> = cases
+        .iter()
+        .map(|(point, _)| MetricPoint {
+            name: point.name,
+            value: point.value,
+            labels: bounded_labels(&point.labels),
+        })
+        .collect();
+    let points = cases
+        .into_iter()
+        .map(|(mut point, token)| {
+            point.labels.insert(CAPTURE_PROCESS_KEY.into(), token);
+            point
+        })
+        .collect();
+
+    sink.emit_metrics(points);
+
+    let queued = queue.0.lock().unwrap();
+    let TelemetryRecord::MetricPoints(record) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(record.points, expected);
 }
 
 #[test]
@@ -245,6 +349,8 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::QueueIssues,
         MetricName::QueueListingFailedRepos,
         MetricName::QueueListingIncompleteRepos,
+        MetricName::QueueSeen,
+        MetricName::QueueHostShard,
         MetricName::LlmTokensInput,
         MetricName::LlmTokensOutput,
         MetricName::LlmTokensCacheRead,
@@ -265,7 +371,12 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::DispatchBusySlots,
         MetricName::DispatchRoleMaxConcurrent,
         MetricName::DispatchRoleIdleSlots,
+        MetricName::DispatchRunningOldestAgeSec,
+        MetricName::DispatchRunningByAge,
+        MetricName::DispatchRunningByPoints,
         MetricName::StepActionable,
+        MetricName::ForgeHoldItems,
+        MetricName::ForgeHoldAgeSeconds,
         MetricName::QueueDispositionRowsDropped,
         MetricName::MergeRedatePrs,
         MetricName::MergeRedatesMax,
@@ -289,6 +400,7 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::AgentScopeOomKills,
         MetricName::ForgeMirrorReads,
         MetricName::ForgeMirrorChanges,
+        MetricName::DiscoveryRecheck,
         MetricName::ForgeMirrorWakeLatency,
         MetricName::StageEntryLookups,
         MetricName::FeedCompletions,
@@ -297,32 +409,23 @@ fn every_metric_name_serializes_to_its_as_str() {
         MetricName::FleetDispatchRefusals,
         MetricName::FleetDispatchExpired,
         MetricName::FleetDispatchClaimLostAfterGrant,
+        MetricName::FleetDispatchRows,
+        MetricName::FleetDispatchFreeSlotsReported,
+        MetricName::FleetDispatchLiveReported,
+        MetricName::FleetDispatchOldestLiveAgeSec,
         MetricName::EgressRequests,
         MetricName::EgressTokens,
         MetricName::EgressLatency,
         MetricName::EgressTtft,
+        MetricName::CiTelemetryCycles,
+        MetricName::CiTelemetryCycleItems,
+        MetricName::CiTelemetryCycleDuration,
+        MetricName::CiTelemetryJournalBytes,
+        MetricName::CiTelemetryExportCursorOffset,
+        MetricName::CiTelemetryExportLag,
     ] {
         assert_eq!(serde_json::to_value(name).unwrap(), name.as_str());
     }
-}
-
-#[test]
-fn native_https_path_drops_metric_points() {
-    let envelopes = vec![
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::MetricPoints(MetricPointsRecord {
-                captured_at: at(0),
-                interval_start: None,
-                points: vec![MetricPoint::int(MetricName::DispatchCandidates, 1)],
-            }),
-        ),
-        TelemetryEnvelope::new(
-            "host-a",
-            TelemetryRecord::Span(tick_span(&TickReport::default(), 1, at(0), at(1))),
-        ),
-    ];
-    assert!(crate::observability::tracing::native_envelopes(&envelopes).is_empty());
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -497,7 +600,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
     let report = TickReport {
         seen: 6,
         dispatched: 2,
-        skipped_peer_claim: 1,
         skipped_host_constraint: 1,
         deferred_capacity: 2,
         ..TickReport::default()
@@ -514,7 +616,6 @@ fn tick_points_emit_only_nonzero_reasons_plus_gauges() {
             ("capacity".to_string(), MetricValue::Int(2)),
             ("dispatched".to_string(), MetricValue::Int(2)),
             ("host_constraint".to_string(), MetricValue::Int(1)),
-            ("peer_claim".to_string(), MetricValue::Int(1)),
         ]
         .into_iter()
         .collect()
@@ -690,10 +791,11 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     ]);
     summary.listing_failed = vec!["/r2".into()];
     summary.listing_incomplete = vec!["/r3".into(), "/r4".into()];
+    summary.seen = 9;
     let points = super::queue::queue_points(&summary);
-    // + listing_failed, listing_incomplete and the four already_landed
-    // evidence points (#11858).
-    assert_eq!(points.len(), Qd::ALL.len() + 2 + 4);
+    // + listing_failed, listing_incomplete, seen (#13007) and the four
+    // already_landed evidence points (#11858).
+    assert_eq!(points.len(), Qd::ALL.len() + 3 + 4);
     let value = |reason: &str| {
         points
             .iter()
@@ -706,7 +808,6 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
     };
     assert_eq!(value("deferred_capacity"), MetricValue::Int(2));
     assert_eq!(value("dispatched"), MetricValue::Int(1));
-    assert_eq!(value("peer_claim"), MetricValue::Int(0));
     let open_pr = points
         .iter()
         .find(|p| p.labels.get("reason").map(String::as_str) == Some("open_pr"))
@@ -722,6 +823,12 @@ fn queue_points_emit_every_disposition_with_zeros_and_no_issue_label() {
         .find(|p| p.name == MetricName::QueueListingIncompleteRepos)
         .unwrap();
     assert_eq!(partial.value, MetricValue::Int(2));
+    // #13007: the OTLP gauge equals the `/ingest` record's `seen`.
+    let seen = points
+        .iter()
+        .find(|p| p.name == MetricName::QueueSeen)
+        .unwrap();
+    assert_eq!(seen.value, MetricValue::Int(9));
     for point in &points {
         // Every label survives the export policy unchanged: only allowlisted,
         // bounded keys (state, reason), never an issue number or repo.
@@ -760,6 +867,58 @@ fn queue_points_split_already_landed_by_evidence() {
     assert_eq!(landed("forge_closed_not_planned"), Some(MetricValue::Int(0)));
     assert_eq!(landed("unknown"), Some(MetricValue::Int(1)));
     assert_eq!(landed("free text"), None);
+}
+
+/// #12827: `loom.queue.host_shard{shard_count}` only for a sharded plan
+/// whose host index is known; absent stays absent.
+#[test]
+fn queue_points_emit_host_shard_only_for_a_sharded_plan() {
+    use crate::types::{DispatchPlanContext, PlanShard, WorkFinderTickSummary};
+    let host_shard = |summary: &WorkFinderTickSummary| -> Vec<MetricPoint> {
+        super::queue::queue_points(summary)
+            .into_iter()
+            .filter(|p| p.name == MetricName::QueueHostShard)
+            .collect()
+    };
+    let with_shard = |shard: PlanShard| {
+        let mut summary = queue_summary(&[]);
+        summary.plan = Some(DispatchPlanContext {
+            shard,
+            ..Default::default()
+        });
+        summary
+    };
+
+    let sharded = with_shard(PlanShard {
+        configured: true,
+        host_shard: Some(2),
+        shard_count: Some(3),
+    });
+    let points = host_shard(&sharded);
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].value, MetricValue::Int(2));
+    assert_eq!(points[0].labels.get("shard_count").map(String::as_str), Some("3"));
+    assert_eq!(points[0].labels.len(), 1);
+    assert!(points[0]
+        .labels
+        .keys()
+        .all(|k| OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+
+    // Unsharded, sharded with no known index, and no plan at all: nothing.
+    assert!(host_shard(&with_shard(PlanShard::default())).is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: true,
+        host_shard: None,
+        shard_count: Some(3),
+    }))
+    .is_empty());
+    assert!(host_shard(&with_shard(PlanShard {
+        configured: false,
+        host_shard: Some(0),
+        shard_count: Some(1),
+    }))
+    .is_empty());
+    assert!(host_shard(&queue_summary(&[])).is_empty());
 }
 
 #[test]

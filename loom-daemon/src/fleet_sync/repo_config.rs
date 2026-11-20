@@ -108,8 +108,7 @@ pub(super) fn pass(
     mode: Mode,
     now: DateTime<Utc>,
 ) -> RepoConfigPass {
-    let commit = Some(snapshot.manifest.commit.clone());
-    apply(render::repo_targets(snapshot, home, is_cloned), mode, now, &commit)
+    apply(render::repo_targets(snapshot, home, is_cloned), mode, now)
 }
 
 /// [`pass`] once the targets are rendered: a seam so tests need no snapshot.
@@ -117,7 +116,6 @@ pub(super) fn apply(
     targets: Result<Vec<RepoTarget>>,
     mode: Mode,
     now: DateTime<Utc>,
-    commit: &Option<String>,
 ) -> RepoConfigPass {
     let targets = match targets {
         Ok(t) => t,
@@ -149,7 +147,7 @@ pub(super) fn apply(
             detail: describe_drift(&drift),
         };
         if mode == Mode::Write && drifted {
-            failures.extend(write_one(t, &stamp, commit, &mut report));
+            failures.extend(write_one(t, &stamp, &mut report));
         }
         out.repos.push(report);
     }
@@ -163,29 +161,13 @@ pub(super) fn apply(
     out
 }
 
-fn write_one(
-    t: &RepoTarget,
-    stamp: &str,
-    commit: &Option<String>,
-    report: &mut RepoTierReport,
-) -> Option<String> {
+fn write_one(t: &RepoTarget, stamp: &str, report: &mut RepoTierReport) -> Option<String> {
     let result = match t.target() {
-        Some(target) => {
-            let keys = crate::config_journal::restart_keys(&target, true);
-            render::write(&target, stamp).map(|(wrote, backup)| {
-                crate::config_journal::record_rendered(wrote, &target, backup, commit, &keys);
-                report.wrote = wrote;
-                report.present = true;
-            })
-        }
-        None => render::remove(&t.path, stamp).map(|(removed, backup)| {
-            crate::config_journal::record_removed(
-                removed,
-                render::Tier::Repo.name(),
-                &t.path,
-                backup,
-                commit,
-            );
+        Some(target) => render::write(&target, stamp).map(|(wrote, _backup)| {
+            report.wrote = wrote;
+            report.present = true;
+        }),
+        None => render::remove(&t.path, stamp).map(|(removed, _backup)| {
             report.removed = removed;
             report.present = false;
         }),

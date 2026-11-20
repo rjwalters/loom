@@ -1,0 +1,35 @@
+{
+  "alert": "CI telemetry export lagging",
+  "alertType": "METRIC_BASED_ALERT",
+  "ruleType": "threshold_rule",
+  "version": "v4",
+  "evalWindow": "30m0s",
+  "frequency": "5m0s",
+  "condition": {
+    "compositeQuery": {
+      "queryType": "clickhouse_sql",
+      "panelType": "graph",
+      "chQueries": {
+        "A": {
+          "name": "A",
+          "query": "WITH\n  series AS (\n    SELECT fingerprint, any(if(JSONExtractString(labels, 'host.name') != '', JSONExtractString(labels, 'host.name'), JSONExtractString(labels, 'host.id'))) AS host\n    FROM signoz_metrics.time_series_v4\n    WHERE metric_name = 'loom.ci_telemetry.export_lag'\n    GROUP BY fingerprint\n  )\nSELECT toStartOfInterval(toDateTime(intDiv(s.unix_milli, 1000)), INTERVAL 1 MINUTE) AS ts,\n       series.host AS host,\n       max(s.value) AS value\nFROM signoz_metrics.samples_v4 AS s\nINNER JOIN series USING (fingerprint)\nWHERE s.metric_name = 'loom.ci_telemetry.export_lag'\n  AND s.unix_milli >= {{.start_timestamp_ms}}\n  AND s.unix_milli < {{.end_timestamp_ms}}\nGROUP BY ts, host\nORDER BY ts",
+          "disabled": false
+        }
+      }
+    },
+    "selectedQueryName": "A",
+    "op": "1",
+    "matchType": "2",
+    "target": 7200
+  },
+  "labels": {
+    "severity": "warning",
+    "loom_signal": "ci_telemetry_export_lagging",
+    "state": "export_lagging"
+  },
+  "annotations": {
+    "summary": "CI telemetry export lagging",
+    "description": "Host {{$labels.host}}: loom.ci_telemetry.export_lag has stayed above 7200 s (2 h) for every sample in the last 30 min, so the oldest CI journal line not yet exported is more than 2 h old. The poller is writing but the exporter is not draining its journal (the 2026-10-15 captain shape: cursor stuck at ~2.3 GB of a 4.9 GB journal). Lag is 0 when caught up or the journal is absent, and no point is emitted when the journal is unreadable, so this arm cannot fire on I/O error; ci-telemetry-arrival-silent is the backstop. Check `ci-telemetry status.json` and the export cursor. Issues #12908, #12792."
+  },
+  "disabled": false
+}

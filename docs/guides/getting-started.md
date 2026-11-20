@@ -82,7 +82,15 @@ Minimal requirements to use Loom:
    brew install tmux          # macOS
    sudo apt install tmux      # Debian/Ubuntu
    ```
-4. **Claude Code** (optional, for AI agents)
+4. **bash >= 4** (stock macOS ships 3.2 — install a newer one)
+   ```bash
+   # Verify bash version (must be 4 or newer)
+   bash --version | head -1
+
+   # Install if needed
+   brew install bash          # macOS (Linux distros already ship bash 4+/5)
+   ```
+5. **Claude Code** (optional, for AI agents)
    ```bash
    # Verify Claude Code is installed
    claude --version
@@ -187,6 +195,9 @@ pnpm --version
 
 # Check tmux (all users)
 tmux -V
+
+# Check bash (all users, must be >= 4)
+bash --version | head -1
 
 # Check Claude Code (optional)
 claude --version
@@ -352,7 +363,7 @@ AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-a
 
 **What to do:**
 1. Review `CLAUDE.md` (Claude Code) and/or `AGENTS.md` (Codex) to understand the codebase structure and patterns
-2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `defaults/scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
+2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
 
 ### Claude Code Configuration
 
@@ -768,9 +779,6 @@ cat > .loom/roles/my-role.json <<'EOF'
 {
   "name": "My Custom Role",
   "description": "Brief description",
-  "defaultInterval": 600000,
-  "defaultIntervalPrompt": "Continue working",
-  "autonomousRecommended": true,
   "suggestedWorkerType": "claude"
 }
 EOF

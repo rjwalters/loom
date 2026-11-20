@@ -13,23 +13,35 @@ mod control;
 pub mod dispatch;
 mod docker;
 pub mod export;
+mod forge_auth;
 mod lease;
 mod lifecycle;
+#[cfg(test)]
+mod recover_tests;
 mod repository;
 #[cfg(test)]
 mod tests;
 pub mod transport;
 mod worker_setup;
 
-pub use lifecycle::{configured, run_job, start, status, stop};
+pub use lease::AccountBusy;
+pub use lifecycle::{
+    check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
+    run_job, session_recover, start, status, stop, Converged,
+};
 pub use repository::WorkerCommand;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use super::session_image::ExtraMount;
+
 pub const ROOT: &str = "/workspace";
 pub const REPO: &str = "/workspace/repo";
+/// Parent of every additional repository clone an account holds beyond the
+/// legacy primary at [`REPO`] (#10795). Lives on the account's own volume.
+pub const WORK_ROOT: &str = "/workspace/work";
 pub const MODE: &str = "private-clone";
 pub const PROTOCOL: &str = "loom-private-workspace-v1";
 const PROFILE: &str = "/home/loom/.codex-profile";
@@ -52,11 +64,145 @@ pub struct Config {
     pub engine: String,
     #[serde(default)]
     pub docker_desktop: bool,
+    /// The primary repository, cloned at [`REPO`]. Kept as-is so a volume,
+    /// container label and credential scope created before multi-repository
+    /// sessions (#10795) stay valid byte for byte.
     pub repository: String,
     pub base: String,
+    /// Further repositories registered on this account, each cloned lazily at
+    /// `WORK_ROOT/<slug>`. Absent in state written before #10795.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repositories: Vec<Registered>,
     pub volume: String,
     pub profile: PathBuf,
     pub gh_config: Option<PathBuf>,
+    /// The configured `accounts.session.image` the container was last created
+    /// from by an operator `start` (#14451). `None` for the stock image or an
+    /// explicit `--image`. Recorded so an unattended [`recover`] recreates a
+    /// missing container from — and re-verifies — the same pinned image, never
+    /// the stock one and never whatever the config names by then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_image: Option<String>,
+    /// The `accounts.session.extraMounts` resolved at the last operator `start`
+    /// (#14451): bound read-only, and the exact set `validate_settings` expects.
+    /// Absent in state written before it, which reads as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_mounts: Vec<ExtraMount>,
+}
+
+/// One additional repository of an account (registered, not necessarily cloned).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Registered {
+    pub repository: String,
+    pub base: String,
+    pub slug: String,
+}
+
+/// The clone one operation acts on: where it lives and what it must be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Target {
+    pub repository: String,
+    pub base: String,
+    pub path: String,
+    /// `None` for the legacy primary at [`REPO`].
+    pub slug: Option<String>,
+}
+
+impl Config {
+    pub(super) fn primary(&self) -> Target {
+        Target {
+            repository: self.repository.clone(),
+            base: self.base.clone(),
+            path: REPO.to_owned(),
+            slug: None,
+        }
+    }
+
+    /// Resolve the requested repository (default: the primary) to its clone.
+    /// An unregistered repository is refused, never registered implicitly.
+    pub(super) fn target(&self, requested: Option<&str>) -> Result<Target> {
+        let Some(requested) = requested else {
+            return Ok(self.primary());
+        };
+        if same_repository(&self.repository, requested) {
+            return Ok(self.primary());
+        }
+        let registered = self
+            .repositories
+            .iter()
+            .find(|r| same_repository(&r.repository, requested))
+            .context("repository is not registered on this private account; run session start --private-clone URL for it while the account is idle")?;
+        Ok(Target {
+            repository: registered.repository.clone(),
+            base: registered.base.clone(),
+            path: format!("{WORK_ROOT}/{}", registered.slug),
+            slug: Some(registered.slug.clone()),
+        })
+    }
+}
+
+/// Canonical identity of a forge repository: the key two spellings of one
+/// repository share, and the collision-safe directory name derived from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RepoId {
+    /// Credential-free clone URL, without a trailing `.git`.
+    pub url: String,
+    /// Lowercase `host[:port]/owner/name`.
+    pub key: String,
+    /// `owner-name-<8 hex of sha256(key)>`: one path component, the same
+    /// basename under different owners (or hosts) never shares it.
+    pub slug: String,
+}
+
+fn safe_segment(segment: &str) -> bool {
+    segment
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+pub(super) fn identify(value: &str) -> Result<RepoId> {
+    use sha2::{Digest, Sha256};
+    let url = reqwest::Url::parse(&repository_url(value)?)?;
+    let authority = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or("")),
+        None => url.host_str().unwrap_or("").to_owned(),
+    };
+    let segments: Vec<&str> = url.path().trim_matches('/').split('/').collect();
+    // A forge may sit under a path prefix (a Gitea sub-path install), so the
+    // whole path is the identity and the last two segments name the directory.
+    let [.., owner, name] = segments[..] else {
+        bail!("private clones need an https://host/owner/name repository URL");
+    };
+    let name_segment = name.strip_suffix(".git").unwrap_or(name);
+    if !segments.iter().all(|s| safe_segment(s)) || name_segment.is_empty() {
+        bail!("repository path contains characters that are unsafe as a path component");
+    }
+    let path = segments[..segments.len() - 1].join("/");
+    let key = format!("{authority}/{path}/{name_segment}").to_ascii_lowercase();
+    let digest = hex::encode(Sha256::digest(key.as_bytes()));
+    Ok(RepoId {
+        url: format!("https://{authority}/{path}/{name_segment}"),
+        slug: format!(
+            "{}-{}-{}",
+            owner.to_ascii_lowercase(),
+            name_segment.to_ascii_lowercase(),
+            &digest[..8]
+        ),
+        key,
+    })
+}
+
+/// Whether two spellings name one repository. An unparseable one only matches
+/// itself byte for byte (a legacy URL shape is never reinterpreted).
+pub(super) fn same_repository(a: &str, b: &str) -> bool {
+    match (identify(a), identify(b)) {
+        (Ok(a), Ok(b)) => a.key == b.key,
+        _ => a == b,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -65,13 +211,33 @@ pub struct Status {
     pub private_root: &'static str,
     pub config: Config,
     pub container_id: Option<String>,
+    /// The image the session container was created from, as Docker reports it
+    /// (#14451); `None` while there is no container.
+    pub image: Option<String>,
+    /// The read-only extra mounts the session is validated against (#14451).
+    /// Also under `config.extra_mounts`; empty without the setting.
+    pub extra_mounts: Vec<ExtraMount>,
     pub running: bool,
+    /// An operator hold on this seat's private profile, even if still running.
+    pub held: bool,
     pub lease: Option<lease::Job>,
     /// Secret-free containment-admission provenance for the CURRENT job
     /// (#8787), so `session status` reports what an execution-specific
     /// admission actually relied on. Absent on every ordinary session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<serde_json::Value>,
+}
+
+impl Status {
+    pub(crate) fn state_label(&self) -> &'static str {
+        if self.running {
+            "running"
+        } else if self.held {
+            "stopped, held (operator stop)"
+        } else {
+            "stopped"
+        }
+    }
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -84,6 +250,10 @@ pub struct JobArgs {
     pub owner: String,
     #[arg(long)]
     pub issue: Option<u64>,
+    /// Repository the job acts on; defaults to the account's primary. Must
+    /// already be registered with `session start --private-clone`.
+    #[arg(long)]
+    pub repository: Option<String>,
     /// Existing issue helpers may create a worktree inside the private clone.
     #[arg(long)]
     pub branch: Option<String>,
@@ -97,6 +267,113 @@ pub enum JobKind {
     Role,
     Sweep,
     Interactive,
+}
+
+/// What `accounts session recover` does with the unpublished branches it
+/// finds (#14030). `List` only reports them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoverAction {
+    List,
+    Publish,
+    Discard,
+}
+
+/// One branch whose tip is not reachable from `origin`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UnpublishedBranch {
+    pub branch: String,
+    /// Commits on the branch no remote-tracking ref of `origin` reaches.
+    pub ahead: u64,
+}
+
+/// Unpublished commits stranded on a detached HEAD, here or in a linked
+/// worktree: no branch names them, so only a human (or the recover verb's
+/// publish/discard of a named branch) can make them safe again.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DetachedWork {
+    pub path: String,
+    pub revision: String,
+    pub ahead: u64,
+}
+
+/// One clone's recover outcome, as the in-container
+/// `private-workspace recover` verb reports it (#14030).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecoverOutcome {
+    pub repository: String,
+    pub cloned: bool,
+    /// Branches still carrying unpublished commits after the action.
+    pub branches: Vec<UnpublishedBranch>,
+    /// Branches this call pushed to origin.
+    pub published: Vec<String>,
+    /// Branches this call deleted, with their unpublished commits.
+    pub discarded: Vec<String>,
+    /// Scoped branches this clone did not act on (absent, or nothing
+    /// unpublished to discard).
+    pub ignored: Vec<String>,
+    /// Detached HEADs still holding unreferenced unpublished work
+    /// (report-only: recover never touches them).
+    pub detached: Vec<DetachedWork>,
+}
+
+/// What one `accounts session recover` call did across the account's clones.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecoverReport {
+    pub account: String,
+    pub clones: Vec<RecoverOutcome>,
+}
+
+/// What one clone looked like to a rebind (#14357): enough to prove a move
+/// kept every branch, dirty file and unpublished commit.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CloneState {
+    pub path: String,
+    pub populated: bool,
+    pub branches: Vec<UnpublishedBranch>,
+    /// Uncommitted or untracked files in the main checkout.
+    pub dirty: bool,
+    /// Detached HEADs carrying unpublished commits.
+    pub detached: usize,
+}
+
+/// How a rebind ended. `BothPopulated` is a refusal: nothing was changed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RebindStatus {
+    /// The old clone was moved to the canonical location and re-pointed.
+    Moved,
+    /// Already bound to the canonical repository; verified (and any
+    /// interrupted step finished) without moving anything.
+    AlreadyBound,
+    /// Neither location holds a clone yet: only the registration changed.
+    NotCloned,
+    /// `--dry-run`: the move was verified possible and not made.
+    DryRun,
+    /// Both locations hold a populated clone; both were left intact.
+    BothPopulated,
+}
+
+/// The in-volume half of a rebind, as `private-workspace rebind` reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindOutcome {
+    pub status: RebindStatus,
+    pub from: CloneState,
+    pub to: CloneState,
+}
+
+/// What `accounts session rebind` did.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RebindReport {
+    pub account: String,
+    pub from: String,
+    pub to: String,
+    pub base: String,
+    pub status: RebindStatus,
+    /// Whether `workspace.json` was (or, under `--dry-run`, would be) changed.
+    pub registration_changed: bool,
+    pub clone_path: String,
+    pub before: CloneState,
+    pub after: CloneState,
 }
 
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {

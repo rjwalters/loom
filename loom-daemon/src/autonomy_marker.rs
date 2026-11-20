@@ -122,10 +122,16 @@ pub struct MarkerFields {
     pub socket_path: PathBuf,
 }
 
-/// Resolve `<loom_dir>` the same way `main.rs::resolve_loom_dir` /
-/// `daemon_heartbeat` / `daemon_install_state` do: the parent of
-/// `LOOM_SOCKET_PATH` when set (so a test daemon pointed at a tempdir socket
-/// heals into that tempdir, never the operator's real `~/.loom`), else `~/.loom`.
+/// Resolve `<loom_dir>`: the parent of `LOOM_SOCKET_PATH` when set (so a test
+/// daemon pointed at a tempdir socket heals into that tempdir, never the
+/// operator's real `~/.loom`), else `~/.loom`.
+///
+/// The single implementation of this rule (#13833, operator ruling
+/// `consolidate-all`): every site that needs `<loom_dir>` — the heartbeat,
+/// install-state, fleet-sync, pending-restart and alerts-ledger paths, the
+/// daemon log path in [`crate::health`], and the `Result` wrapper
+/// [`crate::cli::common::resolve_loom_dir`] — calls this function, so the
+/// test-isolation property can never drift between them.
 ///
 /// `pub(crate)` since #4774: [`crate::daemon_pidfile`] resolves the pid file
 /// against the *same* loom dir this module records in the marker's `pid_file=`
@@ -189,40 +195,15 @@ pub fn render_marker(fields: &MarkerFields) -> String {
 /// temp file + atomic rename, so a concurrent watchdog read never sees a torn
 /// file. Returns a human-readable reason on any I/O failure (never fatal).
 fn write_marker_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return Err(format!("could not create {}: {e}", parent.display()));
-        }
-    }
-    let tmp = path.with_extension(format!("autonomy.tmp.{}", uuid::Uuid::new_v4()));
-
-    let write_result = {
-        #[cfg(unix)]
-        {
-            use std::io::Write as _;
-            use std::os::unix::fs::OpenOptionsExt as _;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)
-                .and_then(|mut f| f.write_all(contents.as_bytes()))
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, contents.as_bytes())
-        }
-    };
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not write temp marker {}: {e}", tmp.display()));
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("could not rename marker into place {}: {e}", path.display()));
-    }
-    Ok(())
+    crate::fs_util::write_atomic(
+        path,
+        contents.as_bytes(),
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: true,
+        },
+    )
+    .map_err(|e| format!("could not write marker {}: {e}", path.display()))
 }
 
 /// Core, side-effect-scoped healing decision: given the resolved supervisor, the

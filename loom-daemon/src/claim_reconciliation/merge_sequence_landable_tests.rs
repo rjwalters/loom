@@ -3,15 +3,15 @@
 //! it is released with the cause named.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use chrono::Utc;
 use serde_json::json;
 
 use super::super::ready::{demote_unlandable, ready, with_readiness, APPROVED_LABEL};
 use super::super::{
-    hold_action, plan_repo_with, release_comment_body, EdgeReason, HoldAction, PredecessorState,
-    SequenceMarker, SEQUENCE_LABEL, SOURCE_PASS,
+    hold_action, release_comment_body, HoldAction, PredecessorState, SequenceMarker,
+    SEQUENCE_LABEL, SOURCE_PASS,
 };
 use super::*;
 
@@ -58,17 +58,6 @@ fn decide(m: &SequenceMarker, follower: &SequencePr, listing: &[SequencePr]) -> 
     let base = hold_action(m, Some(&p), fh, follower.has(APPROVED_LABEL), 72.0);
     let head = listing.iter().find(|h| h.number == m.after);
     with_readiness(base, m, Some(&p), follower, head)
-}
-
-fn edges(prs: &[SequencePr]) -> Vec<(u32, u32, EdgeReason)> {
-    let files = prs
-        .iter()
-        .map(|p| (p.number, BTreeSet::from([".github/workflows/ci.yml".to_string()])))
-        .collect();
-    plan_repo_with(prs, &files, &BTreeMap::new(), &BTreeSet::new())
-        .iter()
-        .flat_map(|g| g.edges.iter().map(|e| (e.follower, e.after, e.reason)))
-        .collect()
 }
 
 fn red(names: &[&str]) -> Landability {
@@ -195,16 +184,6 @@ fn check_runs_classify_red_pending_green_and_unknown() {
 
 // --- AC1: no hold is planned behind a red or conflicting predecessor --------
 
-#[test]
-fn no_edge_is_planned_behind_a_red_or_conflicting_predecessor() {
-    let control = incident(Landability::UNKNOWN);
-    assert!(edges(&control).contains(&(11976, 11729, EdgeReason::SharedFiles)), "control");
-    for probe in [red(&RED_NAMES), conflicting()] {
-        let planned = edges(&incident(probe.clone()));
-        assert!(planned.iter().all(|(_, a, _)| *a != 11729), "{probe:?}: {planned:?}");
-    }
-}
-
 // --- AC2: an existing hold is released, naming the cause ---------------------
 
 #[test]
@@ -227,19 +206,6 @@ fn an_existing_hold_behind_a_predecessor_that_turned_red_is_released_with_its_ca
 }
 
 // --- AC3: pending or unknown changes nothing ---------------------------------
-
-#[test]
-fn pending_or_unknown_state_keeps_the_hold_and_the_plan() {
-    let follower = pr(11976, "2026-10-14T00:00:00Z", &[APPROVED_LABEL, SEQUENCE_LABEL]);
-    for ci in [Ci::Pending, Ci::Unknown] {
-        let listing = incident(Landability {
-            ci: ci.clone(),
-            mergeable: Mergeable::Unknown,
-        });
-        assert_eq!(decide(&soft(11976, 11729), &follower, &listing), HoldAction::HoldSoft);
-        assert!(edges(&listing).contains(&(11976, 11729, EdgeReason::SharedFiles)), "{ci:?}");
-    }
-}
 
 // --- AC4: hard holds, stacked bases and reservations are unaffected ----------
 

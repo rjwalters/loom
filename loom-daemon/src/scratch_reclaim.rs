@@ -55,6 +55,8 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 
+use crate::fs_util::human_size;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -329,18 +331,6 @@ impl ScratchReclaimReport {
             return "nothing".to_string();
         }
         human_size(self.removed_bytes)
-    }
-}
-
-fn human_size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1}K", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes}B")
     }
 }
 

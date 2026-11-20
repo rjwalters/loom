@@ -64,10 +64,9 @@ pub mod phase_tap_usage;
 mod sweep_identity;
 pub use sweep_identity::SweepIdentityRecord;
 pub mod fixture;
-pub mod journal_shadow;
 pub mod ops;
 pub mod provenance;
-pub mod queue_snapshot;
+pub mod queue_repo;
 pub mod repo_identity;
 mod start_facts;
 pub use start_facts::{
@@ -90,7 +89,6 @@ pub use kinds::{
 pub use no_phase_cause::NoPhaseCause;
 pub use ops::MetricPointsRecord;
 pub use phase_tap_usage::PhaseTapUsageRow;
-pub use queue_snapshot::QueueSnapshotRecord;
 
 /// Current telemetry wire-schema version. Bump on any breaking change to the
 /// record shapes below so a Phase-2 backend ingesting a mixed-version fleet can
@@ -129,6 +127,17 @@ pub enum RepoVisibility {
     Public,
     /// A private repository — the public view exposes only redacted aggregates.
     Private,
+}
+
+impl RepoVisibility {
+    /// The wire string (`"public"` / `"private"`), matching the serde spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Private => "private",
+        }
+    }
 }
 
 impl Default for RepoVisibility {
@@ -263,7 +272,7 @@ impl<'de> Visitor<'de> for RepoVisibilityVisitor {
 /// shared file and had to be edited in lockstep by hand.
 macro_rules! define_telemetry_record {
     ($( $(#[$attr:meta])* $variant:ident = $kind:literal => $payload:ty,
-        gate: $gate:expr, otlp: $class:ident, native: $native:literal; )+) => {
+        gate: $gate:expr, otlp: $class:ident; )+) => {
         /// Every telemetry record kind, internally tagged on a `kind` discriminant. The
         /// tag values match the frozen SSE `sweep.*` topic vocabulary where they overlap
         /// (`sweep.started`/`sweep.phase`/`sweep.completed`) plus the epic's added
@@ -272,8 +281,16 @@ macro_rules! define_telemetry_record {
         ///
         /// **Generated** from the one-row-per-kind registry in
         /// [`kinds`](crate::telemetry::kinds) — add a kind there, never here.
+        ///
+        /// `large_enum_variant` is allowed here on purpose: the payloads are
+        /// serde records whose field count is the wire contract, not a sizing
+        /// decision — the honest alternatives (boxing a field, splitting a
+        /// record) would change the wire shape or the reader for every
+        /// consumer to save stack bytes an envelope that is cloned once per
+        /// emit never cared about.
         #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
         #[serde(tag = "kind")]
+        #[allow(clippy::large_enum_variant)]
         pub enum TelemetryRecord {
             $(
                 $(#[$attr])*
@@ -313,15 +330,6 @@ macro_rules! define_telemetry_record {
             pub fn otlp_class(&self) -> TelemetryKindOtlp {
                 match self {
                     $( Self::$variant(_) => TelemetryKindOtlp::$class, )+
-                }
-            }
-
-            /// Whether the native HTTPS `/ingest` backend accepts this kind.
-            /// `false` for OTLP-only kinds (`trace.span`, `metric.points`).
-            #[must_use]
-            pub fn accepted_by_native_ingest(&self) -> bool {
-                match self {
-                    $( Self::$variant(_) => $native, )+
                 }
             }
         }
@@ -454,6 +462,19 @@ pub struct PhaseDuration {
     /// Builder. Same omission contract as `tokens_in`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_by_model: Option<Vec<ModelUsageTotals>>,
+    /// The reasoning effort this attempt's launch ran at (Issue #14242) —
+    /// the per-phase counterpart of [`SweepOutcomeRecord::effort`], stamped
+    /// from the effort that applied at the phase's launch: a sweep session
+    /// runs its phases at the session-default effort (the in-session Task
+    /// tool exposes no effort parameter, so no phase can run at anything
+    /// else), and a step sweep's single phase is its role's own resolved
+    /// effort. Never re-derived from dispatch-time config at read time.
+    ///
+    /// Omitted — never `default` or empty — when unknown: a record written
+    /// before #14242, or one whose entry could not name an effort at all (the
+    /// same conditions the record-level `effort` is absent under).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl PhaseDuration {
@@ -1280,6 +1301,23 @@ pub struct RoleTickOutcomeRecord {
     /// The step's sweep id (`step-<role>-<item>-<ts>`), for a step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_id: Option<String>,
+    /// The step-engine stage a step ran (#14048) — the wire
+    /// [`crate::step_role::StepRole`] name (`builder`, `judge`,
+    /// `champion_promote`, …), which is FINER than `role`: `role` folds
+    /// Champion's two stages (`champion_promote`, `champion_merge`) to
+    /// `champion`, so a consumer splitting per-stage usage cross-host reads
+    /// this key. Present only on a step-sourced record (`source = "step"`);
+    /// absent on every role tick and on records written before #14048 —
+    /// additive, no `schema_version` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// The issue a step worked (#13563); set only on a step whose item is an
+    /// issue, so its token totals attribute to that issue. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u32>,
+    /// The PR a step worked (#13563); set only on a step whose item is a PR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<u32>,
     /// Which host limit deferred this repo's tick (#12084): `ceiling`,
     /// `role_budget`, `demand_width` or `reservation`. Present exactly on
     /// [`RoleTickResult::SkippedDeferred`]. Additive, no `schema_version`
@@ -1292,6 +1330,38 @@ pub struct RoleTickOutcomeRecord {
     /// absent when unsharded, never a guessed `0/1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_owner: Option<String>,
+    /// A launched Judge tick won a PR claim or wrote a verdict (#12362).
+    /// Omitted for any other role and for a tick that never launched; `false`
+    /// is an observation (an idle tick), never a default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found_work: Option<bool>,
+    /// Why a Judge tick found no work: the session's own `LOOM_STEP_OUTCOME`
+    /// reason (advisory), else the daemon-observed `no_claim_no_verdict`.
+    /// Set exactly when `found_work` is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noop_reason: Option<String>,
+    /// The verdicts a Judge tick wrote, one per PR (#12362), from the
+    /// `forge verdict-labels` write. Omitted when it wrote none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdicts: Option<Vec<JudgeVerdictRecord>>,
+    /// The step's `LOOM_STEP_OUTCOME` class (#12362), on a step-sourced record:
+    /// `result` keeps its `tick_outcome` mapping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_class: Option<String>,
+    /// The step's `LOOM_STEP_OUTCOME` reason (#12362); see `step_class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_reason: Option<String>,
+}
+
+/// One verdict a Judge tick wrote ([`RoleTickOutcomeRecord::verdicts`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JudgeVerdictRecord {
+    pub pr_number: u32,
+    /// The head the verdict was written against, when the writer passed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    /// `approved` or `changes_requested`.
+    pub verdict: String,
 }
 
 /// [`RoleTickOutcomeRecord::source`] of a step-engine step (#11906).
@@ -1354,6 +1424,14 @@ pub struct TokenSnapshotRecord {
     pub captured_at: DateTime<Utc>,
     /// Per-account state for every account in the pool.
     pub accounts: Vec<TokenAccountState>,
+    /// Age of the fleet token-probe snapshot this host has applied
+    /// (#13942): `captured_at` minus the captain's probe instant. `None`
+    /// when no fleet sidecar exists (fleet mode off, or the captain has not
+    /// answered a heartbeat yet) — unknown, not zero. Signed on purpose: a
+    /// small negative value is captain/worker clock skew, the same honest
+    /// contract `seconds_until_reset` holds for a stale instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_probe_age_secs: Option<i64>,
 }
 
 /// One `(root, role)` pair's persistent tick-failure detail inside a host's
@@ -1598,8 +1676,8 @@ pub struct HostHealthRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub captainless_singleton_jobs: Vec<String>,
     /// Record kinds this host's started exporters carry (Issue #10196),
-    /// sorted wire `kind` tags -- the export-coverage half of the replay
-    /// contract (`telemetry-replay.md`). Derived from the kind registry via
+    /// sorted wire `kind` tags -- the export-coverage half of the former replay
+    /// contract. Derived from the kind registry via
     /// [`exported_kinds_for`], so it can never drift from routing.
     ///
     /// Empty means "unknown / no exporter started / pre-#10196
@@ -1607,7 +1685,7 @@ pub struct HostHealthRecord {
     /// list as proof of silence. `#[serde(default)]` so an older record decodes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exported_kinds: Vec<String>,
-    /// Exporter names that actually started in this process (`"https"`, `"otlp"`;
+    /// Exporter names that actually started in this process (`"otlp"`;
     /// [`crate::observability::ExporterKind::name`]), sorted. Same
     /// empty-is-unknown and `#[serde(default)]` contract as `exported_kinds`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

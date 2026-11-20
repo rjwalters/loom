@@ -18,7 +18,7 @@
 #
 # ── NOT the same surface as ./.loom/bin/loom ────────────────────────────────
 # ./.loom/bin/loom is the PER-REPO tmux agent-pool manager (verbs: start status
-# health stop attach send scale logs). This dispatcher is the MACHINE-LEVEL
+# health stop attach send logs). This dispatcher is the MACHINE-LEVEL
 # runtime driver. Three verbs collide by name — start / stop / status — and mean
 # different things in each surface. `.loom/bin` is never on PATH, and every
 # in-repo call to the pool manager is path-qualified (`./.loom/bin/loom …`), so

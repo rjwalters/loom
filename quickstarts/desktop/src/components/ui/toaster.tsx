@@ -26,7 +26,7 @@ export function useToast() {
   return context;
 }
 
-export function Toaster() {
+export function Toaster({ children }: { children?: React.ReactNode }) {
   const [toasts, setToasts] = React.useState<Toast[]>([]);
 
   const toast = React.useCallback((newToast: Omit<Toast, "id">) => {
@@ -40,6 +40,7 @@ export function Toaster() {
 
   return (
     <ToastContext.Provider value={{ toast }}>
+      {children}
       <ToastPrimitive.Provider swipeDirection="right">
         {toasts.map((t) => (
           <ToastPrimitive.Root

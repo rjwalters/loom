@@ -668,6 +668,8 @@ pub async fn record(workspace_root: &Path) {
     sink.emit_metrics_since(super::forge_calls::drain_event_points(), since);
     // 2am#4367 P5: mirror reads, delivered changes and wake latency.
     sink.emit_metrics_since(super::forge_mirror::drain_points(), since);
+    // #12318: rechecks asked of the mirror after a stale-draw refusal.
+    sink.emit_metrics_since(super::discovery_recheck::drain_points(), since);
     // #11897: stage-entry answers by source (the step engine's age coverage).
     sink.emit_metrics_since(super::stage_entry::drain_points(), since);
     // #12152: public-feed completions by trigger, reconciliation passes.

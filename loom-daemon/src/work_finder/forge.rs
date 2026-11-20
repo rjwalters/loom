@@ -91,24 +91,7 @@ impl WorkSource for GhWorkSource {
         if let Some(root) = self.cwd.as_deref() {
             crate::intake_reconcile::maybe_run(&self.gh_bin, root);
         }
-        // Event-gated polling (#9255, opt-in `forgeEvents.pollGating`, default
-        // off): while the feed is `healthy`, a repo with no event since its
-        // last poll returns its held *candidate* listing. Off, this is a bare
-        // call. The claim itself (`dispatch`) re-reads the forge and is never
-        // gated.
-        let repo = self.repo.clone();
-        let cwd = self.cwd.clone();
-        let listed =
-            crate::forge_events::poll_gate::gated_list(cwd.as_deref(), repo.as_deref(), || {
-                self.list_ready_issues_uncached()
-            });
-        // #11139: a fresh listing that fell short is never held, so a gated
-        // tick cannot serve partial rows as the whole queue. (A held listing
-        // leaves `complete` at its per-tick default, `true`.)
-        if !self.complete {
-            crate::forge_events::poll_gate::forget_held(cwd.as_deref());
-        }
-        listed
+        self.list_ready_issues_uncached()
     }
 
     fn listing_complete(&self) -> bool {
@@ -285,14 +268,13 @@ impl GhWorkSource {
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
 /// idempotency key, `mkdir`-atomic claim lock, and `loom:issue →
 /// loom:building` label flip — so the finder never reimplements the race
-/// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
+/// guard. `in_flight()` reads the registry's `Running` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
 }
 
 impl RegistryDispatcher {
-    /// Construct a dispatcher over the shared registry. Production goes
-    /// through [`dispatcher_pairs`].
+    /// Construct a dispatcher over the shared registry.
     #[must_use]
     pub fn new(registry: Arc<Mutex<SweepRegistry>>) -> Self {
         Self { registry }
@@ -308,94 +290,68 @@ impl RegistryDispatcher {
     pub fn registry_for_test(&self) -> Arc<Mutex<SweepRegistry>> {
         self.registry.clone()
     }
+
+    /// Run `f` under the registry lock. A poisoned mutex is logged once, here,
+    /// and yields `T::default()` (empty set/map, `0`, `false`) so the finder
+    /// treats an unreadable registry as "nothing to report".
+    fn with_registry<T: Default>(&self, f: impl FnOnce(&mut SweepRegistry) -> T) -> T {
+        match self.registry.lock() {
+            Ok(mut reg) => f(&mut reg),
+            Err(poisoned) => {
+                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
+                T::default()
+            }
+        }
+    }
 }
 
 impl WorkDispatcher for RegistryDispatcher {
     fn in_flight(&self) -> HashSet<u32> {
-        let mut reg = match self.registry.lock() {
-            Ok(r) => r,
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                return HashSet::new();
-            }
-        };
-        // Reap-on-read (Issue #3893): reconcile liveness before seeding
-        // occupancy so a sweep whose child has exited does not over-count
-        // against the concurrency budget and defer legitimate new dispatch.
-        reg.reap_liveness();
-        let mut set = HashSet::new();
-        for state in [SweepState::Running, SweepState::Pending] {
-            for info in reg.list(Some(&state)) {
+        self.with_registry(|reg| {
+            // Reap-on-read (Issue #3893): reconcile liveness before seeding
+            // occupancy so a sweep whose child has exited does not over-count
+            // against the concurrency budget and defer legitimate new dispatch.
+            reg.reap_liveness();
+            let mut set = HashSet::new();
+            for info in reg.list(Some(&SweepState::Running)) {
                 // A step holds its item's slot like a sweep (#11898).
                 if let Some(n) = info.kind.item_number() {
                     set.insert(n);
                 }
             }
-        }
-        set
+            set
+        })
     }
 
     fn quarantined(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.quarantined_issues(),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.quarantined_issues())
     }
 
     /// Issues inside a live per-issue dispatch-backoff window (Issue #4485).
     /// Pure in-memory read of the registry state the reaper maintains — no
     /// forge round trip, mirroring `quarantined()`.
     fn backed_off(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.dispatch_backoff_issues(chrono::Utc::now()),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.dispatch_backoff_issues(chrono::Utc::now()))
     }
 
     /// [`WorkDispatcher::dispatch_backoff_expiry`] (Issue #9311): every
     /// window [`Self::backed_off`] skips on: the later of this host's own end
     /// and a peer-armed window's broadcast end (#11564).
     fn dispatch_backoff_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
-        match self.registry.lock() {
-            Ok(reg) => {
-                let now = chrono::Utc::now();
-                reg.dispatch_backoff_issues(now)
-                    .into_iter()
-                    .filter_map(|issue| {
-                        // The skip lasts until the later of the two windows.
-                        let local = reg.dispatch_backoff_until(issue, now);
-                        let until = local
-                            .into_iter()
-                            .chain(reg.peer_dispatch_backoff_until(issue, now))
-                            .max();
-                        until.map(|u| (issue, u))
-                    })
-                    .collect()
-            }
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashMap::new()
-            }
-        }
+        self.with_registry(|reg| {
+            let now = chrono::Utc::now();
+            reg.dispatch_backoff_issues(now)
+                .into_iter()
+                .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
+                .collect()
+        })
     }
 
     /// The subset of `backed_off()` whose window was armed by the
     /// open-PR guard rather than a real dispatch failure (Issue #7606).
     /// Pure in-memory read, mirroring `backed_off()`.
     fn pr_open_backed_off(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.open_pr_backoff_issues(chrono::Utc::now()),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.open_pr_backoff_issues(chrono::Utc::now()))
     }
 
     /// Issues inside a live no-op re-dispatch cooldown window (Issue
@@ -403,40 +359,20 @@ impl WorkDispatcher for RegistryDispatcher {
     /// `RecordNoopRelease` call maintains — no forge round trip,
     /// mirroring `backed_off()`.
     fn noop_cooldown(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.noop_cooldown_issues(chrono::Utc::now()),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.noop_cooldown_issues(chrono::Utc::now()))
     }
 
     /// [`WorkDispatcher::noop_cooldown_expiry`] (Issue #9311): like
     /// [`Self::dispatch_backoff_expiry`], the later of the local and the
     /// peer-armed window's end (#11564).
     fn noop_cooldown_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
-        match self.registry.lock() {
-            Ok(reg) => {
-                let now = chrono::Utc::now();
-                reg.noop_cooldown_issues(now)
-                    .into_iter()
-                    .filter_map(|issue| {
-                        // The skip lasts until the later of the two windows.
-                        let local = reg.noop_cooldown_until(issue, now);
-                        let until = local
-                            .into_iter()
-                            .chain(reg.peer_noop_cooldown_until(issue, now))
-                            .max();
-                        until.map(|u| (issue, u))
-                    })
-                    .collect()
-            }
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashMap::new()
-            }
-        }
+        self.with_registry(|reg| {
+            let now = chrono::Utc::now();
+            reg.noop_cooldown_issues(now)
+                .into_iter()
+                .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
+                .collect()
+        })
     }
 
     /// Issues inside a live hard-exclusion decline cooldown window (Issue
@@ -444,13 +380,7 @@ impl WorkDispatcher for RegistryDispatcher {
     /// checkpoint-less clean-exit path maintains — no forge round trip,
     /// mirroring `noop_cooldown()`.
     fn declined(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.decline_cooldown_issues(chrono::Utc::now()),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.decline_cooldown_issues(chrono::Utc::now()))
     }
 
     /// [`WorkDispatcher::declined_expiry`] (Issue #9311), mirroring
@@ -458,19 +388,13 @@ impl WorkDispatcher for RegistryDispatcher {
     /// is not fleet-unioned (see its own doc comment), so this is a complete
     /// per-issue expiry map, not a this-host-only subset.
     fn declined_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
-        match self.registry.lock() {
-            Ok(reg) => {
-                let now = chrono::Utc::now();
-                reg.decline_cooldown_issues(now)
-                    .into_iter()
-                    .filter_map(|issue| reg.decline_cooldown_until(issue, now).map(|u| (issue, u)))
-                    .collect()
-            }
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashMap::new()
-            }
-        }
+        self.with_registry(|reg| {
+            let now = chrono::Utc::now();
+            reg.decline_cooldown_issues(now)
+                .into_iter()
+                .filter_map(|issue| reg.decline_cooldown_until(issue, now).map(|u| (issue, u)))
+                .collect()
+        })
     }
 
     /// Issues inside a live PR-less retry window (Issue #7972). Pure
@@ -478,32 +402,20 @@ impl WorkDispatcher for RegistryDispatcher {
     /// classification maintains — no forge round trip, mirroring
     /// `noop_cooldown()`.
     fn prless_retry(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.prless_retry_issues(chrono::Utc::now()),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.prless_retry_issues(chrono::Utc::now()))
     }
 
     /// [`WorkDispatcher::prless_retry_expiry`] (Issue #9311), mirroring
     /// [`Self::declined_expiry`]'s shape — `prless_retry_issues` is not
     /// fleet-unioned either, so this is a complete per-issue expiry map.
     fn prless_retry_expiry(&self) -> HashMap<u32, chrono::DateTime<chrono::Utc>> {
-        match self.registry.lock() {
-            Ok(reg) => {
-                let now = chrono::Utc::now();
-                reg.prless_retry_issues(now)
-                    .into_iter()
-                    .filter_map(|issue| reg.prless_retry_until(issue, now).map(|u| (issue, u)))
-                    .collect()
-            }
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashMap::new()
-            }
-        }
+        self.with_registry(|reg| {
+            let now = chrono::Utc::now();
+            reg.prless_retry_issues(now)
+                .into_iter()
+                .filter_map(|issue| reg.prless_retry_until(issue, now).map(|u| (issue, u)))
+                .collect()
+        })
     }
 
     /// Whether this workspace is missing `.claude/commands/loom/sweep.md`
@@ -522,13 +434,7 @@ impl WorkDispatcher for RegistryDispatcher {
     /// reach (label flips, and thus this guard, are the thing they're
     /// opting out of).
     fn workspace_commands_missing(&self) -> bool {
-        match self.registry.lock() {
-            Ok(reg) => !reg.config().skip_label_flip && !reg.config().has_sweep_command(),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                false
-            }
-        }
+        self.with_registry(|reg| !reg.config().skip_label_flip && !reg.config().has_sweep_command())
     }
 
     /// Discounted occupancy count (Issue #4003): a sweep dispatched longer
@@ -538,35 +444,14 @@ impl WorkDispatcher for RegistryDispatcher {
     /// `in_flight()`, so a child whose process already exited never
     /// over-counts either.
     fn occupancy(&self) -> usize {
-        let mut reg = match self.registry.lock() {
-            Ok(r) => r,
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                return 0;
-            }
-        };
-        reg.reap_liveness();
-        reg.occupied_issues().len()
+        self.with_registry(|reg| {
+            reg.reap_liveness();
+            reg.occupied_issues().len()
+        })
     }
 
     fn collisions(&self) -> u64 {
-        match self.registry.lock() {
-            Ok(reg) => reg.collision_count(),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                0
-            }
-        }
-    }
-
-    fn peer_claimed(&self) -> HashSet<u32> {
-        match self.registry.lock() {
-            Ok(reg) => reg.peer_claimed_issues(),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                HashSet::new()
-            }
-        }
+        self.with_registry(|reg| reg.collision_count())
     }
 
     /// Additional skip-label list for this workspace (Issue #6685),
@@ -577,15 +462,11 @@ impl WorkDispatcher for RegistryDispatcher {
     /// edit takes effect on the very next tick with no registry-side
     /// config plumbing or daemon restart required.
     fn extra_skip_labels(&self) -> Vec<String> {
-        match self.registry.lock() {
-            Ok(reg) => resolve_extra_skip_labels_with_config(&read_work_finder_config(
+        self.with_registry(|reg| {
+            resolve_extra_skip_labels_with_config(&read_work_finder_config(
                 &reg.config().workspace_root,
-            )),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                Vec::new()
-            }
-        }
+            ))
+        })
     }
 
     /// Capabilities this **host** declares it holds (#6893), read fresh each
@@ -602,7 +483,27 @@ impl WorkDispatcher for RegistryDispatcher {
     }
 
     fn dispatch(&mut self, issue: u32) -> Result<bool> {
-        self.dispatch_with(issue, false)
+        log::info!("work_finder: attempting issue #{issue}");
+        // Resolve the model only after runtime admission. A Claude default must not become a native pin.
+        // Idempotency key + the registry's claim lock make a re-dispatch of
+        // an already-running issue a no-op (`was_new = false`) or a loud
+        // lock-collision error.
+        let key = format!("workfinder-{issue}");
+        // Issue #6688: extends the #6592 begin/poll/finish split (proven
+        // for the IPC `DispatchSweep` handler) to this call site, so the
+        // account-selection poll no longer holds the registry mutex a
+        // concurrent `DaemonStatus`/`health` IPC call's per-root
+        // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
+        let outcome = crate::sweep_registry::dispatch_model_releasing_poll_lock(
+            &self.registry,
+            &SweepKind::Issue(issue),
+            Some(key),
+            crate::sweep_registry::DispatchModel::Autonomous,
+            None,
+            None,
+            crate::sweep_registry::DispatchOrigin::WorkFinder,
+        )?;
+        Ok(outcome.was_new)
     }
 
     /// One read of this workspace's ETag-cached open-PR listing, classified
@@ -627,18 +528,6 @@ impl WorkDispatcher for RegistryDispatcher {
     /// [`super::landed_prefilter::lift_in`].
     fn lift_landed_cooldowns(&self, held: &[u32]) -> HashSet<u32> {
         super::landed_prefilter::lift_in(&self.registry, held)
-    }
-
-    /// Whether a live sweep in this registry is the host's overflow sweep
-    /// (#9244). The multi-workspace tick ORs this across every root.
-    fn overflow_in_flight(&self) -> bool {
-        match self.registry.lock() {
-            Ok(reg) => reg.overflow_in_flight(),
-            Err(poisoned) => {
-                log::error!("work_finder: sweep registry mutex poisoned ({poisoned:?})");
-                false
-            }
-        }
     }
 
     /// The red-main-fix lane's CI fallback (#9244) for this workspace's repo.
@@ -680,56 +569,6 @@ impl WorkDispatcher for RegistryDispatcher {
         let open_prs = |issues: &[u32]| self.open_pr_blocked(issues).into_keys().collect();
         super::main_red_autofile::tick(&root, lane, Some(target), &open_prs);
     }
-
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        log::info!("work_finder: attempting issue #{issue}");
-        // Resolve the model only after runtime admission. A Claude default must not become a native pin.
-        // Idempotency key + the registry's claim lock make a re-dispatch of
-        // an already-running issue a no-op (`was_new = false`) or a loud
-        // lock-collision error.
-        let key = format!("workfinder-{issue}");
-        // Issue #6688: extends the #6592 begin/poll/finish split (proven
-        // for the IPC `DispatchSweep` handler) to this call site, so the
-        // account-selection poll no longer holds the registry mutex a
-        // concurrent `DaemonStatus`/`health` IPC call's per-root
-        // `registry.lock()` (`ipc.rs::build_daemon_status`) needs.
-        let outcome = crate::sweep_registry::dispatch_model_releasing_poll_lock(
-            &self.registry,
-            &SweepKind::Issue(issue),
-            Some(key),
-            crate::sweep_registry::DispatchModel::Autonomous,
-            None,
-            None,
-            crate::sweep_registry::DispatchOrigin::WorkFinder,
-        )?;
-        if overflow && outcome.was_new {
-            // Record the over-limit admission on the sweep itself (#9244), so
-            // `list_sweeps` / `get_sweep_status` / `loom-daemon status` show it
-            // and the next tick sees the slot as taken while it runs.
-            if let Ok(mut reg) = self.registry.lock() {
-                reg.mark_overflow(&outcome.sweep_id);
-            }
-            log::info!(
-                "work_finder: issue #{issue} dispatched as this host's overflow sweep (#9244)"
-            );
-        }
-        Ok(outcome.was_new)
-    }
-}
-
-/// Build the per-tick `(source, dispatcher)` pair for every root (#3924).
-#[must_use]
-pub fn dispatcher_pairs(
-    pool: &crate::workspace_pool::WorkspacePool,
-    roots: &[PathBuf],
-) -> Vec<(GhWorkSource, RegistryDispatcher)> {
-    roots
-        .iter()
-        .map(|root| {
-            let registry = pool.get_or_provision(root);
-            (GhWorkSource::for_root(root), RegistryDispatcher::new(registry))
-        })
-        .collect()
 }
 
 #[cfg(test)]

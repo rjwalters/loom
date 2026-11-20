@@ -15,6 +15,11 @@ fn enable(root: &Path, url: &str, enabled: bool) {
     );
 }
 
+/// A step's start time, fixed so a heartbeat's `started_at` is checkable.
+fn started() -> chrono::DateTime<chrono::Utc> {
+    "2026-10-20T01:00:00Z".parse().unwrap()
+}
+
 fn granting() -> TestServer {
     TestServer::start(|path, _| match path {
         proto::CLAIM_PATH => (
@@ -58,7 +63,7 @@ fn with_the_flag_off_nothing_is_asked_or_sent() {
     assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Off);
     assert_eq!(tick_budget(dir.path(), 9, 2), (9, false));
     note_capacity(9, &BTreeSet::new());
-    on_reaper_tick(dir.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(dir.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     release("step-judge-7-1", "verdict");
     std::thread::sleep(Duration::from_millis(100));
     assert!(server.requests().is_empty(), "{:?}", server.requests());
@@ -88,10 +93,43 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
     ] {
         let server = refusing(wire);
         enable(dir.path(), &server.url(), true);
-        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason));
+        let refusal = Refusal {
+            held_by: None,
+            retry_after_s: Some(30),
+        };
+        assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Refused(reason, refusal));
     }
     assert_eq!(refusal_token(RefusalReason::Held), "captain_held");
     assert_eq!(refusal_token(RefusalReason::Cooldown), "captain_cooldown");
+}
+
+/// A cooldown refusal keeps the hold's length for the step tick (#12704); an
+/// answer without one reads as `None`.
+#[test]
+#[serial]
+fn a_cooldown_refusal_keeps_retry_after_and_tolerates_its_absence() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let bare = TestServer::start(|_, _| {
+        (200, json!({"server_epoch":"e1","granted":false,"reason":"cooldown"}))
+    });
+    enable(dir.path(), &bare.url(), true);
+    assert_eq!(
+        claim(dir.path(), 7, StepRole::Judge),
+        Ask::Refused(RefusalReason::Cooldown, Refusal::default())
+    );
+    let timed = refusing("cooldown");
+    enable(dir.path(), &timed.url(), true);
+    assert_eq!(
+        claim(dir.path(), 7, StepRole::Judge),
+        Ask::Refused(
+            RefusalReason::Cooldown,
+            Refusal {
+                held_by: None,
+                retry_after_s: Some(30)
+            }
+        )
+    );
 }
 
 /// `grace` claims as today and leaves the failure run alone: two failures,
@@ -101,8 +139,9 @@ fn a_grant_carries_its_assignment_and_a_refusal_its_reason() {
 fn grace_fails_open_without_touching_the_hysteresis() {
     reset_for_test();
     let dir = tempdir().unwrap();
-    let dead = TestServer::dead_url();
-    enable(dir.path(), &dead, true);
+    // Keep the failing endpoint bound so the grace server cannot reuse its port.
+    let unavailable = TestServer::start(|_, _| (503, json!({})));
+    enable(dir.path(), &unavailable.url(), true);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     let grace = refusing("grace");
@@ -111,8 +150,10 @@ fn grace_fails_open_without_touching_the_hysteresis() {
         assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
     }
     assert_eq!(mode(), Mode::Normal);
-    enable(dir.path(), &dead, true);
+    enable(dir.path(), &unavailable.url(), true);
     assert_eq!(claim(dir.path(), 1, StepRole::Judge), Ask::FailOpen);
+    assert_eq!(unavailable.requests_to(proto::CLAIM_PATH).len(), 3);
+    assert_eq!(grace.requests_to(proto::CLAIM_PATH).len(), 5);
     assert_eq!(mode(), Mode::Fallback, "the graces neither failed nor reset the run");
 }
 
@@ -168,8 +209,8 @@ fn the_heartbeat_and_the_release_reach_the_server() {
     };
     note_spawned(a.path(), "step-judge-7-1", grant);
     note_capacity(5, &BTreeSet::from(["builder".to_string()]));
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
-    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
     assert_eq!(beats.len(), 1, "one heartbeat per gap for the whole host");
     let beat = &beats[0];
@@ -185,10 +226,14 @@ fn the_heartbeat_and_the_release_reach_the_server() {
     assert_eq!(beat["live"].as_array().unwrap().len(), 1, "a's steps were not yet recorded");
     assert_eq!(beat["live"][0]["item"], 9);
     assert!(beat["live"][0].get("assignment_id").is_none());
+    assert_eq!(
+        beat["live"][0]["started_at"], "2026-10-20T01:00:00Z",
+        "the step's start time rides the heartbeat (#12873)"
+    );
 
     // The next due heartbeat lists both repos, with the assignment.
     state().last_heartbeat = None;
-    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 2);
     let live = beats[1]["live"].as_array().unwrap();
     assert_eq!(live.len(), 2);
@@ -253,7 +298,7 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
         panic!("granted");
     };
     note_spawned(a.path(), "step-judge-7-1", grant);
-    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
     assert_eq!(beats[0]["live"][0]["assignment_id"], "a-1");
 
@@ -261,7 +306,7 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
     state().live_by_root.get_mut(a.path()).unwrap().refreshed =
         ago(LIVE_STALE_AFTER - Duration::from_secs(5));
     state().last_heartbeat = None;
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 2);
     assert_eq!(beats[1]["live"].as_array().unwrap().len(), 2);
     assert!(server.requests_to(proto::RELEASE_PATH).is_empty());
@@ -270,7 +315,7 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
     state().live_by_root.get_mut(a.path()).unwrap().refreshed =
         ago(LIVE_STALE_AFTER + Duration::from_secs(1));
     state().last_heartbeat = None;
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 3);
     let live = beats[2]["live"].as_array().unwrap();
     assert_eq!(live.len(), 1, "a's step left the heartbeat: {live:?}");
@@ -290,11 +335,11 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
         panic!("granted");
     };
     note_spawned(a.path(), "step-judge-8-1", grant);
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     assert_eq!(state().assignments.len(), 1, "a fresh grant is not orphaned");
     state().assignments.get_mut("step-judge-8-1").unwrap().since =
         ago(LIVE_STALE_AFTER + Duration::from_secs(1));
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     assert_eq!(server.wait_for(proto::RELEASE_PATH, 2).len(), 2);
     assert!(state().assignments.is_empty());
 }
@@ -324,13 +369,13 @@ fn a_long_reaper_interval_does_not_age_out_a_live_repo() {
         panic!("granted");
     };
     note_spawned(a.path(), "step-judge-7-1", grant);
-    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     server.wait_for(proto::HEARTBEAT_PATH, 1);
 
     // One 120 s interval since a's last tick: past the old fixed 90 s.
     state().live_by_root.get_mut(a.path()).unwrap().refreshed = ago(Duration::from_secs(120));
     state().last_heartbeat = None;
-    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor)]);
+    on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 2);
     std::env::remove_var(crate::sweep_registry::reaper::REAPER_INTERVAL_ENV);
     assert_eq!(beats[1]["live"].as_array().unwrap().len(), 2);
@@ -349,6 +394,75 @@ fn roles_ok_names_each_role_once() {
     let unique: BTreeSet<&String> = roles.iter().collect();
     assert_eq!(unique.len(), roles.len(), "{roles:?}");
     assert!(roles.contains(&"champion".to_string()));
+}
+
+// ---- #12817: a `next` grant stands in for the claim ----------------------
+
+fn offered_grant(url: &str, id: &str, item: u64, step: &str) -> Candidate {
+    Candidate {
+        repo: repo_of(Path::new("/nonexistent")),
+        item,
+        step: step.parse().unwrap(),
+        grant: Grant {
+            assignment_id: id.to_string(),
+            url: url.to_string(),
+            repo: repo_of(Path::new("/nonexistent")),
+            item,
+            step: step.to_string(),
+            lineage: None,
+        },
+    }
+}
+
+/// The claim of an offered item takes the captain's grant and asks nothing;
+/// an item never offered asks as before.
+#[test]
+#[serial]
+fn a_claim_of_an_offered_item_uses_the_grant_and_asks_nothing() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let server = granting();
+    enable(dir.path(), &server.url(), true);
+    let mut c = offered_grant(&server.url(), "n-1", 7, "judge");
+    c.grant.repo = repo_of(dir.path());
+    offer(&[c]);
+    let Ask::Granted(grant) = claim(dir.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    assert_eq!(grant.assignment_id, "n-1");
+    assert!(server.requests_to(proto::CLAIM_PATH).is_empty());
+    // Taken once: the same claim again asks the captain.
+    let Ask::Granted(again) = claim(dir.path(), 7, StepRole::Judge) else {
+        panic!("granted");
+    };
+    assert_eq!(again.assignment_id, "a-1");
+    assert_eq!(server.requests_to(proto::CLAIM_PATH).len(), 1);
+}
+
+/// An offer no claim took is refused back, once, and not kept.
+#[test]
+#[serial]
+fn an_offer_no_claim_took_is_declined_once() {
+    reset_for_test();
+    let dir = tempdir().unwrap();
+    let server = granting();
+    enable(dir.path(), &server.url(), true);
+    offer(&[
+        offered_grant(&server.url(), "n-1", 7, "judge"),
+        offered_grant(&server.url(), "n-2", 8, "doctor"),
+    ]);
+    // Offering the same item again replaces it.
+    offer(&[offered_grant(&server.url(), "n-3", 7, "judge")]);
+    assert_eq!(decline_offered("not_eligible"), 2);
+    assert_eq!(decline_offered("not_eligible"), 0);
+    std::thread::sleep(Duration::from_millis(200));
+    let sent = server.requests_to(proto::REFUSE_PATH);
+    let ids: BTreeSet<String> = sent
+        .iter()
+        .map(|r| r["assignment_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids, BTreeSet::from(["n-2".to_string(), "n-3".to_string()]));
+    assert!(sent.iter().all(|r| r["reason"] == "not_eligible"));
 }
 
 // ---- #12493: the flag is the host's, read from the daemon workspace ------
@@ -385,7 +499,7 @@ fn a_flag_in_the_host_tier_reaches_a_step_in_another_repo() {
 
     note_spawned(repo.path(), "step-judge-7-1", grant);
     note_capacity(3, &BTreeSet::new());
-    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
     assert_eq!(beats[0]["live"][0]["assignment_id"], "a-1");
     release("step-judge-7-1", "verdict");
@@ -406,7 +520,7 @@ fn the_host_tier_flag_off_asks_nothing_whatever_the_repo_says() {
     assert_eq!(claim(repo.path(), 7, StepRole::Judge), Ask::Off);
     assert_eq!(tick_budget(repo.path(), 9, 2), (9, false));
     note_capacity(9, &BTreeSet::new());
-    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge)]);
+    on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     std::thread::sleep(Duration::from_millis(100));
     assert!(server.requests().is_empty(), "{:?}", server.requests());
 }
@@ -448,4 +562,104 @@ fn the_resolved_mode_is_announced_on_each_change() {
     enable_host_tier(host.path(), "http://captain:1/", false);
     assert_eq!(host_endpoint(repo.path()), None);
     assert_eq!(state().announced, None);
+}
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer's token-probe snapshot lands as the
+// worker's fleet sidecar.
+// -----------------------------------------------------------------
+
+/// A captain that publishes one snapshot row on every heartbeat answer.
+fn probing() -> TestServer {
+    TestServer::start(|path, _| match path {
+        proto::HEARTBEAT_PATH => (
+            200,
+            json!({
+                "server_epoch": "e1",
+                "grace": false,
+                "token_probe": {
+                    "probed_at": "2026-11-18T12:00:00Z",
+                    "accounts": [
+                        {"name": "agent-1", "status": "exhausted",
+                         "limit_reset": "2026-11-20T03:00:00Z"}
+                    ]
+                }
+            }),
+        ),
+        _ => (200, json!({"server_epoch": "e1"})),
+    })
+}
+
+/// A root whose per-repo pool holds a token, so the snapshot resolves and
+/// lands beside it deterministically (never the host's real shared pool).
+fn rooted_pool() -> tempfile::TempDir {
+    let root = tempdir().unwrap();
+    let pool = root.path().join(".loom").join("tokens");
+    std::fs::create_dir_all(&pool).unwrap();
+    std::fs::write(pool.join("seed.token"), "sk-ant-oat01-fake").unwrap();
+    root
+}
+
+#[test]
+#[serial]
+fn a_snapshot_on_the_heartbeat_answer_becomes_the_fleet_sidecar() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = probing();
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &BTreeSet::new());
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+
+    // The answer is applied on the client's runtime thread; the sidecar
+    // appears within one heartbeat round-trip.
+    let sidecar = root
+        .path()
+        .join(".loom")
+        .join("tokens")
+        .join(".fleet_probe.json");
+    let mut seen = None;
+    for _ in 0..50 {
+        if let Some(snapshot) = crate::tokens_pool::fleet_probe::read_sidecar(
+            root.path().join(".loom").join("tokens").as_path(),
+        ) {
+            seen = Some(snapshot);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let snapshot = seen.unwrap_or_else(|| {
+        panic!("the fleet sidecar never landed at {}", sidecar.display());
+    });
+    assert_eq!(
+        snapshot.probed_at,
+        "2026-11-18T12:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(snapshot.account("agent-1").map(|a| a.status.as_str()), Some("exhausted"));
+}
+
+/// An old captain's answer (no `token_probe` field) writes nothing: worker
+/// behaviour with the field absent is byte-for-byte today's.
+#[test]
+#[serial]
+fn an_answer_without_the_snapshot_writes_nothing() {
+    reset_for_test();
+    let root = rooted_pool();
+    let server = granting(); // answers carry no token_probe field
+    enable(root.path(), &server.url(), true);
+    note_capacity(1, &BTreeSet::new());
+    on_reaper_tick(root.path(), &[]);
+    server.wait_for(proto::HEARTBEAT_PATH, 1);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !root
+            .path()
+            .join(".loom")
+            .join("tokens")
+            .join(".fleet_probe.json")
+            .exists(),
+        "no snapshot on the wire, no sidecar on disk"
+    );
 }

@@ -12,8 +12,6 @@
 
 use std::path::PathBuf;
 
-use crate::event_bus::EventBus;
-
 /// Join handles for whatever started. Held by the caller for the process's
 /// lifetime; dropping them does not stop the tasks (tokio detaches on drop).
 pub struct SingletonHandles {
@@ -27,9 +25,9 @@ pub struct SingletonHandles {
 }
 
 /// Spawn every loop-owning singleton task against `workspace_root`'s config.
-pub fn spawn(workspace_root: PathBuf, bus: &EventBus) -> SingletonHandles {
+pub fn spawn(workspace_root: PathBuf) -> SingletonHandles {
     SingletonHandles {
-        ci_telemetry: crate::ci_telemetry::spawn_task_on(workspace_root.clone(), bus),
+        ci_telemetry: crate::ci_telemetry::spawn_task(workspace_root.clone()),
         intake_reconcile: crate::intake_reconcile::singleton::spawn_task(workspace_root),
     }
 }

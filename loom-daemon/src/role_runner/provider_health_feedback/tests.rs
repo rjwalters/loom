@@ -14,11 +14,11 @@
 //! already uses it to seed state ahead of the behavior under test.
 
 use super::*;
+use crate::exec_test_support::write_executable;
 use crate::tokens_pool::health::record_terminal_at;
 use crate::tokens_pool::TerminalClassification;
 use serial_test::serial;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 /// Every env var that can change which runtime a role resolves to, or which
 /// credential source `spawn-codex.sh` would use — cleared for the scope of a
@@ -35,41 +35,20 @@ const GUARDED_ENV: [&str; 8] = [
     "LOOM_CODEX_PROFILE_ROOT",
 ];
 
-/// The second field holds the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock (#9964).
+/// The shared env guard plus the crate-wide `LOOM_CODEX_PROFILE_ROOT` lock
+/// (#9964). Field order matters: the env is restored before the lock is released.
 struct EnvGuard(
-    Vec<(&'static str, Option<String>)>,
+    #[allow(dead_code)] crate::env_test_support::EnvGuard,
     #[allow(dead_code)] crate::tokens_pool::profile_root_env::ProfileRootLock,
 );
 
 impl EnvGuard {
     fn new(profile_root: &Path) -> Self {
         let lock = crate::tokens_pool::profile_root_env::lock();
-        let prior = GUARDED_ENV
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect();
-        for key in GUARDED_ENV {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("LOOM_CODEX_PROFILE_ROOT", profile_root);
-        Self(prior, lock)
+        let env = crate::env_test_support::EnvGuard::clear(&GUARDED_ENV)
+            .and_set("LOOM_CODEX_PROFILE_ROOT", Some(profile_root.as_os_str()));
+        Self(env, lock)
     }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.0.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// A workspace whose `judge` role is pinned to the codex runtime, with one
@@ -347,7 +326,7 @@ fn codex_role_tick_honours_the_refusals_own_reset_horizon() {
 
     write_executable(
         &workspace.path().join(".loom/scripts/spawn-worker.sh"),
-        &format!(
+        format!(
             "#!/bin/sh\n\
              echo '# LOOM_ACCOUNT name=alice'\n\
              echo \"ERROR: You've hit your usage limit. Visit \

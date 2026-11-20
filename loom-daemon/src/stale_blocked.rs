@@ -164,6 +164,28 @@ pub struct Evidence {
     /// [`classify`] reports [`Verdict::HeldWithReason`], not
     /// [`Verdict::Undocumented`]. Read from the body only.
     pub held: Option<Held>,
+    /// A trusted `<!-- loom:permanent-block -->` marker stands on the artifact
+    /// (#13889) — the same own-line marker and trust rule `guide.md`'s
+    /// `has_permanent_block()` honours, so the advisory and the unblock sweep
+    /// agree. [`classify`] reports such an artifact as
+    /// [`Verdict::Superseded`], never stale or unticked.
+    pub permanent_block: bool,
+    /// The newest trusted hold comment (#13889), see [`HoldComment`].
+    pub hold: Option<HoldComment>,
+    /// When the last resolved cited blocker closed/merged (RFC 3339); `None`
+    /// when any resolved blocker's time could not be read. Meaningful only
+    /// with [`Evidence::hold`], which treats `None` as "unknown ⇒ held".
+    pub resolved_at: Option<String>,
+}
+
+/// A trusted comment that states a hold (#13889): a park record, an operator
+/// decision, or a Champion/operator hold-restore note.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HoldComment {
+    /// When it was posted (RFC 3339); `None` when the forge did not say.
+    pub at: Option<String>,
+    /// Which marker made it a hold comment, e.g. `loom:operator-decision`.
+    pub marker: String,
 }
 
 /// The stated-reason park record behind [`Verdict::HeldWithReason`].
@@ -173,9 +195,6 @@ pub struct Held {
     pub by: Option<String>,
     /// The non-empty `reason="…"`.
     pub reason: String,
-    /// `at=` as written, if any: [`hold::documents_current_block`] compares it
-    /// to the latest `loom:blocked` application.
-    pub at: Option<String>,
 }
 
 /// A cross-repo park-record blocker with its live state (#10443).
@@ -401,7 +420,36 @@ pub fn classify(e: &Evidence) -> Verdict {
     }
 
     if reasons.is_empty() {
-        return unticked.unwrap_or(Verdict::StillBlocked);
+        // A permanent-block marker keeps an otherwise-unticked artifact out of
+        // the actionable section too (#13889).
+        return match unticked {
+            Some(Verdict::Unticked { resolved_refs, .. }) if e.permanent_block => {
+                Verdict::Superseded {
+                    cleared: vec![format!(
+                        "every parseable unchecked `## Dependencies` ref is resolved: {}",
+                        resolved_refs.join(", ")
+                    )],
+                    block: PERMANENT_BLOCK.to_string(),
+                }
+            }
+            other => other.unwrap_or(Verdict::StillBlocked),
+        };
+    }
+
+    // (c) Superseded by a marker or a later hold comment (#13889). Like (d),
+    // applied over an already-computed stale reason set: it only ever
+    // downgrades "ready to unpark" to "held".
+    if e.permanent_block {
+        return Verdict::Superseded {
+            cleared: reasons,
+            block: PERMANENT_BLOCK.to_string(),
+        };
+    }
+    if let Some(block) = hold_supersedes(e) {
+        return Verdict::Superseded {
+            cleared: reasons,
+            block,
+        };
     }
 
     // (d) The #4634/#7267 superseding-block gate, PR side (#8925). Applied LAST,
@@ -415,6 +463,39 @@ pub fn classify(e: &Evidence) -> Verdict {
         },
         None => Verdict::Stale(reasons),
     }
+}
+
+/// The `block` text of a permanent-block hold.
+pub const PERMANENT_BLOCK: &str =
+    "permanent block — a trusted `<!-- loom:permanent-block -->` marker; the unblock sweep never \
+     unparks it";
+
+/// Whether the newest trusted hold comment is not older than the cited
+/// blockers' resolution (#13889), as a reportable reason.
+///
+/// Fails closed to the *held* side: a hold comment whose time, or a resolved
+/// blocker whose resolution time, is missing or unparseable counts as newer.
+fn hold_supersedes(e: &Evidence) -> Option<String> {
+    use chrono::DateTime;
+    let hold = e.hold.as_ref()?;
+    let parse = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
+    };
+    let held_back = match (parse(&hold.at), parse(&e.resolved_at)) {
+        (Some(h), Some(r)) => h > r,
+        _ => true,
+    };
+    held_back.then(|| {
+        format!(
+            "a trusted hold comment (`<!-- {} -->`, posted {}) is newer than the cited \
+             blockers' resolution ({}) — the dependency resolved but is no longer the binding \
+             constraint",
+            hold.marker,
+            hold.at.as_deref().unwrap_or("at an unknown time"),
+            e.resolved_at.as_deref().unwrap_or("time unknown"),
+        )
+    })
 }
 
 /// Which of `closed` an artifact's body/comments cite as a blocker (issue

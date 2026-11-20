@@ -251,9 +251,6 @@ Each role has default settings in `defaults/roles/<role>.json`:
 ```json
 {
   "name": "Curator Bot",
-  "defaultInterval": 300000,
-  "defaultIntervalPrompt": "Find approved issues...",
-  "autonomousRecommended": true,
   "suggestedWorkerType": "claude"
 }
 ```

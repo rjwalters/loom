@@ -53,16 +53,6 @@ pub const QUEUE_PATH_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_PATH";
 /// Default filename under `<workspace_root>/.loom/logs/`.
 pub const QUEUE_FILENAME: &str = "observability-queue.jsonl";
 
-/// Per-exporter queue filename under `<workspace_root>/.loom/logs/` when more
-/// than one exporter is configured (Issue #8756) — `observability-queue.<name>
-/// .jsonl` for the exporter named `name` ("https", "otlp"). A **sole**
-/// exporter keeps [`QUEUE_FILENAME`] unchanged so a pre-fan-out backlog stays
-/// discoverable without migration.
-#[must_use]
-pub fn named_queue_filename(name: &str) -> String {
-    format!("observability-queue.{name}.jsonl")
-}
-
 /// Resolve the default queue path: [`QUEUE_PATH_ENV`] override (non-empty),
 /// else `<workspace_root>/.loom/logs/observability-queue.jsonl`.
 #[must_use]
@@ -83,6 +73,31 @@ pub fn default_queue_path(workspace_root: &Path) -> PathBuf {
 /// older readers skip it as a corrupt line.
 const HEADER_KEY: &str = "loom_queue_header";
 
+/// Minimum gap between overflow log lines.
+const OVERFLOW_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `kind=count` pairs for `items`, most frequent first (spans by name), capped
+/// at the top eight.
+fn kind_histogram(items: &VecDeque<TelemetryEnvelope>) -> String {
+    use crate::telemetry::TelemetryRecord;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in items {
+        let key = match &item.record {
+            TelemetryRecord::Span(span) => format!("trace.span:{}", span.name.as_str()),
+            other => other.kind().to_string(),
+        };
+        *counts.entry(key).or_default() += 1;
+    }
+    let mut pairs: Vec<_> = counts.into_iter().collect();
+    pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    pairs
+        .iter()
+        .take(8)
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 struct QueueState {
     items: VecDeque<TelemetryEnvelope>,
     /// Envelope lines currently in the file, stale (evicted) prefix included.
@@ -92,6 +107,9 @@ struct QueueState {
     /// Bulk-backfill offers refused at the backfill limit (#11115).
     deferred_total: u64,
     head_sequence: u128,
+    /// When the last overflow line (with its per-kind histogram) was logged
+    /// (#13538), so a burst logs once rather than once per dropped record.
+    last_overflow_log: Option<std::time::Instant>,
 }
 
 /// Outcome of a bounded bulk-backfill offer (#11115).
@@ -209,6 +227,7 @@ impl DurableQueue {
                 file_ready,
                 deferred_total: 0,
                 head_sequence: 0,
+                last_overflow_log: None,
             }),
         }
     }
@@ -245,12 +264,21 @@ impl DurableQueue {
             state.items.pop_front();
             state.head_sequence += 1;
             self.ledger.record(REASON_QUEUE_OVERFLOW, 1);
-            log::warn!(
-                "observability: queue at capacity ({}); dropped oldest record \
-                 (queue_overflow, dropped_total={})",
-                self.capacity,
-                self.ledger.total()
-            );
+            // One line per burst, naming what fills the queue (#13538): the
+            // ledger counts every drop, so per-record lines add only noise.
+            let quiet = state
+                .last_overflow_log
+                .is_some_and(|at| at.elapsed() < OVERFLOW_LOG_INTERVAL);
+            if !quiet {
+                state.last_overflow_log = Some(std::time::Instant::now());
+                log::warn!(
+                    "observability: queue at capacity ({}); dropped oldest record \
+                     (queue_overflow, dropped_total={}); queued by kind: {}",
+                    self.capacity,
+                    self.ledger.total(),
+                    kind_histogram(&state.items)
+                );
+            }
         }
     }
 
@@ -423,6 +451,22 @@ impl DurableQueue {
         self.persist(&mut state);
     }
 
+    /// Drop every queued envelope `keep` rejects, wherever it sits, and
+    /// persist. Returns how many were removed. For a single-writer caller
+    /// (the one-shot watchdog, #12831) that has no sender or snapshot in
+    /// flight: it shifts the head sequence like an ack would.
+    pub fn retain(&self, mut keep: impl FnMut(&TelemetryEnvelope) -> bool) -> usize {
+        let mut state = self.lock();
+        let before = state.items.len();
+        state.items.retain(|e| keep(e));
+        let removed = before - state.items.len();
+        if removed > 0 {
+            state.head_sequence += removed as u128;
+            self.persist(&mut state);
+        }
+        removed
+    }
+
     /// Remove the front `n` envelopes (clamped to the current length) after a
     /// successful export, persisting the drained state to disk.
     pub fn ack(&self, n: usize) {
@@ -482,6 +526,13 @@ pub trait QueueSink: Send + Sync {
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.offer_durable(envelope).map(|()| Admission::Admitted)
     }
+
+    /// How many more backfill offers the sink would admit right now (#13688),
+    /// or `None` for a sink with no capacity notion. The export pass uses it
+    /// to split one pass's admission between its fast and bulk lanes.
+    fn backfill_headroom(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl QueueSink for DurableQueue {
@@ -495,6 +546,10 @@ impl QueueSink for DurableQueue {
 
     fn offer_backfill(&self, envelope: TelemetryEnvelope) -> std::io::Result<Admission> {
         self.push_bounded(envelope)
+    }
+
+    fn backfill_headroom(&self) -> Option<usize> {
+        Some(backfill_limit(self.capacity).saturating_sub(self.lock().items.len()))
     }
 }
 
@@ -536,6 +591,14 @@ impl QueueSink for FanoutQueue {
             queue.push_durable(envelope.clone())?;
         }
         Ok(())
+    }
+
+    /// The tightest member queue's headroom (an offer needs room in all).
+    fn backfill_headroom(&self) -> Option<usize> {
+        self.queues
+            .iter()
+            .filter_map(|queue| queue.backfill_headroom())
+            .min()
     }
 
     /// All-or-defer across unequal queues (#11115). Every queue's lock is
@@ -734,6 +797,39 @@ mod tests {
                 other => panic!("unexpected record {other:?}"),
             })
             .collect()
+    }
+
+    /// #12094: `fleet.state`, `pr.resolved`, `eta.stage_outcome` and
+    /// `pass.summary` left the registry. An older daemon's spool can still hold
+    /// them; they are skipped on load (never a decode error that loses the
+    /// neighbouring records) and rewritten away on the next open.
+    #[test]
+    fn a_retired_kind_in_an_old_spool_is_skipped_not_fatal() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let valid = |n| serde_json::to_string(&envelope(n)).unwrap();
+        let mut retired = serde_json::to_value(envelope(2)).unwrap();
+        for kind in [
+            "fleet.state",
+            "pr.resolved",
+            "eta.stage_outcome",
+            "pass.summary",
+        ] {
+            retired["record"] = serde_json::json!({ "kind": kind, "repo": "o/r" });
+            assert!(
+                serde_json::from_value::<TelemetryEnvelope>(retired.clone()).is_err(),
+                "{kind} must no longer decode as a registered kind"
+            );
+        }
+        let retired_line = serde_json::to_string(&retired).unwrap();
+        std::fs::write(&path, format!("{}\n{retired_line}\n{}\n", valid(1), valid(3))).unwrap();
+
+        let queue = DurableQueue::open(path.clone(), 8);
+        assert_eq!(issues(&queue), vec![1, 3]);
+        queue.push(envelope(4));
+        assert_eq!(issues(&queue), vec![1, 3, 4]);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("eta.stage_outcome"), "{rewritten}");
     }
 
     #[test]
@@ -941,6 +1037,13 @@ mod tests {
         queue.push(envelope(1));
         queue.ack(100); // must not panic
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn kind_histogram_names_what_fills_the_queue() {
+        let items: VecDeque<TelemetryEnvelope> = (1..=3).map(envelope).collect();
+        assert_eq!(kind_histogram(&items), "sweep.started=3");
+        assert_eq!(kind_histogram(&VecDeque::new()), "");
     }
 
     #[test]

@@ -25,21 +25,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 UNINSTALL_SH="$REPO_ROOT/scripts/uninstall-loom.sh"
 SHIPPED_TEMPLATE="$REPO_ROOT/defaults/.github/labels.yml"
 
-PASS=0
-FAIL=0
-TOTAL=0
-RED='\033[0;31m'; GREEN='\033[0;32m'; NC='\033[0m'
-
-assert_eq() {
-  local desc="$1" expected="$2" actual="$3"
-  TOTAL=$((TOTAL + 1))
-  if [[ "$expected" == "$actual" ]]; then
-    echo -e "${GREEN}PASS${NC}: $desc"; PASS=$((PASS + 1))
-  else
-    echo -e "${RED}FAIL${NC}: $desc"; echo "  expected: '$expected'"; echo "  actual:   '$actual'"
-    FAIL=$((FAIL + 1))
-  fi
-}
+source "$SCRIPT_DIR/lib/assert.sh"
 
 # Exact marker-strip pipeline mirrored from uninstall-loom.sh Step 6. Given a
 # labels.yml path, either strips the Loom block (deleting the file when nothing

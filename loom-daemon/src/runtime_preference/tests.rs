@@ -230,6 +230,120 @@ fn an_entirely_unavailable_list_yields_no_choice_and_names_every_reason() {
     assert!(diagnostic.contains("codex -> unavailable"), "{diagnostic}");
 }
 
+/// #13428: a walk over zero taps is a configuration outcome, distinct from
+/// "every tap skipped" — pool pre-flight keys off this to avoid a bogus hold.
+#[test]
+fn an_empty_walk_is_an_empty_list_but_an_all_skipped_walk_is_not() {
+    let empty = resolve(
+        &taps(&[]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(empty.chosen.is_none());
+    assert!(empty.is_empty_list());
+
+    let all_skipped = resolve(
+        &taps(&["claude"]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+    );
+    assert!(all_skipped.chosen.is_none());
+    assert!(!all_skipped.is_empty_list());
+}
+
+/// #14026 acceptance criterion 3: a containment refusal longer than the
+/// [`super::resolve::SUMMARY_DETAIL_MAX`] cap the preference marker applies
+/// appears **untruncated** on the one-line refusal rendering — no `…`, no
+/// embedded newline — so a log filter by level or time window keeps the
+/// obligation the `skipped=` field cuts off.
+#[test]
+fn the_summary_line_carries_a_long_containment_refusal_untruncated_on_one_line() {
+    let obligation = "owned account lease plus durable workspace preparation for the drawn \
+                      model claude/sonnet on credential profile zai-metered is still \
+                      outstanding, so this tap cannot serve the role yet (#13916)";
+    assert!(obligation.chars().count() > super::resolve::SUMMARY_DETAIL_MAX);
+    let resolution = resolve(
+        &taps(&["codex", "claude"]),
+        |tap| -> Result<&'static str, SkipReason> {
+            if tap.runtime == "codex" {
+                Err(SkipReason::NotAdmitted {
+                    unmet: vec!["worktreeIsolation".into()],
+                    detail: format!("unmet capabilities: worktreeIsolation; {obligation}"),
+                })
+            } else {
+                Err(unavailable("claude_pool"))
+            }
+        },
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(resolution.chosen.is_none());
+    let line = resolution.exhausted_summary_line("curator");
+    assert!(!line.contains('\n'), "refusal line must be one line: {line}");
+    assert!(line.contains(obligation), "{line}");
+    assert!(!line.contains('\u{2026}'), "nothing may be truncated: {line}");
+    assert!(line.starts_with("runtime_rejected role=curator: "), "{line}");
+    assert!(line.contains("codex -> not-admitted("), "{line}");
+    assert!(line.contains("claude -> unavailable("), "{line}");
+    // The multi-line operator diagnostic keeps the same full wording, so the
+    // two renderings agree on content and differ only in layout.
+    let diagnostic = resolution.exhausted_diagnostic("curator");
+    assert!(diagnostic.contains('\n'));
+    assert!(diagnostic.contains(obligation), "{diagnostic}");
+}
+
+/// #14026 edge cases: several skipped candidates all appear, joined with
+/// `; `; control characters in a reason are flattened to spaces so the line
+/// stays a line; a zero-candidate walk names the empty list instead of
+/// rendering nothing.
+#[test]
+fn the_summary_line_joins_candidates_flattens_control_characters_and_names_an_empty_list() {
+    let multi = resolve(
+        &taps(&["codex", "opencode", "claude"]),
+        |tap| -> Result<&'static str, SkipReason> {
+            match tap.runtime.as_str() {
+                "codex" => Err(SkipReason::NotAdmitted {
+                    unmet: vec!["worktreeIsolation".into()],
+                    detail: "unmet capabilities: worktreeIsolation".into(),
+                }),
+                "opencode" => Err(unavailable("zai")),
+                _ => Err(unavailable("claude_pool")),
+            }
+        },
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    let line = multi.exhausted_summary_line("judge");
+    assert!(!line.contains('\n'), "{line}");
+    assert!(
+        line.contains(
+            "codex -> not-admitted(worktreeIsolation); \
+             opencode -> unavailable(zai: 0/21 spawnable); \
+             claude -> unavailable(claude_pool: 0/21 spawnable)"
+        ),
+        "{line}"
+    );
+
+    let controls = resolve(
+        &taps(&["claude"]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Err(unavailable("cla\u{0000}ude_pool\u{0007}")),
+    );
+    let line = controls.exhausted_summary_line("builder");
+    assert!(
+        !line.contains('\n') && !line.contains('\u{0000}') && !line.contains('\u{0007}'),
+        "{line}"
+    );
+
+    let empty = resolve(
+        &taps(&[]),
+        |_| Ok::<_, SkipReason>("admitted"),
+        |_, _, _| Ok::<(), SkipReason>(()),
+    );
+    assert!(empty.is_empty_list());
+    let line = empty.exhausted_summary_line("builder");
+    assert!(!line.contains('\n'), "{line}");
+    assert!(line.contains("preference list is empty"), "an empty walk must say so: {line}");
+}
+
 /// The telemetry criterion: the chosen tier AND every higher tier's skip
 /// reason are in the launch record.
 #[test]
@@ -893,6 +1007,78 @@ fn claude_availability_agrees_with_the_preflight_gate() {
         assert_eq!(state.source(), &CredentialSource::ClaudeTokens);
     }
 
+    // #13873 (PR #14088 review): the same agreement across the
+    // `modelFallback` toggle, with class-scoped marks and a role model the
+    // gate can resolve — the mapping reads the pool-level any-class state,
+    // the gate walks the resolved model's rung chain, and the two must
+    // render the same verdict at both ends of the spectrum.
+    write_config(
+        dir.path(),
+        &serde_json::json!({
+            "runtimes": {"default": "claude"},
+            "autonomous": {
+                "roleRunner": {"model": "fable"},
+                "modelFallback": {"enabled": true}
+            }
+        }),
+    );
+    provision_claude_pool(dir.path(), 2);
+    // State A — fable-only marks: a lower rung can serve the launch (the
+    // gate walks to opus) and the any-class read still sees capacity, so
+    // neither side reports a wall.
+    for account in ["account0", "account1"] {
+        crate::tokens_pool::bad_tokens::mark_bad_for_model(
+            dir.path(),
+            account,
+            "exhausted: hit your limit",
+            Some("fable"),
+        )
+        .unwrap();
+    }
+    let gate_skips = crate::role_runner::runtime_preflight::static_check(
+        dir.path(),
+        &logs,
+        "builder",
+        Some(&Ok(admitted.clone())),
+    )
+    .is_some();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    assert_eq!(
+        gate_skips,
+        !state.is_spawnable(),
+        "fable-only marks: gate_skips={gate_skips} availability={state:?}"
+    );
+    assert!(state.is_spawnable(), "{state:?}");
+    // State B — every class marked on every account: the chain walk is
+    // dead and the gate skips; no known class could spawn from any
+    // account, so the mapping must report Exhausted — the every-rung-dead
+    // state the whole feature exists for, on both read paths at once.
+    for account in ["account0", "account1"] {
+        for model in ["claude-opus-5", "sonnet", "haiku"] {
+            crate::tokens_pool::bad_tokens::mark_bad_for_model(
+                dir.path(),
+                account,
+                "exhausted: hit your limit",
+                Some(model),
+            )
+            .unwrap();
+        }
+    }
+    let gate_skips = crate::role_runner::runtime_preflight::static_check(
+        dir.path(),
+        &logs,
+        "builder",
+        Some(&Ok(admitted.clone())),
+    )
+    .is_some();
+    let state = availability(dir.path(), &tap, &admitted, 0);
+    assert_eq!(
+        gate_skips,
+        !state.is_spawnable(),
+        "every class marked: gate_skips={gate_skips} availability={state:?}"
+    );
+    assert!(gate_skips);
+
     // The unprovisioned pool is the permanent hold, not the self-healing one:
     // no amount of waiting makes a token appear.
     provision_claude_pool(dir.path(), 0);
@@ -1280,3 +1466,52 @@ fn resolve_for_dispatch_hands_the_slot_to_the_launch_and_the_next_dispatch_sees_
 
 #[path = "session_down_tests.rs"]
 mod session_down;
+
+/// #13916: a containment refusal names its obligation in both the dispatch
+/// diagnostic (uncapped) and the preference marker (capped, one line), not
+/// just the bare unmet capability.
+#[test]
+fn a_containment_refusal_names_its_obligation_in_the_diagnostic_and_marker() {
+    let obligation = "private-clone containment requires a GitHub token for the exec";
+    let long_tail = "x".repeat(400);
+    let refusal = |tail: &str| SkipReason::NotAdmitted {
+        unmet: vec!["worktreeIsolation".into()],
+        detail: format!(
+            "unmet capabilities: worktreeIsolation; verified private-clone containment \
+             could not satisfy it: {obligation}{tail}"
+        ),
+    };
+    let resolution = resolve(
+        &taps(&["codex", "claude"]),
+        |tap| {
+            if tap.runtime == "codex" {
+                Err(refusal(&long_tail))
+            } else {
+                Ok("admitted")
+            }
+        },
+        |_, tap, _| Err(unavailable(&format!("{}_pool", tap.runtime))),
+    );
+    let diagnostic = resolution.exhausted_diagnostic("builder");
+    assert!(
+        diagnostic.contains("codex -> not-admitted(worktreeIsolation: verified private-clone"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains(obligation), "{diagnostic}");
+    assert!(diagnostic.contains(&long_tail), "diagnostic is uncapped");
+
+    let line = resolution.marker_line();
+    assert!(!line.contains('\n'), "{line}");
+    assert!(line.contains("codex:not-admitted(worktreeIsolation: verified"), "{line}");
+    assert!(!line.contains(&long_tail), "marker detail is capped: {line}");
+    let summary = resolution.skipped[0].reason.summary();
+    assert!(summary.ends_with('\u{2026}'), "{summary}");
+    assert!(
+        summary.chars().count() <= "worktreeIsolation: ".len() + super::resolve::SUMMARY_DETAIL_MAX,
+        "{summary}"
+    );
+
+    // A short obligation is rendered whole in the marker too.
+    let short = refusal("").summary();
+    assert!(short.ends_with(obligation), "{short}");
+}

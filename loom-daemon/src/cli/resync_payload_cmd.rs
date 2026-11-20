@@ -4,19 +4,19 @@
 //! Brand-new logic, native per the shell-language policy.
 //! `resync-installed.sh` hands off to it when no `defaults/` source tree
 //! resolves; it is also run by hand. Logic and the exit-code contract live in
-//! [`loom_daemon::init::payload::standalone`].
+//! [`crate::init::payload::standalone`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 
-use loom_daemon::init::payload::standalone;
-use loom_daemon::release_fetch::source;
-use loom_daemon::release_provenance::{self, Provenance};
+use crate::init::payload::standalone;
+use crate::release_fetch::source;
+use crate::release_provenance::{self, Provenance};
 
 #[derive(clap::Args)]
-pub(crate) struct ResyncPayloadArgs {
+pub struct ResyncPayloadArgs {
     /// Print what would change and write nothing. Exit 2 when something
     /// would, 0 when the install already matches.
     #[arg(long, short = 'n')]
@@ -27,7 +27,7 @@ pub(crate) struct ResyncPayloadArgs {
 }
 
 impl ResyncPayloadArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let dest = match self.workspace {
             Some(dir) => dir,
             None => std::env::current_dir()?,

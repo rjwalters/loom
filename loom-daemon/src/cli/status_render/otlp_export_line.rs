@@ -5,7 +5,7 @@
 //! healthy by omission. An attention state carries
 //! `otlp: failing since <T> (<reason>)` (Issue #11557).
 
-use loom_daemon::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
+use crate::observability::otlp_health::{OtlpExportHealth, OtlpExportState};
 
 /// Render the one-line OTLP-export summary. `None` is a pre-#11353 daemon,
 /// reported as `unknown`, never as `ok`.
@@ -34,8 +34,8 @@ pub fn render(health: Option<&OtlpExportHealth>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::otlp_health::{OtlpHealthInputs, OtlpHealthMonitor};
     use chrono::{Duration, TimeZone, Utc};
-    use loom_daemon::observability::otlp_health::{OtlpHealthInputs, OtlpHealthMonitor};
 
     fn h(state: OtlpExportState, detail: Option<&str>) -> OtlpExportHealth {
         OtlpExportHealth {

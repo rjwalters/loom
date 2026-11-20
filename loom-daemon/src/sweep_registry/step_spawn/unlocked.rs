@@ -13,8 +13,8 @@
 //!    ([`captain_claim`], #12450: a refusal ends here, with no forge call),
 //!    a Builder step's landed check ([`landed_at_spawn`],
 //!    #12251), then the role's resolvers, containment included;
-//! 3. **locked**: the sweep id, the item's lock, the peer advertisement, and
-//!    the pre-claim command;
+//! 3. **locked**: the sweep id, the item's lock, and the pre-claim
+//!    command;
 //! 4. **unlocked**: the pre-claim (non-Builder roles);
 //! 5. **locked**: the roll gate again (a roll may have paused spawns while the
 //!    lock was released), a Builder's claim flip and lease comment (the same
@@ -122,8 +122,9 @@ impl SweepRegistry {
                 dispatch_step::RESULT_REFUSED,
                 refusal.reason,
                 None,
-                refusal.claim.as_ref(),
+                refusal.claim.as_deref(),
                 refusal.assignment_id.as_deref(),
+                refusal.captain.as_deref(),
             );
             log::info!(
                 "sweep_registry: {} step on #{} not spawned — {refusal}",
@@ -176,6 +177,11 @@ impl SweepRegistry {
             }
         };
         let sweep_id = generate_sweep_id(&kind);
+        // Every forge call below (lock, claim, pre-claim) is made for this
+        // sweep: stamp its `invoke github` spans (#13171). `blocking` stays
+        // on this thread, so the thread-local holds across it.
+        let _sweep =
+            crate::gh_invocation::telemetry::enter_sweep(&sweep_id, Some(role.role_name()));
         let claim_cmd = {
             let reg = locked(registry);
             let held = if role.acts_on_pr() {
@@ -187,7 +193,6 @@ impl SweepRegistry {
                 drop(reg);
                 return Err(refuse(StepRefusal::new("claimed", format!("{e:#}"))));
             }
-            reg.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
             (role != StepRole::Builder && !config.skip_label_flip)
                 .then(|| reg.step_claim_command(item, role, &sweep_id))
         };

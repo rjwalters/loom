@@ -1,12 +1,13 @@
 //! The PR-lease half of the Judge no-verdict backstop (#11855): `release`
 //! records a Judge pass that ended without a verdict, and `claim` refuses a
 //! Judge a PR those records hold. The rules live in
-//! [`loom_daemon::judge_backstop`].
+//! [`crate::judge_backstop`].
 
+use crate::forge_call_stats::ops;
+use crate::gh_invocation::AccessIntent;
+use crate::judge_backstop::{self as backstop, CiRead, CiState};
+use crate::step_role::StepRole;
 use chrono::{DateTime, Utc};
-use loom_daemon::forge_call_stats::ops;
-use loom_daemon::gh_invocation::AccessIntent;
-use loom_daemon::judge_backstop::{self as backstop, CiRead, CiState};
 
 use super::{Ctx, Gh, Role, Row};
 
@@ -60,19 +61,25 @@ impl Gh {
 /// deferred because the head's checks are still running (`ci_exempts`, asked
 /// only once a record is otherwise due; [`CiState::exempts`]) is not a
 /// blocked pass: CI settling changes neither the head nor the labels, so a
-/// record would hold the PR from Judge long after CI went green.
+/// record would hold the PR from Judge long after CI went green. `refused`
+/// is the gate-refusal token of the release's skip reason, if any.
 pub(crate) fn release_fields(
     role: Role,
     state: Option<(bool, String, Vec<String>)>,
+    refused: Option<&str>,
     ci_exempts: impl FnOnce(&str) -> bool,
 ) -> String {
     match state {
+        // A pass a gate refused (#13135) is recorded as such whatever CI is
+        // doing: it reached a verdict, so CI settling is not why it ended.
         Some((open, head, labels))
-            if role == Role::Judge
-                && backstop::ended_without_verdict(open, &labels)
-                && !ci_exempts(&head) =>
+            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
         {
-            backstop::released_fields(&head, &labels)
+            match refused {
+                Some(token) => backstop::refused_fields(&head, &labels, token),
+                None if ci_exempts(&head) => String::new(),
+                None => backstop::released_fields(&head, &labels),
+            }
         }
         _ => String::new(),
     }
@@ -90,7 +97,9 @@ pub(crate) fn reaped_release_fields(
 ) -> String {
     match state {
         Some((open, head, labels))
-            if role == Role::Judge && backstop::ended_without_verdict(open, &labels) =>
+            if reason != crate::session_exec::refusal::SEAT_BUSY_REASON
+                && role == Role::Judge
+                && backstop::ended_without_verdict(open, &labels) =>
         {
             backstop::reaped_fields(&head, &labels, reason)
         }
@@ -98,34 +107,74 @@ pub(crate) fn reaped_release_fields(
     }
 }
 
-/// The `outcome=` field a Champion release records (#12616): the step's
-/// `CHAMPION-STEP` outcome word, or `none` when it wrote no line (a step that
-/// died). A merge leaves the release as it was. Anything but `[A-Za-z0-9_-]`
-/// is dropped so the word cannot break the marker.
-pub(crate) fn champion_outcome_fields(role: Role, outcome: Option<&str>) -> String {
-    if role != Role::Champion {
-        return String::new();
+/// The typed outcome a Champion release records (#12616), as the pair its
+/// marker's fields and the step's journal (#14639) both carry: the step's
+/// `CHAMPION-STEP` outcome word (`none` when it wrote no line — a step that
+/// died), and for a `requeued` / `skipped` outcome the gate it stopped at,
+/// `reason=<token>` (#12715; `unspecified` when it named none). Anything but
+/// `[A-Za-z0-9_-]` is dropped so the word cannot break the marker. `None`
+/// when this release records no typed outcome: another role, a promotion
+/// step, or a merge (the marker keeps only its identity).
+pub(crate) fn champion_outcome(
+    role: Role,
+    step: Option<StepRole>,
+    outcome: Option<&str>,
+    stop_reason: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    if role != Role::Champion || step == Some(StepRole::ChampionPromote) {
+        return None;
     }
-    let word: String = outcome
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        .take(32)
-        .collect();
+    let token = |raw: Option<&str>, max: usize| -> String {
+        raw.unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            .take(max)
+            .collect()
+    };
+    let word = token(outcome, 32);
     match word.as_str() {
-        "merged" => String::new(),
-        "" => " outcome=none".to_string(),
-        w => format!(" outcome={w}"),
+        "merged" => None,
+        "" => Some(("none".to_string(), None)),
+        w @ ("requeued" | "skipped") => {
+            let reason = token(stop_reason, 32);
+            let reason = if reason.is_empty() {
+                "unspecified"
+            } else {
+                &reason
+            };
+            Some((w.to_string(), Some(reason.to_string())))
+        }
+        w => Some((w.to_string(), None)),
+    }
+}
+
+/// The marker fields of [`champion_outcome`]'s pair.
+pub(crate) fn format_champion_outcome(word: &str, reason: Option<&str>) -> String {
+    match (word, reason) {
+        (w, Some(r)) => format!(" outcome={w} reason={r}"),
+        ("none", None) => " outcome=none".to_string(),
+        (w, None) => format!(" outcome={w}"),
     }
 }
 
 /// When the backstop's hold on this PR ends, from its trusted lease `rows`
 /// and its live `(open, head, labels)`; `None` when not held. Pure.
+#[cfg(test)]
 pub(crate) fn hold(
     rows: &[Row],
     state: Option<(bool, String, Vec<String>)>,
     now: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
+    hold_with_reason(rows, state, now).map(|(until, _)| until)
+}
+
+/// [`hold`] plus the gate-refusal token behind it, when the hold is the
+/// short cool-down of a gate-refused pass (#13135).
+pub(crate) fn hold_with_reason(
+    rows: &[Row],
+    state: Option<(bool, String, Vec<String>)>,
+    now: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, Option<String>)> {
     let (open, head, labels) = state?;
     if !open {
         return None;
@@ -134,7 +183,7 @@ pub(crate) fn hold(
         .iter()
         .filter_map(|r| backstop::parse(&r.body).map(|nv| (r.updated_at, nv)))
         .collect();
-    backstop::hold_until(&records, &head, &backstop::label_digest(&labels), now)
+    backstop::hold(&records, &head, &backstop::label_digest(&labels), now)
 }
 
 impl Ctx {
@@ -143,11 +192,19 @@ impl Ctx {
         if self.me.role != Role::Judge || !backstop::enabled() {
             return None;
         }
-        let until = hold(rows, self.gh.pr_head(self.pr()), (self.now)())?;
+        let (until, refused) = hold_with_reason(rows, self.gh.pr_head(self.pr()), (self.now)())?;
+        let why = match refused {
+            Some(token) => format!(
+                "the last pass was refused by a gate (`{token}`), not a looping pass (#13135)"
+            ),
+            None => "Judge passes at this head and label set already ended without a verdict \
+                     (#11855)"
+                .to_string(),
+        };
         self.say(&format!(
-            "BACKSTOP: Judge passes at this head and label set already ended without a verdict \
-             (#11855); held until {} — stand down, next PR (a push or label change releases \
-             it; {}=0 disables)",
+            "BACKSTOP: {why}; held until {} — stand down, next PR (a push or a change to the \
+             PR's `loom:*` label set releases it — removing and re-adding the same label does \
+             not; {}=0 disables)",
             until.to_rfc3339(),
             backstop::DISABLE_ENV
         ));
@@ -199,34 +256,44 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_busy_exit_does_not_stamp_a_judge_no_verdict() {
+        let waiting = ["loom:review-requested", "loom:reviewing"];
+        assert_eq!(reaped_release_fields(Role::Judge, state(&waiting), "seat_busy"), "");
+        assert!(
+            reaped_release_fields(Role::Judge, state(&waiting), "exited").contains("verdict=none")
+        );
+    }
+
+    #[test]
     fn only_a_judge_release_without_a_verdict_is_stamped() {
         let waiting = ["loom:review-requested", "loom:reviewing"];
-        let stamped = release_fields(Role::Judge, state(&waiting), |_| false);
+        let stamped = release_fields(Role::Judge, state(&waiting), None, |_| false);
         assert_eq!(stamped, format!(" head={HEAD} verdict=none labels=review-requested"));
-        assert_eq!(release_fields(Role::Doctor, state(&waiting), |_| false), "");
-        assert_eq!(release_fields(Role::Judge, state(&["loom:pr"]), |_| false), "");
-        assert_eq!(release_fields(Role::Judge, None, |_| false), "");
+        assert_eq!(release_fields(Role::Doctor, state(&waiting), None, |_| false), "");
+        assert_eq!(release_fields(Role::Judge, state(&["loom:pr"]), None, |_| false), "");
+        assert_eq!(release_fields(Role::Judge, None, None, |_| false), "");
     }
 
     #[test]
     fn a_pass_deferred_on_pending_checks_is_not_stamped() {
         let waiting = ["loom:review-requested", "loom:reviewing"];
         let mut asked = None;
-        let fields = release_fields(Role::Judge, state(&waiting), |head| {
+        let fields = release_fields(Role::Judge, state(&waiting), None, |head| {
             asked = Some(head.to_string());
             true
         });
         assert_eq!(fields, "");
         assert_eq!(asked.as_deref(), Some(HEAD));
         // Never asked when no record would be written anyway.
-        let fields = release_fields(Role::Judge, state(&["loom:pr"]), |_| panic!("asked"));
+        let fields = release_fields(Role::Judge, state(&["loom:pr"]), None, |_| panic!("asked"));
         assert_eq!(fields, "");
     }
 
     #[test]
     fn stamped_releases_hold_the_pr_and_plain_ones_do_not() {
         let now = Utc.with_ymd_and_hms(2026, 10, 14, 6, 0, 0).unwrap();
-        let fields = release_fields(Role::Judge, state(&["loom:review-requested"]), |_| false);
+        let fields =
+            release_fields(Role::Judge, state(&["loom:review-requested"]), None, |_| false);
         let earlier = now - chrono::Duration::minutes(10);
         let plain = [row(1, earlier, "")];
         assert_eq!(hold(&plain, state(&["loom:review-requested"]), now), None);

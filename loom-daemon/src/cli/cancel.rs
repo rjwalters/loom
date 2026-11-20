@@ -20,7 +20,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use loom_daemon::types::{Request, Response, SweepInfo, SweepState};
+use crate::types::{Request, Response, SweepInfo, SweepState};
 
 use super::common::{query_daemon_bounded, resolve_socket_path};
 use super::dispatch::resolve_cli_dispatch_workspace;
@@ -54,7 +54,7 @@ fn build_cancel_request(sweep_id: String, grace_secs: u64, workspace: Option<Str
 
 /// Pick the sweep to cancel for `--issue N` out of a `ListSweeps` result.
 ///
-/// Only **live** (`Running` / `Pending`) entries are candidates: terminal
+/// Only **live** (`Running`) entries are candidates: terminal
 /// entries linger in the registry for an hour after they exit
 /// (`TERMINAL_RETENTION_SECS`), and cancelling one of those would be a
 /// no-op ack that misleads the operator into thinking the sweep they can still
@@ -69,7 +69,7 @@ fn select_sweep_for_issue(sweeps: &[SweepInfo], issue: u32) -> Result<String, St
         .iter()
         // A step on the item is cancelled like its sweep would be (#11898).
         .filter(|info| info.kind.item_number() == Some(issue))
-        .filter(|info| matches!(info.state, SweepState::Running | SweepState::Pending))
+        .filter(|info| matches!(info.state, SweepState::Running))
         .collect();
     match live.as_slice() {
         [] => Err(format!(
@@ -95,15 +95,14 @@ fn select_sweep_for_issue(sweeps: &[SweepInfo], issue: u32) -> Result<String, St
 /// mode: the wire protocol stays exactly the one `cancel_sweep` already speaks,
 /// and there is no new server-side code path that could diverge from the MCP
 /// tool's.
-pub(crate) async fn handle_cancel_command(
+pub async fn handle_cancel_command(
     sweep_id: Option<String>,
     issue: Option<u32>,
     grace_secs: u64,
     workspace: Option<String>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let registry =
-        loom_daemon::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
+    let registry = crate::workspace_registry::WorkspaceRegistry::load_default().unwrap_or_default();
     let workspace = resolve_cli_dispatch_workspace(workspace, &cwd, &registry);
 
     let socket_path = resolve_socket_path()?;
@@ -216,8 +215,8 @@ mod cancel_tests {
     //! the same frame on the wire the MCP `cancel_sweep` tool does.
     use super::{build_cancel_request, select_sweep_for_issue, DEFAULT_CANCEL_GRACE_SECS};
     use crate::cli::common::query_daemon_bounded;
+    use crate::types::{Request, Response, SweepInfo, SweepKind, SweepState};
     use chrono::Utc;
-    use loom_daemon::types::{Request, Response, SweepInfo, SweepKind, SweepState};
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -241,7 +240,6 @@ mod cancel_tests {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         }
     }
 
@@ -325,7 +323,7 @@ mod cancel_tests {
     fn select_sweep_for_issue_refuses_to_guess_when_ambiguous() {
         let sweeps = vec![
             sweep("sweep-a", 4980, SweepState::Running),
-            sweep("sweep-b", 4980, SweepState::Pending),
+            sweep("sweep-b", 4980, SweepState::Running),
         ];
         let err = select_sweep_for_issue(&sweeps, 4980).unwrap_err();
         assert!(err.contains("refusing to guess"), "{err}");

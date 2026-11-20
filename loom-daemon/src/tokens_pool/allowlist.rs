@@ -143,17 +143,11 @@ fn validate_names(workspace: &Path, names: &[String]) -> Result<Vec<String>, Unk
     Ok(resolved)
 }
 
-/// Atomic same-directory write via a PID-suffixed temp file + rename (the
+/// Atomic same-directory write via [`crate::fs_util::write_atomic`] (the
 /// temp file lives beside `path` so the rename stays on one filesystem).
 pub(super) fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
-    let tmp = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
-    std::fs::write(&tmp, content).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    crate::fs_util::write_atomic(path, content.as_bytes(), crate::fs_util::AtomicOpts::default())
+        .map_err(|e| e.to_string())
 }
 
 /// Replace the allowlist with exactly `names` (validated). Returns the

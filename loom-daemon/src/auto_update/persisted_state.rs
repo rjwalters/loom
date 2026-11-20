@@ -84,7 +84,6 @@ use crate::observability::ops::liveness::{self, Fault};
 use crate::task_liveness::AUTO_UPDATE;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -123,6 +122,10 @@ pub struct PersistedState {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roll_attempt: Option<RollAttempt>,
+    /// #9736: last successful check and unapplied-release clocks. Absent in
+    /// older files (loads as `None`), so the schema version is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<super::freshness::FreshnessRecord>,
 }
 
 /// The settle gate's clocks, as wall-clock times.
@@ -210,14 +213,14 @@ pub fn store(path: &Path, state: &PersistedState) -> std::io::Result<()> {
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".auto_update_state.")
-        .suffix(".tmp")
-        .tempfile_in(dir)?;
-    tmp.write_all(&body)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    crate::fs_util::write_atomic(
+        path,
+        &body,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )?;
     // #10880 item 5: make the rename itself durable. Best-effort.
     report_dir_sync(dir, sync_dir(dir));
     Ok(())
@@ -324,6 +327,7 @@ impl AutoUpdateState {
             },
             floor_stall: self.floor.stall_state(),
             roll_attempt: self.attempt.record().cloned(),
+            freshness: Some(self.freshness.record()),
         }
     }
 
@@ -356,6 +360,12 @@ impl AutoUpdateState {
             .attempt
             .restore(saved.roll_attempt, now, now_utc, running);
         let floor = format!("{floor}{attempt}");
+        // #9736: also before the binary check. A restart of the same binary
+        // keeps a stale host's clocks; a different binary ends convergence.
+        if let Some(saved_freshness) = saved.freshness {
+            self.freshness
+                .restore(saved_freshness, now_utc, saved.binary == binary);
+        }
         if saved.binary != binary {
             return format!(
                 "settle clocks DROPPED because the binary changed ({} -> {binary}), i.e. a roll \

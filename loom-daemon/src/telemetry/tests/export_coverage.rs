@@ -36,46 +36,37 @@ fn pre_10196_record_decodes_with_empty_coverage() {
 
 #[test]
 fn exported_kinds_follow_the_registry_routing() {
-    let https = exported_kinds_for(&["https".to_string()]);
     let otlp = exported_kinds_for(&["otlp".to_string()]);
-    // native-only kinds never appear under otlp-only and vice versa.
-    assert!(https.iter().any(|k| k == "queue.snapshot"));
-    assert!(!otlp.iter().any(|k| k == "queue.snapshot"));
     assert!(otlp.iter().any(|k| k == "session.output"));
-    assert!(!https.iter().any(|k| k == "session.output"));
+    assert!(otlp.iter().any(|k| k == "sweep.outcome"));
     assert!(exported_kinds_for(&[]).is_empty());
     assert!(exported_kinds_for(&["bogus".to_string()]).is_empty());
+    // The retired HTTPS exporter name (#12813) carries nothing.
+    assert!(exported_kinds_for(&["https".to_string()]).is_empty());
 }
 
-/// Judge P1 on #10267: the exact `spawn_task_two_exporters_isolate_the_unbuildable_kind`
-/// shape — HTTPS started, OTLP rejected as misconfigured — must advertise only
-/// `https` and its kinds. A never-started sink in the coverage lists would let
-/// a replay reader read its silence as "nothing happened".
+/// A started OTLP sink next to a misconfigured one (here the retired `https`
+/// name) must advertise only what the started sink carries. A never-started
+/// sink in the coverage lists would let a replay reader read its silence as
+/// "nothing happened".
 #[test]
 fn coverage_excludes_misconfigured_exporters_in_a_mixed_configuration() {
     use crate::observability::ExportStatus;
     let now = chrono::Utc::now();
     let mut statuses = std::collections::BTreeMap::new();
     statuses.insert(
-        "https".to_string(),
-        ExportStatus::started("host-a", "https://ingest.example.com/v1/telemetry", "https", 30)
-            .snapshot(),
+        "otlp".to_string(),
+        ExportStatus::started("host-a", "http://127.0.0.1:4318", "otlp", 30).snapshot(),
     );
     statuses.insert(
-        "otlp".to_string(),
-        ExportStatus::misconfigured(
-            Some("http://127.0.0.1:4318".to_string()),
-            "failed to construct OTLP exporter: headers_file refused".to_string(),
-        )
-        .snapshot(),
+        "https".to_string(),
+        ExportStatus::misconfigured(None, "retired exporter".to_string()).snapshot(),
     );
 
     let (exporters, kinds) = export_coverage(&statuses, now);
-    assert_eq!(exporters, vec!["https".to_string()]);
-    assert_eq!(kinds, exported_kinds_for(&["https".to_string()]));
-    assert!(kinds.iter().any(|k| k == "queue.snapshot"));
-    // OTLP-only kinds must not be advertised by a sink that never ran.
-    assert!(!kinds.iter().any(|k| k == "session.output"));
+    assert_eq!(exporters, vec!["otlp".to_string()]);
+    assert_eq!(kinds, exported_kinds_for(&["otlp".to_string()]));
+    assert!(kinds.iter().any(|k| k == "session.output"));
 }
 
 #[test]

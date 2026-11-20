@@ -5,14 +5,13 @@
 //! Exit 0 = proceed (nothing printed); exit 1 = block, with the refusal on
 //! stdout. Any lookup failure exits 0: the guard fails open, like every other
 //! lookup-based preflight, and the real merge path remains the arbiter. The
-//! decision lives in [`loom_daemon::merge_pr::workflow_scope`].
+//! decision lives in [`crate::merge_pr::workflow_scope`].
 
+use crate::cmd_out::DEFAULT_TIMEOUT;
+use crate::forge_call_stats::ops::PR_DIFF_AND_FILES;
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::merge_pr::workflow_scope::{assess, touches_workflows, Verdict, SKIP_ENV};
 use anyhow::Result;
-use loom_daemon::cmd_out::DEFAULT_TIMEOUT;
-use loom_daemon::forge_call_stats::ops::PR_DIFF_AND_FILES;
-use loom_daemon::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
-use loom_daemon::merge_pr::workflow_scope::{assess, touches_workflows, Verdict, SKIP_ENV};
-use loom_daemon::script_helpers::run_gh;
 
 #[derive(clap::Args)]
 pub(crate) struct WorkflowScopeArgs {
@@ -55,7 +54,24 @@ impl WorkflowScopeArgs {
         if !touches_workflows(&files) {
             return Ok(()); // no scope lookup at all
         }
-        let user = run_gh(&["api", "-i", "user"], &cwd, false);
+        // The one asker-dependent read (#13744): `gh api -i user` reports the
+        // **asking** credential's own scopes, so it must run on the credential
+        // that will do the merge — the writer — never a reader App. Pinned
+        // through the facade's explicit, audited marker
+        // (`GhInvocation::writer_identity`), which `tests/writer_read_guard.rs`
+        // lists with this file and reason; it cannot go through
+        // `script_helpers::gh_read`, whose `reader_only()` ignores a writer
+        // pin by construction.
+        let user = GhInvocation::new(
+            Operation::new("merge_pr.workflow_scope_user"),
+            AccessIntent::Read,
+            GhTarget::None,
+            DEFAULT_TIMEOUT,
+        )
+        .writer_identity()
+        .args(["api", "-i", "user"])
+        .current_dir(&cwd)
+        .run();
         let Some(out) = user.ok_output() else {
             return Ok(());
         };

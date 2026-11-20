@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
 /// Resolve the daemon's IPC socket path exactly as the running daemon does in
 /// `main()`: honour `LOOM_SOCKET_PATH` (test override) first, else
@@ -26,11 +26,11 @@ pub(crate) fn resolve_socket_path() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
         return Ok(PathBuf::from(path));
     }
-    let default = crate::daemon_service::resolve_loom_dir()?.join("loom-daemon.sock");
+    let default = resolve_loom_dir()?.join("loom-daemon.sock");
     if default.exists() {
         return Ok(default);
     }
-    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    let pids = crate::daemon_install_state::pgrep_daemon_pids();
     Ok(pick_socket_path(
         default,
         pids.iter().filter_map(|&pid| daemon_env_socket_path(pid)),
@@ -77,7 +77,7 @@ pub(crate) fn socket_missing_hint(socket_path: &Path, pids: &[u32]) -> Option<St
 
 /// Print [`socket_missing_hint`] for the live dispatchers; true when printed.
 pub(crate) fn eprint_socket_missing_hint(socket_path: &Path) -> bool {
-    let pids = loom_daemon::daemon_install_state::pgrep_daemon_pids();
+    let pids = crate::daemon_install_state::pgrep_daemon_pids();
     match socket_missing_hint(socket_path, &pids) {
         Some(msg) => {
             eprintln!("{msg}");
@@ -128,6 +128,35 @@ pub(crate) async fn query_daemon_bounded(
     tokio::time::timeout(timeout, roundtrip)
         .await
         .map_err(|_| anyhow!("round-trip timed out after {}s", timeout.as_secs()))?
+}
+
+/// Handle the two daemon-failure arms shared by every CLI subcommand that
+/// sends one request and renders one reply (Issue #13912): a daemon-reported
+/// `Response::Error` and an unreachable daemon (`Err`). Both print their
+/// diagnostic to stderr and exit 1 — byte-identical to the arms this
+/// deduplicates, so user-visible output and exit codes are unchanged. Any
+/// other response is returned unwrapped for the caller to match its expected
+/// variants directly (no `Ok(...)` wrapper) with its own `other =>` catch-all
+/// printing "Unexpected response from daemon".
+///
+/// Deliberately does NOT fold in the install-state socket hint that
+/// `restart` special-cases (#4069): those arms are not verbatim copies of the
+/// five this helper serves, and unifying them would change stderr text.
+pub(crate) fn exit_on_daemon_failure(socket_path: &Path, result: Result<Response>) -> Response {
+    match result {
+        Ok(Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
+            eprintln!();
+            eprintln!("Is the daemon running? Start it with:");
+            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Default bounded ack budget for the `dispatch` subcommand (Issue #3952).
@@ -186,6 +215,17 @@ pub(crate) fn apply_ipc_timeout_env_floor(base: Duration) -> Duration {
         }
     }
     base
+}
+
+/// Resolve the loom directory (moved from `daemon_service` so the library CLI tree
+/// does not reach into the binary crate; `daemon_service` re-exports it).
+///
+/// Thin `Result` wrapper over [`crate::autonomy_marker::resolve_loom_dir`] —
+/// the single implementation of the rule (#13833). `None` (a socket path with
+/// no parent and no home directory) becomes one error.
+pub fn resolve_loom_dir() -> Result<PathBuf> {
+    crate::autonomy_marker::resolve_loom_dir()
+        .ok_or_else(|| anyhow!("no home directory and no resolvable LOOM_SOCKET_PATH parent"))
 }
 
 #[cfg(test)]

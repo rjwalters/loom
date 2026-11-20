@@ -10,8 +10,8 @@
 //! backward-compatible.
 use super::{build_status_json_value, render_role_agent_line};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::self_update::SelfUpdateStatus;
-use loom_daemon::types::DaemonStatusReport;
+use crate::self_update::SelfUpdateStatus;
+use crate::types::DaemonStatusReport;
 
 fn no_update() -> SelfUpdateStatus {
     SelfUpdateStatus {

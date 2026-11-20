@@ -442,23 +442,29 @@ pub struct SourceReport {
     pub adoption: Option<&'static str>,
 }
 
-impl SourceReport {
-    /// Add this report's fields to an evidence JSON object.
-    pub fn extend_evidence(&self, obj: &mut serde_json::Map<String, serde_json::Value>) {
-        obj.insert("source_commit".into(), self.source_commit.clone().into());
-        obj.insert("source_anchor".into(), self.source_anchor.clone().into());
-        obj.insert("source_check".into(), self.source_check.map(str::to_string).into());
-        obj.insert("adoption_record".into(), self.adoption.map(str::to_string).into());
-    }
-}
-
 pub struct GateInputs<'a> {
     pub slug: &'a str,
     pub tag: &'a str,
+    /// The release binary (`loom-daemon` or `loom-tools`): both ship per
+    /// triple under one tag, so the adoption record must tell them apart.
+    pub binary: &'a str,
     pub target: &'a str,
     pub asset_sha256: &'a str,
     pub anchor: &'a AnchorSetting,
     pub record_path: Option<&'a Path>,
+}
+
+impl GateInputs<'_> {
+    /// The adoption-record target. The daemon keeps the bare triple, so every
+    /// record written before `loom-tools` shipped stays valid; any other
+    /// binary is namespaced so its sha is not read as a replaced daemon asset.
+    fn record_target(&self) -> String {
+        if self.binary == super::fetch::DAEMON_BIN {
+            self.target.to_string()
+        } else {
+            format!("{}:{}", self.binary, self.target)
+        }
+    }
 }
 
 fn unavailable(why: &str, partial: SourceReport) -> Refusal {
@@ -523,8 +529,9 @@ fn asset_replaced(
     mismatch(
         RefusalClass::AssetReplaced,
         format!(
-            "Asset replacement detected: loom-daemon-{} for release {} now has sha256 {}, but \
+            "Asset replacement detected: {}-{} for release {} now has sha256 {}, but \
              this host adopted sha256 {was} (adoption record {}){when}.",
+            i.binary,
             i.target,
             i.tag,
             i.asset_sha256,
@@ -577,7 +584,10 @@ pub fn gate(api: &ApiFn<'_>, i: &GateInputs<'_>) -> Result<SourceReport, Refusal
             partial.adoption = Some("unavailable");
             unavailable(&e, partial.clone())
         })?;
-        match record.entries.get(&record_key(i.slug, i.tag, i.target)) {
+        match record
+            .entries
+            .get(&record_key(i.slug, i.tag, &i.record_target()))
+        {
             None => partial.adoption = Some("first_seen"),
             Some(prev) => {
                 if let (Some(was), Some(now)) = (prev.commit.as_deref(), commit.as_deref()) {
@@ -636,7 +646,7 @@ pub fn record_adoption(report: &SourceReport, i: &GateInputs<'_>) -> Result<(), 
     let entry = AdoptionEntry {
         slug: i.slug.to_string(),
         tag: i.tag.to_string(),
-        target: i.target.to_string(),
+        target: i.record_target(),
         commit: report.source_commit.clone(),
         asset_sha256: i.asset_sha256.to_string(),
     };

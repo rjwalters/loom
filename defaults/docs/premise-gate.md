@@ -119,6 +119,9 @@ Companion lines, in the **same** comment as the marker:
 - `premise-evidence: <path>[:line] — <what it asserts>`
 - `premise-searched: <path>` — what you read
 - `premise-extends: <why this extends rather than reverses>`
+- `premise-protected: none` — only under `hermit.reversalNeedsOperator:
+  "protected-only"` (see rule 1); otherwise names the protected class that
+  applies
 
 ### The rules, and what each one buys
 
@@ -129,6 +132,20 @@ is always allowed; *declining* to route is what needs a consistent story.
    This is the whole gate. #7855's Curator wrote, in prose, "it reverses the
    documented report-only design … the filing is the ruling" and proceeded. In
    this format that sentence does not parse.
+
+   **Opt-in exception (#13620).** `hermit.reversalNeedsOperator` in
+   `.loom/config.json` (or the fleet tier) is `"always"` (default) or
+   `"protected-only"`; any other value fails closed to `always`. Under
+   `protected-only`, and only for issues labelled `loom:hermit`, a record may be
+   `deliberate=yes reversal=yes verdict=clear` when it carries
+   `premise-protected: none` — the Hermit's attestation that no in-tree caller
+   exists and the target is outside the protected classes: attested/tier
+   evidence and append-only sim/measurement records; provenance or vendoring
+   attestations; the public API of a published package; infra state (IaC state,
+   moved/removed blocks); product-direction features. A record naming a class
+   in `premise-protected:` with `verdict=clear` is malformed (exit `12`), and a
+   missing line is unchanged. The class check is prose-attested, like
+   deliberateness itself; the parser cannot detect callers or classes.
 2. **`deliberate=yes` ⇒ at least one `premise-evidence:` citation that resolves
    against the tree.** A deliberateness claim with no locator is not evidence.
    #8310 was closed `premise-false` for exactly the citation half of this: a
@@ -214,7 +231,49 @@ that reads the rule, then files from a template that never mentions it.
 | `1` | **ERROR** — usage/precondition failure. **Fails closed**: treat as `10`, never as `0` |
 
 Stdout is `KEY=VALUE` lines: `SCOPE`, `TRIGGER`, `RECORD`, `VERDICT`, plus
-`REASON` on `12` and `SUMMARY` when a record parsed.
+`REASON` on `12` and `SUMMARY` when a record parsed. For a deliberate reversal
+routed to the operator it also prints `RESOLUTION=` (`approved`, `pending`,
+`stale`, `conflict`, `malformed`, `unreadable`, `unavailable`, `rejected`,
+`deferred` or `rescope`) with `RESOLUTION-REASON=`, and
+`RESOLUTION-OPTION=` when one verified.
+
+## After the operator chooses: the verified resolution (#14399)
+
+`deliberate=yes reversal=yes verdict=operator-decision` exits `11` until the
+operator's explicit choice is on the issue **and verifies**. The record is never
+rewritten; the gate reads the resolution beside it:
+
+```bash
+loom-daemon operator-decision resolve <N> --option <id> --release   # attended; see operator-decision.md
+./.loom/scripts/premise-check.sh --issue <N>                         # 0, RESOLUTION=approved
+```
+
+A verified `proceed` resolution of the *current* decision and proposal returns
+`0`, the same proceed result as any clear premise. Everything else leaves the
+reversal pending at `11`, with `RESOLUTION-REASON=` naming why:
+
+- no resolution, a **stale** one (decision, option text, proposal or issue
+  changed), **conflicting** ones, or an operator comment that does not parse;
+- a `reject`, `defer` or `rescope` choice: no proceed approval for this text;
+- the decision unreadable from the authoritative body;
+- no authoritative forge read: `--body-file` / `--record-file` reproductions
+  are offline, a pasted approval is only text, and they always stay at `11`
+  (`RESOLUTION=unavailable`). An unreadable comment listing is exit `1`.
+
+Only an **operator** author counts (non-App user, `OWNER`/`MEMBER`/
+`COLLABORATOR` or fleet admin). A recommending agent, a fleet App, a shared
+trusted-commenter entry, an ordinary comment, a copied marker, an un-park
+(`loom:operator` removal) or a hold-label change attests nothing. The
+resolution is consulted only after the premise record itself validates, so
+exit `12` and `13` are unchanged, a direct rewrite to `verdict=clear` is still
+`12`, and the `hermit.reversalNeedsOperator` exception behaves exactly as
+configured.
+
+**Curator and Champion use this one gate.** Curator runs it before enriching
+(exit `11` with `RESOLUTION=pending|stale|…` means routing, not enrichment).
+Champion runs it at the promotion boundary for a deliberate reversal and
+promotes only on `0`. Each keeps its own claim, review checks and promotion
+rules; the gate result is an input, not a promotion.
 
 ## What to do with each code
 
@@ -225,7 +284,10 @@ Stdout is `KEY=VALUE` lines: `SCOPE`, `TRIGGER`, `RECORD`, `VERDICT`, plus
    The `EVIDENCE-CANDIDATE=` lines the gate prints are the starting list.
 3. Post the record as a comment. Re-run the gate.
 
-**`11` — route it, do not enrich.**
+**`11` — route it, do not enrich.** First read `RESOLUTION=`: `pending` means
+route it as below; `stale` or `conflict` means the operator's choice no longer
+matches the text, so the decision is re-asked (or the stale comment deleted) with
+the original decision and record preserved, not requested twice for the same text.
 
 ```bash
 loom-daemon operator-decision apply <N> --input d.json   # writes the decision block, adds loom:operator

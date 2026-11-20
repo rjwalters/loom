@@ -35,6 +35,10 @@
 //! `2>/dev/null` suppressions inside the frozen function are not shaped like
 //! the port's `Stdio::null()` calls.
 
+mod common;
+
+use common::git;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -198,28 +202,7 @@ fn scenarios() -> Vec<Scenario> {
 // ---------------------------------------------------------------------------
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-branch-conflict-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmpdir");
-    fs::canonicalize(&base).expect("canonicalize tmpdir")
-}
-
-fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {args:?} in {repo:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    common::unique_tmpdir("loom-branch-conflict-diff", tag)
 }
 
 fn init_repo(path: &Path, on_branch: &str) {

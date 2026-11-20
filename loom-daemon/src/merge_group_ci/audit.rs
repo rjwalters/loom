@@ -49,6 +49,17 @@ pub enum Code {
     /// An `actions/checkout` step checks out something other than the
     /// merge-group commit (a PR head SHA, a fixed branch, an expression).
     NonMergeGroupCheckout,
+    /// A job runs `forge merge-queue group-check` with no `actions/checkout`
+    /// step: the status write is refused by `write_scope` (#9548) because the
+    /// runner holds no `.loom/` checkout of the target repository (#12568).
+    GroupCheckWithoutCheckout,
+    /// A job runs `forge merge-queue group-check` in a workflow that also has a
+    /// `workflow_run` trigger, but its job-level `if:` does not require both
+    /// that the triggering run was a `merge_group` run and that it came from
+    /// this repository. That gate is the workflow's only trust boundary: without
+    /// it a fork PR on a `gh-readonly-queue/*` branch reaches a `statuses: write`
+    /// token in base-repo context.
+    GroupCheckUngatedWorkflowRun,
     /// `cancel-in-progress` is (or may be) true on `merge_group`: a distinct
     /// commit's run could be cancelled.
     CancellingConcurrency,
@@ -74,6 +85,8 @@ impl Code {
             Code::UndeterminedCondition => "UNDETERMINED_CONDITION",
             Code::PrOnlyStep => "PR_ONLY_STEP",
             Code::NonMergeGroupCheckout => "NON_MERGE_GROUP_CHECKOUT",
+            Code::GroupCheckWithoutCheckout => "GROUP_CHECK_WITHOUT_CHECKOUT",
+            Code::GroupCheckUngatedWorkflowRun => "GROUP_CHECK_UNGATED_WORKFLOW_RUN",
             Code::CancellingConcurrency => "CANCELLING_CONCURRENCY",
             Code::SharedConcurrencyGroup => "SHARED_CONCURRENCY_GROUP",
             Code::MissingRequiredSuite => "MISSING_REQUIRED_SUITE",
@@ -209,6 +222,40 @@ pub(super) fn triggered(wf: &Workflow, event: Event) -> bool {
                 .is_none_or(|ts| ts.iter().any(|x| x == "checks_requested"))
         }),
     }
+}
+
+/// The two clauses a `group-check` job's `if:` must carry when its workflow has
+/// a `workflow_run` trigger. Compared after [`compact_expr`], so spacing, quote
+/// style and the `>-` folding of the YAML scalar do not matter.
+const GATE_RUN_EVENT: &str = "github.event.workflow_run.event=='merge_group'";
+const GATE_SAME_REPO: [&str; 2] = [
+    "github.event.workflow_run.head_repository.full_name==github.repository",
+    "github.repository==github.event.workflow_run.head_repository.full_name",
+];
+
+/// Drop all whitespace and `${{ }}` delimiters and unify quotes, so a clause
+/// can be found by substring regardless of how the YAML scalar was folded.
+fn compact_expr(src: &str) -> String {
+    src.replace("${{", "")
+        .replace("}}", "")
+        .replace('"', "'")
+        .split_whitespace()
+        .collect()
+}
+
+/// Which trust-gate clauses the job-level `if:` lacks (empty when intact).
+/// Substring matching, not evaluation: this is a one-guard check, and the
+/// `merge_group` disjunct that lets the direct trigger through is allowed.
+fn missing_workflow_run_gate(if_cond: Option<&str>) -> Vec<&'static str> {
+    let cond = compact_expr(if_cond.unwrap_or(""));
+    let mut missing = Vec::new();
+    if !cond.contains(GATE_RUN_EVENT) {
+        missing.push("`github.event.workflow_run.event == 'merge_group'`");
+    }
+    if !GATE_SAME_REPO.iter().any(|c| cond.contains(c)) {
+        missing.push("`github.event.workflow_run.head_repository.full_name == github.repository`");
+    }
+    missing
 }
 
 fn truth_state(t: Truth) -> RunState {
@@ -394,6 +441,45 @@ pub fn audit(
         if relied && mg_trigger {
             if let Some(c) = &wf.concurrency {
                 check_concurrency(c, wf, None, &WorkflowScope(&ctx.mg), &mut wf_findings);
+            }
+        }
+
+        if mg_trigger {
+            for job in &wf.jobs {
+                let group_check = job.steps.iter().find(|s| {
+                    s.run
+                        .as_deref()
+                        .is_some_and(|r| r.contains("merge-queue group-check"))
+                });
+                if let Some(step) = group_check {
+                    if !job.steps.iter().any(Step::is_checkout) {
+                        wf_findings.push(Finding {
+                            code: Code::GroupCheckWithoutCheckout,
+                            workflow: wf.file.clone(),
+                            job: Some(job.id.clone()),
+                            step: Some(step.label()),
+                            line: step.line,
+                            detail: "runs `forge merge-queue group-check` with no `actions/checkout` step; write_scope refuses the status write without a `.loom/` checkout of this repository, so `loom/merge-authorization` never posts".to_string(),
+                        });
+                    }
+                    if let Some(trigger) = wf.trigger("workflow_run") {
+                        let missing = missing_workflow_run_gate(job.if_cond.as_deref());
+                        if !missing.is_empty() {
+                            wf_findings.push(Finding {
+                                code: Code::GroupCheckUngatedWorkflowRun,
+                                workflow: wf.file.clone(),
+                                job: Some(job.id.clone()),
+                                step: Some(step.label()),
+                                line: job.line,
+                                detail: format!(
+                                    "the workflow has a `workflow_run` trigger (line {}) but the job-level `if:` is missing {}; a `workflow_run` runs in base-repo context with this job's write token, so a fork PR on a `gh-readonly-queue/*` branch could reach `forge.mergeQueue.statusCommand` (see defaults/docs/merge-queue-ci.md § Trust boundary)",
+                                    trigger.line,
+                                    missing.join(" and ")
+                                ),
+                            });
+                        }
+                    }
+                }
             }
         }
 

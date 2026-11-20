@@ -17,14 +17,17 @@
 
 use serde_json::Value;
 
-use super::authz::{GrantStore, REQUIRED_CHECK_CONTEXT};
+use super::authz::{DenyReason, GrantStore, REQUIRED_CHECK_CONTEXT};
 use super::gh_lifecycle::GhLifecycleForge;
 use super::group_authz::{
-    group_check, status_for, CheckState, GroupConclusion, MemberFacts, MergeGroup,
+    group_check, status_for, CheckState, GroupConclusion, MemberFacts, MergeGroup, StatusState,
     STATUS_DESCRIPTION_MAX,
 };
 use super::group_github::GroupForge;
 use crate::gh_invocation::AccessIntent;
+use crate::merge_pr::check_runs_rollup::{fail_stranded_rows, is_stranded_candidate};
+use crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord;
+use crate::telemetry::kinds::merge_queue_regime::{MergeQueueRegimeRecord, QueueRegime};
 
 /// What happened to one `group-check` run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,13 +52,54 @@ pub trait ContextStates {
     fn states(&self, commit: &str) -> Result<Vec<(String, CheckState)>, String>;
 }
 
+/// What one evaluation read, kept for its `merge.authorization.evaluated`
+/// record (#12666). Nothing here costs a forge call: each field is a value the
+/// evaluation already had.
+#[derive(Default)]
+struct Evidence {
+    /// `(entry the group was built for, member count)`; `None` when the group
+    /// was not found.
+    group: Option<(Option<u32>, usize)>,
+    /// The other required contexts' read; `None` when it was not made.
+    states: Option<Result<Vec<(String, CheckState)>, String>>,
+    /// The newest status on the commit was a `success` (read for the
+    /// repeat-write check); an unreadable one is `false`, never guessed.
+    prior_success: bool,
+}
+
 /// Evaluate and post the check for the merge group built at `commit`.
+///
+/// Emits one `merge.authorization.evaluated` record per call (#12666).
 pub fn run_group_check(
     store: &dyn GrantStore,
     forge: &dyn GroupForge,
     states: &dyn ContextStates,
     facts_for: &dyn Fn(u32) -> Result<MemberFacts, String>,
     commit: &str,
+) -> RunOutcome {
+    let mut evidence = Evidence::default();
+    let outcome = evaluate(store, forge, states, facts_for, commit, &mut evidence);
+    if let Some(record) = evaluation_record(
+        commit,
+        &outcome,
+        &evidence,
+        chrono::Utc::now(),
+        crate::telemetry::provenance::Provenance::current(),
+    ) {
+        crate::observability::ops::emit_record(
+            crate::telemetry::TelemetryRecord::MergeAuthorization(record),
+        );
+    }
+    outcome
+}
+
+fn evaluate(
+    store: &dyn GrantStore,
+    forge: &dyn GroupForge,
+    states: &dyn ContextStates,
+    facts_for: &dyn Fn(u32) -> Result<MemberFacts, String>,
+    commit: &str,
+    evidence: &mut Evidence,
 ) -> RunOutcome {
     let groups = match forge.groups() {
         Ok(g) => g,
@@ -65,7 +109,12 @@ pub fn run_group_check(
         .iter()
         .find(|g| g.commit.eq_ignore_ascii_case(commit))
     {
-        Some(g) => group_check(store, g, states.states(commit), facts_for),
+        Some(g) => {
+            let read = states.states(commit);
+            evidence.group = Some((g.members.last().map(|m| m.pr), g.members.len()));
+            evidence.states = Some(read.clone());
+            group_check(store, g, read, facts_for)
+        }
         None => {
             // Not a live group (rebuilt or dequeued): it must not authorize.
             let g = MergeGroup {
@@ -80,13 +129,89 @@ pub fn run_group_check(
     // call, and GitHub caps statuses per commit and context). An unreadable
     // newest status falls through to the write: never skip toward silence.
     let shown: String = desc.chars().take(STATUS_DESCRIPTION_MAX).collect();
-    if matches!(forge.latest_status(commit), Ok(Some((s, d))) if s == state && d == shown) {
+    let latest = forge.latest_status(commit);
+    evidence.prior_success = matches!(latest, Ok(Some((StatusState::Success, _))));
+    if matches!(latest, Ok(Some((s, d))) if s == state && d == shown) {
         return RunOutcome::Unchanged(conclusion);
     }
     match forge.post_status(commit, state, &desc) {
         Ok(()) => RunOutcome::Posted(conclusion),
         Err(e) => RunOutcome::PostFailed(conclusion, e),
     }
+}
+
+/// The `reason` token for a concluded evaluation. Pending is decided first so
+/// a waiting group is never reported as denied, stale or post-failed.
+fn reason_token(
+    conclusion: &GroupConclusion,
+    states_unreadable: bool,
+    write_failed: bool,
+    prior_success: bool,
+) -> &'static str {
+    match conclusion {
+        GroupConclusion::Pending(_) if states_unreadable => "pending-checks-unreadable",
+        GroupConclusion::Pending(_) => "pending-other-checks",
+        GroupConclusion::Success if write_failed => "status-post-failed",
+        GroupConclusion::Success => "authorized",
+        GroupConclusion::Failure(_) if prior_success => "stale-authorization",
+        GroupConclusion::Failure(why)
+            if matches!(why.as_slice(), [(0, DenyReason::Undeterminable(_))]) =>
+        {
+            "denied-membership-unknown"
+        }
+        GroupConclusion::Failure(_) => "denied",
+    }
+}
+
+/// The record for one evaluation, or `None` when the build provenance is not
+/// valid. Pure: every input is a fact the evaluation already read.
+fn evaluation_record(
+    commit: &str,
+    outcome: &RunOutcome,
+    evidence: &Evidence,
+    at: chrono::DateTime<chrono::Utc>,
+    loom: crate::telemetry::provenance::Provenance,
+) -> Option<MergeAuthorizationRecord> {
+    if !loom.is_valid() {
+        return None;
+    }
+    let (conclusion, write) = match outcome {
+        RunOutcome::Posted(c) => (Some(c), Some("posted")),
+        RunOutcome::Unchanged(c) => (Some(c), Some("unchanged")),
+        RunOutcome::PostFailed(c, _) => (Some(c), Some("failed")),
+        RunOutcome::Unreadable(_) => (None, None),
+    };
+    let states_unreadable = matches!(evidence.states, Some(Err(_)));
+    let reason = match conclusion {
+        Some(c) => {
+            reason_token(c, states_unreadable, write == Some("failed"), evidence.prior_success)
+        }
+        None => "groups-unreadable",
+    };
+    let count = |want: CheckState| -> Option<u32> {
+        let Some(Ok(list)) = &evidence.states else {
+            return None;
+        };
+        u32::try_from(list.iter().filter(|(_, s)| *s == want).count()).ok()
+    };
+    let total = match &evidence.states {
+        Some(Ok(list)) => u32::try_from(list.len()).ok(),
+        _ => None,
+    };
+    Some(MergeAuthorizationRecord {
+        commit: commit.to_string(),
+        reason: reason.to_string(),
+        pr: evidence.group.and_then(|(pr, _)| pr),
+        members: evidence.group.and_then(|(_, n)| u32::try_from(n).ok()),
+        status_write: write.map(str::to_string),
+        status_confirmed: write.map(|w| w != "failed"),
+        other_total: total,
+        other_success: count(CheckState::Success),
+        other_pending: count(CheckState::Pending),
+        other_failure: count(CheckState::Failure),
+        at,
+        loom,
+    })
 }
 
 fn rank(s: CheckState) -> u8 {
@@ -97,11 +222,16 @@ fn rank(s: CheckState) -> u8 {
     }
 }
 
-fn run_state(status: &str, conclusion: Option<&str>) -> CheckState {
-    match (status, conclusion) {
-        ("completed", Some("success" | "neutral" | "skipped")) => CheckState::Success,
-        ("completed", _) => CheckState::Failure,
-        _ => CheckState::Pending,
+/// One check-run object's state. Terminality is the shared
+/// [`is_settled`](crate::merge_pr::check_runs_rollup::is_settled) (#13764), so a
+/// finished run GitHub left at `status: in_progress` is not stuck `Pending`.
+fn run_state(run: &Value) -> CheckState {
+    if !crate::merge_pr::check_runs_rollup::is_settled(run) {
+        return CheckState::Pending;
+    }
+    match run.get("conclusion").and_then(Value::as_str) {
+        Some("success" | "neutral" | "skipped") => CheckState::Success,
+        _ => CheckState::Failure,
     }
 }
 
@@ -156,12 +286,7 @@ pub fn states_from(
             .iter()
             .filter(|r| r.get("name").and_then(Value::as_str) == Some(ctx))
             .max_by_key(|r| r.get("id").and_then(Value::as_u64).unwrap_or(0))
-            .map(|r| {
-                run_state(
-                    r.get("status").and_then(Value::as_str).unwrap_or(""),
-                    r.get("conclusion").and_then(Value::as_str),
-                )
-            });
+            .map(run_state);
         let st = sts
             .iter()
             .find(|s| s.get("context").and_then(Value::as_str) == Some(ctx))
@@ -177,6 +302,15 @@ pub fn states_from(
         out.push((ctx.clone(), state));
     }
     Ok(out)
+}
+
+/// Whether any row of a `check-runs` document could be stranded under a
+/// failed workflow run (non-terminal, with a check-suite id).
+fn has_stranded_candidate(check_runs: &Value) -> bool {
+    check_runs
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| rows.iter().any(is_stranded_candidate))
 }
 
 /// GitHub [`ContextStates`]: reads the commit's check runs and statuses for
@@ -203,9 +337,115 @@ impl ContextStates for GhContextStates<'_> {
             )?;
             serde_json::from_str(&text).map_err(|e| format!("{op}: unparseable: {e}"))
         };
-        let runs = get("merge_queue.check_runs", "check-runs")?;
+        let mut runs = get("merge_queue.check_runs", "check-runs")?;
         let sts = get("merge_queue.statuses", "status")?;
+        // A terminal-failed workflow run can leave its jobs' check runs queued
+        // for good (#14415, #14128); read as `Pending` they would hold a
+        // required context open where `forge wait-checks` already says RED.
+        // Best-effort and only when some row could be stranded: a failed read
+        // changes nothing, so the context stays `Pending` exactly as before.
+        if has_stranded_candidate(&runs) {
+            let url =
+                format!("repos/{}/actions/runs?head_sha={commit}&per_page=100", self.forge.nwo());
+            if let Ok(text) =
+                self.forge
+                    .ok("merge_queue.workflow_runs", AccessIntent::Read, &["api".into(), url])
+            {
+                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                    fail_stranded_rows(&mut runs, &payload, commit);
+                }
+            }
+        }
         states_from(&self.required, &runs, &sts)
+    }
+}
+
+/// The last regime seen per repository, in this process only (#12675). A
+/// restart re-emits once; nothing is persisted.
+static LAST_REGIME: std::sync::Mutex<Option<std::collections::HashMap<String, QueueRegime>>> =
+    std::sync::Mutex::new(None);
+
+/// Record `regime` for `nwo` in `last`; true when it differs from the last one
+/// seen (or is the first). Pure over its inputs.
+fn regime_changed(
+    last: &mut std::collections::HashMap<String, QueueRegime>,
+    nwo: &str,
+    regime: &QueueRegime,
+) -> bool {
+    if last.get(nwo) == Some(regime) {
+        return false;
+    }
+    last.insert(nwo.to_string(), regime.clone());
+    true
+}
+
+/// Emit a `merge.queue.regime` record when the regime read by this tick's
+/// preflight differs from the last one. No forge call: `regime` came from the
+/// read `tick_groups` already makes.
+fn emit_regime_on_change(nwo: &str, regime: QueueRegime) {
+    let changed = {
+        let mut guard = LAST_REGIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        regime_changed(guard.get_or_insert_with(Default::default), nwo, &regime)
+    };
+    if !changed {
+        return;
+    }
+    let loom = crate::telemetry::provenance::Provenance::current();
+    if !loom.is_valid() {
+        return;
+    }
+    crate::observability::ops::emit_record(crate::telemetry::TelemetryRecord::MergeQueueRegime(
+        MergeQueueRegimeRecord {
+            regime,
+            observed_at: chrono::Utc::now(),
+            loom,
+        },
+    ));
+}
+
+/// Repositories whose last rules-unreadable failure was already signalled as
+/// plan/billing, in this process only (cleared when the rules read again).
+static PLAN_GATE_SIGNALLED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+    std::sync::Mutex::new(None);
+
+/// Record a rules-read failure for `nwo`; true when it is a plan/billing gate
+/// that was not already signalled. A successful read (`err` None) or a non-plan
+/// failure re-arms the signal. Pure over `signalled`.
+fn plan_gate_newly_seen(
+    signalled: &mut std::collections::HashSet<String>,
+    nwo: &str,
+    err: Option<&str>,
+) -> bool {
+    match err {
+        Some(e) if crate::merge_pr::stale_checks::fetch::is_plan_gated(e) => {
+            signalled.insert(nwo.to_string())
+        }
+        _ => {
+            signalled.remove(nwo);
+            false
+        }
+    }
+}
+
+/// Once per change, say that the repo's rules are unreadable because of the
+/// GitHub plan or billing (an org-wide cause), not because of any one PR.
+/// Telemetry only; the caller still fails closed.
+pub(super) fn signal_rules_unreadable(nwo: &str, err: Option<&str>) {
+    let fresh = {
+        let mut guard = PLAN_GATE_SIGNALLED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        plan_gate_newly_seen(guard.get_or_insert_with(Default::default), nwo, err)
+    };
+    if fresh {
+        log::error!(
+            "loom.alert merge-queue.rules-unreadable cause=plan-or-billing repo={nwo}: GitHub \
+             refuses to read the rules on this repository (\"Upgrade to GitHub Pro or make this \
+             repository public\"); the org's plan or billing has lapsed. Failing closed: no \
+             enqueue, no direct merge."
+        );
     }
 }
 
@@ -216,9 +456,15 @@ impl ContextStates for GhContextStates<'_> {
 /// never runs.
 pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
     use super::grants::CommentGrantStore;
-    let required = match super::preflight::github_preflight(gh, &forge.nwo(), None) {
-        Ok(c) => c.required_checks,
+    let nwo = forge.nwo();
+    let required = match super::preflight::github_preflight(gh, &nwo, None) {
+        Ok(c) => {
+            emit_regime_on_change(&nwo, c.regime);
+            signal_rules_unreadable(&nwo, None);
+            c.required_checks
+        }
         Err(e) => {
+            signal_rules_unreadable(&nwo, Some(&e.to_string()));
             log::warn!("merge-queue: group pass skipped, required contexts unreadable: {e}");
             return;
         }
@@ -255,12 +501,32 @@ pub fn tick_groups(gh: &str, forge: &GhLifecycleForge) {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn plan_gate_signals_once_and_only_for_plan_gates() {
+        let gate = "HTTP 403: Upgrade to GitHub Pro or make this repository public to enable this feature.";
+        let mut seen = std::collections::HashSet::new();
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A successful read re-arms the signal.
+        assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", None));
+        assert!(super::plan_gate_newly_seen(&mut seen, "o/r", Some(gate)));
+        // A non-plan 403 (scope, rate limit) is never labelled plan/billing.
+        let mut seen = std::collections::HashSet::new();
+        for e in [
+            "HTTP 403: Resource not accessible by integration",
+            "HTTP 403: API rate limit exceeded",
+        ] {
+            assert!(!super::plan_gate_newly_seen(&mut seen, "o/r", Some(e)));
+        }
+    }
+
     use std::cell::RefCell;
 
     use super::super::authz::AuthzFacts;
     use super::super::authz::{Grant, MemoryGrantStore};
-    use super::super::group_authz::{Member, StatusApi, StatusState};
+    use super::super::group_authz::{Member, StatusApi};
     use super::*;
+    use crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord;
     use serde_json::json;
 
     const HA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -439,6 +705,216 @@ mod tests {
         assert_eq!(super::super::group_github::parse_latest_status(&json!([])).unwrap(), None);
     }
 
+    // ---- merge.authorization.evaluated (#12666) ----
+
+    fn provenance() -> crate::telemetry::provenance::Provenance {
+        crate::telemetry::provenance::Provenance {
+            version: "0.19.1".into(),
+            revision: "9d8e226ce0123456789abcdef0123456789abcde".into(),
+            tree_state: "clean".into(),
+            complete: true,
+        }
+    }
+
+    /// Run one evaluation and return the record built from what it read.
+    fn record_of(f: &Fake, st: &States, store: &MemoryGrantStore) -> MergeAuthorizationRecord {
+        record_with(f, st, store, &good)
+    }
+
+    fn record_with(
+        f: &Fake,
+        st: &States,
+        store: &MemoryGrantStore,
+        facts: &dyn Fn(u32) -> Result<MemberFacts, String>,
+    ) -> MergeAuthorizationRecord {
+        let mut evidence = Evidence::default();
+        let outcome = evaluate(store, f, st, facts, GC, &mut evidence);
+        evaluation_record(GC, &outcome, &evidence, chrono::Utc::now(), provenance()).unwrap()
+    }
+
+    #[test]
+    fn authorized_is_confirmed_and_counts_the_other_contexts() {
+        let f = fake(Ok(vec![group()]), true);
+        let r = record_of(&f, &ci(CheckState::Success), &granted());
+        assert_eq!(r.reason, "authorized");
+        assert_eq!(r.pr, Some(1));
+        assert_eq!(r.members, Some(1));
+        assert_eq!(r.status_write.as_deref(), Some("posted"));
+        assert_eq!(r.status_confirmed, Some(true));
+        assert_eq!((r.other_total, r.other_success), (Some(1), Some(1)));
+        assert_eq!((r.other_pending, r.other_failure), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn waiting_on_other_checks_is_pending_even_if_the_write_fails() {
+        for post_ok in [true, false] {
+            let f = fake(Ok(vec![group()]), post_ok);
+            let r = record_of(&f, &ci(CheckState::Pending), &granted());
+            assert_eq!(r.reason, "pending-other-checks");
+            assert_eq!(r.other_pending, Some(1));
+            assert_eq!(r.status_confirmed, Some(post_ok));
+        }
+        // A prior success is not stale while the group is merely waiting.
+        let mut f = fake(Ok(vec![group()]), true);
+        f.latest = Ok(Some((StatusState::Success, "authorized".into())));
+        let r = record_of(&f, &ci(CheckState::Pending), &granted());
+        assert_eq!(r.reason, "pending-other-checks");
+    }
+
+    #[test]
+    fn unreadable_other_checks_have_their_own_token_and_no_counts() {
+        let f = fake(Ok(vec![group()]), true);
+        let r = record_of(&f, &States(Err("down".into())), &granted());
+        assert_eq!(r.reason, "pending-checks-unreadable");
+        assert_eq!(r.other_total, None);
+        assert_eq!(r.other_success, None);
+    }
+
+    #[test]
+    fn a_denied_member_is_denied() {
+        let s = granted();
+        s.revoke(1).unwrap();
+        let f = fake(Ok(vec![group()]), true);
+        let r = record_of(&f, &ci(CheckState::Success), &s);
+        assert_eq!(r.reason, "denied");
+        assert_eq!(r.status_confirmed, Some(true));
+    }
+
+    #[test]
+    fn an_unfound_group_is_membership_unknown_and_omits_group_facts() {
+        let f = fake(Ok(vec![]), true);
+        let r = record_of(&f, &ci(CheckState::Success), &granted());
+        assert_eq!(r.reason, "denied-membership-unknown");
+        assert_eq!((r.pr, r.members, r.other_total), (None, None, None));
+    }
+
+    #[test]
+    fn an_unconfirmed_success_write_is_status_post_failed() {
+        let f = fake(Ok(vec![group()]), false);
+        let r = record_of(&f, &ci(CheckState::Success), &granted());
+        assert_eq!(r.reason, "status-post-failed");
+        assert_eq!(r.status_write.as_deref(), Some("failed"));
+        assert_eq!(r.status_confirmed, Some(false));
+    }
+
+    #[test]
+    fn a_failure_over_a_prior_success_is_stale_authorization() {
+        let s = granted();
+        s.revoke(1).unwrap();
+        let mut f = fake(Ok(vec![group()]), true);
+        f.latest = Ok(Some((StatusState::Success, "authorized".into())));
+        let r = record_of(&f, &ci(CheckState::Success), &s);
+        assert_eq!(r.reason, "stale-authorization");
+        // An unreadable newest status is never guessed into `stale`.
+        f.latest = Err("statuses api down".into());
+        let r = record_of(&f, &ci(CheckState::Success), &s);
+        assert_eq!(r.reason, "denied");
+    }
+
+    #[test]
+    fn an_identical_status_already_present_is_unchanged_and_confirmed() {
+        let mut f = fake(Ok(vec![group()]), true);
+        f.latest = Ok(Some((StatusState::Success, "authorized".into())));
+        let r = record_of(&f, &ci(CheckState::Success), &granted());
+        assert_eq!(r.reason, "authorized");
+        assert_eq!(r.status_write.as_deref(), Some("unchanged"));
+        assert_eq!(r.status_confirmed, Some(true));
+    }
+
+    #[test]
+    fn unreadable_groups_conclude_nothing() {
+        let f = fake(Err("graphql 502".into()), true);
+        let r = record_of(&f, &ci(CheckState::Success), &granted());
+        assert_eq!(r.reason, "groups-unreadable");
+        assert_eq!((r.status_write, r.status_confirmed), (None, None));
+        assert_eq!((r.pr, r.members, r.other_total), (None, None, None));
+    }
+
+    #[test]
+    fn every_token_is_in_the_closed_set() {
+        use crate::telemetry::kinds::merge_authorization::REASONS;
+        let s = granted();
+        s.revoke(1).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for (f, st, store) in [
+            (fake(Ok(vec![group()]), true), ci(CheckState::Success), granted()),
+            (fake(Ok(vec![group()]), true), ci(CheckState::Pending), granted()),
+            (fake(Ok(vec![group()]), true), States(Err("x".into())), granted()),
+            (fake(Ok(vec![group()]), true), ci(CheckState::Success), s),
+            (fake(Ok(vec![]), true), ci(CheckState::Success), granted()),
+            (fake(Ok(vec![group()]), false), ci(CheckState::Success), granted()),
+            (fake(Err("x".into()), true), ci(CheckState::Success), granted()),
+        ] {
+            seen.insert(record_of(&f, &st, &store).reason);
+        }
+        let mut stale = fake(Ok(vec![group()]), true);
+        stale.latest = Ok(Some((StatusState::Success, "authorized".into())));
+        let revoked = granted();
+        revoked.revoke(1).unwrap();
+        seen.insert(record_of(&stale, &ci(CheckState::Success), &revoked).reason);
+        for r in &seen {
+            assert!(REASONS.contains(&r.as_str()), "{r}");
+        }
+        assert_eq!(seen.len(), REASONS.len(), "{seen:?}");
+    }
+
+    #[test]
+    fn invalid_provenance_is_not_exported() {
+        let f = fake(Ok(vec![group()]), true);
+        let mut evidence = Evidence::default();
+        let o = evaluate(&granted(), &f, &ci(CheckState::Success), &good, GC, &mut evidence);
+        let mut bad = provenance();
+        bad.revision = String::new();
+        assert!(evaluation_record(GC, &o, &evidence, chrono::Utc::now(), bad).is_none());
+    }
+
+    #[test]
+    fn one_record_per_call_and_no_extra_forge_reads() {
+        use std::cell::Cell;
+        struct Counting<'a> {
+            inner: &'a Fake,
+            latest: Cell<u32>,
+        }
+        impl StatusApi for Counting<'_> {
+            fn post_status(&self, c: &str, s: StatusState, d: &str) -> Result<(), String> {
+                self.inner.post_status(c, s, d)
+            }
+        }
+        impl GroupForge for Counting<'_> {
+            fn groups(&self) -> Result<Vec<MergeGroup>, String> {
+                self.inner.groups()
+            }
+            fn latest_status(&self, c: &str) -> Result<Option<(StatusState, String)>, String> {
+                self.latest.set(self.latest.get() + 1);
+                self.inner.latest_status(c)
+            }
+        }
+        struct CountingStates(Cell<u32>);
+        impl ContextStates for CountingStates {
+            fn states(&self, _c: &str) -> Result<Vec<(String, CheckState)>, String> {
+                self.0.set(self.0.get() + 1);
+                Ok(vec![("ci".into(), CheckState::Success)])
+            }
+        }
+        let inner = fake(Ok(vec![group()]), true);
+        let f = Counting {
+            inner: &inner,
+            latest: Cell::new(0),
+        };
+        let st = CountingStates(Cell::new(0));
+        let (_, emitted) = crate::observability::ops::capture::capture(|| {
+            run_group_check(&granted(), &f, &st, &good, GC)
+        });
+        assert_eq!((f.latest.get(), st.0.get()), (1, 1));
+        let n = emitted
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::telemetry::TelemetryRecord::MergeAuthorization(_)))
+            .count();
+        // Exactly one, or none when the test build has no valid provenance.
+        assert!(n <= 1, "{n}");
+    }
+
     fn req() -> Vec<String> {
         vec!["ci".into(), REQUIRED_CHECK_CONTEXT.into()]
     }
@@ -470,11 +946,88 @@ mod tests {
     }
 
     #[test]
+    fn states_settled_in_progress_run_is_terminal() {
+        let st = json!({"total_count": 0, "statuses": []});
+        let state = |run: serde_json::Value| {
+            let runs = json!({"total_count": 1, "check_runs": [run]});
+            states_from(&req(), &runs, &st).unwrap()[0].1
+        };
+        let base = |conclusion: serde_json::Value, completed_at: serde_json::Value| {
+            json!({"id": 1, "name": "ci", "status": "in_progress",
+                   "conclusion": conclusion, "completed_at": completed_at})
+        };
+        let done = json!("2026-11-11T00:00:00Z");
+        assert_eq!(state(base(json!("success"), done.clone())), CheckState::Success);
+        assert_eq!(state(base(json!("failure"), done.clone())), CheckState::Failure);
+        assert_eq!(state(base(json!(null), json!(null))), CheckState::Pending);
+        assert_eq!(state(base(json!(null), done)), CheckState::Pending);
+        assert_eq!(state(base(json!("success"), json!(null))), CheckState::Pending);
+    }
+
+    #[test]
+    fn a_stranded_required_context_is_failure_not_pending() {
+        // #14415: the failed run's jobs stay queued for good; once the shared
+        // attribution rewrites them, the required context reads Failure — the
+        // verdict `forge wait-checks` already gives — instead of Pending.
+        let sha = "5f72ee5c0926e69e278a65d5a36b1a561198591b";
+        let mut runs = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "queued", "conclusion": null,
+             "check_suite": {"id": 9}}]});
+        let st = json!({"total_count": 0, "statuses": []});
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Pending);
+        assert!(has_stranded_candidate(&runs));
+        let wf = json!({"total_count": 1, "workflow_runs": [
+            {"id": 5, "workflow_id": 7, "check_suite_id": 9, "event": "merge_group",
+             "head_sha": sha, "created_at": "2026-11-18T10:00:00Z",
+             "status": "completed", "conclusion": "startup_failure", "pull_requests": []}]});
+        assert_eq!(fail_stranded_rows(&mut runs, &wf, sha), 1);
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Failure);
+        // A runs payload that cannot be read leaves the context Pending.
+        let mut runs = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "queued", "conclusion": null,
+             "check_suite": {"id": 9}}]});
+        assert_eq!(
+            fail_stranded_rows(&mut runs, &json!({"total_count": 3, "workflow_runs": []}), sha),
+            0
+        );
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Pending);
+        // A settled-only listing never needs the extra read.
+        let settled = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "completed", "conclusion": "success",
+             "check_suite": {"id": 9}}]});
+        assert!(!has_stranded_candidate(&settled));
+    }
+
+    #[test]
     fn truncated_listing_is_an_error() {
         let runs = json!({"total_count": 150, "check_runs": [
             {"id": 1, "name": "ci", "status": "completed", "conclusion": "success"}]});
         let st = json!({"total_count": 0, "statuses": []});
         assert!(states_from(&req(), &runs, &st).is_err());
         assert!(states_from(&req(), &json!({}), &st).is_err());
+    }
+
+    fn regime(max: u64) -> QueueRegime {
+        QueueRegime {
+            max_entries_to_build: Some(max),
+            ..QueueRegime::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_regime_emits_nothing() {
+        let mut last = std::collections::HashMap::new();
+        assert!(regime_changed(&mut last, "o/r", &regime(5)), "first observation emits");
+        assert!(!regime_changed(&mut last, "o/r", &regime(5)), "unchanged regime emits nothing");
+        assert!(!regime_changed(&mut last, "o/r", &regime(5)));
+    }
+
+    #[test]
+    fn a_changed_regime_emits_again_and_repos_are_independent() {
+        let mut last = std::collections::HashMap::new();
+        assert!(regime_changed(&mut last, "o/r", &regime(5)));
+        assert!(regime_changed(&mut last, "o/r", &regime(3)));
+        assert!(!regime_changed(&mut last, "o/r", &regime(3)));
+        assert!(regime_changed(&mut last, "o/other", &regime(3)));
     }
 }

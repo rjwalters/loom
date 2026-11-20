@@ -524,22 +524,6 @@ fn dead_daemon_exits_two_and_marks_other_sections_unknown() {
 // Observability section (#4830)
 // ===================================================================
 
-/// An inputs fixture whose daemon has confirmed a host-identity mismatch —
-/// the live 2026-07-31 shape (the Studio's key bound to `robb-pro`).
-fn mismatched_inputs(age_secs: i64) -> HealthInputs {
-    let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = Some(crate::types::ObservabilityHostIdMismatch {
-        daemon_host_id: "robb-studio".to_string(),
-        ingest_host_id: "robb-pro".to_string(),
-        first_seen_at: now() - chrono::Duration::seconds(age_secs),
-    });
-    inputs
-}
-
 #[test]
 fn no_observability_section_when_the_host_ids_agree() {
     // AC: "no behavior change when they match" — a healthy daemon's report
@@ -556,11 +540,7 @@ fn no_observability_section_for_a_disabled_or_keyless_exporter() {
     // `None` on the wire — indistinguishable, by design, from "enabled and
     // correctly bound".
     let mut inputs = healthy_inputs();
-    inputs
-        .status
-        .as_mut()
-        .unwrap()
-        .observability_host_id_mismatch = None;
+    inputs.status.as_mut().unwrap().observability_export = None;
     assert!(assess_observability(&inputs).is_none());
 }
 
@@ -569,23 +549,6 @@ fn no_observability_section_when_the_daemon_is_unreachable() {
     let mut inputs = healthy_inputs();
     inputs.status = None;
     assert!(assess_observability(&inputs).is_none());
-}
-
-#[test]
-fn a_host_id_mismatch_is_a_degraded_observability_note() {
-    let report = assess(&mismatched_inputs(3600));
-    let section = report.section("observability").expect("section present");
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(
-        section.summary.contains("robb-pro") && section.summary.contains("robb-studio"),
-        "the note must name BOTH identities: {}",
-        section.summary
-    );
-    assert_eq!(section.detail["daemon_host_id"], "robb-studio");
-    assert_eq!(section.detail["ingest_host_id"], "robb-pro");
-    assert_eq!(section.detail["first_seen_age_secs"], 3600);
-    assert_eq!(report.overall, Verdict::Degraded);
-    assert_eq!(report.exit_code(), EXIT_DEGRADED);
 }
 
 // ===================================================================
@@ -1025,6 +988,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/loom"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1034,6 +998,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1058,6 +1023,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
         crate::types::RepoStatus {
             root: PathBuf::from("/repos/anvil"),
             maintain_only: None,
+            installed_behind: None,
             weight: crate::workspace_registry::default_weight(),
             in_flight_count: 0,
             health_gate_halted: false,
@@ -1067,6 +1033,7 @@ fn tokens_degraded_when_a_registered_repos_own_ranking_is_stale_even_if_the_anch
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,
@@ -1129,6 +1096,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
     status.per_repo = vec![crate::types::RepoStatus {
         root: PathBuf::from("/repos/never-bootstrapped"),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1138,6 +1106,7 @@ fn tokens_per_repo_missing_ranking_counts_as_affected() {
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -1567,6 +1536,7 @@ fn role_liveness_repo_with_intervals(
     crate::types::RepoStatus {
         root: PathBuf::from(root),
         maintain_only: None,
+        installed_behind: None,
         weight: crate::workspace_registry::default_weight(),
         in_flight_count: 0,
         health_gate_halted: false,
@@ -1576,6 +1546,7 @@ fn role_liveness_repo_with_intervals(
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -2332,164 +2303,6 @@ fn an_empty_fleet_is_green_not_unknown() {
 }
 
 // ===================================================================
-// Peer-coordination section (Issue #6157)
-// ===================================================================
-
-#[test]
-fn peer_coordination_is_green_when_safehouse_not_configured() {
-    // `healthy_inputs()` carries no `safehouse`/`peer_claims` at all —
-    // the common single-host / non-fleet case.
-    let section = assess_peer_coordination(&healthy_inputs());
-    assert_eq!(section.verdict, Verdict::Green);
-    assert!(section.summary.contains("not configured"));
-}
-
-#[test]
-fn peer_coordination_is_green_when_receiving_normally() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 1800,
-        expired: 12,
-        dispatch_skipped: 4,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth::default(),
-        claims_room: Some("!claims:example.org".to_string()),
-        same_issue_collisions: 0,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Green);
-    assert!(section.summary.contains("1800 received"));
-    assert!(section.summary.contains("2510 advertised"));
-    // Issue #6242: the resolved claims room is visible in the summary
-    // so two hosts' `health` output makes a mismatch a one-line diff.
-    assert!(section.summary.contains("!claims:example.org"));
-    assert_eq!(section.detail["claims_room"], serde_json::json!("!claims:example.org"));
-    // Issue #6243: the counter is always present in the JSON detail (the
-    // machine-readable surface the 24h observation reads) …
-    assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(0));
-    // … but a ZERO count must NOT appear in the human summary, so the
-    // pre-#6243 wording is byte-for-byte unchanged for a healthy fleet.
-    assert!(!section.summary.contains("#6243"));
-}
-
-/// Issue #6243: a NON-zero same-issue cross-host claim count is surfaced
-/// in the human-readable summary too — an operator running the 24h
-/// verification must not have to reach for `--json` to see the fleet is
-/// colliding. The verdict itself is deliberately unchanged (still Green):
-/// this section's verdict answers #6157's mesh-liveness question, and
-/// building a collision-rate verdict is #6242's scope.
-#[test]
-fn peer_coordination_surfaces_a_nonzero_same_issue_collision_count() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 1800,
-        expired: 12,
-        dispatch_skipped: 4,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth::default(),
-        claims_room: Some("!claims:example.org".to_string()),
-        same_issue_collisions: 3,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Green, "the counter must not change the verdict");
-    assert!(
-        section
-            .summary
-            .contains("3 same-issue cross-host claim(s) in 24h"),
-        "summary must name the non-zero count, got: {}",
-        section.summary
-    );
-    assert_eq!(section.detail["same_issue_collisions_24h"], serde_json::json!(3));
-}
-
-/// The 2026-08-13 incident's exact signature: `received=0` while
-/// `advertised>0` for hours, on every host — must report DEGRADED, not
-/// silently Green.
-#[test]
-fn peer_coordination_is_degraded_when_coordination_reports_degraded() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "connected".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: Some("loom-fleet".to_string()),
-        reason: None,
-    });
-    inputs.status.as_mut().unwrap().peer_claims = Some(crate::types::PeerClaimStatus {
-        self_host: "robb-studio".to_string(),
-        ttl_secs: 120,
-        entries: vec![],
-        advertised: 2510,
-        received: 0,
-        expired: 0,
-        dispatch_skipped: 0,
-        advertise_rejected: 0,
-        coordination: crate::types::PeerCoordinationHealth {
-            degraded: true,
-            degraded_for_secs: Some(9000),
-            consecutive_receives_toward_recovery: 0,
-            recovery_threshold: 3,
-            reason: None,
-        },
-        claims_room: None,
-        same_issue_collisions: 0,
-    });
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(section.summary.contains("DEGRADED"));
-    assert!(section.summary.contains("0 received"));
-    // Issue #6242: a host with no resolvable room (edge case — safehouse
-    // enabled but no `rooms`/legacy `room` configured at all) renders
-    // "none", not a missing field or an empty string.
-    assert!(section.summary.contains("room: none"));
-    assert_eq!(section.detail["claims_room"], serde_json::json!(null));
-    assert_eq!(assess(&inputs).exit_code(), EXIT_DEGRADED);
-}
-
-#[test]
-fn peer_coordination_is_degraded_when_safehouse_socket_unreachable() {
-    let mut inputs = healthy_inputs();
-    inputs.status.as_mut().unwrap().safehouse = Some(crate::types::SafehouseStatus {
-        state: "unreachable".to_string(),
-        socket: Some(PathBuf::from("/tmp/safehoused.sock")),
-        room: None,
-        reason: None,
-    });
-    // No `peer_claims` yet (the coordination task never got established)
-    // — the socket-unreachable check must fire regardless.
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Degraded);
-    assert!(section.summary.contains("unreachable"));
-}
-
-#[test]
-fn peer_coordination_unknown_without_status() {
-    let mut inputs = healthy_inputs();
-    inputs.status = None;
-    let section = assess_peer_coordination(&inputs);
-    assert_eq!(section.verdict, Verdict::Unknown);
-}
-
-// ===================================================================
 // --since parsing / formatting
 // ===================================================================
 
@@ -2887,14 +2700,13 @@ fn worktree_reaper_is_unknown_without_a_status_round_trip() {
 mod section_inventory;
 
 // Wrong-repo-resolution escalation coverage (Issue #8513) — its own child
-// module so this file, already over `.loom/docs/file-size-policy.md`'s
-// threshold, does not grow to hold it.
+// module.
+mod auto_update_freshness;
 mod auto_update_stale_repo;
 
 #[cfg(test)]
 mod model_class_tests;
 
-// Export-liveness coverage (#5083, #5337, #9015) — moved out of this file for
-// the same reason as the two modules above: it is over
-// `.loom/docs/file-size-policy.md`'s threshold and may not grow.
+// Export-liveness coverage (#5083, #5337, #9015) — its own child module, like
+// the two modules above.
 mod observability_export;

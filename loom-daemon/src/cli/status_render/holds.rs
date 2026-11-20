@@ -12,7 +12,7 @@
 //! `status_render::print_status_human` prints whatever comes back, in order,
 //! at the position the #7590 block used to occupy.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// Every stalled-activity warning line this report implies, in print order:
 /// backed-off worktree removals first (#7590), then held token pools
@@ -94,8 +94,8 @@ fn render_pool_hold_lines(report: &DaemonStatusReport) -> Vec<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{render_lines, render_pool_hold_lines};
+    use crate::types::{DaemonStatusReport, PoolExhaustionHoldStatus, StuckWorktreeReclaim};
     use chrono::{Duration, TimeZone, Utc};
-    use loom_daemon::types::{DaemonStatusReport, PoolExhaustionHoldStatus, StuckWorktreeReclaim};
     use std::path::PathBuf;
 
     fn now() -> chrono::DateTime<Utc> {

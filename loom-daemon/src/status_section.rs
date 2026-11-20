@@ -55,7 +55,6 @@ pub enum StatusSection {
     RoleAgents,
     PreflightAdvisory,
     Observability,
-    ForgeEvents,
     DeepClean,
     DynamicCap,
     Capacity,
@@ -77,8 +76,8 @@ pub enum StatusSection {
     RateLimitBreaker,
     ForgeCalls,
     Safehouse,
-    PeerClaims,
     Protection,
+    AgentResidue,
     JournalAdoptedAtStartup,
     FleetStore,
     PendingRestart,
@@ -131,13 +130,11 @@ impl StatusSection {
             S::Observability => (
                 "observability",
                 &[
-                    "observability_host_id_mismatch",
                     "observability_export",
                     "observability_exports",
                     "otlp_export",
                 ],
             ),
-            S::ForgeEvents => ("forge_events", &["forge_events"]),
             S::DeepClean => ("deep_clean", &["deep_clean"]),
             S::DynamicCap => ("dynamic_cap", &["dynamic_cap"]),
             S::Capacity => ("capacity", &["capacity"]),
@@ -161,8 +158,8 @@ impl StatusSection {
             S::RateLimitBreaker => ("rate_limit_breaker", &["rate_limit_breaker"]),
             S::ForgeCalls => ("forge_calls", &["forge_calls"]),
             S::Safehouse => ("safehouse", &["safehouse"]),
-            S::PeerClaims => ("peer_claims", &["peer_claims"]),
             S::Protection => ("protection", &["protection"]),
+            S::AgentResidue => ("agent_residue", &["agent_residue"]),
             S::JournalAdoptedAtStartup => {
                 ("journal_adopted_at_startup", &["journal_adopted_at_startup"])
             }

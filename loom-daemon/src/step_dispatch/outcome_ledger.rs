@@ -19,6 +19,7 @@
 //! | any other `noop` | [`Effect::Cooldown`] for [`LedgerConfig::noop_cooldown`], per `(item, step)` |
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
 //! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]); a **second** one in a row arms a cooldown (below) |
+//! | `refused`, reason `provider_exhausted` ([`PROVIDER_EXHAUSTED`], #13966) | [`Effect::Uncharged`]: nothing, however many in a row |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`]; a **second identical** one in a row arms a cooldown (below) |
 //! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
 //! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
@@ -27,7 +28,8 @@
 //!
 //! Champion's other outcomes fold as: `merged`, `rejected`, `promoted`,
 //! `revise`, `operator`, `closed`, and a `--pr` triage's `triaged`,
-//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` → `noop`;
+//! `triage-blocked`, `triage-operator` (#12499) → `verdict`; `requeued` and
+//! `skipped` (a stop before Step 2, #12715) → `noop`;
 //! `head-moved`, `not-eligible` → `refused` (a state refusal); `failed` →
 //! `failed`.
 //!
@@ -41,14 +43,32 @@
 //! second state refusal of the same `(item, step)` with the **same reason**,
 //! with no other outcome in between, arms [`LedgerConfig::refusal_cooldown`]
 //! (10 min), doubling per further identical refusal up to
-//! [`MAX_SHORT_COOLDOWN`], broadcast like every window. A verdict or any
-//! other outcome on the pair resets the streak.
+//! [`MAX_SHORT_COOLDOWN`]. Unlike every other window this one is host-local,
+//! not broadcast (#11909): a refusal is this host's own (its exhausted pool,
+//! its claim race, its runtime or model pin) and says nothing about a peer's.
+//! A verdict or any other outcome on the pair resets the streak.
 //!
 //! `claim_lost` rides the same streak guard (#11969): one lost claim is a
 //! race and only redraws, but a pair whose claim is lost on every draw (a
 //! peer or an attended session holding it for longer than a tick) would
 //! otherwise spawn and lose on every tick. A second consecutive `claim_lost`
 //! on the pair arms the same doubling refusal cooldown; it still redraws.
+//!
+//! So does a spawn-time admission refusal (#14032): `runtime_rejected`,
+//! `model_runtime_mismatch` and `admission_refused` map to the ledger's
+//! `admission` reason (`step_end::ledger_reason`) and fall through to this
+//! effect — a launch the runtime will not take says the pair cannot run now,
+//! so redrawing it on every tick only burns slots.
+//!
+//! [`PROVIDER_EXHAUSTED`] does **not** ride it (#13966). The streak is
+//! backpressure for a disagreement about the *item*; an exhausted api-key
+//! seat says nothing about the item, and its backpressure already exists on
+//! the seat (the exhausted mark held to the provider's reset, and the
+//! spawn-time `pool_gate` refusal once every seat is marked). During a
+//! multi-seat outage the same item is the likely discoverer of each next
+//! seat's exhaustion, so a streak here would walk it 10 min → 24 h for an
+//! outage that is not its fault. It is [`Effect::Uncharged`]: no window, no
+//! streak, no run, and no streak another outcome built is reset by it.
 //!
 //! # Fast failures of non-Builder issue steps
 //!
@@ -89,24 +109,19 @@
 //! # Durability
 //!
 //! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
-//! landed cooldown's own ceiling), and the registry broadcasts each one on
-//! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
-//! a window after this host restarts. A host never gets its own windows back
-//! from peers (they never re-send them, and a host ignores its own ads), so
-//! the registry mirrors each pair's runs and window to a file in the
+//! landed cooldown's own ceiling), and the registry mirrors each pair's runs and
+//! window to a file in the
 //! workspace's logs directory after every change and reloads it when it is
 //! built (#12251): the restarted host keeps its own windows and its repeat-cap
 //! history. Lapsed runs and windows are dropped on reload. The refusal and
-//! fast-fail streaks and the counters stay in memory. Nothing
-//! longer rides the broadcast: the Champion ladder's
+//! fast-fail streaks and the counters stay in memory. The Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
 //! rollback those parks stay parked until a role or a human clears them.
 //!
 //! # The draw's query
 //!
 //! [`StepCooldowns`] is the pure answer to "is `(item, step)` cooling down at
-//! time T?". The registry builds one per tick from this ledger plus the peers'
-//! broadcasts; the cutover adds the forge ladder's due times
+//! time T?". The registry builds one per tick from this ledger; the cutover adds the forge ladder's due times
 //! ([`super::reeval_ladder::due`], which reads a marker from the pre-#12513
 //! ladder as due now); the draw reads it as part of `actionable`
 //! (`item_draw::WeighContext::cooldowns`).
@@ -151,6 +166,16 @@ pub const UNCLASSIFIED: &str = "unclassified";
 
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
+
+/// The refusal reason of a step that died because its api-key seat was
+/// exhausted (#13966): the provider refused the launch, the seat is marked
+/// to its reset, and the draw falls through to the next runtime — so the
+/// pair records a **refusal**, not a run: no fast-fail ladder, no repeat-cap
+/// run, and no item cooldown however many land in a row
+/// ([`Effect::Uncharged`], never the state-refusal streak). Not an
+/// outcome-line token: the daemon synthesizes it, like the spawn-time
+/// `pool_gate` refusals it mirrors.
+pub const PROVIDER_EXHAUSTED: &str = "provider_exhausted";
 
 /// `noop` reasons that waited on something outside the item; they are not
 /// runs for the repeat cap, and they cool down for
@@ -201,8 +226,10 @@ impl OutcomeClass {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepOutcome {
     pub class: OutcomeClass,
-    /// The reason token (`snake_case`). Champion's outcomes keep their own
-    /// word, with `-` read as `_` (`head-moved` → `head_moved`).
+    /// The reason token (`snake_case`), with `-` read as `_` on both line
+    /// shapes: Champion's outcome word (`head-moved` → `head_moved`) and a
+    /// `LOOM_STEP_OUTCOME` reason (`ci-pending` → `ci_pending`, #13500), so
+    /// the [`EXTERNAL_WAIT_NOOPS`] match holds however the role spells it.
     pub reason: String,
 }
 
@@ -224,7 +251,7 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     let class = match (on_pr, outcome) {
         (true, "merged" | "rejected" | "triaged" | "triage-blocked" | "triage-operator")
         | (false, "promoted" | "revise" | "operator" | "closed") => Verdict,
-        (true, "held" | "requeued") | (false, "blocked") => Noop,
+        (true, "held" | "requeued" | "skipped") | (false, "blocked") => Noop,
         (true, "head-moved") | (_, "not-eligible") => Refused,
         (true, "failed") => Failed,
         _ => return None,
@@ -232,11 +259,33 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     Some(StepOutcome::new(class, &outcome.replace('-', "_")))
 }
 
-/// `key=value` fields of one outcome line.
+/// `key=value` fields of one outcome line. The value is
+/// [`token_value`]`(`v`)`: framing characters a runtime wraps the line in end
+/// the value instead of riding in it.
 fn fields(rest: &str) -> BTreeMap<&str, &str> {
     rest.split_whitespace()
-        .filter_map(|kv| kv.split_once('='))
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k, token_value(v))))
         .collect()
+}
+
+/// A framing-tolerant `key=value` value: the token's first run of value
+/// characters (`A-Za-z0-9_-`, the union of every field's own shape). The
+/// three observed framings of an outcome line (#14168) — bare, backticked,
+/// inside a JSON text event — all leave the value's characters intact and
+/// glue framing onto it (`` `verdict` ``, `verdict"}`, `pr_opened\n"}` as a
+/// literal JSON escape); the run ends at the first character that cannot be
+/// part of a value, whatever the wrapper added. Shared by both outcome-line
+/// parsers (`step_spawn::capture` and this module) so they cannot diverge.
+#[must_use]
+pub fn token_value(token: &str) -> &str {
+    fn is_value_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+    let rest = token.trim_start_matches(|c| !is_value_char(c));
+    match rest.find(|c| !is_value_char(c)) {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
 }
 
 /// The outcome a step session reported for `(target, step)`: the **last**
@@ -244,6 +293,10 @@ fn fields(rest: &str) -> BTreeMap<&str, &str> {
 /// `output` that names this role and target. A line for another role, mode or
 /// target, an unknown class or Champion word, is not this step's. A
 /// `LOOM_STEP_OUTCOME` line without `reason=` reads as [`UNCLASSIFIED`].
+/// The prefix may sit anywhere in the line — a runtime that wraps the
+/// session's output in a JSON text event glues it there (#14168) — and the
+/// role / mode / target / class checks still decide whether a match is this
+/// step's.
 ///
 /// Advisory only: [`classify`] decides with the forge post-state.
 #[must_use]
@@ -251,22 +304,29 @@ pub fn parse_outcome_line(output: &str, step: StepRole, target: u32) -> Option<S
     let champion = step.role_name() == "champion";
     output.lines().rev().find_map(|line| {
         let line = line.trim();
+        let rest = |prefix: &str| line.find(prefix).map(|at| &line[at + prefix.len()..]);
         if champion {
-            let f = fields(line.strip_prefix(CHAMPION_LINE_PREFIX)?);
+            let f = fields(rest(CHAMPION_LINE_PREFIX)?);
             let want_mode = if step.acts_on_pr() { "pr" } else { "issue" };
             if f.get("mode") != Some(&want_mode) || f.get("item")?.parse::<u32>().ok()? != target {
                 return None;
             }
             champion_outcome(step.acts_on_pr(), f.get("outcome")?)
         } else {
-            let f = fields(line.strip_prefix(OUTCOME_LINE_PREFIX)?);
+            let f = fields(rest(OUTCOME_LINE_PREFIX)?);
             if f.get("role") != Some(&step.role_name())
                 || f.get("target")?.parse::<u32>().ok()? != target
             {
                 return None;
             }
             let class = OutcomeClass::parse(f.get("class")?)?;
-            Some(StepOutcome::new(class, f.get("reason").copied().unwrap_or(UNCLASSIFIED)))
+            Some(StepOutcome::new(
+                class,
+                &f.get("reason")
+                    .copied()
+                    .unwrap_or(UNCLASSIFIED)
+                    .replace('-', "_"),
+            ))
         }
     })
 }
@@ -289,7 +349,10 @@ pub struct PostState {
 /// chooses between classes the post-state allows.
 ///
 /// - No post-state (`None`: the forge read failed) is `failed`, reason
-///   `probe_failed`: the session's own line is never trusted alone.
+///   `probe_failed`: the session's own line is never trusted alone. The one
+///   exception is a Champion `requeued` / `skipped` (#12715): it wrote nothing
+///   by contract, so there is no post-state to read, and the line stands as
+///   the `noop` it is.
 /// - A claim still held after exit is `failed`.
 /// - A Champion `not-eligible` on an open item stays that state refusal,
 ///   moved or not: it wrote nothing, so the post-state's move is not its
@@ -303,7 +366,10 @@ pub struct PostState {
 pub fn classify(line: Option<&StepOutcome>, post: Option<PostState>) -> StepOutcome {
     let failed_unclassified = StepOutcome::new(OutcomeClass::Failed, UNCLASSIFIED);
     let Some(post) = post else {
-        return StepOutcome::new(OutcomeClass::Failed, PROBE_FAILED);
+        return match line {
+            Some(l) if is_no_write_stop(l) => l.clone(),
+            _ => StepOutcome::new(OutcomeClass::Failed, PROBE_FAILED),
+        };
     };
     if post.claim_held {
         return match line {
@@ -344,6 +410,12 @@ fn is_no_write_refusal(line: &StepOutcome) -> bool {
     line.class == OutcomeClass::Refused && line.reason == NO_WRITE_REFUSAL
 }
 
+/// Whether `line` is a Champion stop that, by contract, wrote nothing and is
+/// neither a failure nor a verdict: `requeued` or `skipped` (#12715).
+fn is_no_write_stop(line: &StepOutcome) -> bool {
+    line.class == OutcomeClass::Noop && matches!(line.reason.as_str(), "requeued" | "skipped")
+}
+
 /// What the engine does with an `(item, step)` after its step ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -354,6 +426,11 @@ pub enum Effect {
     Landed,
     /// A state refusal: the listing was stale; reclassify the item.
     Reclassify,
+    /// The provider refused the launch ([`PROVIDER_EXHAUSTED`], #13966): the
+    /// pair is charged nothing, on the first or the hundredth in a row. No
+    /// window, no refusal streak, no repeat-cap run; and, since it says
+    /// nothing about the item, it resets no streak another outcome built.
+    Uncharged,
     /// A short `(item, step)` cooldown of this length.
     Cooldown(Duration),
     /// A fast failure on a Builder step: charge the #11854 fast-fail ladder.
@@ -424,6 +501,7 @@ pub fn effect_of(
         OutcomeClass::Refused => match reason {
             "pool_gate" | "claimed" => Effect::Cooldown(cfg.refusal_cooldown),
             "claim_lost" => Effect::Redraw,
+            PROVIDER_EXHAUSTED => Effect::Uncharged,
             _ => Effect::Reclassify,
         },
         OutcomeClass::Failed if ran_for < cfg.fast_fail_window && step == StepRole::Builder => {
@@ -451,6 +529,9 @@ pub enum CooldownCause {
     /// window, held here instead. Unlike [`Self::ForgeLadder`] it is restored
     /// after a restart, since the forge has nothing to read back.
     ForgeLadderFallback,
+    /// A captain's `cooldown` refusal (#12704): its hold, so the next tick
+    /// does not ask again before it ends.
+    CaptainHold,
 }
 
 /// Counters the ledger keeps (for `pick.decision` and the gates).
@@ -620,7 +701,17 @@ impl OutcomeLedger {
                 self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
             Effect::Reclassify => self.refusal_streak(item, step, &outcome.reason, now),
-            Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder => {}
+            Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder | Effect::Uncharged => {}
+        }
+        // An exhausted seat is not an outcome of the pair (#13966): it leaves
+        // the fast-fail and refusal streaks exactly as it found them.
+        if effect == Effect::Uncharged {
+            return Recorded {
+                effect,
+                cooling_until: self.cooling_until(item, step, now),
+                repeat_capped,
+                lifted,
+            };
         }
         if let Some(entry) = self.entries.get_mut(&(item, step)) {
             if effect != Effect::FastFailWindow {

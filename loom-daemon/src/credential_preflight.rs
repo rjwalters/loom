@@ -3,7 +3,7 @@
 //! # Problem
 //!
 //! Every daemon-issued `gh` call (`claim_reconciliation`, `main_health_gate`,
-//! `metrics_collector`, the work finder, …) is a plain `Command::new("gh")`
+//! the work finder, …) is a plain `Command::new("gh")`
 //! with no `env_clear` — so it authenticates however `gh` itself resolves
 //! credentials in the daemon's process environment: `GH_TOKEN` /
 //! `GITHUB_TOKEN`, falling back to `gh`'s own credential store (the macOS
@@ -1168,6 +1168,19 @@ pub fn register_root_gh_config_dir(root: &Path, config_dir: &Path) {
     }
 }
 
+/// Drop `root`'s per-owner registration (#5401), so its `gh`/`git` children
+/// inherit the process-global credential again — the owner-drift cure for a
+/// root re-pointed back at the workspace-root owner (#14223), whose stale
+/// mapping no establish pass covers (`plan_cross_owner_credentials`' filter
+/// drops root-owner repos). A no-op for an unregistered root. The
+/// per-owner `GH_CONFIG_DIR` itself is left on disk: other roots may still
+/// use it, and the next mint overwrites it.
+pub fn unregister_root_gh_config_dir(root: &Path) {
+    if let Ok(mut map) = owner_root_config_registry().lock() {
+        map.remove(&normalize_registry_key(root));
+    }
+}
+
 /// Drop every per-owner registration — the root-keyed (#5401), the
 /// owner-slug-keyed (#5431), and the refresh-source (#6171) maps. Used by
 /// tests to isolate the process-global registries between cases.
@@ -1519,6 +1532,13 @@ pub fn register_primary_workspace_root(root: &Path) {
     PRIMARY_WORKSPACE_ROOT.get_or_init(|| root.to_path_buf());
 }
 
+/// The daemon's primary workspace root, when [`register_primary_workspace_root`]
+/// has run in this process (`None` in a CLI process).
+#[must_use]
+pub fn primary_workspace_root() -> Option<PathBuf> {
+    PRIMARY_WORKSPACE_ROOT.get().cloned()
+}
+
 /// Process-global registry of every per-owner credential the periodic refresh
 /// tick should keep fresh (#6171): owner -> (representative `owner/repo` to
 /// mint from, its `GH_CONFIG_DIR`). Distinct from
@@ -1586,27 +1606,44 @@ pub fn force_refresh_owner_credential_with(
     let Some(owner_repo) = nwo_from_git_remote(repo_root) else {
         return false;
     };
-    let owner = owner_of(&owner_repo).to_string();
-    let source = credential_source_for_owner(&owner_repo);
-    match minter.mint_forced(&owner_repo) {
+    match force_mint_owner_credential(workspace_root, &owner_repo, minter) {
+        Some(owner_dir) => {
+            register_root_gh_config_dir(repo_root, &owner_dir);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The mint + publish + register core shared by [`force_refresh_owner_credential_with`]
+/// and [`force_refresh_owner_credential_for_repo`]: force-mints for
+/// `owner_repo`'s owner and publishes into the owner's `gh` config dir,
+/// returning that dir on success.
+fn force_mint_owner_credential(
+    workspace_root: &Path,
+    owner_repo: &str,
+    minter: &dyn GithubAppMinter,
+) -> Option<PathBuf> {
+    let owner = owner_of(owner_repo).to_string();
+    let source = credential_source_for_owner(owner_repo);
+    match minter.mint_forced(owner_repo) {
         ref outcome @ GithubAppOutcome::Minted {
             ref installation_id,
             ref app_id,
             ..
         } => {
             let owner_dir = github_app_gh_config_dir_for_owner(workspace_root, &owner);
-            match publish_outcome(&owner_dir, outcome, &owner_repo) {
+            match publish_outcome(&owner_dir, outcome, owner_repo) {
                 Ok(()) => {
-                    register_root_gh_config_dir(repo_root, &owner_dir);
                     register_owner_gh_config_dir(&owner, &owner_dir);
-                    register_owner_refresh_source(&owner_repo, &owner_dir);
+                    register_owner_refresh_source(owner_repo, &owner_dir);
                     record_forge_credential_success(&source);
                     log::info!(
                         "credential_preflight: forced per-owner github-app refresh for {owner} \
-                         ({owner_repo}) after a registered-workspace scan failure — retrying (app \
-                         {app_id} installation {installation_id}) — #6171"
+                         ({owner_repo}) — retrying (app {app_id} installation {installation_id}) \
+                         — #6171"
                     );
-                    true
+                    Some(owner_dir)
                 }
                 Err(e) => {
                     log::warn!(
@@ -1614,20 +1651,34 @@ pub fn force_refresh_owner_credential_with(
                          could not publish it to {} ({e}) — #6171",
                         owner_dir.display()
                     );
-                    false
+                    None
                 }
             }
         }
-        GithubAppOutcome::NotConfigured => false,
+        GithubAppOutcome::NotConfigured => None,
         GithubAppOutcome::Error(reason) => {
             record_forge_credential_failure(&source, &reason);
             log::warn!(
                 "credential_preflight: forced per-owner github-app refresh for {owner_repo} \
                  failed ({reason}) — #6171"
             );
-            false
+            None
         }
     }
+}
+
+/// Force-mint a fresh installation token for `owner_repo`'s owner and publish
+/// it, with no checkout root involved (#13306): the write-scope probe knows
+/// only the repo's slug. Returns the owner's `gh` config dir on success.
+#[must_use]
+pub fn force_refresh_owner_credential_for_repo(owner_repo: &str) -> Option<PathBuf> {
+    let workspace_root = PRIMARY_WORKSPACE_ROOT.get()?;
+    let script_path = resolve_github_app_script(workspace_root)?;
+    let minter = RealGithubAppMinter {
+        script_path,
+        cwd: workspace_root.clone(),
+    };
+    force_mint_owner_credential(workspace_root, owner_repo, &minter)
 }
 
 /// Production entry point for the #6171 404-recovery path: resolves the real
@@ -1654,6 +1705,7 @@ pub fn force_refresh_owner_credential(repo_root: &Path) -> bool {
 
 pub mod cross_owner;
 pub mod loom_ui;
+pub mod owner_drift;
 pub mod pool;
 pub use pool::attach as attach_pool;
 mod minted;
@@ -2116,6 +2168,34 @@ mod tests {
             cmd2.get_envs().all(|(k, _)| k != "GH_CONFIG_DIR"),
             "unregistered root must not set GH_CONFIG_DIR on the child"
         );
+
+        clear_owner_root_registry();
+    }
+
+    /// #14223: dropping a root's registration returns it to the
+    /// process-global credential — the owner-drift cure for a root
+    /// re-pointed back at the workspace-root owner.
+    #[test]
+    #[serial_test::serial]
+    fn unregister_root_gh_config_dir_drops_only_that_root() {
+        clear_owner_root_registry();
+        let dir = tempfile::tempdir().unwrap();
+        let re_pointed = dir.path().join("checkout-a");
+        let keeps = dir.path().join("checkout-b");
+        std::fs::create_dir_all(&re_pointed).unwrap();
+        std::fs::create_dir_all(&keeps).unwrap();
+        let owner_dir = dir.path().join(".loom/gh-config-by-owner/2AMLogic");
+        register_root_gh_config_dir(&re_pointed, &owner_dir);
+        register_root_gh_config_dir(&keeps, &owner_dir);
+
+        unregister_root_gh_config_dir(&re_pointed);
+
+        assert_eq!(gh_config_dir_for_root(&re_pointed), None);
+        assert_eq!(gh_config_dir_for_root(&keeps), Some(owner_dir.clone()));
+        // Idempotent: a second drop of an unregistered root is a no-op.
+        unregister_root_gh_config_dir(&re_pointed);
+        assert_eq!(gh_config_dir_for_root(&re_pointed), None);
+        assert_eq!(gh_config_dir_for_root(&keeps), Some(owner_dir));
 
         clear_owner_root_registry();
     }

@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use super::TaskLivenessEntry;
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 
 /// The rule.
 pub const RULE: &str = "daemon.task-dead";

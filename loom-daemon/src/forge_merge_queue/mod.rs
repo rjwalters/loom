@@ -43,6 +43,7 @@
 //! | `4` | refused before any forge call (`NOT_QUEUE_MODE` / `EXECUTION_DORMANT`) |
 
 pub mod authz;
+pub mod clear_gate;
 pub mod events;
 pub mod forge;
 pub mod gh_lifecycle;
@@ -57,6 +58,7 @@ pub mod mode;
 pub mod ops;
 pub mod preflight;
 pub mod removal;
+pub mod status_command;
 
 use std::path::PathBuf;
 

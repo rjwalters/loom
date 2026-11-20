@@ -40,22 +40,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 PROVISION_LIB="$REPO_ROOT/scripts/install/provision-hooks.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
-
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
-}
-assert_contains() {
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else fail "$3 (missing substring: '$2')"; fi
 }
 
 if [[ ! -f "$PROVISION_LIB" ]]; then
@@ -894,6 +883,60 @@ assert_eq "$(jq -S . "$S27")" "$(jq -S . "$H27/before.json")" "re-run: settings 
 jq '.env.LOOM_OPERATOR_PRESENCE = "0"' "$S27" > "$H27/optout.json" && mv "$H27/optout.json" "$S27"
 provision_operator_presence "$H27/.claude" >/dev/null 2>&1
 assert_eq "$(jq -r '.env.LOOM_OPERATOR_PRESENCE' "$S27")" "0" "env=0 opt-out kept"
+
+# ── Test 28 (#13959): the SessionStart entry is wired with a `timeout` ──────
+echo "Test 28: SessionStart gh-front-env.sh carries a 10 s timeout; other entries carry none; convergence leaves hand-written entries alone (#13959)"
+# The timeout of the Loom gh-front-env.sh entry (its command carries the
+# machine-level marker), or "none".
+GH_FRONT_TMO() {
+    jq -r '[.hooks.SessionStart[]? | .hooks[]?
+            | select((.command // "") | contains($m)) | .timeout // "none"] | join(",")' \
+        --arg m "defaults/hooks/gh-front-env.sh" "$1" 2>/dev/null
+}
+# 28a: fresh provision — the SessionStart entry has the timeout, a guard does not.
+H28=$(mktemp -d)
+provision_loom_hooks "$H28/.claude" >/dev/null 2>&1
+S28="$H28/.claude/settings.json"
+assert_eq "$(GH_FRONT_TMO "$S28")" "10" "gh-front-env.sh entry wired with timeout 10"
+assert_eq "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | select((.command // "") | contains("defaults/hooks/guard-destructive.sh")) | .timeout // "none"] | join(",")' "$S28")" "none" "guard entry carries no timeout field"
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains("defaults/hooks/gh-front-env.sh")) | .timeout | type] | join(",")' "$S28")" "number" "timeout is a JSON number, not a string"
+# 28b: idempotent — a second provision keeps exactly one entry, byte-stable.
+cp "$S28" "$H28/before28.json"
+provision_loom_hooks "$H28/.claude" >/dev/null 2>&1
+assert_eq "$(GH_FRONT_TMO "$S28")" "10" "timeout still 10 after re-provision"
+assert_eq "$(jq -S . "$S28")" "$(jq -S . "$H28/before28.json")" "re-provision of a converged install is byte-stable"
+# 28c: a CURRENT-form wrapper seeded WITHOUT the timeout (a pre-#13959 install)
+# converges in place — timeout added, command untouched, no duplicate.
+H28C=$(mktemp -d); mkdir -p "$H28C/.claude"
+CMD28C="$(_phook_cmd gh-front-env.sh)"
+jq -n --arg cmd "$CMD28C" \
+    '{hooks:{SessionStart:[{matcher:"",hooks:[{type:"command",command:$cmd}]}]}}' \
+    > "$H28C/.claude/settings.json"
+provision_loom_hooks "$H28C/.claude" >/dev/null 2>&1
+assert_eq "$(count_marker "$H28C/.claude/settings.json" gh-front-env.sh)" "1" "pre-timeout install: still exactly one gh-front-env.sh entry (no duplicate)"
+assert_eq "$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$H28C/.claude/settings.json")" "$CMD28C" "pre-timeout install: command untouched"
+assert_eq "$(jq -r '.hooks.SessionStart[0].hooks[0].timeout // "none"' "$H28C/.claude/settings.json")" "10" "pre-timeout install: timeout added in place"
+# 28d: a hand-written SessionStart entry sharing the marker never gains a timeout.
+H28D=$(mktemp -d); mkdir -p "$H28D/.claude"
+HAND28='.claude/hooks/my-own-front-env.sh --source defaults/hooks/gh-front-env.sh'
+jq -n --arg cmd "$HAND28" \
+    '{hooks:{SessionStart:[{matcher:"",hooks:[{type:"command",command:$cmd}]}]}}' \
+    > "$H28D/.claude/settings.json"
+provision_loom_hooks "$H28D/.claude" >/dev/null 2>&1
+assert_eq "$(jq -r '[.hooks.SessionStart[] | .hooks[] | select(.command == $h) | .timeout // "none"] | join(",")' --arg h "$HAND28" "$H28D/.claude/settings.json")" "none" "hand-written entry never gains a timeout"
+# 28e: project-level wiring — the emitted ${CLAUDE_PROJECT_DIR} entry carries
+# the timeout, and a pre-timeout Loom entry converges in place.
+R28=$(mktemp -d)
+mkdir -p "$R28/.loom/hooks" "$R28/.claude"
+touch "$R28/.loom/hooks/gh-front-env.sh"
+cat > "$R28/.claude/settings.json" <<'EOF'
+{ "hooks": { "SessionStart": [ { "matcher": "", "hooks": [
+  { "type": "command", "command": "\"${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh\"" }
+] } ] } }
+EOF
+ensure_project_hook_wiring "$R28" >/dev/null 2>&1
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains(".loom/hooks/gh-front-env.sh")) | .timeout // "none"] | join(",")' "$R28/.claude/settings.json")" "10" "project-level gh-front-env.sh entry carries timeout 10"
+assert_eq "$(jq -r '[.hooks.SessionStart[]? | .hooks[]? | select((.command // "") | contains(".loom/hooks/gh-front-env.sh"))] | length' "$R28/.claude/settings.json")" "1" "project-level: converged in place, no duplicate"
 
 echo ""
 echo "======================================"

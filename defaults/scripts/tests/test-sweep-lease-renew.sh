@@ -36,6 +36,9 @@
 #       comment is the "newest" one on the issue — the exact misdirection
 #       this issue reports (a live renewal loop keeping a peer's claim
 #       looking fresh while its own claim's `updated_at` never advances)
+#   (j3) blank and padded env values resolve like Rust's `non_blank`
+#       (#13998): a whitespace-only LOOM_LEASE_HOST_ID falls through to
+#       LOOM_HOST_ID and a padded one trims to its bare form
 #   (k) start's loop stops renewing (self-terminates) as soon as a
 #       renew-once cycle reports the own-yield guard (exit 4), without
 #       waiting for the watched PID to die
@@ -319,7 +322,7 @@ reset_state() {
     # path must not inherit them -- otherwise "newest wins" tests silently
     # become exact-match tests against identity values the fixtures were
     # never written to match.
-    unset LOOM_TERMINAL_ID LOOM_HOST_ID LOOM_LEASE_PUBLISH_HOSTNAME HOSTNAME 2> /dev/null || true
+    unset LOOM_TERMINAL_ID LOOM_HOST_ID LOOM_LEASE_HOST_ID LOOM_LEASE_PUBLISH_HOSTNAME HOSTNAME 2> /dev/null || true
     # Same reason for the gh-call attribution vars (#10139): test (x) sets them
     # deliberately; everything else must start from an absent pair.
     unset LOOM_SWEEP_ID LOOM_ROLE 2> /dev/null || true
@@ -583,6 +586,76 @@ sleep 0.5
 kill "$LOOP_PID_J" 2> /dev/null || true
 assert_true "$([[ -f "$STUB_DIR/patch-10-1.body" ]] && echo true || echo false)" "(j) start renewed its OWN lease comment (id 10), not the newer peer comment"
 assert_true "$([[ ! -f "$STUB_DIR/patch-99-1.body" ]] && echo true || echo false)" "(j) start did NOT renew the peer's newer lease comment (id 99)"
+
+# --- (j2) LOOM_LEASE_HOST_ID outranks LOOM_HOST_ID in that auto-resolution -
+# A session in a container is handed its dispatcher's lease host id; the
+# lease to renew is the one published under THAT host, not under the
+# telemetry host id or the container's hostname.
+reset_state
+cat > "$STUB_DIR/comments.json" <<JSON
+[
+  {"id": 11, "body": "<!-- loom:lease host=${OWN_OPAQUE_HOST} sweep=sweep-mine-1001 -->\nprose"},
+  {"id": 98, "body": "<!-- loom:lease host=$(compute_opaque_host_id other-host) sweep=sweep-mine-1001 -->\nprose"}
+]
+JSON
+sleep 4 &
+WATCH_PID_J2=$!
+export LOOM_LEASE_HOST_ID="$OWN_RAW_HOST" LOOM_HOST_ID="other-host"
+export LOOM_TERMINAL_ID="daemon-sweep-mine-1001"
+LOOP_PID_J2="$("$SCRIPT" start 6485 --interval 1 --watch-pid "$WATCH_PID_J2" 2> "$STUB_DIR/start-j2-stderr.log")"
+unset LOOM_LEASE_HOST_ID LOOM_HOST_ID LOOM_TERMINAL_ID
+wait_until test -f "$STUB_DIR/patch-11-1.body"
+kill "$WATCH_PID_J2" 2> /dev/null || true
+wait "$WATCH_PID_J2" 2> /dev/null || true
+sleep 0.5
+kill "$LOOP_PID_J2" 2> /dev/null || true
+assert_true "$([[ -f "$STUB_DIR/patch-11-1.body" ]] && echo true || echo false)" "(j2) start renewed the lease under LOOM_LEASE_HOST_ID's host (id 11)"
+assert_true "$([[ ! -f "$STUB_DIR/patch-98-1.body" ]] && echo true || echo false)" "(j2) start did NOT renew the LOOM_HOST_ID host's lease (id 98)"
+
+# --- (j3) blank and padded env values resolve like Rust's `non_blank`
+# (#13998): a whitespace-only LOOM_LEASE_HOST_ID counts as unset and falls
+# through to LOOM_HOST_ID, and a padded one trims to the same host as its
+# bare form -- both renew THIS session's lease (id 12), never the peer's.
+reset_state
+cat > "$STUB_DIR/comments.json" <<JSON
+[
+  {"id": 12, "body": "<!-- loom:lease host=${OWN_OPAQUE_HOST} sweep=sweep-mine-1002 -->\nprose"},
+  {"id": 97, "body": "<!-- loom:lease host=$(compute_opaque_host_id other-host) sweep=sweep-mine-1002 -->\nprose"}
+]
+JSON
+sleep 4 &
+WATCH_PID_J3A=$!
+export LOOM_LEASE_HOST_ID="   " LOOM_HOST_ID="$OWN_RAW_HOST"
+export LOOM_TERMINAL_ID="daemon-sweep-mine-1002"
+LOOP_PID_J3A="$("$SCRIPT" start 6485 --interval 1 --watch-pid "$WATCH_PID_J3A" 2> "$STUB_DIR/start-j3a-stderr.log")"
+unset LOOM_LEASE_HOST_ID LOOM_HOST_ID LOOM_TERMINAL_ID
+wait_until test -f "$STUB_DIR/patch-12-1.body"
+kill "$WATCH_PID_J3A" 2> /dev/null || true
+wait "$WATCH_PID_J3A" 2> /dev/null || true
+sleep 0.5
+kill "$LOOP_PID_J3A" 2> /dev/null || true
+assert_true "$([[ -f "$STUB_DIR/patch-12-1.body" ]] && echo true || echo false)" "(j3) start renewed its OWN lease through whitespace-only LOOM_LEASE_HOST_ID's fall-through to LOOM_HOST_ID (id 12)"
+assert_true "$([[ ! -f "$STUB_DIR/patch-97-1.body" ]] && echo true || echo false)" "(j3) ... and did NOT renew the peer's lease (id 97)"
+reset_state
+cat > "$STUB_DIR/comments.json" <<JSON
+[
+  {"id": 12, "body": "<!-- loom:lease host=${OWN_OPAQUE_HOST} sweep=sweep-mine-1002 -->\nprose"},
+  {"id": 97, "body": "<!-- loom:lease host=$(compute_opaque_host_id other-host) sweep=sweep-mine-1002 -->\nprose"}
+]
+JSON
+sleep 4 &
+WATCH_PID_J3B=$!
+export LOOM_LEASE_HOST_ID=" $OWN_RAW_HOST " LOOM_HOST_ID="other-host"
+export LOOM_TERMINAL_ID="daemon-sweep-mine-1002"
+LOOP_PID_J3B="$("$SCRIPT" start 6485 --interval 1 --watch-pid "$WATCH_PID_J3B" 2> "$STUB_DIR/start-j3b-stderr.log")"
+unset LOOM_LEASE_HOST_ID LOOM_HOST_ID LOOM_TERMINAL_ID
+wait_until test -f "$STUB_DIR/patch-12-2.body"
+kill "$WATCH_PID_J3B" 2> /dev/null || true
+wait "$WATCH_PID_J3B" 2> /dev/null || true
+sleep 0.5
+kill "$LOOP_PID_J3B" 2> /dev/null || true
+assert_true "$([[ -f "$STUB_DIR/patch-12-2.body" ]] && echo true || echo false)" "(j3) start renewed its OWN lease under the TRIMMED padded LOOM_LEASE_HOST_ID (id 12)"
+assert_true "$([[ ! -f "$STUB_DIR/patch-97-2.body" ]] && echo true || echo false)" "(j3) ... and did NOT renew the LOOM_HOST_ID host's lease (id 97)"
 
 # --- (k) start's loop stops as soon as its own-yield guard fires ----------
 echo ""

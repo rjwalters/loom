@@ -2,11 +2,11 @@
 //! confirm live-reloadable changes against a running daemon's `DaemonStatus`
 //! (the "signal the running daemon over IPC to re-resolve" half of the
 //! issue), and record restart-required changes in
-//! [`loom_daemon::fleet_store::pending_restart`] so `status` can surface them
+//! [`crate::fleet_store::pending_restart`] so `status` can surface them
 //! until the daemon that was running at render time actually restarts.
 //!
 //! Reuses the existing `DaemonStatus` request rather than adding a new IPC
-//! variant: every knob [`loom_daemon::fleet_store::reload`] classifies as
+//! variant: every knob [`crate::fleet_store::reload`] classifies as
 //! live is, by construction, re-read fresh by its consumer with no
 //! daemon-side caching — so a `DaemonStatus` round-trip taken *after* the
 //! write already reflects the rendered value, and doubles as this module's
@@ -15,9 +15,9 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::fleet_store::pending_restart;
+use crate::types::{DaemonStatusReport, Request, Response};
 use chrono::Utc;
-use loom_daemon::fleet_store::pending_restart;
-use loom_daemon::types::{DaemonStatusReport, Request, Response};
 
 use super::common::{query_daemon_bounded, resolve_socket_path};
 
@@ -118,7 +118,7 @@ fn render_lines(
 fn matching_repo<'a>(
     workspace: &Path,
     status: &'a DaemonStatusReport,
-) -> Option<&'a loom_daemon::types::RepoStatus> {
+) -> Option<&'a crate::types::RepoStatus> {
     let canon = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     status.per_repo.iter().find(|r| {
         r.root == workspace
@@ -155,7 +155,7 @@ fn block_on_query(socket_path: &Path) -> Option<Response> {
 mod tests {
     use std::path::PathBuf;
 
-    use loom_daemon::types::RepoStatus;
+    use crate::types::RepoStatus;
 
     use super::*;
     use crate::cli::status::sample_report::sample_report;
@@ -195,6 +195,7 @@ mod tests {
         status.per_repo = vec![RepoStatus {
             root: PathBuf::from("/repo/a"),
             maintain_only: None,
+            installed_behind: None,
             role_runner_enabled: true,
             role_runner_roles: vec!["judge".to_string()],
             ..sample_repo_status()
@@ -230,6 +231,7 @@ mod tests {
         RepoStatus {
             root: PathBuf::new(),
             maintain_only: None,
+            installed_behind: None,
             weight: 0,
             in_flight_count: 0,
             health_gate_halted: false,
@@ -239,6 +241,7 @@ mod tests {
             health_gate_enabled: None,
             health_gate_verdict_at: None,
             root_missing: false,
+            lock_busy: false,
             health_gate_deferred: false,
             health_gate_deferred_reason: None,
             health_gate_verdict_tier: None,

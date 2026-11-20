@@ -165,6 +165,8 @@ pub(super) fn daemon_owned(key: &str) -> bool {
     matches!(key.as_str(), "service.name" | "service.namespace" | "service.instance.id")
         || key.starts_with("loom.")
         || key.starts_with("host.")
+        // `cloud.provider` / `cloud.region` ride `resource_for_host` (#12874).
+        || key.starts_with("cloud.")
 }
 
 /// Whether an attribute *name* is itself secret-shaped.

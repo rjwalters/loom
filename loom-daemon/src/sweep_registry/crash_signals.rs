@@ -37,13 +37,37 @@ pub(crate) struct TerminalResult {
     /// against any known model class — that normalization happens exactly
     /// once, downstream, in `tokens_pool::health::model_class_of`.
     pub(crate) model: Option<String>,
+    /// The model the adapter was ASKED to run but dropped before exec, named
+    /// by `requested_model=` on a v3 record (#14121 — `spawn-codex.sh`'s
+    /// ChatGPT-plan guard). `None` for a v1/v2 record, and for a v3 record
+    /// whose value is the `none` sentinel or otherwise empty. Purely
+    /// informational: the health path keys on `model`, which stays `None`
+    /// for a dropped pin so a class that never ran is never held.
+    pub(crate) requested_model: Option<String>,
+    /// The reasoning effort the adapter actually applied, named by `effort=`
+    /// on a v4 record (#14141). `None` for a v1-v3 record and for a v4 record
+    /// whose value is the `none` sentinel. Informational only: it never
+    /// feeds account health.
+    pub(crate) effort: Option<String>,
+    /// The service tier (speed setting) the adapter actually applied, named
+    /// by `tier=` on a v4 record (#14141). `None` for a v1-v3 record and for
+    /// a v4 record whose value is the `none` sentinel. Informational only.
+    pub(crate) tier: Option<String>,
+}
+
+/// A record value, with the `none` sentinel and an empty value read as absent.
+fn record_value(fields: &HashMap<&str, &str>, key: &str) -> Option<String> {
+    match fields.get(key) {
+        Some(&"none") | Some(&"") | None => None,
+        Some(value) => Some((*value).to_string()),
+    }
 }
 
 /// Parse the adapter's terminal record from only the current dispatch region.
 /// Unknown fields, duplicate records, malformed identities, and unknown
 /// categories all fail closed: no account health is mutated.
 ///
-/// Two versions are accepted (issue #8277):
+/// Three versions are accepted (issues #8277, #14121):
 ///
 /// - `v=1`, exactly 5 fields (`v provider account category exit_code`) — the
 ///   original contract, byte-for-byte unchanged, so an older adapter talking
@@ -52,6 +76,17 @@ pub(crate) struct TerminalResult {
 /// - `v=2`, exactly 6 fields, adding `model=<value>` — emitted by adapters
 ///   that know which model was in flight. `model=none` (or an absent value)
 ///   parses to `TerminalResult::model == None`, same as v1.
+/// - `v=3`, exactly 7 fields, adding `requested_model=<value>` (#14121) —
+///   emitted when a pinned model was dropped before exec (`model=` stays
+///   `none`; the requested pin rides in its own field). The 7-field arity is
+///   accepted only when the `requested_model` key is present, so a v2 record
+///   carrying some other unknown 7th field still fails closed.
+///
+/// - `v=4`, exactly 8 fields (9 with `requested_model=`), adding `effort=` and
+///   `tier=` (#14141) — the reasoning effort and service tier the adapter
+///   actually applied. Both keys must be present (each `none` when unset); an
+///   adapter that applied neither keeps emitting v2/v3. A v4 record missing
+///   either key fails closed.
 ///
 /// Any other arity or `v=` value fails closed like everything else this
 /// parser rejects.
@@ -71,12 +106,33 @@ pub(crate) fn parse_terminal_result_after(
         .split_ascii_whitespace()
         .filter_map(|field| field.split_once('='))
         .collect();
-    let model = match fields.get("v") {
-        Some(&"1") if fields.len() == 5 => None,
-        Some(&"2") if fields.len() == 6 => match fields.get("model") {
-            Some(&"none") | Some(&"") | None => None,
-            Some(model) => Some((*model).to_string()),
-        },
+    let (model, requested_model, effort, tier) = match fields.get("v") {
+        Some(&"1") if fields.len() == 5 => (None, None, None, None),
+        Some(&"2") if fields.len() == 6 => (record_value(&fields, "model"), None, None, None),
+        // #14121: the 7-field v3 arity is only valid because of its extra
+        // `requested_model=` field — a 7-field record carrying any OTHER
+        // unknown key still fails closed.
+        Some(&"3") if fields.len() == 7 && fields.contains_key("requested_model") => (
+            record_value(&fields, "model"),
+            record_value(&fields, "requested_model"),
+            None,
+            None,
+        ),
+        // #14141: v4 is valid only because of its `effort=`/`tier=` pair; the
+        // optional `requested_model=` adds a ninth field. Any other unknown
+        // key still fails closed.
+        Some(&"4")
+            if fields.contains_key("effort")
+                && fields.contains_key("tier")
+                && fields.len() == 8 + usize::from(fields.contains_key("requested_model")) =>
+        {
+            (
+                record_value(&fields, "model"),
+                record_value(&fields, "requested_model"),
+                record_value(&fields, "effort"),
+                record_value(&fields, "tier"),
+            )
+        }
         _ => return None,
     };
     let provider = match *fields.get("provider")? {
@@ -100,6 +156,9 @@ pub(crate) fn parse_terminal_result_after(
         category: crate::session_exec::refusal::category_of(region, &fields)?,
         exit_code: fields.get("exit_code")?.parse().ok()?,
         model,
+        requested_model,
+        effort,
+        tier,
     })
 }
 
@@ -1063,6 +1122,56 @@ pub(crate) fn is_pid_alive(_pid: u32) -> bool {
     true
 }
 
+/// Shell-parity liveness probe: `kill -0 <pid>` semantics — true **only** when
+/// the signal would be deliverable. This is the deliberately different sibling
+/// of [`is_pid_alive`]: where `is_pid_alive` resolves the ambiguous `EPERM`
+/// failure to *alive* (#4691) because its callers use "dead" to authorize
+/// destruction, these callers ported shell `kill -0 "$pid" 2>/dev/null`, which
+/// reads any failed probe as "not running".
+///
+/// One shared implementation (Issue #13862) so the five former private copies
+/// cannot keep drifting on this rule; whether a given caller *should* use the
+/// EPERM-is-alive rule instead is a decision for whoever owns that path. The
+/// name makes the difference visible at the call site.
+///
+/// PID `<= 0` is treated as dead without probing: a negative pid addresses a
+/// process group, and pid 0 addresses the caller's own group — neither is a
+/// per-process liveness handle.
+#[cfg(unix)]
+pub(crate) fn pid_signalable(pid: i32) -> bool {
+    pid_signalable_with(pid, |pid_t| {
+        // SAFETY: kill(pid, 0) is a documented liveness probe; signal 0 is not
+        // sent, just checked.
+        if libc_kill(pid_t, 0) == 0 {
+            Ok(())
+        } else {
+            // `errno` is only meaningful immediately after a failed call.
+            Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+        }
+    })
+}
+
+/// Decision core of [`pid_signalable`], parameterized over the raw
+/// `kill(pid, 0)` syscall so the EPERM rule is unit-testable without needing a
+/// real unsignallable process — same shape as [`is_pid_alive_with`].
+///
+/// `probe` returns `Ok(())` when the signal would be deliverable, or
+/// `Err(errno)` with the raw `errno` from the failed `kill(2)`.
+#[cfg(unix)]
+pub(crate) fn pid_signalable_with(pid: i32, probe: impl Fn(i32) -> Result<(), i32>) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    probe(pid).is_ok()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn pid_signalable(_pid: i32) -> bool {
+    // Non-unix platforms are not supported targets for Loom; assume alive
+    // so the test suite can run without a hard panic.
+    true
+}
+
 #[cfg(unix)]
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
@@ -1173,6 +1282,41 @@ mod tests {
     fn is_pid_alive_of_self_is_true_through_the_real_syscall() {
         // End-to-end sanity that the real probe still works after the refactor.
         assert!(is_pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn pid_signalable_reports_deliverable_signal_as_alive() {
+        assert!(pid_signalable_with(4242, |_| Ok(())));
+    }
+
+    #[test]
+    fn pid_signalable_reports_esrch_as_dead() {
+        assert!(!pid_signalable_with(4242, |_| Err(ESRCH)));
+    }
+
+    #[test]
+    fn pid_signalable_treats_eperm_as_dead_shell_parity() {
+        // The rule that distinguishes this helper from `is_pid_alive`: the
+        // Group B callers ported shell `kill -0 "$pid" 2>/dev/null`, which
+        // reads EPERM as "cannot confirm running" — preserved here by design
+        // (Issue #13862), not changed behind their owners' backs.
+        assert!(
+            !pid_signalable_with(4242, |_| Err(EPERM)),
+            "EPERM must read as dead for shell parity — see is_pid_alive for the opposite rule"
+        );
+    }
+
+    #[test]
+    fn pid_signalable_rejects_nonpositive_pids_without_probing() {
+        // Negative pids address process groups; pid 0 addresses the caller's
+        // own group. Neither is a per-process liveness handle.
+        assert!(!pid_signalable_with(0, |_| panic!("must not probe pid 0")));
+        assert!(!pid_signalable_with(-1, |_| panic!("must not probe negative pid")));
+    }
+
+    #[test]
+    fn pid_signalable_of_self_is_true_through_the_real_syscall() {
+        assert!(pid_signalable(i32::try_from(std::process::id()).expect("own pid fits i32")));
     }
 
     /// Issue #4255: `classify_crash` derives a stable label from a dead sweep's
@@ -1500,6 +1644,9 @@ sweep_id=current
                 category: TerminalClassification::TokenExhausted,
                 exit_code: 42,
                 model: None,
+                requested_model: None,
+                effort: None,
+                tier: None,
             })
         );
         assert!(parse_terminal_result_after(
@@ -1517,6 +1664,119 @@ sweep_id=current
             "sweep_id=current"
         )
         .is_none());
+    }
+
+    #[test]
+    fn terminal_result_parser_accepts_v3_requested_model_and_stays_strict() {
+        // #14121: v=3 adds `requested_model=` — the pinned model the adapter
+        // dropped before exec. `model=` stays `none` (the #8058 fail-safe),
+        // so a dropped pin never holds a class that never ran.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=3 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=gpt-5-codex",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: None,
+                requested_model: Some("gpt-5-codex".into()),
+                effort: None,
+                tier: None,
+            })
+        );
+        // `requested_model=none` parses to None like the other sentinels.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=3 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=none",
+                "sweep_id=current"
+            )
+            .and_then(|result| result.requested_model),
+            None
+        );
+        // A 7-field record with NO `requested_model` key (some other unknown
+        // 7th field) still fails closed — the v3 arity is only valid because
+        // of that field.
+        assert!(parse_terminal_result_after(
+            "sweep_id=current\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=a \
+             category=SUCCESS exit_code=0 model=none bogus=1",
+            "sweep_id=current"
+        )
+        .is_none());
+        // And the pre-#14121 six-field v2 shape keeps parsing unchanged.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none",
+                "sweep_id=current"
+            )
+            .and_then(|result| result.requested_model),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_result_parser_accepts_v4_effort_and_tier_and_stays_strict() {
+        // #14141: v=4 adds `effort=` and `tier=` — the launch settings the
+        // adapter actually applied. `none` reads as absent.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=4 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=gpt-5-codex effort=high tier=priority",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: Some("gpt-5-codex".into()),
+                requested_model: None,
+                effort: Some("high".into()),
+                tier: Some("priority".into()),
+            })
+        );
+        // An unset tier is `none` -> None; the dropped-pin field rides along
+        // as the optional ninth field and `model=` keeps its `none`.
+        assert_eq!(
+            parse_terminal_result_after(
+                "sweep_id=current\n# LOOM_TERMINAL_RESULT v=4 provider=codex account=profile-a \
+                 category=SUCCESS exit_code=0 model=none requested_model=gpt-5-codex \
+                 effort=low tier=none",
+                "sweep_id=current"
+            ),
+            Some(TerminalResult {
+                provider: AccountProvider::Codex,
+                account: "profile-a".into(),
+                category: TerminalClassification::Success,
+                exit_code: 0,
+                model: None,
+                requested_model: Some("gpt-5-codex".into()),
+                effort: Some("low".into()),
+                tier: None,
+            })
+        );
+        // Fail closed: a v4 record missing `tier=`, one with an unknown extra
+        // key, and a v2/v3 record smuggling the v4 pair all parse to nothing.
+        for bad in [
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low",
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low bogus=1",
+            "v=4 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low tier=none bogus=1",
+            "v=2 provider=codex account=a category=SUCCESS exit_code=0 model=none effort=low tier=none",
+        ] {
+            assert!(
+                parse_terminal_result_after(
+                    &format!("sweep_id=current\n# LOOM_TERMINAL_RESULT {bad}"),
+                    "sweep_id=current"
+                )
+                .is_none(),
+                "{bad}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------------

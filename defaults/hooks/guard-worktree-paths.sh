@@ -411,11 +411,32 @@ any_managed_worktree_exists() {
     [[ -n "$hit" ]]
 }
 
+# True if $1 (an absolute, normalized path) is exactly one of the Champion
+# state files, a DIRECT child of the git common dir (#13180).
+champion_state_path_ok() {
+    local p="$1" common dir phys
+    [[ "$p" =~ ^(.*)/(loom-champion-(pin|facts)-pr-[0-9]+(\.json)?)$ ]] || return 1
+    dir="${BASH_REMATCH[1]}"
+    [[ "$dir" == *"/../"* || "$dir" == */.. || "$dir" == *"/./"* ]] && return 1
+    common="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)" || return 1
+    [[ -n "$common" ]] || return 1
+    [[ "$dir" == "$common" ]] && return 0
+    phys="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+    [[ "$phys" == "$common" ]]
+}
+
 # Decide allow(0)/deny(1) for a resolved target path when no
 # LOOM_WORKTREE_PATH fast path is set. See the mechanism-2 comment above for
 # the rationale.
 path_derived_allow() {
     local target="$1"
+
+    # (a0) The Champion pin / PR-facts file, a direct child of the git common
+    # dir (#13180) -> allow. Exactly those two name patterns; `.git/config`,
+    # siblings, nested paths and `..` traversal never match.
+    if champion_state_path_ok "$target"; then
+        return 0
+    fi
 
     # (a) Already inside some managed worktree -> allow.
     if walk_up_for_sentinel "$target" >/dev/null; then
@@ -585,7 +606,7 @@ if [[ -n "$WORKTREE_PATH" ]]; then
         exit 0
     fi
 
-    emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' is outside worktree '${WORKTREE_PATH}'. Use paths within the worktree directory."
+    emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' is outside worktree '${WORKTREE_PATH}'. Use paths within the worktree directory. Gitignored status does not exempt a path: Edit/Write and Bash writes are confined by the same rule. For repo-local scratch/notes/journal files, write under your issue worktree or under /tmp (session scratch) instead."
 fi
 
 # --------------------------------------------------------------------------
@@ -595,4 +616,4 @@ if path_derived_allow "$NORM_PATH"; then
     exit 0
 fi
 
-emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' resolves to the main repository checkout ('${MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). Builders must write inside their issue worktree ($(worktree_hint)), never the main checkout. Do NOT retry this write via Bash redirection/tee/sed -i/cp/mv -- that is also confined (guard-destructive-generic.sh, #4178) and denied for the same reason. cd into your issue worktree and write there instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4007)"
+emit_deny "BLOCKED: Edit/Write path '${NORM_PATH}' resolves to the main repository checkout ('${MAIN_ROOT}'), but a Loom-managed worktree exists elsewhere in this repository (this check cannot verify it belongs to the acting session — see #4245). Builders must write inside their issue worktree ($(worktree_hint)), never the main checkout. Do NOT retry this write via Bash redirection/tee/sed -i/cp/mv -- that is also confined (guard-destructive-generic.sh, #4178) and denied for the same reason. cd into your issue worktree and write there instead. Gitignored status does not exempt a path: Edit/Write and Bash writes are confined by the same rule. For repo-local scratch/notes/journal files, write under your issue worktree or under /tmp (session scratch) instead. Not a Builder and need to write here directly? Set guards.worktreeIsolation:false in .loom/config.json for the session -- an inline 'LOOM_GUARD_WORKTREE_ISOLATION=0 <command>' prefix does NOT work (this hook runs as a separate process). (#4007)"

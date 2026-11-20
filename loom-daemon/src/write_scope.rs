@@ -63,6 +63,7 @@ pub(crate) mod target;
 use probe::{Permission, PermissionProbe};
 use target::GhTarget;
 
+use crate::credential_preflight::GithubAppOutcome;
 use crate::telemetry::kinds::write_scope_refused::{RefusalClass, WriteScopeRefusedRecord};
 
 /// The answer to "may this installation write here?".
@@ -187,11 +188,17 @@ pub(crate) fn decide_classified(inputs: &Inputs<'_>, probe: &dyn PermissionProbe
             } else {
                 RefusalClass::InsufficientPermission
             };
+            let hint = if class == RefusalClass::NotInInstallation {
+                not_in_installation_hint(&target.nwo)
+            } else {
+                String::new()
+            };
             Decision::deny(
                 class,
                 repo,
                 format!(
-                    "the credential in use cannot write to {} ({what}); Loom writes need WRITE",
+                    "the credential in use cannot write to {} ({what}); Loom writes need \
+                     WRITE{hint}",
                     target.nwo
                 ),
             )
@@ -205,6 +212,19 @@ pub(crate) fn decide_classified(inputs: &Inputs<'_>, probe: &dyn PermissionProbe
             ),
         ),
     }
+}
+
+/// The sanctioned way forward when the refusal is [`RefusalClass::NotInInstallation`]
+/// (#13978): the guard stays as it is, but an agent that only needs to *file an
+/// issue* on a public repo the App is not installed on must not park the report
+/// as "needs an operator". Interim, until the typed `github-write` operation with a
+/// target-repo allowlist (2AMLogic/2am#7455) ships and this points there instead.
+fn not_in_installation_hint(nwo: &str) -> String {
+    format!(
+        "; to file an issue there, run `gh issue create -R {nwo}` (the process `gh` \
+         credential; interim route, see defaults/docs/gh-issue-create-rest-fallback.md) \
+         instead of parking the report for an operator"
+    )
 }
 
 /// `origin`'s `owner/repo` for each root, cached for the process (remotes
@@ -284,6 +304,10 @@ pub fn default_gh() -> PathBuf {
 /// A refusal emits a `write_scope.refused` record (call site
 /// `may_write_from`; a no-op without an ops sink, so CLI processes export
 /// nothing). [`may_write_from_at`] names the call site.
+///
+/// The `loom-daemon forge may-write` *command* does not call this directly:
+/// it layers the per-owner writer establishment on top
+/// ([`may_write_decision_cli`], #13929).
 #[must_use]
 pub fn may_write_from(cwd: &Path, repo: Option<&str>) -> Verdict {
     may_write_from_at(cwd, repo, "may_write_from")
@@ -298,6 +322,133 @@ pub fn may_write_from_at(cwd: &Path, repo: Option<&str>, what: &str) -> Verdict 
         emit_refused(cwd, credential_dir.as_deref(), &decision, what);
     }
     decision.verdict
+}
+
+/// `loom-daemon forge may-write` (#13929): the bare probe under #12606's
+/// credential-selection rule **plus** the per-owner writer route. In a CLI
+/// process nothing has registered a per-owner credential, so
+/// [`may_write_from`] answers for the ambient credential alone — a false
+/// "cannot write" whenever only a `forge.identities.writers[]` entry covers
+/// the target owner, exactly the answer agents are told to trust before
+/// writing. Before probing, this mints the owner's writer credential the way
+/// `forge token` does (`mint`, given the roster identity and the target
+/// `owner/repo`), publishes and registers it, so the existing probe (and the
+/// credential-selection rule) run unchanged and vet the credential the
+/// mintable write would carry. An owner only the default writer covers — or
+/// one no writer covers — is never minted for: its answer stays today's
+/// ambient probe, and a Gitea forge is untouched (`writers[]` is a GitHub
+/// roster).
+///
+/// `workspace` is the roster and publication root (`forge token`'s
+/// [`crate::cli::forge_identity_cmd::workspace`]: the main checkout of
+/// `cwd`); `gh` the binary the probe runs. The daemon's own gates never call
+/// this: their credential is already registered, so their
+/// [`may_write_from`]-equivalent answers are unchanged.
+///
+/// When the covered owner's mint failed, the verdict is still computed
+/// against the ambient credential (fail closed, unchanged) — but a `Deny`
+/// names the mint failure instead of leaving the ambient credential's
+/// "not in this App installation" as the whole answer.
+pub(crate) fn may_write_decision_cli(
+    cwd: &Path,
+    repo: Option<&str>,
+    gh: &Path,
+    workspace: &Path,
+    mint: &dyn Fn(&crate::forge_identity::Identity, &str) -> GithubAppOutcome,
+) -> Verdict {
+    let mint_failure = establish_owner_writer(cwd, repo, workspace, mint);
+    let (decision, credential_dir) = may_write_decision(cwd, repo, gh);
+    if !decision.verdict.is_allowed() {
+        emit_refused(cwd, credential_dir.as_deref(), &decision, "may_write_from");
+    }
+    let mut verdict = decision.verdict;
+    if let (Verdict::Deny(why), Some((owner, reason))) = (&mut verdict, mint_failure) {
+        why.push_str(&format!(
+            "; a per-owner writer covers {owner} but could not mint a credential ({reason})"
+        ));
+    }
+    verdict
+}
+
+/// The `owner/repo` a `forge may-write` call targets, resolved exactly as
+/// [`may_write_decision`] resolves it: the explicit argument, else what `gh`
+/// resolves from the checkout. The establishment step must name the same
+/// repository the probe vets, or the credential it registers would cover a
+/// different owner than the decision reads.
+fn target_nwo_for(cwd: &Path, repo: Option<&str>) -> Option<String> {
+    match repo.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => target::nwo_from_repo_arg(r),
+        None => {
+            let root = checkout_root(cwd);
+            let remotes = target::read_remotes(&root);
+            target::gh_target(&remotes, std::env::var("GH_REPO").ok().as_deref()).map(|t| t.nwo)
+        }
+    }
+}
+
+/// Mint, publish and register the target owner's `forge.identities.writers[]`
+/// credential in this process, the establishment behind
+/// [`may_write_decision_cli`]. `Ok(())` when the credential is (or already
+/// was) established — or when there is nothing to establish: no target, a
+/// Gitea forge, or an owner no `writers[]` entry covers (mirroring
+/// `cross_owner::register_plan`'s registration minus the refresh source,
+/// which only a daemon's tick reads). `Some((owner, reason))` when a writer
+/// covers the owner but the mint or the publish failed.
+fn establish_owner_writer(
+    cwd: &Path,
+    repo: Option<&str>,
+    workspace: &Path,
+    mint: &dyn Fn(&crate::forge_identity::Identity, &str) -> GithubAppOutcome,
+) -> Option<(String, String)> {
+    if crate::forge_cmd::detect_forge(Some(&checkout_root(cwd)))
+        == crate::forge_cmd::ForgeType::Gitea
+    {
+        return None;
+    }
+    let nwo = target_nwo_for(cwd, repo)?;
+    let owner = crate::credential_preflight::owner_of_nwo(&nwo).to_string();
+    if owner.is_empty() {
+        return None;
+    }
+    // Already established in this process (a daemon, or an earlier
+    // establishment in this one): the probe finds it through the normal
+    // selection rule, and re-minting would only race it.
+    if crate::credential_preflight::gh_config_dir_for_owner_slug(&nwo).is_some() {
+        return None;
+    }
+    let roster = crate::forge_identity::resolve(workspace);
+    let writer = crate::forge_identity::per_owner_writer_for(&roster, &owner)?;
+    let owner_dir =
+        crate::credential_preflight::github_app_gh_config_dir_for_owner(workspace, &owner);
+    match mint(writer, &nwo) {
+        ref outcome @ GithubAppOutcome::Minted {
+            ref app_id,
+            ref installation_id,
+            ..
+        } => match crate::credential_preflight::publish_outcome(&owner_dir, outcome, &nwo) {
+            Ok(()) => {
+                // The owner-slug key covers an explicit `--repo`; the root key
+                // (what `gh_config_dir_for_call` checks first) also covers a
+                // call with no `--repo`, whose target came from the checkout.
+                crate::credential_preflight::register_owner_gh_config_dir(&owner, &owner_dir);
+                crate::credential_preflight::register_root_gh_config_dir(cwd, &owner_dir);
+                log::info!(
+                    "write_scope: established the per-owner writer credential for {owner} \
+                     (app {app_id} installation {installation_id}) for `forge may-write` — \
+                     #13929"
+                );
+                None
+            }
+            Err(e) => Some((
+                owner,
+                format!("minted but could not publish to {}: {e}", owner_dir.display()),
+            )),
+        },
+        GithubAppOutcome::NotConfigured => {
+            Some((owner, "the writer App is not configured on this host".into()))
+        }
+        GithubAppOutcome::Error(reason) => Some((owner, reason)),
+    }
 }
 
 /// [`may_write_from`]'s decision, run through `gh`, and the per-owner

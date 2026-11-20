@@ -44,7 +44,8 @@ const NAMED_PATHS: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Refusal {
     /// A local file sits where an incoming commit writes one. Nothing changed.
-    WouldOverwrite(String),
+    /// The short list for a detail line, and every path git named.
+    WouldOverwrite(String, Vec<String>),
     /// Anything else git said, or a command that did not finish.
     Other(String),
 }
@@ -132,7 +133,7 @@ pub(crate) fn ok(root: &Path, args: &[&str], timeout: Duration) -> Result<String
 /// The default branch's name, from the clone's own `origin/HEAD`. Local: no
 /// remote is asked, and `main` is never guessed. `None` when `origin/HEAD` is
 /// unset, or names a branch git could read as an option (#9106).
-pub(super) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
+pub(crate) fn default_branch(root: &Path, timeout: Duration) -> Option<String> {
     let args = [
         "symbolic-ref",
         "--quiet",
@@ -382,7 +383,7 @@ pub(super) fn classify_refusal(stderr: &str) -> Refusal {
         .filter_map(|l| l.strip_prefix('\t'))
         .map(|p| p.trim().to_string())
         .collect();
-    Refusal::WouldOverwrite(summarize(&paths))
+    Refusal::WouldOverwrite(summarize(&paths), paths)
 }
 
 /// A short list of `paths` for a one-line detail.

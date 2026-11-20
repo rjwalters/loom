@@ -1,7 +1,7 @@
 //! The detached renewal loop behind a won `lease pr claim` (#9401).
 //!
 //! The issue path's renewer is `sweep-lease-renew.sh` (#6180), a shell
-//! `contract` file whose portable growth the shell budget refuses outright
+//! `contract` file whose portable growth is not admitted
 //! (see `cli::lease_ensure`'s module docs), and whose readers all assume the
 //! `loom:lease host=` marker. So the PR lease gets a small Rust loop, reusing
 //! the issue renewer's single-owner bookkeeping (`cli::lease_renewer`, #10229):
@@ -76,7 +76,7 @@ pub(crate) struct RenewLoopArgs {
     pub(crate) role: Role,
     /// The lease's step (#11898), when it names one.
     #[arg(long)]
-    pub(crate) step: Option<loom_daemon::step_role::StepRole>,
+    pub(crate) step: Option<crate::step_role::StepRole>,
     #[arg(long)]
     pub(crate) host: String,
     #[arg(long)]
@@ -327,13 +327,28 @@ pub(crate) fn spawn(
     }
     super::super::lease_ensure::mark_inherited_fds_cloexec();
     match command.spawn() {
-        Ok(child) => format!(
-            "renewer {} keeps the lease fresh every {interval}s while pid {watch_pid} lives (log: \
-             .loom/logs/pr-lease/pr-{}-{}.log)",
-            child.id(),
-            ctx.common.pr,
-            ctx.me.role.as_str()
-        ),
+        Ok(child) => {
+            // #14100: attribute the renewer's pid — this is the per-step,
+            // long-lived self-spawn the issue's OOM line must be matchable
+            // to. Start line only: the parent returns immediately after the
+            // spawn, so a `Tracked` here would log a misleading `abandoned`
+            // exit at once and stop the sampler.
+            log::info!(
+                "{}",
+                crate::self_spawn_log::start_line(
+                    "pr_lease_renewer",
+                    child.id(),
+                    &crate::fleet_sync::git_spawn_log::argv_of(&command)
+                )
+            );
+            format!(
+                "renewer {} keeps the lease fresh every {interval}s while pid {watch_pid} lives (log: \
+                 .loom/logs/pr-lease/pr-{}-{}.log)",
+                child.id(),
+                ctx.common.pr,
+                ctx.me.role.as_str()
+            )
+        }
         Err(e) => format!("renewer not started ({e}); the lease ages out at the TTL"),
     }
 }
@@ -393,7 +408,7 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
     let watch = args.watch_pid;
     let watch_ident = lease_renewer::start_identity(watch);
     let alive = || {
-        loom_daemon::live_claim::pid_is_live_process(watch)
+        crate::live_claim::pid_is_live_process(watch)
             && (watch_ident.is_none() || lease_renewer::start_identity(watch) == watch_ident)
     };
     let gh = Gh {
@@ -405,8 +420,8 @@ pub(crate) fn run_loop(args: &RenewLoopArgs) {
         say(&format!("renewer stopping: refusing to write here (#9548): {why}"));
         return;
     }
-    let policy = loom_daemon::comment_trust::TrustPolicy::for_root(&root);
-    let ttl_minutes = loom_daemon::claim_reconciliation::resolve_lease_ttl_minutes();
+    let policy = crate::comment_trust::TrustPolicy::for_root(&root);
+    let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     let ttl = chrono::Duration::seconds((ttl_minutes * 60.0) as i64);
     // Wall clock throughout (#9401 review): `Instant` stands still while a
     // Mac sleeps, so a lid-closed renewer would wake believing its lease fresh.

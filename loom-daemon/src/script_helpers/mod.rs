@@ -6,7 +6,10 @@
 //! `sweep_experiment`, `backlog`) with native `loom-daemon` subcommands. Those
 //! modules all leaned on the same two pieces of `loom_tools.common` plumbing —
 //! repo-root discovery and the `gh`/`gh-cached` runner — so both live here once
-//! rather than being copied into each port.
+//! rather than being copied into each port. The runner half is [`gh_route`]
+//! (#13744): every `gh` call this family makes goes through the
+//! [`crate::gh_invocation`] facade with a declared access intent, so a helper
+//! read cannot silently run on the writer credential.
 //!
 //! Everything in this module is **soft-fail by construction**: the Python
 //! originals were explicitly documented never to raise (a config read must not
@@ -17,6 +20,7 @@
 //! |---|---|---|
 //! | [`log_filter`] | `strip-ansi.sh` | `loom_tools.log_filter` |
 //! | [`model_tiers`] | `resolve-model.sh` | `loom_tools.model_tiers` |
+//! | [`role_model`] | `resolve-role-model.sh` | new in #13956 (attended-subagent chain) |
 //! | [`usage`] | `check-usage.sh` | `loom_tools.common.usage` |
 //! | [`checkpoints`] | `checkpoint.sh` | `loom_tools.checkpoints` |
 //! | [`claim`] | `loom-claim` (PATH shim → `loom-daemon claim`) | `loom_tools.claim` |
@@ -34,15 +38,21 @@
 pub mod checkpoints;
 pub mod claim;
 pub mod fleet_experiment;
+pub mod gh_route;
 pub mod log_filter;
 pub mod model_tiers;
+pub mod role_model;
 pub mod sweep_experiment;
 pub mod sweep_experiment_arms;
 pub mod transcript_usage;
 pub mod usage;
 pub mod validate_phase;
+mod validate_phase_curator;
 
-use crate::cmd_out::{decode_json, run_command, CmdOutcome, Query, DEFAULT_TIMEOUT};
+pub use gh_route::{gh_read, gh_read_json, gh_write};
+
+use crate::cmd_out::{run_command, CmdOutcome, DEFAULT_TIMEOUT};
+use crate::fs_util::is_executable;
 
 /// Ceiling for the `gh-cached --version` capability probe.
 ///
@@ -74,6 +84,17 @@ pub fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Whole seconds since the Unix epoch (`0` if the clock is before it).
+///
+/// The one shared definition of the `SystemTime::now()` /
+/// `duration_since(UNIX_EPOCH)` idiom; millisecond variants are separate.
+#[must_use]
+pub fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Resolve the `gh` binary to invoke: the repo's `.loom/scripts/gh-cached`
 /// wrapper when it is present, executable, and answers `--version`; plain `gh`
 /// otherwise.
@@ -86,7 +107,7 @@ pub fn now_iso() -> String {
 #[must_use]
 pub fn gh_cmd(repo_root: &Path) -> PathBuf {
     let cached = repo_root.join(".loom").join("scripts").join("gh-cached");
-    if is_executable_file(&cached) {
+    if is_executable(&cached) {
         // #7810 PR 2: bounded. The point of this probe is to catch a wrapper
         // that is executable but broken (an unaccepted Xcode licence, a missing
         // interpreter); one that HANGS is the same class of broken, and an
@@ -99,50 +120,6 @@ pub fn gh_cmd(repo_root: &Path) -> PathBuf {
         }
     }
     PathBuf::from(crate::gh_invocation::gh_bin())
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-}
-
-/// Run a `gh` (or `gh-cached`) command inside `repo_root`, under a deadline.
-///
-/// Epic #7810 PR 2: returns [`CmdOutcome`] instead of the retired `GhResult`.
-/// That type reported a **spawn failure as `success: false`**, so "gh is not
-/// installed" and "gh ran and exited 1" were the same value; it also decoded
-/// lossily at the boundary and ran unbounded, so a wedged `gh` blocked forever
-/// (the 2026-07-26 incident). All three are now distinguished or bounded.
-pub fn run_gh(args: &[&str], repo_root: &Path, use_cache: bool) -> CmdOutcome {
-    let program = if use_cache {
-        gh_cmd(repo_root)
-    } else {
-        PathBuf::from(crate::gh_invocation::gh_bin())
-    };
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(repo_root)
-        .stdin(std::process::Stdio::null());
-    run_command(cmd, DEFAULT_TIMEOUT)
-}
-
-/// Run a `gh` JSON query and decode it in-process (epic #7810 PR 2).
-///
-/// Callers pass `--json <fields>` and **no `--jq`**. Flattening JSON to a
-/// scalar inside the subprocess is what made *command failed*, *field absent*,
-/// *valid-but-empty* and *no match* the same empty string.
-pub fn gh_query<T, F>(args: &[&str], repo_root: &Path, use_cache: bool, is_empty: F) -> Query<T>
-where
-    T: serde::de::DeserializeOwned,
-    F: FnOnce(&T) -> bool,
-{
-    decode_json(run_gh(args, repo_root, use_cache), is_empty)
 }
 
 /// Run `git` in `dir` under a deadline, capturing output.

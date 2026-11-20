@@ -4,8 +4,8 @@
 //! every field explicitly without pushing its parent past the
 //! `.loom/docs/file-size-policy.md` ratchet.
 
+use crate::types::{CapacityReport, CredentialPreflightReport, DaemonStatusReport};
 use chrono::Utc;
-use loom_daemon::types::{CapacityReport, CredentialPreflightReport, DaemonStatusReport};
 
 /// A fully-populated report the fake daemon can serialize back to the client
 /// on a successful round-trip. Every field is compiler-checked, so a schema
@@ -29,6 +29,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         preflight_advisory_active: false,
         preflight_advisory_message: None,
         preflight_advisory_changed_at: None,
+        agent_residue: crate::types::AgentResidueStatus::default(),
         configured_max: 5,
         dynamic_cap: 3,
         main_health_gate_halted: false,
@@ -77,6 +78,7 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         auto_update_stale_repo_ticks: 0,
         auto_update_stale_repo: None,
         auto_update_floor_not_rolling: None,
+        auto_update_freshness: None,
         host_update: None,
         auto_update_config_enabled: None,
         task_liveness: Vec::new(),
@@ -97,12 +99,9 @@ pub(crate) fn sample_report() -> DaemonStatusReport {
         daemon_built_at_raw: Some("2026-08-02T03:09:51Z".to_string()),
         work_finder_interval_secs: Some(60),
         startup_jitter_delay_secs: None,
-        observability_host_id_mismatch: None,
         observability_export: None,
         observability_exports: std::collections::BTreeMap::new(),
         otlp_export: None,
-        forge_events: None,
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: None,
         stuck_worktree_reclaims: Vec::new(),

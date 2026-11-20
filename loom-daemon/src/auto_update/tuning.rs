@@ -36,17 +36,22 @@ pub struct TickTuning {
     /// store may chase the newest release. #10954: the loop also runs on a
     /// fleet host with it off, for the floor alone; see [`super::loop_mode`].
     pub chase_enabled: bool,
+    /// #9736: when a quiet or stuck loop becomes a health finding.
+    pub freshness: super::freshness::Thresholds,
 }
 
 impl TickTuning {
     /// Resolve every knob from `config` with **env > config > default**.
     #[must_use]
     pub fn resolve(config: &AutoUpdateConfig) -> Self {
+        let interval = super::resolve_interval(config);
+        let settle = super::resolve_settle(config);
         Self {
-            interval: super::resolve_interval(config),
-            settle: super::resolve_settle(config),
+            interval,
+            settle,
             defer_deadline: super::resolve_defer_deadline(config),
             chase_enabled: super::resolve_enabled(config),
+            freshness: super::freshness::Thresholds::resolve(config, interval, settle),
         }
     }
 
@@ -76,11 +81,13 @@ mod tests {
 
     /// Every env override the resolvers read, cleared so a tier test measures the
     /// tier it means to.
-    const ENV_VARS: [&str; 4] = [
+    const ENV_VARS: [&str; 6] = [
         crate::auto_update::AUTO_UPDATE_ENABLE_ENV,
         crate::auto_update::AUTO_UPDATE_INTERVAL_ENV,
         crate::auto_update::AUTO_UPDATE_SETTLE_ENV,
         crate::auto_update::AUTO_UPDATE_DEFER_DEADLINE_ENV,
+        crate::auto_update::freshness::OVERDUE_ENV,
+        crate::auto_update::freshness::CONVERGE_DEADLINE_ENV,
     ];
 
     #[test]
@@ -109,6 +116,8 @@ mod tests {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            overdue_secs: Some(3000),
+            converge_deadline_secs: Some(90_000),
             removed_keys: Vec::new(),
         });
         assert_eq!(
@@ -118,6 +127,11 @@ mod tests {
                 settle: Duration::from_secs(30),
                 defer_deadline: Duration::from_secs(7200),
                 chase_enabled: true,
+                freshness: crate::auto_update::freshness::Thresholds {
+                    interval: Duration::from_secs(120),
+                    overdue_after: Duration::from_secs(3000),
+                    converge_deadline: Duration::from_secs(90_000),
+                },
             }
         );
         // The description is what both startup log lines render, so pin it.
@@ -138,6 +152,8 @@ mod tests {
             interval_secs: Some(120),
             settle_secs: Some(30),
             defer_deadline_secs: Some(7200),
+            overdue_secs: None,
+            converge_deadline_secs: None,
             removed_keys: Vec::new(),
         };
         let expected = TickTuning::resolve(&plain);

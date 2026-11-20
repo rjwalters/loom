@@ -2,9 +2,38 @@
 use super::*;
 use crate::observability::lifecycle::pre_launch;
 
+/// The outcome and telemetry from one invocation, captured before the
+/// Champion's follow-up ratification runs can reuse the same runner.
+pub(super) struct InvocationOutcome {
+    pub(super) outcome: RoleTickOutcome,
+    pub(super) resolved: Option<crate::role_tick_telemetry::ResolvedLaunch>,
+    pub(super) trace: Option<crate::observability::lifecycle::RoleTrace>,
+    pub(super) unlaunched: Option<crate::observability::lifecycle::RoleFailure>,
+}
+
+impl InvocationOutcome {
+    pub(super) fn capture<R: RoleInvocationRunner + ?Sized>(
+        outcome: RoleTickOutcome,
+        runner: &R,
+    ) -> Self {
+        Self {
+            outcome,
+            resolved: runner.resolved_launch(),
+            trace: runner.trace_context(),
+            unlaunched: runner.unlaunched_failure(),
+        }
+    }
+}
+
 impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn invoke(&mut self, role: &str, prompt: &str) -> RoleTickOutcome {
         let trace_root = self.workspace_root.clone();
+        // #13502: the session's output is whatever lands in its role log from
+        // here on; remember where the log ended before launch.
+        let log_path = role_log_path(&self.logs_dir(), role);
+        let log_start = std::fs::metadata(&log_path).map_or(0, |m| m.len());
+        self.last_output = None;
+        self.resolved_launch = None;
         let (outcome, context, unlaunched) =
             crate::observability::lifecycle::role_invocation_classified(&trace_root, role, || {
                 let script = match self.resolve_spawn_bin() {
@@ -40,12 +69,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         crate::tokens_pool::private_workspace::JobKind::Role,
                         None,
                         format!("role-{role}-{}", uuid::Uuid::new_v4()),
-                        Box::new(move |runtime: &str| {
-                            let (model, _) = reconcile_unpinned_model_with_runtime(
-                                runtime,
-                                model_hint.0.clone(),
-                                model_hint.1.clone(),
-                            );
+                        Box::new(move |runtime: &str, drawn: Option<&str>| {
+                            // Same precedence as the launch below (#12748):
+                            // the runner's override, then the draw's model,
+                            // then the resolved hint.
+                            let (model, source) = match (model_hint.1 == "override", drawn) {
+                                (false, Some(drawn)) => {
+                                    (drawn.to_string(), "role-draw".to_string())
+                                }
+                                _ => model_hint.clone(),
+                            };
+                            let (model, _) =
+                                reconcile_unpinned_model_with_runtime(runtime, model, source);
                             (!model.is_empty()).then_some(model)
                         }),
                     );
@@ -57,7 +92,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                     ) {
                         Err(rejection) if rejection.containment_eligible() => {
                             use crate::runtime_preference::ContainmentPreparer;
-                            containment.contain(role, None, rejection)
+                            containment.contain(role, None, None, rejection)
                         }
                         other => other,
                     }
@@ -129,7 +164,7 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                 // refused below — see `reconcile_unpinned_model_with_runtime`. Only the
                 // shipped-default tier is touched, so an explicit pin still reaches
                 // #5028's refusal unchanged.
-                let (model, model_source) = match &admission {
+                let (model, mut model_source) = match &admission {
                     Some(admitted) => reconcile_unpinned_model_with_runtime(
                         &admitted.runtime,
                         model,
@@ -169,13 +204,48 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
                         return RoleTickOutcome::ModelRuntimeMismatch(mismatch);
                     }
                 }
+                // Selection-time model fallback (#13873): when no account is
+                // usable for the configured model's class, fall one rung down
+                // `autonomous.modelFallback.chain` instead of holding the
+                // tick. Applied AFTER the mismatch preflight above — a wrong
+                // *stated* intent keeps its refusal — and re-resolved on
+                // every tick, so the launch returns to the configured model
+                // the moment an account usable for it reappears. The
+                // per-role log header (model=… source=…) names the fallback
+                // through the source label so `role_tick.outcome` records it.
+                let model = {
+                    let effective = crate::sweep_registry::model_fallback::effective_model(
+                        &self.workspace_root,
+                        &model,
+                    );
+                    if let Some(fallback) = &effective.fallback {
+                        log::info!(
+                            "role_runner: {role} model {from} → {model} (selection-time \
+                             fallback: {reason}, #13873)",
+                            from = fallback.from,
+                            model = effective.model,
+                            reason = fallback.reason,
+                        );
+                        model_source = format!(
+                            "{model_source} +fallback({}→{}: {})",
+                            fallback.from, effective.model, fallback.reason
+                        );
+                    }
+                    effective.model
+                };
                 // Issue #8054: the reasoning-effort axis, resolved independently of the
                 // model (no shipped default — unconfigured resolves to the empty string,
                 // which the emission site renders as no `--effort` argument at all).
                 // Resolved AFTER the mismatch preflight above so a refused launch does
                 // not pay for a second config read.
-                let (effort, effort_source) =
-                    resolve_role_runner_effort(&self.workspace_root, role);
+                // Issue #14017: resolved against the admitted runtime, so a role that
+                // draws both Claude and Codex can carry a different effort for each
+                // (`roleEfforts.<role>@<runtime>`) and a Codex launch never runs unset.
+                let (effort, effort_source) = resolve_role_runner_effort_for_runtime(
+                    &self.workspace_root,
+                    role,
+                    admission.as_ref().map(|a| a.runtime.as_str()),
+                );
                 // Issue #8056: the launched values, captured for the durable
                 // `role_tick.outcome` record. Set here — after every pre-spawn bail-out
                 // above has already returned — so "resolved" never claims a model for a
@@ -219,7 +289,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
             });
         self.trace_context = context;
         self.unlaunched_failure = unlaunched;
+        self.last_output = read_log_since(&log_path, log_start);
+        if let Some(launch) = &mut self.resolved_launch {
+            launch.codex_session_id = self
+                .last_output
+                .as_deref()
+                .and_then(crate::usage_source::role_tick_codex_session_id);
+        }
         outcome
+    }
+
+    fn last_output(&self) -> Option<String> {
+        self.last_output.clone()
     }
 
     fn resolved_launch(&self) -> Option<crate::role_tick_telemetry::ResolvedLaunch> {
@@ -233,4 +314,18 @@ impl RoleInvocationRunner for ScriptRoleInvocationRunner {
     fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
         self.unlaunched_failure.clone()
     }
+}
+
+/// The log bytes appended after `start`, lossily decoded; `None` when the log
+/// is unreadable, shrank (rotated), or nothing was appended.
+fn read_log_since(path: &Path, start: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() <= start {
+        return None;
+    }
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }

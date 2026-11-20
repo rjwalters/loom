@@ -68,15 +68,11 @@ pub fn parse_effective(effective: &serde_json::Value) -> IdleExitConfig {
     }
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().map(|value| {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-    })
-}
-
 #[must_use]
 pub fn resolve_enabled(config: &IdleExitConfig) -> bool {
-    env_bool(ENABLE_ENV).or(config.enabled).unwrap_or(false)
+    crate::env_flag::env_flag(ENABLE_ENV)
+        .or(config.enabled)
+        .unwrap_or(false)
 }
 
 #[must_use]
@@ -91,7 +87,7 @@ pub fn resolve_minutes(config: &IdleExitConfig) -> u64 {
 
 #[must_use]
 pub fn resolve_starvation(config: &IdleExitConfig) -> bool {
-    env_bool(STARVATION_ENV)
+    crate::env_flag::env_flag(STARVATION_ENV)
         .or(config.on_token_starvation)
         .unwrap_or(true)
 }

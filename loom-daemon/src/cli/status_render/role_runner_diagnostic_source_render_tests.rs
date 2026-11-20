@@ -5,7 +5,7 @@
 //! line and the per-root diagnostic line.
 use super::{render_role_runner_disabled_line, render_role_runner_host_header_line};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::types::{DaemonStatusReport, RepoStatus};
+use crate::types::{DaemonStatusReport, RepoStatus};
 
 /// `pub(super)` so the sibling #6374 shard-render tests can build a
 /// baseline [`RepoStatus`] from the same place rather than duplicating
@@ -14,6 +14,7 @@ pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) 
     RepoStatus {
         root: std::path::PathBuf::from("/repos/loom"),
         maintain_only: None,
+        installed_behind: None,
         weight: 100,
         in_flight_count: 0,
         health_gate_halted: false,
@@ -23,6 +24,7 @@ pub(super) fn repo(enabled: bool, on_idle: &[&str], env_override: Option<bool>) 
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,

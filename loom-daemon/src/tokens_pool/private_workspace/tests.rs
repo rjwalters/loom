@@ -97,30 +97,8 @@ fn forge_credential_username_preserves_basic_auth_and_rejects_protocol_injection
         assert!(credential_username(false, Some(invalid)).is_err());
     }
 }
-use std::process::Command;
 
-fn git(path: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args([
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "Git fixture failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
+use crate::test_git_helpers::{configure, run as git};
 
 struct RepoFixture {
     _temp: tempfile::TempDir,
@@ -137,6 +115,7 @@ impl RepoFixture {
         std::fs::create_dir(&remote).unwrap();
         std::fs::create_dir(&root).unwrap();
         git(&remote, &["init", "-b", "main"]);
+        configure(&remote);
         std::fs::write(remote.join("fixture"), "base").unwrap();
         git(&remote, &["add", "."]);
         git(&remote, &["commit", "-m", "fixture"]);
@@ -146,6 +125,7 @@ impl RepoFixture {
             base: "main".into(),
             container_id: "test-container".into(),
             branch: None,
+            slug: None,
         };
         Self {
             _temp: temp,
@@ -212,21 +192,495 @@ fn dirty_root_and_dirty_worktree_are_preserved() {
 }
 
 #[test]
-fn unpushed_and_detached_commits_survive_refused_reuse() {
+fn lease_renew_residue_does_not_refuse_reuse_but_other_dirt_does() {
     let _fork = fork_guard();
     let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // Loom's own lease-renewal lock left in the clone (#14160): untracked in
+    // a repo whose ignore rules do not cover it. Residue Loom itself wrote
+    // must never refuse a seat.
+    std::fs::create_dir_all(repo.join(".loom/lease-renew")).unwrap();
+    std::fs::write(repo.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // A linked worktree holding the same residue is forgiven too.
+    let worktree = f.root.join("issue-5");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "issue-5",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::create_dir_all(worktree.join(".loom/lease-renew")).unwrap();
+    std::fs::write(worktree.join(".loom/lease-renew/.lock"), "").unwrap();
+    f.prepare().unwrap();
+    // Any other dirt still refuses, and the refusal names the path.
+    std::fs::write(repo.join("stray.txt"), "retain").unwrap();
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("dirty"), "{error}");
+    assert!(error.contains("stray.txt"), "{error}");
+    assert!(repo.join("stray.txt").exists());
+    // The named list is bounded (#14160).
+    std::fs::remove_file(repo.join("stray.txt")).unwrap();
+    for i in 0..12 {
+        std::fs::write(repo.join(format!("stray-{i:02}")), "retain").unwrap();
+    }
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("stray-09"), "{error}");
+    assert!(!error.contains("stray-10"), "{error}");
+    assert!(error.contains("and 2 more"), "{error}");
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn unpushed_and_detached_commits_survive_refused_reuse() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
     f.prepare().unwrap();
     let repo = f.root.join("repo");
     git(&repo, &["switch", "-c", "issue-3"]);
     std::fs::write(repo.join("fixture"), "unpushed").unwrap();
     git(&repo, &["commit", "-am", "unpublished"]);
     let tip = git(&repo, &["rev-parse", "HEAD"]);
-    assert!(f.prepare().unwrap_err().to_string().contains("unpushed"));
+    // A branch names the work and preparation never moves a branch: a new
+    // step on the same issue resumes its own unpublished tip (#14030).
+    f.args.branch = Some("issue-3".into());
+    f.prepare().unwrap();
     assert_eq!(git(&repo, &["rev-parse", "HEAD"]), tip);
+    // A step for a different issue proceeds and leaves the branch untouched.
+    f.args.branch = Some("issue-4".into());
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "issue-4"]));
+    // With no requested branch the dispatch detaches to the base; the
+    // branch keeps carrying the work.
+    f.args.branch = None;
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    // Work no longer named by a branch still refuses (a detached HEAD could
+    // be detached away from): the refusal preserves it, names the leftover
+    // unpublished branch and the exact command that clears it.
+    f.args.branch = Some("issue-3".into());
+    f.prepare().unwrap();
+    std::fs::write(repo.join("fixture"), "more").unwrap();
+    git(&repo, &["commit", "-am", "more-unpublished"]);
+    git(&repo, &["switch", "-c", "strand"]);
+    std::fs::write(repo.join("fixture"), "stranded").unwrap();
+    git(&repo, &["commit", "-am", "stranded"]);
     git(&repo, &["switch", "--detach"]);
-    git(&repo, &["branch", "-D", "issue-3"]);
-    assert!(f.prepare().unwrap_err().to_string().contains("detached"));
-    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), tip);
+    git(&repo, &["branch", "-D", "strand"]);
+    let stranded_tip = git(&repo, &["rev-parse", "HEAD"]);
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("unpushed"), "{error}");
+    assert!(error.contains("detached"), "{error}");
+    assert!(error.contains("issue-3"), "{error}");
+    assert!(error.contains("accounts session recover fixture --publish"), "{error}");
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), stranded_tip);
+}
+
+/// A clean linked worktree a contained step created under the clone
+/// (#14122): invisible to both the dirty check and the detached-HEAD scan,
+/// yet holding exactly the branch the next preparation switches to.
+fn linked_worktree_holding(repo: &Path, worktree: &Path, branch: &str) {
+    git(repo, &["switch", "-c", branch]);
+    std::fs::write(repo.join("fixture"), "held").unwrap();
+    git(repo, &["commit", "-am", "held"]);
+    git(repo, &["switch", "--detach", "main"]);
+    git(repo, &["worktree", "add", worktree.to_str().unwrap(), branch]);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_clean_linked_worktree_holding_the_branch_refuses_and_names_the_cure() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let worktree = f.root.join("issue-9");
+    linked_worktree_holding(&repo, &worktree, "feature/issue-9");
+    // A step for another issue proceeds: only the held branch refuses.
+    f.args.branch = Some("feature/issue-10".into());
+    f.prepare().unwrap();
+    // The held branch itself refuses with the holder, the branch and both
+    // recovery commands named, and the hold is left untouched.
+    f.args.branch = Some("feature/issue-9".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("linked worktree"), "{error}");
+    assert!(error.contains(worktree.to_str().unwrap()), "{error}");
+    assert!(error.contains("feature/issue-9"), "{error}");
+    assert!(error.contains("recover fixture --discard --branch feature/issue-9"), "{error}");
+    assert!(error.contains("recover fixture --publish"), "{error}");
+    assert!(worktree.exists());
+    // The named cure clears an unpublished hold: the discard removes the
+    // holding worktree and the branch, and the next preparation proceeds.
+    let mut recover = recover_args(&f.remote);
+    recover.discard = true;
+    recover.branch = vec!["feature/issue-9".into()];
+    let out = repository::recover(&f.root, &recover).unwrap();
+    assert_eq!(out.discarded, vec!["feature/issue-9".to_owned()]);
+    assert!(!worktree.exists());
+    let revision = f.prepare().unwrap();
+    assert_eq!(revision, git(&f.remote, &["rev-parse", "HEAD"]));
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn a_published_branch_held_by_a_worktree_names_the_hand_cure() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let worktree = f.root.join("issue-9");
+    linked_worktree_holding(&repo, &worktree, "feature/issue-9");
+    // Publishing the branch (the real recover verb) preserves its commits on
+    // origin but clears nothing: the hold survives, and the refusal no longer
+    // names a discard — recovery never deletes a published branch, so the
+    // only cure is removing the worktree by hand.
+    let mut recover = recover_args(&f.remote);
+    recover.publish = true;
+    let out = repository::recover(&f.root, &recover).unwrap();
+    assert_eq!(out.published, vec!["feature/issue-9".to_owned()]);
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    let noop = repository::recover(&f.root, &args).unwrap();
+    assert!(noop.published.is_empty(), "the branch is no longer unpublished");
+    f.args.branch = Some("feature/issue-9".into());
+    let error = f.prepare().unwrap_err().to_string();
+    assert!(error.contains("linked worktree"), "{error}");
+    assert!(error.contains(worktree.to_str().unwrap()), "{error}");
+    assert!(error.contains("worktree remove"), "{error}");
+    assert!(error.contains("accounts session attach fixture"), "{error}");
+    assert!(!error.contains("--discard --branch"), "{error}");
+    assert!(worktree.exists());
+    // The hand cure unwedges: the clean worktree carries nothing the branch
+    // ref does not, so removing it releases the hold losslessly.
+    git(&repo, &["worktree", "remove", worktree.to_str().unwrap()]);
+    f.prepare().unwrap();
+    assert_eq!(
+        git(&repo, &["rev-parse", "feature/issue-9"]),
+        git(&f.remote, &["rev-parse", "feature/issue-9"])
+    );
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
+    let _fork = fork_guard();
+    let mut f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    git(&repo, &["switch", "-c", "issue-3"]);
+    std::fs::write(repo.join("fixture"), "unpushed").unwrap();
+    git(&repo, &["commit", "-am", "unpublished"]);
+    let tip = git(&repo, &["rev-parse", "issue-3"]);
+    // A second registered repository of the same account clones and
+    // prepares independently of the primary's unpublished work (#14030).
+    let additional = repository::PrepareArgs {
+        account: "fixture".into(),
+        repository: f.remote.to_string_lossy().into_owned(),
+        base: "main".into(),
+        container_id: "test-container".into(),
+        branch: Some("feature/issue-9".into()),
+        slug: Some("owner-repo-12345678".into()),
+    };
+    let add = repository::prepare(&f.root, &additional).unwrap();
+    assert!(!add.is_empty());
+    // Unpublished commits on one branch of the additional clone do not
+    // block re-preparing it for its own branch, nor the primary at all.
+    let clone = f.root.join("work").join("owner-repo-12345678");
+    git(&clone, &["switch", "-c", "other-unpushed"]);
+    std::fs::write(clone.join("fixture"), "other").unwrap();
+    git(&clone, &["commit", "-am", "other-unpublished"]);
+    f.args.branch = Some("issue-4".into());
+    f.prepare().unwrap();
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), tip);
+    repository::prepare(&f.root, &additional).unwrap();
+    assert_eq!(
+        git(&clone, &["rev-parse", "feature/issue-9"]),
+        add,
+        "the additional clone resumes its own branch"
+    );
+}
+
+/// Fallible git probe for assertions on ref existence (`test_git_helpers::run`
+/// panics on failure).
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    crate::test_git_helpers::git_out(dir, args).status.success()
+}
+
+fn recover_args(remote: &Path) -> repository::RecoverArgs {
+    repository::RecoverArgs {
+        account: "fixture".into(),
+        repository: remote.to_string_lossy().into_owned(),
+        base: "main".into(),
+        publish: false,
+        discard: false,
+        issue: None,
+        branch: Vec::new(),
+        slug: None,
+    }
+}
+
+/// Two unpublished branches (one ahead each) with the root checkout
+/// detached at the base, and the base revision.
+fn two_unpublished_branches() -> (RepoFixture, PathBuf, String, String) {
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    let branch = |name: &str, content: &str, repo: &Path| {
+        git(repo, &["switch", "-c", name]);
+        std::fs::write(repo.join("fixture"), content).unwrap();
+        git(repo, &["commit", "-am", content]);
+        let tip = git(repo, &["rev-parse", name]);
+        git(repo, &["switch", "--detach", &base]);
+        tip
+    };
+    let issue3 = branch("issue-3", "first", &repo);
+    let issue4 = branch("issue-4", "second", &repo);
+    (f, repo, issue3, issue4)
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_lists_unpublished_branches_and_stranded_detached_work() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert!(list.cloned);
+    assert_eq!(
+        list.branches
+            .iter()
+            .map(|b| (b.branch.as_str(), b.ahead))
+            .collect::<Vec<_>>(),
+        vec![("issue-3", 1), ("issue-4", 1)]
+    );
+    assert!(list.published.is_empty() && list.discarded.is_empty());
+    assert!(list.ignored.is_empty() && list.detached.is_empty());
+    // Detached, unnamed work is reported (never touched) by the listing.
+    git(&repo, &["switch", "-c", "strand"]);
+    std::fs::write(repo.join("fixture"), "stranded").unwrap();
+    git(&repo, &["commit", "-am", "stranded"]);
+    let stranded = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["switch", "--detach"]);
+    git(&repo, &["branch", "-D", "strand"]);
+    let list = repository::recover(&f.root, &recover_args(&f.remote)).unwrap();
+    assert_eq!(list.detached.len(), 1);
+    assert_eq!(list.detached[0].revision, stranded);
+    assert_eq!(list.detached[0].ahead, 1);
+    // The detached tip is preserved exactly (nothing was reset).
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), stranded);
+    assert_eq!(git(&repo, &["rev-parse", "issue-3"]), issue3);
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // A clone the account never materialized reports cloned=false.
+    let mut absent = recover_args(&f.remote);
+    absent.slug = Some("owner-other-12345678".into());
+    let list = repository::recover(&f.root, &absent).unwrap();
+    assert!(!list.cloned);
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_publishes_scoped_branches_and_leaves_others_unpublished() {
+    let _fork = fork_guard();
+    let (f, repo, issue3, issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.publish = true;
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.published, vec!["issue-3".to_owned()]);
+    // The remote carries the branch now, and the listing agrees.
+    assert_eq!(git(&f.remote, &["rev-parse", "issue-3"]), issue3);
+    assert_eq!(
+        out.branches
+            .iter()
+            .map(|b| b.branch.as_str())
+            .collect::<Vec<_>>(),
+        vec!["issue-4"]
+    );
+    // issue-4 was never touched: still unpublished at its own tip.
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // Publishing an absent branch is ignored, not an error.
+    args.branch = vec!["absent".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.ignored, vec!["absent".to_owned()]);
+    assert!(out.published.is_empty());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_requires_a_scope_and_only_touches_named_branches() {
+    let _fork = fork_guard();
+    let (f, repo, _issue3, issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("scope"), "{error}");
+    // Nothing was discarded without a scope.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    // Only the named branch is discarded.
+    args.branch = vec!["issue-3".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded, vec!["issue-3".to_owned()]);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    assert_eq!(git(&repo, &["rev-parse", "issue-4"]), issue4);
+    // A published branch (and an absent one) is ignored: a discard never
+    // deletes a branch it was not named for, nor one carrying no unpublished
+    // commits.
+    args.branch = vec!["main".into(), "ghost".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.ignored, vec!["ghost".to_owned(), "main".to_owned()]);
+    assert!(out.discarded.is_empty());
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/main"]));
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_moves_the_checkout_and_removes_a_holding_worktree() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    let base = git(&repo, &["rev-parse", "origin/main"]);
+    // A branch held by the main checkout.
+    git(&repo, &["switch", "-c", "held"]);
+    std::fs::write(repo.join("fixture"), "held").unwrap();
+    git(&repo, &["commit", "-am", "held"]);
+    // A branch held by a linked worktree.
+    let worktree = f.root.join("issue-5");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "wt-held",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "wt-held").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-am", "wt-held"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["held".into(), "wt-held".into()];
+    let out = repository::recover(&f.root, &args).unwrap();
+    assert_eq!(out.discarded.len(), 2);
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/held"]));
+    assert!(!git_ok(&repo, &["show-ref", "--verify", "refs/heads/wt-held"]));
+    // The main checkout was moved to the base on origin, not left stranded.
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), base);
+    assert!(!worktree.exists(), "the holding worktree was removed");
+    // A dirty worktree holding a discarded branch refuses before any
+    // mutation.
+    let dirty = f.root.join("issue-6");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "dirty-holder",
+            dirty.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(dirty.join("fixture"), "committed").unwrap();
+    git(&dirty, &["add", "."]);
+    git(&dirty, &["commit", "-am", "committed"]);
+    std::fs::write(dirty.join("untracked"), "keep").unwrap();
+    args.branch = vec!["dirty-holder".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("uncommitted"), "{error}");
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/dirty-holder"]));
+    assert!(dirty.join("untracked").exists());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_refuses_a_dirty_main_checkout_holding_the_branch() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let repo = f.root.join("repo");
+    // The main checkout holds the branch — where `prepare` itself leaves it —
+    // with uncommitted work on top.
+    git(&repo, &["switch", "-c", "held-dirty"]);
+    std::fs::write(repo.join("fixture"), "committed").unwrap();
+    git(&repo, &["commit", "-am", "committed"]);
+    std::fs::write(repo.join("untracked"), "keep").unwrap();
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.branch = vec!["held-dirty".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("main checkout"), "{error}");
+    assert!(error.contains("uncommitted"), "{error}");
+    // The branch, the checkout, and the uncommitted work are all untouched:
+    // no half-done discard.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/held-dirty"]));
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "held-dirty");
+    assert!(repo.join("untracked").exists());
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_discard_resolves_the_base_before_mutating_any_holder() {
+    let _fork = fork_guard();
+    let (f, repo, _issue3, _issue4) = two_unpublished_branches();
+    // A linked worktree holds the branch that sorts first, so the old code
+    // removed it before the main checkout's unresolvable base failed.
+    let worktree = f.root.join("issue-7");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "aaa-wt",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    std::fs::write(worktree.join("fixture"), "aaa-wt").unwrap();
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-am", "aaa-wt"]);
+    // The main checkout holds the other discarded branch.
+    git(&repo, &["switch", "issue-3"]);
+    let mut args = recover_args(&f.remote);
+    args.discard = true;
+    args.base = "no-such-base".into();
+    args.branch = vec!["issue-3".into(), "aaa-wt".into()];
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("base"), "{error}");
+    // Neither holder was touched: the base resolves before the first mutation.
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/issue-3"]));
+    assert!(git_ok(&repo, &["show-ref", "--verify", "refs/heads/aaa-wt"]));
+    assert!(worktree.exists(), "the holding worktree was not removed");
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "issue-3");
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+#[serial_test::serial]
+fn recover_refuses_an_unknown_clone_identity() {
+    let _fork = fork_guard();
+    let (f, _repo, _issue3, _issue4) = two_unpublished_branches();
+    let mut args = recover_args(&f.remote);
+    args.account = "mallory".into();
+    let error = repository::recover(&f.root, &args).unwrap_err().to_string();
+    assert!(error.contains("identity mismatch"), "{error}");
 }
 
 #[test]
@@ -281,9 +735,12 @@ fn config() -> Config {
         docker_desktop: false,
         repository: "https://forge.example/a/b.git".into(),
         base: "main".into(),
+        repositories: vec![],
         volume: "private-volume".into(),
         profile: "/external/account".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     }
 }
 
@@ -444,6 +901,7 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         base_revision: "abc".into(),
         host_pid: 999_999,
         control: "d".repeat(64),
+        repository: String::new(),
     };
     lease.begin(&job).unwrap();
     drop(lease);
@@ -457,9 +915,12 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         docker_desktop: false,
         repository: "https://example.com/a/b".into(),
         base: "main".into(),
+        repositories: vec![],
         volume: "volume".into(),
         profile: "/external/profile".into(),
         gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
     };
     assert!(lease
         .recover(&config, Some(&serde_json::json!({"Id":"new", "State":{"Running":false}})))
@@ -470,4 +931,516 @@ fn ambiguous_lease_is_durable_and_stopped_container_recovery_retains_last_owner(
         .unwrap();
     assert!(lease::read(root.path()).unwrap().is_none());
     assert!(root.path().join("last-job.json").exists());
+}
+
+// ---- Multi-repository account storage (#10795) ----------------------------
+
+#[test]
+fn same_basename_under_different_owners_or_hosts_gets_distinct_paths() {
+    let a = identify("https://forge.example/alice/tool").unwrap();
+    let b = identify("https://forge.example/bob/tool").unwrap();
+    let c = identify("https://other.example/alice/tool").unwrap();
+    let slugs = [&a.slug, &b.slug, &c.slug];
+    assert_eq!(slugs.iter().collect::<std::collections::HashSet<_>>().len(), 3, "{slugs:?}");
+    // One repository, several spellings: one identity.
+    let same = identify("https://FORGE.example/Alice/Tool.git").unwrap();
+    assert_eq!((same.key, same.slug), (a.key.clone(), a.slug.clone()));
+    assert!(same_repository(
+        "https://forge.example/alice/tool/",
+        "https://forge.example/alice/tool.git"
+    ));
+    assert!(!same_repository(
+        "https://forge.example/alice/tool",
+        "https://forge.example/bob/tool"
+    ));
+    // A forge under a path prefix keeps the whole path in its identity.
+    let prefixed = identify("https://forge.example/git/alice/tool").unwrap();
+    assert_ne!(prefixed.slug, a.slug);
+    assert!(prefixed.slug.starts_with("alice-tool-"), "{}", prefixed.slug);
+    assert!(a
+        .slug
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)));
+}
+
+#[test]
+fn unsafe_repository_identities_and_directory_names_are_refused() {
+    for url in [
+        "https://forge.example/a",
+        "https://forge.example/../b",
+        "https://forge.example/a/..",
+        "https://forge.example/.hidden/b",
+        "https://forge.example/-flag/b",
+        "https://forge.example/a/b%2Fc",
+        "ssh://git@forge.example/a/b",
+        "https://user:secret@forge.example/a/b",
+    ] {
+        assert!(identify(url).is_err(), "accepted {url}");
+    }
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    for slug in ["", "..", "../x", "a/b", ".hidden", "a..b"] {
+        assert!(
+            repository::prepare(&f.root, &f.additional_args("..", slug)).is_err(),
+            "accepted {slug:?}"
+        );
+    }
+}
+
+impl RepoFixture {
+    fn additional_args(&self, remote: &str, slug: &str) -> repository::PrepareArgs {
+        repository::PrepareArgs {
+            repository: remote.into(),
+            slug: Some(slug.into()),
+            ..self.args.clone_args()
+        }
+    }
+    /// A second, independent upstream with its own content.
+    fn second_remote(&self, name: &str) -> PathBuf {
+        let remote = self._temp.path().join(name);
+        std::fs::create_dir(&remote).unwrap();
+        git(&remote, &["init", "-b", "main"]);
+        configure(&remote);
+        std::fs::write(remote.join("fixture"), name).unwrap();
+        git(&remote, &["add", "."]);
+        git(&remote, &["commit", "-m", name]);
+        remote
+    }
+}
+
+impl repository::PrepareArgs {
+    fn clone_args(&self) -> Self {
+        Self {
+            account: self.account.clone(),
+            repository: self.repository.clone(),
+            base: self.base.clone(),
+            container_id: self.container_id.clone(),
+            branch: self.branch.clone(),
+            slug: self.slug.clone(),
+        }
+    }
+}
+
+#[test]
+fn two_repositories_share_one_volume_with_independent_roots_and_untouched_first_clone() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let (r1, r2) = (f.second_remote("one"), f.second_remote("two"));
+    let (a, b) = (
+        f.additional_args(&r1.to_string_lossy(), "o-one-11111111"),
+        f.additional_args(&r2.to_string_lossy(), "o-two-22222222"),
+    );
+    let rev_a = repository::prepare(&f.root, &a).unwrap();
+    // Unfinished work in the first additional clone survives preparing the second.
+    let first = f.root.join("work/o-one-11111111");
+    std::fs::write(first.join("scratch"), "unfinished").unwrap();
+    std::fs::write(first.join("fixture"), "edited").unwrap();
+    let rev_b = repository::prepare(&f.root, &b).unwrap();
+    assert_ne!(rev_a, rev_b);
+    assert_eq!(std::fs::read_to_string(first.join("scratch")).unwrap(), "unfinished");
+    assert_eq!(std::fs::read_to_string(first.join("fixture")).unwrap(), "edited");
+    let second = f.root.join("work/o-two-22222222");
+    for (root, remote) in [
+        (&first, &r1),
+        (&second, &r2),
+        (&f.root.join("repo"), &f.remote),
+    ] {
+        assert_eq!(
+            git(root, &["rev-parse", "--show-toplevel"]),
+            root.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(git(root, &["remote", "get-url", "origin"]), remote.to_string_lossy());
+        assert!(!root.join(".git/objects/info/alternates").exists());
+    }
+    // Re-preparing a dirty additional clone is refused, not cleaned.
+    assert!(repository::prepare(&f.root, &a)
+        .unwrap_err()
+        .to_string()
+        .contains("dirty"));
+    // A repository can never be prepared under another repository's directory.
+    let swapped = f.additional_args(&r2.to_string_lossy(), "o-one-11111111");
+    assert!(repository::prepare(&f.root, &swapped)
+        .unwrap_err()
+        .to_string()
+        .contains("mismatch"));
+}
+
+#[test]
+fn additional_clone_requires_the_primary_and_real_directories() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    let r = f.second_remote("one");
+    let args = f.additional_args(&r.to_string_lossy(), "o-one-11111111");
+    assert!(repository::prepare(&f.root, &args).is_err(), "no primary prepared yet");
+    assert!(!f.root.join("work/o-one-11111111").exists());
+    f.prepare().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), f.root.join("work")).unwrap();
+    assert!(repository::prepare(&f.root, &args)
+        .unwrap_err()
+        .to_string()
+        .contains("real directory"));
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "nothing written through the link"
+    );
+}
+
+#[test]
+fn interrupted_clone_is_recoverable_and_never_ready() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let slug = "o-one-11111111";
+    // A clone that fails leaves no ready path behind.
+    let missing = f._temp.path().join("absent");
+    let bad = f.additional_args(&missing.to_string_lossy(), slug);
+    assert!(repository::prepare(&f.root, &bad).is_err());
+    assert!(!f.root.join("work").join(slug).exists(), "a failed clone must not look ready");
+    // A crashed earlier attempt left a half-written staging directory.
+    let staging = f.root.join("work").join(format!(".cloning-{slug}"));
+    std::fs::create_dir_all(staging.join("partial")).unwrap();
+    std::fs::write(staging.join("partial/junk"), "x").unwrap();
+    let r = f.second_remote("one");
+    let good = f.additional_args(&r.to_string_lossy(), slug);
+    // The failed attempt wrote its identity for ANOTHER url: refused, nothing reset.
+    assert!(repository::prepare(&f.root, &good)
+        .unwrap_err()
+        .to_string()
+        .contains("mismatch"));
+    std::fs::remove_file(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap();
+    let revision = repository::prepare(&f.root, &good).unwrap();
+    assert!(!staging.exists());
+    assert_eq!(git(&f.root.join("work").join(slug), &["rev-parse", "HEAD"]), revision);
+}
+
+#[test]
+fn firewalled_repositories_are_matched_by_forge_identity_in_any_spelling() {
+    let id = identify("https://forge.example/Acme/Notebook").unwrap();
+    let rec = |name: &str, remote: Option<&str>| vec![(name.to_owned(), remote.map(str::to_owned))];
+    for remote in [
+        "https://forge.example/acme/notebook",
+        "https://forge.example/Acme/Notebook.git",
+        "git@forge.example:acme/notebook.git",
+        "ssh://git@forge.example/acme/notebook",
+    ] {
+        assert!(repository::firewalled(&id, &rec("anything", Some(remote))), "{remote}");
+    }
+    assert!(!repository::firewalled(
+        &id,
+        &rec("notebook", Some("https://forge.example/other/notebook"))
+    ));
+    assert!(!repository::firewalled(
+        &id,
+        &rec("loom", Some("https://forge.example/acme/loom"))
+    ));
+    // No usable remote: fail closed on the repository name.
+    assert!(repository::firewalled(&id, &rec("Notebook", None)));
+    assert!(!repository::firewalled(&id, &rec("loom", None)));
+}
+
+#[test]
+fn legacy_single_repository_state_loads_and_resolves_to_the_unchanged_primary() {
+    let legacy = serde_json::json!({
+        "schema_version": 1, "account": "a", "container": "c", "engine": "e",
+        "repository": "https://forge.example/o/primary", "base": "main",
+        "volume": "v", "profile": "/p", "gh_config": null
+    });
+    let mut config: Config = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(config.repositories.is_empty());
+    // Unmigrated state serializes exactly as before.
+    assert_eq!(serde_json::to_value(&config).unwrap()["repositories"], serde_json::Value::Null);
+    let primary = config.target(None).unwrap();
+    assert_eq!((primary.path.as_str(), primary.slug), (REPO, None));
+    assert_eq!(
+        config
+            .target(Some("https://forge.example/o/primary.git"))
+            .unwrap(),
+        config.primary()
+    );
+    let err = config
+        .target(Some("https://forge.example/o/other"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not registered") && err.contains("--private-clone"), "{err}");
+    lifecycle_register(&mut config, "https://forge.example/o/other", "main").unwrap();
+    let other = config
+        .target(Some("https://forge.example/o/other"))
+        .unwrap();
+    assert!(other.path.starts_with("/workspace/work/o-other-"), "{}", other.path);
+    assert_eq!(
+        config.repository, "https://forge.example/o/primary",
+        "primary identity is never rewritten"
+    );
+    // A base change for a configured repository is refused with recovery advice.
+    let err = lifecycle_register(&mut config, "https://forge.example/o/other", "dev").unwrap_err();
+    assert!(err.to_string().contains("resolve unfinished work"), "{err}");
+    assert!(lifecycle_register(&mut config, "https://forge.example/o/primary", "dev").is_err());
+}
+
+fn lifecycle_register(config: &mut Config, repository: &str, base: &str) -> Result<()> {
+    // No fleet store is configured for an empty workspace: the roster is empty.
+    let workspace = tempfile::tempdir().unwrap();
+    lifecycle::register(workspace.path(), config, repository, base)
+}
+
+#[test]
+fn repository_bound_job_keeps_the_account_wide_exclusive_lease() {
+    let _fork = fork_guard();
+    let root = tempfile::tempdir().unwrap();
+    let lease = lease::Lease::acquire(root.path()).unwrap();
+    let job = |repository: &str| lease::Job {
+        owner: "o".into(),
+        kind: JobKind::Role,
+        issue: None,
+        branch: None,
+        container_id: "a".repeat(64),
+        base_revision: "r".into(),
+        host_pid: 1,
+        control: "c".repeat(64),
+        repository: repository.into(),
+    };
+    lease.begin(&job("https://forge.example/o/other")).unwrap();
+    assert_eq!(
+        lease::read(root.path()).unwrap().unwrap().repository,
+        "https://forge.example/o/other"
+    );
+    // A second job for a DIFFERENT clone of the same seat is excluded.
+    assert!(lease::Lease::acquire(root.path())
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("busy"));
+    // A lease written before #10795 (no repository field) still reads: primary.
+    let mut value = serde_json::to_value(job("")).unwrap();
+    assert!(value.get("repository").is_none());
+    value.as_object_mut().unwrap().remove("repository");
+    std::fs::write(root.path().join("job.json"), serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(lease::read(root.path()).unwrap().unwrap().repository, "");
+}
+
+/// #13916: on an App-only host the prepare exec names `GH_TOKEN` as a bare
+/// `--env` and the resolved value rides on the `docker` child alone — never
+/// in argv. A token already in the process env adds nothing to the child.
+#[test]
+fn prepare_exec_carries_a_resolved_token_on_the_child_never_in_argv() {
+    const SECRET: &str = "ghs_prepareTESTONLY13916";
+    let mut config = config();
+    config.repository = "https://github.com/acme/widget".into();
+    let argv = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let seen = argv.clone();
+    let _fake = docker::fake::install(Box::new(move |args| {
+        *seen.borrow_mut() = args.iter().map(|a| (*a).to_owned()).collect();
+        Ok(serde_json::json!({"protocol": PROTOCOL, "revision": "abc"}).to_string())
+    }));
+    let ws = forge_auth::published_owner_workspace("acme");
+    let resolved =
+        forge_auth::ExecAuth::resolve_with(ws.path(), &config.repository, &|_| None, &|_| {
+            Some(SECRET.into())
+        });
+    let revision =
+        docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &resolved).unwrap();
+    assert_eq!(revision, "abc");
+    let args = argv.borrow().clone();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"),
+        "{args:?}"
+    );
+    assert!(!args.iter().any(|a| a.contains(SECRET)), "token leaked into argv");
+    assert_eq!(docker::fake::seen_env(), vec![vec![("GH_TOKEN".to_owned(), SECRET.to_owned())]]);
+
+    // The process already holds a token: forwarded by name, nothing added.
+    let ambient = forge_auth::ExecAuth::resolve_with(
+        Path::new("/nonexistent"),
+        &config.repository,
+        &|name| (name == "GH_TOKEN").then(|| "from-process".into()),
+        &|_| panic!("must not read a token the process already has"),
+    );
+    docker::prepare_with(&config, &config.primary(), &"a".repeat(64), None, &ambient).unwrap();
+    let args = argv.borrow().clone();
+    assert!(args
+        .windows(2)
+        .any(|w| w[0] == "--env" && w[1] == "GH_TOKEN"));
+    assert_eq!(docker::fake::seen_env().last().unwrap(), &Vec::new());
+}
+
+// ---- rebind after a repository transfer (#14357) ----
+
+const OLD_SLUG: &str = "old-one-11111111";
+const NEW_SLUG: &str = "new-one-22222222";
+
+/// A transferred repository: the old remote's history under a new location.
+fn transferred(f: &RepoFixture, old: &Path) -> PathBuf {
+    let new = f._temp.path().join("transferred");
+    git(
+        f._temp.path(),
+        &[
+            "clone",
+            "--bare",
+            &old.to_string_lossy(),
+            &new.to_string_lossy(),
+        ],
+    );
+    new
+}
+
+fn rebind_args(old: &Path, new: &Path, dry_run: bool) -> repository::RebindArgs {
+    repository::RebindArgs {
+        account: "fixture".into(),
+        from: old.to_string_lossy().into_owned(),
+        from_slug: OLD_SLUG.into(),
+        to: new.to_string_lossy().into_owned(),
+        to_slug: NEW_SLUG.into(),
+        base: "main".into(),
+        dry_run,
+    }
+}
+
+/// A primary plus a populated old clone carrying an unpublished branch and a
+/// dirty file, and the transferred remote.
+fn old_clone_with_work() -> (RepoFixture, PathBuf, PathBuf, PathBuf) {
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let old = f.second_remote("old");
+    repository::prepare(&f.root, &f.additional_args(&old.to_string_lossy(), OLD_SLUG)).unwrap();
+    let clone = f.root.join("work").join(OLD_SLUG);
+    git(&clone, &["switch", "-c", "feature/issue-9"]);
+    std::fs::write(clone.join("fixture"), "unpublished").unwrap();
+    git(&clone, &["commit", "-am", "work"]);
+    std::fs::write(clone.join("scratch"), "dirty").unwrap();
+    let new = transferred(&f, &old);
+    (f, old, new, clone)
+}
+
+fn record_of(f: &RepoFixture, slug: &str) -> String {
+    std::fs::read_to_string(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap()
+}
+
+#[test]
+fn rebind_moves_an_old_clone_keeping_its_work_and_is_idempotent() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    let moved = f.root.join("work").join(NEW_SLUG);
+    // The dry run verifies and reports; nothing moves.
+    let dry = repository::rebind(&f.root, &rebind_args(&old, &new, true)).unwrap();
+    assert_eq!(dry.status, RebindStatus::DryRun);
+    assert!(clone.exists() && !moved.exists());
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::Moved);
+    assert!(!clone.exists());
+    assert_eq!(done.from.branches, done.to.branches);
+    assert_eq!(done.to.branches[0].branch, "feature/issue-9");
+    assert!(done.to.dirty);
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+    assert_eq!(git(&moved, &["rev-parse", "feature/issue-9"]).len(), 40);
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+    assert!(record_of(&f, NEW_SLUG).contains(&*new.to_string_lossy()));
+    assert!(!f
+        .root
+        .join("work/.identity")
+        .join(format!("{OLD_SLUG}.json"))
+        .exists());
+
+    // Re-running verifies and changes nothing.
+    let again = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(again.status, RebindStatus::AlreadyBound);
+    assert_eq!(again.to.branches, done.to.branches);
+    // The moved clone prepares under the canonical identity (dirty refusal
+    // proves it got past the identity check).
+    let error = repository::prepare(&f.root, &f.additional_args(&new.to_string_lossy(), NEW_SLUG))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("dirty"), "{error}");
+}
+
+#[test]
+fn rebind_succeeds_when_the_canonical_remote_already_publishes_a_local_branch() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    // The transferred repository already carries the branch (published by
+    // someone else, or pushed after the transfer): the move's `fetch --prune`
+    // shifts the unpublished count without any local work changing.
+    git(&clone, &["push", &new.to_string_lossy(), "feature/issue-9"]);
+    let tip = git(&clone, &["rev-parse", "feature/issue-9"]);
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::Moved);
+    assert_eq!(done.from.branches[0].branch, "feature/issue-9");
+    assert!(done.to.branches.is_empty(), "published upstream by now");
+    let moved = f.root.join("work").join(NEW_SLUG);
+    assert_eq!(git(&moved, &["rev-parse", "feature/issue-9"]), tip);
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+}
+
+#[test]
+fn rebind_finishes_an_interrupted_move() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    // Crash after the directory move, before the record or origin changed.
+    std::fs::rename(&clone, f.root.join("work").join(NEW_SLUG)).unwrap();
+    let done = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(done.status, RebindStatus::AlreadyBound);
+    let moved = f.root.join("work").join(NEW_SLUG);
+    assert_eq!(git(&moved, &["remote", "get-url", "origin"]), new.to_string_lossy());
+    assert!(record_of(&f, NEW_SLUG).contains(&*new.to_string_lossy()));
+    assert!(!f
+        .root
+        .join("work/.identity")
+        .join(format!("{OLD_SLUG}.json"))
+        .exists());
+    assert_eq!(std::fs::read_to_string(moved.join("scratch")).unwrap(), "dirty");
+}
+
+#[test]
+fn rebind_refuses_a_wrong_repository_without_changing_anything() {
+    let _fork = fork_guard();
+    let (f, old, _new, clone) = old_clone_with_work();
+    let unrelated = f.second_remote("unrelated");
+    let before = record_of(&f, OLD_SLUG);
+    let error = repository::rebind(&f.root, &rebind_args(&old, &unrelated, false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("wrong repository"), "{error}");
+    assert!(clone.exists() && !f.root.join("work").join(NEW_SLUG).exists());
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+    assert_eq!(record_of(&f, OLD_SLUG), before);
+    assert_eq!(std::fs::read_to_string(clone.join("scratch")).unwrap(), "dirty");
+}
+
+#[test]
+fn rebind_reports_two_populated_clones_and_leaves_both_intact() {
+    let _fork = fork_guard();
+    let (f, old, new, clone) = old_clone_with_work();
+    repository::prepare(&f.root, &f.additional_args(&new.to_string_lossy(), NEW_SLUG)).unwrap();
+    let other = f.root.join("work").join(NEW_SLUG);
+    std::fs::write(other.join("mine"), "also work").unwrap();
+    let outcome = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(outcome.status, RebindStatus::BothPopulated);
+    assert!(outcome.from.populated && outcome.to.populated);
+    assert_eq!(std::fs::read_to_string(clone.join("scratch")).unwrap(), "dirty");
+    assert_eq!(std::fs::read_to_string(other.join("mine")).unwrap(), "also work");
+    assert_eq!(git(&clone, &["remote", "get-url", "origin"]), old.to_string_lossy());
+    assert_eq!(git(&other, &["remote", "get-url", "origin"]), new.to_string_lossy());
+}
+
+#[test]
+fn rebind_of_an_uncloned_registration_moves_nothing_and_a_foreign_dir_is_kept() {
+    let _fork = fork_guard();
+    let f = RepoFixture::new();
+    f.prepare().unwrap();
+    let (old, new) = (f.second_remote("old"), f.second_remote("new"));
+    let outcome = repository::rebind(&f.root, &rebind_args(&old, &new, false)).unwrap();
+    assert_eq!(outcome.status, RebindStatus::NotCloned);
+    std::fs::create_dir_all(f.root.join("work").join(OLD_SLUG)).unwrap();
+    let error = repository::rebind(&f.root, &rebind_args(&old, &new, false))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unrecognized"), "{error}");
+    let mut same = rebind_args(&old, &new, false);
+    same.to_slug = OLD_SLUG.into();
+    assert!(repository::rebind(&f.root, &same).is_err());
 }

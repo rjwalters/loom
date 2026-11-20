@@ -153,12 +153,15 @@ emit_pages() {
 
 case "$endpoint" in
   graphql)
+    # #13927: a wedged read — never writes, never exits on its own.
+    [[ -f "$FIX/hang-graphql" ]] && sleep 30
     [[ -f "$FIX/fail-graphql" ]] && exit 1
     [[ -f "$FIX/graphql-threads.json" ]] || exit 1
     cat "$FIX/graphql-threads.json"
     exit 0
     ;;
   */issues/*/comments*)
+    [[ -f "$FIX/hang-comments" ]] && sleep 30
     [[ -f "$FIX/fail-comments" ]] && {
       echo "stub gh: simulated issue-comment read failure" >&2
       exit 1
@@ -166,6 +169,7 @@ case "$endpoint" in
     emit_pages 'comments-page-*.json'
     ;;
   */pulls/*/reviews*)
+    [[ -f "$FIX/hang-reviews" ]] && sleep 30
     [[ -f "$FIX/fail-reviews" ]] && {
       echo "stub gh: simulated reviews read failure" >&2
       exit 1
@@ -173,6 +177,7 @@ case "$endpoint" in
     emit_pages 'reviews-page-*.json'
     ;;
   */pulls/*/comments*)
+    [[ -f "$FIX/hang-inline" ]] && sleep 30
     [[ -f "$FIX/fail-inline" ]] && {
       echo "stub gh: simulated inline-comment read failure" >&2
       exit 1
@@ -180,6 +185,7 @@ case "$endpoint" in
     emit_pages 'inline-page-*.json'
     ;;
   */pulls/*)
+    [[ -f "$FIX/hang-pr" ]] && sleep 30
     [[ -f "$FIX/fail-pr" ]] && exit 1
     if [[ -n "$jq_filter" ]]; then
       jq -r "$jq_filter" "$FIX/pr.json"
@@ -215,11 +221,22 @@ fi
 # #12475: comment verdicts are read through the trust filter. The mock keeps
 # every comment except those a fixture marks author_association NONE (an
 # outside commenter), and `fail-trust` simulates a daemon without the verb.
+# Like the real verb it exits 1 on EMPTY stdin ("no JSON comment listing to
+# filter") — a bare `jq` exits 0 there, which hid a gh timeout upstream of
+# this filter behind a passing assertion (#13927).
 if [[ "${1:-} ${2:-}" == "forge trusted-comments" ]]; then
   [[ -f "${LOOM_TEST_FIXTURE_DIR:?}/fail-trust" ]] && exit 1
-  jq -c 'if type == "array" then map(select(.author_association != "NONE")) else . end'
+  _listing=$(cat)
+  if [[ -z "$_listing" ]]; then
+    echo "forge trusted-comments: no JSON comment listing to filter (stdin empty)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$_listing" \
+    | jq -c 'if type == "array" then map(select(.author_association != "NONE")) else . end'
   exit $?
 fi
+# #13055: approvals are gated on a live Judge lease; the caller holds it here.
+[[ "${1:-} ${2:-} ${3:-}" == "lease pr check" ]] && { echo "PR_LEASE_STATE=held-self"; exit 0; }
 [[ "${1:-} ${2:-}" == "forge verdict-gate" ]] && { echo "LOOM-VERDICT-GATE PROCEED ok"; exit 0; }
 [[ "${1:-} ${2:-}" == "forge verdict-labels" ]] && { echo "LOOM-VERDICT-LABELS OK"; exit 0; }
 [[ "${1:-} ${2:-}" == "forge verdict-lock" ]] && exit 0
@@ -250,7 +267,7 @@ printf '{"head":{"sha":"%s"}}\n' "$HEAD_SHA" > "$FIX_DIR/pr.json"
 reset_fixtures() {
   rm -f "$FIX_DIR"/reviews-page-*.json "$FIX_DIR"/inline-page-*.json \
     "$FIX_DIR"/comments-page-*.json \
-    "$FIX_DIR/graphql-threads.json" "$FIX_DIR"/fail-* \
+    "$FIX_DIR/graphql-threads.json" "$FIX_DIR"/fail-* "$FIX_DIR"/hang-* \
     "$FIX_DIR/last-pr.txt" "$FIX_DIR/last-body.txt"
   # Default: no inline threads at all (GraphQL answers with an empty node list).
   cat > "$FIX_DIR/graphql-threads.json" << 'JSON'
@@ -258,6 +275,9 @@ reset_fixtures() {
 JSON
   printf '[]\n' > "$FIX_DIR/inline-page-1.json"
   printf '[]\n' > "$FIX_DIR/reviews-page-1.json"
+  # Default: no PR comments. `gh api` prints `[]` for an empty listing, never
+  # nothing, and the trust filter rejects empty input (as the real verb does).
+  printf '[]\n' > "$FIX_DIR/comments-page-1.json"
 }
 
 run_gate() {
@@ -518,6 +538,20 @@ assert_eq "0" "$PV_RC" "a missing gate script does not block the approval (avail
 assert_contains "$PV_OUT" "WARNING" "the missing gate is reported loudly on stderr"
 assert_contains "$PV_BODY" "state=gate-unavailable" "the forge record shows the approval was NOT review-reconciled"
 
+# #14392: an approval with the gate missing AND --reviews-reconciled appends the text,
+# and its note blames the unavailable gate, not "no gate runs for this verdict".
+reset_fixtures
+set +e
+PV_OUT=$("$ISOLATED/post-verdict.sh" 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "Finding 1 fixed in abc1234; finding 2 superseded by the new design." 2>&1)
+PV_RC=$?
+set -e
+PV_BODY="$(cat "$FIX_DIR/last-body.txt" 2>/dev/null || true)"
+assert_eq "0" "$PV_RC" "approved + missing gate + --reviews-reconciled still posts"
+assert_contains "$PV_BODY" "Finding 1 fixed in abc1234" "the reconciliation text is appended, not dropped (#14392)"
+assert_contains "$PV_BODY" "check-review-feedback.sh was unavailable" "the note names the unavailable gate"
+assert_not_contains "$PV_BODY" "no gate runs for a changes-requested verdict" "an approval is not described as a changes-requested verdict"
+
 # --- T10: id citation is boundary-anchored, not a bare substring match ------
 # A naive `*"$id"*` match lets a short id spuriously match inside an unrelated
 # longer number (e.g. blocking id "42" inside "4242"). The disposition must
@@ -613,6 +647,93 @@ reset_fixtures
 touch "$FIX_DIR/fail-trust"
 run_gate --number 12465 --head-sha "$HEAD_SHA"
 assert_eq "12" "$GATE_RC" "trusted-comments unavailable -> exit 12 (UNKNOWN), never clean"
+
+# --- T12: a hung gh read is wall-clock bounded (#13927) ----------------------
+# The wedge this issue was filed on: under multi-sweep host load a fraction of
+# gh invocations block indefinitely (SNl, no output, no progress) rather than
+# erroring, wedging post-verdict.sh — and the Judge behind it — forever. Every
+# gate read now runs under LOOM_FORGE_REVIEW_READ_TIMEOUT (default 60s); a
+# timeout is an UNKNOWN that --reviews-reconciled cannot disposition, because
+# nothing was read.
+echo ""
+echo "T12: hung gh reads time out to UNKNOWN, not a hang (#13927)"
+reset_fixtures
+touch "$FIX_DIR/hang-reviews"
+export LOOM_FORGE_REVIEW_READ_TIMEOUT=1
+T12_START=$SECONDS
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+T12_ELAPSED=$((SECONDS - T12_START))
+assert_eq "12" "$GATE_RC" "hung reviews read -> exit 12 (UNKNOWN)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=UNKNOWN" "a timed-out read is UNKNOWN, never CLEAR"
+assert_not_contains "$GATE_OUT" "REVIEW_FEEDBACK_STATE=CLEAR" "a timed-out read never reports CLEAR"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=1" "the timeout is machine-readable for post-verdict's distinct refusal"
+if [[ "$T12_ELAPSED" -le 15 ]]; then
+  pass "the gate returned in ${T12_ELAPSED}s, not the 30s the stub sleeps (bounded)"
+else
+  fail "the gate took ${T12_ELAPSED}s — the hung read was not bounded"
+fi
+
+run_pv 5369 approved "$HEAD_SHA" --body "Approved, CI green."
+assert_eq "3" "$PV_RC" "approval refused when the review read timed out"
+assert_contains "$PV_OUT" "TIMED OUT" "refusal says the read timed out (distinct from a generic UNKNOWN)"
+assert_eq "" "$PV_PR" "no approval comment posted on a timed-out read"
+
+# --reviews-reconciled cannot disposition a read that never completed: there
+# are no findings to cite, so the >=40-char text path must not open.
+run_pv 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "The review feedback was addressed in an earlier push; nothing outstanding remains to fix."
+assert_eq "3" "$PV_RC" "--reviews-reconciled cannot wave a timed-out read through"
+assert_contains "$PV_OUT" "TIMED OUT" "the non-overridable refusal keeps the timeout wording"
+assert_eq "" "$PV_PR" "still nothing posted"
+
+# A hung head-SHA read (no --head-sha: the gate must read it live) is bounded
+# the same way.
+rm -f "$FIX_DIR/hang-reviews"
+touch "$FIX_DIR/hang-pr"
+run_gate --number 5369
+assert_eq "12" "$GATE_RC" "hung head-SHA read -> exit 12 (UNKNOWN)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=1" "head-SHA timeout is machine-readable"
+
+# A hung comment-verdict read too.
+rm -f "$FIX_DIR/hang-pr"
+touch "$FIX_DIR/hang-comments"
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "12" "$GATE_RC" "hung comment-verdict read -> exit 12 (UNKNOWN)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=1" "comment-verdict timeout is machine-readable"
+
+# A GraphQL timeout behaves exactly like a GraphQL error (T5): fall back to
+# the REST inline-comment list. With a complete REST read of zero inline
+# comments that is genuinely clean — and no timeout token is reported.
+rm -f "$FIX_DIR/hang-comments"
+touch "$FIX_DIR/hang-graphql"
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "0" "$GATE_RC" "GraphQL timeout + complete empty REST read -> CLEAR (the fallback read completed)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=0" "no timeout token when every read the gate relied on completed"
+assert_contains "$GATE_OUT" "INLINE_RESOLUTION_SOURCE=rest-unknown" "resolution degrades through the REST fallback, as for any GraphQL outage"
+
+# Both thread interfaces hung -> UNKNOWN with the timeout token.
+rm -f "$FIX_DIR/hang-graphql"
+touch "$FIX_DIR/hang-graphql" "$FIX_DIR/hang-inline"
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "12" "$GATE_RC" "GraphQL and REST inline reads both hung -> exit 12 (UNKNOWN)"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=1" "the inline-fallback timeout is machine-readable"
+
+# The portable bounded_run path (no timeout(1); the macOS shape) bounds the
+# gate too.
+rm -f "$FIX_DIR"/hang-*
+touch "$FIX_DIR/hang-reviews"
+export LOOM_FORCE_PORTABLE_TIMEOUT=1
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+unset LOOM_FORCE_PORTABLE_TIMEOUT
+assert_eq "12" "$GATE_RC" "portable bounded_run path also bounds the gate's hung read"
+assert_contains "$GATE_OUT" "REVIEW_FEEDBACK_TIMED_OUT=1" "portable path timeout is machine-readable"
+
+# A fast stub still yields CLEAR under the budget — the bound must not clip a
+# healthy read (T6 re-checked with the override in force).
+rm -f "$FIX_DIR"/hang-*
+run_gate --number 5369 --head-sha "$HEAD_SHA"
+assert_eq "0" "$GATE_RC" "a fast stub still yields CLEAR with a 1s budget in force"
+unset LOOM_FORGE_REVIEW_READ_TIMEOUT
 
 # --- Summary ---
 echo ""

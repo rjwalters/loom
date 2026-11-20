@@ -43,6 +43,7 @@
 //! strands the previous one; each carries a [`LAST_USED`] marker and is removed
 //! after [`Policy::binding_max_idle`] without a launch.
 
+use crate::fs_util::human_size;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -278,7 +279,7 @@ fn stale_session(directory: &Path, policy: &Policy, host: &str, now: SystemTime)
     };
     match read_record(directory) {
         Some(record) if record.host == host => {
-            !pid_alive(record.pid) && age >= policy.exited_min_age
+            !crate::sweep_registry::is_pid_alive(record.pid) && age >= policy.exited_min_age
         }
         // Another host's pid is not a liveness answer, and neither is no
         // record at all (pre-#8663). Age is all that is left.
@@ -289,22 +290,6 @@ fn stale_session(directory: &Path, policy: &Policy, host: &str, now: SystemTime)
 fn read_record(directory: &Path) -> Option<SessionRecord> {
     let raw = fs::read(directory.join(SESSION_RECORD)).ok()?;
     serde_json::from_slice(&raw).ok()
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // SAFETY: signal 0 performs no action beyond an existence/permission check.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    // EPERM means the process exists and belongs to another user — alive.
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    true
 }
 
 /// Age of the most recent write anywhere in `directory`'s top level (the
@@ -382,20 +367,10 @@ pub fn summary(report: &Report, dry_run: bool) -> String {
         if report.sessions.len() == 1 { "y" } else { "ies" },
         report.bindings.len(),
         if report.bindings.len() == 1 { "" } else { "s" },
-        human_bytes(report.bytes),
+        human_size(report.bytes),
         report.kept,
         if report.kept == 1 { "" } else { "s" },
     )
-}
-
-fn human_bytes(bytes: u64) -> String {
-    let value = bytes as f64;
-    for (unit, scale) in [("G", 1u64 << 30), ("M", 1 << 20), ("K", 1 << 10)] {
-        if bytes >= scale {
-            return format!("{:.1}{unit}", value / scale as f64);
-        }
-    }
-    format!("{bytes}B")
 }
 
 #[cfg(test)]

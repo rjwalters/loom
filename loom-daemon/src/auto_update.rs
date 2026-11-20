@@ -161,6 +161,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
+use crate::release_resolve::RepoSource;
 use crate::workspace_pool::WorkspacePool;
 
 mod dirty_paths;
@@ -279,6 +280,10 @@ pub struct AutoUpdateConfig {
     /// priority (#4929). A zero/invalid value is dropped to `None`; `0` is
     /// intentionally *not* "never defer" — use a small positive value.
     pub defer_deadline_secs: Option<u64>,
+    /// #9736: no successful check for this long is a health finding.
+    pub overdue_secs: Option<u64>,
+    /// #9736: a newer release unapplied this long is a health finding.
+    pub converge_deadline_secs: Option<u64>,
     /// #10885: the removed keys this block still sets (see
     /// [`removed_settings`]). They are ignored; this only feeds the warning.
     pub removed_keys: Vec<&'static str>,
@@ -309,6 +314,14 @@ pub fn read_auto_update_config(repo_root: &Path) -> AutoUpdateConfig {
             .filter(|&s| s > 0),
         defer_deadline_secs: block
             .get("deferDeadlineSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        overdue_secs: block
+            .get("overdueSecs")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|&s| s > 0),
+        converge_deadline_secs: block
+            .get("convergeDeadlineSecs")
             .and_then(serde_json::Value::as_u64)
             .filter(|&s| s > 0),
         removed_keys: removed_settings::keys_in(block),
@@ -409,6 +422,8 @@ pub struct AutoUpdateStatusSnapshot {
     pub stale_repo: Option<String>,
     /// #11042: why a host below the fleet floor is not rolling, or `None`.
     pub floor_not_rolling: Option<not_rolling::FloorNotRolling>,
+    /// #9736: last successful check, pending age and thresholds.
+    pub freshness: Option<freshness::FreshnessReport>,
     /// #12420: what the last tick saw of the host's update state (read-only).
     pub observation: update_observation::LoopFacts,
 }
@@ -609,11 +624,18 @@ pub mod tuning;
 pub use tuning::TickTuning;
 /// #10954: the loop runs on every fleet host; `autoUpdate.enabled` gates only chase-latest.
 pub mod loop_mode;
+
+/// Whether the loop is making progress at all: last successful check and
+/// unapplied-release age, with the assessment `health` and the alert share
+/// (#9736).
+pub mod freshness;
 /// Low-priority (`nice`) setup for the rebuild subprocess.
 mod nice;
 /// #11042: the unsupervised re-download guard and the typed not-rolling reason.
 pub mod not_rolling;
 use nice::nice_child;
+/// #12425: arm the pause-and-roll from the restart-required config demand.
+mod config_restart;
 /// #10880: the failed-roll guard (attempt record, gate, held-roll alert).
 pub mod roll_attempt;
 /// #12420: the read-only host-update state projection.
@@ -728,6 +750,14 @@ pub trait AutoUpdateProbe: Send {
     /// exactly as before — the tick falls straight through to the source path.
     fn resolve_artifact(&self) -> ArtifactResolution {
         ArtifactResolution::Unresolved("this probe does not resolve release artifacts".to_string())
+    }
+
+    /// The repo this tick's resolution queries and which tier supplied it
+    /// (#14224), so a below-floor tick that resolves no release can name what
+    /// it asked. Defaults to `None` — a probe that does not resolve artifacts
+    /// has nothing to name.
+    fn resolved_repo(&self) -> Option<(String, RepoSource)> {
+        None
     }
 
     /// Fetch + verify + provision the resolved release artifact (Issue #7609)
@@ -885,6 +915,11 @@ impl AutoUpdateProbe for ScriptAutoUpdateProbe {
         // needed it to borrow the checkout's git remote, which `root` supplies.
         let _ = script;
         native_probe::native_resolution(&root)
+    }
+
+    fn resolved_repo(&self) -> Option<(String, RepoSource)> {
+        let root = self.script_root()?;
+        native_probe::fetch_repo_with_source(&root)
     }
 
     fn fetch_artifact(&mut self, tag: &str, low_priority: bool) -> RebuildOutcome {
@@ -1123,7 +1158,8 @@ pub enum TickDecision {
     /// `loom-daemon status`.
     Skip(String),
     /// Do nothing, but at WARN rather than [`Self::Skip`]'s INFO: a
-    /// [`ArtifactVerdict::StaleRepo`] tick (#8513), where "nothing to do" is
+    /// [`ArtifactVerdict::StaleRepo`] tick (#8513) or a below-floor host
+    /// with no release resolved (#11029, #14224), where "nothing to do" is
     /// itself the symptom rather than a healthy host.
     SkipWarn(String),
     /// All gates passed — run the rebuild.
@@ -1151,6 +1187,13 @@ pub enum TickDecision {
         /// deferred in the first place (Issue #8252) — it just runs politely.
         low_priority: bool,
     },
+    /// Restart-required config changed since boot and no version roll is
+    /// arming (#12425): restart onto the same binary through the one
+    /// pause-and-roll path. No fetch, no gate.
+    ConfigRestart {
+        /// The restart-required dotted paths (never values).
+        paths: Vec<String>,
+    },
 }
 
 /// One tick's probe readings, as [`AutoUpdateState::decide`] consumes them.
@@ -1168,6 +1211,9 @@ pub struct TickInputs<'a> {
     pub tree_clean: bool,
     /// Cross-root in-flight (non-terminal) sweep count (gate 4).
     pub in_flight: usize,
+    /// The repo the tick's resolution asked and the tier that supplied it
+    /// (#14224), so a below-floor host with no release names both at WARN.
+    pub repo_source: Option<(&'a str, RepoSource)>,
 }
 
 /// The loop's mutable bookkeeping: settle-window tracking, backoff, and the
@@ -1242,6 +1288,11 @@ pub struct AutoUpdateState {
     unsupervised: not_rolling::UnsupervisedStage,
     /// #10880: the last version roll armed, persisted, and its retry gate.
     attempt: roll_attempt::AttemptGuard,
+    /// #12425: the restart-required config demand this tick may arm a
+    /// same-binary restart for (`None` unless the host writes its config).
+    config_restart: Option<crate::fleet_sync::config_restart::ConfigRestartDemand>,
+    /// #9736: last successful check and unapplied-release clocks.
+    freshness: freshness::Freshness,
 }
 
 impl AutoUpdateState {
@@ -1286,6 +1337,7 @@ impl AutoUpdateState {
             check,
             tree_clean,
             in_flight,
+            repo_source,
         } = *inputs;
         match artifact {
             ArtifactResolution::Resolved(info) => {
@@ -1305,12 +1357,29 @@ impl AutoUpdateState {
                     self.clear_tracking();
                     let unchased = (check.update_available == Some(true))
                         .then_some("the source checkout's newer HEAD (no source rebuilds)");
+                    // #14224: "below the floor with no release to roll to" is
+                    // WARN from the FIRST such tick, not only after #11029's
+                    // streak — and it names the repo it asked and the tier
+                    // that supplied it, or a stale repo pin stays invisible
+                    // behind a generic wait line. `Unresolved` is exactly the
+                    // below-floor-with-no-comparable-release verdict:
+                    // `floor_verdict` answers `Satisfied` before it can
+                    // return `Unresolved`.
+                    let below_floor_no_release =
+                        matches!(self.floor.verdict(), floor_roll::FloorVerdict::Unresolved { .. });
+                    let asked = match (below_floor_no_release, repo_source) {
+                        (true, Some((repo, source))) => {
+                            format!(" (asked {repo}, from {})", source.label())
+                        }
+                        _ => String::new(),
+                    };
                     let note =
                         format!("no artifact ({reason}) → {}", self.floor.hold_reason(unchased));
-                    // #11029: a below-floor host that stays unresolved is not
-                    // an INFO-level wait for long.
-                    return if self.floor.unresolved_escalated() {
-                        TickDecision::SkipWarn(note)
+                    return if below_floor_no_release {
+                        // #11029: `hold_reason` swaps in the escalated
+                        // STILL-BELOW-THE-FLEET-FLOOR wording once the streak
+                        // is old enough; the level is WARN from the start.
+                        TickDecision::SkipWarn(format!("{note}{asked}"))
                     } else {
                         TickDecision::Skip(note)
                     };
@@ -1582,6 +1651,20 @@ impl AutoUpdateState {
         }
     }
 
+    /// Time left on a retryable-failure backoff as of `now`, or `None` when
+    /// the loop may retry (Issue #14016). The run loop schedules the next
+    /// tick at `min(interval, this)`, so the retry lands when the "backing
+    /// off Ns" log line said it would instead of a full interval later. An
+    /// ELAPSED backoff is `None`, not zero: the gates past the backoff gate
+    /// (settle, the failed-roll hold, the unsupervised hold) can keep a tick
+    /// from retrying, and an immediate wake against such a hold would spin.
+    #[must_use]
+    pub fn backoff_remaining(&self, now: Instant) -> Option<Duration> {
+        self.backoff_until
+            .filter(|until| *until > now)
+            .map(|until| until.saturating_duration_since(now))
+    }
+
     /// Terminal-state and backoff gates, shared by both paths.
     fn terminal_or_backoff_gate(&self, now: Instant) -> Option<TickDecision> {
         if let Some(reason) = &self.terminal_reason {
@@ -1802,6 +1885,7 @@ impl AutoUpdateState {
             }
             ArtifactResolution::Unresolved(_) => (None, None),
         };
+        let freshness = self.freshness.report(last_check, &note);
         AutoUpdateStatusSnapshot {
             enabled,
             last_check: Some(last_check),
@@ -1815,6 +1899,7 @@ impl AutoUpdateState {
             stale_repo_ticks: self.stale_repo.ticks(),
             stale_repo: self.stale_repo.repo(),
             floor_not_rolling: None,
+            freshness: Some(freshness),
             observation: update_observation::LoopFacts::of_tick(
                 artifact,
                 &self.floor,

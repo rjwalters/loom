@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use loom_daemon::event_bus::EventBus;
+use loom_daemon::observability;
 use loom_daemon::workspace_pool::WorkspacePool;
-use loom_daemon::{forge_events, observability};
 
 /// Join handles for whatever started. Held by the caller for the process's
 /// lifetime; dropping them does not stop the tasks (tokio detaches on drop),
@@ -35,9 +35,6 @@ pub struct ObserverHandles {
     /// Collector + sender tasks, `None` when telemetry export is off or
     /// under-configured (#4705).
     pub observability: Option<Vec<tokio::task::JoinHandle<()>>>,
-    /// Feed poll loop, `None` when the forge event feed is off or
-    /// unprovisioned (ADR-0021, #8765).
-    pub forge_events: Option<tokio::task::JoinHandle<()>>,
     /// The GitHub state mirror's task (2am#4367 P5): re-reads `forge.mirror`
     /// every minute, publishes the live mirror for the discovery reads and
     /// pulls its change stream as wakes. Only reads config while unset.
@@ -77,20 +74,10 @@ pub fn spawn(
     // so #11526's startup-policy ruling can act on its `Degraded` branch here.
     let _verdict = observability::otlp_health::check_startup(&observability_config);
 
-    // Forge event-feed consumer (ADR-0021, epic #8764 Phase 1 — #8765). Off
-    // by default. Observe-only in this phase: it publishes one `forge.event`
-    // bus prompt per non-empty page and NOTHING subscribes yet, so a daemon
-    // with the feed on behaves identically to one with it off apart from the
-    // journal it writes and the status it reports.
-    let forge_events_config = forge_events::read_config(workspace_root);
-    let forge_events = forge_events::spawn_task(&forge_events_config, bus);
-
-    // GitHub state mirror (2am#4367 P5): discovery reads and change-stream
-    // wakes. Inert (config re-reads only) while `forge.mirror` is unset; a
-    // wake is a `forge.event` prompt the armed early-tick consumers act on.
+    // GitHub state mirror (2am#4367 P5): discovery reads and the change-stream
+    // pull. Inert (config re-reads only) while `forge.mirror` is unset.
     let forge_mirror = loom_daemon::forge_mirror::wake::spawn(
         workspace_root.to_path_buf(),
-        bus.clone(),
         workspace_pool.clone(),
     );
 
@@ -104,7 +91,6 @@ pub fn spawn(
 
     ObserverHandles {
         observability,
-        forge_events,
         forge_mirror,
         codex_session,
     }

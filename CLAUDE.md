@@ -165,6 +165,21 @@ phase — creating a PR labeled `loom:review-requested` is only the Builder stag
 the work is not complete until reviewed and merged. **`/loom:sweep` handles all
 stages automatically** — prefer it over manual orchestration to avoid skipping any.
 
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](.loom/docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
+
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools directly may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
@@ -210,8 +225,11 @@ blocks self-review and Loom agents often create and review the same PR.
 
 Find unlabeled issues (use `-label:` search terms, **not** `--label` — gh ANDs
 `--label` values with no negation syntax, so a negated `--label` always returns
-empty), enhance with technical detail, then `gh issue edit 42 --add-label
-"loom:curated"`.
+empty), enhance with technical detail,
+then write the standalone `<!-- loom:points=3 -->`
+marker and run `loom-daemon curation-complete --repo OWNER/REPO --issue 42 --model M
+--runtime R --completion-id $(uuidgen) --workspace-root ROOT` (it applies `loom:curated`;
+never a bare `--add-label`, #11787; recipe: `.loom/roles/curator-estimate.md`).
 
 ### Overnight / long-running orchestration
 
@@ -234,7 +252,7 @@ Configuration lives in `.loom/config.json` (committed): a `terminals` array
 - **Runtime dispatch (`runtimes`)** — `spawn-worker.sh` selects the worker runtime
   (`LOOM_RUNTIME` env > `runtimes.default` > `"claude"`), execing `spawn-<runtime>.sh`:
   [`.loom/docs/runtime-adapters.md`](.loom/docs/runtime-adapters.md).
-- **Large files** — no size gate; Hermit may propose splits.
+- **Fail closed** — success must be positively proven; a null, empty, or bare exit-0 result is a failure, not a result: [`.loom/docs/fail-closed.md`](.loom/docs/fail-closed.md).
 - **Language policy** — new executable logic is a `loom-daemon` subcommand, NOT a new `.sh` (a review standard, not a CI gate): [`.loom/docs/shell-language-policy.md`](.loom/docs/shell-language-policy.md).
 - **Role-prompt authoring discipline** — pressure-test a non-trivial role-prompt/operator-dispatch-brief change against a resisting scenario, audit it for rule conflicts, and load-gate by default: [`.loom/docs/role-prompt-authoring.md`](.loom/docs/role-prompt-authoring.md).
 - **Custom roles** — add `.loom/roles/<name>.md` (and optional `<name>.json`).
@@ -274,6 +292,10 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
   atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
+  **Exception — a foreign public repo the App is not installed on** (`forge create-issue` /
+  `create-issue.sh` refuse with `NOT_IN_INSTALLATION`, #9548): file with a raw
+  `gh issue create -R <repo>` (interim) rather than parking for an operator, per
+  [`gh-issue-create-rest-fallback.md`](.loom/docs/gh-issue-create-rest-fallback.md) (#13978).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does

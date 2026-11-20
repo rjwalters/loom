@@ -8,7 +8,7 @@
 //! "tokens bind the cap."
 use super::{ranking_diverges_from_starvation, resolve_capacity};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::types::CapacityReport;
+use crate::types::CapacityReport;
 
 #[test]
 fn resolve_capacity_probe_tier_reports_token_bound_on_zero_healthy() {
@@ -25,7 +25,7 @@ fn resolve_capacity_probe_tier_reports_token_bound_on_zero_healthy() {
     assert!(
         rc.token_bound,
         "a fresh probe with 0 healthy accounts must report starvation, \
-         not the #5304 hardcoded `false`"
+             not the #5304 hardcoded `false`"
     );
 }
 

@@ -30,9 +30,8 @@
 //!   endpoint, never constructs an exporter, and never adds one to the
 //!   configured list — no OTLP exporter configured means
 //!   [`register_sink`] registers nothing and every emit is a no-op.
-//! - `session.output` is declared `native: false`, so even on a host whose
-//!   configured sink *is* the managed HTTPS backend, no session text is
-//!   offered to it.
+//! - `session.output` is an OTLP-only kind (`otlp: Logs`); the managed HTTPS
+//!   backend it never reached has since been removed (#12813).
 //!
 //! # Latency budget
 //!
@@ -691,6 +690,32 @@ fn advance_run(run: &mut Run, projects_dir: &Path, now: DateTime<Utc>) -> Vec<Se
         }
     }
     out
+}
+
+/// Per-test scratch directory shared by the `session_output` test modules;
+/// removed on drop. `tag` is only a readable prefix, uniqueness comes from
+/// `tempfile`.
+#[cfg(test)]
+pub(crate) struct Scratch(tempfile::TempDir);
+
+#[cfg(test)]
+impl Scratch {
+    pub(crate) fn new(tag: &str) -> Self {
+        Scratch(
+            tempfile::Builder::new()
+                .prefix(&format!("loom-session-output-{tag}-"))
+                .tempdir()
+                .unwrap(),
+        )
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        self.0.path()
+    }
+
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
+        self.0.path().join(name)
+    }
 }
 
 #[cfg(test)]

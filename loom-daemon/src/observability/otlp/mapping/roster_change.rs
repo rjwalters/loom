@@ -3,20 +3,11 @@
 //! record's JSON; the scalars ride as `loom.roster.*` attributes, with
 //! `loom.repo` / `loom.repo.visibility` when the repo is known.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 /// `(event_name, severity, record time, attributes, body)`; `None` for every
 /// other kind.
@@ -47,8 +38,7 @@ pub(super) fn log_parts(
     if let Some(repo) = &r.repo {
         attributes.push(kv_string("loom.repo", repo.clone()));
     }
-    attributes
-        .push(kv_string("loom.repo.visibility", super::metadata::visibility_str(r.visibility)));
+    attributes.push(kv_string("loom.repo.visibility", r.visibility.as_str()));
     let body = serde_json::to_string(r).unwrap_or_default();
     Some(("roster.change", SeverityNumber::Info, nanos(r.at), attributes, body))
 }

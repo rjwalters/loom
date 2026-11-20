@@ -1,11 +1,15 @@
 name: Build and Release
 #
 # Release artifacts (Epic #4990): on GitHub Release creation this workflow
-# cross-builds `loom-daemon` for every platform in the fleet's target triples
+# cross-builds `loom-daemon` and `loom-tools` (#12940) for every platform in the fleet's target triples
 # and uploads, for EACH one, the binary plus a `.sha256` checksum file as
 # Release assets:
 #
 #   - loom-daemon-aarch64-apple-darwin(.sha256)
+#   - loom-tools-<triple>(.sha256, and .sig/.pem on Linux) beside each of the
+#     three daemon assets below: the same build, signing and checksum steps run
+#     for both binaries (BINS), and the release is not promoted unless every
+#     triple carries both.
 #   - loom-daemon-x86_64-unknown-linux-gnu(.sha256)
 #   - loom-daemon-aarch64-unknown-linux-gnu(.sha256)
 #
@@ -393,7 +397,7 @@ jobs:
           esac
 
   build-daemon:
-    name: Build loom-daemon (${{ matrix.target }})
+    name: Build loom-daemon + loom-tools (${{ matrix.target }})
     needs: resolve
     if: needs.resolve.outputs.publish != 'skip'
     runs-on: ${{ matrix.os }}
@@ -409,7 +413,7 @@ jobs:
       # Job-level on purpose: the collector step below re-runs cargo for this
       # package, and a step-level value would have it rebuild the binary
       # without the stamp just before it is packaged.
-      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom' && needs.resolve.outputs.tag) || '' }}
+      LOOM_RELEASE_BUILD_TAG: ${{ (needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom' && needs.resolve.outputs.tag) || '' }}
     strategy:
       # Never mask a platform's failure with another's success, and never let
       # one platform's failure cancel an in-flight build for another.
@@ -417,7 +421,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14 # Apple Silicon runner (native build)
+            os: macos-15 # Apple Silicon runner (native build)
             cross: false
           - target: x86_64-unknown-linux-gnu
             # Pinned, not `ubuntu-latest` (#8842): the shipped binary's glibc
@@ -494,7 +498,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             .
@@ -540,13 +544,18 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           LOOM_OTLP_TEST_BINARY: ${{ github.workspace }}/target/${{ matrix.target }}/release/loom-daemon
-        run: cargo test --package loom-daemon --release --features otlp --target ${{ matrix.target }} --test otlp_collector -- --ignored --nocapture
+        run: scripts/run-otlp-collector-test.sh --release --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/loom-daemon" "dist/loom-daemon-${{ matrix.target }}"
+          # `cargo build --package loom-daemon` above builds every bin of the
+          # package, so both binaries come out of the one build (#12940): same
+          # commit, same version, same release stamp.
+          for bin in loom-daemon loom-tools; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${bin}-${{ matrix.target }}"
+          done
 
       # The packaged binary must carry exactly the stamp this run set (#10718):
       # the release tag on a publishing run, nothing on a dry run. Read with
@@ -554,7 +563,7 @@ jobs:
       # checked too. A release whose binaries lost the stamp would leave every
       # fleet host unable to resync, so that fails here instead.
       #
-      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-14 runner
+      # The match MUST be byte-wise: `LC_ALL=C` (#11006). The macos-15 runner
       # exports LC_ALL=en_US.UTF-8, and its BSD grep (2.6.0-FreeBSD) in a
       # UTF-8 locale does not find the marker in the Mach-O binary even though
       # the bytes are there: release run 37837360573 failed this step on
@@ -565,13 +574,15 @@ jobs:
       - name: Verify the release stamp
         run: |
           set -euo pipefail
-          bin="dist/loom-daemon-${{ matrix.target }}"
           marker="loom-release-build-tag=${LOOM_RELEASE_BUILD_TAG};"
-          if ! LC_ALL=C grep -a -q -F -- "$marker" "$bin"; then
-            echo "::error::$bin does not carry the release stamp '$marker' (LOOM_RELEASE_BUILD_TAG='${LOOM_RELEASE_BUILD_TAG}')." >&2
-            exit 1
-          fi
-          echo "Confirmed: $bin carries '$marker'."
+          for name in loom-daemon loom-tools; do
+            bin="dist/${name}-${{ matrix.target }}"
+            if ! LC_ALL=C grep -a -q -F -- "$marker" "$bin"; then
+              echo "::error::$bin does not carry the release stamp '$marker' (LOOM_RELEASE_BUILD_TAG='${LOOM_RELEASE_BUILD_TAG}')." >&2
+              exit 1
+            fi
+            echo "Confirmed: $bin carries '$marker'."
+          done
 
       # Detect which signing secrets are present and record the decision as step
       # outputs. GitHub Actions cannot reference `secrets.*` directly in an
@@ -659,7 +670,6 @@ jobs:
           MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
-          artifact="dist/loom-daemon-${{ matrix.target }}"
           # Import the Developer ID cert into a throwaway keychain scoped to this
           # job's RUNNER_TEMP so no identity persists on the runner. The p12 and
           # its password are secrets; the identity string (which embeds the org
@@ -679,9 +689,12 @@ jobs:
           # `--options runtime` (hardened runtime) is a notarization prerequisite;
           # `--timestamp` binds a secure timestamp so the signature outlives the
           # cert's validity window.
-          codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGNING_IDENTITY" "$artifact"
-          codesign --verify --strict --verbose=2 "$artifact"
+          for name in loom-daemon loom-tools; do
+            artifact="dist/${name}-${{ matrix.target }}"
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_SIGNING_IDENTITY" "$artifact"
+            codesign --verify --strict --verbose=2 "$artifact"
+          done
           rm -f "$p12"
 
       - name: Notarize macOS artifact
@@ -692,7 +705,6 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
-          artifact="dist/loom-daemon-${{ matrix.target }}"
           # notarytool only accepts container formats (zip/dmg/pkg), so submit a
           # zip of the bare binary. A bare Mach-O cannot be stapled (stapling
           # supports only bundles/dmg/pkg), so notarization is registered
@@ -701,15 +713,19 @@ jobs:
           # is all Gatekeeper would ever consult, so no staple is needed and the
           # uploaded asset stays the bare signed binary.
           key="$RUNNER_TEMP/notary-key.p8"
-          zip="$RUNNER_TEMP/loom-daemon-${{ matrix.target }}.zip"
           printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode > "$key"
-          ditto -c -k "$artifact" "$zip"
-          xcrun notarytool submit "$zip" \
-            --key "$key" \
-            --key-id "$MACOS_NOTARY_KEY_ID" \
-            --issuer "$MACOS_NOTARY_ISSUER_ID" \
-            --wait
-          rm -f "$key" "$zip"
+          for name in loom-daemon loom-tools; do
+            artifact="dist/${name}-${{ matrix.target }}"
+            zip="$RUNNER_TEMP/${name}-${{ matrix.target }}.zip"
+            ditto -c -k "$artifact" "$zip"
+            xcrun notarytool submit "$zip" \
+              --key "$key" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" \
+              --wait
+            rm -f "$zip"
+          done
+          rm -f "$key"
 
       - name: Install cosign
         if: steps.signing.outputs.linux_sign == 'true'
@@ -723,49 +739,51 @@ jobs:
           SIGN_MODE: ${{ steps.signing.outputs.linux_sign_mode }}
         run: |
           set -euo pipefail
-          artifact="dist/loom-daemon-${{ matrix.target }}"
-          sig="dist/loom-daemon-${{ matrix.target }}.sig"
-          cert="dist/loom-daemon-${{ matrix.target }}.pem"
-          if [ "$SIGN_MODE" = "keyless" ]; then
-            # Keyless (#5054): cosign exchanges this workflow's OIDC token for a
-            # short-lived Fulcio certificate whose SAN is the running workflow
-            # ref: `.../.github/workflows/release.yml@refs/tags/<tag>` for a
-            # hand-cut `release` run, but `...@refs/heads/main` for the automated
-            # path (a `workflow_run` run, like the `push` run before #10826, runs
-            # on the default branch). In the automated case the certificate's
-            # workflow-SHA claim is main's tip when CI completed, which can be a
-            # descendant of the tagged head_sha rather than equal to it. The
-            # default verifier pins `@refs/tags/<tag>`; see #10611. The
-            # signature is recorded in Rekor. Publishing the certificate
-            # next to the signature is what lets a consumer verify with NO
-            # distributed key:
-            #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
-            #     --certificate-identity-regexp '^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$' \
-            #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <binary>
-            # cosign v3 (bundled by cosign-installer v4.x) defaults sign-blob to
-            # the new combined --bundle output and silently ignores
-            # --output-signature/--output-certificate; --new-bundle-format=false
-            # --use-signing-config=false restores the legacy separate .sig/.pem
-            # files that loom-daemon's release_fetch verifier expects (#9155).
-            cosign sign-blob --yes \
-              --new-bundle-format=false \
-              --use-signing-config=false \
-              --output-signature "$sig" \
-              --output-certificate "$cert" \
-              "$artifact"
-          else
-            # Key mode (only when COSIGN_PRIVATE_KEY is set): detached signature
-            # verified as `cosign verify-blob --key <pubkey> --signature <sig>`.
-            # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
-            key="$RUNNER_TEMP/cosign.key"
-            printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
-            cosign sign-blob --yes --key "$key" \
-              --new-bundle-format=false \
-              --use-signing-config=false \
-              --output-signature "$sig" \
-              "$artifact"
-            rm -f "$key"
-          fi
+          for name in loom-daemon loom-tools; do
+            artifact="dist/${name}-${{ matrix.target }}"
+            sig="dist/${name}-${{ matrix.target }}.sig"
+            cert="dist/${name}-${{ matrix.target }}.pem"
+            if [ "$SIGN_MODE" = "keyless" ]; then
+              # Keyless (#5054): cosign exchanges this workflow's OIDC token for a
+              # short-lived Fulcio certificate whose SAN is the running workflow
+              # ref: `.../.github/workflows/release.yml@refs/tags/<tag>` for a
+              # hand-cut `release` run, but `...@refs/heads/main` for the automated
+              # path (a `workflow_run` run, like the `push` run before #10826, runs
+              # on the default branch). In the automated case the certificate's
+              # workflow-SHA claim is main's tip when CI completed, which can be a
+              # descendant of the tagged head_sha rather than equal to it. The
+              # default verifier pins `@refs/tags/<tag>`; see #10611. The
+              # signature is recorded in Rekor. Publishing the certificate
+              # next to the signature is what lets a consumer verify with NO
+              # distributed key:
+              #   cosign verify-blob --certificate <target>.pem --signature <target>.sig \
+              #     --certificate-identity-regexp '^https://github\.com/<slug>/\.github/workflows/[^@]+@refs/tags/<tag>$' \
+              #     --certificate-oidc-issuer https://token.actions.githubusercontent.com <binary>
+              # cosign v3 (bundled by cosign-installer v4.x) defaults sign-blob to
+              # the new combined --bundle output and silently ignores
+              # --output-signature/--output-certificate; --new-bundle-format=false
+              # --use-signing-config=false restores the legacy separate .sig/.pem
+              # files that loom-daemon's release_fetch verifier expects (#9155).
+              cosign sign-blob --yes \
+                --new-bundle-format=false \
+                --use-signing-config=false \
+                --output-signature "$sig" \
+                --output-certificate "$cert" \
+                "$artifact"
+            else
+              # Key mode (only when COSIGN_PRIVATE_KEY is set): detached signature
+              # verified as `cosign verify-blob --key <pubkey> --signature <sig>`.
+              # COSIGN_PASSWORD is read from the env by cosign to decrypt the key.
+              key="$RUNNER_TEMP/cosign.key"
+              printf '%s' "$COSIGN_PRIVATE_KEY" > "$key"
+              cosign sign-blob --yes --key "$key" \
+                --new-bundle-format=false \
+                --use-signing-config=false \
+                --output-signature "$sig" \
+                "$artifact"
+              rm -f "$key"
+            fi
+          done
 
       # Checksum is computed AFTER signing so it covers the FINAL bytes (macOS
       # codesign rewrites the Mach-O in place). Phase 3 verifies this checksum
@@ -776,11 +794,13 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          if command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
-          else
-            sha256sum "loom-daemon-${{ matrix.target }}" > "loom-daemon-${{ matrix.target }}.sha256"
-          fi
+          for name in loom-daemon loom-tools; do
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "${name}-${{ matrix.target }}" > "${name}-${{ matrix.target }}.sha256"
+            else
+              sha256sum "${name}-${{ matrix.target }}" > "${name}-${{ matrix.target }}.sha256"
+            fi
+          done
           ls -la
 
       # Upload this platform's assets under a verify -> upload-missing ->
@@ -820,28 +840,37 @@ jobs:
           # unsigned build has neither, and a key-mode (non-keyless) signature
           # has a `.sig` but no `.pem`. Whatever the signing steps produced is
           # exactly what must arrive on the Release.
+          #
+          # BOTH binaries are in the expected set (#12940): a leg that produced
+          # `loom-daemon-<triple>` but no `loom-tools-<triple>` fails here, and
+          # `promote-release` runs only when every leg succeeded, so a release
+          # missing either binary for any triple is never marked Latest.
           expected=()
-          for candidate in \
-            "loom-daemon-${TARGET}" \
-            "loom-daemon-${TARGET}.sha256" \
-            "loom-daemon-${TARGET}"*.sig \
-            "loom-daemon-${TARGET}"*.pem
-          do
-            # An unmatched glob stays literal (nullglob is off), so the -f test
-            # is what filters the "this target produced no signature" case.
-            if [ -f "$candidate" ]; then
-              expected+=("$candidate")
-            fi
+          for name in loom-daemon loom-tools; do
+            for candidate in \
+              "${name}-${TARGET}" \
+              "${name}-${TARGET}.sha256" \
+              "${name}-${TARGET}"*.sig \
+              "${name}-${TARGET}"*.pem
+            do
+              # An unmatched glob stays literal (nullglob is off), so the -f test
+              # is what filters the "this target produced no signature" case.
+              if [ -f "$candidate" ]; then
+                expected+=("$candidate")
+              fi
+            done
           done
 
-          # Floor: the binary and its checksum are unconditional for every
-          # target. If either is absent HERE, an earlier step silently produced
+          # Floor: each binary and its checksum are unconditional for every
+          # target. If any is absent HERE, an earlier step silently produced
           # nothing and retrying the upload would only mask that.
-          for required in "loom-daemon-${TARGET}" "loom-daemon-${TARGET}.sha256"; do
-            if [ ! -f "$required" ]; then
-              echo "::error::expected artifact '$required' was never produced in dist/ — refusing to upload a partial asset set for ${TARGET}." >&2
-              exit 1
-            fi
+          for name in loom-daemon loom-tools; do
+            for required in "${name}-${TARGET}" "${name}-${TARGET}.sha256"; do
+              if [ ! -f "$required" ]; then
+                echo "::error::expected artifact '$required' was never produced in dist/ — refusing to upload a partial asset set for ${TARGET}." >&2
+                exit 1
+              fi
+            done
           done
 
           MAX_ATTEMPTS=4
@@ -911,10 +940,10 @@ jobs:
 
       - name: Upload artifacts (for manual runs)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: loom-daemon-${{ matrix.target }}
-          # Mirror the "Upload release assets" file list above, including the
+          # `loom-tools-<triple>` rides in the same artifact (#12940). Mirror the "Upload release assets" file list above, including the
           # `.pem` glob (#5174): a keyless-signed Linux artifact needs its
           # signing certificate to verify, and a manual backfill run onto an
           # existing release can't complete without it.
@@ -923,6 +952,10 @@ jobs:
             dist/loom-daemon-${{ matrix.target }}.sha256
             dist/loom-daemon-${{ matrix.target }}*.sig
             dist/loom-daemon-${{ matrix.target }}*.pem
+            dist/loom-tools-${{ matrix.target }}
+            dist/loom-tools-${{ matrix.target }}.sha256
+            dist/loom-tools-${{ matrix.target }}*.sig
+            dist/loom-tools-${{ matrix.target }}*.pem
           retention-days: 7
 
   promote-release:
@@ -970,21 +1003,37 @@ jobs:
           # asset wipe, a tag recreated underneath us — without duplicating the
           # per-target list.
           assets="$(gh release view "$TAG" --repo "$REPO" --json assets --jq '.assets[].name')"
+          #
+          # Both binaries are required (#12940): every `loom-daemon-<triple>`
+          # pair needs a `loom-tools-<triple>` pair beside it, and the reverse.
+          # A release missing either for any triple it carries stays
+          # un-promoted. (`raise-floor.py` in 2AMLogic/fleet-gitops waits for
+          # every platform binary by name; see the PR for what was checked.)
           pairs=0
+          incomplete=()
           while IFS= read -r name; do
             case "$name" in
               ""|*.sha256|*.sig|*.pem) continue ;;
-              loom-daemon-*)
+              loom-daemon-*|loom-tools-*)
                 if grep -qxF "${name}.sha256" <<<"$assets"; then
                   pairs=$((pairs + 1))
+                else
+                  incomplete+=("${name}.sha256")
                 fi
+                triple="${name#loom-daemon-}"
+                triple="${triple#loom-tools-}"
+                for other in "loom-daemon-${triple}" "loom-tools-${triple}"; do
+                  if ! grep -qxF "$other" <<<"$assets"; then
+                    incomplete+=("$other")
+                  fi
+                done
                 ;;
             esac
           done <<<"$assets"
 
-          if [ "$pairs" -eq 0 ]; then
-            echo "::error::Release ${TAG} carries no complete loom-daemon binary + .sha256 pair — refusing to mark it Latest (#8515)." >&2
-            echo "- REFUSED: \`$TAG\` was not promoted to Latest — no complete binary/checksum pair on the Release." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$pairs" -eq 0 ] || [ "${#incomplete[@]}" -gt 0 ]; then
+            echo "::error::Release ${TAG} does not carry a complete loom-daemon AND loom-tools binary + .sha256 pair for every triple (missing: ${incomplete[*]:-all}) — refusing to mark it Latest (#8515, #12940)." >&2
+            echo "- REFUSED: \`$TAG\` was not promoted to Latest — incomplete binary/checksum pairs: ${incomplete[*]:-none found}." >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
 
@@ -1160,14 +1209,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1197,7 +1246,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1240,7 +1289,7 @@ jobs:
       # CI (no native arm64 runner here; see docker/worker/README.md for the
       # manual Apple-Silicon verification this still requires).
       - name: Build and push multi-arch loom-worker image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -1312,14 +1361,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1340,7 +1389,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1402,7 +1451,7 @@ jobs:
       # rather than resolving from this job's amd64-only local store (which
       # has no arm64 base image to offer the arm64 leg at all).
       - name: Build and push multi-arch loom-worker-session image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
@@ -1471,14 +1520,14 @@ jobs:
 
       - name: Download loom-daemon build artifact - amd64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-x86_64-unknown-linux-gnu
           path: dist
 
       - name: Download loom-daemon build artifact - arm64 (workflow_dispatch)
         if: needs.resolve.outputs.publish == 'false'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: loom-daemon-aarch64-unknown-linux-gnu
           path: dist
@@ -1499,7 +1548,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -1537,7 +1586,7 @@ jobs:
         run: ./docker/native/test-image.sh "ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}"
 
       - name: Build and push multi-arch loom-worker-native image
-        if: needs.resolve.outputs.publish == 'true' && github.repository == 'rjwalters/loom'
+        if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .

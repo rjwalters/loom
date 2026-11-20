@@ -1,8 +1,7 @@
 //! Wire-payload unit tests for [`super`] — extracted from `types.rs`'s
-//! inline `mod tests` (#8514) so that file, already over
-//! `.loom/docs/file-size-policy.md`'s threshold, has room for the
-//! live drain-roll status field. A pure move: every test below is
-//! byte-identical to its inline original, only dedented.
+//! inline `mod tests` (#8514) to make room for the live drain-roll status
+//! field. A pure move: every test below is byte-identical to its inline
+//! original, only dedented.
 
 use super::*;
 
@@ -285,6 +284,7 @@ fn sample_repo_status(root_missing: bool) -> RepoStatus {
     RepoStatus {
         root: PathBuf::from("/repos/gamma"),
         maintain_only: None,
+        installed_behind: None,
         weight: 100,
         in_flight_count: 0,
         health_gate_halted: false,
@@ -294,6 +294,7 @@ fn sample_repo_status(root_missing: bool) -> RepoStatus {
         health_gate_enabled: Some(true),
         health_gate_verdict_at: None,
         root_missing,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -376,7 +377,6 @@ fn running_exporter(uptime_secs: i64) -> ObservabilityExportStatus {
     ObservabilityExportStatus {
         state: ObservabilityExportState::Starting,
         host_id: Some("robb-studio".to_string()),
-        ingest_host_id: None,
         endpoint: Some("https://dashboard.example/ingest".to_string()),
         exporter: Some("https".to_string()),
         started_at: Some(export_now() - chrono::Duration::seconds(uptime_secs)),
@@ -450,27 +450,6 @@ fn an_acked_batch_with_agreeing_ids_is_healthy() {
 }
 
 #[test]
-fn a_disagreeing_ingest_id_is_a_mismatch_even_while_exporting() {
-    // #4830's condition, expressed on the positive surface: data IS
-    // landing, under the wrong identity.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now() - chrono::Duration::seconds(12));
-    status.ingest_host_id = Some("robb-pro".to_string());
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
-    assert!(ObservabilityExportState::HostIdMismatch.is_problem());
-}
-
-#[test]
-fn an_echoed_id_that_agrees_is_not_a_mismatch() {
-    // Defensive: only a *disagreement* is a mismatch. An echo equal to the
-    // daemon's own id must stay healthy.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now());
-    status.ingest_host_id = Some("robb-studio".to_string());
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::Healthy);
-}
-
-#[test]
 fn consecutive_failures_classify_as_failing() {
     let mut status = running_exporter(4 * 3600);
     status.last_success_at = Some(export_now() - chrono::Duration::seconds(7200));
@@ -480,19 +459,6 @@ fn consecutive_failures_classify_as_failing() {
     assert!(ObservabilityExportState::Failing.is_problem());
     // "Never worked" vs "worked, then broke" stays legible.
     assert_eq!(status.last_success_age_secs(export_now()), Some(7200));
-}
-
-#[test]
-fn a_mismatch_outranks_a_transient_flush_failure() {
-    // Precedence documented on `classify`: the config-shaped fault that
-    // cannot self-recover wins; the failure facts remain readable in the
-    // `last_failure_*` fields either way.
-    let mut status = running_exporter(4 * 3600);
-    status.last_success_at = Some(export_now() - chrono::Duration::seconds(60));
-    status.ingest_host_id = Some("robb-pro".to_string());
-    status.consecutive_failures = 2;
-    assert_eq!(status.classify(export_now()), ObservabilityExportState::HostIdMismatch);
-    assert_eq!(status.consecutive_failures, 2);
 }
 
 #[test]
@@ -515,7 +481,6 @@ fn export_state_serializes_snake_case_for_watch_loops() {
         (ObservabilityExportState::Starting, "\"starting\""),
         (ObservabilityExportState::NeverExported, "\"never_exported\""),
         (ObservabilityExportState::Healthy, "\"healthy\""),
-        (ObservabilityExportState::HostIdMismatch, "\"host_id_mismatch\""),
         (ObservabilityExportState::Failing, "\"failing\""),
     ] {
         assert_eq!(serde_json::to_string(&state).unwrap(), wire);
@@ -675,4 +640,27 @@ fn misconfigured_endpoint_is_none_when_the_endpoint_itself_is_what_is_missing() 
     );
     assert!(status.endpoint.is_none());
     assert_eq!(status.classify(export_now()), ObservabilityExportState::Misconfigured);
+}
+
+// ---- #13831: `SweepState::Pending` removed; a stale filter is a parse error ----
+
+#[test]
+fn list_sweeps_state_filter_pending_is_rejected_not_silently_empty() {
+    // No daemon version ever emitted `Pending`, so an old client sending it as
+    // a `state_filter` gets a per-request parse error naming the unknown
+    // variant (the IPC loop turns this into a structured error frame), not an
+    // empty list.
+    let stale = r#"{"type":"ListSweeps","payload":{"state_filter":{"state":"Pending"}}}"#;
+    let err = serde_json::from_str::<Request>(stale)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Pending"), "{err}");
+
+    let live = r#"{"type":"ListSweeps","payload":{"state_filter":{"state":"Running"}}}"#;
+    match serde_json::from_str::<Request>(live).expect("Running filter parses") {
+        Request::ListSweeps { state_filter, .. } => {
+            assert_eq!(state_filter, Some(SweepState::Running));
+        }
+        other => panic!("unexpected request: {other:?}"),
+    }
 }

@@ -34,6 +34,8 @@ struct FakeForge {
     dequeue_fails: Cell<bool>,
     revoke_on_enqueue: Cell<bool>,
     enqueue_fails: Cell<bool>,
+    /// The next N enqueues are refused with `QueueUnavailable` (#13357).
+    queue_unavailable_for: Cell<u32>,
 }
 
 impl FakeForge {
@@ -51,6 +53,7 @@ impl FakeForge {
             dequeue_fails: Cell::new(false),
             revoke_on_enqueue: Cell::new(false),
             enqueue_fails: Cell::new(false),
+            queue_unavailable_for: Cell::new(0),
         }
     }
     fn read_facts(&self) -> Result<AuthzFacts, String> {
@@ -118,6 +121,13 @@ impl QueueApi for FakeForge {
         })
     }
     fn enqueue(&self, _pr: u32, _n: &str, expected: &str) -> Result<EnqueueAck, QueueError> {
+        if self.queue_unavailable_for.get() > 0 {
+            self.queue_unavailable_for
+                .set(self.queue_unavailable_for.get() - 1);
+            return Err(QueueError::QueueUnavailable {
+                detail: "gh: No merge queue found for branch 'main'".into(),
+            });
+        }
         if self.enqueue_fails.get() {
             return Err(QueueError::Forge {
                 detail: "502 transient".into(),
@@ -451,12 +461,36 @@ fn transient_enqueue_failure_leaves_pending_not_failure_and_retry_enqueues() {
 }
 
 #[test]
+fn one_queue_unavailable_is_retried_and_keeps_the_grant() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.queue_unavailable_for.set(1);
+    assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::Enqueued { .. })));
+    assert!(s.get(PR).unwrap().is_some(), "grant live");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Success));
+}
+
+#[test]
+fn two_queue_unavailable_still_roll_back() {
+    let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+    f.queue_unavailable_for.set(2);
+    let e = handoff(&f, &s).unwrap_err();
+    assert!(matches!(e, HandoffError::Enqueue(QueueError::QueueUnavailable { .. })), "{e:?}");
+    assert_eq!(s.get(PR).unwrap(), None, "grant revoked");
+    assert_eq!(f.head_status.borrow().get(SHA1), Some(&StatusState::Pending));
+}
+
+#[test]
 fn a_new_head_never_inherits_the_old_success() {
     let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
     handoff(&f, &s).unwrap();
     f.push_head(SHA2);
+    // GitHub dequeues a PR whose head moves.
+    *f.queued.borrow_mut() = None;
     assert_eq!(f.head_status.borrow().get(SHA2), None);
-    assert!(handoff_at(&f, &s, SHA2).is_err(), "SHA2 needs its own grant and status");
+    // SHA2 is enqueued only after it earns its own grant and status.
+    assert!(matches!(handoff_at(&f, &s, SHA2), Ok(EnqueueOutcome::Enqueued { .. })));
+    assert_eq!(f.head_status.borrow().get(SHA2), Some(&StatusState::Success));
+    assert_eq!(s.get(PR).unwrap().unwrap().approved_sha, SHA2);
 }
 
 fn handoff_at(
@@ -525,4 +559,146 @@ fn grant_for_another_head_is_not_a_noop() {
     .unwrap();
     assert!(matches!(handoff(&f, &s), Ok(EnqueueOutcome::AlreadyQueued { .. })));
     assert_eq!(s.get(PR).unwrap().unwrap().approved_sha, SHA1, "re-granted for the head");
+}
+
+// ---- #12679: forge.mergeQueue.statusCommand replaces the writer-App gate
+
+mod status_command_route {
+    use super::*;
+    use crate::forge_merge_queue::gh_lifecycle::GhLifecycleForge;
+    use crate::forge_merge_queue::group_authz::revoke_refail_dequeue;
+
+    /// A repo root whose config routes status posts to a recording stub that
+    /// exits `exit`. The `gh` binary is a path that cannot run, so any status
+    /// call made with the daemon's own token would fail loudly.
+    struct Route {
+        dir: tempfile::TempDir,
+        forge: GhLifecycleForge,
+    }
+
+    impl Route {
+        fn new(exit: i32) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("calls.log");
+            let script = format!(
+                "echo \"$@\" >> '{}'; case \"$*\" in *--dry-run*) exit {exit};; esac; exit {exit}",
+                log.display()
+            );
+            let cfg = serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
+                ["sh", "-c", script, "stub"]}}});
+            std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+            std::fs::write(dir.path().join(".loom/config.json"), cfg.to_string()).unwrap();
+            let forge = GhLifecycleForge::new("/nonexistent/gh", dir.path(), "o/r").unwrap();
+            Self { dir, forge }
+        }
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("calls.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn handoff_via(
+        f: &FakeForge,
+        s: &MemoryGrantStore,
+        r: &Route,
+    ) -> Result<EnqueueOutcome, HandoffError> {
+        f.require_head_status.set(false);
+        authorize_and_enqueue(MergeMode::Queue, true, f, s, &r.forge, &|| f.read_facts(), PR, SHA1)
+    }
+
+    #[test]
+    fn handoff_succeeds_through_the_command_with_the_pr_and_no_gh_status_call() {
+        let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
+        // The writer would be refused (`statuses: read`); the command gate ignores it.
+        f.cannot_post.set(true);
+        assert!(matches!(handoff_via(&f, &s, &r), Ok(EnqueueOutcome::Enqueued { .. })));
+        let calls = r.calls();
+        assert_eq!(calls.len(), 2, "dry-run probe, then the head success: {calls:?}");
+        assert!(calls[0].contains("--dry-run"));
+        assert!(calls[1].contains(&format!("--sha {SHA1}")));
+        assert!(calls[1].contains("--state success"));
+        assert!(calls[1].contains("--context loom/merge-authorization"));
+        assert!(calls[1].contains("--repo o/r"));
+        assert!(calls[1].contains(&format!("--pr {PR}")));
+        assert!(calls[1].contains("--idempotency-key"));
+        assert!(f.head_status.borrow().is_empty(), "the fake writer was never used");
+    }
+
+    #[test]
+    fn rollback_after_a_failed_enqueue_posts_pending_through_the_command() {
+        let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
+        f.enqueue_fails.set(true);
+        assert!(handoff_via(&f, &s, &r).is_err());
+        let calls = r.calls();
+        assert!(calls.last().unwrap().contains("--state pending"), "{calls:?}");
+        assert!(calls.last().unwrap().contains(&format!("--pr {PR}")));
+    }
+
+    #[test]
+    fn revocation_after_enqueue_posts_failure_through_the_command() {
+        let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
+        f.revoke_on_enqueue.set(true);
+        assert!(matches!(
+            handoff_via(&f, &s, &r),
+            Err(HandoffError::RevokedDuringEnqueue { .. })
+        ));
+        assert!(r.calls().last().unwrap().contains("--state failure"));
+    }
+
+    #[test]
+    fn failing_command_refuses_the_gate_before_any_grant() {
+        let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(1));
+        let e = handoff_via(&f, &s, &r).unwrap_err();
+        assert!(matches!(e, HandoffError::WriterCannotPostStatuses(_)), "{e:?}");
+        assert_eq!(s.get(PR).unwrap(), None, "no grant written");
+        assert!(f.queued.borrow().is_none(), "nothing enqueued");
+    }
+
+    #[test]
+    fn head_and_group_revoke_post_failure_through_the_command() {
+        use crate::forge_merge_queue::group_authz::{Member, MergeGroup};
+        let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
+        let group = MergeGroup {
+            commit: "b".repeat(40),
+            members: vec![Member {
+                pr: PR,
+                head: SHA1.into(),
+            }],
+        };
+        let out = revoke_refail_dequeue(
+            MergeMode::Queue,
+            true,
+            &f,
+            &s,
+            &r.forge,
+            &|| Ok(vec![group.clone()]),
+            &|| Ok(SHA1.to_string()),
+            PR,
+        );
+        assert!(out.refailed.is_ok() && out.head_failed.is_ok());
+        let calls = r.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls.iter().all(|c| c.contains("--state failure")));
+        let group_call = calls.iter().find(|c| c.contains(&"b".repeat(40))).unwrap();
+        assert!(!group_call.contains("--pr"), "a group commit names no single PR");
+        let head_call = calls.iter().find(|c| c.contains(SHA1)).unwrap();
+        assert!(head_call.contains(&format!("--pr {PR}")));
+    }
+
+    #[test]
+    fn malformed_setting_fails_closed_instead_of_falling_back_to_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"forge":{"mergeQueue":{"statusCommand":"post-it"}}}"#,
+        )
+        .unwrap();
+        let forge = GhLifecycleForge::new("/nonexistent/gh", dir.path(), "o/r").unwrap();
+        assert!(forge.can_post_statuses().is_err());
+        assert!(forge.post_status(SHA1, StatusState::Success, "x").is_err());
+    }
 }

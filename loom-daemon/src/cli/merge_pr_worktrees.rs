@@ -41,7 +41,7 @@ use std::io::Read;
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::worktrees;
+use crate::merge_pr::worktrees;
 
 /// Read `git worktree list --porcelain` from stdin.
 ///

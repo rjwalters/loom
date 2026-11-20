@@ -415,16 +415,24 @@ const TRIAGE_LABEL: &str = crate::intake_reconcile::TRIAGE_LABEL;
 
 /// Route issue `issue`, landed by `pr`, to Curator keep-or-close.
 pub fn route_to_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32, pr: u32) -> Route {
-    match forge.route_marked(issue, pr) {
-        Ok(true) => return Route::Kept,
-        Ok(false) => {}
+    let marked = match forge.route_marked(issue, pr) {
+        Ok(marked) => marked,
         Err(_) => return Route::Unrouted("comment read failed"),
-    }
+    };
     let labels = match forge.labels(issue) {
         Ok(Some(labels)) => labels,
         Ok(None) => return Route::Unrouted("not an open issue"),
         Err(_) => return Route::Unrouted("label read failed"),
     };
+    if marked {
+        // The marker is this router's own record, not a Curator decision
+        // (#12713): kept only once Curator took `loom:triage` off.
+        return if labels.iter().any(|l| l == TRIAGE_LABEL) {
+            Route::Unrouted("routed, awaiting Curator")
+        } else {
+            Route::Kept
+        };
+    }
     if !labels.iter().any(|l| l == ISSUE_LABEL) {
         return Route::Unrouted("no loom:issue label");
     }
@@ -543,6 +551,16 @@ impl LandedCache {
     }
 }
 
+/// Whether `issue` still carries `loom:triage`, the router's own label that
+/// only a Curator action removes (#12713). An unreadable answer is "yes".
+fn awaiting_curator<F: LandedForge + ?Sized>(forge: &mut F, issue: u32) -> bool {
+    match forge.labels(issue) {
+        Ok(Some(labels)) => labels.iter().any(|l| l == TRIAGE_LABEL),
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// Ask about `ask` and record each answer, routing every new landing to
 /// Curator. Returns the issues the forge answered for.
 fn settle<F: LandedForge + ?Sized>(
@@ -565,7 +583,15 @@ fn settle<F: LandedForge + ?Sized>(
         answered.push(issue);
         let verdict = match verdict {
             None => Verdict::NotLanded,
-            Some(pr) if cache.handed.get(&issue) == Some(&pr) => Verdict::Kept(pr),
+            // Handed to Curator already: kept only once Curator took
+            // `loom:triage` off; until then still landed (#12713).
+            Some(pr) if cache.handed.get(&issue) == Some(&pr) => {
+                if awaiting_curator(forge, issue) {
+                    Verdict::Landed(pr)
+                } else {
+                    Verdict::Kept(pr)
+                }
+            }
             Some(pr) => {
                 fresh.push((issue, pr));
                 Verdict::Landed(pr)
@@ -685,6 +711,7 @@ pub fn landed_at_spawn(
         gh_bin: gh_bin.to_path_buf(),
         root: root.to_path_buf(),
         slug: slug.to_string(),
+        reads: 0,
     };
     let mut all = caches()
         .lock()
@@ -708,23 +735,36 @@ pub fn landed_in(
     candidates: &[u32],
     open_pr: &[u32],
 ) -> HashMap<u32, u32> {
+    landed_in_counted(registry, candidates, open_pr).0
+}
+
+/// [`landed_in`] and how many closes-graph queries it sent to the forge (a
+/// cached answer sends none), for the tick span's
+/// `loom.discovery.live_reads.landed` (#12317).
+#[must_use]
+pub fn landed_in_counted(
+    registry: &Arc<Mutex<SweepRegistry>>,
+    candidates: &[u32],
+    open_pr: &[u32],
+) -> (HashMap<u32, u32>, u64) {
     if candidates.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     }
     let target = registry
         .lock()
         .ok()
         .and_then(|reg| reg.open_pr_listing_target());
     let Some((gh_bin, root, slug)) = target else {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     };
     if !prefilter_enabled(&root) {
-        return HashMap::new();
+        return (HashMap::new(), 0);
     }
     let mut forge = GhLandedForge {
         gh_bin,
         root: root.clone(),
         slug,
+        reads: 0,
     };
     let landed = {
         let mut all = caches()
@@ -742,7 +782,7 @@ pub fn landed_in(
             }
         }
     }
-    landed
+    (landed, forge.reads)
 }
 
 /// [`super::WorkDispatcher::lift_landed_cooldowns`] for the production
@@ -774,6 +814,7 @@ pub fn lift_in(registry: &Arc<Mutex<SweepRegistry>>, held: &[u32]) -> HashSet<u3
         gh_bin,
         root: root.clone(),
         slug,
+        reads: 0,
     };
     let lifted = {
         let mut all = caches()
@@ -797,6 +838,8 @@ struct GhLandedForge {
     gh_bin: PathBuf,
     root: PathBuf,
     slug: String,
+    /// Closes-graph queries sent (not the ones the breaker skipped).
+    reads: u64,
 }
 
 impl GhLandedForge {
@@ -890,6 +933,7 @@ impl LandedForge for GhLandedForge {
         let inv = closing_refs_invocation(&self.gh_bin, &self.root, &self.slug, issues)?;
         // `gh` exits non-zero when any alias errored but still prints the
         // partial `data`: parse first, judge per alias.
+        self.reads += 1;
         let out = gh_call::output(inv).ok()?;
         let parsed = parse_landed(&String::from_utf8_lossy(&out.stdout), issues, &self.slug);
         if parsed.is_none() {

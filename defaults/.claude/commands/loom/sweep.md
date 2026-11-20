@@ -49,7 +49,7 @@ Read the files the run actually reaches, and only those.
 | [`sweep-wave-lifecycle.md`](sweep-wave-lifecycle.md) | ~662 | **Modes A and B only** (including the `all` sentinel). Baseline snapshot, checkpoint resume, steps 1-8b (pre-flight, Curator, approval gate, Builder, stacking, Judge, Doctor, Merge, wave boundary). |
 | [`sweep-doctor-glm-escalation.md`](sweep-doctor-glm-escalation.md) | ~60 | Only when a GLM tap can serve Doctor (#11359): bounded GLM rejections, then the Claude ladder. |
 | [`sweep-summary-output.md`](sweep-summary-output.md) | ~81 | Step 8b / C3 (#8110). Summary table format, the `merged`/`blocked`/`skipped`/`rate-limited`/`completed externally` outcome vocabulary, and the transcript-archival completion hook. |
-| [`sweep-run-hygiene.md`](sweep-run-hygiene.md) | ~199 | Stop conditions; the five advisory **pre-wave** checks (host sleep, main freshness, quarantine stashes, stale/undocumented `loom:blocked`, silent PR queues); the sweep-child working-set contract; peer-sweep / legacy-daemon / role-runner coexistence. |
+| [`sweep-run-hygiene.md`](sweep-run-hygiene.md) | ~199 | Stop conditions; the six advisory **pre-wave** checks (host sleep, main freshness, quarantine stashes, stale/undocumented `loom:blocked`, silent PR queues, missing hold/state labels); the sweep-child working-set contract; peer-sweep / legacy-daemon / role-runner coexistence. |
 | [`sweep-reference.md`](sweep-reference.md) | ~171 | Look-up only: the Limitations (deferred vs. implemented) status table, and the daemon event-bus wire contract — **required whenever the in-process `loom-daemon` is running**, since the sweep child must publish phase events onto its bus. |
 
 `sweep-mode-c-lifecycle.md` and `sweep-wave-lifecycle.md` are **mutually
@@ -58,6 +58,13 @@ never both (mixed invocations are explicitly unsupported; see
 `sweep-arguments.md` → "Mode C validation rules").
 
 ### Load order for a run
+
+**This dispatcher is the only file that receives the invocation's arguments**
+(step 1 interpolates them below). Sibling reference files are also exposed as
+standalone skills and loaded with no arguments of their own — a placeholder
+there renders as the empty string — so when a sibling says "the arguments
+passed to `/loom:sweep`", classify the ones this dispatcher received, carried
+over from here.
 
 1. **`sweep-arguments.md`** — classify `$ARGUMENTS` into Mode A / Mode B /
    Mode C / the `all` sentinel, strip and store the flags, run the validation
@@ -71,7 +78,7 @@ never both (mixed invocations are explicitly unsupported; see
    - `DECIDE = use_subagent` → continue below.
 3. **`sweep-execution-model.md`** — read before dispatching any subagent
    (dispatch invariants, model resolution, Doctor-cycle cap).
-4. **`sweep-run-hygiene.md`** — the five advisory pre-wave checks, run before
+4. **`sweep-run-hygiene.md`** — the six advisory pre-wave checks, run before
    the first wave (or before the first `mcp__loom__dispatch_sweep` call on the
    daemon path). Advisory only: never block on them.
 5. **`sweep-scheduling-signals.md`** — overlap partitioning + operator-gate

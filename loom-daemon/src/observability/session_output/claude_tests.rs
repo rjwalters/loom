@@ -8,37 +8,12 @@
 #![allow(clippy::unwrap_used)]
 
 use std::io::Write as _;
-use std::path::PathBuf;
 
 use chrono::{TimeZone, Utc};
 
 use super::*;
+use crate::observability::session_output::Scratch;
 use crate::telemetry::kinds::session_output::{OutputCategory, RunIdentity};
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "loom-session-output-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-
-    fn file(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn append(path: &std::path::Path, text: &str) {
     let mut file = std::fs::OpenOptions::new()
@@ -106,7 +81,7 @@ fn user_prompt(text: &str) -> String {
 #[test]
 fn only_assistant_text_and_tool_metadata_ever_become_records() {
     let scratch = Scratch::new("content-boundary");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &user_prompt("MY SECRET PROMPT about acquisition plans"));
     append(&path, &assistant_thinking("INTERNAL REASONING nobody should see"));
     append(&path, &assistant_text("Reading the file now."));
@@ -154,7 +129,7 @@ fn only_assistant_text_and_tool_metadata_ever_become_records() {
 #[test]
 fn a_failed_tool_is_reported_as_such_without_its_output() {
     let scratch = Scratch::new("tool-error");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &assistant_tool_use("tu_9", "Read", "/etc/shadow"));
     append(&path, &user_tool_result("tu_9", "permission denied: /etc/shadow", true));
     let mut cursor = Cursor::default();
@@ -171,7 +146,7 @@ fn a_failed_tool_is_reported_as_such_without_its_output() {
 #[test]
 fn successive_passes_read_only_what_was_appended() {
     let scratch = Scratch::new("incremental");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &assistant_text("first"));
     let mut cursor = Cursor::default();
     let first = cursor.advance(&path, "sess", &identity(), now());
@@ -193,7 +168,7 @@ fn successive_passes_read_only_what_was_appended() {
 #[test]
 fn a_torn_trailing_line_is_held_until_its_newline_arrives() {
     let scratch = Scratch::new("torn");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     let full = assistant_text("complete thought");
     let (head, tail) = full.split_at(full.len() / 2);
     append(&path, head);
@@ -212,7 +187,7 @@ fn a_torn_trailing_line_is_held_until_its_newline_arrives() {
 #[test]
 fn attaching_to_an_existing_transcript_keeps_the_tail_and_declares_the_gap() {
     let scratch = Scratch::new("backlog");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     for i in 0..(ATTACH_TAIL_EVENTS + 5) {
         append(&path, &assistant_text(&format!("line {i}")));
     }
@@ -229,7 +204,7 @@ fn attaching_to_an_existing_transcript_keeps_the_tail_and_declares_the_gap() {
 #[test]
 fn a_transcript_that_shrinks_reports_a_gap_and_resumes() {
     let scratch = Scratch::new("truncate");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &assistant_text("before"));
     let mut cursor = Cursor::default();
     assert_eq!(
@@ -250,7 +225,7 @@ fn a_transcript_that_shrinks_reports_a_gap_and_resumes() {
 #[test]
 fn a_replayed_read_reproduces_the_same_event_ids() {
     let scratch = Scratch::new("replay");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     for i in 0..3 {
         append(&path, &assistant_text(&format!("line {i}")));
     }
@@ -281,7 +256,7 @@ fn a_replayed_read_reproduces_the_same_event_ids() {
 fn a_missing_file_is_an_empty_pass_not_an_error() {
     let scratch = Scratch::new("missing");
     let mut cursor = Cursor::default();
-    let pass = cursor.advance(&scratch.file("nope.jsonl"), "sess", &identity(), now());
+    let pass = cursor.advance(&scratch.path("nope.jsonl"), "sess", &identity(), now());
     assert!(pass.records.is_empty());
     assert_eq!(pass.gap, None);
 }
@@ -289,7 +264,7 @@ fn a_missing_file_is_an_empty_pass_not_an_error() {
 #[test]
 fn malformed_lines_are_skipped_without_disturbing_line_numbering() {
     let scratch = Scratch::new("malformed");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, "{not json at all\n");
     append(&path, &assistant_text("survivor"));
     let mut cursor = Cursor::default();
@@ -301,7 +276,7 @@ fn malformed_lines_are_skipped_without_disturbing_line_numbering() {
 #[test]
 fn a_huge_backlog_is_bounded_per_pass_and_caught_up_over_several() {
     let scratch = Scratch::new("bounded");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     // Enough bytes that one pass cannot consume them all.
     let line = assistant_text(&"y".repeat(4_000));
     let lines = (MAX_BYTES_PER_PASS as usize / line.len()) + 5;
@@ -328,7 +303,7 @@ fn a_huge_backlog_is_bounded_per_pass_and_caught_up_over_several() {
 #[test]
 fn a_secret_printed_by_the_agent_is_scrubbed_before_it_leaves_the_adapter() {
     let scratch = Scratch::new("scrub");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(
         &path,
         &assistant_text("I set GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123 for the push"),
@@ -343,7 +318,7 @@ fn a_secret_printed_by_the_agent_is_scrubbed_before_it_leaves_the_adapter() {
 #[test]
 fn source_time_comes_from_the_record_and_observed_time_from_the_reader() {
     let scratch = Scratch::new("times");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &assistant_text("hello"));
     let mut cursor = Cursor::default();
     let read_at = Utc.with_ymd_and_hms(2026, 9, 30, 12, 0, 5).unwrap();
@@ -357,7 +332,7 @@ fn source_time_comes_from_the_record_and_observed_time_from_the_reader() {
 #[test]
 fn a_record_without_a_timestamp_falls_back_to_the_read_time_not_to_zero() {
     let scratch = Scratch::new("no-ts");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(
         &path,
         "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n",
@@ -374,8 +349,8 @@ fn a_record_without_a_timestamp_falls_back_to_the_read_time_not_to_zero() {
 #[test]
 fn discovery_attributes_a_session_to_its_issue_and_names_its_stream() {
     let scratch = Scratch::new("discover");
-    let projects = scratch.file("projects");
-    let workspace = scratch.file("ws");
+    let projects = scratch.path("projects");
+    let workspace = scratch.path("ws");
     std::fs::create_dir_all(&workspace).unwrap();
     let slug = crate::transcript_tokens::project_slug(&workspace);
     let project_dir = projects.join(&slug);
@@ -407,8 +382,8 @@ fn discovery_is_unaffected_by_the_worktree_directory_name() {
     // project slug, and the slug is only ever a lookup key — it is not
     // exported, and `loom.repo` is resolved separately from the forge.
     let scratch = Scratch::new("odd-name");
-    let projects = scratch.file("projects");
-    let workspace = scratch.file("totally-unrelated-name");
+    let projects = scratch.path("projects");
+    let workspace = scratch.path("totally-unrelated-name");
     std::fs::create_dir_all(&workspace).unwrap();
     let project_dir = projects.join(crate::transcript_tokens::project_slug(&workspace));
     std::fs::create_dir_all(&project_dir).unwrap();
@@ -426,7 +401,7 @@ fn discovery_is_unaffected_by_the_worktree_directory_name() {
 #[test]
 fn a_missing_projects_directory_yields_no_streams() {
     let scratch = Scratch::new("no-projects");
-    assert!(discover(&scratch.file("nope"), &scratch.file("ws"), 9764).is_empty());
+    assert!(discover(&scratch.path("nope"), &scratch.path("ws"), 9764).is_empty());
 }
 
 // ---- #10124: narration filed as `thinking` ----------------------------------
@@ -447,7 +422,7 @@ fn real_shaped_thinking(stop_reason: &str, thinking: &str) -> String {
 #[test]
 fn narration_shaped_and_reasoning_shaped_thinking_are_both_withheld_and_counted() {
     let scratch = Scratch::new("thinking-withheld");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     // Narration-as-thinking: the text a user would have seen before a tool call.
     append(
         &path,
@@ -472,7 +447,7 @@ fn narration_shaped_and_reasoning_shaped_thinking_are_both_withheld_and_counted(
 #[test]
 fn no_thinking_means_no_coverage_gap_signal() {
     let scratch = Scratch::new("no-thinking");
-    let path = scratch.file("t.jsonl");
+    let path = scratch.path("t.jsonl");
     append(&path, &assistant_text("Reading the file now."));
     append(&path, &assistant_tool_use("tu_1", "Read", "x"));
 

@@ -11,7 +11,7 @@ Role records carry the queue the role agent **actually consumed** and what it
 below; the daemon's admission-gate listing is only the fallback when the agent's
 queue was not observed. `candidate_source` and `decisions_observed` say which.
 
-OTLP-only log record (`otlp: Logs`, `native: false`), envelope
+OTLP-only log record (`otlp: Logs`), envelope
 `schema_version: 12` (`NEW_KIND_SCHEMA_VERSION`). The log **body** is the
 record's JSON; the attributes are `loom.kind` (`pick.decision`, which the
 queries below filter on), `loom.role` and, on a role record, `loom.repo`
@@ -48,7 +48,7 @@ no journal is created, when no OTLP exporter runs.
 | `skipped[]` | array | one `{repo, number, reason}` per skipped candidate listed in `candidates`, plus optional fields set only on work-finder rows. `detail`: a `deferred_file_overlap` row's shared `## Affected Files` paths (`file overlap: a, b`, one line, truncated at 160 chars, #9781), or a `workspace_halted` row's halt cause, only when it is a closed-vocabulary `work_finder::halt_cause` token (`main_red`, `drain`, `weight_zero`, ...; #11811), or an `already_landed` row's evidence (`forge_closed`, `forge_closed_not_planned`, `journal_landed`; #11858); no other disposition's detail (e.g. dispatch-error text) is carried. `disposition` (#11811): the row's own un-collapsed `QueueDisposition` wire name (e.g. `deferred_build_backoff` vs `recheck_interval`, both `reason = backoff`), so a reader can name which back-off or hold skipped it. `held_until` (#11811): RFC 3339 instant the row's time-boxed hold clears, as in `queue.snapshot` (#9311): set for the recheck, dispatch / open-PR back-off, cooldown and retry windows the work finder tracks. All additive (absent otherwise and on older daemons), so `schema_version` stays `2` |
 | `candidate_source` | string | `ready_queue` (work finder), `serving_queue` (the role's `pr-queue` result), `listing` (the issue/PR listings the role read, e.g. Curator), `gate_listing` (fallback: the daemon's gate listing), `none` (nothing observed) |
 | `decisions_observed` | boolean | `true` when the agent's writes were observed, so every candidate without an action is a real skip; `false` when only a ranking was seen, and an unexplained candidate is then in neither `acted` nor `skipped` |
-| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md) |
+| `workspace_draw` | object, optional | work finder only (#11103), absent when nothing was drawn: `seed` (decimal string), `draws_total`, optional `seed_scheme` / `seed_minute` / `seed_host` (#11683; absent when the seed was pinned: `seed` = first 8 bytes, big-endian, of `sha256(seed_scheme + ":" + seed_minute + ":" + seed_host)` for `seed_scheme` `"loom-draw/v1"`, `seed_minute` a decimal string of `floor(unix_utc_secs/60)`), and `draws[]` (every draw, in order; `seed`, `draws_total` and the three `seed_*` fields repeat on each chunk), each `{candidates[{repo, weight, base_weight, bonus}], total_weight, roll, picked, number}`. Since #11742 `weight` = `base_weight` (the repo's roster weight) + `bonus` (points for a verified red-main fix, very-important or important work), and the draw picked the repo with probability `weight / total_weight`. Records from before #11742 also carry a per-tick `temperature` and per-draw `pool` / `p_min`, with softmax weights on a 1,000,000 scale and no `base_weight` / `bonus`; readers must tolerate both, so `schema_version` stays `2`. Replaying the draws from `seed` and the logged weights reproduces the dispatch order; see [`priority-model.md`](priority-model.md). Absent on every step-engine tick, the only live dispatch path since #11909 (2026-10-14): live draws are in `item_draw.draws[]`. Records written before #12877 keep only the first 50 draws, so `len(draws) < draws_total` on a busy tick is that truncation |
 | `item_draw` | object, optional | step engine only (#11896, one pool since #12185), absent elsewhere and on a tick that drew nothing: the item draws of a tick from one pool of every actionable item across the host's repos. Header (repeats on every chunk): `seed_scheme` (`loom-draw/v3`), `seed_minute`, `seed_host`, `tick_counter` (decimal strings), `draws_total`, `backlog_exponent` (α) and `busy_exponent` (β) (decimal strings that parse back to the same float), `repos[]` (one `{repo, weight, in_flight, items, pool_weight}` per repo in the starting pool, in pool order: `weight` = `w_repo`, `in_flight` = `in_flight_repo`, `items` = `n_items`, `pool_weight` = `S_r`), `closures[]` (`{repo, after_draw, steps}`: a repo the per-repo cap took out of the pool mid-tick is absent from every draw with `draw_index >= after_draw`; with `steps` (absent when empty), only that repo's rows of those steps are, e.g. a repo whose Champion merge the tick spawned loses its other `champion_merge` and `champion_hold_reevaluate` rows, #12494), `weight_overflow[]` (the repos in the pool when Σw overflowed `u64` and the tick's draws stopped), and `excluded[]`, one `{repo, reason, skip_reason, count}` per workspace and weight-0 reason (`reason` is the classifier's pass reason, e.g. `claimed`, `blocked`, `no_stage`, `draft`, or `pool_exhausted` (the step's role has no spawnable account) or `build_backoff`; `skip_reason` is its closed-set mapping, `PickSkipReason::from_exclusion`; a `refused_<reason>` row counts draws a gate or the claim refused; a `merge_in_flight` row counts the repo's merge steps held out of the pool because a Champion merge, this host's or a peer's, was in flight there, and a `deferred_merge_in_flight` row those a merge this tick spawned took out, #12494). `pools[]` (chunked in order): the pool before the first draw, repos in workspace order, each repo's items in item order, `{repo, index, number, issue, pr, step, weight, priority, age_permille, age_source}`; `index` counts across the whole pool and `weight` is the item weight `iw` = `priority × (divisor_min + min(age_minutes, cap_min))`. `draws[]` (chunked in order): `{repo, draw_index, seed, pool_size, total_weight, roll, picked_index, number, issue, pr, step, weight, draw_weight, repo_weight, repo_items, repo_pool_weight, in_flight_repo, actionable, priority, level, lane, age_permille, age_minutes, age_source}`. Draw `i` of the tick is seeded `sha256("loom-draw/v3:" + seed_minute + ":" + seed_host + ":" + tick_counter + ":" + draw_index)`, first 8 bytes big-endian (`v2` also keyed the repo). A pooled item's draw weight is `w_repo × iw × S_r^(α−1) × (1 + in_flight_repo)^(−β)`, computed in floating point over the items still in the pool, scaled so the heaviest weighs `2^40` and rounded to an integer (a positive weight never becomes 0); `draw_weight` is the drawn item's, `repo_items` and `repo_pool_weight` are its repo's `n_items` and `S_r` at that draw, and P = `draw_weight / total_weight`. Draws are without replacement. The roll is `PickRng(seed)` values with rejection of the low `2^64 mod total_weight` ones, then `% total_weight` (no modulo bias). Replay: start from `pools[]` and `repos[]`; for each draw, drop the repos (or, for a closure with `steps`, those rows of the repo) `closures[]` closed by then, weigh the pool left with the formula above, check `seed`, `total_weight`, `roll` and `draw_weight`, and select the first row whose cumulative weight exceeds the roll; that row's position is `picked_index` (`step_dispatch::item_draw::replay_record`). The tick counter is per process, so a restart within a minute reuses that minute's seeds; replay is unaffected. `age_source` is `mirror`, `events`, `created` or `none`. Additive (a `loom-draw/v2` record has no `repos[]`, exponents or `closures[]` and does not replay under v3), so `schema_version` stays `2` |
 | `very_important_demoted` | array, optional | work finder only (#11509), absent when empty: one `{repo, number, holder}` per `loom:very-important` issue the per-workspace cap ranked as important this tick (`holder` keeps the slot; every one, uncapped). Additive, so `schema_version` is unchanged; see [`priority-model.md`](priority-model.md) |
 
@@ -117,12 +117,6 @@ size, which becomes `candidates_total`. If the file is missing or unreadable
 observed: `decisions_observed` is `false` and unexplained candidates stay
 undecided. A file that exists but is empty is an observed tick with no acts.
 
-A `queue` line keeps at most 200 rows but also records the queue's uncapped
-size, which becomes `candidates_total`. If the file is missing or unreadable
-(a tick whose launch journaled no queue and whose agent never used the `gh` front writes none) nothing was
-observed: `decisions_observed` is `false` and unexplained candidates stay
-undecided. A file that exists but is empty is an observed tick with no acts.
-
 **Role actions (closed set).** `claimed` (`loom:reviewing`, `loom:treating`,
 `loom:curating`, `loom:evaluating`, `loom:building`), `approved` (`loom:pr`, or
 `pr review --approve`), `changes_requested`, `merged`, `curated`, `promoted`
@@ -145,31 +139,45 @@ it, only a hold label names a reason; other candidates are undecided.
 |---|---|---|
 | `overlap_chain` | overlaps an in-flight chain of stacked work, or (work finder) its `## Affected Files` overlap same-repo work admitted earlier this tick or already in flight | `deferred_file_overlap` (#9781; `detail` names the shared paths); roles: the candidate carries `loom:sequenced` |
 | `pr_open_skip` | the item already has an open PR | `open_pr`, `open_pr_backoff` |
-| `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR |
+| `operator_hold` | held for a human | `parked`, `hard_exclusion`, `declined`; roles: a merge-hold / park label on the PR. An `extraSkipLabels` match reads here on this path — the work finder skips it as `parked` (#6685) — but `host_constraint` on the step path; see the note under the mapping below |
 | `quota` | token pool or quota would not admit it | roles: `skipped_no_token_pool`, `skipped_pool_exhausted` ticks |
 | `cap` | the concurrency cap is full | `deferred_capacity` (`deferred_ramp_cap`, `deferred_saturation` and `deferred_repo_cap` mapped here until #12406 removed them; `deferred_out_of_slice` until the dispatch slice was retired, #11682) |
 | `in_flight` | a live sweep or claim covers it | `in_flight`; roles: a claim label the agent did not write |
 | `backoff` | inside a back-off, cooldown, recheck or retry window | `deferred_build_backoff`, `recheck_interval`, `dispatch_backoff`, `noop_cooldown`, `prless_retry` |
 | `halted` | the repo's dispatch is halted (red main, gate, drain, ...) | `workspace_halted` |
-| `host_constraint` | not for this host | `host_constraint`, `peer_claim` |
+| `host_constraint` | not for this host | `host_constraint`, `lease_held`; step engine: `host_skip_label` (an `extraSkipLabels` match, #13891) reads here, where the work-finder mapping above reads the same veto as `operator_hold` |
 | `blocked` | blocked by something specific to the item | `workspace_commands_missing`, `quarantined`, `labelled_blocked`, `unknown`; roles: `loom:blocked`, `loom:ci-failure` |
 | `error` | the dispatch attempt failed | `dispatch_error` |
 | `tick_skipped` | the role tick did not run for another reason | roles: runtime rejected, model/runtime mismatch, load, queue gate |
 | `not_selected` | the role ran, its writes were observed, and it did not act on this candidate | roles only, with `decisions_observed` |
 | `already_landed` | the item's work already landed: the issue is closed, or this host recorded a `landed` sweep for it in the last 30 minutes (#11429) | `already_landed` |
 | `already_closed` | the issue is closed as not planned (#11429) | `already_closed` |
-| `no_step` | the item's state calls for no step: an epic, an unpromoted proposal, an unlabelled draft PR | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `proposal`, `no_stage`, `draft` |
+| `no_step` | the item's state calls for no step: an epic, a tracker, an unpromoted proposal, an unlabelled draft PR | step engine only (#11896): `item_draw.excluded[].skip_reason` for `epic`, `tracker`, `proposal`, `no_stage`, `draft` |
 
 `QueueDisposition::Dispatched` is the one disposition with no reason: it is
 *acted*. The mapping is a total match in
 `PickSkipReason::from_disposition`, so a new disposition must be classified
 there. The step engine's weight-0 exclusions map through the parallel total match
-`PickSkipReason::from_exclusion`: `pool_exhausted` → `quota`, `build_backoff`
-→ `backoff`, `ci_pending` (a Judge step whose PR head has CI running, #12042)
-→ `backoff`, `frozen` / `operator` / `hard_exclusion` → `operator_hold`,
-`claimed` / `queued` → `in_flight`, `shared_pr` → `pr_open_skip`, `sequenced`
-→ `overlap_chain`, `blocked` → `blocked`, `capability_missing` →
-`host_constraint`, `epic` / `proposal` / `no_stage` / `draft` → `no_step`.
+`PickSkipReason::from_exclusion` (24 wire names: `Exclusion::as_str` and
+`PassReason::as_str`): `pool_exhausted` → `quota`, `build_backoff` /
+`cooling_down` → `backoff`, `ci_pending` (a Judge step whose PR head has CI
+running, #12042) / `held_at_head` / `author_gate_held` / `conflicting` /
+`stacked` → `backoff`, `frozen` / `operator` / `hard_exclusion` →
+`operator_hold`, `claimed` / `queued` / `merge_in_flight` → `in_flight`,
+`shared_pr` → `pr_open_skip`, `sequenced` → `overlap_chain`, `blocked` →
+`blocked`, `capability_missing` / `host_skip_label` → `host_constraint`,
+`epic` / `tracker` / `proposal` / `no_stage` / `draft` → `no_step`.
+An `extraSkipLabels` match reads differently on the two paths: the step engine
+excludes it as `host_skip_label` → `host_constraint` (#13891), while the
+work-finder role tick skips the same item as disposition `parked` →
+`operator_hold` (#6685). Both resolve the same
+`autonomous.workFinder.extraSkipLabels` (env > config > default `[]`), so a
+per-reason count that aggregates skips from both paths sees the one veto under
+two names (#13961). A capability gap has the same shape: the step engine passes
+a capability park whose capabilities this host does not fully hold as
+`capability_missing` → `host_constraint` (`work_finder/step_item.rs`), while
+the role tick skips the same item as `parked` → `operator_hold` through the
+capability lane (#6893) — `Qd::Parked` is a mixed bucket on the role-tick path.
 
 ## Rank of an item in each role's latest candidate list
 
@@ -245,9 +253,12 @@ root adds roughly 1.5 k. Lists are not capped (#11567): an empty tick is under 4
 work-finder tick with ~575 candidates and ~350 draws is several hundred KB.
 At 1,440 work-finder ticks/day/host that is on the order of 0.5 GB/day/host
 in the worst case (typical ticks with a handful of candidates stay around
-1 KB). A record whose JSON exceeds `CHUNK_BYTES` (1,000,000) is split into
-chunks, so each chunk is bounded
-(`a_busy_tick_splits_into_bounded_chunks_and_reassembles_exactly` pins that);
+1 KB). A record whose JSON exceeds `CHUNK_BYTES` (16 KiB, the fleet's ~16 KB
+log ingest cap, #12973) is split into chunks, so each chunk is bounded and stays
+queryable in SigNoz (`a_worst_case_tick_keeps_every_chunk_under_the_ingest_cap`
+pins that; a busy tick is now tens of chunks). Known limit: the header repeats
+on every chunk and a lone oversized entry goes out whole, so a header alone
+larger than the cap (hundreds of `item_draw.repos[]`) would exceed it;
 the compact `[repo_idx, number, reason_code]` encoding is the fallback
 if volume proves unacceptable.
 

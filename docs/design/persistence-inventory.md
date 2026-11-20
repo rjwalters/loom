@@ -7,6 +7,14 @@ readers, the authority, the schema/version field, the recovery behaviour and a
 proposed disposition. It then proposes a target journal schema with one writer
 per concern.
 
+> **SUPERSEDED (operator ruling, 2026-10-19, #9908 closed as not planned;
+> unwound by #12848).** The journals described in section 9 (J1 execution,
+> J2 telemetry, J3 configuration-snapshot) and their shadow-write code
+> (`loom_daemon::journal`, `telemetry::journal_shadow`, `config_journal`,
+> `LOOM_TELEMETRY_JOURNAL*`) were removed. The daemon produces telemetry and
+> session transcripts only. Sections 1-8 remain as a store inventory; sections
+> 9-14 are kept as history only and describe no live code.
+
 **Status: proposal for curation.** This phase changes documentation only. It
 creates no runtime store, migrates no reader, deletes no format, and changes no
 forge authority. Phase 4, which retires old formats, still needs the
@@ -173,7 +181,7 @@ prove a claim *dead on this host* (`worktree_ops/orphan_recovery.rs:15-18`).
 | C7 | Fleet sync status | `<loom_dir>/fleet-sync-status.json` (`fleet_sync.rs:121`, written `:770`) | `fleet_sync::publish` | `loom-daemon status` | Last-pass snapshot | Unversioned | Best effort | **J3** `fleet.sync` + **PROJECTION → DELETE** |
 | C8 | Effective-config snapshot | **Does not exist.** Only hashes are persisted: `planner_config_hash` / `fleet_config_hash` on `fleet.state` telemetry (`telemetry/kinds/fleet_state.rs`; no producer since #11301) | — | Backend | No local authority. A hash cannot be resolved back to a config. | — | — | **J3** `config.resolved` (new, content-addressed) |
 | C9 | Install metadata | `<ws>/.loom/install-metadata.json` (`install_compat.rs:68`) | `scripts/install-loom.sh`, `defaults/scripts/resync-installed.sh` | Version gates, `create-pr.sh`, `check-main-freshness.sh` | Authoritative install record | Fields | — | **RETAIN** (install contract) |
-| C10 | MCP state / command files | `~/.loom/state.json`, `~/.loom/mcp-command.json` (`mcp-loom/src/shared/config.ts:25`, `:28`) | `mcp-loom/src/shared/config.ts:189`, `mcp-loom/src/shared/ipc.ts:43` | `mcp-loom` | MCP-local | — | — | **RETAIN** (out of daemon scope) |
+| C10 | MCP state file | **No longer exists.** `~/.loom/state.json` was read and written by `mcp-loom/src/shared/config.ts` until #13821 removed those paths; its only writer was the `set_primary_terminal` tool, itself a leftover of the desktop app removed in #3353 | — | — | — | — | — | **DELETED** (#13821). Old installs may still have the file on disk; `.gitignore` and `scripts/uninstall-loom.sh` still cover it |
 
 ## 6. Inventory: host control state
 
@@ -202,7 +210,7 @@ data. They are **RETAIN**.
 
 - **Locks and mutexes**, which hold no data: `.loom/locks/{build-slot, issue-filing, worktree-add, docs-guide-lock}` (`build_slot.rs`, `filing_lock.rs`, `worktree_cli/lock.rs`); the machine in-flight registry `owner.json` (`inflight.rs:97`); the ceiling control lock (`runtime_preference/ceiling.rs:123`); token-pool `.lock` siblings; the native binding locks (`native_tools/provision/shared.rs`).
 - **Credentials**, which are secret-bearing and stay outside every repo per policy: `~/.loom/tokens/` and its `.bad_tokens`, allowlist, failure counts, rotation cursor, `ranking.json`, `.ranking.weekly.json`, `.ranking.classes.json` (`tokens.rs:68`, `tokens_pool/*`); session holds (`tokens_pool/session_hold.rs:55`); `.session-managed.json` (`tokens_pool/session_lifecycle.rs:531`); account health (`tokens_pool/health.rs:431`); codex profiles and the profile ledger (`tokens_pool/paths.rs:90`, `tokens_pool/profile_ledger.rs:37`); the API-key pool and its `.bad_accounts.json`, `.limits.json`, `.sync_state.json` (`api_keys_pool/paths.rs:54`, `api_keys_pool/bad_marks.rs:58`, `api_keys_pool/limits.rs:42`, `api_keys_pool/sync.rs:61`); the private-workspace leases (`tokens_pool/private_workspace/lease.rs:24`); the forge identity sidecar (`forge_identity/sidecar.rs:22`); and `.loom/gh-config*/`.
-- **Caches**, rebuildable from their sources: the forge ETag / listing cache (`forge_etag_store.rs:60`); the package cache (`native_readiness/package_cache.rs:369`); `usage-cache.json` (`script_helpers/usage.rs:150`); `pr-merge-state.json` (`sweep_outcome_summary.rs:588`); `metrics_state.json` (`metrics_collector.rs:79`); the transcript archive manifests (`activity/transcript_archive.rs:29`); the token-ranking refresh summaries (`token_ranking_refresh.rs`).
+- **Caches**, rebuildable from their sources: the forge ETag / listing cache (`forge_etag_store.rs:60`); the package cache (`native_readiness/package_cache.rs:369`); `usage-cache.json` (`script_helpers/usage.rs:150`); `pr-merge-state.json` (`sweep_outcome_summary.rs:588`); the transcript archive manifests (`activity/transcript_archive.rs:29`); the token-ranking refresh summaries (`token_ranking_refresh.rs`).
 - **Install and provisioning artifacts**: `.loom/manifest.json` (`defaults/scripts/verify-install.sh:117`); the daemon install-state record (`daemon_update/provision/txn.rs:69`); the native session record (`native_tools/provision/reap.rs:63`); the resync pins (`resync_pin.rs:242`); release adoption (`release_fetch/source.rs:109`); fleet experiments (`script_helpers/fleet_experiment/lifecycle.rs:92`).
 - **Audit and operator logs**: `worktree-removals.log` (`worktree_ops/removal_log.rs:17`), `stash-retirement.log` (`stash_retirement.rs:47`), `guard-decisions.log` (`mcp_tool_guard.rs:507`), `main-quarantine.log`, the role and daemon logs, and `native-tools/policy-timeouts.jsonl` (`native_tools/guard.rs:95`).
 - **External stores read but never written**: claude-monitor's `usage.db` (`tokens_pool/monitor_db.rs:54`, `limit_calibration.rs:113`) and OpenCode's `opencode.db` (`opencode_usage.rs`).

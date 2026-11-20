@@ -21,7 +21,7 @@ loads). This doc carries the reasoning, the outcome vocabulary, and the audit.
 |---|---|---|---|---|---|
 | Curator | `gh api rate_limit`, min(core, graphql) under ~500 or unreadable → refuse `pool_gate` | one live REST read of `issues/<N>`: `pull_request != null` → refuse `target_is_pr` | same read: `closed`, `loom:frozen`, any `loom:operator*` label, a hard-exclusion label → refuse | `loom:curating`; **no lease yet** (see "Gaps") | `claim-staleness.sh check --label loom:curating` |
 | Judge | none (the role runner's pool gate runs before spawn) | one live REST read of `issues/<N>`: `pull_request == null` → refuse `target_is_issue` | same read: `closed` (also merged), `loom:frozen`, any `loom:operator*` label → refuse; verdict label without `loom:review-requested` → `noop already_judged`; no stage label (`loom:review-requested`, `loom:reviewing`, a verdict label; a priority label alone does not count) → Fallback Queue rules (review only, never claim) | `lease pr claim --role judge`, then `loom:reviewing` | `claim-staleness.sh check --label loom:reviewing` |
-| Builder | none (as Judge) | `forge check-claim <N>` → `TARGET_IS_PR` | same probe → `CLOSED`, `FROZEN`, `OPERATOR`, `OPEN_PR`; a hard-exclusion label → refuse | `loom:issue` → `loom:building`; `worktree.sh` runs `lease ensure` | `check-claim`'s `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS`, unless the invoker holds the claim |
+| Builder | none (as Judge) | `forge check-claim <N>` → `TARGET_IS_PR` | same probe → `CLOSED`, `FROZEN`, `OPERATOR`, `OPEN_PR`, `MERGED_PR`, `TRIAGE`; a hard-exclusion label → refuse | `loom:issue` → `loom:building`; `worktree.sh` runs `lease ensure` | `check-claim`'s `BUILDING` / `LEASE_ALREADY_HELD` / `BRANCH_EXISTS`, unless the invoker holds the claim |
 
 Why each gate sits where it does:
 
@@ -47,8 +47,12 @@ Why each gate sits where it does:
   the session, and says so through `LOOM_SWEEP_CLAIM_OWNED=<N>`. An in-session
   `/loom:sweep` publishes the lease at pre-flight. A Builder launched by either
   sees its invoker's claim as `BUILDING` / `LEASE_ALREADY_HELD` /
-  `BRANCH_EXISTS` and must continue, not refuse. The signal is mechanical on
-  every launch path:
+  `BRANCH_EXISTS` and must continue, not refuse. `forge check-claim` applies
+  that itself where the marker is set: with `LOOM_SWEEP_CLAIM_OWNED=<N>` it
+  exits `1` past `BUILDING`, `BRANCH_EXISTS` and a `LEASE_ALREADY_HELD` whose
+  lease is this host's (another host's lease still blocks), naming on stderr
+  what it passed, so the session need not reason about it. The signal is
+  mechanical on every launch path:
   - daemon sweep (Task subagent or `worker run`): the daemon exports
     `LOOM_SWEEP_CLAIM_OWNED=<N>` and every child inherits it;
   - attended sweep, `worker run --role builder --issue <N>`: the worker is
@@ -63,7 +67,7 @@ Why each gate sits where it does:
     claim and lease.`
 
   The never-overridable tokens (`TARGET_IS_PR`, `CLOSED`, `FROZEN`,
-  `OPERATOR`, `OPEN_PR`) refuse whoever claimed. A step engine that pre-claims a Builder
+  `OPERATOR`, `OPEN_PR`, `MERGED_PR`, `TRIAGE`) refuse whoever claimed. A step engine that pre-claims a Builder
   step must export the same `LOOM_SWEEP_CLAIM_OWNED=<N>`, or not pre-claim.
 - **The step engine pre-takes only the lease for every other role (#11906).**
   Judge, Doctor, Curator and Champion read a fresh claim label as another
@@ -79,7 +83,7 @@ Why each gate sits where it does:
   attended `/loom:builder <N>` told to resume or force a claim (the
   operator's own crashed run, say) passes `BUILDING` / `LEASE_ALREADY_HELD` /
   `BRANCH_EXISTS`, exactly as `check-claim --force-claim` does. It never
-  passes the five never-overridable tokens.
+  passes the seven never-overridable tokens.
 
 ### The `loom:operator` skip (#11861)
 
@@ -118,6 +122,18 @@ exits (pre-state = the state the step was drawn on):
 | Judge | the PR gained `loom:pr` or `loom:changes-requested` with a verdict-SHA marker at the current head; or, for a fallback PR, a `loom:fallback-evaluated` marker at the head | no verdict and no claim left behind, with a `noop` outcome line | nothing changed and the pre-state fails gate 2 or 3, or a stand-down marker was posted | `loom:reviewing` or a live Judge PR lease is still held after exit; anything else |
 | Builder | an open PR linked to `<N>` with `loom:review-requested` was created during the step; or the issue was parked (`loom:blocked` / `loom:operator`) or closed | `.loom/worktrees/issue-<N>/.no-changes-needed` exists (the sweep's own signal, #6670) | nothing changed and `forge check-claim` would refuse the pre-state | `loom:building` is still held with no PR and no marker |
 | Curator | the issue gained `loom:curated`, was parked or was closed, and `loom:curating` is gone | `loom:curating` is gone and nothing else changed, with a `noop` outcome line | nothing changed and the pre-state fails gates 1 to 3, or a stand-down marker was posted | `loom:curating` is still on the issue after exit |
+| Doctor | the PR gained `loom:review-requested` | the PR is unmoved with no claim left, and the line says `noop` (`no_fix_needed`) | the unmoved item takes the line's `refused` | the Doctor claim is still held after exit |
+| Champion (promote) | the issue gained `loom:issue` or `loom:triage` | the issue is unmoved with no claim left (`blocked`) | `not-eligible` on an open item | the claim is still held after exit |
+| Champion (merge) | the PR closed (merged), or left `loom:pr` with a replacement label (`loom:review-requested`, `loom:changes-requested`, `loom:blocked`, or `loom:operator`) | the PR is unmoved and the line says `noop` (`held` / `requeued` / `skipped`) | as promote | the line says `failed` (merge holds no claim, so a held claim can never fire) |
+
+(Doctor and Champion are classified by the same `outcome_ledger::classify`; the
+labels each role moves an item to are `advanced_labels` in
+`sweep_registry/restore_to_ready/step_restore.rs`. The one exception is
+Champion merge, whose verdict post-state is the special-case arm in
+`step_post_state` in that same file — `advanced_labels` is empty for it.)
+
+Champion writes a `CHAMPION-STEP` line rather than a `LOOM_STEP_OUTCOME` one,
+so the claim-versus-post-state check below has no claimed class for it.
 
 **The outcome line separates what the forge cannot.** `refused` and `failed`
 both leave the forge untouched, and a `pool_gate` refusal is invisible in the
@@ -130,6 +146,13 @@ LOOM_STEP_OUTCOME role=<judge|curator|builder> target=<N> class=<verdict|noop|re
 It is advisory: a classifier uses it only to choose between classes the
 post-state already allows, never to claim a `verdict` the forge does not show.
 A missing line on an unchanged item is `failed` with reason `unclassified`.
+The daemon also records the disagreement (#14234): the step's `loom.sweep`
+close carries `loom.step.outcome.agrees` (`false` when a `verdict` claim the
+forge does not show was classified `failed`), so how often a runtime claims a
+result it did not produce is a trace query, not a log grep
+(`telemetry-schema.md`). It changes no classification.
+The reason is read with `-` folded to `_` (#13500): `reason=ci-pending`, the
+spelling of the Judge's `--skip-reason`, is the `ci_pending` token below.
 
 ### Reason tokens
 
@@ -141,10 +164,11 @@ A missing line on an unchanged item is `failed` with reason `unclassified`.
 | `noop` | `already_judged`, `ci_pending`, `fallback_skip` | Judge | gate 2; Primary Queue step 2b; `judge-fallback-guard.sh` exit 10/11/12 |
 | `verdict` | `fixed` | Doctor | a pushed fix; the PR returns to review |
 | `noop` | `no_fix_needed` | Doctor | the PR needed no change |
+| `failed` | `handback_failed` | Doctor | `forge doctor-handback` exit 1 (#14165) — one token for the whole class (lock held, deadline, refused forge read, credential), so the ledger's repeat accounting never fragments across per-cause spellings |
 | `noop` | `no_changes_needed` | Builder | the `.no-changes-needed` marker |
 | `noop` | `nothing_to_add` | Curator | the issue already meets the Quality Checklist and was curated before |
 | `refused` | `target_is_pr`, `target_is_issue` | issue roles, PR roles | gate 2 |
-| `refused` | `closed`, `frozen`, `hard_excluded`, `open_pr`, `branch_exists` | as gate 3 applies | gate 3; `check-claim` tokens |
+| `refused` | `closed`, `frozen`, `hard_excluded`, `open_pr`, `merged_pr`, `triage`, `branch_exists` | as gate 3 applies | gate 3; `check-claim` tokens |
 | `refused` | `claimed`, `claim_lost`, `head_moved` | all | a fresh peer claim or lease; Judge's verdict-time CAS recheck |
 | `refused` | `pool_gate` | Curator | gate 1 |
 | `failed` | `probe_failed`, `crashed`, `unclassified` | all | a gate read that could not answer (`check-claim` exit 5, a failed REST read); everything else |
@@ -153,6 +177,17 @@ A Builder `noop` needs one more thing the step engine must do itself: the
 sweep releases `loom:building` back to `loom:issue` and records the no-op
 (`record-noop-release.sh`) when it finds the marker. A Builder step run
 without a sweep around it gets neither unless the engine does both.
+
+**Who posts the reason comment (#13054).** For a Builder step the daemon does,
+not the Builder prompt (a cut-short Builder never reaches the prompt): when
+the step engine records a Builder step as `noop` or `failed`,
+`SweepRegistry::note_builder_outcome` posts one comment tagged
+`<!-- loom:builder-step-outcome (#13054) sweep=<id> -->` with the outcome's
+reason token and, for a `noop`, the first 200 characters of
+`.no-changes-needed` when the worktree still has it. It is keyed by the step's
+sweep id, so one step never comments twice. The `/loom:sweep` orchestrator
+posts its own comment on its path (`sweep-wave-lifecycle.md`); the two paths
+do not overlap, because a sweep-run Builder is not a recorded step.
 
 ## Audit (2026-10-14, at `6b6f2074f`)
 

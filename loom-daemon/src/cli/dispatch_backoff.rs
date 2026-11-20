@@ -12,13 +12,13 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
+use crate::types::{Request, Response};
 
-use super::common::{query_daemon, resolve_socket_path};
-use crate::DispatchBackoffAction;
+use super::common::{exit_on_daemon_failure, query_daemon, resolve_socket_path};
+use crate::cli::DispatchBackoffAction;
 
 /// Handle the `dispatch-backoff` subcommand.
-pub(crate) async fn handle_dispatch_backoff_command(action: DispatchBackoffAction) -> Result<()> {
+pub async fn handle_dispatch_backoff_command(action: DispatchBackoffAction) -> Result<()> {
     let socket_path = resolve_socket_path()?;
     match action {
         DispatchBackoffAction::Record {
@@ -31,12 +31,12 @@ pub(crate) async fn handle_dispatch_backoff_command(action: DispatchBackoffActio
                 reason,
                 workspace_root,
             };
-            match query_daemon(&socket_path, &request).await {
-                Ok(Response::DispatchFailureRecorded {
+            match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+                Response::DispatchFailureRecorded {
                     issue,
                     consecutive,
                     backoff_secs,
-                }) => {
+                } => {
                     match backoff_secs {
                         Some(secs) => println!(
                             "Recorded dispatch failure for issue #{issue} — {consecutive} \
@@ -49,19 +49,8 @@ pub(crate) async fn handle_dispatch_backoff_command(action: DispatchBackoffActio
                     }
                     Ok(())
                 }
-                Ok(Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
+                other => {
                     eprintln!("Unexpected response from daemon: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-                    eprintln!();
-                    eprintln!("Is the daemon running? Start it with:");
-                    eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
                     std::process::exit(1);
                 }
             }

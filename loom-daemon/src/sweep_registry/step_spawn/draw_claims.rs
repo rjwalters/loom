@@ -8,63 +8,76 @@
 //! it. So before the draw the tick removes:
 //!
 //! - every item this registry runs (a live sweep or step);
-//! - every item a peer advertises a live claim on
-//!   (`PeerClaimView::claimed_issues_at`);
-//! - every other Champion merge in the repo while this host or a peer is
-//!   merging there (`PeerClaimView::merge_in_flight_at`, the best-effort
-//!   per-repo merge serialisation of design §6).
+//! - every other Champion merge in the repo while this host is already merging
+//!   there at the repo's merge concurrency, one by default (the per-repo merge
+//!   serialisation of design §6, `champion.mergeConcurrencyPerRepo` #13026).
+//!
+//! A peer host's claims are no longer read from a broadcast (#13945): the
+//! cross-host guard is the lease tie-break, and the captain assigns the work.
 
 use std::collections::HashSet;
 
 use super::*;
 use crate::step_role::StepRole;
 
-/// The items the draw skips, and a peer's merge in flight in this repo.
+/// The items the draw skips, and the merges in flight in this repo.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrawClaims {
     pub items: HashSet<u32>,
-    /// `(PR, host)` of a live peer Champion merge in this repo.
-    pub merge_in_flight: Option<(u32, String)>,
+    /// `(PR, host)` of every live Champion merge in this repo, by PR number.
+    pub merges_in_flight: Vec<(u32, String)>,
+    /// `champion.mergeConcurrencyPerRepo` (#13026): the merges the repo may
+    /// run at once. Set by the tick from config, not by the registry; `0`
+    /// (the default) reads as `1`, today's serial lane.
+    pub merge_concurrency: usize,
+}
+
+impl DrawClaims {
+    /// The repo's merge concurrency, never below one.
+    #[must_use]
+    pub fn merge_limit(&self) -> usize {
+        self.merge_concurrency.max(1)
+    }
+
+    /// How many more merges the repo may start: its limit less the merges in
+    /// flight, saturating.
+    #[must_use]
+    pub fn merge_slots_free(&self) -> usize {
+        self.merge_limit()
+            .saturating_sub(self.merges_in_flight.len())
+    }
 }
 
 impl SweepRegistry {
-    /// This registry's and its peers' live claims, for the draw.
+    /// This registry's live claims, for the draw.
     #[must_use]
     pub fn draw_claims(&self) -> DrawClaims {
-        let mut items: HashSet<u32> = self
+        let items: HashSet<u32> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .filter(|i| matches!(i.state, SweepState::Running))
             .filter_map(|i| match i.kind {
                 SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(n),
                 SweepKind::PrSet(_) => None,
             })
             .collect();
-        items.extend(self.peer_claimed_issues());
-        // This host's own live merge serialises the repo too, not only a
-        // peer's.
-        let own_merge = self
+        let mut merges_in_flight: Vec<(u32, String)> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
-            .find_map(|i| match i.kind {
+            .filter(|i| matches!(i.state, SweepState::Running))
+            .filter_map(|i| match i.kind {
                 SweepKind::Step {
                     item,
                     role: StepRole::ChampionMerge,
                 } => Some((item, host_identity())),
                 _ => None,
-            });
-        let merge_in_flight = own_merge.or_else(|| {
-            self.peer_claims.as_ref().and_then(|view| {
-                let repo = peer_claims::repo_slug(&self.config.workspace_root);
-                view.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .merge_in_flight_at(&repo, Instant::now())
             })
-        });
+            .collect();
+        merges_in_flight.sort();
         DrawClaims {
             items,
-            merge_in_flight,
+            merges_in_flight,
+            ..DrawClaims::default()
         }
     }
 }

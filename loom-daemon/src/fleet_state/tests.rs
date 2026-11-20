@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use chrono::{Duration, TimeZone, Utc};
+use serde_json::json;
 
 use super::*;
 use crate::fleet_store::test_support::{location, sample_files, FakeForge};
@@ -16,18 +17,35 @@ fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()
 }
 
-/// `sample_files()` with `fleet/state.yml` replaced by `yaml`.
-fn files_with_state(yaml: &str) -> BTreeMap<String, String> {
+/// `sample_files()` plus a compiled `fleet.json` whose `state` section is
+/// `state` (the only run-state source; the legacy `fleet/state.yml` is not
+/// read).
+fn files_with_state(state: serde_json::Value) -> BTreeMap<String, String> {
     let mut f = sample_files();
-    f.insert(crate::fleet_store::STATE_PATH.to_string(), yaml.to_string());
+    let doc = serde_json::json!({
+        "_generated": {"schema_version": 1},
+        "root": "/srv/src",
+        "repos": [],
+        "state": state,
+        "config": {"defaults": {}}
+    });
+    f.insert(crate::fleet_store::FLEET_JSON_PATH.to_string(), doc.to_string());
     f
 }
 
-/// `sample_files()` with no `fleet/state.yml` at all.
+/// The store the shipped fixture describes: `fleet: running`,
+/// `hosts.build-2: paused`.
+fn sample_state_files() -> BTreeMap<String, String> {
+    files_with_state(serde_json::json!({
+        "fleet": {"state": "running"},
+        "hosts": {"build-2": {"state": "paused"}}
+    }))
+}
+
+/// `sample_files()` with no `fleet.json` (only the legacy, unread
+/// `fleet/state.yml`).
 fn files_without_state() -> BTreeMap<String, String> {
-    let mut f = sample_files();
-    f.remove(crate::fleet_store::STATE_PATH);
-    f
+    sample_files()
 }
 
 /// Read `host`'s state from a live forge serving `files`.
@@ -44,7 +62,7 @@ fn pass_for(files: BTreeMap<String, String>, host: &str) -> (StatePass, tempfile
 
 #[test]
 fn a_fleet_default_of_running_proceeds() {
-    let (pass, _d) = pass_for(files_with_state("fleet:\n  state: running\n"), "build-1");
+    let (pass, _d) = pass_for(files_with_state(json!({"fleet": {"state": "running"}})), "build-1");
     assert_eq!(pass.desired, Some(RunState::Running));
     assert_eq!(pass.source.as_deref(), Some("fleet"));
     assert_eq!(pass.enforcement(), Enforcement::Proceed);
@@ -55,10 +73,10 @@ fn a_fleet_default_of_running_proceeds() {
 #[test]
 fn a_host_entry_of_paused_holds_and_overrides_the_fleet_default() {
     // The shipped fixture: `fleet: running`, `hosts.build-2: paused`.
-    let (running, _d1) = pass_for(sample_files(), "build-1");
+    let (running, _d1) = pass_for(sample_state_files(), "build-1");
     assert_eq!(running.enforcement(), Enforcement::Proceed);
 
-    let (paused, _d2) = pass_for(sample_files(), "build-2");
+    let (paused, _d2) = pass_for(sample_state_files(), "build-2");
     assert_eq!(paused.desired, Some(RunState::Paused));
     assert_eq!(paused.source.as_deref(), Some("host"));
     assert_eq!(paused.enforcement(), Enforcement::Hold);
@@ -67,9 +85,10 @@ fn a_host_entry_of_paused_holds_and_overrides_the_fleet_default() {
 #[test]
 fn a_host_entry_of_stopped_stops() {
     let (pass, _d) = pass_for(
-        files_with_state(
-            "fleet:\n  state: running\nhosts:\n  build-1:\n    state: stopped\n    by: robb\n",
-        ),
+        files_with_state(json!({
+            "fleet": {"state": "running"},
+            "hosts": {"build-1": {"state": "stopped", "by": "robb"}}
+        })),
         "build-1",
     );
     assert_eq!(pass.desired, Some(RunState::Stopped));
@@ -80,15 +99,15 @@ fn a_host_entry_of_stopped_stops() {
 #[test]
 fn metadata_travels_with_the_entry_that_set_the_state() {
     let (pass, _d) = pass_for(
-        files_with_state(concat!(
-            "fleet:\n  state: running\n",
-            "hosts:\n",
-            "  build-1:\n",
-            "    state: paused\n",
-            "    by: operator\n",
-            "    since: 2026-01-01T00:00Z\n",
-            "    reason: disk replacement\n",
-        )),
+        files_with_state(json!({
+            "fleet": {"state": "running"},
+            "hosts": {"build-1": {
+                "state": "paused",
+                "by": "operator",
+                "since": "2026-01-01T00:00Z",
+                "reason": "disk replacement"
+            }}
+        })),
         "build-1",
     );
     assert_eq!(pass.by.as_deref(), Some("operator"));
@@ -101,17 +120,17 @@ fn metadata_travels_with_the_entry_that_set_the_state() {
 }
 
 #[test]
-fn a_store_with_no_state_file_proceeds_and_says_why() {
+fn a_store_with_no_fleet_json_proceeds_and_says_why() {
     let (pass, _d) = pass_for(files_without_state(), "build-1");
     assert_eq!(pass.desired, None);
     assert_eq!(pass.enforcement(), Enforcement::Proceed);
     let err = pass.error.expect("a missing state file is reported");
-    assert!(err.contains(crate::fleet_store::STATE_PATH), "{err}");
+    assert!(err.contains(crate::fleet_store::FLEET_JSON_PATH), "{err}");
 }
 
 #[test]
 fn an_unparseable_state_file_with_no_recorded_state_proceeds() {
-    let (pass, _d) = pass_for(files_with_state("fleet:\n  state: retired\n"), "build-1");
+    let (pass, _d) = pass_for(files_with_state(json!({"fleet": {"state": "retired"}})), "build-1");
     assert_eq!(pass.desired, None);
     assert_eq!(pass.enforcement(), Enforcement::Proceed);
     assert!(pass.error.is_some());
@@ -124,7 +143,7 @@ fn an_unparseable_state_file_keeps_the_last_recorded_paused_or_stopped_state() {
         (RunState::Stopped, Enforcement::Stop),
         (RunState::Running, Enforcement::Proceed),
     ] {
-        let forge = FakeForge::new(files_with_state("fleet:\n  state: retired\n"));
+        let forge = FakeForge::new(files_with_state(json!({"fleet": {"state": "retired"}})));
         let dir = tempfile::tempdir().unwrap();
         let pass = state_pass(&forge, dir.path(), &location(), "build-1", Some(recorded), t0());
         assert_eq!(pass.desired, Some(recorded));
@@ -137,7 +156,7 @@ fn an_unparseable_state_file_keeps_the_last_recorded_paused_or_stopped_state() {
 #[test]
 fn a_state_file_naming_neither_this_host_nor_a_default_proceeds() {
     let (pass, _d) =
-        pass_for(files_with_state("hosts:\n  build-9:\n    state: stopped\n"), "build-1");
+        pass_for(files_with_state(json!({"hosts": {"build-9": {"state": "stopped"}}})), "build-1");
     assert_eq!(pass.desired, None);
     assert_eq!(pass.enforcement(), Enforcement::Proceed);
 }
@@ -148,9 +167,10 @@ fn a_state_file_naming_neither_this_host_nor_a_default_proceeds() {
 
 #[test]
 fn an_unreachable_forge_honours_the_last_good_cached_snapshot() {
-    let forge = FakeForge::new(files_with_state(
-        "fleet:\n  state: running\nhosts:\n  build-1:\n    state: stopped\n",
-    ));
+    let forge = FakeForge::new(files_with_state(json!({
+        "fleet": {"state": "running"},
+        "hosts": {"build-1": {"state": "stopped"}}
+    })));
     let dir = tempfile::tempdir().unwrap();
     // One good read populates the cache...
     let live = state_pass(&forge, dir.path(), &location(), "build-1", None, t0());
@@ -213,9 +233,10 @@ fn an_unreachable_forge_on_a_first_boot_proceeds() {
 
 #[test]
 fn a_forge_that_answers_with_an_error_status_behaves_like_an_outage() {
-    let forge = FakeForge::new(files_with_state(
-        "fleet:\n  state: running\nhosts:\n  build-1:\n    state: paused\n",
-    ));
+    let forge = FakeForge::new(files_with_state(json!({
+        "fleet": {"state": "running"},
+        "hosts": {"build-1": {"state": "paused"}}
+    })));
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(
         state_pass(&forge, dir.path(), &location(), "build-1", None, t0()).enforcement(),

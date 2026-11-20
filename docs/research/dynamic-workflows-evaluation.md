@@ -5,6 +5,15 @@
 > files **no** GitHub issues — recommended follow-ups are *listed* at the end for a
 > human/Curator to file. See "Scope and non-goals".
 
+> **Retired unmeasured (2026-10-17, #12709).** The operator ruled to retire the Judge
+> fan-out experiment scaffold (`defaults/scripts/experiments/judge-fanout-*`, its test,
+> and `docs/research/judge-fanout-measurement-runbook.md`) in an attended fleet-decide
+> session, reversing the KEEP verdict below for that artifact only. The measured
+> comparison was never run, so this is a simplification decision, **not** evidence that
+> multi-agent review is ineffective. The reasoning below is preserved as history; the
+> scaffold files remain available in git history (the commit before the #12709
+> removal). Paths named below no longer exist on `main`.
+
 ## TL;DR
 
 - **Feasibility gate: PASS (capability present).** The Dynamic Workflows primitives

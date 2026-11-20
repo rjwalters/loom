@@ -12,24 +12,22 @@ mod capacity_line;
 mod drain_render;
 mod fleet_store_line;
 mod forge_calls_render;
-mod forge_events_line;
 mod holds;
 mod host_update_line;
 mod last_tick_line;
 mod model_class;
 mod observability_line;
 mod otlp_export_line;
-mod peer_claims_line;
 mod pending_restart_line;
 mod session_containers_line;
 mod task_liveness_line;
 mod telemetry_banner;
 
-use loom_daemon::daemon_install_state;
-use loom_daemon::self_update;
-use loom_daemon::status_section::{SectionSet, StatusSection as Section};
-use loom_daemon::types::{DaemonStatusReport, SweepKind};
-use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
+use crate::daemon_install_state;
+use crate::self_update;
+use crate::status_section::{SectionSet, StatusSection as Section};
+use crate::types::{DaemonStatusReport, SweepKind};
+use crate::worktree_disk_status::{self, WorktreeDiskSummary};
 
 /// The capacity figures the whole status view shares, resolved from a single
 /// source so the summary, the healthy-tokens cap input, and the per-token table
@@ -38,7 +36,7 @@ use loom_daemon::worktree_disk_status::{self, WorktreeDiskSummary};
 /// Preference order:
 /// 1. **fresh probe** — when a client-side `loom-daemon tokens check --json` succeeded
 ///    (the *same* data that renders the per-token table), the health counts are
-///    derived from it via [`loom_daemon::capacity::summarize_probe`], applying
+///    derived from it via [`crate::capacity::summarize_probe`], applying
 ///    the near-ceiling threshold uniformly. This is the accurate *current*
 ///    capacity and matches the table row-for-row.
 /// 2. **daemon ranking** — when no fresh probe is available but the daemon
@@ -98,7 +96,7 @@ fn resolve_capacity(
                     (status, util_7d)
                 })
                 .collect();
-            let cap = loom_daemon::capacity::summarize_probe(pairs.iter().copied());
+            let cap = crate::capacity::summarize_probe(pairs.iter().copied());
             let token_axis_limit = cap.healthy;
             // #5270: the token axis no longer participates in the cap on any
             // auth path — a fresh client-side probe changes the *reported*
@@ -218,7 +216,7 @@ pub(crate) fn build_status_json_value(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) -> serde_json::Value {
@@ -242,7 +240,7 @@ pub(crate) fn build_status_json_value_for(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
     sections: &SectionSet,
@@ -312,19 +310,12 @@ pub(crate) fn build_status_json_value_for(
         // fix. `null` before the first transition this daemon process has
         // observed.
         "preflight_advisory_changed_at": report.preflight_advisory_changed_at,
-        // Observability host-identity mismatch (#4830): non-null means this
-        // host's ingest key is bound to a DIFFERENT host_id than the daemon
-        // reports for itself, so its telemetry is being filed under the wrong
-        // host. `null` in the common case (ids agree, or no exporter running).
-        "observability_host_id_mismatch": report.observability_host_id_mismatch,
-        // Positive export-liveness signal (#5083). Unlike the anomaly-only
-        // field above, this is non-null for any daemon of this vintage and
-        // always carries a `state`, so a watch loop can assert health rather
-        // than infer it from the absence of a warning:
+        // Positive export-liveness signal (#5083). Non-null for any daemon of
+        // this vintage and always carries a `state`, so a watch loop can
+        // assert health rather than infer it from the absence of a warning:
         //   loom-daemon status --json \
         //     | jq -e '.observability_export.state == "healthy"'
-        // States: disabled | starting | never_exported | healthy |
-        // host_id_mismatch | failing. `null` only from a pre-#5083 daemon.
+        // States: disabled | starting | never_exported | healthy | failing. `null` only from a pre-#5083 daemon.
         "observability_export": report.observability_export,
         // Per-exporter cells (#8756): one entry per configured exporter,
         // keyed by exporter name — each sink's queue, counters and liveness
@@ -338,14 +329,6 @@ pub(crate) fn build_status_json_value_for(
         // `exempt`, with an optional `detail` (the exemption reason).
         //   loom-daemon status --json | jq -e '.otlp_export.state == "ok"'
         "otlp_export": report.otlp_export,
-        // Forge event-feed consumer state (ADR-0021, #8765). Non-null for any
-        // daemon of this vintage and always carrying a `state`, so a watch
-        // loop asserts rather than infers:
-        //   loom-daemon status --json | jq -e '.forge_events.state == "healthy"'
-        // States: disabled | misconfigured | connecting | failing |
-        // auth_failed | host_mismatch | backoff | healthy. `null` only from a
-        // pre-ADR-0021 daemon.
-        "forge_events": report.forge_events,
         // Per-repo pressure-triggered deep-clean state (#5919): when the pass
         // last fired, what it reclaimed, and — for the common non-firing tick
         // — why it declined. Scripted consumers can assert reclamation is
@@ -478,6 +461,9 @@ pub(crate) fn build_status_json_value_for(
         "per_repo": report.per_repo.iter().map(|r| serde_json::json!({
             "root": r.root,
             "weight": r.weight,
+            // Installed files older than the daemon but compatible, so not
+            // held (#14015); null when not behind.
+            "installed_behind": r.installed_behind,
             "in_flight_count": r.in_flight_count,
             "health_gate_halted": r.health_gate_halted,
             "health_gate_not_evaluated": r.health_gate_not_evaluated,
@@ -618,6 +604,10 @@ pub(crate) fn build_status_json_value_for(
             "backoff_secs": report.auto_update_backoff_secs,
             "terminal_reason": report.auto_update_terminal_reason,
             "note": report.auto_update_note,
+            // Issue #9736: running version, last successful check, pending
+            // age, next attempt, blocking reason, thresholds. `null` from an
+            // older daemon and while the loop has not ticked.
+            "freshness": report.auto_update_freshness,
             // Issue #7609: the release artifact the loop resolved for this
             // host's platform, next to the installed version above. `null`
             // when no artifact resolved (no Releases yet, an unreachable API,
@@ -683,29 +673,6 @@ pub(crate) fn build_status_json_value_for(
             "room": s.room,
             "reason": s.reason,
         })),
-        // Peer-claim view + transport counters (Issue #5921) — `null` when no
-        // safehouse peer-claim coordination has been established (mirrors
-        // `safehouse`'s `None`-vs-empty-view contract). Non-null carries the
-        // full set `loom-daemon peer-claims` also renders, so a scripted
-        // consumer never needs the standalone subcommand just to get JSON.
-        "peer_claims": report.peer_claims.as_ref().map(|p| serde_json::json!({
-            "self_host": p.self_host,
-            "ttl_secs": p.ttl_secs,
-            "entries": p.entries.iter().map(|e| serde_json::json!({
-                "repo": e.repo,
-                "issue": e.issue,
-                "host": e.host,
-                "remaining_ttl_secs": e.remaining_ttl_secs,
-            })).collect::<Vec<_>>(),
-            "advertised": p.advertised,
-            "received": p.received,
-            "expired": p.expired,
-            "dispatch_skipped": p.dispatch_skipped,
-            // Resolved claims-room identity (Issue #6242) — `null` when
-            // peer-claim coordination was never established (safehouse
-            // disabled, or no socket ever resolved), never an empty string.
-            "claims_room": p.claims_room,
-        })),
         // Watchdog protection state (#4354) — client-side, host-local, read-only.
         // `state` is one of "protected" / "no-marker" /
         // "watchdog-not-provisioned" / "unknown". `marker_present` and
@@ -733,6 +700,9 @@ pub(crate) fn build_status_json_value_for(
             "autonomy_mismatch": autonomy_mismatch(Some(p), report),
         })),
     });
+    // Agent-residue reap counters (#10802); added outside the literal above,
+    // which is at the macro recursion limit.
+    value["agent_residue"] = serde_json::json!(report.agent_residue);
     // Restart-survivorship seed (#6262). Inserted after the literal rather than
     // added as another `json!` key: the macro above is already at the recursion
     // limit (see the `role_agents` comment), and a post-insert costs nothing and
@@ -748,7 +718,7 @@ pub(crate) fn build_status_json_value_for(
     // host with no `fleet.repo` emits exactly the payload it always did.
     let fleet_store = sections
         .has(Section::FleetStore)
-        .then(loom_daemon::fleet_sync::probe_status);
+        .then(crate::fleet_sync::probe_status);
     if let Some(s) = fleet_store.flatten() {
         value["fleet_store"] = fleet_store_line::json(Some(&s));
     }
@@ -771,7 +741,7 @@ pub(crate) fn print_status_json(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
     sections: &SectionSet,
@@ -1201,6 +1171,9 @@ fn deep_clean_lines(report: &DaemonStatusReport) -> Vec<String> {
             (None, _) => "no pass has fired since this daemon started".to_string(),
         };
         lines.push(format!("    {}: {fired}", repo.root.display()));
+        if let Some(kept) = &repo.last_kept {
+            lines.push(format!("      kept (keepBuildArtifacts): {kept}"));
+        }
         if let Some(reason) = &repo.last_reason {
             let when = repo
                 .last_evaluated_at
@@ -1308,7 +1281,7 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
 /// generic `container(...)` prefix it always did.
 ///
 /// This is a CLIENT-SIDE, render-time read of the sweep's own per-sweep log
-/// (`loom_daemon::sweep_registry::containment_signal::detect_containment`) —
+/// (`crate::sweep_registry::containment_signal::detect_containment`) —
 /// deliberately NOT a `SweepInfo` field. `log_path` is always an absolute,
 /// workspace-rooted path (`SweepRegistryConfig::logs_dir()` joins the
 /// workspace root), so this works from any cwd the CLI happens to run from,
@@ -1316,8 +1289,8 @@ fn worktree_disk_lines(worktree_disk: Option<&[WorktreeDiskSummary]>) -> Option<
 /// (same host, same filesystem the daemon itself wrote it to). Best-effort:
 /// a missing/unreadable log (e.g. a very recent dispatch, or a rotated log)
 /// degrades to `-`, never an error, since `detect_containment` never fails.
-fn format_containment_column(s: &loom_daemon::types::SweepInfo) -> String {
-    use loom_daemon::sweep_registry::containment_signal::detect_containment;
+fn format_containment_column(s: &crate::types::SweepInfo) -> String {
+    use crate::sweep_registry::containment_signal::detect_containment;
 
     let header_anchor = format!("sweep_id={}", s.sweep_id);
     let signal = detect_containment(&s.log_path, &header_anchor);
@@ -1358,12 +1331,8 @@ fn render_in_flight_table(report: &DaemonStatusReport) -> String {
             let fallback = s
                 .kind
                 .role()
-                .map_or("-", loom_daemon::step_role::StepRole::as_str);
-            let mut phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
-            if s.overflow {
-                // #9244: the host's single over-limit starred sweep.
-                phase.push_str(" [overflow]");
-            }
+                .map_or("-", crate::step_role::StepRole::as_str);
+            let phase = s.latest_phase.as_deref().unwrap_or(fallback).to_string();
             let ctr = format_containment_column(s);
             let _ = writeln!(
                 out,
@@ -1432,12 +1401,12 @@ fn render_role_runner_host_header_line(report: &DaemonStatusReport) -> String {
     match report.role_runner_host_env_override {
         Some(true) => format!(
             "\nRole runner (host): ON — env {}=<truthy> overrides every root's own config",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ),
         Some(false) => format!(
             "\nRole runner (host): OFF — env {}=<falsy> overrides every root's own config \
              (a root's own autonomous.roleRunner.enabled=true is ignored while this is set)",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ),
         None => {
             let enabled_count = report
@@ -1544,7 +1513,7 @@ fn render_roster_lines(report: &DaemonStatusReport) -> Vec<String> {
 /// prevent structurally — the two hosts resolving *different keys* for the
 /// same workspace.
 #[must_use]
-fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+fn render_role_runner_shard_repo_line(r: &crate::types::RepoStatus) -> Option<String> {
     let shard = r.role_runner_shard.as_ref()?;
     let (owner, count) = (shard.owning_shard?, shard.shard_count?);
     let verdict = if shard.owned_here {
@@ -1553,7 +1522,7 @@ fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Opt
         format!(
             "role slice owned by shard {owner} of {count}, NOT this host — this root's role \
              ticks run on the peer holding {}={owner} (#6374)",
-            loom_daemon::role_shard::SHARD_INDEX_ENV
+            crate::role_shard::SHARD_INDEX_ENV
         )
     };
     Some(format!(
@@ -1576,7 +1545,7 @@ fn render_role_runner_shard_repo_line(r: &loom_daemon::types::RepoStatus) -> Opt
 ///   own `autonomous.roleRunner.enabled` (or the built-in default) decided,
 ///   so the original #4377 config-edit instruction is still correct.
 #[must_use]
-fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Option<String> {
+fn render_role_runner_disabled_line(r: &crate::types::RepoStatus) -> Option<String> {
     if r.role_runner_enabled || r.role_runner_on_idle_roles.is_empty() {
         return None;
     }
@@ -1587,7 +1556,7 @@ fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Optio
              disabled by the host-wide env override {} (this root's own .loom/config.json is \
              overridden, editing it will not help) — see the \"Role runner (host)\" line above \
              (#6470)",
-            loom_daemon::role_runner::ROLE_RUNNER_ENABLE_ENV
+            crate::role_runner::ROLE_RUNNER_ENABLE_ENV
         ))
     } else {
         Some(format!(
@@ -1603,10 +1572,10 @@ fn render_role_runner_disabled_line(r: &loom_daemon::types::RepoStatus) -> Optio
 /// e.g. `hermit: 31h since last tick, PROMOTED (max wait 24h)`. Empty
 /// (`vec![]`, no lines printed) when the repo has no such roles configured —
 /// this is purely additive surfacing of
-/// [`loom_daemon::types::RepoStatus::role_runner_on_idle_promotions`], never
+/// [`crate::types::RepoStatus::role_runner_on_idle_promotions`], never
 /// a gate.
 #[must_use]
-fn render_role_runner_on_idle_promotion_lines(r: &loom_daemon::types::RepoStatus) -> Vec<String> {
+fn render_role_runner_on_idle_promotion_lines(r: &crate::types::RepoStatus) -> Vec<String> {
     r.role_runner_on_idle_promotions
         .iter()
         .map(|p| {
@@ -1667,7 +1636,7 @@ pub(crate) fn print_status_human(
     report: &DaemonStatusReport,
     token_usage: Option<&serde_json::Value>,
     update: &self_update::SelfUpdateStatus,
-    pipeline: Option<&[loom_daemon::pipeline_snapshot::RepoPipelineSnapshot]>,
+    pipeline: Option<&[crate::pipeline_snapshot::RepoPipelineSnapshot]>,
     protection: Option<&daemon_install_state::ProtectionReport>,
     worktree_disk: Option<&[WorktreeDiskSummary]>,
 ) {
@@ -1738,20 +1707,6 @@ pub(crate) fn print_status_human(
     // guard on that line.
     if let Some(line) = render_preflight_advisory_line(report) {
         println!("\n{line}");
-    }
-
-    // Observability host-identity mismatch (#4830): printed alongside the
-    // tripwire above because it has the same character — a silent,
-    // config-level fault whose only symptom is that data goes somewhere
-    // unexpected. `loom-daemon health` reports the same condition as an
-    // `observability DEGRADED` section.
-    if let Some(mismatch) = &report.observability_host_id_mismatch {
-        println!(
-            "\nWARNING: telemetry is being filed under host_id {} — this host's ingest key is \
-             bound to that id, not to {}. Install the key provisioned for {}, or set \
-             $LOOM_HOST_ID to match the key's binding, then restart the daemon.",
-            mismatch.ingest_host_id, mismatch.daemon_host_id, mismatch.daemon_host_id
-        );
     }
 
     // Capacity figures resolved from a single source (fresh probe when
@@ -2036,58 +1991,6 @@ pub(crate) fn print_status_human(
         }
     }
 
-    // Peer-claim view + transport counters (Issue #5921): before this, the
-    // ONLY signal an operator had for #4028/#4431's soft cross-host claim
-    // mechanism was a `debug!`-only re-advertisement log line — a duplicate
-    // dispatch (e.g. #5789) could not be root-caused without attaching a
-    // debugger. `None` when no safehouse peer-claim coordination has been
-    // established (mirrors the Safehouse block's `None` case above).
-    match &report.peer_claims {
-        Some(pc) if pc.entries.is_empty() => {
-            println!(
-                "Peer claims:   none live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 rejected={} received={} expired={} dispatch_skipped={})",
-                pc.self_host,
-                pc.ttl_secs,
-                pc.claims_room.as_deref().unwrap_or("none"),
-                pc.advertised,
-                pc.advertise_rejected,
-                pc.received,
-                pc.expired,
-                pc.dispatch_skipped
-            );
-            peer_claims_line::print_coordination_verdict(&pc.coordination);
-        }
-        Some(pc) => {
-            println!(
-                "Peer claims:   {} live (self_host: {}, ttl: {}s, room: {}, advertised={} \
-                 rejected={} received={} expired={} dispatch_skipped={})",
-                pc.entries.len(),
-                pc.self_host,
-                pc.ttl_secs,
-                pc.claims_room.as_deref().unwrap_or("none"),
-                pc.advertised,
-                pc.advertise_rejected,
-                pc.received,
-                pc.expired,
-                pc.dispatch_skipped
-            );
-            peer_claims_line::print_coordination_verdict(&pc.coordination);
-            for e in &pc.entries {
-                println!(
-                    "               issue #{} ({}) claimed by {} — {}s remaining",
-                    e.issue, e.repo, e.host, e.remaining_ttl_secs
-                );
-            }
-        }
-        None => {
-            println!(
-                "Peer claims:   not configured (safehouse.enabled false, or older daemon \
-                 binary — restart to pick up #5921)"
-            );
-        }
-    }
-
     // Running-vs-disk build staleness (#5341): the answering daemon PROCESS's
     // own build, sourced over IPC, compared against THIS CLI invocation's own
     // compile-time build (which — because `status` always execs the on-disk
@@ -2130,14 +2033,10 @@ pub(crate) fn print_status_human(
         println!("\n{banner}");
     }
 
-    // Forge event-feed consumer (ADR-0021, #8765). Same block, same reason:
-    // "off", "never provisioned", "wrong key", "wrong host" and "quiet feed"
-    // are five different answers that would otherwise all render as nothing.
-    println!("{}", forge_events_line::render_block(report.forge_events.as_ref(), Utc::now()));
     // Fleet-store sync (#9596): what the last startup/timer pass found — the
     // drift the timer detects but deliberately does not write. Nothing at all
     // on a host with no `fleet.repo`.
-    fleet_store_line::print(loom_daemon::fleet_sync::probe_status().as_ref());
+    fleet_store_line::print(crate::fleet_sync::probe_status().as_ref());
     // Pending-restart marker (#9597): a restart-required `fleet-config
     // render` change this daemon's pid has not yet picked up. Nothing at all
     // once the daemon that saw the drift has restarted (or if none ever did).
@@ -2418,6 +2317,20 @@ pub(crate) fn print_status_human(
             if let Some(mark) = &r.maintain_only {
                 println!("        {}: kept current, never dispatched into (#11186)", mark.label());
             }
+            // Behind this daemon but compatible: dispatching, on the older
+            // installed files, until the workspace resync lands (#14015).
+            if let Some(behind) = &r.installed_behind {
+                println!(
+                    "        installed Loom {} is older than daemon {} (compatible, not held; \
+                     files update with the workspace resync)",
+                    behind.installed, behind.running
+                );
+            }
+            if r.lock_busy {
+                println!(
+                    "        sweep registry lock busy — in-flight/quarantine data omitted (#13443)"
+                );
+            }
             if r.root_missing {
                 println!(
                     "        root does not exist on disk — dispatch is skipped; \
@@ -2528,7 +2441,7 @@ pub(crate) fn print_status_human(
             );
             println!("  {:-<75}", "");
             for s in snapshots {
-                use loom_daemon::pipeline_snapshot::format_count;
+                use crate::pipeline_snapshot::format_count;
                 println!(
                     "  {:>6}  {:>8}  {:>6}  {:>7}  {:>5}  {:>9}  {}",
                     format_count(s.queued),
@@ -2619,6 +2532,23 @@ pub(crate) fn print_status_human(
             );
         }
         println!();
+        if let Some(f) = &report.auto_update_freshness {
+            let when = |t: Option<chrono::DateTime<chrono::Utc>>| {
+                t.map_or_else(
+                    || "never".to_string(),
+                    |t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                )
+            };
+            println!(
+                "  Running {}; last successful check {}; next attempt {}",
+                f.running_version,
+                when(f.last_success),
+                when(f.next_check)
+            );
+            if let (Some(target), Some(since)) = (&f.pending_target, f.pending_since) {
+                println!("  Newer release {target} pending since {}", when(Some(since)));
+            }
+        }
         if let Some(why) = report.auto_update_floor_not_rolling {
             println!("  Below the fleet floor, NOT rolling ({}): {}", why.as_str(), why.describe());
         }
@@ -2666,7 +2596,7 @@ fn print_token_usage_table(value: &serde_json::Value) {
             .and_then(serde_json::Value::as_f64);
         // Apply the same near-ceiling override the summary uses so a 99%-7d
         // `available` row never renders `available` here (#3936).
-        let status = loom_daemon::capacity::effective_probe_status(raw_status, util_7d);
+        let status = crate::capacity::effective_probe_status(raw_status, util_7d);
         let fmt_pct = |key: &str| {
             acct.get(key)
                 .and_then(serde_json::Value::as_f64)
@@ -2701,6 +2631,7 @@ mod status_protection_tests;
 mod role_agent_render_tests;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 mod journal_adoption_render_tests;
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 //! Champion's projections (#12027): its merge-gate decisions
-//! (`champion_merge_v1`), its promotion verdicts (`champion_promotion_v1`)
+//! (`champion_merge_v2`), its promotion verdicts (`champion_promotion_v1`)
 //! and its PR triage (`champion_triage_v1`, #12499), each a closed, versioned
 //! reason set. A new
 //! reason is a new version, never a silent addition.
@@ -7,12 +7,13 @@
 //! Evidence, strongest first: the write the gh front journaled (`merged`,
 //! `promoted`), then the markers Champion's comments opened with, then the
 //! daemon subcommands' own writes (`park-record`, `operator-decision`), then
-//! the step's `CHAMPION-STEP … outcome=` word.
+//! the step's `CHAMPION-STEP … outcome=` word — and, when its log has no
+//! such line, the typed outcome of the step's own released lease (#14639).
 
-use super::{Event, Evidence, Projection, Projector, StoreOp};
+use super::{projection, sanitize_detail, Event, Evidence, Projection, Projector, StoreOp};
 
 /// The merge gate's reason set.
-pub const MERGE_REASON_SET: &str = "champion_merge_v1";
+pub const MERGE_REASON_SET: &str = "champion_merge_v2";
 
 /// The promotion verdict's reason set.
 pub const PROMOTION_REASON_SET: &str = "champion_promotion_v1";
@@ -25,7 +26,11 @@ pub const TRIAGE_REASON_SET: &str = "champion_triage_v1";
 pub const TRIAGE_REASONS: [&str; 3] = ["review_requested", "blocked", "operator"];
 
 /// Every reason of [`MERGE_REASON_SET`].
-pub const MERGE_REASONS: [&str; 14] = [
+///
+/// v2 (#12715) adds the stop gates a non-merging step names with `reason=`
+/// ([`STOP_REASONS`], plus `merge_rc<N>`, see [`stop_reason`]) and
+/// `unspecified` for a stop that named none.
+pub const MERGE_REASONS: [&str; 22] = [
     "merged",
     "ci_failing",
     "conflict",
@@ -40,6 +45,27 @@ pub const MERGE_REASONS: [&str; 14] = [
     "not_eligible",
     "failed",
     "unclassified",
+    "facts_unread",
+    "janitor_rc3",
+    "verdict_rc11",
+    "mergeable_unknown",
+    "pin_missing",
+    "guard_refused",
+    "unspecified",
+    "skipped",
+];
+
+/// The `reason=` tokens a `requeued` or `skipped` step may name, besides
+/// `merge_rc<N>`: the gate it stopped at. `ci_pending` is one of them only
+/// when the step says so, never by default.
+pub const STOP_REASONS: [&str; 7] = [
+    "facts_unread",
+    "janitor_rc3",
+    "verdict_rc11",
+    "ci_pending",
+    "mergeable_unknown",
+    "pin_missing",
+    "guard_refused",
 ];
 
 /// Every reason of [`PROMOTION_REASON_SET`].
@@ -83,6 +109,7 @@ pub(super) const PROJECTOR: Projector = Projector {
     step_name,
     project,
     outcome_word,
+    reason_word,
 };
 
 fn step_name(is_pr: bool) -> &'static str {
@@ -93,20 +120,50 @@ fn step_name(is_pr: bool) -> &'static str {
     }
 }
 
-/// The `outcome=` word of the last `CHAMPION-STEP` line in `text` for this
-/// mode and item, verbatim (`head-moved`, `not-eligible`, …).
-fn outcome_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
+/// Outcome and optional reason from the same, last matching step line.
+fn step_words(text: &str, is_pr: bool, item: u32) -> Option<(&str, Option<&str>)> {
     let mode = if is_pr { "pr" } else { "issue" };
     text.lines().rev().find_map(|line| {
-        let rest = line.trim().strip_prefix(STEP_LINE)?;
+        let mut words = line.split_whitespace();
+        if words.next()? != STEP_LINE {
+            return None;
+        }
         let field = |key: &str| {
-            rest.split_whitespace()
+            words
+                .clone()
                 .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
         };
+        // A matching line with a missing outcome stays unclassified.
         (field("mode")? == mode && field("item")?.parse::<u32>().ok()? == item)
-            .then(|| field("outcome").map(str::to_string))
-            .flatten()
+            .then(|| (field("outcome").unwrap_or_default(), field("reason")))
     })
+}
+
+fn outcome_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
+    step_words(text, is_pr, item).map(|(outcome, _)| outcome.to_string())
+}
+
+fn reason_word(text: &str, is_pr: bool, item: u32) -> Option<String> {
+    step_words(text, is_pr, item)?.1.map(str::to_string)
+}
+
+/// The merge-gate reason a stop names (`requeued` / `skipped`): a
+/// [`STOP_REASONS`] token or `merge_rc<N>` (`N` one or two digits, the
+/// `merge-pr.sh` exit code) verbatim, else `unspecified` (a missing or unknown
+/// token), never the old constant `ci_pending`.
+#[must_use]
+pub fn stop_reason(raw: Option<&str>) -> String {
+    match raw {
+        Some(w) if STOP_REASONS.contains(&w) => w.to_string(),
+        Some(w)
+            if w.strip_prefix("merge_rc").is_some_and(|n| {
+                (1..=2).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
+            }) =>
+        {
+            w.to_string()
+        }
+        _ => "unspecified".to_string(),
+    }
 }
 
 /// A marker's inner tokens: `<!-- champion:reject:ci-status:a,b -->` →
@@ -122,15 +179,6 @@ fn marker_parts(marker: &str) -> Option<Vec<&str>> {
         *part = part.split_whitespace().next().unwrap_or_default();
     }
     Some(parts)
-}
-
-fn projection(class: &'static str, reason: &str, set: &'static str) -> Projection {
-    Projection {
-        class,
-        reason: reason.to_string(),
-        reason_set: set,
-        ..Projection::default()
-    }
 }
 
 /// The merge-gate refusal a marker states: `(criterion_key, reason_key,
@@ -214,8 +262,28 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             });
         }
     }
+    // #14639: a step a guard refused mid-flight can end with its lease
+    // released and its typed outcome recorded there, its `CHAMPION-STEP`
+    // line never written. The run's own journaled release is the fallback
+    // for exactly that gap — the step log still wins, and only the release
+    // the daemon itself made and vetted counts, never a marker read off
+    // the forge (#9548).
+    let (outcome, reason) = if e.step_path && e.outcome.is_none() {
+        e.events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                Event::Released {
+                    outcome, reason, ..
+                } => Some((Some(outcome.as_str()), reason.as_deref())),
+                _ => None,
+            })
+            .unwrap_or_default()
+    } else {
+        (e.outcome.as_deref(), e.reason.as_deref())
+    };
     let triage = TRIAGE_REASON_SET;
-    let p = match e.outcome.as_deref() {
+    let p = match outcome {
         Some("triaged") => projection("verdict", "review_requested", triage),
         Some("triage-blocked") => projection("refused", "blocked", triage),
         Some("triage-operator") => projection("refused", "operator", triage),
@@ -227,7 +295,10 @@ fn project_merge(e: &Evidence) -> Option<Projection> {
             store: StoreOp::Lookup,
             ..projection("refused", "unknown", set)
         },
-        Some("requeued") => projection("noop", "ci_pending", set),
+        Some("requeued" | "skipped") => Projection {
+            detail: reason.map(sanitize_detail),
+            ..projection("noop", &stop_reason(reason), set)
+        },
         Some("held") => projection("noop", "held", set),
         Some("head-moved") => Projection {
             store: StoreOp::Clear,
@@ -273,12 +344,12 @@ fn project_promotion(e: &Evidence) -> Option<Projection> {
                 };
                 (at, reason)
             }
-            Event::Applied { at, action, by } => match (action.as_str(), by.as_str()) {
+            Event::Applied { at, action, by, .. } => match (action.as_str(), by.as_str()) {
                 ("blocked", "park_record") => (at, "blocked_dependency"),
                 ("escalated", "operator_decision") => (at, "needs_operator"),
                 _ => continue,
             },
-            Event::Act { .. } => continue,
+            Event::Act { .. } | Event::Released { .. } => continue,
         };
         return Some(with_hash(Projection {
             wrote: true,

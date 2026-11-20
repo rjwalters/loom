@@ -405,6 +405,9 @@ fn every_exclusion_maps_to_a_skip_reason() {
     assert_eq!(map(Exclusion::Pass(P::Claimed)), PickSkipReason::InFlight);
     assert_eq!(map(Exclusion::Pass(P::Operator)), PickSkipReason::OperatorHold);
     assert_eq!(map(Exclusion::Pass(P::CapabilityMissing)), PickSkipReason::HostConstraint);
+    for r in [P::CiPending, P::HeldAtHead, P::AuthorGateHeld] {
+        assert_eq!(map(Exclusion::Pass(r)), PickSkipReason::Backoff);
+    }
     for r in [P::Epic, P::Proposal, P::NoStage, P::Draft] {
         assert_eq!(map(Exclusion::Pass(r)), PickSkipReason::NoStep);
     }
@@ -415,6 +418,7 @@ fn every_exclusion_maps_to_a_skip_reason() {
         P::NoStage,
         P::Draft,
         P::CapabilityMissing,
+        P::AuthorGateHeld,
     ] {
         assert_eq!(serde_json::to_value(r).unwrap(), serde_json::json!(r.as_str()));
     }
@@ -550,4 +554,160 @@ fn a_large_item_pool_splits_into_bounded_chunks_and_reassembles() {
         .map(|p| p.index)
         .collect();
     assert_eq!(indices, (0..600).collect::<Vec<_>>());
+}
+
+/// #12973: the worst case the fleet cap must hold for: hundreds of candidates
+/// and skips, 100+ workspace draws, and a step-engine record with a 40-repo
+/// header, a 600-item pool and 150 draws. Every exported chunk, header
+/// repeated on each, is within the ~16 KB ingest cap, and nothing is dropped.
+#[test]
+fn a_worst_case_tick_keeps_every_chunk_under_the_ingest_cap() {
+    assert_eq!(CHUNK_BYTES, 16 * 1024);
+    let ranked: Vec<_> = (1..=400)
+        .map(|n| {
+            let verdict = if n % 2 == 0 {
+                PickVerdict::Acted("dispatched")
+            } else {
+                PickVerdict::Skipped(PickSkipReason::NotSelected)
+            };
+            (candidate(n, 100_000 + n), verdict)
+        })
+        .collect();
+    let repos: Vec<String> = (0..40)
+        .map(|r| format!("some-organisation/repository-{r}"))
+        .collect();
+    let mut record = PickDecisionRecord::build(tick("work_finder"), ranked)
+        .with_source(source::READY_QUEUE, true);
+    record.workspace_draw = Some(PickWorkspaceDraw {
+        seed: "123456789".to_string(),
+        draws_total: 120,
+        draws: (0..120)
+            .map(|d| PickDraw {
+                candidates: (0..10)
+                    .map(|w| PickDrawCandidate {
+                        repo: repos[w].clone(),
+                        weight: 1000 + u64::try_from(w).unwrap(),
+                        base_weight: None,
+                        bonus: None,
+                    })
+                    .collect(),
+                total_weight: 10_000,
+                roll: d,
+                picked: repos[0].clone(),
+                number: u32::try_from(100_000 + d).unwrap(),
+            })
+            .collect(),
+        seed_scheme: Some("loom-draw/v3".to_string()),
+        seed_minute: Some("29000000".to_string()),
+        seed_host: Some("host-a".to_string()),
+    });
+    record.item_draw = Some(PickItemDraw {
+        seed_scheme: "loom-draw/v3".to_string(),
+        seed_minute: "29000000".to_string(),
+        seed_host: "host-a".to_string(),
+        tick_counter: "2".to_string(),
+        draws_total: 150,
+        backlog_exponent: "0.5".to_string(),
+        busy_exponent: "1".to_string(),
+        repos: repos
+            .iter()
+            .map(|r| PickItemRepo {
+                repo: r.clone(),
+                weight: 100,
+                in_flight: 3,
+                items: 15,
+                pool_weight: 1_000_000,
+            })
+            .collect(),
+        closures: Vec::new(),
+        excluded: repos
+            .iter()
+            .map(|r| PickItemExclusion {
+                repo: r.clone(),
+                reason: "blocked".to_string(),
+                skip_reason: PickSkipReason::NotSelected,
+                count: 7,
+            })
+            .collect(),
+        pools: (0u32..600)
+            .map(|i| PickItemPoolEntry {
+                repo: repos[usize::try_from(i).unwrap() % 40].clone(),
+                index: i,
+                number: 1000 + i,
+                issue: Some(1000 + i),
+                pr: (i % 4 == 0).then_some(5000 + i),
+                step: "champion_hold_reevaluate".to_string(),
+                weight: 43_200 + u64::from(i),
+                priority: 1,
+                age_permille: 1000,
+                age_source: "events".to_string(),
+            })
+            .collect(),
+        draws: (0u32..150)
+            .map(|d| PickItemDrawStep {
+                repo: repos[usize::try_from(d).unwrap() % 40].clone(),
+                draw_index: d,
+                seed: "ab".repeat(8),
+                pool_size: 600,
+                total_weight: u64::MAX / 2,
+                roll: u64::MAX / 3,
+                picked_index: 17,
+                number: 1000 + d,
+                issue: Some(1000 + d),
+                pr: None,
+                step: "champion_hold_reevaluate".to_string(),
+                weight: 43_200,
+                draw_weight: u64::MAX / 5,
+                repo_weight: 100,
+                repo_items: 15,
+                repo_pool_weight: u64::MAX / 7,
+                in_flight_repo: 3,
+                actionable: 15,
+                priority: 1,
+                level: "2".to_string(),
+                lane: "builder".to_string(),
+                age_permille: 1000,
+                age_minutes: 600,
+                age_source: "events".to_string(),
+            })
+            .collect(),
+        weight_overflow: Vec::new(),
+    });
+
+    let chunks = split_into_chunks(record.clone(), CHUNK_BYTES);
+    assert!(chunks.len() > 10, "{} chunks", chunks.len());
+    for chunk in &chunks {
+        let len = serde_json::to_vec(chunk).unwrap().len();
+        assert!(len <= CHUNK_BYTES, "chunk {} is {len} bytes", chunk.chunk_index);
+    }
+    let indices: Vec<u32> = chunks.iter().map(|c| c.chunk_index).collect();
+    assert_eq!(indices, (0..u32::try_from(chunks.len()).unwrap()).collect::<Vec<_>>());
+    assert_eq!(reassemble(&chunks), record, "the union is the original");
+}
+
+/// A tick that fits one chunk, and a lone entry near the cap, are not split
+/// further than the entries force.
+#[test]
+fn an_under_cap_tick_is_one_chunk_and_a_near_cap_entry_stands_alone() {
+    let small =
+        PickDecisionRecord::build(tick("judge"), vec![(candidate(1, 1), PickVerdict::Undecided)]);
+    assert_eq!(split_into_chunks(small, CHUNK_BYTES).len(), 1);
+
+    let mut big = candidate(1, 1);
+    big.sort_key = Some(PickSortKey {
+        name: "k".to_string(),
+        value: "x".repeat(CHUNK_BYTES - 2_500),
+    });
+    let record = PickDecisionRecord::build(
+        tick("judge"),
+        vec![
+            (big, PickVerdict::Undecided),
+            (candidate(2, 2), PickVerdict::Undecided),
+        ],
+    );
+    let chunks = split_into_chunks(record, CHUNK_BYTES);
+    for chunk in &chunks {
+        assert!(serde_json::to_vec(chunk).unwrap().len() <= CHUNK_BYTES);
+    }
+    assert_eq!(chunks.iter().map(|c| c.candidates.len()).sum::<usize>(), 2);
 }

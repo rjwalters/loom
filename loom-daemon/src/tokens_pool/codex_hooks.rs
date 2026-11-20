@@ -61,6 +61,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::profile_ledger::sha256_hex;
+
 /// The sealed registration behind `--dangerously-bypass-hook-trust` (#10102).
 #[path = "codex_hooks_seal.rs"]
 pub mod seal;
@@ -560,11 +562,6 @@ pub fn loom_command(hooks: &serde_json::Value) -> Option<String> {
         .filter_map(|hook| hook["command"].as_str())
         .find(|command| command.contains(MARKER))
         .map(str::to_owned)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(bytes))
 }
 
 fn profile_label(profile: &Path) -> String {

@@ -168,3 +168,15 @@ fn the_clean_sentinel_is_not_a_substring_of_the_warning() {
     // future caller that greps instead.
     assert!(!message("42", "abc1234", "deadbeef").contains(CLEAN));
 }
+
+#[test]
+fn recorded_auth_reads_the_digest_of_the_last_marker() {
+    let c = "<!-- champion:hold-state head=abc1234 auth=0123456789abcdef -->";
+    assert_eq!(recorded_auth(c).as_deref(), Some("0123456789abcdef"));
+    assert_eq!(recorded_head(c).as_deref(), Some("abc1234"));
+    // A legacy marker after a digest-bearing one carries none.
+    let later = format!("{c}\n<!-- champion:hold-state head=def5678 -->");
+    assert_eq!(recorded_auth(&later), None);
+    // Prose quoting the digest outside an HTML comment is not a marker.
+    assert_eq!(recorded_auth("champion:hold-state head=abc auth=ff"), None);
+}

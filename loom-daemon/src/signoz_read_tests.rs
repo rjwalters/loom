@@ -1,17 +1,7 @@
 //! The SigNoz read client: URL binding, the request shape against a loopback
-//! listener (no credential header), endpoint resolution, and [`FileRows`]
-//! paging.
+//! listener (no credential header), and endpoint resolution.
 
 use super::*;
-use chrono::TimeZone;
-
-fn at(secs: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(secs, 0).unwrap()
-}
-
-fn ns(secs: i64) -> i64 {
-    secs * 1_000_000_000
-}
 
 fn reader(endpoint: &str) -> TelemetryReader {
     TelemetryReader {
@@ -20,43 +10,21 @@ fn reader(endpoint: &str) -> TelemetryReader {
     }
 }
 
-fn query(filters: &[(&str, &str)], after: Option<RowCursor>, limit: u32) -> PageQuery {
-    PageQuery {
-        filters: filters
-            .iter()
-            .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
-            .collect(),
-        since: at(1_000),
-        until: at(2_000),
-        after,
-        limit,
-    }
-}
-
 #[test]
-fn every_filter_and_the_keyset_are_bound_as_url_parameters() {
+fn every_parameter_is_bound_as_a_url_parameter() {
     let http = reader("https://reader.example:14341");
-    let q = query(&[("repo", "acme/app"), ("host", "h1")], Some((42, "rec-01".into())), 7);
-    let url = http.url(&q).unwrap();
+    let params = [("repo", "acme/app"), ("host", "h1"), ("limit", "7")]
+        .map(|(n, v)| (n.to_string(), v.to_string()));
+    let url = http.url_with(&params).unwrap();
     assert_eq!(url.path(), QUERY_PATH);
     let pairs: std::collections::BTreeMap<String, String> =
         url.query_pairs().into_owned().collect();
     assert_eq!(pairs["param_repo"], "acme/app");
     assert_eq!(pairs["param_host"], "h1");
-    assert_eq!(pairs["param_since_ns"], ns(1_000).to_string());
-    assert_eq!(pairs["param_until_ns"], ns(2_000).to_string());
-    assert_eq!(pairs["param_after_ns"], "42");
-    assert_eq!(pairs["param_after_id"], "rec-01");
     assert_eq!(pairs["param_limit"], "7");
-    assert_eq!(pairs.len(), 7, "{pairs:?}");
+    assert_eq!(pairs.len(), 3, "{pairs:?}");
     // Only `param_<name>` keys: the reader refuses any other.
     assert!(pairs.keys().all(|k| k.starts_with("param_")), "{pairs:?}");
-
-    let first = http.url(&query(&[], None, 1)).unwrap();
-    let pairs: std::collections::BTreeMap<String, String> =
-        first.query_pairs().into_owned().collect();
-    assert_eq!(pairs["param_after_ns"], "0");
-    assert_eq!(pairs["param_after_id"], "");
 
     let arbitrary = http
         .url_with(&[("as_of_ns".to_string(), "5".to_string())])
@@ -167,82 +135,6 @@ fn a_reader_error_status_is_refused_with_its_answer() {
     };
     assert!(why.contains("403") && why.contains("unknown_caller"), "{why}");
     server.join().unwrap();
-}
-
-fn row(knowable_s: i64, id: &str, repo: &str) -> String {
-    format!(
-        r#"{{"knowable_time_ns":"{}","record_id":"{id}","repo":"{repo}"}}"#,
-        ns(knowable_s)
-    )
-}
-
-fn ids(page: &str) -> Vec<String> {
-    page.lines()
-        .map(|l| {
-            serde_json::from_str::<Value>(l).unwrap()["record_id"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        })
-        .collect()
-}
-
-#[test]
-fn file_rows_page_in_keyset_order_under_the_window_and_filters() {
-    let text = [
-        row(1_500, "b", "acme/app"),
-        row(1_500, "a", "ACME/App"),
-        row(1_200, "z", "acme/app"),
-        row(1_700, "c", "other/repo"),
-        row(999, "early", "acme/app"),
-        row(2_001, "late", "acme/app"),
-        String::new(),
-        row(1_900, "d", "acme/app"),
-    ]
-    .join("\n");
-    let mut rows = FileRows::parse(&text).unwrap();
-    let repo = [("repo", "acme/app")];
-
-    let first = rows.page(&query(&repo, None, 2)).unwrap();
-    assert_eq!(ids(&first), ["z", "a"]);
-    let second = rows
-        .page(&query(&repo, Some((ns(1_500), "a".into())), 2))
-        .unwrap();
-    assert_eq!(ids(&second), ["b", "d"]);
-    let last = rows
-        .page(&query(&repo, Some((ns(1_900), "d".into())), 2))
-        .unwrap();
-    assert_eq!(last, "");
-
-    // No filter: every row in the window, whatever its repo.
-    let all = rows.page(&query(&[], None, 100)).unwrap();
-    assert_eq!(ids(&all), ["z", "a", "b", "c", "d"]);
-    // A filter on a column a row lacks excludes it.
-    let none = rows.page(&query(&[("host", "h1")], None, 100)).unwrap();
-    assert_eq!(none, "");
-}
-
-#[test]
-fn a_malformed_export_is_refused_with_its_line_number() {
-    let missing_cursor = r#"{"record_id":"a"}"#;
-    let err = FileRows::parse(&format!("{}\n{missing_cursor}", row(1, "x", "r"))).unwrap_err();
-    assert!(err.starts_with("line 2:"), "{err}");
-    assert!(FileRows::parse(r#"{"knowable_time_ns":1}"#)
-        .unwrap_err()
-        .contains("record_id"));
-    assert!(FileRows::parse("not json")
-        .unwrap_err()
-        .contains("not JSON"));
-    // A null record id is the empty id, not a malformed row.
-    let rows = FileRows::parse(r#"{"knowable_time_ns":5,"record_id":null}"#).unwrap();
-    assert_eq!(rows.rows[0].0, (5, String::new()));
-}
-
-#[test]
-fn page_query_filter_looks_up_by_name() {
-    let q = query(&[("repo", "acme/app")], None, 1);
-    assert_eq!(q.filter("repo"), Some("acme/app"));
-    assert_eq!(q.filter("host"), None);
 }
 
 #[test]

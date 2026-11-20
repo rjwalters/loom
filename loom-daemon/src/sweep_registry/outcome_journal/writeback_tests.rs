@@ -17,40 +17,7 @@
 use super::*;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
-use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
-
-/// A registry whose `gh` is `script` and whose forge probes are NOT skipped.
-/// Journals are confined to `ws`. Identical shape to `complexity_tests`'
-/// `complexity_registry`, duplicated here rather than shared so this sibling
-/// test file stays self-contained.
-fn writeback_registry(ws: &Path, script: &str) -> SweepRegistry {
-    let fake_gh = ws.join("fake-gh-writeback.sh");
-    std::fs::write(&fake_gh, script).unwrap();
-    let mut perms = std::fs::metadata(&fake_gh).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&fake_gh, perms).unwrap();
-    if let Ok(f) = std::fs::File::open(&fake_gh) {
-        let _ = f.sync_all();
-    }
-
-    let scripts_dir = ws.join(".loom").join("scripts");
-    std::fs::create_dir_all(&scripts_dir).unwrap();
-    let spawn = scripts_dir.join("spawn-claude.sh");
-    std::fs::write(&spawn, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-    let mut sperms = std::fs::metadata(&spawn).unwrap().permissions();
-    sperms.set_mode(0o755);
-    std::fs::set_permissions(&spawn, sperms).unwrap();
-
-    let mut config = SweepRegistryConfig::new(ws.to_path_buf());
-    config.spawn_bin = Some(spawn);
-    config.gh_bin = Some(fake_gh);
-    config.skip_label_flip = false;
-    config.journal_path = Some(ws.join("test-sweeps-journal.json"));
-    config.outcomes_journal_path = Some(ws.join("test-sweep-outcomes.jsonl"));
-    config.outcome_telemetry_path = Some(ws.join("test-sweep-outcome-telemetry.jsonl"));
-    SweepRegistry::new(config)
-}
 
 /// Enable the write-back for `ws` via committed config, mirroring how a real
 /// workspace opts in (`autonomous.sweepOutcomeWriteback.enabled`).
@@ -175,7 +142,7 @@ fn success_with_writeback_enabled_posts_one_marked_comment() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let body = "points:8";
-    let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
+    let mut registry = forge_probing_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90561;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-1", "log\n");
 
@@ -214,7 +181,7 @@ fn writeback_disabled_by_default_never_posts() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let body = "points:8";
-    let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
+    let mut registry = forge_probing_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90562;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-2", "log\n");
 
@@ -244,7 +211,7 @@ fn failure_result_never_posts_even_when_enabled() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let body = "points:8";
-    let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
+    let mut registry = forge_probing_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90563;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-3", "log\n");
 
@@ -274,7 +241,7 @@ fn a_prior_comment_prevents_a_duplicate_post() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let body = "points:8";
-    let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
+    let mut registry = forge_probing_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90564;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-4", "log\n");
     // Pre-seed THIS sweep's marker, simulating a write-back that already
@@ -315,7 +282,7 @@ fn a_terminal_transition_observed_twice_posts_only_once() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let body = "points:8";
-    let mut registry = writeback_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
+    let mut registry = forge_probing_registry(ws, &fake_gh_script(body, &gh_log, &posted_marker));
     let issue = 90565;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-5", "log\n");
 
@@ -370,7 +337,7 @@ fn a_different_sweeps_prior_comment_does_not_suppress_this_sweeps_post() {
     )
     .unwrap();
     let mut registry =
-        writeback_registry(ws, &fake_gh_script(MARKED_BODY, &gh_log, &posted_marker));
+        forge_probing_registry(ws, &fake_gh_script(MARKED_BODY, &gh_log, &posted_marker));
     let issue = 90566;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-6", "log\n");
     assert_ne!(sweep_id, "sweep-issue-90566-earlier-slice");
@@ -399,8 +366,10 @@ fn an_unreadable_comments_check_fails_closed_and_never_posts() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let mut registry =
-        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 1, 0));
+    let mut registry = forge_probing_registry(
+        ws,
+        &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 1, 0),
+    );
     let issue = 90567;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-7", "log\n");
 
@@ -429,7 +398,7 @@ fn a_frozen_issue_gets_no_writeback() {
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
     let mut registry =
-        writeback_registry(ws, &fake_gh_script("loom:frozen", &gh_log, &posted_marker));
+        forge_probing_registry(ws, &fake_gh_script("loom:frozen", &gh_log, &posted_marker));
     let issue = 11743;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-f", "log\n");
 
@@ -449,8 +418,10 @@ fn telemetry_is_durable_before_the_post_and_survives_a_failed_post() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let mut registry =
-        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, 1));
+    let mut registry = forge_probing_registry(
+        ws,
+        &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, 1),
+    );
     let issue = 90568;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-8", "log\n");
 
@@ -477,8 +448,10 @@ fn a_hung_post_is_bounded_and_the_record_is_already_durable() {
     enable_writeback(ws);
     let gh_log = ws.join("gh-invocations.log");
     let posted_marker = ws.join("posted.marker");
-    let mut registry =
-        writeback_registry(ws, &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, -1));
+    let mut registry = forge_probing_registry(
+        ws,
+        &fake_gh_script_with(MARKED_BODY, &gh_log, &posted_marker, 0, -1),
+    );
     let issue = 90569;
     let sweep_id = insert_dead_running_with_log(&mut registry, issue, 0, "agent-wb-9", "log\n");
 

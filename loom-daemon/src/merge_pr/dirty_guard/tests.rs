@@ -261,3 +261,37 @@ fn a_dirty_line_is_never_reshaped_on_its_way_into_a_record() {
     let quoted = assess(&ctx("b"), r#"?? "has\ttabs.rs""#).expect("refusal");
     assert_eq!(quoted[1].1, r#"?? "has\ttabs.rs""#);
 }
+
+// --- #13599: ignored-data filter -------------------------------------------
+
+#[test]
+fn ignored_filter_keeps_user_data_and_drops_regenerable_artifacts() {
+    let porcelain = "!! wip/results/out.json\n!! node_modules/\n!! pkg/node_modules/\n!! target/\n\
+!! .venv/\n!! venv/\n!! a/__pycache__/\n!! .mcp.json\n!! .loom-managed\n!! .snapshots/\n\
+!! linked/\n?? untracked.txt\n M tracked.rs\n";
+    let got = ignored_user_paths(porcelain, &["linked".to_string()]);
+    assert_eq!(got, ["wip/results/out.json"]);
+}
+
+#[test]
+fn ignored_filter_handles_quoted_paths_and_similar_names() {
+    let got = ignored_user_paths("!! \"sub\\303\\251/data.bin\"\n!! targets/\n!! mytarget\n", &[]);
+    assert_eq!(got, ["sub\\303\\251/data.bin", "targets/", "mytarget"]);
+}
+
+#[test]
+fn ignored_refusal_lists_paths_size_and_flag() {
+    let ctx = Context {
+        worktree_path: "/wt",
+        repo_root: "/repo",
+        branch: "",
+    };
+    assert!(assess_ignored(&ctx, &[], 0).is_none());
+    let out = assess_ignored(&ctx, &["a/b.json".to_string()], 42).unwrap();
+    let all: String = out
+        .iter()
+        .map(|(_, t)| t.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all.contains("a/b.json") && all.contains("42 KiB") && all.contains("--remove-ignored"));
+}

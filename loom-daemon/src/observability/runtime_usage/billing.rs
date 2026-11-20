@@ -30,6 +30,19 @@ pub(super) fn attempt(
     runs: &[SpanRecord],
     attempt: &SpanRecord,
 ) -> LlmBilling {
+    LlmBilling::agreed(
+        runs_for_attempt(spans, runs, attempt)
+            .into_iter()
+            .map(|run| LlmBilling::of_launch(&run.attributes)),
+    )
+}
+
+/// Runs whose ancestry or enclosing interval attributes them to this attempt.
+pub(super) fn runs_for_attempt<'a>(
+    spans: &[SpanRecord],
+    runs: &'a [SpanRecord],
+    attempt: &SpanRecord,
+) -> Vec<&'a SpanRecord> {
     let id = &attempt.context.span_id;
     let related: Vec<&SpanRecord> = runs
         .iter()
@@ -38,7 +51,7 @@ pub(super) fn attempt(
                 || descends(spans, attempt, |s| s.context.span_id == run.context.span_id)
         })
         .collect();
-    let candidates = if related.is_empty() {
+    if related.is_empty() {
         runs.iter()
             .filter(|run| {
                 run.started_at <= attempt.started_at
@@ -48,12 +61,7 @@ pub(super) fn attempt(
             .collect()
     } else {
         related
-    };
-    LlmBilling::agreed(
-        candidates
-            .into_iter()
-            .map(|run| LlmBilling::of_launch(&run.attributes)),
-    )
+    }
 }
 
 /// Whether some proper ancestor of `span` (as far as `spans` records the

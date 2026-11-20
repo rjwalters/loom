@@ -330,5 +330,112 @@ not concurrent work — verify and remove manually."
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// Ignored-data guard (#13599) — `--worktree-path` override only
+// ---------------------------------------------------------------------------
+//
+// `git status --porcelain` never lists ignored files, so a non-Loom worktree
+// whose only valuable content is gitignored (benchmark output, logs) reads as
+// clean and is force-removed. On the override path the caller asserted
+// responsibility for a tree Loom does not manage, so that is where the extra
+// read happens. Managed worktrees are deliberately out of scope: they hold
+// large regenerable ignored content (`target/`, linked `node_modules`) and
+// refusing on it would block nearly every cleanup.
+
+/// Directory names whose ignored content is regenerable build/tooling output.
+/// Matched against ANY path component, so a nested `pkg/node_modules/` is
+/// covered too.
+const REGENERABLE_COMPONENTS: &[&str] = &["node_modules", "target", ".venv", "venv", "__pycache__"];
+
+/// Ignored entries (`!! path` lines of `git status --porcelain --ignored`)
+/// that are NOT regenerable artifacts: the data the guard exists to save.
+///
+/// `link_paths` are the repo's `worktree.linkPaths` entries, which `worktree.sh`
+/// symlinks in and therefore never hold the worktree's own data. Order is kept.
+#[must_use]
+pub fn ignored_user_paths(porcelain: &str, link_paths: &[String]) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(|line| line.strip_prefix("!! "))
+        .map(|p| p.trim_matches('"'))
+        .filter(|p| !p.is_empty())
+        .filter(|p| !is_regenerable_ignored(p, link_paths))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_regenerable_ignored(path: &str, link_paths: &[String]) -> bool {
+    let bare = path.trim_end_matches('/');
+    if bare.split('/').any(|c| REGENERABLE_COMPONENTS.contains(&c)) {
+        return true;
+    }
+    if bare == ".mcp.json" || safety::is_loom_own_untracked_path(bare) || in_snapshots_dir(path) {
+        return true;
+    }
+    link_paths.iter().any(|lp| {
+        let lp = lp.trim_matches('/');
+        !lp.is_empty() && (bare == lp || bare.starts_with(&format!("{lp}/")))
+    })
+}
+
+/// Refusal for ignored non-artifact data: each path, the total size, and the
+/// flag that forces removal. `total_kib` is a best-effort `du -sk` sum.
+#[must_use]
+pub fn assess_ignored(
+    ctx: &Context<'_>,
+    paths: &[String],
+    total_kib: u64,
+) -> Option<Vec<(Level, String)>> {
+    if paths.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(paths.len() + 4);
+    out.push((
+        Level::Warning,
+        format!(
+            "Refusing to remove worktree at {} — it holds gitignored files that are not regenerable \
+build artifacts (ignored-data guard, #13599):",
+            ctx.worktree_path
+        ),
+    ));
+    for p in paths {
+        out.push((Level::Warning, format!("  {p}")));
+    }
+    out.push((Level::Warning, format!("Total size of the above: {total_kib} KiB")));
+    out.push((
+        Level::Warning,
+        "Save them first, or re-run merge-pr.sh with --remove-ignored to delete them with the worktree. \
+Manual removal:"
+            .to_string(),
+    ));
+    out.push((
+        Level::Plain,
+        format!(
+            "  git -C \"{}\" worktree remove \"{}\" --force",
+            ctx.repo_root, ctx.worktree_path
+        ),
+    ));
+    Some(out)
+}
+
+/// Refusal when the ignored listing itself could not be read (fail closed).
+#[must_use]
+pub fn ignored_unreadable(ctx: &Context<'_>) -> Vec<(Level, String)> {
+    vec![
+        (
+            Level::Warning,
+            format!(
+                "Refusing to remove worktree at {} — 'git status --ignored' could not be read, so gitignored \
+data cannot be ruled out (ignored-data guard, #13599). Keeping it.",
+                ctx.worktree_path
+            ),
+        ),
+        (
+            Level::Warning,
+            "Re-run merge-pr.sh with --remove-ignored to skip this check.".to_string(),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests;

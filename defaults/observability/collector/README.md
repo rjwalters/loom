@@ -110,7 +110,9 @@ Claude Code's own attribute names (`session.id`, `user.email`,
 `loom.*`-prefixed. The shared `transform/privacy` processor in `config.yaml`
 still applies unmodified to this path — it keeps only the resource keys
 (`service.name`, `service.version`, `service.instance.id`, `host.id`,
-`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`) and the
+`host.name`, `loom.fleet.config_sha`, `loom.daemon.revision`, and the host
+shape `host.cpu.count`, `loom.host.mem_total_bytes`, `host.arch`,
+`host.type`, `cloud.provider`, `cloud.region` — #12874) and the
 explicit `loom.*` log/span allowlist, plus the small non-namespaced
 `metric_statements` datapoint keys listed under "Privacy and remote
 deployment" below. Anything else Claude Code sends — including
@@ -373,6 +375,16 @@ and again when it exports it (#8857). The #8857 quota metrics
 `provider`, `model` and `state`: per-provider aggregates, never an account
 name or credential.
 
+`host.health`'s fleet-state gauges (#12811, `HOST_HEALTH_DATAPOINT_KEYS` in
+`loom-daemon/src/observability/otlp/mapping/host_health.rs`, contract-tested
+against this list) add `sweep_ids`, `visibility` and `workspace`. `sweep_ids`
+is the one deliberate exception to "low cardinality": it is the host's
+in-flight sweep-id set on `loom.host.active_sweeps` (sorted, at most 32 ids),
+which the dashboard reconciles live sweeps against now that the daemon no longer sends to `/ingest` (#12813). It
+opens a new series only when the set changes, at most once per `host.health`
+sample (about every 5 minutes per host). `workspace` is a directory name, never
+a path.
+
 **The body policy, exactly** (rewritten for #8825; this used to read "does not
 accept raw shell output, prompts or model completions", which is no longer the
 whole truth): this collector is **not** a general arbitrary-log redactor.
@@ -458,8 +470,9 @@ acting on it.
 Only the *interactive* half is missing. Daemon-dispatched OpenCode work is
 already on the wire: issue #8507 folds OpenCode session tokens into
 `sweep.outcome` / `role_tick.outcome`'s `tokens_by_model`, and
-`loom.tokens_by_model`, `loom.models_used`, `loom.runtime`, `loom.provider` and
-`loom.model` are already allowlisted in `config.yaml`'s `keep_keys(...)`. A
+`loom.tokens_by_model`, `loom.models_used`, `loom.runtime`, `loom.provider`,
+`loom.model`, `loom.profile` and `loom.stage` (the #14048 per-stage join keys)
+are allowlisted in `config.yaml`'s `keep_keys(...)`. A
 sweep or role tick that ran on OpenCode is queryable by runtime, model and
 duration today.
 

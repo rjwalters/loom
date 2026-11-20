@@ -149,7 +149,7 @@ fn rows_without_suite_ids_are_untouched() {
         {"name": "ci", "status": "completed", "conclusion": "success"}]});
     assert!(!needs_runs(doc["check_runs"].as_array().unwrap()));
     let mut d = doc.clone();
-    assert_eq!(drop_superseded(&mut d, &BTreeMap::from([(1, 2), (2, 1)])), 0);
+    assert_eq!(drop_superseded(&mut d, &BTreeMap::from([(1, vec![2]), (2, vec![1])])), 0);
     assert_eq!(d, doc);
 }
 
@@ -176,7 +176,7 @@ fn green_duplicates_need_no_read() {
 #[test]
 fn drop_lowers_total_count() {
     let mut doc = twin_rows("failure", "success");
-    assert_eq!(drop_superseded(&mut doc, &BTreeMap::from([(1, 2)])), 2);
+    assert_eq!(drop_superseded(&mut doc, &BTreeMap::from([(1, vec![2])])), 2);
     assert_eq!(doc["total_count"], 2);
     assert_eq!(doc["check_runs"].as_array().unwrap().len(), 2);
 }
@@ -232,4 +232,109 @@ fn same_name_dropped_while_unique_name_kept() {
     let s = superseded_suites(&twin_runs("failure", "success"), SHA).unwrap();
     assert_eq!(drop_superseded(&mut doc, &s), 1);
     assert_eq!(doc["total_count"], 2);
+}
+
+/// #14571: the kicad-tools#9396 shape. Cancelled run 1 and successful run 2
+/// both report the job; run 3 (a later `labeled` event) is skipped and its
+/// only job has a different name.
+fn flip_rows() -> Value {
+    rollup(vec![
+        row("Changelog Fragment Check", "cancelled", 1),
+        row("Changelog Fragment Check", "success", 2),
+        row("Changelog Gate", "skipped", 3),
+    ])
+}
+
+fn flip_runs() -> Value {
+    runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:12Z", "completed", Some("cancelled")),
+        wrun(101, 7, 2, "2026-11-18T12:00:19Z", "completed", Some("success")),
+        wrun(102, 7, 3, "2026-11-18T12:58:31Z", "completed", Some("skipped")),
+    ])
+}
+
+#[test]
+fn a_later_skipped_run_with_other_job_names_does_not_resurrect_a_cancelled_row() {
+    assert_eq!(failing_after(flip_rows(), &flip_runs()), "");
+    // Two-run snapshot, as before.
+    let two = rollup(vec![
+        row("Changelog Fragment Check", "cancelled", 1),
+        row("Changelog Fragment Check", "success", 2),
+    ]);
+    let p = runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:12Z", "completed", Some("cancelled")),
+        wrun(101, 7, 2, "2026-11-18T12:00:19Z", "completed", Some("success")),
+    ]);
+    assert_eq!(failing_after(two, &p), "");
+}
+
+#[test]
+fn row_order_does_not_change_the_three_run_answer() {
+    let mut rows = flip_rows()["check_runs"].as_array().unwrap().clone();
+    rows.reverse();
+    let mut list = flip_runs()["workflow_runs"].as_array().unwrap().clone();
+    list.reverse();
+    assert_eq!(failing_after(rollup(rows), &runs(list)), "");
+}
+
+#[test]
+fn an_older_replacement_still_covers_a_name_the_newest_run_omits() {
+    // Red run 1, green run 2 on the same job, then run 3 reports another job.
+    let doc = rollup(vec![
+        row("Daemon Checks", "failure", 1),
+        row("Daemon Checks", "success", 2),
+        row("Other", "success", 3),
+    ]);
+    let p = runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:00Z", "completed", Some("failure")),
+        wrun(101, 7, 2, "2026-11-18T12:01:00Z", "completed", Some("success")),
+        wrun(102, 7, 3, "2026-11-18T12:02:00Z", "completed", Some("success")),
+    ]);
+    assert_eq!(failing_after(doc, &p), "");
+}
+
+#[test]
+fn a_job_absent_from_every_later_run_still_fails() {
+    let doc = rollup(vec![
+        row("Daemon Checks", "failure", 1),
+        row("Other", "success", 2),
+        row("Other", "success", 3),
+    ]);
+    let p = runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:00Z", "completed", Some("failure")),
+        wrun(101, 7, 2, "2026-11-18T12:01:00Z", "completed", Some("success")),
+        wrun(102, 7, 3, "2026-11-18T12:02:00Z", "completed", Some("success")),
+    ]);
+    assert_eq!(failing_after(doc, &p), "Daemon Checks");
+}
+
+#[test]
+fn a_newest_red_run_is_not_hidden_by_an_older_green_one() {
+    let doc = rollup(vec![
+        row("Daemon Checks", "success", 1),
+        row("Daemon Checks", "failure", 2),
+        row("Other", "skipped", 3),
+    ]);
+    let p = runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:00Z", "completed", Some("success")),
+        wrun(101, 7, 2, "2026-11-18T12:01:00Z", "completed", Some("failure")),
+        wrun(102, 7, 3, "2026-11-18T12:02:00Z", "completed", Some("skipped")),
+    ]);
+    assert_eq!(failing_after(doc, &p), "Daemon Checks");
+}
+
+#[test]
+fn an_outstanding_run_is_never_a_replacement() {
+    // The only newer run is still running: the cancelled row stays.
+    let doc = rollup(vec![
+        row("Daemon Checks", "cancelled", 1),
+        json!({"name": "Daemon Checks", "status": "in_progress", "conclusion": null,
+               "check_suite": {"id": 2}}),
+    ]);
+    let p = runs(vec![
+        wrun(100, 7, 1, "2026-11-18T12:00:00Z", "completed", Some("cancelled")),
+        wrun(101, 7, 2, "2026-11-18T12:01:00Z", "in_progress", None),
+    ]);
+    assert!(superseded_suites(&p, SHA).unwrap().is_empty());
+    assert_eq!(failing_after(doc, &p), "Daemon Checks");
 }

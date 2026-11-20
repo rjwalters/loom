@@ -44,6 +44,7 @@ pub const PRESERVE_REASONS: &[&str] = &[
     "grace",
     "uncommitted",
     "private_workspace",
+    "backup_failed",
     "other",
 ];
 
@@ -52,8 +53,12 @@ pub const PRESERVE_REASONS: &[&str] = &[
 pub fn preserve_reason(wording: &str) -> &'static str {
     let w = wording.to_ascii_lowercase();
     // Grace first: "no PR found ..., grace period not passed" also names a PR.
+    // Then the #12458 backup failure, whose git error text can name a push,
+    // a remote or a branch and would otherwise land in `not_merged`.
     if w.contains("grace period") {
         "grace"
+    } else if w.starts_with("remote backup failed") {
+        "backup_failed"
     } else if w.starts_with("uncommitted") {
         "uncommitted"
     } else if w.starts_with("editable") {
@@ -91,6 +96,12 @@ pub struct Pass<'a> {
     pub preserved: Vec<&'a str>,
     /// Bytes reclaimed (worktrees for `reap`, artifact directories for `reclaim`).
     pub bytes: u64,
+    /// Open-item worktrees whose whole state was pushed to a remote backup
+    /// ref before removal (#12458). Always `0` for `reclaim`.
+    pub backed_up: usize,
+    /// The backup refs that pass pushed, one per `backed_up` worktree — the
+    /// restore handle, so an operator can find the content from the span.
+    pub backup_refs: Vec<&'a str>,
 }
 
 /// The workspace directory's name, lowercased: the repo identity a span can
@@ -127,6 +138,12 @@ pub fn pass_span(repo_root: &Path, p: &Pass<'_>, at: DateTime<Utc>) -> SpanRecor
     attributes.insert("loom.reaper.failed".into(), p.failed.to_string());
     attributes.insert("loom.reaper.preserved".into(), p.preserved.len().to_string());
     attributes.insert("loom.reaper.bytes".into(), p.bytes.to_string());
+    // #12458: the restore handles. Only `reap` over open items ever sets them;
+    // absent when nothing was backed up, like the per-reason counts.
+    attributes.insert("loom.reaper.backed_up".into(), p.backed_up.to_string());
+    if !p.backup_refs.is_empty() {
+        attributes.insert("loom.reaper.backup_refs".into(), p.backup_refs.join(" "));
+    }
     for reason in PRESERVE_REASONS {
         let n = p
             .preserved
@@ -182,6 +199,8 @@ mod tests {
             failed,
             preserved,
             bytes: 4096,
+            backed_up: 0,
+            backup_refs: Vec::new(),
         }
     }
 
@@ -202,6 +221,11 @@ mod tests {
             ("PR still open", "pr_open"),
             ("PR status unknown", "pr_unknown"),
             ("issue is OPEN", "issue_open"),
+            (
+                "remote backup failed: push of refs/loom/backup/issue-1/feature/issue-1/x to \
+                 origin failed: git push exited with exit status: 128: fatal: unable to access",
+                "backup_failed",
+            ),
             ("something nobody categorised", "other"),
         ] {
             assert_eq!(preserve_reason(wording), want, "{wording}");
@@ -254,6 +278,31 @@ mod tests {
             pass_span(Path::new("/srv/Work/Loom"), &pass(vec![], 0), at()).context,
             "deterministic"
         );
+    }
+
+    #[test]
+    fn backups_are_counted_and_their_refs_carried_as_the_restore_handle() {
+        let refs = [
+            "refs/loom/backup/issue-12/feature/issue-12/20261020T120000Z",
+            "refs/loom/backup/pr-7/detached/20261020T120001Z",
+        ];
+        let p = Pass {
+            backed_up: 2,
+            backup_refs: refs.to_vec(),
+            ..pass(vec![], 0)
+        };
+        let span = pass_span(Path::new("/r/x"), &p, at());
+        assert!(span.validate().is_ok());
+        let bounded = span.bounded();
+        assert_eq!(bounded.attributes["loom.reaper.backed_up"], "2");
+        assert_eq!(bounded.attributes["loom.reaper.backup_refs"], refs.join(" "));
+        for key in ["loom.reaper.backed_up", "loom.reaper.backup_refs"] {
+            assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key), "{key}");
+        }
+        // Nothing backed up: the count is 0 and the refs attribute is absent.
+        let none = pass_span(Path::new("/r/x"), &pass(vec![], 0), at()).bounded();
+        assert_eq!(none.attributes["loom.reaper.backed_up"], "0");
+        assert!(!none.attributes.contains_key("loom.reaper.backup_refs"));
     }
 
     #[test]

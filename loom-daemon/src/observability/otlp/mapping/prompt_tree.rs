@@ -3,9 +3,9 @@
 //! `loom.prompt.commits_behind > 0`, or `loom.prompt.loom_version` against
 //! the daemon's `loom.version`. Each attribute is absent when unknown.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 
-use super::{kv, kv_int, kv_string};
+use super::{kv_bool, kv_int, kv_string};
 use crate::role_tick_telemetry::prompt_tree::PromptTree;
 
 pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
@@ -21,10 +21,7 @@ pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
         out.push(kv_int("loom.prompt.commits_behind", behind));
     }
     if let Some(on_branch) = prompt.on_branch {
-        let value = AnyValue {
-            value: Some(any_value::Value::BoolValue(on_branch)),
-        };
-        out.push(kv("loom.prompt.on_branch", value));
+        out.push(kv_bool("loom.prompt.on_branch", on_branch));
     }
     if let Some(tip) = &prompt.remote_tip {
         out.push(kv_string("loom.prompt.remote_tip", tip.clone()));
@@ -38,10 +35,7 @@ pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
         ("loom.prompt.remote_foreign", prompt.remote_foreign),
     ] {
         if let Some(flag) = flag {
-            let value = AnyValue {
-                value: Some(any_value::Value::BoolValue(flag)),
-            };
-            out.push(kv(key, value));
+            out.push(kv_bool(key, flag));
         }
     }
     if let Some(repo) = &prompt.remote_repo {
@@ -52,6 +46,8 @@ pub(super) fn attributes(prompt: Option<&PromptTree>) -> Vec<KeyValue> {
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry_proto::tonic::common::v1::any_value;
+
     use super::*;
 
     fn keys(kvs: &[KeyValue]) -> Vec<&str> {

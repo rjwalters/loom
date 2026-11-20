@@ -5,15 +5,15 @@
 //! them. Their flags, stdout markers and exit codes are contract: role prompts
 //! invoke the stubs by path and parse their output line-wise. What each answers,
 //! and why each field exists, is documented on
-//! [`loom_daemon::dep_classify::cli`].
+//! [`crate::dep_classify::cli`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
 //! reason `RestartArgs` does (#6969): `main.rs` is over
 //! `.loom/docs/file-size-policy.md`'s threshold and frozen, so it keeps only a
 //! flattened variant and a one-line dispatch arm.
 
+use crate::dep_classify::cli;
 use anyhow::Result;
-use loom_daemon::dep_classify::cli;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]

@@ -52,6 +52,10 @@ pub enum SpanName {
     /// `loom.runtime.run` span, journalled once usage is known.
     #[serde(rename = "loom.runtime.usage")]
     RuntimeUsage,
+    /// A run whose usage could not be read (Issue #14566): no counters, only
+    /// `loom.usage.missing_reason`, so the gap is countable.
+    #[serde(rename = "loom.runtime.usage_missing")]
+    RuntimeUsageMissing,
     /// One pool dispatch hold, from arming to clearing (Issue #8931) — its own
     /// root trace.
     #[serde(rename = "loom.pool.hold")]
@@ -95,6 +99,11 @@ pub enum SpanName {
     /// until.
     #[serde(rename = "forge.read.shed")]
     ForgeReadShed,
+    /// One safehouse forge lookup that produced no answer (#13156): an
+    /// instant span, its own root trace, naming the call, repo and reason
+    /// class. Emitted on every failure, not just the first per workspace.
+    #[serde(rename = "safehouse.forge_lookup.failed")]
+    SafehouseForgeLookupFailed,
     /// One provider request observed by the egress proxy (Issue #11300): its
     /// own root trace, counts and classified codes only, never a body.
     #[serde(rename = "loom.egress.request")]
@@ -125,6 +134,18 @@ pub enum SpanName {
     /// bytes reclaimed. Never a path or the gate's free-text wording.
     #[serde(rename = "reaper.pass")]
     ReaperPass,
+    /// One EC2 spot interruption or rebalance notice (#12876): an instant
+    /// span, its own root, naming the kind, the host and the sweeps it ended.
+    #[serde(rename = "loom.host.interruption_notice")]
+    HostInterruptionNotice,
+    /// One workspace-resync landing attempt (#13674): an instant span, its own
+    /// root, naming the repo, PR, head, path and outcome.
+    #[serde(rename = "workspace_resync.landing")]
+    WorkspaceResyncLanding,
+    /// One ratification-lane tick (#13707): an instant span, its own root,
+    /// with the tick's reason and selected / skipped / ran / posted counts.
+    #[serde(rename = "ratification_lane.tick")]
+    RatificationLaneTick,
 }
 
 impl SpanName {
@@ -144,6 +165,7 @@ impl SpanName {
             Self::CiTest => "loom.ci.test",
             Self::DispatchTick => "loom.dispatch.tick",
             Self::RuntimeUsage => "loom.runtime.usage",
+            Self::RuntimeUsageMissing => "loom.runtime.usage_missing",
             Self::PoolHold => "loom.pool.hold",
             Self::DispatchAdmission => "loom.dispatch.admission",
             Self::DispatchDisposition => "loom.dispatch.disposition",
@@ -153,12 +175,16 @@ impl SpanName {
             Self::ForgeReaderWithdrawn => "forge.reader.withdrawn",
             Self::ForgeReaderSpill => "forge.reader.spill",
             Self::ForgeReadShed => "forge.read.shed",
+            Self::SafehouseForgeLookupFailed => "safehouse.forge_lookup.failed",
             Self::EgressRequest => "loom.egress.request",
             Self::GuardCargoTargetDirDenied => "guard.cargo_target_dir.denied",
             Self::BuildGateRun => "build_gate.run",
             Self::MainRedAutofile => "main_red.autofile",
             Self::FleetDispatchCall => "loom.fleet_dispatch.call",
             Self::ReaperPass => "reaper.pass",
+            Self::HostInterruptionNotice => "loom.host.interruption_notice",
+            Self::WorkspaceResyncLanding => "workspace_resync.landing",
+            Self::RatificationLaneTick => "ratification_lane.tick",
         }
     }
 }
@@ -250,7 +276,16 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.host.oom_kill_total"
                     | "loom.host.pressure"
                     | "loom.host.load_per_core"
+                    | "loom.host.logical_cpus"
+                    | "loom.host.loadavg_1m"
+                    | "loom.host.start.loadavg_1m"
+                    | "loom.host.start.load_per_core"
+                    | "loom.host.cpu_budget_cores"
+                    | "loom.host.sweeps_in_flight"
                     | "loom.admission.reason"
+                    | "loom.admission.stage"
+                    | "loom.launch.runtime"
+                    | "loom.launch.source"
                     | "loom.admission.load_per_core"
                     | "loom.admission.load_threshold"
                     | "loom.admission.pool"
@@ -259,6 +294,15 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                     | "loom.effort"
                     | "loom.doctor_cycles"
                     | "loom.judge_verdict"
+                    // #12362: a Judge tick's found-work split.
+                    | "loom.found_work"
+                    | "loom.noop_reason"
+                    // #14168: a step's outcome line, countable per
+                    // runtime/model/role from the `loom.sweep` close.
+                    | "loom.step.outcome.class"
+                    | "loom.step.outcome.reason"
+                    // #14234: whether the forge post-state agreed with it.
+                    | "loom.step.outcome.agrees"
                     | "loom.recovered"
                     | "loom.timing_source"
                     | "loom.tool.name"
@@ -267,8 +311,10 @@ pub fn bounded_attributes(attributes: &TraceAttributes) -> TraceAttributes {
                 || crate::gh_invocation::telemetry::SPAN_ATTRIBUTE_KEYS.contains(&key.as_str())
                 || crate::observability::llm_billing::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::roll_interruption::KEYS.contains(&key.as_str())
+                || crate::host_loss::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_runtime::KEYS.contains(&key.as_str())
                 || crate::observability::lifecycle::role_draw::KEYS.contains(&key.as_str())
+                || crate::role_runner::ratification_lane::KEYS.contains(&key.as_str())
                 || super::provenance::KEYS.contains(&key.as_str()))
                 && value.len() <= 256
                 && !value.chars().any(char::is_control)

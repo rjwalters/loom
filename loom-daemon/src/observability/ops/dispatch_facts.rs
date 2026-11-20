@@ -33,10 +33,11 @@
 use std::path::Path;
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use crate::telemetry::queue_repo::QueueRepoRef;
 use crate::telemetry::RepoVisibility;
 use crate::types::CapView;
 use crate::work_finder::halt_cause::since::RootHalt;
+use crate::work_finder::RepoDepth;
 use crate::work_finder::TickReport;
 
 /// Span attribute values are bounded to this many characters at export
@@ -111,6 +112,9 @@ pub fn tick_attributes(
     if let Some(p) = &report.passes {
         out.extend(pass_attributes(p));
     }
+    if let Some(excluded) = excluded_attribute(&report.depth) {
+        out.push(("loom.dispatch.excluded".into(), excluded));
+    }
     if let Some(d) = &report.discovery {
         out.extend(discovery_attributes(d));
     }
@@ -129,6 +133,9 @@ pub fn discovery_attributes(d: &crate::discovery::SnapshotStats) -> Vec<(String,
         ("loom.discovery.tier".into(), d.tier.to_string()),
         ("loom.discovery.items".into(), d.items.to_string()),
         ("loom.discovery.forge_reads".into(), d.discovery_forge_reads.to_string()),
+        ("loom.discovery.live_reads.landed".into(), d.live_reads.landed.to_string()),
+        ("loom.discovery.live_reads.markers".into(), d.live_reads.markers.to_string()),
+        ("loom.discovery.live_reads.ci".into(), d.live_reads.ci.to_string()),
     ];
     if let Some(reason) = &d.fallback_reason {
         out.push(("loom.discovery.fallback_reason".into(), reason.clone()));
@@ -197,6 +204,9 @@ pub fn pass_attributes(
         ("loom.dispatch.draws".to_string(), p.draws.to_string()),
         ("loom.dispatch.draws_unspawned".into(), p.draws_unspawned.to_string()),
         ("loom.dispatch.merge_deferred".into(), p.merge_deferred.to_string()),
+        ("loom.champion.merge_concurrency".into(), p.merge_concurrency.to_string()),
+        ("loom.champion.merge_eligible".into(), p.merge_eligible.to_string()),
+        ("loom.champion.merges_in_flight".into(), p.merges_in_flight.to_string()),
         ("loom.dispatch.budget".into(), p.budget.to_string()),
     ];
     if !p.by_reason.is_empty() {
@@ -206,6 +216,30 @@ pub fn pass_attributes(
         out.push(("loom.dispatch.stop".into(), stop.to_string()));
     }
     out
+}
+
+/// The tick span's `loom.dispatch.excluded` (#13008): the tick's exclusions
+/// by reason, summed over repos, as comma-joined `reason=count` pairs in
+/// reason order (the `loom.dispatch.passes` rendering). `None` when nothing
+/// was excluded. Pure.
+#[must_use]
+pub fn excluded_attribute(depth: &[RepoDepth]) -> Option<String> {
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for d in depth {
+        for (reason, &n) in d.excluded.iter().filter(|(_, n)| **n > 0) {
+            *by_reason.entry(reason).or_default() += n;
+        }
+    }
+    if by_reason.is_empty() {
+        return None;
+    }
+    Some(
+        by_reason
+            .iter()
+            .map(|(reason, n)| format!("{reason}={n}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 /// The tick's extra metric points: the `loom.dispatch.cap_term{kind="configured"}`
@@ -219,11 +253,38 @@ pub fn tick_points(report: &TickReport, cap: Option<CapView>) -> Vec<MetricPoint
                 .label("kind", "configured"),
         );
     }
+    points.extend(depth_points(&report.depth));
     if report.pr_open_prefiltered > 0 {
         points.push(MetricPoint::int(
             MetricName::DispatchPrOpenPrefiltered,
             int(report.pr_open_prefiltered),
         ));
+    }
+    points
+}
+
+/// The step tick's dispatchable depth (#12734): `loom.dispatch.pool_items`
+/// by `repo` and `step`, `loom.dispatch.excluded_items` by `repo` and
+/// `reason`. Non-zero counts only, so absence means zero. Labels are the
+/// registered workspace slugs and the closed `Step` / `Exclusion` names. Pure.
+#[must_use]
+pub fn depth_points(depth: &[RepoDepth]) -> Vec<MetricPoint> {
+    let mut points = Vec::new();
+    for d in depth {
+        for (step, &n) in d.pool.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchPoolItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("step", *step),
+            );
+        }
+        for (reason, &n) in d.excluded.iter().filter(|(_, n)| **n > 0) {
+            points.push(
+                MetricPoint::int(MetricName::DispatchExcludedItems, int(n))
+                    .label("repo", d.repo.as_str())
+                    .label("reason", *reason),
+            );
+        }
     }
     points
 }
@@ -240,7 +301,7 @@ pub fn published_cap() -> Option<CapView> {
 #[must_use]
 pub fn fallback_repo_ref(root: &Path) -> Option<QueueRepoRef> {
     let (host, repo) = crate::forge_etag_store::remote_identity(root)?;
-    if host != "github.com" || !crate::agent_gh::classify::is_slug(&repo) {
+    if host != "github.com" || !crate::forge_slug::valid_slug(&repo) {
         return None;
     }
     let visibility =
@@ -297,6 +358,11 @@ mod tests {
             oldest_watermark_age_secs: Some(90),
             stale_repos: 2,
             discovery_forge_reads: 4,
+            live_reads: crate::discovery::LiveReads {
+                landed: 2,
+                markers: 3,
+                ci: 1,
+            },
         };
         let report = TickReport {
             discovery: Some(mirror),
@@ -319,6 +385,9 @@ mod tests {
         assert_eq!(get("loom.discovery.items"), Some("1555"));
         assert_eq!(get("loom.discovery.oldest_watermark_age_secs"), Some("90"));
         assert_eq!(get("loom.discovery.forge_reads"), Some("4"));
+        assert_eq!(get("loom.discovery.live_reads.landed"), Some("2"));
+        assert_eq!(get("loom.discovery.live_reads.markers"), Some("3"));
+        assert_eq!(get("loom.discovery.live_reads.ci"), Some("1"));
         for (key, _) in &attrs {
             assert!(
                 crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
@@ -350,6 +419,9 @@ mod tests {
                 draws: 9,
                 draws_unspawned: 2,
                 merge_deferred: 7,
+                merge_concurrency: 2,
+                merge_eligible: 4,
+                merges_in_flight: 1,
                 by_reason: [
                     ("backstop_hold".to_string(), 2),
                     ("claim_lost".to_string(), 3),
@@ -366,6 +438,9 @@ mod tests {
         assert_eq!(get("loom.dispatch.draws"), Some("9"));
         assert_eq!(get("loom.dispatch.draws_unspawned"), Some("2"));
         assert_eq!(get("loom.dispatch.merge_deferred"), Some("7"));
+        assert_eq!(get("loom.champion.merge_concurrency"), Some("2"));
+        assert_eq!(get("loom.champion.merge_eligible"), Some("4"));
+        assert_eq!(get("loom.champion.merges_in_flight"), Some("1"));
         assert_eq!(get("loom.dispatch.passes"), Some("backstop_hold=2,claim_lost=3"));
         assert_eq!(get("loom.dispatch.budget"), Some("30"));
         assert_eq!(get("loom.dispatch.stop"), Some("pass_limit"));
@@ -386,6 +461,33 @@ mod tests {
             .any(|(k, v)| k == "loom.dispatch.draws" && v == "0"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.passes"));
         assert!(!attrs.iter().any(|(k, _)| k == "loom.dispatch.stop"));
+    }
+
+    #[test]
+    fn tick_exclusions_are_one_attribute_the_export_keeps() {
+        let depth = |repo: &str, excluded: &[(&'static str, usize)]| RepoDepth {
+            repo: repo.to_string(),
+            excluded: excluded.iter().copied().collect(),
+            ..RepoDepth::default()
+        };
+        let report = TickReport {
+            depth: vec![
+                depth("o/a", &[("held_at_head", 2), ("cooling_down", 1)]),
+                depth("o/b", &[("held_at_head", 3), ("blocked", 0)]),
+            ],
+            ..TickReport::default()
+        };
+        let attrs = tick_attributes(&report, None, None);
+        let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("loom.dispatch.excluded"), Some("cooling_down=1,held_at_head=5"));
+        for (key, _) in &attrs {
+            assert!(
+                crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key.as_str()),
+                "{key} is not on the export allowlist"
+            );
+        }
+        let quiet = tick_attributes(&TickReport::default(), None, None);
+        assert!(!quiet.iter().any(|(k, _)| k == "loom.dispatch.excluded"));
     }
 
     #[test]
@@ -479,6 +581,42 @@ mod tests {
         .unwrap();
         assert!(named.len() <= MAX_ATTRIBUTE_CHARS, "{}", named.len());
         assert!(named.split(',').all(|e| e.ends_with("=drain")), "{named}");
+    }
+
+    #[test]
+    fn depth_points_carry_pool_and_exclusions_within_closed_sets() {
+        use crate::step_dispatch::item_draw::Exclusion;
+        use crate::work_finder::step_item::{PassReason, Step};
+        let depth = RepoDepth {
+            repo: "o/a".into(),
+            pool: [(Step::Builder.as_str(), 2), (Step::Judge.as_str(), 0)].into(),
+            excluded: [
+                (Exclusion::Pass(PassReason::Blocked).as_str(), 5),
+                (Exclusion::MergeInFlight.as_str(), 1),
+            ]
+            .into(),
+        };
+        let held = RepoDepth {
+            repo: "o/b".into(),
+            ..RepoDepth::default()
+        };
+        let points = depth_points(&[depth, held]);
+        let pool = MetricPoint::int(MetricName::DispatchPoolItems, 2)
+            .label("repo", "o/a")
+            .label("step", "builder");
+        let blocked = MetricPoint::int(MetricName::DispatchExcludedItems, 5)
+            .label("repo", "o/a")
+            .label("reason", "blocked");
+        let merging = MetricPoint::int(MetricName::DispatchExcludedItems, 1)
+            .label("repo", "o/a")
+            .label("reason", "merge_in_flight");
+        assert_eq!(points, vec![pool, blocked, merging]);
+        for p in &points {
+            assert!(p
+                .labels
+                .keys()
+                .all(|k| crate::telemetry::ops::OPS_METRIC_LABEL_KEYS.contains(&k.as_str())));
+        }
     }
 
     #[test]

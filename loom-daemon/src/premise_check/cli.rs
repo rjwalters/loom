@@ -12,7 +12,7 @@
 //! - **Hermetic mode** (`--body-file`) — no forge calls at all, which is what
 //!   the tests drive and what makes a #7855 reconstruction reproducible.
 
-use super::{decide, evidence, exit, record, Inputs, Trigger};
+use super::{decide_with, evidence, exit, record, Inputs, Trigger};
 use crate::premise_check::record::{Exists, Outcome, Verdict};
 use std::path::{Path, PathBuf};
 
@@ -78,7 +78,12 @@ fn evaluate(opts: &Options) -> Result<i32, i32> {
         }
     };
 
-    let decision = decide(&inputs, &content_root);
+    let effective = crate::config_resolver::resolve_effective_config(&repo_root);
+    let policy = record::ReversalPolicy::from_config(
+        crate::config_resolver::get_path(&effective, "hermit.reversalNeedsOperator")
+            .and_then(serde_json::Value::as_str),
+    );
+    let decision = decide_with(&inputs, &content_root, policy);
 
     println!(
         "SCOPE={}",
@@ -123,6 +128,19 @@ fn evaluate(opts: &Options) -> Result<i32, i32> {
                 Verdict::OperatorDecision => "operator-decision",
             }
         );
+    }
+
+    if let Some(a) = &decision.resolution {
+        println!("RESOLUTION={}", a.status.token());
+        if let Some(why) = a.status.reason() {
+            println!("RESOLUTION-REASON={}", why.replace(['\r', '\n'], " "));
+        }
+        if let crate::operator_decision::resolution::Status::Resolved(r) = &a.status {
+            println!("RESOLUTION-OPTION={}", r.option);
+        }
+        if a.ignored_unauthorized > 0 {
+            println!("RESOLUTION-IGNORED-UNAUTHORIZED={}", a.ignored_unauthorized);
+        }
     }
 
     // The scan is advisory and costs two `git grep` passes, so it runs only
@@ -202,6 +220,9 @@ fn hermetic_inputs(opts: &Options, body_file: &Path) -> Result<Inputs, i32> {
             .map(str::to_string)
             .collect(),
         comments,
+        // No forge author metadata exists for a file, so a resolution can
+        // never be attested offline (#14399).
+        resolution: None,
     })
 }
 
@@ -232,7 +253,8 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
         name: String,
     }
 
-    let q: crate::cmd_out::Query<View> = crate::script_helpers::gh_query(
+    let q: crate::cmd_out::Query<View> = crate::script_helpers::gh_read_json(
+        "premise.issue_view",
         &[
             "issue",
             "view",
@@ -277,7 +299,11 @@ fn forge_inputs(opts: &Options, issue: i64, repo_root: &Path) -> Result<Inputs, 
     let labels = v.labels.into_iter().map(|l| l.name).collect();
     let inputs = match (listing, object) {
         (Some(listing), Some(object)) => {
-            trusted_inputs(&policy, v.title, v.body, labels, &listing, &object)
+            let evidence = resolution_evidence(&policy, &repo, issue, &v.title, &v.body, &listing);
+            trusted_inputs(&policy, v.title, v.body, labels, &listing, &object).map(|mut i| {
+                i.resolution = evidence;
+                i
+            })
         }
         _ => None,
     };
@@ -303,7 +329,8 @@ fn graphql_listing_and_object(
     repo_root: &Path,
 ) -> Option<(Vec<u8>, serde_json::Value)> {
     let (owner, name) = repo.split_once('/')?;
-    let out = crate::script_helpers::run_gh(
+    let out = crate::script_helpers::gh_route::gh_read_for_repo(
+        "premise.graphql_comments",
         &[
             "api",
             "graphql",
@@ -318,9 +345,7 @@ fn graphql_listing_and_object(
             &format!("number={number}"),
         ],
         repo_root,
-        // The cache wrapper is a REST-read optimisation; this is the path
-        // taken precisely when REST is unavailable.
-        false,
+        repo,
     );
     parse_graphql_comments(&out.ok_output()?.stdout)
 }
@@ -384,6 +409,31 @@ fn trusted_inputs(
         },
         labels,
         comments: crate::comment_trust::records::bodies(&records),
+        resolution: None,
+    })
+}
+
+/// The authoritative read behind the operator-resolution verifier (#14399):
+/// the issue's RAW body and title (the digests are over what the operator
+/// reviewed, not the marker-stripped copy an untrusted author gets) and every
+/// comment of the REST/GraphQL `listing` with the forge's verdict on its
+/// author. A comment counts as a resolution only from an operator, an
+/// identical decision for REST and GraphQL because both shapes go through
+/// [`crate::comment_trust::Author::from_json`].
+fn resolution_evidence(
+    policy: &crate::comment_trust::TrustPolicy,
+    repo: &str,
+    issue: i64,
+    title: &str,
+    raw_body: &str,
+    listing: &[u8],
+) -> Option<crate::operator_decision::resolution::Evidence> {
+    use crate::operator_decision::resolution::{candidates, current, Evidence};
+    let items = crate::comment_trust::parse_listing(listing)?;
+    let candidates = candidates(policy, &items);
+    Some(Evidence {
+        current: current(repo, u64::try_from(issue).ok()?, title, raw_body),
+        candidates,
     })
 }
 
@@ -399,7 +449,7 @@ fn strip_markers(body: &str) -> String {
 
 /// `owner/repo` from the checkout's origin remote, `gh` as the fallback — the
 /// same order, for the same offline/rate-limit reason, as `dep_classify`.
-fn resolve_repo(repo_root: &Path) -> Option<String> {
+pub(crate) fn resolve_repo(repo_root: &Path) -> Option<String> {
     if let Some(nwo) = crate::script_helpers::run_git(repo_root, &["remote", "get-url", "origin"])
         .ok_stdout_trimmed()
         .as_deref()
@@ -412,7 +462,8 @@ fn resolve_repo(repo_root: &Path) -> Option<String> {
         #[serde(rename = "nameWithOwner")]
         name_with_owner: String,
     }
-    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_query(
+    let q: crate::cmd_out::Query<NameWithOwner> = crate::script_helpers::gh_read_json(
+        "premise.repo_view",
         &["repo", "view", "--json", "nameWithOwner"],
         repo_root,
         false,

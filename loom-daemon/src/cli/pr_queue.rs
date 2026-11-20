@@ -1,12 +1,12 @@
-use anyhow::{Context, Result};
-use loom_daemon::{
+use crate::{
     comment_trust::TrustPolicy,
     pr_planning::{self, PrRole},
 };
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
-pub(crate) struct PrQueueArgs {
+pub struct PrQueueArgs {
     #[arg(long, value_enum)]
     role: PrRole,
     #[arg(long, default_value = ".")]
@@ -17,7 +17,14 @@ pub(crate) struct PrQueueArgs {
 }
 
 impl PrQueueArgs {
-    pub(crate) fn run(mut self) -> Result<()> {
+    /// Whether the invocation reads the forge (`gh`), and so must pass the
+    /// tools mode gate (design §10.3): `--input` runs offline instead (#14429).
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.input.is_none()
+    }
+
+    pub fn run(mut self) -> Result<()> {
         self.repo_root =
             std::fs::canonicalize(&self.repo_root).context("resolve repository root")?;
         let rows = if let Some(input) = self.input {

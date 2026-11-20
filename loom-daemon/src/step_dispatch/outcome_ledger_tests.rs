@@ -100,6 +100,27 @@ fn champion_lines_are_read_per_mode_and_folded_onto_the_classes() {
     assert_eq!(champion_outcome(false, "triaged"), None, "a PR triage is --pr only");
 }
 
+/// #14168: the shared framing-tolerant tokenizer — a JSON text event wraps
+/// both line shapes, the prefix sits mid-line, and the wrapper's framing
+/// (`"}`, a literal `\n` escape) glues onto the last value without riding
+/// in it, identically to `step_spawn::capture`'s parser.
+#[test]
+fn a_json_wrapped_outcome_line_parses_like_a_bare_one() {
+    let step_line = concat!(
+        r#"{"type":"result","text":"LOOM_STEP_OUTCOME role=judge target=5 "#,
+        r#"class=noop reason=ci-pending\n"}"#,
+    );
+    assert_eq!(
+        parse_outcome_line(step_line, StepRole::Judge, 5),
+        Some(out(OutcomeClass::Noop, "ci_pending"))
+    );
+    let champion_line = r#"{"text":"CHAMPION-STEP mode=pr item=30 outcome=head-moved"}"#;
+    assert_eq!(
+        parse_outcome_line(champion_line, StepRole::ChampionMerge, 30),
+        Some(out(OutcomeClass::Refused, "head_moved"))
+    );
+}
+
 // ---------------------------------------------------------- the post-state
 
 #[test]
@@ -320,6 +341,22 @@ fn a_verdict_clears_the_items_history_and_cooldowns() {
 /// #12042: a Judge step that stood down for pending CI cools down for the
 /// short refusal window, not the no-op hour, so a PR whose CI concludes in
 /// minutes gets its Judge back in minutes.
+/// #13500: the Judge spells the reason `ci-pending` on its line; the parser
+/// folds it to `ci_pending`, so it is an external wait (the short window,
+/// not a run) however the role spells it.
+#[test]
+fn a_hyphenated_ci_pending_line_parses_to_the_external_wait_token() {
+    let parsed = parse_outcome_line(
+        "LOOM_STEP_OUTCOME role=judge target=5 class=noop reason=ci-pending",
+        StepRole::Judge,
+        5,
+    )
+    .unwrap();
+    assert_eq!(parsed, out(OutcomeClass::Noop, "ci_pending"));
+    assert!(!counts_as_run(&parsed));
+    assert!(EXTERNAL_WAIT_NOOPS.contains(&parsed.reason.as_str()));
+}
+
 #[test]
 fn a_ci_pending_noop_takes_the_short_window() {
     let cfg = LedgerConfig::default();
@@ -792,6 +829,116 @@ fn a_repeated_identical_state_refusal_arms_a_doubling_cooldown() {
         .record(64, step, &refuse("not_eligible"), SLOW, now + mins(5))
         .cooling_until
         .is_some());
+}
+
+/// #13057: a Builder that meets a deterministic `check-claim` refusal
+/// (`MERGED_PR`, `TRIAGE`) ends with `class=refused reason=merged_pr|triage`.
+/// The first reclassifies; the second identical one arms the refusal
+/// cooldown, so the issue is not drawn again until it lapses. A different
+/// reason in between resets the streak.
+#[test]
+fn a_repeated_merged_pr_or_triage_builder_refusal_arms_the_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let refuse = |reason: &str| out(OutcomeClass::Refused, reason);
+    for reason in ["merged_pr", "triage"] {
+        let item = if reason == "merged_pr" { 70 } else { 71 };
+        let first = l.record(item, StepRole::Builder, &refuse(reason), SLOW, now);
+        assert_eq!((first.effect, first.cooling_until), (Effect::Reclassify, None), "{reason}");
+        let at = now + mins(1);
+        let second = l.record(item, StepRole::Builder, &refuse(reason), SLOW, at);
+        assert_eq!(second.effect, Effect::Reclassify, "{reason}");
+        let until = second
+            .cooling_until
+            .expect("second identical refusal cools");
+        assert_eq!((until - at).num_seconds(), 600, "{reason}");
+        assert!(
+            l.snapshot(at)
+                .is_cooling(item, StepRole::Builder, at + mins(9)),
+            "{reason}"
+        );
+        assert!(
+            !l.snapshot(at)
+                .is_cooling(item, StepRole::Builder, at + mins(11)),
+            "{reason}"
+        );
+        assert_eq!(l.cooling_cause(item, StepRole::Builder, at), Some(CooldownCause::Refused));
+    }
+    // A different reason in between resets the streak.
+    l.record(72, StepRole::Builder, &refuse("merged_pr"), SLOW, now);
+    l.record(72, StepRole::Builder, &refuse("open_pr"), SLOW, now);
+    assert_eq!(
+        l.record(72, StepRole::Builder, &refuse("merged_pr"), SLOW, now)
+            .cooling_until,
+        None
+    );
+}
+
+/// #14032: a standing admission refusal (`runtime_rejected`,
+/// `model_runtime_mismatch`, `admission_refused`) reaches the ledger through
+/// `step_end::ledger_reason` as `admission` and rides the state-refusal
+/// streak: the first only reclassifies, a repeat arms the refusal cooldown
+/// doubling to 24 h, and a different reason, another outcome or a verdict
+/// resets the streak.
+#[test]
+fn a_repeated_admission_refusal_arms_a_doubling_cooldown() {
+    let mut l = OutcomeLedger::default();
+    let now = t0();
+    let refuse = |reason: &str| out(OutcomeClass::Refused, reason);
+    let step = StepRole::Builder;
+    for spawn in [
+        "runtime_rejected",
+        "model_runtime_mismatch",
+        "admission_refused",
+    ] {
+        assert_eq!(
+            crate::step_dispatch::step_end::ledger_reason(spawn),
+            Some("admission"),
+            "{spawn}"
+        );
+    }
+    let admission = crate::step_dispatch::step_end::ledger_reason("runtime_rejected").unwrap();
+
+    let first = l.record(80, step, &refuse(admission), SLOW, now);
+    assert_eq!(
+        (first.effect, first.cooling_until),
+        (Effect::Reclassify, None),
+        "the first refusal only reclassifies"
+    );
+    let mut lengths = Vec::new();
+    for k in 1..12 {
+        let at = now + chrono::Duration::days(k);
+        let rec = l.record(80, step, &refuse(admission), SLOW, at);
+        assert_eq!(rec.effect, Effect::Reclassify);
+        lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
+    }
+    assert_eq!(&lengths[..3], &[600, 1200, 2400], "10 min, doubling");
+    assert!(lengths.iter().all(|s| *s <= 24 * 3600), "{lengths:?}");
+    assert_eq!(*lengths.last().unwrap(), 24 * 3600, "capped at 24 h");
+    assert_eq!(
+        l.cooling_cause(80, step, now + chrono::Duration::days(11)),
+        Some(CooldownCause::Refused)
+    );
+
+    // A different reason in between resets the streak (`pool_gate` would
+    // also clear it, but arms its own window, so a state refusal is the
+    // clean probe).
+    l.record(81, step, &refuse(admission), SLOW, now);
+    l.record(81, step, &refuse("open_pr"), SLOW, now);
+    assert_eq!(
+        l.record(81, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
+
+    // So does any other outcome on the pair, a verdict included.
+    l.record(82, step, &refuse(admission), SLOW, now);
+    l.record(82, step, &out(OutcomeClass::Verdict, "rejected"), SLOW, now);
+    assert_eq!(
+        l.record(82, step, &refuse(admission), SLOW, now)
+            .cooling_until,
+        None
+    );
 }
 
 /// #11909: the reaper prunes every tick. A prune just before each draw must

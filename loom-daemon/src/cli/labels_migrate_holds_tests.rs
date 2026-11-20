@@ -2,7 +2,7 @@
 //! every call, so "no write" and "never touched `loom:pr`" are assertable.
 
 use super::*;
-use loom_daemon::champion_hold::{CRITICAL_FILE_HOLD_MARKER, MERGE_RISK_HOLD_MARKER};
+use crate::champion_hold::{CRITICAL_FILE_HOLD_MARKER, MERGE_RISK_HOLD_MARKER};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -168,7 +168,7 @@ fn a_held_pr_keeps_loom_pr_through_the_migration() {
     assert!(labels.contains("loom:pr"), "{labels:?}");
     assert!(labels.contains("loom:blocked"), "{labels:?}");
     assert!(!labels.contains("loom:operator"), "{labels:?}");
-    assert!(loom_daemon::champion_hold::is_champion_hold(
+    assert!(crate::champion_hold::is_champion_hold(
         &labels.iter().cloned().collect::<Vec<_>>(),
         &[hold]
     ));
@@ -310,7 +310,7 @@ fn a_held_pr_out_at_doctor_is_parked_and_stays_doctor_work() {
     );
     let labels: Vec<String> = fake.labels(9).into_iter().collect();
     assert!(labels.iter().any(|l| l == "loom:changes-requested"));
-    assert!(loom_daemon::champion_hold::doctor_may_work(&labels, &[hold]));
+    assert!(crate::champion_hold::doctor_may_work(&labels, &[hold]));
 }
 
 /// The Judge's other live shape: `loom:operator-only` and
@@ -378,7 +378,7 @@ fn a_held_pr_at_review_is_parked_and_stays_judge_work() {
         ]
     );
     let labels: Vec<String> = fake.labels(11).into_iter().collect();
-    assert!(loom_daemon::champion_hold::judge_may_review(&labels, &[hold]));
+    assert!(crate::champion_hold::judge_may_review(&labels, &[hold]));
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn a_capped_hold_routed_to_a_human_keeps_its_operator_label() {
     // human, not the pre-#11861 hold label: the migration must not take it off.
     let rec = format!(
         "{}\nreview, close or release",
-        loom_daemon::champion_hold::CAPPED_HOLD_RECOMMENDATION_MARKER
+        crate::champion_hold::CAPPED_HOLD_RECOMMENDATION_MARKER
     );
     let labels = ["loom:changes-requested", "loom:blocked", "loom:operator"];
     let fake = Fake::default().item(9, &labels, true, &[&mr_hold(), &rec]);
@@ -400,7 +400,7 @@ fn a_capped_hold_routed_to_a_human_keeps_its_operator_label() {
 }
 
 fn noop_notice(released: bool) -> Vec<String> {
-    use loom_daemon::sweep_registry::{
+    use crate::sweep_registry::{
         NOOP_HOLD_APPLIED_COMMENT_MARKER, NOOP_HOLD_COMMENT_MARKER,
         NOOP_HOLD_RELEASED_COMMENT_MARKER,
     };

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::script_helpers;
+use crate::script_helpers;
 
 #[path = "curation_complete.rs"]
 mod curation_complete;
@@ -34,25 +34,19 @@ mod record_rework;
 mod telemetry_export;
 #[path = "telemetry_fixture.rs"]
 mod telemetry_fixture;
+#[path = "telemetry_hold_transitions.rs"]
+pub(crate) mod telemetry_hold_transitions;
 #[path = "telemetry_join.rs"]
 mod telemetry_join;
-#[path = "telemetry_journal_cli.rs"]
-mod telemetry_journal_cli;
 #[path = "telemetry_live.rs"]
 mod telemetry_live;
 #[path = "telemetry_overhead.rs"]
 mod telemetry_overhead;
-#[path = "telemetry_replay.rs"]
-mod telemetry_replay;
 
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
     /// Journal one Curator completion before applying curated labels.
     CurationComplete(curation_complete::CurationCompleteArgs),
-    /// J2 telemetry journal shadow streams (#11348): `append` one record
-    /// after a legacy write, `verify` the concern against the legacy stores.
-    #[command(name = "telemetry")]
-    TelemetryJournal(telemetry_journal_cli::TelemetryJournalArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
@@ -66,8 +60,11 @@ pub(crate) enum TelemetryCommand {
     /// file, send one `host.export` probe, and read it back requiring
     /// `host.id == harness.ingest.principal == <host>`.
     TelemetryJoin(telemetry_join::JoinArgs),
-    /// Print fleet state at an instant from SigNoz, as a daemon then could have known it.
-    TelemetryReplay(telemetry_replay::ReplayArgs),
+    /// Query `hold.transition` records from the telemetry store for a date
+    /// range across repos (Issue #14094): per-repo counts with a Champion
+    /// merge-risk self-release confidence breakout, through the
+    /// telemetry-reader. Fails closed on an unset or unreachable reader.
+    TelemetryHoldTransitions(telemetry_hold_transitions::HoldTransitionsArgs),
     /// Report transport capabilities of this installed binary without reading configuration.
     TelemetryCapabilities {
         /// Fail when this artifact cannot export OTLP.
@@ -178,13 +175,12 @@ impl TelemetryCommand {
     pub(crate) async fn run(self) -> Result<()> {
         match self {
             TelemetryCommand::CurationComplete(args) => args.run(),
-            TelemetryCommand::TelemetryJournal(args) => args.run(),
             TelemetryCommand::TelemetryLiveCanary(args) => args.run(),
             TelemetryCommand::TelemetryFixture(args) => args.run(),
             TelemetryCommand::TelemetryOverhead(args) => args.run(),
             TelemetryCommand::TelemetryExport(args) => args.run().await,
             TelemetryCommand::TelemetryJoin(args) => args.run().await,
-            TelemetryCommand::TelemetryReplay(args) => args.run(),
+            TelemetryCommand::TelemetryHoldTransitions(args) => args.run(),
             // The OTLP exporter is compiled unconditionally (#10700), so
             // `otlp` is always `true` and `--require-otlp` always passes. The
             // flag stays so build/roll probes (`daemon-build.sh`,

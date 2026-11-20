@@ -1159,8 +1159,7 @@ echo x > \"\$tmp/out.txt\"" "$WT_REPO"
 # The ONE chained exception to that ambiguity rule — a second assignment of
 # the exact `NAME=$(cd "$NAME" && pwd -P)` / `NAME=$(realpath "$NAME")`
 # canonicalization form (#7986) — is covered in its own suite alongside the
-# identical rm-scope half (this file is frozen at its
-# scripts/file-size-baseline.txt size, so new cases go to a sibling):
+# identical rm-scope half:
 # tests/hooks/test-guard-destructive-mktemp-canon.sh.
 
 # A '..' traversal in the suffix after a proven-safe mktemp var fails closed
@@ -2471,6 +2470,31 @@ assert_deny "write-confinement (#6968 control): cp with an embedded-apostrophe s
 
 rm -rf "$WT5674_REPO"
 
+# --- #12082: a `cd` inside a subshell / brace group / pushd must be tracked, so
+# a RELATIVE write after it that lands outside the repo is not denied as a
+# main-checkout write. cwd is the main checkout throughout.
+OUT12082="/tmp/loom-test-$$-12082"
+assert_allow "write-confinement (#12082): absolute out-of-repo target at main-checkout cwd allows" \
+    "echo x > $OUT12082/a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): ( cd /tmp/x && echo > rel ) subshell allows" \
+    "( cd $OUT12082 && echo x > a.txt )" "$WT_REPO"
+assert_allow "write-confinement (#12082): (cd /tmp/x && echo > rel) with no inner spaces allows" \
+    "(cd $OUT12082 && echo x > a.txt)" "$WT_REPO"
+assert_allow "write-confinement (#12082): { cd /tmp/x; echo > rel; } brace group allows" \
+    "{ cd $OUT12082; echo x > a.txt; }" "$WT_REPO"
+assert_allow "write-confinement (#12082): pushd /tmp/x && echo > rel allows" \
+    "pushd $OUT12082 >/dev/null && echo x > a.txt" "$WT_REPO"
+assert_allow "write-confinement (#12082): cd persists after a closed subshell group" \
+    "cd $OUT12082 && (echo y > b.txt); echo x > a.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a subshell cd does not leak past its closing paren" \
+    "(cd $OUT12082 && echo x > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): a paren inside a quoted string does not close the subshell" \
+    "(cd $OUT12082; echo \")\" > a.txt); echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): popd restores the pre-pushd cwd" \
+    "pushd $OUT12082 >/dev/null; popd >/dev/null; echo x > b.txt" "$WT_REPO"
+assert_deny "write-confinement (#12082 control): main-checkout target still denies" \
+    "echo hi > $WT_REPO/zz.txt" "$WT_REPO"
+
 # --- #12285: literal loop variable under a literal `cd /tmp/<dir>` -----------
 assert_allow "write-confinement (#12285): for-loop var write under cd /tmp/probe -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > "$name.gds"; done' "$WT_REPO"
@@ -2482,6 +2506,11 @@ assert_allow "write-confinement (#12285): unquoted target -> allow" \
     'cd /tmp/probe && for name in a b; do echo x > $name.gds; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): absolute loop value stays denied" \
     "cd /tmp/probe && for n in $WT_REPO/x; do echo x > \"\$n.gds\"; done" "$WT_REPO"
+# #13773: absolute loop value resolving OUTSIDE the checkout, used as a write target
+assert_deny "write-confinement (#13773): absolute loop value outside checkout stays denied" \
+    'cd /tmp/p && for n in /abs; do echo x > "$n.gds"; done' "$WT_REPO"
+assert_deny "write-confinement (#13773): absolute /tmp/outside loop value stays denied" \
+    'cd /tmp/p && for n in /tmp/outside/a; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with .. stays denied" \
     'cd /tmp/probe && for n in ../x; do echo x > "$n.gds"; done' "$WT_REPO"
 assert_deny "write-confinement (#12285 control): loop value with / stays denied" \
@@ -2533,6 +2562,107 @@ EOF" "$WT_REPO"
 assert_deny "write-confinement (#12596 control): plain write into the main checkout still denies" \
     "echo x > $WT_REPO/defaults/hooks/f.sh" "$WT_REPO"
 rm -rf "${_C12596_OUT%/*/*}"
+
+# --- #13180: Champion pin / PR-facts files are the one write the main
+# checkout's .git admits while a managed worktree exists. Exactly those two
+# basenames, direct children of the git common dir; nothing else under .git.
+_C13180_CD='$(git rev-parse --git-common-dir)'
+assert_allow "write-confinement (#13180): pin write via \$(git rev-parse --git-common-dir) allows" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): same, from inside the linked worktree" \
+    "printf 'sha 1\\n' > \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+assert_allow "write-confinement (#13180): facts write via \$(git rev-parse --git-common-dir) allows" \
+    "jq . x > \"$_C13180_CD/loom-champion-facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): rm of the pin via \$(git rev-parse --git-common-dir) allows" \
+    "rm -f \"$_C13180_CD/loom-champion-pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13180): literal absolute pin path allows" \
+    "echo x > $WT_REPO_LINKED/.git/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): .git/config via git-common-dir denies" \
+    "printf a > \"$_C13180_CD/config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): sibling file in git common dir denies" \
+    "printf a > \"$_C13180_CD/other-file\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): non-numeric PR suffix denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-\$N\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): traversal after the pin name denies" \
+    "printf a > \"$_C13180_CD/loom-champion-pin-pr-1/../config\"" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal .git/config denies" \
+    "echo x > $WT_REPO_LINKED/.git/config" "$WT_REPO_LINKED"
+assert_deny "write-confinement (#13180 control): literal pin name at checkout root denies" \
+    "echo x > $WT_REPO_LINKED/loom-champion-pin-pr-42" "$WT_REPO_LINKED"
+
+# --- #13200: the pin / facts files moved out of .git into
+# /tmp/loom-champion/<key>/ so a guard that refuses .git writes
+# (Repo Skills') never sees one. The docs' exact spelling: the dir in its own
+# plain assignment, then a write to "/tmp/loom-champion/$CHAMPION_KEY/pin-pr-<digits>".
+_C13200_DEF='CHAMPION_KEY=$(git rev-parse --path-format=absolute --git-common-dir | sha256sum | cut -c1-12)'
+assert_allow "write-confinement (#13200): mkdir of the temp champion dir allows" \
+    "$_C13200_DEF; mkdir -p -m 700 /tmp/loom-champion \"/tmp/loom-champion/\$CHAMPION_KEY\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): pin write under the temp dir allows" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): facts write under the temp dir allows" \
+    "$_C13200_DEF; jq . x > \"/tmp/loom-champion/\$CHAMPION_KEY/facts-pr-42.json\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): rm of the pin under the temp dir allows" \
+    "$_C13200_DEF; rm -f \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED"
+assert_allow "write-confinement (#13200): same, from inside the linked worktree" \
+    "$_C13200_DEF; printf 'sha 1\\n' > \"/tmp/loom-champion/\$CHAMPION_KEY/pin-pr-42\"" "$WT_REPO_LINKED/.loom/worktrees/issue-1"
+
+# --- #13608: sky130-temp-por#191 downstream reproducer cases ----------------
+# Six cases from 2AMLogic/sky130-temp-por docs/guard-repro/
+# test-tmp-cwd-relative-writes.sh, pinned here so that script can be retired.
+# Each runs from the linked-worktree cwd and the main-checkout cwd. Verdicts
+# were probed on origin/main @ 25e302039. Names map 1:1 to the downstream cases.
+for _c13608 in "linked:$WT_REPO_LINKED" "main:$WT_REPO"; do
+    _l13608="${_c13608%%:*}"; _d13608="${_c13608#*:}"
+    # unknown-arg-var: deny (unexpanded $1 in the filename root).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 unknown-arg-var, cwd=$_l13608): unexpanded \$1.gds denies" \
+        'cd /tmp/p && echo x > "$1.gds"' "$_d13608"
+    # traversal-literal: deny (unexpanded /$n/../a).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 traversal-literal, cwd=$_l13608): '/\$n/../a' denies" \
+        'cd /tmp/p && for n in a; do echo x > "/$n/../a"; done' "$_d13608"
+    # fn-unknown-arg: deny (function arg $1 is unresolvable).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 fn-unknown-arg, cwd=$_l13608): function \$1 target denies" \
+        'cd /tmp/p && g(){ echo x > "$1.gds"; }; g a' "$_d13608"
+    # no-cwd-var-root: deny (loop var as the target with no known cwd).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 no-cwd-var-root, cwd=$_l13608): loop \$n.gds without a cd denies" \
+        'for n in a; do echo x > "$n.gds"; done' "$_d13608"
+    # unset-cwd-var: deny (unexpanded variable as first real path component).
+    assert_deny "write-confinement (#13608, sky130-temp-por#191 unset-cwd-var, cwd=$_l13608): 'cd \$D && echo x > a' denies" \
+        'cd $D && echo x > a' "$_d13608"
+    # loop-literal-tmp-cwd: ALLOW today. This is a characterization of current
+    # behaviour, not an endorsement: both writes land under the literal
+    # /tmp/klt_probe cwd and $name is only a loop variable in the filename.
+    # If a guard change flips this, the test must fail and force a decision.
+    assert_allow "write-confinement (#13608, sky130-temp-por#191 loop-literal-tmp-cwd, cwd=$_l13608): literal /tmp cwd + loop-var filenames allows (characterization)" \
+        'mkdir -p /tmp/klt_probe && cd /tmp/klt_probe && for name in a b; do echo x > "$name.gds"; echo y > "$name.json"; done' "$_d13608"
+done
+
+# --- Process substitution `>(cmd)` is not an attached redirect (#13814) ---
+# The attached-redirect extraction treated `>(cmd` as `>` + a file named
+# `(cmd`, resolving a phantom `<repo>/(cmd` write target (ported fix from
+# rjwalters/repo#786). The substitution BODY must still be judged, so a nested
+# write into the main checkout keeps denying.
+assert_allow "write-confinement (#13814): ls >(echo) is not a phantom write target" \
+    "ls >(echo)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) is not a phantom write target" \
+    "ls >(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): nested write inside >(...) into the managed worktree allows" \
+    "ls >(echo x > $WT_DIR/f)" "$WT_REPO"
+assert_allow "write-confinement (#13814): 2>(cmd) is not a phantom write target" \
+    "ls 2>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): &>(cmd) is not a phantom write target" \
+    "ls &>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): >>(cmd) is not a phantom write target" \
+    "ls >>(true)" "$WT_REPO"
+assert_allow "write-confinement (#13814): ls >(true) >/dev/null allows" \
+    "ls >(true) >/dev/null" "$WT_REPO"
+assert_deny_reason_matches "write-confinement (#13814): nested >(tee MAIN/x) still denies (body stays scanned)" \
+    "echo x >(tee $WT_REPO/evil.sh)" 'worktree-isolation bypass' "$WT_REPO"
+assert_deny "write-confinement (#13814): nested >(echo > MAIN/x) still denies" \
+    "ls >(echo x > $WT_REPO/evil.sh)" "$WT_REPO"
+assert_deny "write-confinement (#13814 control): plain > MAIN path still denies" \
+    "echo x > $WT_REPO/blocked.txt" "$WT_REPO"
+assert_allow "write-confinement (#13814 control): read-only <(cmd) allows" \
+    "cat <(printf x)" "$WT_REPO"
 
 rm -rf "$HOME_FIXTURE_OUTSIDE"
 rm -rf "$WT_REPO" "$WT_REPO_NOWT" "$WT_REPO_OFF" "$WT_REPO_LINKED"

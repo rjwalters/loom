@@ -239,7 +239,9 @@ fn collisions_and_claim_lock_contention_get_their_own_reasons() {
     let mut report = TickReport::default();
     let collision: Result<bool> = Err(CollisionDispatchError {
         issue: 1,
-        source: CollisionSource::PeerClaim,
+        source: CollisionSource::ForgeLabel {
+            labels: vec!["loom:building".to_string()],
+        },
     }
     .into());
     let lock: Result<bool> = Err(ClaimLockDispatchError {
@@ -274,7 +276,9 @@ fn every_counted_dispatch_error_notes_its_kind() {
         (
             Err(CollisionDispatchError {
                 issue: 2,
-                source: CollisionSource::PeerClaim,
+                source: CollisionSource::ForgeLabel {
+                    labels: vec!["loom:building".to_string()],
+                },
             }
             .into()),
             K::ClaimCollision,
@@ -412,7 +416,7 @@ fn admission_span_carries_loom_repo_when_the_workspace_resolves() {
     let mut repo_refs = HashMap::new();
     repo_refs.insert(
         0,
-        crate::telemetry::queue_snapshot::QueueRepoRef {
+        crate::telemetry::queue_repo::QueueRepoRef {
             repo: "acme/widgets".to_string(),
             visibility: crate::telemetry::RepoVisibility::Public,
         },
@@ -443,7 +447,7 @@ fn a_pr_open_admission_in_a_locked_repo_carries_the_lockout_weight() {
     let mut repo_refs = HashMap::new();
     repo_refs.insert(
         0,
-        crate::telemetry::queue_snapshot::QueueRepoRef {
+        crate::telemetry::queue_repo::QueueRepoRef {
             repo: "acme/widgets".to_string(),
             visibility: crate::telemetry::RepoVisibility::Public,
         },

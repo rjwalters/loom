@@ -27,6 +27,7 @@
 //! (`forge-probe::<group>::<name>`); a handler absent for slice 1 leaves
 //! its row `unknown` with the reason recorded.
 
+use crate::script_helpers::now_epoch_secs;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -82,7 +83,7 @@ impl CaseResult {
             outcome: OUTCOME_UNKNOWN.into(),
             server_version: server_version.to_string(),
             actor: None,
-            at: now_secs(),
+            at: now_epoch_secs(),
             expected: String::new(),
             observed: String::new(),
             notes: vec![why.to_string()],
@@ -346,7 +347,7 @@ pub fn run(cfg: &RunnerConfig, http: &dyn ProbeHttp) -> Result<Vec<CaseResult>> 
                 outcome: OUTCOME_UNKNOWN.into(),
                 server_version: server_version.clone(),
                 actor: None,
-                at: now_secs(),
+                at: now_epoch_secs(),
                 expected: "a definitive answer".into(),
                 observed: o.to_string(),
                 notes: vec!["transport/protocol fault — recorded, not retried".into()],
@@ -375,7 +376,7 @@ fn execute_case(
             outcome: OUTCOME_UNKNOWN.into(),
             server_version: server_version.to_string(),
             actor: None,
-            at: now_secs(),
+            at: now_epoch_secs(),
             expected: "a live write".into(),
             observed: "refused: live-write not opted in (--live-write)".into(),
             notes: vec!["safety: read-only by default (#9789)".into()],
@@ -396,7 +397,7 @@ fn execute_case(
             outcome: OUTCOME_UNKNOWN.into(),
             server_version: server_version.to_string(),
             actor: None,
-            at: now_secs(),
+            at: now_epoch_secs(),
             expected: "a recorded pass/fail/unsupported".into(),
             observed: String::new(),
             notes: vec!["case handler not implemented — slice 2 (#9789 matrix)".into()],
@@ -447,7 +448,7 @@ fn issue_create(
         outcome,
         server_version: server_version.to_string(),
         actor,
-        at: now_secs(),
+        at: now_epoch_secs(),
         expected: format!("HTTP 2xx with issue.number, read back with matching title and body (disposable: {title})"),
         observed,
         notes: number
@@ -514,7 +515,7 @@ fn issue_comment_readback(
             operation: view.id.clone(),
             why: "issue-create did not yield a number to comment on".into(),
         })?;
-    let marker = format!("probe-{}", now_secs());
+    let marker = format!("probe-{}", now_epoch_secs());
     let (code, resp) = http
         .request(
             "POST",
@@ -575,7 +576,7 @@ fn issue_comment_readback(
         outcome,
         server_version: server_version.to_string(),
         actor,
-        at: now_secs(),
+        at: now_epoch_secs(),
         expected: format!("comment read-back contains {marker:?}"),
         observed,
         notes: vec![format!("disposable issue number: {number}")],
@@ -674,13 +675,6 @@ fn redact_secrets(s: &str, secrets: &[&str]) -> String {
 /// Redact the run's writer/readonly tokens from a transport error.
 fn scrub(cfg: &RunnerConfig, s: &str) -> String {
     redact_secrets(s, &secrets_of(cfg))
-}
-
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// The verdict: exit nonzero when any required row is not a clean pass —

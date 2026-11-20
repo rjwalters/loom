@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::forge_identity::{FleetLogins, Roster};
 
 fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-10-11T12:00:00Z")
@@ -81,7 +81,7 @@ fn issue_leases_and_pr_leases_never_read_as_each_other() {
     // The issue-path readers match `<!-- loom:lease host=`; a PR lease must
     // not, and an issue lease must not read as a PR lease.
     let pr = who(Role::Doctor, "s").lease_marker();
-    assert!(!pr.starts_with(loom_daemon::sweep_registry::LEASE_MARKER_PREFIX));
+    assert!(!pr.starts_with(crate::sweep_registry::LEASE_MARKER_PREFIX));
     assert!(!pr.starts_with("<!-- loom:lease-yield host="));
     assert_eq!(parse_record("<!-- loom:lease host=h sweep=s -->"), None);
 }
@@ -514,6 +514,15 @@ until mkdir "$D/lock" 2>/dev/null; do sleep 0.01; done
 trap 'rmdir "$D/lock"' EXIT
 case " $* " in
   *" POST "*)
+    [ -f "$D/fail_post_ratelimit" ] && {{
+      echo 'gh: API rate limit exceeded for installation ID 151241341 (HTTP 403)' >&2
+      exit 1
+    }}
+    [ -f "$D/fail_post_secondary" ] && {{
+      echo 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' >&2
+      exit 1
+    }}
+    [ -f "$D/fail_post_auth" ] && {{ echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1; }}
     prev=""; body=""
     for a in "$@"; do [ "$prev" = "-f" ] && body="${{a#body=}}"; prev="$a"; done
     first="${{body%%$'\n'*}}"
@@ -521,6 +530,13 @@ case " $* " in
     printf '{{"id":%s,"updated_at":"%s","body":"%s",%s}}\n' "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$first" '{AUTHOR}' >> "$D/rows"
     echo "$first" >> "$D/posted"
     echo "$id" ;;
+  *" DELETE "*)
+    echo "$*" >> "$D/deleted"
+    [ -f "$D/fail_delete" ] && {{ echo 'HTTP 404' >&2; exit 1; }}
+    cid=""
+    for a in "$@"; do case "$a" in */issues/comments/*) cid="${{a##*/}}" ;; esac; done
+    grep -v "^{{\"id\":$cid," "$D/rows" > "$D/rows.tmp" || true
+    mv "$D/rows.tmp" "$D/rows" ;;
   *" PATCH "*)
     echo "$*" >> "$D/patched"
     [ -f "$D/fail_patch" ] && {{ echo 'HTTP 403' >&2; exit 1; }}
@@ -647,6 +663,137 @@ fn claim_refuses_without_writing_when_the_list_is_unreadable() {
     assert!(posted(dir.path()).is_empty());
 }
 
+// ---- a writer rate limit is named, not misreported (#13746) -----------------
+
+/// The context with the write target refused for `why` (the write-scope
+/// probe's answer, as `with_context` builds it).
+fn ctx_probe_denied(dir: &Path, me: Identity, why: &str) -> Ctx {
+    let mut c = ctx(dir, me);
+    c.gh.write_repo = Err(why.to_string());
+    c
+}
+
+#[test]
+fn a_ratelimited_post_is_a_writer_refusal_and_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_post_ratelimit"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    assert_eq!(c.claim(), EXIT_UNVERIFIED, "the exit contract is unchanged");
+    assert!(posted(dir.path()).is_empty(), "no claim taken");
+    // The POST's failure classifies, with the bounded facts.
+    let err = c.gh.post_detail(77, "x").unwrap_err();
+    let limited = match err {
+        PostFailure::WriterLimited(l) => l,
+        PostFailure::Other(why) => panic!("not classified: {why}"),
+    };
+    assert_eq!(limited.stage, crate::writer_limit::WriterStage::LeasePost);
+    assert_eq!(limited.status, Some(403));
+    assert_eq!(limited.installation.as_deref(), Some("151241341"));
+    let line = limited.stderr_line();
+    assert!(line.contains("stage=comment_post"), "{line}");
+    assert!(line.contains("status=403"), "{line}");
+    assert!(line.contains("resource=core"), "{line}");
+    assert!(line.ends_with("— no claim taken; stand down"), "{line}");
+}
+
+#[test]
+fn a_secondary_or_auth_post_refusal_keeps_its_own_diagnostic() {
+    for fixture in ["fail_post_secondary", "fail_post_auth"] {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        fs::write(dir.path().join(fixture), "").unwrap();
+        let c = ctx(dir.path(), who(Role::Judge, "s"));
+        assert_eq!(c.claim(), EXIT_UNVERIFIED);
+        assert!(posted(dir.path()).is_empty(), "{fixture}: no claim taken");
+        match c.gh.post_detail(77, "x") {
+            Err(PostFailure::Other(why)) => {
+                assert!(!why.contains("writer rate-limited"), "{fixture}: {why}");
+                assert!(!why.is_empty(), "{fixture} names its cause");
+            }
+            Err(PostFailure::WriterLimited(_)) => panic!("{fixture} must not classify"),
+            Ok(_) => panic!("{fixture} must fail"),
+        }
+    }
+}
+
+#[test]
+fn a_ratelimited_write_scope_probe_is_named_at_the_probe_stage() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let why = "the credential in use cannot write to acme/widgets (gh api exited with 1: \
+               gh: API rate limit exceeded for installation ID 151241341 (HTTP 403))";
+    let c = ctx_probe_denied(dir.path(), who(Role::Judge, "s"), why);
+    assert_eq!(c.claim(), EXIT_UNVERIFIED, "the exit contract is unchanged");
+    assert!(posted(dir.path()).is_empty());
+    let limited = crate::writer_limit::WriterLimited::classify(
+        crate::writer_limit::WriterStage::PermissionProbe,
+        None,
+        why,
+    )
+    .unwrap();
+    assert_eq!(limited.stage, crate::writer_limit::WriterStage::PermissionProbe);
+    assert_eq!(limited.status, Some(403));
+}
+
+#[test]
+fn an_ordinary_permission_denial_keeps_its_own_diagnostic() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let why = "the credential in use cannot write to acme/widgets (repository role `triage`)";
+    let c = ctx_probe_denied(dir.path(), who(Role::Judge, "s"), why);
+    assert_eq!(c.claim(), EXIT_UNVERIFIED);
+    assert!(posted(dir.path()).is_empty());
+    assert!(
+        crate::writer_limit::WriterLimited::classify(
+            crate::writer_limit::WriterStage::PermissionProbe,
+            None,
+            why,
+        )
+        .is_none(),
+        "an ordinary denial is not a writer rate limit"
+    );
+}
+
+// ---- the cause of an unreadable list is named (#13743) ---------------------
+
+#[test]
+fn a_nonzero_gh_exit_and_an_unrunnable_gh_give_distinct_reasons() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let mut c = ctx(dir.path(), who(Role::Judge, "s"));
+    let exited = c.gh.read_rows_why(77, &c.policy).unwrap_err();
+    assert!(exited.starts_with("gh exited "), "{exited}");
+    assert!(exited.ends_with("HTTP 502"), "{exited}");
+    c.gh.bin = dir.path().join("no-such-gh");
+    let unrunnable = c.gh.read_rows_why(77, &c.policy).unwrap_err();
+    assert_ne!(exited, unrunnable);
+    assert!(!unrunnable.starts_with("gh exited "), "{unrunnable}");
+}
+
+#[test]
+fn the_claim_stand_down_line_carries_the_cause_last() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail"), "").unwrap();
+    let c = ctx(dir.path(), who(Role::Judge, "s"));
+    let why = c.gh.read_rows_retrying_why(77, &c.policy).unwrap_err();
+    let line = unreadable_claim_line(Some(&why));
+    assert!(line.contains("nothing written — stand down: gh exited "), "{line}");
+    assert!(line.ends_with("HTTP 502"), "{line}");
+    assert!(unreadable_claim_line(None).ends_with("stand down"));
+}
+
+#[test]
+fn a_failure_reason_is_bounded_and_free_of_control_characters() {
+    let r = bounded_reason(&format!("  a\x1b[31m\tb{}\n", "x".repeat(500)));
+    assert!(!r.chars().any(char::is_control), "{r:?}");
+    assert_eq!(r.chars().count(), REASON_MAX_CHARS + 1, "capped plus the ellipsis");
+    assert!(r.ends_with('…'));
+    assert_eq!(bounded_reason("HTTP 502\n"), "HTTP 502");
+}
+
 // ---- a read-back failure after the claim write (#12252) -------------------
 
 /// The step engine's Judge pre-claim identity (`--step judge`).
@@ -768,10 +915,83 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     fake_gh(dir.path());
     let a = who(Role::Doctor, "sweep-a");
     fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-    assert_eq!(ctx(dir.path(), a.clone()).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains("repos/acme/widgets/issues/comments/100"), "{patched}");
     assert!(patched.contains(&a.released_marker()), "{patched}");
+}
+
+/// #14392: a second release, after the verdict step already released, patches
+/// nothing, keeps the exit code, and is worded "already released" rather than
+/// "released 0"; with no own row at all the plain zero count is kept.
+#[test]
+fn a_second_release_reports_already_released_not_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let a = who(Role::Doctor, "sweep-a");
+    fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+
+    // The row now carries the released marker; release again.
+    fs::remove_file(dir.path().join("patched")).unwrap();
+    fs::write(dir.path().join("rows"), row_at(100, Utc::now(), &a.released_marker())).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty(), "an already-released row is not rewritten");
+
+    assert_eq!(
+        release_summary("released", 0, 1, 1),
+        "already released (1 lease comment(s)); stopped 1 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("released", 0, 0, 1),
+        "released 0 lease comment(s); stopped 1 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("released", 1, 2, 0),
+        "released 1 lease comment(s); stopped 0 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("reaped", 0, 0, 0),
+        "reaped 0 lease comment(s); stopped 0 renewer(s)"
+    );
+}
+
+/// #13132: a release missing the claim's identity names the claimant and
+/// exits nonzero, leaving the lease untouched; the right identity releases.
+#[test]
+fn a_release_under_the_wrong_identity_names_the_claimant_and_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let claimant = who(Role::Doctor, "sweep-pid-1");
+    fs::write(dir.path().join("rows"), live_row(100, &claimant)).unwrap();
+    let wrong = who(Role::Doctor, "pr-lease-unknown");
+    assert_eq!(ctx(dir.path(), wrong).release(None, None, None), EXIT_MISMATCH);
+    assert!(patched(dir.path()).is_empty(), "the lease is untouched");
+    assert_eq!(ctx(dir.path(), claimant).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+}
+
+#[test]
+fn a_release_with_no_matching_same_host_lease_of_the_role_still_exits_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let me = who(Role::Doctor, "sweep-b");
+    // nothing at all
+    assert_eq!(ctx(dir.path(), me.clone()).release(None, None, None), EXIT_HELD);
+    // another host's lease, another role's lease, an expired lease
+    let mut other_host = who(Role::Doctor, "sweep-a");
+    other_host.host = "elsewhere".into();
+    let rows = live_row(100, &other_host)
+        + &live_row(101, &who(Role::Judge, "sweep-j"))
+        + &row_at(
+            102,
+            Utc::now() - chrono::Duration::days(1),
+            &who(Role::Doctor, "old").lease_marker(),
+        );
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), me).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty());
 }
 
 #[test]
@@ -793,7 +1013,7 @@ fn a_champion_release_records_its_step_outcome() {
         fake_gh(dir.path());
         let a = who(Role::Champion, "sweep-c");
         fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
-        assert_eq!(ctx(dir.path(), a.clone()).release(None, outcome), EXIT_HELD);
+        assert_eq!(ctx(dir.path(), a.clone()).release(None, outcome, None), EXIT_HELD);
         (a, fs::read_to_string(dir.path().join("patched")).unwrap())
     };
     let (a, patched) = release(Some("head-moved"));
@@ -806,6 +1026,30 @@ fn a_champion_release_records_its_step_outcome() {
     assert!(patched.contains(&a.released_marker_with(" outcome=ab--")), "{patched}");
 }
 
+/// #12715: a requeued or skipped Champion release names the gate it stopped
+/// at; a stop that names none is `unspecified`, never a guess.
+#[test]
+fn a_champion_stop_release_records_its_gate() {
+    let release = |outcome: &str, reason: Option<&str>| {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        let a = who(Role::Champion, "sweep-c");
+        fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
+        assert_eq!(ctx(dir.path(), a.clone()).release(None, Some(outcome), reason), EXIT_HELD);
+        (a, fs::read_to_string(dir.path().join("patched")).unwrap())
+    };
+    for (outcome, reason, want) in [
+        ("skipped", Some("facts_unread"), " outcome=skipped reason=facts_unread"),
+        ("requeued", Some("merge_rc7"), " outcome=requeued reason=merge_rc7"),
+        ("requeued", None, " outcome=requeued reason=unspecified"),
+        ("skipped", Some("a b-->"), " outcome=skipped reason=ab--"),
+        ("held", Some("facts_unread"), " outcome=held"),
+    ] {
+        let (a, patched) = release(outcome, reason);
+        assert!(patched.contains(&a.released_marker_with(want)), "{want}: {patched}");
+    }
+}
+
 /// #12616: the daemon's reap of a dead Champion records `outcome=none`.
 #[test]
 fn a_reaped_champion_records_no_outcome() {
@@ -816,6 +1060,207 @@ fn a_reaped_champion_records_no_outcome() {
     assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
     let patched = fs::read_to_string(dir.path().join("patched")).unwrap();
     assert!(patched.contains(&dead.released_marker_with(" outcome=none")), "{patched}");
+}
+
+#[test]
+fn adjacent_workspaces_with_the_same_step_id_drain_only_their_own_journal() {
+    use crate::observability::pick_journal::{adopt, set_test_journal, step_path, take};
+    use crate::observability::step_verdict::{
+        self, refusals::RefusalStore, Context, Source, StepSource,
+    };
+
+    let writer = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+    let journals = TempDir::new().unwrap();
+    let sweep = "step-champion_merge-77-1795104600";
+    let path_for = |root: &Path| {
+        journals
+            .path()
+            .join(step_path(root, sweep).file_name().unwrap())
+    };
+    let writer_path = path_for(writer.path());
+    let other_path = path_for(other.path());
+
+    fake_gh(writer.path());
+    let owner = Identity::new(Role::Champion, "host-a1b2c3d4".into(), sweep.into(), None).unwrap();
+    fs::write(writer.path().join("rows"), live_row(100, &owner)).unwrap();
+    set_test_journal(Some(writer_path.clone()));
+    let result =
+        ctx(writer.path(), owner.clone()).release(None, Some("skipped"), Some("guard_refused"));
+    set_test_journal(None);
+    assert_eq!(result, EXIT_HELD);
+    let rows = fs::read_to_string(writer.path().join("rows")).unwrap();
+    assert!(
+        rows.contains(RELEASED_PREFIX) && rows.contains("outcome=skipped reason=guard_refused")
+    );
+    assert!(writer_path.is_file());
+
+    // A release from the other checkout can succeed without writing to the
+    // journal it inherited from the first checkout.
+    fake_gh(other.path());
+    fs::write(other.path().join("rows"), live_row(101, &owner)).unwrap();
+    let mut foreign = ctx(other.path(), owner);
+    foreign.gh.write_repo = Ok("acme/other".to_string());
+    let owned_entries = fs::read(&writer_path).unwrap();
+    set_test_journal(Some(writer_path.clone()));
+    let result = foreign.release(None, Some("skipped"), Some("facts_unread"));
+    set_test_journal(None);
+    assert_eq!(result, EXIT_HELD);
+    let rows = fs::read_to_string(other.path().join("rows")).unwrap();
+    assert!(rows.contains(RELEASED_PREFIX) && rows.contains("outcome=skipped reason=facts_unread"));
+    assert_eq!(fs::read(&writer_path).unwrap(), owned_entries);
+
+    let legacy_path = journals.path().join(format!("step-{sweep}.jsonl"));
+    fs::write(&legacy_path, &owned_entries).unwrap();
+
+    let step = Source::Step(StepSource {
+        sweep_id: sweep.to_string(),
+        step: StepRole::ChampionMerge,
+        item: 77,
+        log_text: None,
+        hold_auth_before: None,
+    });
+    let reason = |root: &Path, path, repo| {
+        adopt(root, path);
+        let journal = take(root).unwrap();
+        let cx = Context {
+            role: "champion",
+            repo,
+            host: "host-a1b2c3d4",
+            now: Utc::now(),
+        };
+        step_verdict::records_for(&cx, &step, Some(&journal), &mut RefusalStore::default())
+            .into_iter()
+            .next()
+            .unwrap()
+            .reason
+    };
+    assert_eq!(reason(other.path(), other_path, "acme/other").as_deref(), Some("unclassified"));
+    assert!(writer_path.is_file(), "the other workspace consumed the writer's journal");
+    assert_eq!(
+        reason(writer.path(), writer_path.clone(), "acme/widgets").as_deref(),
+        Some("guard_refused")
+    );
+    assert!(!writer_path.exists());
+    assert_eq!(fs::read(legacy_path).unwrap(), owned_entries);
+}
+
+/// #14639: the step's own successful release journals its typed outcome —
+/// the trusted fallback evidence the step's projection reads when its log
+/// has no `CHAMPION-STEP` line. A reap (not the step's own word) and a
+/// failed patch journal nothing, and neither does a release that records
+/// no typed outcome (another role, a merge).
+#[test]
+fn a_successful_release_journals_its_typed_outcome_and_a_reap_does_not() {
+    use crate::observability::pick_journal::{parse, set_test_journal, step_path, JournalEntry};
+    use StepRole::{ChampionMerge, ChampionPromote};
+
+    const SWEEP: &str = "step-champion_merge-77-1";
+    let journal_for = |dir: &Path| dir.join(step_path(dir, SWEEP).file_name().unwrap());
+    let journal_after =
+        |dir: &Path, holder: &Identity, run: &dyn Fn(Ctx) -> i32| -> Vec<JournalEntry> {
+            let journal = journal_for(dir);
+            set_test_journal(Some(journal.clone()));
+            let code = run(ctx(dir, holder.clone()));
+            set_test_journal(None);
+            assert_eq!(code, EXIT_HELD);
+            parse(&fs::read_to_string(journal).unwrap_or_default())
+        };
+    let stage = |rows_holder: &Identity| -> TempDir {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        fs::write(dir.path().join("rows"), live_row(100, rows_holder)).unwrap();
+        dir
+    };
+    let typed = |entries: &[JournalEntry]| -> Vec<(String, Option<String>)> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                JournalEntry::Released {
+                    outcome, reason, ..
+                } => Some((outcome.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // The typed release journals its outcome and its gate.
+    let me = Identity::new(Role::Champion, "host-a1b2c3d4".into(), SWEEP.into(), None).unwrap();
+    let entries = journal_after(stage(&me).path(), &me, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![("skipped".into(), Some("guard_refused".into()))]);
+
+    // No outcome passed: the release records `none`, and journals that.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, None, None));
+    assert_eq!(typed(&entries), vec![("none".into(), None)]);
+
+    // A merge records no typed outcome, so it journals nothing.
+    let entries = journal_after(stage(&me).path(), &me, &|c| c.release(None, Some("merged"), None));
+    assert_eq!(typed(&entries), vec![]);
+
+    // A Judge release journals nothing (its record is the backstop's, not a
+    // typed outcome).
+    let judge = who(Role::Judge, "sweep-j");
+    let entries = journal_after(stage(&judge).path(), &judge, &|c| {
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert_eq!(typed(&entries), vec![]);
+
+    // The lease still releases when its sweep, item or step does not belong
+    // to this merge journal. Only the telemetry attribution is withheld.
+    for (sweep, holder_step, caller_step) in [
+        ("step-champion_merge-77-2", Some(ChampionMerge), ChampionMerge),
+        (SWEEP, Some(ChampionPromote), ChampionMerge),
+        (SWEEP, Some(ChampionMerge), ChampionPromote),
+        (SWEEP, None, ChampionMerge),
+    ] {
+        let holder = Identity {
+            sweep: sweep.into(),
+            step: holder_step,
+            ..me.clone()
+        };
+        let caller = Identity {
+            step: Some(caller_step),
+            ..holder.clone()
+        };
+        let dir = stage(&holder);
+        let entries = journal_after(dir.path(), &caller, &|c| {
+            c.release(None, Some("skipped"), Some("guard_refused"))
+        });
+        assert!(fs::read_to_string(dir.path().join("patched"))
+            .unwrap()
+            .contains(RELEASED_PREFIX));
+        assert!(entries.is_empty(), "{sweep} {holder_step:?} {caller_step}: {entries:?}");
+    }
+
+    // Even when the journal and lease name the same sweep, its item must
+    // be the PR that was released.
+    let entries = journal_after(stage(&me).path(), &me, &|mut c| {
+        c.common.pr = 78;
+        c.release(None, Some("skipped"), Some("guard_refused"))
+    });
+    assert!(entries.is_empty());
+
+    // The daemon's reap of a dead step journals nothing.
+    let dir = stage(&me);
+    let journal = journal_for(dir.path());
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(ctx(dir.path(), me.clone()).reap("timeout"), EXIT_HELD);
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
+
+    // A patch that fails journals nothing.
+    let dir = stage(&me);
+    fs::write(dir.path().join("fail_patch"), "").unwrap();
+    let journal = journal_for(dir.path());
+    set_test_journal(Some(journal.clone()));
+    assert_eq!(
+        ctx(dir.path(), me).release(None, Some("skipped"), Some("guard_refused")),
+        EXIT_HELD
+    );
+    set_test_journal(None);
+    assert!(fs::read_to_string(journal).unwrap_or_default().is_empty());
 }
 
 // ---- a timed-out Judge, reaped by the daemon (#11931) ---------------------
@@ -870,7 +1315,7 @@ fn a_timed_out_judge_is_reaped_into_a_record_that_holds_the_pr_on_every_host() {
     claimant.lease_file = Some(lease_file.clone());
     assert_eq!(claimant.claim(), EXIT_HELD);
     // The won lease is listed for the daemon.
-    let listed = loom_daemon::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
+    let listed = crate::pr_lease_reap::parse_file(&fs::read_to_string(&lease_file).unwrap());
     assert_eq!(listed, vec![claimant.held()]);
     // The run times out; the role runner reaps on the claimant's behalf.
     assert_eq!(ctx(dir.path(), dead.clone()).reap("timeout"), EXIT_HELD);
@@ -902,7 +1347,7 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     let mut c = ctx(dir.path(), on("host-a", "run-1"));
     c.lease_file = Some(lease_file.clone());
     assert_eq!(c.claim(), EXIT_HELD);
-    assert_eq!(c.release(None, None), EXIT_HELD);
+    assert_eq!(c.release(None, None, None), EXIT_HELD);
     assert_eq!(fs::read_to_string(&lease_file).unwrap(), "", "nothing left to reap");
     // A reap after a verdict landed frees the lease and records nothing.
     let dir = TempDir::new().unwrap();
@@ -917,6 +1362,44 @@ fn release_drops_the_lease_from_the_runs_list_and_a_verdict_is_never_recorded() 
     assert_eq!(ctx(dir.path(), a.clone()).reap("timeout"), EXIT_HELD);
     assert!(patched(dir.path()).contains(&format!("body={}", a.released_marker())));
     assert!(!patched(dir.path()).contains("verdict=none"));
+}
+
+/// #13135: a pass a verdict gate refused is recorded as such, holds the PR
+/// only briefly, and a fresh Judge claims it once the cool-down is over.
+#[test]
+fn a_gate_refused_judge_pass_cools_down_briefly_then_a_fresh_judge_claims() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    waiting_pr(dir.path());
+    let a = on("host-a", "run-1");
+    assert_eq!(ctx(dir.path(), a.clone()).claim(), EXIT_HELD);
+    let released = ctx(dir.path(), a.clone()).release(Some("gate-refused:stale-read"), None, None);
+    assert_eq!(released, EXIT_HELD);
+    assert!(
+        patched(dir.path()).contains(&a.released_marker_with(&format!(
+            " head={HEAD} verdict=none labels=review-requested refused=stale-read"
+        ))),
+        "{}",
+        patched(dir.path())
+    );
+    let fields = format!(" head={HEAD} verdict=none labels=review-requested refused=stale-read");
+    let marker = on("host-a", "run-1").released_marker_with(&fields);
+    // Inside the cool-down: refused, and the message names the gate.
+    let recent = Utc::now() - chrono::Duration::minutes(5);
+    fs::write(dir.path().join("rows"), row_at(10, recent, &marker)).unwrap();
+    let c = ctx(dir.path(), on("host-b", "run-2"));
+    assert_eq!(c.claim(), backstop::EXIT_BACKSTOP);
+    let rows = c.gh.read_rows(77, &c.policy).unwrap();
+    let (until, why) = backstop::hold_with_reason(&rows, c.gh.pr_head(77), Utc::now()).unwrap();
+    assert_eq!(why.as_deref(), Some("stale-read"));
+    assert!(until > Utc::now());
+    // After it: a fresh Judge claims. Three such records never escalate.
+    let old = Utc::now() - chrono::Duration::minutes(30);
+    let rows = row_at(10, old, &marker)
+        + &row_at(11, old, &marker.replace("run-1", "run-0"))
+        + &row_at(12, old, &marker.replace("run-1", "run-9"));
+    fs::write(dir.path().join("rows"), rows).unwrap();
+    assert_eq!(ctx(dir.path(), on("host-c", "run-3")).claim(), EXIT_HELD);
 }
 
 /// Acceptance (#11931): a timed-out run counts toward the three Judge runs an
@@ -946,7 +1429,7 @@ fn a_timed_out_judge_run_counts_toward_the_three_per_day_cap() {
     let rows = c.gh.read_rows(77, &c.policy).unwrap();
     assert_eq!(
         backstop::hold(&rows, c.gh.pr_head(77), Utc::now()),
-        Some(first + chrono::Duration::hours(loom_daemon::judge_backstop::WINDOW_HOURS))
+        Some(first + chrono::Duration::hours(crate::judge_backstop::WINDOW_HOURS))
     );
 }
 
@@ -1123,7 +1606,7 @@ fn a_labelless_claim_renews_without_a_label_check() {
 /// #11898) agrees with this module's parser on every record shape.
 #[test]
 fn the_lib_role_lease_reader_agrees_with_parse_record() {
-    use loom_daemon::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
+    use crate::sweep_registry::step_lease_owner::{parse_role_lease, RoleLeaseKind};
     let me = Identity::new(Role::Champion, "host-a".into(), "s1".into(), None).unwrap();
     let peer = who(Role::Judge, "s2");
     let bodies = [
@@ -1177,7 +1660,7 @@ fn a_step_less_fence_and_release_find_the_sessions_stepped_lease() {
     assert_eq!(plain.step, Some(StepRole::ChampionMerge), "the default step differs");
     assert_eq!(ctx(dir.path(), plain.clone()).fence(), EXIT_HELD, "own lease, not a peer's");
     assert_eq!(ctx(dir.path(), plain.clone()).check(), EXIT_HELD);
-    assert_eq!(ctx(dir.path(), plain).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), plain).release(None, None, None), EXIT_HELD);
     // The released marker keeps the lease's own step.
     assert!(
         patched(dir.path()).contains(&claimed.released_marker()),
@@ -1214,7 +1697,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
     fake_gh(dir.path());
     let curator = Identity::new(Role::Curator, "host-a".into(), "run-1".into(), None).unwrap();
     fs::write(dir.path().join("rows"), live_row(100, &curator)).unwrap();
-    assert_eq!(ctx(dir.path(), curator.clone()).release(None, None), EXIT_HELD);
+    assert_eq!(ctx(dir.path(), curator.clone()).release(None, None, None), EXIT_HELD);
     assert!(patched(dir.path()).contains(&curator.released_marker()));
     assert!(!dir.path().join("pulled").exists(), "no PR read for a Curator lease");
 }
@@ -1225,7 +1708,7 @@ fn an_issue_scoped_release_reads_no_pr_head() {
 /// next lease is the holder on both.
 #[test]
 fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
-    use loom_daemon::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
+    use crate::sweep_registry::step_lease_owner::{earliest_live_holder, RoleLeaseRow};
     let stepped =
         Identity::new(Role::Judge, "host-a".into(), "run-1".into(), Some(StepRole::Judge)).unwrap();
     let plain = Identity::new(Role::Judge, "host-a".into(), "run-1".into(), None).unwrap();
@@ -1246,4 +1729,74 @@ fn the_lib_and_bin_lease_holders_agree_when_steps_differ() {
         })
         .collect();
     assert_eq!(earliest_live_holder(&lib_rows, "judge", now(), ttl()).as_deref(), Some("run-2"));
+}
+
+// ---- pruning dead records (#13245) --------------------------------------
+
+fn released(id: u64, age_min: i64, holder: &Identity) -> Row {
+    row(id, age_min, format!("{}\nprose", holder.released_marker()))
+}
+
+#[test]
+fn prune_keeps_live_leases_peers_and_the_newest_dead() {
+    let me = who(Role::Doctor, "s-me");
+    let mut peer = who(Role::Doctor, "s-peer");
+    peer.host = "host-other".into();
+    let mut rows: Vec<Row> = (1..=6)
+        .map(|i| released(i, 5, &who(Role::Doctor, &format!("s{i}"))))
+        .collect();
+    rows.push(lease(7, 60, &who(Role::Doctor, "expired")));
+    rows.push(lease(8, 1, &who(Role::Judge, "live")));
+    rows.push(released(9, 5, &peer));
+    rows.push(lease(10, 90, &peer));
+    let ids = prune_candidates(&rows, &me.host, now(), ttl(), 3);
+    assert_eq!(ids, vec![1, 2, 3, 4], "7 dead own records, newest 3 kept");
+    assert!(prune_candidates(&rows, &me.host, now(), ttl(), 50).is_empty());
+}
+
+#[test]
+fn prune_spares_a_yield_whose_lease_is_still_live() {
+    let a = who(Role::Doctor, "s-a");
+    let peer = who(Role::Doctor, "s-peer");
+    let rows = vec![
+        lease(1, 1, &a),
+        row(2, 1, a.yield_marker(&peer)),
+        row(3, 1, who(Role::Doctor, "gone").yield_marker(&peer)),
+    ];
+    assert_eq!(prune_candidates(&rows, &a.host, now(), ttl(), 0), vec![3]);
+}
+
+#[test]
+fn repeated_claim_release_cycles_keep_the_comment_count_bounded() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    for i in 0..20 {
+        let me = who(Role::Doctor, &format!("sweep-{i}"));
+        let c = ctx(dir.path(), me);
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    let rows = fs::read_to_string(dir.path().join("rows")).unwrap();
+    assert!(rows.lines().count() <= KEEP_DEAD_RECORDS + 1, "{rows}");
+}
+
+#[test]
+fn a_failed_prune_delete_does_not_fail_the_claim() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    fs::write(dir.path().join("fail_delete"), "").unwrap();
+    for i in 0..6 {
+        let c = ctx(dir.path(), who(Role::Doctor, &format!("s{i}")));
+        assert_eq!(c.claim(), EXIT_HELD);
+        c.release(None, None, None);
+    }
+    assert!(dir.path().join("deleted").exists());
+}
+
+#[test]
+fn judge_claim_without_identity_warns_about_watch_pid() {
+    let w = unknown_identity_warning(Role::Judge, "pr-lease-unknown").unwrap();
+    assert!(w.contains("--watch-pid") && w.contains("post-verdict.sh"));
+    assert!(unknown_identity_warning(Role::Judge, "sweep-x").is_none());
+    assert!(unknown_identity_warning(Role::Doctor, "pr-lease-unknown").is_none());
 }

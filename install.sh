@@ -21,6 +21,7 @@
 #                              (forwarded to scripts/install-loom.sh)
 #   --allow-stale-target       Permit installing over a target whose Loom is newer/stale
 #                              (forwarded to scripts/install-loom.sh)
+#   --tools-only [ARGS]        Install only loom-tools (no loom-daemon); see scripts/install/provision-tools.sh
 #   -h, --help                 Show this help message
 #
 # Examples:
@@ -186,6 +187,16 @@ print_what_will_be_installed() {
   echo "  • .gitignore                - Loom ephemeral-file patterns appended"
   echo "  • .gitattributes            - install-metadata.json merge=ours driver appended"
   echo "  • .claude/settings.json     - project-level guard-hook entries wired in after the initial copy"
+  echo ""
+  warning "Outside the target repository (user-level, written on this machine):"
+  echo "  • ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon"
+  echo "                              - user-level daemon binary built, signed and replaced;"
+  echo "                                the previous one is kept as loom-daemon.previous"
+  echo "  • ${LOOM_DAEMON_DEFAULTS_DIR:-$HOME/.local/share/loom-daemon/defaults}/"
+  echo "                              - defaults payload mirrored for the daemon"
+  echo "  • $HOME/.claude/settings.json"
+  echo "                              - user-scope guard hooks re-wired; the file is first backed up"
+  echo "                                as settings.json.loom-backup-<timestamp>"
   echo ""
   info "GitHub Changes (if using Full Install):"
   echo "  • Creates GitHub labels for workflow coordination"
@@ -356,6 +367,17 @@ install_hooks_and_cli() {
   local loom_root="$1"
   local target="$2"
   local force="${3:-false}"
+  # Issue #13801: newline-separated hook names that existed BEFORE this run's
+  # `loom-daemon init` (which itself syncs .loom/hooks/). Only those get the
+  # "Preserving" warning; a hook written earlier in the same run is silent.
+  # When the 4th arg is not passed at all, every existing hook is treated as
+  # pre-existing (the original behavior).
+  local have_snapshot=false
+  local preexisting_hooks=""
+  if [[ $# -ge 4 ]]; then
+    have_snapshot=true
+    preexisting_hooks="$4"
+  fi
 
   local canonical_present=false
   if canonical_guard_present "$target"; then
@@ -379,7 +401,9 @@ install_hooks_and_cli() {
         continue
       fi
       if [[ -f "$target/.loom/hooks/$hook_name" ]] && [[ "$force" != "true" ]]; then
-        warning "Preserving existing hook: $hook_name (use --clean to overwrite)"
+        if [[ "$have_snapshot" != "true" ]] || grep -qxF -- "$hook_name" <<<"$preexisting_hooks"; then
+          warning "Preserving existing hook: $hook_name (use --confirm-reinstall to overwrite)"
+        fi
       else
         cp "$hook_file" "$target/.loom/hooks/$hook_name"
         chmod +x "$target/.loom/hooks/$hook_name"
@@ -681,6 +705,7 @@ verify_install() {
     ".loom/config.json"
     ".loom/scripts/worktree.sh"
     ".loom/scripts/lib/loom-tools.sh"
+    ".loom/scripts/lib/repo-root.sh"
     ".loom/install-metadata.json"
     ".loom/config/skill-routes.json"
   )
@@ -1169,9 +1194,7 @@ SOURCE_OVERRIDE_FLAGS=()
 MODE_FLAGS=()
 # NOTE (#8884): the arms below are deliberately written in the compact
 # single-line form (`--flag) cmd; shift ;;`) already used elsewhere in this repo
-# (e.g. scripts/check-doc-tocs.sh). install.sh sits at its file-size ratchet
-# ceiling (.loom/docs/file-size-policy.md), so adding a flag means paying for it
-# from the same case block -- option (2) of that policy's "Hitting the gate".
+# (e.g. scripts/check-doc-tocs.sh).
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes) NON_INTERACTIVE=true; shift ;;
@@ -1194,6 +1217,7 @@ while [[ "${1:-}" == -* ]]; do
       shift
       ;;
     --confirm-reinstall) CONFIRM_REINSTALL=true; shift ;;
+    --tools-only) shift; exec "$LOOM_ROOT/scripts/install/provision-tools.sh" "$@" ;;  # #12940: no daemon needed
     --dry-run) DRY_RUN=true; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op so a caller can be explicit;
@@ -1224,6 +1248,8 @@ while [[ "${1:-}" == -* ]]; do
       echo "                             .loom/scripts/resync-installed.sh in the target repo"
       echo "                             instead; --confirm-reinstall uninstalls before"
       echo "                             reinstalling."
+      echo "  --tools-only [ARGS]        Install only loom-tools (+ payload), no loom-daemon; ARGS go to"
+      echo "                             scripts/install/provision-tools.sh (--help there)"
       echo "  --dry-run                  Print what would be written/removed and exit 0 without"
       echo "                             creating, modifying, or removing anything. Short-circuits"
       echo "                             before any interactive prompt. Composes with"
@@ -1873,6 +1899,47 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
       fi
     fi
 
+    # Issue #13356: everything that can fail without touching the target (the
+    # loom-daemon build and the pinned package manager) must fail BEFORE the
+    # destructive uninstall below, so an aborted run leaves the target intact.
+    # The same block used to run after the uninstall; it now lives only here.
+    resolve_cargo_target_dir "$LOOM_ROOT"
+    if loom_daemon_binary_stale "$LOOM_ROOT" && ! loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+      # Run from $LOOM_ROOT so corepack honors this repo's `packageManager` pin
+      # (the same cwd `pnpm daemon:build` uses).
+      pushd "$LOOM_ROOT" >/dev/null
+      pnpm_probe_ok=0
+      pnpm_probe_version || pnpm_probe_ok=1
+      popd >/dev/null
+      if [[ "$pnpm_probe_ok" -ne 0 ]]; then
+        error "The pinned package manager does not run, so loom-daemon cannot be built. Target left untouched.$(pnpm_failure_hint "$LOOM_PNPM_PROBE_ERROR" "${NODE_VERSION:-}")"
+      fi
+    fi
+
+    # Check if loom-daemon is built AND up to date with the current source
+    # tree (issue #4188 -- a bare existence check reuses a binary built from
+    # an older commit after `git pull` landed a newer one).
+    if loom_daemon_binary_stale "$LOOM_ROOT"; then
+      # Issue #4897: before paying for a `cargo build` (and its
+      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
+      # machine-level binary was already rebuilt from this exact commit --
+      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
+      # instead of rebuilding.
+      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
+        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
+      else
+        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
+          warning "loom-daemon binary is stale (source tree updated since last build)"
+        else
+          warning "loom-daemon binary not found"
+        fi
+        info "Building loom-daemon (this may take a minute)..."
+        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon. Target left untouched."
+        echo ""
+      fi
+    fi
+
+
     # Issue #4928 (AC #3): make the half-uninstalled window explicit in output
     # AND in state. The uninstall below mutates the target's main checkout in
     # place and the fresh install only restores it several steps later, so the
@@ -1896,35 +1963,6 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
 
     info "Running fresh Quick Install..."
     echo ""
-
-    # #5922: resolve Cargo's real target directory ONCE, before anything below
-    # goes looking for the built daemon binary. Honors build.target-dir /
-    # CARGO_TARGET_DIR; falls back to $LOOM_ROOT/target (the previous
-    # assumption) when Cargo can't be consulted.
-    resolve_cargo_target_dir "$LOOM_ROOT"
-
-    # Check if loom-daemon is built AND up to date with the current source
-    # tree (issue #4188 -- a bare existence check reuses a binary built from
-    # an older commit after `git pull` landed a newer one).
-    if loom_daemon_binary_stale "$LOOM_ROOT"; then
-      # Issue #4897: before paying for a `cargo build` (and its
-      # `target/.cargo-lock` wait), check whether the ALREADY-INSTALLED
-      # machine-level binary was already rebuilt from this exact commit --
-      # e.g. by a fleet-mate's install/sweep moments ago -- and reuse it
-      # instead of rebuilding.
-      if loom_daemon_dest_binary_current "$LOOM_ROOT"; then
-        info "loom-daemon already current at ${LOOM_DAEMON_BIN_DIR:-$HOME/.local/bin}/loom-daemon (matches source HEAD) -- skipping rebuild"
-      else
-        if [[ -f "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" ]]; then
-          warning "loom-daemon binary is stale (source tree updated since last build)"
-        else
-          warning "loom-daemon binary not found"
-        fi
-        info "Building loom-daemon (this may take a minute)..."
-        run_daemon_build_with_progress "$LOOM_ROOT" || error "Failed to build loom-daemon"
-        echo ""
-      fi
-    fi
 
     # Export LOOM_VERSION / LOOM_COMMIT so the daemon's template substituter
     # fills CLAUDE.md correctly (issue #3502).
@@ -2434,6 +2472,11 @@ case "$METHOD" in
         error "Installation failed"
     else
       set_install_lock_phase "installing"
+      # Snapshot hooks present before init (#13801) so only those warn below.
+      _PREEXISTING_HOOKS=""
+      if [[ -d "$TARGET_PATH/.loom/hooks" ]]; then
+        _PREEXISTING_HOOKS="$(cd "$TARGET_PATH/.loom/hooks" && ls -1 -- *.sh 2>/dev/null || true)"
+      fi
       # Run loom-daemon init
       "$LOOM_CARGO_TARGET_DIR/release/loom-daemon" init $FORCE_FLAG ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
@@ -2443,8 +2486,9 @@ case "$METHOD" in
     # Force-overwrite existing hooks only under --clean (a deliberate fresh
     # install); otherwise preserve a downstream-tuned hook (#3625).
     _HOOK_FORCE=false
+    _PREEXISTING_HOOKS="${_PREEXISTING_HOOKS-}"
     [[ "$FORCE_FLAG" == "--clean" ]] && _HOOK_FORCE=true
-    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE"
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH" "$_HOOK_FORCE" "${_PREEXISTING_HOOKS-}"
     # Emit skill-routes.json, install-metadata.json, loom-source-path (#3502).
     finalize_quick_install "$LOOM_ROOT" "$TARGET_PATH"
     verify_install "$TARGET_PATH"

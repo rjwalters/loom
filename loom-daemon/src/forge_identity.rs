@@ -105,6 +105,33 @@ pub fn workspace_root() -> Option<&'static Path> {
     WORKSPACE_ROOT.get().map(PathBuf::as_path)
 }
 
+/// The root a read made for the checkout at `given` routes against: the one
+/// whose roster and **published reader directories** [`route_read`] uses —
+/// the daemon's workspace root, else the agent front's reader root, else
+/// `given` (a CLI process with neither).
+///
+/// [`spawn_reader_refresh`] publishes reader tokens under the daemon's
+/// workspace root only. A managed checkout's own `.loom/gh-config-by-owner`
+/// holds at most a writer token, so routing against it found every reader
+/// "stale" and shed the read without asking one (#12630).
+#[must_use]
+pub fn reader_root(given: &Path) -> PathBuf {
+    reader_root_with(given, published_reader_root())
+}
+
+/// The root this process's reader tokens are published under: the daemon's
+/// workspace root, else the agent front's reader root ([`reader_root`]).
+#[must_use]
+pub fn published_reader_root() -> Option<&'static Path> {
+    workspace_root().or_else(front_root)
+}
+
+/// [`reader_root`] with the published root injected.
+#[must_use]
+pub fn reader_root_with(given: &Path, published: Option<&Path>) -> PathBuf {
+    published.unwrap_or(given).to_path_buf()
+}
+
 /// Exported to agent sessions (#12207): the daemon's workspace root, whose
 /// roster and published reader directories the agent `gh` front's served
 /// reads may use when no gateway profile answers for the owner. A
@@ -199,6 +226,12 @@ pub struct Roster {
     pub writers: Vec<Identity>,
     /// Extra logins believed as the fleet (renamed or retired Apps).
     pub legacy_logins: Vec<String>,
+    /// A config tier that carries (or may carry) the roster failed to load
+    /// (parse error, unreadable file), so an empty [`Roster::readers`] means
+    /// "unknown", not "none configured". Reads fail closed on it instead of
+    /// falling back to the writer (#12511). Set by [`resolve`] only.
+    #[serde(skip)]
+    pub load_failed: bool,
 }
 
 /// Which kind of call a credential is for.
@@ -221,7 +254,11 @@ pub fn resolve(root: &Path) -> Roster {
     let effective = crate::config_resolver::resolve_effective_config(root);
     let slug_env = std::env::var(APP_SLUG_ENV).ok();
     let pool = forge_read_pool::configured_pool(root);
-    from_config(&effective, slug_env.as_deref(), &pool)
+    let mut roster = from_config(&effective, slug_env.as_deref(), &pool);
+    // `resolve_effective_config` soft-fails a broken tier to `{}`, which reads
+    // as "no readers configured"; `unreadable_tiers` says which tiers broke.
+    roster.load_failed = !crate::config_resolver::unreadable_tiers(root).is_empty();
+    roster
 }
 
 /// Pure core of [`resolve`]: the effective config, the slug env override,
@@ -270,6 +307,7 @@ pub fn from_config(
                             .collect()
                     })
                     .unwrap_or_default(),
+                load_failed: false,
             }
         } else {
             Roster {
@@ -286,6 +324,7 @@ pub fn from_config(
                     .collect(),
                 writers: Vec::new(),
                 legacy_logins: Vec::new(),
+                load_failed: false,
             }
         };
     if let (Some(w), Some(s)) = (roster.writer.as_mut(), slug_override) {
@@ -303,21 +342,27 @@ pub fn from_config(
     roster
 }
 
+/// The `writers[]` entry whose `owners` lists `owner` (case-insensitive),
+/// without the default-writer fallback (`None`: no per-owner writer covers
+/// `owner`). The half of [`writer_for_owner`] the #13929 probe establishment
+/// needs: an owner only the default writer covers must not be minted for, so
+/// its `forge may-write` answer stays today's ambient probe.
+#[must_use]
+pub fn per_owner_writer_for<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Identity> {
+    roster.writers.iter().find(|w| {
+        w.owners
+            .as_ref()
+            .is_some_and(|l| l.iter().any(|o| o.eq_ignore_ascii_case(owner)))
+    })
+}
+
 /// The writer that writes for `owner` (case-insensitive): the first
 /// `writers[]` entry whose `owners` lists it, else the default
 /// [`Roster::writer`] (#12446). Mirrors `github-app-token.sh`, so the daemon
 /// and the scripts mint as the same App for an owner.
 #[must_use]
 pub fn writer_for_owner<'a>(roster: &'a Roster, owner: &str) -> Option<&'a Identity> {
-    roster
-        .writers
-        .iter()
-        .find(|w| {
-            w.owners
-                .as_ref()
-                .is_some_and(|l| l.iter().any(|o| o.eq_ignore_ascii_case(owner)))
-        })
-        .or(roster.writer.as_ref())
+    per_owner_writer_for(roster, owner).or(roster.writer.as_ref())
 }
 
 /// Config problems an operator should see: the writer declared in
@@ -957,26 +1002,6 @@ pub fn writer_bucket(owner: &str) -> Option<String> {
     (crate::forge_bucket_book::valid_owner(owner)
         && crate::forge_call_stats::sanitize(owner).as_deref() == Some(owner))
     .then(|| format!("{WRITER_BUCKET_PREFIX}{}", owner.to_ascii_lowercase()))
-}
-
-/// The writer bucket that serves `owner_repo` (#10334), mirroring how a
-/// writer `gh` call picks its credential (`GhInvocation::env_plan`): the
-/// owner's own writer when one is registered for it
-/// (`owner_writer_registered`, `credential_preflight::gh_config_dir_for_owner_slug`),
-/// else the primary writer, booked under the workspace's own owner
-/// (`primary_owner`). With the primary owner unknown, the repo's owner — the
-/// same owner a writer row without a credential owner is booked under.
-#[must_use]
-pub fn serving_writer_bucket(
-    owner_repo: &str,
-    owner_writer_registered: bool,
-    primary_owner: Option<&str>,
-) -> Option<String> {
-    let repo_owner = crate::credential_preflight::owner_of_nwo(owner_repo);
-    match primary_owner {
-        Some(primary) if !owner_writer_registered => writer_bucket(primary),
-        _ => writer_bucket(repo_owner),
-    }
 }
 
 /// The one reader-only read shape (#12394; was `reader_then_writer`, #9537/#9872).

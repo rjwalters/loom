@@ -18,21 +18,12 @@
 //! `loom.session.output.sequence`; `loom.session.output.event_id` is the pure
 //! function of the two that survives a producer restart unchanged.
 
-use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::KeyValue;
 use opentelemetry_proto::tonic::logs::v1::SeverityNumber;
 
-use super::{kv, kv_int, kv_string, nanos};
+use super::{kv_bool, kv_int, kv_string, nanos};
 use crate::telemetry::kinds::session_output::{Coverage, OutputCategory, SessionOutputRecord};
 use crate::telemetry::TelemetryRecord;
-
-fn kv_bool(key: &str, value: bool) -> KeyValue {
-    kv(
-        key,
-        AnyValue {
-            value: Some(any_value::Value::BoolValue(value)),
-        },
-    )
-}
 
 /// A record a consumer must not present as healthy live output is raised above
 /// `Info` so an alert can key on severity alone: a lost-events gap is an
@@ -95,13 +86,7 @@ pub(super) fn log_parts(record: &TelemetryRecord) -> Option<LogParts> {
         attributes.push(kv_string("loom.repo", repo.clone()));
         // Only meaningful alongside a repo, and only ever the fail-closed
         // `private` here — this producer makes no forge call to ask.
-        attributes.push(kv_string(
-            "loom.repo.visibility",
-            match r.identity.visibility {
-                crate::telemetry::RepoVisibility::Public => "public",
-                crate::telemetry::RepoVisibility::Private => "private",
-            },
-        ));
+        attributes.push(kv_string("loom.repo.visibility", r.identity.visibility.as_str()));
     }
     if let Some(issue) = r.identity.issue {
         attributes.push(kv_int("loom.issue", i64::from(issue)));

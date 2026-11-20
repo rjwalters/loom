@@ -68,9 +68,6 @@ const TABLE: &[(&str, Reloadability)] = &[
     // inside the tick loop body (`loom-daemon/src/role_runner.rs`), and
     // `loom-daemon status` already reports the live per-root value.
     ("autonomous.roleRunner", Reloadability::Live),
-    // Per-repo approval/merge policy (#11674): `merge_policy::declared` is
-    // read from the effective config on every `fleet.state` export.
-    ("repos", Reloadability::Live),
     // Re-read every multi-workspace work-finder tick since #9060 (the cap,
     // and since #12406 the only cap) — `ConfiguredMaxReloader::refresh()` in
     // `loom-daemon/src/work_finder/configured_max.rs`, consumed from
@@ -103,6 +100,12 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
+    // Re-read from the daemon root's effective config on every session
+    // reconcile pass (#14111) — `session_reconcile::converge_bindings` calls
+    // `bindings::read` each tick. The rest of `autonomous.sessionReconcile`
+    // (`enabled`, `intervalSecs`) is resolved once in `spawn_from_config`, so
+    // it keeps the restart-required default.
+    ("autonomous.sessionReconcile.privateClones", Reloadability::Live),
     // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
     // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
     // (`ram_scope_limit::resolve`), never cached by the daemon.
@@ -127,7 +130,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Resolved once before the ingestion thread is spawned, then frozen for
     // that thread's lifetime (`try_init_transcript_ingest`).
     ("autonomous.transcriptIngest", Reloadability::RestartRequired),
-    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply`
+    // `fleet.repo` / `fleet.ref` / `fleet.syncIntervalSecs` / `fleet.autoApply*`
     // are captured once into `PassInputs` in `fleet_sync::start()`, before
     // the timer task is spawned — including the very config this `render`
     // itself is driven by.
@@ -149,7 +152,7 @@ const TABLE: &[(&str, Reloadability)] = &[
     // `observability::read_config` feeds `observer_tasks::spawn` once at
     // bring-up (exporter wiring, `observability::spawn_task`).
     ("observability", Reloadability::RestartRequired),
-    // `ci_telemetry::spawn_task_on` resolves the config once (owners,
+    // `ci_telemetry::spawn_task` resolves the config once (owners,
     // interval, excluded repos) before the ticker is built; only the
     // captain gate inside the tick is live (see `fleet.captain`).
     ("autonomous.ciTelemetry", Reloadability::RestartRequired),

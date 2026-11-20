@@ -1,15 +1,15 @@
 //! `loom-daemon accounts` handler (Issue #4492): secret-safe machine-level
 //! Codex account lifecycle commands over
-//! `loom_daemon::tokens_pool::account_lifecycle`.
+//! `crate::tokens_pool::account_lifecycle`.
 
-use anyhow::{anyhow, Result};
-use loom_daemon::tokens_pool::account_scope::{
+use crate::tokens_pool::account_scope::{
     resolve_accounts_registry, shadowed_shared_accounts, AccountsRegistry,
 };
+use anyhow::{anyhow, Result};
 
 use super::accounts_session::handle_session_command;
 use super::tokens::resolve_tokens_workspace;
-use crate::AccountsAction;
+use crate::cli::AccountsAction;
 
 /// The `--workspace` default. A value equal to this is "wherever I am", which
 /// [`resolve_accounts_registry`] may resolve to an enclosing Loom workspace or
@@ -46,7 +46,7 @@ fn announce_registry(registry: &AccountsRegistry) {
 }
 
 pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -> Result<()> {
-    use loom_daemon::tokens_pool::account_lifecycle::{
+    use crate::tokens_pool::account_lifecycle::{
         login_exit_code, AccountLifecycle, AccountStatus, ProcessCodexRunner,
     };
 
@@ -77,7 +77,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         if json {
             println!("{}", serde_json::to_string_pretty(status)?);
         } else {
-            println!(
+            let mut line = format!(
                 "codex/{}: {} ({:?}); credential={}, directory-permissions={}, \
                  auth-permissions={}, owner={}, session={}, login={:?}",
                 status.name,
@@ -113,6 +113,19 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
                 },
                 status.login_state,
             );
+            // Issue #14298: `accounts list` also reports each account's
+            // registered private-clone repositories and session image.
+            // Appended, and only when present, so every verb that does not
+            // populate them keeps its line unchanged.
+            if let Some(private) = &status.private_clone {
+                let mut repos = vec![private.repository.as_str()];
+                repos.extend(private.additional_repositories.iter().map(String::as_str));
+                line.push_str(&format!(", repos={}", repos.join(",")));
+            }
+            if let Some(image) = &status.image {
+                line.push_str(&format!(", image={image}"));
+            }
+            println!("{line}");
         }
         Ok(())
     }
@@ -284,11 +297,11 @@ fn run_provision(
     json: bool,
     workspace: &std::path::Path,
 ) -> Result<()> {
-    use loom_daemon::tokens_pool::profile_provisioning::{
+    use crate::tokens_pool::profile_provisioning::{
         default_profile_home, profile_dir_for, provision_all, provision_profile, ProvisionOptions,
         ProvisionReport,
     };
-    use loom_daemon::tokens_pool::profile_sharing::rules_for;
+    use crate::tokens_pool::profile_sharing::rules_for;
 
     let rules = rules_for(provider).ok_or_else(|| {
         anyhow!(
@@ -398,7 +411,7 @@ fn run_availability_check(
     live: bool,
     json: bool,
 ) -> Result<()> {
-    use loom_daemon::tokens_pool::codex_check::{self, CheckOptions};
+    use crate::tokens_pool::codex_check::{self, CheckOptions};
 
     eprintln!("Resolved workspace: {}", workspace.display());
     let (report, effects) = codex_check::run_check(

@@ -83,6 +83,8 @@ impl SweepRegistry {
     /// this backstop already acted (restored `loom:issue`) rather than
     /// leaving the issue held.
     pub(super) fn post_stale_sweep_comment(&self, finding: &StaleSweepFinding) {
+        // The reap comment is posted for the reaped sweep (#13171).
+        let _sweep = crate::gh_invocation::telemetry::enter_sweep(&finding.sweep_id, None);
         if self.config.skip_label_flip
             || self.frozen_blocks_write(finding.issue, "stale-sweep reap comment")
         {
@@ -178,5 +180,36 @@ mod tests {
             assert_eq!(reads.lines().count(), 2, "one label read per comment: {reads}");
         }
         std::env::remove_var("LOOM_REPO");
+    }
+    /// #13171: the watchdog's forge calls for a known sweep carry its id, and
+    /// no thread identity outlives the call.
+    #[test]
+    #[serial_test::serial]
+    fn watchdog_forge_calls_for_a_known_sweep_are_stamped_with_its_id() {
+        use crate::observability::ops::capture::capture;
+        std::env::set_var("LOOM_REPO", "rjwalters/loom");
+        let finding = StaleSweepFinding {
+            issue: 7529,
+            sweep_id: "sweep-7529-stale".to_string(),
+            pid: 1,
+            elapsed: Duration::from_secs(9000),
+            log_idle: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (reg, _log) = registry(dir.path());
+        let (_, captured) = capture(|| {
+            reg.post_stale_sweep_comment(&finding);
+            let _ = reg.midbuild_lease_veto(7529, "sweep-7529-dead");
+        });
+        std::env::remove_var("LOOM_REPO");
+        let stamped = |id: &str| {
+            captured
+                .spans
+                .iter()
+                .any(|s| s.attributes.get("loom.sweep_id").map(String::as_str) == Some(id))
+        };
+        assert!(stamped("sweep-7529-stale"), "stale-sweep comment span not stamped");
+        assert!(stamped("sweep-7529-dead"), "mid-build lease read span not stamped");
+        assert_eq!(crate::gh_invocation::telemetry::ambient_sweep(), (None, None));
     }
 }

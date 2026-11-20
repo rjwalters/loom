@@ -53,6 +53,8 @@
 //! breaks it run as a counterfactual rather than described.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
@@ -67,7 +69,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// `signoz_queue_quota_queries.rs` /
 /// `signoz_ci_failed_run_logs.rs`, so no proof in this repo can drift from the
 /// deployment on ClickHouse version.
-const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server:25.12.5@sha256:cacf32d6884291dc2ff5e0156a97f46fc53ff7c929a7906d114e268a929dfd3a";
+use clickhouse_local::CLICKHOUSE_IMAGE;
 
 /// The committed artifact under proof.
 const RETENTION: &str = include_str!("../../defaults/observability/signoz/retention.sql");

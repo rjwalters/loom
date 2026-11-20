@@ -107,7 +107,6 @@
 pub mod availability;
 pub mod ceiling;
 pub mod codex_guard;
-pub mod explicit_tap;
 pub mod handoff;
 pub mod launch_failure_hold;
 pub mod resolve;
@@ -296,6 +295,10 @@ impl Decision {
                     source: RuntimeSource::Preference,
                     unmet_capabilities: vec![],
                     reason: exhausted_with_draw(&resolution, draw.as_deref(), role),
+                    exhausted_summary_line: Some(
+                        exhausted_summary_with_draw(&resolution, draw.as_deref(), role)
+                            .into_boxed_str(),
+                    ),
                 }),
             },
         }
@@ -331,6 +334,24 @@ pub fn exhausted_with_draw<T>(
     let mut out = resolution.exhausted_diagnostic(role);
     if let Some(draw) = draw {
         out.push_str(&draw.diagnostic_suffix());
+    }
+    out
+}
+
+/// [`Resolution::exhausted_summary_line`] plus the role draw's replay
+/// fragment, when a draw decided (#11726) — the one-line counterpart of
+/// [`exhausted_with_draw`] that the daemon log's refusal line carries
+/// (#14026), so a draw that drew a tap admission then refused still says
+/// which table and pick produced the order.
+#[must_use]
+pub fn exhausted_summary_with_draw<T>(
+    resolution: &Resolution<T>,
+    draw: Option<&role_draw::RoleDrawRecord>,
+    role: &str,
+) -> String {
+    let mut out = resolution.exhausted_summary_line(role);
+    if let Some(draw) = draw {
+        out.push_str(&format!(" ({})", draw.marker_fragment()));
     }
     out
 }
@@ -466,6 +487,7 @@ fn parse_tap(entry: &Value, path: &str, index: usize) -> Result<Tap, String> {
             .map(|runtime| Tap {
                 runtime,
                 model_profile: None,
+                model: None,
             })
             .ok_or_else(|| format!("{path}[{index}] is an empty runtime name")),
         Value::Object(map) => {
@@ -495,6 +517,7 @@ fn parse_tap(entry: &Value, path: &str, index: usize) -> Result<Tap, String> {
             Ok(Tap {
                 runtime,
                 model_profile,
+                model: None,
             })
         }
         _ => Err(format!(
@@ -701,14 +724,27 @@ pub trait ContainmentPreparer {
     /// The original `rejection` (with the unmet obligation appended) whenever
     /// containment does not apply or cannot be proven. An implementation must
     /// never widen the rejection into an admission on any other basis.
+    ///
+    /// `drawn_model` is the model a role draw's pick for this candidate pins
+    /// (#12748), so account selection is for the model the launch will use.
     fn contain(
         &mut self,
         role: &str,
         explicit: Option<&str>,
+        drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection>;
-    /// Release the containment prepared for a candidate the walk passed over,
-    /// so a rejected tap never keeps an account lease reserved.
+    /// Reserve a managed seat for a host-admitted candidate before it can win
+    /// a dispatch. Read-only probes have no launch to carry the lease to.
+    fn reserve_seat(
+        &mut self,
+        _admitted: &ResolvedRuntime,
+        _drawn_model: Option<&str>,
+    ) -> Result<(), RuntimeRejection> {
+        Ok(())
+    }
+
+    /// Return any seat reserved for a candidate the walk passed over.
     fn release(&mut self);
 }
 
@@ -720,6 +756,7 @@ impl ContainmentPreparer for NoContainment {
         &mut self,
         _role: &str,
         _explicit: Option<&str>,
+        _drawn_model: Option<&str>,
         rejection: RuntimeRejection,
     ) -> Result<ResolvedRuntime, RuntimeRejection> {
         Err(rejection)
@@ -736,6 +773,7 @@ fn admit_static(
     role: &str,
     explicit: Option<&str>,
     model_profile: Option<&str>,
+    drawn_model: Option<&str>,
     preparer: &mut dyn ContainmentPreparer,
 ) -> Result<ResolvedRuntime, RuntimeRejection> {
     // `model_profile` is a preference tap's own profile (#11400), so the
@@ -749,10 +787,174 @@ fn admit_static(
         crate::runtime_admission::AdmissionContext::Host,
     ) {
         Err(rejection) if rejection.containment_eligible() => {
-            preparer.contain(role, explicit, rejection)
+            preparer.contain(role, explicit, drawn_model, rejection)
         }
         other => other,
     }
+}
+
+/// The per-candidate gates a spawn walk asks after admission: the role-tick
+/// launch-failure hold (#11453), credential availability, then the backstop
+/// ceiling (#8555) — in that order. A contained candidate a gate passes over
+/// has its prepared selection released here (#8787).
+///
+/// Shared verbatim by the real walk ([`resolve_runtime_in`]'s gate closure)
+/// and the explain view's per-candidate probe ([`probe_candidate`], #14027),
+/// so the read-only view cannot drift from what a launch would decide.
+///
+/// Returns the backstop slot taken for a governed tap ([`Intent::Dispatch`];
+/// a probe is count-less and always `None`).
+#[allow(clippy::too_many_arguments)]
+fn gate_admitted_candidate(
+    root: &Path,
+    role: &str,
+    tap: &Tap,
+    tier: usize,
+    admitted: &ResolvedRuntime,
+    now: u64,
+    context: DispatchContext,
+    config: &Value,
+    binary_env: &availability::BinaryEnv,
+    ceiling_config: Option<&ceiling::BackstopCeiling>,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<Option<ceiling::Reservation>, SkipReason> {
+    // A candidate that is about to be skipped must give its account lease
+    // back before the walk moves on.
+    let release = |preparer: &mut dyn ContainmentPreparer| {
+        if admitted.runtime == "codex" {
+            preparer.release();
+        }
+    };
+    // #11453: a tap that failed to launch the same deterministic way
+    // N times in a row in this workspace is passed over by this
+    // role's ticks until its hold clears. Role ticks only: a sweep
+    // never reads the hold, and an operator pin never reaches here.
+    if context.role_tick {
+        let key = launch_failure_hold::Key::new(root, role, tap);
+        let fingerprint = || launch_failure_hold::fingerprint(config, tap);
+        if let Some(hold) = launch_failure_hold::active(&key, fingerprint, now) {
+            release(preparer);
+            return Err(SkipReason::Unavailable {
+                source: launch_failure_hold::SKIP_SOURCE.to_string(),
+                detail: hold.describe(now),
+            });
+        }
+    }
+    match availability::availability_in(root, tap, admitted, now, binary_env) {
+        state if state.is_spawnable() => {}
+        state => {
+            release(preparer);
+            return Err(state
+                .skip_reason()
+                .expect("a non-spawnable availability always yields a skip reason"));
+        }
+    }
+    if context.intent == Intent::Dispatch {
+        preparer
+            .reserve_seat(admitted, tap.model.as_deref())
+            .map_err(|rejection| SkipReason::NotAdmitted {
+                unmet: rejection.unmet_capabilities,
+                detail: rejection.reason,
+            })?;
+    }
+    // The ceiling is asked LAST, and only for the tiers it governs:
+    // credentials first means a tap that could not have run anyway is
+    // never charged a metered slot, and asking last means the slot is
+    // taken only for a tap the walk is about to return.
+    let Some(bound) = ceiling_config.filter(|c| c.governs(tier)) else {
+        return Ok(None);
+    };
+    match ceiling::admit(bound, role, tap, context.intent) {
+        ceiling::Verdict::Admitted(slot) => Ok(slot),
+        ceiling::Verdict::Refused(reason) => {
+            release(preparer);
+            Err(reason)
+        }
+    }
+}
+
+/// The explain view's per-candidate question (#14027): exactly the question
+/// the spawn walk asks one tap of a draw table — admission first (with the
+/// caller's containment preparer, so a containment-eligible refusal is
+/// retried on the real private-clone path), then the availability and
+/// ceiling gates ([`gate_admitted_candidate`]) — asked here one candidate at
+/// a time, because the real walk short-circuits on the first admitted tap
+/// and the view must mark every candidate.
+///
+/// A probe never launches and never keeps a prepared selection: the caller's
+/// preparer is released before returning, whatever the outcome, so any
+/// account lease containment preparation took is finished before the view
+/// returns (#14027). Pass [`Intent::Probe`] so the ceiling ask is
+/// count-less (#8555).
+///
+/// # Errors
+/// The walk's own skip reason for this tap: [`SkipReason::NotAdmitted`] with
+/// the full rejection detail when admission (or its containment retry)
+/// refused, [`SkipReason::Unavailable`] on a dry credential pool or a
+/// role-tick launch-failure hold, [`SkipReason::Ceiling`] when the metered
+/// tier is bound or its configuration is unreadable (the real walk fails
+/// closed the same way before it would ask any tap).
+pub(crate) fn probe_candidate(
+    root: &Path,
+    role: &str,
+    tap: &Tap,
+    tier: usize,
+    now: u64,
+    context: DispatchContext,
+    preparer: &mut dyn ContainmentPreparer,
+) -> Result<ResolvedRuntime, SkipReason> {
+    let canonical = canonical_role(role).unwrap_or(role);
+    let binary_env = availability::BinaryEnv::from_process();
+    let config = crate::config_resolver::resolve_effective_config(root);
+    let admitted = admit_static(
+        root,
+        canonical,
+        Some(&tap.runtime),
+        tap.model_profile.as_deref(),
+        tap.model.as_deref(),
+        preparer,
+    )
+    .map_err(|rejection| SkipReason::NotAdmitted {
+        unmet: rejection.unmet_capabilities.clone(),
+        detail: rejection.reason.clone(),
+    });
+    let admitted = match admitted {
+        Ok(admitted) => admitted,
+        Err(reason) => {
+            preparer.release();
+            return Err(reason);
+        }
+    };
+    // A malformed ceiling configuration fails the real walk closed before it
+    // asks any tap; the probe renders the same verdict per candidate.
+    let ceiling_config = match ceiling::configured(&config) {
+        Ok(configured) => configured,
+        Err(reason) => {
+            preparer.release();
+            return Err(SkipReason::Ceiling {
+                skip: CeilingSkip::Unknown,
+                detail: reason,
+            });
+        }
+    };
+    let outcome = gate_admitted_candidate(
+        root,
+        canonical,
+        tap,
+        tier,
+        &admitted,
+        now,
+        context,
+        &config,
+        &binary_env,
+        ceiling_config.as_ref(),
+        preparer,
+    );
+    // The probe never launches: a prepared selection is always given back,
+    // whatever the gates decided (#14027). A probe is never charged a
+    // backstop slot, so the gates' `Ok` slot is always `None` here.
+    preparer.release();
+    outcome.map(|_slot| admitted)
 }
 
 /// [`resolve_runtime_for`] with a [`ContainmentPreparer`] (#8787).
@@ -797,7 +999,7 @@ fn resolve_runtime_in(
         // never moves the launch to a different runtime (#8787).
         return Ok(Decision::Static {
             reason: StaticReason::OperatorPin(pin),
-            result: admit_static(root, role, explicit, None, preparer),
+            result: admit_static(root, role, explicit, None, None, preparer),
         });
     }
     let config = crate::config_resolver::resolve_effective_config(root);
@@ -814,11 +1016,12 @@ fn resolve_runtime_in(
             source: RuntimeSource::Preference,
             unmet_capabilities: vec![],
             reason,
+            exhausted_summary_line: None,
         })?;
         let Some(listed) = listed else {
             return Ok(Decision::Static {
                 reason: StaticReason::NoPreferenceConfigured,
-                result: admit_static(root, role, None, None, preparer),
+                result: admit_static(root, role, None, None, None, preparer),
             });
         };
         listed
@@ -829,6 +1032,7 @@ fn resolve_runtime_in(
         source: RuntimeSource::Preference,
         unmet_capabilities: vec![],
         reason,
+        exhausted_summary_line: None,
     })?;
     // Filled in by the availability closure below when — and only when — the
     // walk settles on a governed backstop tap. `resolve` short-circuits on the
@@ -847,6 +1051,7 @@ fn resolve_runtime_in(
                 canonical,
                 Some(&tap.runtime),
                 tap.model_profile.as_deref(),
+                tap.model.as_deref(),
                 *preparer.borrow_mut(),
             )
             .map(|mut admitted| {
@@ -862,61 +1067,28 @@ fn resolve_runtime_in(
             })
         },
         |tier, tap, admitted| {
-            // A contained candidate that is about to be skipped must give its
-            // account lease back before the walk moves on (#8787).
-            let release = || {
-                if admitted.execution.is_some() {
-                    preparer.borrow_mut().release();
-                }
-            };
-            // #11453: a tap that failed to launch the same deterministic way
-            // N times in a row in this workspace is passed over by this
-            // role's ticks until its hold clears. Role ticks only: a sweep
-            // never reads the hold, and an operator pin never reaches here.
-            if context.role_tick {
-                let key = launch_failure_hold::Key::new(root, canonical, tap);
-                let fingerprint = || launch_failure_hold::fingerprint(&config, tap);
-                if let Some(hold) = launch_failure_hold::active(&key, fingerprint, now) {
-                    release();
-                    return Err(SkipReason::Unavailable {
-                        source: launch_failure_hold::SKIP_SOURCE.to_string(),
-                        detail: hold.describe(now),
-                    });
-                }
-            }
-            match availability::availability_in(root, tap, admitted, now, binary_env) {
-                state if state.is_spawnable() => {}
-                state => {
-                    release();
-                    return Err(state
-                        .skip_reason()
-                        .expect("a non-spawnable availability always yields a skip reason"));
-                }
-            }
-            // The ceiling is asked LAST, and only for the tiers it governs:
-            // credentials first means a tap that could not have run anyway is
-            // never charged a metered slot, and asking last means the slot is
-            // taken only for a tap the walk is about to return.
-            let Some(bound) = backstop_ceiling.as_ref().filter(|c| c.governs(tier)) else {
-                return Ok(());
-            };
-            match ceiling::admit(bound, canonical, tap, context.intent) {
-                ceiling::Verdict::Admitted(slot) => {
-                    reservation = slot;
-                    Ok(())
-                }
-                ceiling::Verdict::Refused(reason) => {
-                    release();
-                    Err(reason)
-                }
-            }
+            let slot = gate_admitted_candidate(
+                root,
+                canonical,
+                tap,
+                tier,
+                admitted,
+                now,
+                context,
+                &config,
+                binary_env,
+                backstop_ceiling.as_ref(),
+                *preparer.borrow_mut(),
+            )?;
+            reservation = slot;
+            Ok(())
         },
     );
-    // A contained candidate is kept only when it is the tap actually chosen.
+    // An account reservation survives only when its runtime is chosen.
     if !resolution
         .chosen
         .as_ref()
-        .is_some_and(|chosen| chosen.admitted.execution.is_some())
+        .is_some_and(|chosen| chosen.admitted.runtime == "codex")
     {
         preparer.borrow_mut().release();
     }

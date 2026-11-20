@@ -7,7 +7,7 @@
 //! where no loom dir resolves still emits a well-formed payload.
 use super::{build_is_stale, build_status_json_value, deep_clean_lines, render_build_status_line};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
+use crate::daemon_install_state::{ProtectionReport, ProtectionState, WatchdogJob};
 use std::path::PathBuf;
 
 fn protection(
@@ -29,8 +29,8 @@ fn protection(
 
 /// The `update` argument's fixture — an "unknown" self-update status is
 /// enough for these tests (they assert only on the `protection` object).
-fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-    loom_daemon::self_update::SelfUpdateStatus {
+fn no_update() -> crate::self_update::SelfUpdateStatus {
+    crate::self_update::SelfUpdateStatus {
         built_commit: "abc1234".to_string(),
         source_commit: None,
         update_available: None,
@@ -131,30 +131,6 @@ fn auto_update_artifact_available_is_reported_next_to_the_installed_version() {
     );
 }
 
-#[test]
-fn observability_host_id_mismatch_is_null_when_the_ids_agree() {
-    // #4830: the common case — no exporter, or an exporter whose key is
-    // bound to this very host — is a null field, so `status` is unchanged
-    // for every daemon that is not actually misconfigured.
-    let value = build_status_json_value(&sample_report(), None, &no_update(), None, None, None);
-    assert!(value["observability_host_id_mismatch"].is_null());
-}
-
-#[test]
-fn observability_host_id_mismatch_names_both_identities_in_json() {
-    let mut report = sample_report();
-    report.observability_host_id_mismatch = Some(loom_daemon::types::ObservabilityHostIdMismatch {
-        daemon_host_id: "robb-studio".to_string(),
-        ingest_host_id: "robb-pro".to_string(),
-        first_seen_at: chrono::Utc::now(),
-    });
-    let value = build_status_json_value(&report, None, &no_update(), None, None, None);
-    let m = &value["observability_host_id_mismatch"];
-    assert_eq!(m["daemon_host_id"], "robb-studio");
-    assert_eq!(m["ingest_host_id"], "robb-pro");
-    assert!(m["first_seen_at"].is_string());
-}
-
 // ===================================================================
 // Telemetry export liveness (#5083); first-hop scope (#9015)
 // ===================================================================
@@ -162,9 +138,9 @@ fn observability_host_id_mismatch_names_both_identities_in_json() {
 /// A healthy export record pushing to `endpoint`. The human-readable line
 /// is covered in `status_render::observability_line`'s own tests; these two
 /// pin the `--json` contract a watch loop reads.
-fn healthy_export(endpoint: &str) -> loom_daemon::types::ObservabilityExportStatus {
-    let mut status = loom_daemon::types::ObservabilityExportStatus {
-        state: loom_daemon::types::ObservabilityExportState::Healthy,
+fn healthy_export(endpoint: &str) -> crate::types::ObservabilityExportStatus {
+    let mut status = crate::types::ObservabilityExportStatus {
+        state: crate::types::ObservabilityExportState::Healthy,
         host_id: Some("robb-studio".to_string()),
         endpoint: Some(endpoint.to_string()),
         exporter: Some("https".to_string()),
@@ -224,8 +200,8 @@ fn observability_export_is_null_for_a_pre_5083_daemon() {
 // Artifact reclaim / deep-clean visibility (#5919)
 // ===================================================================
 
-fn deep_clean_entry(root: &str) -> loom_daemon::types::DeepCleanRepoStatus {
-    loom_daemon::types::DeepCleanRepoStatus {
+fn deep_clean_entry(root: &str) -> crate::types::DeepCleanRepoStatus {
+    crate::types::DeepCleanRepoStatus {
         root: std::path::PathBuf::from(root),
         last_evaluated_at: Some(
             chrono::DateTime::parse_from_rfc3339("2026-08-10T21:19:10Z")
@@ -236,6 +212,7 @@ fn deep_clean_entry(root: &str) -> loom_daemon::types::DeepCleanRepoStatus {
         last_free_gb: Some(118),
         last_fired_at: None,
         last_reclaimed: None,
+        last_kept: None,
     }
 }
 
@@ -277,6 +254,26 @@ fn deep_clean_names_when_a_pass_last_ran_and_what_it_reclaimed() {
     assert!(rendered.contains("last fired 2026-08-10T21:04:10"), "{rendered}");
     assert!(rendered.contains("target/ (34.1G)"), "{rendered}");
     assert!(rendered.contains("DISK PRESSURE"), "{rendered}");
+}
+
+#[test]
+fn deep_clean_names_what_keep_build_artifacts_left_in_place() {
+    let mut entry = deep_clean_entry("/home/u/GitHub/loom");
+    entry.last_kept = Some("node_modules/ (1.2G)".to_string());
+    let mut report = sample_report();
+    report.deep_clean = vec![entry];
+    let rendered = deep_clean_lines(&report).join("\n");
+    assert!(
+        rendered.contains("kept (keepBuildArtifacts): node_modules/ (1.2G)"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn deep_clean_status_without_last_kept_still_deserializes() {
+    let json = r#"{"root":"/r","last_evaluated_at":null,"last_reason":null,"last_free_gb":null,"last_fired_at":null,"last_reclaimed":null}"#;
+    let s: crate::types::DeepCleanRepoStatus = serde_json::from_str(json).unwrap();
+    assert_eq!(s.last_kept, None);
 }
 
 #[test]
@@ -383,11 +380,11 @@ fn daemon_build_json_block_carries_the_running_and_disk_facts() {
     assert_eq!(b["running_built_at"], "2026-08-03T02:09:51Z");
     // The disk side is this TEST binary's own compile-time build — the
     // exact quantity `render_build_status_line` also compares against.
-    assert_eq!(b["disk_commit"], loom_daemon::self_update::BUILT_COMMIT);
-    assert_eq!(b["disk_built_at"], loom_daemon::self_update::BUILT_AT_RAW);
+    assert_eq!(b["disk_commit"], crate::self_update::BUILT_COMMIT);
+    assert_eq!(b["disk_built_at"], crate::self_update::BUILT_AT_RAW);
     assert_eq!(
         b["stale"],
-        serde_json::json!(build_is_stale(Some("5111b74a"), loom_daemon::self_update::BUILT_COMMIT))
+        serde_json::json!(build_is_stale(Some("5111b74a"), crate::self_update::BUILT_COMMIT))
     );
 }
 
@@ -544,7 +541,7 @@ fn exit_autonomy_mismatch_is_distinct_from_every_unreachable_and_fleet_exit_code
     // collision would not break *this* command directly, but would make
     // "was this the mismatch, or was it something else" ambiguous for any
     // script that greps a bare exit code instead of `--json`.
-    use loom_daemon::daemon_install_state::{
+    use crate::daemon_install_state::{
         EXIT_ALIVE_BUT_UNRESPONSIVE, EXIT_AUTONOMY_MISMATCH, EXIT_EXPECTED_BUT_DEAD,
         EXIT_NOT_EXPECTED,
     };

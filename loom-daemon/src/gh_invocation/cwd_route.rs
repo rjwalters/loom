@@ -536,7 +536,15 @@ pub(crate) fn checkout_answer(cwd: &Path, gh_env: GhRepoEnv) -> CwdAnswer {
         Some((host, nwo))
             if host.eq_ignore_ascii_case("github.com") && nwo.eq_ignore_ascii_case(&base.nwo) =>
         {
-            CwdAnswer::Sole(base.nwo)
+            // origin = base here. A renamed/transferred repo is not a
+            // disagreement about which repo gh acts on (gh follows the
+            // redirect), only a stale slug: route to the recorded canonical
+            // one instead of shedding the read. Only trust a record computed
+            // against the same base this answer used.
+            let canonical = crate::forge_repo_facts::disagreement(cwd)
+                .filter(|d| d.gh_base_nwo.eq_ignore_ascii_case(&base.nwo))
+                .and_then(|d| d.canonical_nwo);
+            CwdAnswer::Sole(canonical.unwrap_or(base.nwo))
         }
         _ => CwdAnswer::Disagree,
     }
@@ -558,9 +566,12 @@ fn note_disagreement(cwd: &Path, op: &str) {
         .map(|mut w| w.insert(cwd.to_path_buf()))
         .unwrap_or(false);
     if first {
+        // Since #12584 a reader-only read with no route is shed, not sent to
+        // the writer: say so, so a shed run can be traced to this root.
         log::warn!(
             "gh_invocation: {} resolves to different repositories locally ({op}); its \
-             untargeted reads stay on the writer ({DISAGREE_COUNTER}={n})",
+             untargeted reads have no reader route and are shed, never sent to the writer \
+             ({DISAGREE_COUNTER}={n})",
             cwd.display()
         );
     }

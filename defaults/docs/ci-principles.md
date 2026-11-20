@@ -116,7 +116,11 @@ the next person to add one will have an equally good argument.
    a PR (a cancelled / never-acquired runner otherwise skips every filtered
    job while the always-run required checks stay green, as on #10403), when
    any job failed or was cancelled, or when a job was skipped only because its
-   upstream did not succeed. A skip the path filter decided still passes. The
+   upstream did not succeed. A skip the path filter decided still passes. A
+   transient GitHub diff-API outage inside the filter step itself is retried
+   once and then falls **open**: the path-group outputs resolve to `true` and
+   every filtered job runs under a `::warning::`, so an outage costs CI
+   minutes instead of a red run that verifies nothing (#13969). The
    rule lives in `scripts/ci-result-gate.sh`. `merge-pr.sh` no longer
    re-checks the `CI` run itself (#12063): `CI Result` as the required
    context is what GitHub gates the merge on. Remedy: `gh run rerun --failed
@@ -153,9 +157,11 @@ the next person to add one will have an equally good argument.
     reports. A suite that is skipped on `merge_group` is not coverage
     (rule 6), and path filters do not apply there (rule 3). `merge_group` runs
     the full suite: everything `push` runs, plus the image jobs that `push`
-    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit` checks all of
-    this statically, and it counts any suite it cannot prove runs as
-    uncovered. See [merge-queue-ci](merge-queue-ci.md).
+    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit`
+    checks static job eligibility and compares step conditions. Equal unknown
+    step conditions can pass that comparison even when runtime outputs differ.
+    Verify full-suite execution from the actual job and step results on the
+    merge-group SHA. See the [step comparison example](merge-queue-ci.md#reproduce-the-step-comparison).
 
 ## The daily backstop and its tracking issues
 
@@ -216,13 +222,6 @@ to ignore red. So the `report` job is part of the mechanism, not a nicety:
   the label set is intentional and `.github/labels.yml` is authoritative.
   Identity lives in the title, which is why the lookup ignores labels and the
   issue body asks that the title be left unchanged.
-- **This repo's ci-daily also records the same decisions on its dashboard's
-  alert hub** (see the workflow's header comment). After the issue step, the
-  `report` job posts `open` for each job whose issue it opened or updated and
-  `resolved` for each green job, with the job's Actions OIDC token (no secret).
-  It is best-effort (`continue-on-error`, warnings only) and posts only from
-  `main`; it never changes an issue, and an outage there never turns the
-  report red.
 
 SigNoz needs nothing workflow-side: `loom-daemon ci-telemetry` captures every
 run of every workflow of the configured owners by auto-discovery, so the daily

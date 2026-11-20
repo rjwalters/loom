@@ -1,4 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]
 //! Issue #6262 AC4: an operator must be able to see, from `status`, that
 //! the daemon seeded its capacity accounting with sweeps that survived a
 //! restart — and how many — instead of inferring it from a log line.
@@ -12,8 +11,8 @@ fn report_with_adoptions(n: usize) -> DaemonStatusReport {
     }
 }
 
-fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-    loom_daemon::self_update::SelfUpdateStatus {
+fn no_update() -> crate::self_update::SelfUpdateStatus {
+    crate::self_update::SelfUpdateStatus {
         built_commit: "abc".to_string(),
         source_commit: None,
         update_available: None,

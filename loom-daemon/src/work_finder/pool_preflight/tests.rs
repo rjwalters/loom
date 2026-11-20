@@ -361,7 +361,7 @@ fn all_four_hosts_resume_on_the_tick_after_the_pool_recovers() {
 /// `role_runner::runtime_preflight::tests::EnvGuard`.
 const PREFERENCE_ENV: [&str; 8] = [
     "LOOM_RUNTIME",
-    "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+    "LOOM_RUNTIME_BUILDER",
     "LOOM_CODEX_HOME",
     "CODEX_HOME",
     "LOOM_CODEX_PROFILE",
@@ -404,10 +404,10 @@ impl Drop for PreferenceEnvGuard {
 
 /// A workspace with BOTH a Claude token pool (`workspace_with_pool`) and the
 /// on-disk role/runtime manifests plus an executable `codex` adapter stub
-/// that `runtime_preference::resolve_runtime("sweep-lifecycle", ...)` needs
-/// to admit a fallback tap for real, instead of failing closed on missing
-/// files. `sweep-lifecycle`'s role-manifest lookup substitutes `builder.json`
-/// (`runtime_admission`'s own fallback), so that is the file written here.
+/// that `runtime_preference::resolve_runtime("builder", ...)` needs to admit
+/// a fallback tap for real, instead of failing closed on missing files. The
+/// pre-flight probes the **builder** role (#13983), so `builder.json` is the
+/// manifest read directly.
 fn workspace_with_pool_and_preference(names: &[&str], config: &serde_json::Value) -> TempDir {
     let dir = workspace_with_pool(names);
     for sub in ["roles", "runtimes", "scripts"] {
@@ -523,346 +523,276 @@ fn an_operator_pin_disables_fall_through_at_the_hold() {
 }
 
 // ---------------------------------------------------------------------------
-// Fleet broadcast of the hold (Issue #8001)
+// #13983: the probe must not hold on a rejection only containment would lift
 // ---------------------------------------------------------------------------
-//
-// The shape these mirror is #7477's: one process models N hosts, each host
-// being one `PoolHoldState` + one `SweepRegistry` + one `PeerClaimView`. The
-// room itself is modelled by hand-delivering the ad the publishing host put
-// on its outbound channel into the receiving host's view — the same thing
-// `safehouse::PeerClaimSink::on_event` does in production, minus the socket.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration as StdDuration, Instant};
-
-use crate::peer_claims::{ClaimAd, ClaimKind, PeerClaimView};
-use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
-use crate::tokens_pool::paths::resolve_tokens_dir;
-use crate::tokens_pool::select::pool_account_fingerprint;
-
-/// One simulated fleet host: its own hold set, its own registry (with an
-/// outbound peer-claim channel), and its own inbound peer-claim view.
-struct FleetHost {
-    holds: PoolHoldState,
-    registry: SweepRegistry,
-    view: Arc<Mutex<PeerClaimView>>,
-    outbound: tokio::sync::mpsc::Receiver<ClaimAd>,
+/// Rewrite the fixture's `builder.json` role manifest to require exactly
+/// `worktreeIsolation` — the real `defaults/roles/builder.json` vs
+/// `defaults/runtimes/codex.json` shape, whose `"partial"` leaves it unmet —
+/// so a codex tap's admission refusal is `not-admitted(worktreeIsolation)`
+/// and nothing else: the containment-eligible (#8787) rejection this section
+/// exercises. With `capability` instead, the refusal names that capability
+/// and is NOT containment-liftable — the control case.
+fn require_capability(ws: &TempDir, capability: &str) {
+    fs::write(
+        ws.path().join(".loom/roles/builder.json"),
+        format!(r#"{{"runtimeRequirements":["{capability}"]}}"#),
+    )
+    .unwrap();
 }
 
-impl FleetHost {
-    fn new(name: &str, root: &Path) -> Self {
-        let mut registry = SweepRegistry::new(SweepRegistryConfig::new(root.to_path_buf()));
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
-        registry.set_peer_claim_publisher(tx);
-        let view =
-            Arc::new(Mutex::new(PeerClaimView::new(name.to_owned(), StdDuration::from_secs(120))));
-        registry.set_peer_claims(Arc::clone(&view));
-        Self {
-            holds: PoolHoldState::new(),
-            registry,
-            view,
-            outbound: rx,
+/// The incident shape (#13983): on the one host that admits Codex, a
+/// codex-only preference table made the probe — which resolves with
+/// `NoContainment` — report the whole list unavailable, holding the repo
+/// forever although the real step spawn carries a containment preparer
+/// (#8787) and would admit the tap. The probe must not hold, and the
+/// unheld root dispatches on every tick.
+#[test]
+#[serial]
+fn a_containment_liftable_codex_only_list_does_not_hold_or_stop_dispatch() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    require_capability(&ws, "worktreeIsolation");
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a codex-only list whose refusal only containment would lift must not hold (#13983)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+    // The Builder step is dispatched: an unheld root attempts a dispatch on
+    // every tick, where an attempt is exactly the `loom:issue` →
+    // `loom:building` label flip in production.
+    assert_eq!(
+        ticks_for_host(Some(&host), ws.path(), 13983, 3),
+        3,
+        "an unheld root dispatches on every tick"
+    );
+}
+
+/// The carve-out composes with fall-through: a dry Claude tap above a
+/// containment-liftable codex tap is not an exhausted list either — the real
+/// launch skips the dry tap and contains onto codex.
+#[test]
+#[serial]
+fn a_dry_tap_above_a_containment_liftable_codex_tap_does_not_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+    require_capability(&ws, "worktreeIsolation");
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a dry claude tap above a liftable codex tap must not hold (#13983)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// The carve-out is narrow: a codex-only list refused for a capability
+/// containment can NEVER satisfy is a genuine whole-list unavailability and
+/// still arms the hold.
+#[test]
+#[serial]
+fn a_non_liftable_codex_refusal_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    // The fixture's codex manifest has no `subagents` capability, so the
+    // refusal names it — not the one requirement containment satisfies.
+    require_capability(&ws, "subagents");
+
+    let host = PoolHoldState::new();
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "a refusal naming a capability containment cannot satisfy still holds"
+    );
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// AC 2: the halt is not keyed on `sweep-lifecycle`, the role no step
+/// resolves since #11909. A repo whose `sweep-lifecycle` table is wholly
+/// unavailable while the builder probe's own list resolves is not held: the
+/// probe consults the launch's tables, not the retired sweep's.
+#[test]
+#[serial]
+fn a_wholly_unavailable_sweep_lifecycle_table_does_not_key_the_halt() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let ws = workspace_with_pool_and_preference(
+        &["a"],
+        &serde_json::json!({"runtimes": {
+            "rolePreference": {"sweep-lifecycle": ["claude"]},
+            "preference": ["claude", "codex"],
+        }}),
+    );
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a dead sweep-lifecycle table must not hold step dispatch (#13983 AC 2)"
+    );
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Tap-less preference resolution is config, not exhaustion (#13428)
+// ---------------------------------------------------------------------------
+
+/// A `roleDraw` table for `builder` whose only provider is excluded: the
+/// walk runs over ZERO taps, so `resolve_runtime` returns a
+/// `Decision::Preference` whose resolution `is_empty_list()`.
+fn tapless_config() -> serde_json::Value {
+    serde_json::json!({"runtimes": {
+        "excludeProviders": ["codex"],
+        "roleDraw": {"builder": [{"attempt": 1, "draw": {"codex": 100}}]},
+    }})
+}
+
+/// AC1: a tap-less root over a healthy pool must not hold or arm anything.
+/// Reverting the `is_empty_list()` guard in `observe_root_edge` makes this
+/// fail: the empty resolution has `chosen == None`, so it reads as exhausted.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_healthy_pool_does_not_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a", "b"], &tapless_config());
+
+    let host = PoolHoldState::new();
+    assert!(!host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// AC4: a tap-less root over a genuinely exhausted pool still holds — the
+/// pool-state branch decides, exactly as with no preference configured.
+#[test]
+#[serial]
+fn a_tapless_root_with_a_really_exhausted_pool_still_arms_the_hold() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    let ws = workspace_with_pool_and_preference(&["a"], &tapless_config());
+    bad_mark_all(ws.path(), &["a"]);
+
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.held_pool_count(), 1);
+}
+
+/// AC3: two roots sharing one HEALTHY pool, one tap-less and one with a
+/// preference list. Neither may hold, and no arm/clear edge may appear across
+/// repeated ticks. Before the fix the tap-less root read as exhausted and armed
+/// the shared key, which the other root then cleared: the per-tick WARN /
+/// recovered pair.
+#[test]
+#[serial]
+fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+
+    // Neither root has a repo-local pool, so both resolve to the shared one.
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let tapless = workspace_with_pool_and_preference(&[], &tapless_config());
+    let spawnable = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut edges = Vec::new();
+    for _ in 0..3 {
+        for root in [tapless.path(), spawnable.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            edges.push((root == tapless.path(), obs.held, obs.edge));
         }
     }
-
-    /// This host's full per-root verdict: its own pre-flight read, its own
-    /// arm/clear broadcast, and any peer-reported hold folded in — exactly
-    /// what `preflight_held_per_root` computes per root in production.
-    fn preflight(&self, root: &Path, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let observation = self.holds.observe_root_edge(root, now);
-        fold_peer_pool_hold(&self.holds, &self.registry, &observation)
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
     }
 
-    /// Drain everything this host published and deliver it to `peer`'s view —
-    /// the room, modelled.
-    fn deliver_to(&mut self, peer: &FleetHost) {
-        while let Ok(ad) = self.outbound.try_recv() {
-            if ad.kind.is_pool_hold_lane() {
-                let mut v = peer.view.lock().unwrap();
-                v.observe_pool_hold_at(&ad, Instant::now());
+    assert!(edges.iter().all(|(_, held, edge)| !held && edge.is_none()), "{edges:?}");
+    assert_eq!(host.held_pool_count(), 0);
+}
+
+/// #13539: two roots on ONE pool — A lists only `codex` and no Codex seat
+/// exists, B lists `claude` with a spawnable account. Across repeated ticks A
+/// stays held and B stays free, the hold never disappears between A's ticks
+/// (it used to be cleared by B's, flapping the arm WARN / clear INFO per
+/// tick), and nothing is ever offered for broadcast. When a Codex seat
+/// appears A releases exactly once.
+#[test]
+#[serial]
+fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
+    let profiles = tempfile::tempdir().unwrap();
+    let _env = PreferenceEnvGuard::new(profiles.path());
+
+    let shared = tempfile::tempdir().unwrap();
+    fs::write(shared.path().join("a.token"), "sk-ant-oat01-fake").unwrap();
+    let prior = std::env::var_os("LOOM_SHARED_TOKENS_DIR");
+    std::env::set_var("LOOM_SHARED_TOKENS_DIR", shared.path());
+
+    let codex_only = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["codex"]}}),
+    );
+    let claude = workspace_with_pool_and_preference(
+        &[],
+        &serde_json::json!({"runtimes": {"preference": ["claude", "codex"]}}),
+    );
+
+    let host = PoolHoldState::new();
+    let mut observed = Vec::new();
+    for _ in 0..4 {
+        for root in [codex_only.path(), claude.path()] {
+            let obs = host.observe_root_edge(root, chrono::Utc::now());
+            observed.push((root == codex_only.path(), obs.held, obs.edge));
+            if root == codex_only.path() {
+                assert_eq!(
+                    host.held_pool_count(),
+                    1,
+                    "the sibling root's tick must not clear the codex-only hold"
+                );
             }
         }
     }
-
-    /// Drop everything this host published without delivering it — a
-    /// safehoused outage / dropped ad.
-    fn drop_outbound(&mut self) {
-        while self.outbound.try_recv().is_ok() {}
-    }
-}
-
-fn fingerprint_of(root: &Path) -> String {
-    pool_account_fingerprint(&resolve_tokens_dir(root)).expect("fixture pool has accounts")
-}
-
-/// **The #8001 acceptance criterion.** Host A discovers the pool is dead and
-/// broadcasts. Host B — whose own `spawnable_pool_state` read still reports a
-/// perfectly healthy pool, so its own pre-flight would NOT hold — holds
-/// dispatch anyway, purely on the strength of the received ad.
-#[test]
-fn a_peer_holds_on_the_broadcast_without_rederiving_exhaustion_itself() {
-    let now = chrono::Utc::now();
-    // Host A's workspace: dead pool. Host B's: the SAME accounts, but its own
-    // view of them is healthy (no `.bad_tokens`) — B's own read cannot catch
-    // this, which is the whole point.
-    let ws_a = workspace_with_pool(&["a", "b", "c"]);
-    bad_mark_all(ws_a.path(), &["a", "b", "c"]);
-    let ws_b = workspace_with_pool(&["a", "b", "c"]);
-
-    assert_eq!(
-        fingerprint_of(ws_a.path()),
-        fingerprint_of(ws_b.path()),
-        "the same account set must fingerprint identically across hosts"
-    );
-
-    let mut host_a = FleetHost::new("host-a", ws_a.path());
-    let host_b = FleetHost::new("host-b", ws_b.path());
-
-    assert!(host_a.preflight(ws_a.path(), now), "A's own read must hold");
-    // Before the ad arrives B is free — this is the baseline the broadcast
-    // has to change, and it proves B's OWN read says "healthy".
     assert!(
-        !host_b.preflight(ws_b.path(), now),
-        "B's own pre-flight read must report the pool healthy"
+        observed
+            .iter()
+            .all(|(is_codex_only, held, edge)| *is_codex_only == *held && edge.is_none()),
+        "{observed:?}"
     );
-    assert_eq!(
-        host_b.holds.held_pool_count(),
-        0,
-        "B must hold nothing of its own — any hold it takes is the peer's"
-    );
+    assert_eq!(host.active_holds().len(), 1);
 
-    host_a.deliver_to(&host_b);
+    // A Codex seat logs in: the codex-only root releases, once.
+    fs::create_dir(profiles.path().join("alice")).unwrap();
+    let obs = host.observe_root_edge(codex_only.path(), chrono::Utc::now());
+    assert!(!obs.held && obs.edge.is_none());
+    assert_eq!(host.held_pool_count(), 0);
+    assert!(!host.observe_root(codex_only.path(), chrono::Utc::now()));
 
-    assert!(
-        host_b.preflight(ws_b.path(), now),
-        "B must hold on A's broadcast despite its own read saying healthy"
-    );
-    assert_eq!(
-        host_b.holds.held_pool_count(),
-        0,
-        "the peer-sourced hold must not be forged into B's own local hold set"
-    );
-}
-
-/// **The correctness risk the module doc names.** A peer resolving a
-/// genuinely DIFFERENT (healthy) repo-local shadow pool must not be
-/// suppressed by another host's hold — even though both hosts hold their
-/// pools at the identical relative path `<root>/.loom/tokens`, which is
-/// exactly why the broadcast is keyed by account set and not by directory.
-#[test]
-fn a_peer_with_a_different_healthy_shadow_pool_is_not_suppressed() {
-    let now = chrono::Utc::now();
-    let ws_a = workspace_with_pool(&["a", "b", "c"]);
-    bad_mark_all(ws_a.path(), &["a", "b", "c"]);
-    // B's repo-local shadow pool holds a DIFFERENT account set (#7527/#3938).
-    let ws_b = workspace_with_pool(&["x", "y"]);
-
-    assert_ne!(
-        fingerprint_of(ws_a.path()),
-        fingerprint_of(ws_b.path()),
-        "different account sets must fingerprint differently"
-    );
-    assert_eq!(
-        ws_a.path().join(".loom").join("tokens").file_name(),
-        ws_b.path().join(".loom").join("tokens").file_name(),
-        "both pools sit at the same relative path — a path key would collide"
-    );
-
-    let mut host_a = FleetHost::new("host-a", ws_a.path());
-    let host_b = FleetHost::new("host-b", ws_b.path());
-
-    assert!(host_a.preflight(ws_a.path(), now));
-    host_a.deliver_to(&host_b);
-
-    assert!(
-        !host_b.preflight(ws_b.path(), now),
-        "a host whose own pool is healthy and DIFFERENT must never be \
-         suppressed by a peer's hold"
-    );
-}
-
-/// Recovery propagates early: when A's pool recovers it broadcasts a clear,
-/// and B resumes immediately rather than sitting out the remainder of the
-/// advertised TTL.
-#[test]
-fn a_recovery_broadcast_releases_the_peer_early() {
-    let now = chrono::Utc::now();
-    let ws_a = workspace_with_pool(&["a", "b"]);
-    bad_mark_all(ws_a.path(), &["a", "b"]);
-    let ws_b = workspace_with_pool(&["a", "b"]);
-
-    let mut host_a = FleetHost::new("host-a", ws_a.path());
-    let host_b = FleetHost::new("host-b", ws_b.path());
-
-    assert!(host_a.preflight(ws_a.path(), now));
-    host_a.deliver_to(&host_b);
-    assert!(host_b.preflight(ws_b.path(), now), "B holds on the arm ad");
-
-    readmit_all(ws_a.path());
-    assert!(!host_a.preflight(ws_a.path(), now), "A clears on its very next tick");
-    host_a.deliver_to(&host_b);
-
-    assert!(
-        !host_b.preflight(ws_b.path(), now),
-        "B must resume on A's clear ad, not wait out the advertised TTL"
-    );
-}
-
-/// A second host holding the same pool keeps the hold alive after the first
-/// one clears: a `PoolHoldCleared` speaks only for its own sender.
-#[test]
-fn one_peers_recovery_does_not_release_another_peers_hold() {
-    let now = chrono::Utc::now();
-    let pool_key = {
-        let ws = workspace_with_pool(&["a", "b"]);
-        fingerprint_of(ws.path())
-    };
-    let ws_c = workspace_with_pool(&["a", "b"]);
-    let host_c = FleetHost::new("host-c", ws_c.path());
-
-    {
-        let mut v = host_c.view.lock().unwrap();
-        for peer in ["host-a", "host-b"] {
-            v.observe_pool_hold_at(
-                &ClaimAd::pool_hold_armed(
-                    "repo".into(),
-                    peer.into(),
-                    1,
-                    "ts".into(),
-                    pool_key.clone(),
-                    900,
-                ),
-                Instant::now(),
-            );
-        }
-        // Only host-a recovers.
-        v.observe_pool_hold_at(
-            &ClaimAd::pool_hold_cleared(
-                "repo".into(),
-                "host-a".into(),
-                1,
-                "ts".into(),
-                pool_key.clone(),
-            ),
-            Instant::now(),
-        );
+    match prior {
+        Some(v) => std::env::set_var("LOOM_SHARED_TOKENS_DIR", v),
+        None => std::env::remove_var("LOOM_SHARED_TOKENS_DIR"),
     }
-
-    assert!(
-        host_c.preflight(ws_c.path(), now),
-        "host-b still holds the pool — one peer's recovery must not speak for another's"
-    );
-}
-
-/// Fail-open: a dropped ad (safehoused outage, saturated channel) leaves the
-/// peer exactly where it was before #8001 — free to dispatch, and still
-/// protected by its own pre-flight on its own next tick once its own view of
-/// the pool catches up.
-#[test]
-fn a_dropped_ad_degrades_to_the_local_only_preflight() {
-    let now = chrono::Utc::now();
-    let ws_a = workspace_with_pool(&["a", "b"]);
-    bad_mark_all(ws_a.path(), &["a", "b"]);
-    let ws_b = workspace_with_pool(&["a", "b"]);
-
-    let mut host_a = FleetHost::new("host-a", ws_a.path());
-    let host_b = FleetHost::new("host-b", ws_b.path());
-
-    assert!(host_a.preflight(ws_a.path(), now));
-    host_a.drop_outbound(); // the ad never reaches the room
-
-    assert!(!host_b.preflight(ws_b.path(), now), "a dropped ad must not hold B — fail-open");
-
-    // B's own read catching up still holds it, unchanged from pre-#8001.
-    bad_mark_all(ws_b.path(), &["a", "b"]);
-    assert!(host_b.preflight(ws_b.path(), now));
-}
-
-/// The arm edge is published exactly once per outage, not once per tick —
-/// what keeps a multi-hour outage from flooding the shared room.
-#[test]
-fn the_arm_edge_is_broadcast_once_per_outage() {
-    let now = chrono::Utc::now();
-    let ws = workspace_with_pool(&["a"]);
-    bad_mark_all(ws.path(), &["a"]);
-    let mut host = FleetHost::new("host-a", ws.path());
-
-    for _ in 0..5 {
-        assert!(host.preflight(ws.path(), now));
-    }
-
-    let mut ads = Vec::new();
-    while let Ok(ad) = host.outbound.try_recv() {
-        ads.push(ad);
-    }
-    assert_eq!(ads.len(), 1, "five held ticks must publish one arm ad");
-    assert_eq!(ads[0].kind, ClaimKind::PoolHoldArmed);
-    assert_eq!(ads[0].pool_key.as_deref(), Some(fingerprint_of(ws.path()).as_str()));
-    assert!(ads[0].remaining_secs.is_some_and(|s| s > 0 && s <= 900));
-
-    readmit_all(ws.path());
-    for _ in 0..3 {
-        assert!(!host.preflight(ws.path(), now));
-    }
-    let mut ads = Vec::new();
-    while let Ok(ad) = host.outbound.try_recv() {
-        ads.push(ad);
-    }
-    assert_eq!(ads.len(), 1, "three recovered ticks must publish one clear ad");
-    assert_eq!(ads[0].kind, ClaimKind::PoolHoldCleared);
-}
-
-/// A wrapper-confirmed death (the post-mortem path the reaper drives) is the
-/// strongest evidence available, so it broadcasts too — including when it
-/// merely *upgrades* an existing pre-flight hold.
-#[test]
-fn a_post_mortem_hold_broadcasts_its_arming_edge() {
-    let now = chrono::Utc::now();
-    let ws = workspace_with_pool(&["a"]);
-    let host = PoolHoldState::new();
-
-    // Healthy live read, wrapper says otherwise: arms, and must advertise.
-    let observation = host.note_pool_dead(ws.path(), now);
-    assert!(observation.held);
-    assert_eq!(observation.pool_key.as_deref(), Some(fingerprint_of(ws.path()).as_str()));
-    assert!(matches!(observation.edge, Some(PoolHoldEdge::Armed { .. })));
-
-    // Re-confirming an already-post-mortem hold is not a fresh edge.
-    let again = host.note_pool_dead(ws.path(), now);
-    assert!(again.edge.is_none(), "a repeat post-mortem must not re-broadcast");
-}
-
-/// An upgrade from a pre-flight hold to a wrapper-confirmed one IS a fresh
-/// edge: a peer that missed (or has since expired) the original arm ad gets a
-/// new window backed by the strongest evidence this daemon ever gets.
-#[test]
-fn a_preflight_hold_upgraded_by_the_wrapper_rebroadcasts() {
-    let now = chrono::Utc::now();
-    let ws = workspace_with_pool(&["a"]);
-    bad_mark_all(ws.path(), &["a"]);
-    let host = PoolHoldState::new();
-
-    assert!(host.observe_root(ws.path(), now));
-    let upgraded = host.note_pool_dead(ws.path(), now);
-    assert!(
-        matches!(upgraded.edge, Some(PoolHoldEdge::Armed { .. })),
-        "false -> true on wrapper_observed is a fresh, stronger edge"
-    );
-}
-
-/// An empty pool (#4642's ABSENT-pool condition) has no identity, so it is
-/// never advertised and no peer hold can be about it.
-#[test]
-fn an_empty_pool_has_no_broadcast_identity() {
-    let now = chrono::Utc::now();
-    let ws = tempfile::tempdir().unwrap();
-    fs::create_dir_all(ws.path().join(".loom").join("tokens")).unwrap();
-
-    let host = PoolHoldState::new();
-    let observation = host.observe_root_edge(ws.path(), now);
-    assert!(!observation.held);
-    assert!(observation.pool_key.is_none());
-    assert!(observation.edge.is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -933,4 +863,76 @@ fn preflight_cause_names_the_pool_hold_apart_from_the_advisory() {
     // caller decides the probe dispatch, which this root's row must not
     // report as a hold.
     assert_eq!(preflight_cause(false, PreflightDispatchGate::Probe), (false, None));
+}
+
+// ---------------------------------------------------------------------------
+// #13873: the fallback-aware exhaustion read
+// ---------------------------------------------------------------------------
+
+/// Bad-mark every named account for ONE model class (#8058's scoped shape,
+/// #13872's live marks): the class is held, every other class stays usable.
+/// `classes` as a slice keeps the every-class fixture (#14088 review) on the
+/// same on-disk shape: one line per (account, class), exactly what repeated
+/// production writes leave behind.
+fn class_mark_all(root: &Path, names: &[&str], classes: &[&str]) {
+    let pool = root.join(".loom").join("tokens");
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let body: String = names
+        .iter()
+        .flat_map(|n| {
+            let now = now.as_str();
+            classes.iter().map(move |c| {
+                format!("{now} {n} exhausted: hit your {c} limit [model-class:{c}]\n")
+            })
+        })
+        .collect();
+    fs::write(pool.join(".bad_tokens"), body).unwrap();
+}
+
+/// #13873: a pool whose accounts are all bad-marked for one model class,
+/// with `modelFallback.enabled`, must not hold dispatch — the launches it
+/// would spawn fall a rung (`fable → opus`) and select an account the marks
+/// leave usable. With the block absent, the same pool holds exactly as
+/// before: an absent block reproduces today's behaviour byte-for-byte.
+#[test]
+fn a_class_marked_pool_holds_only_without_the_fallback_block() {
+    let ws = workspace_with_pool(&["a", "b"]);
+    class_mark_all(ws.path(), &["a", "b"], &["fable"]);
+
+    // Block absent: the account-wide read treats class-scoped marks as
+    // blocking and arms the hold (the 2026-11-13 fleet-idle state).
+    let host = PoolHoldState::new();
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
+    assert_eq!(host.active_holds().len(), 1);
+
+    // Enabled: the any-class read sees the opus capacity the marks leave,
+    // so the hold never arms — dispatch proceeds and each launch resolves
+    // its own rung at spawn time.
+    fs::create_dir_all(ws.path().join(".loom")).unwrap();
+    fs::write(
+        ws.path().join(".loom/config.json"),
+        r#"{"autonomous":{"modelFallback":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let host = PoolHoldState::new();
+    assert!(
+        !host.observe_root(ws.path(), chrono::Utc::now()),
+        "a usable lower rung must not hold dispatch"
+    );
+    assert!(host.active_holds().is_empty());
+
+    // An account marked for *every* class is the same dead state even
+    // though no mark is class-less (#14088 review): the any-class read must
+    // count it for no class, so the hold arms exactly as the account-wide
+    // read would.
+    class_mark_all(ws.path(), &["a", "b"], &["fable", "claude-opus-5", "sonnet", "haiku"]);
+    assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "every class marked on every account must arm the hold"
+    );
+
+    // ...and a class-LESS mark still holds everything, enabled or not: it
+    // blocks every class outright, leaving no rung to fall to.
+    bad_mark_all(ws.path(), &["a", "b"]);
+    assert!(host.observe_root(ws.path(), chrono::Utc::now()));
 }

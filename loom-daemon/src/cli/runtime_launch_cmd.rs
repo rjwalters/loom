@@ -9,8 +9,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use loom_daemon::runtime_admission::EX_CONFIG;
-use loom_daemon::runtime_launch::{resolve_launch_env, LaunchEnvOutcome};
+use crate::runtime_admission::EX_CONFIG;
+use crate::runtime_launch::{resolve_launch_env, LaunchEnvOutcome};
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct RuntimeLaunchEnvArgs {
@@ -40,7 +40,7 @@ impl RuntimeLaunchEnvArgs {
     pub(crate) fn run(self) -> Result<()> {
         let root = match self.repo_root {
             Some(p) => p,
-            None => loom_daemon::repo_root::find_worktree_root_from_cwd()
+            None => crate::repo_root::find_worktree_root_from_cwd()
                 .unwrap_or_else(|| PathBuf::from(".")),
         };
         match resolve_launch_env(&root, &self.runtime) {

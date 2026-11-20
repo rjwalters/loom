@@ -9,35 +9,17 @@
 //! 2026-10-05 five approved PRs sat in one chain behind a single
 //! changes-requested head.
 //!
-//! Three rules, all keyed on one predicate, [`ready`]:
+//! Since #12775 the pass plans only stacked-base edges, so what remains of
+//! this module is on the release side, keyed on one predicate, [`ready`]:
+//! **release when the head stops being ready** ([`with_readiness`]): an
+//! existing SOFT hold whose predecessor, as this tick's listing shows it,
+//! is no longer ready is released ([`HoldAction::ReleaseNotReady`]).
 //!
-//! 1. **Ready-first ordering** ([`tier`]): within a component, ready members
-//!    are placed ahead of non-ready ones. Inside each tier the #10060 rank
-//!    still applies (stalled last, stars first, then oldest-first), and a
-//!    constraint edge (trusted marker, stacked base) still beats any rank.
-//! 2. **No new holds behind a non-ready head** ([`drop_edges_behind_unready`]):
-//!    the planner never emits a shared-files `source=pass` edge whose
-//!    predecessor is not [`ready`].
-//! 3. **Release when the head stops being ready** ([`with_readiness`]): an
-//!    existing SOFT hold whose predecessor, as this tick's listing shows it,
-//!    is no longer ready is released ([`HoldAction::ReleaseNotReady`]). This
-//!    is the verdict-change re-plan: the release happens on the first tick
-//!    that sees the flip, and the next tick's plan re-derives the order from
-//!    the new readiness (rule 1), so the follower is not put back behind it.
-//!
-//! **Stacked bases are exempt from rules 2 and 3.** A follower whose base
-//! branch is the predecessor's head branch ([`EdgeReason::StackedBase`])
-//! depends on it, and the hold is what stops it merging into an unready
-//! branch; readiness only governs rebase-saving (shared-files) order. Rule 3
-//! mirrors the #10077 no-overlap check: it releases only when the pair is
-//! provably not stacked, and an empty branch name is unknown, so it keeps the
-//! hold (fail closed).
-//!
-//! **One-tick gap for non-ready followers.** When a follower's nearest
-//! overlapping predecessor is not ready, its edge is dropped and the follower
-//! is not re-attached to a farther ready member. That is harmless while the
-//! follower itself is not ready (nothing is about to land), and once it gets
-//! `loom:pr` the next tick re-plans it against the ready members.
+//! **Stacked bases are exempt.** A follower whose base branch is the
+//! predecessor's head branch depends on it, and the hold is what stops it
+//! merging into an unready branch. The rule mirrors the #10077 no-overlap
+//! check: it releases only when the pair is provably not stacked, and an
+//! empty branch name is unknown, so it keeps the hold (fail closed).
 //!
 //! What it never touches: HARD holds (no `source=`, the human-authored shape)
 //! stay [`HoldAction::HoldHard`] and never auto-expire; consolidation
@@ -71,8 +53,8 @@ use std::collections::BTreeMap;
 
 use super::stall::CONSOLIDATION_PLAN_PREFIX;
 use super::{
-    evaluate, EdgeReason, HoldAction, KeepReason, PredecessorState, SequenceGroup, SequenceMarker,
-    SequencePr, Verdict, SOURCE_PASS,
+    evaluate, HoldAction, KeepReason, PredecessorState, SequenceMarker, SequencePr, Verdict,
+    SOURCE_PASS,
 };
 
 /// The verdict label an approved PR carries.
@@ -148,24 +130,6 @@ pub fn demote_unlandable(
 #[must_use]
 pub fn ready(pr: &SequencePr) -> bool {
     pr.has(APPROVED_LABEL) && !NOT_READY_LABELS.iter().any(|l| pr.has(l))
-}
-
-/// The ordering tier: `0` for ready members, `1` for the rest. Sorts ready
-/// work first; the caller's rank breaks ties inside a tier.
-#[must_use]
-pub fn tier(pr: &SequencePr) -> u8 {
-    u8::from(!ready(pr))
-}
-
-/// Remove every planned shared-files edge whose predecessor is not
-/// [`ready`]. A predecessor absent from `by_number` is treated as not ready:
-/// no such hold is ever written against a PR whose state this tick did not
-/// read. [`EdgeReason::StackedBase`] edges are always kept — a stacked
-/// follower depends on its base, whatever the base's readiness.
-pub fn drop_edges_behind_unready(group: &mut SequenceGroup, by_number: &BTreeMap<u32, SequencePr>) {
-    group.edges.retain(|e| {
-        e.reason == EdgeReason::StackedBase || by_number.get(&e.after).is_some_and(ready)
-    });
 }
 
 /// Is `follower` provably not stacked on `head`? Both branch names must be

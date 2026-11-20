@@ -128,49 +128,18 @@ pub fn ledger_path(profile: &Path) -> PathBuf {
     profile.join(LEDGER_FILE)
 }
 
-/// Atomic, owner-only write: a temp file beside the target (same filesystem,
-/// so the rename is atomic) created with mode `0600` before any byte is
-/// written.
+/// Atomic, owner-only write: delegates to [`crate::fs_util::write_atomic`]
+/// (temp file beside the target, `0600` before any byte is written, fsync,
+/// rename).
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)?;
-    let staged = parent.join(format!(
-        ".{}.loom-tmp-{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("profile"),
-        std::process::id()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| -> Result<()> {
-        let mut file = options.open(&staged)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    result?;
-    if let Err(error) = std::fs::rename(&staged, path) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error.into());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::fs_util::write_atomic(
+        path,
+        bytes,
+        crate::fs_util::AtomicOpts {
+            private: true,
+            sync_dir: false,
+        },
+    )?;
     Ok(())
 }
 

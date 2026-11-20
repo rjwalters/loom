@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 
-use super::classify::is_slug;
+use crate::forge_slug::valid_slug;
 
 /// How the front may run one passthrough: the gateway profile, then a reader
 /// App (#12245). A read with a pool but no reader that answers is shed
@@ -293,7 +293,7 @@ fn url_repo(url: &str) -> Result<String, ()> {
     let rest = url.strip_prefix("https://github.com/").ok_or(())?;
     let mut parts = rest.split(['/', '?', '#']);
     let slug = format!("{}/{}", parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    if is_slug(&slug) {
+    if valid_slug(&slug) {
         Ok(slug)
     } else {
         Err(())
@@ -313,7 +313,7 @@ fn argv_repo(args: &[String]) -> Result<Option<String>, ()> {
         Tok::Flag("-R" | "--repo", v) => *v,
         _ => None,
     }) {
-        if !is_slug(v) {
+        if !valid_slug(v) {
             return Err(());
         }
         named.push(v.to_string());
@@ -326,7 +326,7 @@ fn argv_repo(args: &[String]) -> Result<Option<String>, ()> {
         if p.contains("://") {
             named.push(url_repo(p)?);
         } else if cmd == "repo" {
-            named.push(if is_slug(p) {
+            named.push(if valid_slug(p) {
                 p.to_string()
             } else {
                 return Err(());
@@ -341,7 +341,11 @@ fn argv_repo(args: &[String]) -> Result<Option<String>, ()> {
             let (o, r) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             if o != "{owner}" {
                 let slug = format!("{o}/{r}");
-                named.push(if is_slug(&slug) { slug } else { return Err(()) });
+                named.push(if valid_slug(&slug) {
+                    slug
+                } else {
+                    return Err(());
+                });
             }
         }
     }
@@ -367,7 +371,7 @@ pub fn target_repo(
         Err(()) => None,
         Ok(Some(r)) => Some(r),
         Ok(None) => match gh_repo.filter(|r| !r.is_empty()) {
-            Some(r) => is_slug(r).then(|| r.to_string()),
+            Some(r) => valid_slug(r).then(|| r.to_string()),
             None => remote(),
         },
     }

@@ -53,6 +53,7 @@ pub mod next_gh;
 pub mod pr_checks;
 pub mod read_route;
 pub mod session_env;
+pub mod write_span;
 
 #[cfg(test)]
 mod tests;
@@ -262,7 +263,20 @@ pub fn run(raw: &[OsString]) -> i32 {
             );
             return EX_TEMPFAIL;
         }
-        ledger::book(raw, cwd.as_deref(), None, route.read);
+        let booked_repo = ledger::book(raw, cwd.as_deref(), None, route.read);
+        // #13170: a classified write inside a traced execution runs as a
+        // spanned child instead of the exec below, which has no "after".
+        if !route.read {
+            if let Some(code) = write_span::run(
+                &next,
+                raw,
+                (SENTINEL_ENV, OsString::from((depth + 1).to_string())),
+                cwd.as_deref(),
+                booked_repo.as_deref(),
+            ) {
+                return code;
+            }
+        }
         // #11858: a role tick's passed-through `--json` listing runs
         // captured, so its rows reach the tick's `pick.decision`.
         if let Some(code) = listing_capture::run(&next, raw, depth) {
@@ -377,6 +391,13 @@ fn run_on_profile(
     // served reads' reader-then-writer chain does. The front is a new
     // process per call, so no withdrawal remembers it: this is decided on
     // every call.
+    // That is also why a reader's 404 is always shed here (#12511): the
+    // facade lets a 404 through as the item's own answer when the reader
+    // recently served the repo (`served::judge_coverage`), but that evidence
+    // is a process-local map and this process has just started, so it is
+    // always empty. Applying the rule would only ever say "no evidence", so a
+    // genuinely missing item (a new-branch probe) exits 75 until the call is
+    // made through the facade.
     let refused = !gateway
         && !out.status.success()
         && read_route::reader_refused(
@@ -508,7 +529,7 @@ fn pin_repo(mut args: Vec<String>, cwd: Option<&Path>) -> Option<Vec<String>> {
         return Some(args);
     }
     let repo = match std::env::var("GH_REPO").ok().filter(|r| !r.is_empty()) {
-        Some(r) => classify::is_slug(&r).then_some(r)?,
+        Some(r) => crate::forge_slug::valid_slug(&r).then_some(r)?,
         None => implicit_repo(&git_remote_config(cwd?)?)?,
     };
     args.extend(["--repo".to_string(), repo]);
@@ -558,7 +579,7 @@ pub fn implicit_repo(remote_config: &str) -> Option<String> {
         }
     }
     let (host, nwo) = crate::forge_etag_store::parse_remote_url(&url?)?;
-    (host == "github.com" && classify::is_slug(&nwo)).then_some(nwo)
+    (host == "github.com" && crate::forge_slug::valid_slug(&nwo)).then_some(nwo)
 }
 
 /// Append one `x-loom-cache` record to `$GH_CACHE_OUTCOME_LOG` (the opt-in

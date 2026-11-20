@@ -33,8 +33,12 @@ echo -e "${YELLOW}--- Session-owned scratch dir carve-out (rm-scope, #8460) ---$
 
 # --- Fixture ---------------------------------------------------------------
 SS_BASE="$HOME/.loom-guard-session-scratch-test.$$"
-cleanup_session_scratch_fixture() { rm -rf "$SS_BASE"; }
-trap cleanup_session_scratch_fixture EXIT
+cleanup_session_scratch_fixture() {
+    rm -rf "$SS_BASE"
+    # This EXIT trap replaces the harness's; keep its abort report (#14020).
+    _guard_harness_on_exit "$1" "$2"
+}
+trap 'cleanup_session_scratch_fixture "$?" "$BASH_COMMAND"' EXIT
 
 SS_ROOT="$SS_BASE/scratch"
 SID_A="aaaaaaaa-1111-2222-3333-444444444444"   # the acting session

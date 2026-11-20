@@ -5,9 +5,9 @@
 //! A zero in a latency table reads as "instant"; the thing this issue exists to
 //! fix started as exactly that class of misreading.
 
-use loom_daemon::pr_latency::report::LatencyReport;
-use loom_daemon::pr_latency::segments::Treating;
-use loom_daemon::pr_latency::stats::{hours, Distribution};
+use crate::pr_latency::report::LatencyReport;
+use crate::pr_latency::segments::Treating;
+use crate::pr_latency::stats::{hours, Distribution};
 
 /// The full human report.
 pub(crate) fn report_text(r: &LatencyReport, list_error: Option<&str>) -> String {
@@ -293,11 +293,9 @@ pub(crate) fn advise(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::pr_latency::history::PrHistory;
+    use crate::pr_latency::{PrEvent, PrState, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED};
     use chrono::{DateTime, Utc};
-    use loom_daemon::pr_latency::history::PrHistory;
-    use loom_daemon::pr_latency::{
-        PrEvent, PrState, APPROVED, CHANGES_REQUESTED, REVIEW_REQUESTED,
-    };
 
     const HOUR: i64 = 3600;
 

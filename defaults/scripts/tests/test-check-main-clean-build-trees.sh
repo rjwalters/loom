@@ -2,8 +2,8 @@
 # test-check-main-clean-build-trees.sh - check-main-clean.sh --quarantine and
 # cargo build trees: the #11149 follow-ups to #11075.
 #
-# A sibling of test-check-main-clean.sh (which holds the #11075 cases and is
-# frozen by the file-size ratchet). Verified behavior:
+# A sibling of test-check-main-clean.sh (which holds the #11075 cases).
+# Verified behavior:
 #   - a staged `git mv old.txt <buildtree>/b.o` quarantines cleanly (exit 4):
 #     the old.txt deletion is in the stash and the worktree copy is restored;
 #     the build tree is neither stashed nor removed from disk (#11149 item 1)
@@ -29,25 +29,7 @@ SCRIPT="$HELPERS_DIR/check-main-clean.sh"
 source "$SCRIPT_DIR/lib/require-daemon-bin.sh"
 loom_test_require_daemon_bin --self-only "$HELPERS_DIR" "stashes"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # A throwaway git repo with one commit and a tracked source file.
 make_repo_with_source() {

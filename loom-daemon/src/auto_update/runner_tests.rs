@@ -121,6 +121,7 @@ fn tuning(interval: Duration, settle: Duration) -> TickTuning {
         settle,
         defer_deadline: Duration::from_secs(3600),
         chase_enabled: true,
+        freshness: crate::auto_update::freshness::Thresholds::default(),
     }
 }
 
@@ -209,7 +210,6 @@ fn a_tick_with_a_roll_already_armed_reports_drain_wait_and_the_drain() {
     let summary = run_tick(&mut state(&dir), &status, &mut probe, &trigger, NOW, NOW);
     assert_eq!(summary.decision, TickDecisionKind::DrainWait, "{}", summary.note);
     assert!(summary.drain.armed && summary.drain.pending);
-    assert_eq!(summary.drain.refusals, 0, "no deadline refusals are counted any more");
 }
 
 /// The #10414 failure mode: before the fix a panicking tick ended the loop
@@ -311,6 +311,51 @@ async fn the_loop_keeps_ticking_after_a_panicking_tick() {
         !status.snapshot().note.unwrap().contains("panicked"),
         "the latest tick was normal"
     );
+}
+
+/// #14016: after a retryable failure the loop wakes at the back-off its log
+/// line stated, not at the next interval. The failure is seeded 57 s into a
+/// 60 s first-backoff, leaving ~3 s: with a 120 s interval the pre-#14016
+/// loop would resolve again only at ~120 s, this one at ~3 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_loop_resolves_again_at_the_backoff_not_the_next_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut probe = ScriptedProbe::new(newer("0.19.731", "0.19.701"));
+    let (resolve_tx, mut resolve_rx) = tokio::sync::mpsc::unbounded_channel();
+    probe.resolve_notify = Some(resolve_tx);
+    let mut st = state(&dir);
+    // Seed the streak the failure belongs to, so the first tick's
+    // `track_target` sees the same target and does not reset the backoff.
+    st.tracked_target = Some(format!("artifact:0.19.731:{}", "a".repeat(64)));
+    st.stale_since = Some(std::time::Instant::now());
+    let recorded_at = std::time::Instant::now() - Duration::from_secs(57);
+    st.record_rebuild(recorded_at, &RebuildOutcome::Retryable("seeded".into()), false);
+    let status = Arc::new(AutoUpdateStatus::new(true));
+    let tune = tuning(Duration::from_secs(120), Duration::from_secs(3600));
+    let handle =
+        tokio::spawn(run_loop(st, probe, Trigger::default(), status.clone(), tune, no_store()));
+    let started = std::time::Instant::now();
+    let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some(count) = resolve_rx.recv().await {
+            if count >= 2 {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        waited,
+        Ok(true),
+        "the second resolve ran at the seeded backoff (~3s), not at the 120s interval"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the second resolve came at the backoff, not the interval: {elapsed:?}"
+    );
+    assert!(!handle.is_finished(), "the loop is still running");
+    handle.abort();
 }
 
 /// A tick that runs past its bound is reported once as an overrun, and the

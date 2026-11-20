@@ -28,6 +28,7 @@
 //!   recorded owner is dead is broken and retried; but only one retry, so two
 //!   processes racing to break the same stale lock cannot livelock.
 
+use crate::script_helpers::now_iso;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -133,34 +134,10 @@ fn rand_suffix() -> u32 {
     ((a ^ t) & 0x7fff) as u32
 }
 
-fn iso_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
-}
-
 /// The pid recorded in a lock, if the file is readable and parseable.
 fn recorded(lock: &Path) -> Option<Owner> {
     let text = std::fs::read_to_string(lock.join("owner.json")).ok()?;
     serde_json::from_str(&text).ok()
-}
-
-/// Whether `pid` is alive. A failure to signal for any reason other than
-/// "no such process" is treated as ALIVE — refusing to break a lock we cannot
-/// prove is dead is the safe direction.
-///
-/// `pub(crate)` (not private) so [`super::issue_lock`] can reuse the same
-/// liveness primitive for the DIFFERENT, per-issue claim lock it reads
-/// (#8553) — one liveness check, not two that could drift.
-pub(crate) fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    // Safety: `kill(pid, 0)` performs no action beyond permission/existence
-    // checking.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Take the lock on behalf of `owner_pid`, or fail when `timeout` elapses.
@@ -213,7 +190,7 @@ pub fn acquire(
                 owner_pid: pid,
                 token: token.clone(),
                 script: "worktree.sh".to_string(),
-                acquired_at: iso_now(),
+                acquired_at: now_iso(),
             };
             // Best-effort, exactly as the shell's heredoc was: a lock whose
             // metadata could not be written is still HELD. Failing here would
@@ -231,7 +208,7 @@ pub fn acquire(
         // Stale-lock recovery, ONCE. Two processes racing to break the same
         // dead lock must not livelock breaking each other's fresh one.
         if let Some(pid) = holder_pid {
-            if !stale_retry_done && !pid_alive(pid) {
+            if !stale_retry_done && !crate::sweep_registry::is_pid_alive(pid) {
                 let _ = std::fs::remove_dir_all(&lock);
                 stale_retry_done = true;
                 continue;

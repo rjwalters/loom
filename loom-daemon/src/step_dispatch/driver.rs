@@ -8,7 +8,7 @@
 //! step spawn, and returns the [`TickReport`] every tick consumer (the tick
 //! line, the summary, the dispatch plan, `pick.decision`) reads.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use super::gather_budget::{
 use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
+use crate::forge_bucket_book::{self, BucketKey};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
@@ -149,6 +150,11 @@ pub struct StepDriver {
     provider: StageEntryProvider,
     next_start: usize,
     starvation: Starvation,
+    /// The host's capacity-driven work requests to the fleet-dispatch captain
+    /// (#12817), made on first use; idle while fleet mode is off.
+    requests: Option<crate::fleet_dispatch::request::Loop>,
+    /// Reports stale-draw claim refusals to the mirror (#12318).
+    recheck: crate::discovery::recheck::Shared,
 }
 
 impl Default for StepDriver {
@@ -158,6 +164,8 @@ impl Default for StepDriver {
             provider: StageEntryProvider::load(default_cache_path(), DEFAULT_EVENTS_BUDGET),
             next_start: 0,
             starvation: Starvation::default(),
+            requests: None,
+            recheck: crate::discovery::recheck::Shared::default(),
         }
     }
 }
@@ -176,6 +184,10 @@ struct RegistrySpawner {
     concurrency: usize,
     /// Where the spawns' time went, summed over attempts (#12298).
     parts: StepSpawnTimings,
+    /// Mirror mode only (`forge.mirror.discovery = worklist`, #12318).
+    recheck: Option<crate::discovery::recheck::Shared>,
+    /// Evidence captured before applying the per-route draw gate.
+    writer_holds_before_draw: HashMap<BucketKey, i64>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -246,6 +258,23 @@ impl StepSpawner for RegistrySpawner {
 }
 
 impl RegistrySpawner {
+    /// A refusal that means the drawn snapshot was stale tells the mirror to
+    /// re-read the item (#12318). The only call site of the recheck.
+    fn report_stale_draw(&self, idx: usize, item: u32, e: &anyhow::Error) {
+        let (Some(recheck), Some(refusal)) = (&self.recheck, e.downcast_ref::<StepRefusal>())
+        else {
+            return;
+        };
+        let Some(repo) = self
+            .roots
+            .get(idx)
+            .and_then(|root| crate::forge_mirror::resolve_repo(Some(root), None))
+        else {
+            return;
+        };
+        recheck.report(&repo, item, refusal.reason, &refusal.detail);
+    }
+
     /// One spawn. `host_gate`: the tick runs spawns concurrently, so the
     /// launch keeps the host-wide stagger gap (#3887, #12298); a serial
     /// tick (`spawnConcurrency` 1) launches exactly as before.
@@ -265,6 +294,53 @@ impl RegistrySpawner {
             Ok(_) => SpawnResult::Spawned,
             Err(e) => {
                 let reason = refusal_reason(&e);
+                if let Some(secs) = e
+                    .downcast_ref::<StepRefusal>()
+                    .filter(|r| r.reason == super::tick::REFUSAL_CAPTAIN_COOLDOWN)
+                    .and_then(|r| r.hold_secs)
+                {
+                    lock(registry).arm_captain_hold(request.item, request.role, secs);
+                }
+                // #13746: a confirmed writer rate limit arms its route hold,
+                // so the next tick's candidates wait before the draw until
+                // the reset instead of drawing and being refused again.
+                if let Some(limited) = e
+                    .downcast_ref::<StepRefusal>()
+                    .and_then(|r| r.writer_limit.as_deref())
+                {
+                    let now = Utc::now().timestamp();
+                    if let Some(key) = limited.hold_key() {
+                        let before = self.writer_holds_before_draw.get(&key).copied();
+                        if let Some(reset) =
+                            forge_bucket_book::note_missed_writer_hold(&key, before, now)
+                        {
+                            let until = chrono::DateTime::from_timestamp(reset, 0).map_or_else(
+                                || reset.to_string(),
+                                |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            );
+                            log::warn!(
+                                "work_finder: writer hold armed (account {} owner {} installation {}) \
+                                 until {until} but a draw was refused by that writer (#14559)",
+                                key.account, key.owner, key.installation,
+                            );
+                        }
+                    }
+                    if limited.arm_hold(now) {
+                        // #14559: name the armed key so a later missed-hold
+                        // warning can be correlated with this arm.
+                        log::warn!(
+                            "work_finder: writer {} route held until {} (account {} owner {} \
+                             installation {}) (#13746)",
+                            limited.stage.as_str(),
+                            limited
+                                .reset_utc()
+                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string()),
+                            limited.account.as_deref().unwrap_or("-"),
+                            limited.owner.as_deref().unwrap_or("-"),
+                            limited.installation.as_deref().unwrap_or("-")
+                        );
+                    }
+                }
                 if let Some(root) = self.roots.get(idx) {
                     super::step_end::record_refusal(
                         root,
@@ -274,6 +350,7 @@ impl RegistrySpawner {
                         &reason,
                     );
                 }
+                self.report_stale_draw(idx, request.item, &e);
                 SpawnResult::Refused(reason)
             }
         };
@@ -330,6 +407,42 @@ pub(crate) fn occupancy(registry: &Arc<Mutex<SweepRegistry>>) -> usize {
 }
 
 impl StepDriver {
+    /// Report this tick's capacity to the work-request loop and, when it is
+    /// due, ask the captain for items (#12817). The loop's own schedule
+    /// decides whether a request goes out (capacity-driven, backed off on
+    /// empty answers), so most ticks send nothing. What the captain offers is
+    /// kept for the spawn's claim ([`worker::offer`]) and returned for the
+    /// tick to draw through its gates first.
+    fn request_work(
+        &mut self,
+        root: Option<&PathBuf>,
+        free_slots: usize,
+        exhausted: &BTreeSet<String>,
+    ) -> Vec<tick::Offer> {
+        let Some(root) = root else {
+            return Vec::new();
+        };
+        let requests = self
+            .requests
+            .get_or_insert_with(|| crate::fleet_dispatch::request::Loop::start(root));
+        requests.note_capacity(
+            u32::try_from(free_slots).unwrap_or(u32::MAX),
+            &crate::fleet_dispatch::worker::roles_ok(exhausted),
+        );
+        let step = requests.step(root);
+        crate::fleet_dispatch::worker::offer(&step.candidates);
+        step.candidates
+            .iter()
+            .filter_map(|c| {
+                Some(tick::Offer {
+                    repo: c.repo.clone(),
+                    item: u32::try_from(c.item).ok()?,
+                    role: c.step,
+                })
+            })
+            .collect()
+    }
+
     /// Run one step tick (module docs). Its forge reads and spawns block, so
     /// on the daemon's multi-thread runtime it runs under `block_in_place`
     /// rather than stalling a worker.
@@ -340,6 +453,9 @@ impl StepDriver {
     fn tick_blocking(&mut self, input: &TickInputs<'_>) -> TickReport {
         let now = Utc::now();
         self.provider.begin_tick();
+        // Ratification reviewer lane (#13707): step dispatch never reaches the
+        // champion role tick that ticks it, so tick it here (throttled).
+        crate::role_runner::ratification_lane::spawn_step_ticks(input.roots);
         let registries: Vec<_> = input
             .roots
             .iter()
@@ -357,6 +473,11 @@ impl StepDriver {
         // `loom.step.actionable{repo}`: the drawable depth the stalled and
         // idle alerts key on. Absent, never 0, for a repo not listed.
         let mut actionable = Vec::new();
+        // `eta.dispatch_state` (#12918): each listed workspace's ladder
+        // markers by item number, kept only when the fact is on.
+        let journal_state = crate::observability::dispatch_state::enabled();
+        let mut reevals: HashMap<usize, HashMap<u32, super::reeval_ladder::Reeval>> =
+            HashMap::new();
         // #12074: walk from where the last truncated tick stopped; past the
         // deadline, gather no further repo.
         let walk = Mutex::new(GatherWalk::new(input.roots.len(), self.next_start, Instant::now()));
@@ -383,10 +504,16 @@ impl StepDriver {
                     weighing: super::item_draw::Weighing {
                         pool: Vec::new(),
                         excluded: Default::default(),
+                        excluded_items: Vec::new(),
                         demotions: Vec::new(),
                     },
                     halted: true,
                     created_at: Default::default(),
+                    merge_slots: 0,
+                    merge_concurrency: 0,
+                    merge_eligible: 0,
+                    merges_in_flight: 0,
+                    writer_hold: None,
                 });
                 continue;
             }
@@ -443,8 +570,17 @@ impl StepDriver {
         // The other listing readers (blocked queue, quarantine and claim
         // reconciliation) read this tick's repos instead of listing (#12307).
         crate::discovery::published::publish(&snapshot);
+        // Stage arrivals diffed from the same snapshot (#12869); no forge call.
+        crate::observability::stage_entry_fact::observe(&snapshot);
+        // Hold-age gauges from the same snapshot (#12369); no forge call.
+        crate::observability::ops::hold_age::observe(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
+        let now_ts = now.timestamp();
+        let writer_holds_before_draw: HashMap<_, _> =
+            forge_bucket_book::writer_holds_snapshot(now_ts)
+                .into_iter()
+                .collect();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();
         for (pos, result) in listed {
             let Some(job) = jobs.get_mut(pos).and_then(Option::take) else {
@@ -475,12 +611,17 @@ impl StepDriver {
                 gathered.stale_listing || !gathered.pulls_complete,
                 escalated,
             );
-            let (mut cooldowns, pool_exhausted_roles, claims) = {
+            if journal_state {
+                reevals.insert(idx, gathered.reevals.clone());
+            }
+            let (mut cooldowns, pool_exhausted_roles, mut claims) = {
                 let reg = registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
             };
+            // #13026: read each tick, so a change needs no roll.
+            claims.merge_concurrency = crate::config_resolver::champion_merge_concurrency(root);
             exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
@@ -493,6 +634,22 @@ impl StepDriver {
                 cooldowns,
             };
             let mut weighing = weigh(&gathered.inputs, &ctx, &ItemWeights::for_root(root));
+            // #13367: a queue-mode repo's merge limit follows its eligible debt.
+            let eligible = weighing
+                .pool
+                .iter()
+                .filter(|c| c.step == Step::ChampionMerge)
+                .count();
+            let queue_mode = matches!(
+                crate::forge_merge_queue::mode::resolve_merge_mode(root),
+                Ok(m) if m.mode == crate::forge_merge_queue::mode::MergeMode::Queue
+            );
+            claims.merge_concurrency = effective_merge_limit(
+                queue_mode,
+                claims.merge_concurrency,
+                eligible,
+                crate::role_runner::demand::read_demand_config(root).lane_k,
+            );
             let listing = ListingState {
                 pulls_complete: gathered.pulls_complete,
                 stale_listing: gathered.stale_listing,
@@ -503,6 +660,8 @@ impl StepDriver {
             // items leave the pool.
             let in_flight = claims.items.len();
             let held = shape_pool(&mut weighing, &claims, listing);
+            // #13029: the merge lane's per-PR waits, from what the shape just did.
+            crate::observability::lane_wait::observe(&repo, &weighing, &claims);
             if held > 0 {
                 log::warn!(
                     "work_finder: {repo}: {held} Builder step(s) held this tick: the {} cannot \
@@ -518,12 +677,22 @@ impl StepDriver {
             actionable.extend(actionable_point(&repo, Some(&weighing)));
             workspaces.push(StepWorkspace {
                 idx,
-                repo,
+                repo: repo.clone(),
                 weight,
                 in_flight,
                 weighing,
                 halted: false,
                 created_at: gathered.created_at,
+                merge_slots: claims.merge_slots_free(),
+                merge_concurrency: claims.merge_limit(),
+                merge_eligible: eligible,
+                merges_in_flight: claims.merges_in_flight.len(),
+                // #13746: the workspace's writer route, when a confirmed
+                // exhaustion hold stands for it — its candidates wait before
+                // the draw until the reset.
+                writer_hold: crate::writer_limit::WriterLimited::claim_route_key(root, &repo)
+                    .and_then(|key| writer_holds_before_draw.get(&key).copied())
+                    .and_then(|until| tick::WriterHold::from_reset(until, now_ts)),
             });
         }
         let filter_ms = millis(filter_started.elapsed());
@@ -543,6 +712,24 @@ impl StepDriver {
         }
         // The draw keeps its workspace order whatever the walk's rotation.
         workspaces.sort_by_key(|w| w.idx);
+        // Pool-wide, so read once, from the primary workspace like the
+        // work-finder's own hot-applied config.
+        let knobs = input
+            .roots
+            .first()
+            .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root));
+        if journal_state {
+            let observed = workspaces
+                .iter()
+                .filter(|w| !w.halted)
+                .map(|w| w.idx)
+                .collect();
+            crate::observability::dispatch_state::observe(
+                super::state_rows::state_rows(&workspaces, &reevals, &knobs),
+                &observed,
+                input.roots,
+            );
+        }
         crate::observability::ops::emit_metrics(actionable);
         if let Err(e) = self.provider.flush() {
             log::debug!("work_finder: stage-entry cache not written: {e}");
@@ -555,7 +742,10 @@ impl StepDriver {
             attempts: 0,
             concurrency: input.spawn_concurrency.max(1),
             parts: StepSpawnTimings::default(),
+            recheck: input.discovery.is_worklist().then(|| self.recheck.clone()),
+            writer_holds_before_draw,
         };
+        self.recheck.begin_tick();
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
         let seed = SeedBase {
             minute,
@@ -568,6 +758,7 @@ impl StepDriver {
         let draw_started = Instant::now();
         let free_slots = input.max_concurrent.saturating_sub(total);
         crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
+        let offers = self.request_work(input.roots.first(), free_slots, &exhausted_roles);
         // #12450: a host in fleet-dispatch fallback draws one round, with no
         // free `claim_lost`; unchanged with the flag off.
         let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {
@@ -577,7 +768,7 @@ impl StepDriver {
                 input.spawn_concurrency.max(1),
             )
         });
-        let result = tick::run(
+        let result = tick::run_with_offers(
             workspaces,
             StepTickLimits {
                 free_slots,
@@ -585,14 +776,16 @@ impl StepDriver {
                 fallback,
             },
             &seed,
-            // Pool-wide, so read once, from the primary workspace like the
-            // work-finder's own hot-applied config.
-            &input
-                .roots
-                .first()
-                .map_or_else(PoolKnobs::default, |root| PoolKnobs::for_root(root)),
+            &knobs,
             &mut spawner,
+            &offers,
         );
+        // An offer the tick did not claim failed a gate or found no slot:
+        // give it back so its row does not sit out the captain's TTL.
+        let declined = crate::fleet_dispatch::worker::decline_offered("not_eligible");
+        if declined > 0 {
+            log::info!("fleet_dispatch: gave back {declined} offered item(s) the gates refused");
+        }
         let draw_total = draw_started.elapsed();
         let mut report = result.report;
         report.gather = Some(gather);
@@ -616,6 +809,9 @@ impl StepDriver {
             draws: result.draws,
             draws_unspawned: result.draws_unspawned,
             merge_deferred: result.merge_deferred,
+            merge_concurrency: result.merge_concurrency,
+            merge_eligible: result.merge_eligible,
+            merges_in_flight: result.merges_in_flight,
             by_reason: result.passes.clone(),
             budget: result.budget,
             stop: Some(result.stop.as_str()),
@@ -637,6 +833,42 @@ impl StepDriver {
             );
         }
         report
+    }
+}
+
+/// The merge queue's `max_entries_to_build` when the ruleset is not read:
+/// GitHub's own default, so the demand rule never asks for more concurrent
+/// hand-offs than a default queue builds at once (#13367).
+pub const DEFAULT_QUEUE_BUILD_CAP: usize = 5;
+
+/// The effective Champion merge limit of a queue-mode repo (#13367):
+/// `clamp(ceil(eligible / laneK), floor, DEFAULT_QUEUE_BUILD_CAP)`, with the
+/// configured `champion.mergeConcurrencyPerRepo` as the floor (an operator who
+/// sets it higher than the cap keeps it). `eligible` is the repo's
+/// `champion_merge` pool, so a drained debt falls back to the floor. Pure.
+#[must_use]
+pub fn demand_merge_limit(floor: usize, eligible: usize, lane_k: usize) -> usize {
+    let floor = floor.max(1);
+    eligible
+        .div_ceil(lane_k.max(1))
+        .min(DEFAULT_QUEUE_BUILD_CAP)
+        .max(floor)
+}
+
+/// The Champion merge limit a repo runs the tick with (#13367): the demand
+/// rule on a queue-mode repo, the configured `champion.mergeConcurrencyPerRepo`
+/// untouched on a direct-mode one, whatever its eligible debt. Pure.
+#[must_use]
+pub fn effective_merge_limit(
+    queue_mode: bool,
+    configured: usize,
+    eligible: usize,
+    lane_k: usize,
+) -> usize {
+    if queue_mode {
+        demand_merge_limit(configured, eligible, lane_k)
+    } else {
+        configured
     }
 }
 

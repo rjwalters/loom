@@ -7,7 +7,7 @@
 #   loom attach --help            Show help
 #
 # Examples:
-#   loom attach shepherd-1        Attach to shepherd-1 terminal
+#   loom attach builder-1         Attach to builder-1 terminal
 #   loom attach terminal-2        Attach to terminal-2
 #
 # Keyboard shortcuts when attached:
@@ -16,32 +16,6 @@
 #   Ctrl+B then ?                 Show all shortcuts
 
 set -euo pipefail
-
-# Find repository root
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.loom" ]]; then
-            echo "$dir"
-            return 0
-        fi
-        if [[ -f "$dir/.git" ]]; then
-            local gitdir
-            gitdir=$(sed 's/^gitdir: //' "$dir/.git")
-            local main_repo
-            main_repo=$(dirname "$(dirname "$(dirname "$gitdir")")")
-            if [[ -d "$main_repo/.loom" ]]; then
-                echo "$main_repo"
-                return 0
-            fi
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo ""
-}
-
-# shellcheck disable=SC2034  # Used for validation side-effect of find_repo_root
-REPO_ROOT=$(find_repo_root)
 
 # ANSI colors
 if [[ -t 1 ]]; then
@@ -71,7 +45,7 @@ ${YELLOW}USAGE:${NC}
     loom attach --help            Show this help
 
 ${YELLOW}EXAMPLES:${NC}
-    loom attach shepherd-1        Attach to shepherd-1 terminal
+    loom attach builder-1         Attach to builder-1 terminal
     loom attach terminal-2        Attach to terminal-2
 
 ${YELLOW}KEYBOARD SHORTCUTS (when attached):${NC}
@@ -81,11 +55,11 @@ ${YELLOW}KEYBOARD SHORTCUTS (when attached):${NC}
 
 ${YELLOW}SESSION NAMING:${NC}
     Loom uses tmux sessions with the naming pattern:
-      loom-<agent-name>           e.g., loom-shepherd-1, loom-terminal-2
+      loom-<agent-name>           e.g., loom-builder-1, loom-terminal-2
 
     You can specify either the full session name or just the agent name:
-      loom attach loom-shepherd-1  (full name)
-      loom attach shepherd-1       (short name - loom- prefix added)
+      loom attach loom-builder-1  (full name)
+      loom attach builder-1       (short name - loom- prefix added)
 EOF
 }
 

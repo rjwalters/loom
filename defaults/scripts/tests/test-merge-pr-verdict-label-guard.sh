@@ -47,36 +47,6 @@ MERGE_PR_SRC="$HELPERS_DIR/merge-pr.sh"
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    # Here-string, not a pipe (see test-merge-pr-loom-pr-label-guard.sh's
-    # identical rationale, #3820).
-    if grep -qF -- "$needle" <<<"$haystack"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
-
-assert_not_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if ! grep -qF -- "$needle" <<<"$haystack"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Unexpected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
-
 # --- Minimal logging/error shims the extracted function calls ---
 info()    { echo "INFO: $*"; }
 success() { echo "OK: $*"; }
@@ -95,10 +65,9 @@ loom_test_require_daemon_bin "$HELPERS_DIR" "merge-pr"
 # --- Extract the function under test from merge-pr.sh and source it ---
 # From `_check_verdict_label_contradiction() {` up to (not including) the
 # following `_check_verdict_label_contradiction` invocation line — the
-# function is written as a single dense line (file-size-ratchet offset, see
-# merge-pr.sh's own comment above it), so the extraction captures exactly
-# that one line. Extracting from source keeps the test in lockstep with the
-# script instead of re-implementing it.
+# function is written as a single dense line, so the extraction captures
+# exactly that one line. Extracting from source keeps the test in lockstep
+# with the script instead of re-implementing it.
 #
 # Two more lines come with it (#8285): the one-line `_mp_daemon_roll_hint`,
 # which the refusal path calls to name the daemon version floor and the roll
@@ -223,7 +192,7 @@ assert_eq "1" "$LAST_RC" "loom:pr + loom:review-requested -> merge hard-blocked 
 assert_contains "$LAST_OUT" "loom:review-requested" "Block message names loom:review-requested"
 
 # T10 (#9016): the critical-file-hold release path, end to end through this
-# guard. Champion's criterion-#3 hold keeps `loom:pr` and adds `loom:operator`,
+# guard. Champion's critical-files hold keeps `loom:pr` and adds `loom:operator`,
 # and its documented human path is "remove the label, then run merge-pr.sh".
 # Before #9016 Champion re-added the label on its next tick, so the operator's
 # second command hit T4's block again (merge train #8996: the label was back

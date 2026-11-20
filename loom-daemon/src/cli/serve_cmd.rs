@@ -1,10 +1,10 @@
 //! `loom-daemon serve` handler (Issue #4712 — split out of `main.rs`). The
 //! actual HTTP listener/dashboard implementation lives in the lib crate's
-//! `serve` module (`loom_daemon::serve`); this is thin clap→module wiring.
+//! `serve` module (`crate::serve`); this is thin clap→module wiring.
 
 use anyhow::{anyhow, Result};
 
-use loom_daemon::serve;
+use crate::serve;
 
 use super::common::resolve_socket_path;
 
@@ -16,7 +16,7 @@ use super::common::resolve_socket_path;
 /// [`serve::run`] for the accept loop. Each request re-fetches a fresh
 /// snapshot over the daemon's existing Unix socket — this function never
 /// touches daemon state directly.
-pub(crate) async fn handle_serve_command(
+pub async fn handle_serve_command(
     port: u16,
     bind: &str,
     allow_non_loopback: bool,

@@ -4,7 +4,7 @@
 //!
 //! Kept in a sibling file rather than an inline `mod tests`, matching the
 //! `*_empty_pool_tests.rs` precedent, so the production module stays small
-//! enough to hold in view (see `.loom/docs/file-size-policy.md`).
+//! enough to hold in view.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
 use crate::sweep_registry::test_support::fixture_registry;
@@ -58,7 +58,6 @@ fn insert_codex_entry_with_prefixed_log(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
@@ -132,6 +131,64 @@ fn provider_health_feedback_honours_the_refusals_own_reset_horizon() {
         health.cooldown_until,
         Some(expected_epoch),
         "the hold must end at the horizon the provider itself named"
+    );
+}
+
+/// Issue #14564: the refusal the CLI actually printed on the fleet used an
+/// abbreviated month and an ordinal day (`Nov 25th, 2026 7:44 AM`), which the
+/// parser used to reject — so the hold silently fell back to `now + 5h` and the
+/// account bounced back into the pool every few hours. End to end, the hold must
+/// now end at the provider's instant, not at the fallback cooldown.
+#[test]
+fn provider_health_feedback_honours_an_ordinal_abbreviated_month_horizon() {
+    use chrono::Datelike;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    // Six days out, like the observed weekly-limit wall: far past the 5h fallback.
+    let instant = (Local::now() + chrono::Duration::days(6))
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let day = instant.day();
+    let ordinal = match (day % 10, day % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    let rendered =
+        format!("{} {day}{ordinal}, {}", instant.format("%b"), instant.format("%Y %-I:%M %p"));
+    let expected_epoch = u64::try_from(instant.timestamp()).unwrap();
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        75,
+        "profile-ordinal",
+        &format!(
+            "ERROR: You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more credits or try again at \
+             {rendered}.\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-ordinal \
+             category=TOKEN_EXHAUSTED exit_code=1 model=none\n"
+        ),
+    );
+
+    registry.apply_provider_health_feedback(&sweep_id, Some(1));
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "profile-ordinal".into(),
+    };
+    let health = tokens_pool::account_health(dir.path(), &id)
+        .unwrap()
+        .expect("health record written");
+    assert_eq!(
+        health.cooldown_until,
+        Some(expected_epoch),
+        "the hold must end at the provider's own date ({rendered:?}), not now + the fallback cooldown"
     );
 }
 
@@ -430,6 +487,87 @@ fn a_claude_insta_crash_mark_emits_exactly_one_reason_classified_point() {
     assert_eq!(point.labels["reason"], "model_credits");
     let wire = serde_json::to_string(point).unwrap();
     assert!(!wire.contains("secret") && !wire.contains("usage credits"), "{wire}");
+}
+
+/// #13966: a **step** sweep whose exit-time feedback classified the launch's
+/// failure Exhausted notes that fact for its own end — so the release says
+/// `provider_exhausted` and the item is charged nothing — while an issue
+/// sweep's feedback notes nothing (an issue sweep has no step end). The
+/// provider line is SYNTHETIC (`insufficient balance`, the #8931 shape); the
+/// classifier's verbatim live captures are asserted in `classify.rs`/`ingest`
+/// tests, not here.
+#[test]
+fn a_step_sweep_exiting_on_exhaustion_notes_it_for_its_end() {
+    use crate::api_keys_pool::{ingest::LAUNCH_RECORD_PREFIX, paths, registry as keys};
+    use crate::step_role::StepRole;
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    let pool = paths::per_repo_api_keys_dir(&registry.config.workspace_root);
+    keys::add(&pool, "loomtest", "exhaust-seat", "LOOM_TEST_KEY_13966", "fake-key", false).unwrap();
+    let launch = serde_json::json!({
+        "schema": 1, "runtime": "opencode", "model": "glm-5.3-flash",
+        "credentialSource": "pool", "credentialProvider": "loomtest",
+        "credentialAccount": "exhaust-seat",
+    });
+    let log_body = format!(
+        "{LAUNCH_RECORD_PREFIX}{launch}\n# LOOM_CLI_START runtime=opencode\n\
+         Error: insufficient balance for this account\n"
+    );
+    let take =
+        |id: &str| crate::sweep_registry::step_spawn::capture::take_step_provider_exhaustion(id);
+    let insert = |registry: &mut SweepRegistry, sweep_id: String, kind, log_path| {
+        registry.entries.insert(
+            sweep_id.clone(),
+            SweepInfo {
+                pgid: None,
+                sweep_id: sweep_id.clone(),
+                kind,
+                pid: 2_147_483_640,
+                token_name: UNKNOWN_TOKEN_NAME.to_string(),
+                runtime: "opencode".into(),
+                runtime_source: None,
+                log_path,
+                idempotency_key: None,
+                started_at: Utc::now(),
+                state: SweepState::Running,
+                latest_phase: None,
+                pr_number: None,
+                model: None,
+                effort: None,
+                depends_on: None,
+                repo: None,
+            },
+        );
+    };
+
+    // A step sweep: the end is told the seat was exhausted.
+    let step_id = "step-builder-13966-1".to_string();
+    let step_log = registry.compute_step_log_path(13966, StepRole::Builder);
+    std::fs::create_dir_all(step_log.parent().unwrap()).unwrap();
+    std::fs::write(&step_log, format!("sweep_id={step_id} issue=13966 ====\n{log_body}")).unwrap();
+    insert(
+        &mut registry,
+        step_id.clone(),
+        SweepKind::Step {
+            item: 13966,
+            role: StepRole::Builder,
+        },
+        step_log,
+    );
+    assert!(!take(&step_id), "nothing noted before the feedback ran");
+    registry.apply_provider_health_feedback(&step_id, Some(1));
+    assert!(take(&step_id), "the step's end is told the seat was exhausted");
+    assert!(!take(&step_id), "taken once");
+
+    // An issue sweep with the same evidence notes nothing.
+    let issue_id = "sweep-issue-13967-exhaust".to_string();
+    let issue_log = registry.compute_log_path(13967);
+    std::fs::create_dir_all(issue_log.parent().unwrap()).unwrap();
+    std::fs::write(&issue_log, format!("sweep_id={issue_id} issue=13967 ====\n{log_body}"))
+        .unwrap();
+    insert(&mut registry, issue_id.clone(), SweepKind::Issue(13967), issue_log);
+    registry.apply_provider_health_feedback(&issue_id, Some(1));
+    assert!(!take(&issue_id), "an issue sweep has no step end to tell");
 }
 
 /// `IN_RUN_WATCHES` is process-global and `watch_in_run_exhaustion` prunes

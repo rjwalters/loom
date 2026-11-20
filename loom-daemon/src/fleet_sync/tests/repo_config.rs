@@ -192,7 +192,7 @@ fn a_rewrite_keeps_exactly_one_backup() {
 
 #[test]
 fn a_render_error_is_reported_not_raised() {
-    let got = apply(Err(anyhow::anyhow!("boom")), Mode::Write, now(), &None);
+    let got = apply(Err(anyhow::anyhow!("boom")), Mode::Write, now());
     assert_eq!(got.error.as_deref(), Some("boom"));
     assert!(lines(&got)[0].contains("per-repo fleet tier: ERROR — boom"));
 }
@@ -236,47 +236,9 @@ fn several_failing_repos_are_all_visible_in_the_error() {
         b.name = "other".into();
         b
     }];
-    let got = apply(Ok(two), Mode::Write, now(), &None);
+    let got = apply(Ok(two), Mode::Write, now());
     assert_eq!(got.failures, 2, "{got:?}");
     let err = got.error.expect("both failures are reported");
     assert!(err.contains("for app"), "the first failure is named: {err}");
     assert!(err.contains("+1 more"), "the rest are counted: {err}");
-}
-
-#[test]
-#[serial_test::serial(loom_config_env)]
-fn a_removal_is_journaled() {
-    let dir = tempfile::tempdir().unwrap();
-    std::env::set_var("LOOM_SOCKET_PATH", dir.path().join("loom-daemon.sock"));
-    std::env::set_var(crate::config_journal::ROOT_ENV, dir.path().join("journal"));
-    std::env::set_var(crate::config_journal::ENABLE_ENV, "1");
-
-    let root = cloned_root();
-    pass(
-        &snapshot(root.path(), Some(json!({"a": 1}))),
-        Path::new("/x"),
-        &is_cloned,
-        Mode::Write,
-        now(),
-    );
-    pass(&snapshot(root.path(), None), Path::new("/x"), &is_cloned, Mode::Write, now());
-
-    let events = crate::config_journal::read_event_data(&dir.path().join("journal"));
-    for k in [
-        crate::config_journal::ENABLE_ENV,
-        crate::config_journal::ROOT_ENV,
-        "LOOM_SOCKET_PATH",
-    ] {
-        std::env::remove_var(k);
-    }
-    let removed = events
-        .iter()
-        .find(|d| d["event"] == "removed")
-        .expect("a removed record");
-    assert_eq!(removed["tier"], render::Tier::Repo.name());
-    assert!(removed["target"]
-        .as_str()
-        .unwrap()
-        .ends_with("app/.loom-local/fleet-repo.json"));
-    assert!(removed["backup"].is_string());
 }

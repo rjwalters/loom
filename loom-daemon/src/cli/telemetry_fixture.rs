@@ -1,7 +1,7 @@
 //! Offline synthetic inputs, not evidence of a completed backend trial.
+use crate::telemetry::fixture;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use loom_daemon::telemetry::fixture;
 use std::io::Write;
 use std::path::PathBuf;
 

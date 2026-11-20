@@ -66,20 +66,42 @@ test -z "${LOOM_DAEMON_SOCKET:-}"
 test -r .loom/hooks/guard-codex-bridge.sh
 test -r .claude/commands/loom/guide.md
 test -r .claude/commands/loom/sweep.md
+# The issue worktree a step uses: the namespaced base under LOOM_WORKTREE_ROOT.
+issue_worktree() { echo "$LOOM_WORKTREE_ROOT/$(basename "$PWD")/issue-$1"; }
 if [[ "$*" == *retain* ]]; then
   echo unpushed > retained.txt
+  # `retain-<N>`: the interrupted job also left an unpushed commit in issue N's
+  # existing worktree, which is what its snapshot reads (#14031). A bare
+  # `retain` job has no worktree, which snapshots as unpublished too.
+  if [[ "$*" =~ retain-([0-9]+) ]]; then
+    worktree="$(issue_worktree "${BASH_REMATCH[1]}")"
+    echo unpushed > "$worktree/retained.txt"
+    git -C "$worktree" add retained.txt
+    git -C "$worktree" commit -m 'fixture unpushed work'
+  fi
   echo fixture-retained-ready
   sleep 30
   exit 0
 fi
 if [[ "$*" == *mutate* ]]; then
-  git switch -c feature/issue-8786
-  echo 'private issue mutation' > mutation.txt
-  git add mutation.txt
-  git commit -m 'fixture issue mutation'
-  git push -u origin feature/issue-8786
-  .loom/scripts/create-pr.sh --repo github/repo --head feature/issue-8786 --base main --title 'Fixture change' --body 'Part of #8786' --label loom:review-requested
-  .loom/scripts/sweep-checkpoint.sh write 8786 builder-done --task-id fixture-sweep --pr-number 17
+  # Like a real Builder step: the issue branch lives in a worktree under the
+  # step's namespaced base (<LOOM_WORKTREE_ROOT>/<clone basename>/issue-N), which
+  # is where the job snapshot looks. Committing in the root clone would leave no
+  # worktree, and the job would (correctly) read recovery-required (#14031).
+  # `mutate-<N>` names the job's issue; a bare `mutate` is issue 8786.
+  issue=8786
+  [[ "$*" =~ mutate-([0-9]+) ]] && issue="${BASH_REMATCH[1]}"
+  worktree="$(issue_worktree "$issue")"
+  # A real repo gitignores .loom/worktrees/; this fixture clone does not, and
+  # the left-behind worktree must not make the root clone read as dirty.
+  echo '.loom/worktrees/' >> "$(git rev-parse --git-path info/exclude)"
+  git worktree add -b "feature/issue-$issue" "$worktree" HEAD
+  echo 'private issue mutation' > "$worktree/mutation.txt"
+  git -C "$worktree" add mutation.txt
+  git -C "$worktree" commit -m 'fixture issue mutation'
+  git -C "$worktree" push -u origin "feature/issue-$issue"
+  .loom/scripts/create-pr.sh --repo github/repo --head "feature/issue-$issue" --base main --title 'Fixture change' --body "Part of #$issue" --label loom:review-requested
+  .loom/scripts/sweep-checkpoint.sh write "$issue" builder-done --task-id fixture-sweep --pr-number 17
 fi
 if .loom/scripts/run-job.sh --image alpine -- true >/tmp/run-job.log 2>&1; then exit 91; fi
 grep -q 'unsupported in private-clone v1' /tmp/run-job.log
@@ -344,7 +366,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         &std::fs::read(root.join(".loom/private-jobs/issue-8786.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["outcome"], "completed", "{record}");
     assert_eq!(record["owner"], "fixture-sweep");
     assert_eq!(record["snapshot"]["published"], true);
     assert_eq!(
@@ -366,7 +388,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8786), "fixture-interrupted")
             .unwrap()
             .unwrap();
-    let mut retained_command = f.adapter(name, "retain");
+    let mut retained_command = f.adapter(name, "retain-8786");
     interrupted.apply(&mut retained_command);
     let result = retained_command
         .env("GH_HOST", &gh_host)
@@ -546,5 +568,139 @@ impl Fixture {
                 Some(self.root.path().join("write-scope-cache").into_os_string()),
             ),
         ]
+    }
+}
+
+/// Two accounts, each holding a different repository's clone (#10796): every
+/// admission is measured against, and bound to, the clone it was prepared in.
+/// Another repository's proof, an account that holds no clone of the workspace
+/// repository, and an account whose hook trust was never established are all
+/// refused, and none of them reaches host execution.
+#[test]
+#[serial_test::serial]
+#[ignore = "requires Docker; explicitly run by CI"]
+fn each_account_admission_is_bound_to_its_own_repository_clone() {
+    use loom_daemon::tokens_pool::private_workspace::{dispatch::Selection, JobKind};
+    let mut f = Fixture::with_adapters(true);
+    f.repository = f.repository.replace("/gitea/", "/github/");
+    // Repository two is a second copy of the managed fixture repository (it ships
+    // the Loom surface), so only the clone differs between the two accounts.
+    docker(&[
+        "exec",
+        "--user",
+        "0",
+        &f.server,
+        "sh",
+        "-c",
+        "mkdir -p /srv/zed && cp -a /srv/repo.git /srv/zed/second",
+    ]);
+    let one = f.repository.clone();
+    let two = one.replace("/repo.git", "/zed/second");
+    let (a, b, c) = (&f.names[0], &f.names[1], &f.names[2]);
+    let gh_host = reqwest::Url::parse(&f.repository)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
+    let start = |name: &str, url: &str| {
+        checked(
+            f.command(&[
+                "session",
+                "start",
+                name,
+                "--private-clone",
+                url,
+                "--image",
+                &f.image,
+            ])
+            .env("GH_HOST", &gh_host)
+            .env("GH_TOKEN", auth::GH_TOKEN)
+            .output()
+            .unwrap(),
+        );
+    };
+    // Accounts `a` (repository one) and `b` (repository two) have hook trust
+    // established, the operator's one-time decision. Account `c` also holds
+    // repository two but never had trust established.
+    for (name, url) in [(a, &one), (b, &two)] {
+        start(name, url);
+        f.cli(&["session", "stop", name, "--json"]);
+        containment::establish_hook_trust(&f.root.path().join("profiles").join(name));
+        start(name, url);
+    }
+    start(c, &two);
+    let root = containment::registry_workspace(&f);
+    let _env = containment::environment(&f, &root, a, &gh_host);
+    let origin = |url: &str| {
+        checked(
+            Command::new("git")
+                .args(["remote", "set-url", "origin", url])
+                .current_dir(&root)
+                .output()
+                .unwrap(),
+        );
+    };
+    let prepare =
+        |owner: &str| Selection::prepare(&root, "codex", None, JobKind::Role, None, owner);
+    let wrong = "different repository clone";
+
+    // Repository one runs on account `a`: its proof is valid for that clone only.
+    origin(&one);
+    let selection = prepare("bound-one").unwrap().unwrap();
+    let proof = selection.contain(&root).unwrap();
+    proof.require_repository(&one).unwrap();
+    assert!(proof
+        .require_repository(&two)
+        .unwrap_err()
+        .to_string()
+        .contains(wrong));
+    drop(selection);
+
+    // Repository two lives on account `b` only. Naming `a` for it is refused
+    // before any clone is touched, and the refusal leaves no lease behind.
+    origin(&two);
+    let refused = prepare("a-for-two").err().unwrap().to_string();
+    assert!(refused.contains("differs"), "{refused}");
+    assert!(!root
+        .join(".loom/private-jobs")
+        .read_dir()
+        .is_ok_and(|mut d| d.next().is_some()));
+    {
+        let _b = Environment::set(&[("LOOM_CODEX_PROFILE", Some(b.as_str().into()))]);
+        let selection = prepare("bound-two").unwrap().unwrap();
+        let proof = selection.contain(&root).unwrap();
+        proof.require_repository(&two).unwrap();
+        assert!(proof
+            .require_repository(&one)
+            .unwrap_err()
+            .to_string()
+            .contains(wrong));
+        assert_ne!(proof.provenance(Vec::new(), Default::default()).account, a.as_str());
+        drop(selection);
+    }
+    // Account `c` serves repository two too, but without hook trust its clone
+    // is refused with the precise obligation, so no mutable role is admitted.
+    {
+        let _c = Environment::set(&[("LOOM_CODEX_PROFILE", Some(c.as_str().into()))]);
+        let selection = prepare("untrusted-two").unwrap().unwrap();
+        let untrusted = selection.contain(&root).unwrap_err().to_string();
+        assert!(untrusted.contains("hook trust"), "{untrusted}");
+        drop(selection);
+        // The established fallback: a non-Codex runtime gets no private selection,
+        // so nothing runs in a clone and nothing falls through to the host.
+        let fallback =
+            Selection::prepare(&root, "claude", None, JobKind::Role, None, "fallback-two");
+        assert!(fallback.unwrap().is_none());
+    }
+    // A repository no account holds is refused, never registered implicitly.
+    origin(&one.replace("/repo.git", "/nobody/unknown"));
+    assert!(prepare("unregistered").is_err());
+    // Both containers are untouched by the refusals and still serve their clone.
+    for name in [a, b] {
+        assert_eq!(
+            f.exec(name, "git -C /workspace/repo rev-parse --is-inside-work-tree")
+                .trim(),
+            "true"
+        );
     }
 }

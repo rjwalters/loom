@@ -76,7 +76,7 @@ pub const HEAD_SCAN_BYTES: usize = 64 * 1024;
 
 /// Slack applied to both ends of the completion's time window when filtering
 /// candidate sessions by mtime. Covers clock skew, a session flushed after the
-/// reaper observed the exit, and `reconcile_recent_merges`' forge-derived
+/// reaper observed the exit, and `reconcile_merges_since`' forge-derived
 /// (rather than sweep-derived) start time.
 pub const WINDOW_SLACK: Duration = Duration::from_secs(2 * 60 * 60);
 
@@ -143,6 +143,80 @@ pub fn head_names_sweep_issue(head: &str, issue: u32) -> bool {
         .next()
         .and_then(|tok| tok.parse::<u32>().ok())
         == Some(issue)
+}
+
+/// Whether `head` shows a session launched for `issue` by either the legacy
+/// `/loom:sweep <issue>` orchestrator or a dispatched **step** (#11898), which runs
+/// a bare role command instead: `/loom:builder <issue>`, `/loom:curator <issue>`
+/// or `/loom:champion --issue <issue>`.
+///
+/// Measured on a fleet host (#13287): recent transcript heads are all role
+/// commands, none `/loom:sweep`, so the sweep-only match attributed no tokens
+/// to step-narrated completions. Judge / Doctor / `champion --pr` carry a PR
+/// number, which cannot be mapped to an issue here; [`head_names_pr_session`]
+/// matches those once the caller also holds the merged PR (#14018).
+/// The first-argument rule is unchanged (`470` never matches `4705`).
+#[must_use]
+pub fn head_names_issue_session(head: &str, issue: u32) -> bool {
+    if head_names_sweep_issue(head, issue) {
+        return true;
+    }
+    const NAME_OPEN: &str = "<command-name>/loom:";
+    const ARGS_OPEN: &str = "<command-args>";
+    let Some(at) = head.find(NAME_OPEN) else {
+        return false;
+    };
+    let rest = &head[at + NAME_OPEN.len()..];
+    let Some((role, after)) = rest.split_once("</command-name>") else {
+        return false;
+    };
+    let Some(args) = after.split_once(ARGS_OPEN).map(|(_, a)| a) else {
+        return false;
+    };
+    let args = args.split("</command-args>").next().unwrap_or(args);
+    let mut toks = args.split_whitespace();
+    let first = toks.next();
+    let subject = match role {
+        "builder" | "curator" => first,
+        "champion" if first == Some("--issue") => toks.next(),
+        _ => None,
+    };
+    subject.and_then(|t| t.parse::<u32>().ok()) == Some(issue)
+}
+
+/// Whether `head` shows a dispatched **step** session (#11898) for the merged PR
+/// `pr`: `/loom:judge <pr>`, `/loom:doctor <pr>` or `/loom:champion --pr <pr>`
+/// (#14018).
+///
+/// The PR-keyed counterpart of [`head_names_issue_session`]. The two never
+/// overlap — GitHub numbers issues and PRs from one sequence, so a number that
+/// names a PR here cannot also be the issue another role is keyed on — which
+/// is why a caller that holds both passes both rather than guessing which role
+/// command a number belongs to. Same first-argument rule (`470` never matches
+/// `4705`).
+#[must_use]
+pub fn head_names_pr_session(head: &str, pr: u32) -> bool {
+    const NAME_OPEN: &str = "<command-name>/loom:";
+    const ARGS_OPEN: &str = "<command-args>";
+    let Some(at) = head.find(NAME_OPEN) else {
+        return false;
+    };
+    let rest = &head[at + NAME_OPEN.len()..];
+    let Some((role, after)) = rest.split_once("</command-name>") else {
+        return false;
+    };
+    let Some(args) = after.split_once(ARGS_OPEN).map(|(_, a)| a) else {
+        return false;
+    };
+    let args = args.split("</command-args>").next().unwrap_or(args);
+    let mut toks = args.split_whitespace();
+    let first = toks.next();
+    let subject = match role {
+        "judge" | "doctor" => first,
+        "champion" if first == Some("--pr") => toks.next(),
+        _ => None,
+    };
+    subject.and_then(|t| t.parse::<u32>().ok()) == Some(pr)
 }
 
 /// Read at most [`HEAD_SCAN_BYTES`] from `path`, lossily decoded.
@@ -224,6 +298,7 @@ fn sweep_transcript_files(
     projects_dir: &Path,
     workspace_root: &Path,
     issue: u32,
+    pr: Option<u32>,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     what: &str,
 ) -> Option<Vec<PathBuf>> {
@@ -241,7 +316,9 @@ fn sweep_transcript_files(
         let Some(head) = read_head(&path) else {
             continue;
         };
-        if !head_names_sweep_issue(&head, issue) {
+        if !head_names_issue_session(&head, issue)
+            && !pr.is_some_and(|pr| head_names_pr_session(&head, pr))
+        {
             continue;
         }
         for transcript in session_transcripts(&path) {
@@ -287,10 +364,26 @@ pub fn sum_sweep_tokens(
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<u64> {
+    sum_item_tokens(projects_dir, workspace_root, issue, None, window)
+}
+
+/// [`sum_sweep_tokens`] that also counts the sessions of a dispatched Judge,
+/// Doctor or `champion --pr` step for the merged PR `pr` (#14018), which a
+/// step-dispatched completion has and the issue-keyed match cannot reach.
+/// `pr: None` is exactly [`sum_sweep_tokens`].
+#[must_use]
+pub fn sum_item_tokens(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    pr: Option<u32>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<u64> {
     let files = sweep_transcript_files(
         projects_dir,
         workspace_root,
         issue,
+        pr,
         window,
         "safehouse token total",
     )?;
@@ -335,6 +428,7 @@ pub fn sum_sweep_tokens_split(
         projects_dir,
         workspace_root,
         issue,
+        None,
         window,
         "sweep.outcome token split",
     )?;
@@ -373,10 +467,25 @@ pub fn sum_sweep_tokens_by_model(
     issue: u32,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Option<Vec<ModelUsageTotals>> {
+    sum_item_tokens_by_model(projects_dir, workspace_root, issue, None, window)
+}
+
+/// [`sum_sweep_tokens_by_model`] that also counts the PR-keyed step sessions of
+/// `pr` (#14018); see [`sum_item_tokens`]. `pr: None` is exactly
+/// [`sum_sweep_tokens_by_model`].
+#[must_use]
+pub fn sum_item_tokens_by_model(
+    projects_dir: &Path,
+    workspace_root: &Path,
+    issue: u32,
+    pr: Option<u32>,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> Option<Vec<ModelUsageTotals>> {
     let files = sweep_transcript_files(
         projects_dir,
         workspace_root,
         issue,
+        pr,
         window,
         "safehouse per-model token total",
     )?;
@@ -455,6 +564,7 @@ pub fn sum_sweep_tokens_by_window(
         projects_dir,
         workspace_root,
         issue,
+        None,
         window,
         "sweep.outcome per-phase token attribution",
     ) else {
@@ -595,6 +705,87 @@ mod tests {
              <command-args>4705</command-args>\"}}";
         assert!(!head_names_sweep_issue(other, 4705));
         assert!(!head_names_sweep_issue("no markup here at all", 4705));
+    }
+
+    #[test]
+    fn step_role_sessions_are_attributed_to_their_issue() {
+        let role = |name: &str, args: &str| {
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\
+                 \"<command-name>/loom:{name}</command-name>\\n\
+                 <command-args>{args}</command-args>\"}}}}"
+            )
+        };
+        assert!(head_names_issue_session(&role("builder", "4705"), 4705));
+        assert!(!head_names_issue_session(&role("builder", "4705"), 470));
+        assert!(head_names_issue_session(&role("curator", "4705"), 4705));
+        assert!(head_names_issue_session(&role("champion", "--issue 4705"), 4705));
+        // PR-numbered roles are not attributable to an issue.
+        assert!(!head_names_issue_session(&role("judge", "4705"), 4705));
+        assert!(!head_names_issue_session(&role("champion", "--pr 4705"), 4705));
+        assert!(head_names_issue_session(&sweep_head("4705"), 4705));
+    }
+
+    #[test]
+    fn pr_keyed_step_sessions_are_attributed_to_their_pr() {
+        let role = |name: &str, args: &str| {
+            format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\
+                 \"<command-name>/loom:{name}</command-name>\\n\
+                 <command-args>{args}</command-args>\"}}}}"
+            )
+        };
+        assert!(head_names_pr_session(&role("judge", "4705"), 4705));
+        assert!(head_names_pr_session(&role("doctor", "4705"), 4705));
+        assert!(head_names_pr_session(&role("champion", "--pr 4705"), 4705));
+        // Exact number, never a prefix.
+        assert!(!head_names_pr_session(&role("judge", "4705"), 470));
+        // Each command keys on its own kind of number: an issue-keyed command
+        // is not a PR session, and `champion --issue` is not `champion --pr`.
+        assert!(!head_names_pr_session(&role("builder", "4705"), 4705));
+        assert!(!head_names_pr_session(&role("champion", "--issue 4705"), 4705));
+        assert!(!head_names_pr_session(&sweep_head("4705"), 4705));
+    }
+
+    #[test]
+    fn judge_and_doctor_session_tokens_are_summed_only_when_the_pr_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let project = dir.path().join(project_slug(workspace));
+        std::fs::create_dir_all(&project).unwrap();
+        let session = |name: &str, args: &str| {
+            let head = format!(
+                "{{\"type\":\"user\",\"message\":{{\"content\":\
+                 \"<command-name>/loom:{name}</command-name>\\n\
+                 <command-args>{args}</command-args>\"}}}}\n"
+            );
+            format!("{head}{}\n", usage_line(1, 2, 3, 4))
+        };
+        std::fs::write(project.join("b.jsonl"), session("builder", "900")).unwrap();
+        std::fs::write(project.join("j.jsonl"), session("judge", "901")).unwrap();
+        std::fs::write(project.join("d.jsonl"), session("doctor", "901")).unwrap();
+        std::fs::write(project.join("other.jsonl"), session("judge", "902")).unwrap();
+        // The issue-keyed total is the Builder alone (1+2+3+4).
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 900, None), Some(10));
+        // Naming the PR adds its Judge and Doctor, and nobody else's.
+        assert_eq!(sum_item_tokens(dir.path(), workspace, 900, Some(901), None), Some(30));
+        let rows = sum_item_tokens_by_model(dir.path(), workspace, 900, Some(901), None).unwrap();
+        assert_eq!(rows.iter().map(|r| r.input).sum::<i64>(), 3);
+    }
+
+    #[test]
+    fn step_builder_session_tokens_are_summed_for_its_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Path::new("/Users/me/GitHub/loom");
+        let project = dir.path().join(project_slug(workspace));
+        fs::create_dir_all(&project).unwrap();
+        let head = "{\"type\":\"user\",\"message\":{\"content\":\
+            \"<command-name>/loom:builder</command-name>\\n\
+            <command-args>4699</command-args>\"}}\n";
+        fs::write(project.join("uuid-s.jsonl"), format!("{head}{}", usage_line(1, 2, 3, 4)))
+            .unwrap();
+        assert_eq!(sum_sweep_tokens(dir.path(), workspace, 4699, None), Some(10));
+        assert!(sum_sweep_tokens_by_model(dir.path(), workspace, 4699, None).is_some());
     }
 
     #[test]

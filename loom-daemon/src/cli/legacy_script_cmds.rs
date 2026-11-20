@@ -9,14 +9,14 @@ use anyhow::Result;
 use std::path::Path;
 use std::path::PathBuf;
 
-use loom_daemon::script_helpers;
+use crate::script_helpers;
 
-use crate::CheckpointAction;
+use crate::cli::CheckpointAction;
 
 use super::sweep_experiment::SweepExperimentAction;
 
 /// `loom-daemon strip-ansi [--file PATH]` — backs `strip-ansi.sh`.
-pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
+pub fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     use script_helpers::log_filter;
 
     if let Some(path) = file {
@@ -35,27 +35,59 @@ pub(crate) fn handle_strip_ansi_command(file: Option<&str>) -> Result<()> {
     }
 }
 
-/// `loom-daemon resolve-model` — backs `resolve-model.sh`.
+/// The shared `resolve-model` argument surface: one struct behind both clap
+/// roots (`loom-daemon resolve-model` and, since #13878, `loom-tools
+/// resolve-model`), so the two cannot drift apart.
+#[derive(clap::Args)]
+pub struct ResolveModelArgs {
+    /// A logical tier/alias (`opus`, `sonnet`, `sonnet@xhigh`) or a pinned
+    /// model ID.
+    #[arg(value_name = "MODEL")]
+    pub model: String,
+
+    /// Path to a `.loom/config.json` to read verbatim (default: resolve
+    /// the `./.loom` config tier chain).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<String>,
+
+    /// Print the resolved generation number instead of the model ID.
+    #[arg(long)]
+    pub generation: bool,
+
+    /// Map the model back to the nearest value the in-session Task/Agent
+    /// tool's `model` enum accepts (`haiku|sonnet|opus|fable`) — issue
+    /// #4282. Exits 3 with no output when there is no Task-passable alias,
+    /// so the caller omits `model` entirely.
+    #[arg(long = "task-alias")]
+    pub task_alias: bool,
+
+    /// Map the model to the next CHEAPER Task-tool alias (issue #5687) —
+    /// `fable → opus → sonnet → haiku`. This is the "one rung down" step
+    /// `/loom:sweep` applies after a `MODEL_CREDITS_EXHAUSTED` kill.
+    /// Exits 3 with no output when the model is already at the cheapest
+    /// rung or is unrecognized, so the caller falls through to its normal
+    /// mid-phase-death handling instead of guessing a model.
+    #[arg(long)]
+    pub downgrade: bool,
+}
+
+/// `resolve-model` — backs `resolve-model.sh`. Served by both binaries:
+/// `loom-daemon resolve-model` and `loom-tools resolve-model` (#13878), both
+/// calling this one handler.
 ///
 /// Exit codes: `0` on success, `2` (clap) when no model was supplied, and `3`
 /// with NO output when `--task-alias` / `--downgrade` has no mapping so the
 /// caller keeps its own precedence chain.
-pub(crate) fn handle_resolve_model_command(
-    model: &str,
-    config: Option<&str>,
-    generation: bool,
-    task_alias: bool,
-    downgrade: bool,
-) -> Result<()> {
+pub fn handle_resolve_model_command(args: &ResolveModelArgs) -> Result<()> {
     use script_helpers::model_tiers;
 
-    let cfg = model_tiers::load_config(config.map(Path::new));
+    let cfg = model_tiers::load_config(args.config.as_deref().map(Path::new));
 
     // Credit-exhaustion downgrade mode (#5687). Checked before --task-alias:
     // --downgrade already ends at a Task-passable alias, so passing both is a
     // caller shorthand for "degrade, then step one rung down", not a conflict.
-    if downgrade {
-        let cheaper = model_tiers::downgrade_task_alias(model);
+    if args.downgrade {
+        let cheaper = model_tiers::downgrade_task_alias(&args.model);
         if cheaper.is_empty() {
             std::process::exit(3);
         }
@@ -64,8 +96,8 @@ pub(crate) fn handle_resolve_model_command(
     }
 
     // Task-tool degradation mode (#4282).
-    if task_alias {
-        let alias = model_tiers::task_alias_of(model);
+    if args.task_alias {
+        let alias = model_tiers::task_alias_of(&args.model);
         if alias.is_empty() {
             std::process::exit(3);
         }
@@ -73,15 +105,119 @@ pub(crate) fn handle_resolve_model_command(
         return Ok(());
     }
 
-    if generation {
-        match model_tiers::generation_of(model, &cfg) {
+    if args.generation {
+        match model_tiers::generation_of(&args.model, &cfg) {
             Some(g) => println!("{g}"),
             // The Python printed an empty line for an unrecognized model.
             None => println!(),
         }
     } else {
-        println!("{}", model_tiers::resolve_model(model, &cfg));
+        println!("{}", model_tiers::resolve_model(&args.model, &cfg));
     }
+    Ok(())
+}
+
+/// The shared `resolve-role-model` argument surface: one struct behind both
+/// clap roots (`loom-daemon resolve-role-model` and `loom-tools
+/// resolve-role-model`), so the two cannot drift apart (the #13878 pattern).
+#[derive(clap::Args)]
+pub struct ResolveRoleModelArgs {
+    /// A role name (`judge`, `Builder`, `judge.md` — normalized
+    /// case- and `.md`-suffix-insensitively).
+    #[arg(value_name = "ROLE")]
+    pub role: String,
+
+    /// Explicit tier-1 override; wins over every config tier. Blank = unset
+    /// (the same contract `resolve-model`'s callers apply to an explicit
+    /// dispatch param).
+    #[arg(long, value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Path to a `.loom/config.json` to read verbatim (default: resolve
+    /// the `./.loom` config tier chain, including `.loom-local/local.json`).
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<String>,
+
+    /// Map the resolved model to the nearest Task-tool alias (#4282) before
+    /// printing — the one-call form a spawning session uses right before
+    /// passing the value to the Task `model` parameter. Exit 3 when the
+    /// resolved model has no Task-passable alias (caller omits the param).
+    /// A no-op with `--json`, whose record already carries `task_model`.
+    #[arg(long = "task-alias")]
+    pub task_alias: bool,
+
+    /// Print a JSON record (`role`, `model`, `source`, `task_model`) instead
+    /// of the bare model, and always exit 0. The observability form (issue
+    /// #13956): `source` names the tier that supplied the model (`param` |
+    /// `roleConfig.model` | `suggestedModel` | `inherit`), so an experiment
+    /// can log what a spawn actually ran on. `task_model` is the value to
+    /// pass to the Task tool's alias-only `model` parameter (`null` ⇒ omit
+    /// the parameter); `model` keeps the real resolved ID (#14133).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The `--json` record for `resolve-role-model` (#13956, #14133).
+///
+/// `model` is the real resolved value (possibly a pinned ID) so the record
+/// stays an honest observability log; `task_model` is its
+/// [`model_tiers::task_alias_of`] degradation — the only value the Task
+/// tool's alias-only `model` parameter accepts — or `null` when there is no
+/// model or no mapping, meaning the caller omits the parameter.
+fn resolve_role_model_json(
+    role: &str,
+    resolved: &script_helpers::role_model::ResolvedRoleModel,
+) -> serde_json::Value {
+    let task_model = resolved
+        .model
+        .as_deref()
+        .map(script_helpers::model_tiers::task_alias_of)
+        .filter(|alias| !alias.is_empty());
+    serde_json::json!({
+        "role": role,
+        "model": resolved.model,
+        "source": resolved.source,
+        "task_model": task_model,
+    })
+}
+
+/// `resolve-role-model` — backs `resolve-role-model.sh` (issue #13956).
+/// Served by both binaries: `loom-daemon resolve-role-model` and `loom-tools
+/// resolve-role-model`, both calling this one handler.
+///
+/// Exit codes: `0` resolved (or `--json` report printed), `2` (clap) when no
+/// role was supplied, and `3` with NO output when nothing is configured (or
+/// `--task-alias` has no mapping) so the caller omits the Task `model`
+/// parameter and the subagent inherits the parent session's model. `--json`
+/// always exits 0 and ignores `--task-alias` (its `task_model` field carries
+/// the alias).
+pub fn handle_resolve_role_model_command(args: &ResolveRoleModelArgs) -> Result<()> {
+    use script_helpers::{model_tiers, role_model};
+
+    let cfg = model_tiers::load_config(args.config.as_deref().map(Path::new));
+    // The same cwd anchoring `model_tiers::load_config(None)` uses: the stubs
+    // are invoked as `./.loom/scripts/resolve-role-model.sh` from a repo root.
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let resolved =
+        role_model::resolve_role_model(&cfg, &repo_root, &args.role, args.model.as_deref());
+
+    if args.json {
+        println!("{}", resolve_role_model_json(&args.role, &resolved));
+        return Ok(());
+    }
+
+    let Some(model) = resolved.model else {
+        std::process::exit(3);
+    };
+    if args.task_alias {
+        let alias = model_tiers::task_alias_of(&model);
+        if alias.is_empty() {
+            std::process::exit(3);
+        }
+        println!("{alias}");
+        return Ok(());
+    }
+    println!("{model}");
     Ok(())
 }
 
@@ -95,7 +231,7 @@ fn checkpoint_worktree(worktree: Option<&str>) -> PathBuf {
 }
 
 /// `loom-daemon checkpoint <write|read|clear|stages>` — backs `checkpoint.sh`.
-pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
+pub fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> {
     use script_helpers::checkpoints;
 
     match action {
@@ -164,7 +300,7 @@ pub(crate) fn handle_checkpoint_command(action: CheckpointAction) -> Result<()> 
                         checkpoints::IssueStatus::Unknown,
                         |n| {
                             checkpoints::IssueStatus::from_gh_state(
-                                &loom_daemon::worktree_ops::gh::issue_state_rest(&path, n),
+                                &crate::worktree_ops::gh::issue_state_rest(&path, n),
                             )
                         },
                     );
@@ -392,8 +528,9 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_role_model_json;
     use crate::cli::whole_cli_parse::try_parse_cli;
-    use crate::Commands;
+    use crate::cli::Commands;
 
     /// #11665: `resolve-model` keeps its alias / `--task-alias` /
     /// `--downgrade` / `--generation` surface unchanged.
@@ -420,6 +557,99 @@ mod tests {
             let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             assert!(matches!(cli.command, Some(Commands::ResolveModel { .. })), "{argv:?}");
         }
+    }
+
+    /// #13956: `resolve-role-model` parses its surface — the bare role, and
+    /// each flag in composition.
+    #[test]
+    fn resolve_role_model_keeps_its_surface() {
+        for argv in [
+            &["loom-daemon", "resolve-role-model", "judge"][..],
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--model",
+                "claude-opus-5",
+            ],
+            &["loom-daemon", "resolve-role-model", "judge", "--task-alias"],
+            &["loom-daemon", "resolve-role-model", "judge", "--json"],
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--json",
+                "--config",
+                "x.json",
+            ],
+            // #14133: the pair parses; `--task-alias` is a documented no-op
+            // under `--json` (the record's `task_model` carries the alias).
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--json",
+                "--task-alias",
+            ],
+        ] {
+            let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            assert!(matches!(cli.command, Some(Commands::ResolveRoleModel { .. })), "{argv:?}");
+        }
+        // The role argument is required.
+        assert!(try_parse_cli(&["loom-daemon", "resolve-role-model"]).is_err());
+    }
+
+    /// #14133: the `--json` record carries a Task-passable `task_model`
+    /// beside the untouched `role` / `model` / `source`.
+    #[test]
+    fn resolve_role_model_json_carries_task_model() {
+        use crate::script_helpers::role_model::{
+            ResolvedRoleModel, SOURCE_INHERIT, SOURCE_ROLE_CONFIG,
+        };
+
+        // A pinned ID degrades to its family alias; `model` stays the real ID.
+        let pinned = ResolvedRoleModel {
+            model: Some("claude-opus-5-5".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        let v = resolve_role_model_json("judge", &pinned);
+        assert_eq!(v["role"], "judge");
+        assert_eq!(v["model"], "claude-opus-5-5");
+        assert_eq!(v["source"], SOURCE_ROLE_CONFIG);
+        assert_eq!(v["task_model"], "opus");
+
+        // An alias passes through unchanged.
+        let alias = ResolvedRoleModel {
+            model: Some("sonnet".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        assert_eq!(resolve_role_model_json("builder", &alias)["task_model"], "sonnet");
+
+        // An `@effort` suffix is stripped for the Task value only.
+        let effort = ResolvedRoleModel {
+            model: Some("claude-opus-5@high".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        assert_eq!(resolve_role_model_json("judge", &effort)["task_model"], "opus");
+
+        // Nothing configured: `model` and `task_model` are both null.
+        let inherit = ResolvedRoleModel {
+            model: None,
+            source: SOURCE_INHERIT,
+        };
+        let v = resolve_role_model_json("judge", &inherit);
+        assert!(v["model"].is_null());
+        assert!(v["task_model"].is_null());
+        assert_eq!(v["source"], SOURCE_INHERIT);
+
+        // A model with no Task alias maps to null, not an empty string.
+        let unmappable = ResolvedRoleModel {
+            model: Some("gpt-5".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        let v = resolve_role_model_json("judge", &unmappable);
+        assert_eq!(v["model"], "gpt-5");
+        assert!(v["task_model"].is_null());
     }
 
     /// #11665: tier-2.5 routing and the Jev tier shadow are deleted, so their

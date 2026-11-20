@@ -1,37 +1,9 @@
 use super::*;
 use serial_test::serial;
 
-/// Restore both shard env vars to whatever they were, so a `#[serial]`
-/// test that sets them cannot leak into the next one.
-struct EnvGuard {
-    index: Option<String>,
-    count: Option<String>,
-}
+use crate::env_test_support::EnvGuard;
 
-impl EnvGuard {
-    fn capture() -> Self {
-        let g = Self {
-            index: std::env::var(SHARD_INDEX_ENV).ok(),
-            count: std::env::var(SHARD_COUNT_ENV).ok(),
-        };
-        std::env::remove_var(SHARD_INDEX_ENV);
-        std::env::remove_var(SHARD_COUNT_ENV);
-        g
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.index {
-            Some(v) => std::env::set_var(SHARD_INDEX_ENV, v),
-            None => std::env::remove_var(SHARD_INDEX_ENV),
-        }
-        match &self.count {
-            Some(v) => std::env::set_var(SHARD_COUNT_ENV, v),
-            None => std::env::remove_var(SHARD_COUNT_ENV),
-        }
-    }
-}
+const SHARD_ENV: &[&str] = &[SHARD_INDEX_ENV, SHARD_COUNT_ENV];
 
 fn sharded(index: usize, count: usize) -> ShardPosture {
     ShardPosture::Sharded {
@@ -182,7 +154,7 @@ fn an_unsharded_posture_owns_every_workspace() {
 #[test]
 #[serial]
 fn an_out_of_range_index_falls_back_to_unsharded_rather_than_owning_nothing() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_INDEX_ENV, "4");
     std::env::set_var(SHARD_COUNT_ENV, "4");
     let posture = resolve_posture_from(None, Path::new("/repos/loom"));
@@ -196,7 +168,7 @@ fn an_out_of_range_index_falls_back_to_unsharded_rather_than_owning_nothing() {
 #[test]
 #[serial]
 fn a_zero_count_falls_back_to_unsharded() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_INDEX_ENV, "0");
     std::env::set_var(SHARD_COUNT_ENV, "0");
     assert_eq!(
@@ -208,7 +180,7 @@ fn a_zero_count_falls_back_to_unsharded() {
 #[test]
 #[serial]
 fn a_single_shard_fleet_is_unsharded() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_INDEX_ENV, "0");
     std::env::set_var(SHARD_COUNT_ENV, "1");
     assert_eq!(
@@ -220,7 +192,7 @@ fn a_single_shard_fleet_is_unsharded() {
 #[test]
 #[serial]
 fn an_index_without_a_count_falls_back_to_unsharded() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_INDEX_ENV, "1");
     assert_eq!(
         resolve_posture_from(None, Path::new("/repos/loom")),
@@ -234,7 +206,7 @@ fn an_index_without_a_count_falls_back_to_unsharded() {
 #[test]
 #[serial]
 fn a_count_without_an_index_falls_back_to_unsharded() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_COUNT_ENV, "4");
     assert_eq!(
         resolve_posture_from(None, Path::new("/repos/loom")),
@@ -248,7 +220,7 @@ fn a_count_without_an_index_falls_back_to_unsharded() {
 #[test]
 #[serial]
 fn a_malformed_knob_falls_back_to_unsharded_and_names_the_field() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     std::env::set_var(SHARD_INDEX_ENV, "two");
     std::env::set_var(SHARD_COUNT_ENV, "4");
     let posture = resolve_posture_from(None, Path::new("/repos/loom"));
@@ -263,7 +235,7 @@ fn a_malformed_knob_falls_back_to_unsharded_and_names_the_field() {
 #[test]
 #[serial]
 fn nothing_configured_resolves_to_not_configured() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     assert_eq!(
         resolve_posture_from(None, Path::new("/repos/loom")),
         ShardPosture::Unsharded(UnshardedReason::NotConfigured)
@@ -275,7 +247,7 @@ fn nothing_configured_resolves_to_not_configured() {
 #[test]
 #[serial]
 fn env_overrides_config_for_both_knobs() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     let block = serde_json::json!({ "shardIndex": 3, "shardCount": 4 });
     std::env::set_var(SHARD_INDEX_ENV, "1");
     std::env::set_var(SHARD_COUNT_ENV, "2");
@@ -295,7 +267,7 @@ fn env_overrides_config_for_both_knobs() {
 fn the_count_may_come_from_config_while_the_index_comes_from_env() {
     // The intended deployment shape: a fleet-wide count committed to the
     // repo, a per-host index in the service unit.
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     let block = serde_json::json!({ "shardCount": 4 });
     std::env::set_var(SHARD_INDEX_ENV, "2");
     assert_eq!(
@@ -314,7 +286,7 @@ fn the_count_may_come_from_config_while_the_index_comes_from_env() {
 #[test]
 #[serial]
 fn a_tracked_config_shard_index_is_refused_rather_than_honored() {
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     std::fs::create_dir_all(root.join(".loom")).expect("mkdir .loom");
@@ -340,7 +312,7 @@ fn a_tracked_config_shard_index_is_refused_rather_than_honored() {
 fn an_env_index_still_shards_even_when_the_tracked_config_also_declares_one() {
     // The env value is per-host by construction, so it is legitimate and
     // overrides the (ignored) tracked one rather than tripping the refusal.
-    let _env = EnvGuard::capture();
+    let _env = EnvGuard::clear(SHARD_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     std::fs::create_dir_all(root.join(".loom")).expect("mkdir .loom");

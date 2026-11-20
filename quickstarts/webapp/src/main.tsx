@@ -15,8 +15,9 @@ createRoot(root).render(
     <BrowserRouter>
       <ThemeProvider>
         <AuthProvider>
-          <App />
-          <Toaster />
+          <Toaster>
+            <App />
+          </Toaster>
         </AuthProvider>
       </ThemeProvider>
     </BrowserRouter>

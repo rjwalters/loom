@@ -5,7 +5,10 @@
 //! resolution, every autonomous subsystem's startup wiring, and the IPC
 //! accept loop that only returns on a startup failure.
 
+mod credential_startup;
+mod github_app_refresh;
 mod observer_tasks;
+mod sweep_registry_startup;
 
 use loom_daemon::activity::{self, ActivityDb};
 use loom_daemon::auto_update;
@@ -17,13 +20,13 @@ use loom_daemon::daemon_heartbeat;
 use loom_daemon::daemon_startup_reconciliation;
 use loom_daemon::epic_supervisor;
 use loom_daemon::event_bus::EventBus;
+use loom_daemon::extract_configured_terminal_ids;
 use loom_daemon::health_monitor;
 use loom_daemon::hyperparams;
 use loom_daemon::idle_exit;
 use loom_daemon::install_self_check;
 use loom_daemon::ipc::IpcServer;
 use loom_daemon::main_health_gate;
-use loom_daemon::metrics_collector;
 use loom_daemon::orphan_process_reaper;
 use loom_daemon::primary_checkout_reaper;
 use loom_daemon::quarantine_stash_status;
@@ -39,7 +42,6 @@ use loom_daemon::watchdog_provisioning_guard;
 use loom_daemon::work_finder;
 use loom_daemon::workspace_pool::WorkspacePool;
 use loom_daemon::worktree_reaper;
-use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
 use anyhow::{anyhow, Result};
 use std::fs;
@@ -48,9 +50,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use crate::cli;
-use crate::{handle_cli_command, Cli, Commands, FleetAction};
 use clap::Parser;
+use loom_daemon::cli;
+use loom_daemon::cli::root::{handle_cli_command, Cli, Commands, FleetAction};
 
 use cli::dispatch::handle_dispatch_command;
 use cli::dispatch_backoff::handle_dispatch_backoff_command;
@@ -119,13 +121,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             Commands::Health { since, json } => {
                 cli::health::handle_health_command(since, json).await
             }
-            // `peer-claims` connects to the running daemon over its Unix
-            // socket for the same `DaemonStatus` round-trip `status` performs
-            // (Issue #5921), so it needs the async runtime for the same
-            // reason.
-            Commands::PeerClaims { json } => {
-                cli::peer_claims_cmd::handle_peer_claims_command(json).await
-            }
             // `queue` (#8852) reads the same `DaemonStatus` round-trip.
             Commands::Queue { json } => cli::ready_queue_cmd::handle_queue_command(json).await,
             // `jev-merge-risk` POSTs to an external HTTP endpoint (Jev,
@@ -159,7 +154,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
                 depends_on,
                 force,
                 ignore_host_constraint,
-                tap,
             } => {
                 handle_dispatch_command(
                     issue,
@@ -169,8 +163,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
                     depends_on,
                     force,
                     ignore_host_constraint,
-                    tap.runtime,
-                    tap.model_profile,
                 )
                 .await
             }
@@ -302,15 +294,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         // health_state could be stored for querying crash status if needed
     }
 
-    // Start GitHub metrics collection (if workspace is set)
-    // Workspace can be set via LOOM_WORKSPACE environment variable (reuse variable from above)
-    let db_str = db_path.to_str().map(std::string::ToString::to_string);
-
-    if let (Some(workspace), Some(db)) = (workspace_from_env.as_deref(), db_str) {
-        let _metrics_handle = metrics_collector::try_init_metrics_collector(Some(workspace), &db);
-        // Note: metrics_handle is dropped here, but the thread keeps running if enabled
-    }
-
     // Initialize the sweep registry (Issue #3452 — Phase A of #3449).
     // The registry tracks `/loom:sweep` children dispatched via the
     // `DispatchSweep` IPC request. It writes no daemon-side state file;
@@ -393,6 +376,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // from sweep children, plus consumer for `SubscribeEvents` streams).
     let event_bus = Arc::new(EventBus::new());
     log::info!("event_bus: started in-memory pub/sub (capacity={})", event_bus.capacity());
+    loom_daemon::agent_residue_reaper::install_event_bus(event_bus.clone());
 
     // #10832: a live pause manifest must hold restart recovery off its paused
     // agents BEFORE the first registry is reconstructed (design §7 H5).
@@ -406,8 +390,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
         ),
         Err(e) => log::warn!("sweep_registry: reconstruction failed: {e}"),
     }
-    // #11346: J1 concern verification (logged, off-thread; no-op when disabled).
-    loom_daemon::journal::execution::log_startup_verification();
 
     // #6171: record the daemon's own primary workspace root once, before any
     // forge call that could trigger a forced per-owner credential refresh
@@ -421,130 +403,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // the flag from here, not from their own repo roots.
     loom_daemon::fleet_dispatch::worker::set_host_root(&sweep_workspace);
 
-    // Startup forge-credential preflight (Issue #4005; GitHub App identity
-    // mechanism added by #4430). Resolved once, here — immediately before the
-    // claim-reconciliation pass below, the daemon's first `gh` consumer — so
-    // a headless/SSH-only start with neither an exported GH_TOKEN/GITHUB_TOKEN
-    // nor an unlockable GUI login keychain is diagnosed loudly at boot
-    // instead of surfacing as silent per-tick 401s for the life of the
-    // process. Non-fatal and bounded (same posture as the reconciliation pass
-    // itself): a `gh` hiccup here never blocks startup.
-    //
-    // #4430: when a GitHub App id + private key are configured (env or
-    // `forge.githubApp.*` config — see `defaults/scripts/lib/github-app-token.sh`),
-    // this mints a short-lived installation token and exports it as this
-    // process's own `GH_TOKEN`, so every `gh`/`git` child the daemon spawns
-    // from this point on inherits it. Absent that config, `owner_repo`
-    // resolves fine but the shell helper reports "not_configured" and
-    // `run_with_github_app` falls through to the byte-identical pre-#4430
-    // `run(...)` path below — no behavior change for any host that hasn't
-    // opted in.
-    let credential_preflight_probe = credential_preflight::RealGhAuthProbe {
-        gh_bin: "gh".to_string(),
-        cwd: sweep_workspace.clone(),
-    };
-    let github_app_script = credential_preflight::resolve_github_app_script(&sweep_workspace);
-    let github_app_owner_repo = credential_preflight::nwo_from_git_remote(&sweep_workspace);
-    let github_app_preflight = match &github_app_script {
-        Some(script_path) => {
-            let minter = credential_preflight::RealGithubAppMinter {
-                script_path: script_path.clone(),
-                cwd: sweep_workspace.clone(),
-            };
-            credential_preflight::run_with_github_app(
-                &credential_preflight_probe,
-                &minter,
-                github_app_owner_repo.as_deref(),
-            )
-        }
-        // No `github-app-token.sh` on disk at all (stale install predating
-        // #4430, or a workspace root with no `.loom`/`defaults` tree) —
-        // exactly the pre-#4430 path, with zero extra subprocess overhead.
-        None => credential_preflight::GithubAppPreflight {
-            report: credential_preflight::run(&credential_preflight_probe),
-            minted: None,
-        },
-    };
-    // #4458: deliver the minted installation token via a daemon-owned
-    // `GH_CONFIG_DIR` (`credential_preflight::publish_minted`, #10571 sidecar)
-    // instead of exporting it as this process's `GH_TOKEN`. Every `gh` child
-    // this daemon spawns (`Command::new("gh")` without `env_clear`, ~76
-    // call sites — see the issue body's census) re-reads
-    // `$GH_CONFIG_DIR/hosts.yml` fresh on each invocation, so the refresh
-    // tick below becomes a pure file rewrite with **zero** recurring
-    // `std::env::set_var` calls — the UB race (concurrent `setenv` vs. the
-    // `environ` reads inside every concurrently spawned `Command`) this issue
-    // eliminates. `github_app_gh_config_dir_active` tracks whether the
-    // one-time env activation below has happened yet, so it fires **at most
-    // once** for the life of the process (see the tick closure further down
-    // for the rare case where activation happens there instead of here).
-    //
-    // The one remaining `std::env::set_var` (`GH_CONFIG_DIR` itself, plus the
-    // paired `remove_var` calls) is that single activation: it runs here,
-    // before the refresh-tick task (or any other tokio task that spawns
-    // `gh`/`git`) has been created, so there is no concurrent `Command::spawn`
-    // in this process yet to race the `environ` write — the residual window
-    // this issue's acceptance criteria allow a startup site to keep, given a
-    // comment naming the race and the rationale for accepting it. Clearing
-    // `GH_TOKEN`/`GITHUB_TOKEN` here (not just setting `GH_CONFIG_DIR`)
-    // matters too: `gh` checks the env vars *before* `GH_CONFIG_DIR`'s
-    // `hosts.yml`, so an operator-exported ambient token would otherwise
-    // silently outrank the just-minted app token — the pre-#4458 code
-    // achieved the same override by unconditionally overwriting `GH_TOKEN`.
-    let github_app_config_dir = credential_preflight::github_app_gh_config_dir(&sweep_workspace);
-    let mut github_app_gh_config_dir_active = false;
-    if let Some(minted) = &github_app_preflight.minted {
-        match credential_preflight::publish_minted(&github_app_config_dir, minted) {
-            Ok(()) => {
-                std::env::remove_var("GH_TOKEN");
-                std::env::remove_var("GITHUB_TOKEN");
-                std::env::set_var("GH_CONFIG_DIR", &github_app_config_dir);
-                github_app_gh_config_dir_active = true;
-            }
-            Err(e) => {
-                // Fail open, matching the mint-failure posture elsewhere in
-                // this preflight: never block startup, never leave the
-                // daemon worse off than the pre-#4430 ambient path.
-                log::warn!(
-                    "credential_preflight: failed to publish github-app token to {} ({e}); \
-                     falling back to ambient gh auth — #4458",
-                    github_app_config_dir.display()
-                );
-            }
-        }
-    }
-    // #9872: name the rate-limit pool the credential spends (WARN on a
-    // personal one: shared with every PAT/OAuth/`gh` login of that user).
-    let credential_preflight = credential_preflight::attach_pool(github_app_preflight.report);
-    credential_preflight::loom_ui::startup(&credential_preflight); // #11295
-
-    // Per-owner managed-repo credentials (#5401). The App preflight above
-    // mints ONE installation token, for the workspace-root owner; every
-    // managed repo owned by another account/org needs its own, published into
-    // a per-owner `GH_CONFIG_DIR` and registered against its checkout roots
-    // (`credential_preflight::cross_owner`). Only when the App is the active
-    // credential this run; a single-owner fleet plans nothing.
-    //
-    // #11957: a startup mint that fails (a timeout on a saturated host) skips
-    // this pass, and `cross_owner_retry` makes the primary refresh tick below
-    // run it once its own mint succeeds, then with bounded backoff while any
-    // owner still fails — instead of leaving every cross-owner root on the
-    // root owner's credential, refused by the write-scope gate, until restart.
-    let mut cross_owner_retry =
-        credential_preflight::cross_owner::CrossOwnerRetry::after_startup(None);
-    if let (Some(root_owner_repo), Some(script_path), true) = (
-        &github_app_owner_repo,
-        &github_app_script,
-        github_app_preflight.minted.is_some(),
-    ) {
-        let pass = credential_preflight::cross_owner::establish_for_workspace(
-            &sweep_workspace,
-            root_owner_repo,
-            script_path,
-        );
-        cross_owner_retry =
-            credential_preflight::cross_owner::CrossOwnerRetry::after_startup(Some(&pass));
-    }
+    let credential_startup::CredentialStartup {
+        github_app_script,
+        github_app_owner_repo,
+        github_app_config_dir,
+        github_app_gh_config_dir_active,
+        minted_token,
+        credential_preflight,
+        cross_owner_retry,
+        startup_roots,
+    } = credential_startup::run_startup(&sweep_workspace);
 
     // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
     // ordering reasons: the store is read through `gh` under the credentials
@@ -568,256 +436,21 @@ pub(crate) async fn run_daemon() -> Result<()> {
     let fleet_started =
         loom_daemon::fleet_sync::start(&sweep_workspace, Some(event_bus.clone())).await;
 
-    // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
-    // minted installation token fresh across its ~1h lifetime for a
-    // long-running daemon. Ticks that don't rotate the token
-    // never *write* anything: the `NotConfigured` arm is a true no-op, and a
-    // cache-hit tick (the shell helper's own cache still has plenty of life —
-    // ~10 of every ~11 ticks) compares against `current_token` (a plain local
-    // captured by this task, never the process env — #4456's original
-    // intent, now trivially true since there is no shared `GH_TOKEN` env var
-    // left to read) and skips the write because the minted value is
-    // unchanged. Only a genuine rotation (value differs) rewrites
-    // `hosts.yml`; a mint failure is logged and the loop keeps whatever
-    // credential `GH_CONFIG_DIR` already has on disk (fail-open, matching the
-    // startup preflight's posture).
     if let (Some(script_path), Some(owner_repo)) = (&github_app_script, &github_app_owner_repo) {
-        let script_path = script_path.clone();
-        let cwd = sweep_workspace.clone();
-        let owner_repo = owner_repo.clone();
-        let config_dir = github_app_config_dir.clone();
-        let mut current_token = github_app_preflight.minted.map(|m| m.token);
-        let mut config_dir_active = github_app_gh_config_dir_active;
-        let (pass_workspace, pass_script) = (cwd.clone(), script_path.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
-                let script_path = script_path.clone();
-                let cwd = cwd.clone();
-                let repo = owner_repo.clone();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
-                    credential_preflight::GithubAppMinter::mint(&minter, &repo)
-                })
-                .await;
-                let primary_minted =
-                    matches!(outcome, Ok(credential_preflight::GithubAppOutcome::Minted { .. }));
-                match outcome {
-                    Ok(
-                        ref minted @ credential_preflight::GithubAppOutcome::Minted {
-                            ref token,
-                            ref installation_id,
-                            ref app_id,
-                            ..
-                        },
-                    ) => {
-                        // #5630: a successful mint (fresh or cache hit) ends this
-                        // source's credential-failure streak, so the main-health
-                        // gate goes back to trusting its forge answers on the very
-                        // next tick. A publish failure below re-opens it — an
-                        // unpublished token is just as un-refreshed on disk.
-                        credential_preflight::record_forge_credential_success(
-                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
-                        );
-                        // #4456/#4458: only rewrite when the value actually
-                        // rotated, and do it as a pure file write — no
-                        // `std::env::set_var` anywhere in this arm once
-                        // `config_dir_active` is already true (the common
-                        // case: activation happened at startup above).
-                        if gh_token_needs_update(current_token.as_deref(), token) {
-                            // Rare edge case: the app becomes configured
-                            // *after* startup (e.g. the shell helper's own
-                            // config appears mid-run) without the daemon
-                            // restarting, so activation didn't happen above.
-                            // This is a second, still-bounded (at most once
-                            // per process) `std::env::set_var` window — the
-                            // recurring, steady-state race this issue targets
-                            // is the one eliminated; this cold-start
-                            // transition is unchanged in kind from the
-                            // pre-#4458 code's own equivalent one-time
-                            // `set_var` in this same arm.
-                            if !config_dir_active {
-                                std::env::remove_var("GH_TOKEN");
-                                std::env::remove_var("GITHUB_TOKEN");
-                                std::env::set_var("GH_CONFIG_DIR", &config_dir);
-                                config_dir_active = true;
-                            }
-                            match credential_preflight::publish_outcome(
-                                &config_dir,
-                                minted,
-                                &owner_repo,
-                            ) {
-                                Ok(()) => {
-                                    current_token = Some(token.clone());
-                                    log::debug!(
-                                        "credential_preflight: github-app refresh tick rotated \
-                                         GH_TOKEN (app {app_id} installation {installation_id}) \
-                                         — #4430"
-                                    );
-                                }
-                                Err(e) => {
-                                    // #5630: the mint succeeded but the token never
-                                    // reached disk, so `GH_CONFIG_DIR` still holds the
-                                    // aging one — same staleness as a failed mint.
-                                    credential_preflight::record_forge_credential_failure(
-                                        credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
-                                        &format!("could not publish the minted token: {e}"),
-                                    );
-                                    log::warn!(
-                                        "credential_preflight: github-app refresh tick failed to \
-                                         publish token to {} ({e}); GH_CONFIG_DIR left unchanged \
-                                         (app {app_id} installation {installation_id}) — #4458",
-                                        config_dir.display()
-                                    );
-                                }
-                            }
-                        } else {
-                            log::debug!(
-                                "credential_preflight: github-app refresh tick cache hit, \
-                                 GH_TOKEN unchanged (app {app_id} installation {installation_id}) \
-                                 — #4456"
-                            );
-                        }
-                    }
-                    Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
-                        // Cheap no-op tick -- nothing to refresh.
-                    }
-                    Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
-                        // #5630: the credential on disk is now aging with no
-                        // successful refresh behind it. Record the streak so the
-                        // main-health gate holds its previous verdicts instead of
-                        // reading the resulting forge failures as "every repo's
-                        // main just went red".
-                        credential_preflight::record_forge_credential_failure(
-                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
-                            &reason,
-                        );
-                        log::warn!(
-                            "credential_preflight: github-app refresh tick failed ({reason}); \
-                             GH_TOKEN left unchanged — main-health gate verdicts are held for up \
-                             to {}s while this persists — #4430/#5630",
-                            credential_preflight::resolve_forge_credential_stale_grace().as_secs()
-                        );
-                    }
-                    Err(e) => {
-                        // A join error means the mint never completed either, so
-                        // the credential is just as un-refreshed as an Error arm.
-                        credential_preflight::record_forge_credential_failure(
-                            credential_preflight::CREDENTIAL_SOURCE_PRIMARY,
-                            &format!("github-app refresh task join error: {e}"),
-                        );
-                        log::warn!(
-                            "credential_preflight: github-app refresh task join error: {e} — #4430"
-                        );
-                    }
-                }
-                // #11957: run the per-owner pass startup skipped or could not
-                // finish, once the App mints again. After the primary publish
-                // above, so the cached refusals it expires are filed under
-                // the process credential as it now stands.
-                if primary_minted && cross_owner_retry.due() {
-                    let (ws, repo, script) =
-                        (pass_workspace.clone(), owner_repo.clone(), pass_script.clone());
-                    let pass =
-                        credential_preflight::cross_owner::establish_for_workspace_off_thread(
-                            ws, repo, script,
-                        )
-                        .await;
-                    cross_owner_retry.record(&pass);
-                }
-            }
-        });
+        github_app_refresh::spawn_primary_refresh(
+            script_path.clone(),
+            owner_repo.clone(),
+            sweep_workspace.clone(),
+            github_app_config_dir.clone(),
+            minted_token,
+            github_app_gh_config_dir_active,
+            cross_owner_retry,
+            startup_roots,
+        );
     }
 
-    // #5401: keep each per-owner credential fresh across its ~1h lifetime,
-    // ticking every `GITHUB_APP_REFRESH_INTERVAL` (~5min) — the same cadence
-    // as the workspace-root owner's tick above. Re-mint the
-    // owner's representative repo and republish into its `GH_CONFIG_DIR` — a
-    // pure file rewrite via #4458's delivery path; the root->dir registration
-    // is path-stable and never needs re-registering. A fail-open loop
-    // (matching the startup posture): a mint/publish miss logs and keeps
-    // whatever token that owner's dir already holds.
-    //
-    // #6171: spawned whenever the App mechanism itself is configured
-    // (`github_app_script.is_some()`), NOT only when a per-owner plan
-    // happened to exist at startup — the source list
-    // (`credential_preflight::owner_refresh_sources()`) is re-read from the
-    // shared registry on every tick, so an owner discovered later via
-    // `force_refresh_owner_credential`'s 404-recovery path (including a
-    // fleet that started single-owner and only later grew a cross-owner
-    // workspace) is picked up automatically, without a second task to spawn.
-    // An empty registry makes a tick a cheap no-op loop, same cost as the
-    // pre-#6171 early return.
     if let Some(script_path) = &github_app_script {
-        let script_path = script_path.clone();
-        let cwd = sweep_workspace.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
-                let owners = credential_preflight::owner_refresh_sources();
-                for (owner_repo, config_dir) in &owners {
-                    let script_path = script_path.clone();
-                    let cwd = cwd.clone();
-                    let owner_repo_for_mint = owner_repo.clone();
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        let minter = credential_preflight::RealGithubAppMinter { script_path, cwd };
-                        credential_preflight::GithubAppMinter::mint(&minter, &owner_repo_for_mint)
-                    })
-                    .await;
-                    // #5630: each owner's credential is its own refresh
-                    // source. A saturated host times these out alongside the
-                    // primary tick, and their repos' forge calls go just as
-                    // wrong — so they feed the same staleness tracker, keyed
-                    // separately so a healthy owner's success cannot clear a
-                    // failing owner's streak.
-                    let source = credential_preflight::credential_source_for_owner(owner_repo);
-                    match outcome {
-                        Ok(ref minted @ credential_preflight::GithubAppOutcome::Minted { .. }) => {
-                            if let Err(e) = credential_preflight::publish_outcome(
-                                config_dir, minted, owner_repo,
-                            ) {
-                                credential_preflight::record_forge_credential_failure(
-                                    &source,
-                                    &format!("could not publish the minted token: {e}"),
-                                );
-                                log::warn!(
-                                    "credential_preflight: per-owner github-app refresh could \
-                                         not publish the token for {owner_repo} to {} ({e}); its \
-                                         credential left unchanged — #5401",
-                                    config_dir.display()
-                                );
-                            } else {
-                                credential_preflight::record_forge_credential_success(&source);
-                            }
-                        }
-                        Ok(credential_preflight::GithubAppOutcome::NotConfigured) => {
-                            // Cheap no-op — nothing to refresh for this owner.
-                        }
-                        Ok(credential_preflight::GithubAppOutcome::Error(reason)) => {
-                            credential_preflight::record_forge_credential_failure(&source, &reason);
-                            log::warn!(
-                                "credential_preflight: per-owner github-app refresh for \
-                                     {owner_repo} failed ({reason}); its credential left \
-                                     unchanged — main-health gate verdicts are held for up to \
-                                     {}s while this persists — #5401/#5630",
-                                credential_preflight::resolve_forge_credential_stale_grace()
-                                    .as_secs()
-                            );
-                        }
-                        Err(e) => {
-                            credential_preflight::record_forge_credential_failure(
-                                &source,
-                                &format!("per-owner refresh task join error: {e}"),
-                            );
-                            log::warn!(
-                                "credential_preflight: per-owner github-app refresh task join \
-                                     error for {owner_repo}: {e} — #5401"
-                            );
-                        }
-                    }
-                }
-            }
-        });
+        github_app_refresh::spawn_owner_refresh(script_path.clone(), sweep_workspace.clone());
     }
 
     // #9537: keep each reader App's token fresh per managed owner (no-op when
@@ -955,144 +588,14 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // invariant (#6615) intact despite the passes no longer blocking startup.
     let startup_reconciliation_ready =
         daemon_startup_reconciliation::spawn_startup_passes(sweep_workspace.clone());
-    let _claim_reconciliation_handle = claim_reconciliation::spawn_periodic_reconciliation_task(
-        sweep_workspace.clone(),
-        event_bus.clone(),
-    );
+    let _claim_reconciliation_handle =
+        claim_reconciliation::spawn_periodic_reconciliation_task(sweep_workspace.clone());
 
-    // Startup-race mitigation (Issue #3887): resolve the dispatch stagger + the
-    // watchdog knobs from `.loom/config.json → autonomous` with env override
-    // (precedence env > config > default). The stagger serializes back-to-back
-    // child startups so a burst dispatch does not trip the 0-HTTPS MCP-init
-    // race; the watchdog is the self-healing backstop for any hang that slips
-    // past it.
-    let startup_race_config = sweep_registry::read_startup_race_config(&sweep_workspace);
-    let dispatch_stagger = sweep_registry::resolve_dispatch_stagger(&startup_race_config);
-    sweep.set_dispatch_stagger(dispatch_stagger);
-    log::info!("sweep_registry: dispatch stagger = {}ms (#3887)", dispatch_stagger.as_millis());
-
-    // Startup-proof occupancy grace (Issue #4003): a freshly-dispatched sweep
-    // counts toward the work-finder's admission budget regardless of progress
-    // for this long; past it, a sweep with zero observed startup-proof signal
-    // (no worktree/checkpoint/log-past-header) stops consuming a slot, well
-    // before the (unchanged) 300s startup watchdog would cancel/re-dispatch it.
-    let startup_proof_grace = sweep_registry::resolve_startup_proof_grace(&startup_race_config);
-    sweep.set_startup_proof_grace(startup_proof_grace);
-    log::info!(
-        "sweep_registry: startup-proof occupancy grace = {}s (#4003)",
-        startup_proof_grace.as_secs()
-    );
-
-    // Insta-crash quarantine (#3939): resolve env > config > default for the
-    // default workspace so the reaper quarantines a repeatedly-insta-crashing
-    // issue instead of letting the work finder re-dispatch it every tick.
-    let quarantine_config = sweep_registry::resolve_quarantine_config(&sweep_workspace);
-    sweep.set_quarantine_config(quarantine_config);
-    log::info!(
-        "sweep_registry: insta-crash quarantine {} (threshold={}, ttl={}s, insta-crash<{}s) (#3939)",
-        if quarantine_config.enabled { "enabled" } else { "disabled" },
-        quarantine_config.threshold,
-        quarantine_config.ttl.as_secs(),
-        quarantine_config.insta_crash_secs
-    );
-
-    // Per-issue dispatch backoff (#4485): resolve env > config > default for the
-    // default workspace so a failing issue's re-dispatch cadence is bounded even
-    // when its deaths land in a quarantine carve-out (#4122 exhaustion, #4386
-    // pre-flight) and never reach the 3-strike quarantine threshold.
-    let dispatch_backoff_config = sweep_registry::resolve_dispatch_backoff_config(&sweep_workspace);
-    sweep.set_dispatch_backoff_config(dispatch_backoff_config);
-    log::info!(
-        "sweep_registry: per-issue dispatch backoff {} (base={}s, max={}s) (#4485)",
-        if dispatch_backoff_config.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        dispatch_backoff_config.base.as_secs(),
-        dispatch_backoff_config.max.as_secs()
-    );
-
-    // No-op re-dispatch cooldown (#6670): resolve env > config > default for
-    // the default workspace so a sweep's self-reported "no actionable delta
-    // this pass" holds its issue out of dispatch for a cooldown window,
-    // distinct from and independent of the insta-crash quarantine and
-    // dispatch backoff above.
-    let noop_cooldown_config = sweep_registry::resolve_noop_cooldown_config(&sweep_workspace);
-    sweep.set_noop_cooldown_config(noop_cooldown_config);
-    // #11481: re-arm windows a restart would otherwise drop.
-    sweep.replay_noop_cooldown_from_journal(chrono::Utc::now());
-    log::info!(
-        "sweep_registry: no-op re-dispatch cooldown {} (cooldown={}s) (#6670)",
-        if noop_cooldown_config.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        noop_cooldown_config.cooldown.as_secs()
-    );
-
-    // Hard-exclusion decline cooldown (#7528): resolve env > config > default
-    // for the default workspace so a sweep that declines because the issue
-    // carries a `crate::hard_exclusion` label (`external` today) is held out
-    // of dispatch for a cooldown window instead of being re-offered on the
-    // very next tick. Independent of all three brakes above.
-    let decline_cooldown_config = sweep_registry::resolve_decline_cooldown_config(&sweep_workspace);
-    sweep.set_decline_cooldown_config(decline_cooldown_config);
-    log::info!(
-        "sweep_registry: hard-exclusion decline cooldown {} (cooldown={}s, warn_threshold={}, \
-         labels={:?}) (#7528)",
-        if decline_cooldown_config.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
-        decline_cooldown_config.cooldown.as_secs(),
-        decline_cooldown_config.warn_threshold,
-        loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS.as_slice()
-    );
-
-    // PR-less retry bound (#7972): resolve env > config > default for the
-    // default workspace so an issue whose dispatches keep ending without a
-    // pull request is spaced out and — at the threshold — held with
-    // `loom:blocked`, instead of being re-claimed forever. The only brake of
-    // the four keyed on "did the dispatch produce a PR" rather than on how the
-    // child died, which is why it catches the shape the others structurally
-    // cannot (a sweep that advances its checkpoint and still produces nothing).
-    // Resolve + set + log live in the module (`configure_prless_retry`), not
-    // inline here: `daemon_service.rs` is over the file-size ratchet's
-    // threshold and frozen at its current size (.loom/docs/file-size-policy.md).
-    sweep_registry::configure_prless_retry(&mut sweep, &sweep_workspace);
-
-    // Claude-wrapper pre-flight-death workspace tripwire (#4386): resolve
-    // env > config > default for the default workspace so a fleet-wide,
-    // cross-issue spawn failure (e.g. a stale `.mcp.json`) trips a visible
-    // advisory instead of reading as an idle-healthy daemon.
-    let preflight_tripwire_config =
-        sweep_registry::resolve_preflight_tripwire_config(&sweep_workspace);
-    sweep.set_preflight_tripwire_config(preflight_tripwire_config);
-    log::info!(
-        "sweep_registry: pre-flight-death tripwire threshold={} (#4386)",
-        preflight_tripwire_config.threshold
-    );
-
-    // Cross-host collision detection + enforcement (#4085, upgraded from
-    // detection-only by #5789): resolve env > config > default(off) for the
-    // default workspace. When enabled, a confirmed pre-flip collision now
-    // backs off the dispatch instead of only recording it.
-    let detect_collisions = sweep_registry::resolve_collision_detection(&sweep_workspace);
-    sweep.set_collision_detection(detect_collisions);
-    log::info!(
-        "sweep_registry: cross-host collision detection {} (#4085)",
-        if detect_collisions {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-
-    let sweep_registry = Arc::new(Mutex::new(sweep));
-    let _reaper_handle = sweep_registry::spawn_reaper_task(sweep_registry.clone());
+    let sweep_registry_startup::SweepRegistryStartup {
+        sweep_registry,
+        startup_race_config,
+        reaper_handle: _reaper_handle,
+    } = sweep_registry_startup::configure_and_share(sweep, &sweep_workspace);
 
     // Multi-workspace sweep-registry pool (Issue #3928 — phase b of #3835/#3926).
     // Both autonomous loops (work-finder + epic supervisor) share ONE pool so a
@@ -1116,36 +619,36 @@ pub(crate) async fn run_daemon() -> Result<()> {
         });
     }
 
-    // Optional cross-host soft-claim coordination (#4028): a dedicated safehouse
-    // connection that advertises this daemon's dispatch claims and consumes peer
-    // advertisements into a shared TTL-bounded view, so peer daemons back off
-    // before the non-atomic `loom:building` label flip would let them race.
-    // Byte-for-byte no-op when `safehouse.enabled` is false/absent. Injected into
-    // the seeded default registry here (the IPC `DispatchSweep` path); every other
-    // provisioned registry is injected in `get_or_provision`.
-    //
-    // Deliberately started **before** `start_safehouse_narration` below (Issue
-    // #6352): the narration sink reads back this call's publisher + view
-    // synchronously (`WorkspacePool::start_safehouse_narration` locks
-    // `peer_coord`) to build its fleet-wide completion-dedup handle, so peer
-    // coordination must already be established by the time narration starts
-    // — reversing this order would silently leave completion dedup
-    // per-host-only even with `safehouse.enabled` true.
-    workspace_pool.start_peer_coordination(&sweep_workspace);
+    // #12876: on an EC2 host, watch for spot interruption / rebalance notices.
+    // Never started (no IMDS traffic) elsewhere.
     {
-        let mut reg = sweep_registry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        workspace_pool.inject_peer_coordination(&mut reg);
+        let pool = workspace_pool.clone();
+        let root = sweep_workspace.clone();
+        if loom_daemon::host_loss::spawn(move || loom_daemon::ipc::in_flight_sweeps(&pool, &root)) {
+            log::info!("host_loss: EC2 host; watching for spot interruption notices (#12876)");
+        }
     }
+
+    // Optional cross-host completion dedup (#6352): a dedicated safehouse
+    // connection that announces this daemon's narrated completions and consumes
+    // peers', so a merge is posted to the public feed once fleet-wide.
+    // Byte-for-byte no-op when `safehouse.enabled` is false/absent.
+    //
+    // Deliberately started **before** `start_safehouse_narration` below: the
+    // narration sink reads back this call's publisher + view synchronously
+    // (`WorkspacePool::start_safehouse_narration` locks `completion_dedup`) to
+    // build its fleet-wide completion-dedup handle — reversing this order would
+    // silently leave completion dedup per-host-only even with `safehouse.enabled`
+    // true.
+    workspace_pool.start_completion_dedup(&sweep_workspace);
 
     // Optional safehouse fleet-comms narration (#3997): subscribe the shared
     // event bus and narrate sweep-lifecycle transitions into an E2E Matrix room.
     // Byte-for-byte no-op when `safehouse.enabled` is false/absent. The activity
     // DB handle (#4497) is the same `Arc` the IPC server gets, shared so the
     // public-feed `completion` envelope can carry a best-effort per-issue token
-    // total; the sink only ever reads, on the blocking pool. Started after peer
-    // coordination above (Issue #6352) so it can pick up the fleet-wide
+    // total; the sink only ever reads, on the blocking pool. Started after the
+    // completion dedup above (Issue #6352) so it can pick up the fleet-wide
     // completion-dedup handle.
     workspace_pool.start_safehouse_narration(&sweep_workspace, Some(activity_db.clone()));
 
@@ -1354,8 +857,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
 
     let _work_finder_handle = if work_finder::resolve_enabled(&work_finder_config) {
         let interval = work_finder::resolve_interval_with_config(&work_finder_config);
-        // #9255: opt-in event-gated polling; read once at startup (restart to change).
-        loom_daemon::forge_events::poll_gate::configure_for(&sweep_workspace, interval);
         // #6203: also resolve *which layer* supplied `configured_max` (env /
         // config / default) so the startup log below can tell an operator
         // whether their `.loom/config.json` edit was actually picked up. This
@@ -1413,20 +914,20 @@ pub(crate) async fn run_daemon() -> Result<()> {
         log::debug!("work_finder: disabled (set LOOM_WORK_FINDER=1 to enable)");
         None
     };
-    // #11295: loom-ui's Alerts page, before its producers below start.
-    // Started before the watches below; alerts raised earlier wait in its outbox.
-    if loom_daemon::loom_ui_alerts::start(&sweep_workspace).is_some() {
-        loom_daemon::loom_ui_alerts::watches::spawn_all(&sweep_workspace);
-    }
     // #11104: star-liveness is gone; its `autonomous.operatorPriority` keys warn once.
     work_finder::operator_priority::warn_retired_config(&sweep_workspace);
     // #11406: the fleet-captain gauge block is gone; its keys warn once.
     loom_daemon::observability::retired_captain_config::warn_retired_config(&sweep_workspace);
-    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
-        sweep_workspace.clone(),
-        socket_path.clone(),
-        Some(event_bus.clone()),
-    ); // #10164
+    // #12812: the dashboard /ingest target is retired; legacy keys warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_ingest_config(
+        &sweep_workspace,
+    );
+
+    // #12809: the dashboard event-feed client and its consumers are gone;
+    // leftover `forgeEvents` / `LOOM_FORGE_EVENTS_*` settings warn once.
+    loom_daemon::observability::retired_captain_config::warn_retired_forge_events_config(
+        &sweep_workspace,
+    );
 
     // Idle-edge role triggering (#4364) is inert without the work-finder loop:
     // the work finder is the sole source of the per-root idle signal, so an
@@ -1532,14 +1033,16 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // Fleet-captain singleton tasks that own their loop (`fleet_singletons`):
     // the GitHub Actions CI telemetry poller (Issue #8824): FLAGS-OFF
     // (`autonomous.ciTelemetry.enabled`), no task and zero side effects when
-    // off, feed-driven (#9201) only when `forgeEvents.events.ciTelemetryRuns`
-    // is on; and the intake reconcile singleton (W7), a config read per tick
+    // off; and the intake reconcile singleton (W7), a config read per tick
     // unless `fleet.intakeReconcile.singleton` makes this host the producer.
     // (The `loom:blocked` release task that used to start here was retired,
     // #11301.) The role-runner decision is resolved here, once, and reused below.
     let role_runner_config = role_runner::read_role_runner_config(&sweep_workspace);
     let role_runner_on = role_runner::resolve_enabled(&role_runner_config);
-    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone(), &event_bus);
+    let _fleet = loom_daemon::fleet_singletons::spawn(sweep_workspace.clone());
+    // #12727: measure (never move) the daemon-root checkout's lag and dirt.
+    let _daemon_root_freshness =
+        loom_daemon::daemon_root_freshness::spawn_task(sweep_workspace.clone());
 
     // Codex session-container reconcile pass (#10453); LOOM_SESSION_RECONCILE=0 opts out.
     let _session_reconcile = loom_daemon::session_reconcile::spawn_from_config(&sweep_workspace);
@@ -1880,8 +1383,6 @@ pub(crate) async fn run_daemon() -> Result<()> {
             watch_registry::GhWatchProbe::new(),
             interval,
             expiry,
-            event_bus.clone(),
-            sweep_workspace.clone(),
         ))
     } else {
         log::debug!(
@@ -1942,6 +1443,19 @@ pub(crate) async fn run_daemon() -> Result<()> {
     // `observer_tasks` for why they share a call site.
     let _observer_handles =
         observer_tasks::spawn(&sweep_workspace, &event_bus, workspace_pool.clone());
+
+    // #11295 / #12806: alerts go out as `alert.transition` OTLP records, so
+    // the output is decided once the exporters above are up. Alerts raised
+    // earlier (credential preflight, the fleet-sync startup pass) were held
+    // and go out now; the watches and fleet_alert start after it.
+    if loom_daemon::alerts::start().is_some() {
+        loom_daemon::alerts::watches::spawn_all(&sweep_workspace);
+    }
+    let _fleet_alert = loom_daemon::fleet_alert::task::spawn(
+        sweep_workspace.clone(),
+        socket_path.clone(),
+        Some(event_bus.clone()),
+    ); // #10164
 
     // Start IPC server. `workspace_health_states` is threaded in so the
     // `DaemonStatus` request can report each registered repo's own halt state
@@ -2086,26 +1600,13 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
-/// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
-/// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
-/// effects (no directory creation), so it's safe to call from `setup_logging()`
-/// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
-/// as well as from `main()` and `resolve_socket_path()` without duplicating the
-/// branching logic three times over.
-pub(crate) fn resolve_loom_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        let socket_path = PathBuf::from(path);
-        let loom_dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
-            .to_path_buf();
-        return Ok(loom_dir);
-    }
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    Ok(loom_dir)
-}
+// Resolve the daemon's loom directory: the parent of `LOOM_SOCKET_PATH` when
+// that env var is set (test isolation), else `$HOME/.loom`. Pure — no side
+// effects (no directory creation), so it's safe to call from `setup_logging()`
+// (which runs before `main()`'s own `loom_dir`/`socket_path` resolution block)
+// as well as from `main()` and `resolve_socket_path()` without duplicating the
+// branching logic three times over.
+pub(crate) use loom_daemon::cli::common::resolve_loom_dir;
 
 /// Resolve the daemon log file path: `LOOM_DAEMON_LOG` (full override) when
 /// set, else `<loom dir>/daemon.log` derived from [`resolve_loom_dir`]. This
@@ -2128,13 +1629,12 @@ fn setup_logging() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    // Rotate log file if it exceeds 10MB (keeps last 10 files)
-    rotate_log_file(&log_path, 10 * 1024 * 1024, 10)?;
-
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
+    // Issue #13917: daily-rolling writer — rolls a prior-day file at startup,
+    // then at 00:00 UTC while running; retention is by days (see `daily_log`).
+    let log_file = loom_daemon::daily_log::DailyLogWriter::open(
+        &log_path,
+        loom_daemon::daily_log::Retention::from_env(),
+    )?;
 
     // Issue #8504: every machine-readable timestamp `loom-daemon` writes is
     // UTC with an explicit `Z` designator, so it can never be mistaken for

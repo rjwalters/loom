@@ -6,9 +6,7 @@
 //! never silent about a configuration the operator asked for.
 use super::{render_role_runner_shard_header_line, render_role_runner_shard_repo_line};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::types::{
-    DaemonStatusReport, RepoStatus, RoleRunnerShardPosture, RoleRunnerShardStatus,
-};
+use crate::types::{DaemonStatusReport, RepoStatus, RoleRunnerShardPosture, RoleRunnerShardStatus};
 
 fn posture(configured: bool, summary: &str) -> RoleRunnerShardPosture {
     RoleRunnerShardPosture {
@@ -82,7 +80,7 @@ fn header_renders_a_misconfiguration_rather_than_swallowing_it() {
         role_runner_shard: Some(posture(
             true,
             "off (REFUSED: shardIndex=1 is declared in the workspace's TRACKED \
-             .loom/config.json) — this host runs role ticks for EVERY registered workspace",
+                 .loom/config.json) — this host runs role ticks for EVERY registered workspace",
         )),
         ..sample_report()
     };

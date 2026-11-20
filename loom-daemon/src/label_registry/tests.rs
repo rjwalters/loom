@@ -390,16 +390,6 @@ fn derived_pr_latency_hold_labels_equal_the_previous_set() {
 }
 
 #[test]
-fn derived_queue_blocked_hold_labels() {
-    assert_eq!(
-        set(crate::observability::queue_blocked::HOLD_LABELS
-            .iter()
-            .copied()),
-        set(crate::work_finder::OPERATOR_HOLD_NAMES.iter().copied())
-    );
-}
-
-#[test]
 fn derived_merge_pr_blocking_equals_the_previous_literal_in_order() {
     // Order matters: the guard reports the first match in this order.
     assert_eq!(

@@ -495,7 +495,11 @@ Every host is configured the same way. There is no per-host pinning:
   `github-app-token.sh`, so with it set credential delivery, agent writes and
   `merge-pr.sh` use that one App for every owner, while `forge token` (lease
   posting) ignores the env and follows `writers[]`. `forge identities` warns
-  when both are present.
+  when both are present. `forge may-write --repo acme/x` agrees with
+  `forge token --repo acme/x` (#13929): the probe mints the listed owner's
+  writer credential the same way before answering, so a writer-covered owner
+  reads as writable when the mint works, and a failed mint is refused with
+  the mint failure named (never a guess).
 
   Each withdrawal is exported as a `forge.reader.withdrawn` span
   ([`telemetry-schema.md`](telemetry-schema.md)), and `loom-daemon status`
@@ -650,7 +654,7 @@ over all reads. A rise means a classifier gap, not an outage.
 Discovery listings can also skip GitHub, and the gateway, entirely: with a
 state mirror configured (`forge.mirror`), the work finder
 reads fresh listings from it and fall back to the paths above. See
-[`forge-events.md` §8](forge-events.md#8-the-state-mirror-forgemirror-discovery-reads-and-wakes).
+[`forge-events.md`](forge-events.md#the-state-mirror-forgemirror-discovery-reads-and-the-change-stream).
 
 ### The cached-permission window: `403 … not accessible by integration` (#6074)
 
@@ -915,6 +919,12 @@ issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`.
 Full recipe, the atomic create+label requirement, the scripted
 `forge_gh_create_issue_rl_safe` equivalent, and why `loom-daemon forge issue
 create` is NOT a fallback: [`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md).
+
+**Exception (#13978): a foreign public repo the App is not installed on.** There
+`create-issue.sh` and `forge create-issue` are refused (`NOT_IN_INSTALLATION`, the
+#9548 guard, unchanged) and a raw `gh issue create -R <repo>` is the sanctioned
+interim route; do not park the report for an operator. When and how:
+[`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md#foreign-public-repo-not_in_installation---raw-gh-issue-create--r-interim-13978).
 
 ### The duplicate backstop, and what makes it refuse (exit 3)
 

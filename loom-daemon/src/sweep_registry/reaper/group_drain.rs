@@ -73,6 +73,28 @@ pub(crate) enum GroupDrain {
 }
 
 impl SweepRegistry {
+    /// Hand a terminal run to the agent-residue reaper (#10802), which stops
+    /// its scope and process tree on a detached thread.
+    pub(crate) fn request_residue_teardown(
+        &self,
+        sweep_id: &str,
+        issue: Option<u32>,
+        pid: u32,
+        pgid: Option<u32>,
+        started_at: DateTime<Utc>,
+    ) {
+        crate::agent_residue_reaper::request_exit_teardown(
+            crate::agent_residue_reaper::ExitRequest::capture(
+                &self.config.workspace_root,
+                sweep_id,
+                issue,
+                pid,
+                pgid,
+                started_at,
+            ),
+        );
+    }
+
     /// Terminate the surviving process group of a sweep whose **leader is
     /// already dead** (Issue #4980) — the crash path.
     ///
@@ -151,9 +173,10 @@ impl SweepRegistry {
         let now = Instant::now();
         let mut done: Vec<SweepId> = Vec::new();
         for (sweep_id, pending) in &mut self.pending_group_reaps {
-            let gated = self.entries.get(sweep_id).is_some_and(|info| {
-                matches!(info.state, SweepState::Running | SweepState::Pending)
-            });
+            let gated = self
+                .entries
+                .get(sweep_id)
+                .is_some_and(|info| matches!(info.state, SweepState::Running));
             if !group_has_members(pending.pgid) {
                 // The SIGTERM worked (or the group drained on its own).
                 if !gated {

@@ -25,7 +25,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::remove;
+use crate::worktree_cli::remove;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeRemoveArgs {

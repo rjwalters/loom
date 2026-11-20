@@ -385,6 +385,7 @@ impl TestClient {
     /// creating the socket and calling `listen(2)` while `num-cpus` sibling test
     /// processes run. The previous 5-attempt budget (~0.75s) was calibrated for
     /// `cargo test`'s one-binary-at-a-time model.
+    #[allow(dead_code)]
     pub async fn connect(socket_path: &Path) -> Result<Self> {
         let max_retries = 8;
         let mut retry_delay = Duration::from_millis(50);
@@ -842,4 +843,51 @@ impl Drop for RealFallbackRecordGuard {
             self.path.display()
         );
     }
+}
+
+/// Fresh, empty, canonicalized scratch directory under the system temp dir,
+/// unique per `(prefix, tag, process, thread)`.
+///
+/// Shared by the `worktree_*_differential` tests, which each used to carry a
+/// byte-identical copy differing only in `prefix`.
+#[allow(dead_code)]
+pub fn unique_tmpdir(prefix: &str, tag: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!(
+        "{prefix}-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("create tmpdir");
+    std::fs::canonicalize(&base).expect("canonicalize tmpdir")
+}
+
+/// Make a `git` invocation hermetic: no user/system config, fixed identity,
+/// and a stable locale/terminal. Shared by the `worktree_*_differential` tests.
+#[allow(dead_code)]
+pub fn hermetic_git(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Loom Test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Loom Test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+        .env("LC_ALL", "C")
+        .env("TERM", "dumb")
+}
+
+/// Run `git -C <dir> <args>` under [`hermetic_git`] and assert it succeeded,
+/// naming the directory and git's stderr on failure. Shared by the
+/// `worktree_*_differential` tests' fixture builders.
+#[allow(dead_code)]
+pub fn git(dir: &Path, args: &[&str]) {
+    let mut cmd = Command::new("git");
+    hermetic_git(&mut cmd);
+    let out = cmd.arg("-C").arg(dir).args(args).output().expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

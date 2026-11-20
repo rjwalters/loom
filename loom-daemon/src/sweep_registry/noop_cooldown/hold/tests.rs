@@ -2,12 +2,10 @@
 //! forge state is a handful of files the test can edit between no-ops.
 
 use super::*;
-use crate::peer_claims::{ClaimAd, PeerClaimView};
 use crate::sweep_registry::test_support::fake_gh_graphql_arm;
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
 const ISSUE: u32 = 694;
@@ -414,7 +412,6 @@ fn zero_threshold_disables_the_hold_without_touching_the_cooldown() {
     assert!(forge.calls("issue edit").is_empty());
     assert!(forge.calls("api").is_empty(), "no forge reads when disabled");
     assert!(reg.noop_cooldown_remaining(ISSUE, Utc::now()).is_some());
-    assert_eq!(reg.noop_release_count(ISSUE), 5);
 }
 
 #[test]
@@ -643,72 +640,24 @@ fn assert_no_operator_write(forge: &Forge) {
     );
 }
 
-// --- #12024: the hold parks on loom:blocked, counted across the fleet -------
+// --- #12024: the hold parks on loom:blocked ----------------------------------
 
-/// One simulated host: a registry over the shared fake forge, with its own
-/// peer view and its own outbound ad queue.
-struct Host {
-    reg: SweepRegistry,
-    name: String,
-    view: Arc<Mutex<PeerClaimView>>,
-    rx: tokio::sync::mpsc::Receiver<ClaimAd>,
-}
-
-fn host(dir: &Path, name: &str, threshold: u32) -> Host {
-    let mut reg = registry_over(dir, threshold);
-    let view = Arc::new(Mutex::new(PeerClaimView::new(name.into(), Duration::from_secs(120))));
-    reg.set_peer_claims(Arc::clone(&view));
-    let (tx, rx) = tokio::sync::mpsc::channel(64);
-    reg.set_peer_claim_publisher(tx);
-    Host {
-        reg,
-        name: name.into(),
-        view,
-        rx,
-    }
-}
-
-/// Deliver every ad each host published to every other host, stamped with
-/// the sender's name (one process has one `host_identity()`).
-fn relay(hosts: &mut [Host]) {
-    let mut sent = Vec::new();
-    for h in hosts.iter_mut() {
-        while let Ok(mut ad) = h.rx.try_recv() {
-            ad.host.clone_from(&h.name);
-            sent.push(ad);
-        }
-    }
-    for ad in &sent {
-        for h in hosts.iter() {
-            crate::peer_claims::observe_brake_ad(
-                &mut h.view.lock().unwrap(),
-                ad,
-                std::time::Instant::now(),
-            );
-        }
-    }
-}
-
-/// The #12024 acceptance case: three no-ops on three different hosts park
-/// the issue at the threshold, although no host saw more than one.
+/// The #12024 acceptance case, on one host (the streak is this host's own
+/// since #13945): the threshold parks the issue on `loom:blocked`, and a
+/// lifted park restarts the count.
 #[test]
 #[serial]
-fn no_ops_across_hosts_park_the_item_at_the_threshold() {
-    let (_reg, forge, dir) = forge_registry(3);
+fn no_ops_park_the_item_at_the_threshold() {
+    let (mut reg, forge, _dir) = forge_registry(3);
     let reason = Some("remaining work is an operator decision".to_string());
-    let mut hosts: Vec<Host> = ["host-a", "host-b", "host-c"]
-        .iter()
-        .map(|n| host(dir.path(), n, 3))
-        .collect();
-    for i in 0..2 {
-        hosts[i].reg.record_noop_release(ISSUE, reason.clone());
-        relay(&mut hosts);
-        assert!(!hosts[i].reg.noop_hold_applied(ISSUE), "host {i} saw only {}", i + 1);
+    for i in 1..=2 {
+        reg.record_noop_release(ISSUE, reason.clone());
+        assert!(!reg.noop_hold_applied(ISSUE), "only {i} so far");
     }
     assert!(forge.calls("issue edit").is_empty(), "nothing parked below the threshold");
-    hosts[2].reg.record_noop_release(ISSUE, reason.clone());
-    assert!(hosts[2].reg.noop_hold_applied(ISSUE), "1 here + 2 on peers = 3");
-    assert_eq!(hosts[2].reg.noop_streak_count(ISSUE), 1, "this host's own count is 1");
+    reg.record_noop_release(ISSUE, reason.clone());
+    assert!(reg.noop_hold_applied(ISSUE), "the third parks");
+    assert_eq!(reg.noop_streak_count(ISSUE), 3);
     let edit = edit_args(&forge);
     assert!(edit.contains("--add-label loom:blocked"), "{edit}");
     assert_no_operator_write(&forge);
@@ -719,37 +668,29 @@ fn no_ops_across_hosts_park_the_item_at_the_threshold() {
     // The notice records the digest any host can adopt it from.
     assert!(forge.comment_bodies()[0].contains(NOOP_HOLD_FP_MARKER_PREFIX));
 
-    // The park broke the fleet streak: a human lifts the park, and host A's
-    // stale count does not re-park on the next no-op anywhere.
-    relay(&mut hosts);
+    // A human lifts the park: the count restarts instead of re-parking at once.
     reflect_park(&forge, &["loom:issue", "loom:important"]);
-    hosts[0].reg.record_noop_release(ISSUE, reason.clone());
-    relay(&mut hosts);
-    assert_eq!(hosts[0].reg.noop_streak_count(ISSUE), 1, "the break reset host A");
-    assert!(!hosts[0].reg.noop_hold_applied(ISSUE));
+    reg.record_noop_release(ISSUE, reason.clone());
+    assert_eq!(reg.noop_streak_count(ISSUE), 1, "the held streak restarted");
+    assert!(!reg.noop_hold_applied(ISSUE));
     assert_eq!(forge.calls("issue edit").len(), 1, "no immediate re-park");
 }
 
-/// A peer count taken against another state of the issue is not part of the
-/// streak: a fingerprint change restarts the fleet streak too.
+/// A count taken against another state of the issue is not part of the
+/// streak: a fingerprint change restarts it.
 #[test]
 #[serial]
-fn a_peer_count_on_another_fingerprint_does_not_add_up() {
-    let (_reg, forge, dir) = forge_registry(3);
-    let mut hosts: Vec<Host> = ["host-a", "host-b"]
-        .iter()
-        .map(|n| host(dir.path(), n, 3))
-        .collect();
-    hosts[0].reg.record_noop_release(ISSUE, None);
-    hosts[0].reg.record_noop_release(ISSUE, None);
-    relay(&mut hosts);
-    // A human comment lands: host A's two no-ops were on the old state.
+fn a_count_on_another_fingerprint_does_not_add_up() {
+    let (mut reg, forge, _dir) = forge_registry(3);
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    // A human comment lands: the two no-ops were on the old state.
     forge.set_comments("5:2026-10-14T00:00:00Z\n");
-    hosts[1].reg.record_noop_release(ISSUE, None);
-    assert!(!hosts[1].reg.noop_hold_applied(ISSUE), "1, not 1 + 2");
-    hosts[1].reg.record_noop_release(ISSUE, None);
-    hosts[1].reg.record_noop_release(ISSUE, None);
-    assert!(hosts[1].reg.noop_hold_applied(ISSUE), "three on the new state park");
+    reg.record_noop_release(ISSUE, None);
+    assert!(!reg.noop_hold_applied(ISSUE), "1, not 3");
+    reg.record_noop_release(ISSUE, None);
+    reg.record_noop_release(ISSUE, None);
+    assert!(reg.noop_hold_applied(ISSUE), "three on the new state park");
 }
 
 /// A parked item is not offered again until its fingerprint changes: the

@@ -34,6 +34,9 @@
 #       LOOM_HOST_ID, not the raw value (#6322)
 #   (n) a lease comment carrying the raw hostname no longer matches the
 #       opaque default resolution -> ABORT SUPERSEDED (#6322)
+#   (n3) blank and padded env values resolve like Rust's `non_blank`
+#       (#13998): whitespace-only LOOM_LEASE_HOST_ID falls through to
+#       LOOM_HOST_ID; padded trims to the same opaque id as its bare form
 #   (o) a yielded (host, sweep)'s lease is excluded from "freshest" and the
 #       check falls back to the next-freshest, non-yielded lease (#6485)
 #   (p) every lease comment on the issue has yielded -> PASS, fail-open
@@ -152,7 +155,7 @@ reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/comments-fail \
         "$STUB_DIR"/check-branch-rc "$STUB_DIR"/check-branch-stdout \
         "$STUB_DIR"/check-branch-args.log "$STUB_DIR"/check-branch-legacy-rc
-    unset LOOM_LEASE_FENCE_NOW LOOM_HOST_ID LOOM_LEASE_TTL_MINUTES HOSTNAME \
+    unset LOOM_LEASE_FENCE_NOW LOOM_HOST_ID LOOM_LEASE_HOST_ID LOOM_LEASE_TTL_MINUTES HOSTNAME \
         LOOM_LEASE_PUBLISH_HOSTNAME LOOM_REPO 2> /dev/null || true
 }
 
@@ -301,6 +304,34 @@ cat > "$STUB_DIR/comments.json" <<'JSON'
 JSON
 LOOM_HOST_ID="opaque-test-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
 assert_eq "4" "$RC" "(n) a raw-hostname lease comment does not match the opaque default -> ABORT SUPERSEDED"
+
+# --- (n2) LOOM_LEASE_HOST_ID outranks LOOM_HOST_ID and $HOSTNAME: a session
+# in a container (its own hostname) is handed its dispatcher's lease host id
+# and must read the dispatcher's lease -- published under the opaque id of
+# THAT host, the pinned `host-60a4fb97` of (m) -- as its own.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-60a4fb97 sweep=step-builder-6309-1 -->\nprose"}]
+JSON
+LOOM_LEASE_HOST_ID="opaque-test-host" LOOM_HOST_ID="telemetry-host" HOSTNAME="a9a3f88cc974" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(n2) LOOM_LEASE_HOST_ID names the dispatcher's lease host from inside a container -> exit 0"
+# The same lease without the pin is what the container read before: a peer's.
+HOSTNAME="a9a3f88cc974" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "4" "$RC" "(n2) without LOOM_LEASE_HOST_ID the container's own hostname decides -> ABORT SUPERSEDED"
+
+# --- (n3) blank and padded env values resolve like Rust's `non_blank`
+# (#13998): a whitespace-only value counts as unset and falls through to the
+# next chain link, and a padded value trims to the same opaque id as its
+# bare form -- before the fix, " " blocked the fall-through (`-n`) and
+# " opaque-test-host " hashed to a different id than `opaque-test-host`.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[{"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=host-60a4fb97 sweep=step-builder-6309-1 -->\nprose"}]
+JSON
+LOOM_LEASE_HOST_ID="   " LOOM_HOST_ID="opaque-test-host" HOSTNAME="a9a3f88cc974" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(n3) whitespace-only LOOM_LEASE_HOST_ID falls through to LOOM_HOST_ID -> exit 0"
+LOOM_LEASE_HOST_ID=" opaque-test-host " LOOM_HOST_ID="telemetry-host" HOSTNAME="a9a3f88cc974" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
+assert_eq "0" "$RC" "(n3) padded LOOM_LEASE_HOST_ID trims to the same opaque id -> exit 0"
 
 # --- (o) a lease excluded by a same (host, sweep) loom:lease-yield record
 # (#6485) falls back to the next-freshest, non-yielded candidate -- here

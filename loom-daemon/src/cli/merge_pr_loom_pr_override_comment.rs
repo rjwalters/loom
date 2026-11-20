@@ -3,7 +3,7 @@
 //! Renders the audit-comment body `_check_loom_pr_label` posts to the PR on a
 //! REAL (non-dry-run) `--allow-unapproved` override — byte-frozen from the
 //! retired shell, see
-//! [`loom_daemon::merge_pr::loom_pr_guard::override_comment`]. Shares the
+//! [`crate::merge_pr::loom_pr_guard::override_comment`]. Shares the
 //! `LOOM-MERGE-PR-COMMENT` sentinel protocol [`super::merge_pr_partial_comment`]
 //! established: a sentinel line, then the body verbatim with NO trailing
 //! newline, so a daemon predating this verb prints nothing recognisable and
@@ -29,9 +29,9 @@
 //! the override itself), so a missing body costs only the note (see the
 //! module docs on `override_comment`).
 
+use crate::merge_pr::loom_pr_guard::override_comment;
+use crate::merge_pr::partial_comment::now_timestamp;
 use anyhow::Result;
-use loom_daemon::merge_pr::loom_pr_guard::override_comment;
-use loom_daemon::merge_pr::partial_comment::now_timestamp;
 use std::io::{Read, Write};
 
 #[derive(clap::Args)]

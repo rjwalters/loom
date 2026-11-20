@@ -330,8 +330,6 @@ fn is_token_char(byte: u8) -> bool {
 /// the entry has no `headers_file`; otherwise the detail its `misconfigured`
 /// status reports.
 ///
-/// - Only an `otlp` entry may carry one: refusing beats silently dropping
-///   headers the operator asked for.
 /// - The path must be a non-empty string.
 /// - The endpoint must be `https`, or loopback. The headers are credentials,
 ///   and unlike the ingest key they are typically accepted by a whole proxy,
@@ -341,17 +339,10 @@ fn is_token_char(byte: u8) -> bool {
 /// # Errors
 ///
 /// The reason the entry is refused, worded for `loom-daemon status`.
-pub fn entry_policy(
-    is_otlp: bool,
-    endpoint: &str,
-    headers_file: Option<&str>,
-) -> Result<(), String> {
+pub fn entry_policy(endpoint: &str, headers_file: Option<&str>) -> Result<(), String> {
     let Some(path) = headers_file else {
         return Ok(());
     };
-    if !is_otlp {
-        return Err("headers_file is only supported on an otlp exporter entry".to_string());
-    }
     if path.trim().is_empty() {
         return Err("headers_file must be a non-empty string path".to_string());
     }

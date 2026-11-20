@@ -70,6 +70,12 @@
 #                          the sweep escalation ladder's per-rung `@effort`
 #                          cannot be threaded here because the in-session Task
 #                          tool exposes no effort parameter (see sweep.md).
+#   LOOM_SERVICE_TIER      Runtime-neutral speed tier (issue #14141). `fast` (or
+#                          `priority`) turns on Claude fast mode via an inline
+#                          `--settings '{"fastMode":true}'`; `standard`/
+#                          `default` emit nothing; any other value is ignored
+#                          with one warning. Empty = unset. An existing
+#                          `--settings` is merged (inline JSON + jq) or wins.
 #   LOOM_SWEEP_NICENESS    Scheduling niceness applied to this process (and
 #                          everything it execs/forks — claude, claude-wrapper,
 #                          cargo, rustc, test binaries) via a `nice -n N exec`
@@ -106,8 +112,8 @@
 #                          of asking the local daemon for it. A test hook,
 #                          and the escape hatch for a host whose concurrent
 #                          agents this daemon does not track.
-#   LOOM_SWEEP_INFLIGHT_PROBE_TIMEOUT_SECS  Hard bound on that daemon probe
-#                          (default `10`). On timeout the divisor falls back
+#   LOOM_SWEEP_INFLIGHT_PROBE_TIMEOUT_SECS  Hang-guard bound on that daemon probe
+#                          (default `60`, above the CLI budget). On timeout the divisor falls back
 #                          to `1`, i.e. exactly pre-#5979 behavior.
 #   LOOM_SWEEP_CPU_BUDGET_CORES  OUTPUT, not an input: exported into the
 #                          spawned session with the computed per-sweep core
@@ -415,9 +421,14 @@ if [[ "${LOOM_SWEEP_CPU_QUOTA:-1}" != "0" ]]; then
     # on its side.
     export LOOM_SWEEP_CPU_BUDGET_CORES="$_cpu_budget_cores"
     if [[ "$_cpu_shared" == "1" ]]; then
+        # #12884: the sweep count the budget was divided by, for the phase
+        # spans. Only a shared budget measured it; unshared, `1` is a
+        # placeholder, so the key is unset (no parent value leaks through).
+        export LOOM_SWEEP_CPU_INFLIGHT="$_cpu_inflight"
         log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) divided across ${_cpu_inflight} in-flight sweep(s) on this host — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issues #5111/#5979)"
     else
         log_info "spawn-claude: CPU budget = ${_cpu_budget_cores} core(s) of ${_cpu_total_cores} (reserved ${_cpu_reserved}) — host-wide sharing disabled (LOOM_SWEEP_SHARED_CPU_BUDGET=0, #5979) — exported as LOOM_SWEEP_CPU_BUDGET_CORES (issue #5111)"
+        unset LOOM_SWEEP_CPU_INFLIGHT
     fi
 
     _systemd_user_lib="${_script_dir}/lib/systemd-user.sh"
@@ -1032,6 +1043,21 @@ else
     log_info "spawn-claude: model=default"
 fi
 
+# Export the RESOLVED model so everything downstream sees the model actually
+# in flight (#13872). The daemon dispatch path appends an explicit `--model`
+# argv (#4501) without setting LOOM_MODEL, and claude-wrapper.sh's exhaustion
+# mark reads ONLY `LOOM_MODEL` (`retry-classify model-class --model
+# "${LOOM_MODEL:-}"`) — so without this export a role child launched with
+# `--model <m>` wrote class-less `.bad_tokens` marks and one model's limit
+# blocked the whole pool for every model (the 2026-11-13 fleet incident).
+# Exporting the resolved value keeps env and argv in agreement by construction;
+# claude-wrapper.sh's own precedence block then sees `--model` already in its
+# args and appends no duplicate. A session-default spawn (nothing resolved)
+# exports nothing, preserving the account-wide mark for an unknown model.
+if [[ -n "$_resolved_model" ]]; then
+    export LOOM_MODEL="$_resolved_model"
+fi
+
 # --- Effort selection (issue #3705) ---
 # Mirrors the model block above for the `claude --effort <level>` session knob.
 # Precedence: explicit `--effort` in the passthrough args > LOOM_EFFORT env >
@@ -1160,7 +1186,7 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
     _account_provider="$(_loom_account_provider_for_runtime claude)"
     _select_args=(tokens select --workspace "$WORKSPACE" --provider "$_account_provider" --export)
     # Pre-flight: auto-unpin if every allowlisted account has hit the
-    # consecutive-failure threshold (default 5). Without this, an
+    # failure-count threshold (default 5). Without this, an
     # operator-set pin can trap the spawner once all pinned accounts
     # exhaust their weekly quota. Empty-pool guard: we never silently
     # clear .bad_tokens — if that file blocks every account, the user
@@ -1274,6 +1300,21 @@ if [[ "$_loom_print_mode" == "true" ]]; then
 fi
 unset _loom_print_mode
 
+# --- Refuse to invent a git identity (issue #13088) ---
+# A worker with no user.name/user.email commits as `user@hostname` (git's
+# auto-detected fallback), which fails DCO/attribution checks only after a full
+# Judge/Doctor cycle. `user.useConfigOnly=true` makes git refuse to commit
+# unless the identity is explicit (config or GIT_AUTHOR_*/GIT_COMMITTER_*
+# env). Injected per-process via GIT_CONFIG_COUNT/KEY_n/VALUE_n, appending
+# after any count already set, so no config file (the shared primary clone or
+# the host-global config) is written. Fix on refusal: set a real identity
+# (git config --global user.name/user.email, or GIT_AUTHOR_* env).
+_gc_count="${GIT_CONFIG_COUNT:-0}"
+[[ "$_gc_count" =~ ^[0-9]+$ ]] || _gc_count=0
+export "GIT_CONFIG_KEY_${_gc_count}=user.useConfigOnly" "GIT_CONFIG_VALUE_${_gc_count}=true"
+export GIT_CONFIG_COUNT=$((_gc_count + 1))
+unset _gc_count
+
 # --- Session pinning and roll resume (issue #10830) ---
 # Pause-and-roll (docs/design/daemon-roll-pause-resume.md) resumes a paused
 # agent from its saved session, so the daemon pins every Claude session id at
@@ -1297,6 +1338,54 @@ if [[ -n "${LOOM_CLAUDE_SESSION_ID:-}${LOOM_RESUME_SESSION_ID:-}" ]]; then
     while IFS= read -r -d '' _arg; do PASSTHROUGH_ARGS+=("$_arg"); done <"$_resume_args_file"
     rm -f "$_resume_args_file"
 fi
+# --- Service-tier / speed selection (issue #14141) ---
+# `LOOM_SERVICE_TIER` is Loom's one runtime-neutral speed knob. Claude's
+# equivalent is fast mode, a settings key (`fastMode`) with no dedicated CLI
+# flag, so it is delivered as an inline `--settings '{"fastMode":true}'`.
+#   fast | priority      -> fast mode on (priority is Codex's id for the same tier)
+#   standard | default   -> the runtime default; nothing is emitted
+#   anything else        -> one warning, ignored (never a failure)
+# An empty value is unset. Placed AFTER the resume block above because that
+# block may already have appended its own inline `--settings` (roll-pause hook,
+# #11049): two `--settings` flags would not reliably compose, so an existing
+# inline-JSON `--settings` is MERGED with fastMode (needs jq) and any other
+# existing `--settings` (a file path, or no jq) WINS with one log line.
+# Exactly one `spawn-claude: service_tier=<v>` line reports what was applied;
+# unset logs nothing and changes no argument.
+if [[ -n "${LOOM_SERVICE_TIER:-}" ]]; then
+    _tier_norm="$(printf '%s' "$LOOM_SERVICE_TIER" | tr '[:upper:]' '[:lower:]')"
+    case "$_tier_norm" in
+        fast|priority)
+            _tier_settings_idx=-1
+            _tier_i=0
+            for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+                if [[ "$_tier_i" -gt 0 && "${PASSTHROUGH_ARGS[$((_tier_i - 1))]}" == "--settings" ]]; then
+                    _tier_settings_idx="$_tier_i"
+                fi
+                _tier_i=$((_tier_i + 1))
+            done
+            if [[ "$_tier_settings_idx" -lt 0 ]]; then
+                PASSTHROUGH_ARGS+=(--settings '{"fastMode":true}')
+                log_info "spawn-claude: service_tier=fast (fastMode via --settings, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            elif [[ "${PASSTHROUGH_ARGS[$_tier_settings_idx]}" == "{"* ]] \
+                && command -v jq >/dev/null 2>&1 \
+                && _tier_merged="$(printf '%s' "${PASSTHROUGH_ARGS[$_tier_settings_idx]}" | jq -c '. + {fastMode: true}' 2>/dev/null)" \
+                && [[ -n "$_tier_merged" ]]; then
+                PASSTHROUGH_ARGS[_tier_settings_idx]="$_tier_merged"
+                log_info "spawn-claude: service_tier=fast (fastMode merged into the existing --settings, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            else
+                log_warn "spawn-claude: explicit --settings in args wins over LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER'; fast mode not applied (set fastMode there, or pass inline JSON with jq available)"
+            fi
+            ;;
+        standard|default)
+            log_info "spawn-claude: service_tier=standard (runtime default; no flag emitted, from LOOM_SERVICE_TIER=$LOOM_SERVICE_TIER)"
+            ;;
+        *)
+            log_warn "spawn-claude: LOOM_SERVICE_TIER='$LOOM_SERVICE_TIER' is not a Claude tier (fast|priority|standard|default); ignoring it"
+            ;;
+    esac
+fi
+
 # The dispatch identity is consumed: left exported it would reach the agent's own
 # Bash calls, and a nested spawn-claude.sh would reuse the parent's session id and
 # collide on its scope unit (the scope was named at the systemd-run probe above).

@@ -41,6 +41,7 @@ test-build-slot.sh
 test-cargo-test-daemon-guard.sh
 test-champion-capped-hold-routing.sh
 test-champion-ci-checks-no-checks-signal.sh
+test-champion-ci-workflow-blast.sh
 test-champion-critical-file-check.sh
 test-champion-evaluating-reclaim-trust.sh
 test-champion-epic-child-discovery.sh
@@ -52,12 +53,20 @@ test-champion-followon-out-of-scope.sh
 test-champion-held-pr-health-pass.sh
 test-champion-issue-promo-escalation-respects-human-hold.sh
 test-champion-markerless-park.sh
+test-champion-merged-before-hold.sh
 test-champion-merge-queue-step-no-fallthrough.sh
+test-champion-out-of-band-ac-gate-switch.sh
+test-champion-merge-risk-self-release.sh
+test-champion-pr-merge-digest-dedup.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-park-marker-dedupe.sh
 test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
+test-champion-ratification-hold.sh
+test-doctor-champion-hold-conflict.sh
+test-champion-resync-waiver.sh
 test-champion-standing-authorization.sh
 test-champion-targeted-modes.sh
 test-champion-terminal-verdicts.sh
@@ -88,7 +97,9 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-body-at-path.sh
 test-create-issue-refuse-labels.sh
+test-create-pr-body-at-path.sh
 test-create-pr-priority-labels.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
@@ -115,16 +126,24 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-pinned-paths.sh
 test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
+test-guide-awaiting-revision-park.sh
 test-guide-blocked-unblock-limit.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
+# #13892: Guide docs tick runs a repo-provided post-stage hook and stages its
+# printed paths by exact path; any hook failure is fail-closed. Hermetic.
+test-guide-post-stage-hook.sh
 test-guide-superseding-block-merge-state.sh
+test-guide-work-log-rotation.sh
 test-guide-unblock-merged-blocker.sh
+test-guide-split-parent-unblock.sh
+test-guide-skip-docs.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -133,8 +152,13 @@ test-guide-work-log-pr-pagination.sh
 test-guide-work-log-self-loop.sh
 test-guide-work-plan-approved-review-label-fidelity.sh
 test-guide-work-plan-debounce.sh
+test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
+test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
+test-guide-work-plan-receipt.sh
+test-guide-work-plan-roadmap-convention.sh
+test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
 test-install-active-session.sh
@@ -144,10 +168,8 @@ test-install-lock.sh
 test-install-pr-markers.sh
 test-install-source-guard.sh
 test-install-stash-scope.sh
-test-install-sync-labels.sh
 test-jq-reserved-word-args.sh
 test-judge-fallback-cap.sh
-test-judge-fanout-experiment.sh
 test-judge-payload-drop-guard.sh
 test-judge-spec-reconcile.sh
 test-judge-tdd-merge-base.sh
@@ -162,13 +184,9 @@ test-mcp-pnpm-selfrepair.sh
 test-memory-budget.sh
 test-merge-admission-telemetry.sh
 test-merge-pr-app-permission-fallback.sh
-test-merge-pr-auto-merge-disabled-fallback.sh
-test-merge-pr-auto-queued-stacked-children.sh
 test-merge-pr-expected-head.sh
 test-merge-pr-pr-state.sh
-test-merge-pr-check-runs-404-fallback.sh
 test-merge-pr-daemon-version-floor.sh
-test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-stacked-child-branch-delete.sh
 test-merge-pr-tree-checks.sh
 test-merge-pr-required-checks.sh
@@ -193,10 +211,12 @@ test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-manifest-prune.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
+test-resync-installed-agents-md-create.sh
 test-resync-installed-output-staging.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
@@ -226,6 +246,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-sibling-no-arguments-placeholder.sh
 test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-sync-labels-migrate-retired.sh
@@ -248,7 +269,9 @@ test-worktree-root-override.sh
 test-worktree-sentinel.sh
 
 # tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
+tests/hooks/test-guard-cross-tool-champion.sh
 tests/hooks/test-guard-destructive-dispatcher.sh
+tests/hooks/test-guard-install-matrix.sh
 tests/hooks/test-guard-destructive-cargo-and-perf.sh
 tests/hooks/test-guard-destructive-category-opt-ins.sh
 tests/hooks/test-guard-destructive-core.sh
@@ -260,13 +283,16 @@ tests/hooks/test-guard-destructive-masking.sh
 tests/hooks/test-guard-destructive-matching-precision.sh
 tests/hooks/test-guard-destructive-mkdir-confinement.sh
 tests/hooks/test-guard-destructive-mktemp-canon.sh
+tests/hooks/test-guard-destructive-primary-checkout.sh
 tests/hooks/test-guard-destructive-readonly-fastpath.sh
 tests/hooks/test-guard-destructive-rm-scope.sh
 tests/hooks/test-guard-destructive-sed-operands.sh
 tests/hooks/test-guard-destructive-session-scratch.sh
 tests/hooks/test-guard-destructive-stash-scope.sh
 tests/hooks/test-guard-destructive-write-confinement.sh
+tests/hooks/test-guard-confinement-evidence.sh
 tests/hooks/test-guard-loom-workflow.sh
+tests/hooks/test-guard-worktree-edit-bash-parity.sh
 # Not a Claude-path guard, but the same repo-root tests/hooks/ location and
 # hermetic-fixture pattern (throwaway `git worktree add` trees, fake binaries,
 # no network/forge calls) — covers .loom/hooks/post-worktree.sh's redirected-
@@ -296,6 +322,7 @@ tests/install/test-daemon-build-otlp-probe.sh
 tests/install/test-daemon-build-shortcut.sh
 tests/install/test-dry-run-preview-manifest.sh
 tests/install/test-forge-detect.sh
+tests/install/test-gitattributes-in-install-worktree.sh
 tests/install/test-git-repo-detection.sh
 tests/install/test-hooks-preserve.sh
 tests/install/test-initial-commit-credential-exclusion.sh
@@ -303,6 +330,7 @@ tests/install/test-lint-ignore-configs.sh
 tests/install/test-manifest-freshness-after-hook-wiring.sh
 tests/install/test-pnpm-runnable-check.sh
 tests/install/test-provision-daemon.sh
+tests/install/test-provision-tools.sh
 tests/install/test-setup-branch-protection-bypass-actors.sh
 tests/install/test-setup-branch-protection-required-checks.sh
 tests/install/test-setup-repository-settings-merge-method.sh
@@ -337,3 +365,20 @@ test-spawn-claude-memory-max.sh
 # #11863: prompt-lint that targeted Judge/Curator/Builder invocations repeat
 # discovery gates before the first write. Hermetic: reads files only.
 test-targeted-role-invocation.sh
+# #10574: prompt-lint that Judge/Doctor CI-wait recipes agree (snapshot vs
+# bounded wait, unknown required contexts). Hermetic: reads files only.
+test-ci-wait-prompt-consistency.sh
+# #12939: tools-first slice resolution on a clean install (loom-tools before
+# loom-daemon, transitional fallback). Hermetic.
+test-tools-first-clean-install.sh
+# #12941: lib/loom-tools.sh is a compat alias for lib/repo-root.sh. Hermetic.
+test-repo-root-alias.sh
+# #11787: create-issue.sh refuses a direct loom:curated write (exits 2 before forge_detect). Hermetic.
+test-create-issue-curated.sh
+# #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
+test-guide-park-record-precedence.sh
+test-guide-transient-first-at.sh
+# #13956: resolve-role-model.sh — tools-first slice wiring, exit-3 data-code
+# passthrough, the 0.19.1312 version floor, and the resync-keeps-the-setting
+# recheck (agents stay unpinned, config survives). Hermetic: mocks only.
+test-resolve-role-model.sh

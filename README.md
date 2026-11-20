@@ -22,6 +22,11 @@ Loom spawns AI agents that claim issues, implement features, review PRs, and mer
 
 ## Quick Start
 
+Loom's [operating modes](docs/operating-modes.md) distinguish fleet operation,
+an isolated local daemon, and operator-directed sessions. That document records
+the intended support contract, current gaps in running without a daemon
+installed, and the planned separation of CLI tools from the work engine.
+
 ```bash
 # Clone and install to your repository
 git clone https://github.com/rjwalters/loom
@@ -180,7 +185,7 @@ stateDiagram-v2
 **Developer Experience**
 - Git worktree isolation per issue
 - Simple slash command: `/loom:sweep 42` runs a single issue end-to-end
-- MCP integration for programmatic control (30 tools)
+- MCP integration for programmatic control (22 tools)
 - Crash-safe checkpoints: restart `/loom:sweep N` to resume from the last completed phase
 
 ## Forge Support
@@ -210,6 +215,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)
+- bash >= 4 (`brew install bash` on macOS; stock macOS ships 3.2)
 - [Claude Code](https://claude.ai/code) for AI agents
 
 ### Install Options
@@ -243,6 +249,12 @@ your-repo/
 ├── .github/labels.yml   # Workflow labels
 └── CLAUDE.md            # AI context document
 ```
+
+The installer also makes user-level changes outside your repo (`--dry-run` lists them):
+
+- the `loom-daemon` binary in `~/.local/bin` (override with `LOOM_DAEMON_BIN_DIR`), keeping the previous one as `loom-daemon.previous`
+- a mirror of the defaults payload in `~/.local/share/loom-daemon/defaults` (override with `LOOM_DAEMON_DEFAULTS_DIR`)
+- user-scope guard hooks in `~/.claude/settings.json`, after a `settings.json.loom-backup-<timestamp>` backup
 
 ## Usage
 
@@ -341,6 +353,7 @@ gh pr create --label "loom:review-requested"
 | Document | Description |
 |----------|-------------|
 | [ADR Index](docs/adr/README.md) | Architecture decision records |
+| [Roadmap](docs/ROADMAP.md) | Where the project stands and what comes next |
 | [MCP Tools](docs/mcp/README.md) | Programmatic control interface |
 
 ### Repository Layout

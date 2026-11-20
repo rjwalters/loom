@@ -242,6 +242,8 @@ fn rebase_commits(gd: &Path) -> Result<Vec<String>, String> {
 
 /// Is a `git` process running with its working directory inside `root`?
 /// Fails closed: a process whose directory cannot be read counts as live.
+/// A zombie (`unreaped`) is skipped first: it matches `pgrep` and answers
+/// `kill(pid, 0)` but is not running anything (#13887).
 pub(super) fn live_git(root: &Path) -> bool {
     let Ok(out) = Command::new("pgrep").args(["-x", "git"]).output() else {
         return true;
@@ -255,15 +257,36 @@ pub(super) fn live_git(root: &Path) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .filter_map(|p| p.parse::<i32>().ok())
-        .any(|pid| match cwd_of(pid) {
-            Some(cwd) => cwd.starts_with(&root),
-            None => process_exists(pid),
+        .any(|pid| match unreaped(pid) {
+            Some(true) => false,
+            _ => match cwd_of(pid) {
+                Some(cwd) => cwd.starts_with(&root),
+                None => crate::sweep_registry::pid_signalable(pid),
+            },
         })
 }
 
-fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe { libc::kill(pid, 0) == 0 }
+/// Is `pid` an exited process its parent has not reaped? Such a process is
+/// running nothing, yet it still matches `pgrep` and still answers
+/// `kill(pid, 0)`, and its working directory is gone, so the cwd check below
+/// cannot tell it from a live one (#13887). `Some(true)` when it is a
+/// zombie, `Some(false)` when it is alive or gone, `None` when the state
+/// cannot be read: the caller keeps its fail-closed fallback.
+fn unreaped(pid: i32) -> Option<bool> {
+    if let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The process name sits in parens and may itself close with `)`;
+        // every field after it is numeric, so the state follows the last one.
+        let state = text.rsplit(')').next()?.trim_start().chars().next()?;
+        return Some(state == 'Z');
+    }
+    let out = Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().starts_with('Z'))
 }
 
 fn cwd_of(pid: i32) -> Option<PathBuf> {
@@ -307,6 +330,92 @@ fn untracked_in_the_way(
         .filter(|p| !p.is_empty() && !tracked.contains(p))
         .find(|p| root.join(p).symlink_metadata().is_ok())
         .map(str::to_string))
+}
+
+/// A HEAD that is off the default branch with nothing of its own to lose
+/// (#13588): the repair puts the checkout back on the branch.
+#[derive(Debug)]
+pub(super) struct Strand {
+    /// The branch HEAD is on, `None` when detached.
+    pub from: Option<String>,
+    /// HEAD, for the rescue ref and the log.
+    pub head: String,
+    /// Commits on HEAD that are not on `origin/<branch>` (all of them a merged
+    /// pull request's).
+    pub unique: usize,
+}
+
+/// Is `root` stranded off `branch` with everything on its HEAD safe elsewhere?
+/// `Ok(None)`: HEAD is on `branch`. `Err(why)`: stranded, but not provably
+/// safe, or in doubt; the hold stays. Every doubt, including a failed forge
+/// lookup, is an `Err`.
+pub(super) fn stranded(
+    env: &Env<'_>,
+    root: &Path,
+    branch: &str,
+    gd: &Path,
+) -> Result<Option<Strand>, String> {
+    let current = git::current_branch(root, local(env))?;
+    if current.as_deref() == Some(branch) {
+        return Ok(None);
+    }
+    if operation(gd)
+        .map_err(|()| "an operation is in progress")?
+        .is_some()
+    {
+        return Err("an operation is in progress".to_string());
+    }
+    if gd.join("index.lock").exists() {
+        return Err("index.lock exists".to_string());
+    }
+    if !dirty_paths(env, root)?.is_empty() {
+        return Err("the working tree has a tracked change".to_string());
+    }
+    let tracking = git::tracking(branch);
+    read(env, root, &["rev-parse", "--verify", "--quiet", &tracking])
+        .map_err(|_| format!("no {tracking} to compare with"))?;
+    let head = read(env, root, &["rev-parse", "HEAD"])?;
+    let unique = read(env, root, &["rev-list", "HEAD", "--not", &tracking])?
+        .lines()
+        .count();
+    if unique > MAX_COMMITS {
+        return Err(format!("{unique} commits are more than are read"));
+    }
+    if current.is_none() {
+        let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
+            .unwrap_or_default();
+        if keep.trim().eq_ignore_ascii_case("keep") {
+            return Err("HEAD is detached on purpose (loom.checkoutFf.detached=keep)".to_string());
+        }
+    }
+    let moved = managed::head_moved_at(gd);
+    let old_enough = moved.is_some_and(|at| {
+        (env.clock)()
+            .signed_duration_since(at)
+            .to_std()
+            .is_ok_and(|age| age >= managed::detached_after())
+    });
+    if !old_enough {
+        return Err("HEAD moved recently".to_string());
+    }
+    if live_git(root) {
+        return Err("a git process is running in the repository".to_string());
+    }
+    // Last, because it is the only forge read on this path (#13835): every
+    // cheaper local check above has already agreed, so this lookup is the one
+    // answer that can still change the outcome. Before the reorder a checkout
+    // parked on an unmerged branch spent one `commits/<sha>/pulls` read per
+    // pass that a local refusal then threw away.
+    if unique > 0 && (env.pr_merged)(root, &head) != Some(true) {
+        return Err(format!(
+            "{unique} commit(s) are not on {tracking} and HEAD is not a merged pull request's head"
+        ));
+    }
+    Ok(Some(Strand {
+        from: current,
+        head,
+        unique,
+    }))
 }
 
 /// Classify what blocks `root`'s fast-forward to `origin/<branch>`.
@@ -377,6 +486,20 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         if listed.contains(p) {
             return true;
         }
+        // #13970: OpenCode rewrites a tracked `opencode.json` (committed by
+        // the squad installer, not Loom) adding one `$schema` entry, and that
+        // dirt then holds a primary checkout for an operator. Exactly that
+        // one-entry diff in the working tree is Loom's to clear; every other
+        // change to the file, and every committed change, is not. Any read
+        // error fails closed to "not owned".
+        if p == managed::OPENCODE_CONFIG && rev.is_none() {
+            let working = std::fs::read_to_string(root.join(p)).ok();
+            let head = read(env, root, &["show", &format!("HEAD:{p}")]).ok();
+            return matches!(
+                (working, head),
+                (Some(w), Some(h)) if managed::opencode_schema_only(&w, &h)
+            );
+        }
         if !managed::resync_owned(p, &pins) {
             return false;
         }
@@ -437,10 +560,11 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
     // Re-attached only when the repair resets anyway, or the HEAD is behind.
     let reattach = stray && (stray_behind || !commits.is_empty() || blocking_dirt);
     if reattach {
-        // A tool that pins a checkout to a commit on purpose (2am's
-        // `provision.sh` keeps geode-fem at the newest green one) says so here;
-        // while main is red such a HEAD is detached, behind and unmoved, which
-        // is exactly the shape this repair puts back.
+        // A tool that pins a registered workspace to a commit on purpose
+        // says so here; while the default branch is red such a HEAD is
+        // detached, behind and unmoved, which is exactly the shape this repair
+        // puts back. A tool clone kept outside the registered workspaces is
+        // never reached by a pass and needs no opt-out.
         let keep = read(env, root, &["config", "--local", "--get", "loom.checkoutFf.detached"])
             .unwrap_or_default();
         if keep.trim().eq_ignore_ascii_case("keep") {
@@ -482,4 +606,37 @@ fn classify_inner(env: &Env<'_>, root: &Path, branch: &str, gd: &Path) -> Result
         branch_differs: !tip.is_empty() && tip != head,
         detached: reattach,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #13887: a zombie (exited, not yet reaped) still matches
+    /// `pgrep -x git` and still answers `kill(pid, 0)`, but nothing is
+    /// running in it: its working directory died with it. One dropped
+    /// `Child` anywhere on the host — on the nightly run, another test's —
+    /// must not hold every checkout's self-heal.
+    #[test]
+    fn a_zombie_git_is_not_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("git")
+            .args(["hash-object", "/dev/null"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let mut zombied = false;
+        for _ in 0..100 {
+            if unreaped(child.id() as i32) == Some(true) {
+                zombied = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(zombied, "the child never exited unreaped");
+        assert!(!live_git(dir.path()), "a zombie is not a running git");
+        child.wait().unwrap();
+    }
 }

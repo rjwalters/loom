@@ -350,7 +350,10 @@ fn host_only(resource: &Resource) -> Resource {
                 | "loom.runtime"
                 | "loom.relay.redaction"
                 | "loom.session.launch"
+                // Host shape (#12874): describes the host, not a session.
+                | "loom.host.mem_total_bytes"
         ) || key.starts_with("host.")
+            || key.starts_with("cloud.")
     };
     Resource {
         attributes: resource

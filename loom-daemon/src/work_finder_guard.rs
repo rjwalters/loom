@@ -31,8 +31,8 @@ use std::sync::OnceLock;
 
 use serde::Serialize;
 
-use crate::loom_ui_alerts::ledger::Ledger;
-use crate::loom_ui_alerts::{Alert, Severity, State};
+use crate::alerts::ledger::Ledger;
+use crate::alerts::{Alert, Severity, State};
 use crate::work_finder::{self, WorkFinderConfig, WORK_FINDER_ENABLE_ENV};
 
 /// The loom-ui alert rule.

@@ -613,6 +613,18 @@ impl SweepRegistry {
                 })
                 .unwrap_or_default();
         }
+        // Issue #14242: each phase entry carries the effort its launch ran at
+        // — the same resolved `effort` above, which for a sweep session is the
+        // session-default every in-sweep phase inherits (the Task tool exposes
+        // no effort parameter, so no phase can run at anything else) and for a
+        // step is its role's own resolved effort. Stamped from the launch the
+        // entry recorded, never re-derived from dispatch-time config here;
+        // absent, never fabricated, when no effort could be named.
+        if let Some(effort) = &effort {
+            for entry in &mut phase_durations {
+                entry.effort = Some(effort.clone());
+            }
+        }
 
         // The sweep's own PR, taken from the checkpoint values sampled while it
         // ran (free), falling back to the checkpoint still on disk for a sweep
@@ -719,8 +731,16 @@ impl SweepRegistry {
         // this record's own `runtime`/`provider`/`profile` fields stay
         // launch-record-sourced (`apply_runtime_attribution` below), because
         // the marker carries no provider or profile to publish.
-        let usage_runtime = crate::usage_source::sweep_usage_runtime(
+        //
+        // Issue #14166: read the marker from the entry's OWN log. A
+        // step-dispatched run logs to `step-<role>-<item>.log`, which the
+        // per-issue `sweep-issue-<N>.log` lookup never saw — so a Codex step
+        // resolved to `None`, took the Claude reader, and produced no usage
+        // span. `resolve_runtime_attribution` already reads this same path.
+        let dispatch_log = self.entries.get(sweep_id).map(|i| i.log_path.clone());
+        let usage_runtime = crate::usage_source::sweep_usage_runtime_from_log(
             runtime_attribution.as_ref().map(|r| r.runtime.as_str()),
+            dispatch_log.as_deref(),
             &self.config.workspace_root,
             issue,
         );
@@ -1121,6 +1141,16 @@ impl SweepRegistry {
         if let Some(cause) = &outcome_record.no_phase_cause {
             no_phase::insert_span_attributes(&mut metadata, cause);
         }
+        // #14166: `loom.runtime` on the usage spans is the runtime the usage
+        // was actually READ from. `outcome_record.runtime` is launch-record
+        // only, so a legacy-adapter Codex run (no `# LOOM_LAUNCH`) left the
+        // attribute absent even though its tokens were read; the resolved
+        // usage runtime fills that gap. Claude resolves to `None` on both
+        // sides, so its spans are unchanged.
+        let span_runtime = outcome_record
+            .runtime
+            .clone()
+            .or_else(|| usage_runtime.clone());
         // #9443: the same per-phase numbers `phase_durations` carries, on the
         // execution's own `loom.role_attempt` spans, so the D1/JSONL path and
         // the OTLP path report one set of per-phase costs. Before
@@ -1142,7 +1172,7 @@ impl SweepRegistry {
             &self.config.workspace_root,
             sweep_id,
             &phase_usage_spans,
-            outcome_record.runtime.as_deref(),
+            span_runtime.as_deref(),
         );
         // #8908: this execution's exact token usage, joined to its trace.
         crate::observability::runtime_usage::finish_sweep(
@@ -1150,7 +1180,14 @@ impl SweepRegistry {
             sweep_id,
             started_at,
             outcome_record.tokens_by_model.as_deref(),
-            outcome_record.runtime.as_deref(),
+            // #14566: an unreadable sweep says why, so the gap is countable.
+            (outcome_record.tokens_status == Some(crate::telemetry::TokensStatus::Unattributable))
+                .then_some(outcome_record.tokens_status_reason.as_deref())
+                .flatten()
+                .and_then(
+                    crate::observability::runtime_usage::missing::UsageMissing::from_sweep_reason,
+                ),
+            span_runtime.as_deref(),
         );
         let trace_context = crate::observability::lifecycle::finish_execution(
             &self.config.workspace_root,
@@ -1164,13 +1201,7 @@ impl SweepRegistry {
         );
         envelope.trace_context = trace_context;
         let path = self.config.resolve_outcome_telemetry_path();
-        // #11348: shadow into the J2 `sweep` stream only after this succeeds.
-        if let Err(e) = telemetry::journal_shadow::after_legacy(
-            &self.config.workspace_root,
-            telemetry::journal_shadow::TelemetryStream::Sweep,
-            || sweep_outcomes::append_outcome_telemetry(&path, &envelope),
-            |()| telemetry::journal_shadow::ShadowRecord::from_envelope(&envelope),
-        ) {
+        if let Err(e) = sweep_outcomes::append_outcome_telemetry(&path, &envelope) {
             log::warn!(
                 "sweep_outcomes: failed to append sweep.outcome telemetry record for issue \
                  #{issue} ({sweep_id}) at {}: {e} — best-effort, not blocking reap (#4704)",
@@ -1529,6 +1560,17 @@ mod runtime_tests;
 )]
 mod phase_usage_tests;
 
+// Per-phase effort stamping on `phase_durations` (Issue #14242), in its own
+// sibling module for the same file-size reason as `phase_usage_tests` above.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::expect_used,
+    unused_imports
+)]
+mod phase_effort_tests;
+
 // Tap-attributed usage accounting (#8556) end-to-end across both terminal
 // journals, in its own sibling module for the same file-size reason.
 #[cfg(test)]
@@ -1600,9 +1642,3 @@ mod tokens_status_tests;
     unused_imports
 )]
 mod pr_link_tests;
-
-// #11348: the T1 call site shadows into the J2 `sweep` stream only after the
-// legacy `sweep.outcome` append succeeded, and never when disabled.
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod shadow_tests;

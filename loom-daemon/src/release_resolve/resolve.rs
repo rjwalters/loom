@@ -1,8 +1,8 @@
 //! The resolution itself (epic #7810, PR 5).
 
 use super::{host, semver};
-use crate::cmd_out::Query;
-use crate::script_helpers::gh_query;
+use crate::cmd_out::{decode_json, Query, Unavailable};
+use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -84,10 +84,15 @@ pub struct Resolved {
 pub enum Resolution {
     Resolved(Box<Resolved>),
     /// No artifact for this host. **Not an error** — no Releases yet, an
-    /// unreachable or rate-limited API, an unbuilt platform, a release whose
-    /// per-target assets are *still uploading* (#8515), fetch disabled. The
-    /// tick falls back to the source path, exactly as before #7609.
+    /// unbuilt platform, a release whose per-target assets are *still
+    /// uploading* (#8515), fetch disabled. The tick falls back to the source
+    /// path, exactly as before #7609.
     Unresolved(String),
+    /// The releases could not be **read** (#13745): rate-limited, 403/429/5xx,
+    /// the reader shed or timed out. Says nothing about what the repo
+    /// publishes, so callers must not treat it as "no release", a wrong repo,
+    /// or a floor above every release. The next tick asks again.
+    Unavailable(String),
 }
 
 /// Inputs a caller can override, so resolution is drivable without env vars.
@@ -180,16 +185,254 @@ struct PublishedAt {
 /// *unknown* into *absent* there is exactly the fail-open that issue closes.
 #[must_use]
 pub fn asset_names(root: &Path, repo: &str, tag: Option<&str>) -> Option<Vec<String>> {
+    asset_names_detailed(root, repo, tag).ok()
+}
+
+/// Retries after the first failed read of release metadata (#12849).
+const READ_RETRIES: u32 = 2;
+/// Fixed pause between those attempts; each attempt keeps its own `gh` deadline.
+const READ_BACKOFF: Duration = Duration::from_secs(2);
+/// Longest `gh` stderr excerpt carried into a log line.
+const STDERR_EXCERPT_CHARS: usize = 240;
+
+/// Why a release read produced no value (#13745).
+///
+/// `unavailable` separates "the forge could not be read" (rate limit, 403/429,
+/// 5xx, shed, timeout) from "the forge answered and the thing is not there",
+/// which is the only case that may be reported as a missing release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadFailure {
+    pub why: String,
+    pub unavailable: bool,
+}
+
+/// Run one read through the facade as a **read**: a reader's or the gateway's
+/// credential, never the writer's (#12394, #12584). `repo` scopes the route.
+fn gh_read<T, F>(op: &'static str, repo: &str, args: &[&str], root: &Path, is_empty: F) -> Query<T>
+where
+    T: serde::de::DeserializeOwned,
+    F: FnOnce(&T) -> bool,
+{
+    let target = GhTarget::repo(repo).unwrap_or(GhTarget::None);
+    let outcome = GhInvocation::new(Operation::new(op), AccessIntent::Read, target, GH_TIMEOUT)
+        .program(crate::gh_invocation::gh_bin())
+        .current_dir(root)
+        .args(args)
+        .reader_only()
+        .run();
+    decode_json(outcome, is_empty)
+}
+
+/// The HTTP status `gh` reported on stderr (`HTTP 403: ...`), if any.
+fn http_status(stderr: &str) -> Option<u16> {
+    let rest = &stderr[stderr.find("HTTP ")? + 5..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok().filter(|c| (100..600).contains(c))
+}
+
+/// A rate-limit reset time when `gh` echoed one (`X-RateLimit-Reset: <epoch>`).
+fn reset_hint(stderr: &str) -> Option<String> {
+    let lower = stderr.to_ascii_lowercase();
+    let rest = &stderr[lower.find("x-ratelimit-reset")? + "x-ratelimit-reset".len()..];
+    let digits: String = rest
+        .trim_start_matches(|c: char| c == ':' || c == '=' || c.is_whitespace())
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let at = chrono::DateTime::from_timestamp(digits.parse().ok()?, 0)?;
+    Some(at.to_rfc3339())
+}
+
+/// Whether a failed query means the releases could not be read, as opposed to
+/// the forge answering that they are absent. Rate limits (403/429 or the
+/// "rate limit" text, primary or secondary), 5xx, and every `Unavailable`
+/// (reader shed, routing blocked, adapter down, timeout) are unreadable; a 404
+/// or "release not found" is an answer.
+fn is_unavailable<T>(q: &Query<T>) -> bool {
+    match q {
+        Query::Unavailable(_) => true,
+        Query::Failed { stderr, .. } => {
+            let lower = stderr.to_ascii_lowercase();
+            lower.contains("rate limit")
+                || lower.contains("abuse detection")
+                || http_status(stderr).is_some_and(|c| c == 403 || c == 429 || c >= 500)
+        }
+        Query::Malformed { .. } | Query::Empty | Query::Populated(_) => false,
+    }
+}
+
+/// One line saying why a query did not produce a value: exit status plus a
+/// bounded `gh` stderr excerpt (HTTP status / rate-limit text when present).
+/// An unreadable forge is worded as such: HTTP status, the credential class
+/// (always reader-routed, never the writer), and the reset time when given.
+fn describe_failure<T>(q: &Query<T>) -> String {
+    if is_unavailable(q) {
+        let mut parts = Vec::new();
+        if let Query::Failed { stderr, .. } = q {
+            if let Some(code) = http_status(stderr) {
+                parts.push(format!("HTTP {code}"));
+            }
+            if let Some(reset) = reset_hint(stderr) {
+                parts.push(format!("resets {reset}"));
+            }
+        }
+        parts.push("read via the reader route, never the writer".to_string());
+        let detail = match q {
+            Query::Failed { stderr, .. } => {
+                let e: String = stderr.chars().take(STDERR_EXCERPT_CHARS).collect();
+                e.replace('\n', " ")
+            }
+            Query::Unavailable(u) => format!("{u:?}"),
+            _ => String::new(),
+        };
+        return format!("releases unavailable ({}): {detail}", parts.join("; "));
+    }
+    match q {
+        Query::Failed { status, stderr } => {
+            let excerpt: String = stderr.chars().take(STDERR_EXCERPT_CHARS).collect();
+            if excerpt.is_empty() {
+                format!("gh {status}")
+            } else {
+                format!("gh {status}: {}", excerpt.replace('\n', " "))
+            }
+        }
+        Query::Malformed { error, .. } => format!("gh output could not be decoded: {error}"),
+        Query::Unavailable(u) => format!("gh did not answer: {u:?}"),
+        Query::Empty => "gh returned an empty result".to_string(),
+        Query::Populated(_) => "no error".to_string(),
+    }
+}
+
+/// Whether another attempt could plausibly change the answer. A routing block
+/// or down adapter is not the forge's doing and is never retried (#9987), a
+/// definite `Empty` is an answer, and a rate limit is not hammered within the
+/// tick: the next tick asks again (#13745).
+fn is_transient<T>(q: &Query<T>) -> bool {
+    match q {
+        Query::Failed { .. } => !is_rate_limited(q),
+        Query::Malformed { .. } => true,
+        Query::Unavailable(u) => !matches!(
+            u,
+            Unavailable::RoutingBlocked(_)
+                | Unavailable::AdapterUnavailable(_)
+                | Unavailable::Shed { .. }
+        ),
+        Query::Populated(_) | Query::Empty => false,
+    }
+}
+
+/// A 403/429 or "rate limit" failure — retrying within seconds cannot help.
+fn is_rate_limited<T>(q: &Query<T>) -> bool {
+    let Query::Failed { stderr, .. } = q else {
+        return false;
+    };
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("abuse detection")
+        || http_status(stderr).is_some_and(|c| c == 403 || c == 429)
+}
+
+/// Run `attempt` until it yields a value, up to `1 + retries` times with
+/// `backoff` between tries. `Err` carries the LAST failure's description.
+fn read_retrying<T>(
+    mut attempt: impl FnMut() -> Query<T>,
+    retries: u32,
+    backoff: Duration,
+) -> Result<T, ReadFailure> {
+    let mut tries = 0;
+    loop {
+        let q = attempt();
+        match q {
+            Query::Populated(v) => return Ok(v),
+            _ if tries < retries && is_transient(&q) => {
+                tries += 1;
+                std::thread::sleep(backoff);
+            }
+            _ => {
+                let why = describe_failure(&q);
+                return Err(ReadFailure {
+                    why: if tries == 0 {
+                        why
+                    } else {
+                        format!("{why} (after {} attempts)", tries + 1)
+                    },
+                    unavailable: is_unavailable(&q),
+                });
+            }
+        }
+    }
+}
+
+/// [`asset_names`] with the reason a read failed, retrying transient failures.
+fn asset_names_detailed(
+    root: &Path,
+    repo: &str,
+    tag: Option<&str>,
+) -> Result<Vec<String>, ReadFailure> {
     let mut args: Vec<&str> = vec!["release", "view"];
     if let Some(t) = tag {
         args.push(t);
     }
     args.extend_from_slice(&["--json", "assets", "-R", repo]);
-    let q: Query<Assets> = gh_query(&args, root, false, |_: &Assets| false);
-    match q {
-        Query::Populated(a) => Some(a.assets.into_iter().map(|a| a.name).collect()),
-        _ => None,
+    read_retrying(
+        || gh_read::<Assets, _>("release.assets", repo, &args, root, |_: &Assets| false),
+        READ_RETRIES,
+        READ_BACKOFF,
+    )
+    .map(|a| a.assets.into_iter().map(|a| a.name).collect())
+}
+
+/// Which tier supplied the repo [`resolve_repo`] chose (#14224).
+///
+/// The tiers are the priority order itself: the label names the tier that
+/// actually won, never a config key — resolution reads no config file, only
+/// the env override, the machine checkout, the compiled-in repository and
+/// the workspace's own origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSource {
+    /// Tier 1: `LOOM_DAEMON_UPDATE_GH_REPO`, the operator's explicit answer.
+    EnvOverride,
+    /// Tier 2: the `origin` of `LOOM_MACHINE_CHECKOUT`.
+    MachineCheckout,
+    /// Tier 3: the repo this binary was built from, compiled in.
+    BuildTime,
+    /// Tier 4: the workspace's own `origin` — the worst answer, last resort.
+    WorkspaceOrigin,
+}
+
+impl RepoSource {
+    /// The human-readable tier name for a log line.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EnvOverride => "env override",
+            Self::MachineCheckout => "machine checkout",
+            Self::BuildTime => "build-time default",
+            Self::WorkspaceOrigin => "workspace origin",
+        }
     }
+}
+
+/// [`resolve_repo`] paired with [`RepoSource`], the tier that supplied the
+/// slug. One function so the priority order cannot drift between the slug
+/// and its source (#14224).
+#[must_use]
+pub fn resolve_repo_with_source(inputs: &Inputs<'_>) -> Option<(String, RepoSource)> {
+    if let Some(repo) = inputs.repo_override.clone().filter(|r| !r.is_empty()) {
+        return Some((repo, RepoSource::EnvOverride));
+    }
+    if let Some(repo) = inputs
+        .machine_checkout
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+        .and_then(host::repo_slug)
+    {
+        return Some((repo, RepoSource::MachineCheckout));
+    }
+    if let Some(repo) = inputs.build_time_repo.clone().filter(|r| !r.is_empty()) {
+        return Some((repo, RepoSource::BuildTime));
+    }
+    host::repo_slug(inputs.repo_root).map(|repo| (repo, RepoSource::WorkspaceOrigin))
 }
 
 /// Which repo's releases to ask about, by **descending** priority (#8513).
@@ -216,19 +459,7 @@ pub fn asset_names(root: &Path, repo: &str, tag: Option<&str>) -> Option<Vec<Str
 /// how a shell says "not set"), never a literal empty slug.
 #[must_use]
 pub fn resolve_repo(inputs: &Inputs<'_>) -> Option<String> {
-    inputs
-        .repo_override
-        .clone()
-        .filter(|r| !r.is_empty())
-        .or_else(|| {
-            inputs
-                .machine_checkout
-                .as_deref()
-                .filter(|p| !p.as_os_str().is_empty())
-                .and_then(host::repo_slug)
-        })
-        .or_else(|| inputs.build_time_repo.clone().filter(|r| !r.is_empty()))
-        .or_else(|| host::repo_slug(inputs.repo_root))
+    resolve_repo_with_source(inputs).map(|(repo, _)| repo)
 }
 
 /// Resolve the release artifact for this host: the forge's Latest release, or
@@ -287,32 +518,43 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
     let (tag, version) = if let Some(found) = walked {
         match found {
             Walk::Found { tag, version } => (tag, version),
+            // #13745: an unreadable list or asset read must not fall through to
+            // an older complete release or Latest, which would then be judged
+            // against the floor / the installed version as if it were the
+            // newest the repo publishes.
+            Walk::Unavailable { reason } => {
+                return Resolution::Unavailable(format!("{repo}: {reason}"));
+            }
             Walk::NoneComplete { newest_tag } => {
-                let listed = asset_names(root, &repo, Some(&newest_tag));
+                let listed = asset_names_detailed(root, &repo, Some(&newest_tag));
+                if let Some(u) = unavailable_of(&listed) {
+                    return Resolution::Unavailable(format!("{repo}: {u}"));
+                }
                 return Resolution::Unresolved(format!(
                     "no listed release of {repo} publishes this platform's artifact; {}",
-                    classify_no_artifact(
-                        root,
-                        &repo,
-                        &newest_tag,
-                        &target,
-                        listed.as_ref().map(Vec::len),
-                    )
+                    classify_no_artifact(root, &repo, &newest_tag, &target, &listed)
                 ));
             }
         }
     } else {
-        let q: Query<TagName> = gh_query(
+        let q: Query<TagName> = gh_read(
+            "release.latest",
+            &repo,
             &["release", "view", "--json", "tagName", "-R", &repo],
             root,
-            false,
             |t: &TagName| t.tag_name.is_empty(),
         );
-        let Query::Populated(tag) = q else {
-            return Resolution::Unresolved(format!(
-                "'gh release view' found no latest release for {repo} \
-                 (no Releases yet, an unreachable/rate-limited API, or an auth failure)"
-            ));
+        let tag = match q {
+            Query::Populated(tag) => tag,
+            q if is_unavailable(&q) => {
+                return Resolution::Unavailable(format!("{repo}: {}", describe_failure(&q)));
+            }
+            _ => {
+                return Resolution::Unresolved(format!(
+                    "'gh release view' found no latest release for {repo} \
+                     (no Releases yet, or an auth failure)"
+                ));
+            }
         };
         let tag = tag.tag_name;
         let Some(version) = semver::extract_version(&tag) else {
@@ -323,21 +565,20 @@ pub fn resolve(inputs: &Inputs<'_>) -> Resolution {
         // An unreadable asset list is `None` here and resolves to the same
         // empty list it always did: unresolved, fall back to source. (The
         // fetch path treats that `None` differently -- see `asset_names`.)
-        let listed = asset_names(root, &repo, Some(&tag));
+        let listed = asset_names_detailed(root, &repo, Some(&tag));
+        if let Some(u) = unavailable_of(&listed) {
+            return Resolution::Unavailable(format!("{repo}: {u}"));
+        }
         let names: Vec<String> = listed.clone().unwrap_or_default();
         if !names.contains(&bin_name) || !names.contains(&sha_name) {
             return Resolution::Unresolved(classify_no_artifact(
-                root,
-                &repo,
-                &tag,
-                &target,
-                listed.as_ref().map(Vec::len),
+                root, &repo, &tag, &target, &listed,
             ));
         }
         (tag, version)
     };
 
-    let published_at = fetch_published_at(&tag, &repo, root);
+    let published_at = fetch_published_at(&tag, &repo, root).ok();
     let asset_sha256 = fetch_asset_sha256(&tag, &repo, &sha_name, root);
     let (installed_version, installed_commit) = installed_identity(inputs.installed_bin.as_deref());
 
@@ -372,6 +613,24 @@ enum Walk {
     /// Releases were listed but none inspected publishes both assets.
     /// `newest_tag` is the newest, for the refusal wording.
     NoneComplete { newest_tag: String },
+    /// The list, or an asset read of a release being inspected, could not be
+    /// read (#13745). Nothing is concluded about what the repo publishes.
+    Unavailable { reason: String },
+}
+
+/// What inspecting one release's assets found.
+enum Probe {
+    Complete,
+    Incomplete,
+    Unreadable(String),
+}
+
+/// The "releases unavailable" reason of a failed read, when it is one.
+fn unavailable_of<T>(r: &Result<T, ReadFailure>) -> Option<String> {
+    r.as_ref()
+        .err()
+        .filter(|e| e.unavailable)
+        .map(|e| e.why.clone())
 }
 
 /// The releases a walk considers, newest version first: published (not draft,
@@ -400,15 +659,21 @@ fn walk_candidates(releases: Vec<ListedRelease>) -> Vec<(String, String)> {
 /// [`WALK_MAX_RELEASES`]. `None` when there are no candidates at all.
 fn pick_complete(
     candidates: &[(String, String)],
-    mut has_assets: impl FnMut(&str) -> bool,
+    mut has_assets: impl FnMut(&str) -> Probe,
 ) -> Option<Walk> {
     let (newest_tag, _) = candidates.first()?;
     for (tag, version) in candidates.iter().take(WALK_MAX_RELEASES) {
-        if has_assets(tag) {
-            return Some(Walk::Found {
-                tag: tag.clone(),
-                version: version.clone(),
-            });
+        match has_assets(tag) {
+            Probe::Complete => {
+                return Some(Walk::Found {
+                    tag: tag.clone(),
+                    version: version.clone(),
+                })
+            }
+            // Walking past a release whose assets could not be READ would land
+            // on an older one and report it as the newest (#13745).
+            Probe::Unreadable(reason) => return Some(Walk::Unavailable { reason }),
+            Probe::Incomplete => {}
         }
     }
     Some(Walk::NoneComplete {
@@ -420,7 +685,9 @@ fn pick_complete(
 /// `None` when the listing could not be read or holds nothing usable, so the
 /// caller falls back to the Latest-only lookup.
 fn walk_releases(root: &Path, repo: &str, bin_name: &str, sha_name: &str) -> Option<Walk> {
-    let q: Query<Vec<ListedRelease>> = gh_query(
+    let q: Query<Vec<ListedRelease>> = gh_read(
+        "release.list",
+        repo,
         &[
             "release",
             "list",
@@ -432,15 +699,28 @@ fn walk_releases(root: &Path, repo: &str, bin_name: &str, sha_name: &str) -> Opt
             repo,
         ],
         root,
-        false,
         |l: &Vec<ListedRelease>| l.is_empty(),
     );
-    let Query::Populated(listed) = q else {
-        return None;
+    let listed = match q {
+        Query::Populated(listed) => listed,
+        q if is_unavailable(&q) => {
+            return Some(Walk::Unavailable {
+                reason: describe_failure(&q),
+            })
+        }
+        _ => return None,
     };
     pick_complete(&walk_candidates(listed), |tag| {
-        asset_names(root, repo, Some(tag))
-            .is_some_and(|n| n.iter().any(|a| a == bin_name) && n.iter().any(|a| a == sha_name))
+        match asset_names_detailed(root, repo, Some(tag)) {
+            Ok(n) if n.iter().any(|a| a == bin_name) && n.iter().any(|a| a == sha_name) => {
+                Probe::Complete
+            }
+            Ok(_) => Probe::Incomplete,
+            Err(e) if e.unavailable => Probe::Unreadable(e.why),
+            // A read that failed for a reason that is not the forge being
+            // unreadable (e.g. malformed output) keeps the old reading.
+            Err(_) => Probe::Incomplete,
+        }
     })
 }
 
@@ -461,14 +741,17 @@ fn walk_releases(root: &Path, repo: &str, bin_name: &str, sha_name: &str) -> Opt
 pub fn explain_no_artifact(root: &Path, repo: &str, tag: &str, target: &str) -> Option<String> {
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    let listed = asset_names(root, repo, Some(tag));
+    let listed = asset_names_detailed(root, repo, Some(tag));
     if listed
         .as_ref()
-        .is_some_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
+        .is_ok_and(|n| n.contains(&bin_name) && n.contains(&sha_name))
     {
         return None;
     }
-    Some(classify_no_artifact(root, repo, tag, target, listed.as_ref().map(Vec::len)))
+    if let Some(u) = unavailable_of(&listed) {
+        return Some(format!("release {tag} of {repo} could not be inspected: {u}"));
+    }
+    Some(classify_no_artifact(root, repo, tag, target, &listed))
 }
 
 /// The one place the no-artifact reason is assembled, shared by [`resolve`]
@@ -483,13 +766,27 @@ fn classify_no_artifact(
     repo: &str,
     tag: &str,
     target: &str,
-    asset_count: Option<usize>,
+    listed: &Result<Vec<String>, ReadFailure>,
 ) -> String {
     let bin_name = format!("loom-daemon-{target}");
     let sha_name = format!("{bin_name}.sha256");
-    let age =
-        release_age_minutes(fetch_published_at(tag, repo, root).as_deref(), chrono::Utc::now());
-    no_artifact_reason(tag, repo, target, &bin_name, &sha_name, asset_count, age)
+    let published = fetch_published_at(tag, repo, root);
+    let age = release_age_minutes(published.as_deref().ok(), chrono::Utc::now());
+    let read_error = listed
+        .as_ref()
+        .err()
+        .map(|e| &e.why)
+        .or(published.as_ref().err().map(|e| &e.why));
+    no_artifact_reason(
+        tag,
+        repo,
+        target,
+        &bin_name,
+        &sha_name,
+        listed.as_ref().ok().map(Vec::len),
+        age,
+        read_error.map(String::as_str),
+    )
 }
 
 /// Minutes since `published_at` (an RFC3339 timestamp as `gh` reports it), or
@@ -559,13 +856,21 @@ fn no_artifact_reason(
     sha_name: &str,
     asset_count: Option<usize>,
     age_minutes: Option<i64>,
+    read_error: Option<&str>,
 ) -> String {
     let head =
         format!("release {tag} of {repo} has no artifact for target {target} (checked for {bin_name} + {sha_name})");
     let assets = match asset_count {
         Some(0) => "it publishes no assets at all yet".to_string(),
         Some(n) => format!("it publishes {n} asset(s), none matching this target"),
-        None => "its asset list could not be read".to_string(),
+        None => match read_error {
+            Some(e) => format!("its asset list could not be read ({e})"),
+            None => "its asset list could not be read".to_string(),
+        },
+    };
+    let age_unread = match read_error {
+        Some(e) if asset_count.is_some() => format!("its publish time could not be read ({e})"),
+        _ => "its publish time could not be read".to_string(),
     };
     match (assets_may_still_be_uploading(age_minutes), age_minutes) {
         (true, Some(m)) => format!(
@@ -579,24 +884,29 @@ fn no_artifact_reason(
             human_age(m)
         ),
         (_, None) => format!(
-            "{head}; {assets} and its publish time could not be read, so an in-flight upload cannot be ruled out"
+            "{head}; {assets} and {age_unread}, so an in-flight upload cannot be ruled out"
         ),
     }
 }
 
-/// The release's publish timestamp, verbatim. `None` on an older `gh` that does
-/// not report the field.
-fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Option<String> {
-    let q: Query<PublishedAt> = gh_query(
-        &["release", "view", tag, "--json", "publishedAt", "-R", repo],
-        root,
-        false,
-        |p: &PublishedAt| p.published_at.is_empty(),
-    );
-    match q {
-        Query::Populated(p) => Some(p.published_at),
-        _ => None,
-    }
+/// The release's publish timestamp, verbatim, retrying transient failures.
+/// `Err` says why it could not be read (#12849).
+fn fetch_published_at(tag: &str, repo: &str, root: &Path) -> Result<String, ReadFailure> {
+    let args = ["release", "view", tag, "--json", "publishedAt", "-R", repo];
+    read_retrying(
+        || {
+            gh_read::<PublishedAt, _>(
+                "release.published_at",
+                repo,
+                &args,
+                root,
+                |p: &PublishedAt| p.published_at.is_empty(),
+            )
+        },
+        READ_RETRIES,
+        READ_BACKOFF,
+    )
+    .map(|p| p.published_at)
 }
 
 /// The published sha256 for this platform's binary, read from the release's own
@@ -621,22 +931,28 @@ fn fetch_asset_sha256(tag: &str, repo: &str, sha_name: &str, root: &Path) -> Opt
     std::fs::create_dir_all(&dir).ok()?;
     let digest = (|| {
         let dir_str = dir.to_str()?;
-        let out = crate::script_helpers::run_gh(
-            &[
-                "release",
-                "download",
-                tag,
-                "-R",
-                repo,
-                "-p",
-                sha_name,
-                "-D",
-                dir_str,
-                "--clobber",
-            ],
-            root,
-            false,
-        );
+        let out = GhInvocation::new(
+            Operation::new("release.checksum"),
+            AccessIntent::Read,
+            GhTarget::repo(repo).unwrap_or(GhTarget::None),
+            GH_TIMEOUT,
+        )
+        .program(crate::gh_invocation::gh_bin())
+        .current_dir(root)
+        .args([
+            "release",
+            "download",
+            tag,
+            "-R",
+            repo,
+            "-p",
+            sha_name,
+            "-D",
+            dir_str,
+            "--clobber",
+        ])
+        .reader_only()
+        .run();
         if !out.succeeded() {
             return None;
         }

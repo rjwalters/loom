@@ -6,7 +6,7 @@
 //! Every number here is a difference between two label transitions, and Loom
 //! persists **no** label-transition history: the cycle-time rollup (#8665)
 //! starts at `sweep.started` and says so explicitly in its own question doc,
-//! and `forge_events` is a read-only wake signal. Deriving each segment from
+//! and no wake signal is a history. Deriving each segment from
 //! `issues/<n>/timeline` per run is therefore the only option that does not
 //! first require building a transitions store — see `defaults/docs/pr-latency.md`
 //! for that decision in full. `claim_reconciliation` already derives verdict
@@ -25,10 +25,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use loom_daemon::cmd_out::Query;
-use loom_daemon::pr_latency::timeline::parse_timeline;
-use loom_daemon::pr_latency::{LatencyReport, PrEvent, PrHistory, PrState};
-use loom_daemon::script_helpers::gh_query;
+use crate::cmd_out::Query;
+use crate::pr_latency::timeline::parse_timeline;
+use crate::pr_latency::{LatencyReport, PrEvent, PrHistory, PrState};
+use crate::script_helpers::gh_read_json;
 
 use super::pr_latency_render as render;
 
@@ -221,7 +221,8 @@ fn list_prs(
         &limit,
     ]);
 
-    let q: Query<Vec<PrRow>> = gh_query(&args, root, false, |v: &Vec<PrRow>| v.is_empty());
+    let q: Query<Vec<PrRow>> =
+        gh_read_json("latency.pr_list", &args, root, false, |v: &Vec<PrRow>| v.is_empty());
     match q {
         Query::Populated(rows) => (rows, None),
         Query::Empty => (Vec::new(), None),
@@ -261,9 +262,14 @@ fn fetch_timeline(pr: u32, repo: Option<&str>, root: &Path) -> (Vec<PrEvent>, bo
         Some(r) => format!("repos/{r}/issues/{pr}/timeline"),
         None => format!("repos/{{owner}}/{{repo}}/issues/{pr}/timeline"),
     };
-    let out = loom_daemon::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+    let out = crate::script_helpers::gh_read(
+        "latency.timeline",
+        &["api", &path, "--paginate"],
+        root,
+        false,
+    );
     let bytes = match &out {
-        loom_daemon::cmd_out::CmdOutcome::Ran(o) if o.status.success() => o.stdout.clone(),
+        crate::cmd_out::CmdOutcome::Ran(o) if o.status.success() => o.stdout.clone(),
         _ => return (Vec::new(), false),
     };
     match parse_timeline(&bytes) {

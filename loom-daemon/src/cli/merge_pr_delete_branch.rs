@@ -1,6 +1,6 @@
 //! `loom-daemon merge-pr delete-branch` (#8191): `merge-pr.sh`'s
 //! `_maybe_delete_local_branch` (#4100/#5015/#7812), now a thin call into the
-//! same [`loom_daemon::worktree_cli::branch_delete`] rule `worktree.sh
+//! same [`crate::worktree_cli::branch_delete`] rule `worktree.sh
 //! remove` already uses (#8195 slice 3) — one implementation instead of two.
 //!
 //! # Why a text protocol instead of icon-formatted output
@@ -32,8 +32,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::branch_delete::{self, DeleteContext};
-use loom_daemon::worktree_cli::wip::Sink;
+use crate::worktree_cli::branch_delete::{self, DeleteContext};
+use crate::worktree_cli::wip::Sink;
 
 #[derive(clap::Args)]
 pub(crate) struct DeleteBranchArgs {

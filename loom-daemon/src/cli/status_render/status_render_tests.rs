@@ -318,7 +318,7 @@ fn gate_column_label_distinguishes_missing_sweep_command_from_healthy_idle() {
     assert_eq!(
         healthy_idle_label, "off",
         "sanity check: healthy idle repo's own HEALTH-GATE label passes through \
-         gate_status_short_label unchanged (#8288 renamed it from \"disabled\")"
+             gate_status_short_label unchanged (#8288 renamed it from \"disabled\")"
     );
 
     // Same underlying gate verdict — the bug is that today this is the
@@ -327,7 +327,7 @@ fn gate_column_label_distinguishes_missing_sweep_command_from_healthy_idle() {
     assert_ne!(
         missing_sweep_label, healthy_idle_label,
         "a workspace missing /loom:sweep must not render the same HEALTH-GATE value \
-         as a healthy idle repo"
+             as a healthy idle repo"
     );
     assert_eq!(missing_sweep_label, "no-sweep");
     assert!(

@@ -4,10 +4,9 @@
 #
 # WHY THIS EXISTS, AND WHY IT IS NOT A PORT
 #
-# `claude-wrapper.sh` is 1,675 code lines and had NO dedicated test suite.
-# .loom/docs/file-size-policy.md names it as the one port target whose logic
-# exists only in shell: "retry/backoff lives ONLY here -- the retry policy
-# itself, which is application logic".
+# `claude-wrapper.sh` is 1,675 code lines and had NO dedicated test suite. It
+# is the one port target whose logic exists only in shell: retry/backoff lives
+# ONLY here -- the retry policy itself, which is application logic.
 #
 # Every port epic #7810 has landed used one method: keep the script's black-box
 # suite and run its assertions unchanged against the Rust, as the equivalence
@@ -46,16 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WRAPPER="$SCRIPTS_DIR/claude-wrapper.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $1"; }
-fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $1"; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 # assert_pred <fn> <expect 0|1> <output> <exit_code> <msg>
 assert_pred() {
@@ -66,17 +56,6 @@ assert_pred() {
         pass "$msg"
     else
         fail "$msg (wanted $want, got $got)"
-    fi
-}
-
-assert_eq() {
-    local expected="$1" actual="$2" msg="$3"
-    if [[ "$expected" == "$actual" ]]; then
-        pass "$msg"
-    else
-        fail "$msg"
-        echo "    Expected: '$expected'"
-        echo "    Actual:   '$actual'"
     fi
 }
 

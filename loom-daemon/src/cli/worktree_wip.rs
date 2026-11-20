@@ -30,7 +30,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::{baseline, snapshot};
+use crate::worktree_cli::{baseline, snapshot};
 
 /// The raw tail of argv, parsed by the verb rather than by clap.
 #[derive(clap::Args)]

@@ -36,7 +36,6 @@ use crate::types::{DaemonStatusReport, WorkFinderTickSummary};
 
 pub mod causes;
 pub mod loom_ui;
-pub mod outputs;
 pub mod state;
 pub mod task;
 

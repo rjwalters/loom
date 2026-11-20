@@ -111,7 +111,7 @@ max-threads = 1
 
 # --- merge-pr shell-oracle differentials (#10189) ----------------------------
 #
-# `merge_pr_response_differential` and `merge_pr_head_sync_differential` spawn
+# `merge_pr_response_differential` spawns
 # `bash` + `grep` once per corpus case (hundreds of short-lived pipelines) to
 # run the frozen retired ladder as an oracle. On a CPU-starved CI shard that
 # made a scheduler-dependent SIGPIPE race observable (main run 37178206556, case
@@ -142,7 +142,7 @@ test-group = 'daemon-integration'
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.default.overrides]]
-filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential))'
 test-group = 'merge-pr-differential'
 
 # --- CI profile -------------------------------------------------------------
@@ -179,5 +179,5 @@ test-group = 'daemon-integration'
 slow-timeout = { period = "180s", terminate-after = 3 }
 
 [[profile.ci.overrides]]
-filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential) | binary(=merge_pr_head_sync_differential))'
+filter = 'package(loom-daemon) & kind(test) & (binary(=merge_pr_response_differential))'
 test-group = 'merge-pr-differential'

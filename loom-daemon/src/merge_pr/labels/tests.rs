@@ -245,3 +245,24 @@ fn a_frozen_pr_is_refused_whatever_else_it_carries() {
     assert!(msg.contains("is `loom:frozen`"), "{msg}");
     assert!(!msg.contains("carries both"), "{msg}");
 }
+
+#[test]
+fn the_champion_hold_shape_is_named_and_points_at_release_hold() {
+    // #13517: only `loom:pr` + `loom:blocked` is the releasable hold shape.
+    assert!(hold_shape("loom:pr\nloom:blocked\nloom:important"));
+    for extra in [
+        "loom:changes-requested",
+        "loom:operator",
+        "loom:sequenced",
+        "loom:frozen",
+    ] {
+        assert!(!hold_shape(&format!("loom:pr\nloom:blocked\n{extra}")), "{extra}");
+    }
+    assert!(!hold_shape("loom:blocked"));
+    assert!(!hold_shape("loom:pr"));
+    let hold = message("7", "loom:blocked", "loom:pr\nloom:blocked", "abc1234");
+    assert!(hold.contains("--release-hold") && !hold.contains("fresh Judge verdict"));
+    let rejection =
+        message("7", "loom:changes-requested", "loom:pr\nloom:changes-requested", "abc1234");
+    assert!(rejection.contains("fresh Judge verdict") && !rejection.contains("--release-hold"));
+}

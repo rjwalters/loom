@@ -1,16 +1,16 @@
 //! `loom-daemon affected-files check` — Curator's Affected-Files preflight
 //! (issue #9400). The classifier, its marker grammar and the exit-code
-//! contract live in [`loom_daemon::work_finder::affected_files::check`]; this
+//! contract live in [`crate::work_finder::affected_files::check`]; this
 //! file is the argument surface.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::work_finder::affected_files::check::{check, EXIT_COULD_NOT_RUN};
 use anyhow::Result;
-use loom_daemon::work_finder::affected_files::check::{check, EXIT_COULD_NOT_RUN};
 
 #[derive(clap::Subcommand)]
-pub(crate) enum AffectedFilesCommand {
+pub enum AffectedFilesCommand {
     /// Classify each `## Affected Files` path of an issue body against the
     /// build base. No forge call.
     ///
@@ -40,7 +40,7 @@ pub(crate) enum AffectedFilesCommand {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct CheckArgs {
+pub struct CheckArgs {
     /// File holding the issue body; `-` reads stdin.
     #[arg(long = "body-file", value_name = "PATH")]
     body_file: PathBuf,
@@ -57,7 +57,7 @@ pub(crate) struct CheckArgs {
 
 impl AffectedFilesCommand {
     /// Never returns: exits with the code documented on [`Self::Check`].
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let Self::Check(args) = self;
         let (code, stdout) = args.evaluate();
         print!("{stdout}");

@@ -37,9 +37,13 @@
 //!   draws from the next attempt's table ([`attempts`]). A success resets to
 //!   attempt 1. Attempt `N` uses the highest configured attempt `<= N`.
 //! - No content validation: any mix is allowed. A table that is empty after
-//!   exclusions is a non-blocking **warning** (logged, shown by `loom-daemon
-//!   roles draw --explain`); the stage then has nothing to run on and its tick
-//!   is a pre-spawn skip, exactly like a wholly unavailable preference list.
+//!   exclusions does not stall the tick: the draw falls through to the next
+//!   configured attempt's table and the first non-empty one decides (#11782,
+//!   see [`DrawConfig::effective_for`]). `loom-daemon roles draw --explain`
+//!   flags every configured empty table with a non-blocking **warning**. Only
+//!   when every remaining table is empty is the stage's tick a pre-spawn skip,
+//!   exactly like a wholly unavailable preference list; that is the case that
+//!   also logs the daemon-log warning.
 //! - Malformed entries are skipped with a warning, never fatal — an older or
 //!   newer shape must not stop a daemon.
 //! - When a role has **no** `roleDraw` table for the attempt, nothing here
@@ -154,6 +158,7 @@ impl Candidate {
         Tap {
             runtime: self.runtime.clone(),
             model_profile: self.model_profile.clone(),
+            model: self.model.clone(),
         }
     }
 }
@@ -699,6 +704,37 @@ pub fn plan(
     }
 }
 
+/// Last-warned table hash per `(root, role, attempt)` for the EMPTY-table
+/// notice. Process-global, like [`attempts`]: `prepare` has no dispatcher state.
+type EmptyWarned = std::sync::Mutex<BTreeMap<(PathBuf, String, u32), u64>>;
+
+fn empty_warned() -> &'static EmptyWarned {
+    static WARNED: std::sync::OnceLock<EmptyWarned> = std::sync::OnceLock::new();
+    WARNED.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// True when this `(root, role, attempt, table-hash)` has not been reported
+/// yet; records it. A changed table (layer or exclusion set) hashes
+/// differently and so reports again.
+fn empty_table_first_sighting(
+    root: &Path,
+    role: &str,
+    attempt: u32,
+    table: &EffectiveTable,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    table.attempt.hash(&mut hasher);
+    table.layer.as_str().hash(&mut hasher);
+    table.off.hash(&mut hasher);
+    let digest = hasher.finish();
+    let key = (root.to_path_buf(), role.to_string(), attempt);
+    let mut guard = empty_warned()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.insert(key, digest) != Some(digest)
+}
+
 /// The draw for one resolution of `role` in `root`, or `None` when no
 /// `roleDraw` table applies (the caller then keeps today's path).
 ///
@@ -718,13 +754,22 @@ pub fn prepare(root: &Path, role: &str, now: u64, role_tick: bool) -> Option<Dra
     };
     let table = config.effective_for(role, attempt)?;
     if table.active.is_empty() {
-        log::warn!(
-            "role_draw: {role} attempt {attempt} table a{} ({}) is EMPTY after exclusions — \
+        // A permanent config exclusion cannot change between ticks: WARN once
+        // per (root, role, attempt, table-hash), DEBUG afterwards (#13463).
+        let first = empty_table_first_sighting(root, role, attempt, &table);
+        let message = format!(
+            "role_draw: {role} attempt {attempt} table a{} ({}) in {} is EMPTY after exclusions — \
              nothing can run this stage on this host; the tick is skipped. Not an error: \
              check `loom-daemon roles draw --explain` (#11726)",
             table.attempt,
-            table.layer.as_str()
+            table.layer.as_str(),
+            root.display()
         );
+        if first {
+            log::warn!("{message}");
+        } else {
+            log::debug!("{message}");
+        }
     }
     let workspace = root
         .file_name()

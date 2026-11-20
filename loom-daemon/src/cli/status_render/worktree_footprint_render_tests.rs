@@ -4,11 +4,11 @@
 //! `worktree_disk_status`'s own tests cover the collection side.
 use super::{build_status_json_value, worktree_disk_lines};
 use crate::cli::status::sample_report::sample_report;
-use loom_daemon::worktree_disk_status::WorktreeDiskSummary;
+use crate::worktree_disk_status::WorktreeDiskSummary;
 use std::path::PathBuf;
 
-fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-    loom_daemon::self_update::SelfUpdateStatus {
+fn no_update() -> crate::self_update::SelfUpdateStatus {
+    crate::self_update::SelfUpdateStatus {
         built_commit: "abc1234".to_string(),
         source_commit: None,
         update_available: None,
@@ -36,7 +36,7 @@ fn renders_the_headline_count_size_and_class_split() {
     assert_eq!(
         lines[0],
         "Worktree footprint: 125 worktree(s), 39.0 GB on disk \
-         (issue-* 14, pr-* 110, other 1)"
+             (issue-* 14, pr-* 110, other 1)"
     );
     // A per-repo row carries the same figures, so a multi-repo host shows
     // WHICH repo is carrying the weight.

@@ -6,8 +6,8 @@
 //! render path actually wires `log_path`/`sweep_id` through correctly.
 use super::{format_containment_column, render_in_flight_table};
 use crate::cli::status::sample_report::sample_report;
+use crate::types::{SweepInfo, SweepKind, SweepState};
 use chrono::Utc;
-use loom_daemon::types::{SweepInfo, SweepKind, SweepState};
 use std::path::PathBuf;
 
 fn mk(sweep_id: &str, issue: u32, log_path: PathBuf) -> SweepInfo {
@@ -29,7 +29,6 @@ fn mk(sweep_id: &str, issue: u32, log_path: PathBuf) -> SweepInfo {
         effort: None,
         depends_on: None,
         repo: Some("/repos/loom".to_string()),
-        overflow: false,
     }
 }
 
@@ -61,7 +60,7 @@ fn bare_metal_sweep_renders_dash() {
     let (_tmp, log_path) = TempLog::new(
         "bare-metal",
         "==== loom-daemon dispatch: sweep_id=s1 issue=1 ====\n\
-         # LOOM_DISPATCH_MODE mode=bare-metal\n",
+             # LOOM_DISPATCH_MODE mode=bare-metal\n",
     );
     let sweep = mk("s1", 1, log_path);
     assert_eq!(format_containment_column(&sweep), "-");
@@ -78,7 +77,7 @@ fn containerized_sweep_with_both_limits_renders_both() {
     let (_tmp, log_path) = TempLog::new(
         "both-limits",
         "==== loom-daemon dispatch: sweep_id=s3 issue=3 ====\n\
-         # LOOM_DISPATCH_MODE mode=container image=w cpus=4 memory=2048m\n",
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=4 memory=2048m\n",
     );
     let sweep = mk("s3", 3, log_path);
     assert_eq!(format_containment_column(&sweep), "container(cpu=4,mem=2048m)");
@@ -89,7 +88,7 @@ fn containerized_sweep_with_unbounded_limits_renders_unbounded() {
     let (_tmp, log_path) = TempLog::new(
         "unbounded",
         "==== loom-daemon dispatch: sweep_id=s4 issue=4 ====\n\
-         # LOOM_DISPATCH_MODE mode=container image=w cpus=none memory=none\n",
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=none memory=none\n",
     );
     let sweep = mk("s4", 4, log_path);
     assert_eq!(format_containment_column(&sweep), "container(unbounded)");
@@ -101,7 +100,7 @@ fn table_header_advertises_ctr_column() {
     let (_tmp, log_path) = TempLog::new(
         "table-header",
         "==== loom-daemon dispatch: sweep_id=s5 issue=5 ====\n\
-         # LOOM_DISPATCH_MODE mode=container image=w cpus=2 memory=1024m\n",
+             # LOOM_DISPATCH_MODE mode=container image=w cpus=2 memory=1024m\n",
     );
     report.in_flight = vec![mk("s5", 5, log_path)];
     let table = render_in_flight_table(&report);

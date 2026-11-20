@@ -166,6 +166,13 @@ impl Chain {
         self.mode
     }
 
+    /// Whether a `forge.mirror` block makes this a fleet chain (not
+    /// standalone).
+    #[must_use]
+    pub fn is_fleet(&self) -> bool {
+        self.mode.is_some()
+    }
+
     /// The tier a direct listing is recorded under.
     #[must_use]
     pub fn listing_tier(&self) -> Tier {

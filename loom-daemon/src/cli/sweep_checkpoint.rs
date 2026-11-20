@@ -132,18 +132,15 @@ fn execute(root: &Path, args: &[String], out: &mut impl Write) -> Result<()> {
         // Telemetry only (#9935): the checkpoint file, which drives resume,
         // is never read or written, and tracing stays best effort.
         let (role, attempt, model) = parse_begin(&args[2..])?;
-        loom_daemon::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
+        crate::observability::lifecycle::checkpoint_begun(root, issue, role, attempt, model);
         return Ok(());
     }
     if command == "write" {
         let mut record = parse_write(&args[2..])?;
         escalation::carry_forward(&target, &mut record)?;
         persist(&dir, &target, &record)?;
-        // Default-off shadow append (#11347); the legacy file stays authoritative
-        // and a journal failure never reaches this command's result.
-        loom_daemon::journal::execution::checkpoint_written(&target, root, issue, &record);
         // Telemetry remains best effort, and only follows a successful durable write.
-        loom_daemon::observability::lifecycle::checkpoint_completed(
+        crate::observability::lifecycle::checkpoint_completed(
             root,
             issue,
             record["phase"].as_str().unwrap_or_default(),

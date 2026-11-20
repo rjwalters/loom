@@ -53,8 +53,10 @@
 //! a repo is cloned once. A `paused`/`stopped` order that lands *during* a
 //! clone is likewise read one such delay later.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -554,11 +556,48 @@ fn resolve_repo(root: &Path, remote: Option<&str>) -> (Option<String>, RepoVisib
     }
 }
 
+/// Workspace roots whose `skip:not-cloned` row was already emitted and which
+/// are still uncloned (#12910); only [`emit_changes`] touches it.
+static SKIPPED_ROOTS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// The events of `changes` to emit this pass, and the skipped roots to
+/// remember for the next. A `skip:not-cloned` event is dropped when its root
+/// was already skipped in `previous`; every other action always passes. The
+/// returned set is exactly this pass's skipped roots, so a repo that leaves
+/// the set (cloned, removed) emits again if it re-enters.
+fn fresh_events<'a>(
+    changes: &'a [RosterEvent],
+    previous: &BTreeSet<PathBuf>,
+) -> (Vec<&'a RosterEvent>, BTreeSet<PathBuf>) {
+    let mut skipped = BTreeSet::new();
+    let mut fresh = Vec::new();
+    for event in changes {
+        if event.action == RosterAction::SkipNotCloned {
+            skipped.insert(event.root.clone());
+            if previous.contains(&event.root) {
+                continue;
+            }
+        }
+        fresh.push(event);
+    }
+    (fresh, skipped)
+}
+
 /// Emit one `roster.change` record per [`RosterPass::changes`] entry. A pass
 /// with none emits nothing; the roster pass, not the repo's queue, is the
-/// emitter, so an idle repo still produces rows.
+/// emitter, so an idle repo still produces rows. `skip:not-cloned` is emitted
+/// when a repo enters the uncloned set, not on every pass while it stays in it
+/// (#12910); a daemon restart re-emits the set once.
 pub(super) fn emit_changes(status: &FleetSyncStatus) {
-    for event in &status.roster.changes {
+    let fresh = {
+        let mut seen = SKIPPED_ROOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (fresh, skipped) = fresh_events(&status.roster.changes, &seen);
+        *seen = skipped;
+        fresh
+    };
+    for event in fresh {
         let record = event.record(&status.host, status.at, &resolve_repo);
         if record.has_provenance() {
             crate::observability::ops::emit_record(TelemetryRecord::RosterChange(record));

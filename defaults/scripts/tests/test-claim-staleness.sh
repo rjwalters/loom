@@ -28,34 +28,6 @@ TARGET_SCRIPT="$HELPERS_DIR/claim-staleness.sh"
 # shellcheck source=lib/assert.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-assert_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -qF -- "$needle" <<<"$haystack"; then
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    else
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Expected substring: '$needle'"
-        echo "    In: '$haystack'"
-    fi
-}
-
-assert_not_contains() {
-    local haystack="$1" needle="$2" msg="$3"
-    TESTS_RUN=$((TESTS_RUN + 1))
-    if grep -qF -- "$needle" <<<"$haystack"; then
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo -e "  ${RED}FAIL${NC}: $msg"
-        echo "    Unexpected substring: '$needle'"
-        echo "    In: '$haystack'"
-    else
-        TESTS_PASSED=$((TESTS_PASSED + 1))
-        echo -e "  ${GREEN}PASS${NC}: $msg"
-    fi
-}
-
 [[ -x "$TARGET_SCRIPT" ]] || {
     echo -e "${RED}FATAL${NC}: $TARGET_SCRIPT missing or not executable"
     exit 2
@@ -415,8 +387,11 @@ out="$("$TARGET_SCRIPT" marker --repo owner/repo --number 6513 --label loom:revi
 assert_eq "<!-- loom:claim-activity claim=$CLAIM_TS -->" "$out" \
     "T16: marker prints the activity marker for the live claim"
 set_labels "loom:review-requested"
-out="$("$TARGET_SCRIPT" marker --repo owner/repo --number 6513 --label loom:reviewing)"
-assert_eq "" "$out" "T16: marker prints nothing when there is no live claim"
+out="$(env -u LOOM_SWEEP_ID "$TARGET_SCRIPT" marker --repo owner/repo --number 6513 --label loom:reviewing)"
+assert_eq "" "$out" "T16: marker prints nothing when there is no live claim and no sweep id"
+out="$(LOOM_SWEEP_ID=step-judge-6513-1 "$TARGET_SCRIPT" marker --repo owner/repo --number 6513 --label loom:reviewing)"
+assert_eq "<!-- loom:claim-activity sweep=step-judge-6513-1 -->" "$out" \
+    "T16: marker falls back to a sweep-identified marker when there is no claim (#13134)"
 
 # --- T17: per-label thresholds -------------------------------------------
 reset

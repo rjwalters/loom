@@ -10,7 +10,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
-use loom_daemon::forge_identity::{FleetLogins, Roster};
+use crate::comment_trust::records::AUTHOR_JQ;
+use crate::forge_identity::{FleetLogins, Roster};
 
 const ISSUE: u64 = 5781;
 
@@ -148,7 +149,7 @@ fn parse_rows_drops_malformed_lines_and_keeps_the_rest() {
                   not json\n\
                   {\"updated_at\":\"garbage\",\"body\":\"x\"}\n\
                   {\"body\":\"no timestamp\"}\n";
-    let rows = parse_rows(ndjson);
+    let rows = parse_lease_rows(ndjson);
     assert_eq!(rows.len(), 1);
     assert!(rows[0].body.starts_with("<!-- loom:lease host=h"));
 }

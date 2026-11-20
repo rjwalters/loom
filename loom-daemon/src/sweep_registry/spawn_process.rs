@@ -1,6 +1,13 @@
 //! Command assembly, isolated from claim bookkeeping.
 use super::dispatch::child_env_markers;
 use super::*;
+use crate::worker_spawn::rejection;
+
+pub(crate) struct SpawnedChild {
+    pub child: Child,
+    pub header_anchor: String,
+    pub rejection: Option<rejection::Receiver>,
+}
 
 impl SweepRegistry {
     /// Build the child's `Command` and spawn it — everything `spawn_child`
@@ -27,7 +34,7 @@ impl SweepRegistry {
         runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
         selection: Option<&crate::tokens_pool::private_workspace::dispatch::Selection>,
     ) -> Result<(Child, String)> {
-        self.spawn_child_process_for(
+        let spawned = self.spawn_child_process_for(
             kind,
             log_path,
             sweep_id,
@@ -37,7 +44,8 @@ impl SweepRegistry {
             runtime_admission,
             selection,
             None,
-        )
+        )?;
+        Ok((spawned.child, spawned.header_anchor))
     }
 
     /// [`Self::spawn_child_process`], or — with `resume` — the relaunch of a
@@ -60,7 +68,7 @@ impl SweepRegistry {
         runtime_admission: Option<&crate::runtime_admission::ResolvedRuntime>,
         selection: Option<&crate::tokens_pool::private_workspace::dispatch::Selection>,
         resume: Option<&super::resume_handle::RollResumeLaunch>,
-    ) -> Result<(Child, String)> {
+    ) -> Result<SpawnedChild> {
         let spawn_bin = self.config.resolve_spawn_bin()?;
 
         // Ensure log dir exists.
@@ -224,12 +232,13 @@ impl SweepRegistry {
         child_env_markers::apply_issue_scoped_markers(&mut cmd, kind);
         // The issue this run's telemetry belongs to: a sweep's issue, an
         // issue step's item, a PR step's linked issue (#11898).
-        let issue = self.step_issue(kind);
+        let keys = self.step_keys(kind);
+        let issue = keys.issue;
         crate::observability::tracing::prepare_child(
             &mut cmd,
             &self.config.workspace_root,
             sweep_id,
-            issue,
+            &keys,
         );
         // #9215: opt-in, default-off — hand the child's OWN Claude Code session
         // the OTel env it needs to emit `claude_code.llm_request` /
@@ -425,6 +434,16 @@ impl SweepRegistry {
                 );
             }
         }
+        let standard_worker = [
+            ".loom/scripts/spawn-worker.sh",
+            "defaults/scripts/spawn-worker.sh",
+        ]
+        .iter()
+        .any(|path| spawn_bin == self.config.workspace_root.join(path));
+        let rejection = rejection::Receiver::prepare(
+            &mut cmd,
+            matches!(kind, SweepKind::Step { .. }) && standard_worker,
+        );
         let child = crate::observability::lifecycle::spawn_child(
             &mut cmd,
             &self.config.workspace_root,
@@ -453,6 +472,13 @@ impl SweepRegistry {
             self.stamp_resume_handle_in_lock(issue, session, model, effort);
         }
         let header_anchor = format!("sweep_id={sweep_id}");
-        Ok((child, header_anchor))
+        Ok(SpawnedChild {
+            child,
+            header_anchor,
+            rejection,
+        })
     }
 }
+
+#[cfg(test)]
+mod tests;

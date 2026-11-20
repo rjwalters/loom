@@ -56,6 +56,8 @@
 //! same runs.
 
 use std::collections::BTreeMap;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -567,14 +569,7 @@ fn normalize(text: &str, root: &Path) -> String {
 }
 
 fn tmproot(tag: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "loom-upstream-diff-{tag}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = fs::remove_dir_all(&base);
-    fs::create_dir_all(&base).expect("create tmproot");
-    fs::canonicalize(&base).expect("canonicalize tmproot")
+    common::unique_tmpdir("loom-upstream-diff", tag)
 }
 
 struct Comparison {

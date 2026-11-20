@@ -24,7 +24,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::telemetry::queue_snapshot::QueueRepoRef;
+use chrono::{DateTime, Utc};
+
+use crate::telemetry::queue_repo::QueueRepoRef;
+
+/// Whether a work-finder tick completed at `tick_at` still needs a sample,
+/// given the last sampled tick's timestamp. A stalled work finder then shows
+/// downstream as silence, not as a re-stamped copy of an old tick.
+#[must_use]
+pub fn is_new_tick(tick_at: DateTime<Utc>, last_emitted: Option<DateTime<Utc>>) -> bool {
+    last_emitted.is_none_or(|last| tick_at > last)
+}
 
 /// Resolve every root in `roots` to its [`QueueRepoRef`], skipping roots that
 /// are not absolute paths (the single-workspace loop's `workspace #N`

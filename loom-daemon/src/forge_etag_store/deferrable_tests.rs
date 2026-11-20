@@ -225,7 +225,8 @@ fn a_gate_read_is_shed_not_retried_on_the_writer() {
 }
 
 /// #12074: past the tick deadline a listing page is not sent at all; the
-/// error is a shed, which the step gather answers with its last good listing.
+/// error is a `TickDeadlineReached` (not a `ReadShed`: no reader budget is
+/// involved, #12641), which the step gather answers with its last good listing.
 #[test]
 fn a_listing_past_the_tick_deadline_is_shed_with_no_request() {
     let tmp = tempfile::tempdir().unwrap();
@@ -237,7 +238,9 @@ fn a_listing_past_the_tick_deadline_is_shed_with_no_request() {
     let no_pool = |_: &RouteRequest<'_>| RouteDecision::NoPool;
     let r =
         fetch_conditional_via(site(ReadClass::Hygiene), &gh, None, &target(), URL, None, &no_pool);
-    assert!(is_shed(&r), "{:?}", r.map(|x| x.0));
+    let err = r.map(|x| x.0).unwrap_err();
+    assert!(err.downcast_ref::<TickDeadlineReached>().is_some(), "{err:#}");
+    assert!(err.downcast_ref::<ReadShed>().is_none(), "{err:#}");
     assert!(calls(&log).is_empty(), "{:?}", calls(&log));
 }
 

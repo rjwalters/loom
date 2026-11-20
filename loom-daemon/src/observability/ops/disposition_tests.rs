@@ -1,15 +1,14 @@
-//! Pure-tracker and row/span-building tests for `ops::disposition` (Issue
-//! #9222). `record`'s own impure wrapper is exercised only for its early
-//! return (no ops sink is ever registered in this test binary), exactly like
-//! `ops::dwell`'s `record_tick_without_sink_is_a_noop`.
+//! Tracker, sample and row/span-building tests for `ops::disposition`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, TimeZone, Utc};
 
 use super::*;
-use crate::telemetry::queue_snapshot::QueueRepoRef;
-use crate::telemetry::RepoVisibility;
+use crate::observability::queue::QueueSink;
+use crate::telemetry::queue_repo::QueueRepoRef;
+use crate::telemetry::{RepoVisibility, TelemetryEnvelope, TelemetryRecord};
 use crate::types::{QueueDisposition as Qd, ReadyQueueRow, WorkFinderTickSummary};
 
 fn at(secs: i64) -> chrono::DateTime<Utc> {
@@ -30,6 +29,7 @@ fn row(slug: &str, issue: u32, rank: usize, disposition: Qd) -> DispositionRow {
         priority_score: None,
         story_points: None,
         halt_cause: None,
+        plan: PlanAttributes::default(),
     }
 }
 
@@ -174,11 +174,10 @@ fn an_unresolved_root_is_dropped_and_counted() {
     let (rows, dropped) = build_rows(&summary, &HashMap::new());
     assert!(rows.is_empty());
     assert_eq!(dropped.unresolved, 1);
-    assert_eq!(dropped.truncated, 0);
 }
 
 #[test]
-fn more_than_256_rows_are_truncated_and_counted() {
+fn more_than_256_rows_are_all_emitted() {
     let mut repos = HashMap::new();
     repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
     let queue: Vec<ReadyQueueRow> = (0..300)
@@ -189,18 +188,17 @@ fn more_than_256_rows_are_truncated_and_counted() {
         ..Default::default()
     };
     let (rows, dropped) = build_rows(&summary, &repos);
-    assert_eq!(rows.len(), MAX_ROWS);
-    assert_eq!(dropped.truncated, 300 - MAX_ROWS);
-    assert_eq!(dropped.unresolved, 0);
+    assert_eq!(rows.len(), 300);
+    assert_eq!(dropped, DroppedCounts::default());
 }
 
 #[test]
 fn loom_repo_is_the_resolved_slug_never_the_local_path() {
     let mut repos = HashMap::new();
-    repos.insert("/Users/joseph/dev/loom".to_string(), repo_ref("rjwalters/loom"));
+    repos.insert("/Users/alice/dev/loom".to_string(), repo_ref("rjwalters/loom"));
     let summary = WorkFinderTickSummary {
         queue: vec![summary_row(
-            "/Users/joseph/dev/loom",
+            "/Users/alice/dev/loom",
             42,
             1,
             Qd::DeferredCapacity,
@@ -242,7 +240,7 @@ fn build_rows_extracts_queue_position_metadata() {
         ..Default::default()
     };
     let (rows, dropped) = build_rows(&summary, &repos);
-    assert!(dropped.unresolved == 0 && dropped.truncated == 0);
+    assert!(dropped.unresolved == 0);
     assert_eq!(rows.len(), 2);
     // Every row sees the same denominator: the tick's ready-queue depth.
     assert_eq!(rows.iter().map(|r| r.total_candidates).collect::<Vec<_>>(), [2, 2]);
@@ -535,6 +533,21 @@ fn changed_emission() -> Emission {
                 .to_string(),
         ),
         halt_cause: None,
+        plan: full_plan(),
+    }
+}
+
+/// Every #12827 dispatch-plan attribute set.
+fn full_plan() -> PlanAttributes {
+    PlanAttributes {
+        plan_state: Some("next"),
+        position: Some(4),
+        gate: Some("capacity"),
+        step: Some("judge"),
+        owning_shard: Some(1),
+        level: Some("important"),
+        workspace_weight: Some(100),
+        created_at: Some("2026-10-01T00:00:00Z".to_string()),
     }
 }
 
@@ -559,6 +572,15 @@ fn every_attribute_survives_the_export_time_allowlist() {
     assert_eq!(span.attributes["loom.queue.transition"], "changed");
     assert_eq!(span.attributes["loom.queue.previous_disposition"], "deferred_capacity");
     assert_eq!(span.attributes["loom.queue.park_label"], "loom:blocked");
+    // Dispatch-plan attributes (Issue #12827).
+    assert_eq!(span.attributes["loom.queue.plan_state"], "next");
+    assert_eq!(span.attributes["loom.queue.position"], "4");
+    assert_eq!(span.attributes["loom.queue.gate"], "capacity");
+    assert_eq!(span.attributes["loom.queue.step"], "judge");
+    assert_eq!(span.attributes["loom.queue.owning_shard"], "1");
+    assert_eq!(span.attributes["loom.queue.level"], "important");
+    assert_eq!(span.attributes["loom.queue.workspace_weight"], "100");
+    assert_eq!(span.attributes["loom.queue.created_at"], "2026-10-01T00:00:00Z");
     assert!(span.validate().is_ok());
 }
 
@@ -734,16 +756,251 @@ async fn record_without_sink_is_a_noop() {
     // No ops sink is registered in this test binary: nothing panics, nothing
     // emits — mirrors `ops::dwell::record_tick_without_sink_is_a_noop`.
     let mut slug_cache = HashMap::new();
-    record(&mut slug_cache).await;
+    let mut sampler = Sampler::default();
+    record(&mut sampler, Some(&mut slug_cache)).await;
+    record(&mut sampler, None).await;
+    assert_eq!(sampler.last_sampled_tick, None);
+    assert_eq!(sampler.last_resolved_tick, None);
+}
+
+fn quiet_deliveries(poll_secs: u64, refresh_secs: i64) -> Vec<(i64, DateTime<Utc>)> {
+    let mut sampler = Sampler::default();
+    let rows = [row("acme/quiet", 7, 1, Qd::DeferredCapacity)];
+    let refresh = Duration::seconds(refresh_secs);
+    let source_period = crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS as i64;
+    (0..=3600)
+        .step_by(poll_secs as usize)
+        .filter_map(|poll| {
+            let source = at(poll / source_period * source_period);
+            let sample = sampler.consume(source, &rows, &[], refresh)?;
+            if sample.emissions.is_empty() {
+                return None;
+            }
+            assert_eq!(sample.emissions.len(), 1);
+            assert_eq!(sample.source_at, source);
+            // Polls run 25s out of phase with the whole source listings;
+            // delivery and the page read add 45s after the collector poll.
+            Some((poll + 25 + 45, sample.source_at))
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_rows_keep_positive_delivery_headroom_and_a_bounded_span_rate() {
+    let old = quiet_deliveries(300, 600);
+    assert_eq!(&old[..2], &[(70, at(0)), (670, at(600))]);
+    assert!(at(old[1].0 - 1) - old[0].1 > Duration::seconds(300));
+    assert_eq!(old.len() - 1, 6);
+
+    // Even a shorter threshold leaves a gap when the slow poll can see
+    // newer summaries only 300s apart and there is delivery latency.
+    let threshold_only = quiet_deliveries(300, 300);
+    assert_eq!(threshold_only[1], (370, at(300)));
+    assert!(at(threshold_only[1].0 - 1) - threshold_only[0].1 > Duration::seconds(300));
+
+    let fast_poll = crate::observability::collector::DISPOSITION_INTERVAL.as_secs();
+    let actual = quiet_deliveries(fast_poll, refresh_secs(None));
+    assert_eq!(&actual[..2], &[(70, at(0)), (250, at(180))]);
+    assert_eq!(actual.len() - 1, 20);
+    for window in actual.windows(2) {
+        let previous_observation = window[0].1;
+        let next_delivery = at(window[1].0);
+        assert!(next_delivery - previous_observation < Duration::seconds(300));
+    }
+
+    let overridden = quiet_deliveries(fast_poll, refresh_secs(Some("600")));
+    assert_eq!(overridden[1], (670, at(600)));
+}
+
+#[derive(Default)]
+struct RecordingQueue(Mutex<Vec<TelemetryEnvelope>>);
+
+impl QueueSink for RecordingQueue {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        self.0.lock().unwrap().push(envelope);
+    }
+
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+#[test]
+fn delayed_new_source_stays_old_and_both_paths_share_one_watermark() {
+    let queue = Arc::new(RecordingQueue::default());
+    let sink = super::super::OpsSink::new(queue.clone(), "host-quiet");
+    let mut sampler = Sampler::default();
+    let rows = [row("acme/quiet", 7, 1, Qd::DeferredCapacity)];
+    let refresh = Duration::seconds(refresh_secs(None));
+    let parent = TraceContext::derived("work-finder-tick", &["quiet-fixture"]);
+    let now = Utc::now();
+    let first_source = now - Duration::seconds(720);
+    let delayed_source = now - Duration::seconds(360);
+    sampler.consume(first_source, &rows, &[], refresh).unwrap();
+    sampler
+        .consume(delayed_source, &rows, &[], refresh)
+        .unwrap()
+        .offer(&sink, Some(&parent), &HashMap::new());
+    assert!(sampler
+        .consume(delayed_source, &rows, &[], refresh)
+        .is_none());
+    assert!(sampler.consume(first_source, &rows, &[], refresh).is_none());
+
+    let captured = queue.0.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let envelope = &captured[0];
+    let TelemetryRecord::Span(span) = &envelope.record else {
+        panic!("expected a disposition span");
+    };
+    assert_eq!(span.started_at, delayed_source);
+    assert_eq!(span.ended_at, delayed_source);
+    assert_eq!(span.parent_span_id.as_ref(), Some(&parent.span_id));
+    assert_eq!(span.attributes["loom.queue.transition"], "refresh");
+    assert!(envelope.emitted_at >= now);
+    assert!(envelope.emitted_at - span.started_at > Duration::seconds(300));
+}
+
+#[test]
+fn missing_identity_partial_and_failed_keep_rows_until_a_whole_departure() {
+    let known = repos_with_repo();
+    let cache = |root: &str| known.get(root).cloned();
+    let unknown = HashMap::new();
+    let queued = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    let refresh = Duration::seconds(refresh_secs(None));
+    let mut sampler = Sampler::default();
+    let sample = |sampler: &mut Sampler, summary: WorkFinderTickSummary, repos: &HashMap<_, _>| {
+        let roots = summary_roots(&summary);
+        let failed = failed_slugs(&summary, &roots, repos, cache);
+        let (rows, _) = build_rows(&summary, repos);
+        sampler
+            .consume(summary.at, &rows, &failed, refresh)
+            .unwrap()
+            .emissions
+    };
+    let whole = |seconds| WorkFinderTickSummary {
+        at: at(seconds),
+        queue: vec![queued.clone()],
+        ..Default::default()
+    };
+    let summary = whole(0);
+    let roots = summary_roots(&summary);
+    assert!(sampler.cached_repos(&roots, |_| None).is_empty());
+    assert_eq!(sampler.cached_repos(&roots, cache), known);
+    assert_eq!(sample(&mut sampler, summary, &known)[0].transition, Transition::Changed);
+    let unresolved = whole(180);
+    let roots = summary_roots(&unresolved);
+    sampler.note_resolution(&roots, &unknown);
+    assert!(sampler.cached_repos(&roots, cache).is_empty());
+    assert!(sample(&mut sampler, whole(180), &unknown).is_empty());
+    assert!(sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(240),
+            listing_incomplete: vec!["/repo".into()],
+            ..Default::default()
+        },
+        &known
+    )
+    .is_empty());
+    assert!(sample(
+        &mut sampler,
+        WorkFinderTickSummary {
+            at: at(300),
+            listing_failed: vec!["/repo".into()],
+            ..Default::default()
+        },
+        &unknown
+    )
+    .is_empty());
+    sampler.note_resolution(&roots, &known);
+    assert_eq!(sampler.cached_repos(&roots, cache), known);
+    assert_eq!(sample(&mut sampler, whole(360), &known)[0].transition, Transition::Refresh);
+    let empty = |seconds| WorkFinderTickSummary {
+        at: at(seconds),
+        ..Default::default()
+    };
+    assert_eq!(sample(&mut sampler, empty(420), &known)[0].transition, Transition::LeftQueue);
+    assert!(sample(&mut sampler, empty(480), &known).is_empty());
+}
+
+#[test]
+fn a_persistent_cold_root_does_not_stall_warm_repo_heartbeats() {
+    let known = HashMap::from([
+        ("/warm".to_string(), repo_ref("acme/warm")),
+        ("/failed".to_string(), repo_ref("acme/failed")),
+    ]);
+    let warm_only = HashMap::from([("/warm".to_string(), known["/warm"].clone())]);
+    let cache = |root: &str| known.get(root).cloned();
+    let refresh = Duration::seconds(refresh_secs(None));
+    let warm = summary_row("/warm", 1, 1, Qd::DeferredCapacity, None);
+    let failed = summary_row("/failed", 2, 2, Qd::DeferredCapacity, None);
+    let unknown = summary_row("/cold", 3, 3, Qd::DeferredCapacity, None);
+    let mut sampler = Sampler::default();
+
+    let first = WorkFinderTickSummary {
+        at: at(0),
+        queue: vec![warm.clone(), failed],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&first, &known);
+    assert_eq!(
+        sampler
+            .consume(first.at, &rows, &[], refresh)
+            .unwrap()
+            .emissions
+            .len(),
+        2
+    );
+    sampler.note_resolution(&HashSet::from(["/failed"]), &HashMap::new());
+
+    for second in [180, 360] {
+        let mixed = WorkFinderTickSummary {
+            at: at(second),
+            queue: vec![warm.clone(), unknown.clone()],
+            listing_failed: vec!["/failed".into()],
+            ..Default::default()
+        };
+        let roots = summary_roots(&mixed);
+        let repos = sampler.cached_repos(&roots, cache);
+        assert_eq!(repos, warm_only);
+        let (rows, _) = build_rows(&mixed, &repos);
+        let protected = failed_slugs(&mixed, &roots, &repos, cache);
+        assert_eq!(protected, ["acme/failed"]);
+        let sample = sampler
+            .consume(mixed.at, &rows, &protected, refresh)
+            .unwrap();
+        assert_eq!(sample.emissions.len(), 1);
+        assert_eq!(sample.emissions[0].slug, "acme/warm");
+        assert_eq!(sample.emissions[0].transition, Transition::Refresh);
+        assert!(sampler
+            .consume(mixed.at, &rows, &protected, refresh)
+            .is_none());
+    }
+
+    // The cached identity stops protecting the old key once a whole source
+    // listing confirms it departed, while the unrelated cold root remains.
+    let whole = WorkFinderTickSummary {
+        at: at(420),
+        queue: vec![warm, unknown],
+        ..Default::default()
+    };
+    let roots = summary_roots(&whole);
+    let repos = sampler.cached_repos(&roots, cache);
+    let (rows, _) = build_rows(&whole, &repos);
+    let protected = failed_slugs(&whole, &roots, &repos, cache);
+    let sample = sampler
+        .consume(whole.at, &rows, &protected, refresh)
+        .unwrap();
+    assert_eq!(sample.emissions.len(), 1);
+    assert_eq!(sample.emissions[0].slug, "acme/failed");
+    assert_eq!(sample.emissions[0].transition, Transition::LeftQueue);
 }
 
 #[test]
 fn dropped_points_emit_one_delta_counter_per_nonzero_reason() {
     assert!(dropped_points(DroppedCounts::default()).is_empty());
-    let points = dropped_points(DroppedCounts {
-        unresolved: 2,
-        truncated: 0,
-    });
+    let points = dropped_points(DroppedCounts { unresolved: 2 });
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].name, MetricName::QueueDispositionRowsDropped);
     assert_eq!(points[0].labels["reason"], "unresolved");
@@ -755,4 +1012,308 @@ fn refresh_secs_falls_back_to_the_default_on_bad_input() {
     assert_eq!(refresh_secs(Some("garbage")), DEFAULT_REFRESH_SECS);
     assert_eq!(refresh_secs(Some("0")), DEFAULT_REFRESH_SECS);
     assert_eq!(refresh_secs(Some("120")), 120);
+}
+
+// ------------------------------------------------------- dispatch-plan attributes (Issue #12827)
+
+use crate::types::{DispatchPlanContext, PlanGate, PlanState, PlanStep, RowPlan};
+use crate::work_finder::step_item::Step;
+
+/// The #12827 span keys, plus `level` and `workspace_weight` (#13007).
+const PLAN_KEYS: [&str; 8] = [
+    "loom.queue.plan_state",
+    "loom.queue.position",
+    "loom.queue.gate",
+    "loom.queue.step",
+    "loom.queue.owning_shard",
+    "loom.queue.level",
+    "loom.queue.workspace_weight",
+    "loom.queue.created_at",
+];
+
+fn planned_summary(rows: Vec<ReadyQueueRow>) -> WorkFinderTickSummary {
+    WorkFinderTickSummary {
+        queue: rows,
+        plan: Some(DispatchPlanContext::default()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn build_rows_maps_a_full_plan_and_created_at() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut queued = summary_row("/repo", 7, 2, Qd::DeferredCapacity, None);
+    queued.created_at = Some("2026-10-01T02:00:00+02:00".to_string());
+    queued.plan = RowPlan {
+        position: Some(3),
+        plan_state: PlanState::Queued,
+        gate: Some(PlanGate::BuildBackoff),
+        owning_shard: Some(2),
+        step: Some(PlanStep::Known(Step::ChampionMerge)),
+        ..RowPlan::default()
+    };
+    let (rows, _) = build_rows(&planned_summary(vec![queued]), &repos);
+    assert_eq!(
+        rows[0].plan,
+        PlanAttributes {
+            plan_state: Some("queued"),
+            position: Some(3),
+            gate: Some("build_backoff"),
+            step: Some("champion_merge"),
+            owning_shard: Some(2),
+            // The /ingest row's own values (`summary_row`: default, 100).
+            level: Some("default"),
+            workspace_weight: Some(100),
+            // Re-formatted as UTC, never the raw text.
+            created_at: Some("2026-10-01T00:00:00Z".to_string()),
+        }
+    );
+}
+
+#[test]
+fn build_rows_leaves_every_plan_attribute_absent_without_a_plan() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    // No published plan: the default `Unknown` state says nothing.
+    let summary = WorkFinderTickSummary {
+        queue: vec![summary_row("/repo", 7, 2, Qd::DeferredCapacity, None)],
+        ..Default::default()
+    };
+    let (rows, _) = build_rows(&summary, &repos);
+    // `level` and `workspace_weight` come from the row itself, not the plan
+    // (#13007), so they are set even without one.
+    let row_only = PlanAttributes {
+        level: Some("default"),
+        workspace_weight: Some(100),
+        ..PlanAttributes::default()
+    };
+    assert_eq!(rows[0].plan, row_only);
+
+    // A published plan that gave this row no position, gate, step or shard:
+    // only `plan_state` is set. `position` stays absent, never the rank.
+    let (rows, _) = build_rows(
+        &planned_summary(vec![summary_row("/repo", 7, 2, Qd::DeferredCapacity, None)]),
+        &repos,
+    );
+    assert_eq!(
+        rows[0].plan,
+        PlanAttributes {
+            plan_state: Some("unknown"),
+            ..row_only
+        }
+    );
+    assert_eq!(rows[0].candidate_rank, 2, "the rank fallback stays on candidate_rank");
+}
+
+#[test]
+fn an_unparseable_created_at_is_never_exported() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut row = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    row.created_at = Some("last tuesday, ask x_secret".to_string());
+    let (rows, _) = build_rows(&planned_summary(vec![row]), &repos);
+    assert_eq!(rows[0].plan.created_at, None);
+}
+
+#[test]
+fn unknown_plan_values_export_the_literal_unknown_never_the_raw_string() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let mut row = summary_row("/repo", 7, 1, Qd::DeferredCapacity, None);
+    row.plan = RowPlan {
+        plan_state: PlanState::Unknown,
+        gate: Some(PlanGate::Unknown),
+        step: Some(PlanStep::Unknown("x_secret".to_string())),
+        ..RowPlan::default()
+    };
+    let (rows, _) = build_rows(&planned_summary(vec![row]), &repos);
+    let mut tracker = DispositionTracker::default();
+    let emissions = tracker.diff(&rows, &[], at(0), Duration::seconds(600));
+    let span = build_span(&emissions[0], at(0), None, &HashMap::new());
+    assert_eq!(span.attributes["loom.queue.plan_state"], "unknown");
+    assert_eq!(span.attributes["loom.queue.gate"], "unknown");
+    assert_eq!(span.attributes["loom.queue.step"], "unknown");
+    assert!(
+        span.attributes
+            .iter()
+            .all(|(k, v)| !k.contains("x_secret") && !v.contains("x_secret")),
+        "{:?}",
+        span.attributes
+    );
+}
+
+#[test]
+fn each_plan_attribute_is_present_only_when_set() {
+    let span = build_span(&changed_emission(), Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(span.attributes.contains_key(key), "{key} missing");
+    }
+    let empty = Emission {
+        plan: PlanAttributes::default(),
+        ..changed_emission()
+    };
+    let span = build_span(&empty, Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(!span.attributes.contains_key(key), "{key} present when unset");
+    }
+    // One at a time: each key appears alone when only its field is set.
+    let singles = [
+        PlanAttributes {
+            plan_state: Some("running"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            position: Some(1),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            gate: Some("file_overlap"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            step: Some("builder"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            owning_shard: Some(0),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            level: Some("very-important"),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            workspace_weight: Some(0),
+            ..PlanAttributes::default()
+        },
+        PlanAttributes {
+            created_at: Some("2026-10-01T00:00:00Z".to_string()),
+            ..PlanAttributes::default()
+        },
+    ];
+    for (plan, key) in singles.into_iter().zip(PLAN_KEYS) {
+        let span = build_span(
+            &Emission {
+                plan,
+                ..changed_emission()
+            },
+            Utc::now(),
+            None,
+            &HashMap::new(),
+        );
+        let present: Vec<&str> = PLAN_KEYS
+            .iter()
+            .copied()
+            .filter(|k| span.attributes.contains_key(*k))
+            .collect();
+        assert_eq!(present, vec![key]);
+    }
+}
+
+#[test]
+fn a_left_queue_span_carries_no_plan_attribute() {
+    // From the tracker: the row left, so its emission has no plan.
+    let mut tracker = DispositionTracker::default();
+    let mut planned = row("acme/widgets", 1, 1, Qd::DeferredCapacity);
+    planned.plan = full_plan();
+    tracker.diff(&[planned], &[], at(0), Duration::seconds(600));
+    let emissions = tracker.diff(&[], &[], at(1), Duration::seconds(600));
+    assert_eq!(emissions[0].transition, Transition::LeftQueue);
+    assert_eq!(emissions[0].plan, PlanAttributes::default());
+
+    // And from the span builder, even for a hand-built emission that has one.
+    let emission = Emission {
+        transition: Transition::LeftQueue,
+        rank: None,
+        previous_disposition: None,
+        ..changed_emission()
+    };
+    let span = build_span(&emission, Utc::now(), None, &HashMap::new());
+    for key in PLAN_KEYS {
+        assert!(!span.attributes.contains_key(key), "{key} on a left_queue span");
+    }
+}
+
+#[test]
+fn every_plan_key_is_on_the_export_and_collector_allowlists() {
+    let collector = include_str!("../../../../defaults/observability/collector/config.yaml");
+    for key in PLAN_KEYS {
+        assert!(
+            crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key),
+            "{key} not in OPS_SPAN_ATTRIBUTE_KEYS"
+        );
+        assert!(collector.contains(&format!("\"{key}\"")), "{key} not in collector keep_keys");
+    }
+}
+
+/// Cardinality: whatever the plan says, `plan_state`, `gate` and `step`
+/// stay inside their closed vocabularies.
+#[test]
+fn plan_vocabularies_stay_closed_over_arbitrary_rows() {
+    let mut repos = HashMap::new();
+    repos.insert("/repo".to_string(), repo_ref("acme/widgets"));
+    let states = [
+        PlanState::Running,
+        PlanState::Next,
+        PlanState::Queued,
+        PlanState::Blocked,
+        PlanState::Unknown,
+    ];
+    let gates = [
+        None,
+        Some(PlanGate::Capacity),
+        Some(PlanGate::BuildBackoff),
+        Some(PlanGate::FileOverlap),
+        Some(PlanGate::Unknown),
+    ];
+    let queue: Vec<ReadyQueueRow> = (0..300u32)
+        .map(|i| {
+            let mut row = summary_row("/repo", i + 1, i as usize + 1, Qd::DeferredCapacity, None);
+            let step = match i % 3 {
+                0 => Some(PlanStep::Unknown(format!("newer_step_{i}"))),
+                1 => Some(PlanStep::Known(Step::Doctor)),
+                _ => None,
+            };
+            row.plan = RowPlan {
+                plan_state: states[i as usize % states.len()],
+                gate: gates[i as usize % gates.len()],
+                step,
+                ..RowPlan::default()
+            };
+            row
+        })
+        .collect();
+    let (rows, dropped) = build_rows(&planned_summary(queue), &repos);
+    assert_eq!(rows.len(), 300);
+    assert_eq!(dropped, DroppedCounts::default());
+    let mut tracker = DispositionTracker::default();
+    let spans: Vec<SpanRecord> = tracker
+        .diff(&rows, &[], at(0), Duration::seconds(600))
+        .iter()
+        .map(|e| build_span(e, at(0), None, &HashMap::new()))
+        .collect();
+    let distinct = |key: &str| -> HashSet<String> {
+        spans
+            .iter()
+            .filter_map(|s| s.attributes.get(key).cloned())
+            .collect()
+    };
+    let allowed_states: HashSet<String> = ["running", "next", "queued", "blocked", "unknown"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let allowed_gates: HashSet<String> = ["capacity", "build_backoff", "file_overlap", "unknown"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    assert!(distinct("loom.queue.plan_state").is_subset(&allowed_states));
+    assert!(distinct("loom.queue.gate").is_subset(&allowed_gates));
+    assert_eq!(
+        distinct("loom.queue.step"),
+        ["doctor", "unknown"]
+            .into_iter()
+            .map(String::from)
+            .collect::<HashSet<_>>()
+    );
 }

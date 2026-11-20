@@ -171,13 +171,6 @@ pub enum AuthzDecision {
     Denied(Vec<DenyReason>),
 }
 
-impl AuthzDecision {
-    #[must_use]
-    pub fn is_authorized(&self) -> bool {
-        matches!(self, AuthzDecision::Authorized)
-    }
-}
-
 /// Decide whether the PR may be (or stay) queued at `approved_sha`.
 /// Fail-closed: every fact must be known and non-denying.
 #[must_use]
@@ -370,11 +363,11 @@ pub fn authorize_and_enqueue(
         })
         .map_err(HandoffError::Store)?;
     let (state, desc) = status_for(&GroupConclusion::Success);
-    if let Err(e) = statuses.post_status(approved_sha, state, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, approved_sha, state, &desc) {
         let _ = store.revoke(pr);
         return Err(HandoffError::HeadStatus(e));
     }
-    let out = match ops::enqueue(api, pr, approved_sha) {
+    let out = match enqueue_with_retry(api, pr, approved_sha) {
         Ok(o) => o,
         Err(e) => {
             // Roll the grant back; a failed rollback is surfaced by the next
@@ -397,6 +390,35 @@ pub fn authorize_and_enqueue(
     Ok(out)
 }
 
+/// Backoff before the single `QueueUnavailable` retry. Zero under test so the
+/// fake-forge suite never sleeps.
+#[cfg(not(test))]
+const ENQUEUE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(test)]
+const ENQUEUE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::ZERO;
+
+/// Enqueue, retrying once after a short backoff when the forge answers
+/// `QueueUnavailable` right after the head-status post (a GitHub-side lag
+/// between the status write and the merge requirements being re-evaluated,
+/// #13357). Any other error class, and a second `QueueUnavailable`, are
+/// returned unchanged for the caller's rollback.
+fn enqueue_with_retry(
+    api: &dyn QueueApi,
+    pr: u32,
+    approved_sha: &str,
+) -> Result<EnqueueOutcome, QueueError> {
+    match ops::enqueue(api, pr, approved_sha) {
+        Err(QueueError::QueueUnavailable { detail }) => {
+            log::warn!(
+                "merge-queue: enqueue of #{pr} refused as QueueUnavailable ({detail}); retrying (attempt 2 of 2)"
+            );
+            std::thread::sleep(ENQUEUE_RETRY_BACKOFF);
+            ops::enqueue(api, pr, approved_sha)
+        }
+        other => other,
+    }
+}
+
 /// The PR is open, queued at `approved_sha`, and a live grant covers that same
 /// head: nothing to do. Any read that fails answers `None`, so the normal
 /// (guarded) path runs instead.
@@ -411,8 +433,8 @@ fn already_queued(
         return None;
     }
     let entry = status.entry?;
-    let queued_head = entry.head_oid.unwrap_or(status.head_oid);
-    if !queued_head.eq_ignore_ascii_case(approved_sha) {
+    // The PR head, not `entry.head_oid` (possibly the merge-group commit).
+    if !status.head_oid.eq_ignore_ascii_case(approved_sha) {
         return None;
     }
     let grant = store.get(pr).ok()??;
@@ -430,7 +452,7 @@ fn already_queued(
 /// failed write here is logged, not an error of the handoff.
 pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
     let desc = format!("authorization for #{pr} revoked");
-    if let Err(e) = statuses.post_status(head, StatusState::Failure, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, head, StatusState::Failure, &desc) {
         log::warn!("merge-queue: could not withdraw the head status for #{pr}: {e}");
     }
 }
@@ -441,7 +463,7 @@ pub(super) fn withdraw_head_status(statuses: &dyn StatusApi, pr: u32, head: &str
 /// read as red CI, so re-approving the same head is not routed to Doctor.
 pub(super) fn clear_head_status(statuses: &dyn StatusApi, pr: u32, head: &str) {
     let desc = format!("authorization for #{pr} pending re-handoff");
-    if let Err(e) = statuses.post_status(head, StatusState::Pending, &desc) {
+    if let Err(e) = statuses.post_pr_status(pr, head, StatusState::Pending, &desc) {
         log::warn!("merge-queue: could not clear the head status for #{pr}: {e}");
     }
 }

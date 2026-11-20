@@ -113,6 +113,11 @@ pub(super) fn run_reconciliation_pass_over_roots(
         if let Some(open) = open_prs.as_deref() {
             super::ci_gate_recovery::reconcile(gh_bin, root, open);
         }
+        // #12760: open PRs stacked on a parent that closed unmerged are
+        // replayed onto the default branch and retargeted (rebase repos) or
+        // flagged (merge repos, conflicts). Rides the same shared listing, or
+        // lists for itself when the conflict pass wrote.
+        super::orphan_stack::reconcile(gh_bin, root, open_prs.as_deref());
         // Issue #9464: after every other reconciliation — a claim this pass
         // just reclaimed must not be immediately "healed" back. Re-applies
         // `loom:building` to OPEN issues whose sweep is live here but whose

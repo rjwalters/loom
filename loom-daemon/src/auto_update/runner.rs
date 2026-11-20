@@ -72,6 +72,31 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     // newer release, is superseded rather than completed onto a binary that is
     // already stale. Every other shape — a pause that has already stopped
     // agents, a teardown, an operator drain, no newer artifact — still skips.
+    // #12610: a floor rolled back (or met) since a floor roll was armed
+    // withdraws it, as long as it has stopped no agent. H4 re-checks against a
+    // fresh store read just before it stops anything; this is the same check
+    // on the floor this host has synced, so a lowered floor disarms at once.
+    if let Some(roll) = armed
+        .as_ref()
+        .filter(|r| r.target.is_some() && !r.committed && !r.then_exit)
+    {
+        let why = state.floor.floor().and_then(|floor| {
+            floor_roll::disarm_reason(
+                None,
+                &crate::fleet_sync::FloorKnowledge::Set(floor.to_string()),
+                state.floor.running(),
+                state.repo_ahead.driving(),
+            )
+        });
+        if let Some(why) = why.filter(|_| state.floor.fleet_host()) {
+            if trigger.disarm_roll(&why) {
+                log::info!(
+                    "auto_update: disarmed the pending roll to {}: {why}",
+                    roll.target.as_deref().unwrap_or("?")
+                );
+            }
+        }
+    }
     if trigger.roll_in_progress() {
         let armed_artifact = probe.resolve_artifact();
         match supersede::decide_armed_roll(armed.as_ref(), &armed_artifact) {
@@ -102,6 +127,9 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     let artifact = probe.resolve_artifact();
     let check = probe.check();
     let tree_clean = probe.is_tree_clean().unwrap_or(false);
+    // #9736: what this tick learned. An error is an attempt, not an answer.
+    let observation = freshness::classify(&artifact, &check, !state.floor.fleet_host());
+    state.freshness.observe(last_check, &observation);
     // Only pay for the in-flight count once a roll is actually on the table (it
     // loads the workspace registry from disk); a cheap pre-filter avoids that
     // read on every up-to-date tick.
@@ -131,16 +159,25 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         log::warn!("auto_update: {warning}");
     }
 
+    // #14224: what the tick asked, for the below-floor no-release WARN. One
+    // probe call, shared with `resolve_artifact`'s own resolution inputs.
+    let repo_pair = probe.resolved_repo();
     let inputs = TickInputs {
         artifact: &artifact,
         check: &check,
         tree_clean,
         in_flight,
+        repo_source: repo_pair
+            .as_ref()
+            .map(|(repo, source)| (repo.as_str(), *source)),
     };
     let decision = state.decide(now, &inputs, settle, defer_deadline);
     // #11042: an unsupervised host does not re-fetch a target it already
     // installed and could not roll to.
     let decision = not_rolling::gate(state, trigger, decision);
+    // #12425: nothing else rolling and restart-required config changed since
+    // boot: restart onto this binary.
+    let decision = config_restart::arm(state, decision);
     let unsupervised = trigger.unsupervised().is_some();
     let (kind, outcome, note) = match decision {
         TickDecision::Skip(reason) => {
@@ -259,6 +296,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
                 to_version: Some(version.clone()),
                 to_artifact_sha256: info.asset_sha256.clone().filter(|s| !s.is_empty()),
                 label: Some(supersede::artifact_roll_target(&info)),
+                floor_at_arm: state.floor.floor().map(str::to_string),
             };
             // #10880: record the attempt and write it to disk before the
             // arm, so the binary that comes back can tell the roll did not
@@ -295,6 +333,27 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
             log_roll_outcome(&outcome, &note);
             (TickDecisionKind::Fetch, Some(outcome_str(&outcome)), note)
         }
+        TickDecision::ConfigRestart { paths } => {
+            // The state a same-binary restart restores (settle clocks, stall
+            // episode, #10877) is written ahead of the restart the roll may
+            // perform at once. Nothing else is recorded: this is not a version
+            // roll, so `last_roll`, the artifact record, the roll attempt and
+            // the backoff stay as they were.
+            state.persist_before_arm(&RebuildOutcome::Success);
+            let drain_accepted = trigger.trigger_pause_roll(&config_restart::target());
+            summary.roll_armed = drain_accepted;
+            summary.config_restart = Some(tick_telemetry::ConfigRestartFacts {
+                source: pause_manifest::TargetSource::ConfigRestart.as_str(),
+                paths: paths.len(),
+            });
+            let note = config_restart::note(&paths, drain_accepted);
+            if drain_accepted {
+                log::warn!("auto_update: {note}");
+            } else {
+                log::error!("auto_update: {note}");
+            }
+            (TickDecisionKind::ConfigRestart, None, note)
+        }
     };
     // #10712: a host below the fleet floor says so on whatever the tick
     // decided (the floor-driven cause, or the unsatisfiable-floor alert). The
@@ -316,7 +375,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
     }
     // #10866: the note and the record's `floor_stall` are state and are set on
     // every tick the stall stands. Only the ERROR line is rate-limited.
-    let floor_was_alerted = state.floor.stall_declared_at().is_some();
+    let floor_was_alerted = state.floor.was_alerted();
     summary.floor_alerted = state
         .floor
         .alert_due(last_check, floor_roll::alert::REMINDER);
@@ -326,7 +385,7 @@ pub(super) fn run_tick<P: AutoUpdateProbe, T: RollTrigger>(
         summary.floor_alerted,
         floor_was_alerted,
     ) {
-        crate::loom_ui_alerts::post(alert);
+        crate::alerts::post(alert);
     }
     if let Some(stall) = state.floor.stall() {
         if summary.floor_alerted {
@@ -423,9 +482,14 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
     state
         .repo_ahead
         .set_basis(floor.demand(), env!("CARGO_PKG_VERSION"));
+    // #12425: and whether the config on disk needs a restart this host may
+    // perform on itself.
+    state.set_config_restart(floor.config_restart());
     // #10954: a loop that runs only for the fleet floor (autoUpdate off) does
     // nothing on a tick where the host has no fleet store.
     let idle = loop_mode::idle_reason(tuning.chase_enabled, state.floor.fleet_host());
+    let is_idle = idle.is_some();
+    state.freshness.set_tuning(tuning.freshness, started_at);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match idle {
         Some(note) => idle_tick(state, status, note),
         None => run_tick(state, status, probe, trigger, tuning.settle, tuning.defer_deadline),
@@ -441,6 +505,9 @@ pub(super) fn guarded_tick<P: AutoUpdateProbe, T: RollTrigger>(
         status.publish(state.snapshot(true, started_at, note.clone(), &unresolved));
         TickSummary::new(None).finish(TickDecisionKind::Panic, note, &unresolved, None)
     });
+    if !is_idle {
+        state.alert_on_freshness_edge(&status.snapshot());
+    }
     // #12420: the host's state as this tick leaves it. An armed pause-roll is
     // H4: the tick that arms it ends with the pause starting.
     summary.observed = Some(update_observation::observe(
@@ -468,7 +535,10 @@ fn idle_tick(state: &mut AutoUpdateState, status: &AutoUpdateStatus, note: Strin
     log::info!("auto_update: {note}");
     state.clear_tracking();
     let unchecked = ArtifactResolution::Unresolved("not checked".to_string());
-    status.publish(state.snapshot(true, Utc::now(), note.clone(), &unchecked));
+    // #9736: a loop that checks nothing by design is not "overdue".
+    let mut snapshot = state.snapshot(true, Utc::now(), note.clone(), &unchecked);
+    snapshot.freshness = None;
+    status.publish(snapshot);
     TickSummary::new(None).finish(TickDecisionKind::Skip, note, &unchecked, None)
 }
 
@@ -512,6 +582,10 @@ pub(super) struct FloorFeed {
     wake: Arc<dyn Fn() -> &'static crate::fleet_sync::FloorWake + Send + Sync>,
     /// #10719: the highest daemon version a registered workspace needs.
     demand: Arc<dyn Fn() -> Option<floor_roll::repo_ahead::Demand> + Send + Sync>,
+    /// #12425: the restart-required config demand a restart may be armed for.
+    config_restart: Arc<
+        dyn Fn() -> Option<crate::fleet_sync::config_restart::ConfigRestartDemand> + Send + Sync,
+    >,
 }
 
 impl FloorFeed {
@@ -521,6 +595,7 @@ impl FloorFeed {
             read: Arc::new(crate::fleet_sync::floor_knowledge),
             wake: Arc::new(crate::fleet_sync::floor_wake),
             demand: Arc::new(floor_roll::repo_ahead::Demand::live),
+            config_restart: Arc::new(crate::fleet_sync::armable_demand),
         }
     }
 
@@ -534,7 +609,18 @@ impl FloorFeed {
             read: Arc::new(read),
             wake: Arc::new(move || wake),
             demand: Arc::new(|| None),
+            config_restart: Arc::new(|| None),
         }
+    }
+
+    /// The same feed, with a fixed restart-required config demand (#12425).
+    #[cfg(test)]
+    pub(super) fn with_config_restart(
+        mut self,
+        demand: crate::fleet_sync::config_restart::ConfigRestartDemand,
+    ) -> Self {
+        self.config_restart = Arc::new(move || Some(demand.clone()));
+        self
     }
 
     /// The same feed, with a fixed repo-ahead demand (#10719).
@@ -555,6 +641,10 @@ impl FloorFeed {
     fn demand(&self) -> Option<floor_roll::repo_ahead::Demand> {
         (self.demand)()
     }
+
+    fn config_restart(&self) -> Option<crate::fleet_sync::config_restart::ConfigRestartDemand> {
+        (self.config_restart)()
+    }
 }
 
 /// The loop [`spawn_auto_update_task`] runs: tick at once, then every
@@ -570,7 +660,9 @@ impl FloorFeed {
 ///
 /// #12072: while the floor is unsatisfiable the next tick is
 /// [`stall_recheck::STALL_RECHECK`] away, not `tuning.interval`, for the first
-/// [`stall_recheck::STALL_WINDOW`] of the stall.
+/// [`stall_recheck::STALL_WINDOW`] of the stall. #14016: and after a
+/// retryable failure the next tick is `min(interval, backoff_until - now)`
+/// away, so the retry happens at the back-off the tick's log line stated.
 pub(super) async fn run_loop<P, T>(
     mut state: AutoUpdateState,
     mut probe: P,
@@ -611,8 +703,14 @@ pub(super) async fn run_loop<P, T>(
                 task_liveness::beat(AUTO_UPDATE, tuning.interval);
                 // #12072: a standing unsatisfiable floor is re-checked soon,
                 // so the roll starts minutes after the asset lands.
-                let delay =
-                    stall_recheck::delay_after_tick(&state.floor, Utc::now(), tuning.interval);
+                // #14016: and a retryable failure is retried when its log
+                // line said, not a full interval later.
+                let delay = stall_recheck::delay_after_tick_with_backoff(
+                    &state.floor,
+                    state.backoff_remaining(Instant::now()),
+                    Utc::now(),
+                    tuning.interval,
+                );
                 if delay < tuning.interval {
                     ticker = tokio::time::interval_at(
                         tokio::time::Instant::now() + delay,

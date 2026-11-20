@@ -156,6 +156,30 @@ pub fn sample() -> HostPressure {
     }
 }
 
+/// The host's total physical memory in bytes — only the `mem_total_bytes`
+/// half of [`sample`], without its `vm_stat` / PSI / `vmstat` reads, for a
+/// caller that needs the static size and nothing else (`host_shape`, #12874).
+/// `None` when it cannot be measured, never `0`.
+#[must_use]
+pub fn mem_total_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl_u64("hw.memsize").filter(|&b| b > 0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        parse_meminfo(&text)
+            .mem_total_kb
+            .filter(|&kb| kb > 0)
+            .map(|kb| kb.saturating_mul(1024))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Per-second rates of the two cumulative swap counters between successive
 /// samples.
 ///
@@ -193,12 +217,6 @@ pub fn swap_rates(
         ),
         None => (None, None),
     }
-}
-
-/// True when a byte-rate `Option` carries a usable, finite, non-negative rate.
-#[must_use]
-pub fn valid_rate(r: f64) -> bool {
-    r.is_finite() && r >= 0.0
 }
 
 #[cfg(target_os = "macos")]
@@ -311,10 +329,14 @@ pub struct MeminfoSample {
     pub swap_total_kb: Option<u64>,
     /// `SwapFree` (kB).
     pub swap_free_kb: Option<u64>,
+    /// `Shmem` (kB) — tmpfs-resident + SysV/POSIX shared-memory pages, the same
+    /// figure `free -h`'s `shared` column reports.
+    pub shmem_kb: Option<u64>,
 }
 
 /// Parse a `/proc/meminfo` snapshot. Lines are `Key: <value> kB`; the unit is
-/// always kB on Linux, and a missing key leaves its field `None`.
+/// always kB on Linux, and a missing or malformed key leaves its field `None`.
+/// The single `/proc/meminfo` parser for the daemon — callers convert units.
 #[must_use]
 pub fn parse_meminfo(text: &str) -> MeminfoSample {
     let mut out = MeminfoSample::default();
@@ -329,6 +351,7 @@ pub fn parse_meminfo(text: &str) -> MeminfoSample {
             "MemAvailable" => out.mem_available_kb = value,
             "SwapTotal" => out.swap_total_kb = value,
             "SwapFree" => out.swap_free_kb = value,
+            "Shmem" => out.shmem_kb = value,
             _ => {}
         }
     }
@@ -525,6 +548,15 @@ SwapFree:              9502720 kB
         assert_eq!(m.mem_available_kb, Some(21_431_040));
         assert_eq!(m.swap_total_kb, Some(10_485_760));
         assert_eq!(m.swap_free_kb, Some(9_502_720));
+        assert_eq!(m.shmem_kb, None);
+    }
+
+    #[test]
+    fn meminfo_reads_shmem_independently() {
+        let m = parse_meminfo("MemTotal: 16384000 kB\nShmem:  512000 kB\n");
+        assert_eq!(m.mem_total_kb, Some(16_384_000));
+        assert_eq!(m.mem_available_kb, None);
+        assert_eq!(m.shmem_kb, Some(512_000));
     }
 
     #[test]

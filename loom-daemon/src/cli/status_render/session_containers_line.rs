@@ -7,7 +7,7 @@
 //! operator hold, a drift-removal record and the reconciler's last action.
 //! Nothing is printed on a host without a session-managed account.
 
-use loom_daemon::session_status::SessionContainersReport;
+use crate::session_status::SessionContainersReport;
 
 /// Print the block (nothing when `report` is `None`).
 pub fn print(report: Option<&SessionContainersReport>) {
@@ -52,7 +52,7 @@ pub fn render(report: Option<&SessionContainersReport>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_daemon::session_status::{LastReconcile, SeatMounts, SeatRemoval, SeatStatus};
+    use crate::session_status::{LastReconcile, SeatMounts, SeatRemoval, SeatStatus};
     use std::path::PathBuf;
 
     fn seat(account: &str, state: &str, verdict: &str) -> SeatStatus {

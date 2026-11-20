@@ -7,7 +7,7 @@
 //! Nothing is printed when no loop registered (a pre-#10414 daemon, or every
 //! loop configured off).
 
-use loom_daemon::task_liveness::TaskLivenessEntry;
+use crate::task_liveness::TaskLivenessEntry;
 
 /// Print the block (nothing when `entries` is empty).
 pub fn print(entries: &[TaskLivenessEntry]) {

@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use loom_daemon::worktree_cli::existing;
+use crate::worktree_cli::existing;
 
 #[derive(clap::Args)]
 pub(crate) struct WorktreeExistingArgs {

@@ -30,7 +30,7 @@
 //! which is what keeps the 252-assertion shell suite green.
 
 use crate::cmd_out::Query;
-use crate::script_helpers::gh_query;
+use crate::script_helpers::gh_read_json;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -78,7 +78,8 @@ pub fn ref_state(node: &str, repo_root: &Path, use_cache: bool) -> RefState {
     };
 
     for entity in ["issue", "pr"] {
-        let q: Query<StateField> = gh_query(
+        let q: Query<StateField> = gh_read_json(
+            "dep.state",
             &[entity, "view", num, "--repo", repo, "--json", "state"],
             repo_root,
             use_cache,
@@ -122,11 +123,6 @@ impl ClassifiedRefs {
     #[must_use]
     pub fn resolved_joined(&self) -> String {
         self.resolved.join(" ")
-    }
-
-    #[must_use]
-    pub fn unknown_joined(&self) -> String {
-        self.unknown.join(" ")
     }
 }
 

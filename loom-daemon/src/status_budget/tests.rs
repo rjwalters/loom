@@ -228,3 +228,12 @@ fn the_status_build_stays_within_budget_at_the_documented_root_ceiling() {
          the client budget is modelled on — the model, or the loop, has drifted"
     );
 }
+
+/// #13438: within-budget slow builds must not log at WARN.
+#[test]
+fn slow_build_level_warns_only_when_over_budget() {
+    let budget = Duration::from_secs(10);
+    assert_eq!(slow_build_level(Duration::from_secs(1), budget), log::Level::Info);
+    assert_eq!(slow_build_level(budget, budget), log::Level::Warn);
+    assert_eq!(slow_build_level(Duration::from_secs(11), budget), log::Level::Warn);
+}

@@ -661,7 +661,7 @@ fn link_configured_paths(opts: &Options, exclude: &ExcludeFile, out: &Reporter) 
 /// - `// empty` drops `null` and `false` outputs — the two values jq considers
 ///   falsy — and keeps everything else.
 /// - `-r` prints a string raw and anything else as its JSON text.
-fn configured_link_paths(repo_root: &Path) -> Vec<String> {
+pub(crate) fn configured_link_paths(repo_root: &Path) -> Vec<String> {
     let effective = crate::config_resolver::resolve_effective_config(repo_root);
     let Some(node) = crate::config_resolver::get_path(&effective, "worktree.linkPaths") else {
         return Vec::new();

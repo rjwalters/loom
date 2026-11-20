@@ -3,8 +3,7 @@
 # mode "next steps" recipe can never stage a credential path, whatever that
 # path is called (#7818, #8005, #9141).
 #
-# Split out of test-resync-installed.sh (which is frozen by the file-size
-# ratchet, .loom/docs/file-size-policy.md) rather than grown in place -- see
+# Split out of test-resync-installed.sh rather than grown in place -- see
 # that file's own header for the full fixture-based test catalog this one
 # does not duplicate.
 #
@@ -44,25 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/test-resync-ghconfig.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below

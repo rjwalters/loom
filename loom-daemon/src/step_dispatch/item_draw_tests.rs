@@ -20,6 +20,8 @@ fn item(issue: Option<u32>, pr: Option<u32>, verdict: Verdict, lane: Lane) -> It
         verdict,
         lane,
         send_back: false,
+        story_points: None,
+        hold_auth: None,
     }
 }
 
@@ -180,6 +182,46 @@ fn a_cooling_item_step_is_excluded_and_counted() {
     let pooled: Vec<u32> = w.pool.iter().map(Candidate::target).collect();
     assert_eq!(pooled, vec![40], "a window ending now has lapsed");
     assert_eq!(Exclusion::CoolingDown.as_str(), "cooling_down");
+}
+
+/// #12918: every weight-0 item is kept by identity with its exclusion, one per
+/// [`Exclusion`] `weigh` produces; only a cooling item carries a `gate_until`.
+#[test]
+fn excluded_items_keep_identity_and_exclusion_per_variant() {
+    let fresh = "2026-10-01T00:00:00Z";
+    let pass = DrawInput {
+        item: item(Some(1), None, Verdict::Pass(PassReason::Frozen), Lane::Normal),
+        ..step_input(1, Step::Builder, &[], fresh)
+    };
+    let pooled_out = step_input(2, Step::Curator, &[], fresh);
+    let backoff = step_input(3, Step::Builder, &[], fresh);
+    let cooling = step_input(4, Step::ChampionReevaluate, &[], fresh);
+    let pooled = step_input(5, Step::Judge, &[], fresh);
+    let until = now() + chrono::Duration::hours(3);
+    let mut c = ctx();
+    c.pool_exhausted_roles
+        .insert(Step::Curator.role().to_string());
+    c.build_backoff_engaged = true;
+    c.cooldowns.insert(4, StepRole::ChampionPromote, until);
+    let w = weigh(&[pass, pooled_out, backoff, cooling, pooled], &c, &ItemWeights::default());
+    let got: Vec<_> = w
+        .excluded_items
+        .iter()
+        .map(|e| (e.item.issue, e.exclusion.as_str(), e.gate_until))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Some(1), "frozen", None),
+            (Some(2), "pool_exhausted", None),
+            (Some(3), "build_backoff", None),
+            (Some(4), "cooling_down", Some(until)),
+        ]
+    );
+    // The identity list and the counts agree.
+    let by_variant: usize = w.excluded.values().sum();
+    assert_eq!(by_variant, w.excluded_items.len());
+    assert_eq!(w.pool.len(), 1);
 }
 
 #[test]

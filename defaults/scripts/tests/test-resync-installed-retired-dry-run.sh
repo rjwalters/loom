@@ -4,8 +4,7 @@
 # (a .loom/resync-ignore pin, a symlinked destination) suppress the PREVIEW too
 # (#8675).
 #
-# Split out of test-resync-installed.sh (2835 lines, frozen by the file-size
-# ratchet — .loom/docs/file-size-policy.md) rather than grown in place. That
+# Split out of test-resync-installed.sh rather than grown in place. That
 # file's group 22 already covers the apply path and the happy-path dry-run
 # preview; this file is the dry-run-specific half its group 22 does not have:
 # the pin and symlink guards are asserted there only on the APPLY path, so a
@@ -32,25 +31,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELPERS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCRIPT="$HELPERS_DIR/resync-installed.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
-
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/test-resync-retired-dryrun.XXXXXX")"
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below

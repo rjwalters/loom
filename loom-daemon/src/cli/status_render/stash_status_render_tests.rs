@@ -4,8 +4,8 @@
 use super::{build_status_json_value, format_stash_age};
 use crate::cli::status::sample_report::sample_report;
 
-fn no_update() -> loom_daemon::self_update::SelfUpdateStatus {
-    loom_daemon::self_update::SelfUpdateStatus {
+fn no_update() -> crate::self_update::SelfUpdateStatus {
+    crate::self_update::SelfUpdateStatus {
         built_commit: "abc1234".to_string(),
         source_commit: None,
         update_available: None,
@@ -18,7 +18,7 @@ fn repo_with_stashes(
     total: usize,
     quarantine: usize,
     oldest_age_secs: Option<u64>,
-) -> loom_daemon::types::RepoStatus {
+) -> crate::types::RepoStatus {
     repo_with_stashes_full(total, quarantine, oldest_age_secs, 0, None)
 }
 
@@ -30,10 +30,11 @@ fn repo_with_stashes_full(
     oldest_age_secs: Option<u64>,
     non_quarantine_unrecoverable_count: usize,
     non_quarantine_unrecoverable_oldest_age_secs: Option<u64>,
-) -> loom_daemon::types::RepoStatus {
-    loom_daemon::types::RepoStatus {
+) -> crate::types::RepoStatus {
+    crate::types::RepoStatus {
         root: std::path::PathBuf::from("/repos/loom"),
         maintain_only: None,
+        installed_behind: None,
         weight: 100,
         in_flight_count: 0,
         health_gate_halted: false,
@@ -43,6 +44,7 @@ fn repo_with_stashes_full(
         health_gate_enabled: None,
         health_gate_verdict_at: None,
         root_missing: false,
+        lock_busy: false,
         health_gate_deferred: false,
         health_gate_deferred_reason: None,
         health_gate_verdict_tier: None,
@@ -75,6 +77,23 @@ fn per_repo_json_carries_stash_counts_and_oldest_age() {
     assert_eq!(stash["total_count"], 5);
     assert_eq!(stash["quarantine_count"], 2);
     assert_eq!(stash["oldest_age_secs"], 3600);
+}
+
+/// #14015: `per_repo[].installed_behind` names the installed and running
+/// versions of a behind-but-compatible repo, and is null for any other.
+#[test]
+fn per_repo_json_carries_installed_behind_only_when_behind() {
+    let mut behind = repo_with_stashes(0, 0, None);
+    behind.installed_behind = Some(crate::workspace_hold::InstalledBehind {
+        installed: "0.19.800".to_string(),
+        running: "0.19.880".to_string(),
+    });
+    let mut report = sample_report();
+    report.per_repo = vec![behind, repo_with_stashes(0, 0, None)];
+    let value = build_status_json_value(&report, None, &no_update(), None, None, None);
+    assert_eq!(value["per_repo"][0]["installed_behind"]["installed"], "0.19.800");
+    assert_eq!(value["per_repo"][0]["installed_behind"]["running"], "0.19.880");
+    assert!(value["per_repo"][1]["installed_behind"].is_null(), "{value}");
 }
 
 #[test]

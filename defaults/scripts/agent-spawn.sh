@@ -2,7 +2,7 @@
 # agent-spawn.sh - Thin stub delegating to `loom-daemon agent-spawn`.
 #
 # This script preserves backward compatibility for callers that invoke
-# agent-spawn.sh directly (loom-start.sh, loom-scale.sh, operators).
+# agent-spawn.sh directly (loom-start.sh, operators).
 #
 # The Python `loom_tools.agent_spawn` implementation was ported to native
 # `loom-daemon agent-spawn` in epic #4081 Phase 3 family 4 (issue #4415); this
@@ -25,8 +25,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=lib/locate-daemon-bin.sh
 source "$SCRIPT_DIR/lib/locate-daemon-bin.sh"
-# shellcheck source=lib/loom-tools.sh
-source "$SCRIPT_DIR/lib/loom-tools.sh"
+# shellcheck source=lib/repo-root.sh
+source "$SCRIPT_DIR/lib/repo-root.sh"
 
 REPO_ROOT="$(_find_repo_root "$SCRIPT_DIR" 2>/dev/null || echo "$PWD")"
 DAEMON_BIN="$(loom_locate_daemon_bin "$REPO_ROOT")"

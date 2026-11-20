@@ -251,8 +251,67 @@ fn run_live(live: &Live<'_>, roots: &[PathBuf], memory: &mut Memory) -> Checkout
         budget: Some(live.budget),
         elapsed: &|| started.elapsed(),
         clock: &Utc::now,
+        pr_merged: &|root, sha| {
+            if !live.network || crate::rate_limit_breaker::global_skip_pass(CALLER) {
+                return None;
+            }
+            pr_head_merged(root, sha)
+        },
     };
     super::run(&env, roots, memory)
+}
+
+/// Does the forge report `sha` as the head of a merged pull request (#13588)?
+/// `None` when the lookup fails for any reason: a caller must not read that as
+/// "not merged" and act on it, only as "unknown".
+fn pr_head_merged(root: &Path, sha: &str) -> Option<bool> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    if sha.is_empty() || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let path = format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls");
+    let jq = format!("any(.[]; .merged_at != null and .head.sha == \"{sha}\")");
+    let out = GhInvocation::new(
+        Operation::new("checkout_ff.pr_merged"),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(20),
+    )
+    .current_dir(root)
+    .args(["api", path.as_str(), "--jq", jq.as_str()])
+    .run();
+    match out.ok_stdout_trimmed()?.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// The roots a checkout pass visits: the registered workspaces plus the
+/// daemon root `daemon_root` (#12727).
+///
+/// The daemon root (`~/loom-daemon` on a release-roll host) is deliberately
+/// **not** a registered workspace (2am runbook §5c), yet three live readers use
+/// its content, so it must not drift. It is visited like any registered root
+/// (same gates, timeouts, holds, identical-dirt handling) but is only ever
+/// appended here: never registered, never offered to dispatch.
+///
+/// A daemon root that is not a git checkout, or is already among `registered`
+/// (compared on the canonical path), adds nothing.
+#[must_use]
+pub(in crate::fleet_sync) fn with_daemon_root(
+    mut registered: Vec<PathBuf>,
+    daemon_root: &Path,
+) -> Vec<PathBuf> {
+    if !daemon_root.join(".git").exists() {
+        return registered;
+    }
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let wanted = canon(daemon_root);
+    if registered.iter().all(|r| canon(r) != wanted) {
+        registered.push(daemon_root.to_path_buf());
+    }
+    registered
 }
 
 /// May the startup pass's checkout half use the network? Only on a host the
@@ -297,9 +356,12 @@ pub(in crate::fleet_sync) fn startup(
     let paused = status.enforced != Enforcement::Proceed;
     let floor = status.floor.floor.clone();
     let gate = || HostGateInputs::at_boot(paused, floor.as_deref());
-    let roots = crate::fleet_sync::workspace_resync::registered_roots();
+    let roots = with_daemon_root(
+        crate::fleet_sync::workspace_resync::registered_roots(),
+        &inputs.workspace,
+    );
     let mut guard = memory().lock().unwrap_or_else(PoisonError::into_inner);
-    let pass = boot_step(&mut guard, &roots, inputs.auto_apply, &gate);
+    let pass = boot_step(&mut guard, &roots, inputs.auto_apply.checkout, &gate);
     status.checkouts = pass.checkouts;
     pass.transitions
 }
@@ -444,18 +506,28 @@ pub(in crate::fleet_sync) fn after_resync(
     impl FnOnce(Instant, &WorkspacePass) -> Stepped + Send + 'static,
     impl FnOnce(Stepped) + Send + 'static,
 ) {
-    let (write, gate, bus) = (inputs.auto_apply, registered_gate(), bus.clone());
+    let (write, gate, bus) = (inputs.auto_apply.checkout, registered_gate(), bus.clone());
     let enforcer = enforcer.clone();
     let hold_bus = bus.clone();
+    let daemon_root = inputs.workspace.clone();
     let step = move |began: Instant, resync: &WorkspacePass| {
-        let roots = crate::fleet_sync::workspace_resync::registered_roots;
+        let roots = || {
+            with_daemon_root(crate::fleet_sync::workspace_resync::registered_roots(), &daemon_root)
+        };
         let held = || write_hold_now(enforcer.as_deref());
         let stepped = timer_step(memory(), &roots, write, &held, resync, began, gate.as_ref());
         // #11052: a checkout this step moved is judged again now, so its
         // hold clears in this pass rather than the next.
         if let Stepped::Ran(pass) = &stepped {
+            // The daemon root is not a registered workspace: it has no hold
+            // to clear, so it is not re-judged.
+            let moved: Vec<PathBuf> = pass
+                .fast_forwarded()
+                .into_iter()
+                .filter(|moved| moved != &daemon_root)
+                .collect();
             crate::fleet_sync::workspace_resync::rejudge_checkouts(
-                &pass.fast_forwarded(),
+                &moved,
                 enforcer.as_deref(),
                 hold_bus.as_deref(),
             );

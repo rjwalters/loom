@@ -105,7 +105,7 @@ Against rule 3, over the inventory window:
 
 | Check | Window result | Disposition | Follow-up |
 |-------|---------------|-------------|-----------|
-| `CI Daily` → Flake Detection (shell suites, macos-latest) | 2 completed (both red), 15 cancelled by timeout, 0 green | Advisory until #12043 lands, then fix | #12198 (`loom:triage`); existing report #12019 |
+| `CI Daily` → Flake Detection (shell suites, macos-latest) | 2 completed (both red), 15 cancelled by timeout, 0 green | Re-scoped to Homebrew bash 5 on the macOS leg (bash >= 4 floor); judge on the next green/red runs | #12916 (closes #12198 and #12019 as moot) |
 | `Security Scan` | 152 of 1000 runs red, all before #11688 closed; the latest runs on `main` are green | No change: fixed | #11688 |
 
 No `ci.yml` job is red on more than half of its runs. `Structural Checks`

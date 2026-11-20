@@ -63,7 +63,7 @@
 //!   soft-fail pattern as [`crate::worktree_root`]'s `read_config_worktree_root`
 //!   (missing file / missing key / malformed JSON / `enabled: false` all resolve
 //!   to "gate disabled"), matching #3749's opt-in contract.
-//! - **Cadence loop** [`spawn_main_health_gate_task`] runs as a plain
+//! - **Cadence loop** [`spawn_multi_main_health_gate_task`] runs as a plain
 //!   `tokio::spawn` interval task on the shared daemon runtime, mirroring the
 //!   work-finder. The (potentially minutes-long) gate command is executed on a
 //!   blocking thread via `tokio::task::spawn_blocking` so it never parks a
@@ -1232,8 +1232,9 @@ impl GateOutcome {
 
 /// Runs the configured `buildGate` command once and classifies the result.
 ///
-/// Abstracted behind a trait so [`spawn_main_health_gate_task`] is testable with
-/// a scripted fake runner, exactly as [`crate::work_finder::WorkSource`] /
+/// Abstracted behind a trait so a gate run is testable with a scripted fake
+/// runner (`FakeGateRunner` in this module's tests), exactly as
+/// [`crate::work_finder::WorkSource`] /
 /// [`crate::work_finder::WorkDispatcher`] make `tick` testable.
 pub trait GateRunner {
     /// Run the gate once and return its classified outcome. Never errors — a
@@ -2820,8 +2821,8 @@ fn verdict_phrase(halted: bool) -> &'static str {
 /// and after any change of failure class (#3950 AC2, #3974). Every other
 /// transition (green/red) logs unthrottled via `log_fn` exactly as before.
 /// `log_fn` renders the actual `HealthTransition`/`GateOutcome` pair plus the
-/// (unchanged) halt verdict — the single- vs multi-workspace loops pass
-/// different renderers (the latter also names the repo root).
+/// (unchanged) halt verdict — production passes the root-aware renderer
+/// ([`log_transition_for_root`], which also names the repo root).
 fn apply_and_log<F>(state: &MainHealthState, outcome: &GateOutcome, log_fn: F)
 where
     F: Fn(HealthTransition, &GateOutcome, bool),
@@ -2847,49 +2848,13 @@ where
     log_fn(transition, outcome, halted);
 }
 
-/// Log a health transition at a severity matching its significance.
-fn log_transition(transition: HealthTransition, outcome: &GateOutcome, halted: bool) {
-    match transition {
-        HealthTransition::EnteredHalt => log::error!(
-            "main_health_gate: main is VERIFIED RED — HALTING autonomous dispatch. {}",
-            outcome.detail()
-        ),
-        HealthTransition::RemainedHalted => log::warn!(
-            "main_health_gate: main still VERIFIED RED — dispatch remains halted. {}",
-            outcome.detail()
-        ),
-        HealthTransition::Recovered => log::info!(
-            "main_health_gate: main GREEN again — RESUMING autonomous dispatch on the next work-finder tick"
-        ),
-        HealthTransition::RemainedHealthy => {
-            // Positive evidence, at the default level, that the gate ran and
-            // produced a green verdict this tick (#4083). Includes the elapsed
-            // run time so a green-with-headroom run is distinguishable from a
-            // green-at-the-edge-of-the-timeout-budget run.
-            log::info!(
-                "main_health_gate: main GREEN in {} — dispatch unaffected",
-                format_elapsed(green_elapsed(outcome))
-            );
-        }
-        // Loud, and explicit that this is NOT a statement about main (#3974).
-        HealthTransition::Unevaluated => log::warn!(
-            "main_health_gate: gate run UNEVALUATED [{}] — {} — this is a failure of the GATE, not evidence about main; {}",
-            outcome
-                .unevaluated_class()
-                .map_or("unknown", UnevaluatedClass::label),
-            outcome.detail(),
-            verdict_phrase(halted)
-        ),
-    }
-}
-
 // ============================================================================
 // Env-var configuration helpers
 // ============================================================================
 
 /// Whether the main-health gate loop is enabled, per
 /// [`MAIN_HEALTH_GATE_ENABLE_ENV`]. Off by default (opt-in); parsing mirrors
-/// [`crate::work_finder::enabled`]. This is the **env-only** primitive; the
+/// [`crate::epic_supervisor::supervisor_enabled`]. This is the **env-only** primitive; the
 /// config-aware entry point the daemon uses is [`resolve_enabled`] (precedence
 /// env > config > default).
 #[must_use]
@@ -3063,70 +3028,6 @@ impl Drop for GateInFlightGuard {
     }
 }
 
-/// Spawn the main-health gate loop on the shared daemon runtime and return its
-/// task handle so the daemon can keep it alive for the process lifetime.
-///
-/// Every `interval` the loop runs one gate command (on a blocking thread via
-/// `spawn_blocking`, since it may take minutes), applies the outcome to the
-/// shared `health_state`, and logs the transition. The work-finder loop reads
-/// `health_state` each of its own ticks and dispatches nothing while halted.
-///
-/// A plain `tokio::spawn` is correct here (unlike the epic supervisor's
-/// dedicated OS thread) because the blocking command runs inside `spawn_blocking`
-/// — the interval task itself never parks a runtime worker.
-pub fn spawn_main_health_gate_task<R>(
-    mut runner: R,
-    health_state: Arc<MainHealthState>,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()>
-where
-    R: GateRunner + Send + 'static,
-{
-    log::info!("main_health_gate: starting loop (interval={}s)", interval.as_secs());
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // A gate run can exceed the cadence interval (a `buildGate` build may take
-        // minutes). Without this, `interval`'s default `Burst` behavior would fire
-        // the missed ticks back-to-back, churning rebuild after rebuild with no
-        // gap. `Delay` measures the next interval from when the previous run
-        // finished, so a slow build never triggers a rebuild storm (#3885).
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // First tick fires immediately; skip it so we don't churn at boot.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            // Run the (potentially minutes-long) gate command off the runtime.
-            // Move the runner in and back out so it survives across ticks. The
-            // in-flight guard is set here (before the blocking build starts) and
-            // moved into the closure so it clears on return *or* panic (#4084) —
-            // the work-finder holds new dispatch off this root while it is set.
-            let flight_guard = GateInFlightGuard::new(health_state.clone());
-            let joined = tokio::task::spawn_blocking(move || {
-                let _flight_guard = flight_guard;
-                let outcome = runner.run_gate();
-                (outcome, runner)
-            })
-            .await;
-            let outcome = match joined {
-                Ok((outcome, r)) => {
-                    runner = r;
-                    outcome
-                }
-                Err(e) => {
-                    // The blocking task panicked; we can't recover the runner.
-                    // Clear the halt flag so a panic here never wedges dispatch
-                    // in a permanently-halted state, then stop the loop.
-                    log::error!("main_health_gate: gate run task panicked ({e}); clearing halt and stopping loop");
-                    health_state.set_halted(false);
-                    health_state.note_gate_tick(None, SKIP_WARN_THROTTLE);
-                    return;
-                }
-            };
-            apply_and_log(&health_state, &outcome, log_transition);
-        }
-    })
-}
-
 /// Log a health transition (root-aware variant, #3930) at a severity matching
 /// its significance, naming which repo's `main` the gate evaluated.
 fn log_transition_for_root(
@@ -3152,7 +3053,9 @@ fn log_transition_for_root(
         HealthTransition::RemainedHealthy => {
             // Positive evidence, at the default level, that this repo's gate ran
             // and produced a green verdict this tick (#4083). Names the repo and
-            // includes the elapsed run time (see `log_transition` for rationale).
+            // includes the elapsed run time so a green-with-headroom run is
+            // distinguishable from a green-at-the-edge-of-the-timeout-budget
+            // run (#4083).
             log::info!(
                 "main_health_gate: {r} main GREEN in {} — dispatch unaffected",
                 format_elapsed(green_elapsed(outcome))
@@ -3172,7 +3075,7 @@ fn log_transition_for_root(
 /// Spawn the **multi-workspace** main-health gate loop (Issue #3930) on the
 /// shared daemon runtime and return its task handle.
 ///
-/// This is the multi-repo replacement for [`spawn_main_health_gate_task`]. Every
+/// Every
 /// `interval` it re-reads [`WorkspaceRegistry::effective_roots`] against
 /// `fallback_root` (an **empty** registry ⇒ the single `fallback_root`,
 /// byte-for-byte the pre-#3930 single-workspace behavior) and runs **one gate

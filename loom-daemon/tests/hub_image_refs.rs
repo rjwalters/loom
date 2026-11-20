@@ -2,6 +2,8 @@
 //! the pin list (#11755), and the pull's deadline, GHCR-first order, fallback
 //! and terminal report against a fake `docker` that stalls or fails on demand.
 
+#[path = "common/clickhouse_local.rs"]
+mod clickhouse_local;
 #[path = "common/hub_image.rs"]
 mod hub_image;
 
@@ -173,6 +175,17 @@ fn the_pin_list_maps_tag_only_and_digest_requests_to_their_entry() {
     assert_eq!(hub_image::pinned("ubuntu"), None);
 }
 
+/// The ClickHouse pin the replay tests share must be the one on the pin list, or
+/// a digest bump that misses one of them silently drops off the GHCR copy path.
+#[test]
+fn the_shared_clickhouse_pin_is_on_the_pin_list() {
+    assert_eq!(
+        hub_image::pinned(clickhouse_local::CLICKHOUSE_IMAGE).as_deref(),
+        Some(clickhouse_local::CLICKHOUSE_IMAGE),
+        "clickhouse_local::CLICKHOUSE_IMAGE differs from the .github/ci-images.txt entry"
+    );
+}
+
 /// Every Docker Hub image a test or `ci.yml` hands to `docker` must be on the
 /// pin list, or the copy workflow never copies it and CI pulls it from a
 /// third party (#11755). The sources: `*IMAGE: &str = "<ref>"` constants and
@@ -199,6 +212,8 @@ fn every_docker_hub_image_ci_pulls_is_on_the_pin_list() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
         .collect();
     sources.push(workflow);
+    // The shared ClickHouse pin lives beside `hub_image.rs`, not in a test binary.
+    sources.push(tests.join("common/clickhouse_local.rs"));
     for path in sources {
         let text = std::fs::read_to_string(&path).unwrap();
         for line in text.lines() {

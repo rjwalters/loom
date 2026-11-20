@@ -28,9 +28,31 @@ pub fn list_all_open(
     cwd: Option<&Path>,
     repo: Option<&str>,
 ) -> Result<Vec<RestIssue>> {
+    list_all_open_on(crate::forge_cmd::ForgeType::GitHub, gh_bin, cwd, repo)
+}
+
+/// [`list_all_open`] on `forge` (#12312): Gitea's dialect lists issues and
+/// pulls as two walks, so the rows are the same set GitHub's one walk gives.
+///
+/// # Errors
+///
+/// As [`list_all_open`].
+pub fn list_all_open_on(
+    forge: crate::forge_cmd::ForgeType,
+    gh_bin: &Path,
+    cwd: Option<&Path>,
+    repo: Option<&str>,
+) -> Result<Vec<RestIssue>> {
     // #12310: the step engine's items listing is discovery.
     let _discovery = crate::gh_invocation::purpose::discovery();
-    crate::forge_listing::list_open_issues_cached_all_as(CALLER, gh_bin, cwd, repo)
+    crate::forge_listing::list_open_issues_on(
+        forge,
+        CALLER,
+        gh_bin,
+        cwd,
+        repo,
+        crate::forge_identity::ReadClass::Hygiene,
+    )
 }
 
 #[cfg(test)]

@@ -228,6 +228,13 @@ pub struct CallFacts {
     /// The step's wire name (`judge`, `champion_merge`, ...).
     pub step: Option<String>,
     pub assignment_id: Option<String>,
+    /// The host holding the item, on a refused claim that names one (#12707).
+    pub held_by: Option<String>,
+    /// Seconds before asking again is worthwhile, on a refused claim.
+    pub retry_after_s: Option<u64>,
+    /// Whether the refusal is a no-progress hold (`cooldown`): then the
+    /// span carries `hold_until`.
+    pub hold: bool,
 }
 
 /// The span for `facts`, ended at `at`. Pure.
@@ -293,6 +300,18 @@ pub fn span(facts: &CallFacts, at: DateTime<Utc>) -> SpanRecord {
     }
     if let Some(id) = &facts.assignment_id {
         put("loom.assignment.id", id.clone());
+    }
+    if let Some(step) = &facts.step {
+        put("loom.fleet_dispatch.step", step.clone());
+    }
+    if let Some(held_by) = &facts.held_by {
+        put("loom.fleet_dispatch.held_by", held_by.clone());
+    }
+    if let Some(retry) = facts.retry_after_s {
+        put("loom.fleet_dispatch.retry_after_s", retry.to_string());
+        if facts.hold {
+            put("loom.fleet_dispatch.hold_until", super::telemetry::hold_until(at, retry));
+        }
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     let started_at =
@@ -393,6 +412,9 @@ mod tests {
             item: Some(9),
             step: Some("judge".into()),
             assignment_id: None,
+            held_by: Some("host-b".into()),
+            retry_after_s: Some(90),
+            hold: true,
         };
         let span = span(&facts, Utc::now());
         assert_eq!(span.name.as_str(), "loom.fleet_dispatch.call");
@@ -407,6 +429,11 @@ mod tests {
         assert_eq!(attr("loom.pr_number").as_deref(), Some("9"), "a Judge's item is a PR");
         assert_eq!(attr("loom.issue"), None);
         assert_eq!(attr("loom.role").as_deref(), Some("judge"));
+        assert_eq!(attr("loom.fleet_dispatch.step").as_deref(), Some("judge"));
+        assert_eq!(attr("loom.fleet_dispatch.held_by").as_deref(), Some("host-b"));
+        assert_eq!(attr("loom.fleet_dispatch.retry_after_s").as_deref(), Some("90"));
+        let until = attr("loom.fleet_dispatch.hold_until").unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&until).is_ok(), "{until}");
         assert!(
             !span.attributes.keys().any(|k| k.starts_with("loom.step.")),
             "the captain's join keys, not loom.step.*: {:?}",

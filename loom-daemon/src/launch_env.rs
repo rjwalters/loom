@@ -14,7 +14,9 @@
 //! preference marker #8599 carries to the child — without growing either
 //! dispatch surface. #8602 reuses the same seam to pin a profile-pinned tap's
 //! `modelProfile` (`LOOM_MODEL_PROFILE`), rather than re-duplicating the
-//! block a third time.
+//! block a third time; #13965 pins the daemon's registered primary root
+//! (`LOOM_MACHINE_CHECKOUT`) so a dispatched child on a pristine fleet host
+//! can still find the refreshed owner dir.
 //!
 //! # Why the marker travels in the environment
 //!
@@ -52,6 +54,19 @@ pub fn apply_launch_env(cmd: &mut Command, admission: Option<&ResolvedRuntime>, 
     let Some(admission) = admission else {
         return;
     };
+    // #13965: hand the child the daemon's registered primary root when this
+    // process env names none. A pristine `fleet add-worker` unit renders only
+    // `PATH` and `LOOM_DAEMON_SUPERVISOR` (`unit_env_tests::STRUCTURAL`), so
+    // without this pin nothing downstream of the child — the agent session,
+    // its `session-exec host` exec — can find the owner dir the daemon's
+    // refresh tick keeps fresh, and the exec falls back to a managed repo's
+    // never-refreshed copy (the #13933 `HTTP 401`). A path only, never a
+    // token; a unit/operator-provided value is inherited untouched.
+    pin_primary_root(
+        cmd,
+        std::env::var_os("LOOM_MACHINE_CHECKOUT").as_deref(),
+        crate::credential_preflight::primary_workspace_root().as_deref(),
+    );
     cmd.env("LOOM_RUNTIME", &admission.runtime);
     cmd.env("LOOM_ROLE", &admission.role);
     // #12207: the agent `gh` front's read routing (the gateway profiles and
@@ -94,6 +109,38 @@ fn apply_vars(cmd: &mut Command, vars: Vec<(&'static str, Option<std::ffi::OsStr
             Some(v) => cmd.env(key, v),
             None => cmd.env_remove(key),
         };
+    }
+}
+
+/// The primary-root pin (#13965): export the daemon's registered root as
+/// `LOOM_MACHINE_CHECKOUT` when `process` names none. An empty value is as
+/// good as absent (the same filter `forge_auth::primary_root` applies); a
+/// non-empty one — a unit re-rendered in machine mode, an operator export —
+/// stands and is never overridden.
+///
+/// # Downstream consumer: the daemon-start unit renderer (#14022)
+///
+/// A child env carrying this var does not stop at the child:
+/// `daemon_start::envh::forwarded_env_pairs` collects it and
+/// `daemon_start::render` bakes it into the unit as
+/// `Environment=LOOM_MACHINE_CHECKOUT=…` — the render-time strip
+/// (`is_session_scoped_env_key`) covers `LOOM_ROLE` but **not** this var.
+/// What keeps the render safe is that `apply_launch_env` pins `LOOM_ROLE` on
+/// the same child it pins the root into, so the #6568
+/// `guard_session_context_start` refusal fires before any render. That
+/// coupling is asserted (not assumed) by
+/// `tests::a_child_that_carries_the_root_pin_also_trips_the_start_refusal_detection`
+/// — keep the two pins together, or change that test deliberately alongside.
+fn pin_primary_root(
+    cmd: &mut Command,
+    process: Option<&std::ffi::OsStr>,
+    registered: Option<&std::path::Path>,
+) {
+    if process.is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+    if let Some(root) = registered {
+        cmd.env("LOOM_MACHINE_CHECKOUT", root);
     }
 }
 
@@ -154,6 +201,113 @@ mod tests {
                 Some((k.to_string_lossy().into_owned(), v?.to_string_lossy().into_owned()))
             })
             .collect()
+    }
+
+    /// #13965: the primary-root pin. A pristine fleet unit's env carries no
+    /// `LOOM_MACHINE_CHECKOUT` (`unit_env_tests::STRUCTURAL`), so the
+    /// daemon's registered root is the only source a dispatched child — and,
+    /// under it, a `session-exec host` — has. A non-empty process-env value
+    /// (a unit re-rendered in machine mode, an operator export) stands and is
+    /// never overridden; an empty one is as good as absent.
+    #[test]
+    fn the_primary_root_is_pinned_only_when_the_process_env_names_none() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let pinned = |process: Option<&OsStr>, registered: Option<&Path>| {
+            let mut cmd = Command::new("/bin/true");
+            pin_primary_root(&mut cmd, process, registered);
+            env_of(&cmd)
+                .iter()
+                .find(|(name, _)| name == "LOOM_MACHINE_CHECKOUT")
+                .map(|(_, value)| value.clone())
+        };
+
+        // Nothing in the process env, a registered root: pinned.
+        assert_eq!(
+            pinned(None, Some(Path::new("/machine/checkout"))).as_deref(),
+            Some("/machine/checkout")
+        );
+        // An empty value is as good as absent.
+        assert_eq!(
+            pinned(Some(OsStr::new("")), Some(Path::new("/machine/checkout"))).as_deref(),
+            Some("/machine/checkout")
+        );
+        // A process-env value stands: no explicit pin, the child inherits it
+        // (`get_envs` reports only explicit overrides, never inherited vars).
+        assert_eq!(
+            pinned(Some(OsStr::new("/unit/value")), Some(Path::new("/machine/checkout"))),
+            None
+        );
+        // No registered root (a CLI process): pin nothing.
+        assert_eq!(pinned(None, None), None);
+    }
+
+    /// #14022: the invariant the root pin leans on, pinned rather than
+    /// assumed. A dispatched child whose env carries `LOOM_MACHINE_CHECKOUT`
+    /// would reach a rendered unit (`daemon_start::envh::forwarded_env_pairs`
+    /// → `daemon_start::render`; the strip set `is_session_scoped_env_key`
+    /// covers `LOOM_ROLE` but not this var), so the only thing standing
+    /// between the pin and that drift is the #6568 refusal:
+    /// `guard_session_context_start` refuses a real start from any env whose
+    /// detection set (`session_context_keys_from`) is non-empty — and the
+    /// only key `apply_launch_env` pins that trips it is `LOOM_ROLE`. The two
+    /// pins must therefore travel together on the same child.
+    ///
+    /// The root pin is forced through `pin_primary_root` directly (process
+    /// `None`, registered `Some`) because a unit test cannot make
+    /// `apply_launch_env`'s own inputs deterministic —
+    /// `primary_workspace_root()` reads a process-global only seeded at
+    /// daemon startup — but the role pin comes from `apply_launch_env`
+    /// itself, so dropping *that* pin turns this test red (detection finds
+    /// only `LOOM_RUNTIME`, which is deliberately not a detection signal).
+    #[test]
+    fn a_child_that_carries_the_root_pin_also_trips_the_start_refusal_detection() {
+        use std::path::Path;
+
+        // `apply_launch_env` on a pristine fleet unit: no process-env root to
+        // inherit, so the #13965 pin fires — reproduce exactly that child env
+        // by forcing the pin through the same seam `apply_launch_env` uses.
+        let mut cmd = Command::new("/bin/true");
+        apply_launch_env(&mut cmd, Some(&admitted(None)), "test");
+        pin_primary_root(&mut cmd, None, Some(Path::new("/machine/checkout")));
+
+        let env = env_of(&cmd);
+        let text = env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            env.iter().any(|(name, _)| name == "LOOM_MACHINE_CHECKOUT"),
+            "forced pin must be present: {env:?}"
+        );
+        let detected = crate::daemon_start::guards::session_context_keys_from(&text);
+        assert!(
+            !detected.is_empty(),
+            "INVARIANT (#14022): a dispatched child whose env carries \
+             LOOM_MACHINE_CHECKOUT must also carry a session-context key, so \
+             guard_session_context_start (#6568) refuses a real daemon-start \
+             before any unit render; detection found none in: {text}"
+        );
+
+        // Edge case: when the process env already names the root (a unit
+        // re-rendered in machine mode, an operator export), `pin_primary_root`
+        // does not fire and the child's explicit env carries no root var at
+        // all — `get_envs` reports explicit overrides only, the inherited
+        // value travels implicitly — so the invariant above holds vacuously.
+        if std::env::var_os("LOOM_MACHINE_CHECKOUT").is_some_and(|v| !v.is_empty()) {
+            let mut inherited = Command::new("/bin/true");
+            apply_launch_env(&mut inherited, Some(&admitted(None)), "test");
+            assert!(
+                !env_of(&inherited)
+                    .iter()
+                    .any(|(name, _)| name == "LOOM_MACHINE_CHECKOUT"),
+                "an inherited root must not be re-pinned: {:?}",
+                env_of(&inherited)
+            );
+        }
     }
 
     #[test]

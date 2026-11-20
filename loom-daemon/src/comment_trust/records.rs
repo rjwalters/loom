@@ -184,7 +184,7 @@ impl TrustPolicy {
 
 /// Every trusted comment on issue/PR `number` of `repo` (`owner/name`), oldest
 /// first, from the REST listing (whose `user.login` names an App as `x[bot]`).
-/// Bounded through [`crate::script_helpers::run_gh`]. `None` on any failure.
+/// Bounded through [`crate::script_helpers::gh_read`]. `None` on any failure.
 #[must_use]
 pub fn fetch_trusted_comments(
     repo: &str,
@@ -198,6 +198,13 @@ pub fn fetch_trusted_comments(
 
 /// The raw REST comment listing (`gh api …/comments --paginate` stdout) for
 /// issue/PR `number` of `repo`. `None` when `gh` failed.
+///
+/// A failed read (a non-zero exit or a `gh` that could not run) is retried
+/// in-process — at most [`crate::forge_retry::MAX_ATTEMPTS`] attempts, never
+/// more than [`crate::forge_retry::MAX_ADDED_WAIT`] of added wait — so one
+/// transient failure no longer refuses a whole composite write (#13975). A
+/// successful read, an empty listing included, is never retried, and an
+/// exhausted retry returns the same `None` a single failed attempt did.
 #[must_use]
 pub fn fetch_comment_listing(
     repo: &str,
@@ -206,8 +213,29 @@ pub fn fetch_comment_listing(
     use_cache: bool,
 ) -> Option<Vec<u8>> {
     let path = format!("repos/{repo}/issues/{number}/comments");
-    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], repo_root, use_cache);
-    Some(out.ok_output()?.stdout.clone())
+    fetch_comment_listing_with(
+        || {
+            crate::script_helpers::gh_read(
+                "trust.comment_listing",
+                &["api", &path, "--paginate"],
+                repo_root,
+                use_cache,
+            )
+            .ok_output()
+            .map(|o| o.stdout.clone())
+        },
+        crate::forge_retry::thread_sleep,
+    )
+}
+
+/// [`fetch_comment_listing`] with the read and the backoff sleeper injected:
+/// tests stub the reader to count calls without a process-global `gh`, and
+/// zero the sleeps.
+pub(crate) fn fetch_comment_listing_with(
+    mut read: impl FnMut() -> Option<Vec<u8>>,
+    sleep: impl FnMut(std::time::Duration),
+) -> Option<Vec<u8>> {
+    crate::forge_retry::bounded_option(&mut read, sleep)
 }
 
 /// The REST issue object for `number` of `repo` (a PR is an issue here), the
@@ -220,7 +248,8 @@ pub fn fetch_issue_object(
     use_cache: bool,
 ) -> Option<Value> {
     let path = format!("repos/{repo}/issues/{number}");
-    let out = crate::script_helpers::run_gh(&["api", &path], repo_root, use_cache);
+    let out =
+        crate::script_helpers::gh_read("trust.issue_object", &["api", &path], repo_root, use_cache);
     serde_json::from_slice::<Value>(&out.ok_output()?.stdout)
         .ok()
         .filter(Value::is_object)

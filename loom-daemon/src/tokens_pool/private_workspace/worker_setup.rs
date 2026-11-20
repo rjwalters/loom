@@ -227,7 +227,8 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
     }
     let (bin, args) = command.split_first().context("private command missing")?;
     let mut child = Command::new(bin);
-    child.args(args).current_dir(REPO);
+    let clone = selected_clone()?;
+    child.args(args).current_dir(&clone);
     // The last check before the model runs, on the boundary the host bound at
     // admission. Nothing has started yet — the session was proven idle — so a
     // boundary that is Ready here is the boundary Codex will read its hook
@@ -248,30 +249,33 @@ pub(super) fn execute(command: Vec<String>) -> Result<()> {
 /// boundary. Everything else still fails closed with its original diagnostic,
 /// and a containment refusal names the precise obligation that was not met.
 fn admit_role(role: &str) -> Result<()> {
-    let rejection =
-        match crate::runtime_admission::resolve_and_admit(Path::new(REPO), role, Some("codex")) {
-            // A merging role needs no containment for admission, but it acts
-            // with merge/verdict authority, so the guard obligations a mutable
-            // role proves (managed registration naming the sealed bridge,
-            // Codex trust recorded for it) must hold here too (#9390
-            // follow-up). The same in-container proof, minus the admission it
-            // would otherwise grant.
-            Ok(_) if crate::runtime_preference::codex_guard::guarded(role) => {
-                let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
-                let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
-                let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
-                containment::in_container(&account, &bound, &revision).map_err(|error| {
+    let clone = selected_clone()?;
+    let repository = std::env::var("LOOM_PRIVATE_REPOSITORY").unwrap_or_default();
+    let clone_text = clone.to_string_lossy();
+    let rejection = match crate::runtime_admission::resolve_and_admit(&clone, role, Some("codex")) {
+        // A merging role needs no containment for admission, but it acts
+        // with merge/verdict authority, so the guard obligations a mutable
+        // role proves (managed registration naming the sealed bridge,
+        // Codex trust recorded for it) must hold here too (#9390
+        // follow-up). The same in-container proof, minus the admission it
+        // would otherwise grant.
+        Ok(_) if crate::runtime_preference::codex_guard::guarded(role) => {
+            let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
+            let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
+            let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
+            containment::in_container(&account, &bound, &revision, &repository, &clone_text)
+                .map_err(|error| {
                     anyhow::anyhow!(
                         "role {role} merges or issues verdicts, and Loom's guard hook is not \
                          proven for this private session: {error}"
                     )
                 })?;
-                return Ok(());
-            }
-            Ok(_) => return Ok(()),
-            Err(rejection) if rejection.containment_eligible() => rejection,
-            Err(rejection) => bail!("{}", rejection.diagnostic()),
-        };
+            return Ok(());
+        }
+        Ok(_) => return Ok(()),
+        Err(rejection) if rejection.containment_eligible() => rejection,
+        Err(rejection) => bail!("{}", rejection.diagnostic()),
+    };
     // The transport wrote both of these onto this container process with
     // `docker exec --env`, from the host-owned lease, after re-validating the
     // container by ID. A worker cannot write its own process environment
@@ -279,16 +283,17 @@ fn admit_role(role: &str) -> Result<()> {
     let bound = std::env::var("LOOM_PRIVATE_CONTROL").unwrap_or_default();
     let revision = std::env::var("LOOM_PRIVATE_BASE_REVISION").unwrap_or_default();
     let account = std::env::var("LOOM_ACCOUNT_NAME").unwrap_or_default();
-    let proof = containment::in_container(&account, &bound, &revision).map_err(|error| {
-        anyhow::anyhow!(
-            "{}",
-            rejection
-                .clone()
-                .with_containment_failure(&error.to_string())
-                .diagnostic()
-        )
-    })?;
-    let admitted = containment::admit_with(Path::new(REPO), role, Some("codex"), &proof)
+    let proof = containment::in_container(&account, &bound, &revision, &repository, &clone_text)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{}",
+                rejection
+                    .clone()
+                    .with_containment_failure(&error.to_string())
+                    .diagnostic()
+            )
+        })?;
+    let admitted = containment::admit_with(&clone, role, Some("codex"), &proof)
         .map_err(|e| anyhow::anyhow!(e.diagnostic()))?;
     if let Some(execution) = &admitted.execution {
         eprintln!("{}{}", crate::runtime_admission::CONTAINMENT_LOG_MARKER, execution.summary());
@@ -311,6 +316,18 @@ fn control_boundary(child: &mut Command) -> Result<()> {
     bundle::rebind(&bundle::observe(root, Path::new(PROFILE)), Path::new(PROFILE), &bound)?;
     bundle::apply_policy(child);
     Ok(())
+}
+
+/// The clone the host selected for this execution, from the process
+/// environment the host's `docker exec` wrote (a worker cannot write it before
+/// it exists). Unset is the legacy primary; anything that is not the primary or
+/// one directory of [`WORK_ROOT`] is refused.
+pub(super) fn selected_clone() -> Result<PathBuf> {
+    match std::env::var("LOOM_PRIVATE_CLONE") {
+        Err(_) => Ok(PathBuf::from(REPO)),
+        Ok(clone) if containment::valid_clone(&clone) => Ok(PathBuf::from(clone)),
+        Ok(_) => bail!("{}", containment::WRONG_CLONE),
+    }
 }
 
 pub(super) fn check_host_job() -> Result<()> {

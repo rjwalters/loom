@@ -219,7 +219,13 @@ pub fn apply(
             }
             if !add.is_empty() {
                 if let Err(e) = forge.add_labels(issue, &add) {
-                    let _ = writeln!(err, "operator-decision: labeling #{issue} failed: {e}");
+                    let _ = writeln!(
+                        err,
+                        "operator-decision: labeling #{issue} failed: {e}\n\
+                         operator-decision: the decision record is in the body but the hold label \
+                         is not on the issue; if the label is missing on the forge, run \
+                         ./.loom/scripts/sync-labels.sh --check (then without --check) and re-apply"
+                    );
                     return exit::FORGE;
                 }
             }
@@ -289,6 +295,42 @@ pub struct GhForge {
     call_site: &'static str,
 }
 
+/// Writer available to the shared park and decision handlers. The tools
+/// fleet route can read through the gateway, but the scoped write broker
+/// has no operation for editing an existing issue body.
+#[derive(Clone, Copy)]
+pub(crate) enum WorkflowWriter {
+    Gh,
+    FleetBrokerUnavailable,
+}
+
+impl WorkflowWriter {
+    pub(crate) fn for_tools(reaches_forge: bool) -> anyhow::Result<Self> {
+        if reaches_forge {
+            let mode = crate::tools_mode::configure_forge_read_route(&default_repo_root())
+                .map_err(anyhow::Error::msg)?;
+            if mode == "fleet" {
+                crate::forge_gateway::require_cli_read_route();
+                return Ok(Self::FleetBrokerUnavailable);
+            }
+        }
+        Ok(Self::Gh)
+    }
+
+    pub(crate) fn forge(self, root: PathBuf, repo: Option<String>) -> GhForge {
+        let mut forge = GhForge::new(root, repo);
+        if matches!(self, Self::FleetBrokerUnavailable) {
+            // Every mutation, including create-issue.sh, consults check_write
+            // before its first side effect. Previews and no-ops can still run.
+            forge.write_ok = Some(Err(
+                "the scoped fleet write broker has no route for this park or decision write"
+                    .to_owned(),
+            ));
+        }
+        forge
+    }
+}
+
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
 /// `create-issue.sh` may wait on the machine-wide filing lock and run the
 /// duplicate scan, so it gets a longer deadline.
@@ -343,17 +385,6 @@ impl GhForge {
     pub fn with_call_site(mut self, what: &'static str) -> Self {
         self.call_site = what;
         self
-    }
-
-    /// Like [`Self::new`], but writes are vetted under the root's own
-    /// per-owner credential probed with `gh_bin` (#11437) — the credential
-    /// the tick's gate admitted the root under, and the one the write uses.
-    #[must_use]
-    pub fn for_root_credential(repo_root: PathBuf, repo: Option<String>, gh_bin: PathBuf) -> Self {
-        Self {
-            root_credential_gh: Some(gh_bin),
-            ..Self::new(repo_root, repo)
-        }
     }
 
     /// Refuse a forge write the write scope denies (#9548).
@@ -490,6 +521,10 @@ impl Forge for GhForge {
         body: &str,
         labels: &[String],
     ) -> Result<String, (i32, String)> {
+        // The target's write scope is checked here, before `create-issue.sh`
+        // runs its duplicate scan and takes the filing lock (#14464): a denied
+        // or unverifiable target is refused with no nested call at all.
+        self.check_write().map_err(|e| (exit::FORGE, e))?;
         let script = self
             .repo_root
             .join(".loom")
@@ -524,6 +559,63 @@ impl Forge for GhForge {
             }
             other => Err((exit::FORGE, other.failure_reason("create-issue.sh"))),
         }
+    }
+}
+
+impl super::resolve::ResolveForge for GhForge {
+    fn repo(&mut self) -> Result<String, String> {
+        if let Some(r) = self.repo.clone().filter(|r| !r.trim().is_empty()) {
+            return Ok(r);
+        }
+        crate::premise_check::cli::resolve_repo(&self.repo_root)
+            .ok_or_else(|| "pass --repo OWNER/REPO".to_string())
+    }
+
+    fn view(&mut self, issue: u64) -> Result<super::resolve::IssueView, String> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            body: Option<String>,
+            #[serde(default)]
+            labels: Vec<RawLabel>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawLabel {
+            name: String,
+        }
+        let path = self.issue_path(issue);
+        let r = self.gh(AccessIntent::Read, &["api", &path]);
+        let Some(o) = r.ok_output() else {
+            return Err(r.failure_reason(&format!("gh api {path}")));
+        };
+        let raw: Raw = serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())?;
+        Ok(super::resolve::IssueView {
+            title: raw.title.unwrap_or_default(),
+            body: raw.body.unwrap_or_default(),
+            labels: raw.labels.into_iter().map(|l| l.name).collect(),
+        })
+    }
+
+    fn comments(&mut self, issue: u64) -> Result<Vec<serde_json::Value>, String> {
+        let path = format!("{}/comments", self.issue_path(issue));
+        let r = self.gh(AccessIntent::Read, &["api", &path, "--paginate"]);
+        let Some(o) = r.ok_output() else {
+            return Err(r.failure_reason(&format!("gh api {path}")));
+        };
+        crate::comment_trust::parse_listing(&o.stdout)
+            .ok_or_else(|| format!("gh api {path}: unparseable or empty listing"))
+    }
+
+    fn post_comment(&mut self, issue: u64, body: &str) -> Result<(), String> {
+        self.check_write()?;
+        let path = format!("{}/comments", self.issue_path(issue));
+        self.send_json("POST", &path, &serde_json::json!({ "body": body }))
+    }
+
+    fn remove_label(&mut self, issue: u64, label: &str) -> Result<(), String> {
+        Forge::remove_label(self, issue, label)
     }
 }
 

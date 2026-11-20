@@ -67,36 +67,14 @@ loom_test_require_daemon_bin "$SCRIPTS_DIR" "duplicate-scan"
 # shellcheck source=lib/write-scope-fixture.sh
 source "$TEST_DIR/lib/write-scope-fixture.sh"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-NC='\033[0m'
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 
-TESTS_RUN=0
-TESTS_PASSED=0
-TESTS_FAILED=0
-
-pass() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: $1"
-}
-fail() {
-    TESTS_RUN=$((TESTS_RUN + 1))
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: $1"
-}
-
+# Local assert_eq kept: takes (actual, expected, msg); shared assert_eq is (expected, actual, msg).
 assert_eq() {
     if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
 }
 # Pure-bash substring match (no forked grep) so a transient fork failure under
 # the parallel suite pool cannot masquerade as a content mismatch (#7819).
-assert_contains() {
-    if [[ "$1" == *"$2"* ]]; then pass "$3"; else fail "$3 (missing '$2' in: $1)"; fi
-}
-assert_not_contains() {
-    if [[ "$1" != *"$2"* ]]; then pass "$3"; else fail "$3 (unexpectedly found '$2' in: $1)"; fi
-}
 
 WORK="$(mktemp -d)"
 cleanup() { [[ -n "${LOOM_KEEP_WORK:-}" ]] || { [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"; }; }
@@ -494,6 +472,67 @@ STUB_ISSUE_LIST="$WORK/issues-block.json" run_create --duplicate-threshold 30 \
 assert_eq "$RC" "3" "(e2e) a real 33% score at/above the block line still blocks"
 assert_contains "$OUT" "#701" "(e2e) …naming the blocking match"
 assert_eq "$(wc -l < "$GH_CREATES" | tr -d ' ')" "0" "(e2e) …and nothing was created"
+
+echo "--- END-TO-END epic phase siblings through the normal duplicate gate ---"
+phase_body() {
+    cat <<EOF
+**Epic**: #2468 - Operator dashboard navigation and reporting
+**Phase**: 1 of 3
+**Phase Goal**: Improve issue triage for release operators across repositories
+
+## Description
+
+$1
+
+## Acceptance Criteria
+
+- [ ] $2
+- [ ] $3
+- [ ] Tests pass for new functionality
+
+## Dependencies
+
+Part of Epic #2468. This is a Phase 1 issue with no blocking dependencies.
+
+---
+*Created by Epic skill from Epic #2468*
+EOF
+}
+
+file_phase_pair() {
+    local size="$1" first_title="$2" second_title="$3"
+    run_create --title "$first_title" --body-file "$WORK/$size-first.md"
+    assert_eq "$RC" "0" "($size) the first phase files on an empty pool"
+    assert_eq "$(awk '$1 == "issue" && $2 == "create" { writes++ } END { print writes + 0 }' "$GH_CREATES")" "1" "($size) first filing reaches the fake Forge"
+
+    # Model the just-filed issue including the dashboard footer appended by
+    # create-issue.sh. The second create sees that stored issue.
+    jq -n --arg title "$first_title" --rawfile body "$WORK/$size-first.md" \
+        '[{number: 9999, title: $title, body: ($body + "\n[loom dashboard](https://dashboard.example.com/github.com/example/repo/issues/9999)\n<!-- loom:dashboard-link -->")} ]' \
+        > "$WORK/$size-open.json"
+    STUB_ISSUE_LIST="$WORK/$size-open.json" run_create --title "$second_title" --body-file "$WORK/$size-second.md"
+    assert_eq "$RC" "0" "($size) distinct sibling files at the default thresholds"
+    assert_eq "$(awk '$1 == "issue" && $2 == "create" { writes++ } END { print writes + 0 }' "$GH_CREATES")" "1" "($size) sibling reaches the fake Forge"
+
+    STUB_ISSUE_LIST="$WORK/$size-open.json" run_create --title "$first_title" --body-file "$WORK/$size-first.md"
+    assert_eq "$RC" "3" "($size) repeating the first phase is still blocked"
+    assert_contains "$OUT" "#9999" "($size) duplicate names the first filing"
+    assert_eq "$(awk '$1 == "issue" && $2 == "create" { writes++ } END { print writes + 0 }' "$GH_CREATES")" "0" "($size) duplicate reaches no write"
+}
+
+phase_body 'Generate CSV from elapsed runner records.' 'Escape commas' 'Sort timestamps' > "$WORK/compact-first.md"
+phase_body 'Dismiss a branch selector and restore focused control.' 'Tab reaches inputs' 'Close on Escape' > "$WORK/compact-second.md"
+file_phase_pair compact '[Epic #2468] Export job timing' '[Epic #2468] Restore keyboard focus'
+
+phase_body 'Add a CSV export to the throughput table. Extract runner elapsed seconds and emitted job IDs in reports/export.ts.' \
+    'Escape commas inside job names' 'Download records in chronological order' > "$WORK/expanded-first.md"
+phase_body 'Restore the active element after dismissing the branch selector. Use the popover close handler in web/filters.tsx.' \
+    'Escape closes an open selector' 'Tab reaches the next enabled control' > "$WORK/expanded-second.md"
+file_phase_pair expanded '[Epic #2468] Export job timing reports' '[Epic #2468] Restore keyboard focus in filter menu'
+
+phase_body 'CI' 'CI' 'CI' > "$WORK/low-signal-first.md"
+phase_body 'Measure runner cache misses.' 'Report restore times' 'Count successful reuse' > "$WORK/low-signal-second.md"
+file_phase_pair low-signal '[Epic #2468] CI' '[Epic #2468] Report cache reuse'
 
 mv "$WORK/check-duplicate.stub" "$FAKE_SCRIPTS/check-duplicate.sh"
 

@@ -61,7 +61,7 @@ pub mod evidence;
 pub mod record;
 pub mod scope;
 
-pub use record::{Outcome, Record};
+pub use record::{Outcome, Record, ReversalPolicy};
 pub use scope::Trigger;
 
 /// Exit codes. These are contract: `defaults/scripts/premise-check.sh` is a
@@ -102,6 +102,12 @@ pub struct Inputs {
     /// independently: companion `premise-evidence:` lines must live in the
     /// *same* comment as the marker they support.
     pub comments: Vec<String>,
+    /// The authoritative forge read of the operator's resolution of a ranked
+    /// decision (#14399). `None` (hermetic `--body-file` input, or a caller
+    /// that did not read the forge) can never open a deliberate-reversal
+    /// gate: a resolution is attested by the forge's author metadata, and a
+    /// pasted file has none.
+    pub resolution: Option<crate::operator_decision::resolution::Evidence>,
 }
 
 /// The gate's whole answer for one issue.
@@ -111,6 +117,35 @@ pub struct Decision {
     pub record: Option<Record>,
     pub outcome: Outcome,
     pub exit_code: i32,
+    /// For a deliberate reversal routed to the operator: what the verifier
+    /// found. The record itself is never rewritten (#14399).
+    pub resolution: Option<crate::operator_decision::resolution::Assessment>,
+}
+
+/// A deliberate reversal routed to the operator stays routed unless the
+/// operator's explicit resolution of the current decision verifies. Anything
+/// else (no evidence, stale, conflicting, malformed, unreadable) keeps
+/// [`Outcome::RouteOperator`]; only a verified `proceed` yields
+/// [`Outcome::Proceed`].
+fn apply_resolution(
+    rec: &Record,
+    outcome: Outcome,
+    evidence: Option<&crate::operator_decision::resolution::Evidence>,
+) -> (Outcome, Option<crate::operator_decision::resolution::Assessment>) {
+    use crate::operator_decision::resolution::{verify, Assessment};
+    if outcome != Outcome::RouteOperator || !(rec.deliberate && rec.reversal) {
+        return (outcome, None);
+    }
+    let assessment = evidence.map_or_else(
+        || Assessment::unavailable("no authoritative forge read of the decision (offline input)"),
+        verify,
+    );
+    let outcome = if assessment.status.approves() {
+        Outcome::Proceed
+    } else {
+        outcome
+    };
+    (outcome, Some(assessment))
 }
 
 /// Run stages 1 and 2. The evidence scan is the caller's, because it needs a
@@ -122,12 +157,30 @@ pub struct Decision {
 /// [`crate::repo_root::find_worktree_root`].
 #[must_use]
 pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
+    decide_with(inputs, content_root, ReversalPolicy::Always)
+}
+
+/// [`decide`] under `hermit.reversalNeedsOperator`. The policy only applies to
+/// Hermit-filed issues (`loom:hermit`): the operator ruling behind it covers
+/// Hermit removals, so Architect/Auditor records keep today's rule.
+#[must_use]
+pub fn decide_with(
+    inputs: &Inputs,
+    content_root: &std::path::Path,
+    policy: ReversalPolicy,
+) -> Decision {
+    let policy = if inputs.labels.iter().any(|l| l == "loom:hermit") {
+        policy
+    } else {
+        ReversalPolicy::Always
+    };
     let Some(trigger) = scope::trigger(&inputs.title, &inputs.body, &inputs.labels) else {
         return Decision {
             trigger: None,
             record: None,
             outcome: Outcome::OutOfScope,
             exit_code: exit::PROCEED,
+            resolution: None,
         };
     };
 
@@ -144,6 +197,7 @@ pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
             record: None,
             outcome: Outcome::RecordRequired,
             exit_code: exit::RECORD_REQUIRED,
+            resolution: None,
         };
     };
 
@@ -153,9 +207,11 @@ pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
             record: None,
             outcome: Outcome::Malformed(why),
             exit_code: exit::RECORD_MALFORMED,
+            resolution: None,
         },
         Ok(rec) => {
-            let outcome = record::check(&rec, content_root);
+            let outcome = record::check_with(&rec, content_root, policy);
+            let (outcome, resolution) = apply_resolution(&rec, outcome, inputs.resolution.as_ref());
             let exit_code = match outcome {
                 Outcome::Proceed => exit::PROCEED,
                 Outcome::RouteOperator => exit::ROUTE_OPERATOR,
@@ -171,7 +227,44 @@ pub fn decide(inputs: &Inputs, content_root: &std::path::Path) -> Decision {
                 record: Some(rec),
                 outcome,
                 exit_code,
+                resolution,
             }
         }
     }
 }
+
+#[cfg(test)]
+mod policy_scope_tests {
+    use super::*;
+
+    fn inputs(labels: &[&str]) -> Inputs {
+        Inputs {
+            title: "hermit: remove dead helper".into(),
+            body:
+                "<!-- loom:premise-check exists=yes deliberate=yes reversal=yes verdict=clear -->\n\
+                   premise-evidence: Cargo.toml:1 — kept for later\npremise-protected: none\n"
+                    .into(),
+            labels: labels.iter().map(ToString::to_string).collect(),
+            comments: vec![],
+            resolution: None,
+        }
+    }
+
+    /// The knob is a Hermit-removal ruling: it must not widen to other roles.
+    #[test]
+    fn policy_applies_only_to_hermit_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let hermit =
+            decide_with(&inputs(&["loom:hermit"]), dir.path(), ReversalPolicy::ProtectedOnly);
+        let other =
+            decide_with(&inputs(&["loom:architect"]), dir.path(), ReversalPolicy::ProtectedOnly);
+        if hermit.trigger.is_some() {
+            assert_eq!(hermit.outcome, Outcome::Proceed);
+        }
+        assert_ne!(other.outcome, Outcome::Proceed);
+    }
+}
+
+#[cfg(test)]
+mod resolution_gate_tests;

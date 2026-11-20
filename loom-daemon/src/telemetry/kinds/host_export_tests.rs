@@ -15,7 +15,6 @@ fn envelope() -> TelemetryEnvelope {
             captured_at: Utc::now(),
             host: "host-a".to_string(),
             exporters: vec![],
-            fact_id_missing_total: 0,
         }),
     )
 }
@@ -74,7 +73,6 @@ fn record_round_trips_and_omits_unknown_flush_time() {
             dropped_by_reason: BTreeMap::new(),
             last_flush_ok_at: None,
         }],
-        fact_id_missing_total: 0,
     };
     let wrapped = TelemetryRecord::HostExport(record.clone());
     let json = serde_json::to_string(&wrapped).unwrap();
@@ -100,7 +98,6 @@ fn build_carries_dropped_by_reason_and_the_body_round_trips() {
             ]),
             last_flush_ok_at: None,
         }],
-        fact_id_missing_total: 0,
     };
     let json = serde_json::to_string(&record).unwrap();
     assert!(
@@ -125,19 +122,21 @@ fn inactive_exporters_are_omitted() {
     assert!(record.exporters.is_empty());
 }
 
-/// #11401: `host.export` reports the exits emitted without a fact id.
+/// #12741: `fact_id_missing_total` was retired (always 0, no producer). A
+/// stored body that still carries it decodes, one without it decodes, and a
+/// fresh record never emits it.
 #[test]
-fn build_reports_the_exits_emitted_without_a_fact_id() {
-    let before = super::super::stage_outcome::fact_id_missing_total();
-    super::super::stage_outcome::note_fact_id_missing();
-    let record = HostExportRecord::build("h", Utc::now(), &BTreeMap::new(), &BTreeMap::new());
-    // Process-wide and cumulative; parallel tests may add more.
-    assert!(record.fact_id_missing_total > before, "{record:?}");
-}
-
-#[test]
-fn a_body_from_before_the_fact_id_count_still_parses() {
-    let old = r#"{"captured_at":"2026-10-08T12:00:00Z","host":"h","exporters":[]}"#;
-    let record: HostExportRecord = serde_json::from_str(old).unwrap();
-    assert_eq!(record.fact_id_missing_total, 0);
+fn retired_fact_id_missing_total_decodes_with_or_without_and_is_never_emitted() {
+    let with = r#"{"captured_at":"2026-10-08T12:00:00Z","host":"h","exporters":[],"fact_id_missing_total":5}"#;
+    let without = r#"{"captured_at":"2026-10-08T12:00:00Z","host":"h","exporters":[]}"#;
+    let a: HostExportRecord = serde_json::from_str(with).unwrap();
+    let b: HostExportRecord = serde_json::from_str(without).unwrap();
+    assert_eq!(a, b);
+    let wrapped: TelemetryRecord =
+        serde_json::from_str(&format!(r#"{{"kind":"host.export",{}"#, &with[1..])).unwrap();
+    assert!(matches!(wrapped, TelemetryRecord::HostExport(_)));
+    let fresh = HostExportRecord::build("h", Utc::now(), &BTreeMap::new(), &BTreeMap::new());
+    assert!(!serde_json::to_string(&fresh)
+        .unwrap()
+        .contains("fact_id_missing_total"));
 }

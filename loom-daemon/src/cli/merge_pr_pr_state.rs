@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 
-use loom_daemon::merge_pr::pr_state::classify;
+use crate::merge_pr::pr_state::classify;
 
 #[derive(clap::Args)]
 pub(crate) struct PrStateArgs {

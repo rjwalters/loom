@@ -82,6 +82,10 @@ mod zai_accounts;
 use zai_accounts::sample_zai_accounts;
 pub(crate) type DispatchKey = (String, u32);
 
+/// Disposition rows have a five-minute consumer freshness limit. Check for a
+/// completed source summary independently of the slower host snapshots.
+pub(super) const DISPOSITION_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Timeout on the `gh repo view` slug lookup — generous but bounded so a
 /// wedged `gh` cannot stall the collector loop indefinitely.
 const SLUG_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -148,6 +152,9 @@ async fn run_collector(
     identity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
     snapshot_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut disposition_sampler = super::ops::disposition::Sampler::default();
+    let mut disposition_timer = tokio::time::interval(DISPOSITION_INTERVAL);
+    disposition_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -228,6 +235,7 @@ async fn run_collector(
                     daemon_started_at,
                     &workspace_pool,
                     &mut slug_cache,
+                    &mut disposition_sampler,
                 )
                 .await;
                 // Periodic backfill (Issue #5084), same cadence as the host
@@ -236,6 +244,12 @@ async fn run_collector(
                 // first-boot case above (e.g. a sweep whose terminal
                 // transition raced this task's own startup).
                 run_backfill(&queue, &workspace_root, &workspace_pool).await;
+            }
+
+            _ = disposition_timer.tick() => {
+                // The same sampler owns both timers. Only the snapshot path
+                // can resolve repo references on the forge.
+                super::ops::disposition::record(&mut disposition_sampler, None).await;
             }
         }
     }
@@ -974,6 +988,7 @@ async fn sample_snapshots(
     daemon_started_at: Instant,
     workspace_pool: &WorkspacePool,
     slug_cache: &mut HashMap<String, String>,
+    disposition_sampler: &mut super::ops::disposition::Sampler,
 ) {
     let mut token_record = sample_token_snapshot(workspace_root);
     // The Claude pool comes from `.ranking`; every other provider's pool
@@ -1024,16 +1039,22 @@ async fn sample_snapshots(
     // Memory/swap/worktree-volume gauges (Issue #8860), same cadence, through
     // the OTLP-only ops sink — a no-op when no OTLP exporter is running.
     super::ops::host::record(worktree_volume).await;
-    // The work finder's ranked ready queue (Issue #8852, phase 2) — native
-    // HTTPS only, and only when the work finder has ticked since last time.
-    super::queue_snapshot::record(workspace_pool, slug_cache).await;
     // Merge-chain re-date pressure (Issue #10163), OTLP-only: local `git log`
     // reads, no forge call; a no-op without the ops sink.
     super::ops::redate_chain::record(workspace_pool).await;
-    // Per-issue dispatch disposition spans (Issue #9222), OTLP-only: a no-op
-    // without the ops sink, and without a new work-finder tick since the last
-    // export pass.
-    super::ops::disposition::record(slug_cache).await;
+    // Resolve disposition repo references at the existing snapshot cadence,
+    // and offer rows if the faster sample has not consumed this summary yet.
+    super::ops::disposition::record(disposition_sampler, Some(slug_cache)).await;
+    // Per-item dispatch eligibility facts (Issue #12790), OTLP-only: splits
+    // `ready_wait` dwell at the eligibility boundary and records the eligible
+    // work-ahead. Reads only the repo-ref cache warmed above, so
+    // it makes no forge call; a no-op without the OTLP sink or a fresh tick.
+    super::dispatch_eligibility::record();
+    // Per-stage occupancy gauge (Issue #12866), OTLP-only: the items still
+    // waiting in triage / approval / operator hold. Counts come from the
+    // mirror snapshot or ETag-cached all-pages label listings; a no-op
+    // without the OTLP sink.
+    super::stage_occupancy::record(workspace_pool, slug_cache).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot
@@ -1103,9 +1124,19 @@ fn sample_token_snapshot(workspace_root: &Path) -> TokenSnapshotRecord {
             });
         }
     }
+    // #13942: the fleet-convergence drift signal. Next to the usage series so
+    // "how stale is the probe every host is acting on" is one query, not a
+    // log read across workers. Absent sidecar ⇒ absent field, never zero.
+    let fleet_probe_age_secs =
+        crate::tokens_pool::fleet_probe::read_sidecar(&pool_dir).map(|snapshot| {
+            Utc::now()
+                .signed_duration_since(snapshot.probed_at)
+                .num_seconds()
+        });
     TokenSnapshotRecord {
         captured_at: Utc::now(),
         accounts,
+        fleet_probe_age_secs,
     }
 }
 
@@ -1509,7 +1540,7 @@ pub(super) fn provisioned_roots(workspace_pool: &WorkspacePool) -> Vec<PathBuf> 
         .collect()
 }
 
-/// This host's currently in-flight (`Pending`/`Running`, i.e. non-terminal)
+/// This host's currently in-flight (`Running`, i.e. non-terminal)
 /// sweep IDs, across every repo [`WorkspacePool::provisioned_registries`]
 /// currently tracks (Issue #4955). Feeds `host.health`'s `active_sweep_ids`
 /// so the Phase-2 dashboard's `FleetState` Durable Object can reconcile its

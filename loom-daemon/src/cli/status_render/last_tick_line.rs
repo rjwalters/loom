@@ -7,7 +7,7 @@
 //! The note carries what replaced them: on a fleet host it names the floor and
 //! why the tick did or did not roll.
 
-use loom_daemon::types::DaemonStatusReport;
+use crate::types::DaemonStatusReport;
 
 /// Print the last tick's note, when there is one.
 pub fn print(report: &DaemonStatusReport) {

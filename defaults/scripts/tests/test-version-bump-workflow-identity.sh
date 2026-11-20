@@ -67,6 +67,14 @@
 #  10. The publisher's response contract: 200 is success, a 409 and a 503
 #      upstream_ambiguous re-read main and re-run the gate, and anything not
 #      named fails red.
+#  11. A minor release is dispatch-only and needs force (#14577): the `level`
+#      dispatch input is a `choice` of exactly patch|minor defaulting to patch;
+#      in the `id: bump` step LEVEL is read only on `workflow_dispatch` (else
+#      'patch'), FORCE is dispatch-gated, `inputs.level`/`inputs.force` reach a
+#      shell only through `env:`, and the step runs `version.sh bump "$LEVEL"`.
+#      The step's `case "$LEVEL"` guard is extracted from the workflow under
+#      test and run over the level x force matrix (patch always accepted, minor
+#      only with force=true, anything else rejected).
 #   8. Mutation controls (durable, not ad-hoc): the suite re-runs itself
 #      against mutated copies of the workflow and requires each one to FAIL on
 #      the specific assertion that guards it. The unmodified workflow is the
@@ -441,28 +449,40 @@ echo "Case 6: no-self-trigger invariant"
 assert_present 'branches: [main]' \
     "Case 6: trigger is restricted to pushes on main"
 
+# The release paths: defaults/ plus the two workspace crates that compile
+# into the release binaries (#13452). The gate's RELEASE_PATHS must be the
+# same set, so a scheduled or dispatched run sees what a push would have.
+EXPECTED_PATHS=$'"defaults/**"\n"loom-daemon/**"\n"loom-api/**"'
 TRIGGER_PATHS="$(workflow_code | awk '/^ +paths:/{found=1; next} found {if ($1 == "-") print $2; else exit}')"
-if [[ "$TRIGGER_PATHS" == '"defaults/**"' ]]; then
-    pass "Case 6: path filter is exactly defaults/** (one entry)"
+if [[ "$TRIGGER_PATHS" == "$EXPECTED_PATHS" ]]; then
+    pass "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)"
 else
-    fail "Case 6: path filter is exactly defaults/** (one entry)" \
+    fail "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
         "Parsed path list was: '${TRIGGER_PATHS:-<none>}'" \
-        "Widening this filter lets the bump commit re-trigger the workflow." \
+        "Widening this filter past the release paths lets the bump commit re-trigger the workflow." \
         "Publisher App commits DO trigger workflows, so this is the real loop guard."
+fi
+GATE_PATHS="$(sed -n 's/^RELEASE_PATHS=(\(.*\))$/\1/p' "$REPO_ROOT/scripts/version-bump-gate.sh")"
+if [[ "$GATE_PATHS" == "defaults/ loom-daemon/ loom-api/" ]]; then
+    pass "Case 6: the gate's RELEASE_PATHS is the same set as the push path filter"
+else
+    fail "Case 6: the gate's RELEASE_PATHS is the same set as the push path filter" \
+        "scripts/version-bump-gate.sh RELEASE_PATHS was: '${GATE_PATHS:-<none>}'"
 fi
 
 # Every `files=(...)` set: what the bump is diffed over (bump-version) and
-# what the request is built from (publish).
+# what the request is built from (publish). None may lie under a release
+# path, or the bump commit would re-trigger the workflow.
 FILE_SETS="$(workflow_code | awk '/files\+?=\(/{f=1} f {print} f && /\)$/{f=0}')"
 SET_COUNT="$(grep -c 'files=(' <<<"$FILE_SETS" || true)"
 if [[ "$SET_COUNT" -ne 2 ]]; then
-    fail "Case 6: version-file sets stage no defaults/ path" \
+    fail "Case 6: version-file sets stage no release path" \
         "expected 2 files=(...) sets (bump-version, publish), found $SET_COUNT"
-elif grep -q 'defaults/' <<<"$FILE_SETS"; then
-    fail "Case 6: version-file sets stage no defaults/ path" \
-        "A defaults/ path would make the bump commit re-trigger the workflow:" "$FILE_SETS"
+elif grep -qE 'defaults/|loom-daemon/|loom-api/' <<<"$FILE_SETS"; then
+    fail "Case 6: version-file sets stage no release path" \
+        "A defaults/, loom-daemon/ or loom-api/ path would make the bump commit re-trigger the workflow:" "$FILE_SETS"
 else
-    pass "Case 6: version-file sets stage no defaults/ path (cannot re-trigger itself)"
+    pass "Case 6: version-file sets stage no release path (cannot re-trigger itself)"
 fi
 
 for managed in VERSION package.json mcp-loom/package.json mcp-loom/package-lock.json \
@@ -646,6 +666,148 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
+# Case 11: a minor release is dispatch-only and needs force (#14577)
+# ---------------------------------------------------------------------------
+# #14563 added a `level` (patch|minor) dispatch input. Two one-token edits
+# would let a push/schedule run or an unforced dispatch cut an X.(Y+1).0:
+# dropping `github.event_name == 'workflow_dispatch' &&` from LEVEL, or the
+# `[ "$FORCE" = "true" ]` test from the guard's minor arm.
+#
+# Scoping matters: FORCE is bound in three steps, so a matching line elsewhere
+# must not satisfy the bump-step assertions. The input checks read only the
+# `workflow_dispatch:` declaration, the env/command checks only the step with
+# `id: bump`, and everything runs on the comment-stripped view.
+echo "Case 11: minor release is dispatch-only and needs force"
+
+DISPATCH_BLOCK="$(workflow_code | awk '
+    /^  workflow_dispatch:$/ { f = 1; next }
+    f && NF && match($0, /^ */) && RLENGTH <= 2 { exit }
+    f { print }
+')"
+LEVEL_INPUT="$(awk '
+    /^      level:$/ { f = 1; next }
+    f && NF && match($0, /^ */) && RLENGTH <= 6 { exit }
+    f { print }
+' <<<"$DISPATCH_BLOCK")"
+
+if grep -qxF '        type: choice' <<<"$LEVEL_INPUT"; then
+    pass "Case 11: the dispatch input level is type: choice"
+else
+    fail "Case 11: the dispatch input level is type: choice" \
+        "level input block was: '${LEVEL_INPUT:-<none>}'"
+fi
+
+LEVEL_OPTIONS="$(sed -n 's/^        options: //p' <<<"$LEVEL_INPUT")"
+if [[ "$LEVEL_OPTIONS" == "[patch, minor]" ]]; then
+    pass "Case 11: the dispatch input level offers exactly patch and minor"
+else
+    fail "Case 11: the dispatch input level offers exactly patch and minor" \
+        "options was: '${LEVEL_OPTIONS:-<none>}' (expected the single line '[patch, minor]')"
+fi
+
+LEVEL_DEFAULT="$(sed -n 's/^        default: //p' <<<"$LEVEL_INPUT")"
+if [[ "$LEVEL_DEFAULT" == "patch" ]]; then
+    pass "Case 11: the dispatch input level defaults to patch"
+else
+    fail "Case 11: the dispatch input level defaults to patch" \
+        "default was: '${LEVEL_DEFAULT:-<none>}'"
+fi
+
+# The step with `id: bump`, up to the next step or job.
+BUMP_STEP="$(workflow_code | awk '
+    /^        id: bump$/ { f = 1; next }
+    f && /^      - / { exit }
+    f && /^  [A-Za-z0-9_-]+:$/ { exit }
+    f { print }
+')"
+if [[ -n "$BUMP_STEP" ]]; then
+    pass "Case 11: the bump step (id: bump) is found"
+else
+    fail "Case 11: the bump step (id: bump) is found" "no executable lines after 'id: bump'"
+fi
+
+BUMP_LEVEL_LINE="          LEVEL: \${{ github.event_name == 'workflow_dispatch' && inputs.level || 'patch' }}"
+if grep -qxF -- "$BUMP_LEVEL_LINE" <<<"$BUMP_STEP"; then
+    pass "Case 11: LEVEL is read only on dispatch and falls back to patch (bump step env)"
+else
+    fail "Case 11: LEVEL is read only on dispatch and falls back to patch (bump step env)" \
+        "expected this exact line inside the id: bump step:" "$BUMP_LEVEL_LINE" \
+        "LEVEL lines found there: $(grep -E '^ +LEVEL:' <<<"$BUMP_STEP" || echo '<none>')"
+fi
+
+BUMP_FORCE_LINE="          FORCE: \${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}"
+if grep -qxF -- "$BUMP_FORCE_LINE" <<<"$BUMP_STEP"; then
+    pass "Case 11: FORCE is dispatch-gated in the bump step env"
+else
+    fail "Case 11: FORCE is dispatch-gated in the bump step env" \
+        "expected this exact line inside the id: bump step:" "$BUMP_FORCE_LINE" \
+        "FORCE lines found there: $(grep -E '^ +FORCE:' <<<"$BUMP_STEP" || echo '<none>')"
+fi
+
+# Like inputs.reason: a dispatch input expanded inside a run: script is
+# template injection, so each may appear only as an env: value.
+for input in level force; do
+    upper="$(tr '[:lower:]' '[:upper:]' <<<"$input")"
+    INPUT_HITS="$(workflow_code | grep -nF "inputs.$input" || true)"
+    INPUT_BAD="$(grep -vE "^[0-9]+: +${upper}: \\\$\\{\\{ [^}]*inputs\\.${input}[^}]* \\}\\}\$" <<<"$INPUT_HITS" || true)"
+    if [[ -z "$INPUT_HITS" ]]; then
+        fail "Case 11: inputs.$input reaches a shell only through env:" "inputs.$input is never passed"
+    elif [[ -n "$INPUT_BAD" ]]; then
+        fail "Case 11: inputs.$input reaches a shell only through env:" \
+            "template injection: inputs.$input used outside its ${upper}: env entry" "$INPUT_BAD"
+    else
+        pass "Case 11: inputs.$input reaches a shell only through env:"
+    fi
+done
+
+BUMP_CMDS="$(grep -F 'version.sh bump' <<<"$BUMP_STEP" || true)"
+if [[ "$BUMP_CMDS" =~ ^\ +\./scripts/version\.sh\ bump\ \"\$LEVEL\"$ ]]; then
+    pass "Case 11: the bump step runs version.sh bump \"\$LEVEL\" (one bump, quoted)"
+else
+    fail "Case 11: the bump step runs version.sh bump \"\$LEVEL\" (one bump, quoted)" \
+        "version.sh bump lines in the id: bump step: ${BUMP_CMDS:-<none>}"
+fi
+
+# Behavioural: run only the `case "$LEVEL" in ... esac` guard, extracted from
+# the workflow under test, over the level x force matrix. env -i: the guard
+# needs nothing from the caller's environment.
+LEVEL_GUARD="$(awk '
+    /^ +case "\$LEVEL" in$/ { f = 1 }
+    f { print }
+    f && /^ +esac$/ { exit }
+' <<<"$BUMP_STEP")"
+if [[ "$LEVEL_GUARD" == *"esac" ]]; then
+    pass "Case 11: the bump step's level guard (case \"\$LEVEL\" ... esac) is extractable"
+    while IFS='|' read -r g_level g_force g_want; do
+        g_rc=0
+        env -i PATH="$PATH" LEVEL="$g_level" FORCE="$g_force" \
+            bash -c "set -euo pipefail"$'\n'"$LEVEL_GUARD" >/dev/null 2>&1 || g_rc=$?
+        g_msg="Case 11: level guard LEVEL=${g_level:-<empty>} FORCE=${g_force:-<empty>} exits $g_want"
+        if [[ "$g_rc" -eq "$g_want" ]]; then
+            pass "$g_msg"
+        else
+            fail "$g_msg" "exited $g_rc"
+        fi
+    done <<'MATRIX'
+patch|true|0
+patch|false|0
+minor|true|0
+minor|false|1
+minor||1
+bogus|true|1
+bogus|false|1
+major|true|1
+|true|1
+|false|1
+MATRIX
+else
+    fail "Case 11: the bump step's level guard (case \"\$LEVEL\" ... esac) is extractable" \
+        "no case \"\$LEVEL\" in ... esac block inside the id: bump step"
+fi
+
+echo ""
+
+# ---------------------------------------------------------------------------
 # Case 8: mutation controls -- the suite must FAIL on each injected regression
 # ---------------------------------------------------------------------------
 # Parent mode only. Each control writes a mutated copy of the workflow, re-runs
@@ -729,6 +891,10 @@ if [[ "$RUN_MUTATION_CONTROLS" -eq 1 ]]; then
         fi
         expect_child_fails "$expected_fail" "Case 8: commented anchor rejected: $anchor"
     done <<'ANCHORS'
+type: choice|Case 11: the dispatch input level is type: choice
+options: [patch, minor]|Case 11: the dispatch input level offers exactly patch and minor
+LEVEL: ${{|Case 11: LEVEL is read only on dispatch and falls back to patch
+./scripts/version.sh bump|Case 11: the bump step runs version.sh bump
 PUBLISH_URL: https://|Case 1: the publish job targets an https /v1/publish_version_bump URL
 &audience=https://|Case 1: the OIDC token is requested with the publisher's origin as audience
 id-token: write|Case 2: id-token: write is granted exactly once, to the publish job
@@ -794,21 +960,31 @@ ANCHORS
     expect_child_fails "Case 5: no Authorization header is passed to curl in argv" \
         "Case 8: an argv Authorization header is rejected"
 
-    # Widen the trigger path filter (would let the bump commit re-trigger).
-    awk '/- "defaults\/\*\*"/ { print; sub(/"defaults\/\*\*"/, "\"docs/**\""); print; next } { print }' \
+    # Widen the trigger path filter past the release paths (would let a
+    # bump commit, or anything else, re-trigger).
+    awk '/- "loom-api\/\*\*"/ { print; sub(/"loom-api\/\*\*"/, "\"docs/**\""); print; next } { print }' \
         "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: path filter is exactly defaults/** (one entry)" \
+    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
         "Case 8: widened paths: filter is rejected"
+
+    # Narrow it back to defaults/** alone (the #13452 defect: a Rust-only
+    # daemon change never releases).
+    grep -vE '^      - "(loom-daemon|loom-api)/\*\*"$' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 6: path filter is exactly defaults/**, loom-daemon/**, loom-api/** (three entries)" \
+        "Case 8: narrowed paths: filter (defaults/** alone) is rejected"
 
     # Grant contents: write at workflow level.
     sed 's|^  contents: read$|  contents: write|' "$WORKFLOW" >"$MUTANT"
     expect_child_fails "Case 2: no permissions: block grants contents: write" \
         "Case 8: workflow-level contents: write grant is rejected"
 
-    # A defaults/ path in the version-file set (self-trigger loop).
+    # A release path in the version-file set (self-trigger loop).
     sed 's|files=(VERSION package.json|files=(VERSION defaults/VERSION package.json|' "$WORKFLOW" >"$MUTANT"
-    expect_child_fails "Case 6: version-file sets stage no defaults/ path" \
+    expect_child_fails "Case 6: version-file sets stage no release path" \
         "Case 8: a defaults/ path in the version-file set is rejected"
+    sed 's|files=(VERSION package.json|files=(VERSION loom-daemon/Cargo.toml package.json|' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 6: version-file sets stage no release path" \
+        "Case 8: a loom-daemon/ path in the version-file set is rejected"
 
     # An unnamed answer logged and retried instead of failing red.
     awk '/die "the publisher refused the bump: \$outcome"/ { sub(/die "the publisher refused the bump: \$outcome"/, "echo \"unexpected: $outcome\"") } { print }' \
@@ -883,6 +1059,76 @@ ANCHORS
         "$WORKFLOW" >"$MUTANT"
     expect_child_fails "Case 9: no gh call" \
         "Case 8: an added gh call is rejected"
+
+    # --- 8f: minor-release regressions (#14577) ---
+
+    # The dispatch condition dropped from LEVEL: a push or schedule run would
+    # read inputs.level (empty there, but a one-token edit from a real minor).
+    sed "s/LEVEL: \${{ github.event_name == 'workflow_dispatch' \&\& inputs.level || 'patch' }}/LEVEL: \${{ inputs.level || 'patch' }}/" \
+        "$WORKFLOW" >"$MUTANT"
+    cmp -s "$WORKFLOW" "$MUTANT" && echo "  (stale mutation control: LEVEL edit changed nothing)"
+    expect_child_fails "Case 11: LEVEL is read only on dispatch and falls back to patch" \
+        "Case 8: LEVEL without the dispatch condition is rejected"
+
+    # The minor arm accepts an unforced dispatch.
+    sed 's/minor) \[ "\$FORCE" = "true" \] ||/minor) true ||/' "$WORKFLOW" >"$MUTANT"
+    cmp -s "$WORKFLOW" "$MUTANT" && echo "  (stale mutation control: minor arm edit changed nothing)"
+    expect_child_fails "Case 11: level guard LEVEL=minor FORCE=false exits 1" \
+        "Case 8: a guard that allows an unforced minor is rejected"
+
+    # An unsupported level accepted.
+    sed 's/^\( *\)\*) echo "ERROR: level must be patch or minor.*$/\1*) ;;/' "$WORKFLOW" >"$MUTANT"
+    cmp -s "$WORKFLOW" "$MUTANT" && echo "  (stale mutation control: catch-all edit changed nothing)"
+    expect_child_fails "Case 11: level guard LEVEL=bogus FORCE=true exits 1" \
+        "Case 8: a guard that accepts an unsupported level is rejected"
+
+    # The bump goes back to a hard-coded patch (the level is ignored).
+    sed 's|version.sh bump "\$LEVEL"|version.sh bump patch|' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: the bump step runs version.sh bump" \
+        "Case 8: a hard-coded bump patch is rejected"
+
+    # The level input gains a third option.
+    sed 's/options: \[patch, minor\]/options: [patch, minor, major]/' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: the dispatch input level offers exactly patch and minor" \
+        "Case 8: an extra level option is rejected"
+
+    # The level input's default becomes minor.
+    awk '/^      level:$/ { f = 1 } f && /^        default: patch$/ { sub(/patch/, "minor"); f = 0 } { print }' \
+        "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: the dispatch input level defaults to patch" \
+        "Case 8: a level default other than patch is rejected"
+
+    # inputs.level expanded inside a run: script (template injection).
+    awk '/^ +set -euo pipefail$/ && !done { print; print "          echo \"${{ inputs.level }}\""; done=1; next } { print }' \
+        "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: inputs.level reaches a shell only through env:" \
+        "Case 8: \${{ inputs.level }} inside run: is rejected"
+
+    # A matching LEVEL/FORCE binding left in a DIFFERENT step must not satisfy
+    # the bump-step assertions: move both out of the bump step into the gate
+    # step's env.
+    awk -v level_line="$BUMP_LEVEL_LINE" -v force_line="$BUMP_FORCE_LINE" '
+        /^        id: bump$/ { in_bump = 1 }
+        in_bump && /^          (LEVEL|FORCE): / { next }
+        { print }
+        /^          EVENT_NAME: / && !done { print level_line; print force_line; done = 1 }
+    ' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: LEVEL is read only on dispatch and falls back to patch" \
+        "Case 8: LEVEL bound in another step does not satisfy the bump-step check"
+
+    # FORCE alone dropped from the bump step while the other steps keep theirs.
+    awk '
+        /^        id: bump$/ { in_bump = 1 }
+        in_bump && /^          FORCE: / { next }
+        { print }
+    ' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: FORCE is dispatch-gated in the bump step env" \
+        "Case 8: FORCE bound only in other steps does not satisfy the bump-step check"
+
+    # The guard disappears (renamed variable): extraction must fail, not skip.
+    sed 's/case "\$LEVEL" in/case "$LVL" in/' "$WORKFLOW" >"$MUTANT"
+    expect_child_fails "Case 11: the bump step's level guard" \
+        "Case 8: a missing level guard is rejected, not skipped"
 
     echo ""
 fi

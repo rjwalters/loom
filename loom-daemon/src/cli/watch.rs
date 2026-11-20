@@ -2,19 +2,19 @@
 
 use anyhow::Result;
 
-use loom_daemon::types::{Request, Response};
-use loom_daemon::watch_registry;
+use crate::types::{Request, Response};
+use crate::watch_registry;
 
-use super::common::{query_daemon, resolve_socket_path};
-use crate::WatchAction;
+use super::common::{exit_on_daemon_failure, query_daemon, resolve_socket_path};
+use crate::cli::WatchAction;
 
 /// Handle the `watch` subcommand (Issue #3971). Connects to the running daemon
 /// over its Unix socket and registers/lists/removes durable watches. The watches
 /// are persisted machine-level (`~/.loom/watches.json`), so — like the daemon's
 /// other file-backed state — they survive both this shell and a daemon restart;
 /// the resolution report lands in `~/.loom/logs/watch-results.log`.
-pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
-    use loom_daemon::watch_registry::WatchKind;
+pub async fn handle_watch_command(action: WatchAction) -> Result<()> {
+    use crate::watch_registry::WatchKind;
 
     let socket_path = resolve_socket_path()?;
     // `json_out` only applies to `list`; captured here so the request build below
@@ -41,11 +41,11 @@ pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
         WatchAction::Remove { id } => Request::RemoveWatch { id },
     };
 
-    match query_daemon(&socket_path, &request).await {
-        Ok(Response::WatchRegistered {
+    match exit_on_daemon_failure(&socket_path, query_daemon(&socket_path, &request).await) {
+        Response::WatchRegistered {
             watch,
             already_present,
-        }) => {
+        } => {
             if already_present {
                 println!("Already watching {} (id {}) — no-op.", watch.target_label(), watch.id);
             } else {
@@ -55,7 +55,7 @@ pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
             }
             Ok(())
         }
-        Ok(Response::WatchList { watches }) => {
+        Response::WatchList { watches } => {
             if json_out {
                 println!("{}", serde_json::to_string_pretty(&watches)?);
             } else if watches.is_empty() {
@@ -75,7 +75,7 @@ pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
             }
             Ok(())
         }
-        Ok(Response::WatchRemoved { id, was_present }) => {
+        Response::WatchRemoved { id, was_present } => {
             if was_present {
                 println!("Removed watch {id}.");
             } else {
@@ -83,19 +83,8 @@ pub(crate) async fn handle_watch_command(action: WatchAction) -> Result<()> {
             }
             Ok(())
         }
-        Ok(Response::Error { message }) => {
-            eprintln!("Daemon error: {message}");
-            std::process::exit(1);
-        }
-        Ok(other) => {
+        other => {
             eprintln!("Unexpected response from daemon: {other:?}");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Could not reach loom-daemon at {}: {e}", socket_path.display());
-            eprintln!();
-            eprintln!("Is the daemon running? Start it with:");
-            eprintln!("  ./.loom/scripts/cli/loom-daemon-start.sh");
             std::process::exit(1);
         }
     }

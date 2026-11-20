@@ -714,17 +714,6 @@ pub fn account_region_by_tap(contents: &str, header_anchor: &str) -> RegionAccou
     }
 }
 
-/// Filesystem wrapper for a caller holding a log *path*. An unreadable log is
-/// "no opinion", never a failure.
-#[must_use]
-pub fn account_launch_log_at(
-    log_path: &std::path::Path,
-    header_anchor: &str,
-) -> Option<TapAccounting> {
-    let contents = std::fs::read_to_string(log_path).ok()?;
-    account_launch_log(&contents, header_anchor)
-}
-
 /// Fold rows by [`TapAttribution::key`] — the #8556 query, *"how much went to
 /// the metered backstop vs. the subscriptions"*, in one call.
 ///
