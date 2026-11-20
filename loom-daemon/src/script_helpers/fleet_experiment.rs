@@ -223,7 +223,8 @@ pub fn merges_in_window(root: &Path, now: DateTime<Utc>) -> Option<u32> {
         .format("%Y-%m-%d")
         .to_string();
     let search = format!("merged:>={cutoff}");
-    let q = super::gh_query::<Vec<PrRow>, _>(
+    let q = super::gh_read_json::<Vec<PrRow>, _>(
+        "experiment.merges_in_window",
         &[
             "pr", "list", "--state", "merged", "--search", &search, "--limit", "200", "--json",
             "number",

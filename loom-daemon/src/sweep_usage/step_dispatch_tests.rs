@@ -311,6 +311,7 @@ fn end_step(
         .join(".loom/logs")
         .join(format!("step-{role}-{item}.log"));
     emit_step_capture(&StepCapture {
+        runtime: None,
         root: root.to_owned(),
         role,
         sweep_id: sweep_id.to_owned(),

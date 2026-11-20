@@ -1180,6 +1180,13 @@ impl SweepRegistry {
             sweep_id,
             started_at,
             outcome_record.tokens_by_model.as_deref(),
+            // #14566: an unreadable sweep says why, so the gap is countable.
+            (outcome_record.tokens_status == Some(crate::telemetry::TokensStatus::Unattributable))
+                .then_some(outcome_record.tokens_status_reason.as_deref())
+                .flatten()
+                .and_then(
+                    crate::observability::runtime_usage::missing::UsageMissing::from_sweep_reason,
+                ),
             span_runtime.as_deref(),
         );
         let trace_context = crate::observability::lifecycle::finish_execution(

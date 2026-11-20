@@ -16,6 +16,123 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-19
 
+- **PR #14545**: feat: route script-helper gh calls through GhInvocation with a declared intent
+- **PR #14597**: feat: prefer the Codex seat with the most weekly headroom among healthy seats
+- **PR #14690**: fix: build main again after #14597 met #14599's serves_repository removal
+- **Issue #13744** (closed): Reads can still land on the writer: raw run_gh bypasses GhInvocation routing (writer budget exhausted 35 min of every hour on 1283)
+- **Issue #14585** (closed): Codex seat selection does not prefer the account with the most 7d headroom among idle, eligible seats
+- **Issue #14684** (closed): Rust tests fail to compile on main after #14597
+- **Issue #14698** (closed): codex_guard::GUARDED_ROLES doc comment claims an exact mirror of spawn-codex.sh's role lists, but adds sweep-lifecycle
+- **PR #14267**: fix: clear recycled-pid claim locks in loom-clean's stale-lock pass
+- **PR #14283**: docs: drop retired claude-md-budget and docs-defaults-parity CI jobs from judge prompt
+- **PR #14289**: feat(daemon): publish the captain's token probe to fleet workers
+- **PR #14322**: fix: drop unreachable action=defer from champion-hold ratification --help
+- **PR #14330**: daemon: detect a checkout whose origin owner drifted from its resolved credential
+- **PR #14619**: fix: private-clone admission tries every eligible seat before refusing
+- **PR #14673**: fix(dispatch): ignore released leases in claim ordering
+- **PR #14675**: Compare epic-phase siblings on their own issue content
+- **Issue #13942** (closed): Token pool: captain publishes its account probe; workers apply it (part 2 of #13893)
+- **Issue #14056** (closed): loom-clean's claim-lock pass uses bare pid liveness, so a recycled-pid lock is now never cleared
+- **Issue #14223** (closed): Daemon and doctor: detect a checkout whose origin owner differs from the forge's canonical owner
+- **Issue #14269** (closed): docs: six stale references to scripts/check-claude-md-budget.sh, removed in #12106
+- **Issue #14271** (closed): champion-hold ratification: --help still advertises action=defer, which the verb can no longer emit
+- **Issue #14578** (closed): Codex Builder/Doctor admission says 'account session is busy' while other seats on the host are idle (0.19.1316; #14492 covered read-only roles only)
+- **Issue #14660** (closed): create-issue.sh duplicate check rejects sibling epic-phase issues; only --force gets through
+- **Issue #14671** (closed): Builder lease ordering can yield to a peer that already released its lease
+- **PR #14086**: feat: add workflow-lint subcommand and Doctor pre-push workflow gate
+- **PR #14295**: ci: gate docs/README.md index against the docs/ tree
+- **PR #14319**: ci: cover all of defaults/ in the backend PR path filter
+- **PR #14368**: docs: correct merge-queue dormancy reason and cutover step 3 failures
+- **PR #14645**: fix: keep a guard-refused Champion step's release reason in its verdict
+- **PR #14655**: docs: explain merge-group CI audit step parity
+- **PR #14661**: docs: index the merge queue pilot directory
+- **PR #14666**: fix(telemetry): key Codex role-tick usage on session ids and name each miss
+- **PR #14667**: test: pin the captain tier off in test-filing-lock and surface filer failures
+- **PR #14669**: fix: carry discovery and decode completeness into Codex by-id usage misses
+- **PR #14670**: fix(telemetry): project hold transition rollup fields
+- **PR #14672**: docs(sweep): replace $ARGUMENTS placeholder in sibling reference files with carried-over invocation arguments
+- **Issue #13155** (closed): [ci-daily] Flake Detection (shell suites, macos-latest, parallelism 1)
+- **Issue #13896** (closed): Doctor conflict-resolution should structurally validate touched workflow files; a vanished check should not satisfy a green rollup
+- **Issue #14075** (closed): docs: add a CI check that docs/README.md indexes every docs/ directory and top-level doc
+- **Issue #14244** (closed): Live-verify telemetry-hold-transitions against the real reader (14-day window vs the 5 known self-releases)
+- **Issue #14247** (closed): docs: stale 'user-owned' reason in ci.yml comments, and cutover step 3 understates expected eligibility failures
+- **Issue #14301** (closed): ci.yml backend path filter omits defaults/scripts/lib/bounded-run.sh, skipping the Rust tests that read it from disk
+- **Issue #14355** (closed): Version-bump publish returns 403 wrong_repository after org transfer
+- **Issue #14556** (closed): [ci-daily] Compatibility Floor (SUPPORTS_INSTALLED)
+- **Issue #14569** (closed): telemetry-hold-transitions fails on the real reader: rows refused as 'no body string', and the 14-day window exceeds the store memory limit
+- **Issue #14639** (closed): Targeted Champion pin or facts guard refuses on 0.19.1316 across two repos
+- **Issue #14654** (closed): Document step-parity limits of the merge-group CI audit
+- **Issue #14658** (closed): Main Lint fails because the docs index omits merge-queue-pilot
+- **Issue #14659** (closed): sweep: sibling reference files render $ARGUMENTS as empty when loaded as skills
+- **Issue #14664** (closed): Telemetry: on 0.20.0 most Codex runs still have no usage row (15 no_attributable_usage; Guide and Hermit 0 of 10)
+- **Issue #14668** (closed): Codex by-id usage lookup: two read failures still report confirmed absence (session_not_found / no_usage_tokens)
+- **PR #14638**: fix: classify launcher preflight rejections with a typed boundary
+- **PR #14646**: fix(tests): derive the config-restart fixture's release from the running version
+- **PR #14644**: chore: remove stale quickstart worktree.sh copies
+- **Issue #14643** (closed): Fix config-restart test fixtures that assume the running version is below 0.19.999999
+- **Issue #14641** (closed): Remove quickstart worktree.sh copies: stale duplicates of the installer-provided script
+- **PR #14297**: ci: forbid the current owner's repo URL in installed templates
+- **PR #14276**: ci: gate .agents/skills mirrors on generate-agent-skills --check in lint
+- **PR #14171**: ci: add named nextest discovery step with stall diagnostics
+- **PR #14631**: test: publish fake fleet gateways with explicit private modes
+- **PR #14629**: test(loom-tools): per-verb denied-target evidence for the #14519 forge writes
+- **PR #14628**: feat(guide): configure the work-log batching threshold
+- **PR #14624**: test: name served forge commands accurately
+- **PR #14623**: test: close dead-port fixture windows
+- **PR #14616**: test: never rebind dead_url() ports in TestServer start/silent
+- **PR #14611**: docs: explain Fleet rescue-stash retention in troubleshooting
+- **PR #14531**: feat: serve the shared non-queue forge verbs through loom-tools
+- **Issue #14219** (closed): Two owner-identity leftovers after the transfer: the installed-template URL denylist and a stale mirrored comment in ci.yml
+- **Issue #14248** (closed): CI does not run `generate-agent-skills --check`, though two docs say it does
+- **Issue #14066** (closed): test flake: nextest discovery (lib binary --list) stalls past the 10-minute Run tests cap on Rust Unit Tests (3/5) — recurrence of #11121
+- **Issue #14630** (closed): Set explicit permissions on the fake gateways in loom_tools_slice fleet-routing tests
+- **Issue #14625** (closed): Make Guide work-log batching threshold configurable per repository
+- **Issue #14621** (closed): loom-tools: a denied write scope has no per-verb proof for the #14519 forge writes
+- **Issue #14618** (closed): Close the two residual dead-port windows left by #14616 (record-before-drop; test bypasses the dead set)
+- **Issue #14610** (closed): Harden TestServer::dead_url() against ephemeral-port reuse (the #14601 flake class)
+- **Issue #14608** (closed): troubleshooting.md: stash-producer enumeration omits loom-rescue-<ts>, and self-heal is the first automated dropper
+- **Issue #14554** (closed): Rename the misleading read variable in the forge capability test
+- **Issue #14519** (closed): loom-tools: admit the shared non-queue forge actions
+- **Issue #14580** (closed): Reuse the claim guard’s issue-lease parser in the worktree co-occupancy guard
+- **PR #14606**: refactor: reuse the claim guard's lease-comment parsers in lease co-occupancy
+- **Issue #14572** (closed): accounts.session.extraMounts host sources are not denied for ~/.loom/tokens, ~/.ssh or a session profile/seat directory
+- **PR #14600**: fix: refuse session extra mounts overlapping host credentials
+- **Issue #14512** (closed): private_dispatch prepares a Codex seat twice after reserve_seat (#14481)
+- **PR #14599**: fix: consume held Codex seat, name repo-routing misses, count seat_busy refusals
+- **PR #14589**: feat: journal a loom.runtime.usage_missing span when a run's usage is unreadable
+- **Issue #14601** (closed): Test flake: grace_fails_open_without_touching_the_hysteresis fails on Rust Unit Tests (2/5)
+- **PR #14605**: test: keep the failing endpoint bound in the fleet grace test
+- **Issue #14584** (closed): Codex pool: an account's exhaustion horizon is learned per host, so each host must fail a real step to find it
+- **PR #14594**: feat: fold Codex rollout snapshots into account health on the ranking-refresh tick
+- **Issue #14607** (closed): Main CI red: Guide Approved provenance query includes frozen PRs
+- **PR #14609**: fix(guide): exclude frozen PRs from plan provenance
+- **Issue #14602** (closed): daemon-reference: self-heal now prunes loom-rescue stash entries, not just rescue refs
+- **PR #14604**: docs: rescue-stash pruning shares the rescue-ref retention window
+- **Issue #14564** (closed): Codex pool: an account at its weekly limit is retried with real steps every ~20–30 min; the provider's stated reset (6 days out) is not used
+- **PR #14579**: fix: parse Codex reset horizons with ordinal day and abbreviated month
+- **Issue #14456** (closed): Confirm loom.runtime.usage rows for step-dispatched work roles in SigNoz after #14423 rolls
+- **Issue #13977** (closed): self-heal's loom-rescue-* stashes accumulate forever, and #13970 adds a recurring generator
+- **PR #14042**: fix: prune expired loom-rescue stash entries in the self-heal sweep
+- **Issue #14571** (closed): Fix forge wait-checks reporting RED after a skipped workflow run hides a successful replacement
+- **PR #14598**: fix: resolve CI replacement runs per job name in wait-checks
+- **Issue #14575** (closed): Guide rejects approved PR closing references when verifying WORK_PLAN titles
+- **PR #14587**: fix(guide): verify Approved rows against forge closing references
+- **PR #14591**: Split work-finder pre-span time into reclaim and CPU-fallback phases
+- **Issue #14577** (closed): Test the dispatch-only and force requirements for minor version bumps
+- **PR #14595**: test: pin dispatch-only and force requirements for minor version bumps
+- **Issue #14582** (closed): w1 forge-calls test fails under the forge_calls filter batch but passes solo (test isolation)
+- **PR #14592**: test: isolate forge call accounting from the ambient repo
+- **Issue #14559** (closed): A missed writer route hold is invisible: writer_holds_snapshot has no caller and route_key can disagree with the claim's attribution
+- **PR #14581**: feat: report armed writer route holds in status; log armed-but-not-found holds
+- **PR #14590**: fix(observability): refresh quiet dispatch rows from source time
+- **PR #14573**: feat: bundle zai-full, the full-strength GLM-5.3 profile
+- **Issue #14540** (closed): Telemetry: Codex steps in private-clone seats will never get loom.runtime.usage rows (session filter requires the host workspace path; the rollout's cwd is the container path)
+- **PR #14555**: fix: attribute Codex step usage by exact session id, not host directory
+- **PR #14568**: fix: raise the installed Loom compatibility floor to 0.19.175
+- **PR #14499**: feat: register and start per-seat Claude session containers
+- **PR #14563**: ci: add level: minor to the forced bump dispatch (for v0.20.0)
+- **Issue #14561** (closed): spawn-codex.sh's APPLIED_EFFORT reports an effort codex was never handed when an inline --config= value contains model_reasoning_effort=
+- **PR #14567**: fix: recognize Codex effort overrides only at the start of inline config
 - **PR #14562**: feat: record work-finder tick phase timings
 - **Issue #14414** (closed): adapter_launch_facts records an effort the codex adapter will not launch when argv carries -c model_reasoning_effort=
 - **PR #14468**: fix: report an explicit codex model_reasoning_effort config as the launched effort

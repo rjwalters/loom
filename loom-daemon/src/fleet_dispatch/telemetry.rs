@@ -584,7 +584,8 @@ mod tests {
     fn an_unknown_refuse_token_is_counted_as_other() {
         let mut c = Counters::default();
         c.refused("head_moved");
-        for junk in ["x-1", "x-2", "", "claim_lost "] {
+        c.refused("seat_busy");
+        for junk in ["x-1", "x-2", "", "claim_lost ", "seat_busy_"] {
             c.refused(junk);
         }
         let labels: Vec<(&str, &str, i64)> = c
@@ -592,6 +593,13 @@ mod tests {
             .iter()
             .map(|((k, r), n)| (*k, r.as_str(), *n))
             .collect();
-        assert_eq!(labels, vec![("refuse", "head_moved", 1), ("refuse", "other", 4)]);
+        assert_eq!(
+            labels,
+            vec![
+                ("refuse", "head_moved", 1),
+                ("refuse", "other", 5),
+                ("refuse", "seat_busy", 1)
+            ]
+        );
     }
 }

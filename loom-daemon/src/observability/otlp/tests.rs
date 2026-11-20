@@ -349,6 +349,7 @@ async fn empty_token_snapshot_advances_without_fabricating_metrics() {
         "host",
         TelemetryRecord::TokensSnapshot(crate::telemetry::TokenSnapshotRecord {
             captured_at: chrono::Utc::now(),
+            fleet_probe_age_secs: None,
             accounts: Vec::new(),
         }),
     );

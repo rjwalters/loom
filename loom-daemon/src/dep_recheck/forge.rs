@@ -14,7 +14,7 @@
 
 use super::{extract, named, premise, recheck};
 use crate::cmd_out::Query;
-use crate::script_helpers::gh_query;
+use crate::script_helpers::gh_read_json;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -70,7 +70,8 @@ pub fn fetch_pr(pr: i64, repo: Option<&str>, repo_root: &Path) -> Result<recheck
     let mut args = vec!["pr", "view", &pn];
     args.extend(repo_args(repo));
     args.extend(["--json", "number,state,labels,mergeable,mergeStateStatus"]);
-    let q: Query<PrView> = gh_query(&args, repo_root, false, |_: &PrView| false);
+    let q: Query<PrView> =
+        gh_read_json("recheck.pr_view", &args, repo_root, false, |_: &PrView| false);
     let Query::Populated(p) = q else {
         return Err(read_failed(&format!("gh pr view {pr}")));
     };
@@ -107,7 +108,8 @@ pub fn fetch_prs(
     let mut args = vec!["issue", "view", &n];
     args.extend(repo_args(repo));
     args.extend(["--json", "closedByPullRequestsReferences"]);
-    let q: Query<IssueView> = gh_query(&args, repo_root, false, |_: &IssueView| false);
+    let q: Query<IssueView> =
+        gh_read_json("recheck.issue_view", &args, repo_root, false, |_: &IssueView| false);
     let Query::Populated(view) = q else {
         return Err(read_failed(&format!("gh issue view {issue}")));
     };
@@ -139,7 +141,9 @@ fn fetch_state(number: i64, repo: Option<&str>, repo_root: &Path) -> Option<Stri
         args.extend(repo_args(repo));
         args.extend(["--json", "state"]);
         let q: Query<StateField> =
-            gh_query(&args, repo_root, false, |s: &StateField| s.state.is_empty());
+            gh_read_json("recheck.ref_state", &args, repo_root, false, |s: &StateField| {
+                s.state.is_empty()
+            });
         if let Query::Populated(s) = q {
             return Some(s.state);
         }
@@ -187,7 +191,8 @@ pub fn fetch_body(issue: i64, repo: Option<&str>, repo_root: &Path) -> Result<St
     let mut args = vec!["issue", "view", &n];
     args.extend(repo_args(repo));
     args.extend(["--json", "body"]);
-    let q: Query<BodyOnly> = gh_query(&args, repo_root, false, |_: &BodyOnly| false);
+    let q: Query<BodyOnly> =
+        gh_read_json("recheck.issue_body", &args, repo_root, false, |_: &BodyOnly| false);
     match q {
         Query::Populated(b) => Ok(b.body),
         _ => Err(read_failed(&format!("gh issue view {issue}"))),
@@ -253,7 +258,8 @@ pub fn fetch_body_and_comments(
     let mut args = vec!["issue", "view", &n];
     args.extend(repo_args(repo));
     args.extend(["--json", "body,comments"]);
-    let q: Query<extract::Input> = gh_query(&args, repo_root, false, |_: &extract::Input| false);
+    let q: Query<extract::Input> =
+        gh_read_json("recheck.body_comments", &args, repo_root, false, |_: &extract::Input| false);
     match q {
         Query::Populated(v) => Ok(v),
         _ => Err(ReadError(format!(

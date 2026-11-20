@@ -200,6 +200,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
@@ -764,6 +766,18 @@ pub enum MetricName {
     /// fallback began), #12450. Host-level: the resource names the host.
     #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
     FleetDispatchFallbackTicks,
+    /// The captain's published token-probe cycle (#13942): one point per
+    /// account per distinct probe instant, by `account` and `state` (the
+    /// probe's verdict) — the fleet-side record of what every worker was
+    /// told to converge on.
+    #[serde(rename = "loom.tokens.fleet_probe_accounts")]
+    TokensFleetProbeAccounts,
+    /// Age of the fleet token-probe snapshot a worker host has applied
+    /// (#13942): sample time minus the captain's probe instant. The
+    /// fleet-convergence drift signal — equal ages across hosts mean every
+    /// worker is reading the same probe.
+    #[serde(rename = "loom.tokens.fleet_probe_age")]
+    TokensFleetProbeAge,
     // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
     /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
     /// for a claim the captain refused, `refuse` for a worker's `refuse`
@@ -913,6 +927,8 @@ impl MetricName {
             Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
             Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
+            Self::TokensFleetProbeAccounts => "loom.tokens.fleet_probe_accounts",
+            Self::TokensFleetProbeAge => "loom.tokens.fleet_probe_age",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
@@ -1048,6 +1064,8 @@ impl MetricName {
             Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
+            Self::TokensFleetProbeAccounts => "{account}",
+            Self::TokensFleetProbeAge => "s",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
             Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
@@ -1214,6 +1232,12 @@ impl MetricName {
             }
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
+            }
+            Self::TokensFleetProbeAccounts => {
+                "The captain's published token-probe cycle: one point per account per cycle, by account and state."
+            }
+            Self::TokensFleetProbeAge => {
+                "Age of the fleet token-probe snapshot this host applied (sample time minus the captain's probe)."
             }
             Self::FleetDispatchRefusals => {
                 "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."

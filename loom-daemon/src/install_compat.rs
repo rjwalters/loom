@@ -399,6 +399,18 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge suspect-critical-diff",
     "forge merge-method",
     "forge merge-config",
+    // #14519: the shared non-queue writes.
+    "forge comment",
+    "forge create-issue",
+    "forge rerun",
+    "forge auto-merge",
+    "forge disable-auto-merge",
+    "forge verdict-labels",
+    "forge verdict-reconcile",
+    "forge verdict-lock",
+    "forge doctor-handback",
+    "forge journal-ci-refusal",
+    "forge parent link",
     "forge merge-queue mode",
     "forge merge-queue preflight",
     "forge merge-queue status",
@@ -443,7 +455,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease pr release",
     // #14429: top-level reads and config inspection. The write forms inside
     // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
-    // (#14396) exactly as a `forge` write verb does.
+    // (#14396).
     "labels",
     "pr-queue",
     "premise-check",

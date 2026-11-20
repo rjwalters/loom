@@ -70,7 +70,6 @@ impl Fixture {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::create_dir(&launcher).unwrap();
         fs::create_dir(path.join("writer")).unwrap();
-        fs::create_dir_all(gateway.join("acme")).unwrap();
         for args in [
             ["init", "--quiet", "", ""],
             ["remote", "add", "origin", "https://github.com/acme/widgets"],
@@ -91,9 +90,7 @@ impl Fixture {
 
         fs::write(&gh, include_str!("pr_lease_forge.sh")).unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(gateway.join("gh-ok"), gh.canonicalize().unwrap().as_os_str().as_encoded_bytes())
-            .unwrap();
-        fs::write(gateway.join("acme/hosts.yml"), b"github.com: {}\n").unwrap();
+        super::publish_fake_gateway(&gateway, "acme", &gh);
         fs::write(path.join("rows"), "").unwrap();
         fs::write(path.join("next"), "500\n").unwrap();
         Self {

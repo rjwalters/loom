@@ -470,7 +470,13 @@ pub fn session_recover(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
 ) -> Result<RecoverReport> {
+    if !worktrees.is_empty()
+        && (action != RecoverAction::Discard || !branches.is_empty() || issue.is_some())
+    {
+        bail!("discard accepts a worktree scope or a branch/issue scope, separately");
+    }
     let (config, dir) = resolve(workspace, name)?;
     let targets = {
         let mut targets = vec![config.primary()];
@@ -496,14 +502,13 @@ pub fn session_recover(
     // for a GitHub clone the in-container helper can only fail, so refuse
     // before ANY exec and name what to provide (#14433). List and discard
     // never push.
-    let auths: Vec<_> = targets
+    let recovery_targets: Vec<_> = targets
         .iter()
-        .map(|target| forge_auth::ExecAuth::resolve(workspace, &target.repository))
+        .map(|target| (target, forge_auth::ExecAuth::resolve(workspace, &target.repository)))
         .collect();
     if action == RecoverAction::Publish {
-        if let Some((target, auth)) = targets
+        if let Some((target, auth)) = recovery_targets
             .iter()
-            .zip(&auths)
             .find(|(_, auth)| auth.github_token_missing())
         {
             // An owner whose only published credential is provably expired
@@ -527,27 +532,77 @@ pub fn session_recover(
             );
         }
     }
+    let paths_by_clone = if worktrees.is_empty() {
+        vec![Vec::new(); targets.len()]
+    } else {
+        // Check every path across all clones while holding the same account
+        // lease. A refusal in a later clone must not follow a removal in an
+        // earlier one. The worker revalidates its scope before executing it.
+        let mut validations = Vec::new();
+        for (target, auth) in &recovery_targets {
+            validations.push(docker::recover_target(
+                &config,
+                target,
+                RecoverAction::ValidateWorktrees,
+                None,
+                &[],
+                worktrees,
+                auth,
+            )?);
+        }
+        plan_worktree_discard(worktrees, &validations)?
+    };
     let mut clones = Vec::new();
-    for (target, auth) in targets.iter().zip(&auths) {
-        clones.push(docker::recover_target(&config, target, action, issue, branches, auth)?);
+    for ((target, auth), paths) in recovery_targets.into_iter().zip(paths_by_clone) {
+        let action = if !worktrees.is_empty() && paths.is_empty() {
+            RecoverAction::List
+        } else {
+            action
+        };
+        clones
+            .push(docker::recover_target(&config, target, action, issue, branches, &paths, &auth)?);
     }
     let report = RecoverReport {
         account: config.account.clone(),
         clones,
     };
     if action != RecoverAction::List
-        && (issue.is_some() || !branches.is_empty())
-        && report
-            .clones
-            .iter()
-            .all(|clone| clone.published.is_empty() && clone.discarded.is_empty())
+        && (issue.is_some() || !branches.is_empty() || !worktrees.is_empty())
+        && report.clones.iter().all(|clone| {
+            clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
+        })
     {
         bail!(
-            "no clone of this account has unpublished commits on the named branches; \
-             run the listing form (`accounts session recover {name}`) to see what is unpublished"
+            "no clone of this account has unpublished commits on the named branches or a \
+             worktree at the named paths; run the listing form (`accounts session recover \
+             {name}`) to see what is unpublished and which worktrees are dirty"
         );
     }
     Ok(report)
+}
+
+pub(super) fn plan_worktree_discard(
+    worktrees: &[PathBuf],
+    validations: &[RecoverOutcome],
+) -> Result<Vec<Vec<PathBuf>>> {
+    let mut by_clone = vec![Vec::new(); validations.len()];
+    for path in worktrees {
+        let name = path.display().to_string();
+        let mut owners = validations
+            .iter()
+            .enumerate()
+            .filter(|(_, clone)| clone.cloned && !clone.ignored.contains(&name));
+        let Some((index, _)) = owners.next() else {
+            bail!("no clone of this account owns worktree {}; nothing removed", path.display());
+        };
+        if owners.next().is_some() {
+            bail!("multiple clones claim worktree {}; nothing removed", path.display());
+        }
+        by_clone[index].push(path.clone());
+    }
+    Ok(by_clone)
 }
 
 /// Rebind an additional private-clone registration to the repository's
@@ -697,6 +752,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
+        held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
         config,

@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn tokens_snapshot() -> TelemetryRecord {
     TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
         captured_at: ts(),
+        fleet_probe_age_secs: None,
         accounts: vec![
             TokenAccountState {
                 account: "agent-1".to_string(),

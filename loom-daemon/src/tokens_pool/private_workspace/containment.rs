@@ -305,7 +305,7 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = dispatch::Selection::prepare(root, "codex", model, kind, issue, owner);
+    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner);
     admit_selection(root, role, explicit, rejection, selection)
 }
 
@@ -428,6 +428,13 @@ impl<'a> Preparer<'a> {
         self.seat_unavailable |= selection.as_ref().is_err_and(|error| {
             error.is::<super::AccountBusy>()
                 || error.is::<super::super::health::NoHealthyAccountError>()
+                // #14578: only a walk where EVERY tried seat was busy means
+                // the pool has no idle seat. A seat that failed for any other
+                // reason (a containment proof that could not be taken) is
+                // reported with its own reason, never counted as busy.
+                || error
+                    .downcast_ref::<dispatch::NoEligibleSeat>()
+                    .is_some_and(|exhausted| exhausted.all_busy)
         });
     }
 
@@ -466,9 +473,8 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             }
         }
         self.held = None;
-        let selection = dispatch::Selection::prepare(
+        let selection = dispatch::Selection::prepare_contained(
             &self.root,
-            "codex",
             model.as_deref(),
             self.kind,
             self.issue,
@@ -506,7 +512,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             source: admitted.source.clone(),
             unmet_capabilities: vec![],
             reason: if error.is::<super::AccountBusy>() {
-                "no idle seat".to_string()
+                dispatch::NO_IDLE_SEAT.to_string()
             } else {
                 error.to_string()
             },
