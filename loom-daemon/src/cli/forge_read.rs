@@ -61,8 +61,9 @@ impl ForgeReadCli {
             self.action,
             // Reads local git objects only (its own doc comment).
             ForgeAction::RebaseGuard(_)
-                // stdin in, one line out.
+                // Classify stdin locally.
                 | ForgeAction::VerdictBodyCheck
+                | ForgeAction::WorkflowWriteAllCheck
                 // Pure formatting of the dashboard footer.
                 | ForgeAction::DashboardLink { .. }
                 // This host's forge-call sink: local files only.
@@ -153,6 +154,7 @@ impl ForgeAction {
             | Self::ClaimLiveness { .. }
             | Self::VerdictStaleNotice { .. }
             | Self::VerdictBodyCheck
+            | Self::WorkflowWriteAllCheck
             | Self::VerdictGate { .. }
             | Self::MayWrite { .. }
             | Self::Calls(_)
@@ -226,6 +228,7 @@ impl ForgeAction {
             Self::ClaimLiveness { .. } => "claim-liveness",
             Self::VerdictStaleNotice { .. } => "verdict-stale-notice",
             Self::VerdictBodyCheck => "verdict-body-check",
+            Self::WorkflowWriteAllCheck => "workflow-write-all-check",
             Self::VerdictGate { .. } => "verdict-gate",
             Self::VerdictLabels { .. } => "verdict-labels",
             Self::DoctorHandback { .. } => "doctor-handback",
