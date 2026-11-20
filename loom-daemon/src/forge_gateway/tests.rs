@@ -28,17 +28,33 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// The public test names stay as wrappers, so the default suite and focused
 /// filters still exercise each body.
 fn in_a_child_process(child: &str) {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             &format!("forge_gateway::tests::{child}"),
             "--ignored",
             "--test-threads=1",
+            "--format",
+            "pretty",
+            "--color",
+            "never",
         ])
-        .stdout(std::process::Stdio::null())
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "the gateway fixture child `{child}` failed: {status}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let single_pass = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;";
+    assert!(
+        output.status.success() && stdout.lines().any(|line| line.starts_with(single_pass)),
+        "gateway fixture child `{child}` did not run exactly one passing test ({})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+}
+
+#[test]
+#[should_panic(expected = "test result: ok. 0 passed; 0 failed;")]
+fn a_missing_gateway_child_is_refused_even_with_a_successful_exit() {
+    in_a_child_process("missing_gateway_fixture_child");
 }
 
 fn cfg(owners: &[(&str, &str)]) -> Value {
