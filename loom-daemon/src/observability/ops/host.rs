@@ -16,6 +16,9 @@
 //! handed in by the collector.
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::tokens_pool::private_workspace::{reader_image, SeatVolumeSamples, SeatVolumeUsage};
+use crate::tokens_pool::session_image;
+use std::path::Path;
 
 /// One host resource sample, in bytes. `None` = unmeasurable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -186,5 +189,57 @@ pub async fn record(worktree_volume: (Option<u64>, Option<u64>)) {
     };
     if let Ok(resources) = tokio::task::spawn_blocking(move || sample(worktree_volume)).await {
         sink.emit_metrics(resources.points());
+    }
+}
+
+pub(super) fn seat_volume_points(sample: SeatVolumeUsage) -> Vec<MetricPoint> {
+    let mut points: Vec<_> = sample
+        .seats
+        .into_iter()
+        .map(|(account, bytes)| {
+            MetricPoint::int(MetricName::HostCodexWorkspaceVolumeUsedBytes, bytes)
+                .label("account", account)
+        })
+        .collect();
+    if let Some(total) = sample.total {
+        points.push(MetricPoint::int(MetricName::HostCodexWorkspaceVolumeTotalUsedBytes, total));
+    }
+    points
+}
+
+/// Rotate bounded volume reads off the collector and skip a tick if a
+/// preceding walk is still in progress.
+#[derive(Default)]
+pub(crate) struct SeatVolumeSampler {
+    active: Option<tokio::task::JoinHandle<SeatVolumeSamples>>,
+}
+
+impl SeatVolumeSampler {
+    pub(crate) async fn record_if_due(&mut self, workspace_root: &Path) {
+        if self.active.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let Some(sink) = super::global_ops_sink() else {
+            return;
+        };
+        // The task is finished here, so awaiting it only recovers the rolling samples.
+        let mut samples = match self.active.take() {
+            Some(task) => task.await.unwrap_or_default(),
+            None => SeatVolumeSamples::default(),
+        };
+        let workspace_root = workspace_root.to_path_buf();
+        self.active = Some(tokio::task::spawn_blocking(move || {
+            match session_image::read_session_image_config(&workspace_root) {
+                Ok(config) => {
+                    let usage = samples.sample(|| reader_image(config.image.as_deref()));
+                    sink.emit_metrics(seat_volume_points(usage));
+                    samples
+                }
+                Err(_) => {
+                    log::debug!("private workspace volume sampling skipped: invalid session image configuration");
+                    SeatVolumeSamples::default()
+                }
+            }
+        }));
     }
 }
