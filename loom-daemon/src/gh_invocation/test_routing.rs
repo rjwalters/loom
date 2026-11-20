@@ -58,6 +58,14 @@ pub(crate) fn install(routing: TestRouting) -> Guard {
     Guard
 }
 
+/// Install routing and a test-owned executable for this thread.
+#[must_use]
+pub(crate) fn install_with_program(routing: TestRouting, program: PathBuf) -> Guard {
+    let guard = install(routing);
+    PROGRAM.with(|p| *p.borrow_mut() = Some(program));
+    guard
+}
+
 /// Exercise a real caller with a fake forge response under a healthy reader and
 /// with no subprocess at all under an exhausted reader. The checkout is not
 /// usable for derivation, so the caller has to supply its actual target.

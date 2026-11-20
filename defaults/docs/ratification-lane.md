@@ -44,14 +44,41 @@ them. Selection also honors `champion.ratificationPaths` / `ratificationPhrases`
    spec/decision file declaring ratification-by-merge counts, not only status
    flips. A candidate file that cannot be read is not selected (logged). A PR
    whose current head already carries both markers is skipped. The head SHA is captured here.
-3. Two sessions run, `ratification-ee` and `ratification-market`. Each prompt is
-   its pinned instructions plus the PR reference and nothing else.
-4. For each key whose session ends in success **and** whose output parses as
-   that key's review (below) the daemon posts one comment. A key that failed
-   closed, whose session did not succeed, or whose output carries no verdict
-   posts nothing and the reason is logged; the other key is unaffected. A
-   withheld key posts no marker, so the PR is selected again at the same head
-   on a later tick.
+3. Only the keys still missing a current-head marker are dispatched (#14797),
+   `ratification-ee` and `ratification-market`, in that order when both are
+   missing. Each prompt is its pinned instructions plus the PR reference and
+   nothing else.
+4. For each attempted key whose session ends in success **and** whose output
+   parses as that key's review (below) the daemon posts one comment. A key
+   that failed closed, whose session did not succeed, or whose output carries
+   no verdict posts nothing and the reason is logged; the other key is
+   unaffected. A withheld key posts no marker, so that key is retried at the
+   same head on a later tick.
+
+### Missing-key retry (#14797)
+
+A key is **complete** for a head when a trusted comment (the same trust
+policy as every marker read, `.loom/docs/comment-trust.md`) carries its
+marker for the PR's *current* head — whether the lane or a hand-run lane
+posted it, and whatever the verdict it records (`escalate` and
+`request-changes` reviews were still performed). A later tick dispatches,
+reads instructions for and posts **only the incomplete keys**; a complete key
+consumes no role session, no marker post and no withheld count. The head is
+still the one captured at selection: a push mid-review leaves the new head
+with no markers, so both keys run again there. Two completed keys do not
+release the separate human ratification hold
+([`ratification-hold.md`](ratification-hold.md)).
+
+### Unreadable comment lists
+
+The marker state lives in the PR's comment history, so the lane must be able
+to tell "read, and there are no markers" from "could not read". A comment
+listing that fails or does not parse is **unreadable**: the PR is skipped
+before any instruction read or session runs and counts in the tick's
+`unreadable` (a `degraded` tick), the same accounting as an unreadable
+candidate file. An unreadable list never authorizes a rerun — treating it as
+"no markers" would duplicate completed keys. A successfully read empty list
+selects both keys as missing.
 
 ## Marker format
 
