@@ -1071,6 +1071,9 @@ impl<R: super::RoleInvocationRunner + ?Sized> super::RoleInvocationRunner for Ru
     fn last_output(&self) -> Option<String> {
         self.0.last_output()
     }
+    fn unlaunched_failure(&self) -> Option<crate::observability::lifecycle::RoleFailure> {
+        self.0.unlaunched_failure()
+    }
 }
 
 /// Roots with a lane tick in flight, process-wide: the role-tick and
@@ -1230,6 +1233,125 @@ mod tests {
     use std::collections::HashMap;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn production_adapter_preserves_typed_launch_evidence() {
+        use crate::observability::lifecycle::{pre_launch, RoleFailure, UNCLASSIFIED_PRE_LAUNCH};
+        use crate::role_runner::{
+            ratification_dispatch::InstructionSource, RoleInvocationRunner, RoleTickOutcome,
+        };
+        use std::cell::{Cell, RefCell};
+
+        #[derive(Default)]
+        struct Inputs {
+            instruction_repos: RefCell<Vec<String>>,
+            visibility_reads: Cell<usize>,
+        }
+
+        impl InstructionSource for Inputs {
+            fn fetch(&self, pin: &Pin) -> Result<String, String> {
+                self.instruction_repos.borrow_mut().push(pin.repo.clone());
+                Ok("fixture instructions".into())
+            }
+
+            fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+                self.visibility_reads.set(self.visibility_reads.get() + 1);
+                Some(false)
+            }
+        }
+
+        #[derive(Default)]
+        struct Sink(RefCell<Vec<(u64, String)>>);
+
+        impl CommentSink for Sink {
+            fn post(&self, pr: u64, body: &str) -> Result<(), String> {
+                self.0.borrow_mut().push((pr, body.into()));
+                Ok(())
+            }
+        }
+
+        struct Runner {
+            evidence: &'static str,
+            calls: Vec<String>,
+        }
+
+        impl RoleInvocationRunner for Runner {
+            fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+                self.calls.push(role.into());
+                if role == "ratification-ee" {
+                    RoleTickOutcome::Failure("fixture failure".into())
+                } else {
+                    RoleTickOutcome::Success
+                }
+            }
+
+            fn last_output(&self) -> Option<String> {
+                self.calls
+                    .last()
+                    .filter(|role| *role == "ratification-market")
+                    .map(|_| {
+                        "## Market-key review: fixture\n**Overall verdict:** uncompetitive\n".into()
+                    })
+            }
+
+            fn unlaunched_failure(&self) -> Option<RoleFailure> {
+                // The Market call replaces the evidence from EE, as the production runner does.
+                self.calls
+                    .last()
+                    .filter(|role| *role == "ratification-ee")
+                    .map(|_| RoleFailure::new(self.evidence, None, "fixture-only typed detail"))
+            }
+        }
+
+        let mut cfg = enabled();
+        cfg.ee.as_mut().unwrap().commit = SHA.into();
+        cfg.market.as_mut().unwrap().commit = SHA.into();
+        let prs = one_pr("alice", request(), vec![]);
+        for (evidence, counts) in [
+            (UNCLASSIFIED_PRE_LAUNCH, ("0", "1", "1")),
+            (pre_launch::WRITE_SCOPE_REFUSED.class, ("1", "0", "1")),
+        ] {
+            let inputs = Inputs::default();
+            let sink = Sink::default();
+            let mut runner = Runner {
+                evidence,
+                calls: vec![],
+            };
+            let mut adapter = RunnerRef(&mut runner as &mut dyn RoleInvocationRunner);
+            let (results, skipped, unreadable) =
+                run_lane_stats(&cfg, None, "fixture/example", &prs, &inputs, &sink, &mut adapter);
+            assert_eq!(inputs.instruction_repos.borrow().as_slice(), ["o/ee", "o/mk"]);
+            assert_eq!(inputs.visibility_reads.get(), 1);
+            assert_eq!(runner.calls, ["ratification-ee", "ratification-market"]);
+            let posts = sink.0.borrow();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(posts[0].0, 7);
+            assert!(posts[0]
+                .1
+                .starts_with(&format!("<!-- ratify:key=market sha={SHA} -->")));
+            assert!(posts[0].1.contains("**Overall verdict:** uncompetitive"));
+
+            let tick = TickOutcome::from_run_stats(&results, skipped, unreadable);
+            assert_eq!((tick.posted, tick.withheld, tick.unreadable), (1, 1, 0));
+            let span =
+                tick_span(std::path::Path::new("/fixture-only"), "test", &tick, chrono::Utc::now())
+                    .bounded();
+            let count = |key: &str| span.attributes.get(key).unwrap().as_str();
+            assert_eq!(
+                (
+                    count("loom.ratification.ee.pre_launch_failed"),
+                    count("loom.ratification.ee.invocation_failed"),
+                    count("loom.ratification.market.posted"),
+                ),
+                counts,
+                "typed evidence: {evidence}"
+            );
+            assert!(span
+                .attributes
+                .values()
+                .all(|value| !value.contains("fixture-only typed detail")));
+        }
+    }
 
     fn file(name: &str, head: &str) -> ChangedFile {
         ChangedFile {
