@@ -662,28 +662,13 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
             None => return OpenPrProbe::ProbeFailed,
         },
     };
-    // Leg 0 (#10514): the cached open-PR listing, pinned to the repo just
-    // resolved (never `LOOM_REPO`, #5511). A read listing is decisive.
-    let nwo = format!("{owner}/{repo}");
-    let gh = gh_bin();
-    let listed = super::linked_pr_listing::probe(
-        "worktree.linked_pr_listing",
-        Path::new(&gh),
-        repo_root,
-        (&nwo, issue),
-        None,
-    );
-    let gone = std::cell::Cell::new(false);
-    let verdict = match listed {
-        Some(verdict) => verdict,
-        None => legacy_union(repo_root, &owner, &repo, issue, &gone),
-    };
+    let (verdict, gone) = probe_linked_pr_at(repo_root, &owner, &repo, issue, false);
     let Some(fact) = fact else {
         return verdict;
     };
     // W3a: a repo the forge could not resolve under the remembered name is
     // suspect, and nothing computed from it is a verdict.
-    if gone.get() {
+    if gone {
         facts::invalidate(repo_root, "linked-PR probe could not resolve the repository");
         return OpenPrProbe::ProbeFailed;
     }
@@ -699,6 +684,140 @@ pub fn probe_open_linked_pr(repo_root: &Path, issue: u32) -> OpenPrProbe {
     verdict
 }
 
+/// A deferred publisher needs evidence for the literal repo its POST would target.
+/// The ordinary worktree probe intentionally ignores the publisher's overrides.
+pub(crate) fn probe_open_linked_pr_for_lease(repo_root: &Path, issue: u32) -> OpenPrProbe {
+    use crate::forge_repo_facts::{self as facts, GhRepoEnv, Lookup};
+    let Some(target) = lease_publish_repo(repo_root) else {
+        return OpenPrProbe::ProbeFailed;
+    };
+    let host = crate::forge_etag_store::host_scope(&Default::default());
+    let env = GhRepoEnv::Honour;
+    // In the unambiguous case use the existing authenticated fact cache. An
+    // ambiguous root is resolved by the very endpoint and host the POST uses,
+    // without making a writer-side crosscheck merely to learn its target.
+    let lookup = match facts::base_repo(repo_root, env) {
+        Some(base)
+            if !base.ambiguous
+                && base.host.eq_ignore_ascii_case(&host)
+                && base.nwo.eq_ignore_ascii_case(&target) =>
+        {
+            facts::canonical(repo_root, env)
+        }
+        _ => Lookup::Legacy,
+    };
+    let nwo = match lookup {
+        Lookup::Fact(f)
+            if f.host.eq_ignore_ascii_case(&host)
+                && f.configured_nwo.eq_ignore_ascii_case(&target) =>
+        {
+            let canonical = f.full_name();
+            if !f.fresh {
+                let Some(current) = lease_reader_repo(repo_root, &target) else {
+                    return OpenPrProbe::ProbeFailed;
+                };
+                if !current.full_name.eq_ignore_ascii_case(&canonical)
+                    || f.repo_id.is_some_and(|id| current.id != Some(id))
+                {
+                    facts::invalidate(repo_root, "deferred lease target changed");
+                    return OpenPrProbe::ProbeFailed;
+                }
+            }
+            canonical
+        }
+        Lookup::Legacy => {
+            let Some(current) = lease_reader_repo(repo_root, &target) else {
+                return OpenPrProbe::ProbeFailed;
+            };
+            if !current.full_name.eq_ignore_ascii_case(&target) {
+                return OpenPrProbe::ProbeFailed;
+            }
+            current.full_name
+        }
+        _ => return OpenPrProbe::ProbeFailed,
+    };
+    let Some((owner, repo)) = nwo.split_once('/') else {
+        return OpenPrProbe::ProbeFailed;
+    };
+    let (verdict, gone) = probe_linked_pr_at(repo_root, owner, repo, issue, true);
+    if gone {
+        facts::invalidate(repo_root, "deferred linked-PR probe could not resolve the repository");
+        return OpenPrProbe::ProbeFailed;
+    }
+    if !lease_publish_repo(repo_root).is_some_and(|repo| repo.eq_ignore_ascii_case(&target)) {
+        return OpenPrProbe::ProbeFailed;
+    }
+    verdict
+}
+
+/// Reuse the publisher's local target resolution without invoking write
+/// permission or credential establishment. The publisher still checks both.
+fn lease_publish_repo(root: &Path) -> Option<String> {
+    use crate::write_scope::target;
+    match std::env::var("LOOM_REPO")
+        .ok()
+        .filter(|repo| !repo.trim().is_empty())
+    {
+        Some(repo) => target::nwo_from_repo_arg(&repo),
+        None => {
+            let remotes = target::read_remotes(root);
+            let repo = target::gh_target(&remotes, std::env::var("GH_REPO").ok().as_deref())?;
+            let origin = target::origin_nwo(&remotes)?;
+            repo.nwo.eq_ignore_ascii_case(&origin).then_some(repo.nwo)
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LeaseReaderRepo {
+    full_name: String,
+    id: Option<u64>,
+}
+
+/// Read the literal publication endpoint on the default API host, just like
+/// the installed publisher's POST.
+fn lease_reader_repo(root: &Path, target: &str) -> Option<LeaseReaderRepo> {
+    let endpoint = format!("repos/{target}");
+    let result = invocation(
+        "lease.deferred_repo",
+        AccessIntent::Read,
+        root,
+        GH_CALL_TIMEOUT,
+        ["api", "--include", &endpoint],
+    )
+    .reader_repo(target)
+    .run();
+    let text = String::from_utf8_lossy(&result.ok_output()?.stdout);
+    let response = crate::forge_listing::parse_http_response(&text)?;
+    if response.status != 200 {
+        return None;
+    }
+    serde_json::from_str(response.body.trim()).ok()
+}
+
+fn probe_linked_pr_at(
+    repo_root: &Path,
+    owner: &str,
+    repo: &str,
+    issue: u32,
+    require_complete_absence: bool,
+) -> (OpenPrProbe, bool) {
+    let nwo = format!("{owner}/{repo}");
+    let gh = gh_bin();
+    let listed = super::linked_pr_listing::probe(
+        "worktree.linked_pr_listing",
+        Path::new(&gh),
+        repo_root,
+        (&nwo, issue),
+        None,
+    );
+    let gone = std::cell::Cell::new(false);
+    let verdict = listed.unwrap_or_else(|| {
+        legacy_union(repo_root, owner, repo, issue, &gone, require_complete_absence)
+    });
+    (verdict, gone.get())
+}
+
 /// The pre-#10514 GraphQL-then-timeline union of [`probe_open_linked_pr`], now
 /// only its fallback when the open-PR listing could not be read.
 fn legacy_union(
@@ -707,6 +826,7 @@ fn legacy_union(
     repo: &str,
     issue: u32,
     gone: &std::cell::Cell<bool>,
+    require_complete_absence: bool,
 ) -> OpenPrProbe {
     let graphql = run_probe_for(
         "worktree.linked_pr_graphql",
@@ -726,10 +846,9 @@ fn legacy_union(
         &|s| parse_open_linked_pr_timeline_trusted(s, issue, repo_root),
         gone,
     );
-    // A verified NoneOpen from leg 1 survives a leg-2 probe failure: leg 2
-    // is a superset *when it answers*, and an unanswered superset is no
-    // evidence.
-    if matches!(timeline, OpenPrProbe::ProbeFailed) {
+    // Leave ordinary callers' fallback unchanged. A deferred publisher
+    // requires absence of partial links too, which GraphQL cannot establish.
+    if matches!(timeline, OpenPrProbe::ProbeFailed) && !require_complete_absence {
         graphql
     } else {
         timeline

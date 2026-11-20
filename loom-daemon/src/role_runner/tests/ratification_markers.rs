@@ -48,8 +48,8 @@ impl PrSource for Prs {
             head_content: Some("Ratified only on operator merge.".into()),
         }]
     }
-    fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
-        Vec::new()
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -556,10 +556,503 @@ fn unreadable_second_page_fails_closed() {
     assert!(parse_listing(b"").is_none());
 }
 
+// ---- #14797: a completed key is not rerun on the same head ------------------
+
+/// A runner whose output depends on the key that ran last.
+struct KeyedRunner {
+    ee: String,
+    market: String,
+    calls: Vec<String>,
+}
+
+impl RoleInvocationRunner for KeyedRunner {
+    fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+        self.calls.push(role.to_string());
+        RoleTickOutcome::Success
+    }
+    fn last_output(&self) -> Option<String> {
+        Some(match self.calls.last() {
+            Some(r) if r == "ratification-market" => self.market.clone(),
+            _ => self.ee.clone(),
+        })
+    }
+}
+
+/// An instruction source that counts fetches (by pin path) and visibility
+/// reads, so a partial-key retry can prove it reads only the missing key's
+/// instructions and does market-only visibility work only when market runs.
+#[derive(Default)]
+struct CountingInstr {
+    fetches: RefCell<Vec<String>>,
+    visibility: RefCell<u32>,
+    private: Option<bool>,
+}
+
+impl InstructionSource for CountingInstr {
+    fn fetch(&self, pin: &crate::role_runner::ratification_lane::Pin) -> Result<String, String> {
+        self.fetches.borrow_mut().push(pin.path.clone());
+        Ok("INSTR".into())
+    }
+    fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+        *self.visibility.borrow_mut() += 1;
+        self.private
+    }
+}
+
+#[test]
+fn partial_key_retry_runs_and_posts_only_the_missing_key() {
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = Instr { fail_market: false };
+    // Tick 1: both keys missing; market ends in a valid verdict, ee declines.
+    let mut r = KeyedRunner {
+        ee: "declined without a verdict".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee", "ratification-market"]);
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=market"));
+
+    // Tick 2: the trusted market marker is visible on the same head, so only
+    // the missing ee key may run again — not the completed market key.
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 3, "only the missing key reruns; calls so far: {:?}", r.calls);
+    assert_eq!(r.calls[2], "ratification-ee");
+    assert_eq!(sink.posted.borrow().len(), 1, "no duplicate market marker");
+}
+
+#[test]
+fn unreadable_forge_comment_rows_stop_dispatch() {
+    use crate::comment_trust::TrustPolicy;
+    use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::{test_routing, test_support};
+    use crate::role_runner::ratification_lane::{marker_body, run_lane_stats, GhPrSource};
+
+    struct CommentReader<'a> {
+        prs: Prs,
+        forge: GhPrSource<'a>,
+    }
+
+    impl PrSource for CommentReader<'_> {
+        fn open_prs(&self) -> Vec<OpenPr> {
+            self.prs.open_prs()
+        }
+        fn files(
+            &self,
+            pr: u64,
+            hold: &crate::champion_hold::ratification::Config,
+        ) -> Vec<ChangedFile> {
+            self.prs.files(pr, hold)
+        }
+        fn trusted_comments(&self, pr: u64) -> Result<Vec<Comment>, String> {
+            self.forge.trusted_comments(pr)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("reader");
+    std::fs::create_dir(&reader).unwrap();
+    let program = test_support::stub(
+        dir.path(),
+        "gh-comments",
+        r#"test "$1" = api && test "$2" = 'repos/o/r/issues/7/comments?per_page=100' && test "$3" = --paginate || exit 64
+cat "${0%/*}/reply"
+test ! -f "${0%/*}/failed""#,
+    );
+    let _routing = test_routing::install_with_program(
+        test_routing::TestRouting {
+            decision: RouteDecision::Reader {
+                dir: reader,
+                app_id: "fixture-reader".into(),
+                placement: Placement::Home,
+            },
+            env: DeriveEnv::default(),
+            checkout: CwdAnswer::Unresolved,
+        },
+        program,
+    );
+    let cfg = cfg();
+    let policy = TrustPolicy::new(FleetLogins::single("fleet-bot"), None, Vec::new());
+    let source = CommentReader {
+        prs: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        forge: GhPrSource::new(dir.path(), "o/r", &policy),
+    };
+    let marker =
+        marker_body(Key::Market, HEAD, "ratification-market", Some(&valid_review(Key::Market)));
+    let marked = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":marker
+    }]);
+    let ordinary = json!([
+        {"user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":"ordinary discussion"},
+        {"user":{"login":"unknown[bot]","type":"Bot"}, "author_association":"NONE", "body":marker},
+        {"user":null, "author_association":"NONE", "body":marker}
+    ]);
+    let missing_body = json!([{
+        "user":{"login":"fixture-owner","type":"User"}, "author_association":"OWNER", "body":null
+    }]);
+    let bare_row = json!([{"message":"incomplete comment record"}]);
+    let run =
+        |label, listing: String, failed: bool, expected_pins: &[&str], expected_unreadable| {
+            std::fs::write(dir.path().join("reply"), listing).unwrap();
+            let failure = dir.path().join("failed");
+            if failed {
+                std::fs::write(&failure, "").unwrap();
+            }
+            let instructions = CountingInstr {
+                private: Some(true),
+                ..Default::default()
+            };
+            let sink = Sink::default();
+            let mut runner = ok_runner();
+            let (_, _, unreadable) =
+                run_lane_stats(&cfg, None, "o/r", &source, &instructions, &sink, &mut runner);
+            if failed {
+                std::fs::remove_file(failure).unwrap();
+            }
+            assert_eq!(unreadable, expected_unreadable, "{label}: unreadable PRs");
+            assert_eq!(*instructions.fetches.borrow(), expected_pins, "{label}: instructions");
+            assert_eq!(
+                *instructions.visibility.borrow(),
+                u32::from(expected_pins.contains(&"market.md")),
+                "{label}: visibility reads"
+            );
+            assert_eq!(runner.calls as usize, expected_pins.len(), "{label}: sessions");
+            assert_eq!(sink.posted.borrow().len(), expected_pins.len(), "{label}: marker posts");
+        };
+    let both = ["ee.md", "market.md"];
+    run("empty listing", "[]".into(), false, &both, 0);
+    run("readable ordinary and untrusted rows", ordinary.to_string(), false, &both, 0);
+    run("trusted marker", marked.to_string(), false, &["ee.md"], 0);
+    run("failed read", marked.to_string(), true, &[], 1);
+    run("invalid later page", format!("{marked}\n[{{"), false, &[], 1);
+    run("malformed row", bare_row.to_string(), false, &[], 1);
+    run("trusted row without a readable body", missing_body.to_string(), false, &[], 1);
+    run(
+        "valid marker before malformed row",
+        format!("{marked}\n{missing_body}"),
+        false,
+        &[],
+        1,
+    );
+}
+
+#[test]
+fn partial_key_retry_reads_only_the_missing_keys_instructions() {
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = CountingInstr {
+        private: Some(false),
+        ..Default::default()
+    };
+    let mut r = KeyedRunner {
+        ee: "declined without a verdict".into(),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let run = |r: &mut KeyedRunner| {
+        run_lane(&cfg(), None, "o/r", &live, &instr, &sink, r);
+    };
+    // Tick 1: both keys missing — both instructions read, EE first.
+    run(&mut r);
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md"]);
+    assert_eq!(*instr.visibility.borrow(), 1, "one market visibility read");
+    assert_eq!(sink.posted.borrow().len(), 1);
+
+    // Tick 2: market complete, ee still declining. One missing-key
+    // instruction fetch, one role call, no new marker, no visibility read.
+    run(&mut r);
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md", "ee.md"]);
+    assert_eq!(r.calls.last().map(String::as_str), Some("ratification-ee"));
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert_eq!(*instr.visibility.borrow(), 1);
+
+    // Tick 3: ee finally reviews — only its marker, at the captured head.
+    r.ee = valid_review(Key::Ee);
+    run(&mut r);
+    assert_eq!(sink.posted.borrow().len(), 2);
+    assert!(sink.posted.borrow()[1].1.contains("ratify:key=ee"));
+    assert!(sink.posted.borrow()[1].1.contains(HEAD));
+
+    // Tick 4: both keys complete — zero instruction reads, role calls, posts.
+    let fetches_before = instr.fetches.borrow().len();
+    let calls_before = r.calls.len();
+    run(&mut r);
+    assert_eq!(instr.fetches.borrow().len(), fetches_before);
+    assert_eq!(r.calls.len(), calls_before);
+    assert_eq!(sink.posted.borrow().len(), 2);
+}
+
+#[test]
+fn partial_key_retry_works_in_both_directions() {
+    // The other direction: ee completes first, market withholds and is then
+    // retried alone; its session keeps the public-source constraint.
+    let sink = Sink::default();
+    let live = Live {
+        inner: Prs {
+            author: "alice",
+            listed: 0.into(),
+        },
+        sink: &sink,
+    };
+    let instr = CountingInstr {
+        private: Some(false),
+        ..Default::default()
+    };
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: "declined without a verdict".into(),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=ee"));
+
+    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 3, "only market reruns: {:?}", r.calls);
+    assert_eq!(r.calls[2], "ratification-market");
+    assert_eq!(*instr.fetches.borrow(), vec!["ee.md", "market.md", "market.md"]);
+    assert_eq!(*instr.visibility.borrow(), 2, "each market session reads visibility");
+    assert_eq!(sink.posted.borrow().len(), 1, "no duplicate ee marker");
+}
+
+/// A forge whose comment read can fail, and whose trusted comments can be
+/// seeded with raw records filtered through the real trust policy.
+struct Feed {
+    author: &'static str,
+    head: std::cell::Cell<String>,
+    /// Raw REST comment records, filtered through `TrustPolicy` on read.
+    records: RefCell<Vec<serde_json::Value>>,
+    fail_comments: Option<String>,
+}
+
+impl PrSource for Feed {
+    fn open_prs(&self) -> Vec<OpenPr> {
+        vec![OpenPr {
+            number: 7,
+            author: self.author.into(),
+            head_sha: self.head.replace(String::new()),
+        }]
+    }
+    fn files(
+        &self,
+        _pr: u64,
+        _hold: &crate::champion_hold::ratification::Config,
+    ) -> Vec<ChangedFile> {
+        vec![ChangedFile {
+            filename: "ratification/requests/a.md".into(),
+            previous_filename: None,
+            status: "added".into(),
+            head_content: Some("Ratified only on operator merge.".into()),
+        }]
+    }
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        if let Some(why) = &self.fail_comments {
+            return Err(why.clone());
+        }
+        let policy = crate::comment_trust::TrustPolicy::new(
+            crate::forge_identity::FleetLogins::single("fleet-bot"),
+            None,
+            Vec::new(),
+        );
+        Ok(self
+            .records
+            .borrow()
+            .iter()
+            .filter(|c| policy.trusts_json(c))
+            .filter_map(Comment::from_record)
+            .collect())
+    }
+}
+
+impl Feed {
+    fn new() -> Self {
+        Feed {
+            author: "alice",
+            head: std::cell::Cell::new(HEAD.into()),
+            records: RefCell::new(Vec::new()),
+            fail_comments: None,
+        }
+    }
+
+    /// A raw comment record as the REST listing reports it.
+    fn record(login: &str, association: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "user": {"login": login, "type": "Bot"},
+            "author_association": association,
+            "body": body,
+        })
+    }
+
+    /// A hand-lane marker in the accepted wire format (#14797), optionally
+    /// carrying a recorded review.
+    fn seed_marker(
+        &self,
+        login: &str,
+        association: &str,
+        key: &str,
+        sha: &str,
+        verdict: Option<&str>,
+    ) {
+        let body = match verdict {
+            Some(v) => format!(
+                "<!-- ratify:key={key} sha={sha} -->\nreviewer=hand-run-lane\n\nVerdict:\n\n{v}\n"
+            ),
+            None => format!("<!-- ratify:key={key} sha={sha} -->\nreviewer=hand-run-lane\n"),
+        };
+        self.records
+            .borrow_mut()
+            .push(Self::record(login, association, &body));
+    }
+}
+
+#[test]
+fn a_trusted_hand_lane_marker_completes_only_its_key() {
+    let feed = Feed::new();
+    // A trusted fleet App's hand-run marker completes market — even though
+    // its recorded review was negative (`escalate`).
+    feed.seed_marker(
+        "fleet-bot[bot]",
+        "NONE",
+        "market",
+        HEAD,
+        Some("## Market-key review: x\n\n**Overall verdict:** escalate, niche.\n"),
+    );
+    // An otherwise identical lookalike from an untrusted author is prose and
+    // completes nothing: it goes through the actual trust filter above.
+    feed.seed_marker("stranger[bot]", "NONE", "ee", HEAD, None);
+
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee"], "only ee was missing");
+    assert_eq!(sink.posted.borrow().len(), 1);
+    assert!(sink.posted.borrow()[0].1.contains("ratify:key=ee"));
+    // The completed key contributes neither a post nor a withheld count.
+    assert_eq!(results[0].1.len(), 1);
+    assert_eq!(results[0].1[0], (Key::Ee, KeyPost::Posted));
+}
+
+#[test]
+fn unreadable_comment_list_runs_posts_and_counts_nothing() {
+    let feed = Feed {
+        fail_comments: Some("exit 1: HTTP 502".into()),
+        ..Feed::new()
+    };
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = ok_runner();
+    // A failed or malformed paginated read: zero instruction fetches, role
+    // calls and posts, and the PR counts as unreadable (degraded), never as
+    // "no markers" authorizing a duplicate run.
+    let (results, skipped, unreadable) =
+        run_lane_stats(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!((results.len(), skipped, unreadable), (0, 0, 1));
+    assert_eq!(r.calls, 0);
+    assert!(sink.posted.borrow().is_empty());
+    assert!(instr.fetches.borrow().is_empty());
+    let o = TickOutcome::from_run_stats(&results, skipped, unreadable);
+    assert_eq!(o.reason, "degraded");
+}
+
+#[test]
+fn a_verified_empty_comment_list_still_selects_both_keys() {
+    // `Ok(vec![])` is a successfully read empty list, not an unreadable one.
+    let feed = Feed::new();
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee", "ratification-market"]);
+    assert_eq!(sink.posted.borrow().len(), 2);
+}
+
+#[test]
+fn a_moved_head_loses_both_keys_even_with_old_markers() {
+    let feed = Feed::new();
+    feed.seed_marker("fleet-bot[bot]", "NONE", "ee", HEAD, None);
+    feed.seed_marker("fleet-bot[bot]", "NONE", "market", HEAD, None);
+    let new_head = "f".repeat(40);
+    feed.head.set(new_head.clone());
+
+    let sink = Sink::default();
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls.len(), 2, "both keys are missing at the new head");
+    assert_eq!(sink.posted.borrow().len(), 2);
+    for (_, body) in sink.posted.borrow().iter() {
+        assert!(body.contains(&new_head), "markers name the new head: {body}");
+    }
+}
+
+#[test]
+fn a_failed_post_for_the_missing_key_leaves_the_completed_key_alone() {
+    /// A sink that refuses every post.
+    struct Refusing;
+    impl CommentSink for Refusing {
+        fn post(&self, _pr: u64, _body: &str) -> Result<(), String> {
+            Err("HTTP 403".into())
+        }
+    }
+
+    let feed = Feed::new();
+    feed.seed_marker("fleet-bot[bot]", "NONE", "market", HEAD, None);
+    let sink = Refusing;
+    let instr = CountingInstr::default();
+    let mut r = KeyedRunner {
+        ee: valid_review(Key::Ee),
+        market: valid_review(Key::Market),
+        calls: Vec::new(),
+    };
+    let results = run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
+    assert_eq!(r.calls, vec!["ratification-ee"]);
+    match results[0].1.as_slice() {
+        [(Key::Ee, KeyPost::Withheld(reason))] => {
+            assert!(reason.contains("post failed"), "{reason}")
+        }
+        other => panic!("expected the failed ee post, got {other:?}"),
+    }
+    // Withheld stays scoped to the attempted key: the completed market key
+    // contributes nothing, and a later tick retries ee alone.
+    let o = TickOutcome::from_run_stats(&results, 0, 0);
+    assert_eq!((o.reason, o.selected, o.ran, o.posted, o.withheld), ("ran", 1, 1, 0, 1));
+}
+
 // ---- tick outcome + shared entry points (#13707) ----
 
 use crate::role_runner::ratification_lane::{
-    run_lane_counted, tick_span, KeyPost, TickOutcome, STEP_TICK_INTERVAL,
+    run_lane_counted, run_lane_stats, tick_span, KeyPost, TickOutcome, STEP_TICK_INTERVAL,
 };
 
 /// A forge whose trusted comments are whatever the sink has posted so far.
@@ -579,8 +1072,8 @@ impl PrSource for Live<'_> {
     ) -> Vec<ChangedFile> {
         self.inner.files(pr, hold)
     }
-    fn trusted_comments(&self, _pr: u64) -> Vec<Comment> {
-        comments(self.sink)
+    fn trusted_comments(&self, _pr: u64) -> Result<Vec<Comment>, String> {
+        Ok(comments(self.sink))
     }
 }
 

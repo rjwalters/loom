@@ -7,7 +7,7 @@ The body below is a snapshot of GitHub label state as of the last merged docs-ma
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
 <!-- guide:plan-body:start -->
-_Generated: 2026-11-20T07:57:41Z (snapshot; compare against live labels)_
+_Generated: 2026-11-20T13:23:48Z (snapshot; compare against live labels)_
 ## Operator Attention: Merge-Risk-Hold Pileup
 
 Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a human merge decision is missing.
@@ -18,6 +18,7 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#14078**: fix: classify gh api -F/--raw-field as writes in gh-cached; flag stalled census reads
 - **#14108**: fix(private_workspace): forward the freshest owner token, not a fixed primary-first one
 - **#14136**: fix: ignore pnpm artifacts in the managed gitignore block of loom-workspace stub repos
+- **#14253**: fix: drop dead unreadable verdict from ratification help and defer row
 - **#14260**: fix(daemon): contained launches draw only private-clone accounts registering the workspace repository
 - **#14281**: docs: name 2AMLogic/loom in shipped files and add old-slug guard test
 - **#14335**: docs: drop stale file-size ratchet comments from loom-daemon and ci.yml (slice c)
@@ -52,6 +53,11 @@ Judge-approved PRs under a hold (`loom:blocked` or `loom:operator`) — only a h
 - **#14752**: fix: report worktrees reaped before preparation refuses
 - **#14753**: fix: mint a bootstrap reader so first-start fleet-config render can confirm the store
 - **#14758**: fix(release): keep checksum reads on the reader route
+- **#14760**: test: compare the canonical path of a reaped worktree
+- **#14766**: fix: skip the gh-config bind for daemon-owned App credentials in new private seats
+- **#14769**: fix: skip source-remote lookup on no-op resyncs
+- **#14773**: fix(forge): recover admission reads after GraphQL exhaustion
+- **#14776**: feat(daemon): reclaim private-seat scratch and merged-PR worktrees via a leased idle pass
 
 ## Very Important
 
@@ -73,7 +79,7 @@ _None._
 
 Human-approved issues (`loom:issue`) ready for implementation — excluding held (`loom:blocked`/`loom:operator`/`loom:frozen`), `loom:building`, and issues closed by an open `loom:pr` PR (listed under Approved).
 
-_None._
+- **#14632**: Merge-queue handoff can lose the status broker route on a fleet worker
 
 ## In Progress
 
@@ -105,38 +111,33 @@ Issues currently being built (`loom:building`).
 - **#14516**: Verdict staleness trusts an old rejection when a prepared Doctor commit is pushed later
 - **#14534**: recover --publish: CLI discovers the daemon's workspace root without an exported variable (AC1 of #14433)
 - **#14560**: Work-finder completion gaps leave the Fleet queue stale
-- **#14565**: Test which forge route serves installed issue leases in the three Loom modes
 - **#14570**: Installer: an option to install into a repo without replacing the machine's daemon or user-scope hooks
 - **#14615**: accounts check --ranking still shows borrowed weekly usage for a profile whose sessions dir is a symlink, while selection now ignores it
 - **#14617**: forge verdict-lock waits 90 seconds and reports contention when its lock parent is read-only
 - **#14626**: Private-clone admission contains the winning seat twice per admission
-- **#14632**: Merge-queue handoff can lose the status broker route on a fleet worker
-- **#14651**: judge.md's worktree drift recovery (`git pull --ff-only`) moves a PR branch onto main when upstream tracking has drifted
 - **#14677**: resync-installed.sh --output has no sanctioned source path for an agent working from a managed worktree in a consumer repo
 - **#14678**: Private-clone Codex seat volumes grow without bound: a full clone per repo per seat, and nothing reclaims them
 - **#14708**: ci: discovery-stall diagnostic prints `(unreadable)` for /proc/<pid>/stack — needs sudo to capture the kernel stack
+- **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue
 - **#14716**: Prove a stable forge read authority for private seat mirror admission
 - **#14730**: First daemon start on a new host cannot fetch the fleet store: fleet-config render is shed when readers are configured and no daemon is running
 - **#14732**: Champion routes an issue to the operator for a dependency cycle it is not on (a Part-of parent link read as an edge)
 - **#14735**: private seat: a reaped worktree is unreported when preparation then refuses
-- **#14737**: Observed Loom step attempt spans omit the recorded failure class
 - **#14739**: forge_identity: a release.checksum refusal withdraws the reader gateway for the whole owner, shedding every 2AMLogic read ~20 min/h since 0.20.0
 - **#14740**: Fresh install writes no requires_daemon, so newly admitted repos are dispatch-held when the fleet floor moves
-- **#14741**: pricing: gpt-6.2-astra is not on the pricing card; every Codex step is costed at the Sonnet fallback
 - **#14742**: Builder admission stops at GraphQL-only issue and split-parent reads when REST is available
 - **#14744**: session_reconcile cannot create a private-clone seat on an App-only host: the daemon's own GH_CONFIG_DIR is inside its checkout
 - **#14757**: private_workspace reap test asserts a non-canonical worktree path, failing where TMPDIR holds a symlink
+- **#14783**: Reuse EnvGuard in the five tests that clear GH_CONFIG_DIR
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
 - **#12969**: feat: age-bound Codex rollout history in live profiles *(held)*
-- **#14253**: fix: drop dead unreadable verdict from ratification help and defer row
 - **#14612**: fix: launch eager reclaim detached so it cannot hold back a work-finder tick *(held)*
-- **#14760**: test: compare the canonical path of a reaped worktree
-- **#14766**: fix: skip the gh-config bind for daemon-owned App credentials in new private seats
+- **#14786**: test: reuse EnvGuard in unregistered workspace fixtures
 
 ## Approved (Awaiting Merge)
 
@@ -148,6 +149,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#14078**: fix: classify gh api -F/--raw-field as writes in gh-cached; flag stalled census reads — closes #14011
 - **#14108**: fix(private_workspace): forward the freshest owner token, not a fixed primary-first one — closes #13933
 - **#14136**: fix: ignore pnpm artifacts in the managed gitignore block of loom-workspace stub repos — closes #13898
+- **#14253**: fix: drop dead unreadable verdict from ratification help and defer row — closes #14125
 - **#14260**: fix(daemon): contained launches draw only private-clone accounts registering the workspace repository — closes #14110
 - **#14281**: docs: name 2AMLogic/loom in shipped files and add old-slug guard test — closes #14221
 - **#14335**: docs: drop stale file-size ratchet comments from loom-daemon and ci.yml (slice c) — closes #13827
@@ -182,6 +184,11 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 - **#14752**: fix: report worktrees reaped before preparation refuses — closes #14735
 - **#14753**: fix: mint a bootstrap reader so first-start fleet-config render can confirm the store — closes #14730
 - **#14758**: fix(release): keep checksum reads on the reader route
+- **#14760**: test: compare the canonical path of a reaped worktree — closes #14757
+- **#14766**: fix: skip the gh-config bind for daemon-owned App credentials in new private seats — closes #14744
+- **#14769**: fix: skip source-remote lookup on no-op resyncs — closes #14712
+- **#14773**: fix(forge): recover admission reads after GraphQL exhaustion — closes #14742
+- **#14776**: feat(daemon): reclaim private-seat scratch and merged-PR worktrees via a leased idle pass — closes #14678
 
 ## Proposed
 
@@ -284,6 +291,7 @@ Issues carrying `loom:curated`.
 - **#14680**: Share origin-only Git objects across Codex seats through read-only per-repository mirrors *(curated)* *(held)*
 - **#14685**: Live-verify Docker retention per-evaluation summaries on a containerd-store worker (#14679 follow-up) *(curated)* *(held)*
 - **#14708**: ci: discovery-stall diagnostic prints `(unreadable)` for /proc/<pid>/stack — needs sudo to capture the kernel stack *(curated)*
+- **#14712**: resync: a no-op resync warns that it stamped the canonical loom_source_remote, but leaves the stale one *(curated)*
 - **#14714**: Held Doctor repairs leave stale approvals outside the Judge queue *(curated)*
 - **#14716**: Prove a stable forge read authority for private seat mirror admission *(curated)*
 - **#14730**: First daemon start on a new host cannot fetch the fleet store: fleet-config render is shed when readers are configured and no daemon is running *(curated)*
@@ -292,16 +300,18 @@ Issues carrying `loom:curated`.
 - **#14737**: Observed Loom step attempt spans omit the recorded failure class *(curated)* *(held)*
 - **#14739**: forge_identity: a release.checksum refusal withdraws the reader gateway for the whole owner, shedding every 2AMLogic read ~20 min/h since 0.20.0 *(curated)*
 - **#14740**: Fresh install writes no requires_daemon, so newly admitted repos are dispatch-held when the fleet floor moves *(curated)*
-- **#14741**: pricing: gpt-6.2-astra is not on the pricing card; every Codex step is costed at the Sonnet fallback *(curated)*
+- **#14741**: pricing: gpt-6.2-astra is not on the pricing card; every Codex step is costed at the Sonnet fallback *(curated)* *(held)*
 - **#14742**: Builder admission stops at GraphQL-only issue and split-parent reads when REST is available *(curated)*
 - **#14744**: session_reconcile cannot create a private-clone seat on an App-only host: the daemon's own GH_CONFIG_DIR is inside its checkout *(curated)*
 - **#14757**: private_workspace reap test asserts a non-canonical worktree path, failing where TMPDIR holds a symlink *(curated)*
+- **#14785**: Guide work plan counts issues with open partial PRs as ready for new Builders *(curated)* *(held)*
 
 ## Proposed (Architect / Hermit)
 
 - **#13071**: Peer claims: move machine coordination off rendered room messages (custom event type / state events) *(architect)* *(held)*
 - **#14186**: Remove warn-out-of-set-deps.sh: advisory script with no caller *(hermit)* *(held)*
 - **#14647**: Remove unused Radix dropdown and switch dependencies from both UI quickstarts *(hermit)* *(held)*
+- **#14787**: Remove duplicate field mappings from eight status JSON entries *(hermit)*
 
 ## Epics
 
@@ -317,14 +327,14 @@ Issues carrying `loom:curated`.
 
 | Bucket | Count |
 |------|-------|
-| Operator merge-risk holds | 40 |
+| Operator merge-risk holds | 46 |
 | Very important | 0 |
 | Important | 5 |
-| Ready (`loom:issue`, net of holds/building/merge-pending) | 0 |
-| In Progress (`loom:building`) | 48 |
-| PRs awaiting review | 5 |
-| Approved PRs awaiting merge | 40 |
-| Curated | 109 |
-| Architect / Hermit proposals | 3 |
+| Ready (`loom:issue`, net of holds/building/merge-pending) | 1 |
+| In Progress (`loom:building`) | 45 |
+| PRs awaiting review | 3 |
+| Approved PRs awaiting merge | 46 |
+| Curated | 111 |
+| Architect / Hermit proposals | 4 |
 | Active epics | 7 |
 <!-- guide:plan-body:end -->
