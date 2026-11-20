@@ -52,6 +52,7 @@ fn docker_report(now: DateTime<Utc>) -> DockerRetentionReport {
         plan: None,
         removed: Vec::new(),
         deferred: None,
+        inventory_error: None,
         at: now,
     }
 }
