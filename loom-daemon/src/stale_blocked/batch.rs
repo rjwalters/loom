@@ -197,6 +197,9 @@ pub struct Options {
 #[derive(Debug, Clone)]
 pub struct Gathering {
     pub items: Vec<Gathered>,
+    /// Open parked issues and their exact body declarations, from the same
+    /// listing as the PR resweep. This does not read or evaluate the issues.
+    pub issue_parks: Vec<(u32, Vec<crate::park_record::BlockerRef>)>,
     pub enumerate_error: Option<String>,
     pub cost: ForgeCost,
     /// The archived-repository probe's answer (#10562): `Some(true)` means
@@ -267,6 +270,7 @@ fn gather_checked_with(
     };
     Gathering {
         items: Vec::new(),
+        issue_parks: Vec::new(),
         enumerate_error,
         cost: ForgeCost {
             floor: opts.floor,
@@ -316,6 +320,7 @@ fn gather_filtered_for(
         Err(e) => {
             return Gathering {
                 items: Vec::new(),
+                issue_parks: Vec::new(),
                 enumerate_error: Some(format!("loom:blocked listing failed: {e}")),
                 cost,
                 archived: None,
@@ -323,6 +328,15 @@ fn gather_filtered_for(
         }
     };
     let limit = opts.limit as usize;
+    let issue_parks = if named_pr_resweep {
+        rows.iter()
+            .filter(|r| !r.is_pull_request)
+            .filter_map(|r| Some((r.number, crate::park_record::blockers(r.body.as_deref()?))))
+            .filter(|(_, blockers)| !blockers.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut selected: Vec<(Artifact, RestIssue)> = Vec::new();
     for (kind, want_pr) in [(Artifact::Issue, false), (Artifact::Pr, true)] {
         if (want_pr && opts.no_prs) || (!want_pr && named_pr_resweep) {
@@ -380,6 +394,7 @@ fn gather_filtered_for(
             cost.meter = forge.meter();
             return Gathering {
                 items,
+                issue_parks,
                 enumerate_error: None,
                 cost,
                 archived: None,
@@ -405,6 +420,7 @@ fn gather_filtered_for(
     cost.budget_stopped = guard.stopped();
     Gathering {
         items,
+        issue_parks,
         enumerate_error: None,
         cost,
         archived: None,
@@ -860,6 +876,10 @@ pub struct GhStaleBlockedForge {
 }
 
 impl GhStaleBlockedForge {
+    pub(crate) fn repo_slug(&self) -> &str {
+        &self.slug
+    }
+
     fn graphql_response(
         &mut self,
         name: &'static str,
@@ -1023,7 +1043,7 @@ impl StaleBlockedForge for GhStaleBlockedForge {
             .ok_or_else(|| anyhow!("cannot bind a PR snapshot to {}", self.slug))?;
         let query = format!(
             "query {{ rateLimit {{ cost remaining }} repository(owner:{owner:?},name:{name:?}) \
-             {{ nameWithOwner pullRequest(number:{number}) {{ number state body \
+             {{ nameWithOwner pullRequest(number:{number}) {{ number state body isDraft headRefOid baseRefOid baseRefName \
              labels(first:100) {{ totalCount nodes {{ name }} }} \
              mergeable mergeStateStatus reviewDecision }} }} }}"
         );
@@ -1333,7 +1353,34 @@ pub(super) fn parse_pr_resweep_state(
     }
     let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
     let status = pr["mergeStateStatus"].as_str().unwrap_or("UNKNOWN");
-    if mergeable == "CONFLICTING" || matches!(status, "DIRTY" | "CONFLICTING") {
+    if mergeable == "CONFLICTING" && matches!(status, "DIRTY" | "CONFLICTING") {
+        if pr["isDraft"].as_bool() != Some(false) {
+            anyhow::bail!("the direct PR draft state is absent or draft");
+        }
+        let valid_oid = |value: &serde_json::Value| {
+            value
+                .as_str()
+                .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        };
+        if !valid_oid(&pr["headRefOid"]) || !valid_oid(&pr["baseRefOid"]) {
+            anyhow::bail!("the direct PR head or base commit is unknown");
+        }
+        let base = pr["baseRefName"]
+            .as_str()
+            .filter(|base| !base.is_empty())
+            .ok_or_else(|| anyhow!("the direct PR base ref is unknown"))?;
+        if crate::merge_pr::stacked_children::is_stackable_parent_branch(base) {
+            return Ok(PrResweepState::Held(
+                "stacked base is outside Guide conflict routing".into(),
+            ));
+        }
+        if names.iter().any(|label| {
+            matches!(*label, "loom:pr" | "loom:reviewing" | "loom:treating" | "loom:sequenced")
+        }) {
+            return Ok(PrResweepState::Held(
+                "review, active claim, or stack keeps Guide from routing this conflict".into(),
+            ));
+        }
         return Ok(PrResweepState::Conflict(format!(
             "the PR cannot currently land (mergeable={mergeable}, mergeStateStatus={status})"
         )));
