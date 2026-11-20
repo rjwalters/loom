@@ -31,7 +31,7 @@ pub use lifecycle::{
     run_job, session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
-pub(crate) use volume_usage::{sample_seat_volumes, SeatVolumeUsage};
+pub(crate) use volume_usage::{SeatVolumeSamples, SeatVolumeUsage};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,11 @@ pub const REPO: &str = "/workspace/repo";
 /// legacy primary at [`REPO`] (#10795). Lives on the account's own volume.
 pub const WORK_ROOT: &str = "/workspace/work";
 pub const MODE: &str = "private-clone";
+const VOLUME_PREFIX: &str = "loom-codex-workspace-";
+
+fn workspace_volume_name(account: &str) -> String {
+    format!("{VOLUME_PREFIX}{account}")
+}
 pub const PROTOCOL: &str = "loom-private-workspace-v1";
 const PROFILE: &str = "/home/loom/.codex-profile";
 const GH_CONFIG: &str = "/run/loom-gh";

@@ -16,10 +16,10 @@
 //! handed in by the collector.
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::tokens_pool::private_workspace::{sample_seat_volumes, SeatVolumeUsage};
-use std::time::{Duration, Instant};
+use crate::tokens_pool::private_workspace::{SeatVolumeSamples, SeatVolumeUsage};
+use std::time::Duration;
 
-const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+pub(crate) const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// One host resource sample, in bytes. `None` = unmeasurable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -208,30 +208,29 @@ pub(super) fn seat_volume_points(sample: SeatVolumeUsage) -> Vec<MetricPoint> {
     points
 }
 
-/// Walk storage less often than ordinary host probes. A slow walk does not
-/// hold up host-health events or overlap a later sample.
+/// Rotate bounded volume reads off the collector and skip a tick if a
+/// preceding walk is still in progress.
 #[derive(Default)]
 pub(crate) struct SeatVolumeSampler {
-    last_attempt: Option<Instant>,
-    active: Option<tokio::task::JoinHandle<()>>,
+    active: Option<tokio::task::JoinHandle<SeatVolumeSamples>>,
 }
 
 impl SeatVolumeSampler {
-    pub(crate) fn record_if_due(&mut self) {
-        let now = Instant::now();
-        if self
-            .last_attempt
-            .is_some_and(|last| now.duration_since(last) < SEAT_VOLUME_SAMPLE_INTERVAL)
-            || self.active.as_ref().is_some_and(|task| !task.is_finished())
-        {
+    pub(crate) async fn record_if_due(&mut self) {
+        if self.active.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
         }
         let Some(sink) = super::global_ops_sink() else {
             return;
         };
-        self.last_attempt = Some(now);
+        // The task is finished here, so awaiting it only recovers the rolling samples.
+        let mut samples = match self.active.take() {
+            Some(task) => task.await.unwrap_or_default(),
+            None => SeatVolumeSamples::default(),
+        };
         self.active = Some(tokio::task::spawn_blocking(move || {
-            sink.emit_metrics(seat_volume_points(sample_seat_volumes()));
+            sink.emit_metrics(seat_volume_points(samples.sample()));
+            samples
         }));
     }
 }
