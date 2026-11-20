@@ -338,6 +338,7 @@ fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
         workspace,
         std::env::var_os("GH_CONFIG_DIR"),
         dirs::home_dir().map(|home| home.join(".config/gh")),
+        crate::credential_preflight::primary_workspace_root(),
     )
 }
 
@@ -348,6 +349,7 @@ pub(super) fn resolve_gh_config_with(
     workspace: &Path,
     gh_config_dir: Option<std::ffi::OsString>,
     home_default: Option<PathBuf>,
+    primary_root: Option<PathBuf>,
 ) -> Result<Option<PathBuf>> {
     let resolved = gh_config_dir
         .map(PathBuf::from)
@@ -355,7 +357,7 @@ pub(super) fn resolve_gh_config_with(
         .filter(|path| path.is_dir())
         .map(|path| path.canonicalize())
         .transpose()?
-        .filter(|path| !daemon_owned_gh_config(workspace, path));
+        .filter(|path| !daemon_owned_gh_config(workspace, primary_root.as_deref(), path));
     if let Some(path) = &resolved {
         for parent in path.ancestors() {
             if parent.join(".git").exists() {
@@ -367,23 +369,30 @@ pub(super) fn resolve_gh_config_with(
 }
 
 /// `true` when `path` (already canonicalized) is one of the daemon-owned
-/// GitHub App credential directories under `workspace`'s own `.loom/`: the
-/// process-global `GH_CONFIG_DIR` the daemon activates at startup
-/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a
-/// per-owner sibling ([`github_app_gh_config_dir_for_owner`]). A symlinked
-/// spelling of either resolves to the same canonical path and matches; a
-/// workspace that cannot be resolved owns nothing, so the caller's refusal
-/// stands.
-fn daemon_owned_gh_config(workspace: &Path, path: &Path) -> bool {
-    let Some(root) = workspace.canonicalize().ok() else {
-        return false;
-    };
-    if path == crate::credential_preflight::github_app_gh_config_dir(&root) {
-        return true;
-    }
-    let owners = root.join(".loom").join("gh-config-by-owner");
-    path.strip_prefix(&owners)
-        .is_ok_and(|rest| rest.components().count() == 1)
+/// GitHub App credential directories: the process-global `GH_CONFIG_DIR` the
+/// daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a per-owner
+/// sibling ([`github_app_gh_config_dir_for_owner`]), under either the daemon's
+/// primary workspace root (the credential owner: startup config belongs to it,
+/// whichever registered checkout acts) or the acting `workspace`.
+///
+/// Both sides are compared canonicalized: `path` already is, so each expected
+/// location is canonicalized too (an aliased `.loom` or `gh-config` resolves
+/// to the same place). A root that cannot be resolved owns nothing, so the
+/// caller's refusal stands.
+fn daemon_owned_gh_config(workspace: &Path, primary_root: Option<&Path>, path: &Path) -> bool {
+    std::iter::once(workspace)
+        .chain(primary_root)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            if path == canon(crate::credential_preflight::github_app_gh_config_dir(&root)) {
+                return true;
+            }
+            let owners = canon(root.join(".loom").join("gh-config-by-owner"));
+            path.strip_prefix(&owners)
+                .is_ok_and(|rest| rest.components().count() == 1)
+        })
 }
 
 /// Unattended recovery of an already-configured private session whose

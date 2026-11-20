@@ -735,7 +735,7 @@ fn daemon_owned_gh_config_dir_under_a_checkout_is_not_recorded() {
     std::fs::create_dir_all(&dir).expect("app dir");
     std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
     assert!(matches!(
-        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None),
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
         Ok(None)
     ));
 }
@@ -747,7 +747,7 @@ fn a_per_owner_daemon_gh_config_dir_under_a_checkout_is_not_recorded() {
     std::fs::create_dir_all(&dir).expect("owner dir");
     std::fs::create_dir_all(ws.path().join(".git")).expect("daemon checkout");
     assert!(matches!(
-        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None),
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
         Ok(None)
     ));
 }
@@ -761,7 +761,7 @@ fn a_symlinked_spelling_of_the_daemon_owned_gh_config_dir_is_not_recorded() {
     symlink(&dir, ws.path().join("linked-gh-config")).expect("symlink");
     let linked = ws.path().join("linked-gh-config");
     assert!(matches!(
-        lifecycle::resolve_gh_config_with(ws.path(), Some(linked.into_os_string()), None),
+        lifecycle::resolve_gh_config_with(ws.path(), Some(linked.into_os_string()), None, None),
         Ok(None)
     ));
 }
@@ -772,8 +772,9 @@ fn a_gh_config_dir_under_a_checkout_the_daemon_does_not_own_is_refused() {
     std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
     let dir = ws.path().join("credentials/gh");
     std::fs::create_dir_all(&dir).expect("gh dir");
-    let error = lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None)
-        .expect_err("a foreign dir under a checkout must be refused");
+    let error =
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None)
+            .expect_err("a foreign dir under a checkout must be refused");
     assert!(error
         .to_string()
         .contains("forge credentials must be outside every repository/worktree"));
@@ -785,7 +786,7 @@ fn a_home_default_gh_dir_under_a_checkout_is_refused() {
     std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
     let home_default = ws.path().join(".config/gh");
     std::fs::create_dir_all(&home_default).expect("gh dir");
-    let error = lifecycle::resolve_gh_config_with(ws.path(), None, Some(home_default))
+    let error = lifecycle::resolve_gh_config_with(ws.path(), None, Some(home_default), None)
         .expect_err("the home-default dir under a checkout must be refused");
     assert!(error
         .to_string()
@@ -799,10 +800,74 @@ fn a_gh_config_dir_outside_every_checkout_is_recorded() {
     let dir = elsewhere.path().join("gh");
     std::fs::create_dir_all(&dir).expect("gh dir");
     assert_eq!(
-        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.clone().into_os_string()), None)
-            .expect("an ordinary dir is recorded"),
+        lifecycle::resolve_gh_config_with(
+            ws.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            None
+        )
+        .expect("an ordinary dir is recorded"),
         Some(dir.canonicalize().expect("canonical"))
     );
+}
+
+#[test]
+fn the_primary_workspace_app_dir_is_not_recorded_for_a_distinct_acting_checkout() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    let acting = tempfile::tempdir().expect("tempdir");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(primary.path());
+    std::fs::create_dir_all(&dir).expect("app dir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("daemon checkout");
+    std::fs::create_dir_all(acting.path().join(".git")).expect("acting checkout");
+    let primary_root = Some(primary.path().to_path_buf());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(
+            acting.path(),
+            Some(dir.clone().into_os_string()),
+            None,
+            primary_root
+        ),
+        Ok(None)
+    ));
+    // Without the primary root the acting checkout does not own it: refused.
+    assert!(lifecycle::resolve_gh_config_with(
+        acting.path(),
+        Some(dir.into_os_string()),
+        None,
+        None
+    )
+    .is_err());
+}
+
+#[test]
+fn an_aliased_app_dir_location_is_not_recorded() {
+    use std::os::unix::fs::symlink;
+    let ws = tempfile::tempdir().expect("tempdir");
+    let real = ws.path().join("real-gh-config");
+    std::fs::create_dir_all(&real).expect("real dir");
+    std::fs::create_dir_all(ws.path().join(".loom")).expect(".loom");
+    symlink(&real, ws.path().join(".loom/gh-config")).expect("symlink");
+    std::fs::create_dir_all(ws.path().join(".git")).expect("checkout");
+    let dir = crate::credential_preflight::github_app_gh_config_dir(ws.path());
+    assert!(matches!(
+        lifecycle::resolve_gh_config_with(ws.path(), Some(dir.into_os_string()), None, None),
+        Ok(None)
+    ));
+}
+
+#[test]
+fn an_unrelated_dir_under_the_primary_checkout_is_still_refused() {
+    let primary = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(primary.path().join(".git")).expect("checkout");
+    let dir = primary.path().join("credentials/gh");
+    std::fs::create_dir_all(&dir).expect("gh dir");
+    assert!(lifecycle::resolve_gh_config_with(
+        primary.path(),
+        Some(dir.into_os_string()),
+        None,
+        Some(primary.path().to_path_buf())
+    )
+    .is_err());
 }
 
 fn config() -> Config {
