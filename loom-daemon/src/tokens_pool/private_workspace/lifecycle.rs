@@ -497,10 +497,41 @@ pub fn session_recover(
     if state["State"]["Running"] != true || !docker::idle(Some(&state), &config.container)? {
         bail!("private session is not running and idle; refuse recover admission");
     }
+    // Resolved per exec (an installation token outlives no job), but checked
+    // for every clone up front: a publish pushes, and with no write credential
+    // for a GitHub clone the in-container helper can only fail, so refuse
+    // before ANY exec and name what to provide (#14433). List and discard
+    // never push.
     let recovery_targets: Vec<_> = targets
         .iter()
         .map(|target| (target, forge_auth::ExecAuth::resolve(workspace, &target.repository)))
         .collect();
+    if action == RecoverAction::Publish {
+        if let Some((target, auth)) = recovery_targets
+            .iter()
+            .find(|(_, auth)| auth.github_token_missing())
+        {
+            // An owner whose only published credential is provably expired
+            // reaches the same bail (`config_dir_for` skips a matched-but-
+            // expired directory), but the message must not tell the operator
+            // to publish an App config that is already published (#14435).
+            if auth.expired() {
+                bail!(
+                    "private workspace forge credential for {} is expired and no fresher \
+                     one is published; the credential refresh has not renewed it; the \
+                     unpublished work is retained",
+                    target.repository
+                );
+            }
+            bail!(
+                "no GitHub write credential for {}: provide the repository owner's published \
+                 App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \
+                 workspace root; set LOOM_MACHINE_CHECKOUT to that root) or GH_TOKEN in the \
+                 environment; the unpublished work is retained",
+                target.repository
+            );
+        }
+    }
     let paths_by_clone = if worktrees.is_empty() {
         vec![Vec::new(); targets.len()]
     } else {
@@ -721,6 +752,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
+        held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
         config,

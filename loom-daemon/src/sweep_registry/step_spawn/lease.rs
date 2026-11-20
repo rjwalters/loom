@@ -26,6 +26,7 @@ use crate::pr_lease_reap::{self, Reaper};
 
 /// `lease pr claim` exits (`cli/pr_lease.rs`).
 const EXIT_HELD: i32 = 0;
+const EXIT_UNVERIFIED: i32 = 5;
 const EXIT_PEER: i32 = 4;
 const EXIT_BACKSTOP: i32 = 6;
 const EXIT_ACTIVE: i32 = 7;
@@ -171,24 +172,33 @@ fn stderr_tail(raw: &str) -> Option<String> {
 }
 
 /// Run `cmd` to completion within `limit`; how it ended, how long it took,
-/// and the tail of its stderr when `cmd` pipes it.
-fn run_bounded(cmd: &mut Command, limit: Duration) -> (ClaimRun, Duration, Option<String>) {
+/// and the tail of its stderr plus its (bounded) stdout when `cmd` pipes
+/// them. The stdout is the claim child's typed channel
+/// (`writer_limit::parse_handoff`): vendor output never reaches it.
+fn run_bounded(
+    cmd: &mut Command,
+    limit: Duration,
+) -> (ClaimRun, Duration, Option<String>, Option<String>) {
     let start = Instant::now();
     let Ok(mut child) = cmd.spawn() else {
-        return (ClaimRun::SpawnFailed, start.elapsed(), None);
+        return (ClaimRun::SpawnFailed, start.elapsed(), None, None);
     };
     // #14100: a `lease pr` child is the daemon's own binary; attribute its pid.
     let tracked = crate::self_spawn_log::track("step_lease", cmd, child.id());
-    // Drained on a thread, so a chatty child cannot fill the pipe and stall.
-    let reader = child.stderr.take().map(|stderr| {
+    // Drained on threads, so a chatty child cannot fill a pipe and stall.
+    fn drain<R: std::io::Read + Send + 'static>(
+        stream: R,
+    ) -> Option<std::sync::mpsc::Receiver<String>> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stderr, 65_536), &mut buf);
+            let _ = std::io::Read::read_to_end(&mut std::io::Read::take(stream, 65_536), &mut buf);
             let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
         });
-        rx
-    });
+        Some(rx)
+    }
+    let stderr_reader = child.stderr.take().and_then(drain);
+    let stdout_reader = child.stdout.take().and_then(drain);
     let run = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -205,10 +215,11 @@ fn run_bounded(cmd: &mut Command, limit: Duration) -> (ClaimRun, Duration, Optio
         }
     };
     let elapsed = start.elapsed();
-    let tail = reader
+    let tail = stderr_reader
         .and_then(|rx| rx.recv_timeout(STDERR_GRACE).ok())
         .and_then(|raw| stderr_tail(&raw));
-    (run, elapsed, tail)
+    let stdout = stdout_reader.and_then(|rx| rx.recv_timeout(STDERR_GRACE).ok());
+    (run, elapsed, tail, stdout)
 }
 
 impl SweepRegistry {
@@ -228,7 +239,11 @@ impl SweepRegistry {
             .current_dir(root)
             .env(pr_lease_reap::LEASE_FILE_ENV, pr_lease_reap::path_for(root, sweep_id))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // The claim's stdout is its typed handoff channel (#13746); on a
+            // won claim it stays the `host sweep` line, on a stand-down the
+            // bounded writer facts. Piped for every verb; nobody reads the
+            // renewal's.
+            .stdout(Stdio::piped())
             .stderr(if pipe_stderr {
                 Stdio::piped()
             } else {
@@ -325,7 +340,11 @@ impl SweepRegistry {
 
 /// Run a pre-claim command ([`SweepRegistry::step_claim_command`]); no
 /// registry state is read, so the caller holds no lock. The facts of the
-/// run, won or refused (#12183).
+/// run, won or refused (#12183). A confirmed writer rate limit the child
+/// handed over (`writer_limit::parse_handoff` of its stdout, the one typed
+/// channel vendor output cannot reach) is the distinct
+/// `writer_rate_limited` refusal (#13746); every other way the claim fails
+/// stays `claim_unverified`.
 pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimFacts, StepRefusal> {
     let Some(mut cmd) = cmd else {
         let mut refusal = StepRefusal::new("claim_unverified", "no loom-daemon binary");
@@ -338,7 +357,7 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
         }));
         return Err(refusal);
     };
-    let (run, elapsed, tail) = run_bounded(&mut cmd, CLAIM_TIMEOUT);
+    let (run, elapsed, tail, stdout) = run_bounded(&mut cmd, CLAIM_TIMEOUT);
     let facts = ClaimFacts {
         outcome: run.token(),
         exit_code: run.code(),
@@ -346,10 +365,28 @@ pub(super) fn run_step_claim(cmd: Option<Command>) -> std::result::Result<ClaimF
         stderr_tail: tail,
         rollback: None,
     };
+    // The typed handoff only ever upgrades the child's own unverified
+    // exit: an EXIT_HELD (or any other) run never reads one.
+    let writer_limited = if run.code() == Some(EXIT_UNVERIFIED) {
+        stdout
+            .as_deref()
+            .and_then(crate::writer_limit::parse_handoff)
+    } else {
+        None
+    };
     match claim_verdict(&run) {
         Ok(()) => Ok(facts),
         Err(mut refusal) => {
-            if let Some(tail) = &facts.stderr_tail {
+            if let Some(limited) = writer_limited {
+                let reset = limited
+                    .reset_utc()
+                    .map_or_else(|| "reset unconfirmed".to_string(), |at| at.to_string());
+                refusal = StepRefusal::new(
+                    crate::writer_limit::OUTCOME,
+                    format!("the writer is rate-limited ({}): {}", limited.stage.as_str(), reset),
+                );
+                refusal.writer_limit = Some(Box::new(limited));
+            } else if let Some(tail) = &facts.stderr_tail {
                 refusal.detail = format!("{} (stderr: {tail})", refusal.detail);
             }
             refusal.claim = Some(Box::new(facts));
@@ -377,20 +414,67 @@ mod facts_tests {
     fn each_way_a_claim_can_end_has_its_outcome() {
         let sh = |script: &str| {
             let mut cmd = Command::new("sh");
-            cmd.args(["-c", script]).stderr(Stdio::piped());
+            cmd.args(["-c", script])
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped());
             run_bounded(&mut cmd, Duration::from_secs(5))
         };
-        let (run, _, tail) = sh("echo cause >&2; exit 5");
+        let (run, _, tail, stdout) = sh("echo cause >&2; exit 5");
         assert_eq!((run.token(), run.code()), ("exited", Some(5)));
         assert_eq!(tail.as_deref(), Some("cause"));
-        let (run, _, _) = sh("kill -9 $$");
+        assert_eq!(stdout.as_deref(), Some(""));
+        let (run, _, _, _) = sh("kill -9 $$");
         assert_eq!((run.token(), run.code()), ("signaled", None));
-        let (run, _, _) = run_bounded(&mut Command::new("/nonexistent/loom-claim"), CLAIM_TIMEOUT);
+        let (run, _, _, _) =
+            run_bounded(&mut Command::new("/nonexistent/loom-claim"), CLAIM_TIMEOUT);
         assert_eq!(run.token(), "spawn_failed");
         let mut slow = Command::new("sh");
         slow.args(["-c", "sleep 5"]);
-        let (run, elapsed, _) = run_bounded(&mut slow, Duration::from_millis(300));
+        let (run, elapsed, _, _) = run_bounded(&mut slow, Duration::from_millis(300));
         assert_eq!(run.token(), "timed_out");
         assert!(elapsed < Duration::from_secs(3));
+    }
+
+    /// A confirmed writer rate limit the child handed over on stdout is the
+    /// distinct refusal (#13746); vendor stderr shaped like a marker never
+    /// is. The stub stands in for `lease pr claim` (both pipes set, as
+    /// [`SweepRegistry::step_claim_command`] builds it).
+    #[test]
+    fn a_typed_handoff_upgrades_only_the_unverified_exit() {
+        let handoff = crate::writer_limit::WriterLimited::classify(
+            crate::writer_limit::WriterStage::LeasePost,
+            None,
+            "gh: API rate limit exceeded for installation ID 151241341 (HTTP 403)",
+        )
+        .unwrap();
+        let claim = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script])
+                .stderr(Stdio::piped())
+                .stdout(Stdio::piped());
+            run_step_claim(Some(cmd))
+        };
+        // Exit 5 + typed handoff: the writer refusal.
+        let line = handoff.handoff_line();
+        let e = claim(&format!("echo boom >&2; echo '{line}'; exit 5")).unwrap_err();
+        assert_eq!(e.reason, crate::writer_limit::OUTCOME);
+        assert!(e.writer_limit.is_some());
+        assert_eq!(
+            e.claim.as_ref().and_then(|c| c.stderr_tail.as_deref()),
+            Some("boom"),
+            "the stderr tail stays the diagnostic"
+        );
+        // Exit 5 with vendor stderr shaped like a marker: still unverified.
+        let e = claim("echo 'loom-claim-writer-limited {\"stage\":\"comment_post\"}' >&2; exit 5")
+            .unwrap_err();
+        assert_eq!(e.reason, "claim_unverified");
+        assert!(e.writer_limit.is_none());
+        // A handoff on a won claim is ignored.
+        let line = handoff.handoff_line();
+        assert!(claim(&format!("echo '{line}'; exit 0")).is_ok());
+        // Exit 4 (a peer) with a handoff is still a peer loss.
+        let line = handoff.handoff_line();
+        let e = claim(&format!("echo '{line}'; exit 4")).unwrap_err();
+        assert_eq!(e.reason, "claim_lost");
     }
 }

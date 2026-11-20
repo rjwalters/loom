@@ -318,7 +318,12 @@ pub(crate) fn verdict_stale_notice(
 fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Option<Vec<u8>> {
     let repo = repo.unwrap_or("{owner}/{repo}");
     let get = |path: String| {
-        let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+        let out = crate::script_helpers::gh_read(
+            "forge_cmd.listing",
+            &["api", &path, "--paginate"],
+            root,
+            false,
+        );
         out.ok_output().map(|o| o.stdout.clone())
     };
     let comments = get(format!("repos/{repo}/issues/{n}/comments"))?;

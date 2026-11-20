@@ -59,6 +59,13 @@ never both (mixed invocations are explicitly unsupported; see
 
 ### Load order for a run
 
+**This dispatcher is the only file that receives the invocation's arguments**
+(step 1 interpolates them below). Sibling reference files are also exposed as
+standalone skills and loaded with no arguments of their own — a placeholder
+there renders as the empty string — so when a sibling says "the arguments
+passed to `/loom:sweep`", classify the ones this dispatcher received, carried
+over from here.
+
 1. **`sweep-arguments.md`** — classify `$ARGUMENTS` into Mode A / Mode B /
    Mode C / the `all` sentinel, strip and store the flags, run the validation
    rules. Mode B/C candidate resolution (and its GraphQL→REST fallback) is

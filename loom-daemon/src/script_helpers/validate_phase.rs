@@ -22,7 +22,8 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use super::{run_gh, run_git};
+use super::run_git;
+use super::{gh_read, gh_read_json, gh_write};
 use crate::cmd_out::{run_command, CmdOutcome, Query, Unavailable, DEFAULT_TIMEOUT};
 
 /// Typed shapes for the `gh --json` queries this module makes (#7810 PR 2).
@@ -85,7 +86,8 @@ mod gh_shapes {
 /// looked at.
 fn gh_labels_query(entity: &str, number: i64, repo_root: &Path) -> Query<Vec<String>> {
     let n = number.to_string();
-    let q: Query<gh_shapes::Labelled> = super::gh_query(
+    let q: Query<gh_shapes::Labelled> = gh_read_json(
+        "validate_phase.labels",
         &[entity, "view", &n, "--json", "labels"],
         repo_root,
         true,
@@ -136,7 +138,12 @@ fn gh_string_field(
     use_cache: bool,
 ) -> Query<String> {
     let n = number.to_string();
-    let outcome = run_gh(&[entity, "view", &n, "--json", field], repo_root, use_cache);
+    let outcome = gh_read(
+        "validate_phase.field",
+        &[entity, "view", &n, "--json", field],
+        repo_root,
+        use_cache,
+    );
     let q: Query<serde_json::Map<String, serde_json::Value>> =
         crate::cmd_out::decode_json(outcome, |m: &serde_json::Map<String, serde_json::Value>| {
             m.get(field)
@@ -165,8 +172,13 @@ fn gh_string_field(
 /// — and is now distinguishable from the query having failed, which is what
 /// `.[0].number` on an empty list could never express.
 fn gh_first_pr_number(args: &[&str], repo_root: &Path) -> Option<i64> {
-    let q: Query<Vec<gh_shapes::Numbered>> =
-        super::gh_query(args, repo_root, true, |v: &Vec<gh_shapes::Numbered>| v.is_empty());
+    let q: Query<Vec<gh_shapes::Numbered>> = gh_read_json(
+        "validate_phase.pr_list",
+        args,
+        repo_root,
+        true,
+        |v: &Vec<gh_shapes::Numbered>| v.is_empty(),
+    );
     match q {
         Query::Populated(v) => v.first().map(|n| n.number),
         _ => None,
@@ -378,7 +390,8 @@ fn mark_phase_failed(
         return;
     }
     let issue_s = issue.to_string();
-    let _ = run_gh(
+    let _ = gh_write(
+        "validate_phase.fail_labels",
         &[
             "issue",
             "edit",
@@ -409,7 +422,12 @@ fn mark_phase_failed(
     let nwo =
         crate::worktree_ops::gh::resolve_owner_repo(repo_root).map(|(o, r)| format!("{o}/{r}"));
     let body = crate::forge_comment::footer_or_body(nwo.as_deref(), &issue_s, false, &body);
-    let _ = run_gh(&["issue", "comment", &issue_s, "--body", &body], repo_root, false);
+    let _ = gh_write(
+        "validate_phase.fail_comment",
+        &["issue", "comment", &issue_s, "--body", &body],
+        repo_root,
+        false,
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -579,7 +597,12 @@ fn ensure_pr_body_references_issue(repo_root: &Path, pr: i64, issue: i64, task_i
     }
 
     if needs_edit {
-        let r = run_gh(&["pr", "edit", &pr_s, "--body", &body], repo_root, false);
+        let r = gh_write(
+            "validate_phase.pr_body_fix",
+            &["pr", "edit", &pr_s, "--body", &body],
+            repo_root,
+            false,
+        );
         if r.succeeded() {
             let mut action = format!("recovery: ensured PR #{pr} body references #{issue}");
             if !wrong.is_empty() {
@@ -704,7 +727,8 @@ fn recover_minimal_pr_body(repo_root: &Path, pr: i64, issue: i64, task_id: Optio
     // The only `--jq` here that FORMATTED rather than selected: it interpolated
     // `"\(.path) (+\(.additions)/-\(.deletions))"` inside the gh subprocess.
     // That string building now happens in Rust, where the numbers are numbers.
-    let files_q: Query<gh_shapes::Filed> = super::gh_query(
+    let files_q: Query<gh_shapes::Filed> = gh_read_json(
+        "validate_phase.pr_files",
         &["pr", "view", &pr_s, "--json", "files"],
         repo_root,
         false,
@@ -739,7 +763,12 @@ fn recover_minimal_pr_body(repo_root: &Path, pr: i64, issue: i64, task_id: Optio
     }
     let new_body = parts.join("\n");
 
-    let r = run_gh(&["pr", "edit", &pr_s, "--body", &new_body], repo_root, false);
+    let r = gh_write(
+        "validate_phase.pr_body_enrich",
+        &["pr", "edit", &pr_s, "--body", &new_body],
+        repo_root,
+        false,
+    );
     if r.succeeded() {
         report_milestone(
             task_id,
@@ -1210,7 +1239,12 @@ fn create_recovery_pr(
     }
     // The bare fallback. It used to post an inherited-star audit comment for
     // the star-liveness removal rule (#10518); that rule is gone (#11104).
-    run_gh(&[&["pr", "create"][..], &args].concat(), repo_root, false)
+    gh_write(
+        "validate_phase.recovery_pr",
+        &[&["pr", "create"][..], &args].concat(),
+        repo_root,
+        false,
+    )
 }
 
 /// Extract the file path from a `git status --porcelain` line.
@@ -1516,7 +1550,12 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
         }
         // Reopen so a legitimate feature request is not destroyed.
         if !opts.check_only {
-            let _ = run_gh(&["issue", "reopen", &issue_s], repo_root, true);
+            let _ = gh_write(
+                "validate_phase.issue_reopen",
+                &["issue", "reopen", &issue_s],
+                repo_root,
+                true,
+            );
             mark_phase_failed(
                 repo_root,
                 issue,
@@ -1583,7 +1622,8 @@ pub fn validate_builder(repo_root: &Path, opts: &ValidateOpts) -> ValidationResu
             ));
         }
 
-        let r = run_gh(
+        let r = gh_write(
+            "validate_phase.add_review_label",
             &["pr", "edit", &pr_s, "--add-label", "loom:review-requested"],
             repo_root,
             false,

@@ -148,7 +148,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike as _, Duration, NaiveDate, Utc};
 
 use crate::script_helpers::sweep_experiment::ModelUsageTotals;
 
@@ -284,31 +284,36 @@ pub fn discover_rollouts(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<PathBuf> {
     discover_home_rollouts(home, window)
+        .0
         .into_iter()
         .map(|(_, path)| path)
         .collect()
 }
 
 /// [`discover_rollouts`], paired with the home each path was found under —
-/// the home [`read_rollout`]'s gate must check it against.
+/// the home [`read_rollout`]'s gate must check it against — and with whether
+/// any home's walk came back incomplete (#14668; see [`rollouts_under`]).
 fn discover_home_rollouts(
     home: Option<&Path>,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Vec<(PathBuf, PathBuf)> {
+) -> (Vec<(PathBuf, PathBuf)>, bool) {
     let mut seen = HashSet::new();
     let mut found = Vec::new();
+    let mut incomplete = false;
     for codex_home in codex_homes(home) {
-        for path in rollouts_under(&codex_home, window) {
+        let (paths, walk_incomplete) = rollouts_under(&codex_home, window);
+        incomplete |= walk_incomplete;
+        for path in paths {
             if seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())) {
                 found.push((codex_home.clone(), path));
             }
         }
     }
-    found
+    (found, incomplete)
 }
 
 /// Every rollout file that could hold a session inside `window`, under one
-/// `$CODEX_HOME`.
+/// `$CODEX_HOME`, paired with whether the walk is incomplete (#14668).
 ///
 /// Only `<sessions>/<YYYY>/<MM>/<DD>/` directories whose date falls inside the
 /// window padded by [`DATE_PAD`] are descended into; `window: None` scans the
@@ -316,11 +321,16 @@ fn discover_home_rollouts(
 /// the authorization gate, and this is the only producer of paths
 /// [`read_rollout`] is ever given.
 ///
+/// A walk is incomplete when it cannot enumerate a candidate directory or
+/// identify an eligible child. An absent `sessions/` tree contributes no
+/// rollouts. Names outside the padded window are excluded before checking
+/// their metadata or attempting to descend into them.
+///
 /// Sorted, so output is deterministic for tests and operator diffs.
 fn rollouts_under(
     codex_home: &Path,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
-) -> Vec<PathBuf> {
+) -> (Vec<PathBuf>, bool) {
     let sessions = codex_home.join(SESSIONS_DIR);
     let allowed_dates = window.map(|(start, end)| {
         (
@@ -329,60 +339,93 @@ fn rollouts_under(
         )
     });
     let mut found = Vec::new();
-    // sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl — three fixed levels, walked
-    // explicitly rather than recursively so no sibling tree can ever be
-    // entered by a symlink or an unexpected nesting depth.
-    for year in numeric_children(&sessions) {
-        for month in numeric_children(&year.0) {
-            for day in numeric_children(&month.0) {
-                if let Some((first, last)) = allowed_dates {
-                    let Some(date) = NaiveDate::from_ymd_opt(year.1, month.1 as u32, day.1 as u32)
-                    else {
-                        continue;
-                    };
-                    if date < first || date > last {
-                        continue;
-                    }
-                }
-                let Ok(entries) = std::fs::read_dir(&day.0) else {
+    // sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl — three fixed levels.
+    let (years, mut incomplete) = numeric_children(&sessions, true, |year| {
+        allowed_dates.is_none_or(|(first, last)| (first.year()..=last.year()).contains(&year))
+    });
+    for (year_path, year) in years {
+        let (months, unreadable) = numeric_children(&year_path, false, |month| {
+            allowed_dates.is_none_or(|(first, last)| {
+                (1..=12).contains(&month)
+                    && (year != first.year() || month >= first.month() as i32)
+                    && (year != last.year() || month <= last.month() as i32)
+            })
+        });
+        incomplete |= unreadable;
+        for (month_path, month) in months {
+            let (days, unreadable) = numeric_children(&month_path, false, |day| {
+                allowed_dates.is_none_or(|(first, last)| {
+                    NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+                        .is_some_and(|date| (first..=last).contains(&date))
+                })
+            });
+            incomplete |= unreadable;
+            for (day_path, _) in days {
+                let Ok(entries) = std::fs::read_dir(&day_path) else {
+                    incomplete = true;
                     continue;
                 };
-                for entry in entries.flatten() {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        incomplete = true;
+                        continue;
+                    };
                     let path = entry.path();
-                    if path.is_file() && is_rollout_path(codex_home, &path) {
-                        found.push(path);
+                    if !is_rollout_path(codex_home, &path) {
+                        continue;
+                    }
+                    match path.metadata() {
+                        Ok(metadata) if metadata.is_file() => found.push(path),
+                        Ok(_) => {}
+                        Err(_) => incomplete = true,
                     }
                 }
             }
         }
     }
     found.sort();
-    found
+    (found, incomplete)
 }
 
-/// The numerically-named child directories of `dir`, as `(path, value)`.
-///
-/// Non-numeric names are skipped rather than descended: that is what keeps the
-/// walk to the `<YYYY>/<MM>/<DD>` shape the store documents, and it is why a
-/// stray `sessions/auth.json` could never be reached even before
-/// [`is_rollout_path`] gets a say.
-fn numeric_children(dir: &Path) -> Vec<(PathBuf, i32)> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// Enumerate numerically named directories that could contain candidate
+/// rollouts. Check eligibility before metadata, so failures on irrelevant
+/// names cannot affect the result. A failed entry read has no known name
+/// to exclude and makes enumeration incomplete.
+fn numeric_children(
+    dir: &Path,
+    missing_is_empty: bool,
+    eligible: impl Fn(i32) -> bool,
+) -> (Vec<(PathBuf, i32)>, bool) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return (Vec::new(), !missing_is_empty || error.kind() != std::io::ErrorKind::NotFound);
+        }
     };
-    let mut out: Vec<(PathBuf, i32)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let value: i32 = path.file_name()?.to_str()?.parse().ok()?;
-            Some((path, value))
-        })
-        .collect();
+    let mut out = Vec::new();
+    let mut incomplete = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            incomplete = true;
+            continue;
+        };
+        let name = entry.file_name();
+        let Some(value) = name
+            .to_str()
+            .and_then(|name| name.parse().ok())
+            .filter(|v| eligible(*v))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        match path.metadata() {
+            Ok(metadata) if metadata.is_dir() => out.push((path, value)),
+            Ok(_) => {}
+            Err(_) => incomplete = true,
+        }
+    }
     out.sort();
-    out
+    (out, incomplete)
 }
 
 /// Which sessions a caller wants attributed.
@@ -531,6 +574,11 @@ impl Counters {
     }
 }
 
+struct RolloutRead {
+    lines: Vec<String>,
+    complete: bool,
+}
+
 /// Read one rollout file's lines. **The whole file-open surface of this
 /// module** (see the module doc's "Security" section): it refuses any path
 /// [`is_rollout_path`] does not accept, so no credential-bearing sibling of
@@ -544,17 +592,28 @@ impl Counters {
 /// `None`, so a rollout that grew past a caller's size check between its
 /// `stat` and this read is still never loaded whole. `u64::MAX` is no ceiling
 /// (the usage path, which streams one file at a time).
-fn read_rollout(codex_home: &Path, path: &Path, max_bytes: u64) -> Option<Vec<String>> {
+fn read_rollout(codex_home: &Path, path: &Path, max_bytes: u64) -> Option<RolloutRead> {
     if !is_rollout_path(codex_home, path) {
         return None;
     }
     let mut reader = BufReader::new(File::open(path).ok()?.take(max_bytes.saturating_add(1)));
-    let lines: Vec<String> = reader.by_ref().lines().map_while(Result::ok).collect();
+    let mut complete = true;
+    let lines = reader
+        .by_ref()
+        .lines()
+        .map_while(|line| match line {
+            Ok(line) => Some(line),
+            Err(_) => {
+                complete = false;
+                None
+            }
+        })
+        .collect();
     if max_bytes != u64::MAX && reader.into_inner().limit() == 0 {
         // `max_bytes + 1` bytes were read: the file is over the ceiling.
         return None;
     }
-    Some(lines)
+    Some(RolloutRead { lines, complete })
 }
 
 /// One authorized rollout path, paired with the home whose
@@ -578,7 +637,7 @@ impl RolloutPath {
     /// `max_bytes`.
     #[must_use]
     pub fn read_capped(&self, max_bytes: u64) -> Option<Vec<String>> {
-        read_rollout(&self.home, &self.path, max_bytes)
+        read_rollout(&self.home, &self.path, max_bytes).map(|read| read.lines)
     }
 }
 
@@ -593,6 +652,7 @@ pub fn rollout_paths(
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<RolloutPath> {
     discover_home_rollouts(home, window)
+        .0
         .into_iter()
         .map(|(home, path)| RolloutPath { home, path })
         .collect()
@@ -613,6 +673,24 @@ pub fn fold_rollout(
     filter: &SessionFilter,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Vec<CodexSessionUsage> {
+    fold_rollout_selected(lines, filter, window).rows
+}
+
+/// [`fold_rollout`]'s full outcome, keeping the evidence a by-id read needs
+/// ([`lookup_ids`], #14664/#14668). A `selected` rollout passed both the
+/// filter and window. A `discarded` nonblank JSON line could carry identity,
+/// window, or usage evidence, so a read like that cannot establish absence.
+struct FoldedRollout {
+    selected: bool,
+    discarded: bool,
+    rows: Vec<CodexSessionUsage>,
+}
+
+fn fold_rollout_selected(
+    lines: &[String],
+    filter: &SessionFilter,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+) -> FoldedRollout {
     let mut directory: Option<String> = None;
     let mut provider: Option<String> = None;
     let mut session_id: Option<String> = None;
@@ -620,9 +698,11 @@ pub fn fold_rollout(
     let mut model: Option<String> = None;
     let mut previous = Counters::default();
     let mut by_model: BTreeMap<String, Counters> = BTreeMap::new();
+    let mut discarded = false;
 
     for line in lines {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            discarded |= !line.trim().is_empty();
             continue;
         };
         let payload = value.get("payload");
@@ -678,40 +758,60 @@ pub fn fold_rollout(
     }
 
     let Some(directory) = directory else {
-        return Vec::new();
+        return FoldedRollout {
+            selected: false,
+            discarded,
+            rows: Vec::new(),
+        };
     };
     if !filter.matches(&directory, session_id.as_deref()) {
-        return Vec::new();
+        return FoldedRollout {
+            selected: false,
+            discarded,
+            rows: Vec::new(),
+        };
     }
     // `session_meta.timestamp` is present in every observed rollout; one
     // without a decodable instant is unattributable to a window, so it is
     // dropped rather than assumed to be inside it.
     let Some(created_at) = created_at else {
-        return Vec::new();
+        return FoldedRollout {
+            selected: false,
+            discarded,
+            rows: Vec::new(),
+        };
     };
     if let Some((start, end)) = window {
         if created_at < start || created_at > end {
-            return Vec::new();
+            return FoldedRollout {
+                selected: false,
+                discarded,
+                rows: Vec::new(),
+            };
         }
     }
-    by_model
-        .into_iter()
-        .map(|(model, counters)| CodexSessionUsage {
-            model,
-            provider: provider.clone(),
-            directory: directory.clone(),
-            session_id: session_id.clone(),
-            created_at,
-            // Keep Claude's DISJOINT vocabulary: Codex's `input_tokens`
-            // includes its `cached_input_tokens`, so the cached part is moved
-            // to `cache_read` rather than counted twice.
-            input: counters.uncached_input(),
-            cache_read: counters.cached_input,
-            cache_write: counters.cache_write,
-            output: counters.output,
-        })
-        .filter(|row| !row.is_empty())
-        .collect()
+    FoldedRollout {
+        selected: true,
+        discarded,
+        rows: by_model
+            .into_iter()
+            .map(|(model, counters)| CodexSessionUsage {
+                model,
+                provider: provider.clone(),
+                directory: directory.clone(),
+                session_id: session_id.clone(),
+                created_at,
+                // Keep Claude's DISJOINT vocabulary: Codex's `input_tokens`
+                // includes its `cached_input_tokens`, so the cached part is moved
+                // to `cache_read` rather than counted twice.
+                input: counters.uncached_input(),
+                cache_read: counters.cached_input,
+                cache_write: counters.cache_write,
+                output: counters.output,
+            })
+            .filter(|row| !row.is_empty())
+            .collect(),
+    }
 }
 
 /// A non-empty, trimmed string field, or `None` — the "omit rather than guess"
@@ -749,9 +849,10 @@ pub fn sessions(
     home: Option<&Path>,
 ) -> Vec<CodexSessionUsage> {
     let mut all: Vec<CodexSessionUsage> = discover_home_rollouts(home, window)
+        .0
         .into_iter()
         .filter_map(|(root, path)| read_rollout(&root, &path, u64::MAX))
-        .flat_map(|lines| fold_rollout(&lines, filter, window))
+        .flat_map(|read| fold_rollout(&read.lines, filter, window))
         .collect();
     all.sort_by(|a, b| {
         a.created_at
@@ -781,6 +882,83 @@ pub fn tokens_by_model(
     home: Option<&Path>,
 ) -> Option<Vec<ModelUsageTotals>> {
     fold_sessions(sessions(filter, window, home))
+}
+
+/// The usage rows or the reason a by-id Codex read could not produce them —
+/// the rollout-store counterpart of [`crate::opencode_usage::IdLookup`], so
+/// `usage_source::native_close_usage` can say WHY a Codex run closed without
+/// usage (#14664) instead of one undifferentiated "nothing attributable".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdLookup {
+    /// The named sessions' attributable per-model rows.
+    Found(Vec<ModelUsageTotals>),
+    /// No rollout store held a readable candidate rollout: the store side of
+    /// the read failed (absent — nothing discovered in the window's date
+    /// directories — or unreadable), so no conclusion about the ids follows.
+    NoStore,
+    /// Every candidate rollout was read and none was selected by the
+    /// id + window key.
+    NotFound,
+    /// A named rollout was selected by the whole key but recorded no tokens.
+    NoUsage,
+}
+
+/// Read the sessions named in `ids` once and preserve the evidence for a
+/// missing result (#14664), mirroring [`crate::opencode_usage::lookup_ids`].
+///
+/// The key is id + window, exactly as a step's read has been since #14540:
+/// `window` bounds the date-directory scan and each rollout's
+/// `session_meta.timestamp`. There is deliberately NO directory retry on an
+/// id miss — a directory-keyed second read could fold a sibling launch's
+/// spend into this one, the hazard #14540 already ruled out.
+///
+/// #14668: a miss is only "confirmed absence" when every candidate read was
+/// COMPLETE. A date directory the walk could not enumerate, a rollout whose
+/// byte stream stopped mid-read (#14664) and a rollout with a line dropped as
+/// unparseable JSON each leave the requested session's identity or usage
+/// unknown, so the miss routes to [`IdLookup::NoStore`] — "investigate the
+/// store" — rather than `NotFound`/`NoUsage`. Rows always win first: a valid
+/// usage result keeps its totals whatever else the store failed to yield.
+#[must_use]
+pub fn lookup_ids(
+    ids: &[String],
+    window: (DateTime<Utc>, DateTime<Utc>),
+    home: Option<&Path>,
+) -> IdLookup {
+    if ids.is_empty() {
+        return IdLookup::NotFound;
+    }
+    let filter = SessionFilter {
+        directories: Vec::new(),
+        ids: ids.to_vec(),
+    };
+    let mut rows: Vec<CodexSessionUsage> = Vec::new();
+    let mut selected = false;
+    let mut read_any = false;
+    let mut read_incomplete = false;
+    let (candidates, walk_incomplete) = discover_home_rollouts(home, Some(window));
+    read_incomplete |= walk_incomplete;
+    for (root, path) in candidates {
+        let Some(read) = read_rollout(&root, &path, u64::MAX).filter(|read| read.complete) else {
+            read_incomplete = true;
+            continue;
+        };
+        read_any = true;
+        let folded = fold_rollout_selected(&read.lines, &filter, Some(window));
+        selected |= folded.selected;
+        read_incomplete |= folded.discarded;
+        rows.extend(folded.rows);
+    }
+    if let Some(totals) = fold_sessions(rows) {
+        return IdLookup::Found(totals);
+    }
+    if read_incomplete || !read_any {
+        IdLookup::NoStore
+    } else if selected {
+        IdLookup::NoUsage
+    } else {
+        IdLookup::NotFound
+    }
 }
 
 /// Fold already-selected session rows into per-model totals.

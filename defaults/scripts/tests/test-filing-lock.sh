@@ -17,11 +17,12 @@
 #   7. degrade OPEN when the lock store is unusable (a FILE in the way).
 #   8. LOOM_FILING_LOCK=0 disables serialization entirely.
 #   9. re-entrancy — LOOM_FILING_LOCK_HELD makes a nested acquire a no-op.
-#  10. fleet tier — a live peer hold blocks filing and expires on its TTL.
-#  11. create-issue.sh actually takes the lock (the wiring, not just the lib).
+#  10. create-issue.sh actually takes the lock (the wiring, not just the lib).
 #
 # Style follows test-build-slot.sh: throwaway mktemp dirs, assert harness, no
-# network, no real ~/.loom.
+# network, no real ~/.loom. The captain tier (#13918) is pinned off for the
+# whole suite (see the LOOM_DAEMON_BIN pin below): a host that has a real
+# loom-daemon must not let live fleet state decide this suite's outcome.
 
 set -euo pipefail
 
@@ -60,6 +61,17 @@ export LOOM_FILING_LOCK_WAIT_SECS=1
 # Never reach the real safehouse socket from a test.
 unset SAFEHOUSED_SOCKET LOOM_SAFEHOUSE_SOCKET SAFEHOUSE_PERSONA || true
 unset LOOM_FILING_LOCK_HELD || true
+# Isolate the captain tier (#13918, the nightly #14663 flake): unpinned, a
+# host with a loom-daemon on PATH or in $LOOM_DAEMON_BIN takes every acquire
+# below into the REAL fleet filing slot — a slot held by another filer answers
+# rc 75 and the concurrent filers exit 75 (case rc 1), so live fleet state
+# would decide this suite's outcome. Pointing the bin at a nonexistent path
+# makes `command -v` fail in loom_filing_lock_host and
+# _loom_filing_lock_captain_acquire alike — the lib header's "no binary"
+# contract: file under the host lock alone, exactly like a CI runner. The
+# sections that DO test daemon interplay (host-id, captain stubs) override
+# this pin locally with their own LOOM_DAEMON_BIN.
+export LOOM_DAEMON_BIN="$TMPROOT/no-loom-daemon"
 
 echo ""
 echo "=== filing-lock.sh: acquire / release round-trip ==="
@@ -97,29 +109,52 @@ DIR="$(new_store)"
     mkdir -p "$DIR"
     : > "$FILED"
 
-    filer() { # <repo> <body>
-        local repo="$1" body="$2" i
+    filer() { # <repo> <body> <log>
+        local repo="$1" body="$2" log="$3" i rc
         for i in 1 2 3 4; do
-            loom_filing_lock_acquire "$repo" >/dev/null 2>&1 || exit 75
+            # Acquire output goes to the filer's own log — the caller dumps it
+            # on failure (#14663: a blind >/dev/null 2>&1 here left the nightly
+            # flake with nothing but "rc=1" to go on). Never discarded blind.
+            rc=0
+            loom_filing_lock_acquire "$repo" >>"$log" 2>&1 || rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+                echo "filer ${repo}: acquire FAILED rc=${rc} (iteration ${i})" >>"$log"
+                exit "$rc"
+            fi
             printf '%s #%s' "$body" "$i" > "$SCRATCH"
             sleep 0.05
             printf '%s%s%s\n' "$repo" "$TAB" "$(cat "$SCRATCH")" >> "$FILED"
-            loom_filing_lock_release >/dev/null 2>&1
+            loom_filing_lock_release >>"$log" 2>&1
         done
     }
 
-    ( filer "gf180-sram" "SRAM macro: 512x8 bitcell array" ) &
+    ( filer "gf180-sram" "SRAM macro: 512x8 bitcell array" "$DIR/filer-gf180-sram.log" ) &
     P1=$!
-    ( filer "sky130-modexp" "RTL synthesis: rtl/modexp.v timing closure" ) &
+    ( filer "sky130-modexp" "RTL synthesis: rtl/modexp.v timing closure" "$DIR/filer-sky130-modexp.log" ) &
     P2=$!
-    wait "$P1" || exit 1
-    wait "$P2" || exit 1
+    R1=0; wait "$P1" || R1=$?
+    R2=0; wait "$P2" || R2=$?
+    if [[ "$R1" -ne 0 || "$R2" -ne 0 ]]; then
+        echo "filer exited nonzero: gf180-sram rc=${R1}, sky130-modexp rc=${R2}; filer logs follow" >&2
+        sed 's/^/  [gf180-sram] /' "$DIR/filer-gf180-sram.log" >&2 || true
+        sed 's/^/  [sky130-modexp] /' "$DIR/filer-sky130-modexp.log" >&2 || true
+        exit 1
+    fi
 
-    [[ "$(wc -l < "$FILED")" -eq 8 ]] || exit 1
+    if [[ "$(wc -l < "$FILED")" -ne 8 ]]; then
+        echo "FILED has $(wc -l < "$FILED") rows, want 8; contents follow" >&2
+        cat "$FILED" >&2
+        exit 1
+    fi
     # Every filed body must carry ITS OWN repo's text: all 8 rows must match
     # the correct (repo, body-prefix) pairing, so any single crossed body fails.
-    [[ "$(grep -c "^gf180-sram${TAB}SRAM macro" "$FILED")" -eq 4 ]] || exit 1
-    [[ "$(grep -c "^sky130-modexp${TAB}RTL synthesis" "$FILED")" -eq 4 ]] || exit 1
+    GF="$(grep -c "^gf180-sram${TAB}SRAM macro" "$FILED" || true)"
+    SK="$(grep -c "^sky130-modexp${TAB}RTL synthesis" "$FILED" || true)"
+    if [[ "$GF" -ne 4 || "$SK" -ne 4 ]]; then
+        echo "cross-contaminated FILED (gf180-sram rows=${GF}, sky130-modexp rows=${SK}, want 4/4); contents follow" >&2
+        cat "$FILED" >&2
+        exit 1
+    fi
     exit 0
 ) && CASE_RC=0 || CASE_RC=$?
 assert_true "$CASE_RC" \
@@ -246,39 +281,6 @@ DIR="$(new_store)"
     exit 0
 ) && CASE_RC=0 || CASE_RC=$?
 assert_true "$CASE_RC" "LOOM_FILING_LOCK_HELD makes a nested acquire a re-entrant no-op"
-
-echo ""
-echo "=== fleet tier: a mirrored peer hold blocks, then expires ==="
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_WAIT_SECS=1
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=3600
-    # What safehouse::PeerClaimSink writes on an observed peer FilingLock ad.
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    RC=0
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || RC=$?
-    [[ "$RC" -eq 75 ]] || exit 1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "a live peer hold defers local filing (the cross-host tier)"
-
-DIR="$(new_store)"
-(
-    export LOOM_FILING_LOCK_DIR="$DIR"
-    export LOOM_FILING_LOCK_PEER_TTL_SECS=1
-    mkdir -p "$DIR/peers"
-    printf 'host-remote' > "$DIR/peers/host-remote"
-    sleep 1.1
-    # A peer that crashed without sending FilingUnlock must not wedge us.
-    loom_filing_lock_acquire "architect" >/dev/null 2>&1 || exit 1
-    [[ ! -e "$DIR/peers/host-remote" ]] || exit 1
-    loom_filing_lock_release >/dev/null 2>&1
-    exit 0
-) && CASE_RC=0 || CASE_RC=$?
-assert_true "$CASE_RC" "an expired peer hold is pruned and never wedges filing"
 
 echo ""
 echo "=== store resolution ==="

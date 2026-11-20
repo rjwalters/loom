@@ -703,11 +703,15 @@ pub fn run_with_proxy(
         .worker_threads(2)
         .enable_all()
         .build()
-        .map_err(|e| LaunchError::config(format!("credentialProxy runtime: {e}")))?;
+        .map_err(|e| {
+            LaunchError::config(format!("credentialProxy runtime: {e}"))
+                .with_stage(crate::worker_spawn::LaunchStage::EgressProxy)
+        })?;
     let guard = runtime.enter();
-    let listener = bound
-        .into_tokio()
-        .map_err(|e| LaunchError::config(format!("credentialProxy listener: {e}")))?;
+    let listener = bound.into_tokio().map_err(|e| {
+        LaunchError::config(format!("credentialProxy listener: {e}"))
+            .with_stage(crate::worker_spawn::LaunchStage::EgressProxy)
+    })?;
     runtime.spawn(server::serve(listener, registry.clone()));
     drop(guard);
 
@@ -718,10 +722,12 @@ pub fn run_with_proxy(
             126
         },
         message: format!("cannot execute worker harness under the credential proxy: {error}"),
+        stage: None,
     })?;
     let status = child.wait().map_err(|error| LaunchError {
         code: 126,
         message: format!("worker harness could not be waited on: {error}"),
+        stage: None,
     });
     // Invalidate FIRST, whatever happened: a placeholder that escaped the
     // container must be dead the moment the launch is over.

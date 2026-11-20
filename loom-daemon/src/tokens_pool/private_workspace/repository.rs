@@ -204,6 +204,18 @@ impl WorkerCommand {
     }
 }
 
+/// The credential helper's own diagnostics (`credential`), the only text from
+/// Git's stderr that is ever surfaced (#14433).
+const HELPER_CAUSES: [&str; 2] = [
+    "forge authentication helper failed",
+    "forge authentication unavailable",
+];
+
+fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(stderr);
+    HELPER_CAUSES.into_iter().find(|cause| text.contains(cause))
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String> {
     let result = Command::new("git")
         .arg("-C")
@@ -222,8 +234,13 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     if !result.status.success() {
         // Neither URLs nor Git's stderr are emitted: a configured helper may
         // include a secret in its own diagnostic. Preserve the clone in place.
+        // The one exception is a fixed allowlist of this binary's own helper
+        // messages (never Git's text), so a failed push names its cause.
+        let cause = helper_cause(&result.stderr)
+            .map(|cause| format!(", cause: {cause}"))
+            .unwrap_or_default();
         bail!(
-            "workspace Git {} failed ({}); work is retained for recovery",
+            "workspace Git {} failed ({}{cause}); work is retained for recovery",
             args.first().unwrap_or(&"operation"),
             result.status
         );
@@ -1377,4 +1394,23 @@ fn private_metadata(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod helper_cause_tests {
+    use super::*;
+
+    /// #14433: only this binary's own helper diagnostics are surfaced from
+    /// Git's stderr; anything else (URLs, a secret a helper printed) is not.
+    #[test]
+    fn only_the_credential_helpers_own_diagnostics_name_a_push_cause() {
+        let stderr = b"Error: forge authentication helper failed\nfatal: could not read Username for 'https://github.com'\n";
+        assert_eq!(helper_cause(stderr), Some("forge authentication helper failed"));
+        let missing = b"Error: forge authentication unavailable; provide an external gh profile";
+        assert_eq!(helper_cause(missing), Some("forge authentication unavailable"));
+        assert_eq!(
+            helper_cause(b"fatal: unable to access 'https://x:ghs_SECRET@github.com/a/b/'"),
+            None
+        );
+    }
 }

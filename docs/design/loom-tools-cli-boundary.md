@@ -30,8 +30,10 @@ re-reading the source it names. Counts are from the pinned tree below.
 10. [The first slice](#10-the-first-slice)
 11. [Phase 2 hand-off and serialization](#11-phase-2-hand-off-and-serialization)
 12. [Not traced, and open questions](#12-not-traced-and-open-questions)
-13. [Phase 3a: forge reads (#14395)](#13-phase-3a-forge-reads-14395)
+13. [Phase 3a: forge verbs (#14395, #14519)](#13-phase-3a-forge-verbs-14395-14519)
 14. [Phase 3b: park records and operator decisions (#14464)](#14-phase-3b-park-records-and-operator-decisions-14464)
+15. [Phase 3c: issue leases (#14488)](#15-phase-3c-issue-leases-14488)
+16. [Phase 3b: the remaining merge-queue actions (#14520)](#16-phase-3b-the-remaining-merge-queue-actions-14520)
 
 ## 1. Pinned inputs
 
@@ -698,30 +700,38 @@ Open questions for the reviewer:
 3. Whether env `LOOM_MODE` should exist at all, or `mode` should be tier-only
    (7.3 assumes the existing `env > config > default` rule).
 
-## 13. Phase 3a: forge reads (#14395)
+## 13. Phase 3a: forge verbs (#14395, #14519)
 
-The first Phase 3 slice (epic #12708). It moves the **read** half of the
-`forge` family onto `loom-tools`; writes are #14396, worktree/claim/lease is
-#14397 and the role/skill/wrapper switch-over is #14398.
+The first Phase 3 slice (epic #12708) moved the **read** half of the `forge`
+family onto `loom-tools` (#14395); #14519 admits the shared non-queue writes
+through the same seam. Worktree/claim/lease is #14397 and the role/skill/
+wrapper switch-over is #14398.
 
 ### 13.1 Mechanism
 
 `loom-tools forge <verb>` parses the same `ForgeAction` clap tree and runs the
 same `handle_forge_command` as `loom-daemon forge` (`cli/forge_read.rs`); no
 handler was copied or moved, and `loom-daemon forge` is unchanged. What the
-slice adds is one exhaustive `match` (`ForgeAction::is_read`, no wildcard arm):
-a new `forge` verb does not compile until its author says which side it is on.
-A verb that is not a read exits **64** (`EX_USAGE`) with a message naming
-#14396 before any handler runs. 64 is deliberate: `check-claim`,
-`check-open-pr` and `check-branch` use `0`/`1`/`5` as data, so a refusal must
-not alias any of them.
+slice adds is one exhaustive `match` (`ForgeAction::is_served`, no wildcard
+arm): a new `forge` verb does not compile until its author says whether the
+tools binary serves it. The declared forge verbs are all served after #14519
+and #14520. The dispatcher reserves exit **64** (`EX_USAGE`) for an
+unserved verb. `check-claim`, `check-open-pr` and `check-branch` use
+`0`/`1`/`5` as data.
 
-Mode: every migrated verb that can reach the forge resolves `mode` through
+Mode: every served verb that can reach the forge resolves `mode` through
 `mode_gate()` before it runs (§7.3), so an inherited `LOOM_GH_GATEWAY_DIR` /
-`LOOM_GH_READER_ROOT` with `mode` unset is the actionable error. Four verbs
-touch nothing but stdin, argv, local git objects or local files and skip the
-gate: `rebase-guard`, `verdict-body-check`, `dashboard-link`, `calls`
-(`ForgeReadCli::reaches_forge`).
+`LOOM_GH_READER_ROOT` with `mode` unset is the actionable error — before any
+write, and before `create-issue --json` can print its stdout error object.
+Six verbs touch nothing but stdin, argv, local git objects, a local lock
+directory or a local journal and skip the gate: `rebase-guard`,
+`verdict-body-check`, `dashboard-link`, `calls`, `verdict-lock`
+(`LOOM_VERDICT_LOCK_DIR`, no forge call) and `journal-ci-refusal`
+(`LOOM_PICK_JOURNAL`, a no-op outside a journaled run)
+(`ForgeReadCli::reaches_forge`). Admission (is_served) and reach
+(reaches_forge) are separate decisions: a verb can be served and local.
+The merge-queue family also classifies each invocation by its effect in the
+resolved queue or direct mode (§16.3).
 
 Capability source: `install_compat::TOOLS_COMMANDS` is the one list.
 `loom-tools capabilities --json` and `loom-daemon install-compat show --json`
@@ -729,30 +739,47 @@ both print it as `tools_commands` (an added key, so
 `CAPABILITIES_SCHEMA_VERSION` is unchanged), and unit tests fail when it and
 the clap tree disagree in either direction.
 
-### 13.2 Migrated (read-only `forge` verbs)
+### 13.2 Served `forge` verbs
 
-`issue`, `pr` (passthroughs to the person's own `gh`; a write op through them is
-still vetted by `write_scope` exactly as under `loom-daemon forge`), `auth`,
-`check-open-pr`, `check-claim`, `check-branch`, `wait-checks`,
-`priority-labels`, `pr-congestion`, `rebase-guard`, `tree-unchanged`,
-`verdict-equivalent`, `version-only-diff`, `additive-migrations`,
-`locked-deps-only`, `resync-waiver`, `suspect-critical-diff`, `merge-method`,
-`merge-config`, `merge-queue mode|preflight|status`, `token`, `is-fleet`,
-`trusted-comments`, `promotion-author`, `claim-liveness`,
-`verdict-stale-notice`, `verdict-body-check`, `verdict-gate`, `may-write`,
-`calls`, `identities`, `parent body|split-state`, `dashboard-link`.
+Reads (#14395): `issue`, `pr` (passthroughs to the person's own `gh`; a write
+op through them is still vetted by `write_target` exactly as under
+`loom-daemon forge`), `auth`, `check-open-pr`, `check-claim`, `check-branch`,
+`wait-checks`, `priority-labels`, `pr-congestion`, `rebase-guard`,
+`tree-unchanged`, `verdict-equivalent`, `version-only-diff`,
+`additive-migrations`, `locked-deps-only`, `resync-waiver`,
+`suspect-critical-diff`, `merge-method`, `merge-config`,
+`merge-queue mode|preflight|status`, `token`, `is-fleet`, `trusted-comments`,
+`promotion-author`, `claim-liveness`, `verdict-stale-notice`,
+`verdict-body-check`, `verdict-gate`, `may-write`, `calls`, `identities`,
+`parent body|split-state`, `dashboard-link`.
 
-### 13.3 Not migrated, with the reason
+Shared non-queue writes (#14519): `comment` (the #9772 chokepoint, including
+`--patch-created`), `create-issue` (REST-first, labels atomic), `rerun`,
+`auto-merge`, `disable-auto-merge` (the pre-#8410 `merge-pr.sh` compat
+surface), `verdict-labels`, `verdict-reconcile`, `verdict-lock` (local only),
+`doctor-handback` (lock + forge ops, so gated), `journal-ci-refusal` (local
+only), and `parent link` (the child ref is checked against the resolved repo
+before `link_created`). Each runs the shared handler unchanged: the
+`write_target` gate vets a write exactly as `loom-daemon forge` does, and the
+handlers that vet inside (`create-issue`, `rerun`, `comment --patch-created`
+via the created object's own ref) keep doing so, so the effective destination
+is checked at the write boundary either way.
+
+The remaining merge-queue verbs (#14520) are listed in §16.
+
+### 13.3 Not served, with the reason
 
 | Verb or family | Reason |
 | --- | --- |
-| `forge comment`, `create-issue`, `rerun`, `auto-merge`, `disable-auto-merge`, `verdict-labels`, `verdict-reconcile`, `verdict-lock`, `doctor-handback`, `journal-ci-refusal`, `parent link`, `merge-queue enqueue\|dequeue\|reconcile\|handoff\|step\|revoke\|group-check\|authorize-check` | write the forge, a local journal or lock, or were not shown to be read-only (`authorize-check` and `group-check` post or compute merge-authorization state). #14396 |
 | `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
-| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | not in this PR: this slice exceeded the issue's sizing bound for the seam plus the forge tree alone, so these follow as #14429 (a `loom:triage` child of #14395) |
-| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | same follow-up, #14429 |
-| Worktree, claim and lease commands | #14397 |
+| Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
+| Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
+| Worktree operations | #14397 and its child issues. |
+| Checkout-local claims | Available through `loom-tools claim` (#14487, §13.8). |
+| Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | Served in `loom-tools` by #14488 (§15). |
+| Role-keyed PR leases | Available through `loom-tools lease pr` (#14489, §13.6). |
 
 ### 13.4 Gitea decision
 
@@ -771,6 +798,99 @@ No wrapper or locator changed. `loom_tools_serves` in
 `lib/locate-daemon-bin.sh` still lists the four slice commands; making the
 `forge-helpers.sh` stubs tools-first is part of the switch-over (#14398),
 which can now read the served list from `capabilities --json`.
+
+### 13.6 Role-keyed PR leases (#14489)
+
+`loom-tools lease pr claim|check|fence|release` shares the daemon CLI's
+arguments, handlers, lease states and result codes. GitHub actions resolve
+mode from the same canonical checkout selected by `--workspace`. Fleet
+reads use the configured gateway or reader pool. If neither can serve the
+request, the lease handler keeps its unreadable-state behavior. Writes use
+the existing repository scope and writer. In session and local-daemon modes, the local
+credential serves both and inherited fleet read routing is discarded.
+
+A successful claim starts the internal `renew-loop` in the same executable.
+The child receives the canonical workspace and the selected mode, then
+initializes its own read route before any forge operations. The watcher PID,
+process start identity and lease ownership guard keep detached renewal tied
+to the original claim. On Gitea, agent-facing leases return success with
+the label-only diagnostic and perform no forge lease operations. Scheduled
+`attach` and `reap` remain daemon service commands. Tools return 64 for them.
+
+### 13.7 Top-level reads and config inspection (#14429)
+
+The Phase 3a follow-up (epic #12708): the remaining top-level read commands
+and the config-inspection commands, the same story one level up from §13.1.
+`loom-tools <cmd>` parses the same clap tree and runs the same handler
+`loom-daemon <cmd>` runs (`cli/pr_queue.rs`, `cli/premise_check.rs`,
+`cli/duplicate_scan.rs`, `cli/points_marker_check.rs`,
+`cli/label_duplicates.rs`, `cli/forge_probe_cmd.rs`,
+`cli/forge_inventory_cmd.rs`, `cli/affected_files_check.rs`,
+`cli/stale_blocked.rs`, `cli/labels_cmd.rs`, `cli/skip_labels.rs`,
+`cli/roles_draw_cmd.rs`, `cli/guards_status.rs`,
+`cli/install_compat_cli.rs`, `cli/hooks_home_cmd.rs`); no handler was copied
+or moved, and every `loom-daemon` entry point is unchanged.
+
+Migrated: `labels`, `pr-queue`, `premise-check`, `duplicate-scan`,
+`check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`,
+`affected-files`, `check-stale-blocked` (top-level reads); `skip-labels`,
+`roles`, `guards`, `install-compat`, `hooks-home` (config inspection).
+`fleet-config` stays in `loom-daemon`: it reaches the workspace registry
+(§3.6) and does not degrade cleanly with an empty one.
+
+Each handler was read before migrating (#14396 holds everything that
+writes), which moved three commands onto the refusal pattern rather than
+onto the plain passthrough:
+
+| Command | Refused form (exit `EX_WRITE_VERB_NOT_MIGRATED` = 64) | Why |
+| --- | --- | --- |
+| `labels` | `generate --write`, `undeclared --prune`, `migrate --apply` | rewrite the `labels.yml` copies / the forge's labels; the dry-run and report forms are served |
+| `forge-probe` | `--live-write` | executes the probe manifest's write cases; the read-only run is served |
+| `forge-inventory` | `gate --update` | rewrites the change-gate baseline; every other verb is served |
+
+The classifiers (`LabelsArgs::is_read`, `ForgeProbeArgs::is_read`,
+`ForgeInventoryCommand::is_read`) are exhaustive `match`es with no wildcard
+arm, so a new form does not compile until its author says which side it is
+on — the §13.1 rule at flag granularity.
+
+Mode: only the invocations that can reach the forge pass the gate
+(`reaches_forge`): `pr-queue` without `--input`, `premise-check --issue`,
+`forge-probe`, `check-stale-blocked`, and `labels undeclared` / `migrate`
+(whose dry runs read the repo's labels). The rest — the whole config-
+inspection family, `duplicate-scan`, `check-points-marker`,
+`label-duplicates`, `affected-files`, `forge-inventory`, `labels`' registry
+forms — touch nothing but argv, stdin, local git objects or local files and
+skip the gate. `install-compat` is ungated like `release-fetch` (#12940):
+its `check --fetch-old-daemon` fetches a release artifact, not a forge read.
+
+Capability source unchanged: `install_compat::TOOLS_COMMANDS` is the one
+list; `capabilities --json` and `install-compat show --json` both print
+these fifteen entries as `tools_commands` (`CAPABILITIES_SCHEMA_VERSION`
+unchanged — an added key would be the only reason to bump), and the
+`bin/loom_tools.rs` unit test still fails when the list and the clap tree
+disagree. The Gitea stance is §13.4's: these commands' forge reads (their
+`gh` calls) keep whatever the facade and the shell adapter already do.
+
+### 13.8 Local claim commands (#14487)
+
+Part of #14475. `loom-tools claim <verb>` serves `claim`, `extend`, `check`,
+`release`, `list` and `cleanup` through the same `script_helpers::claim::run`
+that `loom-daemon claim` (and the `loom-claim` shim from
+`scripts/install/provision-daemon.sh`) calls; the argument shape is the same
+optional verb plus trailing positionals. The claim is the
+directory `.loom/claims/issue-<N>.lock` with its `claim.json`, found by walking up
+from the current directory to the checkout root.
+
+**Mode:** none of the six verbs reaches the forge, so none passes through
+`mode_gate()`: they behave the same under `fleet`, `local-daemon`, `session` and
+with `mode` unset, offline, with no daemon binary. Exit codes are the
+handler's: 0 success, 1 existing claim or general error, 2 bad input (or no
+Loom checkout), 3 claim not found, 4 owner mismatch. A refused `claim`, `extend`
+or `release` leaves the owner's `claim.json` unchanged.
+
+`install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
+split into reads and writes, so no sub-verbs are listed). Forge claim checks
+(§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 
@@ -793,8 +913,8 @@ reaches the forge.
 
 ### 14.2 Mode gate, classified by effect
 
-`mode_gate()` (§7.3, §10.3) runs only for an invocation that can reach the
-forge; the offline forms work with `mode` unset.
+The tools entry points resolve mode (§7.3, §10.3) only for an invocation
+that can reach the forge. The offline forms work with `mode` unset.
 
 | Invocation | Gate | Effect |
 | --- | --- | --- |
@@ -813,16 +933,186 @@ forge; the offline forms work with `mode` unset.
 duplicate scan, lock or nested call. `create-issue.sh` calls `$LOOM_DAEMON_BIN
 forge create-issue`; when `loom-tools` runs `apply --new` and `LOOM_DAEMON_BIN`
 is unset, it points it at itself, so the nested call stays on the route the gate
-chose and needs no daemon binary. **`loom-tools forge create-issue` is
-#14461's slice and is still refused (exit 64) at the time of this section**, so a
-tools-only `apply --new` that reaches the nested call fails with the handler's
-forge-failure exit (4) until #14461 lands; the existing-issue forms do not depend
-on it. Gitea behavior is unchanged: it is whatever the shared adapter and the
-facade's decline already do, identical from both roots.
+chose and needs no daemon binary. **`loom-tools forge create-issue` is served since #14519** (§13.2), so a
+tools-only `apply --new` reaches the nested call on the route the gate chose;
+the nested call still fails with the handler's forge-failure exit (4) when the
+route has no usable credential, exactly as `loom-daemon` does. The
+existing-issue forms do not depend on it. Gitea behavior is unchanged: it is
+whatever the shared adapter and the facade's decline already do, identical
+from both roots.
+
+In fleet mode, tools-only park and decision commands read through the fleet
+reader. A missing reader fails the read. When the shared handler needs to
+change a body, label or comment, or invoke nested filing, it returns its forge
+failure (exit 4) before using a local writer. Previews and idempotent calls
+that need only reads can finish. The current fleet role can create issues and
+post statuses. It has no operation to edit an existing issue body. Successful
+scoped writes and integration with the shared filing verb are tracked in
+#14464.
 
 ### 14.4 Served commands
 
 `install_compat::TOOLS_COMMANDS` lists all nine subcommands: `park-record
 render|parse|apply|released|decision|retract` and `operator-decision
-validate|apply|resolve`. The unit test in `bin/loom_tools.rs` still fails if the
-list and the clap tree disagree.
+validate|apply|resolve`. The unit test in `bin/loom_tools.rs` checks that each
+listed verb resolves in the clap tree and that every declared verb in these
+two families is listed.
+
+## 15. Phase 3c: issue leases (#14488)
+
+Part of #14475. An attended worker on a tools-only checkout can publish its
+`loom:building` lease, keep it renewed for the life of its session, ask whether
+a worktree is shared, hand the lease back, and run the builder's pre-push fence,
+with no `loom-daemon` installed. Role-keyed PR leases use the shared
+dispatcher described in §13.6. New nested `forge` actions belong to #14461.
+
+### 15.1 Mechanism
+
+`loom-tools lease <verb>` wraps the one `LeaseCommand` clap tree
+(`cli/lease_cli.rs`, `cli/lease_ensure.rs`) and runs the in-process handlers
+`loom-daemon lease` runs. `LeaseCli::needs_issue_mode_gate` classifies each
+issue-lease verb by effect. The shared dispatcher sends role-keyed PR leases
+to their workspace-specific mode gate (§13.6).
+
+The whole process chain stays on the binary that was selected:
+
+| Step | How it stays on that binary |
+| --- | --- |
+| `lease ensure` -> `sweep-lease-publish.sh`, `sweep-lease-renew.sh start` | `pin_running_binary` gives both scripts `LOOM_DAEMON_BIN=<current_exe>` unless the caller already exported one |
+| the scripts' `forge may-write`, `forge trusted-comments`, `forge token`, `forge check-branch`, `lease renewer ...` | read `${LOOM_DAEMON_BIN:-loom-daemon}`; `loom-tools` serves each of those verbs |
+| the re-exec through `lease renewer sanitize-exec` and the detached renewal loop | inherit the exported variable |
+| the deferred retry (`lease ensure --deferred`) | `deferred::launch_process` starts `current_exe()` |
+| `renewer stop` and `release` | `is_renewer_argv` recognises `loom-tools lease renewer` as well as `loom-daemon lease renewer`, so the ownership check does not refuse the process it started |
+| `sweep-lease-fence.sh`, or any of the three scripts run on their own | `loom_select_lease_bin` (`lib/locate-daemon-bin.sh`), below |
+
+`loom_select_lease_bin` exports `LOOM_DAEMON_BIN` once at the top of each of the
+three scripts: (1) a value the caller already exported wins; (2) with a
+`loom-daemon` on PATH and `LOOM_MODE` not `session`, nothing changes, so fleet
+hosts resolve exactly what they did before (making `loom-tools` preferred is
+the wrapper switch-over, #14398); (3) otherwise a `loom-tools` that answers
+`lease renewer --help`, found as `loom_locate_tools_bin` finds it. With neither
+binary the scripts keep their existing fail-open (publish, renew) and
+fail-closed (fence, exit 6) answers.
+
+### 15.2 Per-verb outcome by mode
+
+| Verb | `fleet` | `local-daemon` / `session` | Mode gate | A mode error |
+| --- | --- | --- | --- | --- |
+| `ensure` | reads and posts on the exported gateway / reader pool | reads and posts on the person's own credential; inherited fleet variables are dropped before any child sees them | yes, unless the environment settles it (no agent session, or already dispatched: the message prints and nothing starts) | printed, exit **0** (it "always exits 0"; a lease is evidence, never a precondition) |
+| `co-occupancy` | reads the lease comments | same, own credential | yes | printed, exit **0** (its exit 1 means "refuse the shared worktree" to `worktree.sh`, so a mode error must not alias it) |
+| `release` | reads, stops this host's renewers, posts the yield (write-scoped, #9548) | same, own credential | yes | exit **1** (it already exits 1 when the comments are unreadable) |
+| `renewer claim\|check\|release\|stop\|sanitize-exec` | local files and the process table only | same | no | n/a |
+
+A session-mode `ensure` is the same code as the fleet one: the route only
+changes which credential the `gh` calls the scripts and handlers run on, and
+`write_scope` vets every write the same way on either route.
+
+### 15.3 Consumers
+
+| Consumer | Call | Binary |
+| --- | --- | --- |
+| `worktree.sh` (Builder claim) | `lease ensure`, `lease co-occupancy` through `_WT_DAEMON_BIN` | unchanged: whichever `worktree.sh` resolved (#14397 owns its resolution) |
+| Builder pre-push / PR-open | `sweep-lease-fence.sh check` | `loom_select_lease_bin` |
+| `/loom:sweep` | `sweep-lease-publish.sh`, `sweep-lease-renew.sh start\|stop\|release`, `sweep-lease-fence.sh` | `loom_select_lease_bin`; unchanged on a host with a `loom-daemon` |
+
+### 15.4 Served commands and tests
+
+`install_compat::TOOLS_COMMANDS` gains `lease ensure`, `lease co-occupancy`,
+`lease release` and `lease renewer`; the unit test in `bin/loom_tools.rs` fails
+if the list and the clap tree disagree. `loom_tools_slice.rs` checks the
+issue-lease capability entries and exercises both lease families.
+
+`defaults/scripts/tests/test-loom-tools-lease.sh` (run by
+`loom-daemon/tests/loom_tools_lease.rs` against the built binary) puts only
+`loom-tools` and a stateful stub forge on PATH. The shell suite is registered
+as covered by that Rust test in `ci-excluded.txt`. It runs the real publish,
+deferred retry, renew, release, co-occupancy and fence paths: one owner and one
+renewer for a repeated `ensure`; a live peer's record kept and never posted
+over; renewal and the deferred publisher stopping when the watched process
+ends; `release` idempotent and refusing a live peer; the fence's branch probe
+answered by `loom-tools` against a local origin; an inherited gateway visible to the children on the `fleet` route and dropped on a `session` route; and a read-only credential refused by `forge may-write` (no lease posted, no yield posted). The existing
+`test-sweep-lease-{publish,renew,renew-lifecycle,renew-fd-hygiene,fence,
+fence-race,convergence}.sh` and `test-worktree-lease-co-occupancy.sh` suites
+run unchanged.
+
+## 16. Phase 3b: the remaining merge-queue actions (#14520)
+
+Part of #14461 (Phase 3b). `loom-tools forge merge-queue` now serves all eleven
+verbs. `mode`, `preflight` and `status` shipped in §13; this batch adds
+`enqueue`, `dequeue`, `reconcile`, `handoff`, `step`, `revoke`, `group-check`
+and `authorize-check`. The sanctioned end-to-end merge script and its nested
+merge helpers stay #14463; wrapper cutover stays #14398.
+
+### 16.1 Mechanism
+
+Admission is `ForgeAction::is_served` (`cli/forge_read.rs`): the `MergeQueue` arm
+is an exhaustive `match` over `MergeQueueAction` that names every verb, so a
+twelfth verb does not compile until its author classifies it. The handler call
+is unchanged: `handle_forge_command` -> `forge_merge_queue_cmd::run` ->
+`forge_merge_queue::handle`. Both binaries therefore share arguments, output
+and exit codes, the exact approved-SHA, authorization, required-check and
+checkout rules, and the scoped writer / status-command path
+(`forge_merge_queue/status_command.rs`), and a fleet failure still never falls
+back to a direct merge (`Nothing fell back to a direct merge.`). Nothing was
+copied into `loom-tools`. #14519 uses the same admission seam for non-queue
+verbs.
+
+### 16.2 Scope checks, traced per verb
+
+Every write to the forge is preceded by `write_scope::may_write_from` against
+the named `--repo` (or the checkout's own target). Where it runs differs by
+verb, and `loom-tools` reaches the same call because it runs the same
+`handle_forge_command`:
+
+| Verb | Where the scope check runs | Remote effect | Denied or unreadable scope |
+| --- | --- | --- | --- |
+| `enqueue`, `dequeue`, `handoff`, `revoke` | `write_target` in `handle_forge_command`, before the handler and in every mode | enqueue/dequeue; `handoff` also posts the approved-head status; `revoke` comments, fails statuses, dequeues | exit 1, `refusing the write (#9548)`, handler never runs |
+| `reconcile --pr` / sweep | inside the handler's queue branch, after the direct, Gitea and `--mode-only` short circuits and before any forge client is used | comments, relabels, dequeues | `LOOM-MERGE-QUEUE-UNDETERMINED`, exit 3 |
+| `reconcile --mode-only` | none: reads and writes nothing in any mode | none | n/a |
+| `step` | direct mode: none (prints `DIRECT`). Otherwise it runs `reconcile` first, so its check is reconcile's; `handoff` runs only on a first line of `LOOM-MERGE-QUEUE-CONTINUE`, which a denied reconcile never prints | as `reconcile`, then `handoff` | as `reconcile`, exit 3, no handoff |
+| `group-check` | inside the handler, after the clients are built (no forge call) and before the required contexts are read or any status is posted | posts `loom/merge-authorization` on the merge group commit | `UNDETERMINED`, exit 3, nothing posted |
+| `authorize-check` | none, because it never posts: it evaluates the check body for the PR head from forge facts, and any unknown fact, outage or forge error is a failure (exit 1). Posting the check is the caller's job (the `merge_group` workflow, or `group-check`) | none | n/a (a read) |
+
+Evaluating a status (`authorize-check`, the evaluation half of `group-check`) is
+therefore separate from posting one (`group-check`'s post, `handoff`'s
+head status), and only the posting paths are vetted.
+
+### 16.3 Mode gate, classified by effect
+
+`loom-tools` resolves its `mode` (§10.3) only for a verb that can reach the
+forge. `MergeQueueAction::reaches_forge(&resolved_merge_mode)` mirrors the
+handler's own short circuits, so the forge-free answers work with `mode` unset:
+
+- an invalid `champion.mergeMode` is answered (exit 2) before anything else;
+- `reconcile --mode-only` is forge-free in every mode;
+- `reconcile` and `step` are forge-free in `direct` mode (`DIRECT` sentinel);
+- `enqueue`, `dequeue`, `handoff` and `revoke` are gated in every mode, because
+  `write_target` probes the target's credential before the handler's own
+  direct-mode refusal (exit 4 for the first three, `DIRECT` for `revoke`);
+- `mode`, `preflight`, `status`, `group-check` and `authorize-check` are gated
+  (the last two are mode-independent).
+
+### 16.4 Gitea
+
+Unchanged and identical from both roots: the queue handlers answer a Gitea
+checkout themselves (`UNSUPPORTED_FORGE`, exit 1, for `preflight`, `enqueue`,
+`dequeue` and `status`; `UNDETERMINED`, exit 3, for the queue-mode lifecycle
+verbs) and never fall through to a merge. No Gitea behavior was ported (§13.4).
+
+### 16.5 Served commands and evidence
+
+`install_compat::TOOLS_COMMANDS` lists `forge merge-queue` plus each of the
+eleven verbs; the tests in `bin/loom_tools.rs` and `cli/forge_read/tests.rs`
+fail if the list and the clap tree disagree. Coverage: `cli/forge_read/tests.rs`
+(`merge_queue_verbs_reach_the_forge_by_effect`), `tests/loom_tools_slice.rs`
+(direct-mode parity with `loom-daemon`, the mode gate, and an unreadable scope
+that makes no remote mutation against a recording fake `gh`), and the existing
+fixture suites under `forge_merge_queue/` (stale vs current approved head,
+failed status post, direct vs queue mode).
+
+**Live verification NOT performed in the implementing worktree**: running the
+migrated actions in tools-only session mode against a controlled merge-queue
+repository with disposable PRs, and recording the resulting queue entry and
+status state, needs that repository and a writer credential. It is recorded on
+the PR and the issue for an operator with that access; no repo permission is
+broadened here.

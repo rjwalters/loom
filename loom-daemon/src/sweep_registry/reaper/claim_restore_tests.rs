@@ -792,6 +792,54 @@ fn reap_with_checkpoint_and_open_pr_keeps_the_claim_and_still_resumes() {
     std::env::remove_var("LOOM_REPO");
 }
 
+#[test]
+#[serial]
+fn reap_liveness_resume_steps_down_only_for_an_enabled_model_limit() {
+    let _repo = crate::env_test_support::EnvGuard::set("LOOM_REPO", "rjwalters/loom");
+    for (enabled, log, expected_model) in [
+        (true, "You've hit your Fable limit.\n", Some("opus")),
+        (false, "You've hit your Fable limit.\n", None),
+        (true, "segfault\n", None),
+    ] {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let issue = 14443;
+        let (mut reg, _) = open_pr_guard_registry(ws, "14472", 0, false);
+        write_config(
+            ws,
+            &serde_json::json!({
+                "autonomous": {"model": "fable", "modelFallback": {
+                    "enabled": enabled, "chain": ["fable", "opus", "sonnet"]
+                }}
+            })
+            .to_string(),
+        );
+        let argv_log = ws.join("resume-argv.log");
+        std::fs::write(
+            reg.config.spawn_bin.as_ref().unwrap(),
+            format!(
+                "#!/bin/sh\n{{ printf 'arg: %s\\n' \"$@\"; printf 'recorded\\n'; }} > '{}'\n",
+                argv_log.display()
+            ),
+        )
+        .unwrap();
+        write_checkpoint(&reg, issue, "builder-done");
+        let dead = insert_dead_running_with_log(&mut reg, issue, 0, "unknown", log);
+        reg.entries.get_mut(&dead).unwrap().model = Some("fable".into());
+
+        assert!(reg.reap_liveness() >= 1, "the read path must reap the dead child");
+        let resumed = running_issue_sweep_id(&reg, issue).expect("the open PR must resume");
+        assert_ne!(resumed, dead);
+        let argv = assert_child_wrote(&argv_log, "recorded\n");
+        let model = argv
+            .lines()
+            .skip_while(|line| *line != "arg: --model")
+            .nth(1)
+            .and_then(|line| line.strip_prefix("arg: "));
+        assert_eq!(model, expected_model, "fallback enabled={enabled}, exit log: {log:?}");
+    }
+}
+
 /// The guard on #11852: the same crash with no open PR (pre-PR phase, empty
 /// closes-graph) still restores `loom:issue`, as before.
 #[test]

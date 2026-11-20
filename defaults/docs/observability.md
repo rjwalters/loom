@@ -757,16 +757,18 @@ out earlier (`workspace_halted`, `parked`,
 `host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
-refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
-once as a terminal `left_queue` record when it leaves a repo whose listing
-succeeded. Sampled from the collector's periodic pass (the same cadence as
-the other queue samples), never the tick loop, so a disposition lasting less than one
-collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Every queued row becomes a
-span (no volume cap: a cap would make which items carry facts depend on
-iteration order), and a row whose repo root never resolved to a forge slug is
-dropped and counted as `reason="unresolved"` rather than exported with a local
-path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 150 seconds of
+source time), or once as a terminal `left_queue` record when it leaves a repo
+whose listing succeeded. A 30-second timer checks for a newer completed tick
+using cached identities. It shares the collector loop with host snapshots and
+backfill, whose work can delay the check. The existing five-minute host snapshot
+pass resolves repo identities and counts unresolved rows. The span
+timestamp is the source tick's completion time; the envelope records when
+the collector offered it. Warm repos can refresh while other identities are
+unresolved. Missing rows in failed or incomplete listings keep their last
+observation. The export has no row cap. Rows without a resolved forge slug
+are counted as `reason="unresolved"` and omit any local path from telemetry.
+`loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
 host. Full attribute table in
 [`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
@@ -993,7 +995,7 @@ override for a stopped daemon or an opted-out reconciler.
 
 **Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
 `auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
-`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+and `main_health_gate` bypasses the `invoke github` span, so it
 reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
 operational check on a fleet host (shadow recipe above), not a CI check.
 

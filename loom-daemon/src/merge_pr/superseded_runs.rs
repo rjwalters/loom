@@ -18,22 +18,27 @@
 //! be wrong: two different workflows may share a job name, and hiding one of
 //! them would hide a real failure. Within a group of two or more runs:
 //!
-//! - the **authority** is the newest run (`created_at`, tie-break `id`) that
-//!   is `completed` and did not conclude `cancelled` — a cancelled run is not
-//!   a verdict about the commit;
-//! - a group with no such run supersedes nothing (today's behaviour);
-//! - a `completed` run is **superseded** when it is older than the authority
-//!   or concluded `cancelled`;
-//! - a run that is not `completed` is never superseded, so a still-running
-//!   twin keeps the wait pending rather than letting an older verdict settle
-//!   it.
+//! - a **replacement** run is one that is `completed` and did not conclude
+//!   `cancelled` — a cancelled run is not a verdict about the commit;
+//! - a `completed` run X is **superseded** when some replacement run exists
+//!   that is newer (`created_at`, tie-break `id`) than X, or when X itself
+//!   concluded `cancelled` (then any replacement run counts, whatever its
+//!   age);
+//! - a run that is not `completed` is never superseded and never a
+//!   replacement, so a still-running twin keeps the wait pending rather than
+//!   letting an older verdict settle it.
 //!
-//! Then a check-run whose check suite belongs to a superseded run is dropped
-//! ONLY when the authority run's suite reported a check of the SAME NAME: the
-//! authority's row replaces it. A check the authority never reported (a red
-//! job unique to the older run) is kept, because nothing newer vouches for
-//! that commit on it. A check-run whose suite maps to no run (a third-party app, or a
-//! payload without suite ids) is always kept.
+//! Replacement is resolved **per check NAME** (#14571). A check-run whose
+//! check suite belongs to a superseded run X is dropped ONLY when some
+//! replacement run for X reported a check of the SAME NAME: that run's row
+//! replaces it. A check no replacement reported (a red job unique to the
+//! older run) is kept, because nothing newer vouches for that commit on it.
+//! A newer run that reports only OTHER job names (for example a skipped run
+//! fired by a later `labeled` event) therefore changes nothing for a name an
+//! earlier replacement already covered: choosing one authority for the whole
+//! group let such a run hide the real replacement and resurrect the
+//! cancelled row. A check-run whose suite maps to no run (a third-party app,
+//! or a payload without suite ids) is always kept.
 //!
 //! # Fail direction
 //!
@@ -126,14 +131,15 @@ fn run_of(i: usize, v: &Value) -> Result<Run, String> {
     })
 }
 
-/// Superseded check-suite id -> the authority run's check-suite id, for a
-/// `GET actions/runs?head_sha=` payload, considering only runs whose `head_sha` is exactly `sha`.
+/// Superseded check-suite id -> the check-suite ids of its replacement runs
+/// (see the module docs), for a `GET actions/runs?head_sha=` payload,
+/// considering only runs whose `head_sha` is exactly `sha`.
 ///
 /// # Errors
 ///
 /// When the payload is unreadable or truncated, or any run on `sha` lacks a
 /// field the rule reads — the caller then drops nothing.
-pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeMap<u64, u64>, String> {
+pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeMap<u64, Vec<u64>>, String> {
     let arr = payload
         .get("workflow_runs")
         .and_then(Value::as_array)
@@ -153,27 +159,26 @@ pub fn superseded_suites(payload: &Value, sha: &str) -> Result<BTreeMap<u64, u64
     }
     let mut out = BTreeMap::new();
     for runs in groups.values().filter(|g| g.len() > 1) {
-        let Some(authority) = runs
-            .iter()
-            .filter(|r| r.completed && !r.cancelled)
-            .max_by(|a, b| a.order.cmp(&b.order))
-        else {
-            continue;
-        };
-        out.extend(
-            runs.iter()
-                .filter(|r| r.completed && (r.cancelled || r.order < authority.order))
-                .map(|r| (r.suite, authority.suite)),
-        );
+        for run in runs.iter().filter(|r| r.completed) {
+            let replacements: Vec<u64> = runs
+                .iter()
+                .filter(|r| r.completed && !r.cancelled && r.suite != run.suite)
+                .filter(|r| run.cancelled || r.order > run.order)
+                .map(|r| r.suite)
+                .collect();
+            if !replacements.is_empty() {
+                out.insert(run.suite, replacements);
+            }
+        }
     }
     Ok(out)
 }
 
 /// Remove the rows of `doc["check_runs"]` that a newer run replaces: a row
-/// whose suite is a key of `superseded` AND whose name the mapped authority
-/// suite also reported. Other rows stay (a check only the older run ran still
+/// whose suite is a key of `superseded` AND whose name at least one of the
+/// mapped replacement suites also reported. Other rows stay (a check only the older run ran still
 /// counts). Lowers `total_count` by the number removed and returns it.
-pub fn drop_superseded(doc: &mut Value, superseded: &BTreeMap<u64, u64>) -> usize {
+pub fn drop_superseded(doc: &mut Value, superseded: &BTreeMap<u64, Vec<u64>>) -> usize {
     if superseded.is_empty() {
         return 0;
     }
@@ -192,9 +197,11 @@ pub fn drop_superseded(doc: &mut Value, superseded: &BTreeMap<u64, u64>) -> usiz
         let (Some(suite), Some(name)) = (suite_of(r), r.get("name").and_then(Value::as_str)) else {
             return true;
         };
-        !superseded
-            .get(&suite)
-            .is_some_and(|auth| reported.contains(&(*auth, name.to_string())))
+        !superseded.get(&suite).is_some_and(|replacements| {
+            replacements
+                .iter()
+                .any(|rep| reported.contains(&(*rep, name.to_string())))
+        })
     });
     let removed = before - rows.len();
     if let Some(n) = doc.get("total_count").and_then(Value::as_u64) {

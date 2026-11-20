@@ -106,7 +106,7 @@ impl SweepRegistry {
                 continue;
             };
             let count = self.noop_cooldown_config.hold_threshold;
-            let mut streak = NoopStreak::recovered(count, fingerprint, ParkKind::HumanGate);
+            let mut streak = NoopRun::recovered(count, fingerprint, ParkKind::HumanGate);
             streak.adopted = true;
             self.noop_cooldown.streaks.insert(issue, streak);
             adopted += 1;

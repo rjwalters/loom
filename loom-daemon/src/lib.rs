@@ -326,7 +326,6 @@ pub mod orphan_replace;
 pub mod overlap_replay;
 pub mod parent_link;
 pub mod park_record;
-pub mod peer_claims;
 pub mod phase_join;
 pub mod pi_usage;
 pub mod pipeline_snapshot;
@@ -496,6 +495,7 @@ pub mod weighted_draw;
 pub mod work_finder;
 pub mod work_finder_guard;
 pub mod worker_spawn;
+pub mod workflow_lint;
 pub mod workspace_hold;
 pub mod workspace_pool;
 pub mod workspace_registry;
@@ -509,6 +509,7 @@ pub mod worktree_state;
 pub mod write_scope;
 #[cfg(test)]
 pub(crate) mod write_scope_test_support;
+pub mod writer_limit;
 
 use std::collections::HashSet;
 use std::fs;
