@@ -6,7 +6,11 @@
 
 use crate::script_helpers::now_epoch_secs;
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -465,6 +469,28 @@ fn path_status(path: &Path) -> PathStatus {
     }
 }
 
+/// Look up one validated leaf in the directory we actually opened. A path
+/// lookup followed by a separate stat of the root can mix two observations
+/// when the configured root disappears and returns.
+fn profile_entry_missing(directory: &File, reference: &str) -> bool {
+    let Ok(reference) = CString::new(reference) else {
+        return false;
+    };
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: the borrowed directory and C string remain live for the call
+    // and the output pointer is writable storage for a stat. We only use the
+    // return code. A dangling leaf symlink counts as an existing entry.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            reference.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    result == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+}
+
 fn read_repo_registry(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
     read_repo_registry_observed(workspace).map(|(entries, _)| entries)
 }
@@ -700,13 +726,20 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<(Vec<AccountDescript
                     if validate_name(&entry.credential_reference).is_ok() {
                         let status = path_status(&root.join(&entry.credential_reference));
                         if status != PathStatus::Present {
-                            // A child also reports NotFound when the configured
-                            // root is unavailable. That cannot prove absence.
                             absence_verified &= status == PathStatus::Missing
                                 && err.downcast_ref::<std::io::Error>().is_some_and(|error| {
                                     error.kind() == std::io::ErrorKind::NotFound
                                 })
-                                && root.is_dir();
+                                && OpenOptions::new()
+                                    .read(true)
+                                    .custom_flags(libc::O_DIRECTORY)
+                                    .open(&root)
+                                    .is_ok_and(|directory| {
+                                        profile_entry_missing(
+                                            &directory,
+                                            &entry.credential_reference,
+                                        )
+                                    });
                             if !quiet {
                                 warn_unprovisioned_once(
                                     &entry.name,
@@ -1007,6 +1040,27 @@ mod tests {
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.name, "work");
+    }
+
+    #[test]
+    fn profile_absence_is_relative_to_the_opened_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("profiles");
+        let moved = temp.path().join("moved-profiles");
+        fs::create_dir_all(root.join("alice")).unwrap();
+        symlink(root.join("missing-target"), root.join("dangling")).unwrap();
+        let directory = File::open(&root).unwrap();
+
+        fs::rename(&root, &moved).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(root.join("alice")).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(!profile_entry_missing(&directory, "alice"));
+        assert!(!profile_entry_missing(&directory, "dangling"));
+        assert!(profile_entry_missing(&directory, "unprovisioned"));
     }
 
     #[test]
