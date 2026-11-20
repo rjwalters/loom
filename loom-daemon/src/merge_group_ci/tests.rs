@@ -876,3 +876,107 @@ fn detect_changes_fail_open_rejects_a_third_filter_step() {
     let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
     assert!(bad.iter().any(|b| b.contains("step ids must be")), "{bad:?}");
 }
+
+const DOCS_ONLY_REFERENCE: &str = include_str!("fixtures/docs_only_exception.yml");
+
+#[test]
+fn docs_only_exception_is_visible_without_claiming_full_suite_coverage() {
+    let w = wf("ci.yml", DOCS_ONLY_REFERENCE);
+    let r = run(&w, &["Project Tests", "CI Result"]);
+    assert!(r.qualified(), "{:#?}", r.findings);
+    let tests = r.jobs.iter().find(|job| job.id == "tests").unwrap();
+    assert_eq!(tests.docs_only_steps, ["Full suites"]);
+    assert!(!tests.covered);
+    assert!(!r.required[0].covered && r.required[0].docs_only_exception);
+    assert!(r.required[1].covered && !r.required[1].docs_only_exception);
+    for e in Event::ALL {
+        assert_eq!(state(&r, "tests", e), RunState::Runs);
+        assert_eq!(state(&r, "result", e), RunState::Runs);
+    }
+    let text = super::render_audit(&r, false);
+    assert!(text.contains("DOCS-ONLY EXCEPTION"));
+    assert!(text.contains("step `Full suites` can skip"));
+    assert!(text.contains("required contexts report"));
+    let report = serde_json::to_value(r).unwrap();
+    assert_eq!(report["required"][0]["docs_only_exception"], true);
+    assert_eq!(report["required"][0]["covered"], false);
+}
+
+#[test]
+fn docs_only_audit_rejects_noncanonical_or_job_level_gating() {
+    let no_failure_fallback = DOCS_ONLY_REFERENCE.replace(
+        "needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true'",
+        "needs.docs_only.outputs.docs_only != 'true'",
+    );
+    let gated_job = DOCS_ONLY_REFERENCE.replace(
+        "    if: ${{ !cancelled() }}\n",
+        "    if: ${{ needs.docs_only.outputs.docs_only != 'true' }}\n",
+    );
+    let bracket_guard = DOCS_ONLY_REFERENCE
+        .replace("needs.docs_only.outputs.docs_only", "needs['docs_only'].outputs['docs_only']");
+    let no_classifier = DOCS_ONLY_REFERENCE.replace("loom-daemon ci-docs-only", "other-command");
+    let auth_gated = DOCS_ONLY_REFERENCE
+        .replace("run: ./scripts/test", "run: loom-daemon forge merge-queue group-check");
+    for modified in [
+        no_failure_fallback,
+        gated_job,
+        bracket_guard,
+        no_classifier,
+        auth_gated,
+    ] {
+        let report = run(&wf("ci.yml", &modified), &["Project Tests", "CI Result"]);
+        assert!(codes_for(&report, Some("tests")).contains(&Code::UnprovenDocsOnlyGuard));
+        assert!(!report.qualified());
+    }
+}
+
+#[test]
+fn docs_only_workflow_contract_runs_heavy_steps_and_reports_without_a_successful_proof() {
+    use super::expr::{parse_condition, Context, Truth, Value};
+    struct Decisions<'a> {
+        classifier: &'a str,
+        output: Option<&'a str>,
+        suites: &'a str,
+    }
+    impl Context for Decisions<'_> {
+        fn lookup(&self, path: &[String]) -> Value {
+            let value = match path.join(".").as_str() {
+                "needs.docs_only.result" => Some(self.classifier),
+                "needs.docs_only.outputs.docs_only" => self.output,
+                "needs.tests.result" => Some(self.suites),
+                _ => panic!("unexpected expression path {path:?}"),
+            };
+            value.map_or(Value::Null, |value| Value::Str(value.to_string()))
+        }
+    }
+    let w = wf("ci.yml", DOCS_ONLY_REFERENCE);
+    assert_eq!(w.permissions.as_deref(), Some("contents: read, actions: read"));
+    let suite = w.job("tests").unwrap();
+    let aggregate = w.job("result").unwrap();
+    let heavy = parse_condition(suite.steps.last().unwrap().if_cond.as_deref().unwrap()).unwrap();
+    let red = parse_condition(aggregate.steps[0].if_cond.as_deref().unwrap()).unwrap();
+    assert_eq!(suite.if_cond.as_deref(), Some("${{ !cancelled() }}"));
+    assert_eq!(aggregate.if_cond, suite.if_cond);
+    assert_eq!(aggregate.steps[0].run.as_deref(), Some("exit 1"));
+    for step in &suite.steps[..suite.steps.len() - 1] {
+        assert!(step.if_cond.is_none(), "always-run checkout and cheap checks: {step:?}");
+    }
+    for (classifier, output, suites, runs, fails) in [
+        ("success", Some("true"), "success", false, false),
+        ("success", Some("false"), "success", true, false),
+        ("success", None, "success", true, false),
+        ("failure", None, "success", true, true),
+        ("failure", Some("true"), "success", true, true),
+        ("cancelled", None, "success", true, true),
+        ("skipped", None, "success", true, true),
+        ("success", Some("false"), "failure", true, true),
+    ] {
+        let context = Decisions {
+            classifier,
+            output,
+            suites,
+        };
+        assert_eq!(heavy.eval(&context).truth() == Truth::True, runs);
+        assert_eq!(red.eval(&context).truth() == Truth::True, fails);
+    }
+}

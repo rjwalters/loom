@@ -51,7 +51,7 @@ use serde::Deserialize;
 
 use super::budget::{self, Budget, Floor, ForgeCost, Guard, Meter};
 use super::unreadable::Unreadable;
-use super::{classify, park_self_block, Artifact, Evidence, RemoteRef, Verdict};
+use super::{classify, park_self_block, Artifact, Evidence, PrResweepState, RemoteRef, Verdict};
 use crate::dep_recheck::{extract, named, premise, recheck};
 use crate::forge_call_stats::{ops, ForgeOp};
 use crate::forge_etag_store as store;
@@ -65,6 +65,7 @@ const CALLER: &str = "stale_blocked";
 
 /// The closing-reference query's telemetry name.
 const GRAPHQL_OP: &str = "stale_blocked.closing_refs_graphql";
+const PR_RESWEEP_OP: &str = "stale_blocked.pr_resweep_graphql";
 
 /// Issues per aliased closing-reference query.
 pub const CLOSING_BATCH: usize = 100;
@@ -135,6 +136,9 @@ pub trait StaleBlockedForge {
     /// # Errors
     /// The read failed or the PR does not exist.
     fn pr_merge_state(&mut self, number: u32) -> Result<(String, String)>;
+
+    /// A direct PR snapshot including its formal review decision.
+    fn pr_resweep_state(&mut self, number: u32, body: &str) -> Result<PrResweepState>;
 
     /// The closing PRs of up to [`CLOSING_BATCH`] issues. An issue is present
     /// in the map only when its answer was complete.
@@ -213,6 +217,7 @@ struct Pending {
     declared: Vec<crate::park_record::BlockerRef>,
     held: Option<super::Held>,
     permanent_block: bool,
+    champion_hold: Option<crate::champion_hold::HoldKind>,
     hold: Option<super::HoldComment>,
     closing: Vec<ClosingRef>,
     failed: Option<Unreadable>,
@@ -231,11 +236,30 @@ pub fn gather_checked(
     fleet: &FleetLogins,
     opts: Options,
 ) -> Gathering {
+    gather_checked_with(forge, opts, |forge| gather_all(forge, fleet, opts))
+}
+
+/// Gather only PRs and the exact references in their body park records.
+pub fn gather_pr_resweep(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+) -> Gathering {
+    gather_checked_with(forge, opts, |forge| {
+        gather_filtered_for(forge, fleet, opts, true, &mut |_, _, _| true)
+    })
+}
+
+fn gather_checked_with(
+    forge: &mut dyn StaleBlockedForge,
+    opts: Options,
+    gather: impl FnOnce(&mut dyn StaleBlockedForge) -> Gathering,
+) -> Gathering {
     let (archived, enumerate_error) = match forge.archived() {
         Ok(false) => {
             return Gathering {
                 archived: Some(false),
-                ..gather_all(forge, fleet, opts)
+                ..gather(forge)
             }
         }
         Ok(true) => (Some(true), None),
@@ -273,6 +297,16 @@ pub fn gather_filtered(
     opts: Options,
     keep: &mut dyn FnMut(Artifact, i64, &extract::Input) -> bool,
 ) -> Gathering {
+    gather_filtered_for(forge, fleet, opts, false, keep)
+}
+
+fn gather_filtered_for(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+    named_pr_resweep: bool,
+    keep: &mut dyn FnMut(Artifact, i64, &extract::Input) -> bool,
+) -> Gathering {
     let mut cost = ForgeCost {
         floor: opts.floor,
         ..ForgeCost::default()
@@ -291,7 +325,7 @@ pub fn gather_filtered(
     let limit = opts.limit as usize;
     let mut selected: Vec<(Artifact, RestIssue)> = Vec::new();
     for (kind, want_pr) in [(Artifact::Issue, false), (Artifact::Pr, true)] {
-        if want_pr && opts.no_prs {
+        if (want_pr && opts.no_prs) || (!want_pr && named_pr_resweep) {
             continue;
         }
         let rows = rows
@@ -301,7 +335,7 @@ pub fn gather_filtered(
             .filter(|r| !super::digest::excluded(kind, r))
             // #11743: a frozen artifact is not read as work by any pass,
             // the notifier included.
-            .filter(|r| !crate::work_finder::is_frozen(&r.labels))
+            .filter(|r| named_pr_resweep || !crate::work_finder::is_frozen(&r.labels))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
     }
@@ -309,6 +343,16 @@ pub fn gather_filtered(
     // Nothing to gather, nothing to probe.
     if !selected.is_empty() {
         cost.projected = budget::project(&selected);
+        if named_pr_resweep {
+            cost.projected.graphql = selected
+                .iter()
+                .filter(|(_, row)| {
+                    row.body
+                        .as_deref()
+                        .is_some_and(|b| !crate::park_record::blockers(b).is_empty())
+                })
+                .count() as u64;
+        }
         let refused: Option<Unreadable> = if forge.breaker_open() {
             Some(Unreadable::read_failed(
                 "rate-limit breaker is suppressing forge calls — not evaluated this run",
@@ -346,7 +390,7 @@ pub fn gather_filtered(
     let mut guard = Guard::new(opts.floor);
     let mut pending: Vec<Pending> = Vec::new();
     for (kind, row) in selected {
-        let (p, input) = read_text(forge, fleet, kind, row, &mut guard);
+        let (p, input) = read_text(forge, fleet, kind, row, &mut guard, named_pr_resweep);
         if input.is_none_or(|i| keep(kind, i64::from(p.row.number), &i)) {
             pending.push(p);
         }
@@ -355,7 +399,7 @@ pub fn gather_filtered(
     let states = read_states(forge, &pending, &mut guard);
     let items = pending
         .into_iter()
-        .map(|p| assemble(forge, p, &states, &mut guard))
+        .map(|p| assemble(forge, p, &states, &mut guard, named_pr_resweep))
         .collect();
     cost.meter = forge.meter();
     cost.budget_stopped = guard.stopped();
@@ -376,6 +420,7 @@ fn read_text(
     kind: Artifact,
     row: RestIssue,
     guard: &mut Guard,
+    named_pr_resweep: bool,
 ) -> (Pending, Option<extract::Input>) {
     let body = row.body.clone().unwrap_or_default();
     let mut p = Pending {
@@ -384,14 +429,18 @@ fn read_text(
         prose: Vec::new(),
         named: Vec::new(),
         unparsed_unchecked: 0,
-        declared: Vec::new(),
+        declared: crate::park_record::blockers(&body),
         held: None,
         permanent_block: false,
+        champion_hold: None,
         hold: None,
         closing: Vec::new(),
         failed: None,
         row,
     };
+    if named_pr_resweep && p.declared.is_empty() {
+        return (p, None);
+    }
     let comments = if p.row.comments == 0 {
         Vec::new()
     } else {
@@ -421,6 +470,14 @@ fn read_text(
         || (super::hold::has_permanent_block(&body)
             && forge.trusts_author(p.row.author.as_deref(), p.row.author_association.as_deref()));
     p.hold = super::hold::newest_hold(&comments);
+    if kind == Artifact::Pr {
+        let trusted = comments
+            .iter()
+            .filter(|c| c.trusted)
+            .map(|c| &c.body)
+            .collect::<Vec<_>>();
+        p.champion_hold = crate::champion_hold::standing_hold(&trusted);
+    }
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
     // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
@@ -435,12 +492,18 @@ fn read_text(
         body: crate::park_record::mask_qualified(&prose_body),
         comments: input.comments.clone(),
     };
-    p.prose = extract::extract_with(&masked, fleet)
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    // The park record is read from the BODY only (#8925).
-    p.declared = crate::park_record::blockers(&p.body);
+    p.prose = if named_pr_resweep {
+        p.declared
+            .iter()
+            .filter(|r| r.repo.is_none())
+            .filter_map(|r| i64::try_from(r.number).ok())
+            .collect()
+    } else {
+        extract::extract_with(&masked, fleet)
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect()
+    };
     // Records are append-only: the newest reason-only one, not the first (#10558).
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
@@ -562,10 +625,11 @@ fn assemble(
     p: Pending,
     states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
+    named_pr_resweep: bool,
 ) -> Gathered {
     let outcome = match p.failed.clone() {
         Some(why) => Err(why),
-        None => evidence_for(forge, &p, states, guard),
+        None => evidence_for(forge, &p, states, guard, named_pr_resweep),
     };
     let (evidence, cause) = match outcome {
         Ok(ev) => (Ok(ev), None),
@@ -587,6 +651,7 @@ fn evidence_for(
     p: &Pending,
     states: &HashMap<RefKey, Result<RefState, Unreadable>>,
     guard: &mut Guard,
+    named_pr_resweep: bool,
 ) -> Result<Evidence, Unreadable> {
     let lookup = |key: RefKey, what: String| -> Result<RefState, Unreadable> {
         match states.get(&key) {
@@ -668,6 +733,8 @@ fn evidence_for(
         declared: p.declared.clone(),
         remote,
         self_block: None,
+        pr_resweep_state: None,
+        champion_hold: p.champion_hold,
         held: p.held.clone(),
         permanent_block: p.permanent_block,
         hold: p.hold.clone(),
@@ -686,8 +753,20 @@ fn evidence_for(
         }
     }
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
-        guard.core_stop(&forge.meter())?;
-        evidence.self_block = self_block(forge, &p.row)?;
+        if named_pr_resweep {
+            if evidence.prose.iter().all(|r| super::resolved(&r.state))
+                && evidence.remote.iter().all(|r| super::resolved(&r.state))
+            {
+                guard.graphql_stop(&forge.meter())?;
+                evidence.pr_resweep_state =
+                    Some(forge.pr_resweep_state(p.row.number, &p.body).map_err(|e| {
+                        format!("PR #{} direct state is unevaluated: {e}", p.row.number)
+                    })?);
+            }
+        } else {
+            guard.core_stop(&forge.meter())?;
+            evidence.self_block = self_block(forge, &p.row)?;
+        }
     }
     Ok(evidence)
 }
@@ -781,6 +860,54 @@ pub struct GhStaleBlockedForge {
 }
 
 impl GhStaleBlockedForge {
+    fn graphql_response(
+        &mut self,
+        name: &'static str,
+        op: ForgeOp,
+        query: &str,
+    ) -> Result<(String, String)> {
+        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
+            return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
+        }
+        let field = format!("query={query}");
+        let inv = GhInvocation::new(
+            Operation::new(name),
+            AccessIntent::Read,
+            GhTarget::None,
+            GRAPHQL_TIMEOUT,
+        )
+        .forge_op(op)
+        .identity_scope(None, Some(&self.slug))
+        // Reader-only (#12394, #12584): a GraphQL argv does not spell its
+        // repo for the facade, so the reader route names it.
+        .reader_repo(&self.slug)
+        .program(&self.gh_bin)
+        .current_dir(&self.root)
+        .args(["api", "graphql", "-f", field.as_str()]);
+        let out = match inv.execute() {
+            Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
+            Ok(GhCompletion::DeadlineReached) => {
+                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
+            }
+            Ok(GhCompletion::Shed { .. }) => {
+                return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
+            }
+            Ok(_) => {
+                // It may still have been charged.
+                self.meter.graphql(None, None);
+                return Err(anyhow!("gh api graphql timed out"));
+            }
+            Err(e) => return Err(anyhow!("gh api graphql could not run: {e:?}")),
+        };
+        // `gh` exits non-zero when the answer carries any `errors` entry, but
+        // still prints the partial `data`: parse first, judge per alias.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (cost, remaining) = parse_rate_limit(&stdout);
+        self.meter.graphql(cost, remaining);
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Ok((stdout.into_owned(), stderr))
+    }
+
     #[must_use]
     pub fn new(root: &Path, repo: Option<&str>) -> Self {
         let repo = repo.map(str::to_string).or_else(|| {
@@ -891,50 +1018,29 @@ impl StaleBlockedForge for GhStaleBlockedForge {
         parse_pr_merge_state(&body)
     }
 
+    fn pr_resweep_state(&mut self, number: u32, body: &str) -> Result<PrResweepState> {
+        let (owner, name) = owner_name(&self.slug)
+            .ok_or_else(|| anyhow!("cannot bind a PR snapshot to {}", self.slug))?;
+        let query = format!(
+            "query {{ rateLimit {{ cost remaining }} repository(owner:{owner:?},name:{name:?}) \
+             {{ nameWithOwner pullRequest(number:{number}) {{ number state body \
+             labels(first:100) {{ totalCount nodes {{ name }} }} \
+             mergeable mergeStateStatus reviewDecision }} }} }}"
+        );
+        let (stdout, stderr) = self.graphql_response(PR_RESWEEP_OP, ops::PR_VIEW_STATE, &query)?;
+        parse_pr_resweep_state(&stdout, &self.slug, number, body).inspect_err(|_| {
+            crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
+        })
+    }
+
     fn closing_refs_batch(&mut self, issues: &[u32]) -> Result<HashMap<u32, Vec<ClosingRef>>> {
-        if crate::rate_limit_breaker::global_skip_pass(CALLER) {
-            return Err(anyhow!("rate-limit breaker is suppressing forge calls"));
-        }
         let (owner, name) = owner_name(&self.slug).ok_or_else(|| {
             anyhow!("cannot name the repository for the closing-PR query ({})", self.slug)
         })?;
-        let field = format!("query={}", closing_refs_query(owner, name, issues));
-        let inv = GhInvocation::new(
-            Operation::new(GRAPHQL_OP),
-            AccessIntent::Read,
-            GhTarget::None,
-            GRAPHQL_TIMEOUT,
-        )
-        .forge_op(ops::ISSUE_CLOSED_BY_PULL_REQUESTS)
-        .identity_scope(None, Some(&self.slug))
-        // Reader-only (#12394, #12584): a GraphQL argv does not spell its
-        // repo for the facade, so the reader route names it.
-        .reader_repo(&self.slug)
-        .program(&self.gh_bin)
-        .current_dir(&self.root)
-        .args(["api", "graphql", "-f", field.as_str()]);
-        let out = match inv.execute() {
-            Ok(GhCompletion::Captured(Completion::Exited(out))) => out,
-            Ok(GhCompletion::DeadlineReached) => {
-                return Err(anyhow!("gh api graphql not sent: the tick deadline passed"));
-            }
-            Ok(GhCompletion::Shed { .. }) => {
-                return Err(anyhow!("gh api graphql was shed: no reader can serve it"));
-            }
-            Ok(_) => {
-                // It may still have been charged.
-                self.meter.graphql(None, None);
-                return Err(anyhow!("gh api graphql timed out"));
-            }
-            Err(e) => return Err(anyhow!("gh api graphql could not run: {e:?}")),
-        };
-        // `gh` exits non-zero when the answer carries any `errors` entry, but
-        // still prints the partial `data`: parse first, judge per alias.
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let (cost, remaining) = parse_rate_limit(&stdout);
-        self.meter.graphql(cost, remaining);
+        let query = closing_refs_query(owner, name, issues);
+        let (stdout, stderr) =
+            self.graphql_response(GRAPHQL_OP, ops::ISSUE_CLOSED_BY_PULL_REQUESTS, &query)?;
         parse_closing_refs(&stdout, issues).ok_or_else(|| {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             crate::rate_limit_breaker::global_observe_failure(&stderr, CALLER);
             anyhow!("gh api graphql (closing PRs) failed: {stderr}")
         })
@@ -1165,6 +1271,81 @@ pub fn parse_pr_merge_state(body: &str) -> Result<(String, String)> {
         .map(|s| s.to_ascii_uppercase())
         .unwrap_or_default();
     Ok((mergeable.to_string(), state))
+}
+
+pub(super) fn parse_pr_resweep_state(
+    response: &str,
+    expected_repo: &str,
+    number: u32,
+    body: &str,
+) -> Result<PrResweepState> {
+    let decoded: serde_json::Value = serde_json::from_str(response)?;
+    if decoded
+        .get("errors")
+        .is_some_and(|errors| errors.as_array().is_none_or(|a| !a.is_empty()))
+    {
+        anyhow::bail!("GitHub returned errors for the PR snapshot");
+    }
+    let repo = &decoded["data"]["repository"];
+    let pr = &repo["pullRequest"];
+    if repo["nameWithOwner"]
+        .as_str()
+        .is_none_or(|r| !r.eq_ignore_ascii_case(expected_repo))
+        || pr["number"].as_u64() != Some(u64::from(number))
+    {
+        anyhow::bail!("GitHub did not return the requested repository and PR");
+    }
+    if pr["state"].as_str() != Some("OPEN") {
+        anyhow::bail!("the direct PR state is absent or no longer open");
+    }
+    let labels = &pr["labels"];
+    let names: Vec<&str> = labels["nodes"]
+        .as_array()
+        .and_then(|nodes| nodes.iter().map(|n| n["name"].as_str()).collect())
+        .ok_or_else(|| anyhow!("the direct PR labels are unreadable"))?;
+    if labels["totalCount"].as_u64() != Some(names.len() as u64) {
+        anyhow::bail!("the direct PR label list is incomplete");
+    }
+    if !names.contains(&"loom:blocked") {
+        anyhow::bail!("the PR no longer carries loom:blocked");
+    }
+    if pr["body"].as_str() != Some(body) {
+        anyhow::bail!("the PR description changed since listing");
+    }
+    if names.contains(&crate::work_finder::FROZEN_LABEL)
+        || crate::work_finder::is_operator_hold(&names)
+    {
+        return Ok(PrResweepState::Held("operator or frozen hold".into()));
+    }
+    if names.contains(&"loom:changes-requested") && names.contains(&"loom:review-requested") {
+        return Ok(PrResweepState::Held("contradictory review labels".into()));
+    }
+    match pr.get("reviewDecision") {
+        Some(serde_json::Value::Null) => {}
+        Some(decision) => match decision.as_str() {
+            Some("APPROVED" | "REVIEW_REQUIRED") => {}
+            Some("CHANGES_REQUESTED") => {
+                return Ok(PrResweepState::Held("formal review requests changes".into()))
+            }
+            _ => anyhow::bail!("the formal review decision is unrecognized"),
+        },
+        None => anyhow::bail!("the formal review decision is missing"),
+    }
+    let mergeable = pr["mergeable"].as_str().unwrap_or("UNKNOWN");
+    let status = pr["mergeStateStatus"].as_str().unwrap_or("UNKNOWN");
+    if mergeable == "CONFLICTING" || matches!(status, "DIRTY" | "CONFLICTING") {
+        return Ok(PrResweepState::Conflict(format!(
+            "the PR cannot currently land (mergeable={mergeable}, mergeStateStatus={status})"
+        )));
+    }
+    if mergeable == "MERGEABLE"
+        && matches!(status, "BLOCKED" | "BEHIND" | "CLEAN" | "DRAFT" | "HAS_HOOKS" | "UNSTABLE")
+    {
+        return Ok(PrResweepState::Mergeable);
+    }
+    anyhow::bail!(
+        "the PR has no confirmed mergeability (mergeable={mergeable}, mergeStateStatus={status})"
+    );
 }
 
 /// A REST comments page → [`extract::Comment`]s.
