@@ -1262,8 +1262,10 @@ fn refresh_pass(ws: &Path, primary: Option<String>) {
 /// uses, so every later process, the daemon included, reuses the token while
 /// it stays fresh.
 ///
-/// `Ok(())` means the routing can now serve `owner_repo` on a reader. `Err`
-/// names the reader setup to fix before starting the daemon. A mint failure
+/// `Ok(())` asks the caller to retry routing. If a credential was already
+/// published for an eligible reader, skip minting and let routing decide
+/// whether it can serve the read. `Err` names the reader setup to fix before
+/// starting the daemon. A mint failure
 /// never withdraws the reader (owner-level coverage, exactly as in
 /// [`refresh_reader_credentials`]).
 pub fn provision_bootstrap_reader(
@@ -1283,6 +1285,14 @@ pub fn provision_bootstrap_reader(
              `owners` list covers the store repository",
         ));
     }
+    if eligible.iter().any(|reader| {
+        reader_dir(workspace_root, owner, reader)
+            .join("hosts.yml")
+            .is_file()
+    }) {
+        return Ok(());
+    }
+
     let mut failures: Vec<String> = Vec::new();
     for reader in eligible {
         let minted = match make_minter(reader).mint(owner_repo) {
@@ -1314,6 +1324,11 @@ pub fn provision_bootstrap_reader(
     }
     if read_credential_in(workspace_root, roster, owner_repo, SystemTime::now()).is_some() {
         return Ok(());
+    }
+    if failures.is_empty() {
+        return Err(format!(
+            "published bootstrap credentials still cannot route a read of {owner_repo}"
+        ));
     }
     Err(failures.join("; "))
 }

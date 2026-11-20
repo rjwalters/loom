@@ -322,6 +322,7 @@ struct Boot {
     log: PathBuf,
     mint_log: PathBuf,
     mint_fail: PathBuf,
+    rate_limited: PathBuf,
     commit: PathBuf,
     gh: PathBuf,
 }
@@ -337,10 +338,15 @@ impl Boot {
         let log = tmp.path().join("calls.log");
         let mint_log = tmp.path().join("mints.log");
         let mint_fail = tmp.path().join("mint.fail");
+        let rate_limited = tmp.path().join("rate-limited");
         let commit = tmp.path().join("commit");
         let blob_a = "a".repeat(40);
         let blob_b = "b".repeat(40);
-        let expires = (chrono::Utc::now() + chrono::Duration::minutes(55)).to_rfc3339();
+        let now = chrono::Utc::now();
+        let expires = (now + chrono::Duration::minutes(55)).to_rfc3339();
+        let reset = (now + chrono::Duration::minutes(10))
+            .timestamp()
+            .to_string();
         // The stub store: `commits/main` answers the current commit file, the
         // tree and blob endpoints answer the files that commit names.
         let gh = tmp.path().join("gh-store-stub");
@@ -350,6 +356,11 @@ impl Boot {
 path=""; for a in "$@"; do path="$a"; done
 dir="${GH_CONFIG_DIR:-writer}"
 echo "$(basename "$dir") $path" >> '@@LOG@@'
+if [ -f '@@RATE_LIMITED@@' ]; then
+  printf 'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: @@RESET@@\r\n\r\n{"message":"API rate limit exceeded"}'
+  echo 'gh: API rate limit exceeded (HTTP 403)' >&2
+  exit 1
+fi
 cur=$(cat '@@COMMIT@@')
 case "$path" in
   */git/ref/*)
@@ -370,6 +381,8 @@ esac
 "#
             .replace("@@LOG@@", &log.display().to_string())
             .replace("@@COMMIT@@", &commit.display().to_string())
+            .replace("@@RATE_LIMITED@@", &rate_limited.display().to_string())
+            .replace("@@RESET@@", &reset)
             .replace("@@BLOBA@@", &blob_a)
             .replace("@@BLOBB@@", &blob_b)
             .replace("@@B64A@@", &b64(&boot_fleet_json("stopped")))
@@ -401,6 +414,7 @@ printf '{"status":"ok","token":"ghs_bootstrap","installation_id":"77","app_id":"
             log,
             mint_log,
             mint_fail,
+            rate_limited,
             commit,
             gh,
         }
@@ -410,8 +424,15 @@ printf '{"status":"ok","token":"ghs_bootstrap","installation_id":"77","app_id":"
     /// daemon-published root): a pooled workspace that has never published a
     /// reader token, with the real bootstrap mint attached.
     fn transport(&self) -> GhTransport {
-        let mut t =
-            GhTransport::new_with_reader_root(self.tmp.path(), None, BOOT_REPO, boot_roster);
+        self.transport_for(BOOT_REPO, boot_roster)
+    }
+
+    fn transport_for(
+        &self,
+        repo: &str,
+        roster: fn(&Path) -> crate::forge_identity::Roster,
+    ) -> GhTransport {
+        let mut t = GhTransport::new_with_reader_root(self.tmp.path(), None, repo, roster);
         t.gh_bin = self.gh.display().to_string();
         t
     }
@@ -552,6 +573,86 @@ fn a_bootstrap_fetch_advances_a_cached_stop_and_lets_the_host_run() {
         mints_before_start,
         "the start check reuses the token the render published"
     );
+}
+
+#[test]
+fn a_withdrawn_reader_keeps_the_ordinary_cached_fallback() {
+    const APP: &str = "147002";
+    const REPO: &str = "outage-fixture-14730/fleet";
+    fn roster(ws: &Path) -> crate::forge_identity::Roster {
+        let mut roster = boot_roster(ws);
+        roster.readers[0].app_id = APP.into();
+        roster
+    }
+
+    let b = Boot::new();
+    let cache = tempfile::tempdir().unwrap();
+    let location = crate::fleet_store::StoreLocation {
+        repo: REPO.into(),
+        reference: "main".into(),
+    };
+    let now = chrono::Utc::now();
+    std::fs::write(&b.commit, COMMIT_A).unwrap();
+    crate::fleet_store::fetch::sync(&b.transport_for(REPO, roster), cache.path(), &location, now)
+        .unwrap();
+    let mints = b.mints();
+    assert_eq!(mints.len(), 1);
+    std::fs::write(&b.log, "").unwrap();
+    std::fs::write(&b.rate_limited, "").unwrap();
+
+    let transport = b.transport_for(REPO, roster);
+    let expect_cached = |candidate: &GhTransport| {
+        let loaded = crate::fleet_store::fetch::load(
+            candidate,
+            cache.path(),
+            &location,
+            crate::fleet_store::fetch::Policy::AllowStale,
+            now,
+        )
+        .unwrap();
+        assert!(matches!(loaded.freshness, crate::fleet_store::fetch::Freshness::Cached { .. }));
+        assert_eq!(loaded.snapshot.manifest.commit, COMMIT_A);
+        assert_eq!(
+            candidate.bootstrap_failure(),
+            None,
+            "an ordinary withdrawal is not a bootstrap failure"
+        );
+        assert_eq!(b.mints(), mints, "a withdrawn published reader must not be minted again");
+    };
+    expect_cached(&transport);
+    expect_cached(&transport);
+    expect_cached(&b.transport_for(REPO, roster));
+    let calls = b.calls();
+    never_the_writer(&calls);
+    assert_eq!(calls, vec![(APP.into(), format!("repos/{REPO}/commits/main"))]);
+}
+
+#[test]
+fn a_bootstrap_mint_that_cannot_route_has_a_nonempty_failure() {
+    const APP: &str = "147003";
+    const REPO: &str = "blocked-bootstrap-fixture-14730/fleet";
+    fn roster(ws: &Path) -> crate::forge_identity::Roster {
+        let mut roster = boot_roster(ws);
+        roster.readers[0].app_id = APP.into();
+        roster
+    }
+
+    let b = Boot::new();
+    crate::forge_identity::withdraw_after(
+        APP,
+        REPO,
+        crate::forge_identity::Failure::Credential,
+        "fixture withdrawal",
+    );
+    let transport = b.transport_for(REPO, roster);
+    let error = transport
+        .get(&format!("repos/{REPO}/commits/main"), None, None)
+        .unwrap_err();
+    let reason = format!("published bootstrap credentials still cannot route a read of {REPO}");
+    assert_eq!(transport.bootstrap_failure().as_deref(), Some(reason.as_str()));
+    assert!(error.to_string().contains(&reason));
+    assert_eq!(b.mints().len(), 1);
+    assert!(b.calls().is_empty(), "no reader or writer may serve the withdrawn route");
 }
 
 #[test]

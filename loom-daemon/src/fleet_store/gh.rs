@@ -375,10 +375,9 @@ impl GhTransport {
         let mut bootstrapped = false;
         loop {
             let Some((dir, app_id)) = self.reader.borrow().clone() else {
-                // #14730: the pool has no usable reader — on a host whose
-                // daemon never published one, mint it before shedding. The
-                // read stays reader-only whatever happens.
-                if bootstrapped {
+                // A reader withdrawn during this request must shed
+                // normally. Bootstrap serves the initial unpublished pool.
+                if bootstrapped || !tried.is_empty() {
                     break;
                 }
                 bootstrapped = true;
