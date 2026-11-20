@@ -513,10 +513,35 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     }
     let pool = crate::forge_identity::route_read(req, now);
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
-    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
-        None
-    } else {
-        withdrawn_until(&owner, req, now)
+    let gateway_configured = !owner.is_empty() && profile_for(&owner).is_some();
+    let gateway_until = gateway_configured
+        .then(|| withdrawn_until(&owner, req, now))
+        .flatten();
+    let pool = match pool {
+        // The gateway was part of this route. A non-primary gateway hold
+        // must veto the stronger proof from the readers behind it.
+        RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::GraphqlPrimaryBudget,
+        } if gateway_configured
+            && (crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+                || crate::forge_identity::repo_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    req.owner_repo,
+                    now,
+                )
+                || !crate::forge_identity::route::primary_graphql_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    &owner,
+                    now,
+                )) =>
+        {
+            RouteDecision::Exhausted {
+                until,
+                cause: ExhaustCause::Budget,
+            }
+        }
+        decision => decision,
     };
     match past_withdrawn_gateway(pool, gateway_until) {
         RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {

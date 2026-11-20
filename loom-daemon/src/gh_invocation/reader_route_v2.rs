@@ -181,7 +181,7 @@ impl GhInvocation {
                     ));
                 }
                 RouteDecision::Exhausted { until, cause } => {
-                    let why = if cause == ExhaustCause::Budget
+                    let why = if cause == ExhaustCause::GraphqlPrimaryBudget
                         && class == ReadClass::Gate
                         && resource == Resource::Graphql
                         && primary_graphql_failures_only
@@ -240,6 +240,7 @@ impl GhInvocation {
                 if fault == crate::forge_gateway::outage::Fault::Withdraw {
                     super::withdraw_gateway_outage(self.operation.as_str());
                 }
+                primary_graphql_failures_only = false;
                 tried.insert(app_id.clone());
                 last_app = Some(app_id);
                 last_failure = None;
@@ -287,15 +288,7 @@ impl GhInvocation {
             // A rate limit, a refused token, or a 403/404 from a reader with
             // no evidence it can see the repo: withdraw it (for this repo
             // only on coverage) and ask the router for the next one.
-            primary_graphql_failures_only &= matches!(
-                failure,
-                Failure::RateLimited {
-                    resource: Resource::Graphql,
-                    secondary: false,
-                    remaining: None | Some(0),
-                    ..
-                }
-            );
+            primary_graphql_failures_only &= failure.is_primary_graphql();
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);

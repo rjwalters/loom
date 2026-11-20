@@ -512,7 +512,7 @@ esac"#;
             mocked_split("", GRAPHQL_EXHAUSTED, &[first.clone(), second]).unwrap(),
             SplitState::OpenChildren(1)
         );
-        assert!(mocked_split("", GRAPHQL_EXHAUSTED, &[first.clone()]).is_err());
+        assert!(mocked_split("", GRAPHQL_EXHAUSTED, std::slice::from_ref(&first)).is_err());
         let duplicate = marker_page(101, vec![marker_row(100, "open", parent_marker(12).into())]);
         assert!(mocked_split("", GRAPHQL_EXHAUSTED, &[first, duplicate]).is_err());
     }
