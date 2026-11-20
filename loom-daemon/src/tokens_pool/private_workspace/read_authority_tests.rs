@@ -870,3 +870,20 @@ fn an_unproved_route_keeps_the_legacy_exec_auth_path() {
         "the legacy path still forwards ambient credentials"
     );
 }
+
+#[test]
+fn live_curl_reply_classifies_every_status_shape() {
+    // Real curl output: `%{redirect_url}` is empty off a 3xx, so the tail is "200 ".
+    assert_eq!(
+        classify_curl_reply("{\"id\":123}\n200 "),
+        ProbeAnswer::Ok("{\"id\":123}".into())
+    );
+    assert_eq!(classify_curl_reply("nope\n404 "), ProbeAnswer::Status(404));
+    assert_eq!(classify_curl_reply("\n401 "), ProbeAnswer::Status(401));
+    assert_eq!(
+        classify_curl_reply("\n301 https://elsewhere/x"),
+        ProbeAnswer::Redirect("https://elsewhere/x".into())
+    );
+    assert!(matches!(classify_curl_reply("no newline"), ProbeAnswer::Transport(_)));
+    assert!(matches!(classify_curl_reply("body\nxyz "), ProbeAnswer::Transport(_)));
+}

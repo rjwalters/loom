@@ -471,6 +471,15 @@ else
     fail "the scoped mint must not put Authorization or the JWT on argv" "$(cat "$STUB_CURL_ARGV_LOG")"
 fi
 
+# The narrow request must name the BARE repository (GitHub's `repositories`
+# contract), never `owner/repo` (#14726).
+if grep -q '"repositories":\["repo"\]' "$STUB_CURL_ARGV_LOG" \
+    && ! grep -q '"repositories":\["cliowner/repo"\]' "$STUB_CURL_ARGV_LOG"; then
+    pass "scoped mint request names the bare repository, not owner/repo (#14726)"
+else
+    fail "the scoped mint request must send repositories:[\"repo\"]" "$(cat "$STUB_CURL_ARGV_LOG")"
+fi
+
 # A scoped mint whose response names no repository is refused.
 scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z"}'
 cli_scoped_bad=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)

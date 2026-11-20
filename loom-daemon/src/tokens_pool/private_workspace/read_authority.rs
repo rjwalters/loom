@@ -927,6 +927,29 @@ pub(crate) fn parse_scoped_envelope(stdout: &str, owner_repo: &str) -> ScopedOut
     }
 }
 
+/// Classify the stdout of the probe's `curl` call: the body, then a final
+/// `\n%{http_code} %{redirect_url}` line. `%{redirect_url}` is EMPTY for every
+/// non-3xx answer, so the tail is `"200 "` and must be split on whitespace,
+/// never on a literal space after a trim (#14726).
+pub(crate) fn classify_curl_reply(raw: &str) -> ProbeAnswer {
+    let Some((body, tail)) = raw.rsplit_once('\n') else {
+        return ProbeAnswer::Transport("unparseable curl reply".into());
+    };
+    let mut fields = tail.split_whitespace();
+    let Some(Ok(code)) = fields.next().map(str::parse::<u16>) else {
+        return ProbeAnswer::Transport(format!("unparseable status line from curl: {tail:?}"));
+    };
+    let redirect = fields.next().unwrap_or("");
+    if (300..400).contains(&code) {
+        return ProbeAnswer::Redirect(redirect.to_owned());
+    }
+    if (200..300).contains(&code) {
+        ProbeAnswer::Ok(body.to_owned())
+    } else {
+        ProbeAnswer::Status(code)
+    }
+}
+
 /// The live provider transport (#14716): `curl` with the Authorization
 /// header on stdin (never argv), bounded `--max-time`, redirects NEVER
 /// followed — `curl` reports one through `%{redirect_url}` instead.
@@ -994,24 +1017,7 @@ impl ProviderHttp for LiveProviderHttp {
                 output.status.code().unwrap_or(-1)
             ));
         }
-        let raw = String::from_utf8_lossy(&output.stdout);
-        let Some((body, tail)) = raw.rsplit_once('\n') else {
-            return ProbeAnswer::Transport("unparseable curl reply".into());
-        };
-        let Some((code, redirect)) = tail.trim().split_once(' ') else {
-            return ProbeAnswer::Transport(format!("unparseable status line from curl: {tail:?}"));
-        };
-        let Ok(code) = code.parse::<u16>() else {
-            return ProbeAnswer::Transport(format!("unparseable status line from curl: {tail:?}"));
-        };
-        if (300..400).contains(&code) {
-            return ProbeAnswer::Redirect(redirect.trim().to_owned());
-        }
-        if (200..300).contains(&code) {
-            ProbeAnswer::Ok(body.to_owned())
-        } else {
-            ProbeAnswer::Status(code)
-        }
+        classify_curl_reply(&String::from_utf8_lossy(&output.stdout))
     }
 }
 

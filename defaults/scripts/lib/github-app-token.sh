@@ -425,7 +425,7 @@ _github_app_api_mint_scoped() {
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     -H "Content-Type: application/json" \
-    --data-binary "$(jq -cn --arg repo "$nwo" '{repositories:[$repo], permissions:{contents:"read"}}')" \
+    --data-binary "$(jq -cn --arg repo "${nwo#*/}" '{repositories:[$repo], permissions:{contents:"read"}}')" \
     "https://api.github.com/app/installations/${installation_id}/access_tokens" 2>/dev/null) || {
     _GH_APP_LAST_ERROR="could not reach the GitHub API to mint a scoped read token for installation ${installation_id}"
     return 1
