@@ -216,6 +216,7 @@ pub(crate) mod tokens_weekly_points;
 pub(crate) mod transcript_archive_cli;
 pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
+mod usage_window;
 pub mod watch;
 mod watchdog;
 mod work_docs_archive;
