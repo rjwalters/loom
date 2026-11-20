@@ -8,9 +8,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::{anyhow, Result};
 
 use super::batch::{
-    closing_refs_query, gather_all, parse_closing_refs, parse_comments, parse_pr_merge_state,
-    parse_rate_limit, parse_ref_state, ClosingRef, Gathered, Options, RefState, StaleBlockedForge,
-    CLOSING_BATCH,
+    closing_refs_query, gather_all, gather_pr_resweep, parse_closing_refs, parse_comments,
+    parse_pr_merge_state, parse_rate_limit, parse_ref_state, ClosingRef, Gathered, Options,
+    RefState, StaleBlockedForge, CLOSING_BATCH,
 };
 use super::budget::{Budget, Floor, Meter};
 use super::{classify, park_self_block, undeclared, Artifact, Verdict};
@@ -187,6 +187,66 @@ fn find(out: &[Gathered], n: i64) -> &Gathered {
     out.iter()
         .find(|g| g.number == n)
         .expect("artifact present")
+}
+
+#[test]
+fn named_pr_resweep_reads_only_exact_park_dependencies() {
+    let body = "Depends on #9999\n\n<!-- loom:park Blocked by: #6343 by=judge -->\n\
+                <!-- loom:park Blocked by: #6348 by=judge -->\n\
+                <!-- loom:park Blocked by: #6354 by=judge -->";
+    let mut fake = Fake {
+        rows: vec![
+            row(
+                5991,
+                body,
+                0,
+                true,
+                &["loom:blocked", "loom:changes-requested", "loom:ci-failure"],
+            ),
+            row(
+                6242,
+                "<!-- loom:park Blocked by: (unstated) by=judge reason=\"ci-gate\" -->",
+                1,
+                true,
+                &["loom:blocked"],
+            ),
+            issue(22, "Blocked by #8888"),
+        ],
+        states: HashMap::from([
+            ((None, 6343), state("CLOSED")),
+            ((None, 6348), state("MERGED")),
+            ((None, 6354), state("MERGED")),
+        ]),
+        merge: HashMap::from([(5991, ("MERGEABLE".into(), "BLOCKED".into()))]),
+        ..Fake::default()
+    };
+    let report = gather_pr_resweep(
+        &mut fake,
+        &fleet(),
+        Options {
+            limit: 1000,
+            no_prs: false,
+            floor: Floor::default(),
+        },
+    );
+    assert_eq!(report.items.len(), 2);
+    let evidence = find(&report.items, 5991)
+        .evidence
+        .as_ref()
+        .expect("all three named blockers are readable");
+    assert_eq!(evidence.declared.len(), 3);
+    assert!(evidence.mergeability_confirmed);
+    assert!(find(&report.items, 6242)
+        .evidence
+        .as_ref()
+        .expect("unnamed park documented")
+        .declared
+        .is_empty());
+    fake.state_calls.sort();
+    assert_eq!(fake.state_calls, vec![(None, 6343), (None, 6348), (None, 6354)]);
+    assert!(fake.comment_calls.is_empty());
+    assert!(fake.closing_calls.is_empty());
+    assert_eq!(fake.merge_calls, vec![5991]);
 }
 
 // --- call counts --------------------------------------------------------------

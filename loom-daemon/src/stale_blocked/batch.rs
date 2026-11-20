@@ -213,6 +213,7 @@ struct Pending {
     declared: Vec<crate::park_record::BlockerRef>,
     held: Option<super::Held>,
     permanent_block: bool,
+    champion_hold: Option<crate::champion_hold::HoldKind>,
     hold: Option<super::HoldComment>,
     closing: Vec<ClosingRef>,
     failed: Option<Unreadable>,
@@ -231,11 +232,30 @@ pub fn gather_checked(
     fleet: &FleetLogins,
     opts: Options,
 ) -> Gathering {
+    gather_checked_with(forge, opts, |forge| gather_all(forge, fleet, opts))
+}
+
+/// Gather only PRs and the exact references in their body park records.
+pub fn gather_pr_resweep(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+) -> Gathering {
+    gather_checked_with(forge, opts, |forge| {
+        gather_filtered_for(forge, fleet, opts, true, &mut |_, _, _| true)
+    })
+}
+
+fn gather_checked_with(
+    forge: &mut dyn StaleBlockedForge,
+    opts: Options,
+    gather: impl FnOnce(&mut dyn StaleBlockedForge) -> Gathering,
+) -> Gathering {
     let (archived, enumerate_error) = match forge.archived() {
         Ok(false) => {
             return Gathering {
                 archived: Some(false),
-                ..gather_all(forge, fleet, opts)
+                ..gather(forge)
             }
         }
         Ok(true) => (Some(true), None),
@@ -273,6 +293,16 @@ pub fn gather_filtered(
     opts: Options,
     keep: &mut dyn FnMut(Artifact, i64, &extract::Input) -> bool,
 ) -> Gathering {
+    gather_filtered_for(forge, fleet, opts, false, keep)
+}
+
+fn gather_filtered_for(
+    forge: &mut dyn StaleBlockedForge,
+    fleet: &FleetLogins,
+    opts: Options,
+    named_pr_resweep: bool,
+    keep: &mut dyn FnMut(Artifact, i64, &extract::Input) -> bool,
+) -> Gathering {
     let mut cost = ForgeCost {
         floor: opts.floor,
         ..ForgeCost::default()
@@ -291,7 +321,7 @@ pub fn gather_filtered(
     let limit = opts.limit as usize;
     let mut selected: Vec<(Artifact, RestIssue)> = Vec::new();
     for (kind, want_pr) in [(Artifact::Issue, false), (Artifact::Pr, true)] {
-        if want_pr && opts.no_prs {
+        if (want_pr && opts.no_prs) || (!want_pr && named_pr_resweep) {
             continue;
         }
         let rows = rows
@@ -301,7 +331,7 @@ pub fn gather_filtered(
             .filter(|r| !super::digest::excluded(kind, r))
             // #11743: a frozen artifact is not read as work by any pass,
             // the notifier included.
-            .filter(|r| !crate::work_finder::is_frozen(&r.labels))
+            .filter(|r| named_pr_resweep || !crate::work_finder::is_frozen(&r.labels))
             .take(limit);
         selected.extend(rows.map(|row| (kind, row.clone())));
     }
@@ -346,7 +376,7 @@ pub fn gather_filtered(
     let mut guard = Guard::new(opts.floor);
     let mut pending: Vec<Pending> = Vec::new();
     for (kind, row) in selected {
-        let (p, input) = read_text(forge, fleet, kind, row, &mut guard);
+        let (p, input) = read_text(forge, fleet, kind, row, &mut guard, named_pr_resweep);
         if input.is_none_or(|i| keep(kind, i64::from(p.row.number), &i)) {
             pending.push(p);
         }
@@ -376,6 +406,7 @@ fn read_text(
     kind: Artifact,
     row: RestIssue,
     guard: &mut Guard,
+    named_pr_resweep: bool,
 ) -> (Pending, Option<extract::Input>) {
     let body = row.body.clone().unwrap_or_default();
     let mut p = Pending {
@@ -384,14 +415,18 @@ fn read_text(
         prose: Vec::new(),
         named: Vec::new(),
         unparsed_unchecked: 0,
-        declared: Vec::new(),
+        declared: crate::park_record::blockers(&body),
         held: None,
         permanent_block: false,
+        champion_hold: None,
         hold: None,
         closing: Vec::new(),
         failed: None,
         row,
     };
+    if named_pr_resweep && p.declared.is_empty() {
+        return (p, None);
+    }
     let comments = if p.row.comments == 0 {
         Vec::new()
     } else {
@@ -421,6 +456,14 @@ fn read_text(
         || (super::hold::has_permanent_block(&body)
             && forge.trusts_author(p.row.author.as_deref(), p.row.author_association.as_deref()));
     p.hold = super::hold::newest_hold(&comments);
+    if kind == Artifact::Pr {
+        let trusted = comments
+            .iter()
+            .filter(|c| c.trusted)
+            .map(|c| &c.body)
+            .collect::<Vec<_>>();
+        p.champion_hold = crate::champion_hold::standing_hold(&trusted);
+    }
     let input = extract::Input { body, comments };
     // A qualified park-record blocker is read in its own repo via `declared`,
     // never as a local `#N` (#10443). An issue's `## Dependencies` checklist
@@ -435,12 +478,18 @@ fn read_text(
         body: crate::park_record::mask_qualified(&prose_body),
         comments: input.comments.clone(),
     };
-    p.prose = extract::extract_with(&masked, fleet)
-        .split_whitespace()
-        .filter_map(|t| t.parse().ok())
-        .collect();
-    // The park record is read from the BODY only (#8925).
-    p.declared = crate::park_record::blockers(&p.body);
+    p.prose = if named_pr_resweep {
+        p.declared
+            .iter()
+            .filter(|r| r.repo.is_none())
+            .filter_map(|r| i64::try_from(r.number).ok())
+            .collect()
+    } else {
+        extract::extract_with(&masked, fleet)
+            .split_whitespace()
+            .filter_map(|t| t.parse().ok())
+            .collect()
+    };
     // Records are append-only: the newest reason-only one, not the first (#10558).
     p.held = super::hold::latest_reasoned(&p.body).map(|r| super::Held {
         by: r.by,
@@ -668,6 +717,8 @@ fn evidence_for(
         declared: p.declared.clone(),
         remote,
         self_block: None,
+        mergeability_confirmed: false,
+        champion_hold: p.champion_hold,
         held: p.held.clone(),
         permanent_block: p.permanent_block,
         hold: p.hold.clone(),
@@ -687,7 +738,7 @@ fn evidence_for(
     }
     if p.kind == Artifact::Pr && matches!(classify(&evidence), Verdict::Stale(_)) {
         guard.core_stop(&forge.meter())?;
-        evidence.self_block = self_block(forge, &p.row)?;
+        (evidence.self_block, evidence.mergeability_confirmed) = self_block(forge, &p.row)?;
     }
     Ok(evidence)
 }
@@ -741,7 +792,7 @@ fn resolution_time(
 fn self_block(
     forge: &mut dyn StaleBlockedForge,
     row: &RestIssue,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, bool), String> {
     let mut pr = recheck::Pr {
         number: i64::from(row.number),
         state: "OPEN".to_string(),
@@ -749,14 +800,19 @@ fn self_block(
         ..recheck::Pr::default()
     };
     if let Some(block) = park_self_block(&pr) {
-        return Ok(Some(block));
+        return Ok((Some(block), false));
     }
     let (mergeable, merge_state_status) = forge.pr_merge_state(row.number).map_err(|e| {
         format!("PR #{} merge-state read failed — cannot assess its own block: {e}", row.number)
     })?;
     pr.mergeable = mergeable;
     pr.merge_state_status = merge_state_status;
-    Ok(park_self_block(&pr))
+    let confirmed = pr.mergeable == "MERGEABLE"
+        && matches!(
+            pr.merge_state_status.as_str(),
+            "BLOCKED" | "BEHIND" | "CLEAN" | "DRAFT" | "HAS_HOOKS" | "UNSTABLE"
+        );
+    Ok((park_self_block(&pr), confirmed))
 }
 
 // ============================================================================
