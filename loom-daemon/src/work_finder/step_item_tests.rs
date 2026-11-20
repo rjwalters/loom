@@ -390,6 +390,28 @@ fn an_approved_conflicting_pr_is_not_a_merge_step() {
     assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
 }
 
+#[test]
+fn guide_unparked_conflict_reaches_doctor_even_with_a_ci_failure_label() {
+    let mut inputs = Inputs {
+        pulls: vec![PullInput {
+            number: 514,
+            labels: labels(&[
+                "loom:blocked",
+                "loom:changes-requested",
+                "loom:merge-conflict",
+                "loom:ci-failure",
+            ]),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    assert_eq!(classify(&inputs)[0].verdict, Verdict::Pass(PassReason::Blocked));
+    inputs.pulls[0]
+        .labels
+        .retain(|label| label != "loom:blocked");
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Doctor));
+}
+
 /// #13737: an approved, unheld PR on a Loom stack branch is a pass (the janitor
 /// would only skip it); any other base, and any held/contradictory/conflicting
 /// stacked PR, keeps its existing verdict.

@@ -175,7 +175,7 @@ fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
 /// contributing). Any other case — non-git root, no `origin/HEAD`, diverged
 /// or detached-ahead `HEAD`, local edit — returns `None` and the caller reads
 /// the working copy exactly as before.
-fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+fn default_branch_tier_ref(repo_root: &Path, rel: &str) -> Option<String> {
     let top = git_stdout(repo_root, &["rev-parse", "--show-toplevel"])?;
     if std::fs::canonicalize(top.trim()).ok()? != std::fs::canonicalize(repo_root).ok()? {
         return None;
@@ -194,7 +194,12 @@ fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
     {
         return None;
     }
-    Some(git_stdout(repo_root, &["show", &format!("origin/HEAD:{rel}")]).unwrap_or_default())
+    Some(format!("origin/HEAD:{rel}"))
+}
+
+fn default_branch_tier_text(repo_root: &Path, rel: &str) -> Option<String> {
+    let object = default_branch_tier_ref(repo_root, rel)?;
+    Some(git_stdout(repo_root, &["show", &object]).unwrap_or_default())
 }
 
 /// [`soft_read_json_object`] for a tracked tier, preferring the default
@@ -326,6 +331,53 @@ pub fn resolve_effective_config(repo_root: &Path) -> Value {
     warn_retired_curator_backlog_target(&effective);
     warn_retired_idle_gate(&effective);
     effective
+}
+
+/// Resolve the same tiers for decisions that must preserve a hold when policy
+/// cannot be read. Absent files contribute nothing. A selected but unreadable
+/// or malformed file is an error, including a tracked tier on origin/HEAD.
+pub(crate) fn resolve_effective_config_checked(repo_root: &Path) -> anyhow::Result<Value> {
+    use anyhow::{bail, Context as _};
+
+    let mut effective = Value::Object(Map::new());
+    for path in tier_paths_by_precedence(repo_root).into_iter().rev() {
+        let selected = [LEGACY_CONFIG_REL, PROJECT_CONFIG_REL]
+            .into_iter()
+            .find(|rel| path == repo_root.join(rel))
+            .and_then(|rel| default_branch_tier_ref(repo_root, rel).map(|object| (rel, object)));
+        let text = if let Some((rel, object)) = selected {
+            if let Some(text) = git_stdout(repo_root, &["show", &object]) {
+                text
+            } else if git_stdout(repo_root, &["ls-tree", "origin/HEAD", "--", rel])
+                .is_some_and(|line| line.is_empty())
+            {
+                continue;
+            } else {
+                bail!("could not read config tier {object}");
+            }
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::fs::symlink_metadata(&path)
+                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("reading {}", path.display()))
+                }
+            }
+        };
+        let value: Value =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if !value.is_object() {
+            bail!("config tier {} is not a JSON object", path.display());
+        }
+        effective = deep_merge(&effective, &value);
+    }
+    Ok(effective)
 }
 
 /// Tier files that exist but could not contribute (#11029): unreadable,

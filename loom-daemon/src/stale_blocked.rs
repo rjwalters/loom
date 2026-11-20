@@ -62,6 +62,102 @@
 
 use crate::dep_recheck::{extract, named, premise, recheck};
 
+/// Whether the configured Doctor step lane can receive a cleared park.
+pub(crate) fn guide_conflict_route_enabled(root: &std::path::Path) -> anyhow::Result<bool> {
+    use crate::claim_reconciliation::review_conflict::{
+        review_conflict_enabled, REVIEW_CONFLICT_ENABLED_ENV,
+    };
+    use crate::work_finder::{resolve_enabled, WORK_FINDER_ENABLE_ENV};
+
+    for key in [REVIEW_CONFLICT_ENABLED_ENV, WORK_FINDER_ENABLE_ENV] {
+        if matches!(std::env::var(key), Err(std::env::VarError::NotUnicode(_))) {
+            anyhow::bail!("could not read {key}");
+        }
+    }
+    if !review_conflict_enabled() {
+        return Ok(false);
+    }
+    let effective = crate::config_resolver::resolve_effective_config_checked(root)?;
+    Ok(guide_conflict_work_finder(&effective)?.is_some_and(|config| resolve_enabled(&config)))
+}
+
+fn guide_conflict_work_finder(
+    effective: &serde_json::Value,
+) -> anyhow::Result<Option<crate::work_finder::WorkFinderConfig>> {
+    use crate::config_resolver::get_path;
+    use crate::work_finder::WorkFinderConfig;
+
+    let get = |path| get_path(effective, path).filter(|value| !value.is_null());
+    for path in [
+        "autonomous",
+        "autonomous.roleRunner",
+        "autonomous.workFinder",
+    ] {
+        if get(path).is_some_and(|value| !value.is_object()) {
+            anyhow::bail!("{path} must be an object");
+        }
+    }
+    // Preserve the Guide's explicit Doctor allowlist opt-out. The actual
+    // Doctor work runs as a step, so the role runner's switch is insufficient.
+    if let Some(roles) = get("autonomous.roleRunner.roles") {
+        let roles = roles
+            .as_array()
+            .filter(|roles| roles.iter().all(serde_json::Value::is_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!("autonomous.roleRunner.roles must be an array of names")
+            })?;
+        if !roles.iter().any(|role| role.as_str() == Some("doctor")) {
+            return Ok(None);
+        }
+    }
+    let enabled = get("autonomous.workFinder.enabled")
+        .map(|enabled| {
+            enabled
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("autonomous.workFinder.enabled must be a boolean"))
+        })
+        .transpose()?;
+    Ok(Some(WorkFinderConfig {
+        enabled,
+        ..WorkFinderConfig::default()
+    }))
+}
+
+#[cfg(test)]
+mod guide_conflict_policy_tests {
+    use super::guide_conflict_work_finder;
+    use serde_json::json;
+
+    #[test]
+    fn guide_conflict_policy_preserves_explicit_role_opt_out_and_step_switch() {
+        let enabled = |value| guide_conflict_work_finder(&value).unwrap().unwrap().enabled;
+        assert_eq!(enabled(json!({})), None);
+        assert_eq!(
+            enabled(json!({"autonomous":{"roleRunner":{"enabled":true,"roles":["doctor"]}}})),
+            None,
+        );
+        assert_eq!(enabled(json!({"autonomous":{"workFinder":{"enabled":false}}})), Some(false),);
+        assert_eq!(enabled(json!({"autonomous":{"workFinder":{"enabled":true}}})), Some(true),);
+        assert!(guide_conflict_work_finder(&json!({"autonomous":{
+            "workFinder":{"enabled":true},"roleRunner":{"roles":["guide"]}
+        }}))
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn guide_conflict_policy_refuses_unreadable_policy_fields() {
+        for config in [
+            json!({"autonomous":false}),
+            json!({"autonomous":{"roleRunner":"guide"}}),
+            json!({"autonomous":{"workFinder":{"enabled":"off"}}}),
+            json!({"autonomous":{"roleRunner":{"roles":["doctor",null]}}}),
+        ] {
+            assert!(guide_conflict_work_finder(&config).is_err());
+        }
+    }
+}
+
 pub mod batch;
 pub mod budget;
 pub mod hold;

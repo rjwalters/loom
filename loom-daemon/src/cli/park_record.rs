@@ -56,6 +56,10 @@ pub(crate) enum ParkRecordCommand {
     /// no-op outside a role tick. Exit 0 always.
     Decision(DecisionArgs),
 
+    /// Report whether Guide may route a parked conflict to Doctor for this
+    /// base. Prints enabled, disabled, or stacked. Unreadable policy fails.
+    GuideConflictRoute(GuideConflictRouteArgs),
+
     /// Withdraw one declared blocker (#13895): wrap every live park marker
     /// naming `--blocked-by` in an inline code span — marker text unchanged,
     /// so `parse`/`blockers` stop reading it — and append one visible
@@ -66,6 +70,35 @@ pub(crate) enum ParkRecordCommand {
     /// the caller or Guide's unblock sweep does. Re-parking appends a fresh
     /// record with `apply --blocked-by`.
     Retract(RetractArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct GuideConflictRouteArgs {
+    /// The exact base ref name from a direct PR snapshot.
+    #[arg(long)]
+    base_ref: String,
+
+    /// Repository whose effective policy applies.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+}
+
+impl GuideConflictRouteArgs {
+    fn run(self) -> Result<()> {
+        if self.base_ref.trim().is_empty() {
+            anyhow::bail!("the direct PR base ref is unknown");
+        }
+        let disposition =
+            if crate::merge_pr::stacked_children::is_stackable_parent_branch(&self.base_ref) {
+                "stacked"
+            } else if crate::stale_blocked::guide_conflict_route_enabled(&self.workspace)? {
+                "enabled"
+            } else {
+                "disabled"
+            };
+        println!("{disposition}");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -277,7 +310,8 @@ impl ParkRecordCommand {
             ParkRecordCommand::Render(_)
             | ParkRecordCommand::Parse(_)
             | ParkRecordCommand::Released(_)
-            | ParkRecordCommand::Decision(_) => false,
+            | ParkRecordCommand::Decision(_)
+            | ParkRecordCommand::GuideConflictRoute(_) => false,
             ParkRecordCommand::Apply(_) => true,
             // `--file` composes against a local body: the forge is never read.
             ParkRecordCommand::Retract(args) => args.file.is_none(),
@@ -298,6 +332,7 @@ impl ParkRecordCommand {
                 Ok(())
             }
             ParkRecordCommand::Retract(args) => args.run(writer),
+            ParkRecordCommand::GuideConflictRoute(args) => args.run(),
         }
     }
 }

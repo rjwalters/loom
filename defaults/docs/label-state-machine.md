@@ -409,6 +409,14 @@ a compromised trusted agent, and it adds no signed decisions or keys.
   leaves every pattern, and respect a human's hand-removal at the held diff.
 - **Queues** — `pr-queue --role champion` keeps `loom:pr` + `loom:blocked`
   (and no other park); Judge's and Doctor's queues drop every park.
+- **Base conflicts after a foreign park clears (#14810)** — Guide applies
+  `loom:changes-requested` and `loom:merge-conflict`, confirms those labels and
+  the current conflict and exact blocked-label episode, then removes
+  `loom:review-requested` and `loom:blocked`. Doctor takes the PR in its
+  existing conflict lane. Named blockers must all be terminal. A reason-only
+  park needs evidence for its exact cause, head, and blocked-label episode.
+  Explicit holds, Loom stack bases, unverified state, and disabled conflict
+  routing retain the park. See [Guide's PR unblock sweep](park-record.md#the-unblock-sweeps-pr-side-functions).
 - **The stale-verdict machinery** (`verdict-staleness-guard.sh`,
   `reconcile_pr_verdicts`) reports a moved head as stale but does not clear a
   verdict on a PR carrying any hold (`loom:blocked`, `loom:operator`,

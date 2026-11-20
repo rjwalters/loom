@@ -303,6 +303,40 @@ fn named_pr_resweep_requires_bound_current_state_labels_and_formal_review() {
     assert!(check(missing).is_err());
 }
 
+#[test]
+fn guide_conflict_inventory_requires_definite_state_and_no_stronger_lane() {
+    use serde_json::json;
+    let body = "<!-- loom:park Blocked by: #520 by=doctor -->";
+    let current = json!({"number": 514, "state": "OPEN", "body": body, "isDraft": false,
+        "headRefOid":"1111111111111111111111111111111111111111", "baseRefOid":"2222222222222222222222222222222222222222", "baseRefName":"main",
+        "labels": {"totalCount": 1, "nodes": [{"name": "loom:blocked"}]},
+        "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "reviewDecision": null});
+    let check = |pr: serde_json::Value| {
+        parse_pr_resweep_state(
+            &json!({"data":{"repository":{"nameWithOwner":"fixture/loom","pullRequest":pr}}})
+                .to_string(),
+            "fixture/loom",
+            514,
+            body,
+        )
+    };
+    assert!(matches!(check(current.clone()).unwrap(), PrResweepState::Conflict(_)));
+    let mut unknown = current.clone();
+    unknown["mergeStateStatus"] = json!("UNKNOWN");
+    assert!(check(unknown).is_err());
+    for label in [
+        "loom:pr",
+        "loom:reviewing",
+        "loom:treating",
+        "loom:sequenced",
+    ] {
+        let mut held = current.clone();
+        held["labels"] =
+            json!({"totalCount": 2, "nodes": [{"name": "loom:blocked"}, {"name": label}]});
+        assert!(matches!(check(held).unwrap(), PrResweepState::Held(_)));
+    }
+}
+
 // --- call counts --------------------------------------------------------------
 
 #[test]
