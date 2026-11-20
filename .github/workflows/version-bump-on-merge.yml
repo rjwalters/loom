@@ -20,9 +20,9 @@ name: Version Bump on Merge
 # `package.json`, `mcp-loom/package.json`, `Cargo.toml`,
 # `VERSION`, `.loom/install-metadata.json` if present, plus the derived
 # `Cargo.lock` / `mcp-loom/package-lock.json`), so the `paths:` filter below
-# (`defaults/**` plus the two workspace crates that compile into the release
-# binaries, `loom-daemon/**` and `loom-api/**` — #13452; both inherit
-# `version.workspace = true`, so a bump touches nothing under them) can never
+# (`defaults/**` plus the workspace crate that compiles into the release
+# binary, `loom-daemon/**` — #13452; it inherits
+# `version.workspace = true`, so a bump touches nothing under it) can never
 # see its own push and re-trigger a loop. Do NOT add
 # an extra guard for that -- a naive one (e.g. skipping when the pusher is
 # this workflow's own bot identity) would also suppress a legitimate human
@@ -67,8 +67,8 @@ name: Version Bump on Merge
 #   workflow_dispatch `force: true` + `reason` skips the window (operator
 #                     hotfix path, e.g. a fix a `loom_min_version` floor needs
 #                     now); the reason and actor are recorded in the commit
-# Every path still requires an unreleased change under defaults/,
-# loom-daemon/ or loom-api/ (the gate's RELEASE_PATHS; #13452), so no no-op
+# Every path still requires an unreleased change under defaults/
+# or loom-daemon/ (the gate's RELEASE_PATHS; #13452), so no no-op
 # version is ever cut. The gate runs before any toolchain setup, so a
 # deferred run costs seconds.
 
@@ -78,7 +78,6 @@ on:
     paths:
       - "defaults/**"
       - "loom-daemon/**"
-      - "loom-api/**"
   # Hourly, not daily: against a 24 h window that started at an arbitrary
   # time, a once-a-day cron can push the catch-up out to ~48 h. Hourly bounds
   # the worst case at RELEASE_MIN_INTERVAL + ~1 h (+ GitHub's own schedule

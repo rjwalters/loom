@@ -82,7 +82,6 @@ See the [Getting Started Guide](docs/guides/getting-started.md) and [CLI Referen
 ```
 loom/
 ├── loom-daemon/            # Rust daemon (terminal management, orchestration)
-├── loom-api/               # Rust shared types and protocol definitions
 ├── mcp-loom/               # Unified MCP server (TypeScript)
 ├── loom-tools/             # `loom-search` only (opt-in Python; see docs/adr/0013-*)
 ├── .loom/                  # Workspace config and agent roles

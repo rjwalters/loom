@@ -2064,12 +2064,11 @@ its critical-file caveat, or its role as sticky-hold release path (a).
 **Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read** — an existing key in `.loom/config.json` is inert and can be deleted. A repo that used a low value to keep Champion conservative should rely instead on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running the auto-merge pass.
 
 ### `critical-files`: Critical File Exclusion Check
-- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below), a `Cargo.toml` / `package.json` edit with no suspect line (see "Suspect-line carve-out" below), or a workflow change with `WF_BLAST=green`
+- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 5 version-bearing files (see "Version-only diff carve-out" below), a `Cargo.toml` / `package.json` edit with no suspect line (see "Suspect-line carve-out" below), or a workflow change with `WF_BLAST=green`
 
 **Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
 - `loom-daemon/Cargo.toml` - daemon dependency changes
-- `loom-api/Cargo.toml` - api dependency changes
 - `package.json` - npm dependency changes
 - `.github/workflows/*` - CI/CD pipeline changes
 - `*migrations/*` - database migration directories (Django/Alembic/Rails-style `migrations/` folders; the pattern has no leading `/`, so root-level layouts like Alembic/Flask-Migrate's `migrations/versions/*.py` match too) — **not** a bare `migration` substring, which false-positived on the intentional `docs/migration/` documentation directory (#5723)
@@ -2094,7 +2093,6 @@ FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq '.[].
 CRITICAL_PATTERNS=(
   "Cargo.toml"
   "loom-daemon/Cargo.toml"
-  "loom-api/Cargo.toml"
   "package.json"
   ".github/workflows/"
   # Deliberately NO bare ".sql" (#9357) — "why doesn't my .sql file hold?":
@@ -2106,7 +2104,7 @@ CRITICAL_PATTERNS=(
   "_migration.py"
 )
 
-# Version-only diff carve-out (#6147): a version bump rewrites exactly these 6
+# Version-only diff carve-out (#6147): a version bump rewrites exactly these 5
 # files with nothing but a version-string change. Since #7743 it comes from a
 # post-merge workflow, not the PR (CI now forbids a hand-edit) — the carve-out
 # still applies: that commit lands with exactly this shape. Without this carve-out, every one of them trips a CRITICAL_PATTERNS
@@ -2115,7 +2113,7 @@ CRITICAL_PATTERNS=(
 # #6114, #6118, #6137, #6142, #6146) that permanently blocked auto-merge with
 # no override (`loom:auto-merge-ok` overrides only the merge-risk criterion, not critical-files).
 # The decision is `loom-daemon forge version-only-diff` (#9611): exit 0 ONLY
-# when $file is exactly one of the 6 version-bearing files (never a substring
+# when $file is exactly one of the 5 version-bearing files (never a substring
 # match), the paginated file-list read succeeded, the file has a non-empty
 # patch, and every changed (+/-) line is that format's version line. ANY
 # non-zero exit — not eligible, a forge error, 2 (a daemon predating the
@@ -2306,15 +2304,15 @@ echo "PASS: No critical files modified (or only version-only carve-out files)"
 textual check — it never becomes a judgment call, and it fails closed: when
 `loom-daemon forge version-only-diff` cannot prove a version-only diff, for any
 reason, the file fails the `critical-files` criterion (#9611). It applies file-by-file:
-a PR that touches `loom-api/Cargo.toml` with only the version bump AND
+a PR that touches `loom-daemon/Cargo.toml` with only the version bump AND
 `package.json` with a real new dependency still fails the `critical-files` criterion overall
-(on `package.json`), even though `loom-api/Cargo.toml` alone would have
+(on `package.json`), even though `loom-daemon/Cargo.toml` alone would have
 passed. The carve-out is independent of the `merge-risk` criterion — it only ever removes
 this one criterion's veto on the mechanical version-sync files; the PR's
 actual substantive changes (in whichever other files it touches) still go
 through the `merge-risk` criterion's normal merge-risk judgment as usual. Do **not**
 generalize this pattern to any other critical file or any other kind of
-"trivial-looking" diff — it is scoped to exactly these 6 filenames and
+"trivial-looking" diff — it is scoped to exactly these 5 filenames and
 exactly a version-string line change.
 
 **Suspect-line carve-out (#12999, operator ruling 2026-10-21)**: a critical-file hit is not a blanket veto on every edit to it. For a `Cargo.toml`-family or `package.json`-family hit that `version_only_diff` did not clear, the check-loop calls `suspect_critical_diff`, which wraps `loom-daemon forge suspect-critical-diff <pr> <file>`. Only a clean exit 0 with `SUSPECT=0` passes. It holds when a changed line is in a dependency, dev/build/target dependency, `[patch.*]`, `[replace]` or `[features]` table, is a `build =` / `links =` / `git =` / `registry =` / `path =` source key (a target table's own `path =` under `[[bin]]`, `[[bench]]`, `[[test]]`, `[[example]]` or `[lib]` is not one), or, in `package.json`, sits under `dependencies` / `devDependencies` / `optionalDependencies` / `peerDependencies` / `overrides` / `resolutions` or is a `preinstall` / `install` / `postinstall` / `prepare` script. A suspect hit emits the FAIL line with the matched line and its section, and passes that line on to the hold comment as `$CRITERION3_SUSPECT_LINE` / `$CRITERION3_SUSPECT_SECTION`. The verb takes an explicit `OWNER/REPO` (`--repo`, else resolved from the cwd; it never sends a `{owner}/{repo}` placeholder), and a forge read failure keeps its HTTP status and message in the verb's stderr, which the hold comment shows as `$CRITERION3_SUSPECT_ERROR`. Every other outcome is a hold: no patch, an unparseable hunk, an unreadable head file for a hunk whose section the patch does not show, a forge error, exit 2 from an older daemon, 126/127 for no binary. A `.github/workflows/*` hit passes only on `WF_BLAST=green` (the `merge-risk` criterion's `ci_workflow_blast_eval`); red, none, or an unreadable read holds. `migrations/` and `_migration.py` hits still hold on any change, unless an `additiveMigrations` class (#13102) applies. The carve-out never widens `CRITICAL_PATTERNS` and never judges anything but these two manifest families; `Cargo.lock` and `package-lock.json` keep today's version-only treatment.

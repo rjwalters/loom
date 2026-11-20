@@ -65,7 +65,7 @@ pub fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
 /// # Detection Methods
 ///
 /// 1. **Marker file**: `.loom-source` file exists (most reliable)
-/// 2. **Directory structure**: Has `loom-api/`, `loom-daemon/`, and `defaults/` directories
+/// 2. **Directory structure**: Has `loom-daemon/` and `defaults/` directories
 /// 3. **Git remote**: Remote URL matches known Loom repositories
 ///
 /// # Returns
@@ -78,11 +78,10 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     }
 
     // Method 2: Check for Loom-specific directory structure
-    let has_loom_api = workspace_path.join("loom-api").is_dir();
     let has_loom_daemon = workspace_path.join("loom-daemon").is_dir();
     let has_defaults = workspace_path.join("defaults").is_dir();
 
-    if has_loom_api && has_loom_daemon && has_defaults {
+    if has_loom_daemon && has_defaults {
         // Additional check: defaults should have config.json and roles/
         let defaults_has_config = workspace_path.join("defaults").join("config.json").exists();
         let defaults_has_roles = workspace_path.join("defaults").join("roles").is_dir();
@@ -95,8 +94,7 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     // Method 3: Check git remote for known Loom repositories
     if let Some((owner, repo)) = extract_repo_info(workspace_path) {
         // Match various Loom repository locations
-        let is_loom_repo =
-            (workspace_path.join("loom-api").is_dir() || owner == "rjwalters") && repo == "loom";
+        let is_loom_repo = owner == "rjwalters" && repo == "loom";
 
         if is_loom_repo {
             return true;
@@ -782,7 +780,6 @@ mod tests {
     #[cfg(unix)]
     fn build_loom_source_repo(temp: &TempDir) -> PathBuf {
         let workspace = temp.path();
-        fs::create_dir_all(workspace.join("loom-api")).unwrap();
         fs::create_dir_all(workspace.join("loom-daemon")).unwrap();
         fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
         fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();

@@ -89,10 +89,6 @@ fn test_is_loom_source_repo_directory_structure() {
     assert!(!is_loom_source_repo(workspace));
 
     // Create partial structure (not enough)
-    fs::create_dir(workspace.join("loom-api")).unwrap();
-    assert!(!is_loom_source_repo(workspace));
-
-    // Create more structure
     fs::create_dir(workspace.join("loom-daemon")).unwrap();
     assert!(!is_loom_source_repo(workspace));
 
@@ -113,7 +109,6 @@ fn test_self_install_returns_validation_report() {
     fs::create_dir(workspace.join(".git")).unwrap();
 
     // Create Loom source structure
-    fs::create_dir(workspace.join("loom-api")).unwrap();
     fs::create_dir(workspace.join("loom-daemon")).unwrap();
     fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
     fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
@@ -264,7 +259,6 @@ fn test_self_install_creates_dogfood_symlinks_on_fresh_clone() {
     let workspace = temp_dir.path();
 
     fs::create_dir(workspace.join(".git")).unwrap();
-    fs::create_dir(workspace.join("loom-api")).unwrap();
     fs::create_dir(workspace.join("loom-daemon")).unwrap();
     fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
     fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
@@ -363,7 +357,7 @@ fn test_dogfood_symlink_creation_never_fires_on_a_consumer_repo() {
     // `.claude/commands/loom/` and `.claude/agents/` content if that
     // logic ever ran outside `is_loom_source_repo()`. This workspace
     // deliberately has none of the loom-source markers (no
-    // `.loom-source`, no `loom-api`/`loom-daemon` directories) — the
+    // `.loom-source` or `loom-daemon` directory) — the
     // ordinary consumer-repo shape — with pre-existing REAL,
     // non-defaults-tracked command/agent files already on disk, exactly
     // as a real consumer project would have after installing Loom.

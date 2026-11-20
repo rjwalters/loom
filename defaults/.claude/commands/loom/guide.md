@@ -2709,7 +2709,7 @@ check_readme_staleness() {
   fi
 
   # Check recently merged PRs for architectural file changes
-  local arch_patterns="Cargo.toml|package.json|loom-daemon/|loom-api/|install.sh|scripts/install"
+  local arch_patterns="Cargo.toml|package.json|loom-daemon/|install.sh|scripts/install"
 
   # Get last 10 merged PRs and check their changed files
   local recent_prs=$("$GH_READ" pr list --state merged --limit 10 --json number,files \

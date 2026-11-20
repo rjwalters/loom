@@ -103,7 +103,6 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 CRITICAL_PATTERNS=(
     "Cargo.toml"
     "loom-daemon/Cargo.toml"
-    "loom-api/Cargo.toml"
     "package.json"
     ".github/workflows/"
     "migrations/"
@@ -311,9 +310,9 @@ assert_eq "PASS" "$out" \
 echo
 echo "--- version_only_diff (shipped): only a daemon exit 0 is eligible; every other exit fails closed (#9611) ---"
 
-STUB_RCS="package.json=0 loom-api/Cargo.toml=1 Cargo.lock=2 loom-daemon/Cargo.toml=70"
+STUB_RCS="package.json=0 mcp-loom/package.json=1 Cargo.lock=2 loom-daemon/Cargo.toml=70"
 assert_eq "0" "$(vod "$STUB_DIR/bin" package.json)" "daemon exit 0 (version-only) is eligible"
-assert_eq "1" "$(vod "$STUB_DIR/bin" loom-api/Cargo.toml)" "daemon exit 1 (not eligible / forge error) is not eligible"
+assert_eq "1" "$(vod "$STUB_DIR/bin" mcp-loom/package.json)" "daemon exit 1 (not eligible / forge error) is not eligible"
 assert_eq "1" "$(vod "$STUB_DIR/bin" Cargo.lock)" "daemon exit 2 (a daemon predating the verb: clap error) is not eligible"
 assert_eq "1" "$(vod "$STUB_DIR/bin" loom-daemon/Cargo.toml)" "any other non-zero daemon exit is not eligible"
 assert_eq "1" "$(vod "$STUB_DIR/noexec" package.json)" "a non-executable loom-daemon (exit 126) is not eligible"
@@ -350,25 +349,24 @@ assert_eq "1" "$r" "a missing loom-daemon (127) holds"
 echo
 echo "--- champion_critical_file_check_with_carveout: full check-loop integration (#6147) ---"
 
-STUB_RCS="loom-api/Cargo.toml=0 loom-daemon/Cargo.toml=0 package.json=0 mcp-loom/package.json=0"
-fixture=$'defaults/scripts/merge-pr.sh\nloom-api/Cargo.toml\nloom-daemon/Cargo.toml\nCargo.lock\npackage.json\nmcp-loom/package.json\nmcp-loom/package-lock.json'
+STUB_RCS="loom-daemon/Cargo.toml=0 package.json=0 mcp-loom/package.json=0"
+fixture=$'defaults/scripts/merge-pr.sh\nloom-daemon/Cargo.toml\nCargo.lock\npackage.json\nmcp-loom/package.json\nmcp-loom/package-lock.json'
 out="$(printf '%s\n' "$fixture" | champion_critical_file_check_with_carveout)"
 # Only files matching a CRITICAL_PATTERNS entry reach version_only_diff
 # (Cargo.lock and mcp-loom/package-lock.json match none today).
-assert_eq "PASS (version-only carve-out): loom-api/Cargo.toml
-PASS (version-only carve-out): loom-daemon/Cargo.toml
+assert_eq "PASS (version-only carve-out): loom-daemon/Cargo.toml
 PASS (version-only carve-out): package.json
 PASS (version-only carve-out): mcp-loom/package.json
 PASS" "$out" \
-    "a PR #6118-shaped file list passes via the carve-out on the 4 critical-pattern files, ending on PASS"
+    "a PR #6118-shaped file list passes via the carve-out on the 3 critical-pattern files, ending on PASS"
 
-STUB_RCS="loom-daemon/Cargo.toml=0 package.json=0 mcp-loom/package.json=0"
+STUB_RCS="package.json=0 mcp-loom/package.json=0"
 out="$(printf '%s\n' "$fixture" | champion_critical_file_check_with_carveout)"
-assert_eq "FAIL: loom-api/Cargo.toml" "$out" \
+assert_eq "FAIL: loom-daemon/Cargo.toml" "$out" \
     "the same list fails the critical-files criterion when the daemon finds one file not version-only"
 
 STUB_RCS="" out="$(printf '%s\n' "$fixture" | champion_critical_file_check_with_carveout)"
-assert_eq "FAIL: loom-api/Cargo.toml" "$out" \
+assert_eq "FAIL: loom-daemon/Cargo.toml" "$out" \
     "with every daemon answer non-zero (forge down, old daemon) the critical-files criterion FAILS rather than PASSes"
 
 echo

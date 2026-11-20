@@ -74,7 +74,7 @@ is_loom_source_repo() {
   # Check for marker file
   [[ -f "$path/.loom-source" ]] && return 0
   # Check for Loom-specific directory structure
-  [[ -d "$path/loom-daemon" && -d "$path/loom-api" && -d "$path/defaults" ]] && return 0
+  [[ -d "$path/loom-daemon" && -d "$path/defaults" ]] && return 0
   return 1
 }
 
@@ -792,7 +792,7 @@ loom_daemon_binary_stale() {
   [[ -f "$binary" ]] || return 0
 
   local newer_file
-  newer_file="$(find "$loom_root/loom-daemon" "$loom_root/loom-api" \
+  newer_file="$(find "$loom_root/loom-daemon" \
       "$loom_root/Cargo.toml" "$loom_root/Cargo.lock" \
       -type f -newer "$binary" 2>/dev/null | head -n1)"
   [[ -n "$newer_file" ]]

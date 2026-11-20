@@ -94,9 +94,8 @@ Two limits a reviewer should know. `Command::new(<variable>)` spawns are not
 matched by Sweep 2 (the `gh_invocation` choke point resolves the binary from
 policy, so many forge calls are built through it); the module list in row 17
 was therefore assembled from `rg -l 'gh_invocation|forge_'` as well as Sweep 2.
-And Sweep 2 only sees the daemon crate. `mcp-loom/` is row 5; `loom-api/` is
-listed under "Not an input". Sweep 6's "no HTTP framework" applies to
-`loom-daemon/Cargo.toml` only.
+And Sweep 2 only sees the daemon crate. `mcp-loom/` is row 5. Sweep 6's "no
+HTTP framework" applies to `loom-daemon/Cargo.toml` only.
 
 ## Inputs that change daemon behavior
 
@@ -157,7 +156,6 @@ holds.
 | Anthropic OAuth usage | `script_helpers/usage.rs` `call_usage_api` (`curl`) | Behind `loom-daemon usage` / `check-usage.sh`; the only callers found are that script and docs. No daemon loop consumes it. Cached in `.loom/usage-cache.json` |
 | Kimi, Codex, OpenCode, Pi usage | `kimi_usage/`, `codex_usage/`, `opencode_usage/`, `pi_usage/` | No HTTP client or network `Command` in any of them; they read local session files |
 | Jev merge-risk score | `jev_merge_risk.rs` `run` (`POST https://api.typesafe.ai/v1/systemone`, `LOOM_JEV_ENDPOINT`) | CLI invoked by Champion after it has decided. Shadow telemetry: prints a number, comments, labels and merges nothing. The old `jev_tier` routing is retired and old journal lines are ignored |
-| `loom-api/` analytics server | `loom-api/src/main.rs` (axum `TcpListener` on `127.0.0.1:9999`) | Separate binary, not part of `loom-daemon`. Loopback, GET-only analytics routes; feeds nothing back to the daemon |
 | Operator-run fleet CLIs | `fleet/add_worker*.rs`, `fleet/status.rs`, `session_exec/host.rs`, `remote_fleet_exec/` (`ssh`, `curl` inside provisioning scripts) | Operator-initiated outbound actions against fleet hosts |
 | `daemon_service.rs`, `fleet/path_bootstrap.rs`, `live_gh_guard.rs` | as named | `which`, PATH construction and a stand-in guard for `gh`; no network |
 

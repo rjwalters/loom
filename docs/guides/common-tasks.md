@@ -221,7 +221,7 @@ loom-daemon init --force
 
 ## Adding a New Daemon IPC Endpoint
 
-1. Add a new variant to the request enum in `loom-api/src/protocol.rs`
+1. Add a new variant to the request enum in `loom-daemon/src/types.rs`
 2. Implement the handler in `loom-daemon/src/`
 3. Add tests in `loom-daemon/tests/` (mirror the patterns in `integration_basic.rs`)
 4. If exposing via MCP, add the wrapping tool in `mcp-loom/src/tools/`

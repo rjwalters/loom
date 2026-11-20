@@ -73,7 +73,7 @@ trap 'rm -rf "$WORK"' EXIT
 # make_target <dir> — scaffold a minimal, valid uninstall target: a git repo
 # with a .loom/ tree and an install-metadata.json carrying an (empty)
 # installed_files manifest (mirrors test-uninstall-clean-preserves-unmanaged-hooks.sh),
-# avoiding the is_loom_source_repo() short-circuit (no loom-daemon/loom-api/
+# avoiding the is_loom_source_repo() short-circuit (no loom-daemon/
 # defaults siblings).
 make_target() {
   local target="$1"

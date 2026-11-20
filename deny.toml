@@ -70,13 +70,9 @@ exceptions = []
 multiple-versions = "warn"
 # A wildcard version requirement means the next breaking release of that crate
 # lands in this workspace without a diff. No registry dependency is wildcarded.
-# The only version-less requirement is loom-api's intra-workspace path
-# dependency on loom-daemon, which cannot drift that way. allow-wildcard-paths
-# exempts it, and it applies only because loom-api is `publish = false`.
-# Do not add a `version =` to that path dependency to satisfy this check:
-# PRs must never hand-edit version-bearing files (#7743).
+# Do not introduce a wildcard requirement (or a version-less path dependency)
+# to dodge this check: PRs must never hand-edit version-bearing files (#7743).
 wildcards = "deny"
-allow-wildcard-paths = true
 deny = []
 
 [sources]
