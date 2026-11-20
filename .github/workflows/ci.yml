@@ -569,7 +569,12 @@ jobs:
       # listing) settle whether the stub was written (#14229, #14691). The
       # per-pid /proc capture names WHICH fd a hung child is blocked on:
       # occurrence 3 (#14691) caught the lib binary in anon_pipe_write but
-      # could not say which pipe fd or how full it was. Guard dir resolves via
+      # could not say which pipe fd it was blocked on. The fdinfo capture
+      # answers that; it does NOT carry the pipe's buffer fill level --
+      # /proc/<pid>/fdinfo/<n> for a pipe reports only pos/flags/mnt_id/ino,
+      # and occupancy needs an ioctl(FIONREAD) on the read end -- so no
+      # fill-level number will appear in this log (#14708). Guard dir
+      # resolves via
       # `${TMPDIR:-/tmp}` because `live_gh_guard` uses `std::env::temp_dir()`,
       # which honors TMPDIR. Every command is failure-tolerant: this step is
       # continue-on-error evidence gathering, never a verdict.
@@ -586,8 +591,10 @@ jobs:
           for pid in $pids; do
             echo "--- pid ${pid}: $(tr '\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)"
             echo "wchan: $(cat /proc/${pid}/wchan 2>/dev/null || true)"
-            echo "/proc/${pid}/stack (best effort; often root-only):"
-            cat /proc/${pid}/stack 2>/dev/null || echo "(unreadable)"
+            echo "/proc/${pid}/stack (best effort; sudo -n fallback for the root-only read):"
+            cat /proc/${pid}/stack 2>/dev/null \
+              || sudo -n cat /proc/${pid}/stack 2>/dev/null \
+              || echo "(unreadable)"
             echo "/proc/${pid}/fd:"
             ls -l /proc/${pid}/fd 2>/dev/null || echo "(unreadable)"
             echo "fdinfo for pipe fds of ${pid}:"
