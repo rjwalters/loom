@@ -10707,6 +10707,26 @@ takes while the account is idle, so the per-host manual step goes away. It
 runs after every account's own recovery, and is skipped while Docker is backing
 off.
 
+Several accounts serving the same repositories can share one named list
+(#14699): declare it once under `privateCloneSets` and reference it by name,
+instead of repeating the list per account in every config tier:
+
+```json
+{ "autonomous": { "sessionReconcile": {
+  "privateCloneSets": { "fleet": [ { "repository": "https://github.com/OWNER/REPO" } ] },
+  "privateClones": { "seat-1": { "set": "fleet" }, "seat-2": { "set": "fleet" } }
+} } }
+```
+
+A `{"set": …}` reference resolves into exactly the bindings the inline list
+form yields, so both forms (and their fail-closed rules) behave identically
+and can be mixed per account. A set defined in one tier and referenced from
+another resolves — the pass reads the merged effective config. A reference
+naming an undefined set, a set that is not a list, or an account value that is
+neither a list nor a `{"set": …}` object fails closed for that account only,
+WARNing once per account with the key; a malformed entry inside a shared set
+is likewise WARNed once per referencing account, naming the set entry path.
+
 - An account with no binding is never read or touched.
 - A **busy** account (a job holds its lease, or a worker is alive) is retried on
   the next pass and never interrupted. A held (`session stop`) or disabled
@@ -10721,7 +10741,8 @@ off.
   with the registered one, an account running a host-mounted session (a binding
   never converts it), and a private session whose container is missing (the
   reconcile recovery restores it first, with its recorded image).
-- Live: re-read every pass, no restart.
+- Live: `privateClones` and `privateCloneSets` are re-read every pass, no
+  restart.
 
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session
