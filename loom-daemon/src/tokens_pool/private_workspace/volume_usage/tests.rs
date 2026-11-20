@@ -456,15 +456,24 @@ fn partial_batch_retains_only_confirmed_readings_and_recovers_without_a_rotation
 
 #[test]
 fn incomplete_batch_withholds_total_even_if_the_selected_seat_is_reconfirmed() {
-    let batch_status = Rc::new(Cell::new(true));
-    let success = Rc::clone(&batch_status);
+    enum Batch {
+        Normal,
+        Nonzero,
+        Malformed,
+    }
+    let batch_status = Rc::new(Cell::new(Batch::Normal));
+    let next_batch = Rc::clone(&batch_status);
     let _fake = docker::fake::install_timed(Box::new(move |args, _| match args {
         ["volume", "ls", ..] => Ok((true, workspace_volume_name("alice"))),
         ["volume", "inspect", "--format", VOLUME_FORMAT, volume] => {
             let row = infos(&[volume], CREATED);
-            // Batch and single inspect have identical arguments for this
-            // roster. Only the first inspect after ls should fail.
-            Ok((success.replace(true), row))
+            // Batch and single inspect have identical arguments here.
+            // Simulate an incomplete result only for the first inspect.
+            match next_batch.replace(Batch::Normal) {
+                Batch::Normal => Ok((true, row)),
+                Batch::Nonzero => Ok((false, row)),
+                Batch::Malformed => Ok((true, row.replace("\tlocal\t", "\t\t"))),
+            }
         }
         ["info", "--format", "{{.DockerRootDir}}"] => Ok((true, ENGINE_ROOT.into())),
         ["run", ..] => Ok((true, "1\t/workspace\n".into())),
@@ -472,14 +481,16 @@ fn incomplete_batch_withholds_total_even_if_the_selected_seat_is_reconfirmed() {
     }));
     let mut samples = SeatVolumeSamples::default();
     assert_eq!(sample(&mut samples).total, Some(1024));
-    batch_status.set(false);
-    assert_eq!(
-        sample(&mut samples),
-        SeatVolumeUsage {
-            seats: vec![("alice".into(), 1024)],
-            total: None,
-        }
-    );
+    for incomplete in [Batch::Nonzero, Batch::Malformed] {
+        batch_status.set(incomplete);
+        assert_eq!(
+            sample(&mut samples),
+            SeatVolumeUsage {
+                seats: vec![("alice".into(), 1024)],
+                total: None,
+            }
+        );
+    }
     assert_eq!(sample(&mut samples).total, Some(1024));
 }
 

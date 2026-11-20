@@ -180,11 +180,22 @@ impl SeatVolumeSamples {
                 continue;
             };
             if roster.contains(account) {
-                let identity = (fields.count() == 5 && !line.ends_with('\t')).then_some(line);
+                let driver = fields.next();
+                // An unowned volume still belongs to the roster. Its empty
+                // account label does not make the inspect row incomplete.
+                let _owner = fields.next();
+                let options = fields.next();
+                let backing = fields.next();
+                let created = fields.next();
+                let complete = driver.is_some_and(|driver| !driver.is_empty())
+                    && matches!(options, Some("0" | "1"))
+                    && backing.is_some_and(|path| !path.is_empty())
+                    && created.is_some_and(|created| !created.is_empty())
+                    && fields.next().is_none();
                 current
                     .entry(account)
                     .and_modify(|row| *row = None)
-                    .or_insert(identity);
+                    .or_insert(complete.then_some(line));
             }
         }
         // Only an exact, unique match of the previously verified identity
