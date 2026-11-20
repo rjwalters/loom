@@ -2702,6 +2702,9 @@ fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
         for file in bundle::PROFILE_CONTROLS {
             std::fs::copy(untrusted.join(file), profile.join(file)).unwrap();
         }
+        // The seal now admits a sealable registration without recorded trust,
+        // so the proof fails only for one the seal refuses (#14181).
+        super::containment_tests::unsealable(&profile);
     }
     let config = Config {
         schema_version: 1,

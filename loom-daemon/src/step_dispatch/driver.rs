@@ -348,6 +348,7 @@ impl RegistrySpawner {
                         request.item,
                         request.role,
                         &reason,
+                        e.downcast_ref::<StepRefusal>().map(|r| r.detail.as_str()),
                     );
                 }
                 self.report_stale_draw(idx, request.item, &e);

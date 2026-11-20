@@ -228,9 +228,13 @@ pub(crate) fn handle_session_command(
         let removal = crate::tokens_pool::session_drift_removal::read(std::slice::from_ref(
             &status.codex_home,
         ));
+        // Whether Codex will run Loom's guard hook here (#14105).
+        let trust =
+            crate::tokens_pool::private_workspace::containment::trust_state(&status.codex_home);
         if json {
             let mut value = serde_json::to_value(status)?;
             value["drift_removal"] = serde_json::to_value(&removal)?;
+            value["hook_trust"] = trust.into();
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
@@ -246,7 +250,7 @@ pub(crate) fn handle_session_command(
         {
             println!(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
-                 mount={}, session_managed={}, workspace={}, workspace_mode={})",
+                 mount={}, session_managed={}, workspace={}, workspace_mode={}, hook_trust={})",
                 status.name,
                 if status.running {
                     "running"
@@ -269,6 +273,7 @@ pub(crate) fn handle_session_command(
                     .as_ref()
                     .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
                 status.workspace_mode,
+                trust,
             );
             if let Some(removed) = removed {
                 println!("{}: {}", status.name, removed.trim_start_matches(", "));
@@ -289,11 +294,16 @@ pub(crate) fn handle_session_command(
 
     use crate::tokens_pool::private_workspace as private;
     fn print_private(status: &private::Status, json: bool) -> Result<()> {
+        let trust = crate::tokens_pool::private_workspace::containment::trust_state(
+            std::path::Path::new(&status.config.profile),
+        );
         if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
+            let mut value = serde_json::to_value(status)?;
+            value["hook_trust"] = trust.into();
+            println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!(
-                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
+                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={}, hook_trust={})",
                 status.config.account,
                 status.state_label(),
                 status.workspace_mode,
@@ -304,7 +314,8 @@ pub(crate) fn handle_session_command(
                 status
                     .lease
                     .as_ref()
-                    .map_or("idle", |job| job.owner.as_str())
+                    .map_or("idle", |job| job.owner.as_str()),
+                trust
             );
             println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
             if !status.extra_mounts.is_empty() {

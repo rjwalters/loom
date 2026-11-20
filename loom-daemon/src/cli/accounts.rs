@@ -79,7 +79,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
         } else {
             let mut line = format!(
                 "codex/{}: {} ({:?}); credential={}, directory-permissions={}, \
-                 auth-permissions={}, owner={}, session={}, login={:?}",
+                 auth-permissions={}, owner={}, session={}, login={:?}, hook-trust={}",
                 status.name,
                 if status.enabled {
                     "enabled"
@@ -112,6 +112,7 @@ pub(crate) fn handle_accounts_command(action: AccountsAction, workspace: &str) -
                     "host"
                 },
                 status.login_state,
+                status.hook_trust,
             );
             // Issue #14298: `accounts list` also reports each account's
             // registered private-clone repositories and session image.

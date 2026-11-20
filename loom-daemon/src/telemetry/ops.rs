@@ -485,6 +485,12 @@ pub enum MetricName {
     /// Capacity of the worktree-root volume.
     #[serde(rename = "loom.host.worktree_volume.total_bytes")]
     HostWorktreeVolumeTotalBytes,
+    /// Allocated bytes on a measured Codex private workspace volume, by account.
+    #[serde(rename = "loom.host.codex_workspace_volume.used_bytes")]
+    HostCodexWorkspaceVolumeUsedBytes,
+    /// Allocated bytes across all discovered Codex private workspace volumes.
+    #[serde(rename = "loom.host.codex_workspace_volume.total_used_bytes")]
+    HostCodexWorkspaceVolumeTotalUsedBytes,
     // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
     /// Ready issues on the last work-finder tick, labelled `state` and
     /// `reason` (the queue disposition). Never labelled by issue or repo.
@@ -855,6 +861,12 @@ impl MetricName {
             Self::HostSwapTotalBytes => "loom.host.swap.total_bytes",
             Self::HostWorktreeVolumeFreeBytes => "loom.host.worktree_volume.free_bytes",
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
+            Self::HostCodexWorkspaceVolumeUsedBytes => {
+                "loom.host.codex_workspace_volume.used_bytes"
+            }
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "loom.host.codex_workspace_volume.total_used_bytes"
+            }
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
@@ -1098,6 +1110,10 @@ impl MetricName {
             Self::HostSwapTotalBytes => "Swap space configured.",
             Self::HostWorktreeVolumeFreeBytes => "Free space on the worktree-root volume.",
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
+            Self::HostCodexWorkspaceVolumeUsedBytes => "Allocated bytes on a Codex workspace volume.",
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "Allocated bytes on all discovered Codex workspace volumes when fully measured."
+            }
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
             Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
