@@ -12,7 +12,6 @@
 import { describe, expect, it } from "vitest";
 import {
   describeObservability,
-  isTelemetryProblem,
   relayDirective,
   renderDaemonStatus,
   type DaemonStatusReport,
@@ -40,19 +39,6 @@ function exportStatus(mutate: (s: ObservabilityExportStatus) => void): Observabi
   mutate(s);
   return s;
 }
-
-describe("isTelemetryProblem", () => {
-  it("flags exactly the states that mean telemetry is going wrong", () => {
-    expect(isTelemetryProblem("failing")).toBe(true);
-    expect(isTelemetryProblem("never_exported")).toBe(true);
-    expect(isTelemetryProblem("misconfigured")).toBe(true);
-    expect(isTelemetryProblem("host_id_mismatch")).toBe(true);
-    expect(isTelemetryProblem("healthy")).toBe(false);
-    expect(isTelemetryProblem("disabled")).toBe(false);
-    expect(isTelemetryProblem("starting")).toBe(false);
-    expect(isTelemetryProblem("unrecognized")).toBe(false);
-  });
-});
 
 describe("describeObservability", () => {
   it("names the endpoint and what it means when failing", () => {
@@ -111,10 +97,11 @@ describe("relayDirective", () => {
     expect(d).toContain("LOOM_HOST_ID");
   });
 
-  it("healthy and disabled stay quiet — no relay pressure", () => {
+  it("quiet states stay quiet — no relay pressure, including an unrecognized state", () => {
     expect(relayDirective(exportStatus((s) => { s.state = "healthy"; }))).toBe("");
     expect(relayDirective(exportStatus((s) => { s.state = "disabled"; }))).toBe("");
     expect(relayDirective(exportStatus((s) => { s.state = "starting"; }))).toBe("");
+    expect(relayDirective(exportStatus((s) => { s.state = "unrecognized"; }))).toBe("");
   });
 });
 
@@ -136,6 +123,37 @@ describe("renderDaemonStatus", () => {
     expect(out).toContain("in-flight sweeps: 2");
     expect(out).toContain("NEVER EXPORTED");
     expect(out).toContain("RELAY TO THE USER");
+  });
+
+  it("a misconfigured exporter carries the relay directive with the fix hint", () => {
+    const report: DaemonStatusReport = {
+      daemon_build_commit: "8703b78",
+      in_flight: [],
+      observability_export: exportStatus((s) => {
+        s.state = "misconfigured";
+      }),
+      observability_host_id_mismatch: null,
+    };
+    const out = renderDaemonStatus(report);
+    expect(out).toContain("MISCONFIGURED");
+    expect(out).toContain("RELAY TO THE USER");
+    expect(out).toContain("loom-daemon health");
+    expect(out).toContain("Tell the user");
+  });
+
+  it("an unrecognized state is described with the upgrade hint, without relay pressure", () => {
+    const report: DaemonStatusReport = {
+      daemon_build_commit: "8703b78",
+      in_flight: [],
+      observability_export: exportStatus((s) => {
+        s.state = "unrecognized";
+      }),
+      observability_host_id_mismatch: null,
+    };
+    const out = renderDaemonStatus(report);
+    expect(out).toContain('unrecognized state "unrecognized"');
+    expect(out).toContain("upgrade this client");
+    expect(out).not.toContain("RELAY");
   });
 
   it("a healthy daemon renders OK without a relay block", () => {
