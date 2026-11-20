@@ -114,6 +114,10 @@ pub struct DispatchStateRecord {
     /// [`Exclusion::as_str`]: crate::step_dispatch::item_draw::Exclusion::as_str
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusion: Option<String>,
+    /// On an operator-held PR, the open issue binding the hold. With
+    /// `exclusion=operator` on a PR, absence identifies a direct PR hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_hold_issue: Option<u32>,
     /// When the gate lifts, where it has a per-item end (a `cooling_down`
     /// item's window, including a not-yet-due re-evaluation). Absent, never 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +175,7 @@ mod tests {
             step: Some("champion_merge".into()),
             in_pool: false,
             exclusion: Some("cooling_down".into()),
+            operator_hold_issue: None,
             gate_until: Some(at),
             reeval_rung: Some(2),
             reeval_next: Some(at),

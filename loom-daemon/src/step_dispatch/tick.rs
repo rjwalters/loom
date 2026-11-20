@@ -583,7 +583,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::HeldAtHead
                 | PassReason::AuthorGateHeld
                 | PassReason::Conflicting
-                | PassReason::Stacked,
+                | PassReason::Stacked
+                | PassReason::OperatorLinkUnverified,
             ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
