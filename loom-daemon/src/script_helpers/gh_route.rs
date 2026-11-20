@@ -308,12 +308,15 @@ fn forge_op_for(op: &str) -> Option<crate::forge_call_stats::ForgeOp> {
         | "recheck.body_comments"
         | "premise.issue_view"
         | "champion_hold.labels"
-        | "verdict.labels" => inv::ISSUE_VIEW_STATE,
+        | "verdict.labels"
+        | "recheck.state_bound" => inv::ISSUE_VIEW_STATE,
         "recheck.pr_view" | "verdict.handback_read" => inv::PR_VIEW_STATE,
         "recheck.issue_view" | "notify.close_targets" => inv::ISSUE_CLOSED_BY_PULL_REQUESTS,
         "latency.timeline" => inv::TIMELINE_READ,
         "champion_hold.ratify_files" | "validate_phase.pr_files" => inv::PR_DIFF_AND_FILES,
-        "curator.repo_view" | "dep.repo_view" | "premise.repo_view" => inv::REPO_VIEW,
+        "curator.repo_view" | "dep.repo_view" | "premise.repo_view" | "recheck.repo_canonical" => {
+            inv::REPO_VIEW
+        }
         "validate_phase.fail_labels"
         | "dep.add_labels"
         | "dep.remove_label"
