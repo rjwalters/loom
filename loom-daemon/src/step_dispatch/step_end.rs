@@ -449,7 +449,7 @@ mod tests {
         .unwrap();
         let outcome = outcome_line(&step).unwrap();
         assert_eq!(outcome.class, OutcomeClass::Noop);
-        assert_eq!(outcome.reason, "already-curated");
+        assert_eq!(outcome.reason, "already_curated");
     }
 
     fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {
