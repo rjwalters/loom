@@ -229,7 +229,7 @@ assert_eq $'#1\nowner/repo#3' "$out" "mixed same-repo/cross-repo comma-list capt
 out="$(champion_all_deps 'Part of #2. Depends on #4')"
 assert_eq '#4' "$out" "a Part-of parent reference on a mixed line is not a blocker (#14732)"
 
-out="$(champion_all_deps 'Part of other/epic#2. Depends on #4')"
+out="$(champion_all_deps 'Part of example-org/epic#2. Depends on #4')"
 assert_eq '#4' "$out" "a cross-repo Part-of parent reference is excluded too (#14732)"
 
 out="$(champion_all_deps 'Depends on #2 (parent). Part of #2')"
