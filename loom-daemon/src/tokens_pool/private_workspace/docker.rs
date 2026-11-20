@@ -160,7 +160,10 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
     // required to be distinct AND to match one of those exact roles, an exact
     // count is also a proof that none of them is MISSING — which is what makes
     // this the host-side half of the control-file protection (issue #8839).
-    let expected = 2 + bundle::PROFILE_CONTROLS.len() + usize::from(config.gh_config.is_some());
+    let expected = 2
+        + bundle::PROFILE_CONTROLS.len()
+        + usize::from(config.gh_config.is_some())
+        + config.extra_mounts.len();
     if mounts.len() != expected {
         bail!("private session has unexpected mounts; no host workspace, peer volume or runtime socket may be mounted, and every account profile control file must be bound read-only");
     }
@@ -190,12 +193,24 @@ pub(super) fn validate_settings(config: &Config, state: &Value) -> Result<()> {
             // receipt, each bound READ-ONLY over its own canonical path. The
             // mount point is what makes them unremovable and unrenameable from
             // inside the session while `auth.json` beside them stays writable.
-            other => bundle::PROFILE_CONTROLS.iter().any(|name| {
-                other == bundle::control_destination(name)
-                    && mount["Type"] == "bind"
-                    && bind_source_matches(config, mount, &config.profile.join(name))
-                    && mount["RW"] == false
-            }),
+            other => {
+                bundle::PROFILE_CONTROLS.iter().any(|name| {
+                    other == bundle::control_destination(name)
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &config.profile.join(name))
+                        && mount["RW"] == false
+                })
+                // The recorded `accounts.session.extraMounts` (#14451): data
+                // only, so each must be a read-only bind of exactly its
+                // recorded host path. One that is not recorded, or recorded
+                // and missing, breaks the exact count above.
+                || config.extra_mounts.iter().any(|extra| {
+                    Path::new(other) == extra.container
+                        && mount["Type"] == "bind"
+                        && bind_source_matches(config, mount, &extra.host)
+                        && mount["RW"] == false
+                })
+            }
         };
         if !valid {
             bail!("private session mount does not match its account-owned configuration");
@@ -344,6 +359,11 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
         "CARGO_HOME=/workspace/cache/cargo".into(),
         "CARGO_TARGET_DIR=/workspace/cache/target".into(),
         "npm_config_cache=/workspace/cache/npm".into(),
+        // `.loom/lease-renew/.lock` has been observed untracked in seat clones
+        // (#14160); the writer is not traced (#14226). It is not this
+        // container's `$HOME`, which is `/home/loom` here. Point the store at
+        // the cache volume so Loom's own lock stays out of the work tree.
+        "LOOM_LEASE_RENEW_STATE_DIR=/workspace/cache/lease-renew".into(),
         format!("LOOM_PRIVATE_REPOSITORY={}", config.repository),
     ] {
         args.extend(["--env".into(), value]);
@@ -356,6 +376,29 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
             format!("GH_CONFIG_DIR={GH_CONFIG}"),
         ]);
     }
+    // The configured extra mounts, always read-only (#14451). Their JSON is
+    // labelled only when there are any, so an unconfigured create is
+    // byte-identical to what it has always been.
+    for extra in &config.extra_mounts {
+        args.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={},readonly",
+                extra.host.display(),
+                extra.container.display()
+            ),
+        ]);
+    }
+    if !config.extra_mounts.is_empty() {
+        args.extend([
+            "--label".into(),
+            format!(
+                "{}={}",
+                super::super::session_lifecycle::EXTRA_MOUNTS_LABEL,
+                super::super::session_image::extra_mounts_label_json(&config.extra_mounts)
+            ),
+        ]);
+    }
     args.extend([
         "--entrypoint".into(),
         "/usr/bin/tini".into(),
@@ -366,6 +409,42 @@ pub(super) fn create(config: &Config, image: &str) -> Result<()> {
     ]);
     command(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
     Ok(())
+}
+
+/// The sealed-bundle probe of [`super::super::session_image::verify_override_bundle`]
+/// routed through [`command`], so it shares this module's engine seam (and its
+/// test fake) rather than spawning its own `docker`.
+struct ImageProbe;
+
+impl super::super::session_image::BundleProbe for ImageProbe {
+    fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
+        command_with(
+            &[
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                script,
+            ],
+            docker_cli::DOCKER_RUN_TIMEOUT,
+        )
+    }
+}
+
+/// Prove the configured override `image` carries the sealed control bundle
+/// this daemon enforces, before any container is created from it (#14451).
+pub(super) fn verify_image(image: &str) -> Result<()> {
+    super::super::session_image::verify_override_bundle(image, &ImageProbe)
+        .context("refusing to create a private session from the configured override image")
 }
 
 pub(super) fn setup(config: &Config) -> Result<()> {
@@ -491,6 +570,114 @@ pub(super) fn prepare_target(
     // Resolved per exec (#13916): an App installation token outlives no job.
     let auth = forge_auth::ExecAuth::resolve(workspace, &target.repository);
     prepare_with(config, target, id, branch, &auth)
+}
+
+/// Drive one clone's `private-workspace recover` verb under the job's auth
+/// context (#14030): the exec carries the same repository-scoped credential
+/// env as preparation, so a publish pushes only through that clone's helper.
+pub(super) fn recover_target(
+    config: &Config,
+    target: &Target,
+    action: RecoverAction,
+    issue: Option<u64>,
+    branches: &[String],
+    auth: &forge_auth::ExecAuth,
+) -> Result<RecoverOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", target.repository);
+    let issue_flag = issue.map(|n| n.to_string());
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "recover",
+        "--account",
+        &config.account,
+        "--repository",
+        &target.repository,
+        "--base",
+        &target.base,
+    ]);
+    match action {
+        RecoverAction::Publish => args.extend(["--publish"]),
+        RecoverAction::Discard => args.extend(["--discard"]),
+        RecoverAction::List => {}
+    }
+    if let Some(issue) = &issue_flag {
+        args.extend(["--issue", issue]);
+    }
+    for branch in branches {
+        args.extend(["--branch", branch]);
+    }
+    if let Some(slug) = &target.slug {
+        args.extend(["--slug", slug]);
+    }
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone recovery refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace recover returned an invalid report")
+}
+
+/// Drive the in-volume `private-workspace rebind` verb (#14357) under the
+/// credential scope of the CANONICAL repository.
+pub(super) fn rebind_target(
+    config: &Config,
+    from: &Registered,
+    to: &RepoId,
+    dry_run: bool,
+    auth: &forge_auth::ExecAuth,
+) -> Result<RebindOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", to.url);
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "rebind",
+        "--account",
+        &config.account,
+        "--from",
+        &from.repository,
+        "--from-slug",
+        &from.slug,
+        "--to",
+        &to.url,
+        "--to-slug",
+        &to.slug,
+        "--base",
+        &from.base,
+    ]);
+    if dry_run {
+        args.push("--dry-run");
+    }
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone rebind refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace rebind returned an invalid report")
 }
 
 pub(super) fn prepare_with(

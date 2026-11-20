@@ -812,6 +812,53 @@ fn offered(answer: &Value) -> Vec<(String, u64)> {
 }
 
 #[test]
+fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::capture::{
+        parse_outcome_line, seat_busy_exit_reason, StepEnd,
+    };
+
+    let mut snapshot = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+    snapshot.rows[0].is_pull_request = true;
+    snapshot.rows[0].labels = vec!["loom:review-requested".into()];
+    for early in [true, false] {
+        let s = open_server("node-a");
+        s.queue().refresh_repos([&snapshot]);
+        let first = ask_next(&s, A, 1, &["judge"]);
+        assert_eq!(offered(&first), [("acme/w".into(), 7)]);
+        let first_id = first["assignments"][0]["assignment_id"].as_str().unwrap();
+        assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
+        if early {
+            assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
+        } else {
+            let line = parse_outcome_line(
+                "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
+            );
+            let outcome = seat_busy_exit_reason(
+                StepRole::Judge,
+                7,
+                StepEnd::Exited(Some(REFUSAL_EXIT_CODE)),
+                line.as_ref(),
+            )
+            .unwrap();
+            let release = json!({"host_id": A, "assignment_id": first_id, "outcome": outcome});
+            let (reply, _) = s.handle(A, "/v1/release", release.to_string().as_bytes());
+            assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], true);
+        }
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (1, 0));
+        s.queue().refresh_repos([&snapshot]);
+        let second = ask_next(&s, B, 1, &["judge"]);
+        assert_eq!(offered(&second), [("acme/w".into(), 7)]);
+        assert_ne!(second["assignments"][0]["assignment_id"], first_id);
+    }
+}
+
+#[test]
 fn next_grants_up_to_free_slots_in_rounds_of_one_item_per_repo() {
     let s = open_server("node-a");
     let (w, x) = (next_snapshot("acme/w", &[1, 2, 3]), next_snapshot("acme/x", &[10, 11]));
@@ -941,4 +988,303 @@ async fn next_over_http_rejects_a_body_naming_another_host() {
     assert_eq!(offered(&body), [("acme/w".into(), 5)]);
     let (status, _) = post(addr, "/v1/next", &json!({"host_id": A})).await;
     assert_eq!(status, 400);
+}
+
+/// Claim `item` for `host` at `clock`, release it with `outcome`; the answer.
+fn claim_release(
+    s: &Server<StaticIdentity>,
+    clock: &ManualClock,
+    at: u64,
+    host: &str,
+    outcome: &str,
+) -> Value {
+    clock.set(at);
+    let hb = hb_body(host, json!([]), 4);
+    s.handle(host, "/v1/heartbeat", hb.to_string().as_bytes());
+    let (reply, _) =
+        s.handle(host, "/v1/claim", claim_body(host, 11, "builder").to_string().as_bytes());
+    let id = serde_json::from_str::<Value>(&reply.body).unwrap()["assignment_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rel = json!({"host_id": host, "assignment_id": id, "outcome": outcome});
+    let (reply, _) = s.handle(host, "/v1/release", rel.to_string().as_bytes());
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
+    // The #11930 sequence: one item fast-failing across hosts, each draw past
+    // the previous no-progress hold.
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    let first = claim_release(&s, &clock, 100, A, "fast_fail");
+    assert!(first.get("park").is_none(), "no order on the first: {first}");
+    let second = claim_release(&s, &clock, 2_000, B, "fast_fail");
+    assert!(second.get("park").is_none());
+    let third = claim_release(&s, &clock, 9_300, A, "fast_fail");
+    assert_eq!(third["park"], json!(true));
+    assert_eq!(third["known"], json!(true));
+    // Refused afterwards, whoever asks.
+    clock.set(9_400);
+    let (reply, _) = s.handle(B, "/v1/claim", claim_body(B, 11, "builder").to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+    // The park ended on a worker (TTL expiry or an operator's clear, from any
+    // host): the hold ends with it. Asked as `judge`, since the Builder
+    // step keeps its own no-progress hold.
+    let judge = claim_body(B, 11, "judge").to_string();
+    let (reply, _) = s.handle(B, "/v1/claim", judge.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["reason"], json!("held"));
+    // No `cause` means a TTL expiry: it ends the order, never the hold.
+    let ended = json!({"host_id": B, "repo": "acme/w", "item": 11}).to_string();
+    let (reply, call) = s.handle(B, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(call.endpoint, "/v1/park_ended");
+    let ack: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(ack["known"], json!(true));
+    assert!(ack.get("park").is_none());
+    let (reply, _) = s.handle(B, "/v1/claim", judge.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["granted"], json!(true));
+    // A second notice finds nothing; another host's id in the body is refused.
+    let (reply, _) = s.handle(B, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
+    let (reply, _) = s.handle(A, "/v1/park_ended", ended.as_bytes());
+    assert_eq!(reply.status, 403);
+}
+
+// ---------------------------------------------------------------- the filing lock (#13918)
+
+fn filing_body(host: &str, holder: &str) -> Value {
+    json!({"host_id": host, "holder": holder, "label": "architect"})
+}
+
+fn filing_lock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> Value {
+    let (reply, call) =
+        s.handle(host, "/v1/filing-lock", filing_body(host, holder).to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(call.endpoint, "/v1/filing-lock");
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn filing_unlock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> bool {
+    let body = json!({"host_id": host, "holder": holder}).to_string();
+    let (reply, _) = s.handle(host, "/v1/filing-unlock", body.as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let v: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(v["server_epoch"], "epoch-test");
+    v["known"].as_bool().unwrap()
+}
+
+/// Two hosts at once: exactly one is granted, the other is held with a retry
+/// hint, and after the first unlocks the second is granted.
+#[test]
+fn two_hosts_filing_at_once_serialise_through_the_captain() {
+    let s = open_server("node-a");
+    let a = filing_lock(&s, A, "a-1");
+    assert_eq!(a["granted"], true);
+    assert_eq!(a["ttl_s"], 60);
+    let b = filing_lock(&s, B, "b-1");
+    assert_eq!(b["granted"], false);
+    assert_eq!(b["held_by"], A);
+    assert!(b["retry_after_s"].as_u64().unwrap() >= 1);
+    assert!(b.get("ttl_s").is_none());
+
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+#[test]
+fn an_unlock_from_a_non_holder_does_not_free_the_slot() {
+    let s = open_server("node-a");
+    filing_lock(&s, A, "a-1");
+    assert!(!filing_unlock(&s, B, "a-1"), "another host naming the holder id");
+    assert!(!filing_unlock(&s, A, "stale"), "a stale holder id");
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "still held");
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert!(!filing_unlock(&s, A, "a-1"), "a second unlock is a no-op");
+}
+
+/// A holder that never unlocks loses the slot at its TTL, and a refresh under
+/// the same holder id extends it.
+#[test]
+fn a_holder_that_never_unlocks_expires_and_a_refresh_extends_the_ttl() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    assert_eq!(filing_lock(&s, A, "a-1")["granted"], true);
+    clock.set(150);
+    let refreshed = filing_lock(&s, A, "a-1");
+    assert_eq!(refreshed["granted"], true, "the same holder is re-granted");
+    clock.set(200);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "refreshed to 210");
+    clock.set(210);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true, "A never unlocked: expired");
+    assert!(!filing_unlock(&s, A, "a-1"), "A's late unlock must not free B's hold");
+    assert_eq!(filing_lock(&s, A, "a-2")["granted"], false);
+}
+
+/// The sweep expires an abandoned hold without a request arriving.
+#[test]
+fn the_sweep_expires_an_abandoned_filing_hold() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    filing_lock(&s, A, "a-1");
+    clock.set(161);
+    s.sweep_points(chrono::Utc::now());
+    s.expire_filing();
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+/// A restart empties the slot (soft state): the holder's next refresh is
+/// granted again, it does not wedge.
+#[test]
+fn a_restarted_captain_grants_a_holders_refresh_again() {
+    let first = open_server("node-a");
+    filing_lock(&first, A, "a-1");
+    let second = open_server("node-a");
+    assert_eq!(filing_lock(&second, A, "a-1")["granted"], true);
+}
+
+/// Identity is the same `whois` as for claims, and the holder id is bounded.
+#[tokio::test]
+async fn filing_calls_need_a_roster_host_and_a_bounded_holder() {
+    let clock = Arc::new(ManualClock::default());
+    let addr = listen(server(StaticIdentity::default(), Arc::clone(&clock))).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["server_epoch"], "epoch-test");
+
+    let addr = listen(open_server("node-a")).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(B, "b-1")).await;
+    assert_eq!(status, 403, "host_id is not the caller's: {body}");
+    let (status, _) = post(addr, "/v1/filing-lock", &filing_body(A, "")).await;
+    assert_eq!(status, 400);
+    let long = "x".repeat(129);
+    let (status, _) = post(addr, "/v1/filing-unlock", &json!({"host_id": A, "holder": long})).await;
+    assert_eq!(status, 400);
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!((status, &body["granted"]), (200, &json!(true)));
+}
+
+/// #14047, end to end: the Builder step's no-progress hold survives a TTL
+/// expiry (`cause: expired`) and ends on an operator's clear (`cause:
+/// cleared`).
+#[tokio::test]
+async fn an_operator_clear_lifts_the_no_progress_hold_but_a_ttl_expiry_does_not() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    claim_release(&s, &clock, 100, A, "fast_fail");
+    claim_release(&s, &clock, 2_000, B, "fast_fail");
+    claim_release(&s, &clock, 9_300, A, "fast_fail");
+    // Past the park order's hold, inside the 6 h no-progress hold.
+    clock.set(9_300 + 3_600 + 600);
+    let builder = claim_body(B, 11, "builder").to_string();
+    let reason = |s: &Server<StaticIdentity>| {
+        let (reply, _) = s.handle(B, "/v1/claim", builder.as_bytes());
+        serde_json::from_str::<Value>(&reply.body).unwrap()
+    };
+    assert_eq!(reason(&s)["reason"], json!("cooldown"), "refused before any park-ended call");
+
+    let expired = json!({"host_id": B, "repo": "acme/w", "item": 11, "cause": "expired"});
+    let (reply, _) = s.handle(B, "/v1/park_ended", expired.to_string().as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(reason(&s)["reason"], json!("cooldown"), "a TTL expiry leaves the hold");
+
+    let cleared = json!({"host_id": B, "repo": "acme/w", "item": 11, "cause": "cleared"});
+    let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(true));
+    assert_eq!(reason(&s)["granted"], json!(true), "granted right after the clear");
+
+    // A clear on an item with nothing to forget: acknowledged, `known` false.
+    let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
+    assert_eq!(reply.status, 200);
+    assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
+}
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer publishes the captain's token probe.
+// -----------------------------------------------------------------
+
+/// A server with a token-probe pool dir holding one ranking row.
+fn probing_server(
+    node_name: &str,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir) {
+    let pool = tempfile::tempdir().unwrap();
+    std::fs::write(pool.path().join(".ranking"), ranking).unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity(node_name),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf()),
+    );
+    clock.set(91);
+    (s, pool)
+}
+
+#[test]
+fn the_heartbeat_answer_carries_the_captains_snapshot() {
+    let (s, _pool) = probing_server(
+        "node-a",
+        "agent-1|available|0.42\nagent-2|exhausted||2026-11-20T03:00:00Z\n",
+    );
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    let probe = &body["token_probe"];
+    assert!(probe.is_object(), "the snapshot rides the answer: {body}");
+    assert_eq!(probe["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(probe["accounts"][0]["name"], "agent-1");
+    assert_eq!(probe["accounts"][0]["util_5h"], 0.42);
+    assert_eq!(probe["accounts"][1]["limit_reset"], "2026-11-20T03:00:00Z");
+    // The probe instant is recorded, not sampled: the worker's freshness
+    // comparison needs the captain's probe time, not this answer's.
+    assert!(probe["probed_at"].is_string());
+}
+
+/// A server built without a pool dir omits the field entirely — the exact
+/// body an old captain sent.
+#[test]
+fn a_server_without_a_pool_dir_omits_the_field() {
+    let s = open_server("node-a");
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body.get("token_probe").is_none(), "absent, not null: {body}");
+}
+
+/// The captain-side per-account record is one per distinct probe cycle, not
+/// one per heartbeat: a second heartbeat over the same `.ranking` emits
+/// nothing, a rewritten `.ranking` emits the new cycle.
+#[test]
+fn the_per_account_cycle_record_fires_once_per_cycle() {
+    let (s, pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let beat = hb_body(A, json!([]), 1).to_string();
+    let (_, first) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    let cycle = |captured: &crate::observability::ops::capture::Captured| {
+        captured
+            .metrics
+            .iter()
+            .filter(|p| p.name == crate::telemetry::ops::MetricName::TokensFleetProbeAccounts)
+            .count()
+    };
+    assert_eq!(cycle(&first), 1, "one point per account of the new cycle");
+
+    let (_, again) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&again), 0, "the same cycle is not re-emitted");
+
+    std::fs::write(pool.path().join(".ranking"), "agent-1|available|0.10\nagent-2|error\n")
+        .unwrap();
+    let (_, next) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&next), 2, "a new probe cycle records every account");
 }

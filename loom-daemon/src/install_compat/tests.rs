@@ -456,6 +456,7 @@ fn capabilities_json_schema_is_pinned() {
             "running",
             "schema_version",
             "supports_installed",
+            "tools_commands",
         ]
     );
     assert_eq!(obj["schema_version"], CAPABILITIES_SCHEMA_VERSION);

@@ -195,6 +195,7 @@ mod tests {
         status.per_repo = vec![RepoStatus {
             root: PathBuf::from("/repo/a"),
             maintain_only: None,
+            installed_behind: None,
             role_runner_enabled: true,
             role_runner_roles: vec!["judge".to_string()],
             ..sample_repo_status()
@@ -230,6 +231,7 @@ mod tests {
         RepoStatus {
             root: PathBuf::new(),
             maintain_only: None,
+            installed_behind: None,
             weight: 0,
             in_flight_count: 0,
             health_gate_halted: false,

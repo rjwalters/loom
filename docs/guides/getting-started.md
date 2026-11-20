@@ -363,7 +363,7 @@ AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-a
 
 **What to do:**
 1. Review `CLAUDE.md` (Claude Code) and/or `AGENTS.md` (Codex) to understand the codebase structure and patterns
-2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `defaults/scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
+2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
 
 ### Claude Code Configuration
 

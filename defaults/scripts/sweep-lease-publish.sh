@@ -139,6 +139,13 @@
 
 set -euo pipefail
 
+# #14488: one binary for the whole lease chain (see loom_select_lease_bin).
+# Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
+# shellcheck source=lib/locate-daemon-bin.sh
+_lease_lib="$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
+if [[ -r "$_lease_lib" ]]; then source "$_lease_lib" && loom_select_lease_bin "$PWD" || true; fi
+unset _lease_lib
+
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
 YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"
@@ -207,22 +214,29 @@ lease_publish_raw_hostname() {
 # `LOOM_LEASE_HOST_ID` is first, as in `host_identity::lease_host_identity`:
 # a dispatcher exports its own lease host id to the session it spawns, so a
 # session whose hostname differs (a Codex session container) still names the
-# host its lease was published under, not its container.
+# host its lease was published under, not its container. Every value is
+# trimmed and a whitespace-only one counts as unset, matching Rust's
+# `non_blank` (#13998) -- " " must fall through to the next link, and
+# "worker-4 " must hash to the same opaque id as `worker-4`, or what this
+# script publishes and what the Rust side compares would disagree on a
+# hand-set variable.
+trim() {
+    local s="${1-}"
+    s="${s#"${s%%[![:space:]]*}"}" # ltrim
+    s="${s%"${s##*[![:space:]]}"}" # rtrim
+    printf '%s' "$s"
+}
+
 resolve_host() {
-    if [[ -n "${LOOM_LEASE_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_LEASE_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${LOOM_HOST_ID:-}" ]]; then
-        printf '%s' "$LOOM_HOST_ID"
-        return 0
-    fi
-    if [[ -n "${HOSTNAME:-}" ]]; then
-        printf '%s' "$HOSTNAME"
-        return 0
-    fi
-    local h
-    h="$(hostname 2>/dev/null || true)"
+    local v h
+    for v in "${LOOM_LEASE_HOST_ID-}" "${LOOM_HOST_ID-}" "${HOSTNAME-}"; do
+        h="$(trim "$v")"
+        if [[ -n "$h" ]]; then
+            printf '%s' "$h"
+            return 0
+        fi
+    done
+    h="$(trim "$(hostname 2>/dev/null || true)")"
     if [[ -n "$h" ]]; then
         printf '%s' "$h"
         return 0

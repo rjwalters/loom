@@ -17,6 +17,7 @@ fn input_with_comment(body: &str) -> extract::Input {
         comments: vec![extract::Comment {
             author: extract::Author::default(),
             body: body.to_string(),
+            ..extract::Comment::default()
         }],
     }
 }

@@ -4,8 +4,7 @@
 //! file.
 //!
 //! Lives in its own sibling module rather than `crash_signals.rs`'s `mod
-//! tests`: that file sits close to the file-size ratchet's 1000-line
-//! threshold (see `.loom/docs/file-size-policy.md`). Mirrors the existing
+//! tests`. Mirrors the existing
 //! `crash_signals_empty_pool_tests.rs` precedent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;

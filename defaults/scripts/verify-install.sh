@@ -378,9 +378,24 @@ collect_tracked_files() {
 # only the intra-repo filesystem path.
 # ----------------------------------------------------------------------------
 
+# Print `file` with fenced code-block lines (the fence markers and everything
+# between them) removed. Same rule as scripts/check-dangling-links.sh's awk
+# pass — a line matching ^[[:space:]]*(```|~~~) toggles fence state — so the
+# source-tree and installed-tree link checkers agree (one mechanism per
+# behaviour). An unterminated fence at EOF treats the rest as fenced. A link
+# inside a fence is an illustrative example: the installer cannot know what a
+# consumer's fenced template illustrates, so it is not resolved (#14134).
+strip_fenced_lines() {
+    awk '
+        /^[[:space:]]*(```|~~~)/ { infence = 1 - infence; next }
+        !infence { print }
+    ' "$1" 2>/dev/null
+}
+
 # Extract every link target referenced by `file`, one per output line.
-# Jq-free (grep/sed only) — this check runs unconditionally at install time,
-# same dependency policy as cmd_generate.
+# Jq-free (grep/sed/awk only) — this check runs unconditionally at install
+# time, same dependency policy as cmd_generate. Fenced code blocks are skipped
+# for both extraction forms (see strip_fenced_lines).
 extract_link_targets() {
     local file="$1"
     {
@@ -394,7 +409,8 @@ extract_link_targets() {
         # file that has, say, backtick-only refs but no markdown-style
         # links. A file legitimately having zero targets of one form is not
         # an error (#4147).
-        grep -oE '\]\([^)]+\)' "$file" 2>/dev/null \
+        strip_fenced_lines "$file" \
+            | grep -oE '\]\([^)]+\)' \
             | sed -E 's/^\]\(//; s/\)$//; s/ "[^"]*"$//' \
             || true
         # Backtick-only install-rooted paths, e.g. `.loom/docs/build-gate.md`
@@ -406,7 +422,8 @@ extract_link_targets() {
         # instructing the READER to create the file (`Create \`....md\``) are
         # tutorial placeholders, not packaging references, and are excluded
         # (see e.g. `.loom-README.md`'s "Create `.loom/roles/my-role.md`:").
-        grep -viE '\bcreate\b' "$file" 2>/dev/null \
+        strip_fenced_lines "$file" \
+            | grep -viE '\bcreate\b' \
             | grep -oE '`\.(loom|claude|codex|github)/[A-Za-z0-9_./-]+\.md(#[A-Za-z0-9_-]+)?`' \
             | sed -E 's/^`//; s/`$//' \
             || true

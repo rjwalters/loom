@@ -101,3 +101,40 @@ fn a_symlinked_agents_directory_is_left_alone() {
     resync_workspace_with(&payload(), &ws).unwrap();
     assert_eq!(fs::read_to_string(target.join("loom-champion.md")).unwrap(), "mine\n");
 }
+
+/// #13956: the shipped agent definitions carry NO hardcoded `model:`
+/// frontmatter — the operator declined hardcoded tiers, so a role's model
+/// comes from the config chain via `resolve-role-model.sh` at spawn time,
+/// never from these files. Asserted against the real `defaults/` tree so a
+/// future edit that pins a model fails here, not in an operator's repo.
+#[test]
+fn shipped_agents_carry_no_model_frontmatter() {
+    let agents = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/.claude/agents");
+    let mut checked = 0;
+    for entry in fs::read_dir(&agents).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let Some(rest) = text.strip_prefix("---\n") else {
+            panic!("{} has no frontmatter block", path.display());
+        };
+        let frontmatter = rest
+            .split("\n---\n")
+            .next()
+            .expect("frontmatter block is terminated");
+        for line in frontmatter.lines() {
+            let field = line.split(':').next().unwrap_or("").trim();
+            assert_ne!(
+                field,
+                "model",
+                "{} pins a model: frontmatter — the #13956 ruling forbids hardcoded tiers; \
+                 configure per-role models via .loom/config.json roleConfig.model instead",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked >= 10, "expected the shipped agent set, found {checked}");
+}

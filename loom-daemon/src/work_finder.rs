@@ -16,8 +16,8 @@
 //!    --state open --json number,labels` via [`GhWorkSource`], the direct
 //!    analogue of [`crate::epic_supervisor::forge::GhEpicSource`].
 //! 2. Filters out issues that are **already in flight** (present in the
-//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running` /
-//!    `Pending` sweep) or that defensively carry any [`SKIP_LABELS`] entry
+//!    [`SweepRegistry`](crate::sweep_registry::SweepRegistry) as a `Running`
+//!    sweep) or that defensively carry any [`SKIP_LABELS`] entry
 //!    (`loom:building` / `loom:blocked` / `loom:operator`).
 //! 3. For each remaining issue, dispatches through the existing
 //!    [`SweepRegistry::dispatch`](crate::sweep_registry::SweepRegistry::dispatch)
@@ -60,7 +60,7 @@
 //!   a collision (e.g. a concurrent epic-supervisor sweep for the same child)
 //!   fails loudly and is logged, never double-dispatched.
 //! - **Registry dedup** — the authoritative "already in-flight" check is the
-//!   registry itself: an issue with a live `Running`/`Pending` entry is skipped
+//!   registry itself: an issue with a live `Running` entry is skipped
 //!   even if the forge still shows `loom:issue` (label-flip lag).
 //!
 //! A forge-query error aborts *that* tick only; the caller logs it and the next
@@ -84,7 +84,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -163,7 +163,6 @@ pub mod workspace_draw;
 use crate::types::QueueDisposition as Qd;
 pub use labels::*;
 pub use main_red_fix::RedMainLane;
-pub use operator_priority::OverflowSlot;
 pub use ordering::{candidate_cmp, PriorityCandidate};
 use tick_report::record_dispatch_outcome;
 pub use tick_report::{error_kind::DispatchErrorKind, Admission, RepoDepth, TickReport};
@@ -415,8 +414,8 @@ pub trait WorkSource {
 /// query). Splitting it out keeps [`tick`] unit-testable without a real
 /// registry or `gh` credentials.
 pub trait WorkDispatcher {
-    /// The set of issue numbers that currently have a live (`Running` /
-    /// `Pending`) sweep — the authoritative "already in-flight" view.
+    /// The set of issue numbers that currently have a live (`Running`)
+    /// sweep — the authoritative "already in-flight" view.
     fn in_flight(&self) -> HashSet<u32>;
 
     /// The set of issue numbers currently **quarantined** for repeated
@@ -601,18 +600,6 @@ pub trait WorkDispatcher {
         0
     }
 
-    /// The set of issue numbers a **peer host** has advertised as in-flight over
-    /// the shared safehouse room and not yet expired (Issue #4028, Phase 1 soft
-    /// claim). The finder skips these — treating a peer's soft claim as an
-    /// additional TTL-bounded skip reason alongside [`SKIP_LABELS`] — so two
-    /// daemons on a shared backlog collide far less than the non-atomic forge
-    /// label flip alone permits. Defaults to empty so a dispatcher that does not
-    /// model peer claims (a test fake, or a registry with `safehouse.enabled`
-    /// false) opts out with zero boilerplate and **zero behavior change**.
-    fn peer_claimed(&self) -> HashSet<u32> {
-        HashSet::new()
-    }
-
     /// Additional label names — beyond the hardcoded [`PARK_LABELS`] —
     /// this dispatcher's workspace wants treated as a skip/park signal
     /// (Issue #6685), resolved once per workspace via
@@ -678,24 +665,11 @@ pub trait WorkDispatcher {
     /// The caller logs and counts it; it is never fatal.
     fn dispatch(&mut self, issue: u32) -> Result<bool>;
 
-    /// [`dispatch`](Self::dispatch), additionally recording whether this is
-    /// the host's overflow sweep (#9244, inert since #11508) on the sweep
-    /// record. Defaults to plain `dispatch` (the flag dropped), so a
-    /// dispatcher that does not model overflow opts out with zero boilerplate.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`dispatch`](Self::dispatch).
-    fn dispatch_with(&mut self, issue: u32, overflow: bool) -> Result<bool> {
-        let _ = overflow;
-        self.dispatch(issue)
-    }
-
     /// The batched open-PR pre-filter (#8865, [`open_pr_prefilter`]): the
     /// issues in `candidates` with a VERIFIED open linked PR, each mapped to
     /// that PR. Asked at most once per workspace per tick; the multi-workspace
     /// tick skips those candidates without calling
-    /// [`dispatch_with`](Self::dispatch_with). It can only remove candidates:
+    /// [`dispatch`](Self::dispatch). It can only remove candidates:
     /// anything not verified (unreadable listing included) must be left out,
     /// and still meets `dispatch()`'s own open-PR guard. Defaults to empty.
     fn open_pr_blocked(&self, _candidates: &[u32]) -> HashMap<u32, u32> {
@@ -728,13 +702,6 @@ pub trait WorkDispatcher {
     /// treats them as not backed off. Defaults to empty.
     fn lift_landed_cooldowns(&self, _held: &[u32]) -> HashSet<u32> {
         HashSet::new()
-    }
-
-    /// Whether a live sweep on this host is already marked `overflow`
-    /// (#9244): the [`OverflowSlot`] is then taken for the whole tick.
-    /// Defaults to `false`.
-    fn overflow_in_flight(&self) -> bool {
-        false
     }
 
     /// Whether this workspace's `main` is red by its latest CI conclusion —
@@ -918,7 +885,6 @@ pub fn tick_with_lanes(
     // `noop_cooldown` / `declined` above. Empty until a dispatch actually
     // releases an issue without leaving a PR behind.
     let prless_retry = dispatcher.prless_retry();
-    let peer_claimed = dispatcher.peer_claimed();
     // Per-workspace additional skip-label list (#6685) — resolved once per
     // tick, mirroring every other dispatcher-supplied set above.
     let extra_skip_labels = dispatcher.extra_skip_labels();
@@ -1078,18 +1044,6 @@ pub fn tick_with_lanes(
             report.skipped_prless_retry += 1;
             continue;
         }
-        // 2c. Peer soft claim (#4028): a peer host advertised a live claim over
-        //     the safehouse room. Back off — treated like a skip label, before
-        //     the capacity gate so a peer-claimed issue never reserves a slot.
-        if peer_claimed.contains(&item.number) {
-            report.skipped_peer_claim += 1;
-            log::info!(
-                "work_finder: skipping issue #{} — a peer host advertised a soft claim \
-                 over safehouse (#4028)",
-                item.number
-            );
-            continue;
-        }
         // 3. Fixed concurrency cap — defer the rest to a future tick. No
         //    priority overflows it (#11508).
         if occupancy >= max_concurrent {
@@ -1099,7 +1053,7 @@ pub fn tick_with_lanes(
         // 4. Dispatch. The registry's idempotency key + claim lock make a
         //    double-dispatch of an already-running issue a no-op / loud error.
         let started = chrono::Utc::now();
-        let outcome = dispatcher.dispatch_with(item.number, false);
+        let outcome = dispatcher.dispatch(item.number);
         if record_dispatch_outcome(&mut report, item.number, 0, started, &outcome).0
             == Qd::Dispatched
         {
@@ -1248,8 +1202,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
     // The same-tick affected-files overlap gate (#9781): a scheduling signal,
     // not a cap.
     let mut overlap = affected_files::OverlapGate::default();
-    // The inert overflow slot (#11508) only reports a live legacy overflow sweep.
-    let overflow = OverflowSlot::for_workspaces(workspaces);
 
     // Snapshot each workspace's quarantined set (#3939) alongside its in-flight
     // set. Quarantined candidates are dropped in pass 1 *before* the global sort
@@ -1320,15 +1272,8 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         .map(|(_, d)| d.prless_retry_expiry())
         .collect();
 
-    // Snapshot each workspace's peer-claim set (#4028) alongside its quarantined
-    // set. A peer's live soft claim drops the candidate in pass 1, before the
-    // global sort and slot fill, so a peer-claimed issue never reserves a shared
-    // dispatch slot.
-    let peer_claimed_sets: Vec<HashSet<u32>> =
-        workspaces.iter().map(|(_, d)| d.peer_claimed()).collect();
-
-    // Snapshot each workspace's additional skip-label list (#6685) alongside
-    // the peer-claim set — a per-workspace/per-repo configured list of extra
+    // Snapshot each workspace's additional skip-label list (#6685) — a
+    // per-workspace/per-repo configured list of extra
     // label names, beyond the hardcoded `PARK_LABELS`, this workspace wants
     // treated as a skip/park signal.
     let extra_skip_label_sets: Vec<Vec<String>> = workspaces
@@ -1581,18 +1526,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
                 skip(Qd::PrlessRetry, None, prless_retry_until[idx].get(&item.number).copied());
                 continue;
             }
-            // Peer soft claim (#4028): a peer host is already building it — drop
-            // before the global queue so it consumes no shared slot.
-            if peer_claimed_sets[idx].contains(&item.number) {
-                report.skipped_peer_claim += 1;
-                skip(Qd::PeerClaim, None, None);
-                log::info!(
-                    "work_finder: skipping issue #{} — a peer host advertised a soft claim \
-                     over safehouse (#4028)",
-                    item.number
-                );
-                continue;
-            }
             // One key feeds both the view and dispatch, so they cannot drift.
             ready_queue::record_candidate(q, &key, &item);
             candidates.push(key);
@@ -1642,7 +1575,7 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
         // A candidate with a verified open linked PR is resolved `OpenPr`
         // here without a dispatch attempt; every other one is dispatched and
         // counted (`record_dispatch_outcome`) exactly as before (#8865).
-        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, false, &mut report);
+        let (disposition, detail) = open_prs.dispatch(dispatcher, &cand, &mut report);
         ready_queue::resolve(&mut report.queue, &cand, disposition, detail);
         if disposition == Qd::Dispatched {
             occupancy += 1;
@@ -1652,7 +1585,6 @@ pub fn tick_multi_with_build_backoff<S: WorkSource, D: WorkDispatcher>(
 
     report.note_halts(halted, halt_causes, workspaces.len()); // #11649
     report.occupancy = Some(occupancy);
-    report.overflow_free = Some(overflow.is_free());
     // Sum the cumulative cross-host collision totals across every workspace's
     // dispatcher (#4085), read after pass 2 so this tick's collisions count.
     report.collisions = workspaces.iter().map(|(_, d)| d.collisions()).sum();
@@ -1945,10 +1877,25 @@ pub fn spawn_multi_work_finder_task(
         let mut idle_trigger = crate::role_runner::IdleTrigger::new();
         let mut was_rate_limited = false;
         let mut step_driver = crate::step_dispatch::driver::StepDriver::default();
+        let host_id = crate::sweep_registry::host_identity();
+        let process_id = crate::observability::ops::busy_slots::reporting_process_id();
+        let mut previous_published = None;
         loop {
+            let wait_started = Instant::now();
             ticker.tick().await;
-            // #12074: one INFO line per tick body, and its wall-clock deadline.
-            let tick_budget = crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
+            let began = Instant::now();
+            let (number, tick_budget) =
+                crate::step_dispatch::gather_budget::begin_tick(&fallback_root);
+            let timing = tick_line::TickTiming {
+                number,
+                host_id: &host_id,
+                process_id,
+                began,
+            };
+            log::info!(
+                "{}",
+                timing.start_line(tick_budget, wait_started, previous_published.take())
+            );
 
             // #8121: reload the registry and provision any newly-registered
             // root's `SweepRegistry` BEFORE the rate-limit breaker check
@@ -1991,6 +1938,7 @@ pub fn spawn_multi_work_finder_task(
                     }
                     was_rate_limited = true;
                     tick_summary::publish_rate_limit_skip(now); // #12083
+                    log::info!("{}", timing.rate_limit_skip_line(now, Instant::now()));
                     continue;
                 }
                 was_rate_limited = false;
@@ -2022,7 +1970,6 @@ pub fn spawn_multi_work_finder_task(
             // Eager, out-of-cycle reclaim (#7512, #11192) for `fallback_root`,
             // due while free space is below the floor (#12406). Hygiene, not
             // admission: it never changes the cap.
-            crate::eager_reclaim::tick(&fallback_root).await;
             // Read the filtered CPU idle (#12114) — **observational only**
             // since #4512 (see the single-workspace loop above). It feeds the
             // `observed_idle=` figure in the axis line and `loom-daemon status`
@@ -2030,15 +1977,17 @@ pub fn spawn_multi_work_finder_task(
             // `maxConcurrent`; it no longer gates admission.
             // With no published record (observability off, so no sampler tick)
             // fall back to the memoized raw sample, as before #12114.
-            let idle = match crate::host_status::filtered_cpu_idle_fraction() {
-                Some(idle) => Some(idle),
-                None => {
+            let (idle, phases) = tick_line::sample_pre_span(
+                crate::eager_reclaim::tick(&fallback_root),
+                crate::host_status::filtered_cpu_idle_fraction,
+                async {
                     let _ =
                         tokio::task::spawn_blocking(crate::cpu_headroom::refresh_cpu_util_cache)
                             .await;
                     crate::cpu_headroom::cached_cpu_idle_fraction()
-                }
-            };
+                },
+            )
+            .await;
             // The cap, for the published summary and the tick span
             // (`ops::dispatch_facts`).
             tick_summary::record_cap(crate::types::CapView {
@@ -2190,6 +2139,7 @@ pub fn spawn_multi_work_finder_task(
                 log::debug!("{axis_line}");
             }
 
+            let span_started = Instant::now();
             let tick_started = chrono::Utc::now();
             // #12256: the tick's forge calls are children of its span.
             let tick_parent = crate::gh_invocation::telemetry::enter_parent(Some(
@@ -2220,7 +2170,21 @@ pub fn spawn_multi_work_finder_task(
             // Publish before any logging so `loom-daemon health` sees the same
             // tick the log line describes (#4761).
             let plan = dispatch_plan::PlanInputs::new(max_concurrent, interval, &shard_decisions);
-            publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
+            let (completed_at, span_completed) =
+                publish_tick(&report, max_concurrent, tick_started, &roots, Some(&plan));
+            let published = Instant::now();
+            previous_published = Some(published);
+            log::info!(
+                "{}",
+                timing.completion_line(
+                    tick_started,
+                    completed_at,
+                    span_started,
+                    span_completed,
+                    published,
+                    phases,
+                )
+            );
 
             if report.halted && !was_halted {
                 // #9591: name the hold(s) actually active — a drain is not a red main.

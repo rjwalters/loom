@@ -17,6 +17,7 @@ struct Fake {
     calls: Vec<String>,
     fail_body: bool,
     fail_label: bool,
+    fail_view: bool,
 }
 
 impl Fake {
@@ -48,6 +49,9 @@ impl Fake {
 impl ParkForge for Fake {
     fn view(&mut self, number: u64) -> Result<IssueState, String> {
         self.calls.push(format!("view {number}"));
+        if self.fail_view {
+            return Err("boom".into());
+        }
         Ok(self.state.clone())
     }
     fn state(&mut self, repo: Option<&str>, number: u64) -> Result<String, String> {
@@ -597,4 +601,169 @@ mod transient {
         let body = compose_transient_body("", "capacity:batch", None, AT, None, 0.0).unwrap();
         assert_eq!(render(&parse(&body)[0]), body.trim());
     }
+}
+
+// --- retract (#13895) -------------------------------------------------------
+
+use crate::park_record::apply::{compose_retract_body, precheck_retract, retract, RetractRequest};
+
+fn rreq(target: u64, reason: Option<&str>) -> RetractRequest {
+    RetractRequest {
+        number: 10,
+        repo: Some("me/here".to_string()),
+        blocked_by: BlockerRef::local(target),
+        reason: reason.unwrap_or("ruling: not a gate").to_string(),
+        by: Some("guide".to_string()),
+        at: AT.to_string(),
+        dry_run: false,
+    }
+}
+
+fn rrun(f: &mut Fake, r: &RetractRequest) -> (i32, String, String) {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = retract(f, r, &mut out, &mut err);
+    (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn retract_demotes_the_marker_and_appends_one_audit_line() {
+    let mut f = Fake::new(
+        "Do it.\n\n<!-- loom:park Blocked by: #11 by=builder at=2026-10-01T00:00:00Z -->\n",
+        &["loom:blocked"],
+    );
+    let (code, out, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK, "{err}");
+    assert_eq!(f.mutations(), vec!["set_body 10"], "labels untouched");
+    assert!(out.contains("APPLIED=true"), "{out}");
+    let body = &f.state.body;
+    assert_eq!(park_record_blockers(body), Vec::<BlockerRef>::new(), "{body}");
+    assert!(body.contains("<!-- loom:park Blocked by: #11 by=builder"), "verbatim: {body}");
+    let ws = super::super::withdrawn(body);
+    assert_eq!(ws.len(), 1, "{body}");
+    assert_eq!(ws[0].blocker, BlockerRef::local(11));
+    assert_eq!(ws[0].by.as_deref(), Some("guide"));
+    assert_eq!(ws[0].at.as_deref(), Some(AT));
+    assert_eq!(ws[0].reason.as_deref(), Some("ruling: not a gate"));
+    // The label stays: retract edits the body only.
+    assert_eq!(f.state.labels, vec!["loom:blocked".to_string()]);
+}
+
+#[test]
+fn retract_keeps_the_live_blocker_and_never_splits_a_multi_ref_marker() {
+    let mut f = Fake::new(
+        "<!-- loom:park Blocked by: #11 by=builder -->\n\
+         <!-- loom:park Blocked by: #12 by=curator -->\n",
+        &["loom:blocked"],
+    );
+    let (code, _, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert_eq!(park_record_blockers(&f.state.body), vec![BlockerRef::local(12)]);
+
+    let mut f = Fake::new("<!-- loom:park Blocked by: #11, #12 -->\n", &["loom:blocked"]);
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::REFUSED);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(err.contains("#12"), "{err}");
+    assert_eq!(
+        park_record_blockers(&f.state.body),
+        vec![BlockerRef::local(11), BlockerRef::local(12)]
+    );
+}
+
+#[test]
+fn retract_is_a_noop_without_a_live_marker_or_on_a_rerun() {
+    let mut f = Fake::new("nothing declared\n", &["loom:blocked"]);
+    let (code, out, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(out.contains("BODY_CHANGED=false"), "{out}");
+
+    // Re-running after a successful retract changes nothing.
+    let mut f =
+        Fake::new("Do it.\n\n<!-- loom:park Blocked by: #11 by=builder -->\n", &["loom:blocked"]);
+    assert_eq!(rrun(&mut f, &rreq(11, None)).0, exit::OK);
+    let once = f.state.body.clone();
+    f.calls.clear();
+    let (code, out, _) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert_eq!(f.state.body, once);
+    assert!(out.contains("BODY_CHANGED=false"), "{out}");
+}
+
+#[test]
+fn a_blank_reason_is_refused_before_any_forge_call() {
+    let mut f = Fake::new("b", &[]);
+    for reason in [Some(""), Some("   ")] {
+        let (code, _, err) = rrun(&mut f, &rreq(11, reason));
+        assert_eq!(code, exit::REFUSED, "{reason:?}");
+        assert!(err.contains("--reason is required"), "{err}");
+        assert!(f.calls.is_empty(), "{:?}", f.calls);
+    }
+    assert!(precheck_retract(&rreq(11, None)).is_none(), "a real reason passes");
+}
+
+#[test]
+fn retract_dry_run_prints_the_body_and_writes_nothing() {
+    let mut f = Fake::new("b\n\n<!-- loom:park Blocked by: #11 -->\n", &["loom:blocked"]);
+    let mut req = rreq(11, None);
+    req.dry_run = true;
+    let (code, out, _) = rrun(&mut f, &req);
+    assert_eq!(code, exit::OK);
+    assert!(f.mutations().is_empty(), "{:?}", f.calls);
+    assert!(out.contains("DRY_RUN=true"), "{out}");
+    assert!(out.contains("BODY<<EOF"), "{out}");
+    assert!(out.contains("Park withdrawn: #11"), "{out}");
+}
+
+#[test]
+fn retract_reports_forge_failures() {
+    let mut f = Fake::new("b", &[]);
+    f.fail_view = true;
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::FORGE, "unreadable artifact");
+    assert!(err.contains("could not read #10"), "{err}");
+    assert!(f.mutations().is_empty());
+
+    let mut f = Fake::new("b\n\n<!-- loom:park Blocked by: #11 -->\n", &[]);
+    f.fail_body = true;
+    let (code, _, err) = rrun(&mut f, &rreq(11, None));
+    assert_eq!(code, exit::FORGE);
+    assert!(err.contains("body write to #10 failed"), "{err}");
+}
+
+#[test]
+fn compose_retract_body_shapes() {
+    // A body that is only the marker: no head, no stray blank line.
+    let b = compose_retract_body(
+        "<!-- loom:park Blocked by: #11 by=builder -->\n",
+        &BlockerRef::local(11),
+        Some("guide"),
+        AT,
+        "why",
+    )
+    .unwrap()
+    .unwrap();
+    let marker = "<!-- loom:park Blocked by: #11 by=builder -->";
+    assert_eq!(
+        b,
+        format!("`{marker}`\n\nPark withdrawn: #11 — by=guide at={AT} reason=\"why\"\n")
+    );
+
+    // No live marker: the None of idempotence.
+    assert_eq!(
+        compose_retract_body("b", &BlockerRef::local(11), None, AT, "why").unwrap(),
+        None
+    );
+
+    // Multi-ref: the refusal message names the other refs.
+    let e = compose_retract_body(
+        "<!-- loom:park Blocked by: #11, #12 -->",
+        &BlockerRef::local(11),
+        None,
+        AT,
+        "why",
+    )
+    .unwrap_err();
+    assert!(e.contains("#12"), "{e}");
 }

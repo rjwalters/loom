@@ -538,7 +538,7 @@ fn discover_tokens_for(
             // records a bare `<name>|blocked` row, and that row then carries
             // no evidence for `bad_tokens::session_window_has_reset` (or, for
             // an ambiguous reason, the two-signal
-            // `bad_tokens::ambiguous_exhaustion_has_reset` check, #7538) to
+            // `bad_tokens::ambiguous_exhaustion_evidence` check, #7538) to
             // act on — so the entry could only ever clear on its TTL, and the
             // `.ranking` row stayed `blocked` until a human ran `tokens
             // unblock`. That is exactly the host-to-host divergence #7522
@@ -1007,14 +1007,112 @@ pub(crate) fn ranking_line(
 /// the in-memory [`ProbeReport`] (so `--json` and [`format_table`] show them —
 /// the operator-visible signal the pool lacked before this issue), and every
 /// other status is written exactly as before.
+///
+/// This is the pure formatter: it sees only this round's report. The
+/// previous-round carry-forward that [`write_ranking_atomic`] applies on disk
+/// (issue #14145) lives in [`format_ranking_lines_with_preserve`].
 #[must_use]
 pub fn format_ranking_lines(report: &ProbeReport) -> String {
+    format_ranking_lines_with_preserve(report, &HashMap::new(), Utc::now())
+}
+
+/// `true` for the statuses a **failed or inconclusive** probe produces:
+/// `error` (transport failure — timeout, connection, 5xx) and `blocked`
+/// (no request possible: empty token, credential-shape mismatch, `401`).
+/// Neither carries a utilization measurement — the round says nothing about
+/// the account's quota state (issue #14145). Every other status was derived
+/// from a response that actually reported rate-limit headers (or the monitor's
+/// own data) and is positive evidence.
+///
+/// The codex path's evidence-free status, `unknown` (a profile with nothing
+/// measurable — [`super::codex_check::STATUS_UNKNOWN`]), is deliberately **not**
+/// here: it is fail-open (#8539), so it may only displace a hold while that
+/// hold is not running — see [`carries_forward`] (issue #14265).
+fn is_evidence_free_status(status: &str) -> bool {
+    status == "error" || status == "blocked"
+}
+
+/// Whether a fresh row with `status` must yield to the `carried` previous
+/// `exhausted` row (issue #14145 / #14265).
+///
+/// - `error` / `blocked` ([`is_evidence_free_status`]) always yield.
+/// - `unknown` yields **only while the carried hold is still running**: the
+///   previous row's `limit_reset` parses and satisfies
+///   `now < reset <= now + MAX_WEEKLY_RESET_HORIZON_SECS` — the same
+///   credibility horizon the reader applies (`bad_tokens`, #13893). A past,
+///   missing, unparseable, or beyond-horizon reset means no credible hold is
+///   in force, so the fresh fail-open `unknown` row is written as before
+///   (#8539) and the fail-open contract is bounded to the hold window instead
+///   of being made permanently exclusionary (an implausible far-future reset
+///   would otherwise be re-carried every round and never self-heal, #14349).
+/// - Everything else is positive evidence and overwrites.
+fn carries_forward(status: &str, carried: &str, now: DateTime<Utc>) -> bool {
+    if is_evidence_free_status(status) {
+        return true;
+    }
+    if status != super::codex_check::STATUS_UNKNOWN {
+        return false;
+    }
+    let reset = super::select::parse_ranking_line(carried).and_then(|row| row.limit_reset);
+    super::monitor::parse_iso8601(reset.as_deref()).is_some_and(|reset| {
+        reset > now
+            && reset - now
+                <= chrono::Duration::seconds(super::bad_tokens::MAX_WEEKLY_RESET_HORIZON_SECS)
+    })
+}
+
+/// Read the current `.ranking` and keep its `exhausted` rows (keyed by
+/// account name, line text trimmed) for [`format_ranking_lines_with_preserve`]
+/// to carry forward. An unreadable file simply preserves nothing — the write
+/// then behaves exactly as before this existed.
+fn previous_exhausted_rows(ranking_path: &Path) -> HashMap<String, String> {
+    let Ok(text) = std::fs::read_to_string(ranking_path) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let row = super::select::parse_ranking_line(line)?;
+            (row.status == "exhausted").then(|| (row.name, line.trim().to_string()))
+        })
+        .collect()
+}
+
+/// [`format_ranking_lines`], additionally carrying `preserve`'s rows forward
+/// in place of this round's own row for that account.
+///
+/// A failed probe must not destroy the previous round's knowledge. This is
+/// the probe-path twin of a rule the monitor path already applies
+/// (`run_monitor_check_with_reprobe`, issue #7420): an inconclusive (`error`)
+/// outcome "leaves the row alone" rather than downgrading a hard exclusion.
+/// Before #14145 the probe path had no such rule — a single transport failure
+/// overwrote `name|exhausted||<7d-reset>` with a bare `name|error`, and the
+/// next `bad_tokens::ambiguous_exhaustion_evidence` read then fell to the
+/// 6h fixed cooldown, readmitting an account whose weekly hold still had
+/// days to run. The carry-forward applies only when the previous row is
+/// `exhausted` **and** the fresh row is evidence-free per [`carries_forward`]
+/// (`error` / `blocked`, or a codex `unknown` while the hold's recorded reset
+/// is still in the future **and** within `MAX_WEEKLY_RESET_HORIZON_SECS`,
+/// #14265 / #14349) — anything else is positive evidence this round and
+/// overwrites as before — and the reader's own credibility gates
+/// (parseability, `MAX_WEEKLY_RESET_HORIZON_SECS`, pre-mark instants) still
+/// bound whatever is carried forward.
+fn format_ranking_lines_with_preserve(
+    report: &ProbeReport,
+    preserve: &HashMap<String, String>,
+    now: DateTime<Utc>,
+) -> String {
     let mut out = String::new();
     for a in &report.accounts {
         if a.status == "unsupported" {
             continue;
         }
-        out.push_str(&marked_probe::ranking_row(a));
+        match preserve
+            .get(a.name.as_str())
+            .filter(|carried| carries_forward(&a.status, carried, now))
+        {
+            Some(carried) => out.push_str(carried),
+            None => out.push_str(&marked_probe::ranking_row(a)),
+        }
         out.push('\n');
     }
     out
@@ -1022,8 +1120,21 @@ pub fn format_ranking_lines(report: &ProbeReport) -> String {
 
 /// Write `report` to `ranking_path` atomically (`<path>.tmp` + rename in the
 /// same directory). Mirrors `check.write_ranking_atomic`.
+///
+/// Issue #14145: before overwriting, the file's current `exhausted` rows are
+/// read and a fresh row that carries no probe evidence
+/// ([`carries_forward`] — `error` / `blocked`, or a codex `unknown` while the
+/// hold's reset is still in the future) does not replace the
+/// previous `exhausted` row for the same account; the previous row is carried
+/// forward (trimmed) so a mid-hold transport failure cannot shorten an active
+/// weekly hold to the 6h fixed cooldown. See
+/// [`format_ranking_lines_with_preserve`].
 pub fn write_ranking_atomic(report: &ProbeReport, ranking_path: &Path) -> std::io::Result<()> {
-    super::monitor::write_ranking_text(&format_ranking_lines(report), ranking_path)
+    let preserve = previous_exhausted_rows(ranking_path);
+    super::monitor::write_ranking_text(
+        &format_ranking_lines_with_preserve(report, &preserve, Utc::now()),
+        ranking_path,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1954,6 +2065,281 @@ mod tests {
         assert!(!target.with_extension("ranking.tmp").exists());
     }
 
+    // ---- #14145: a failed probe round must not destroy hold evidence ----
+
+    /// #14145 core: a probe round in which the account's probe fails
+    /// (`error`) must not overwrite the previous round's
+    /// `exhausted||<7d-reset>` row — that row is the only record of the
+    /// weekly hold `bad_tokens::ambiguous_exhaustion_evidence` extends past
+    /// the 6h fixed cooldown, and a bare `error` row carries no reset to
+    /// hold to. The previous row is carried forward verbatim.
+    #[test]
+    fn failed_probe_round_preserves_the_previous_exhausted_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(&target, "agent-1|exhausted||2026-11-24T08:00:00Z\nagent-2|available|0.10\n")
+            .unwrap();
+        // This round: agent-1's probe times out; agent-2 probed fine.
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("agent-1", "error"),
+                AccountResult::new("agent-2", "available"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "agent-1|exhausted||2026-11-24T08:00:00Z\nagent-2|available\n",
+            "the failed round must carry the exhausted hold row forward, not write `error`"
+        );
+    }
+
+    /// #14145, `blocked` variant: a `401` / shape-mismatch round is just as
+    /// evidence-free as a transport failure — the hold row survives it too.
+    #[test]
+    fn blocked_probe_round_preserves_the_previous_exhausted_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(&target, "agent-1|exhausted||2026-11-24T08:00:00Z\n").unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("agent-1", "blocked")],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "agent-1|exhausted||2026-11-24T08:00:00Z\n",
+            "a blocked round must not shorten the recorded hold either"
+        );
+    }
+
+    /// #14145 boundary: positive evidence overwrites as before. A fresh
+    /// `exhausted` row (a successful probe that re-measured the account)
+    /// must replace the previous one, a successful `available` verdict must
+    /// unfreeze a previously-`exhausted` account, and an `error` row whose
+    /// account had NO previous `exhausted` row is written as before (there
+    /// is nothing to preserve).
+    #[test]
+    fn positive_evidence_and_evidence_free_rows_without_a_predecessor_overwrite_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "held|exhausted||2026-11-24T08:00:00Z\nrecovered|exhausted||2026-11-24T09:00:00Z\nplain|available|0.20\n",
+        )
+        .unwrap();
+        // `held` was re-measured this round (fresh verdict + fresh reset);
+        // `recovered` probed fine; `plain`'s probe failed.
+        let mut held = AccountResult::new("held", "exhausted");
+        held.s7d_reset = Some("2026-11-25T10:00:00Z".into());
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                held,
+                AccountResult::new("recovered", "available"),
+                AccountResult::new("plain", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "held|exhausted||2026-11-25T10:00:00Z\nrecovered|available\nplain|error\n",
+        );
+    }
+
+    /// The carried row stays subject to the reader's own credibility gates:
+    /// this test only pins that the writer transports it byte-for-byte, so
+    /// `bad_tokens_tests.rs`' end-to-end regression (hold survives a failed
+    /// round) exercises the same text the reader parses.
+    #[test]
+    fn carried_row_is_byte_identical_even_for_the_empty_util_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        // The steady-state hold row shape (`name|exhausted||reset`) and one
+        // with a utilization, plus surrounding whitespace to prove the trim.
+        fs::write(
+            &target,
+            "  a-1|exhausted|0.02|2026-11-24T08:00:00Z  \nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("a-1", "error"),
+                AccountResult::new("b-2", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "a-1|exhausted|0.02|2026-11-24T08:00:00Z\nb-2|exhausted||2026-11-24T09:00:00Z\n",
+        );
+    }
+
+    // ---- #14265: a codex `unknown` round must not shorten a running hold ----
+
+    fn prev_exhausted(line: &str) -> HashMap<String, String> {
+        HashMap::from([("codex-1".to_string(), line.to_string())])
+    }
+
+    fn unknown_report() -> ProbeReport {
+        ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("codex-1", "unknown")],
+        }
+    }
+
+    fn instant(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// #14265 core: a fresh `unknown` row (the codex path measured nothing)
+    /// keeps the previous `exhausted` row while its reset is in the future.
+    #[test]
+    fn unknown_round_preserves_an_exhausted_row_whose_hold_is_still_running() {
+        let prev = prev_exhausted("codex-1|exhausted||2026-11-24T08:00:00Z");
+        let out = format_ranking_lines_with_preserve(
+            &unknown_report(),
+            &prev,
+            instant("2026-11-20T00:00:00Z"),
+        );
+        assert_eq!(out, "codex-1|exhausted||2026-11-24T08:00:00Z\n");
+    }
+
+    /// #14265: once the recorded reset is past (or exactly `now`) there is no
+    /// credible hold — the fail-open `unknown` row (#8539) is written as before.
+    #[test]
+    fn unknown_round_overwrites_an_exhausted_row_whose_reset_is_past_or_now() {
+        let prev = prev_exhausted("codex-1|exhausted||2026-11-24T08:00:00Z");
+        for now in ["2026-11-24T08:00:00Z", "2026-11-25T00:00:00Z"] {
+            let out = format_ranking_lines_with_preserve(&unknown_report(), &prev, instant(now));
+            assert_eq!(out, "codex-1|unknown\n", "now={now}");
+        }
+    }
+
+    /// #14265: a missing or unparseable reset is not a hold window — fail open.
+    #[test]
+    fn unknown_round_overwrites_an_exhausted_row_with_no_usable_reset() {
+        let now = instant("2026-11-20T00:00:00Z");
+        for line in [
+            "codex-1|exhausted",
+            "codex-1|exhausted||",
+            "codex-1|exhausted||not-a-date",
+            "codex-1|exhausted|0.02|",
+        ] {
+            let out =
+                format_ranking_lines_with_preserve(&unknown_report(), &prev_exhausted(line), now);
+            assert_eq!(out, "codex-1|unknown\n", "line={line}");
+        }
+    }
+
+    /// #14265: an account absent from the previous file, or whose previous row
+    /// was not `exhausted` (so never entered the map), is unchanged; and
+    /// `error` / `blocked` still carry forward even with a past reset (#14145).
+    #[test]
+    fn unknown_without_a_predecessor_and_error_with_a_past_reset_behave_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        fs::write(
+            &target,
+            "was-available|available|0.10\nold-hold|exhausted||2000-01-01T00:00:00Z\n",
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("was-available", "unknown"),
+                AccountResult::new("brand-new", "unknown"),
+                AccountResult::new("old-hold", "error"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "was-available|unknown\nbrand-new|unknown\nold-hold|exhausted||2000-01-01T00:00:00Z\n",
+        );
+    }
+
+    /// #14349: the hold window is bounded above by the reader's credibility
+    /// horizon (`MAX_WEEKLY_RESET_HORIZON_SECS`, 8 d). A reset ~7 d out is
+    /// carried; exactly at the horizon is carried; one second past, or an
+    /// implausible far-future instant, is not (the fail-open `unknown` row is
+    /// written so the profile self-heals).
+    #[test]
+    fn unknown_round_carries_only_within_the_weekly_reset_horizon() {
+        let now = instant("2026-11-20T00:00:00Z");
+        let cases = [
+            ("2026-11-27T00:00:00Z", true),  // 7 d
+            ("2026-11-28T00:00:00Z", true),  // exactly now + 8 d
+            ("2026-11-28T00:00:01Z", false), // now + 8 d + 1 s
+            ("2999-01-01T00:00:00Z", false), // implausible far future
+        ];
+        for (reset, carried) in cases {
+            let line = format!("codex-1|exhausted||{reset}");
+            let out =
+                format_ranking_lines_with_preserve(&unknown_report(), &prev_exhausted(&line), now);
+            let want = if carried {
+                format!("{line}\n")
+            } else {
+                "codex-1|unknown\n".to_string()
+            };
+            assert_eq!(out, want, "reset={reset}");
+        }
+    }
+
+    /// #14349: `error` / `blocked` carry-forward stays unconditional by design
+    /// — the horizon bound applies only to the `unknown` hold window.
+    #[test]
+    fn error_round_still_carries_a_beyond_horizon_reset() {
+        let line = "codex-1|exhausted||2999-01-01T00:00:00Z";
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![AccountResult::new("codex-1", "error")],
+        };
+        let out = format_ranking_lines_with_preserve(
+            &report,
+            &prev_exhausted(line),
+            instant("2026-11-20T00:00:00Z"),
+        );
+        assert_eq!(out, format!("{line}\n"));
+    }
+
+    /// #14265 end-to-end through the on-disk writer with the real clock: an
+    /// in-horizon hold survives an `unknown` round; a far-past one does not,
+    /// and (#14349) neither does an implausible far-future one.
+    #[test]
+    fn write_ranking_atomic_applies_the_unknown_hold_window_against_the_real_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join(".ranking");
+        let in_horizon = (Utc::now() + chrono::Duration::days(3))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let held = format!("held|exhausted||{in_horizon}");
+        fs::write(
+            &target,
+            format!(
+                "{held}\nimplausible|exhausted||2999-01-01T00:00:00Z\npast|exhausted||2000-01-01T00:00:00Z\n"
+            ),
+        )
+        .unwrap();
+        let report = ProbeReport {
+            ranked_at: "x".into(),
+            accounts: vec![
+                AccountResult::new("held", "unknown"),
+                AccountResult::new("implausible", "unknown"),
+                AccountResult::new("past", "unknown"),
+            ],
+        };
+        write_ranking_atomic(&report, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            format!("{held}\nimplausible|unknown\npast|unknown\n"),
+        );
+    }
+
     // ---- discover_tokens ----------------------------------------------
 
     #[test]
@@ -2002,7 +2388,7 @@ mod tests {
     /// #7538: an ambiguous-reason `Exhaustion` entry (does not match
     /// `is_session_limit_reason`) is now probed with its live token too —
     /// exactly like a session-limit-worded entry — so it can accumulate real
-    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_has_reset` to
+    /// `.ranking` evidence for `bad_tokens::ambiguous_exhaustion_evidence` to
     /// act on. Probing alone does not change how long the entry is held; that
     /// is still decided read-side by `blocking_entry_in_dir`.
     #[test]

@@ -193,6 +193,81 @@ fn group_check_without_checkout_is_flagged_and_the_shipped_template_is_clean() {
 }
 
 #[test]
+fn group_check_workflow_run_without_the_job_gate_is_flagged() {
+    let src = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    let r = run(&wf("merge-group-check.yml", src), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(!r.qualified());
+    let detail = &r.findings[0].detail;
+    assert!(detail.contains("workflow_run.event == 'merge_group'"), "{detail}");
+    assert!(detail.contains("head_repository.full_name == github.repository"), "{detail}");
+    assert!(detail.contains("merge-queue-ci.md"), "{detail}");
+    assert_eq!(r.findings[0].code.as_str(), "GROUP_CHECK_UNGATED_WORKFLOW_RUN");
+}
+
+#[test]
+fn group_check_gate_with_only_one_clause_names_the_missing_one() {
+    let base = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    let with_if = |cond: &str| {
+        base.replace(
+            "    name: Merge authorization\n",
+            &format!("    name: Merge authorization\n    if: {cond}\n"),
+        )
+    };
+    let only_event = with_if(
+        "github.event_name == 'merge_group' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group')",
+    );
+    let r = run(&wf("merge-group-check.yml", &only_event), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(r.findings[0].detail.contains("head_repository"), "{}", r.findings[0].detail);
+    assert!(!r.findings[0]
+        .detail
+        .contains("is missing `github.event.workflow_run.event"));
+
+    let only_repo = with_if(
+        "github.event_name == 'merge_group' || (github.event.workflow_run.head_repository.full_name == github.repository)",
+    );
+    let r = run(&wf("merge-group-check.yml", &only_repo), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(
+        r.findings[0]
+            .detail
+            .contains("workflow_run.event == 'merge_group'"),
+        "{}",
+        r.findings[0].detail
+    );
+}
+
+#[test]
+fn group_check_intact_gate_is_clean_whatever_its_spacing_or_quoting() {
+    let base = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    for cond in [
+        // Folded scalar, as the shipped template writes it.
+        ">-\n      github.event_name == 'merge_group' ||\n      (github.event_name == 'workflow_run' &&\n      github.event.workflow_run.event == 'merge_group' &&\n      github.event.workflow_run.head_repository.full_name == github.repository)",
+        // `${{ }}` wrapper, double quotes, no spaces, swapped repo operands.
+        "${{ github.event.workflow_run.event==\"merge_group\" && github.repository==github.event.workflow_run.head_repository.full_name }}",
+    ] {
+        let src = base.replace(
+            "    name: Merge authorization\n",
+            &format!("    name: Merge authorization\n    if: {cond}\n"),
+        );
+        let r = run(&wf("merge-group-check.yml", &src), &[]);
+        assert!(r.findings.is_empty(), "{cond}: {:?}", r.findings);
+    }
+}
+
+#[test]
+fn group_check_without_a_workflow_run_trigger_needs_no_gate() {
+    let src = include_str!("fixtures/group_check_ungated_workflow_run.yml").replace(
+        "  workflow_run:\n    workflows: [\"CI\"]\n    types: [completed]\n    branches: ['gh-readonly-queue/**']\n",
+        "",
+    );
+    assert!(!src.contains("workflow_run"));
+    let r = run(&wf("merge-group-check.yml", &src), &[]);
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+}
+
+#[test]
 fn shipped_group_check_template_pins_permissions_and_recheck_trigger() {
     let template =
         include_str!("../../../defaults/optional/github-workflows/merge-group-check.yml");
@@ -652,4 +727,152 @@ fn installation_permissions_fixture_decides_the_statuses_level() {
     assert_eq!(installation_statuses(&body, "11", None).as_deref(), Some("write"));
     assert_eq!(installation_statuses(&body, "99", None), None, "not listed: unknown");
     assert_eq!(installation_statuses(&json!({"message": "x"}), "42", None), None);
+}
+
+/// Static shape of the `changes` job's fail-open Detect Changes (#13969):
+/// two `paths-filter` attempts pinned identically, both reading the shared
+/// `PR_PATH_FILTERS`, and every path-group output falling open to `'true'`.
+/// String shapes only; the GitHub-side expression semantics are not evaluated.
+fn detect_changes_fail_open_violations(w: &Workflow) -> Vec<String> {
+    const GROUPS: [&str; 4] = ["backend", "mcp", "quickstarts", "scripts"];
+    let mut bad = Vec::new();
+    let Some(job) = w.job("changes") else {
+        return vec!["no `changes` job".to_string()];
+    };
+
+    let filters: Vec<_> = job.steps.iter().filter(|s| s.is_paths_filter()).collect();
+    let ids: Vec<_> = filters.iter().map(|s| s.id.as_deref()).collect();
+    if ids != [Some("filter"), Some("filter-retry")] {
+        bad.push(format!("paths-filter step ids must be [filter, filter-retry], got {ids:?}"));
+    }
+    if filters.windows(2).any(|p| p[0].uses != p[1].uses) {
+        let uses: Vec<_> = filters.iter().map(|s| s.uses.as_deref()).collect();
+        bad.push(format!("paths-filter attempts must share one pinned `uses:`, got {uses:?}"));
+    }
+    for s in &filters {
+        if s.with_value("filters") != Some("${{ env.PR_PATH_FILTERS }}") {
+            bad.push(format!(
+                "step {:?} must read `filters: ${{{{ env.PR_PATH_FILTERS }}}}`, got {:?}",
+                s.id,
+                s.with_value("filters")
+            ));
+        }
+    }
+
+    for g in GROUPS {
+        let Some((_, expr)) = job.outputs.iter().find(|(k, _)| k == g) else {
+            bad.push(format!("output `{g}` is missing"));
+            continue;
+        };
+        // Whitespace-insensitive: collapse runs of blanks and drop the `}}`.
+        let norm = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = norm.trim_end_matches("}}").trim_end();
+        for step in ["filter", "filter-retry"] {
+            let reference = format!("steps.{step}.outputs.{g}");
+            if !body.contains(&reference) {
+                bad.push(format!("output `{g}` does not name `{reference}`: {expr}"));
+            }
+        }
+        if !body.ends_with("|| 'true'") {
+            bad.push(format!("output `{g}` must fail open (end `|| 'true'`): {expr}"));
+        }
+    }
+    bad
+}
+
+const DETECT_CHANGES_OK: &str = r"
+name: CI
+on: [pull_request, push]
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend || steps.filter-retry.outputs.backend || 'true' }}
+      mcp: ${{ steps.filter.outputs.mcp || steps.filter-retry.outputs.mcp || 'true' }}
+      quickstarts: ${{ steps.filter.outputs.quickstarts || steps.filter-retry.outputs.quickstarts || 'true' }}
+      scripts: ${{  steps.filter.outputs.scripts  ||  steps.filter-retry.outputs.scripts  ||  'true'  }}
+    steps:
+      - uses: dorny/paths-filter@aaaa # v4.0.3
+        id: filter
+        with:
+          filters: ${{ env.PR_PATH_FILTERS }}
+      - uses: dorny/paths-filter@aaaa # v4.0.3 - retry
+        id: filter-retry
+        with:
+          filters: ${{ env.PR_PATH_FILTERS }}
+";
+
+#[test]
+fn repo_ci_yml_detect_changes_keeps_the_fail_open_shape() {
+    let src = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.is_empty(), "Detect Changes fail-open drifted (#13969):\n{}", bad.join("\n"));
+}
+
+#[test]
+fn detect_changes_fail_open_fixture_is_clean() {
+    // Also covers different whitespace inside the output expression.
+    assert_eq!(
+        detect_changes_fail_open_violations(&wf("ci.yml", DETECT_CHANGES_OK)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_mismatched_pin() {
+    let src = DETECT_CHANGES_OK.replacen(
+        "paths-filter@aaaa # v4.0.3 - retry",
+        "paths-filter@bbbb # v4.0.4",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("one pinned `uses:`")), "{bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_dropped_true_tail() {
+    let src = DETECT_CHANGES_OK.replacen(
+        "steps.filter-retry.outputs.mcp || 'true'",
+        "steps.filter-retry.outputs.mcp",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(
+        bad.iter()
+            .any(|b| b.contains("output `mcp` must fail open")),
+        "{bad:?}"
+    );
+    assert_eq!(bad.len(), 1, "only the edited group may be flagged: {bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_an_output_missing_the_retry_attempt() {
+    let src = DETECT_CHANGES_OK.replacen("steps.filter-retry.outputs.backend || ", "", 1);
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(
+        bad.iter()
+            .any(|b| b.contains("steps.filter-retry.outputs.backend")),
+        "{bad:?}"
+    );
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_an_inline_filters_block() {
+    // The first attempt carries an inline filter instead of the shared env.
+    let src = DETECT_CHANGES_OK.replacen(
+        "filters: ${{ env.PR_PATH_FILTERS }}",
+        "filters: |\n            backend:\n              - 'src/**'",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("PR_PATH_FILTERS")), "{bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_third_filter_step() {
+    let src = format!(
+        "{DETECT_CHANGES_OK}      - uses: dorny/paths-filter@aaaa # v4.0.3\n        id: extra\n        with:\n          filters: ${{{{ env.PR_PATH_FILTERS }}}}\n"
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("step ids must be")), "{bad:?}");
 }

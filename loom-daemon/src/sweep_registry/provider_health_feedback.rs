@@ -193,9 +193,9 @@ impl SweepRegistry {
             // A sweep that left the registry without an exit-time feedback
             // pass (cancelled, GC'd) must not keep its watcher forever.
             watches.retain(|id, _| {
-                self.entries.get(id).is_some_and(|entry| {
-                    matches!(entry.state, SweepState::Running | SweepState::Pending)
-                })
+                self.entries
+                    .get(id)
+                    .is_some_and(|entry| matches!(entry.state, SweepState::Running))
             });
             watches
                 .entry(sweep_id.to_string())

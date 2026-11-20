@@ -29,7 +29,7 @@ use anyhow::Result;
 use crate::forge_probe::{run, verdict, LiveHttp, RunnerConfig};
 
 #[derive(clap::Args)]
-pub(crate) struct ForgeProbeArgs {
+pub struct ForgeProbeArgs {
     /// Base URL of the instance under qualification
     /// (e.g. `https://gitea.example.com`). Defaults to
     /// `$GITEA_QUAL_INSTANCE_URL`.
@@ -66,7 +66,22 @@ pub(crate) struct ForgeProbeArgs {
 }
 
 impl ForgeProbeArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    /// Whether the parsed invocation is served by `loom-tools`: read-only
+    /// cases only. `--live-write` executes the manifest's write cases and is
+    /// #14396's, not a read (#14429).
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        !self.live_write
+    }
+
+    /// Always `true`: probing a live forge is the command's whole purpose,
+    /// so the tools path always passes the mode gate (design §10.3).
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        true
+    }
+
+    pub fn run(self) -> Result<()> {
         // "Could not run" is exit 2 per the forge-inventory family contract:
         // config/credential gaps print to stderr and exit directly, never
         // through main's error path (which is exit 1).
@@ -141,4 +156,22 @@ impl ForgeProbeArgs {
             std::process::exit(1);
         }
     }
+}
+
+/// Run the probe through the one shared handler. Refuses (exit
+/// [`super::forge_read::EX_WRITE_VERB_NOT_MIGRATED`]) the `--live-write`
+/// form: executing write cases is #14396's, not a read.
+///
+/// # Errors
+/// Whatever [`ForgeProbeArgs::run`] returns; the runner reports its own
+/// failure classes on stderr and exits with the family contract's codes.
+pub fn handle_forge_probe_read_command(args: ForgeProbeArgs) -> Result<()> {
+    if !args.is_read() {
+        eprintln!(
+            "loom-tools forge-probe: `--live-write` executes the write cases and is not \
+             served by loom-tools yet (#14396); use `loom-daemon forge-probe --live-write`."
+        );
+        std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+    }
+    args.run()
 }

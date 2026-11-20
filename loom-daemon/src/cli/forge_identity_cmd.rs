@@ -318,7 +318,12 @@ pub(crate) fn verdict_stale_notice(
 fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Option<Vec<u8>> {
     let repo = repo.unwrap_or("{owner}/{repo}");
     let get = |path: String| {
-        let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+        let out = crate::script_helpers::gh_read(
+            "forge_cmd.listing",
+            &["api", &path, "--paginate"],
+            root,
+            false,
+        );
         out.ok_output().map(|o| o.stdout.clone())
     };
     let comments = get(format!("repos/{repo}/issues/{n}/comments"))?;
@@ -343,9 +348,24 @@ fn gh_comment(c: &Value) -> Value {
 
 /// `forge may-write [--repo R]` (#9548): exit 0 printing the repository to
 /// name on the write, or exit 1 with the refusal on stderr. Never returns.
+///
+/// The probe runs with the per-owner writer route established first
+/// ([`crate::write_scope::may_write_decision_cli`], #13929): when a
+/// `forge.identities.writers[]` entry covers the target owner, the owner's
+/// writer credential is minted, published and registered in-process, so the
+/// probe vets the credential `forge token` could mint — not just the ambient
+/// one.
 pub(crate) fn may_write(repo: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    match crate::write_scope::may_write_from(&cwd, repo.as_deref()) {
+    let ws = workspace();
+    let verdict = crate::write_scope::may_write_decision_cli(
+        &cwd,
+        repo.as_deref(),
+        &crate::write_scope::default_gh(),
+        &ws,
+        &|identity, nwo| mint_as(&ws, identity, nwo, false),
+    );
+    match verdict {
         crate::write_scope::Verdict::Allow(nwo) => {
             println!("{nwo}");
             std::process::exit(0)
@@ -441,7 +461,12 @@ fn adopter(
     root: &Path,
 ) -> Option<String> {
     let path = format!("repos/{repo}/issues/{number}/timeline");
-    let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+    let out = crate::script_helpers::gh_read(
+        "promotion_author.timeline",
+        &["api", &path, "--paginate"],
+        root,
+        false,
+    );
     let events = crate::comment_trust::parse_listing(&out.ok_output()?.stdout)?;
     let edits = body_edits(repo, number, root)?;
     // Timeline actors and editors have no association: map write access or
@@ -452,8 +477,12 @@ fn adopter(
             return known.clone();
         }
         let path = format!("repos/{repo}/collaborators/{login}/permission");
-        let out =
-            crate::script_helpers::run_gh(&["api", &path, "--jq", ".permission"], root, false);
+        let out = crate::script_helpers::gh_read(
+            "promotion_author.permission",
+            &["api", &path, "--jq", ".permission"],
+            root,
+            false,
+        );
         let access = out.ok_output().and_then(|out| {
             matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
                 .then(|| "COLLABORATOR".to_string())
@@ -495,7 +524,12 @@ fn body_edits_args(repo: &str, number: u64) -> Option<Vec<String>> {
 fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Value>> {
     let args = body_edits_args(repo, number)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = crate::script_helpers::run_gh(&args, root, false);
+    let out = crate::script_helpers::gh_route::gh_read_for_repo(
+        "promotion_author.body_edits",
+        &args,
+        root,
+        repo,
+    );
     let json: serde_json::Value = serde_json::from_slice(&out.ok_output()?.stdout).ok()?;
     if json.get("errors").is_some() {
         return None;

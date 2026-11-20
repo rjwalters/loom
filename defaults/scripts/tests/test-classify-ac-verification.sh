@@ -281,6 +281,13 @@ for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
     esac
 done
 assert_eq "0" "$BARE_WORD_FOUND" "no bare single-word phrase is in the vocabulary"
+ERE_METACHAR_FOUND=0
+for phrase in "${OUT_OF_BAND_PHRASES[@]}"; do
+    case "$phrase" in
+        *[\.\[\]\(\)\*\+\?\{\}\|^\$\\]*) ERE_METACHAR_FOUND=1 ;;
+    esac
+done
+assert_eq "0" "$ERE_METACHAR_FOUND" "no vocabulary phrase contains an ERE metacharacter (-qE depends on it)"
 
 # -------- Test 21: forge evidence counts only via the trust filter (#9548) --------
 echo "Test 21: --issue evidence is read through forge trusted-comments, never raw"
@@ -330,6 +337,10 @@ run_classify "## Acceptance Criteria
 
 - [ ] verify the (production run) metrics are archived"
 assert_eq "12" "$CAP_RC" "'(production run)' after punctuation still matches"
+run_classify "## Acceptance Criteria
+
+- [ ] confirm the export lands on the _next run_ of the nightly job"
+assert_eq "12" "$CAP_RC" "_next run_ underscore emphasis is a boundary (#14004)"
 
 # -------- Test 23: the shipped hold notice never embeds a live marker (#13900) --------
 echo "Test 23: the Champion hold notice renders without a live-matchable marker"

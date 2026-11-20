@@ -536,8 +536,7 @@ pub(crate) fn finish_container_stop_with(
 // The registry-level cancellation-latency regression for #8776 (a stalled fake
 // `docker ps` must not delay SIGTERM or an unrelated `get_status`) lives in its
 // own sibling file rather than in `reaper::tests`: both `reaper.rs` and
-// `reaper/tests.rs` sit at the file-size ratchet's ceiling and are frozen
-// (`.loom/docs/file-size-policy.md`), and the contract it pins — that neither
+// `reaper/tests.rs` are already large, and the contract it pins — that neither
 // teardown half touches docker on the caller's thread — is this module's.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic, clippy::expect_used)]

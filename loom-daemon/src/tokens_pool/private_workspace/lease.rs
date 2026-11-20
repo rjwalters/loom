@@ -28,6 +28,20 @@ pub struct Job {
 /// the durable job it belongs to and retired with it.
 pub(super) const ADMISSION: &str = "admission.json";
 
+/// The account is in use (a job holds the lease, or a worker is alive that no
+/// lease names). Typed so an unattended caller can defer — retry on a later
+/// pass — instead of counting a failure; the message is what an operator sees.
+#[derive(Debug)]
+pub struct AccountBusy(pub &'static str);
+
+impl std::fmt::Display for AccountBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AccountBusy {}
+
 /// The open file owns process exclusion; the durable JSON owns uncertainty
 /// after a crash. Never unlink a lock inode: two callers must lock the same one.
 pub(super) struct Lease {
@@ -60,7 +74,10 @@ impl Lease {
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join("account.lock"))?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            bail!("account session is busy; role, sweep, interactive and lifecycle operations share one exclusive lease");
+            return Err(AccountBusy(
+                "account session is busy; role, sweep, interactive and lifecycle operations share one exclusive lease",
+            )
+            .into());
         }
         Ok(Self {
             _file: file,

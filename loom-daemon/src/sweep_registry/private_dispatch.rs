@@ -8,6 +8,21 @@ pub(crate) struct PreparedLaunch {
     pub selection: Option<Selection>,
 }
 
+/// The selection the preference walk left held, and the model it was selected
+/// for, for the launch to use. A contained admission always holds one; a
+/// host-admitted Codex candidate can too (`reserve_seat`, #14481), and is
+/// consumed here rather than dropped and prepared a second time (#14512).
+pub(crate) fn take_held(
+    containment: &mut Preparer<'_>,
+    contained: bool,
+) -> Result<Option<(Selection, Option<String>)>> {
+    let held = containment.take();
+    if contained && held.is_none() {
+        anyhow::bail!("contained admission lost its prepared private selection");
+    }
+    Ok(held)
+}
+
 pub(crate) fn prepare(
     registry: &Arc<Mutex<SweepRegistry>>,
     kind: &SweepKind,
@@ -85,29 +100,27 @@ pub(crate) fn prepare(
         .admitted
         .as_ref()
         .is_some_and(|admitted| admitted.execution.is_some());
-    let (selection, resolved) = if contained {
-        let (selection, model) = containment
-            .take()
-            .context("contained admission lost its prepared private selection")?;
-        (Some(selection), model)
-    } else {
-        // Nothing was contained: release any transient lease the walk took and
-        // fall back to the unchanged preparation path.
-        drop(containment);
-        let resolved = model.resolve(&config, kind, admission.admitted.as_ref());
-        let selection = Selection::prepare(
-            &config.workspace_root,
-            admission
-                .admitted
-                .as_ref()
-                .map_or("claude", |a| a.runtime.as_str()),
-            resolved.as_deref(),
-            JobKind::Sweep,
-            issue,
-            &owner,
-        )?;
-        (selection, resolved)
-    };
+    let (selection, resolved) =
+        if let Some((selection, model)) = take_held(&mut containment, contained)? {
+            (Some(selection), model)
+        } else {
+            // Nothing was held: release any transient lease the walk took and
+            // fall back to the unchanged preparation path.
+            drop(containment);
+            let resolved = model.resolve(&config, kind, admission.admitted.as_ref());
+            let selection = Selection::prepare(
+                &config.workspace_root,
+                admission
+                    .admitted
+                    .as_ref()
+                    .map_or("claude", |a| a.runtime.as_str()),
+                resolved.as_deref(),
+                JobKind::Sweep,
+                issue,
+                &owner,
+            )?;
+            (selection, resolved)
+        };
     Ok(Some(PreparedLaunch {
         admission,
         model: resolved,
@@ -218,7 +231,6 @@ mod tests {
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         };
         registry.entries.insert(entry.sweep_id.clone(), entry);
         let registry = Arc::new(Mutex::new(registry));
@@ -251,5 +263,24 @@ mod tests {
             }
             _ => panic!("idempotency retry prepared or spawned a new job"),
         }
+    }
+
+    fn empty() -> Preparer<'static> {
+        Preparer::new(
+            std::path::Path::new("."),
+            JobKind::Sweep,
+            None,
+            "owner".into(),
+            Box::new(|_, _| None),
+        )
+    }
+
+    #[test]
+    fn nothing_held_falls_back_unless_the_admission_was_contained() {
+        assert!(take_held(&mut empty(), false).unwrap().is_none());
+        let error = take_held(&mut empty(), true)
+            .err()
+            .expect("contained needs a selection");
+        assert!(error.to_string().contains("contained admission lost"), "{error}");
     }
 }

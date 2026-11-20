@@ -3,11 +3,7 @@
 //! [`super::sample_host_health`] as fed by
 //! [`crate::fleet_captain::record_shell_arm`].
 //!
-//! A sibling module rather than more lines in `collector/tests.rs`, which sits
-//! at the 1000-code-line ratchet threshold
-//! (`scripts/check-file-size-budget.sh`) — the file-size policy's preferred
-//! remedy is "put the new code in a new sibling module", not "trim something
-//! unrelated to make room".
+//! A sibling module rather than more lines in `collector/tests.rs`.
 
 use super::*;
 

@@ -51,7 +51,11 @@
 //! ([`on_reaper_tick`]); at most one heartbeat per [`HEARTBEAT_GAP`] goes out
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
-//! fallback the heartbeat is the probe that ends it.
+//! fallback the heartbeat is the probe that ends it. The answer may carry the
+//! captain's token-pool probe snapshot (#13942), which the worker stores
+//! beside its pool as the fleet sidecar for the evidence readers
+//! ([`crate::tokens_pool::fleet_probe`]) — absent on an old captain or an
+//! unreachable one, where the worker keeps its own evidence untouched.
 //!
 //! A repo whose live set has not been refreshed for [`live_stale_after`]
 //! (its workspace was deregistered and its reaper aborted, so neither its
@@ -73,7 +77,8 @@ use super::client::{self, CallError, CallFacts};
 use super::fallback::{self, Hysteresis, Mode, Transition};
 use super::proto::{
     self, AckResponse, ClaimRequest, ClaimResponse, HeartbeatRequest, HeartbeatResponse, LiveStep,
-    NextRequest, NextResponse, RefusalReason, RefuseRequest, ReleaseRequest,
+    NextRequest, NextResponse, ParkEndCause, ParkEndedRequest, RefusalReason, RefuseRequest,
+    ReleaseRequest,
 };
 use crate::step_role::StepRole;
 
@@ -267,6 +272,10 @@ struct State {
     /// Grants the captain offered in answer to a `next` that no claim has
     /// consumed yet (#12817).
     offered: Vec<Grant>,
+    /// Items the captain ordered this host to park (#13919), by the repo
+    /// root of the step whose release it answered. The reaper tick drains
+    /// them ([`take_park_orders`]).
+    park_orders: HashMap<PathBuf, Vec<u32>>,
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -281,7 +290,7 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 /// is a failure like any other, and it is logged at ERROR: the server does
 /// not map this host's tailnet node to its `host_id`, a fleet config error
 /// that must be loud (#12450 refinement 7).
-fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
+pub(super) fn observe(ok: bool, failure: Option<&CallError>) -> Mode {
     if let Some(CallError::Status(403)) = failure {
         log::error!(
             "fleet_dispatch: the captain refused this host's identity (HTTP 403): its tailnet \
@@ -315,14 +324,14 @@ pub fn mode() -> Mode {
     state().hysteresis.mode()
 }
 
-fn host_id() -> String {
+pub(super) fn host_id() -> String {
     crate::host_identity::host_identity()
 }
 
 /// `owner/name` of `root`, without a forge call.
 fn repo_of(root: &Path) -> String {
     crate::observability::ops::dispatch_facts::repo_for_root(root)
-        .unwrap_or_else(|| crate::peer_claims::repo_slug(root))
+        .unwrap_or_else(|| crate::host_identity::repo_slug(root))
 }
 
 /// A claim answer, typed.
@@ -454,10 +463,25 @@ where
     Req: serde::Serialize + Send + Sync + 'static,
     Resp: serde::de::DeserializeOwned + Send + 'static + Epoch,
 {
+    send_detached_then::<Req, Resp>(url, path, body, facts, |_| {});
+}
+
+/// [`send_detached`], also handing a good answer to `on_ok`.
+fn send_detached_then<Req, Resp>(
+    url: &str,
+    path: &str,
+    body: Req,
+    facts: CallFacts,
+    on_ok: impl FnOnce(&Resp) + Send + 'static,
+) where
+    Req: serde::Serialize + Send + Sync + 'static,
+    Resp: serde::de::DeserializeOwned + Send + 'static + Epoch,
+{
     client::post_detached::<Req, Resp>(url, path, body, move |answer, latency| {
         let mut facts = CallFacts { latency, ..facts };
         match answer {
             Ok(resp) => {
+                on_ok(&resp);
                 observe(true, None);
                 facts.status = Some(200);
                 facts.result = client::RESULT_OK;
@@ -529,7 +553,41 @@ pub fn release(sweep_id: &str, outcome: &str) {
     let Some(assigned) = state().assignments.remove(sweep_id) else {
         return;
     };
-    send_release(&assigned.grant, outcome);
+    send_release(&assigned.grant, outcome, Some(assigned.root));
+}
+
+/// The items the captain ordered this host to park for the repo at `root`
+/// (#13919), each once. The caller makes the park: a forge write that stays
+/// the worker's (ADR-0027 §8).
+pub fn take_park_orders(root: &Path) -> Vec<u32> {
+    state().park_orders.remove(root).unwrap_or_default()
+}
+
+/// The park of `item` in the repo at `root` ended on this host (its
+/// quarantine TTL ran out, or an operator cleared it), or the captain ordered
+/// one and this host made none (#13919): tell the captain, so it stops
+/// refusing claims for the item and forgets its fast-fail streak. `cause`
+/// says which: only an operator's clear ([`ParkEndCause::Cleared`]) also lifts
+/// the captain's no-progress hold (#14047). Sent without waiting. A no-op outside fleet mode; a call that gets no answer
+/// leaves the captain's own bound on the hold
+/// ([`super::table::FAST_FAIL_PARK_HOLD`]) to end it.
+pub fn park_ended(root: &Path, item: u32, cause: ParkEndCause) {
+    let Some(url) = host_endpoint(root) else {
+        return;
+    };
+    let body = ParkEndedRequest {
+        host_id: host_id(),
+        repo: repo_of(root),
+        item: u64::from(item),
+        cause,
+    };
+    let facts = CallFacts {
+        endpoint: proto::PARK_ENDED_PATH,
+        repo: Some(body.repo.clone()),
+        item: Some(body.item),
+        ..CallFacts::default()
+    };
+    send_detached::<_, AckResponse>(&url, proto::PARK_ENDED_PATH, body, facts);
 }
 
 /// This host is being lost (#12876): release every assignment it holds with
@@ -541,12 +599,12 @@ pub fn release_all(outcome: &str) -> usize {
         .map(|a| a.grant)
         .collect();
     for grant in &grants {
-        send_release(grant, outcome);
+        send_release(grant, outcome, None);
     }
     grants.len()
 }
 
-fn send_release(grant: &Grant, outcome: &str) {
+fn send_release(grant: &Grant, outcome: &str, root: Option<PathBuf>) {
     let body = ReleaseRequest {
         host_id: host_id(),
         assignment_id: grant.assignment_id.clone(),
@@ -561,7 +619,18 @@ fn send_release(grant: &Grant, outcome: &str) {
         assignment_id: Some(grant.assignment_id.clone()),
         ..CallFacts::default()
     };
-    send_detached::<_, AckResponse>(&grant.url, proto::RELEASE_PATH, body, facts);
+    let item = u32::try_from(grant.item).ok();
+    send_detached_then::<_, AckResponse>(
+        &grant.url,
+        proto::RELEASE_PATH,
+        body,
+        facts,
+        move |ack| {
+            if let (true, Some(root), Some(item)) = (ack.park, root, item) {
+                state().park_orders.entry(root).or_default().push(item);
+            }
+        },
+    );
 }
 
 /// The step tick's view of this host: its free slots and the roles whose
@@ -664,14 +733,34 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
         (vanished, heartbeat)
     };
     for grant in &vanished {
-        send_release(grant, "failed");
+        send_release(grant, "failed", None);
     }
     if let Some((url, request)) = heartbeat {
         let facts = CallFacts {
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        send_detached::<_, HeartbeatResponse>(&url, proto::HEARTBEAT_PATH, request, facts);
+        // #13942: the pool the snapshot lands in is a host-level fact, so it
+        // resolves from the daemon workspace (`host_root`) the same way the
+        // endpoint does, falling back to the ticking repo's root before one
+        // is named.
+        let probe_root = state()
+            .host_root
+            .clone()
+            .unwrap_or_else(|| root.to_path_buf());
+        send_detached_then::<_, HeartbeatResponse>(
+            &url,
+            proto::HEARTBEAT_PATH,
+            request,
+            facts,
+            move |resp| {
+                let Some(snapshot) = &resp.token_probe else {
+                    return;
+                };
+                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+            },
+        );
     }
 }
 

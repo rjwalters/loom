@@ -60,6 +60,43 @@ enum FleetDispatchCommand {
         #[arg(long)]
         no_captain_gate: bool,
     },
+    /// Take or give back the captain-hosted fleet issue-filing lock (#13918).
+    /// The shell filer (`lib/filing-lock.sh`) calls it after taking the
+    /// host-local lock. With fleet mode off, an unreachable captain or an
+    /// older captain it exits 0 and prints nothing: file under the local lock.
+    #[command(subcommand)]
+    FilingLock(FilingLockCommand),
+}
+
+/// Exit code of a filing acquire that gave up waiting: `EX_TEMPFAIL`, the one
+/// `create-issue.sh` already returns for a deferred burst.
+const EXIT_DEFERRED: i32 = 75;
+
+#[derive(Subcommand)]
+enum FilingLockCommand {
+    /// Ask the captain for the fleet filing slot, waiting up to `--wait-secs`.
+    /// Prints the holder id on stdout when it is granted (pass it to
+    /// `release`), nothing when the captain is off or unreachable (exit 0, file
+    /// under the local lock), and exits 75 when the slot stayed held (do not
+    /// file).
+    Acquire {
+        /// What is being filed, for the captain's log.
+        #[arg(long, default_value = "issue-filing")]
+        label: String,
+        /// Longest wait while another host holds the slot, seconds.
+        #[arg(long, default_value_t = crate::filing_lock::DEFAULT_WAIT_SECS)]
+        wait_secs: u64,
+        /// Re-ask under this holder id: refreshes a grant's TTL.
+        #[arg(long)]
+        holder: Option<String>,
+    },
+    /// Give the slot back. Always exits 0: a failed unlock is freed by the
+    /// captain's TTL.
+    Release {
+        /// The holder id `acquire` printed.
+        #[arg(long)]
+        holder: String,
+    },
 }
 
 impl FleetDispatchArgs {
@@ -86,8 +123,90 @@ impl FleetDispatchArgs {
                 )
                 .await
             }
+            FleetDispatchCommand::FilingLock(cmd) => filing_lock(cmd).await,
         }
     }
+}
+
+/// `fleet-dispatch filing-lock …` (module docs of
+/// [`crate::fleet_dispatch::filing`]).
+async fn filing_lock(cmd: FilingLockCommand) -> Result<()> {
+    use crate::fleet_dispatch::filing::{self, Hold, Tier};
+    let root = filing::workspace_root();
+    // A one-shot process: daemon startup never runs here, so without the
+    // setup below every span `filing::acquire`/`release` records and every
+    // `log::warn!` it emits is dropped — the fail-open the fleet tier exists
+    // to make loud would be silent on the shell path (#14129). Register the
+    // standalone ops sink over this process's own queue files (the watchdog's
+    // short-lived treatment, #12806) and drain them once at exit; what does
+    // not flush stays queued, retried by the next filing's flush.
+    init_stderr_logger();
+    let config = crate::observability::read_config(&root);
+    let export_in_process =
+        crate::observability::standalone_ops::register_sink(&config, &root, FILING_QUEUE_TAG);
+    let mut deferred: Option<i32> = None;
+    match cmd {
+        FilingLockCommand::Acquire {
+            label,
+            wait_secs,
+            holder,
+        } => {
+            let holder = holder.unwrap_or_else(filing::new_holder);
+            let root = root.clone();
+            let tier = tokio::task::spawn_blocking(move || {
+                filing::acquire(&root, &label, &holder, Duration::from_secs(wait_secs))
+            })
+            .await
+            .map_err(|e| anyhow!("filing-lock acquire task failed: {e}"))?;
+            match tier {
+                Tier::Granted(hold) => println!("{}", hold.holder),
+                Tier::Off | Tier::FailOpen { .. } => {}
+                Tier::Deferred { reason } => {
+                    eprintln!("filing-lock: deferred: {reason}");
+                    deferred = Some(EXIT_DEFERRED);
+                }
+            }
+        }
+        FilingLockCommand::Release { holder } => {
+            if let Some(url) = filing::endpoint(&root) {
+                tokio::task::spawn_blocking(move || filing::release(&Hold::new(&url, &holder)))
+                    .await
+                    .map_err(|e| anyhow!("filing-lock release task failed: {e}"))?;
+            }
+        }
+    }
+    if export_in_process {
+        // Best-effort: what does not drain stays queued (Queued), retried by
+        // the next filing's flush.
+        let _ = crate::observability::standalone_ops::flush_pending(
+            &config,
+            &root,
+            FILING_QUEUE_TAG,
+            FILING_FLUSH_TIMEOUT,
+        );
+    }
+    if let Some(code) = deferred {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// The filing-lock CLI's queue-file tag, distinct from the captain server's
+/// and the watchdog's, so a queue left behind by a flush that ran out of time
+/// is retried by the next filing's flush, never mixed with theirs.
+const FILING_QUEUE_TAG: &str = "filing-lock";
+
+/// Longest the one-shot export may block the shell filer: the watchdog's
+/// bound (`watchdog::loom_ui::EXPORT_TIMEOUT`). A slower exporter keeps the
+/// spans queued; the next filing flushes them.
+const FILING_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stderr logger for the one-shot subcommand (the daemon's `setup_logging`
+/// targets its own log file and never runs here). Normal grants and releases
+/// print nothing; a fail-open or a failed unlock warns. `RUST_LOG` overrides.
+fn init_stderr_logger() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 }
 
 /// The `--no-progress-cooldown-secs` ladder: one to four whole seconds,
@@ -161,13 +280,18 @@ async fn serve(
     )
     .with_no_progress(no_progress);
     let epoch = fleet_dispatch::new_epoch();
-    let server = Arc::new(Server::new(
-        TailscaleWhois::new(tailscale_socket),
-        Arc::new(SystemClock::start()),
-        roster,
-        policy,
-        epoch.clone(),
-    ));
+    let server = Arc::new(
+        Server::new(
+            TailscaleWhois::new(tailscale_socket),
+            Arc::new(SystemClock::start()),
+            roster,
+            policy,
+            epoch.clone(),
+        )
+        // #13942: every heartbeat answer publishes the captain's own pool
+        // probe, so fleet workers converge on one probe result.
+        .with_token_probe(crate::tokens_pool::paths::resolve_tokens_dir(&root)),
+    );
     let opts = Options::default();
     let listener = tokio::net::TcpListener::bind((addr, port))
         .await

@@ -555,6 +555,7 @@ fn ported_extract_refs_diverges_from_the_retired_shell_only_in_known_ways() {
                         login: login.clone(),
                     },
                     body: body.clone(),
+                    ..Comment::default()
                 })
                 .collect(),
         };

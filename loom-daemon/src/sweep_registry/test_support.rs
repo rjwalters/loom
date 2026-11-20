@@ -574,7 +574,6 @@ pub(crate) fn insert_clean_exit_running(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     registry.children.insert(sweep_id.clone(), child);
@@ -692,7 +691,6 @@ pub(crate) fn insert_running_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -733,7 +731,6 @@ pub(crate) fn insert_running_with_pid_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -798,7 +795,6 @@ pub(crate) fn insert_dead_running_at(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
     sweep_id
@@ -1285,7 +1281,6 @@ pub(crate) fn insert_terminal_issue(
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 }
@@ -1386,7 +1381,7 @@ pub(crate) fn running_issue_sweep_id(reg: &SweepRegistry, issue: u32) -> Option<
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(i.kind, SweepKind::Issue(n) if n == issue)
         })
         .map(|i| i.sweep_id.clone())
@@ -1399,7 +1394,7 @@ pub(crate) fn running_prset_sweep_id(reg: &SweepRegistry, prs: &[u32]) -> Option
     reg.entries
         .values()
         .find(|i| {
-            matches!(i.state, SweepState::Running | SweepState::Pending)
+            matches!(i.state, SweepState::Running)
                 && matches!(&i.kind, SweepKind::PrSet(set) if set.as_slice() == prs)
         })
         .map(|i| i.sweep_id.clone())
@@ -2108,11 +2103,7 @@ pub(crate) fn lease_order_dispatch_registry(
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
              if [[ -f \"{store}\" ]]; then\n\
-             while IFS= read -r line; do\n\
-             [[ -z \"$line\" ]] && continue\n\
-             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
-             printf '%s\\n' \"$line\"\n\
-             done < \"{store}\"\n\
+             jq -cs \"${{@: -1}}\" < \"{store}\" || exit $?\n\
              fi\n\
              exit 0\n\
              fi\n\
@@ -2171,6 +2162,14 @@ pub(crate) fn lease_order_dispatch_registry(
     config.skip_label_flip = false; // exercise the real flip + lease-order path
     config.journal_path = Some(ws.join("test-sweeps-journal.json"));
     (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
+}
+
+/// A posted yield is an issue-comment write. The read projection also names
+/// the marker, so searching the whole invocation log would match a read.
+pub(crate) fn posted_lease_yield(gh_calls: &str) -> bool {
+    gh_calls
+        .lines()
+        .any(|line| line.starts_with("issue comment ") && line.contains("<!-- loom:lease-yield "))
 }
 
 /// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the
@@ -2358,7 +2357,6 @@ pub(crate) fn insert_dead_running_entry(reg: &mut SweepRegistry, issue: u32, swe
             effort: None,
             depends_on: None,
             repo: None,
-            overflow: false,
         },
     );
 }

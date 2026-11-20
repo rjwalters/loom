@@ -469,6 +469,15 @@ pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-
 check "trailing-newline body hash: exit 0" 0 "$RC"
 check "trailing-newline body hash: posted" 12614 "$POSTED"
 
+# #13992: a body that itself ends in a newline makes `gh api --jq .body |
+# sha256sum` hash TWO trailing newlines; that form is accepted too.
+echo '{"body":"the design as reviewed\n"}' > "$STUB_DIR/issue-50.json"
+NL2_HASH="$(printf '%s\n\n' 'the design as reviewed' | sha256sum | cut -d' ' -f1)"
+state "[]" loom:review-requested loom:reviewing
+pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$NL2_HASH"
+check "double-newline body hash (body itself ends in newline): exit 0" 0 "$RC"
+check "double-newline body hash: posted" 12614 "$POSTED"
+
 echo '{"body":"rescoped to a daemon-only design"}' > "$STUB_DIR/issue-50.json"
 state "[]" loom:review-requested loom:reviewing
 pv 12614 approved "$HEAD" --body "Approved: covered by the new tests." --review-started "$PAST_T" --issue-body-sha "50=$OLD_HASH"

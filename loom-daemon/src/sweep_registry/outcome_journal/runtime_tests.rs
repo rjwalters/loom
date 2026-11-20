@@ -117,7 +117,7 @@ fn an_opencode_launch_sources_tokens_by_model_from_the_session_db() {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "CREATE TABLE session (
-                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 id TEXT, model TEXT, tokens_input INTEGER, tokens_output INTEGER,
                  tokens_reasoning INTEGER, tokens_cache_read INTEGER,
                  tokens_cache_write INTEGER, directory TEXT, time_created INTEGER
              );",
@@ -130,8 +130,9 @@ fn an_opencode_launch_sources_tokens_by_model_from_the_session_db() {
             .into_owned();
         let now_ms = Utc::now().timestamp_millis();
         conn.execute(
-            "INSERT INTO session VALUES (?1, 1000, 200, 0, 50, 10, ?2, ?3)",
+            "INSERT INTO session VALUES (?1, ?2, 1000, 200, 0, 50, 10, ?3, ?4)",
             rusqlite::params![
+                "ses_sweep",
                 serde_json::json!({"id": "zai-org/GLM-5.3", "providerID": "friendli"}).to_string(),
                 directory,
                 now_ms,

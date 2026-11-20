@@ -12,9 +12,10 @@
 //! runner's runtime admission and pool gate for that role
 //! (`runtime_admission::resolve_and_admit` then
 //! `role_runner::runtime_preflight::check`, preference walk included), and
-//! the role's model and effort (`roleModels` / `roleEfforts`, the role draw's
-//! model when one picked the tap, #7894's reconciliation, #5028's mismatch
-//! refusal). Only a Builder step keeps the per-issue experiment arm
+//! the role's model, effort and service tier (`roleModels` / `roleEfforts` /
+//! `roleServiceTiers`, the role draw's model when one picked the tap, #7894's
+//! reconciliation, #5028's mismatch refusal). Only a Builder step keeps the
+//! per-issue experiment arm
 //! (`model_dispatch.rs`). A binding whose only unmet requirement is
 //! repository isolation is admitted on private-clone containment (#8787),
 //! as a role run is. A refused gate refuses the step before any claim.
@@ -33,10 +34,6 @@
 //!   sweep id from `LOOM_TERMINAL_ID`; a lease is owned by role, host and
 //!   sweep, the step being metadata (#11950), so it re-attaches to the
 //!   pre-taken lease instead of standing down.
-//!
-//! The `(item, step)` claim is advertised to peers at spawn ([`lease`]), not
-//! only on the reaper's heartbeat, so two hosts cannot draw the same item in
-//! between.
 //!
 //! # Landed work (#12251)
 //!
@@ -64,6 +61,7 @@
 
 use super::*;
 use crate::observability::ops::dispatch_step::{self, StepDispatch};
+use crate::runtime_preference::role_draw::RoleDrawRecord;
 use crate::step_role::StepRole;
 use crate::tokens_pool::private_workspace::{containment::Preparer, JobKind};
 
@@ -159,6 +157,12 @@ pub struct StepRefusal {
     /// Seconds the captain says its hold lasts (`retry_after_s`), for a
     /// `captain_cooldown` refusal that carried one (#12704).
     pub hold_secs: Option<u32>,
+    /// The confirmed writer rate limit behind a `writer_rate_limited`
+    /// refusal (#13746): the typed handoff the claim child emitted, with the
+    /// facts the spawn records as a route hold. `None` for every other
+    /// refusal.
+    pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
+    seat_unavailable: bool,
 }
 
 impl StepRefusal {
@@ -170,7 +174,14 @@ impl StepRefusal {
             assignment_id: None,
             captain: None,
             hold_secs: None,
+            writer_limit: None,
+            seat_unavailable: false,
         }
+    }
+
+    fn with_seat_unavailable(mut self, seat_unavailable: bool) -> Self {
+        self.seat_unavailable |= seat_unavailable;
+        self
     }
 
     /// A refusal of the fleet-dispatch server's (#12450): no forge call ran.
@@ -215,7 +226,12 @@ pub(crate) fn give_back(
     mut refusal: StepRefusal,
 ) -> StepRefusal {
     if let Some(grant) = grant {
-        crate::fleet_dispatch::worker::refuse(grant, refusal.reason);
+        let reason = if refusal.seat_unavailable {
+            crate::session_exec::refusal::SEAT_BUSY_REASON
+        } else {
+            refusal.reason
+        };
+        crate::fleet_dispatch::worker::refuse(grant, reason);
         refusal.assignment_id = Some(grant.assignment_id.as_str().into());
     }
     refusal
@@ -234,6 +250,13 @@ pub(crate) struct StepLaunch {
     pub(crate) admission: crate::runtime_preference::DispatchAdmission,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    /// The configured model before any selection-time fallback (#13873);
+    /// `Some` exactly when [`Self::model`] was resolved. Telemetry's
+    /// `loom.step.model_configured`.
+    pub(crate) model_configured: Option<String>,
+    /// The selection-time fallback that changed configured → launched
+    /// (#13873), when one fired.
+    pub(crate) model_fallback: Option<crate::sweep_registry::model_fallback::ModelFallbackDecision>,
     /// A private-clone containment selection (#8787), when admission needed
     /// one; the launch uses exactly it.
     pub(crate) selection: Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
@@ -246,6 +269,7 @@ pub struct PreparedStep {
     pub child: Child,
     pub header_anchor: String,
     pub log_path: PathBuf,
+    rejection: Option<crate::worker_spawn::rejection::Receiver>,
     request: StepSpawnRequest,
     sweep_id: SweepId,
     launch: StepLaunch,
@@ -279,11 +303,18 @@ pub(crate) fn landed_refusal(item: u32, pr: u32) -> StepRefusal {
 
 /// Map a role tick's pre-spawn refusal to a step refusal. Pure.
 pub(crate) fn refusal_of(outcome: &crate::role_runner::RoleTickOutcome) -> StepRefusal {
-    use crate::role_runner::RoleTickOutcome as O;
+    use crate::role_runner::{CredentialPool, PoolHold, RoleTickOutcome as O};
     match outcome {
         O::NoTokenPool => StepRefusal::new("no_token_pool", "no credential pool for the runtime"),
-        O::PoolExhausted { .. } => StepRefusal::new("pool_exhausted", format!("{outcome:?}")),
-        O::RuntimeRejected(rejection) => StepRefusal::new("runtime_rejected", &rejection.reason),
+        O::PoolExhausted { pool, hold, .. } => {
+            StepRefusal::new("pool_exhausted", format!("{outcome:?}")).with_seat_unavailable(
+                *pool == CredentialPool::CodexAccounts
+                    && matches!(hold, PoolHold::SelfHealing | PoolHold::Unprovisioned),
+            )
+        }
+        O::RuntimeRejected(rejection) => {
+            StepRefusal::new("runtime_rejected", rejection.refusal_line())
+        }
         O::ModelRuntimeMismatch(mismatch) => {
             StepRefusal::new("model_runtime_mismatch", mismatch.detail())
         }
@@ -375,8 +406,6 @@ impl SweepRegistry {
             self.acquire_lock(item, &sweep_id)
         };
         locked.map_err(|e| StepRefusal::new("claimed", format!("{e:#}")))?;
-        // Advertise at spawn, before any forge write (#11906 review item 4).
-        self.publish_step_claim(peer_claims::ClaimKind::Advertise, item, role);
         let claim = match self.pre_claim_step(item, role, &sweep_id) {
             Ok(claim) => claim,
             Err(refusal) => {
@@ -458,9 +487,10 @@ impl SweepRegistry {
             spawn(self)
         };
         match spawned {
-            Ok((child, header_anchor)) => Ok(PreparedStep {
-                child,
-                header_anchor,
+            Ok(spawned) => Ok(PreparedStep {
+                child: spawned.child,
+                header_anchor: spawned.header_anchor,
+                rejection: spawned.rejection,
                 log_path,
                 request: request.clone(),
                 sweep_id,
@@ -611,15 +641,17 @@ impl SweepRegistry {
         Err(self.roll_back_builder_claim(item, sweep_id, wrote, &loss, episode_start, refusal))
     }
 
-    /// Undo a step's claim: the peer advertisement, the forge claim when one
-    /// was taken (`claimed`), and the lock.
+    /// Undo a step's claim: the forge claim when one was taken (`claimed`), and
+    /// the lock.
     fn unwind_step_claim(&mut self, item: u32, role: StepRole, sweep_id: &str, claimed: bool) {
-        self.publish_step_claim(peer_claims::ClaimKind::Retract, item, role);
         if claimed && !self.config.skip_label_flip {
             match role {
                 StepRole::Builder => {
-                    let _ = self.restore_label_to_ready(item);
+                    if let Err(e) = self.restore_step_claim(item, role, sweep_id) {
+                        log::warn!("Builder spawn failure on #{item}: claim restore failed: {e:#}");
+                    }
                     self.note_label_flip(item);
+                    self.yield_finished_builder_lease(item, sweep_id, "spawn_failed");
                 }
                 _ => self.reap_step_leases(sweep_id, "spawn_failed"),
             }
@@ -646,6 +678,7 @@ impl SweepRegistry {
         let PreparedStep {
             child,
             log_path,
+            rejection,
             request,
             sweep_id,
             mut launch,
@@ -695,6 +728,9 @@ impl SweepRegistry {
             );
         }
         self.children.insert(sweep_id.clone(), child);
+        if let Some(receiver) = rejection {
+            self.launch_rejections.insert(sweep_id.clone(), receiver);
+        }
         let admitted = launch.admission.admitted.as_ref();
         self.entries.insert(
             sweep_id.clone(),
@@ -716,7 +752,6 @@ impl SweepRegistry {
                 effort: launch.effort.clone(),
                 depends_on: None,
                 repo: Some(self.config.workspace_root.display().to_string()),
-                overflow: false,
             },
         );
         if let Some(points) = request.story_points {
@@ -754,8 +789,20 @@ impl SweepRegistry {
             Some(dispatch_step::StepModels {
                 selected: selected.as_deref(),
                 launched: launch.model.as_deref(),
+                configured: launch.model_configured.as_deref(),
+                fallback: launch.model_fallback.as_ref().map(|f| {
+                    dispatch_step::StepModelFallback {
+                        from: f.from.as_str(),
+                        reason: f.reason,
+                    }
+                }),
             }),
             assignment.as_ref().and_then(|g| g.lineage.as_ref()),
+            admitted.map(|a| a.runtime.as_str()),
+            launch.effort.as_deref(),
+            admitted
+                .and_then(|a| a.preference.as_ref())
+                .and_then(|p| p.draw.as_deref()),
         );
         if let Some(grant) = assignment {
             crate::fleet_dispatch::worker::note_spawned(
@@ -801,11 +848,15 @@ impl SweepRegistry {
             captain,
             None,
             None,
+            None,
+            None,
+            None,
         );
     }
 
     /// [`Self::record_step_dispatch`] with the selected and launched models
-    /// of a spawned step (#12748).
+    /// of a spawned step (#12748), plus the runtime and effort the launch
+    /// resolves (#14167).
     #[allow(clippy::too_many_arguments)]
     fn record_step_dispatch_with(
         &self,
@@ -818,6 +869,9 @@ impl SweepRegistry {
         captain: Option<&crate::fleet_dispatch::worker::Refusal>,
         models: Option<dispatch_step::StepModels<'_>>,
         lineage: Option<&crate::fleet_dispatch::worker::GrantLineage>,
+        runtime: Option<&str>,
+        effort: Option<&str>,
+        role_draw: Option<&RoleDrawRecord>,
     ) {
         dispatch_step::record(
             &self.config.workspace_root,
@@ -837,6 +891,9 @@ impl SweepRegistry {
                 lineage,
                 captain,
                 models,
+                runtime,
+                effort,
+                role_draw,
             },
         );
     }
@@ -848,9 +905,7 @@ impl SweepRegistry {
         use crate::observability::ops::busy_slots::{self, LiveStep, LiveSteps};
         let mut running = LiveSteps::new();
         for info in self.entries.values() {
-            if let (SweepKind::Step { role, .. }, SweepState::Running | SweepState::Pending) =
-                (&info.kind, &info.state)
-            {
+            if let (SweepKind::Step { role, .. }, SweepState::Running) = (&info.kind, &info.state) {
                 running.entry(role.role_name()).or_default().push(LiveStep {
                     started_at: info.started_at,
                     points: self.step_points(&info.sweep_id),
@@ -884,17 +939,22 @@ impl SweepRegistry {
         use crate::role_runner::model_resolution as models;
         let root = &config.workspace_root;
         let name = role.role_name();
-        let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
         if config.skip_label_flip {
+            // No runtime is admitted here, so only the runtime-independent tiers apply.
+            let effort = non_empty(models::resolve_role_runner_effort(root, name).0);
             // Hermetic fixtures install no runtime manifests.
             let model = match role {
                 StepRole::Builder => DispatchModel::Autonomous.resolve(config, kind, None),
                 _ => non_empty(models::resolve_role_runner_model(root, name).0),
             };
+            let (model, model_configured, model_fallback) =
+                with_model_fallback(root, kind, role, model);
             return Ok(StepLaunch {
                 admission: crate::runtime_preference::DispatchAdmission::none(),
                 model,
                 effort,
+                model_configured,
+                model_fallback,
                 selection: None,
             });
         }
@@ -953,12 +1013,15 @@ impl SweepRegistry {
             if matches!(outcome, crate::role_runner::RoleTickOutcome::PoolExhausted { .. }) {
                 log::info!("sweep_registry: the {name} pool is exhausted; steps refused (#11906)");
             }
-            refusal_of(&outcome)
+            refusal_of(&outcome).with_seat_unavailable(containment.seat_unavailable())
         })?;
         let selection = containment.take().map(|(selection, _)| selection);
         let admitted = match chosen.admitted.map_or(statically, Ok) {
             Ok(admitted) => admitted,
-            Err(rejection) => return Err(StepRefusal::new("runtime_rejected", rejection.reason)),
+            Err(rejection) => {
+                return Err(StepRefusal::new("runtime_rejected", rejection.refusal_line())
+                    .with_seat_unavailable(containment.seat_unavailable()));
+            }
         };
         let model = match role {
             StepRole::Builder => {
@@ -984,6 +1047,20 @@ impl SweepRegistry {
                 non_empty(model)
             }
         };
+        // Selection-time fallback (#13873): applied AFTER the mismatch
+        // refusal above, on the final accepted model — a wrong *stated*
+        // intent must keep its refusal; only a class-exhausted pool falls a
+        // launch back a rung. Re-resolved on every spawn, so nothing is
+        // sticky. The runtime-mismatch check already passed for the
+        // configured model, and a Claude-shaped chain rung cannot mismatch a
+        // runtime the configured Claude-shaped model fit.
+        let (model, model_configured, model_fallback) =
+            with_model_fallback(root, kind, role, model);
+        // #14017: effort is resolved once the runtime is admitted, so a
+        // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
+        let effort = non_empty(
+            models::resolve_role_runner_effort_for_runtime(root, name, Some(&admitted.runtime)).0,
+        );
         Ok(StepLaunch {
             admission: crate::runtime_preference::DispatchAdmission {
                 admitted: Some(admitted),
@@ -991,9 +1068,46 @@ impl SweepRegistry {
             },
             model,
             effort,
+            model_configured,
+            model_fallback,
             selection,
         })
     }
+}
+
+/// Apply the selection-time model fallback (#13873) to a resolved launch
+/// model: `(launched, configured, fallback)`.
+fn with_model_fallback(
+    root: &Path,
+    kind: &SweepKind,
+    role: StepRole,
+    model: Option<String>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<crate::sweep_registry::model_fallback::ModelFallbackDecision>,
+) {
+    let Some(configured) = model else {
+        return (None, None, None);
+    };
+    let effective = crate::sweep_registry::model_fallback::effective_model(root, &configured);
+    // In-flight fallback (#13905): a predecessor killed by a model limit
+    // steps this launch down one rung, over whatever selection resolved.
+    let stepped_down = kind.item_number().and_then(|item| {
+        crate::sweep_registry::model_limit_kill::step_down(
+            root,
+            item,
+            role.role_name(),
+            &effective.model,
+            &effective.configured,
+        )
+    });
+    if let Some((model, decision)) = stepped_down {
+        let configured = (!effective.configured.is_empty()).then_some(effective.configured);
+        return (Some(model), configured, Some(decision));
+    }
+    let configured = (!effective.configured.is_empty()).then_some(effective.configured);
+    (non_empty(effective.model), configured, effective.fallback)
 }
 
 /// The step-only environment of a step child (called from
@@ -1001,8 +1115,8 @@ impl SweepRegistry {
 /// in, so a timed-out step's leases are reaped (#11931); the daemon's lease
 /// host id (`LOOM_LEASE_HOST_ID`), so its pre-taken lease is the session's own
 /// wherever the session runs; its pick journal
-/// (#11877's capture); and, for a Curator, the curation provenance the role
-/// runner gives its Curator (`role_runner/launch/curation.rs`).
+/// (#11877's capture), the service tier for its admitted runtime, and the
+/// curation provenance the role runner gives Curator children.
 pub(crate) fn apply_step_env(
     cmd: &mut Command,
     root: &Path,
@@ -1024,7 +1138,18 @@ pub(crate) fn apply_step_env(
         crate::host_identity::LEASE_HOST_ID_ENV,
         crate::host_identity::lease_host_identity(),
     );
-    crate::observability::pick_journal::attach_step(cmd, sweep_id);
+    crate::observability::pick_journal::attach_step(cmd, root, sweep_id);
+    // The admitted runtime can differ from the configured preference. Leave
+    // an inherited tier in place when there is no matching configuration.
+    if let Some((tier, _)) = runtime.and_then(|runtime| {
+        crate::role_runner::resolve_role_runner_service_tier_for_runtime(
+            root,
+            role.role_name(),
+            Some(runtime),
+        )
+    }) {
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     if role == StepRole::Curator {
         cmd.env("LOOM_CURATION_MODEL", model.filter(|m| !m.is_empty()).unwrap_or("unknown"))
             .env("LOOM_CURATION_RUNTIME", runtime.unwrap_or("unknown"));
