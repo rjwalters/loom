@@ -876,6 +876,14 @@ fn payload_surface_covers_everything_the_installer_writes() {
 
     let diff = materialize_with(&embedded, &fresh("probe")).unwrap();
     assert!(diff.changed.is_empty() && diff.removed.is_empty(), "{diff:?}");
+    let policy = ".loom/scripts/ci-docs-only-paths.txt";
+    for path in [policy, ".loom/scripts/ci-docs-only.sh"] {
+        assert!(diff.added.iter().any(|added| added == path), "missing {path}");
+    }
+    assert_eq!(
+        fs::read_to_string(installed.join(policy)).unwrap(),
+        include_str!("../../../defaults/scripts/ci-docs-only-paths.txt")
+    );
     let missed: Vec<&String> = written.iter().filter(|p| !diff.added.contains(p)).collect();
     assert!(missed.is_empty(), "installer writes outside the resync surface: {missed:?}");
     // Beyond that step: the slash commands `init` copies with `.claude/`, and

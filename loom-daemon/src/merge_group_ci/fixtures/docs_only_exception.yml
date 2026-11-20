@@ -1,0 +1,54 @@
+# Offline audit fixture. This is not an installed or enabled workflow.
+name: CI
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  docs_only:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: classify
+        run: >-
+          /opt/trusted/loom-daemon ci-docs-only --root "$GITHUB_WORKSPACE"
+          --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH"
+          --head "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          --workflow-id 18 >> "$GITHUB_OUTPUT"
+  tests:
+    name: Project Tests
+    needs: docs_only
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Conflict markers
+        run: ./scripts/check-conflict-markers
+      - name: Markdown lint
+        run: ./scripts/markdown-lint
+      - name: Links
+        run: ./scripts/check-links
+      - name: Full suites
+        if: ${{ needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true' }}
+        run: ./scripts/test
+  result:
+    name: CI Result
+    needs: [docs_only, tests]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require results
+        if: ${{ needs.docs_only.result != 'success' || needs.tests.result != 'success' }}
+        run: exit 1
