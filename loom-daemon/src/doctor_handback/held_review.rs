@@ -44,9 +44,8 @@ pub(crate) fn candidate(labels: &[String]) -> bool {
     labels.iter().any(|label| label == BLOCKED)
         && labels.iter().any(|label| label == APPROVED)
         && !labels.iter().any(|label| {
-            (label != BLOCKED
-                && crate::claim_reconciliation::VERDICT_HOLD_LABELS.contains(&label.as_str()))
-                || matches!(label.as_str(), "loom:frozen" | CHANGES | REVIEWING)
+            (label != BLOCKED && crate::work_finder::PARK_LABELS.contains(&label.as_str()))
+                || matches!(label.as_str(), CHANGES | REVIEWING)
         })
 }
 
