@@ -111,6 +111,7 @@ mod host;
 pub mod landing_span;
 mod loom_ui;
 mod memory;
+mod provenance;
 mod supersede;
 mod w2;
 pub mod waiver;
