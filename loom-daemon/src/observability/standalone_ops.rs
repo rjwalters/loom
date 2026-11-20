@@ -80,10 +80,11 @@ fn plan(config: &ObservabilityConfig, tag: &str) -> Vec<Planned> {
         if key.is_none() && entry.headers_file.is_none() {
             continue;
         }
-        match otlp::OtlpExporter::with_headers_file(
+        match otlp::OtlpExporter::with_max_batch_bytes(
             endpoint.clone(),
             key.clone(),
             entry.headers_file.as_deref(),
+            entry.max_batch_bytes,
         ) {
             Ok(exporter) => out.push(Planned {
                 index,
@@ -459,6 +460,7 @@ mod tests {
         let key = dir.join("ingest.key");
         std::fs::write(&key, "k\n").unwrap();
         let raw = |endpoint: &str| RawExporterEntry {
+            max_batch_bytes: None,
             kind: "otlp".to_string(),
             endpoint: Some(endpoint.to_string()),
             headers_file: None,

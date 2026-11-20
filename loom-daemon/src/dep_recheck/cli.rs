@@ -34,7 +34,7 @@
 //! and the "never raw forge text" claim that used to stand here was false for
 //! exactly those two lines).
 
-use super::{decide, extract, forge, named, premise, recheck};
+use super::{decide, extract, forge, named, premise, recheck, states};
 use std::path::Path;
 
 /// Which fingerprint is being asked for.
@@ -45,6 +45,7 @@ pub enum Sub {
     NamedDependency,
     ExtractRefs,
     Decide,
+    DepStates,
 }
 
 /// `dep-recheck-fingerprint.sh`'s argv.
@@ -139,6 +140,13 @@ fn dispatch(cwd: &Path, sub: Sub, opts: &Opts, stdin_text: Option<&str>) -> Resu
     }
 
     if opts.stdin {
+        if sub == Sub::DepStates {
+            return Err(die(
+                "dep-states is live-only: --stdin is not supported (the binding-verified \
+                 forge read IS the check this subcommand exists to perform, #14710)",
+                EX_USAGE,
+            ));
+        }
         if opts.number.is_some() {
             return Err(die("--stdin and --number are mutually exclusive", EX_USAGE));
         }
@@ -150,6 +158,16 @@ fn dispatch(cwd: &Path, sub: Sub, opts: &Opts, stdin_text: Option<&str>) -> Resu
         // independently; it never needs the parent issue's own number.
         if opts.refs.as_deref().unwrap_or("").is_empty() {
             return Err(die("one of --refs or --stdin is required", EX_USAGE));
+        }
+    } else if sub == Sub::DepStates {
+        // Same shape as operator-premise (the refs ARE the input), but with
+        // no offline twin: an --stdin mode would bypass the very
+        // binding-verified read this subcommand was added for.
+        if opts.number.is_some() {
+            return Err(die("--number is not valid for dep-states (pass --refs)", EX_USAGE));
+        }
+        if opts.refs.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(die("--refs is required for dep-states", EX_USAGE));
         }
     } else {
         let Some(n) = opts.number else {
@@ -175,6 +193,7 @@ fn dispatch(cwd: &Path, sub: Sub, opts: &Opts, stdin_text: Option<&str>) -> Resu
         Sub::NamedDependency => run_named_dependency(cwd, opts, stdin_text),
         Sub::ExtractRefs => run_extract_refs(cwd, opts, stdin_text),
         Sub::Decide => unreachable!("handled above"),
+        Sub::DepStates => run_dep_states(cwd, opts),
     }
 }
 
@@ -292,6 +311,82 @@ fn run_named_dependency(cwd: &Path, opts: &Opts, stdin_text: Option<&str>) -> Re
         // Quoted: consumers eval these assignments and the list is multi-line.
         println!("DEPS={}", shell_quote(&o.deps));
         println!("CONCLUSION_HASH={}", o.conclusion_hash);
+    }
+    Ok(0)
+}
+
+/// The invoking repository for a bare `#N` dependency: explicit `--repo`,
+/// else the checkout's own NWO. `None` when neither answers — a bare dep is
+/// then unresolvable *and unbindable*, so the caller must fail it closed
+/// rather than let `gh`'s ambient-cwd default answer for whatever repository
+/// it happens to sit in.
+fn invoking_repo(cwd: &Path, opts: &Opts) -> Option<String> {
+    if let Some(r) = opts.repo.as_deref().filter(|r| !r.trim().is_empty()) {
+        return Some(r.to_string());
+    }
+    crate::dep_classify::cli::resolve_repo(cwd).filter(|r| !r.is_empty())
+}
+
+/// `dep-states` (#14710): classify every `--refs` dependency as resolved /
+/// open / unknown, each state read live and bound to its qualified
+/// `OWNER/REPO#N`. `ALL_RESOLVED` is true only when every ref is terminal;
+/// anything else — open draft, unreadable read, mismatched answer, malformed
+/// token — leaves it false, which is precisely the fail-closed contract the
+/// Guide's unblock sweep consumes (`resolve_dep_states` in `guide.md`).
+fn run_dep_states(cwd: &Path, opts: &Opts) -> Result<i32, i32> {
+    let fallback_repo = invoking_repo(cwd, opts);
+    // One reader for the whole run: the per-repository canonical-name
+    // resolution (the rename layer) is shared across every dependency that
+    // names the same repository.
+    let mut reader = forge::BoundReader::new(cwd);
+
+    let mut resolved: Vec<String> = Vec::new();
+    let mut open: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+
+    for parsed in states::parse_refs(opts.refs.as_deref().unwrap_or("")) {
+        match parsed {
+            states::ParsedRef::Invalid(token) => unknown.push(token),
+            states::ParsedRef::Spec(spec) => {
+                let rendered = spec.reference();
+                // Each entry's own repo takes precedence, with the invoking
+                // one as the fallback for a bare `#N` — fetch_named_deps'
+                // rule, for the same reason: looking a cross-repo ref up
+                // locally answers a question nobody asked.
+                let Some(target) = spec.repo.as_deref().or(fallback_repo.as_deref()) else {
+                    unknown.push(rendered);
+                    continue;
+                };
+                match reader.state(spec.number, target) {
+                    Some(state) => match states::DepState::from_forge_state(&state) {
+                        states::DepState::Resolved => resolved.push(rendered),
+                        states::DepState::Open => open.push(rendered),
+                        states::DepState::Unknown => unknown.push(rendered),
+                    },
+                    None => unknown.push(rendered),
+                }
+            }
+        }
+    }
+
+    let all_resolved = !resolved.is_empty() && open.is_empty() && unknown.is_empty();
+    if opts.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "all_resolved": all_resolved,
+                "resolved": resolved,
+                "open": open,
+                "unknown": unknown,
+            })
+        );
+    } else {
+        println!("ALL_RESOLVED={all_resolved}");
+        // Quoted: consumers eval these assignments and the lists are
+        // multi-value (the #8323 rule every sibling subcommand follows).
+        println!("RESOLVED={}", shell_quote(&resolved.join(" ")));
+        println!("OPEN={}", shell_quote(&open.join(" ")));
+        println!("UNKNOWN={}", shell_quote(&unknown.join(" ")));
     }
     Ok(0)
 }

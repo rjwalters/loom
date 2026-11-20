@@ -275,7 +275,40 @@ an operator runs to ask "is this mark still true?". A host that sets
 `max_tokens: 1` request per marked account per cycle. This is **reporting
 only**: a healthy answer never edits `.bad_tokens`, and the account stays
 excluded from selection — and `<name>|blocked` in `.ranking` — until
-`loom-daemon tokens unblock <name>`.
+`loom-daemon tokens unblock <name>`. That holds even if the account was
+`exhausted` in an earlier round: the previous-round carry-forward (below) is
+never applied to an account with a standing `auth` / `malformed-timestamp`
+mark, so its row is `blocked`, not a frozen `exhausted` one (#14317).
+
+**`.ranking` rows can be carried over from the previous round (#14145,
+#14265, #14317).** `tokens check --ranking` (the probe path) does not blindly
+overwrite the file. When an account's previous row was `exhausted` and this
+round's row carries no probe evidence — `error` (timeout, connection, 5xx) or
+`blocked` (empty token, credential-shape mismatch, `401`), or a codex `unknown`
+while the held reset is still in the future — the previous `exhausted` row is
+written back unchanged, so one failed probe cannot shorten an active weekly
+hold to the 6h fixed cooldown. Positive evidence (`available`, `rate_limited`,
+a fresh `exhausted`) overwrites as before. Two consequences for an operator
+reading `.ranking` directly:
+
+- **A row may be a previous round's record, and nothing on disk marks it as
+  carried.** The line format has no "carried" field, and the file's mtime is
+  the write time of the round, not the age of the row. `--json` is the
+  measurement view: its `probed` field says whether a request was sent in *this*
+  run, and a failed round's `status`/`error` show what this round saw even when
+  `.ranking` kept the older `exhausted` row.
+- **A carried row is re-measured only by a round that gets evidence.** It stays
+  until a probe of that account returns a real answer, so while a probe keeps
+  failing the `exhausted` row (with its recorded reset) persists, and the
+  selector's `exhausted` hard exclusion keeps applying to it. Carrying never
+  widens the selectable set: `error` and `blocked` are excluded or ranked after
+  every selectable status anyway.
+
+The carry-forward does **not** apply to an account with a standing `auth` or
+`malformed-timestamp` mark: that account's `blocked` row comes from the mark,
+not from a failed probe, and it is written as `<name>|blocked` even when the
+previous row was `exhausted`. A self-clearing `exhaustion` mark is probed live
+and keeps the carry-forward.
 
 Every row says whether it is a measurement or a stored record:
 
@@ -879,6 +912,14 @@ the whole known vocabulary — deliberately: the Claude pool's classes are a
 closed set (`haiku`/`sonnet`/`opus`/`fable`), so the un-marked ones can be
 named and shown to be fine, while a provider whose class vocabulary is
 open-ended model IDs has no list to enumerate and must not invent one.
+
+The `N exhausted/near-ceiling` figure is `total − healthy`, not a count of
+`exhausted` rows: a `blocked` (e.g. auth-dead), `error`, `rate_limited` or
+`unknown` account is in it too. With a `.ranking` source it can also include an
+account whose row is a previous round's `exhausted` record carried forward
+(see "`.ranking` rows can be carried over from the previous round"); an
+account with a standing `auth` / `malformed-timestamp` mark is never one of
+those (#14317).
 
 Three properties are worth relying on:
 
@@ -1994,9 +2035,18 @@ under a sibling `mkdir` lock.
 For managed headless runs, `spawn-codex.sh` asks the native selector for an
 eligible profile and exports that profile as `CODEX_HOME`. Selection excludes
 disabled profiles, persistent `reauth_required` holds, and unexpired cooldowns;
-then prefers fewer recent transient failures and round-robins equal candidates.
-If none are healthy, selection exits closed rather than using ambient
-`~/.codex`.
+then prefers fewer recent transient failures. Within that group it prefers the
+seat(s) with the **lowest weekly (7d) utilization** (#14585) and round-robins
+among seats tied for the lowest. Ranking reads the provider's weekly window
+from the seat's own rollout logs because provisioned profiles can share session
+history. A reading expires at its reported reset or after one known window
+from the observation when a reset is unavailable.
+If **any** candidate in the group lacks a live weekly reading, the whole group
+falls back to plain round-robin. A measured `0%` is a reading. Live-session
+preference, repository and model eligibility, and explicit profile pins apply
+first. A seat that turns out busy at lease time is skipped and the next-best
+eligible seat is tried. If none are healthy, selection exits closed rather than using
+ambient `~/.codex`.
 
 Terminal policy is intentionally conservative:
 
@@ -2014,8 +2064,8 @@ Terminal policy is intentionally conservative:
   the tick's working directory) do not poison account health. Those three also
   record no freshness, because nothing ran.
 
-Codex exposes no trustworthy quota-headroom percentage here. Status/capacity
-therefore reports raw, enabled, healthy, cooldown, and reauth-required counts;
+Capacity reporting makes no use of utilization: Status/capacity
+reports raw, enabled, healthy, cooldown, and reauth-required counts;
 transcript token totals remain observability and are never presented as
 remaining quota. Claude's existing global daemon concurrency cap is unchanged.
 

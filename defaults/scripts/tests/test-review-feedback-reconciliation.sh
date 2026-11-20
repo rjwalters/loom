@@ -538,6 +538,20 @@ assert_eq "0" "$PV_RC" "a missing gate script does not block the approval (avail
 assert_contains "$PV_OUT" "WARNING" "the missing gate is reported loudly on stderr"
 assert_contains "$PV_BODY" "state=gate-unavailable" "the forge record shows the approval was NOT review-reconciled"
 
+# #14392: an approval with the gate missing AND --reviews-reconciled appends the text,
+# and its note blames the unavailable gate, not "no gate runs for this verdict".
+reset_fixtures
+set +e
+PV_OUT=$("$ISOLATED/post-verdict.sh" 5369 approved "$HEAD_SHA" --body "Approved." \
+  --reviews-reconciled "Finding 1 fixed in abc1234; finding 2 superseded by the new design." 2>&1)
+PV_RC=$?
+set -e
+PV_BODY="$(cat "$FIX_DIR/last-body.txt" 2>/dev/null || true)"
+assert_eq "0" "$PV_RC" "approved + missing gate + --reviews-reconciled still posts"
+assert_contains "$PV_BODY" "Finding 1 fixed in abc1234" "the reconciliation text is appended, not dropped (#14392)"
+assert_contains "$PV_BODY" "check-review-feedback.sh was unavailable" "the note names the unavailable gate"
+assert_not_contains "$PV_BODY" "no gate runs for a changes-requested verdict" "an approval is not described as a changes-requested verdict"
+
 # --- T10: id citation is boundary-anchored, not a bare substring match ------
 # A naive `*"$id"*` match lets a short id spuriously match inside an unrelated
 # longer number (e.g. blocking id "42" inside "4242"). The disposition must

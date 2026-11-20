@@ -24,6 +24,11 @@ pub(super) struct CredentialStartup {
     /// Passed on to the IPC/daemon wiring (#4005).
     pub credential_preflight: CredentialPreflightReport,
     pub cross_owner_retry: credential_preflight::cross_owner::CrossOwnerRetry,
+    /// The per-root `owner/repo` snapshot the startup credentials were
+    /// resolved against (#14223) — the primary refresh tick's owner-drift
+    /// baseline. Empty when the per-owner mechanism is not configured (no
+    /// tick consumes it).
+    pub startup_roots: Vec<(PathBuf, String)>,
 }
 
 pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
@@ -138,6 +143,15 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
     // root owner's credential, refused by the write-scope gate, until restart.
     let mut cross_owner_retry =
         credential_preflight::cross_owner::CrossOwnerRetry::after_startup(None);
+    // #14223: the owner-drift baseline — what each managed root's `origin`
+    // named when the credentials below were resolved. Captured whenever the
+    // per-owner mechanism is configured (the tick runs whenever the App
+    // script + owner resolve, even when the startup mint itself failed and
+    // the retry below establishes later).
+    let startup_roots = match (&github_app_owner_repo, &github_app_script) {
+        (Some(_), Some(_)) => credential_preflight::cross_owner::managed_roots(sweep_workspace),
+        _ => Vec::new(),
+    };
     if let (Some(root_owner_repo), Some(script_path), true) = (
         &github_app_owner_repo,
         &github_app_script,
@@ -160,5 +174,6 @@ pub(super) fn run_startup(sweep_workspace: &Path) -> CredentialStartup {
         minted_token: github_app_preflight.minted.map(|m| m.token),
         credential_preflight,
         cross_owner_retry,
+        startup_roots,
     }
 }

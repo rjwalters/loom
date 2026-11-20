@@ -1780,6 +1780,13 @@ pub enum StashesAction {
     BuildTrees(super::stashes::BuildTreesArgs),
 }
 
+fn parse_excluded_pool_name(value: &str) -> Result<String, &'static str> {
+    if value.trim().is_empty() {
+        return Err("expected a nonblank pool name");
+    }
+    Ok(value.to_owned())
+}
+
 /// Sub-actions for `loom-daemon tokens`.
 #[derive(Subcommand)]
 pub enum TokensAction {
@@ -1936,6 +1943,11 @@ pub enum TokensAction {
         #[arg(long)]
         force: bool,
 
+        /// Skip a Claude account by its exact derived pool name, without the
+        /// `.token` suffix. Repeat for more names. Existing files are preserved.
+        #[arg(long = "exclude-name", value_name = "NAME", value_parser = parse_excluded_pool_name)]
+        exclude_names: Vec<String>,
+
         /// Delete `*.token` files for accounts claude-monitor no longer
         /// reports active (pool state files are never touched).
         #[arg(long)]
@@ -1996,6 +2008,30 @@ pub enum TokensAction {
         /// never double-counted.
         #[arg(long)]
         all_pools: bool,
+    },
+
+    /// Run the captain's token-pool probe now and publish it fleet-wide
+    /// (`tokens refresh --fleet`, #13943, part 3 of #13893): one request
+    /// over the fleet-dispatch channel, the captain probes the pool
+    /// immediately instead of at the next `tokenRankingRefresh` tick, and
+    /// every worker applies the result on its next heartbeat (at most
+    /// ~25 s, `HEARTBEAT_GAP`). Exits 0 once the captain acknowledges the
+    /// probe it ran (or joined — a request arriving while a probe runs
+    /// coalesces into it). Never probes locally: no captain declared
+    /// (`fleetDispatch.enabled`/`fleetDispatch.url`) or an unreachable
+    /// captain exits non-zero with a one-line reason — a local probe stays
+    /// what it always was, `tokens check --ranking`.
+    Refresh {
+        /// Refresh the whole fleet through its captain. The only mode: the
+        /// verb exists for the fleet refresh, and a local ranking refresh
+        /// is `tokens check --ranking`.
+        #[arg(long, required = true)]
+        fleet: bool,
+
+        /// Repo root whose effective config names the captain (the host
+        /// tier's `fleetDispatch.enabled` / `fleetDispatch.url`).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
     },
 
     /// Manage the `.allowlist` file constraining which accounts `select` may

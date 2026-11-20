@@ -124,6 +124,11 @@ pub(crate) enum SessionAction {
         /// Scope the action to a named branch (repeatable).
         #[arg(long, value_name = "BRANCH")]
         branch: Vec<String>,
+        /// With `--discard`: remove a leftover worktree (repeatable) and its
+        /// uncommitted files; refused while commits on it are unpublished.
+        /// The listing form names every dirty worktree and its path.
+        #[arg(long, value_name = "PATH", requires = "discard", conflicts_with_all = ["branch", "issue"])]
+        worktree: Vec<std::path::PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -223,9 +228,13 @@ pub(crate) fn handle_session_command(
         let removal = crate::tokens_pool::session_drift_removal::read(std::slice::from_ref(
             &status.codex_home,
         ));
+        // Whether Codex will run Loom's guard hook here (#14105).
+        let trust =
+            crate::tokens_pool::private_workspace::containment::trust_state(&status.codex_home);
         if json {
             let mut value = serde_json::to_value(status)?;
             value["drift_removal"] = serde_json::to_value(&removal)?;
+            value["hook_trust"] = trust.into();
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(());
         }
@@ -241,7 +250,7 @@ pub(crate) fn handle_session_command(
         {
             println!(
                 "{}: {} (container={}, id={}, image={}, started_at={}, codex_home={}, \
-                 mount={}, session_managed={}, workspace={}, workspace_mode={})",
+                 mount={}, session_managed={}, workspace={}, workspace_mode={}, hook_trust={})",
                 status.name,
                 if status.running {
                     "running"
@@ -264,6 +273,7 @@ pub(crate) fn handle_session_command(
                     .as_ref()
                     .map_or_else(|| "-".to_string(), |w| w.display().to_string()),
                 status.workspace_mode,
+                trust,
             );
             if let Some(removed) = removed {
                 println!("{}: {}", status.name, removed.trim_start_matches(", "));
@@ -284,13 +294,18 @@ pub(crate) fn handle_session_command(
 
     use crate::tokens_pool::private_workspace as private;
     fn print_private(status: &private::Status, json: bool) -> Result<()> {
+        let trust = crate::tokens_pool::private_workspace::containment::trust_state(
+            std::path::Path::new(&status.config.profile),
+        );
         if json {
-            println!("{}", serde_json::to_string_pretty(status)?);
+            let mut value = serde_json::to_value(status)?;
+            value["hook_trust"] = trust.into();
+            println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
             println!(
-                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={})",
+                "{}: {} (workspace_mode={}, private_root={}, volume={}, repository={}, additional_repositories={}, lease={}, hook_trust={})",
                 status.config.account,
-                if status.running { "running" } else { "stopped" },
+                status.state_label(),
                 status.workspace_mode,
                 status.private_root,
                 status.config.volume,
@@ -299,7 +314,8 @@ pub(crate) fn handle_session_command(
                 status
                     .lease
                     .as_ref()
-                    .map_or("idle", |job| job.owner.as_str())
+                    .map_or("idle", |job| job.owner.as_str()),
+                trust
             );
             println!("{}: image={}", status.config.account, status.image.as_deref().unwrap_or("-"));
             if !status.extra_mounts.is_empty() {
@@ -357,10 +373,27 @@ pub(crate) fn handle_session_command(
                     report.account, head.path, head.revision, head.ahead
                 );
             }
+            for path in &clone.removed_worktrees {
+                println!("{}: removed worktree {}", report.account, path);
+            }
+            for dirty in &clone.dirty_worktrees {
+                println!(
+                    "{}: dirty worktree {} ({}): {} tracked, {} untracked, {} unpublished; {}",
+                    report.account,
+                    dirty.path,
+                    dirty.branch.as_deref().unwrap_or("detached HEAD"),
+                    dirty.tracked,
+                    dirty.untracked,
+                    dirty.unpublished,
+                    dirty.recovery_guidance(&report.account)
+                );
+            }
             if clone.published.is_empty()
                 && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
                 && clone.branches.is_empty()
                 && clone.detached.is_empty()
+                && clone.dirty_worktrees.is_empty()
             {
                 println!("{}: {} has no unpublished work", report.account, clone.repository);
             }
@@ -420,6 +453,7 @@ pub(crate) fn handle_session_command(
             discard,
             issue,
             branch,
+            worktree,
             json,
         } => {
             if !private::configured(&workspace, &name)? {
@@ -433,7 +467,7 @@ pub(crate) fn handle_session_command(
                 private::RecoverAction::List
             };
             print_recover(
-                &private::session_recover(&workspace, &name, action, issue, &branch)?,
+                &private::session_recover(&workspace, &name, action, issue, &branch, &worktree)?,
                 json,
             )
         }
