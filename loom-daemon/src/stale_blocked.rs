@@ -158,6 +158,10 @@ pub struct Evidence {
     /// ([`park_self_block`]). Always `None` for an issue, whose superseding-block
     /// question is answered by [`Evidence::closing`] instead.
     pub self_block: Option<String>,
+    /// Fresh PR state used by the named-park resweep.
+    pub pr_resweep_state: Option<PrResweepState>,
+    /// A standing trusted Champion hold (including ratification) on a PR.
+    pub champion_hold: Option<crate::champion_hold::HoldKind>,
     /// A body park record that names **no** blocker but states a reason
     /// (`<!-- loom:park Blocked by: (unstated) by=… reason="…" -->`, #10558).
     /// Such a hold is documented by its reason, so with no numbered reference
@@ -176,6 +180,13 @@ pub struct Evidence {
     /// when any resolved blocker's time could not be read. Meaningful only
     /// with [`Evidence::hold`], which treats `None` as "unknown ⇒ held".
     pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrResweepState {
+    Mergeable,
+    Conflict(String),
+    Held(String),
 }
 
 /// A trusted comment that states a hold (#13889): a park record, an operator
