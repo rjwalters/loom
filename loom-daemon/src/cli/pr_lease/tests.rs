@@ -921,6 +921,42 @@ fn release_rewrites_the_marker_so_the_claim_frees_at_once() {
     assert!(patched.contains(&a.released_marker()), "{patched}");
 }
 
+/// #14392: a second release, after the verdict step already released, patches
+/// nothing, keeps the exit code, and is worded "already released" rather than
+/// "released 0"; with no own row at all the plain zero count is kept.
+#[test]
+fn a_second_release_reports_already_released_not_zero() {
+    let dir = TempDir::new().unwrap();
+    fake_gh(dir.path());
+    let a = who(Role::Doctor, "sweep-a");
+    fs::write(dir.path().join("rows"), live_row(100, &a)).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).contains("issues/comments/100"));
+
+    // The row now carries the released marker; release again.
+    fs::remove_file(dir.path().join("patched")).unwrap();
+    fs::write(dir.path().join("rows"), row_at(100, Utc::now(), &a.released_marker())).unwrap();
+    assert_eq!(ctx(dir.path(), a.clone()).release(None, None, None), EXIT_HELD);
+    assert!(patched(dir.path()).is_empty(), "an already-released row is not rewritten");
+
+    assert_eq!(
+        release_summary("released", 0, 1, 1),
+        "already released (1 lease comment(s)); stopped 1 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("released", 0, 0, 1),
+        "released 0 lease comment(s); stopped 1 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("released", 1, 2, 0),
+        "released 1 lease comment(s); stopped 0 renewer(s)"
+    );
+    assert_eq!(
+        release_summary("reaped", 0, 0, 0),
+        "reaped 0 lease comment(s); stopped 0 renewer(s)"
+    );
+}
+
 /// #13132: a release missing the claim's identity names the claimant and
 /// exits nonzero, leaving the lease untouched; the right identity releases.
 #[test]

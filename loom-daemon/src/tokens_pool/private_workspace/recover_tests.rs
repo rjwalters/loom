@@ -1760,6 +1760,41 @@ fn recorded(env: &Env) -> Config {
 
 #[test]
 #[serial]
+fn private_status_reports_the_profile_hold_with_running_precedence() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, false);
+    let read = || status(env.workspace.path(), &env.config.account).unwrap();
+
+    let stopped = read();
+    assert_eq!(stopped.state_label(), "stopped");
+    assert_eq!(serde_json::to_value(&stopped).unwrap()["held"], false);
+
+    session_hold::write_hold(&env.config.profile, 1).unwrap();
+    let held = read();
+    assert_eq!(held.state_label(), "stopped, held (operator stop)");
+    assert_eq!(serde_json::to_value(&held).unwrap()["held"], true);
+
+    env.seed_container(CONTAINER_ID, true);
+    let running = read();
+    assert_eq!(running.state_label(), "running");
+    assert_eq!(serde_json::to_value(&running).unwrap()["held"], true);
+
+    assert!(env.engine().calls.iter().all(|call| {
+        let args = call.iter().map(String::as_str).collect::<Vec<_>>();
+        matches!(
+            args.as_slice(),
+            ["info", "--format", "{{.ID}}"]
+                | ["container", "ls", "-a", "--format", "{{.Names}}"]
+                | ["inspect", _]
+                | ["volume", "inspect", _]
+                | ["ps", "-a", "--filter", _, "--format", "{{.Names}}"]
+        )
+    }));
+}
+
+#[test]
+#[serial]
 fn a_private_start_creates_from_the_configured_image_and_read_only_mounts() {
     let env = setup();
     env.seed_volume();

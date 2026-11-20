@@ -697,6 +697,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
+        held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
         config,

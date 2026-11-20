@@ -2561,13 +2561,16 @@ mod busy;
 /// round-trip that could not happen), and the overall verdict is `Dead` so the
 /// exit code is `2` rather than a misleading `1`.
 ///
-/// Every section is unconditional except `observability` (#4830),
-/// `codesign_identity` (#7605), `limit_calibration` (#8063/#8349), `codex`
-/// (#8407), `tmpfs_visibility` (#8572), `review_role_pins` (#11970) and
-/// `owner_drift` (#14223), each of which is appended only when there is
+/// Every section is unconditional except seven, in two shapes.
+/// `observability` (#4830), `codesign_identity` (#7605), `tmpfs_visibility`
+/// (#8572) and `review_role_pins` (#11970) are appended only when there is
 /// something to report — see [`assess_observability`],
-/// [`assess_codesign_identity`], [`assess_limit_calibration`],
-/// [`codex_accounts::assess`] and [`assess_tmpfs_visibility`].
+/// [`assess_codesign_identity`], [`assess_tmpfs_visibility`] and
+/// [`assess_review_role_pins`]. `limit_calibration` (#8063/#8349), `codex`
+/// (#8407) and `owner_drift` (#14223) are appended whenever their collection
+/// ran or the signal applies on this host, Green when clean — see
+/// [`assess_limit_calibration`], [`codex_accounts::assess`] and
+/// [`assess_owner_drift`].
 ///
 /// # `IndeterminateBusy` (#6191, #8163)
 ///
