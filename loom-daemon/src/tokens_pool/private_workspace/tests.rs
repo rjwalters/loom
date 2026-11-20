@@ -136,7 +136,7 @@ impl RepoFixture {
     }
 
     fn prepare(&self) -> Result<String> {
-        repository::prepare(&self.root, &self.args)
+        repository::prepare(&self.root, &self.args).map(|outcome| outcome.revision)
     }
 }
 
@@ -391,7 +391,7 @@ fn unpublished_commits_in_one_clone_do_not_block_another_clone_or_branch() {
         branch: Some("feature/issue-9".into()),
         slug: Some("owner-repo-12345678".into()),
     };
-    let add = repository::prepare(&f.root, &additional).unwrap();
+    let add = repository::prepare(&f.root, &additional).unwrap().revision;
     assert!(!add.is_empty());
     // Unpublished commits on one branch of the additional clone do not
     // block re-preparing it for its own branch, nor the primary at all.
@@ -1033,12 +1033,12 @@ fn two_repositories_share_one_volume_with_independent_roots_and_untouched_first_
         f.additional_args(&r1.to_string_lossy(), "o-one-11111111"),
         f.additional_args(&r2.to_string_lossy(), "o-two-22222222"),
     );
-    let rev_a = repository::prepare(&f.root, &a).unwrap();
+    let rev_a = repository::prepare(&f.root, &a).unwrap().revision;
     // Unfinished work in the first additional clone survives preparing the second.
     let first = f.root.join("work/o-one-11111111");
     std::fs::write(first.join("scratch"), "unfinished").unwrap();
     std::fs::write(first.join("fixture"), "edited").unwrap();
-    let rev_b = repository::prepare(&f.root, &b).unwrap();
+    let rev_b = repository::prepare(&f.root, &b).unwrap().revision;
     assert_ne!(rev_a, rev_b);
     assert_eq!(std::fs::read_to_string(first.join("scratch")).unwrap(), "unfinished");
     assert_eq!(std::fs::read_to_string(first.join("fixture")).unwrap(), "edited");
@@ -1112,7 +1112,7 @@ fn interrupted_clone_is_recoverable_and_never_ready() {
         .to_string()
         .contains("mismatch"));
     std::fs::remove_file(f.root.join("work/.identity").join(format!("{slug}.json"))).unwrap();
-    let revision = repository::prepare(&f.root, &good).unwrap();
+    let revision = repository::prepare(&f.root, &good).unwrap().revision;
     assert!(!staging.exists());
     assert_eq!(git(&f.root.join("work").join(slug), &["rev-parse", "HEAD"]), revision);
 }
@@ -1633,7 +1633,8 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
     let _fork = fork_guard();
     for state in ["fast-forward", "squash", "closed"] {
         let f = RepoFixture::new();
-        f.prepare().unwrap();
+        let fresh = repository::prepare(&f.root, &f.args).unwrap();
+        assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
         let worktree = linked_worktree(&f, "finished");
         for text in ["first", "second"] {
             std::fs::write(worktree.join("fixture"), text).unwrap();
@@ -1666,8 +1667,13 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
             assert_eq!(revision, tip);
             true
         };
-        repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
+        let outcome = repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
+        assert_eq!(
+            outcome.reaped,
+            vec![worktree.display().to_string()],
+            "{state} reaped worktree is reported"
+        );
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
         assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
     }

@@ -81,6 +81,10 @@ pub struct AccountStatus {
     /// indistinguishable from a host-direct one, the mechanism is reported
     /// separately instead of being inferred from a missing probe.
     pub session_managed: bool,
+    /// Codex hook trust for Loom's managed entry (#14105): `recorded`,
+    /// `sealed` (no recorded decision, but a launch vets the registration and
+    /// passes the waiver instead) or `missing`.
+    pub hook_trust: &'static str,
     /// This account's registered private-clone repositories (issue #14298),
     /// read from its private-workspace `workspace.json`. Populated by
     /// `accounts list` only; absent for host-mode accounts and for every
@@ -836,6 +840,10 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
         } else {
             login_state_from(&self.runner.login_status(&account.credential_reference)?)
         };
+        let hook_trust = super::codex_hooks::trust_state(
+            &account.credential_reference,
+            &super::private_workspace::bundle::registration(),
+        );
         Ok(AccountStatus {
             schema_version: 1,
             provider: account.id.provider,
@@ -846,6 +854,7 @@ impl<R: CodexCommandRunner> AccountLifecycle<R> {
             diagnostics,
             login_state,
             session_managed,
+            hook_trust,
             private_clone: None,
             image: None,
         })
@@ -2163,7 +2172,8 @@ mod tests {
                 "owner_valid": true
             },
             "login_state": "not_checked",
-            "session_managed": false
+            "session_managed": false,
+            "hook_trust": "missing"
         }))
         .unwrap();
         assert_eq!(
