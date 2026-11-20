@@ -94,7 +94,7 @@ echo "Test 4: the parked PR sweep reaches older PRs and respects current holds"
 (
     TMPROOT="$(mktemp -d)"; trap 'rm -rf "$TMPROOT"' EXIT
     DOC="$REPO_ROOT/defaults/docs/park-record.md"
-    for fn in check_and_unblock_prs pr_has_superseding_block previous_review_label; do
+    for fn in check_and_unblock_prs pr_has_superseding_block pr_trusted_marker pr_conflict_snapshot pr_has_reason_only_park pr_park_clearance_marker route_parked_pr_conflict previous_review_label; do
         eval "$(sed -n "/^$fn() {\$/,/^}\$/p" "$DOC")"
     done
     cd "$TMPROOT" || exit 1

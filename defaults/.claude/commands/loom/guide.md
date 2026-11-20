@@ -790,12 +790,10 @@ check_and_unblock() {
 
 ### Unblocking Pull Requests (#8925)
 
-A parked PR clears to a review-lane label, never `loom:issue` (a PR was never
-curated), and its superseding check reads the PR's OWN state, not a linked
-PR's. `check_and_unblock_prs`, `pr_has_superseding_block` and
-`previous_review_label` are defined in full, with a worked example, in
-`.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`
-— read on demand, not inlined here.
+Load the full PR sweep, including its reason-only evidence helper, from
+`.loom/docs/park-record.md#the-unblock-sweeps-pr-side-functions`. Run
+`check_and_unblock_prs` to restore the review lane or hand a cleared conflict
+to Doctor. Verify any reported reason-only candidate through that section.
 
 ### Awaiting-Revision Parks → Revise Path (#10936)
 
