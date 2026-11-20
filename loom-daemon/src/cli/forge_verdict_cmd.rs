@@ -357,11 +357,17 @@ struct GhHandback<'a> {
     labels: String,
     pull: String,
     root: &'a Path,
+    held_gh: std::path::PathBuf,
+    /// The claim's `--watch-pid`, so the held route resolves the claim's lease
+    /// identity even when the session PID is not exported.
+    watch_pid: Option<u32>,
     /// #14165: which forge call failed and why (a 401 classed as
     /// `[github_auth]`), so a `FAILED` outcome names the call instead of a
     /// generic "could not be read".
     failure: Option<String>,
 }
+
+pub(crate) mod held_review;
 
 impl GhHandback<'_> {
     /// Record a named forge-call failure (#14165).
@@ -375,6 +381,10 @@ impl GhHandback<'_> {
 }
 
 impl crate::doctor_handback::Forge for GhHandback<'_> {
+    fn held_approval(&mut self, expected_head: &str) -> Option<crate::doctor_handback::Outcome> {
+        held_review::doctor(self, expected_head)
+    }
+
     fn read(&mut self) -> Option<crate::doctor_handback::Snapshot> {
         // One `pulls/{n}` read carries both labels and head, so they agree.
         let out = crate::script_helpers::gh_read(
@@ -567,6 +577,8 @@ pub(crate) fn doctor_handback(
     repo: Option<&str>,
     expected_head: &str,
     deadline_secs: Option<u64>,
+    recover_held: bool,
+    watch_pid: Option<u32>,
 ) -> Result<()> {
     use crate::doctor_handback as hb;
     if expected_head.trim().is_empty() {
@@ -596,15 +608,13 @@ pub(crate) fn doctor_handback(
     let outcome = match acquire_lock(&lock, wait) {
         Ok(()) => {
             publish_held_lock(&lock);
-            let mut forge = GhHandback {
-                repo: repo.clone(),
-                pr,
-                labels: format!("repos/{repo}/issues/{pr}/labels"),
-                pull: format!("repos/{repo}/pulls/{pr}"),
-                root: &root,
-                failure: None,
+            let mut forge = GhHandback::new(repo, pr, &root);
+            forge.watch_pid = watch_pid;
+            let outcome = if recover_held {
+                held_review::recover_cli(&mut forge, expected_head)
+            } else {
+                hb::run(&mut forge, expected_head)
             };
-            let outcome = hb::run(&mut forge, expected_head);
             unpublish_held_lock();
             let _ = std::fs::remove_dir(&lock);
             match (outcome, forge.failure) {
@@ -762,14 +772,7 @@ mod lock_tests {
         let tmp = std::env::temp_dir();
         let out = gh_401();
         assert!(is_github_auth(&out), "an HTTP 401 must class as github_auth");
-        let mut forge = GhHandback {
-            repo: "owner/name".into(),
-            pr: 1,
-            labels: "repos/owner/name/issues/1/labels".into(),
-            pull: "repos/owner/name/pulls/1".into(),
-            root: &tmp,
-            failure: None,
-        };
+        let mut forge = GhHandback::new("owner/name".into(), 1, &tmp);
         forge.note("pull read (labels+head)", &out);
         let named = forge.failure.expect("the failure must be recorded");
         assert!(named.contains("pull read"), "the failing call must be named: {named}");

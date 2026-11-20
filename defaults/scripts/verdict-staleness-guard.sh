@@ -702,7 +702,19 @@ if [[ "$CLEAR" -eq 1 ]]; then
   REASON="$REASON; auto-merge DISARMED=${AUTO_MERGE_DISARMED:-FAILED (could not resolve loom-daemon, or the disarm itself failed — a queued merge may still be armed; disarm it by hand)}"
 
   if [[ -n "$HOLD_LABEL" ]]; then
-    REASON="$REASON; clear suppressed — PR is on an explicit $HOLD_LABEL hold"
+    HELD_REVIEW=""
+    if [[ "$HOLD_LABEL" == loom:blocked && "$VERDICT_LABEL" == loom:pr && -n "$MARKER_SHA" ]]; then
+      # requires-daemon: forge optional   Older installations leave the
+      # hold unchanged. The daemon alone may recover a verified held repair.
+      HELD_REVIEW="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge doctor-handback "$PR" \
+        --repo "$WRITE_REPO" --expected-head-sha "$HEAD_SHA" --recover-held --deadline-secs 45 2>/dev/null)" || HELD_REVIEW=""
+    fi
+    if [[ "$HELD_REVIEW" == "LOOM-DOCTOR-HANDBACK HELD-REVIEW "* ]]; then
+      CLEARED=1
+      REASON="$REASON; verified held repair returned to Judge with the hold intact"
+    else
+      REASON="$REASON; clear suppressed — PR is on an explicit $HOLD_LABEL hold"
+    fi
   else
     # Idempotency: if this exact old->new transition was already announced,
     # don't post a second comment (a Judge pass and the daemon backstop can

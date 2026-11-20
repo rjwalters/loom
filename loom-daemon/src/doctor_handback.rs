@@ -30,6 +30,8 @@ use serde_json::Value;
 use crate::claim_reconciliation::VerdictKind;
 use crate::verdict_gate::parse_verdict;
 
+pub(crate) mod held_review;
+
 /// The first token of every answer, so a caller accepts only a positive signal.
 pub const SENTINEL: &str = "LOOM-DOCTOR-HANDBACK";
 /// The Doctor's own claim.
@@ -134,6 +136,11 @@ pub fn decide(read: Option<&Snapshot>, expected_head: &str) -> Plan {
 pub trait Forge {
     /// A fresh (uncached) read of the PR's labels and head.
     fn read(&mut self) -> Option<Snapshot>;
+    /// Try the exact held-approval route where the ordinary decision sees an
+    /// advanced verdict label. Other shapes retain the ordinary handback.
+    fn held_approval(&mut self, _expected_head: &str) -> Option<Outcome> {
+        None
+    }
     /// Add one label.
     fn add(&mut self, label: &str) -> bool;
     /// Remove one label (absent is not an error the caller relies on).
@@ -209,6 +216,10 @@ pub fn rejection_precedes_claim(
 pub enum Outcome {
     /// `loom:review-requested` on; `loom:changes-requested`/`loom:treating` off.
     HandedBack,
+    /// The held stale approval was replaced by a fresh review request.
+    HeldReview,
+    /// A recovery-only request had no verified pending held repair.
+    NoHeldReview,
     /// The PR was already advanced; only the claim was released.
     AlreadyAdvanced(Vec<String>),
     /// The claim was gone; nothing written.
@@ -229,6 +240,16 @@ impl Outcome {
             Self::HandedBack => (
                 format!("{SENTINEL} HANDED-BACK {QUEUE} added; {CHANGES} and {CLAIM} removed"),
                 0,
+            ),
+            Self::HeldReview => (
+                format!(
+                    "{SENTINEL} HELD-REVIEW {QUEUE} on; stale approval off; Champion hold retained"
+                ),
+                0,
+            ),
+            Self::NoHeldReview => (
+                format!("{SENTINEL} NO-HELD-REVIEW no eligible held repair"),
+                EXIT_ALREADY_ADVANCED,
             ),
             Self::AlreadyAdvanced(on) => (
                 format!(
@@ -312,10 +333,20 @@ pub fn run(forge: &mut impl Forge, expected_head: &str) -> Outcome {
             Ok(()) => Outcome::HeadMoved(current),
             Err(why) => Outcome::Failed(why),
         },
-        Plan::AlreadyAdvanced(on) => match release_claim(forge) {
-            Ok(()) => Outcome::AlreadyAdvanced(on),
-            Err(why) => Outcome::Failed(why),
-        },
+        Plan::AlreadyAdvanced(on) => {
+            if pre
+                .as_ref()
+                .is_some_and(|snap| held_review::candidate(&snap.labels))
+            {
+                if let Some(outcome) = forge.held_approval(expected_head) {
+                    return outcome;
+                }
+            }
+            match release_claim(forge) {
+                Ok(()) => Outcome::AlreadyAdvanced(on),
+                Err(why) => Outcome::Failed(why),
+            }
+        }
         Plan::HandBack => {
             let Some(pre) = pre else {
                 return Outcome::Failed("unreachable: no pre-read".into());

@@ -283,6 +283,10 @@ fn verdict_sha_readers_go_through_the_trust_filter() {
         ("doctor_handback.rs", "parses already-filtered records"),
         // In-memory records for the pure predicate and the `Fake` forge; no forge read.
         ("doctor_handback/tests.rs", "test fixture"),
+        // In-memory records and synthetic forge responses. These tests exercise
+        // held handback and reconciliation; neither reads live forge comments.
+        ("doctor_handback/held_review/tests.rs", "test fixture"),
+        ("claim_reconciliation/verdict_dedup_tests/held_recovery_e2e.rs", "test fixture"),
         ("comment_trust.rs", "module docs"),
         ("comment_trust/tests.rs", "this test"),
     ];

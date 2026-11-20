@@ -565,9 +565,11 @@ gh pr list --state=open --label=loom:merge-conflict --json number,labels,comment
 `loom:blocked` PR under Champion's ratification or merge-risk hold goes
 CONFLICTING when siblings merge, and the shared queue hides it (hold exclusion),
 so nothing else would fix it. It is Doctor work: resolve the conflict, push, and
-**leave the hold alone**. Never remove `loom:blocked` or `loom:pr`, never add
-`loom:changes-requested`; the hold stays for the operator, and Judge re-reviews
-the new head through the Stale-Verdict Check. Admit a PR only when it carries
+**leave the hold alone**. Keep both labels during repair and use the ordinary
+native handback with the pushed SHA and the same Doctor lease identity. The
+native handback can replace a verified stale approval with a fresh review
+request while preserving `loom:blocked` (#14714). Do not change either label
+by hand or add `loom:changes-requested`. Admit a PR only when it carries
 `loom:pr` and `loom:blocked`, no `loom:operator` / `loom:frozen` /
 `loom:treating`, is CONFLICTING, and the **latest trusted** marker comment is a
 hold (`<!-- champion:ratification-hold -->` or
@@ -695,7 +697,7 @@ fi
 
 # Complete normally (hand-back: see "Verdict-Time CAS Recheck")
 git push
-loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)"
+loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 ./.loom/scripts/post-comment.sh 588 --pr --body "Per-finding handoff (see Communicate Clearly): <fixed at file:line / still open / disputed + reason, per finding>. Ready for re-review"
 ```
 
@@ -1029,7 +1031,7 @@ Recheck"). A prose re-read plus a separate `gh pr edit` did not hold, so the
 read-decide-write is one verb. **Never hand-write the completion labels:**
 
 ```bash
-loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)"  # the SHA you pushed
+loom-daemon forge doctor-handback $N --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"  # the SHA you pushed
 ```
 
 It re-reads labels and head, adds `loom:review-requested` *before* removing
@@ -1038,7 +1040,7 @@ and withdraws its add if a verdict landed meanwhile. Act on the exit:
 
 | Exit | Line | Action |
 |------|------|--------|
-| 0 | `HANDED-BACK` | Post the notifying comment. |
+| 0 | `HANDED-BACK` or `HELD-REVIEW` | Post the notifying comment. A held review retains the Champion hold. |
 | 10 | `ALREADY-ADVANCED` | Already re-queued/reviewed/approved; only your claim was released. Success — comment, assert no transition. |
 | 13 | `RACED` | A verdict landed mid-write; it withdrew its add. Done — write nothing more. |
 | 11 | `CLAIM-LOST` | `loom:treating` was gone; nothing written. Stand down (comment, exit). |
@@ -1413,7 +1415,7 @@ git push
 
 # Signal completion and unclaim — one verified write; act on its exit code
 # (see "Verdict-Time CAS Recheck" above): 0/10 comment, 13 done, 11/12 stand down
-loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)"
+loom-daemon forge doctor-handback 42 --expected-head-sha "$(git rev-parse HEAD)" --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 ./.loom/scripts/post-comment.sh 42 --pr --body "🩺 Doctor handoff — per-finding status at $(git rev-parse --short HEAD):
 - Reviewer A, null handling: **fixed** at foo.ts:15
 - Reviewer A, missing error-case test: **fixed** at foo.test.ts:40

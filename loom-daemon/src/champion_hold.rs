@@ -258,6 +258,9 @@ pub fn judge_shape<L: AsRef<str>>(labels: &[L]) -> bool {
         .iter()
         .any(|l| matches!(l.as_ref(), "loom:review-requested" | "loom:reviewing"))
         && only_the_blocked_park(labels)
+        // A held stale-approval handback adds the queue label first so it
+        // stays retryable. Do not let Judge claim until approval is retired.
+        && !labels.iter().any(|l| l.as_ref() == "loom:pr")
 }
 
 /// The durable record the sweep's Doctor-cycle cap writes (#11861): one

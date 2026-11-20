@@ -69,10 +69,16 @@ check "" "$(sel "$(pr CONFLICTING loom:pr,loom:blocked "$MR" "<!-- champion:merg
 check "" "$(sel "$(pr CONFLICTING loom:pr,loom:blocked "quoting $RH mid-comment")")" "marker not at comment start"
 
 echo "prose"
-grep -q 'never add' "$DOCTOR_MD" && grep -q '`loom:changes-requested`' "$DOCTOR_MD"
-check 0 $? "doctor.md forbids adding loom:changes-requested on this path"
-grep -q 'Never remove `loom:blocked` or `loom:pr`' "$DOCTOR_MD"
-check 0 $? "doctor.md forbids removing the hold"
+HELD_PROSE=$(awk '
+    /^\*\*Find Champion-held PRs with merge conflicts/ { inside = 1 }
+    inside && /^```/ { exit }
+    inside { print }
+' "$DOCTOR_MD")
+grep -Fq "by hand or add \`loom:changes-requested\`" <<<"$HELD_PROSE"
+check 0 $? "doctor.md forbids manual verdict changes on the held repair path"
+grep -Fq 'Keep both labels during repair' <<<"$HELD_PROSE" \
+    && grep -Fq "request while preserving \`loom:blocked\`" <<<"$HELD_PROSE"
+check 0 $? "doctor.md retains the merge hold through native review handback"
 grep -q 'served by Doctor' "$PROMPT_DIR/champion-ratification-hold.md"
 check 0 $? "champion-ratification-hold.md notes Doctor serves held conflicts"
 

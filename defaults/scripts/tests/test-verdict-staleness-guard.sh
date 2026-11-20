@@ -287,6 +287,14 @@ if [[ "$1" == "forge" && "$2" == "disable-auto-merge" ]]; then
   fi
   exit 0
 fi
+if [[ "$1" == "forge" && "$2" == "doctor-handback" ]]; then
+  if [[ -f "$STUB_DIR_FROM_ENV/held-recovery-$3" && " $* " == *" --recover-held "* ]]; then
+    echo "LOOM-DOCTOR-HANDBACK HELD-REVIEW loom:review-requested on; stale approval off; Champion hold retained"
+    exit 0
+  fi
+  echo "LOOM-DOCTOR-HANDBACK NO-HELD-REVIEW no eligible held repair"
+  exit 10
+fi
 echo "stub loom-daemon: unexpected invocation: $*" >&2
 exit 64
 STUB
@@ -1128,6 +1136,20 @@ assert_eq "" "$WRITES" "(q8) No label writes"
 assert_eq "" "$COMMENTS_POSTED" "(q8) No comment on a held PR with nothing armed"
 assert_eq "0" "$(get_field "$OUT" AUTO_MERGE_DISARMED)" "(q8) AUTO_MERGE_DISARMED=0"
 assert_contains "$DAEMON" "--hold loom:blocked" "(q8) The hold label is still passed through"
+
+# (q8a) The installed guard delegates the already-recorded held repair. It
+# does not attempt a raw label edit or treat ordinary blocked as eligible.
+reset_state
+pr_json_unarmed 247 "$SHA_B" "loom:pr" "loom:blocked"
+{ echo "["; verdict_comment "2026-09-22T22:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-247.json"
+touch "$STUB_DIR/held-recovery-247"
+run_guard 247 --clear
+assert_eq "12" "$RC" "(q8a) A requeued stale approval still returns the stale exit"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(q8a) Native held-review success was observed"
+assert_contains "$DAEMON" "--expected-head-sha $SHA_B --recover-held" "(q8a) Recovery is bound to the guard's exact head"
+assert_eq "" "$WRITES" "(q8a) Only the native recovery owns the held label writes"
+assert_eq "" "$COMMENTS_POSTED" "(q8a) The guard does not duplicate the native audit"
+rm "$STUB_DIR/held-recovery-247"
 
 # (q9) Idempotent re-run: the transition was already announced, so no duplicate
 #      comment — but the disarm is NOT skipped by that shortcut. An arm still

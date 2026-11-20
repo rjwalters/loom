@@ -822,6 +822,7 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("cli/forge_action.rs", Gated),
         ("cli/forge_verdict_cmd.rs", ShellVetted("post-verdict.sh")),
+        ("cli/forge_verdict_cmd/held_review.rs", Gated),
         ("role_runner/launch.rs", Gated),
         // #10832: gives back the claim label a role run a roll could not
         // resume had taken; `release_claim` gates on the root itself.
