@@ -710,7 +710,7 @@ resolve_dep_states() {
   # closed: an open draft, an unreadable read (failed/empty/shed), or an
   # answer naming a different repo or number all leave that dependency
   # unresolved. (On 2026-11-19 the inline loop read the cross-repo draft
-  # 2AMLogic/.loom#630 as resolved and lifted a hold that was still live.) A
+  # example-org/tool-repo#630 as resolved and lifted a hold that was still live.) A
   # daemon failure — including an old binary without the subcommand — also
   # answers false: the hold is preserved, never guessed off. Output: line 1
   # `true`/`false` (all deps terminal?), line 2 the space-joined resolved

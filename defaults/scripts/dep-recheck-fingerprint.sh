@@ -103,7 +103,7 @@
 #                      answer's number and URL must name the exact node asked
 #                      about, so a cached/shed/mismatched read for the same
 #                      number in a DIFFERENT repo cannot read as resolved
-#                      (2AMLogic/.loom#630 was reported resolved on
+#                      (example-org/tool-repo#630 was reported resolved on
 #                      2026-11-19 while the cross-repo draft PR was open).
 #                      A renamed repository still resolves: a URL naming the
 #                      asked slug's CANONICAL name (resolved via REST, which

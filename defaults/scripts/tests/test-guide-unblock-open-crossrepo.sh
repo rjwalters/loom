@@ -2,7 +2,7 @@
 # test-guide-unblock-open-crossrepo.sh - Regression test for issue #14710
 #
 # The Fleet Guide removed `loom:blocked` from a parked issue whose park record
-# named a still-OPEN cross-repository draft PR (2AMLogic/.loom#630): the
+# named a still-OPEN cross-repository draft PR (example-org/tool-repo#630): the
 # inline per-dependency `gh issue view ... --json state` read in
 # check_and_unblock reported it resolved. Dependency resolution now goes
 # through ONE daemon-side resolver — `loom-daemon dep-recheck-fingerprint

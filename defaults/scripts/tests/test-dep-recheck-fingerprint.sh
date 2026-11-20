@@ -1010,7 +1010,7 @@ assert_eq "false" "$(jq -r '.claim' <<<"$out")" "T37b: --json reports claim as a
 # subcommand instead of inline `gh issue view` reads (guide.md's
 # resolve_dep_states; defaults/docs/park-record.md's check_and_unblock_prs).
 # The incident shape: a lookup for the still-open cross-repo draft
-# 2AMLogic/.loom#630 was answered "resolved" and the hold was lifted. Every
+# example-org/tool-repo#630 was answered "resolved" and the hold was lifted. Every
 # fixture below carries number+url, because binding the answer to the exact
 # OWNER/REPO#N — not trusting a bare state string — is the fix.
 #
