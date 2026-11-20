@@ -29,9 +29,9 @@ impl ConfiguredSeatMissing {
     pub(crate) fn observe(
         &self,
         account: &super::super::account_registry::AccountDescriptor,
-        snapshot: &super::super::session_state::Snapshot,
+        snapshot: &super::super::session_state::BindingSnapshot,
     ) -> BindingReadiness {
-        use super::super::session_state::{container_running, Snapshot};
+        use super::super::session_state::container_running;
 
         if self.account != account.id.name
             || account.credential_reference.canonicalize().ok().as_ref() != Some(&self.profile)
@@ -42,11 +42,13 @@ impl ConfiguredSeatMissing {
         else {
             return BindingReadiness::Unverified;
         };
-        if matches!(snapshot, Snapshot::Unavailable(_)) {
-            return BindingReadiness::Unverified;
+        match snapshot.listed(&self.engine, &self.container) {
+            Some(false) => return BindingReadiness::Missing,
+            Some(true) => {}
+            None => return BindingReadiness::Unverified,
         }
-        let Some(inspection) = snapshot.inspect_of(&self.container) else {
-            return BindingReadiness::Missing;
+        let Some(inspection) = snapshot.snapshot.inspect_of(&self.container) else {
+            return BindingReadiness::Unverified;
         };
         let state = &inspection["State"];
         if !state["Running"].is_boolean()

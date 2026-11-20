@@ -112,32 +112,101 @@ fn a_binding_needs_a_current_running_observation_of_the_recorded_private_seat() 
             "Source": config.profile.join(control), "RW": false
         }));
     }
-    let snapshot = |inspect| {
-        Snapshot::Available(BTreeMap::from([(
-            config.container.clone(),
-            Observed::of(inspect, &DriftInputs::new(None)),
-        )]))
+    use std::os::unix::fs::PermissionsExt as _;
+    let runner = dir.path().join("fixture-docker");
+    let engine_file = dir.path().join("fixture-engine");
+    let next_engine = dir.path().join("fixture-next-engine");
+    let listed_file = dir.path().join("fixture-listed");
+    let inspect_file = dir.path().join("fixture-inspect");
+    let calls_file = dir.path().join("fixture-calls");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+fixture=${0%/*}
+printf '%s\n' "$1" >> "$fixture/fixture-calls"
+case "$1" in
+  info) cat "$fixture/fixture-engine" ;;
+  ps) cat "$fixture/fixture-listed" ;;
+  inspect)
+    if [ -f "$fixture/fixture-next-engine" ]; then
+      mv "$fixture/fixture-next-engine" "$fixture/fixture-engine"
+    fi
+    cat "$fixture/fixture-inspect" ;;
+  *) exit 90 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = |attest_engine| {
+        session_state::binding_snapshot(
+            runner.to_str().unwrap(),
+            &DriftInputs::new(None),
+            Duration::from_secs(2),
+            attest_engine,
+        )
     };
-    assert_eq!(waiting.observe(&account, &snapshot(inspect.clone())), BindingReadiness::Ready);
+    inspect["Name"] = format!("/{}", config.container).into();
+    let inspect_seat = |value: &Value| {
+        std::fs::write(&inspect_file, serde_json::to_vec(&[value]).unwrap()).unwrap();
+    };
+    std::fs::write(&listed_file, &config.container).unwrap();
+    std::fs::write(&engine_file, "engine").unwrap();
+    inspect_seat(&inspect);
+    assert_eq!(waiting.observe(&account, &snapshot(false)), BindingReadiness::Unverified);
+    assert_eq!(std::fs::read_to_string(&calls_file).unwrap(), "ps\ninspect\n");
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Ready);
+
     for (field, label) in [
         ("loom.account", "other"),
         ("loom.workspace-mode", "host-mounted"),
     ] {
         let mut other = inspect.clone();
         other["Config"]["Labels"][field] = label.into();
-        assert_eq!(waiting.observe(&account, &snapshot(other)), BindingReadiness::Unverified);
+        inspect_seat(&other);
+        assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
     }
     let mut restarting = inspect.clone();
     restarting["State"]["Restarting"] = true.into();
-    assert_eq!(waiting.observe(&account, &snapshot(restarting)), BindingReadiness::Missing);
+    inspect_seat(&restarting);
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Missing);
+
+    // The valid list includes this name, but the raw inspect row is unreadable.
+    inspect_seat(&json!({"State":{"Running":true,"Restarting":false}}));
+    let partial = snapshot(true);
+    assert_eq!(
+        partial.snapshot.state_of(&config.container),
+        Some(session_state::SessionState::Missing)
+    );
+    assert_eq!(waiting.observe(&account, &partial), BindingReadiness::Unverified);
+
+    // A matching inspect row cannot prove the seat is up on the recorded engine.
+    inspect_seat(&inspect);
+    std::fs::write(&engine_file, "different-engine").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&engine_file, "").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+
+    // Even a known engine before the read cannot attest a switch during it.
+    std::fs::write(&engine_file, "engine").unwrap();
+    std::fs::write(&next_engine, "different-engine").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&engine_file, "engine").unwrap();
+    std::fs::write(&listed_file, [0xff]).unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&listed_file, "").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Missing);
+
     let counts = (Cell::new(0), Cell::new(0));
     let mut original = || {
         counts.0.set(counts.0.get() + 1);
-        Snapshot::Available(BTreeMap::new())
+        std::fs::write(&listed_file, "").unwrap();
+        snapshot(true)
     };
     let mut refreshed = || {
         counts.1.set(counts.1.get() + 1);
-        snapshot(inspect.clone())
+        std::fs::write(&listed_file, &config.container).unwrap();
+        snapshot(true)
     };
     let mut original = PassSnapshot::new(&mut original);
     let mut refreshed = PassSnapshot::new(&mut refreshed);
@@ -165,21 +234,21 @@ fn a_binding_needs_a_current_running_observation_of_the_recorded_private_seat() 
     }
     assert_eq!((counts.0.get(), counts.1.get()), (1, 1));
 
-    let mut stale = || snapshot(inspect.clone());
-    let mut unreadable = || Snapshot::Unavailable("fixture".into());
-    let chosen = binding_snapshot(
-        "alice",
-        &recovered,
-        &mut PassSnapshot::new(&mut stale),
-        &mut PassSnapshot::new(&mut unreadable),
-    )
-    .clone();
-    assert_eq!(waiting.observe(&account, &chosen), BindingReadiness::Unverified);
+    let mut stale = || snapshot(true);
+    let mut unreadable = || {
+        std::fs::remove_file(&listed_file).unwrap();
+        snapshot(true)
+    };
+    let mut stale = PassSnapshot::new(&mut stale);
+    let mut unreadable = PassSnapshot::new(&mut unreadable);
+    let chosen = binding_snapshot("alice", &recovered, &mut stale, &mut unreadable);
+    assert_eq!(waiting.observe(&account, chosen), BindingReadiness::Unverified);
 
     let mut replaced = config.clone();
     replaced.engine = "other-engine".into();
     std::fs::write(state.join("workspace.json"), serde_json::to_vec(&replaced).unwrap()).unwrap();
-    assert_eq!(waiting.observe(&account, &snapshot(inspect)), BindingReadiness::Unverified);
+    std::fs::write(&listed_file, &config.container).unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
 }
 
 #[path = "session_reconcile_drift_tests.rs"]

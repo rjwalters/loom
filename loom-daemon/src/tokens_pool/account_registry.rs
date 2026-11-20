@@ -313,7 +313,8 @@ fn adopted_codex_entries() -> Result<Vec<RegistryEntry>> {
     let Some(root) = codex_profile_root() else {
         return Ok(Vec::new());
     };
-    Ok(discovered_codex_profiles(&root)?
+    let (profiles, _) = discovered_codex_profiles(&root)?;
+    Ok(profiles
         .into_iter()
         .map(|(name, _)| RegistryEntry {
             provider: AccountProvider::Codex,
@@ -444,22 +445,37 @@ fn validate_codex_directory(root: &Path, reference: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-/// True only when `reference` is a well-formed, single-component name (per
-/// [`validate_name`]) that simply has no matching directory under `root` yet
-/// -- the "this host hasn't provisioned this committed profile locally"
-/// case. Any other reason [`validate_codex_directory`] might fail (a
-/// malformed reference, an entry that resolves to a non-directory, or one
-/// that escapes the configured profile root) is a corrupted or malicious
-/// registry entry, not a missing-directory gap, so it is deliberately
-/// excluded here and left to propagate as a hard error by the caller.
-fn codex_directory_is_missing(root: &Path, reference: &str) -> bool {
-    validate_name(reference).is_ok() && !root.join(reference).exists()
+#[derive(PartialEq, Eq)]
+enum PathStatus {
+    Present,
+    Missing,
+    Unreadable,
+}
+
+/// Like the previous existence probe, but distinguishes a truly absent
+/// path from one that cannot be followed. Ordinary paths still cost one stat.
+fn path_status(path: &Path) -> PathStatus {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_symlink() && std::fs::metadata(path).is_err() => {
+            PathStatus::Unreadable
+        }
+        Ok(_) => PathStatus::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathStatus::Missing,
+        Err(_) => PathStatus::Unreadable,
+    }
 }
 
 fn read_repo_registry(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
+    read_repo_registry_observed(workspace).map(|(entries, _)| entries)
+}
+
+fn read_repo_registry_observed(workspace: &Path) -> Result<(Option<Vec<RegistryEntry>>, bool)> {
     let path = per_repo_accounts_file(workspace);
-    if !path.exists() {
-        return Ok(None);
+    let status = path_status(&path);
+    if status != PathStatus::Present {
+        // Preserve the directory-discovery fallback, but an unreadable
+        // registry cannot prove that an omitted binding account is absent.
+        return Ok((None, status == PathStatus::Missing));
     }
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read account registry {}", path.display()))?;
@@ -475,7 +491,7 @@ fn read_repo_registry(workspace: &Path) -> Result<Option<Vec<RegistryEntry>>> {
             bail!("duplicate account identity {:?}/{}", entry.provider, entry.name);
         }
     }
-    Ok(Some(registry.accounts))
+    Ok((Some(registry.accounts), true))
 }
 
 /// The Codex account names `workspace`'s own registry *file* holds, or an
@@ -538,23 +554,36 @@ fn claude_inventory(workspace: &Path) -> Result<Vec<AccountDescriptor>> {
 /// Codex profile directories discovered directly under `root`, with their
 /// canonical paths. Hidden names are skipped so machine-private state such as
 /// `.quarantine` is never surfaced as an account.
-fn discovered_codex_profiles(root: &Path) -> Result<Vec<(String, PathBuf)>> {
-    let Ok(canonical_root) = root.canonicalize() else {
-        return Ok(Vec::new());
+fn discovered_codex_profiles(root: &Path) -> Result<(Vec<(String, PathBuf)>, bool)> {
+    let canonical_root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) => {
+            let missing = error.kind() == std::io::ErrorKind::NotFound
+                && path_status(root) == PathStatus::Missing;
+            return Ok((Vec::new(), missing));
+        }
     };
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(root)?.filter_map(std::result::Result::ok) {
+    let mut absence_verified = true;
+    for entry in std::fs::read_dir(root)? {
+        let Ok(entry) = entry else {
+            absence_verified = false;
+            continue;
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') || validate_name(&name).is_err() {
             continue;
         }
-        let Ok(directory) = validate_codex_directory(&canonical_root, &name) else {
-            continue;
-        };
-        out.push((name, directory));
+        match validate_codex_directory(&canonical_root, &name) {
+            Ok(directory) => out.push((name, directory)),
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {
+                absence_verified = false;
+            }
+            Err(_) => {}
+        }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
+    Ok((out, absence_verified))
 }
 
 /// Warn once per process that a registered Codex account has no profile
@@ -643,7 +672,7 @@ pub fn reject_repository_local_root(workspace: &Path, root: &Path) -> Result<()>
     Ok(())
 }
 
-fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescriptor>> {
+fn codex_inventory(workspace: &Path, quiet: bool) -> Result<(Vec<AccountDescriptor>, bool)> {
     let root = codex_profile_root()
         .ok_or_else(|| anyhow!("Codex profile root is disabled by LOOM_CODEX_PROFILE_ROOT"))?;
     reject_repository_local_root(workspace, &root)?;
@@ -655,7 +684,7 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescripto
     } else {
         InventoryProvenance::Repo
     };
-    let entries = read_repo_registry(workspace)?;
+    let (entries, mut absence_verified) = read_repo_registry_observed(workspace)?;
     let mut out = Vec::new();
     if let Some(entries) = entries {
         for entry in entries
@@ -668,15 +697,22 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescripto
             let directory = match validate_codex_directory(&root, &entry.credential_reference) {
                 Ok(directory) => directory,
                 Err(err) => {
-                    if codex_directory_is_missing(&root, &entry.credential_reference) {
-                        if !quiet {
-                            warn_unprovisioned_once(
-                                &entry.name,
-                                &entry.credential_reference,
-                                &root,
-                            );
+                    if validate_name(&entry.credential_reference).is_ok() {
+                        let status = path_status(&root.join(&entry.credential_reference));
+                        if status != PathStatus::Present {
+                            absence_verified &= status == PathStatus::Missing
+                                && err.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                    error.kind() == std::io::ErrorKind::NotFound
+                                });
+                            if !quiet {
+                                warn_unprovisioned_once(
+                                    &entry.name,
+                                    &entry.credential_reference,
+                                    &root,
+                                );
+                            }
+                            continue;
                         }
-                        continue;
                     }
                     // Anything else (invalid name, wrong type, escapes the
                     // profile root) is a corrupted or malicious registry
@@ -698,7 +734,9 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescripto
             });
         }
     } else {
-        for (name, directory) in discovered_codex_profiles(&root)? {
+        let (profiles, complete) = discovered_codex_profiles(&root)?;
+        absence_verified &= complete;
+        for (name, directory) in profiles {
             out.push(AccountDescriptor {
                 id: AccountId {
                     provider: AccountProvider::Codex,
@@ -713,7 +751,7 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<Vec<AccountDescripto
         }
     }
     out.sort_by(|a, b| a.id.name.cmp(&b.id.name));
-    Ok(out)
+    Ok((out, absence_verified))
 }
 
 pub fn account_inventory(
@@ -722,7 +760,7 @@ pub fn account_inventory(
 ) -> Result<Vec<AccountDescriptor>> {
     match provider {
         AccountProvider::Claude => claude_inventory(workspace),
-        AccountProvider::Codex => codex_inventory(workspace, false),
+        AccountProvider::Codex => codex_inventory(workspace, false).map(|(accounts, _)| accounts),
     }
 }
 
@@ -740,8 +778,15 @@ pub fn account_inventory_quiet(
 ) -> Result<Vec<AccountDescriptor>> {
     match provider {
         AccountProvider::Claude => claude_inventory(workspace),
-        AccountProvider::Codex => codex_inventory(workspace, true),
+        AccountProvider::Codex => codex_inventory(workspace, true).map(|(accounts, _)| accounts),
     }
+}
+
+/// The usual quiet inventory plus whether omitted accounts are known to be
+/// absent. An unreadable entry can leave the useful part of the inventory
+/// intact without re-arming a binding retry.
+pub(crate) fn codex_inventory_observed(workspace: &Path) -> Result<(Vec<AccountDescriptor>, bool)> {
+    codex_inventory(workspace, true)
 }
 
 /// Raw enabled candidates only; health and cooldown policy belongs to #4493.
@@ -959,6 +1004,54 @@ mod tests {
         let accounts = account_inventory(workspace.path(), AccountProvider::Codex).unwrap();
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id.name, "work");
+    }
+
+    #[test]
+    #[serial]
+    fn codex_inventory_only_attests_readable_absence() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        fs::create_dir(profiles.path().join("work")).unwrap();
+        let ghost = profiles.path().join("ghost");
+        registry(
+            workspace.path(),
+            r#"{"version":1,"accounts":[
+                {"provider":"codex","name":"work","credential_kind":"codex_home","credential_reference":"work","enabled":true},
+                {"provider":"codex","name":"ghost","credential_kind":"codex_home","credential_reference":"ghost","enabled":true}
+            ]}"#,
+        );
+        let observe = || codex_inventory_observed(workspace.path()).unwrap();
+        let (accounts, complete) = observe();
+        assert_eq!(accounts.len(), 1);
+        assert!(complete, "a cleanly missing profile can re-arm a retry");
+
+        symlink(&ghost, &ghost).unwrap();
+        let (partially_read, complete) = observe();
+        assert_eq!(partially_read, accounts);
+        assert!(!complete, "a looping configured path is unverified");
+
+        fs::remove_file(&ghost).unwrap();
+        symlink(profiles.path().join("still-missing"), &ghost).unwrap();
+        let (partially_read, complete) = observe();
+        assert_eq!(partially_read, accounts);
+        assert!(!complete, "a dangling configured path is unverified");
+
+        let registry_path = per_repo_accounts_file(workspace.path());
+        fs::remove_file(&registry_path).unwrap();
+        let (discovered, complete) = observe();
+        assert_eq!(discovered[0].id.name, "work");
+        assert!(!complete, "discovery also retains unreadable paths as unknown");
+
+        fs::remove_file(&ghost).unwrap();
+        assert!(observe().1, "clean discovery can attest absence");
+        symlink(&registry_path, &registry_path).unwrap();
+        let (discovered, complete) = observe();
+        assert_eq!(discovered[0].id.name, "work");
+        assert!(!complete, "an unreadable registry cannot attest absence");
     }
 
     #[test]

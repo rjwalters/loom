@@ -530,6 +530,70 @@ pub fn parse_inspect_array(
 /// off the async runtime (`spawn_blocking`).
 #[must_use]
 pub fn snapshot(docker: &str, inputs: &DriftInputs<'_>, deadline: Duration) -> Snapshot {
+    read_snapshot(docker, inputs, deadline).0
+}
+
+/// A lifecycle snapshot with the extra evidence needed to wake a private
+/// binding early. A usable list can still have an unreadable inspect row.
+pub(crate) struct BindingSnapshot {
+    pub(crate) snapshot: Snapshot,
+    engine: Option<String>,
+    listed: Option<Vec<String>>,
+}
+
+impl std::borrow::Borrow<Snapshot> for BindingSnapshot {
+    fn borrow(&self) -> &Snapshot {
+        &self.snapshot
+    }
+}
+
+impl BindingSnapshot {
+    /// Whether a verified list from the recorded engine named this seat.
+    pub(crate) fn listed(&self, engine: &str, container: &str) -> Option<bool> {
+        if self.engine.as_deref() != Some(engine)
+            || matches!(self.snapshot, Snapshot::Unavailable(_))
+        {
+            return None;
+        }
+        self.listed.as_ref().map(|names| {
+            names
+                .binary_search_by(|name| name.as_str().cmp(container))
+                .is_ok()
+        })
+    }
+}
+
+/// Attest the engine on both sides of the shared read. The identity checks
+/// have their own short bounds so they cannot consume the lifecycle read's
+/// deadline. Ordinary passes skip them.
+pub(crate) fn binding_snapshot(
+    docker: &str,
+    inputs: &DriftInputs<'_>,
+    deadline: Duration,
+    attest_engine: bool,
+) -> BindingSnapshot {
+    let before = attest_engine.then(|| read_engine(docker)).flatten();
+    let (snapshot, listed) = read_snapshot(docker, inputs, deadline);
+    let engine = before.filter(|id| read_engine(docker).as_ref() == Some(id));
+    BindingSnapshot {
+        snapshot,
+        engine,
+        listed,
+    }
+}
+
+fn read_engine(docker: &str) -> Option<String> {
+    let until = Instant::now() + Duration::from_secs(1);
+    let ran = run_bounded(docker, &["info", "--format", "{{.ID}}"], until).ok()?;
+    let id = std::str::from_utf8(&ran.stdout).ok()?.trim();
+    (ran.success && !id.is_empty() && !id.contains(char::is_whitespace)).then(|| id.to_owned())
+}
+
+fn read_snapshot(
+    docker: &str,
+    inputs: &DriftInputs<'_>,
+    deadline: Duration,
+) -> (Snapshot, Option<Vec<String>>) {
     let until = Instant::now() + deadline;
     let ps = match run_bounded(
         docker,
@@ -546,14 +610,28 @@ pub fn snapshot(docker: &str, inputs: &DriftInputs<'_>, deadline: Duration) -> S
     ) {
         Ok(ran) if ran.success => ran,
         Ok(ran) => {
-            return Snapshot::Unavailable(format!("docker ps failed: {}", first_line(&ran.stderr)))
+            let error = format!("docker ps failed: {}", first_line(&ran.stderr));
+            return (Snapshot::Unavailable(error), None);
         }
-        Err(reason) => return Snapshot::Unavailable(reason),
+        Err(reason) => return (Snapshot::Unavailable(reason), None),
     };
-    let names = parse_ps_names(&String::from_utf8_lossy(&ps.stdout));
-    if names.is_empty() {
-        return Snapshot::Available(BTreeMap::new());
-    }
+    let list = String::from_utf8_lossy(&ps.stdout);
+    let names = parse_ps_names(&list);
+    let snapshot = if names.is_empty() {
+        Snapshot::Available(BTreeMap::new())
+    } else {
+        read_inspections(docker, inputs, until, &names)
+    };
+    let listed = matches!(list, std::borrow::Cow::Borrowed(_)).then_some(names);
+    (snapshot, listed)
+}
+
+fn read_inspections(
+    docker: &str,
+    inputs: &DriftInputs<'_>,
+    until: Instant,
+    names: &[String],
+) -> Snapshot {
     let mut args = vec!["inspect", "--type", "container", "--"];
     args.extend(names.iter().map(String::as_str));
     match run_bounded(docker, &args, until) {

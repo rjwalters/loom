@@ -358,6 +358,33 @@ pub struct State {
     drift_reported: HashMap<String, Vec<String>>,
 }
 
+/// Whether any declared binding can use engine evidence this pass. The
+/// lifecycle read happens before convergence, so decide whether it needs
+/// attestation without taking the snapshot early.
+pub(super) fn needs_seat_observation(
+    declared: &Declared,
+    index: &AccountIndex,
+    state: &ReconcileState,
+    now: u64,
+    account_present: impl Fn(&str) -> bool,
+) -> bool {
+    state.docker_retry_at <= now
+        && declared.bindings.iter().any(|binding| {
+            let reference = binding.account.as_str();
+            !index.is_disabled(reference)
+                && !index.is_held(reference)
+                && state
+                    .bindings
+                    .memory
+                    .get(&(binding.account.clone(), binding.key.clone()))
+                    .is_some_and(|memory| {
+                        memory.retry_at > now
+                            && matches!(memory.waiting, Some(WaitReason::ConfiguredSeatMissing(_)))
+                    })
+                && account_present(reference)
+        })
+}
+
 /// What a pass needs from the outside, so it can be driven without Docker.
 #[allow(clippy::type_complexity)]
 pub struct Inputs<'a> {

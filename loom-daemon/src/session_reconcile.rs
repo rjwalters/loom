@@ -124,12 +124,13 @@
 //! drift-recreated.
 
 use crate::script_helpers::now_epoch_secs;
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::tokens_pool::account_registry::{
-    account_inventory_quiet, AccountDescriptor, AccountProvider,
+    codex_inventory_observed, AccountDescriptor, AccountProvider,
 };
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::private_workspace::{self, BindingReadiness};
@@ -140,7 +141,7 @@ use crate::tokens_pool::session_lifecycle::{
     ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
     EXTRA_MOUNTS_LABEL, SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
-use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
+use crate::tokens_pool::session_state::{self, BindingSnapshot, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
 use crate::workspace_registry::WorkspaceRegistry;
 use serde_json::Value;
@@ -588,18 +589,18 @@ pub struct PassInputs<'a> {
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
 /// first use and reused for every account after that (issue #10364 Part B).
-pub struct PassSnapshot<'a> {
-    take: &'a mut dyn FnMut() -> Snapshot,
-    taken: Option<Snapshot>,
+pub struct PassSnapshot<'a, S = Snapshot> {
+    take: &'a mut dyn FnMut() -> S,
+    taken: Option<S>,
 }
 
-impl<'a> PassSnapshot<'a> {
-    pub fn new(take: &'a mut dyn FnMut() -> Snapshot) -> Self {
+impl<'a, S> PassSnapshot<'a, S> {
+    pub fn new(take: &'a mut dyn FnMut() -> S) -> Self {
         Self { take, taken: None }
     }
 
     /// The pass's snapshot, taking it on the first call.
-    pub fn get(&mut self) -> &Snapshot {
+    pub fn get(&mut self) -> &S {
         self.taken.get_or_insert_with(|| (self.take)())
     }
 }
@@ -621,11 +622,11 @@ fn will_read(state: &ReconcileState, index: &AccountIndex, name: &str, now: u64)
 /// longer lists (`extra` drift, a containment gap) are handled first, then
 /// those only missing a mount, then the rest, so a pass spent waiting on
 /// `docker stop`/`run` closes the gap before anything else.
-pub fn reconcile_accounts<R: ContainerRunner>(
+pub fn reconcile_accounts<R: ContainerRunner, S: Borrow<Snapshot>>(
     lifecycle: &mut SessionLifecycle<R>,
     accounts: &[AccountDescriptor],
     inputs: &PassInputs<'_>,
-    observe: &mut PassSnapshot<'_>,
+    observe: &mut PassSnapshot<'_, S>,
     state: &mut ReconcileState,
     now: u64,
 ) -> Vec<AccountOutcome> {
@@ -643,7 +644,7 @@ pub fn reconcile_accounts<R: ContainerRunner>(
         .iter()
         .any(|a| will_read(state, index, &a.id.name, now))
     {
-        let snapshot = observe.get();
+        let snapshot = observe.get().borrow();
         let class =
             |a: &&AccountDescriptor| drift::priority(snapshot, &container_name(&a.id.name), inputs);
         match inputs.class {
@@ -675,7 +676,8 @@ pub fn reconcile_accounts<R: ContainerRunner>(
             }
         } else {
             mem.held_reported = false;
-            match reconcile_one(lifecycle, account, &container, inputs, observe.get(), mem) {
+            match reconcile_one(lifecycle, account, &container, inputs, observe.get().borrow(), mem)
+            {
                 Ok(outcome) => {
                     if outcome == Outcome::Running {
                         if mem.failures > 0 {
@@ -1097,18 +1099,17 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     // Holds and `enabled=false` count across every root before any root
     // acts: the one hold root set the CLI also uses (#10661), a superset of
     // the roots the pass acts in.
-    let hold_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> =
-        session_hold_roots::hold_roots(&registered, Some(fallback_root))
-            .into_iter()
-            .filter_map(|root| {
-                let inventory = account_inventory_quiet(&root, AccountProvider::Codex).ok()?;
-                Some((root, inventory))
-            })
-            .collect();
+    let hold_inventories: Vec<_> = session_hold_roots::hold_roots(&registered, Some(fallback_root))
+        .into_iter()
+        .filter_map(|root| {
+            let (inventory, complete) = codex_inventory_observed(&root).ok()?;
+            Some((root, inventory, complete))
+        })
+        .collect();
     let index = AccountIndex::from_inventories(
         &hold_inventories
             .iter()
-            .map(|(_, inv)| inv.as_slice())
+            .map(|(_, inv, _)| inv.as_slice())
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
@@ -1129,22 +1130,34 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                 None
             }
         };
-    let acting_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = hold_inventories
-        .into_iter()
-        .filter(|(root, _)| acting.contains(root))
-        .collect();
     let acting_inventory_complete = readable
         && acting.iter().all(|root| {
-            acting_inventories
+            hold_inventories
                 .iter()
-                .any(|(observed, _)| observed == root)
+                .any(|(observed, _, complete)| observed == root && *complete)
         });
+    let acting_inventories: Vec<_> = hold_inventories
+        .into_iter()
+        .filter(|(root, _, _)| acting.contains(root))
+        .map(|(root, inventory, _)| (root, inventory))
+        .collect();
     let inventories = acting_inventories.iter().cloned();
+    let declared = bindings::read(fallback_root);
+    let attest_engine =
+        bindings::needs_seat_observation(&declared, &index, state, now, |reference| {
+            binding_account(&acting_inventories, reference).is_some()
+        });
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
-    let read =
-        || session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+    let read = || {
+        session_state::binding_snapshot(
+            "docker",
+            &drift_inputs,
+            session_state::SNAPSHOT_DEADLINE,
+            attest_engine,
+        )
+    };
     let mut take = read;
     let mut observe = PassSnapshot::new(&mut take);
     let dispatch_locks = session_dispatch_lock::lock_dir();
@@ -1236,7 +1249,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             seat.observe(account, snapshot)
         };
     converge_bindings(
-        fallback_root,
+        &declared,
         &index,
         &acting_inventories,
         acting_inventory_complete,
@@ -1247,7 +1260,9 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
-        session_state::publish(std::sync::Arc::new(read()), started);
+        let published =
+            session_state::snapshot("docker", &drift_inputs, session_state::SNAPSHOT_DEADLINE);
+        session_state::publish(std::sync::Arc::new(published), started);
     }
     crate::session_status::record_pass(&all, now);
     all
@@ -1258,9 +1273,9 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
 fn binding_snapshot<'a>(
     account: &str,
     outcomes: &[AccountOutcome],
-    before: &'a mut PassSnapshot<'_>,
-    after: &'a mut PassSnapshot<'_>,
-) -> &'a Snapshot {
+    before: &'a mut PassSnapshot<'_, BindingSnapshot>,
+    after: &'a mut PassSnapshot<'_, BindingSnapshot>,
+) -> &'a BindingSnapshot {
     if outcomes.iter().any(|item| {
         item.name == account
             && (item.outcome.started()
@@ -1295,7 +1310,7 @@ fn binding_account<'a>(
 /// every account's own recovery so a dead container is restored first. Costs a
 /// config read when nothing is declared; skipped while Docker is backing off.
 fn converge_bindings(
-    fallback_root: &Path,
+    declared: &bindings::Declared,
     index: &AccountIndex,
     inventories: &[(PathBuf, Vec<AccountDescriptor>)],
     inventory_complete: bool,
@@ -1306,7 +1321,6 @@ fn converge_bindings(
     state: &mut ReconcileState,
     now: u64,
 ) -> bindings::Pass {
-    let declared = bindings::read(fallback_root);
     if declared.bindings.is_empty() && declared.invalid.is_empty() {
         return bindings::Pass::default();
     }
@@ -1345,7 +1359,7 @@ fn converge_bindings(
         }
     };
     bindings::converge_pass(
-        &declared,
+        declared,
         &mut bindings::Inputs {
             index,
             converge: &converge,
