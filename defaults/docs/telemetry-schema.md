@@ -1905,6 +1905,8 @@ Every other name is a **`Gauge`**:
 | `loom.host.swap.used_bytes`, `loom.host.swap.total_bytes` | bytes | `host.health` interval |
 | `loom.agent_scope.peak_memory_bytes` (`repo`) | bytes | once per finished agent scope, sweep or role agent (cgroup `memory.peak`, #11094); `repo` is `(unattributed)` for a scope outside every workspace; absent without cgroup v2 |
 | `loom.host.worktree_volume.free_bytes`, `loom.host.worktree_volume.total_bytes` | bytes | `host.health` interval |
+| `loom.host.codex_workspace_volume.used_bytes` (`account` = seat name) | bytes | when that seat is measured, one seat attempted every three minutes |
+| `loom.host.codex_workspace_volume.total_used_bytes` | bytes | after a pass with fresh readings for the complete inventory |
 | `loom.queue.issues` | count | every work-finder tick |
 | `loom.queue.listing_failed_repos` | count | every work-finder tick |
 | `loom.queue.listing_incomplete_repos` | count | every work-finder tick |
@@ -1915,6 +1917,24 @@ Every other name is a **`Gauge`**:
 | `loom.dispatch.busy_slots` (`role`; step series also carry `pool="step"` and `loom.daemon.process_instance_id`), `loom.dispatch.role_max_concurrent`, `loom.dispatch.role_idle_slots` | count | every work-finder tick |
 | `loom.dispatch.running_oldest_age_sec` (`role`, `pool="step"`), `loom.dispatch.running_by_age` (`role`, `pool="step"`, `age`), #12873 | seconds, count | every work-finder tick (default 60 s) once a registry has published its steps; the oldest age only for a role with a live step |
 | `loom.dispatch.running_by_points` (`role`, `pool="step"`, `points`), #12957 | count | every work-finder tick (default 60 s) once a registry has published its steps, `0` included |
+
+The Codex workspace volume gauges (#14678) report allocated bytes on the
+worker's discovered private workspace volumes. Each three-minute tick advances
+one seat, including after a failed attempt. Reads run off the host-health loop
+with no overlapping passes. The sampler verifies volume ownership and the
+Docker-managed backing path, then mounts just that directory read-only in a
+short-lived container. It uses the local session image and never pulls an
+image during a sample. Volumes can be measured with or without a live seat.
+Each read has up to 175 seconds, covering the observed 33–147-second cold scans
+while leaving time to verify the volume identity again before reporting.
+
+An unavailable image, an unverified or replaced volume, a timeout or nonzero
+du exit yields no point and invalidates the previous reading. A successful
+empty measurement can report zero. The host total requires a successful
+reading from every volume in the latest inventory and expires readings at one
+full inventory rotation. Removed volumes are dropped and new volumes need
+their own readings. The rolling total combines readings taken at different
+times.
 
 `loom.queue.issues` (Issue #8852, phase 2) is the ready-queue depth. It has
 one point per queue disposition, labelled `state` (`running`, `ready`,

@@ -58,6 +58,9 @@ const LOCAL_TOKEN: &str = "local `gh auth token` read of the chosen credential; 
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
+    // Promotion's collaborator-permission endpoint depends on which
+    // credential asks. Timeline and body-edit reads still use readers.
+    ("cli/forge_identity_cmd.rs", ASKER),
     ("cli/lease_release.rs", WRITE),
     // #13744: `merge-pr workflow-scope`'s `gh api -i user` probe reports the
     // asking credential's own scopes — the credential that will do the merge,

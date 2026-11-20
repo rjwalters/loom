@@ -707,6 +707,43 @@ fn host_points_skip_unmeasured_fields() {
     assert!(HostResources::default().points().is_empty());
 }
 
+#[test]
+fn seat_volume_points_use_host_gauges_and_emit_the_total_only_when_complete() {
+    use super::host::seat_volume_points;
+    use crate::tokens_pool::private_workspace::SeatVolumeUsage;
+
+    let (queue, sink) = sink();
+    sink.emit_metrics(seat_volume_points(SeatVolumeUsage {
+        seats: vec![("alice".into(), 12_288), ("bob".into(), 0)],
+        total: Some(12_288),
+    }));
+    sink.emit_metrics(seat_volume_points(SeatVolumeUsage {
+        seats: vec![("alice".into(), 12_288)],
+        total: None,
+    }));
+    let queued = queue.0.lock().unwrap();
+    let per_seat = MetricPoint::int(MetricName::HostCodexWorkspaceVolumeUsedBytes, 12_288)
+        .label("account", "alice");
+    let TelemetryRecord::MetricPoints(complete) = &queued[0].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(queued[0].host_id, "host-a");
+    assert_eq!(
+        complete.points,
+        [
+            per_seat.clone(),
+            MetricPoint::int(MetricName::HostCodexWorkspaceVolumeUsedBytes, 0)
+                .label("account", "bob"),
+            MetricPoint::int(MetricName::HostCodexWorkspaceVolumeTotalUsedBytes, 12_288),
+        ]
+    );
+    let TelemetryRecord::MetricPoints(partial) = &queued[1].record else {
+        panic!("expected metric.points");
+    };
+    assert_eq!(partial.points, [per_seat]);
+    assert!(seat_volume_points(SeatVolumeUsage::default()).is_empty());
+}
+
 // ---------------------------------------------------------------- gateway contract
 
 const COLLECTOR_CONFIG: &str =

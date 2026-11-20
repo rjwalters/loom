@@ -688,6 +688,26 @@ has_restore_note() {  # #13414: latest trusted comment is a Champion/operator ho
   jq -e '(. | last | .body // "") | test("(^|\n)[ \t]*<!-- loom:hold-restored -->[ \t\r]*(\n|$)")' <<<"$t" >/dev/null && echo true || echo false
 }
 
+resolve_dep_states() {
+  # #14710: every dependency's state comes from ONE daemon-side resolver, not
+  # per-dep inline `gh issue view` reads. `dep-recheck-fingerprint dep-states`
+  # reads each ref live, bound to its qualified OWNER/REPO#N, and fails
+  # closed: an open draft, an unreadable read (failed/empty/shed), or an
+  # answer naming a different repo or number all leave that dependency
+  # unresolved. (On 2026-11-19 the inline loop read the cross-repo draft
+  # example-org/tool-repo#630 as resolved and lifted a hold that was still live.) A
+  # daemon failure — including an old binary without the subcommand — also
+  # answers false: the hold is preserved, never guessed off. Output: line 1
+  # `true`/`false` (all deps terminal?), line 2 the space-joined resolved
+  # refs for the unblock announcement, both read through the daemon's
+  # eval-safe KEY=VALUE quoting.
+  local out ALL_RESOLVED="" RESOLVED=""
+  out=$(loom-daemon dep-recheck-fingerprint dep-states --refs "$1" 2>/dev/null) || out=""
+  eval "$(printf '%s\n' "$out" | grep -E '^(ALL_RESOLVED|RESOLVED)=')" || true
+  [ "$ALL_RESOLVED" = "true" ] || ALL_RESOLVED=false
+  printf '%s\n%s\n' "$ALL_RESOLVED" "$RESOLVED"
+}
+
 check_and_unblock() {
   # --limit: gh defaults to 30 (#10553)
   local blocked_limit=1000 blocked_json blocked_count
@@ -712,18 +732,13 @@ check_and_unblock() {
       continue
     fi
 
-    local all_resolved=true
-    local resolved_deps=""
-
-    for dep in $deps; do
-      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
-      local state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
-      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
-        all_resolved=false
-        break
-      fi
-      resolved_deps="$resolved_deps $dr#$dn"
-    done
+    # #14710: binding-verified, fail-closed dependency resolution — see
+    # resolve_dep_states above. (An open cross-repo draft PR among the deps
+    # answers false here; the hold survives.)
+    local dep_verdict
+    dep_verdict=$(resolve_dep_states "$deps")
+    local all_resolved=$(printf '%s\n' "$dep_verdict" | sed -n '1p')
+    local resolved_deps=$(printf '%s\n' "$dep_verdict" | sed -n '2p')
 
     if [ "$all_resolved" = true ]; then
       # Superseding-block gate (#4634): a resolved body dependency is NOT
