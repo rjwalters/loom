@@ -258,6 +258,11 @@ fn confirm_merge(ctx: &Ctx<'_>, pr: u32, rec: &GrantRecord) -> Reconciled {
         at: merged_at,
         merged_after_revocation: after_revocation,
     });
+    if recorded && ctx.execution_enabled {
+        if let Err(e) = ctx.forge.confirmed_merge_issue_claims(pr) {
+            log::warn!("merge-queue: PR #{pr} could not reconcile closed issue claims: {e}");
+        }
+    }
     Reconciled::Merged {
         recorded,
         after_revocation,
