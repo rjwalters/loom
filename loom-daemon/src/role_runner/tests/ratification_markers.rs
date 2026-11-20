@@ -183,9 +183,14 @@ fn failed_closed_key_posts_nothing_and_other_key_is_unaffected() {
         Sink::default(),
         ok_runner(),
     );
-    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: true }, &sink, &mut r);
     assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Ee]);
     assert_eq!(sink.posted.borrow().len(), 1);
+    assert_eq!(r.calls, 1);
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "posted"), ("market", "pre_launch_failed")],
+    );
 }
 
 #[test]
@@ -203,9 +208,13 @@ fn non_success_session_fails_closed_without_marker() {
         output: None,
         last_key: std::cell::Cell::new(None),
     };
-    run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &prs, &Instr { fail_market: false }, &sink, &mut r);
     assert_eq!(r.calls, 2);
     assert!(sink.posted.borrow().is_empty());
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "invocation_failed"), ("market", "invocation_failed")],
+    );
 }
 
 #[test]
@@ -401,7 +410,7 @@ fn success_without_a_parsed_verdict_withholds_and_posts_nothing() {
         results[0]
             .1
             .iter()
-            .all(|(_, p)| matches!(p, KeyPost::Withheld(_))),
+            .all(|(_, p)| matches!(p, KeyPost::Withheld(..))),
         "{:?}",
         results
     );
@@ -442,7 +451,9 @@ fn one_key_with_a_verdict_and_one_without_post_independently() {
         fn last_output(&self) -> Option<String> {
             match self.0.last_key.get() {
                 Some(Key::Market) => Some("declined: disclosure problem".into()),
-                _ => Some(valid_review(Key::Ee)),
+                _ => Some(
+                    "## EE-key review: fixture\n\n**Overall verdict:** request-changes\n".into(),
+                ),
             }
         }
     }
@@ -465,7 +476,73 @@ fn one_key_with_a_verdict_and_one_without_post_independently() {
     assert_eq!(keys_marked(&comments(&sink), HEAD), vec![Key::Ee]);
     assert_eq!(sink.posted.borrow().len(), 1);
     assert_eq!(results[0].1[0].1, KeyPost::Posted);
-    assert!(matches!(results[0].1[1].1, KeyPost::Withheld(_)));
+    assert!(matches!(results[0].1[1].1, KeyPost::Withheld(..)));
+    assert!(sink.posted.borrow()[0].1.contains("request-changes"));
+    assert_buckets(
+        &TickOutcome::from_run(&results, 0),
+        &[("ee", "posted"), ("market", "verdict_invalid")],
+    );
+}
+
+#[test]
+fn positive_prelaunch_evidence_is_captured_before_the_next_key() {
+    use crate::observability::lifecycle::{
+        pre_launch, RoleFailure, ROLL_INTERRUPTED, UNCLASSIFIED_PRE_LAUNCH,
+    };
+
+    struct AdmissionOnce {
+        ee_outcome: RoleTickOutcome,
+        evidence: Option<&'static str>,
+        last_ee: bool,
+    }
+    impl RoleInvocationRunner for AdmissionOnce {
+        fn invoke(&mut self, role: &str, _prompt: &str) -> RoleTickOutcome {
+            self.last_ee = role == "ratification-ee";
+            if self.last_ee {
+                self.ee_outcome.clone()
+            } else {
+                RoleTickOutcome::Success
+            }
+        }
+        fn unlaunched_failure(&self) -> Option<RoleFailure> {
+            self.evidence
+                .filter(|_| self.last_ee)
+                .map(|class| RoleFailure::new(class, None, "local fixture detail"))
+        }
+    }
+
+    let failure = RoleTickOutcome::Failure("local admission detail".into());
+    for (ee_outcome, evidence, expected) in [
+        (
+            failure.clone(),
+            Some(pre_launch::WRITE_SCOPE_REFUSED.class),
+            "pre_launch_failed",
+        ),
+        (RoleTickOutcome::NoTokenPool, None, "pre_launch_failed"),
+        (failure.clone(), None, "invocation_failed"),
+        (failure.clone(), Some(UNCLASSIFIED_PRE_LAUNCH), "invocation_failed"),
+        (failure, Some(ROLL_INTERRUPTED), "invocation_failed"),
+    ] {
+        let sink = Sink::default();
+        let results = run_lane(
+            &cfg(),
+            None,
+            "o/r",
+            &Feed::new(),
+            &CountingInstr::default(),
+            &sink,
+            &mut AdmissionOnce {
+                ee_outcome,
+                evidence,
+                last_ee: false,
+            },
+        );
+        assert!(sink.posted.borrow().is_empty());
+        assert_buckets(
+            &TickOutcome::from_run(&results, 0),
+            &[("ee", expected), ("market", "output_missing")],
+        );
+    }
 }
 
 #[test]
@@ -975,6 +1052,7 @@ fn unreadable_comment_list_runs_posts_and_counts_nothing() {
     assert!(instr.fetches.borrow().is_empty());
     let o = TickOutcome::from_run_stats(&results, skipped, unreadable);
     assert_eq!(o.reason, "degraded");
+    assert_buckets(&o, &[]);
 }
 
 #[test]
@@ -1038,7 +1116,7 @@ fn a_failed_post_for_the_missing_key_leaves_the_completed_key_alone() {
     let results = run_lane(&cfg(), None, "o/r", &feed, &instr, &sink, &mut r);
     assert_eq!(r.calls, vec!["ratification-ee"]);
     match results[0].1.as_slice() {
-        [(Key::Ee, KeyPost::Withheld(reason))] => {
+        [(Key::Ee, KeyPost::Withheld(WithheldClass::PostFailed, reason))] => {
             assert!(reason.contains("post failed"), "{reason}")
         }
         other => panic!("expected the failed ee post, got {other:?}"),
@@ -1047,13 +1125,48 @@ fn a_failed_post_for_the_missing_key_leaves_the_completed_key_alone() {
     // contributes nothing, and a later tick retries ee alone.
     let o = TickOutcome::from_run_stats(&results, 0, 0);
     assert_eq!((o.reason, o.selected, o.ran, o.posted, o.withheld), ("ran", 1, 1, 0, 1));
+    assert_buckets(&o, &[("ee", "post_failed")]);
 }
 
 // ---- tick outcome + shared entry points (#13707) ----
 
 use crate::role_runner::ratification_lane::{
-    run_lane_counted, run_lane_stats, tick_span, KeyPost, TickOutcome, STEP_TICK_INTERVAL,
+    run_lane_counted, run_lane_stats, tick_span, KeyPost, TickOutcome, WithheldClass,
+    STEP_TICK_INTERVAL,
 };
+
+fn assert_buckets(o: &TickOutcome, expected: &[(&str, &str)]) {
+    let span =
+        tick_span(std::path::Path::new("/fixture"), "role_tick", o, chrono::Utc::now()).bounded();
+    let mut posted = 0;
+    let mut withheld = 0;
+    for key in ["ee", "market"] {
+        for class in [
+            "posted",
+            "pre_launch_failed",
+            "invocation_failed",
+            "output_missing",
+            "verdict_invalid",
+            "post_failed",
+        ] {
+            let name = format!("loom.ratification.{key}.{class}");
+            let expected = if expected.contains(&(key, class)) {
+                "1"
+            } else {
+                "0"
+            };
+            let value = &span.attributes[&name];
+            assert_eq!(value, expected, "{name}");
+            let count: usize = value.parse().unwrap();
+            if class == "posted" {
+                posted += count;
+            } else {
+                withheld += count;
+            }
+        }
+    }
+    assert_eq!((posted, withheld), (o.posted, o.withheld));
+}
 
 /// A forge whose trusted comments are whatever the sink has posted so far.
 struct Live<'a> {
@@ -1114,9 +1227,10 @@ fn second_pass_over_a_marked_head_posts_nothing() {
     let instr = Instr { fail_market: false };
     run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
     assert_eq!(sink.posted.borrow().len(), 2);
-    run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
+    let results = run_lane(&cfg(), None, "o/r", &live, &instr, &sink, &mut r);
     assert_eq!(sink.posted.borrow().len(), 2, "no double-posting of keys");
     assert_eq!(r.calls, 2, "no second reviewer dispatch");
+    assert_buckets(&TickOutcome::from_run(&results, 0), &[]);
 }
 
 #[test]
@@ -1196,7 +1310,10 @@ fn withheld_keys_are_counted() {
     let results = vec![(
         5,
         vec![
-            (Key::Ee, KeyPost::Withheld("could not resolve".into())),
+            (
+                Key::Ee,
+                KeyPost::Withheld(WithheldClass::PreLaunchFailed, "could not resolve".into()),
+            ),
             (Key::Market, KeyPost::Posted),
         ],
     )];

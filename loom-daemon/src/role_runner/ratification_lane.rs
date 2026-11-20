@@ -544,8 +544,18 @@ fn bound_verdict(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPost {
     Posted,
-    /// No marker posted; the reason is logged.
-    Withheld(String),
+    /// No marker posted. Only the fixed class goes to telemetry.
+    Withheld(WithheldClass, String),
+}
+
+/// Fixed causes of a withheld marker, in tick attribute order after `posted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithheldClass {
+    PreLaunchFailed = 1,
+    InvocationFailed,
+    OutputMissing,
+    VerdictInvalid,
+    PostFailed,
 }
 
 /// Post a marker for each **attempted** key whose session ended in
@@ -564,34 +574,39 @@ pub fn post_markers(
 ) -> Vec<(Key, KeyPost)> {
     use super::ratification_dispatch::{role_name, KeyOutcome};
     use super::RoleTickOutcome;
+    use WithheldClass::{
+        InvocationFailed, OutputMissing, PostFailed, PreLaunchFailed, VerdictInvalid,
+    };
     [Key::Ee, Key::Market]
         .into_iter()
         .filter_map(|key| {
             let result = match dispatched.get(key)? {
                 KeyOutcome::Ran(RoleTickOutcome::Success) => {
-                    let parsed = dispatched
-                        .output(key)
-                        .ok_or_else(|| "no session output captured".to_string())
-                        .and_then(|out| parse_review(key, out));
-                    match parsed {
-                        Ok(review) => sink
+                    match dispatched.output(key).map(|out| parse_review(key, out)) {
+                        Some(Ok(review)) => sink
                             .post(
                                 pr,
                                 &marker_body(key, head_sha, role_name(key), Some(&review.text)),
                             )
                             .map(|()| KeyPost::Posted)
                             .unwrap_or_else(|e| {
-                                KeyPost::Withheld(format!("marker post failed: {e}"))
+                                KeyPost::Withheld(PostFailed, format!("marker post failed: {e}"))
                             }),
-                        Err(reason) => KeyPost::Withheld(reason),
+                        Some(Err(reason)) => KeyPost::Withheld(VerdictInvalid, reason),
+                        None => {
+                            KeyPost::Withheld(OutputMissing, "no session output captured".into())
+                        }
                     }
                 }
-                KeyOutcome::Ran(other) => {
-                    KeyPost::Withheld(format!("session did not succeed: {other:?}"))
+                KeyOutcome::Ran(other) => KeyPost::Withheld(
+                    InvocationFailed,
+                    format!("session did not succeed: {other:?}"),
+                ),
+                KeyOutcome::FailedClosed(reason) => {
+                    KeyPost::Withheld(PreLaunchFailed, reason.clone())
                 }
-                KeyOutcome::FailedClosed(reason) => KeyPost::Withheld(reason.clone()),
             };
-            if let KeyPost::Withheld(reason) = &result {
+            if let KeyPost::Withheld(_, reason) = &result {
                 let kind = match key {
                     Key::Ee => "withheld:ee",
                     Key::Market => "withheld:market",
@@ -703,9 +718,13 @@ pub struct TickOutcome {
     pub posted: usize,
     /// PRs not selected because a candidate file's head content was unreadable.
     pub unreadable: usize,
-    /// Keys not posted (pin unresolved, session failed, post failed).
+    /// Keys not posted.
     pub withheld: usize,
+    /// One count per fixed class, first for EE and then for market.
+    key_counts: [[usize; CLASSES_PER_KEY]; 2],
 }
+
+const CLASSES_PER_KEY: usize = 1 + WithheldClass::PostFailed as usize;
 
 impl TickOutcome {
     fn bare(reason: &'static str) -> Self {
@@ -717,6 +736,7 @@ impl TickOutcome {
             posted: 0,
             unreadable: 0,
             withheld: 0,
+            key_counts: Default::default(),
         }
     }
 
@@ -733,16 +753,20 @@ impl TickOutcome {
         skipped: usize,
         unreadable: usize,
     ) -> Self {
-        let withheld = results
-            .iter()
-            .flat_map(|(_, keys)| keys)
-            .filter(|(_, p)| matches!(p, KeyPost::Withheld(_)))
-            .count();
-        let posted = results
-            .iter()
-            .flat_map(|(_, keys)| keys)
-            .filter(|(_, p)| *p == KeyPost::Posted)
-            .count();
+        let mut key_counts = [[0; CLASSES_PER_KEY]; 2];
+        for (key, post) in results.iter().flat_map(|(_, keys)| keys) {
+            let key_index = match key {
+                Key::Ee => 0,
+                Key::Market => 1,
+            };
+            let class_index = match post {
+                KeyPost::Posted => 0,
+                KeyPost::Withheld(class, _) => *class as usize,
+            };
+            key_counts[key_index][class_index] += 1;
+        }
+        let posted = key_counts.iter().map(|counts| counts[0]).sum();
+        let withheld = key_counts.iter().flatten().sum::<usize>() - posted;
         Self {
             reason: if !results.is_empty() {
                 "ran"
@@ -757,6 +781,7 @@ impl TickOutcome {
             posted,
             unreadable,
             withheld,
+            key_counts,
         }
     }
 }
@@ -789,7 +814,8 @@ pub const KEY_RAN: &str = "loom.ratification.ran";
 pub const KEY_POSTED: &str = "loom.ratification.posted";
 pub const KEY_UNREADABLE: &str = "loom.ratification.unreadable";
 pub const KEY_WITHHELD: &str = "loom.ratification.withheld";
-pub const KEYS: [&str; 8] = [
+const KEY_COUNT_START: usize = 8;
+pub const KEYS: [&str; KEY_COUNT_START + 2 * CLASSES_PER_KEY] = [
     KEY_REASON,
     KEY_SOURCE,
     KEY_SELECTED,
@@ -798,6 +824,18 @@ pub const KEYS: [&str; 8] = [
     KEY_POSTED,
     KEY_UNREADABLE,
     KEY_WITHHELD,
+    "loom.ratification.ee.posted",
+    "loom.ratification.ee.pre_launch_failed",
+    "loom.ratification.ee.invocation_failed",
+    "loom.ratification.ee.output_missing",
+    "loom.ratification.ee.verdict_invalid",
+    "loom.ratification.ee.post_failed",
+    "loom.ratification.market.posted",
+    "loom.ratification.market.pre_launch_failed",
+    "loom.ratification.market.invocation_failed",
+    "loom.ratification.market.output_missing",
+    "loom.ratification.market.verdict_invalid",
+    "loom.ratification.market.post_failed",
 ];
 
 /// The `ratification_lane.tick` span: an instant, its own root.
@@ -826,6 +864,12 @@ pub fn tick_span(
     put(KEY_POSTED, o.posted.to_string());
     put(KEY_UNREADABLE, o.unreadable.to_string());
     put(KEY_WITHHELD, o.withheld.to_string());
+    for (key, count) in KEYS[KEY_COUNT_START..]
+        .iter()
+        .zip(o.key_counts.iter().flatten())
+    {
+        put(key, count.to_string());
+    }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
         context,

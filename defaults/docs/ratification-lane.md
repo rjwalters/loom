@@ -80,6 +80,73 @@ candidate file. An unreadable list never authorizes a rerun — treating it as
 "no markers" would duplicate completed keys. A successfully read empty list
 selects both keys as missing.
 
+## Tick outcome counts
+
+The existing `ratification_lane.tick` span reports one final outcome per
+attempted key. Each entry below is a count at
+`loom.ratification.<ee|market>.<outcome>`. All twelve fields are present,
+including zeroes. Review content and diagnostic details stay off the span.
+
+| Outcome | When it is counted |
+|---|---|
+| `posted` | The marker was posted for a valid verdict, including a negative review. |
+| `pre_launch_failed` | An instruction pin failed or the runner reported a known pre-launch refusal. |
+| `invocation_failed` | An invocation did not succeed, including interruption or failure with an unknown launch stage. |
+| `output_missing` | The invocation succeeded without captured output. |
+| `verdict_invalid` | The captured output did not parse as a review for that key. |
+| `post_failed` | The review parsed and the forge did not accept the marker post. |
+
+The two `posted` fields sum to `loom.ratification.posted`. The other
+ten sum to `loom.ratification.withheld`. A trusted marker for the current
+head skips that key, and an unreadable candidate counts once in
+`loom.ratification.unreadable`. Neither case adds a key outcome.
+
+### Check retained counts after rollout
+
+After ordinary rollout, substitute the exact deployed daemon SHA and a
+bounded UTC interval with retained work in the query below. It collapses
+replayed spans by trace and span ID before comparing and summing the same
+tick rows. Rows missing fields are counted separately from genuine zeroes.
+Require nonzero `ticks`, zero `incomplete_ticks`, and zero
+`unreconciled_ticks`. Use a window with nonzero posted or withheld counts
+to observe actual outcomes. Check the fields remain present through the
+collector route if any are missing.
+
+```sql
+WITH
+  ['ee', 'market'] AS review_keys,
+  ['posted', 'pre_launch_failed', 'invocation_failed', 'output_missing',
+   'verdict_invalid', 'post_failed'] AS outcomes,
+  arrayConcat(
+    ['loom.ratification.posted', 'loom.ratification.withheld'],
+    arrayFlatten(arrayMap(k -> arrayMap(o -> concat('loom.ratification.', k, '.', o),
+                                        outcomes), review_keys))
+  ) AS fields,
+  per_tick AS (
+    SELECT argMax(attributes_string, timestamp) AS attrs
+    FROM signoz_traces.signoz_index_v3
+    WHERE name = 'ratification_lane.tick'
+      AND attributes_string['loom.daemon.revision'] = '<deployed-sha>'
+      AND timestamp >= toDateTime64('<start-utc>', 9, 'UTC')
+      AND timestamp < toDateTime64('<end-utc>', 9, 'UTC')
+    GROUP BY trace_id, span_id
+  ),
+  decoded AS (
+    SELECT arrayMap(f -> toUInt64OrNull(attrs[f]), fields) AS parsed,
+           arrayAll(x -> isNotNull(x), parsed) AS complete,
+           arrayMap(x -> ifNull(x, toUInt64(0)), parsed) AS n
+    FROM per_tick
+  )
+SELECT count() AS ticks,
+       countIf(NOT complete) AS incomplete_ticks,
+       countIf(complete AND (n[1] != n[3] + n[9]
+         OR n[2] != arraySum(arraySlice(n, 3)) - n[3] - n[9])) AS unreconciled_ticks,
+       mapFromArrays(fields,
+         arrayResize(sumForEach(arrayMap(x -> if(complete, x, toUInt64(0)), n)),
+                     length(fields), toUInt64(0))) AS totals
+FROM decoded;
+```
+
 ## Marker format
 
 ```

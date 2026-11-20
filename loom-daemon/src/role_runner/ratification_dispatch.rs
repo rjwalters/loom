@@ -49,7 +49,7 @@ pub trait InstructionSource {
 /// The result for one key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyOutcome {
-    /// The session ran; step 3 reads the verdict from it.
+    /// Invocation result; a successful one can supply a verdict.
     Ran(RoleTickOutcome),
     /// The session was not launched; the reason is recorded.
     FailedClosed(String),
@@ -150,7 +150,13 @@ pub fn dispatch(
                     key == Key::Market && src.repo_is_private(target_repo) != Some(true);
                 let prompt = build_prompt(&text, pr_ref, public_only);
                 let outcome = runner.invoke(role_name(key), &prompt);
-                (KeyOutcome::Ran(outcome), runner.last_output())
+                // Read the evidence now: the next key reuses the same runner.
+                let result = if failed_before_launch(&outcome, runner) {
+                    KeyOutcome::FailedClosed(format!("session did not succeed: {outcome:?}"))
+                } else {
+                    KeyOutcome::Ran(outcome)
+                };
+                (result, runner.last_output())
             }
         }
     };
@@ -167,6 +173,26 @@ pub fn dispatch(
         market,
         ee_output,
         market_output,
+    }
+}
+
+fn failed_before_launch(outcome: &RoleTickOutcome, runner: &dyn RoleInvocationRunner) -> bool {
+    use crate::observability::lifecycle::pre_launch;
+    match outcome {
+        RoleTickOutcome::RuntimeRejected(_)
+        | RoleTickOutcome::NoTokenPool
+        | RoleTickOutcome::PoolExhausted { .. }
+        | RoleTickOutcome::ModelRuntimeMismatch(_)
+        | RoleTickOutcome::QueueEmpty => true,
+        // The runner also uses this channel for a launched version-roll stop
+        // and for an unclassified failure without a launch span. Neither is
+        // positive evidence that the invocation was refused before launch.
+        RoleTickOutcome::Failure(_) => runner.unlaunched_failure().is_some_and(|failure| {
+            pre_launch::ALL
+                .iter()
+                .any(|site| site.class == failure.class())
+        }),
+        RoleTickOutcome::Success | RoleTickOutcome::LoadSkipped { .. } => false,
     }
 }
 

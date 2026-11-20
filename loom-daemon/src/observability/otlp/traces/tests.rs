@@ -101,6 +101,113 @@ fn traces_resource_carries_the_build_service_version() {
     assert_eq!(version, Some(serde_json::json!(env!("CARGO_PKG_VERSION"))));
 }
 
+#[test]
+fn ratification_counts_reconcile_on_the_otlp_wire_without_exporting_detail() {
+    use crate::role_runner::ratification_lane::{
+        tick_span, Key, KeyPost, TickOutcome, WithheldClass,
+    };
+    use prost::Message;
+
+    let results = [
+        vec![(
+            731,
+            vec![
+                (
+                    Key::Ee,
+                    KeyPost::Withheld(
+                        WithheldClass::VerdictInvalid,
+                        "fixture private review".into(),
+                    ),
+                ),
+                (Key::Market, KeyPost::Posted),
+            ],
+        )],
+        vec![(
+            732,
+            vec![
+                (Key::Ee, KeyPost::Posted),
+                (
+                    Key::Market,
+                    KeyPost::Withheld(WithheldClass::PostFailed, "fixture raw error".into()),
+                ),
+            ],
+        )],
+    ];
+    let root = std::path::Path::new("/fixture/private-prompt-path");
+    let now = Utc::now();
+    let times = [now, now + chrono::TimeDelta::seconds(1)];
+    let envelopes: Vec<_> = results
+        .iter()
+        .zip(times)
+        .map(|(results, at)| {
+            let tick = TickOutcome::from_run(results, 0);
+            let record = tick_span(root, "step_dispatch", &tick, at);
+            TelemetryEnvelope::new("host", TelemetryRecord::Span(record))
+        })
+        .collect();
+    let request = build_traces_request(&envelopes).unwrap();
+    let wire = request.encode_to_vec();
+    let json =
+        serde_json::to_value(ExportTraceServiceRequest::decode(wire.as_slice()).unwrap()).unwrap();
+    let spans = json["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap();
+    assert_eq!(spans.len(), 2);
+    let mut nonzero = BTreeMap::new();
+    for span in spans {
+        assert_eq!(span["name"], "ratification_lane.tick");
+        let attrs = span["attributes"].as_array().unwrap();
+        let count = |key: &str| -> usize {
+            attrs.iter().find(|kv| kv["key"] == key).unwrap()["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let mut posted = 0;
+        let mut withheld = 0;
+        for key in ["ee", "market"] {
+            for class in [
+                "posted",
+                "pre_launch_failed",
+                "invocation_failed",
+                "output_missing",
+                "verdict_invalid",
+                "post_failed",
+            ] {
+                let count = count(&format!("loom.ratification.{key}.{class}"));
+                if class == "posted" {
+                    posted += count;
+                } else {
+                    withheld += count;
+                }
+                if count > 0 {
+                    *nonzero.entry((key, class)).or_insert(0) += count;
+                }
+            }
+        }
+        assert_eq!(posted, count("loom.ratification.posted"));
+        assert_eq!(withheld, count("loom.ratification.withheld"));
+    }
+    assert_eq!(
+        nonzero,
+        BTreeMap::from([
+            (("ee", "verdict_invalid"), 1),
+            (("ee", "posted"), 1),
+            (("market", "post_failed"), 1),
+            (("market", "posted"), 1),
+        ])
+    );
+    let wire = json.to_string();
+    for private in [
+        "fixture private review",
+        "fixture raw error",
+        "/fixture/private-prompt-path",
+    ] {
+        assert!(!wire.contains(private));
+    }
+}
+
 /// #9985: an `invoke github` span reaches the OTLP wire with its fixed name,
 /// derived IDs, every `github.*` attribute and `service.name=loom-daemon`.
 #[test]
