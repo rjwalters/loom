@@ -185,14 +185,44 @@ assert_eq "1" "$RC" "exit 1 on a 3-hop cycle"
 assert_contains "$OUT" "CYCLE_PATH: o/r#1 -> o/r#2 -> o/r#3 -> o/r#1" "3-hop path reported in order"
 
 echo
-echo "--- cycle that does not pass through the root ---"
+echo "--- a downstream cycle is an ordinary dependency wait, not the root's deadlock (#14732) ---"
 reset_state
 fixture 'o/r#1' OPEN 'Depends on #2'
 fixture 'o/r#2' OPEN 'Depends on #3'
 fixture 'o/r#3' OPEN 'Depends on #2'
 run_ddc --issue 1 --repo o/r
-assert_eq "1" "$RC" "exit 1 - a cycle downstream of the root still deadlocks the root"
+assert_eq "0" "$RC" "exit 0 - the loop belongs to #2 and #3, not the root"
+assert_contains "$OUT" "NO_CYCLE" "no cycle reported for an issue not on the loop"
+run_ddc --issue 2 --repo o/r
+assert_eq "1" "$RC" "exit 1 - walked from a member, the same loop is found"
 assert_contains "$OUT" "CYCLE_PATH: o/r#2 -> o/r#3 -> o/r#2" "reports the loop itself, not the approach path"
+
+echo
+echo "--- a loop elsewhere does not stop the search for the root's own loop (#14732) ---"
+reset_state
+fixture 'o/r#1' OPEN 'Depends on #2 and #9'
+fixture 'o/r#2' OPEN 'Depends on #3'
+fixture 'o/r#3' OPEN 'Depends on #2'
+fixture 'o/r#9' OPEN 'Depends on #1'
+run_ddc --issue 1 --repo o/r
+assert_eq "1" "$RC" "exit 1 - the #2 -> #3 loop is met first but is not the answer"
+assert_contains "$OUT" "CYCLE_PATH: o/r#1 -> o/r#9 -> o/r#1" "the reported loop is the one through the root"
+
+echo
+echo "--- a Part of parent reference is not a dependency edge (#14732) ---"
+reset_state
+fixture 'o/r#1' OPEN 'Part of #2. Depends on #4'
+fixture 'o/r#2' OPEN 'Depends on #3'
+fixture 'o/r#3' OPEN 'Depends on #2'
+fixture 'o/r#4' CLOSED 'Done.'
+run_ddc --issue 1 --repo o/r
+assert_eq "0" "$RC" "the mixed Part-of line does not walk into the parent's cycle"
+assert_contains "$OUT" "NO_CYCLE" "the incident shape reports no cycle"
+assert_contains "$OUT" "SCANNED: 2" "only #1 and its real dependency #4 were fetched - the parent was never an edge"
+fixture 'o/r#1' OPEN $'Part of #2\nDepends on #4'
+run_ddc --issue 1 --repo o/r
+assert_eq "0" "$RC" "the separate-line Part-of layout also reports no cycle"
+assert_contains "$OUT" "SCANNED: 2" "same two fetches: the parent on its own line was never an edge"
 
 echo
 echo "--- cross-repo cycle (the motivating incident's shape) ---"
@@ -328,6 +358,22 @@ assert_eq "1" "$RC" "second pass still reports the cycle to its caller"
 assert_contains "$OUT" "ALREADY_REPORTED: example-org/downstream-repo#101" "second pass skips the comment"
 COMMENT_COUNT="$(jq '.comments | length' "$STUB_DIR/issue-example-org_downstream-repo_101.json")"
 assert_eq "1" "$COMMENT_COUNT" "exactly one comment posted across two passes"
+
+echo
+echo "--- --report on a downstream cycle writes nothing to the forge (#14732) ---"
+reset_state
+fixture 'o/r#1' OPEN 'Depends on #2'
+fixture 'o/r#2' OPEN 'Depends on #3'
+fixture 'o/r#3' OPEN 'Depends on #2'
+run_ddc --issue 1 --repo o/r --report
+assert_eq "0" "$RC" "--report exits 0 when the root is not on the loop"
+assert_contains "$OUT" "NO_CYCLE" "no cycle, so no report"
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! ls "$STUB_DIR"/comments-*.log "$STUB_DIR"/labels-*.log >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: an issue waiting on a cyclic blocker gets no comment and no operator label"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: an issue waiting on a cyclic blocker gets no comment and no operator label"
+fi
 
 echo
 echo "--- default (no --report) is strictly read-only ---"

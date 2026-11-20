@@ -13,7 +13,9 @@
 # "still blocked" on both, forever: waiting cannot resolve a cycle, so it is the
 # one dependency shape that SHOULD reach a human. This walks the declared
 # `Blocked by` / `Depends on` / `Requires` graph from one issue, bounded in
-# depth, nodes and steps, and reports the first loop it closes.
+# depth, nodes and steps, and reports the first loop it closes THROUGH that
+# issue (#14732) — a loop closed elsewhere belongs to its own members, and for
+# the starting issue is an ordinary dependency wait.
 #
 # A truncated or partially-unreadable walk reports NO_CYCLE with the reason - it
 # never invents one, and never claims completeness it did not have.

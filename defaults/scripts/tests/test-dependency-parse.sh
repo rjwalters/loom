@@ -129,11 +129,17 @@ sweep_auto_stack_detect() {
 # anchored to the phrase + its immediately-following #N can only ever
 # match one ref per phrase occurrence, silently dropping every other
 # comma-separated ref on the same line.
+# The sed stage between them is the #14732 parent-reference rule: a ref
+# introduced by `Part of` on a mixed line names the issue's PARENT, not a
+# blocker, and is masked before extraction. It keys off the introducing
+# phrase, never the number, so a parent genuinely declared again as a
+# dependency still counts.
 # =====================================================================
 champion_all_deps() {
     local blocked_body="$1"
     printf '%s\n' "$blocked_body" \
         | grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
+        | sed -E 's/[Pp]art of[*_:.[:space:]]*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g' \
         | grep -Eo '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
         | sort -u
 }
@@ -220,6 +226,15 @@ assert_eq $'#1\n#3' "$out" "bold+colon comma-list captures ALL refs, not just th
 out="$(champion_all_deps 'Blocked by: #1, owner/repo#3')"
 assert_eq $'#1\nowner/repo#3' "$out" "mixed same-repo/cross-repo comma-list captures both refs"
 
+out="$(champion_all_deps 'Part of #2. Depends on #4')"
+assert_eq '#4' "$out" "a Part-of parent reference on a mixed line is not a blocker (#14732)"
+
+out="$(champion_all_deps 'Part of other/epic#2. Depends on #4')"
+assert_eq '#4' "$out" "a cross-repo Part-of parent reference is excluded too (#14732)"
+
+out="$(champion_all_deps 'Depends on #2 (parent). Part of #2')"
+assert_eq '#2' "$out" "a parent declared again as a dependency IS a blocker (#14732)"
+
 echo
 echo "--- champion-pr-merge.md BLOCKED_ISSUES jq filter: widened separator ---"
 
@@ -265,6 +280,10 @@ assert_doc_contains "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_COMMON_MD" \
     "grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)'" \
     "champion-common.md extract_blocker_refs ships the widened cross-repo pattern (two-stage: whole-line select)"
+
+assert_doc_contains "$CHAMPION_COMMON_MD" \
+    "sed -E 's/[Pp]art of[*_:.[:space:]]*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g'" \
+    "champion-common.md extract_blocker_refs masks the Part-of parent reference between the two stages (#14732)"
 
 assert_doc_contains "$CHAMPION_MD" \
     'test(\"(Blocked by|Depends on|Requires)[*_:[:space:]]*#$CLOSED_ISSUE\"; \"i\")' \
