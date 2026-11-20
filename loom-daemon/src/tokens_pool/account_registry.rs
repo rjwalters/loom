@@ -700,10 +700,13 @@ fn codex_inventory(workspace: &Path, quiet: bool) -> Result<(Vec<AccountDescript
                     if validate_name(&entry.credential_reference).is_ok() {
                         let status = path_status(&root.join(&entry.credential_reference));
                         if status != PathStatus::Present {
+                            // A child also reports NotFound when the configured
+                            // root is unavailable. That cannot prove absence.
                             absence_verified &= status == PathStatus::Missing
                                 && err.downcast_ref::<std::io::Error>().is_some_and(|error| {
                                     error.kind() == std::io::ErrorKind::NotFound
-                                });
+                                })
+                                && root.is_dir();
                             if !quiet {
                                 warn_unprovisioned_once(
                                     &entry.name,

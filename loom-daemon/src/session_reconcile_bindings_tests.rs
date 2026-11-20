@@ -233,6 +233,66 @@ fn absent_account_wait_transitions_to_the_recorded_seat_and_retains_a_raced_dead
 }
 
 #[test]
+#[serial_test::serial]
+fn unavailable_profile_root_does_not_rearm_an_account_retry() {
+    use crate::tokens_pool::account_registry::codex_inventory_observed;
+    use crate::tokens_pool::profile_root_env::ProfileRootEnv;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let host = tempfile::tempdir().unwrap();
+    let profiles = host.path().join("profiles");
+    let unavailable = host.path().join("unavailable");
+    let root = host.path().join("declared-root");
+    fs::create_dir(&profiles).unwrap();
+    symlink(&profiles, &root).unwrap();
+    let _root = ProfileRootEnv::set(&root);
+
+    fs::create_dir(workspace.path().join(".loom")).unwrap();
+    fs::write(
+        workspace.path().join(".loom/accounts.json"),
+        r#"{"version":1,"accounts":[{"provider":"codex","name":"alice","credential_kind":"codex_home","credential_reference":"alice","enabled":true}]}"#,
+    )
+    .unwrap();
+    let mut observe = |_: &str, _: &WaitReason| {
+        let (accounts, complete) = codex_inventory_observed(workspace.path()).unwrap();
+        if accounts.iter().any(|account| account.id.name == "alice") {
+            Ready
+        } else if complete {
+            Missing
+        } else {
+            Unverified
+        }
+    };
+
+    let declared = parse(&config(&json!({"alice": [{"repository": URL}]})));
+    let fake = Fake::new(|_| Err(AccountAbsent::SelectedRoot.into()));
+    let index = index_of(&[]);
+    let mut state = ReconcileState::default();
+    assert_eq!(observe("alice", &WaitReason::AccountAbsent), Missing);
+    fake.run(&declared, &index, &mut state, 1_000);
+
+    fs::create_dir(profiles.join("alice")).unwrap();
+    assert_eq!(observe("alice", &WaitReason::AccountAbsent), Ready);
+    fake.run_ready(&declared, &index, &mut state, 1_005, &mut observe);
+    assert_eq!(fake.calls(), 2);
+
+    fs::rename(&profiles, &unavailable).unwrap();
+    let outage = observe("alice", &WaitReason::AccountAbsent);
+    fake.run_ready(&declared, &index, &mut state, 1_006, &mut observe);
+
+    fs::rename(&unavailable, &profiles).unwrap();
+    assert_eq!(observe("alice", &WaitReason::AccountAbsent), Ready);
+    let still_waiting = fake.run_ready(&declared, &index, &mut state, 1_007, &mut observe);
+    assert_eq!((outage, fake.calls()), (Unverified, 2));
+    assert_eq!(outcomes(&still_waiting), [Outcome::BackingOff { retry_at: 1_120 }]);
+
+    fake.run_ready(&declared, &index, &mut state, 1_120, &mut observe);
+    assert_eq!(fake.calls(), 3, "the scheduled retry still runs");
+}
+
+#[test]
 fn an_already_consumed_positive_cannot_hold_the_binding_past_its_deadline() {
     let declared = parse(&config(&json!({"alice": [{"repository": URL}]})));
     let fake = Fake::new(|_| Err(AccountAbsent::SelectedRoot.into()));
