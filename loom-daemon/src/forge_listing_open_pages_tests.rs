@@ -182,8 +182,15 @@ fn a_comment_mid_walk_aborts_only_the_strict_walk() {
         change_after_first_read(d, "a2", &page_with_comments(1..101, 1));
         let gh = stub(d);
         let site = issue_list("t");
-        let walked =
-            walk_pages(site, &gh, Some(d), Some(&repo), ("", "open"), MAX_OPEN_PAGES, snapshot);
+        let walked = walk_pages(
+            site,
+            &gh,
+            Some(d),
+            ListingRepo::Resolve(Some(&repo)),
+            ("", "open"),
+            MAX_OPEN_PAGES,
+            snapshot,
+        );
         assert_eq!(drain_calls(d), ["1 200", "2 200", "1 200"], "{snapshot:?}");
         if strict {
             let err = walked.expect_err("a row walk aborts on any changed row");

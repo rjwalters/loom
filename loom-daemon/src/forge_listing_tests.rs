@@ -786,9 +786,13 @@ fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
     let script_dir = workspace_root.path().join(".loom/scripts/lib");
     std::fs::create_dir_all(&script_dir).unwrap();
     let app_script = script_dir.join("github-app-token.sh");
+    let mint_log = workspace_root.path().join("mint.log");
     std::fs::write(
         &app_script,
-        "#!/bin/sh\necho '{\"status\":\"ok\",\"token\":\"ghs_retry\",\"installation_id\":\"1\",\"app_id\":\"2\",\"expires_at\":\"2099-01-01T00:00:00Z\"}'\n",
+        format!(
+            "#!/bin/sh\nprintf '%s\n' \"$*\" >> '{}'\necho '{{\"status\":\"ok\",\"token\":\"ghs_retry\",\"installation_id\":\"1\",\"app_id\":\"2\",\"expires_at\":\"2099-01-01T00:00:00Z\"}}'\n",
+            mint_log.display()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -858,6 +862,54 @@ fn a_registered_workspace_404_forces_one_refresh_and_retries_successfully() {
         2,
         "exactly one retry after the forced refresh, never a loop: {calls:?}"
     );
+
+    // Pinned reads of the same registered root still recover in place. The
+    // owner registration established by the ordinary retry points at the
+    // same config file as an explicit refresh of that owner.
+    std::fs::write(&calls_log, "").unwrap();
+    let pin = resolve_target(Some(repo_root.path()), None);
+    let issues = list_issues_cached_all_for_target_as(
+        "t",
+        &fake_gh,
+        repo_root.path(),
+        &pin,
+        "loom:issue",
+        "open",
+    )
+    .expect("same-root pinned listing should retry once after refreshing");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(std::fs::read_to_string(&calls_log).unwrap().lines().count(), 2);
+    let prior_mints = std::fs::read_to_string(&mint_log).unwrap();
+    assert_eq!(prior_mints.lines().count(), 2);
+    assert!(prior_mints.lines().all(|mint| mint.contains(&owner_repo)));
+
+    std::fs::write(&calls_log, "").unwrap();
+    let root = repo_root.path().to_path_buf();
+    set_after_send_hook(Some(Box::new(move || {
+        assert!(Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/other-owner/retargeted"
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+    })));
+    let result = list_issues_cached_all_for_target_as(
+        "t",
+        &fake_gh,
+        repo_root.path(),
+        &pin,
+        "loom:issue",
+        "open",
+    );
+    set_after_send_hook(None);
+    assert!(result.unwrap_err().to_string().contains("HTTP 404"));
+    assert_eq!(std::fs::read_to_string(calls_log).unwrap().lines().count(), 1);
+    assert_eq!(std::fs::read_to_string(mint_log).unwrap(), prior_mints);
 }
 
 // Resolved-identity key + disk persistence for the daemon cache (#9252) and
@@ -964,6 +1016,69 @@ fn the_paged_listing_reads_past_page_one_through_the_same_cache_entry() {
     assert!(!calls[1].contains("&page="), "{calls:?}");
     assert!(calls[1].contains(r#"If-None-Match: W/"p1""#), "{calls:?}");
     assert!(calls[2].contains(&format!("{plain}&page=2")), "{calls:?}");
+}
+
+#[test]
+fn a_pinned_listing_keeps_its_host_and_repo_after_a_mid_walk_retarget() {
+    crate::forge_repo_facts::set_test_enabled(true);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://forge-one.invalid/acme/pinned-listing",
+    ]);
+    let pin = resolve_target(Some(root), None);
+    assert_eq!(pin.host.as_deref(), Some("forge-one.invalid"));
+    assert_eq!(pin.repo.as_deref(), Some("acme/pinned-listing"));
+    std::fs::write(root.join("p1.json"), page_json(1..101)).unwrap();
+    std::fs::write(root.join("pages.json"), page_json(101..106)).unwrap();
+    let gh = paging_stub(root);
+    let mut to_move = Some(root.to_path_buf());
+    set_after_send_hook(Some(Box::new(move || {
+        if let Some(root) = to_move.take() {
+            assert!(Command::new("git")
+                .args([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "https://forge-two.invalid/other/retargeted"
+                ])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success());
+        }
+    })));
+    let rows = list_issues_cached_all_for_target_as("t", &gh, root, &pin, "loom:triage", "open");
+    set_after_send_hook(None);
+    let updated = resolve_target(Some(root), None);
+    crate::forge_repo_facts::set_test_enabled(false);
+
+    assert_eq!(updated.host.as_deref(), Some("forge-two.invalid"));
+    assert_eq!(updated.repo.as_deref(), Some("other/retargeted"));
+    assert_eq!(rows.unwrap().len(), 105);
+    let calls = calls(root);
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(calls[1].contains("&page=2"), "{calls:?}");
+    assert!(calls[2].contains(r#"If-None-Match: W/"p1""#), "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.contains("--hostname forge-one.invalid")
+                && call.contains("repos/acme/pinned-listing/issues?")),
+        "{calls:?}"
+    );
 }
 
 /// An incomplete walk is an error, never a partial set: a later page

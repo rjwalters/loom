@@ -174,8 +174,16 @@ pub fn list_issues_cached_as(
     label: &str,
     state: &str,
 ) -> Result<Vec<RestIssue>> {
-    list_issues_cached_retrying(issue_list(caller), gh_bin, cwd, repo_override, label, state, None)
-        .map(|page| page.rows)
+    list_issues_cached_retrying(
+        issue_list(caller),
+        gh_bin,
+        cwd,
+        ListingRepo::Resolve(repo_override),
+        label,
+        state,
+        None,
+    )
+    .map(|page| page.rows)
 }
 
 /// Most pages [`list_issues_cached_all_as`] reads.
@@ -217,11 +225,93 @@ pub fn list_issues_cached_all_as(
         issue_list(caller),
         gh_bin,
         cwd,
-        repo_override,
+        ListingRepo::Resolve(repo_override),
         (label, state),
         MAX_PAGES,
         Snapshot::Rows,
     )
+}
+
+/// Read the full listing of a previously resolved host and repository, even
+/// if the checkout's remote changes between pages. Keep the normal reader
+/// route, checkout context, ETag key, pagination, and completeness checks.
+pub(crate) fn list_issues_cached_all_for_target_as(
+    caller: &'static str,
+    gh_bin: &Path,
+    cwd: &Path,
+    target: &store::Target,
+    label: &str,
+    state: &str,
+) -> Result<Vec<RestIssue>> {
+    walk_pages(
+        issue_list(caller),
+        gh_bin,
+        Some(cwd),
+        ListingRepo::Pinned(target),
+        (label, state),
+        MAX_PAGES,
+        Snapshot::Rows,
+    )
+}
+
+pub(crate) fn listing_target(cwd: Option<&Path>, repo_override: Option<&str>) -> store::Target {
+    let env_repo = std::env::var("LOOM_REPO").ok();
+    store::resolve_target(cwd, repo_override.or(env_repo.as_deref()))
+}
+
+#[derive(Clone, Copy)]
+enum ListingRepo<'a> {
+    Resolve(Option<&'a str>),
+    Pinned(&'a store::Target),
+}
+
+impl ListingRepo<'_> {
+    fn target(self, cwd: Option<&Path>) -> store::Target {
+        match self {
+            Self::Resolve(repo) => listing_target(cwd, repo),
+            Self::Pinned(target) => target.clone(),
+        }
+    }
+
+    fn refresh_credential(self, root: &Path) -> bool {
+        use crate::credential_preflight::{
+            force_refresh_owner_credential, force_refresh_owner_credential_for_repo,
+            gh_config_dir_for_owner_slug, gh_config_dir_for_root,
+        };
+        let Self::Pinned(target) = self else {
+            return force_refresh_owner_credential(root);
+        };
+        let Some(repo) = target.repo.as_deref() else {
+            return false;
+        };
+        let matches_checkout = || {
+            crate::forge_cmd::get_remote_url(root)
+                .and_then(|url| store::parse_remote_url(&url))
+                .is_some_and(|(host, name)| {
+                    host.eq_ignore_ascii_case("github.com") && name.eq_ignore_ascii_case(repo)
+                })
+        };
+        // The GitHub App refresh is for the pinned owner, never the owner of
+        // a newly retargeted checkout. Only retry when that root already uses
+        // this owner's config dir and will see the refreshed file in place.
+        if !store::host_scope(target).eq_ignore_ascii_case("github.com") || !matches_checkout() {
+            return false;
+        }
+        let Some(config_dir) = gh_config_dir_for_root(root) else {
+            return false;
+        };
+        gh_config_dir_for_owner_slug(repo).as_ref() == Some(&config_dir)
+            && force_refresh_owner_credential_for_repo(repo).as_ref() == Some(&config_dir)
+            && matches_checkout()
+            && gh_config_dir_for_root(root).as_ref() == Some(&config_dir)
+    }
+
+    fn log_repo(&self) -> Option<&str> {
+        match self {
+            Self::Resolve(repo) => *repo,
+            Self::Pinned(target) => target.repo.as_deref(),
+        }
+    }
 }
 
 /// Most pages [`list_open_issues_cached_all_as`] reads: an unfiltered listing
@@ -307,7 +397,7 @@ pub fn list_open_issues_on(
             site,
             gh_bin,
             cwd,
-            repo_override,
+            ListingRepo::Resolve(repo_override),
             ("", "open"),
             max_pages,
             Snapshot::Membership,
@@ -345,12 +435,12 @@ fn walk_pages(
     site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
-    repo_override: Option<&str>,
+    repo: ListingRepo<'_>,
     query: (&str, &str),
     max_pages: u32,
     snapshot: Snapshot,
 ) -> Result<Vec<RestIssue>> {
-    let walk = walk_pages_partial(site, gh_bin, cwd, repo_override, query, max_pages, snapshot)?;
+    let walk = walk_pages_partial(site, gh_bin, cwd, repo, query, max_pages, snapshot)?;
     match walk.incomplete {
         None => Ok(walk.rows),
         Some(reason) => Err(reason),
@@ -399,7 +489,7 @@ pub fn list_issues_cached_paged_as(
         issue_list(caller),
         gh_bin,
         cwd,
-        repo_override,
+        ListingRepo::Resolve(repo_override),
         (label, state),
         MAX_PAGES,
         Snapshot::Rows,
@@ -413,7 +503,7 @@ fn walk_pages_partial(
     site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
-    repo_override: Option<&str>,
+    repo: ListingRepo<'_>,
     (label, state): (&str, &str),
     max_pages: u32,
     snapshot: Snapshot,
@@ -423,9 +513,8 @@ fn walk_pages_partial(
     } else {
         label
     };
-    let read = |page: u32| {
-        list_issues_cached_retrying(site, gh_bin, cwd, repo_override, label, state, Some(page))
-    };
+    let read =
+        |page: u32| list_issues_cached_retrying(site, gh_bin, cwd, repo, label, state, Some(page));
     let partial = |pages: Vec<Vec<RestIssue>>, reason: anyhow::Error| PagedListing {
         rows: dedup_rows(pages),
         incomplete: Some(reason),
@@ -493,12 +582,12 @@ fn list_issues_cached_retrying(
     site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
-    repo_override: Option<&str>,
+    repo: ListingRepo<'_>,
     label: &str,
     state: &str,
     page: Option<u32>,
 ) -> Result<ListedPage> {
-    match list_issues_cached_once(site, gh_bin, cwd, repo_override, label, state, page) {
+    match list_issues_cached_once(site, gh_bin, cwd, repo, label, state, page) {
         Ok(issues) => Ok(issues),
         Err(e) => {
             // #6171: a 404 from a *registered* workspace (a `Some(cwd)` — an
@@ -511,24 +600,14 @@ fn list_issues_cached_retrying(
             // before treating this as a real scan failure; a repeat 404
             // after the refresh is real (AC2).
             if let Some(root) = cwd {
-                if is_404_error(&e.to_string())
-                    && crate::credential_preflight::force_refresh_owner_credential(root)
-                {
+                if is_404_error(&e.to_string()) && repo.refresh_credential(root) {
                     log::info!(
                         "forge_listing: retrying {} in {} after a forced per-owner credential \
                          refresh (#6171)",
-                        build_issues_url(repo_override, label, state),
+                        build_issues_url(repo.log_repo(), label, state),
                         root.display()
                     );
-                    return list_issues_cached_once(
-                        site,
-                        gh_bin,
-                        cwd,
-                        repo_override,
-                        label,
-                        state,
-                        page,
-                    );
+                    return list_issues_cached_once(site, gh_bin, cwd, repo, label, state, page);
                 }
             }
             Err(e)
@@ -590,16 +669,14 @@ fn list_issues_cached_once(
     site: store::ConditionalRead,
     gh_bin: &Path,
     cwd: Option<&Path>,
-    repo_override: Option<&str>,
+    repo: ListingRepo<'_>,
     label: &str,
     state: &str,
     page: Option<u32>,
 ) -> Result<ListedPage> {
-    let env_repo = std::env::var("LOOM_REPO").ok();
-    let repo = repo_override.or(env_repo.as_deref());
     // #9252: the URL names the SAME resolved repo the key does (never gh's
     // own placeholder remote choice), so key and request cannot disagree.
-    let target = store::resolve_target(cwd, repo);
+    let target = repo.target(cwd);
     let mut url = match site.shape {
         store::Shape::GitHub => build_issues_url(target.repo.as_deref(), label, state),
         shape => build_gitea_items_url(target.repo.as_deref(), shape, label, state),

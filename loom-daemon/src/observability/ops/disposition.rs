@@ -855,6 +855,18 @@ pub(in crate::observability) async fn record(
     let Some(summary) = crate::work_finder::last_tick_summary() else {
         return;
     };
+    let refresh = refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref());
+    record_summary(sampler, slug_cache, &summary, sink, cached_repo_ref, refresh).await;
+}
+
+pub(in crate::observability) async fn record_summary(
+    sampler: &mut Sampler,
+    slug_cache: Option<&mut HashMap<String, String>>,
+    summary: &WorkFinderTickSummary,
+    sink: &super::OpsSink,
+    cached_ref: impl Fn(&str) -> Option<QueueRepoRef>,
+    refresh_secs: i64,
+) {
     let slow_pass = slug_cache.is_some();
     let previous_lookup = sampler.last_resolved_tick;
     let watermark = if slow_pass {
@@ -865,7 +877,7 @@ pub(in crate::observability) async fn record(
     if !is_new_tick(summary.at, watermark) {
         return;
     }
-    let roots = summary_roots(&summary);
+    let roots = summary_roots(summary);
     let repos = if let Some(slug_cache) = slug_cache {
         // Even when the fast pass emitted this tick, keep the original
         // cadence and watermark for trusted identity and drop-counter reads.
@@ -874,7 +886,7 @@ pub(in crate::observability) async fn record(
         sampler.last_resolved_tick = Some(summary.at);
         repos
     } else {
-        let repos = sampler.cached_repos(&roots, cached_repo_ref);
+        let repos = sampler.cached_repos(&roots, &cached_ref);
         // Leave an entirely cold source unconsumed so the slow pass can
         // still offer it after resolving identities. In a mixed sample, the
         // warm rows proceed and newly resolved roots join on a later tick.
@@ -883,12 +895,12 @@ pub(in crate::observability) async fn record(
         }
         repos
     };
-    let (rows, dropped) = build_rows(&summary, &repos);
+    let (rows, dropped) = build_rows(summary, &repos);
     if slow_pass {
         sink.emit_metrics_since(dropped_points(dropped), previous_lookup);
     }
-    let failed = failed_slugs(&summary, &roots, &repos, cached_repo_ref);
-    let refresh = Duration::seconds(refresh_secs(std::env::var(REFRESH_SECS_ENV).ok().as_deref()));
+    let failed = failed_slugs(summary, &roots, &repos, cached_ref);
+    let refresh = Duration::seconds(refresh_secs);
     let Some(sample) = sampler.consume(summary.at, &rows, &failed, refresh) else {
         return;
     };
