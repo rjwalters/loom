@@ -172,6 +172,7 @@ fn tokens_snapshot_envelope() -> TelemetryEnvelope {
         "host-b",
         TelemetryRecord::TokensSnapshot(TokenSnapshotRecord {
             captured_at: ts(),
+            fleet_probe_age_secs: None,
             accounts: vec![
                 TokenAccountState {
                     account: "agent-1".to_string(),
@@ -1038,6 +1039,7 @@ fn role_tick_outcome_envelope(
             actions: None,
             source: None,
             sweep_id: None,
+            stage: None,
             issue: None,
             pr_number: None,
             deferred_by: None,
@@ -1077,6 +1079,47 @@ fn a_steps_role_tick_outcome_is_marked_as_a_step() {
     assert_eq!(attr(&records[0], "loom.sweep_id"), s("step-judge-7-1"));
     assert_eq!(attr(&records[1], "loom.role_tick.source"), None);
     assert_eq!(attr(&records[1], "loom.sweep_id"), None);
+}
+
+/// #14048: a step's `role_tick.outcome` carries its launch identity
+/// (`loom.runtime` / `loom.provider` / `loom.profile`, from the step's own
+/// `# LOOM_LAUNCH` record) and its `loom.stage` — finer than `loom.role`,
+/// which folds Champion's two stages. Each absent when unobserved, so the
+/// per-stage cross-host join keys never read a guessed value.
+#[test]
+fn a_steps_outcome_maps_stage_and_launch_identity_and_each_stays_absent_when_unobserved() {
+    let mut step = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    if let TelemetryRecord::RoleTickOutcome(r) = &mut step.record {
+        r.source = Some(crate::telemetry::ROLE_TICK_SOURCE_STEP.to_string());
+        r.stage = Some("champion_merge".to_string());
+        r.runtime = Some("opencode".to_string());
+        r.provider = Some("friendli".to_string());
+        r.profile = Some("glm-flash".to_string());
+    }
+    let bare = role_tick_outcome_envelope(crate::telemetry::RoleTickResult::Success, None);
+    let request = build_logs_request(&[step, bare]).unwrap();
+    let records = &request.resource_logs[0].scope_logs[0].log_records;
+    let attr = |record: &LogRecord, key: &str| {
+        record
+            .attributes
+            .iter()
+            .find(|kv| kv.key == key)
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| v.value.clone())
+    };
+    let s = |v: &str| Some(any_value::Value::StringValue(v.to_string()));
+    assert_eq!(attr(&records[0], "loom.stage"), s("champion_merge"));
+    assert_eq!(attr(&records[0], "loom.runtime"), s("opencode"));
+    assert_eq!(attr(&records[0], "loom.provider"), s("friendli"));
+    assert_eq!(attr(&records[0], "loom.profile"), s("glm-flash"));
+    for key in [
+        "loom.stage",
+        "loom.runtime",
+        "loom.provider",
+        "loom.profile",
+    ] {
+        assert_eq!(attr(&records[1], key), None, "a tick with no launch record carries no {key}");
+    }
 }
 
 /// #12362: a Judge tick's found-work split reaches the wire, explicit `false`
@@ -1324,5 +1367,43 @@ fn sweep_started_exports_story_points_numerically_when_sized() {
     assert_eq!(
         story_points(envelope("host-a", TelemetryRecord::SweepStarted(record))),
         Some(any_value::Value::IntValue(13))
+    );
+}
+
+/// #13942: the applied-snapshot-age gauge is a host-level series beside the
+/// per-account ones, emitted only when the host has a fleet sidecar.
+#[test]
+fn tokens_snapshot_fleet_probe_age_is_a_host_gauge_absent_when_unknown() {
+    let mut envelope = tokens_snapshot_envelope();
+    let TelemetryRecord::TokensSnapshot(record) = &mut envelope.record else {
+        unreachable!();
+    };
+    record.fleet_probe_age_secs = Some(311);
+    let request = build_metrics_request(&[envelope]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    let age = metrics
+        .iter()
+        .find(|m| m.name == "loom.tokens.fleet_probe_age")
+        .expect("fleet_probe_age metric must exist");
+    let points = match &age.data {
+        Some(metric::Data::Gauge(gauge)) => &gauge.data_points,
+        other => panic!("expected Gauge, got {other:?}"),
+    };
+    assert_eq!(points.len(), 1);
+    assert!(
+        points[0].attributes.is_empty(),
+        "host-level: no account attribute, so it compares across hosts"
+    );
+    assert_eq!(points[0].value, Some(number_data_point::Value::AsInt(311)));
+
+    // The default record carries no sidecar age: no series, per the
+    // absent-not-zero rule.
+    let request = build_metrics_request(&[tokens_snapshot_envelope()]).unwrap();
+    let metrics = &request.resource_metrics[0].scope_metrics[0].metrics;
+    assert!(
+        metrics
+            .iter()
+            .all(|m| m.name != "loom.tokens.fleet_probe_age"),
+        "unknown age must not fabricate a zero series"
     );
 }

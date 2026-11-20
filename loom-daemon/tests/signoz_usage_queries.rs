@@ -152,7 +152,7 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
     clickhouse(&verbatim, "TSV");
 
     let sections = sections();
-    assert_eq!(sections.len(), 7, "usage-queries.sql is documented as sections 0 through 6");
+    assert_eq!(sections.len(), 8, "usage-queries.sql is documented as sections 0 through 7");
 
     // ---- 0. arrival and shape ---------------------------------------------
     let preflight = &sections[0];
@@ -278,6 +278,40 @@ fn committed_usage_queries_answer_the_measured_usage_questions_on_real_clickhous
         "the two cache-write horizons are priced differently and must not be \
          collapsed into one column"
     );
+
+    // ---- 7. per-run comparison --------------------------------------------
+    let runs = &sections[7];
+    assert_eq!(runs.len(), 3, "subscription, API-key and missing launched identity");
+
+    let seat = runs
+        .iter()
+        .find(|row| {
+            text(row, "credential_kind") == "chatgpt-seat" && text(row, "model") == "gpt-5.4"
+        })
+        .expect("subscription run cohort");
+    assert_eq!(text(seat, "runtime"), "codex");
+    assert_eq!(text(seat, "effort"), "high");
+    assert_eq!(text(seat, "role"), "builder");
+    assert_eq!(
+        num(seat, "runs"),
+        3,
+        "count the shared span id in distinct traces once each, and exclude old runs"
+    );
+    assert_eq!(num(seat, "repos"), 2);
+    assert_eq!(num(seat, "traces"), 2);
+    assert_eq!(seat["duration_p50_s"], serde_json::json!(2.5));
+    assert_eq!(num(seat, "success"), 2);
+    assert_eq!(num(seat, "not_success"), 1);
+
+    let api = by(runs, "credential_kind", "api-key");
+    assert_eq!(text(api, "model"), "gpt-5.4");
+    assert_eq!(text(api, "effort"), "high");
+    assert_eq!(num(api, "runs"), 1, "the account pool is part of the cohort");
+
+    let missing = by(runs, "model", "");
+    assert_eq!(text(missing, "effort"), "");
+    assert_eq!(text(missing, "credential_kind"), "chatgpt-seat");
+    assert_eq!(num(missing, "runs"), 1, "configured model does not fill launched identity");
 }
 
 /// The negative control for the artifact's first documented trap. Reading a

@@ -97,7 +97,9 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-body-at-path.sh
 test-create-issue-refuse-labels.sh
+test-create-pr-body-at-path.sh
 test-create-pr-priority-labels.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
@@ -119,7 +121,6 @@ test-fleet-check.sh
 test-forge-helpers.sh
 test-forge-helpers-rate-limit-fallback.sh
 test-forge-transient-classification.sh
-test-generate-agents-md-layouts.sh
 test-gh-cached.sh
 test-github-app-token.sh
 test-gitignore-guard.sh
@@ -155,6 +156,7 @@ test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
+test-guide-work-plan-receipt.sh
 test-guide-work-plan-roadmap-convention.sh
 test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
@@ -244,6 +246,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-sibling-no-arguments-placeholder.sh
 test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-sync-labels-migrate-retired.sh

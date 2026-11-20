@@ -735,7 +735,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::WorktreeState(cmd) => cmd.run(),
             ScriptPortCommand::DuplicateScan(args) => args.run(),
             ScriptPortCommand::PremiseCheck(args) => args.run(),
-            ScriptPortCommand::OperatorDecision(cmd) => cmd.run(),
+            ScriptPortCommand::OperatorDecision(cmd) => {
+                cmd.run(crate::operator_decision::cli::WorkflowWriter::Gh)
+            }
             ScriptPortCommand::ReconcileStack(args) => args.run(),
             ScriptPortCommand::OrphanReplace(cmd) => cmd.run(),
             ScriptPortCommand::PushLease(cmd) => cmd.run(),
@@ -756,7 +758,9 @@ impl ScriptPortCommand {
             ScriptPortCommand::CheckRenovateLabels(args) => args.run(),
             ScriptPortCommand::Guards(cmd) => cmd.run(),
             ScriptPortCommand::PrLatency(args) => args.run(),
-            ScriptPortCommand::ParkRecord(cmd) => cmd.run(),
+            ScriptPortCommand::ParkRecord(cmd) => {
+                cmd.run(crate::operator_decision::cli::WorkflowWriter::Gh)
+            }
             ScriptPortCommand::ChampionHold(cmd) => cmd.run(),
             ScriptPortCommand::CheckPointsMarker(args) => args.run(),
             ScriptPortCommand::RamScopeLimit(args) => args.run(),

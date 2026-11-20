@@ -1,5 +1,6 @@
 use super::super::PlanEntry;
 use super::*;
+use crate::exec_test_support::write_executable;
 
 pub(super) fn base_config() -> AddWorkerConfig {
     AddWorkerConfig {
@@ -850,15 +851,6 @@ pub(super) fn which_bash() -> Option<PathBuf> {
     }
 }
 
-/// Write an executable shell-script stub at `path` (mode 0755).
-pub(super) fn write_executable(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, contents).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(path, perms).unwrap();
-}
-
 #[test]
 fn safehouse_disabled_stays_a_single_skip_and_plain_worker_unchanged() {
     // AC: "Without --safehouse, behavior is unchanged: skip-with-notice,
@@ -1296,13 +1288,13 @@ fn run_idle_guard(
     let daemon_exit = if status_exit_ok { 0 } else { 1 };
     write_executable(
             &stub_bin.join("loom-daemon"),
-            &format!(
+            format!(
                 "#!/bin/sh\nif [ \"$1\" = \"status\" ]; then cat <<'JSON'\n{status_json}\nJSON\nexit {daemon_exit}\nfi\nexit 1\n"
             ),
         );
     write_executable(
         &stub_bin.join("sudo"),
-        &format!("#!/bin/sh\necho \"$@\" >> \"{}/sudo-calls\"\nexit 0\n", dir.path().display()),
+        format!("#!/bin/sh\necho \"$@\" >> \"{}/sudo-calls\"\nexit 0\n", dir.path().display()),
     );
 
     let out = Command::new(bash)

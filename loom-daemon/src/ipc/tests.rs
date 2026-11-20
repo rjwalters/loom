@@ -3935,7 +3935,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
+    // start_completion_dedup still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse

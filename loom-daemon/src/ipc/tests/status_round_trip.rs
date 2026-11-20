@@ -55,6 +55,7 @@ fn test_daemon_status_request_response_round_trip() {
         per_repo: vec![crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repo/a"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: true,
@@ -207,7 +208,6 @@ fn test_daemon_status_request_response_round_trip() {
             since: None,
             kinds: Vec::new(),
         }),
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {
             enabled: true,

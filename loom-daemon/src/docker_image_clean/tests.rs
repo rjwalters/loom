@@ -5,7 +5,10 @@
 
 use super::*;
 use chrono::TimeZone;
+use log::Level;
 use serial_test::serial;
+
+use crate::test_log_capture::capture_logs;
 
 fn t(secs: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_800_000_000 + secs, 0).unwrap()
@@ -38,6 +41,18 @@ fn slot_free(work: &mut dyn FnMut()) -> Option<String> {
 /// **without** running the removal work at all.
 fn slot_busy(_work: &mut dyn FnMut()) -> Option<String> {
     Some("held by another build".to_string())
+}
+
+/// The representative production inventory failure (#14679): the daemon
+/// socket is unreachable, so the very first stage of [`list_images`] fails.
+fn inventory_error() -> DockerInventoryError {
+    DockerInventoryError {
+        stage: STAGE_IMAGE_LS,
+        detail:
+            "exit status: 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+             Is the docker daemon running?"
+                .to_string(),
+    }
 }
 
 // ===================================================================
@@ -97,6 +112,54 @@ fn container_referenced_untagged_image_is_never_planned() {
     let plan = plan_retention(&[img], &tracked(), &[], 2);
     assert!(plan.to_remove().is_empty());
     assert_eq!(plan.kept.len(), 1);
+}
+
+// ===================================================================
+// Issue #14019: trackedRepos can name an operator's own (derived) image
+// repository, so a configured session override image is kept per keepLastN.
+// ===================================================================
+
+#[test]
+fn tracked_repos_accept_an_arbitrary_operator_image_repository() {
+    // The config override is taken verbatim — any repository name is allowed.
+    let config = DockerRetentionConfig {
+        tracked_repos: Some(vec![
+            "ghcr.io/example/loom-worker-session-eda".to_string(),
+            "registry.internal:5000/acme/tools".to_string(),
+        ]),
+        ..DockerRetentionConfig::default()
+    };
+    assert_eq!(
+        resolve_tracked_repos(&config),
+        vec![
+            "ghcr.io/example/loom-worker-session-eda",
+            "registry.internal:5000/acme/tools"
+        ]
+    );
+    // An image from that repository is tracked: kept within keepLastN even
+    // though it is unknown to the defaults.
+    let derived = image(
+        "sha256:derived",
+        &["ghcr.io/example/loom-worker-session-eda:2026-11-01"],
+        0,
+        8.0,
+    );
+    let plan = plan_retention(&[derived], &resolve_tracked_repos(&config), &[], 2);
+    assert!(plan.remove_stale_tracked.is_empty(), "{plan:?}");
+    assert_eq!(plan.kept.len(), 1);
+    // And the second-newest of three is the one kept (keepLastN semantics).
+    let deriveds = vec![
+        image("sha256:d1", &["ghcr.io/example/loom-worker-session-eda:2026-11-01"], 0, 8.0),
+        image("sha256:d2", &["ghcr.io/example/loom-worker-session-eda:2026-11-02"], 1_000, 8.0),
+        image("sha256:d3", &["ghcr.io/example/loom-worker-session-eda:2026-11-03"], 2_000, 8.0),
+    ];
+    let plan = plan_retention(&deriveds, &resolve_tracked_repos(&config), &[], 2);
+    let removed: Vec<&str> = plan
+        .remove_stale_tracked
+        .iter()
+        .map(|i| i.id.as_str())
+        .collect();
+    assert_eq!(removed, vec!["sha256:d1"]);
 }
 
 // ===================================================================
@@ -350,7 +413,7 @@ fn disabled_never_lists_or_removes() {
         &inputs,
         &|| {
             listed.store(true, std::sync::atomic::Ordering::SeqCst);
-            Some(Vec::new())
+            Ok(Vec::new())
         },
         &|_| panic!("must never remove while disabled"),
         &slot_free,
@@ -370,9 +433,19 @@ fn docker_unavailable_removes_nothing_and_is_distinguishable_from_empty() {
         now: t(0),
         pressure: None,
     };
-    let report = run_pass(&inputs, &|| None, &|_| panic!("must never remove"), &slot_free);
+    let report = run_pass(
+        &inputs,
+        &|| Err(inventory_error()),
+        &|_| panic!("must never remove"),
+        &slot_free,
+    );
     assert!(report.plan.is_none());
-    assert!(report.reason().contains("unqueryable"));
+    // #14679: the failure names the operation that failed instead of a bare
+    // "unqueryable".
+    let failure = report.inventory_error.as_deref().unwrap();
+    assert!(failure.contains("docker image ls"), "{failure}");
+    assert!(report.reason().contains("docker inventory failed"), "{}", report.reason());
+    assert!(report.reason().contains("zero removals"), "{}", report.reason());
 }
 
 #[test]
@@ -388,7 +461,7 @@ fn a_build_in_progress_holding_the_slot_defers_removal_entirely() {
     };
     let report = run_pass(
         &inputs,
-        &move || Some(images.clone()),
+        &move || Ok(images.clone()),
         &|_| panic!("must never remove while the build slot is held elsewhere"),
         &slot_busy,
     );
@@ -425,7 +498,7 @@ fn every_removal_runs_while_the_build_slot_is_still_held() {
     let removals_while_held = std::cell::Cell::new(0usize);
     let report = run_pass(
         &inputs,
-        &move || Some(images.clone()),
+        &move || Ok(images.clone()),
         &|_| {
             assert!(slot_held.get(), "a docker rmi ran outside the machine build slot");
             removals_while_held.set(removals_while_held.get() + 1);
@@ -499,7 +572,7 @@ fn nothing_to_remove_never_takes_the_build_slot() {
     let took_slot = std::sync::atomic::AtomicBool::new(false);
     let report = run_pass(
         &inputs,
-        &move || Some(images.clone()),
+        &move || Ok(images.clone()),
         &|_| panic!("nothing planned for removal"),
         &|work: &mut dyn FnMut()| {
             took_slot.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -527,7 +600,7 @@ fn removal_failures_are_soft_and_excluded_from_the_removed_list() {
     };
     let report = run_pass(
         &inputs,
-        &move || Some(images.clone()),
+        &move || Ok(images.clone()),
         &|id| id == "sha256:a", // sha256:b "fails" (e.g. backs a running container)
         &slot_free,
     );
@@ -550,9 +623,348 @@ fn reason_mentions_removed_kept_and_allowlisted_counts() {
         now: t(0),
         pressure: None,
     };
-    let report = run_pass(&inputs, &move || Some(images.clone()), &|_| true, &slot_free);
+    let report = run_pass(&inputs, &move || Ok(images.clone()), &|_| true, &slot_free);
     assert!(report.reason().contains("removed 1 of planned 1"));
     assert!(report.reason().contains("1 kept"));
+}
+
+// ===================================================================
+// #14679: one pass summary per enabled evaluation — the incident's
+// silence (failed inventory and healthy pass indistinguishable at the
+// daemon's default `info` verbosity) must be impossible from here on.
+// ===================================================================
+
+#[test]
+fn a_failed_inventory_performs_zero_removals_and_carries_the_failed_stage() {
+    // The incident shape: 1 GB free against a 20 GB floor, and `docker`
+    // itself unqueryable. The pass must remove nothing and carry *which*
+    // operation failed, so the one WARN summary can name it.
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let report = run_pass(
+        &inputs,
+        &|| Err(inventory_error()),
+        &|_| panic!("a failed inventory must perform zero removals"),
+        &slot_free,
+    );
+    assert!(report.plan.is_none());
+    assert!(report.removed.is_empty());
+    assert!(report.deferred.is_none());
+    let failure = report.inventory_error.as_deref().unwrap();
+    assert!(failure.contains("docker image ls"), "{failure}");
+    assert!(failure.contains("Cannot connect"), "{failure}");
+}
+
+#[test]
+fn a_failed_inventory_logs_exactly_one_warn_summary_at_normal_verbosity() {
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let report = run_pass(&inputs, &|| Err(inventory_error()), &|_| true, &slot_free);
+    let lines = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(lines.len(), 1, "one pass summary, got {lines:?}");
+    assert_eq!(lines[0].0, Level::Warn, "visible at the default info level");
+    assert!(lines[0].1.contains("docker image ls"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("zero removals"), "{}", lines[0].1);
+}
+
+#[cfg(unix)]
+#[test]
+fn multiline_inventory_stderr_stays_on_one_warn_line() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: Vec::new(),
+        stderr: format!(
+            "Cannot connect to the Docker daemon.\r\n\tIs the daemon running?\n{} beyond the limit",
+            "x".repeat(200),
+        )
+        .into_bytes(),
+    };
+    let report = run_pass(
+        &inputs,
+        &|| {
+            Err(DockerInventoryError {
+                stage: "docker image ls",
+                detail: failure_detail(&output),
+            })
+        },
+        &|_| panic!("a failed inventory must perform zero removals"),
+        &slot_free,
+    );
+    let records = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(records.len(), 1, "one pass summary, got {records:?}");
+    let (level, line) = &records[0];
+    assert_eq!(*level, Level::Warn);
+    assert!(!line.contains(['\r', '\n']), "multiline outcome: {line:?}");
+    assert!(line.contains("docker image ls (exit status: 1: Cannot connect to the Docker daemon. Is the daemon running?"), "{line}");
+    assert!(!line.contains("beyond the limit"), "{line}");
+    assert!(line.ends_with("— zero removals performed"), "{line}");
+}
+
+#[test]
+fn a_zero_plan_below_the_floor_logs_exactly_one_info_summary_with_the_numbers() {
+    // The incident's other silent shape: the inventory succeeds, everything
+    // in it is protected, and the disk is below the floor — the pass must
+    // still say so once, with the measured numbers, at INFO.
+    let mut seat = image("sha256:seat", &["2am/loom-worker-session:0.19.1313"], 29 * DAY, 2.3);
+    seat.in_use = true; // the running seats reference this image
+    let eda = image("sha256:eda", &["shared/eda-toolchain:2026.1"], 0, 6.5);
+    let images = vec![seat, eda];
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &["eda".to_string()],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let report = run_pass(
+        &inputs,
+        &move || Ok(images.clone()),
+        &|_| panic!("nothing planned for removal"),
+        &slot_free,
+    );
+    assert!(report.plan.as_ref().unwrap().to_remove().is_empty());
+    let lines = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(lines.len(), 1, "one pass summary, got {lines:?}");
+    assert_eq!(lines[0].0, Level::Info);
+    let line = &lines[0].1;
+    assert!(line.contains("1 GB free < 20 GB floor"), "{line}");
+    assert!(line.contains("removed 0 of planned 0"), "{line}");
+    assert!(line.contains("left reclaimable"), "{line}");
+}
+
+#[test]
+fn a_below_floor_evaluation_that_removed_images_logs_one_warn_line_not_two() {
+    // Pre-#14679 a removing pass below the floor emitted the WARN reason
+    // line *plus* a separate below-floor INFO line — two lines for one
+    // evaluation. One summary now carries both halves.
+    let images = vec![
+        image("sha256:a", &[], 0, 2.0),
+        image("sha256:b", &[], 0, 2.0),
+    ];
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let report = run_pass(&inputs, &move || Ok(images.clone()), &|_| true, &slot_free);
+    assert_eq!(report.removed.len(), 2);
+    let lines = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, Level::Warn);
+    assert!(lines[0].1.contains("removed 2 of planned 2"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("1 GB free < 20 GB floor"), "{}", lines[0].1);
+}
+
+#[test]
+fn a_below_floor_deferral_logs_one_warn_summary_naming_the_deferral() {
+    let images = vec![image("sha256:a", &[], 0, 2.0)];
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let report = run_pass(
+        &inputs,
+        &move || Ok(images.clone()),
+        &|_| panic!("must never remove while the build slot is held elsewhere"),
+        &slot_busy,
+    );
+    let lines = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, Level::Warn);
+    assert!(lines[0].1.contains("1 GB free < 20 GB floor"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("deferred: held by another build"), "{}", lines[0].1);
+    assert!(lines[0].1.contains("removed 0 of planned 1"), "{}", lines[0].1);
+}
+
+#[test]
+fn an_above_floor_no_op_evaluation_stays_debug_quiet() {
+    let images = vec![image("sha256:a", &["ubuntu:22.04"], 0, 0.1)];
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(25)),
+    };
+    let report = run_pass(
+        &inputs,
+        &move || Ok(images.clone()),
+        &|_| panic!("nothing planned for removal"),
+        &slot_free,
+    );
+    let lines = capture_logs(|| log_pass_outcome(&report, Some(&pressure(25))));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(
+        lines[0].0,
+        Level::Debug,
+        "an above-floor no-op stays quiet at the default info level: {:?}",
+        lines[0].1
+    );
+}
+
+#[test]
+#[serial]
+fn a_cooldown_only_call_logs_nothing() {
+    // Cooldown-only calls stay quiet (#14679): on a multi-repo host they
+    // fire once per repo per reaper tick. `run_for` must return before any
+    // logging — the same discipline the production cooldown skip keeps.
+    reset_state_for_test();
+    record_evaluated_for_test(Utc::now());
+    let tmp = tempfile::tempdir().unwrap();
+    let lines = capture_logs(|| {
+        let _ = run_for(tmp.path());
+    });
+    let ours: Vec<_> = lines
+        .iter()
+        .filter(|(_, msg)| msg.starts_with("docker_image_clean:"))
+        .collect();
+    assert!(
+        ours.is_empty(),
+        "cooldown-only calls stay quiet (ignoring unrelated config-resolver debug \
+         lines): {ours:?}"
+    );
+    reset_state_for_test();
+}
+
+// ===================================================================
+// #14679: containerd-store replay — the incident inventory shape.
+// Several tags on one ID, distinct superseded GHCR session IDs, the
+// digest-only/<none> dangling shapes, unreferenced third-party images,
+// a container-referenced seat image, and an allowlisted image, run
+// through `run_pass` with a fake remover at the incident's pressure
+// (1 GB free, 20 GB floor) and default retention.
+// ===================================================================
+
+#[test]
+fn containerd_store_incident_shape_plans_the_expected_ids_with_default_retention() {
+    let mut seat = image("sha256:seat", &["2am/loom-worker-session@sha256:acdc"], 29 * DAY, 2.3);
+    seat.in_use = true; // referenced by a container (running or stopped)
+    let images = vec![
+        // The two newest session tags — the newest carries two aliases on
+        // one ID (multi-tag aliasing is one unit, never double-counted).
+        image(
+            "sha256:s1313",
+            &[
+                "ghcr.io/rjwalters/loom-worker-session:0.19.1313",
+                "loom-worker-session:0.19.1313",
+            ],
+            29 * DAY,
+            2.3,
+        ),
+        image(
+            "sha256:s1312",
+            &["ghcr.io/rjwalters/loom-worker-session:0.19.1312"],
+            28 * DAY,
+            2.3,
+        ),
+        // Three superseded distinct session IDs (of the incident's 24 tags).
+        image(
+            "sha256:s1183",
+            &["ghcr.io/rjwalters/loom-worker-session:0.19.1183"],
+            20 * DAY,
+            2.3,
+        ),
+        image(
+            "sha256:s1182",
+            &["ghcr.io/rjwalters/loom-worker-session:0.19.1182"],
+            19 * DAY,
+            2.3,
+        ),
+        image(
+            "sha256:s1181",
+            &["ghcr.io/rjwalters/loom-worker-session:0.19.1181"],
+            18 * DAY,
+            2.3,
+        ),
+        // The containerd-store dangling shapes: a digest-only ref and the
+        // classic `<none>:<none>`.
+        image("sha256:orfs", &["openroad/orfs@sha256:ebc8"], 30 * DAY, 2.0),
+        image("sha256:none1", &["<none>:<none>"], 30 * DAY, 2.0),
+        // Unreferenced third-party images, both older than the 7-day floor.
+        image("sha256:kicad", &["kicad/kicad:9.0"], 0, 12.0),
+        image("sha256:golang", &["golang:1.26"], 21 * DAY, 2.5),
+        seat,
+        // An allowlisted long-lived image.
+        image("sha256:eda", &["shared/eda-toolchain:2026.1"], 0, 6.5),
+    ];
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &["eda".to_string()],
+        keep_last_n: DEFAULT_KEEP_LAST_N,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let removed_ids = std::cell::RefCell::new(Vec::<String>::new());
+    let report = run_pass(
+        &inputs,
+        &move || Ok(images.clone()),
+        &|id| {
+            removed_ids.borrow_mut().push(id.to_string());
+            true
+        },
+        &slot_free,
+    );
+    // Dangling first (digest-only, then <none>), then the three superseded
+    // tracked IDs, then the one aged third-party image large enough to cover
+    // the remaining deficit: 19 GB deficit − (4.0 GB dangling + 6.9 GB
+    // stale tracked) = 8.1 GB, which the 12 GB kicad image covers, so the
+    // 2.5 GB golang image stays.
+    assert_eq!(
+        *removed_ids.borrow(),
+        vec![
+            "sha256:orfs",
+            "sha256:none1",
+            "sha256:s1183",
+            "sha256:s1182",
+            "sha256:s1181",
+            "sha256:kicad",
+        ],
+    );
+    assert_eq!(report.removed.len(), 6);
+    let plan = report.plan.as_ref().unwrap();
+    let kept: Vec<&str> = plan.kept.iter().map(|i| i.id.as_str()).collect();
+    for expected in [
+        "sha256:s1313",
+        "sha256:s1312",
+        "sha256:golang",
+        "sha256:seat",
+    ] {
+        assert!(kept.contains(&expected), "kept = {kept:?}, missing {expected}");
+    }
+    assert_eq!(plan.allowlisted.len(), 1, "the eda image is exempt");
+    assert_eq!(plan.allowlisted[0].id, "sha256:eda");
 }
 
 // ===================================================================

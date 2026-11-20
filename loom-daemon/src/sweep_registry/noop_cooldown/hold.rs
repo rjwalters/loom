@@ -33,13 +33,12 @@
 //! never touched; `loom:blocked` is in [`crate::work_finder::SKIP_LABELS`],
 //! which every candidate path applies, and Champion does not promote it.
 //!
-//! # Counted across the fleet (#12024)
+//! # Counted per host
 //!
-//! The streak compared with the threshold is this host's count **plus every
-//! peer's** count on the same fingerprint ([`fleet_streak`]): one issue took
-//! ten no-op sweeps from six hosts in 97 minutes, no host saw more than two,
-//! and the old per-host streak never tripped. Parking and releasing publish a
-//! break that resets the streak everywhere.
+//! The streak compared with the threshold is this host's own count. It was
+//! summed with every peer's count over the safehouse claims room (#12024); that
+//! channel was retired in #13945, so a loop spread across many hosts trips the
+//! threshold only when one host sees it that many times.
 //!
 //! # Never `loom:operator` (#12024)
 //!
@@ -108,15 +107,11 @@ const STDERR_LIMIT: usize = 300;
 
 /// One issue's consecutive-no-op streak.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NoopStreak {
-    /// This host's consecutive no-ops with an unchanged fingerprint (the
-    /// peers' counts are added at the threshold check, #12024).
+pub(crate) struct NoopRun {
+    /// This host's consecutive no-ops with an unchanged fingerprint.
     pub(crate) count: u32,
     /// The [`digest`] of the fingerprint the streak is accumulating against.
     fingerprint: String,
-    /// When this host last counted a no-op (or adopted the hold): a peer's
-    /// streak break at or after it resets the count (#12024).
-    counted_at: DateTime<Utc>,
     /// The sweep whose no-op was counted last, so the IPC report and the
     /// reaper's classification of one dispatch never count twice.
     last_sweep: Option<String>,
@@ -133,14 +128,13 @@ pub(crate) struct NoopStreak {
     adopted: bool,
 }
 
-impl NoopStreak {
+impl NoopRun {
     /// A hold this host did not count itself: recovered from disk or adopted
     /// from the forge, against the digest `fingerprint`.
     pub(super) fn recovered(count: u32, fingerprint: String, park: ParkKind) -> Self {
         Self {
             count,
             fingerprint,
-            counted_at: Utc::now(),
             last_sweep: None,
             park,
             held: true,
@@ -165,7 +159,7 @@ const RECONCILE_PER_TICK: usize = 2;
 #[derive(Debug, Default)]
 pub(crate) struct NoopCooldownTable {
     cooldowns: HashMap<u32, NoopCooldownState>,
-    streaks: HashMap<u32, NoopStreak>,
+    streaks: HashMap<u32, NoopRun>,
     /// Persisted holds have been reloaded into `streaks` (once per process).
     restored: bool,
     /// The forge has been searched for no-op parks to adopt (#12024).
@@ -385,12 +379,9 @@ impl SweepRegistry {
         let fingerprint = digest(&snapshot.fingerprint());
         let park = choose_park(reason, Some(&snapshot));
         let prev = self.noop_cooldown.streaks.get(&issue);
-        // #12024: a peer parked or released the issue since this host last
-        // counted it, so this host's streak is broken too.
-        let broken = prev.is_some_and(|p| self.peer_broke_noop_streak(issue, p.counted_at));
         // A held streak that is being no-op'd again means the park was lifted
         // and the issue re-offered: a fresh streak, not an instant re-hold.
-        let continues = !broken && prev.is_some_and(|p| !p.held && p.fingerprint == fingerprint);
+        let continues = prev.is_some_and(|p| !p.held && p.fingerprint == fingerprint);
         let count = if continues {
             prev.map_or(1, |p| p.count.saturating_add(1))
         } else {
@@ -399,10 +390,9 @@ impl SweepRegistry {
         let failure_notice_posted = continues && prev.is_some_and(|p| p.failure_notice_posted);
         self.noop_cooldown.streaks.insert(
             issue,
-            NoopStreak {
+            NoopRun {
                 count,
                 fingerprint: fingerprint.clone(),
-                counted_at: Utc::now(),
                 last_sweep: sweep_id.map(str::to_owned),
                 park,
                 held: false,
@@ -411,19 +401,14 @@ impl SweepRegistry {
                 adopted: false,
             },
         );
-        // #12024: the streak is the fleet's. Advertise this host's own count,
-        // then add every peer's count on the same fingerprint.
-        self.publish_noop_streak(issue, count, &fingerprint);
-        let peers = self.peer_noop_streak(issue, &fingerprint);
-        let fleet = count.saturating_add(peers);
         log::info!(
-            "sweep_registry: issue #{issue} no-op streak {fleet}/{threshold} with an unchanged \
-             fingerprint ({count} on this host, {peers} on peers) (#10156, #12024)"
+            "sweep_registry: issue #{issue} no-op streak {count}/{threshold} with an unchanged \
+             fingerprint (#10156)"
         );
-        if fleet < threshold {
+        if count < threshold {
             return;
         }
-        let outcome = self.apply_noop_hold(issue, fleet, park, reason, &fingerprint);
+        let outcome = self.apply_noop_hold(issue, count, park, reason, &fingerprint);
         if let Some(s) = self.noop_cooldown.streaks.get_mut(&issue) {
             match outcome {
                 NoopHoldOutcome::Applied => {
@@ -436,9 +421,6 @@ impl SweepRegistry {
                 }
                 NoopHoldOutcome::VetoedNoForge => {}
             }
-        }
-        if outcome == NoopHoldOutcome::Applied {
-            self.break_fleet_noop_streak(issue);
         }
         self.persist_noop_holds();
     }
@@ -536,13 +518,12 @@ impl SweepRegistry {
             return;
         }
         self.noop_cooldown.streaks.remove(&issue);
-        self.break_fleet_noop_streak(issue);
         log::info!("sweep_registry: no-op hold for #{issue} released: inputs changed (#10156)");
         let body = format!(
             "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_RELEASED_COMMENT_MARKER}\n\
              **Hold released.** A comment, label, linked PR or dependency changed since this \
-             issue was held, so {} was removed{} and the no-op count restarts across the \
-             fleet (Issue #10156, #12024).",
+             issue was held, so {} was removed{} and the no-op count restarts \
+             (Issue #10156, #12024).",
             ours.join(" + "),
             if restore {
                 " and `loom:issue` restored"
@@ -628,7 +609,7 @@ impl SweepRegistry {
         let body = format!(
             "{NOOP_HOLD_COMMENT_MARKER}\n{NOOP_HOLD_APPLIED_COMMENT_MARKER}\n\
              {NOOP_HOLD_FP_MARKER_PREFIX}{announced} -->\n\
-             **Held after {count} consecutive no-op sweeps across the fleet.** Each of the last \
+             **Held after {count} consecutive no-op sweeps.** Each of the last \
              {count} sweeps concluded there was nothing to do, and nothing this issue depends on \
              changed in between — {needs}. It now carries {} with a `no-op hold` park record \
              instead of being offered again (Issue #10156, #12024). A priority label \

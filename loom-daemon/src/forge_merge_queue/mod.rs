@@ -44,6 +44,7 @@
 
 pub mod authz;
 pub mod clear_gate;
+mod closed_issue_claims;
 pub mod events;
 pub mod forge;
 pub mod gh_lifecycle;

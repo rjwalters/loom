@@ -1,6 +1,7 @@
 //! `loom-daemon forge merge-queue …` (#10255) — clap surface only. All
 //! decisions live in [`crate::forge_merge_queue`].
 
+use crate::forge_merge_queue::mode::{MergeMode, MergeModeError, ResolvedMergeMode};
 use crate::forge_merge_queue::{handle, MergeQueueCmd};
 use clap::Subcommand;
 
@@ -122,6 +123,45 @@ pub(crate) enum MergeQueueAction {
         #[arg(long, value_name = "NWO")]
         repo: Option<String>,
     },
+}
+
+impl MergeQueueAction {
+    /// Whether this verb can reach the forge, given the resolved
+    /// `champion.mergeMode`, and so must pass `loom-tools`' mode gate (design
+    /// §10.3, #14520). Mirrors [`crate::forge_merge_queue::run`]'s own
+    /// short circuits, by effect:
+    ///
+    /// - an invalid mode is answered (exit 2) before anything else runs, for
+    ///   every verb;
+    /// - `reconcile --mode-only` reads and writes nothing in any mode;
+    /// - in `direct` mode `reconcile` and `step` print their
+    ///   `LOOM-MERGE-QUEUE-DIRECT` sentinel before the forge is identified;
+    /// - `enqueue`, `dequeue`, `handoff` and `revoke` are vetted by
+    ///   `write_target` (a credential probe against the target) *before* the
+    ///   handler's direct-mode refusal, so they reach the forge in every mode;
+    /// - `mode`, `preflight`, `status`, `group-check` and `authorize-check` are
+    ///   mode-independent and always may.
+    #[must_use]
+    pub(crate) fn reaches_forge(&self, mode: &Result<ResolvedMergeMode, MergeModeError>) -> bool {
+        let Ok(resolved) = mode else {
+            return false;
+        };
+        match self {
+            Self::Reconcile {
+                mode_only: true, ..
+            } => false,
+            Self::Reconcile { .. } | Self::Step { .. } => resolved.mode == MergeMode::Queue,
+            Self::Mode
+            | Self::Preflight { .. }
+            | Self::Status { .. }
+            | Self::Enqueue { .. }
+            | Self::Dequeue { .. }
+            | Self::Handoff { .. }
+            | Self::Revoke { .. }
+            | Self::GroupCheck { .. }
+            | Self::AuthorizeCheck { .. } => true,
+        }
+    }
 }
 
 /// `forge merge-queue`'s subcommand slot (#10256), built lazily.

@@ -425,9 +425,6 @@ impl SweepRegistry {
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
         // operator command look like it did nothing.
-        // #11930: and the fleet's fast-failure streak, here and on the peers;
-        // otherwise the first failure after the clear re-parks on stale counts.
-        self.break_fleet_fast_fail_streak(issue);
         // #13919: and the captain's count and park order, which is what
         // refuses the item fleet-wide while a captain-ordered park stands.
         // Sent whether or not this host holds the park: the operator may run

@@ -447,6 +447,42 @@ fn midbuild_recovers_dead_sweep_with_dirty_worktree_once() {
 }
 
 #[test]
+#[serial(loom_config_env)]
+fn midbuild_retry_only_steps_down_after_a_model_limit_kill() {
+    for (log, previous, expected) in [
+        ("working...\nYou've hit your Fable limit.\n", "fable", "opus"),
+        ("working...\nYou've hit your Fable limit.\n", "sonnet", "sonnet"),
+        ("working...\nsegfault\n", "fable", "fable"),
+    ] {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let issue = 6001;
+        let (mut reg, rec) = fixture_registry(ws);
+        write_config(
+            ws,
+            r#"{
+            "autonomous": {"model": "fable", "modelFallback": {
+                "enabled": true, "chain": ["fable", "opus", "sonnet"]
+            }}
+        }"#,
+        );
+        make_quiet_dirty_git_worktree(&mut reg, ws, issue);
+        let dead = insert_dead_running_with_log(&mut reg, issue, 0, "unknown", log);
+        reg.entries.get_mut(&dead).unwrap().model = Some(previous.into());
+        assert!(reg.reap_once() >= 1, "the reaper must observe the dead child");
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "watchdog must re-dispatch once");
+        assert!(wait_for_contents(&rec, "LOOM_SWEEP_ID=", 5000), "fake dispatch ran");
+        let recorded = std::fs::read_to_string(&rec).unwrap();
+        let actual = recorded
+            .lines()
+            .skip_while(|line| *line != "arg: --model")
+            .nth(1)
+            .and_then(|line| line.strip_prefix("arg: "));
+        assert_eq!(actual, Some(expected), "watchdog retry after {previous} and {log:?}");
+    }
+}
+
+#[test]
 fn midbuild_recovery_is_bounded_to_one() {
     let tmp = tempdir().unwrap();
     let ws = tmp.path();

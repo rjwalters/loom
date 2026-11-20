@@ -4,6 +4,7 @@
 use super::*;
 use crate::claim_reconciliation::forge::parse_max_timestamp;
 use crate::comment_trust::records;
+use crate::forge_check_claim::{parse_lease_rows, parse_yield_marker_line};
 use crate::gh_invocation::AccessIntent;
 
 /// The pure pre-flip label predicate behind [`CollisionClass`] (Issue #7873).
@@ -434,20 +435,6 @@ impl SweepRegistry {
                     labels = labels.join(", "),
                     count = self.collision_count,
                 );
-                // Issue #6243: feed the SAME confirmed collision into the
-                // shared peer-claim view's windowed same-issue counter,
-                // distinct from `self.collision_count`'s monotonic total —
-                // see `PeerClaimView::record_same_issue_collision_at`'s doc
-                // comment for why a second counter is needed here. A no-op
-                // when no view is attached (safehouse disabled) — the same
-                // fail-open posture `detect_and_record_collision` already
-                // has for every other branch.
-                if let Some(view) = &self.peer_claims {
-                    let repo = peer_claims::repo_slug(&self.config.workspace_root);
-                    view.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .record_same_issue_collision_at(repo, issue, std::time::Instant::now());
-                }
             }
             CollisionClass::NotYetApproved { labels } => {
                 // Issue #7873: an unpromoted issue is NOT a peer claim. Logged
@@ -1469,41 +1456,32 @@ impl SweepRegistry {
         out
     }
 
-    /// Read back every lease-record comment currently on `issue` (Issue
-    /// #6287). Uses REST (`gh api repos/{owner}/{repo}/issues/N/comments`),
-    /// the same transport [`current_labels_via_rest`](Self::current_labels_via_rest)
-    /// and [`fetch_claim_labeled_at`](Self::fetch_claim_labeled_at) use, so
-    /// this read rides a separate rate-limit bucket from the GraphQL calls
-    /// earlier dispatch guards use. `--jq` pre-filters to comments whose body
-    /// starts with [`LEASE_MARKER_PREFIX`] client-side (applied by the `gh`
-    /// binary to the already-downloaded response — the full comment payload
-    /// still crosses the wire; only the *output* is filtered, sparing the
-    /// caller from unrelated comment volume).
-    ///
-    /// The `--jq` filter emits one JSON object per line (NDJSON), not a
-    /// `[...]`-wrapped array — see [`parse_lease_comments_json`]'s doc
-    /// comment for why: `--paginate` re-invokes `--jq` once per response page
-    /// (Issue #4637), and an array-literal filter turns a multi-page result
-    /// into `[...][...]`, which is not valid JSON.
-    ///
-    /// Also carries each comment's `updated_at` (Issue #7612) alongside the
-    /// `created_at` [`resolve_lease_order`] already consumed —
-    /// [`SweepRegistry::freshest_lease_owner`] (`watchdog.rs`) is the second
-    /// reader, using `updated_at` (the renewal loop's PATCH target) rather
-    /// than `created_at` (fixed at comment creation) to find which sweep
-    /// currently holds the most-recently-renewed lease on an issue.
-    ///
-    /// This function itself only reports transport success/failure — `None`
-    /// on any unresolved repo, timeout, or non-zero exit. What a caller does
-    /// with that `None` is the caller's call: [`resolve_lease_order`] treats
-    /// it as FAIL-OPEN ("unverifiable, do not block a dispatch"), while
-    /// [`SweepRegistry::freshest_lease_owner`]'s destructive-cleanup caller
-    /// deliberately treats it as FAIL-CLOSED ("unverifiable, do not destroy
-    /// data") — see that function's own doc comment for why the two
-    /// call sites disagree on purpose.
-    ///
-    /// [`parse_lease_comments_json`]: Self::parse_lease_comments_json
+    /// The historical lease records used by watchdog, pruning and the
+    /// leaseless claim guard. Their view still includes released records.
     pub(crate) fn read_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
+        let rows = self.read_lease_comment_rows(issue)?;
+        Some(Self::parse_lease_comments_json(&rows))
+    }
+
+    /// Admission, confirmation and rollback need the same order candidates.
+    /// Once a trusted host/sweep pair yields, renewal cannot make it live again.
+    pub(crate) fn read_order_lease_comments(&self, issue: u32) -> Option<Vec<LeaseComment>> {
+        let rows = self.read_lease_comment_rows(issue)?;
+        let yielded: HashSet<_> = parse_lease_rows(&String::from_utf8_lossy(&rows))
+            .into_iter()
+            .filter_map(|row| parse_yield_marker_line(&row.body))
+            .collect();
+        let mut leases = Self::parse_lease_comments_json(&rows);
+        if !yielded.is_empty() {
+            leases.retain(|lease| !yielded.contains(&(lease.host.clone(), lease.sweep_id.clone())));
+        }
+        Some(leases)
+    }
+
+    /// Read trusted lease and yield rows together. Keep one NDJSON row per
+    /// comment across paginated REST reads (#4637), including timestamps and
+    /// the Forge ID used by the order guard. Unreadable data stays `None`.
+    fn read_lease_comment_rows(&self, issue: u32) -> Option<Vec<u8>> {
         let (owner, repo) = self.resolve_owner_repo()?;
         let gh = self.resolved_gh();
         // #12555: a reader or the gateway answers, never the writer (#12394).
@@ -1519,7 +1497,7 @@ impl SweepRegistry {
             .arg("--paginate")
             .arg("--jq")
             .arg(format!(
-                r#".[] | select(.body | startswith("{prefix}")) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
+                r#".[] | select(.body != null and ((.body | startswith("{prefix}")) or (.body | startswith("<!-- loom:lease-yield host=")))) | {{id: .id, created_at: .created_at, updated_at: .updated_at, body: .body, {author}}}"#,
                 prefix = LEASE_MARKER_PREFIX,
                 author = records::AUTHOR_JQ,
             ));
@@ -1530,7 +1508,7 @@ impl SweepRegistry {
         // #9548: an untrusted author's lease is prose, so it can neither win
         // the tie-break nor fence a watchdog cleanup.
         let policy = crate::comment_trust::TrustPolicy::for_root(&self.config.workspace_root);
-        Some(Self::parse_lease_comments_json(&policy.trusted_ndjson(&output.stdout)))
+        Some(policy.trusted_ndjson(&output.stdout))
     }
 
     /// The claim-then-verify-order tie-break itself (Issue #6287, Epic #6165
@@ -1699,7 +1677,7 @@ impl SweepRegistry {
         let renewal_cutoff = lease_episode::renewal_cutoff(episode_start);
 
         for attempt in 1..=LEASE_ORDER_OWN_COMMENT_MAX_ATTEMPTS {
-            let Some(comments) = self.read_lease_comments(issue) else {
+            let Some(comments) = self.read_order_lease_comments(issue) else {
                 // Issue #6994: a single transient read failure (rate limit,
                 // timeout, non-zero `gh` exit) is a DIFFERENT signal than a
                 // sustained, unreadable forge — retry it exactly like the
@@ -1819,7 +1797,7 @@ impl SweepRegistry {
         };
         for attempt in 1..=LEASE_ORDER_SOLE_CLAIM_CONFIRM_ATTEMPTS {
             std::thread::sleep(LEASE_ORDER_SOLE_CLAIM_CONFIRM_DELAY);
-            let Some(comments) = self.read_lease_comments(issue) else {
+            let Some(comments) = self.read_order_lease_comments(issue) else {
                 // Issue #6994 (4th occurrence, quarantine-TTL-expiry
                 // cluster): before this fix, a single transient read
                 // failure here (rate limit, timeout, non-zero `gh` exit —
@@ -2411,50 +2389,6 @@ mod tests {
         assert_eq!(registry.collision_count(), 1);
         registry.detect_and_record_collision(43);
         assert_eq!(registry.collision_count(), 2);
-    }
-
-    /// Issue #6243: a confirmed collision also feeds the SAME-issue windowed
-    /// counter on the attached `PeerClaimView`, distinct from
-    /// `registry.collision_count()`'s own monotonic total — both must
-    /// advance together from one detection event.
-    #[test]
-    fn detect_and_record_collision_feeds_the_peer_claims_same_issue_counter() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let mut registry =
-            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
-        registry.set_collision_detection(true);
-        let view = std::sync::Arc::new(std::sync::Mutex::new(peer_claims::PeerClaimView::new(
-            "self-host".to_string(),
-            peer_claims::DEFAULT_PEER_CLAIM_TTL,
-        )));
-        registry.set_peer_claims(view.clone());
-
-        registry.detect_and_record_collision(42);
-        registry.detect_and_record_collision(43);
-
-        assert_eq!(registry.collision_count(), 2, "the existing monotonic total still advances");
-        let now = std::time::Instant::now();
-        let locked = view.lock().unwrap();
-        assert_eq!(
-            locked.same_issue_collision_count(now),
-            2,
-            "the new windowed same-issue counter must advance identically"
-        );
-    }
-
-    /// With NO `PeerClaimView` attached (safehouse disabled — the common
-    /// case), `detect_and_record_collision` must still work exactly as
-    /// before: the monotonic counter advances and nothing panics.
-    #[test]
-    fn detect_and_record_collision_without_peer_claims_view_still_counts() {
-        let dir = tempdir().unwrap();
-        let gh_log = dir.path().join("gh.log");
-        let mut registry =
-            collision_registry(dir.path(), &gh_log, r#"{"labels":[{"name":"loom:building"}]}"#, 0);
-        registry.set_collision_detection(true);
-        registry.detect_and_record_collision(42);
-        assert_eq!(registry.collision_count(), 1);
     }
 
     /// With detection DISABLED, `detect_and_record_collision` is a pure no-op:

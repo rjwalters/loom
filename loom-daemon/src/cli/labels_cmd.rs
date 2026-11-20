@@ -13,7 +13,7 @@ use clap::Subcommand;
 
 /// Query the label registry and keep `labels.yml` generated from it (#10013).
 #[derive(clap::Args)]
-pub(crate) struct LabelsArgs {
+pub struct LabelsArgs {
     #[command(subcommand)]
     action: LabelsCommand,
 }
@@ -109,6 +109,54 @@ pub(crate) enum LabelsCommand {
 
 const COPIES: &[&str] = &[".github/labels.yml", "defaults/.github/labels.yml"];
 
+impl LabelsArgs {
+    /// Whether the parsed invocation writes nothing — the forms `loom-tools
+    /// labels` serves (#14429). `generate --write`, `undeclared --prune` and
+    /// `migrate --apply` are false: they rewrite the `labels.yml` copies or
+    /// the forge's labels, and those writes are #14396's. The exhaustive
+    /// `match` keeps a new subcommand from compiling until its author has
+    /// said which side it is on.
+    #[must_use]
+    pub fn is_read(&self) -> bool {
+        match &self.action {
+            LabelsCommand::List { .. }
+            | LabelsCommand::Aliases { .. }
+            | LabelsCommand::Get { .. }
+            | LabelsCommand::Check { .. } => true,
+            LabelsCommand::Generate { write, .. } => !*write,
+            LabelsCommand::Undeclared { prune, .. } => !*prune,
+            LabelsCommand::Migrate { apply, .. } => !*apply,
+        }
+    }
+
+    /// Whether the invocation can read the forge, and so must pass the tools
+    /// mode gate (design §10.3): only `undeclared` and `migrate` (whose dry
+    /// run reads the repo's labels) do; the rest of the family reads the
+    /// embedded registry or local files only.
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        matches!(&self.action, LabelsCommand::Undeclared { .. } | LabelsCommand::Migrate { .. })
+    }
+}
+
+/// Run the parsed invocation through the one shared dispatch. Refuses (exit
+/// [`super::forge_read::EX_WRITE_VERB_NOT_MIGRATED`]) a form that writes —
+/// `generate --write`, `undeclared --prune`, `migrate --apply` (#14396).
+///
+/// # Errors
+/// Whatever [`dispatch`] returns; the subcommands exit the process
+/// themselves with their documented exit codes.
+pub fn handle_labels_read_command(args: LabelsArgs) -> Result<()> {
+    if !args.is_read() {
+        eprintln!(
+            "loom-tools labels: this form writes and is not served by loom-tools yet \
+             (#14396); use `loom-daemon labels`."
+        );
+        std::process::exit(super::forge_read::EX_WRITE_VERB_NOT_MIGRATED);
+    }
+    dispatch(args)
+}
+
 fn root_of(root: Option<PathBuf>) -> PathBuf {
     // The git toplevel of the CWD, NOT the canonical repo root: from a worktree
     // `generate --write` must edit that worktree's files, never the primary
@@ -137,7 +185,7 @@ fn load(root: &Path) -> Result<Registry> {
     }
 }
 
-pub(crate) fn dispatch(args: LabelsArgs) -> Result<()> {
+pub fn dispatch(args: LabelsArgs) -> Result<()> {
     // 2AMLogic/2am#4367: `undeclared` and `migrate` read the forge; run by a
     // host job with LOOM_GH_GATEWAY_DIR set, those reads use the daemon's
     // published gateway profiles. Every subcommand enables that at startup

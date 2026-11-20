@@ -81,6 +81,35 @@ PASS=0
 FAIL=0
 TOTAL=0
 
+# Located-abort reporting (#14020). Every suite runs under `set -e`, so a
+# command that fails outside an assertion kills the suite mid-run: no
+# Total/Passed/Failed block and no FAIL line, just a bare non-zero exit that CI
+# shows as "failed without emitting a recognizable failure line". Two traps make
+# that class of failure locatable:
+#   * ERR  (needs `set -E` so functions inherit it) records the last failing
+#     command's file:line, rc and text. Commands under `||`/`if` do not fire it.
+#   * EXIT prints "ABORTED ..." to stderr when the shell exits non-zero and the
+#     suite did not finish through print_summary (which sets the flag below).
+# Neither trap changes the exit code. A suite that exits non-zero on purpose
+# (e.g. test-guard-cross-tool-champion.sh's INCOMPLETE rc 3) sets
+# _GUARD_HARNESS_FINISHED=1 first. A suite that installs its own EXIT trap must
+# call _guard_harness_on_exit from it.
+_GUARD_HARNESS_FINISHED=0
+_GUARD_HARNESS_LAST_ERR=""
+_guard_harness_on_exit() {
+    local rc="${1:-0}" last_cmd="${2:-?}"
+    if [[ "$rc" -ne 0 && "$_GUARD_HARNESS_FINISHED" -ne 1 ]]; then
+        echo "ABORTED ${0##*/} rc=$rc before print_summary; last command: ${last_cmd}" >&2
+        if [[ -n "$_GUARD_HARNESS_LAST_ERR" ]]; then
+            echo "ABORTED last failing command (ERR trap): $_GUARD_HARNESS_LAST_ERR" >&2
+        fi
+    fi
+    return 0
+}
+set -E
+trap '_GUARD_HARNESS_LAST_ERR="${BASH_SOURCE[0]##*/}:${LINENO} rc=$? cmd: ${BASH_COMMAND}"' ERR
+trap '_guard_harness_on_exit "$?" "$BASH_COMMAND"' EXIT
+
 # Colors (if terminal supports them)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -642,6 +671,7 @@ _S3SYNC="aws s3 syn""c"
 # Printed by every suite at exit; the partition's totals must sum to the
 # monolith's count.
 print_summary() {
+    _GUARD_HARNESS_FINISHED=1
     rm -rf "$TEST_REPO"
     echo ""
     echo "========================================="

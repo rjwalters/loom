@@ -216,3 +216,6 @@ pub fn render_eligibility(e: &Eligibility) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod workflow_identity_tests;

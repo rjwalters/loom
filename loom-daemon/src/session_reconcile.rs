@@ -134,10 +134,11 @@ use crate::tokens_pool::account_registry::{
 use crate::tokens_pool::docker_cli::DockerTimedOut;
 use crate::tokens_pool::private_workspace;
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
+use crate::tokens_pool::session_image::SessionImageConfig;
 use crate::tokens_pool::session_lifecycle::{
     container_name, is_session_managed, refresh_session_health_uncached, ContainerRunner,
     ContainerState, ProcessContainerRunner, SessionLifecycle, SessionStatus, UndoLock,
-    SESSION_POSTURE, SESSION_POSTURE_LABEL,
+    EXTRA_MOUNTS_LABEL, SESSION_POSTURE, SESSION_POSTURE_LABEL,
 };
 use crate::tokens_pool::session_state::{self, DriftInputs, MountDrift, Snapshot};
 use crate::tokens_pool::{session_dispatch_lock, session_hold_roots, session_mount_gate};
@@ -147,6 +148,8 @@ use serde_json::Value;
 #[path = "session_reconcile_drift.rs"]
 pub mod drift;
 pub use drift::DeferReason;
+#[path = "session_reconcile_bindings.rs"]
+pub mod bindings;
 #[path = "session_reconcile_skew.rs"]
 pub mod skew;
 
@@ -443,6 +446,8 @@ pub struct ReconcileState {
     docker_failures: u32,
     docker_retry_at: u64,
     docker_last_error: Option<String>,
+    /// Declared private-clone bindings: backoff and what was already WARNed.
+    bindings: bindings::State,
 }
 
 /// The container read failed: the runtime, not the account, is the problem.
@@ -465,6 +470,10 @@ impl std::error::Error for DockerUnavailable {}
 pub struct AccountIndex {
     disabled: HashSet<String>,
     profiles: HashMap<String, Vec<PathBuf>>,
+    /// ASCII-lowercased account email → `id.name` (first inventory wins, the
+    /// order `converge_bindings::root_of` resolves in), so a lookup accepts
+    /// every spelling `account_matches_reference` does (#14287).
+    emails: HashMap<String, String>,
 }
 
 impl AccountIndex {
@@ -479,6 +488,12 @@ impl AccountIndex {
             if !account.enabled {
                 index.disabled.insert(name.clone());
             }
+            if let Some(email) = account.email.as_deref() {
+                index
+                    .emails
+                    .entry(email.to_ascii_lowercase())
+                    .or_insert_with(|| name.clone());
+            }
             let profiles = index.profiles.entry(name).or_default();
             if !profiles.contains(&account.credential_reference) {
                 profiles.push(account.credential_reference.clone());
@@ -487,14 +502,28 @@ impl AccountIndex {
         index
     }
 
-    fn profiles(&self, name: &str) -> &[PathBuf] {
-        self.profiles.get(name).map_or(&[], Vec::as_slice)
+    /// The canonical `id.name` for an account reference: the name itself, or —
+    /// as in `account_matches_reference` — an `@` reference matching an email.
+    /// An unknown reference comes back unchanged (and so matches nothing).
+    fn canonical<'a>(&'a self, reference: &'a str) -> &'a str {
+        if self.profiles.contains_key(reference) || !reference.contains('@') {
+            return reference;
+        }
+        self.emails
+            .get(&reference.to_ascii_lowercase())
+            .map_or(reference, String::as_str)
     }
 
-    /// `enabled=false` in at least one root.
+    fn profiles(&self, reference: &str) -> &[PathBuf] {
+        self.profiles
+            .get(self.canonical(reference))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// `enabled=false` in at least one root. `name` may be an email reference.
     #[must_use]
     pub fn is_disabled(&self, name: &str) -> bool {
-        self.disabled.contains(name)
+        self.disabled.contains(self.canonical(name))
     }
 
     /// An operator hold is in force (read from disk on every call).
@@ -548,6 +577,13 @@ pub struct PassInputs<'a> {
     /// The host daemon's version; `None` when it could not be read, which
     /// disables every version-coupling decision (#11727).
     pub host_version: Option<skew::DaemonVersion>,
+    /// The resolved `accounts.session` settings (issue #14019): an override
+    /// seat is never recreated by the skew pass, and a missing seat is
+    /// recreated from the configured image rather than a stale recorded
+    /// pin. `None`: unset (or unreadable — the pass warns once and carries
+    /// on; the CLI refuses the start outright, so nothing can be *created*
+    /// with a broken override).
+    pub session_config: Option<&'a SessionImageConfig>,
 }
 
 /// The pass's single container read: one [`Snapshot`] from `take`, taken on
@@ -771,6 +807,10 @@ pub fn observe_container<'s>(
 #[must_use]
 pub fn container_state(inspect: &Value) -> ContainerState {
     let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let extra_mounts = inspect["Config"]["Labels"][EXTRA_MOUNTS_LABEL]
+        .as_str()
+        .map(crate::tokens_pool::session_image::parse_extra_mounts_label)
+        .unwrap_or_default();
     ContainerState {
         id: inspect["Id"].as_str().unwrap_or_default().to_string(),
         running: session_state::container_running(inspect),
@@ -778,6 +818,7 @@ pub fn container_state(inspect: &Value) -> ContainerState {
         started_at: text(&inspect["State"]["StartedAt"]),
         image: text(&inspect["Config"]["Image"]),
         workspace: session_state::workspace_label(inspect).map(Path::to_path_buf),
+        extra_mounts,
     }
 }
 
@@ -990,6 +1031,15 @@ fn reconcile_one<R: ContainerRunner>(
                     workspace.display()
                 );
             }
+            // The configured override image (issue #14019) beats a recorded
+            // start's image: the config is what the seat should run now, and
+            // a stale recorded digest pin would recreate it on an image the
+            // operator has since replaced. It is bundle-verified inside the
+            // start (a refusal leaves the seat down, not on the stock image).
+            let recreate_image = ctx
+                .session_config
+                .and_then(|config| config.image.clone())
+                .or(recreate_image);
             skew::guard_image(ctx, recreate_image.as_deref())?;
             let undo = UndoLock::Take(ctx.dispatch_locks);
             recreate_container(lifecycle, name, &workspace, recreate_image, &is_held, undo)?;
@@ -1062,9 +1112,28 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             .collect::<Vec<_>>(),
     );
     let acting = registry.effective_roots(fallback_root);
-    let inventories = hold_inventories
+    // The resolved `accounts.session` settings (issue #14019), read once per
+    // pass against the daemon's own root (its tier chain covers the host
+    // defaults and the per-repo tiers). An unreadable block warns and is
+    // treated as unset: the CLI refuses a *start* with the same block, so a
+    // broken override cannot silently put a fresh seat on the stock image —
+    // but an already-running seat keeps its reconcile care.
+    let session_config =
+        match crate::tokens_pool::session_image::read_session_image_config(fallback_root) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                log::warn!(
+                    "session_reconcile: the accounts.session config cannot be read ({error:#}); \
+                 extra mounts and the image override are ignored this pass"
+                );
+                None
+            }
+        };
+    let acting_inventories: Vec<(PathBuf, Vec<AccountDescriptor>)> = hold_inventories
         .into_iter()
-        .filter(|(root, _)| acting.contains(root));
+        .filter(|(root, _)| acting.contains(root))
+        .collect();
+    let inventories = acting_inventories.iter().cloned();
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
     let drift_inputs = DriftInputs::new(readable.then_some(registered.as_slice()));
@@ -1103,7 +1172,8 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             if accounts.is_empty() {
                 continue;
             }
-            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None);
+            let mut lifecycle = SessionLifecycle::new(root.clone(), ProcessContainerRunner, None)
+                .with_session_config(session_config.clone());
             let is_private_clone =
                 |a: &AccountDescriptor| private_workspace::configured(root, &a.id.name);
             let recover_private =
@@ -1132,6 +1202,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
                 host_version: skew::DaemonVersion::from_version_output(
                     crate::self_update::BUILD_IDENTITY,
                 ),
+                session_config: session_config.as_ref(),
             };
             let outcomes =
                 reconcile_accounts(&mut lifecycle, &accounts, &inputs, &mut observe, state, now);
@@ -1151,6 +1222,7 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
+    converge_bindings(fallback_root, &index, &acting_inventories, state, now);
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
@@ -1158,6 +1230,65 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     }
     crate::session_status::record_pass(&all, now);
     all
+}
+
+/// Make the declared private-clone bindings true ([`bindings`], #14111), after
+/// every account's own recovery so a dead container is restored first. Costs a
+/// config read when nothing is declared; skipped while Docker is backing off.
+fn converge_bindings(
+    fallback_root: &Path,
+    index: &AccountIndex,
+    inventories: &[(PathBuf, Vec<AccountDescriptor>)],
+    state: &mut ReconcileState,
+    now: u64,
+) -> bindings::Pass {
+    let declared = bindings::read(fallback_root);
+    if declared.bindings.is_empty() && declared.invalid.is_empty() {
+        return bindings::Pass::default();
+    }
+    if state.docker_retry_at > now {
+        return bindings::Pass::default();
+    }
+    // The first acting root whose inventory lists the account (accounts are
+    // host-global; a machine-tier binding reaches every root).
+    let root_of = |account: &str| {
+        inventories
+            .iter()
+            .find(|(_, inventory)| {
+                inventory.iter().any(|a| {
+                    a.id.provider == AccountProvider::Codex
+                        && crate::tokens_pool::account_registry::account_matches_reference(
+                            a, account,
+                        )
+                })
+            })
+            .map(|(root, _)| root.as_path())
+    };
+    let converge = |binding: &bindings::Binding, hold: &dyn Fn() -> anyhow::Result<()>| {
+        let root = root_of(&binding.account)
+            .ok_or_else(|| anyhow::anyhow!("Codex account not found in any registered root"))?;
+        private_workspace::converge(
+            root,
+            &binding.account,
+            &binding.repository,
+            &binding.base,
+            hold,
+        )
+    };
+    let registered = |account: &str| {
+        root_of(account)
+            .map_or(Ok(None), |root| private_workspace::registered_repositories(root, account))
+    };
+    bindings::converge_pass(
+        &declared,
+        &bindings::Inputs {
+            index,
+            converge: &converge,
+            registered: &registered,
+        },
+        state,
+        now,
+    )
 }
 
 /// Spawn the loop on the shared runtime. The first tick fires immediately, so

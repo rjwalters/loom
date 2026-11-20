@@ -1761,6 +1761,95 @@ else
 fi
 
 # ============================================================
+# Section: service tier (issue #14141)
+#
+#   1. LOOM_SERVICE_TIER maps to `-c service_tier=<id>` (fast -> priority)
+#   2. explicit `-c service_tier=` wins; standard/unset/empty emit nothing
+#   3. the terminal record carries effort= and tier= on a v4 record, and an
+#      unset launch keeps the v2 record unchanged
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh service tier (#14141)..."
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "-c service_tier=priority" "$out" "LOOM_SERVICE_TIER=fast maps to -c service_tier=priority"
+out="$(run_argv LOOM_SERVICE_TIER=Ultrafast -- -p x)"
+assert_contains "-c service_tier=ultrafast" "$out" "a catalog id passes through (lower-cased)"
+err="$(run_argv_stderr LOOM_SERVICE_TIER=fast -- -p x)"
+assert_contains "spawn-codex: service_tier=priority" "$err" "the applied tier is logged"
+
+out="$(run_argv LOOM_SERVICE_TIER=fast -- -p x -c service_tier=flex)"
+assert_contains "service_tier=flex" "$out" "an explicit -c service_tier= is kept"
+assert_not_contains "service_tier=priority" "$out" "an explicit -c service_tier= wins over LOOM_SERVICE_TIER"
+
+out="$(run_argv LOOM_SERVICE_TIER=standard -- -p x)"
+assert_not_contains "service_tier" "$out" "standard emits no override"
+out="$(run_argv LOOM_SERVICE_TIER= -- -p x)"
+assert_not_contains "service_tier" "$out" "an empty LOOM_SERVICE_TIER is unset"
+out="$(run_argv -- -p x)"
+assert_not_contains "service_tier" "$out" "no tier configured emits no override"
+err="$(run_argv_stderr LOOM_SERVICE_TIER='bad value!' -- -p x)"
+assert_contains "not a valid tier id" "$err" "a malformed tier warns and is ignored"
+
+# Terminal record (v4): effort + tier applied.
+_tr4() { printf '# LOOM_TERMINAL_RESULT v=4 provider=codex account=%s category=%s exit_code=%s model=%s effort=%s tier=%s' "$1" "$2" "$3" "$4" "$5" "$6"; }
+mk_authmode_codex "Logged in using an API key"
+out="$(run_authmode LOOM_SERVICE_TIER=fast LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high priority)" "$out" \
+    "the record names the applied model, effort and tier (v4)"
+out="$(run_authmode LOOM_EFFORT=high -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr4 unknown SUCCESS 0 gpt-5-codex high none)" "$out" \
+    "an unset tier is recorded as tier=none"
+out="$(run_authmode -- -p x -m gpt-5-codex)"
+assert_contains "$(_tr unknown SUCCESS 0 gpt-5-codex)" "$out" \
+    "nothing applied keeps the v2 record unchanged"
+# The dropped-pin behaviour is unchanged: model=none plus requested_model=, now
+# with the applied settings appended.
+mk_authmode_codex "Logged in using ChatGPT"
+out="$(run_authmode LOOM_SERVICE_TIER=fast -- -p x -m gpt-5-codex)"
+assert_contains "model=none requested_model=gpt-5-codex effort=none tier=priority" "$out" \
+    "a dropped pin still reports model=none (+ requested_model) alongside the tier"
+
+# Compare config arguments in order, one per line, with the record from the
+# same mock launch. A substring inside an instruction is not an effort key.
+assert_effort_launch() {
+    local description="$1" expected_record="$2" expected_config="$3"
+    shift 3
+    local output config
+    output="$(run_mock LOOM_ROLE= LOOM_ACCOUNT_NAME= LOOM_MODEL= LOOM_CODEX_MODEL= \
+        LOOM_EFFORT= LOOM_SERVICE_TIER= -- -p x "$@" 2>&1)"
+    config="$(awk '/^(-c|--config)$/ { print; getline; print; next }
+                   /^(-c|--config)=/ { print }' "$MOCK_ARGV_FILE")"
+    assert_eq "$expected_config" "$config" "$description forwards the expected config arguments"
+    assert_eq "$expected_record" "$(grep '^# LOOM_TERMINAL_RESULT ' <<< "$output")" \
+        "$description emits the expected terminal record"
+}
+
+quoted_data='--config=developer_instructions="model_reasoning_effort=low"'
+plain_data='-c=developer_instructions=model_reasoning_effort=low'
+medium='model_reasoning_effort=medium'
+high_record="$(_tr4 unknown SUCCESS 0 none high none)"
+medium_record="$(_tr4 unknown SUCCESS 0 none medium none)"
+for data in "$quoted_data" "$plain_data"; do
+    assert_effort_launch "inline $data with --effort" "$high_record" \
+        "$(printf '%s\n' "$data" -c model_reasoning_effort=high)" --effort high "$data"
+done
+assert_effort_launch "explicit effort before inline data" "$medium_record" \
+    "$(printf '%s\n' "-c=$medium" "$quoted_data")" --effort high "-c=$medium" "$quoted_data"
+assert_effort_launch "last explicit effort after inline data" "$medium_record" \
+    "$(printf '%s\n' -c model_reasoning_effort=low "$plain_data" "--config=$medium")" \
+    --effort high -c model_reasoning_effort=low "$plain_data" "--config=$medium"
+assert_effort_launch "inline data without an effort source" "$(_tr unknown SUCCESS 0 none)" \
+    "$plain_data" "$plain_data"
+mixed_data='--config=developer_instructions=model_reasoning_effort=low,service_tier=priority'
+assert_effort_launch "instruction mentioning effort and tier" "$(_tr unknown SUCCESS 0 none)" \
+    "$mixed_data" "$mixed_data"
+assert_effort_launch "separate-value instruction" "$high_record" \
+    "$(printf '%s\n' --config "${quoted_data#--config=}" -c model_reasoning_effort=high)" \
+    --effort high --config "${quoted_data#--config=}"
+
+# ============================================================
 # Summary
 # ============================================================
 

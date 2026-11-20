@@ -99,13 +99,15 @@ pub(super) fn validate_runtime_labels(obj: &Map<String, Value>) -> Result<()> {
 /// of a legacy adapter that keeps a usage store of its own (Codex, #8594) from
 /// the log marker every runtime writes — and deliberately yields `None` for
 /// Claude, keeping the pre-#8507 transcript reader and a byte-identical
-/// payload. Runs on the blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`]
+/// payload. `pr` is the merged PR, which a step-dispatched merge needs to find
+/// its Judge/Doctor/`champion --pr` work (#14018). Runs on the blocking pool under the same [`TOKEN_LOOKUP_TIMEOUT`]
 /// as every other token lookup, so a pathological store can never delay a
 /// completion past the lookup budget.
 pub(super) async fn fetch_tokens_by_model(
     runtime: Option<&str>,
     workspace_root: &str,
     issue: u32,
+    pr: u32,
     window: (DateTime<Utc>, DateTime<Utc>),
 ) -> Option<Vec<ModelUsageTotals>> {
     if !transcript_tokens_enabled() {
@@ -114,6 +116,12 @@ pub(super) async fn fetch_tokens_by_model(
     let root = PathBuf::from(workspace_root);
     let runtime = runtime.map(str::to_owned);
     let scan = tokio::task::spawn_blocking(move || {
+        // #14018: a step-dispatched merge is read from its step logs — the
+        // published `runtime` names one step's launch, but the PR's steps can
+        // have run on different runtimes, so no single-source reader fits.
+        if crate::usage_source::has_merge_step_logs(&root, issue, pr) {
+            return crate::usage_source::merge_step_tokens_by_model(&root, issue, pr, Some(window));
+        }
         let runtime = crate::usage_source::sweep_usage_runtime(runtime.as_deref(), &root, issue);
         crate::usage_source::sweep_tokens_by_model(runtime.as_deref(), &root, issue, Some(window))
     });

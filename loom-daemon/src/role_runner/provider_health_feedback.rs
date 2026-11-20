@@ -106,6 +106,17 @@ pub(super) fn apply_role_tick_provider_health_feedback(
             "role_runner: spawn-codex dropped the pinned model '{requested}' before exec (issue #14121); the step ran on the profile's default model"
         );
     }
+    // #14141: a v4 record names the effort and service tier the adapter
+    // actually applied; log them so a configured-but-ignored speed setting is
+    // visible next to the account-health outcome. Informational only.
+    if result.effort.is_some() || result.tier.is_some() {
+        log::info!(
+            "role_runner: spawn-codex applied effort={} tier={} for role={}",
+            result.effort.as_deref().unwrap_or("none"),
+            result.tier.as_deref().unwrap_or("none"),
+            admission.role
+        );
+    }
     let id = AccountId {
         provider: result.provider,
         name: result.account,

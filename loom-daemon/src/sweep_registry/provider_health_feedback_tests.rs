@@ -134,6 +134,64 @@ fn provider_health_feedback_honours_the_refusals_own_reset_horizon() {
     );
 }
 
+/// Issue #14564: the refusal the CLI actually printed on the fleet used an
+/// abbreviated month and an ordinal day (`Nov 25th, 2026 7:44 AM`), which the
+/// parser used to reject — so the hold silently fell back to `now + 5h` and the
+/// account bounced back into the pool every few hours. End to end, the hold must
+/// now end at the provider's instant, not at the fallback cooldown.
+#[test]
+fn provider_health_feedback_honours_an_ordinal_abbreviated_month_horizon() {
+    use chrono::Datelike;
+
+    let dir = tempdir().unwrap();
+    let (mut registry, _record_log) = fixture_registry(dir.path());
+    // Six days out, like the observed weekly-limit wall: far past the 5h fallback.
+    let instant = (Local::now() + chrono::Duration::days(6))
+        .with_minute(0)
+        .unwrap()
+        .with_second(0)
+        .unwrap()
+        .with_nanosecond(0)
+        .unwrap();
+    let day = instant.day();
+    let ordinal = match (day % 10, day % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    let rendered =
+        format!("{} {day}{ordinal}, {}", instant.format("%b"), instant.format("%Y %-I:%M %p"));
+    let expected_epoch = u64::try_from(instant.timestamp()).unwrap();
+    let sweep_id = insert_codex_entry_with_log(
+        &mut registry,
+        75,
+        "profile-ordinal",
+        &format!(
+            "ERROR: You've hit your usage limit. Visit \
+             https://chatgpt.com/codex/settings/usage to purchase more credits or try again at \
+             {rendered}.\n# LOOM_TERMINAL_RESULT v=2 provider=codex account=profile-ordinal \
+             category=TOKEN_EXHAUSTED exit_code=1 model=none\n"
+        ),
+    );
+
+    registry.apply_provider_health_feedback(&sweep_id, Some(1));
+
+    let id = AccountId {
+        provider: AccountProvider::Codex,
+        name: "profile-ordinal".into(),
+    };
+    let health = tokens_pool::account_health(dir.path(), &id)
+        .unwrap()
+        .expect("health record written");
+    assert_eq!(
+        health.cooldown_until,
+        Some(expected_epoch),
+        "the hold must end at the provider's own date ({rendered:?}), not now + the fallback cooldown"
+    );
+}
+
 /// The anchor argument at this call site is load-bearing: a refusal printed by
 /// an *earlier* run sharing the log file is outside this sweep's region and
 /// must not set its deadline. A call site that passed the whole file (or a

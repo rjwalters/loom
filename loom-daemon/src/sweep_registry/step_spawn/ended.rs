@@ -13,9 +13,22 @@
 //! and the tick takes it ([`take_post`]). The tick runs after both, so the
 //! order of the end and the release does not matter (the reaper releases
 //! then ends; startup adoption ends then releases).
-//! A step whose claim was not released (another claimant holds the item, a
-//! merge step with no claim label) has no noted read; the tick reads the
-//! item itself. The queue is per workspace root and
+//! The release notes its read before it decides anything: for the role
+//! steps (`restore_role_step`) `note_step_post` precedes the release plan,
+//! so the post-state is noted even when the plan then leaves the claim
+//! untouched (its `Nothing` plan fires when the claim label is already
+//! gone — the step released it, or another role advanced the item — or
+//! when the item is frozen); the Builder's `restore_builder_step` notes
+//! its read unconditionally too. The steps with no noted read are three:
+//! the `skip_label_flip` early return, a `ChampionMerge` step (no claim
+//! label), and a step whose item is held elsewhere — the reaper and startup
+//! adoption check `step_claim_held_elsewhere` before `restore_step_claim`,
+//! and a roll requeue makes its own ownership check instead
+//! (`roll_claim_still_ours` for an issue role, `roll_pr_step_claim_still_ours`
+//! for a PR role, which does call `step_claim_held_elsewhere`); all three
+//! skip the release entirely, so no read and no note happen; the tick reads
+//! the item itself for those.
+//! The queue is per workspace root and
 //! in-memory: a step that ended just before a restart is not recorded, which
 //! costs at most one cooldown the ledger would have armed.
 
@@ -41,6 +54,15 @@ pub struct EndedStep {
     /// (#13966): the launch died on an empty api-key seat, so the ledger
     /// records a refusal (`provider_exhausted`), never a run or a cooldown.
     pub provider_exhausted: bool,
+    /// The launcher's own typed preflight-rejection reason for THIS attempt
+    /// (#14634): a `preflight_<stage>` token from the worker launcher's
+    /// per-spawn socket (or the coarse `preflight_rejected`), accepted only
+    /// when the worker exited 78 and wrote no outcome line. The step-log
+    /// marker is diagnostic, never the classifier input. The report is
+    /// spent only where the ledger would otherwise have recorded
+    /// `unclassified`; ownership release, the `failed` class and the
+    /// fast-fail ladder are unchanged.
+    pub launch_rejection: Option<&'static str>,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;

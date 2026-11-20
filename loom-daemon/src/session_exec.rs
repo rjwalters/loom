@@ -93,8 +93,11 @@ impl SessionExecCommand {
         match result {
             Ok(code) => std::process::exit(code),
             Err(error) => {
+                if error.is::<crate::tokens_pool::private_workspace::AccountBusy>() {
+                    refusal::announce_seat_busy();
+                }
                 eprintln!("session-exec: {error:#}");
-                std::process::exit(78);
+                std::process::exit(refusal::REFUSAL_EXIT_CODE);
             }
         }
     }

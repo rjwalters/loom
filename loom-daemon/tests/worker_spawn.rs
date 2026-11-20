@@ -17,6 +17,13 @@ fn worker(root: &std::path::Path, runtime: &str) -> Command {
         .env("LOOM_CONFIG_DEFAULTS_FILE", "")
         // Never let a test reach the operator's real `~/.loom/api-keys` (#8401).
         .env("LOOM_SHARED_API_KEYS_DIR", "")
+        // The spawned binary resolves forge repo facts into the host-shared
+        // `${TMPDIR:-/tmp}/loom-forge-listing-cache` store; a stub answering
+        // on a cold record must never overwrite the real repo's record there
+        // (the same #8401 concern, one level down). Point the child's store
+        // at the test's own root so the record is cold — and the stub, when
+        // one is installed, consulted — on every run.
+        .env("LOOM_LISTING_CACHE_DIR", root.join(".loom-etag-cache"))
         .env(
             "LOOM_NATIVE_GUARD_DIR",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../defaults/hooks"),
@@ -139,8 +146,52 @@ fn missing_binary_is_127_and_builder_uses_guarded_tools() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(127));
+    // The real-checkout root makes the #14167 preflight stamping resolve the
+    // checkout's live repo facts; the isolated etag cache keeps that record
+    // cold on every run, so the read deterministically goes to the forge
+    // through `gh` — a spawn the live-gh guard fails the whole binary for
+    // (#10138). A fake `gh` ahead of PATH answers that one read the way the
+    // real one would, so the stamping runs as designed and the record write
+    // lands in this test's tempdir; the guard's documented escape hatch
+    // (#10138: a fake ahead of PATH never reaches the stand-in) keeps the
+    // fall-through unreachable.
+    let fake = d.path().join("fake-gh");
+    std::fs::create_dir_all(&fake).unwrap();
+    let gh = fake.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+case "$*" in
+  "api --include repos/"*)
+    repo=${*##*repos/}
+    repo=${repo%% *}
+    owner=${repo%%/*}
+    name=${repo#*/}
+    printf 'HTTP/2.0 200 OK\r\nEtag: "v1"\r\n\r\n{"id":7,"name":"%s","full_name":"%s","owner":{"login":"%s"}}' "$name" "$repo" "$owner"
+    exit 0 ;;
+esac
+echo "unexpected: $*" >&2
+exit 1
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(fake)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
     let out = worker(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/..")), "pi")
         .env("LOOM_ROLE", "builder")
+        .env("PATH", path)
+        // The checkout itself must stay clean: override the helper's store
+        // isolation to this test's tempdir, so the fabricated record (from
+        // the stub) lands here, never in the tree or the host store.
+        .env("LOOM_LISTING_CACHE_DIR", d.path().join("etag-cache"))
         .args(["-p", "hello"])
         .output()
         .unwrap();
@@ -1054,6 +1105,117 @@ fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
     let used = classify_native_stream(&run("used"));
     assert_eq!(used.loom_tool_uses, 1);
     assert!(!used.observed_a_toolless_run());
+}
+
+/// #14634: a known launcher preflight rejection carries the typed
+/// `# LOOM_LAUNCH_REJECTED` marker (exit 78 + boundary stage) on the same
+/// stream the step log captures, names the runtime it resolved before
+/// rejecting, and never reaches the harness: stdout stays empty (the fake
+/// harness's own sentinel — every real launch prints its argv there).
+#[test]
+fn a_rejected_preflight_writes_the_typed_marker_and_never_launches() {
+    let d = tempfile::tempdir().unwrap();
+    // Worker-options rejection (an unsupported flag fails the argv parser).
+    let out = worker(d.path(), "pi")
+        .args(["-p", "hello", "--api-key", "never-print-this"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=worker_options"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("never-print-this"));
+    // An argv-parse rejection precedes the launch record by contract (the
+    // parser cannot have read `--log` yet); the record itself is asserted on
+    // the post-parse rejections below.
+    assert!(
+        out.stdout.is_empty(),
+        "the harness never ran: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Runner-missing rejection: a legacy runtime with no spawn script.
+    let out = worker(d.path(), "grail")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=runner_missing"),
+        "{stderr}"
+    );
+    let resolved_at = stderr
+        .find("# LOOM_RUNTIME_RESOLVED runtime=grail")
+        .expect("resolved runtime recorded");
+    let rejected_at = stderr.find("# LOOM_LAUNCH_REJECTED").unwrap();
+    assert!(
+        resolved_at < rejected_at,
+        "the resolved runtime precedes the rejection: {stderr}"
+    );
+    assert!(out.stdout.is_empty());
+
+    // A missing harness binary is 127 (spawn mechanics, not preflight): no
+    // rejection marker, or the step end would classify a post-start-shaped
+    // failure as a preflight rejection.
+    let out = worker(d.path(), "pi")
+        .env("LOOM_PI_BIN", d.path().join("missing"))
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(127), "{stderr}");
+    assert!(!stderr.contains("LOOM_LAUNCH_REJECTED"), "{stderr}");
+}
+
+/// #14634: the OpenCode CLI-qualification guard (an unqualified major, or a
+/// version probe that fails) is a typed preflight boundary, so the recurrence
+/// receipt can name it instead of `unclassified`.
+#[test]
+fn an_unqualified_opencode_cli_refuses_at_the_cli_qualification_stage() {
+    let d = tempfile::tempdir().unwrap();
+    // A version the launcher cannot qualify (unsupported major), and a
+    // version probe that fails outright.
+    for (version, exit) in [("3.0.0", "0"), (OPENCODE_V1, "1")] {
+        let out = worker(d.path(), "opencode")
+            .env("FIXTURE_VERSION", version)
+            .env("FIXTURE_VERSION_EXIT", exit)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{version:?}: {stderr}");
+        assert!(
+            stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+            "{version:?}: {stderr}"
+        );
+        assert!(stderr.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{stderr}");
+        assert!(out.stdout.is_empty(), "{version:?}");
+    }
+    // The guarded-2.x refusal (no live guarded-canary receipt) is the same
+    // typed boundary — the shape the observed exit-78 receipts could not
+    // name.
+    let d2 = tempfile::tempdir().unwrap();
+    builder_role(d2.path());
+    std::fs::write(d2.path().join(".loom/roles/builder.md"), "Role task: $ARGUMENTS").unwrap();
+    let out = worker(d2.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args([
+            "--dangerously-skip-permissions",
+            "-p",
+            "/loom:builder 14634",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
 }
 
 #[path = "worker_spawn/cargo_debuginfo.rs"]

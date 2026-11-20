@@ -53,6 +53,24 @@ pub(crate) struct CreateIssueCli {
     json: bool,
 }
 
+/// The refusal message for an inline `--body` that is a lone `@`-token
+/// (`@path`, `@-`, `@`), or `None` when the body may be filed (#14323).
+/// `--body` takes the literal text and never expands `@path` like `curl -d`,
+/// so such a body would file an issue whose body is the literal string.
+/// Only `is_lone_at_token` is applied, not `verdict_body::check`: its length
+/// floor would refuse legitimate short bodies (`fix`). Mirrors
+/// `forge comment --body` (#14286).
+fn lone_at_body_refusal(body: &str) -> Option<String> {
+    crate::verdict_body::is_lone_at_token(body).then(|| {
+        format!(
+            "refusing to file: --body {:?} is a lone '@' token, which files the \
+             literal string and reads nothing — use --body-file <path> (or \
+             --body-file - for stdin)",
+            body.trim()
+        )
+    })
+}
+
 fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
     use crate::forge_create_issue::{create, CreateError, RealGh, Request};
     let fail = |e: &CreateError, json: bool| -> ! {
@@ -79,7 +97,12 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
         fail(&e, a.json);
     }
     let body = match (&a.body, &a.body_file) {
-        (Some(b), _) => b.clone(),
+        (Some(b), _) => {
+            if let Some(msg) = lone_at_body_refusal(b) {
+                usage(msg);
+            }
+            b.clone()
+        }
         (None, Some(p)) if p.as_os_str() == "-" => {
             let mut s = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
@@ -1719,5 +1742,33 @@ mod write_target_tests {
             nonce: String::new(),
         };
         assert_eq!(write_target(&reconcile), Some(Some("unmanaged/repo".into())));
+    }
+}
+
+#[cfg(test)]
+mod create_issue_body_tests {
+    use super::lone_at_body_refusal;
+
+    #[test]
+    fn lone_at_tokens_are_refused_naming_body_file() {
+        for body in ["@path", "@-", "@", "  @/tmp/f\n", "@a.md"] {
+            let msg =
+                lone_at_body_refusal(body).unwrap_or_else(|| panic!("{body:?} must be refused"));
+            assert!(msg.contains("--body-file"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn ordinary_bodies_are_not_refused() {
+        for body in [
+            "fix",
+            "",
+            "@ with space",
+            "see @alice for details",
+            "a@b",
+            "-",
+        ] {
+            assert!(lone_at_body_refusal(body).is_none(), "{body:?} must be allowed");
+        }
     }
 }

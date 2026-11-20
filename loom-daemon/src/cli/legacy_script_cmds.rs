@@ -142,16 +142,43 @@ pub struct ResolveRoleModelArgs {
     /// printing — the one-call form a spawning session uses right before
     /// passing the value to the Task `model` parameter. Exit 3 when the
     /// resolved model has no Task-passable alias (caller omits the param).
+    /// A no-op with `--json`, whose record already carries `task_model`.
     #[arg(long = "task-alias")]
     pub task_alias: bool,
 
-    /// Print a JSON record (`role`, `model`, `source`) instead of the bare
-    /// model, and always exit 0. The observability form (issue #13956):
-    /// `source` names the tier that supplied the model (`param` |
+    /// Print a JSON record (`role`, `model`, `source`, `task_model`) instead
+    /// of the bare model, and always exit 0. The observability form (issue
+    /// #13956): `source` names the tier that supplied the model (`param` |
     /// `roleConfig.model` | `suggestedModel` | `inherit`), so an experiment
-    /// can log what a spawn actually ran on.
+    /// can log what a spawn actually ran on. `task_model` is the value to
+    /// pass to the Task tool's alias-only `model` parameter (`null` ⇒ omit
+    /// the parameter); `model` keeps the real resolved ID (#14133).
     #[arg(long)]
     pub json: bool,
+}
+
+/// The `--json` record for `resolve-role-model` (#13956, #14133).
+///
+/// `model` is the real resolved value (possibly a pinned ID) so the record
+/// stays an honest observability log; `task_model` is its
+/// [`model_tiers::task_alias_of`] degradation — the only value the Task
+/// tool's alias-only `model` parameter accepts — or `null` when there is no
+/// model or no mapping, meaning the caller omits the parameter.
+fn resolve_role_model_json(
+    role: &str,
+    resolved: &script_helpers::role_model::ResolvedRoleModel,
+) -> serde_json::Value {
+    let task_model = resolved
+        .model
+        .as_deref()
+        .map(script_helpers::model_tiers::task_alias_of)
+        .filter(|alias| !alias.is_empty());
+    serde_json::json!({
+        "role": role,
+        "model": resolved.model,
+        "source": resolved.source,
+        "task_model": task_model,
+    })
 }
 
 /// `resolve-role-model` — backs `resolve-role-model.sh` (issue #13956).
@@ -161,7 +188,9 @@ pub struct ResolveRoleModelArgs {
 /// Exit codes: `0` resolved (or `--json` report printed), `2` (clap) when no
 /// role was supplied, and `3` with NO output when nothing is configured (or
 /// `--task-alias` has no mapping) so the caller omits the Task `model`
-/// parameter and the subagent inherits the parent session's model.
+/// parameter and the subagent inherits the parent session's model. `--json`
+/// always exits 0 and ignores `--task-alias` (its `task_model` field carries
+/// the alias).
 pub fn handle_resolve_role_model_command(args: &ResolveRoleModelArgs) -> Result<()> {
     use script_helpers::{model_tiers, role_model};
 
@@ -173,12 +202,7 @@ pub fn handle_resolve_role_model_command(args: &ResolveRoleModelArgs) -> Result<
         role_model::resolve_role_model(&cfg, &repo_root, &args.role, args.model.as_deref());
 
     if args.json {
-        let obj = serde_json::json!({
-            "role": args.role,
-            "model": resolved.model,
-            "source": resolved.source,
-        });
-        println!("{obj}");
+        println!("{}", resolve_role_model_json(&args.role, &resolved));
         return Ok(());
     }
 
@@ -504,6 +528,7 @@ pub(crate) fn handle_sweep_experiment_command(action: SweepExperimentAction) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::resolve_role_model_json;
     use crate::cli::whole_cli_parse::try_parse_cli;
     use crate::cli::Commands;
 
@@ -557,12 +582,74 @@ mod tests {
                 "--config",
                 "x.json",
             ],
+            // #14133: the pair parses; `--task-alias` is a documented no-op
+            // under `--json` (the record's `task_model` carries the alias).
+            &[
+                "loom-daemon",
+                "resolve-role-model",
+                "judge",
+                "--json",
+                "--task-alias",
+            ],
         ] {
             let cli = try_parse_cli(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             assert!(matches!(cli.command, Some(Commands::ResolveRoleModel { .. })), "{argv:?}");
         }
         // The role argument is required.
         assert!(try_parse_cli(&["loom-daemon", "resolve-role-model"]).is_err());
+    }
+
+    /// #14133: the `--json` record carries a Task-passable `task_model`
+    /// beside the untouched `role` / `model` / `source`.
+    #[test]
+    fn resolve_role_model_json_carries_task_model() {
+        use crate::script_helpers::role_model::{
+            ResolvedRoleModel, SOURCE_INHERIT, SOURCE_ROLE_CONFIG,
+        };
+
+        // A pinned ID degrades to its family alias; `model` stays the real ID.
+        let pinned = ResolvedRoleModel {
+            model: Some("claude-opus-5-5".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        let v = resolve_role_model_json("judge", &pinned);
+        assert_eq!(v["role"], "judge");
+        assert_eq!(v["model"], "claude-opus-5-5");
+        assert_eq!(v["source"], SOURCE_ROLE_CONFIG);
+        assert_eq!(v["task_model"], "opus");
+
+        // An alias passes through unchanged.
+        let alias = ResolvedRoleModel {
+            model: Some("sonnet".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        assert_eq!(resolve_role_model_json("builder", &alias)["task_model"], "sonnet");
+
+        // An `@effort` suffix is stripped for the Task value only.
+        let effort = ResolvedRoleModel {
+            model: Some("claude-opus-5@high".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        assert_eq!(resolve_role_model_json("judge", &effort)["task_model"], "opus");
+
+        // Nothing configured: `model` and `task_model` are both null.
+        let inherit = ResolvedRoleModel {
+            model: None,
+            source: SOURCE_INHERIT,
+        };
+        let v = resolve_role_model_json("judge", &inherit);
+        assert!(v["model"].is_null());
+        assert!(v["task_model"].is_null());
+        assert_eq!(v["source"], SOURCE_INHERIT);
+
+        // A model with no Task alias maps to null, not an empty string.
+        let unmappable = ResolvedRoleModel {
+            model: Some("gpt-5".to_string()),
+            source: SOURCE_ROLE_CONFIG,
+        };
+        let v = resolve_role_model_json("judge", &unmappable);
+        assert_eq!(v["model"], "gpt-5");
+        assert!(v["task_model"].is_null());
     }
 
     /// #11665: tier-2.5 routing and the Jev tier shadow are deleted, so their

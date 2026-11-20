@@ -423,6 +423,28 @@ async fn collect(window: Duration) -> HealthReport {
         .map(|r| (r.root.display().to_string(), crate::resync_pin::read_pins(&r.root)))
         .collect();
 
+    // 14. Managed-checkout owner drift (#14223) — the canonical-owner
+    //     comparison over the roots the daemon reported: per-root bounded
+    //     `git remote get-url` reads plus one cached `GET repos/{nwo}` per
+    //     distinct repo, on a blocking thread like this command's other
+    //     subprocess work. Skipped entirely when the daemon did not answer
+    //     (no root list): `None`, no section — unknown, not an all-clear.
+    //     A per-repo forge lookup failure yields no verdict for that repo,
+    //     never a false drift.
+    let owner_drift = match &status {
+        Some(report) => {
+            let roots: Vec<PathBuf> = report.per_repo.iter().map(|r| r.root.clone()).collect();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::credential_preflight::owner_drift::collect_canonical_drift(&roots)
+                })
+                .await
+                .unwrap_or_default(),
+            )
+        }
+        None => None,
+    };
+
     health::assess(&HealthInputs {
         at: chrono::Utc::now(),
         window,
@@ -454,6 +476,7 @@ async fn collect(window: Duration) -> HealthReport {
         // 12. The last fleet-sync snapshot (#11740) — local file read.
         fleet_sync: crate::fleet_sync::probe_status(),
         resync_pins,
+        owner_drift,
     })
 }
 

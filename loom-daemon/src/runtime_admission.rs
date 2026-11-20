@@ -31,9 +31,23 @@ pub enum RuntimeSource {
     BuiltIn,
 }
 
+impl RuntimeSource {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::RoleEnvironment => "role-environment",
+            Self::GlobalEnvironment => "global-environment",
+            Self::RoleConfig => "role-config",
+            Self::DefaultConfig => "default-config",
+            Self::Preference => "preference",
+            Self::BuiltIn => "built-in",
+        }
+    }
+}
+
 impl fmt::Display for RuntimeSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", serde_json::to_value(self).unwrap().as_str().unwrap())
+        f.write_str(self.as_str())
     }
 }
 

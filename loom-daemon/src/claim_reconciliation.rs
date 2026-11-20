@@ -27,12 +27,11 @@
 //! host-scoped rules below concluded. This is the SOLE fleet-scoped gate as
 //! of Epic #6165 Phase 4 (#6317) — an earlier, now-removed gate additionally
 //! consulted whether the peer-claim/safehouse advertisement channel itself
-//! looked healthy (Issue #6157); that channel is fleet-scoped in principle
-//! but only *eventually consistent* (`peer_claims.rs`'s own "soft claim, not
-//! a mutex" framing), so treating its silence — degraded or otherwise — as
-//! reclamation-relevant evidence was itself the drift Epic #6165 set out to
-//! fix. The lease's forge-assigned `updated_at` needs no receipt at all,
-//! which is strictly stronger.
+//! looked healthy (Issue #6157); that channel (retired entirely in #13945) was
+//! fleet-scoped in principle but only *eventually consistent*, so treating its
+//! silence — degraded or otherwise — as reclamation-relevant evidence was
+//! itself the drift Epic #6165 set out to fix. The lease's forge-assigned
+//! `updated_at` needs no receipt at all, which is strictly stronger.
 //!
 //! ## Decision rule (host-scoped evidence only — see the lease gate above)
 //!
@@ -332,13 +331,11 @@ pub const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 600;
 /// (e.g. `5` meaning "5 minutes") cannot turn this into a `gh`-API busy loop.
 pub const MIN_RECONCILE_INTERVAL_SECS: u64 = 60;
 
-/// Default periodic reconciliation interval when safehouse peer-claims are
-/// live (Issue #4431): 30 minutes. With claims advertised at dispatch and
-/// re-advertised every reaper tick (`sweep_registry::readvertise_peer_claims`),
-/// the fleet room — not the `loom:building` label — is the fast in-flight
-/// claim signal, and this pass demotes to a slow *healing* sweep for the
-/// divergence cases safehouse cannot see (a host that crashed without
-/// retracting, a stranded label from a pre-safehouse dispatch). Hosts without
+/// Default periodic reconciliation interval on a `safehouse.enabled` host
+/// (Issue #4431): 30 minutes. It was chosen while peer claims, re-advertised
+/// every reaper tick, were the fast in-flight signal and this pass was only a
+/// *healing* sweep. That channel was retired in #13945 (the lease record is the
+/// fast signal now), but the cadence is unchanged. Hosts without
 /// `safehouse.enabled` keep [`DEFAULT_RECONCILE_INTERVAL_SECS`] unchanged.
 pub const DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS: u64 = 1800;
 
@@ -368,8 +365,7 @@ pub fn resolve_reconcile_interval() -> Duration {
 /// 2. `.loom/config.json → safehouse.claimReconcileIntervalSecs` — a per-repo
 ///    override of the safehouse-mode cadence (zero/invalid ignored).
 /// 3. [`DEFAULT_SAFEHOUSE_RECONCILE_INTERVAL_SECS`] when `safehouse.enabled`
-///    resolves true for `root` — peer-claims carry the fast signal, labels
-///    demote to a healing cadence.
+///    resolves true for `root` (see that constant for the history).
 /// 4. [`DEFAULT_RECONCILE_INTERVAL_SECS`] otherwise — byte-for-byte the
 ///    pre-#4431 behavior for hosts without safehouse (e.g. robb-pro).
 ///
@@ -2241,11 +2237,8 @@ pub mod forge {
     /// while peer coordination looked DEGRADED (sustained advertising with
     /// no receive); that gate has been removed, because a healthy-vs-
     /// degraded *advertisement channel* was never meant to be load-bearing
-    /// for correctness in the first place (`peer_claims.rs`'s own "soft
-    /// claim, not a mutex" framing, and this epic's own root-cause finding).
-    /// The peer-claim channel keeps its #4028 fast-backoff role at dispatch
-    /// time ([`crate::sweep_registry::SweepRegistry::dispatch`]'s
-    /// `peer_claimed_issues` check) — advisory only, never consulted here.
+    /// for correctness in the first place (this epic's own root-cause finding).
+    /// That channel was retired in #13945.
     pub fn reconcile_workspace(gh_bin: &Path, root: &Path, is_startup: bool) -> (usize, usize) {
         let repo = root.display().to_string();
 

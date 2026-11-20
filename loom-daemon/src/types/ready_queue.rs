@@ -65,8 +65,10 @@ pub enum QueueDisposition {
     Declined,
     /// Waiting: a previous dispatch produced no PR; its retry window is open.
     PrlessRetry,
-    /// Held elsewhere: a peer host advertised a live soft claim.
-    PeerClaim,
+    /// Held elsewhere: another host's or sweep's claim holds it — a live lease,
+    /// a captain assignment, or a merge in flight. (Named for the retired
+    /// safehouse peer-claim channel until #13945.)
+    LeaseHeld,
     /// Blocked: it already has an open linked PR.
     OpenPr,
     /// The dispatch attempt failed.
@@ -113,7 +115,7 @@ impl QueueDisposition {
         Self::NoopCooldown,
         Self::Declined,
         Self::PrlessRetry,
-        Self::PeerClaim,
+        Self::LeaseHeld,
         Self::OpenPr,
         Self::DispatchError,
         Self::AlreadyLanded,
@@ -142,7 +144,7 @@ impl QueueDisposition {
             Self::NoopCooldown => "noop_cooldown",
             Self::Declined => "declined",
             Self::PrlessRetry => "prless_retry",
-            Self::PeerClaim => "peer_claim",
+            Self::LeaseHeld => "lease_held",
             Self::OpenPr => "open_pr",
             Self::DispatchError => "dispatch_error",
             Self::AlreadyLanded => "already_landed",
@@ -189,7 +191,7 @@ impl QueueDisposition {
             Self::NoopCooldown => "waiting: no-op release cooldown",
             Self::Declined => "blocked: declined, cooldown active",
             Self::PrlessRetry => "waiting: last run produced no PR",
-            Self::PeerClaim => "held by a peer host",
+            Self::LeaseHeld => "held by another claim (lease or captain order)",
             Self::OpenPr => "blocked: open linked PR",
             Self::DispatchError => "dispatch failed",
             Self::AlreadyLanded => "skipped: work already landed",
@@ -311,7 +313,7 @@ mod tests {
                 "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
                 "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
                 "skipped_quarantined": 0, "skipped_pr_open": 0,
-                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "skipped_backoff": 0,
                 "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
                 "halted": false
             }))
@@ -351,7 +353,7 @@ mod tests {
                 "at": "2026-09-28T00:00:00Z", "max_concurrent": 2, "seen": 0,
                 "dispatched": 0, "skipped_labeled": 0, "skipped_in_flight": 0,
                 "skipped_quarantined": 0, "skipped_pr_open": 0,
-                "skipped_peer_claim": 0, "skipped_backoff": 0,
+                "skipped_backoff": 0,
                 "deferred_capacity": 0, "deferred_ramp_cap": 0, "errors": 0,
                 "halted": false, "saturation_held": true
             }))

@@ -50,6 +50,7 @@ struct Gh {
     removals: RefCell<Vec<RemovalEvent>>,
     group_runs: RefCell<Result<Vec<GroupRun>, String>>,
     comments_down: Cell<bool>,
+    issue_cleanups: Cell<u32>,
     dequeue_fails: Cell<bool>,
     /// Latest `loom/merge-authorization` status per commit.
     head_status: RefCell<std::collections::HashMap<String, StatusState>>,
@@ -74,6 +75,7 @@ impl Gh {
             removals: RefCell::new(Vec::new()),
             group_runs: RefCell::new(Ok(Vec::new())),
             comments_down: Cell::new(false),
+            issue_cleanups: Cell::new(0),
             dequeue_fails: Cell::new(false),
             head_status: RefCell::new(std::collections::HashMap::new()),
             status_fails: Cell::new(false),
@@ -241,6 +243,10 @@ impl LifecycleForge for Gh {
         }
         Ok(())
     }
+    fn confirmed_merge_issue_claims(&self, _pr: u32) -> Result<(), String> {
+        self.issue_cleanups.set(self.issue_cleanups.get() + 1);
+        Ok(())
+    }
     fn removals(&self, _pr: u32) -> Result<Vec<RemovalEvent>, String> {
         self.tick();
         Ok(self.removals.borrow().clone())
@@ -285,6 +291,7 @@ fn enqueue_is_not_merge_and_merge_is_confirmed_once() {
     assert_eq!(gh.state.get(), PrState::Open);
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued]);
     assert_eq!(ev.pending().unwrap(), vec![PR]);
+    assert_eq!(gh.issue_cleanups.get(), 0);
     let c = ctx(&gh, &ev, MergeMode::Queue, t0() + Duration::minutes(5));
     assert!(matches!(reconcile_pr(&c, PR), Reconciled::StillQueued { .. }));
 
@@ -313,6 +320,7 @@ fn enqueue_is_not_merge_and_merge_is_confirmed_once() {
         }
     );
     assert_eq!(kinds(&ev), vec![EventKind::Enqueued, EventKind::Merged]);
+    assert_eq!(gh.issue_cleanups.get(), 1, "only the first confirmed merge cleans issues");
 }
 
 #[test]

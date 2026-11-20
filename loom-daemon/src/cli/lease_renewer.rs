@@ -120,7 +120,7 @@ pub(crate) enum RenewerAction {
     },
     /// Stop a renewer safely (#11086): `stop <PID>` signals the pid only if it
     /// is provably a lease renewer (its command line is `<bash|sh|zsh|dash>
-    /// sweep-lease-renew.sh start ...` or `loom-daemon lease renewer ...`, with a start identity
+    /// sweep-lease-renew.sh start ...` or `loom-daemon|loom-tools lease renewer ...`, with a start identity
     /// that did not change while it was checked); `stop --issue N` ends every
     /// recorded renewer of issue N in this repo (any sweep unless `--sweep-id`
     /// is given) and never a peer issue's. Anything else is refused (exit 1)
@@ -420,7 +420,7 @@ fn argv_base(a: &str) -> &str {
 /// Is this argv a lease renewer this tooling started? Either
 /// `<shell> [-flags] .../sweep-lease-renew.sh start ...` (the detached loop is
 /// a subshell of that `#!/usr/bin/env bash` script, so it shares its argv) or
-/// `.../loom-daemon lease renewer ...`. The program must be a shell
+/// `.../loom-daemon lease renewer ...` (or `loom-tools`, #14488). The program must be a shell
 /// (bash/sh/zsh/dash by basename) running the script FILE: any other program
 /// (an editor, another interpreter) and command-string / stdin forms (`-c`,
 /// `-s`) or option clusters that may consume the script path as their own
@@ -446,7 +446,11 @@ pub(crate) fn is_renewer_argv(argv: &[String]) -> bool {
                     && rest.get(i + 1).is_some_and(|a| a == "start")
             })
     };
-    let daemon = argv.first().is_some_and(|a| argv_base(a) == "loom-daemon")
+    // Either binary serves `lease renewer` (#14488), so either may be the
+    // process named in a recorded owner.
+    let daemon = argv
+        .first()
+        .is_some_and(|a| matches!(argv_base(a), "loom-daemon" | "loom-tools"))
         && argv.get(1).is_some_and(|a| a == "lease")
         && argv.get(2).is_some_and(|a| a == "renewer");
     script_start || daemon
