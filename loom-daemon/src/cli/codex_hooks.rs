@@ -127,6 +127,7 @@ impl VerifyArgs {
                     docker: self.docker.clone(),
                     name,
                 }),
+                command: None,
             }),
         }
         .verify();
