@@ -10,6 +10,8 @@ pub(super) const NO_IDLE_SEAT: &str = "no idle seat";
 /// The resolved repository is served by no inventoried account: a routing
 /// misconfiguration, not contention (#14512).
 pub(super) const NO_SEAT_SERVES_REPOSITORY: &str = "no seat serves this repository";
+pub(super) const WRONG_ACCOUNT: &str =
+    "private dispatch account or profile does not match the named account";
 
 /// The one descriptor a private dispatch hands its account lease down on.
 /// Also the only value `roll_pause::resume::release_inherited_lease` accepts.
@@ -64,7 +66,7 @@ pub fn uses_private(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
-enum SeatPolicy {
+enum SeatPolicy<'a> {
     /// Containment admission (#8787): every eligible seat is tried at most
     /// once, and a candidate only wins when a containment proof can be taken
     /// for it — the winning lease, proof and launch stay bound to one seat.
@@ -79,7 +81,7 @@ enum SeatPolicy {
     /// The one account a caller resolved by name and must launch on: never
     /// walks, so a busy named seat refuses with its own reason instead of
     /// handing back a different seat (#14627).
-    Named(String),
+    Named(&'a Config),
 }
 
 /// Why the bounded seat walk passed one candidate over.
@@ -228,19 +230,17 @@ impl Selection {
         Self::prepare_with(root, "codex", model, kind, issue, owner, SeatPolicy::Contained)
     }
 
-    /// Prepare exactly the one account `name` resolved to — no seat walk
-    /// (#14627). `transport::run` resolves a specific account up front and
-    /// must refuse on that account's own state (a busy session surfaces its
-    /// `AccountBusy` text), never on a different seat a pool walk would hand
-    /// back and the caller would misread as a wrong-clone mismatch.
+    /// Prepare only the account already resolved by transport (#14627).
+    /// A busy named seat must retain its own refusal even when other seats
+    /// are available.
     pub(super) fn prepare_named(
         root: &Path,
-        name: &str,
+        config: &Config,
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
     ) -> Result<Option<Self>> {
-        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(name.into()))
+        Self::prepare_with(root, "codex", None, kind, issue, owner, SeatPolicy::Named(config))
     }
 
     fn prepare_with(
@@ -250,7 +250,7 @@ impl Selection {
         kind: JobKind,
         issue: Option<u64>,
         owner: &str,
-        policy: SeatPolicy,
+        policy: SeatPolicy<'_>,
     ) -> Result<Option<Self>> {
         export::check_runtime(root, issue, runtime)?;
         if runtime == "codex" {
@@ -284,7 +284,14 @@ impl Selection {
             account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
         };
         let try_idle_seats = matches!(policy, SeatPolicy::Idle { .. });
-        let prepare = |name, profile| -> Result<Self> {
+        let prepare = |name, profile: PathBuf| -> Result<Self> {
+            // Explicit pins may confirm a named launch. A conflicting pin
+            // cannot substitute a different account before we take a lease.
+            if let SeatPolicy::Named(config) = policy {
+                if config.account != name || config.profile != profile.canonicalize()? {
+                    bail!("{WRONG_ACCOUNT}");
+                }
+            }
             let selection = Self::prepare_profile(root, name, profile, kind, issue, owner)?;
             match policy {
                 // A guarded read-only reservation must already prove
@@ -340,10 +347,8 @@ impl Selection {
         // The caller resolved one account by name and must launch on it
         // (#14627): prepare that seat and nothing else, so its own refusal
         // (a busy session) reaches the caller instead of another seat.
-        if let SeatPolicy::Named(name) = &policy {
-            let account = account(root, name)?;
-            return prepare(account.id.name.clone(), account.credential_reference.clone())
-                .map(Some);
+        if let SeatPolicy::Named(config) = policy {
+            return prepare(config.account.clone(), config.profile.clone()).map(Some);
         }
 
         let logical = logical_repository(root);
@@ -424,7 +429,10 @@ impl Selection {
             return Ok(selection);
         }
         adapter::check(Some(&selection.profile))?;
-        let (config, dir) = lifecycle::resolve(root, &selection.name)?;
+        let (config, resolved_dir) = lifecycle::resolve(root, &selection.name)?;
+        if resolved_dir != dir {
+            bail!("private dispatch account profile changed during preparation");
+        }
         export::check_failover(root, issue, &selection.name)?;
         let target = select_target(root, &config)?;
         // Refuse BEFORE the lease, the container exec and the claim when the
