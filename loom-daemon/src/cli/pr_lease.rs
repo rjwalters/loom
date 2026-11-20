@@ -964,15 +964,10 @@ pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>)
 /// PR must not keep seeing that behind a released marker. `reaped` words it
 /// as the role runner's reap of a claimant that ended without releasing.
 pub(crate) fn released_body(holder: &Identity, pr: u64, reaped: bool) -> String {
-    let how = if reaped {
-        "the role runner reaped it for a claimant that ended without releasing"
-    } else {
-        "the role finished with it"
-    };
     format!(
-        "PR #{pr}'s `{label}` claim was {verb} by the {role} of sweep `{sweep}` on host \
-         `{host}`: {how}. This **PR lease record** (#9401) is no longer live; the claim is \
-         free for the next {role}. See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
+        "PR #{pr}'s `{label}` lease for the {role} of sweep `{sweep}` on host `{host}` was {verb}. \
+         This **PR lease record** (#9401) is no longer live. \
+         See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
         verb = if reaped { "reaped" } else { "released" },
         label = holder.claim_label_text(),
         role = holder.role.as_str(),

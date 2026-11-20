@@ -1005,17 +1005,36 @@ fn a_released_row_no_longer_reads_as_a_held_claim() {
     assert_eq!(ctx(dir.path(), a).check(), EXIT_HELD);
 }
 
-/// #14807: a reap words the rewritten prose as reaped, not released.
+/// #14807: release and reap only change their own lease record.
 #[test]
-fn a_reaped_row_names_the_reap_in_its_prose() {
-    let dir = TempDir::new().unwrap();
-    fake_gh(dir.path());
-    let dead = who(Role::Judge, "sweep-j");
-    fs::write(dir.path().join("rows"), live_row(100, &dead)).unwrap();
-    assert_eq!(ctx(dir.path(), dead).reap("timeout"), EXIT_HELD);
-    let patched = patched(dir.path());
-    assert!(patched.contains("was reaped"), "{patched}");
-    assert!(!patched.contains("is held by"), "{patched}");
+fn release_and_reap_describe_only_the_departing_lease() {
+    for reaped in [false, true] {
+        let dir = TempDir::new().unwrap();
+        fake_gh(dir.path());
+        let departing = on("host-a", "sweep-j");
+        let peer = on("host-b", "sweep-peer");
+        fs::write(dir.path().join("rows"), live_row(100, &departing) + &live_row(101, &peer))
+            .unwrap();
+        let departing_ctx = ctx(dir.path(), departing.clone());
+        let result = if reaped {
+            departing_ctx.reap("timeout")
+        } else {
+            departing_ctx.release(None, None, None)
+        };
+        assert_eq!(result, EXIT_HELD);
+
+        let text = patched(dir.path());
+        assert!(text.contains("issues/comments/100"), "{text}");
+        assert!(text.contains(&departing.released_marker()), "{text}");
+        assert!(!text.contains("issues/comments/101"), "{text}");
+        assert_eq!(departing_ctx.check(), EXIT_PEER);
+        let verb = if reaped { "reaped" } else { "released" };
+        assert!(text.contains(&format!("was {verb}.")), "{text}");
+        assert!(text.contains("This **PR lease record** (#9401) is no longer live."), "{text}");
+        assert!(!text.contains("is held by"), "{text}");
+        assert!(!text.contains("the claim is free"), "{text}");
+        assert!(!text.contains("finished with it"), "{text}");
+    }
 }
 
 /// #13132: a release missing the claim's identity names the claimant and
