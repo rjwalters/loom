@@ -1005,7 +1005,8 @@ pub fn prepare_execution(command: &mut Command, root: &Path, execution: &str, ke
 /// it. When that close *did* observe the step's end, the swept phase and
 /// attempt mirror it instead of reading `exit_unobserved`: the same
 /// `loom.result` as the step's `loom.sweep` root, plus the launch's
-/// `loom.runtime` / `loom.engine`.
+/// `loom.runtime` / `loom.engine`. A failed attempt also mirrors the root's
+/// `loom.failure_class` when the root recorded one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepEndObserved {
     pub result: String,
@@ -1079,6 +1080,12 @@ pub fn finish_execution_observing(
             Some(end) => (true, end.result.as_str()),
             None => (root_span, result),
         };
+        if let Some(class) = mirrored
+            .filter(|end| active.record.name == SpanName::RoleAttempt && end.result == "failure")
+            .and_then(|_| metadata.get(FAILURE_CLASS))
+        {
+            attrs.insert(FAILURE_CLASS.into(), class.clone());
+        }
         if let Some(runtime) = mirrored
             .and_then(|end| end.runtime.clone())
             .filter(|r| !r.is_empty())

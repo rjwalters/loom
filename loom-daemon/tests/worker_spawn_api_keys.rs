@@ -256,7 +256,14 @@ fn an_unreadable_pool_fails_closed_at_78_instead_of_launching() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(78), "{stderr}");
     assert!(out.stdout.is_empty(), "the harness must not have launched");
-    assert!(!stderr.contains("# LOOM_LAUNCH"), "{stderr}");
+    assert!(
+        !stderr.lines().any(|l| l.starts_with("# LOOM_LAUNCH ")),
+        "the harness must not have launched: {stderr}"
+    );
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=credential"),
+        "must classify the typed rejection boundary: {stderr}"
+    );
     assert!(stderr.contains(&dir.display().to_string()), "must name the path: {stderr}");
     assert!(stderr.contains("PermissionDenied"), "must name the error: {stderr}");
     assert!(!stderr.contains(ALPHA_KEY), "{stderr}");

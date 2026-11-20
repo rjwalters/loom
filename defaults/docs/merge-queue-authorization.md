@@ -205,7 +205,61 @@ stdout line is the reason. Each call is bounded at 60 s. Eligibility reports the
 route as `facts.status_route: "statusCommand"` and a refused probe as
 `STATUS_COMMAND_REFUSED`. Out of scope: the broker itself and its allowlist.
 
+### Which checkout may configure the route (#14632)
+
+The command is per-target configuration, so it is resolved from a root that is
+**verifiably of the exact target**, never from whatever directory the
+invocation happened to run in:
+
+1. a workspace registered on this machine (`loom-daemon workspace list`) whose
+   `origin` is the target — the checkout the fleet sync materializes
+   `.loom-local/fleet-repo.json` into;
+2. otherwise the invocation's own checkout, when its `origin` is the target
+   **and the machine has no registered workspaces at all** (a developer clone,
+   a CI checkout). An unreadable registry, or one that manages other
+   repositories but not this one, trusts no invocation checkout.
+
+`origin` must match the target's host (`github.com`, or `GH_HOST`) as well as
+its `owner/repo` slug; a same-slug remote on another host is another repository.
+
+A registered root wins even when the invocation runs from another clone of the
+same repository: an isolated clone's git-ignored local tiers are not the
+fleet's configuration for it. This closes one plausible way a handoff could
+lose the broker and fall back to a writer credential without `statuses: write`
+(#14632); the retained traces of that incident cannot establish that this was
+the cause, so #14632 and #14636 stay open until a natural admission is
+observed. With no verifiable root, a command configured in the invocation
+directory **refuses** the route before any grant, status or enqueue (a bare
+`--repo` cannot authorize a broker), while an unset one keeps the direct path
+for repositories that never configured a broker. A trusted root with an
+unreadable or malformed config tier refuses too (a dead tier would otherwise
+read as "no command"), and so does a target whose earlier route observations
+show a command route but which resolves none now. That refusal identifies the
+earlier broker route record. The selected root supplies the existing config
+tiers in their original precedence order.
+
+Every invocation appends one bounded observation to
+`.loom/logs/merge-queue-route.jsonl` (deduplicated against its recent tail, and
+the file is cut to a bounded size): target, route, root class, an opaque root
+identity, and the config tier that supplied the command. Each status write
+additionally appends a record carrying the PR and the approved head sha, so a
+normal handoff can be joined to the route it took. Never command argv,
+credentials, environment, URLs, absolute paths or raw stderr.
+
 Still open: the grant store is PR comments (not tamper-proof), the
 post-pass-to-merge window above, and no live pilot has yet confirmed the fake's
 model of GitHub's group semantics (2AMLogic/loom-ui, #10257).
 `INVARIANT_FULLY_DEMONSTRATED` stays `false`.
+
+### Broker-required policy and attempt evidence (#14632, #14636)
+
+A target is *broker-required* when the machine-level defaults tier
+(`~/.local/share/loom/config/defaults.json`, outside every checkout) lists it in
+`forge.mergeQueue.brokerRequiredRepos` (`["owner/repo", …]`). With no resolvable
+`forge.mergeQueue.statusCommand` the route is then refused — never the direct
+writer — even on a fresh host with no route history. The diagnostic names the
+machine policy key that requires the broker. The route log supplies a separate
+fallback signal when the machine policy has no entry for the target. Each
+probe and post attempt appends a bounded record with
+the exact PR/head and a typed `outcome` (`probe_ok`, `probe_refused`,
+`post_ok`, `post_failed`), including refusals that make no mutation.

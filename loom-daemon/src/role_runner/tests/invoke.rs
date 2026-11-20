@@ -6,6 +6,7 @@
 //! in front of every tick).
 
 use super::*;
+use crate::env_test_support::EnvGuard;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
 
 // ===================================================================
@@ -312,7 +313,7 @@ fn run_role_with_timeout_forwards_owner_gh_config_dir_for_a_registered_root() {
 #[test]
 #[serial]
 fn run_role_with_timeout_leaves_gh_config_dir_untouched_for_an_unregistered_root() {
-    let _env_guard = ClearedGhConfigDirEnv::new();
+    let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
     crate::credential_preflight::clear_owner_root_registry();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();

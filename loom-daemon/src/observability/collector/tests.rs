@@ -6,6 +6,22 @@ use super::*;
 use crate::health;
 use serial_test::serial;
 
+#[test]
+fn disposition_poll_preserves_snapshot_cadence_and_leaves_delivery_headroom() {
+    use crate::observability::ops::disposition::DEFAULT_REFRESH_SECS;
+    use crate::observability::{DEFAULT_FLUSH_INTERVAL_SECS, SNAPSHOT_INTERVAL};
+    use crate::work_finder::DEFAULT_WORK_FINDER_INTERVAL_SECS;
+
+    let poll = DISPOSITION_INTERVAL.as_secs();
+    let refresh = u64::try_from(DEFAULT_REFRESH_SECS).unwrap();
+    let ideal_period = refresh.div_ceil(poll) * poll;
+    let worst_assumed_age =
+        refresh + DEFAULT_WORK_FINDER_INTERVAL_SECS + poll + DEFAULT_FLUSH_INTERVAL_SECS;
+    assert_eq!(SNAPSHOT_INTERVAL.as_secs(), 300);
+    assert_eq!(ideal_period, 150);
+    assert_eq!(300 - worst_assumed_age, 30);
+}
+
 fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
         story_points: None,
@@ -995,6 +1011,10 @@ fn all_other_axes_healthy_inputs(now: DateTime<Utc>, roots: &[&str]) -> health::
         ci_telemetry: None,
         fleet_sync: None,
         resync_pins: Vec::new(),
+        // `HealthInputs` gained this field in #14223 after this fixture was
+        // added — `None` (not collected) is fine here since this fixture is
+        // not about the `owner_drift` axis.
+        owner_drift: None,
     }
 }
 
@@ -1201,4 +1221,34 @@ fn protection_summary_carries_none_when_the_provisioning_probe_could_not_answer(
     ));
     assert_eq!(summary.state, "unknown");
     assert_eq!(summary.watchdog_provisioned, None);
+}
+
+/// #13942: the collector samples the fleet sidecar's age next to the usage
+/// series — the per-host drift signal — and leaves it absent without one.
+#[test]
+fn token_snapshot_samples_the_fleet_sidecar_age() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = dir.path().join(".loom/tokens");
+    std::fs::create_dir_all(&pool).unwrap();
+    std::fs::write(pool.join("seed.token"), "sk-ant-oat01-fake").unwrap();
+    std::fs::write(pool.join(".ranking"), "agent-1|available|0.42\n").unwrap();
+    let probed_at = (Utc::now() - chrono::Duration::seconds(300))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    std::fs::write(
+        pool.join(".fleet_probe.json"),
+        format!(r#"{{"schema":1,"probed_at":"{probed_at}","accounts":[{{"name":"agent-1","status":"available"}}]}}"#),
+    )
+    .unwrap();
+
+    let record = sample_token_snapshot(dir.path());
+    let age = record
+        .fleet_probe_age_secs
+        .expect("a sidecar on disk yields an age");
+    // Probed 5 minutes before the sample (slack for whole-second stamps).
+    assert!((240..=700).contains(&age), "age should be ~5 minutes, got {age}s");
+
+    std::fs::remove_file(pool.join(".fleet_probe.json")).unwrap();
+    let record = sample_token_snapshot(dir.path());
+    assert_eq!(record.fleet_probe_age_secs, None, "no sidecar, no series — unknown, not zero");
 }

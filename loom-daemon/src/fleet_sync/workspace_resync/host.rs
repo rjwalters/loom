@@ -360,18 +360,21 @@ fn run_live(
     // retried with backoff), and only from a host that could write: one with
     // `fleet.autoApply` off or dispatch paused asks nobody.
     if mode == Mode::Write && !enforcer.drain_facts().draining {
-        let found = crate::release_provenance::ensure(Utc::now(), inputs.interval, &|repo, tag| {
-            // The release-resolve machinery: `gh api`, peeling an
-            // annotated tag to the commit it names.
-            crate::release_fetch::source::resolve_tag_commit(
-                &|path| crate::release_fetch::source::gh_api(&inputs.workspace, path),
-                repo,
-                tag,
-            )
-        });
-        if guard.noted.insert(format!("provenance:{found}")) {
-            log::info!("workspace_resync: release provenance: {found}");
-        }
+        let started_at = Utc::now();
+        let (found, attempt) = crate::release_provenance::ensure_with_attempt(
+            started_at,
+            inputs.interval,
+            &|repo, tag| {
+                // The release-resolve machinery: `gh api`, peeling an
+                // annotated tag to the commit it names.
+                crate::release_fetch::source::resolve_tag_commit(
+                    &|path| crate::release_fetch::source::gh_api(&inputs.workspace, path),
+                    repo,
+                    tag,
+                )
+            },
+        );
+        super::provenance::report(&mut guard, &inputs.host, &found, attempt, started_at);
     }
     let payload = LazyPayload::new(Payload::embedded);
     let env = Env {

@@ -337,6 +337,7 @@ fn a_steps_end_gives_its_attempt_and_phase_the_result_and_runtime() {
     assert!(journal.active().unwrap().is_empty());
     let spans = drained(&journal);
     let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes[lifecycle::FAILURE_CLASS], "exit-2");
     for name in [SpanName::RoleAttempt, SpanName::Phase] {
         let s = spans.iter().find(|s| s.name == name).unwrap();
         assert_eq!(s.attributes["loom.result"], sweep.attributes["loom.result"], "{name:?}");
@@ -344,7 +345,41 @@ fn a_steps_end_gives_its_attempt_and_phase_the_result_and_runtime() {
         assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
         assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
         assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+        assert_eq!(
+            s.attributes.get(lifecycle::FAILURE_CLASS),
+            (name == SpanName::RoleAttempt).then_some(&sweep.attributes[lifecycle::FAILURE_CLASS]),
+            "{name:?}"
+        );
     }
+}
+
+#[test]
+fn an_observed_failure_class_does_not_require_a_known_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_737, StepRole::Judge, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "unknown".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "judge");
+
+    reg.end_step(&id, 14_737, StepRole::Judge, Utc::now(), StepEnd::Exited(Some(2)));
+
+    let spans = drained(&journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "failure");
+    assert_eq!(
+        attempt
+            .attributes
+            .get(lifecycle::FAILURE_CLASS)
+            .map(String::as_str),
+        Some("exit-2")
+    );
+    assert!(!attempt.attributes.contains_key("loom.runtime"));
+    assert!(!attempt.attributes.contains_key("loom.engine"));
 }
 
 /// #14407: a registry entry with no known runtime stamps none (never guessed),
@@ -365,6 +400,7 @@ fn an_unknown_runtime_is_not_stamped_and_a_roll_stopped_step_stays_unobserved() 
         .unwrap();
     assert_eq!(attempt.attributes["loom.result"], "success");
     assert!(!attempt.attributes.contains_key("loom.runtime"));
+    assert!(!attempt.attributes.contains_key(lifecycle::FAILURE_CLASS));
 
     let pid = dead_pid();
     let id = insert_step(&mut reg, 14_409, StepRole::Doctor, pid);
@@ -377,6 +413,7 @@ fn an_unknown_runtime_is_not_stamped_and_a_roll_stopped_step_stays_unobserved() 
         let s = spans.iter().find(|s| s.name == name).unwrap();
         assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
         assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+        assert!(!s.attributes.contains_key(lifecycle::FAILURE_CLASS), "{name:?}");
     }
 }
 

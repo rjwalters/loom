@@ -51,7 +51,11 @@
 //! ([`on_reaper_tick`]); at most one heartbeat per [`HEARTBEAT_GAP`] goes out
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
-//! fallback the heartbeat is the probe that ends it.
+//! fallback the heartbeat is the probe that ends it. The answer may carry the
+//! captain's token-pool probe snapshot (#13942), which the worker stores
+//! beside its pool as the fleet sidecar for the evidence readers
+//! ([`crate::tokens_pool::fleet_probe`]) — absent on an old captain or an
+//! unreachable one, where the worker keeps its own evidence untouched.
 //!
 //! A repo whose live set has not been refreshed for [`live_stale_after`]
 //! (its workspace was deregistered and its reaper aborted, so neither its
@@ -629,15 +633,11 @@ fn send_release(grant: &Grant, outcome: &str, root: Option<PathBuf>) {
     );
 }
 
-/// The step tick's view of this host: its free slots and the roles whose
-/// pools are not exhausted (`exhausted`, role names), for the heartbeat.
-///
-/// Phase 1 reports pool exhaustion only. Spec §5.2's `roles_ok` also leaves
-/// out roles behind the load brake or a disk back-off; those still run
-/// through today's admission after a grant, and the captain does not yet
-/// use `roles_ok` to pick hosts.
-pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
-    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok(exhausted)));
+/// Cache the step tick's free slots and host role list for the heartbeat.
+/// The work-request loop uses this same list. Local candidate admission still
+/// checks the workspace's own load, disk, pool and claim gates.
+pub fn note_capacity(free_slots: usize, roles_ok: &[String]) {
+    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok.to_vec()));
 }
 
 /// The role names this host can run: every step role's, but `exhausted`.
@@ -736,7 +736,27 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        send_detached::<_, HeartbeatResponse>(&url, proto::HEARTBEAT_PATH, request, facts);
+        // #13942: the pool the snapshot lands in is a host-level fact, so it
+        // resolves from the daemon workspace (`host_root`) the same way the
+        // endpoint does, falling back to the ticking repo's root before one
+        // is named.
+        let probe_root = state()
+            .host_root
+            .clone()
+            .unwrap_or_else(|| root.to_path_buf());
+        send_detached_then::<_, HeartbeatResponse>(
+            &url,
+            proto::HEARTBEAT_PATH,
+            request,
+            facts,
+            move |resp| {
+                let Some(snapshot) = &resp.token_probe else {
+                    return;
+                };
+                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+            },
+        );
     }
 }
 

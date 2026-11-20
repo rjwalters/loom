@@ -299,6 +299,21 @@ run_pv 101 changes-requested deadbee --body "Please fix the tests."
 assert_eq "0" "$EXIT_CODE" "valid changes-requested call -> exits 0"
 assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=deadbee verdict=changes-requested -->" "changes-requested marker uses the right token"
 
+# T2b (#14392): --reviews-reconciled on changes-requested is appended, never
+# silently dropped; the approval path and a plain changes-requested are unchanged.
+reset_state
+RECON_TEXT="Finding 1 fixed in abc1234; finding 2 still blocking (thread 99)."
+run_pv 101 changes-requested deadbee --body "Still failing." --reviews-reconciled "$RECON_TEXT"
+assert_eq "0" "$EXIT_CODE" "changes-requested + --reviews-reconciled -> exits 0"
+assert_contains "$LAST_BODY" "Still failing." "changes-requested + flag keeps the caller's body"
+assert_contains "$LAST_BODY" "$RECON_TEXT" "changes-requested + flag appends the reconciliation text (#14392)"
+assert_contains "$LAST_BODY" "Review reconciliation (#14392)" "changes-requested + flag labels the appended note"
+assert_not_contains "$LAST_BODY" "loom:review-reconciliation" "changes-requested + flag stamps no gate marker (nothing was gated)"
+assert_contains "$LAST_BODY" "<!-- loom:verdict-sha sha=deadbee verdict=changes-requested -->" "changes-requested + flag still ends with the verdict marker"
+reset_state
+run_pv 101 changes-requested deadbee --body "Please fix the tests."
+assert_not_contains "$LAST_BODY" "Review reconciliation" "changes-requested without the flag gets no reconciliation note"
+
 # T3: --body-file with a real file.
 reset_state
 BODY_FILE="$STUB_DIR/body.txt"

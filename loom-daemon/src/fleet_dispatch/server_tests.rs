@@ -753,10 +753,12 @@ async fn the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_los
     until("the full-refresh backstop", || s.queue_len() == 4).await;
 
     // The next period finds the worklist unchanged: a 304 only advances the age.
+    let prior_not_modified = worklist_calls(Some(304));
     clock.set(400);
-    until("the conditional full read", || worklist_calls(Some(304)) >= 1).await;
+    until("the conditional full read", || worklist_calls(Some(304)) > prior_not_modified).await;
+    // The mirror logs the response before the client receives it.
+    until("the client to advance the full-refresh age", || !s.queue_refresh_due()).await;
     assert_eq!(s.queue_len(), 4);
-    assert!(!s.queue_refresh_due(), "a 304 advances the age");
 
     // A truncated cursor means changes were missed: the next full refresh
     // recovers them with no period elapsing.
@@ -831,6 +833,10 @@ fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
         assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
         if early {
             assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
         } else {
             let line = parse_outcome_line(
                 "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
@@ -1196,4 +1202,307 @@ async fn an_operator_clear_lifts_the_no_progress_hold_but_a_ttl_expiry_does_not(
     let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
     assert_eq!(reply.status, 200);
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
+}
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer publishes the captain's token probe.
+// -----------------------------------------------------------------
+
+/// A server with a token-probe pool dir holding one ranking row.
+fn probing_server(
+    node_name: &str,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir) {
+    let pool = tempfile::tempdir().unwrap();
+    std::fs::write(pool.path().join(".ranking"), ranking).unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity(node_name),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf()),
+    );
+    clock.set(91);
+    (s, pool)
+}
+
+#[test]
+fn the_heartbeat_answer_carries_the_captains_snapshot() {
+    let (s, _pool) = probing_server(
+        "node-a",
+        "agent-1|available|0.42\nagent-2|exhausted||2026-11-20T03:00:00Z\n",
+    );
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    let probe = &body["token_probe"];
+    assert!(probe.is_object(), "the snapshot rides the answer: {body}");
+    assert_eq!(probe["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(probe["accounts"][0]["name"], "agent-1");
+    assert_eq!(probe["accounts"][0]["util_5h"], 0.42);
+    assert_eq!(probe["accounts"][1]["limit_reset"], "2026-11-20T03:00:00Z");
+    // The probe instant is recorded, not sampled: the worker's freshness
+    // comparison needs the captain's probe time, not this answer's.
+    assert!(probe["probed_at"].is_string());
+}
+
+/// A server built without a pool dir omits the field entirely — the exact
+/// body an old captain sent.
+#[test]
+fn a_server_without_a_pool_dir_omits_the_field() {
+    let s = open_server("node-a");
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body.get("token_probe").is_none(), "absent, not null: {body}");
+}
+
+/// The captain-side per-account record is one per distinct probe cycle, not
+/// one per heartbeat: a second heartbeat over the same `.ranking` emits
+/// nothing, a rewritten `.ranking` emits the new cycle.
+#[test]
+fn the_per_account_cycle_record_fires_once_per_cycle() {
+    let (s, pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let beat = hb_body(A, json!([]), 1).to_string();
+    let (_, first) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    let cycle = |captured: &crate::observability::ops::capture::Captured| {
+        captured
+            .metrics
+            .iter()
+            .filter(|p| p.name == crate::telemetry::ops::MetricName::TokensFleetProbeAccounts)
+            .count()
+    };
+    assert_eq!(cycle(&first), 1, "one point per account of the new cycle");
+
+    let (_, again) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&again), 0, "the same cycle is not re-emitted");
+
+    std::fs::write(pool.path().join(".ranking"), "agent-1|available|0.10\nagent-2|error\n")
+        .unwrap();
+    let (_, next) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&next), 2, "a new probe cycle records every account");
+}
+
+// -----------------------------------------------------------------
+// #13943: `POST /v1/tokens-refresh` — the on-demand fleet probe
+// (`tokens refresh --fleet`, part 3 of #13893).
+// -----------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::token_ranking_refresh::RefreshOutcome;
+
+/// A probe's `.ranking` rewrite with a pinned mtime, so the probe instant
+/// is a fact the test names rather than a race with the filesystem clock.
+fn write_ranking_at(dir: &std::path::Path, rows: &str, mtime: SystemTime) {
+    let path = dir.join(".ranking");
+    std::fs::write(&path, rows).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+/// A captain that can run an on-demand probe over `pool` (#13943): the
+/// clock is returned so a test can order arrivals and completions.
+fn refreshing_server(
+    probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync>,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir, Arc<ManualClock>) {
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), ranking, UNIX_EPOCH);
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity("node-a"),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf())
+        .with_token_refresh(probe),
+    );
+    clock.set(91);
+    (s, pool, clock)
+}
+
+/// The probe the request names runs now, the answer carries the probe
+/// instant (`probed_at`), and the very next heartbeat publishes that same
+/// instant to the fleet (#13943 acceptance: the snapshot workers receive
+/// carries the new `probed_at`).
+#[tokio::test]
+async fn a_tokens_refresh_runs_the_captains_probe_and_answers_its_instant() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), "agent-1|available|0.42\n", UNIX_EPOCH);
+    let clock = Arc::new(ManualClock::default());
+    let dir = pool.path().to_path_buf();
+    let seen_runs = Arc::clone(&runs);
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(move || {
+            seen_runs.fetch_add(1, Ordering::SeqCst);
+            // What `tokens check --ranking` leaves behind: a fresh ranking
+            // with a later mtime.
+            write_ranking_at(
+                &dir,
+                "agent-1|exhausted||2026-11-21T03:00:00Z\n",
+                UNIX_EPOCH + Duration::from_secs(1_000_000_500),
+            );
+            RefreshOutcome::Success
+        });
+    let s = Arc::new(
+        Server::new(identity("node-a"), clock, roster(), Policy::default(), "epoch-test".into())
+            .with_token_probe(pool.path().to_path_buf())
+            .with_token_refresh(probe),
+    );
+    let addr = listen(Arc::clone(&s)).await;
+    let (status, body) = post(addr, "/v1/tokens-refresh", &json!({"host_id": A})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["coalesced"], json!(false));
+    let probed_at = body["probed_at"].as_str().expect("the probe instant");
+    let expected = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(1_000_000_500));
+    assert_eq!(
+        probed_at.parse::<DateTime<Utc>>().unwrap(),
+        expected,
+        "the answer names the probe the captain just ran"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one probe ran");
+
+    // The snapshot the fleet receives carries the same new probe instant
+    // and the probe's verdicts (AC: workers' snapshot carries new probed_at).
+    let (_, hb) = post(addr, "/v1/heartbeat", &hb_body(A, json!([]), 1)).await;
+    let probe_json = &hb["token_probe"];
+    assert_eq!(probe_json["probed_at"].as_str().unwrap(), probed_at);
+    assert_eq!(probe_json["accounts"][0]["status"], json!("exhausted"));
+}
+
+/// A request arriving while a probe runs joins that probe: one probe run,
+/// both requests answered with its instant, the second marked coalesced
+/// (#13943 acceptance: the coalescing rate-limit).
+#[tokio::test]
+async fn a_request_while_a_probe_runs_joins_it_without_a_second_probe() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (probe_started, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), "agent-1|available|0.42\n", UNIX_EPOCH);
+    let dir = pool.path().to_path_buf();
+    let seen_runs = Arc::clone(&runs);
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(move || {
+            seen_runs.fetch_add(1, Ordering::SeqCst);
+            let _ = probe_started.send(());
+            // Hold the probe until the test has a second request arrive.
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            write_ranking_at(
+                &dir,
+                "agent-1|exhausted||2026-11-21T03:00:00Z\n",
+                UNIX_EPOCH + Duration::from_secs(1_000_000_500),
+            );
+            RefreshOutcome::Success
+        });
+    let (s, _pool, clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let body = json!({"host_id": A}).to_string();
+    clock.set(100);
+    let first = {
+        let s = Arc::clone(&s);
+        let body = body.clone();
+        tokio::spawn(async move { s.tokens_refresh(A, body.as_bytes()).await })
+    };
+    // Wait for the probe to be running, yielding to the runtime: the
+    // current-thread test runtime only polls the spawned task while this
+    // main task awaits.
+    let mut probe_running = false;
+    for _ in 0..500 {
+        if started_rx.try_recv().is_ok() {
+            probe_running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(probe_running, "the probe is running");
+    // The second operator arrives mid-probe; the probe completes after
+    // that, so the second answer must be the first probe's.
+    clock.set(101);
+    let second = {
+        let s = Arc::clone(&s);
+        let body = body.clone();
+        tokio::spawn(async move { s.tokens_refresh(A, body.as_bytes()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    clock.set(102);
+    let _ = release_tx.send(());
+
+    let (reply_a, call_a) = first.await.unwrap();
+    let (reply_b, call_b) = second.await.unwrap();
+    assert_eq!(reply_a.status, 200);
+    assert_eq!(reply_b.status, 200);
+    let a: Value = serde_json::from_str(&reply_a.body).unwrap();
+    let b: Value = serde_json::from_str(&reply_b.body).unwrap();
+    assert_eq!(a["coalesced"], json!(false), "the first request ran the probe");
+    assert_eq!(b["coalesced"], json!(true), "the second joined it");
+    assert_eq!(a["probed_at"], b["probed_at"], "one probe, one instant");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no second probe was started");
+    assert_eq!(call_a.reason.as_deref(), Some("probed"));
+    assert_eq!(call_b.reason.as_deref(), Some("coalesced"));
+}
+
+/// A captain built without a probe hook answers 503 with a reason — the
+/// worker exits non-zero, nothing is probed (#13943).
+#[tokio::test]
+async fn a_server_without_a_probe_hook_refuses_the_refresh() {
+    let (s, _pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let (reply, call) = s
+        .tokens_refresh(A, json!({"host_id": A}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 503);
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("probe"), "{body}");
+    assert_eq!(call.result, "error");
+}
+
+/// A probe that ran and failed is an answer carrying the failure, not a
+/// protocol error: the worker exits non-zero on the captain's own reason
+/// (#13943).
+#[tokio::test]
+async fn a_failed_probe_is_answered_with_its_reason() {
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(|| RefreshOutcome::Failure("every account errored".into()));
+    let (s, _pool, _clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let (reply, call) = s
+        .tokens_refresh(A, json!({"host_id": A}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 200, "the request was served");
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["error"], json!("every account errored"));
+    assert!(body.get("probed_at").is_none(), "no instant for a failed probe: {body}");
+    assert_eq!(call.result, "error", "the span reports the probe's failure");
+}
+
+/// A body naming another host is the same 403 every endpoint answers.
+#[tokio::test]
+async fn a_refresh_naming_another_host_is_refused() {
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(|| RefreshOutcome::Success);
+    let (s, _pool, _clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let (reply, _) = s
+        .tokens_refresh(A, json!({"host_id": B}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 403);
 }

@@ -90,12 +90,10 @@ Visit `http://localhost:8787/docs` to see the Swagger UI.
 ## Project Structure
 
 ```
-├── .loom/
-│   ├── roles/
-│   │   ├── builder.md      # API-specific build guidance
-│   │   └── judge.md        # API review criteria
-│   └── scripts/
-│       └── worktree.sh
+├── .loom/              # Loom config (scripts/ come from the Loom installer)
+│   └── roles/
+│       ├── builder.md      # API-specific build guidance
+│       └── judge.md        # API review criteria
 ├── migrations/
 │   └── 0001_initial.sql    # D1 schema
 ├── src/

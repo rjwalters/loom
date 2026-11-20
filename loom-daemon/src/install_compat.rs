@@ -27,14 +27,15 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.19.0 is the first release whose installed tree carries every file in
-/// [`DAEMON_INVOKED_INSTALLED_FILES`]. No break has been declared since.
+/// 0.19.175 is the first release whose installed watchdog delegates to
+/// `loom-daemon daemon-watchdog`. The 0.19.174 watchdog still calls the
+/// retired `peer-claims` subcommand.
 ///
 /// It must name a release tag. `ci-daily.yml` (`Compatibility Floor`) runs
 /// that release's installed files against today's daemon every day (#10868).
 /// If that fails, raise this to the oldest release that passes, or restore
 /// what the old files need (`defaults/docs/release-cadence.md`).
-pub const SUPPORTS_INSTALLED: &str = "0.19.0";
+pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
@@ -396,6 +397,18 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge suspect-critical-diff",
     "forge merge-method",
     "forge merge-config",
+    // #14519: the shared non-queue writes.
+    "forge comment",
+    "forge create-issue",
+    "forge rerun",
+    "forge auto-merge",
+    "forge disable-auto-merge",
+    "forge verdict-labels",
+    "forge verdict-reconcile",
+    "forge verdict-lock",
+    "forge doctor-handback",
+    "forge journal-ci-refusal",
+    "forge parent link",
     "forge merge-queue mode",
     "forge merge-queue preflight",
     "forge merge-queue status",
@@ -414,6 +427,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge claim-liveness",
     "forge verdict-stale-notice",
     "forge verdict-body-check",
+    "forge workflow-write-all-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",
@@ -441,7 +455,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease pr release",
     // #14429: top-level reads and config inspection. The write forms inside
     // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
-    // (#14396) exactly as a `forge` write verb does.
+    // (#14396).
     "labels",
     "pr-queue",
     "premise-check",

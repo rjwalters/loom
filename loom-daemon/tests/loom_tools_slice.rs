@@ -257,23 +257,149 @@ fn forge_reads_match_loom_daemon_including_exit_codes_as_data() {
     );
 }
 
-/// A write verb is refused before any handler runs, with a status no read
-/// verb uses as data (design §3.1 split; the writes are #14396).
+/// #14519: the shared write verbs are served. Without a usable forge
+/// credential (`gh` with no auth config) both roots fail identically on the
+/// one shared handler and write nothing; the exit code is the handler's, not
+/// the refusal's. Each case gets a fresh home so a held verdict lock (an
+/// expected local success) cannot leak into the next case.
 #[test]
-fn forge_write_verbs_are_refused_with_exit_64() {
-    let tmp = tempfile::tempdir().unwrap();
-    for args in [
-        &["forge", "comment", "7", "--body", "x"][..],
-        &["forge", "auto-merge", "7"],
-        &["forge", "parent", "link", "--parent", "1", "--child", "2"],
+fn shared_write_verbs_are_served_and_fail_identically_without_a_forge() {
+    for (args, stdin) in [
+        (
+            &[
+                "forge",
+                "comment",
+                "7",
+                "--body",
+                "x",
+                "--repo",
+                "acme/widgets",
+            ][..],
+            None,
+        ),
+        (
+            &[
+                "forge",
+                "comment",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--body-file",
+                "-",
+            ],
+            Some("body from stdin\n"),
+        ),
+        (
+            &[
+                "forge",
+                "create-issue",
+                "--title",
+                "T",
+                "--body",
+                "B",
+                "--repo",
+                "acme/widgets",
+                "--json",
+            ],
+            None,
+        ),
+        (&["forge", "rerun", "12345", "--repo", "acme/widgets"], None),
+        (
+            &[
+                "forge",
+                "verdict-labels",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--verdict",
+                "approved",
+            ],
+            None,
+        ),
+        (
+            &[
+                "forge",
+                "verdict-reconcile",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--verdict",
+                "approved",
+                "--sha",
+                "a",
+            ],
+            None,
+        ),
+        (
+            // Idempotent and forge-free: the acquire/contention/release
+            // lifecycle itself is covered offline below.
+            &[
+                "forge",
+                "verdict-lock",
+                "release",
+                "7",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
+        (
+            &[
+                "forge",
+                "doctor-handback",
+                "7",
+                "--expected-head-sha",
+                "a",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
+        (&["forge", "auto-merge", "7"], None),
+        (&["forge", "disable-auto-merge", "7"], None),
+        (
+            &[
+                "forge",
+                "parent",
+                "link",
+                "--parent",
+                "1",
+                "--child",
+                "2",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
+        (
+            // `child_number` vetoes a cross-repo child before any forge call:
+            // nothing is written, identically from both roots.
+            &[
+                "forge",
+                "parent",
+                "link",
+                "--parent",
+                "1",
+                "--child",
+                "other/repo#2",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+        ),
     ] {
-        let mut c = base(TOOLS, tmp.path(), tmp.path());
-        c.args(args);
-        let o = run(c, None);
-        assert_eq!(o.status.code(), Some(64), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        assert!(o.stdout.is_empty(), "{args:?}");
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(err.contains("#14396") && err.contains("loom-daemon forge"), "{err}");
+        let tmp = tempfile::tempdir().unwrap();
+        let o = parity(args, stdin, tmp.path(), tmp.path());
+        assert_ne!(
+            o.status.code(),
+            Some(64),
+            "{args:?} must be served, not refused: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&o.stderr).contains("#14520"),
+            "{args:?} must not hit the merge-queue refusal"
+        );
     }
 }
 
@@ -308,10 +434,10 @@ fn forge_read_with_unset_mode_and_fleet_variables_is_an_error() {
 }
 
 /// `capabilities --json` is the one capability source: it lists the forge
-/// reads and none of the writes, and `install-compat show --json` prints the
-/// same list.
+/// verbs served by #14395, #14519 and #14520. `install-compat show --json`
+/// prints the same list.
 #[test]
-fn capabilities_list_the_forge_reads_and_not_the_writes() {
+fn capabilities_list_the_served_forge_verbs() {
     let tmp = tempfile::tempdir().unwrap();
     let t = run(
         {
@@ -329,7 +455,7 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
         .iter()
         .filter_map(|c| c.as_str())
         .collect();
-    for read in [
+    for command in [
         "forge check-claim",
         "forge wait-checks",
         "forge merge-queue status",
@@ -343,15 +469,23 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
         "forge merge-queue authorize-check",
         "forge issue",
     ] {
-        assert!(cmds.contains(&read), "{read} missing from {cmds:?}");
+        assert!(cmds.contains(&command), "{command} missing from {cmds:?}");
     }
+    // #14519: the shared non-queue writes are served.
     for write in [
         "forge comment",
         "forge create-issue",
-        "forge auto-merge",
         "forge rerun",
+        "forge auto-merge",
+        "forge disable-auto-merge",
+        "forge verdict-labels",
+        "forge verdict-reconcile",
+        "forge verdict-lock",
+        "forge doctor-handback",
+        "forge journal-ci-refusal",
+        "forge parent link",
     ] {
-        assert!(!cmds.contains(&write), "{write} must not be served: {cmds:?}");
+        assert!(cmds.contains(&write), "{write} missing from {cmds:?}");
     }
     let d = run(
         {
@@ -363,6 +497,156 @@ fn capabilities_list_the_forge_reads_and_not_the_writes() {
     );
     let dv: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
     assert_eq!(dv["tools_commands"], v["tools_commands"]);
+}
+
+// ---- #14519: the shared non-queue writes ----------------------------------
+
+/// A served verb that can reach the forge is gated exactly like a read: with
+/// `mode` unset and an inherited gateway variable, the actionable error comes
+/// before any write — stdout stays empty, including the `--json` error object
+/// `create-issue` would print for a forge failure.
+#[test]
+fn gated_write_verbs_stop_before_the_write_with_mode_unset() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    for args in [
+        &["forge", "comment", "7", "--body", "x"][..],
+        &[
+            "forge",
+            "create-issue",
+            "--title",
+            "T",
+            "--body",
+            "B",
+            "--json",
+        ],
+        &["forge", "rerun", "1"],
+        &[
+            "forge",
+            "verdict-labels",
+            "7",
+            "--repo",
+            "acme/widgets",
+            "--verdict",
+            "approved",
+        ],
+        &["forge", "doctor-handback", "7", "--expected-head-sha", "a"],
+    ] {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .args(args);
+        let o = run(c, None);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("LOOM_GH_GATEWAY_DIR") && err.contains("LOOM_MODE=session"),
+            "{args:?}: {err}"
+        );
+        assert!(o.stdout.is_empty(), "{args:?} wrote before the gate");
+    }
+}
+
+/// #14519: the local write verbs (`verdict-lock`, `journal-ci-refusal`)
+/// touch local state only, so they run with `mode` unset and inherited fleet
+/// variables present — no gate, no route, and the daemon reads the same
+/// handler (plus its own lock/journal wiring), so nothing changes there.
+#[test]
+fn local_write_verbs_run_offline_with_mode_unset_and_fleet_variables() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let gw = tempfile::tempdir().unwrap();
+    let locks = tempfile::tempdir().unwrap();
+    let journal = home.path().join("pick.jsonl");
+    let offline = |argv: &[&str], journal_env: Option<&Path>| {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .env("LOOM_VERDICT_LOCK_DIR", locks.path());
+        match journal_env {
+            Some(j) => c.env("LOOM_PICK_JOURNAL", j),
+            None => c.env_remove("LOOM_PICK_JOURNAL"),
+        };
+        c.args(argv);
+        run(c, None)
+    };
+
+    // `verdict-lock`: acquire takes a per-PR directory; a rival acquire with
+    // a zero wait is refused with exit 9 (fail closed); release removes it.
+    let lock = locks.path().join("acme_widgets-7");
+    let o = offline(
+        &[
+            "forge",
+            "verdict-lock",
+            "acquire",
+            "7",
+            "--repo",
+            "acme/widgets",
+        ],
+        None,
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(lock.is_dir(), "{lock:?} must exist after acquire");
+    let rival = {
+        let mut c = base(TOOLS, home.path(), wt.path());
+        c.env_remove("LOOM_MODE")
+            .env("LOOM_GH_GATEWAY_DIR", gw.path())
+            .env("LOOM_VERDICT_LOCK_DIR", locks.path())
+            .env("LOOM_VERDICT_LOCK_WAIT_SECS", "0")
+            .args([
+                "forge",
+                "verdict-lock",
+                "acquire",
+                "7",
+                "--repo",
+                "acme/widgets",
+            ]);
+        run(c, None)
+    };
+    assert_eq!(rival.status.code(), Some(9), "{}", String::from_utf8_lossy(&rival.stderr));
+    let o = offline(
+        &[
+            "forge",
+            "verdict-lock",
+            "release",
+            "7",
+            "--repo",
+            "acme/widgets",
+        ],
+        None,
+    );
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!lock.exists(), "{lock:?} must be gone after release");
+
+    // `journal-ci-refusal`: a recognized class appends one marker line; an
+    // unknown class and an unset journal are no-ops. Exit 0 in every case.
+    let o = offline(
+        &[
+            "forge",
+            "journal-ci-refusal",
+            "7",
+            "--class",
+            "ci_red",
+            "--head",
+            "abc",
+        ],
+        Some(journal.as_path()),
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    let line = std::fs::read_to_string(&journal).unwrap();
+    assert!(line.contains("judge:ci-refused") && line.contains("ci_red"), "{line}");
+
+    let unknown = home.path().join("pick2.jsonl");
+    let o = offline(
+        &["forge", "journal-ci-refusal", "7", "--class", "ci_green"],
+        Some(unknown.as_path()),
+    );
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!unknown.exists(), "an unknown class must not journal");
+
+    let o = offline(&["forge", "journal-ci-refusal", "7", "--class", "ci_red"], None);
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
 }
 
 // ---- #14464: park records and operator decisions --------------------------
@@ -796,17 +1080,54 @@ fn recording_gh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (bin, log)
 }
 
+/// A recording `gh` for the unverifiable case (#14621): the installation
+/// listing fails (exit 1, so the W8 snapshot answers Unavailable) and every
+/// other call is answered with `{}` — the per-repo probe reads the all-false
+/// `none` role an App installation token is served everywhere, which is no
+/// verdict, so the credential cannot be verified and the caller must fail
+/// closed. Every argv lands in the returned log.
+fn unverifiable_gh(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("gh.log");
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n  \
+         *installation/repositories*) echo 'gh: listing unavailable' >&2; exit 1;;\n  \
+         *) echo '{{}}';;\nesac\n",
+        log.display()
+    );
+    let gh = bin.join("gh");
+    std::fs::write(&gh, script).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, log)
+}
+
 /// An unmanaged target (#9548) is read but never written, on every online form
 /// that can mutate, including the nested filing of `apply --new`: the write
 /// scope is checked before `create-issue.sh` runs, so a denied target gets no
 /// duplicate scan, no filing lock and no forge write. Asserted on the recorded
 /// `gh` argv, not on the exit code alone.
+///
+/// #14621 extends the table with the #14519 write verbs (`forge comment`,
+/// `verdict-labels`, `verdict-reconcile`, `doctor-handback`, `rerun`,
+/// `create-issue` from the tools root, and `auto-merge`/`disable-auto-merge`).
+/// Their vet runs before any forge call (`read` is false), and the refusal
+/// exit is each entry point's own: the central forge
+/// gate and `create-issue` exit 1, `rerun` exits 3 with its sentinel on
+/// stdout — only `park-record`/`operator-decision` exit 4. The no-`--repo`
+/// auto-merge verbs run from a remoteless directory, so their target is
+/// unresolved: rule 1's NoTarget refusal (a rule-2 "unmanaged origin" denial
+/// is not producible for them — with an empty workspace registry
+/// `effective_roots` falls back to the checkout itself, which makes any
+/// checkout whose origin matches the resolved target managed; their
+/// credential-unverifiable refusal is the sibling test below).
 #[test]
 fn a_denied_target_is_read_but_never_written_on_any_online_form() {
     let tmp = tempfile::tempdir().unwrap();
     let (shim, log) = recording_gh(tmp.path());
     let path = format!("{}:/usr/bin:/bin", shim.display());
-    for (args, stdin) in [
+    for (args, stdin, want, read, cwd) in [
         (
             vec![
                 "park-record",
@@ -821,6 +1142,9 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "loom:building",
             ],
             None,
+            4,
+            true,
+            tmp.path(),
         ),
         (
             vec![
@@ -836,6 +1160,9 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "acme/widgets",
             ],
             None,
+            4,
+            true,
+            tmp.path(),
         ),
         (
             vec![
@@ -848,6 +1175,9 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "acme/widgets",
             ],
             Some(DECISION),
+            4,
+            true,
+            tmp.path(),
         ),
         (
             vec![
@@ -862,17 +1192,134 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "acme/widgets",
             ],
             Some(DECISION),
+            4,
+            false,
+            tmp.path(),
         ),
+        // #14621: the #14519 write verbs, from the tools root, against a
+        // denied explicit target.
+        (
+            vec![
+                "forge",
+                "comment",
+                "7",
+                "--body",
+                "x",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+            1,
+            false,
+            tmp.path(),
+        ),
+        (
+            vec![
+                "forge",
+                "verdict-labels",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--verdict",
+                "approved",
+            ],
+            None,
+            1,
+            false,
+            tmp.path(),
+        ),
+        (
+            vec![
+                "forge",
+                "verdict-reconcile",
+                "7",
+                "--repo",
+                "acme/widgets",
+                "--verdict",
+                "approved",
+                "--sha",
+                "a",
+            ],
+            None,
+            1,
+            false,
+            tmp.path(),
+        ),
+        (
+            vec![
+                "forge",
+                "doctor-handback",
+                "7",
+                "--expected-head-sha",
+                "a",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+            1,
+            false,
+            tmp.path(),
+        ),
+        (
+            vec!["forge", "rerun", "12345", "--repo", "acme/widgets"],
+            None,
+            3,
+            false,
+            tmp.path(),
+        ),
+        (
+            vec![
+                "forge",
+                "create-issue",
+                "--title",
+                "T",
+                "--body",
+                "B",
+                "--repo",
+                "acme/widgets",
+            ],
+            None,
+            1,
+            false,
+            tmp.path(),
+        ),
+        // No `--repo` and no git remote: the target cannot be resolved, so
+        // rule 1's NoTarget refusal fires before any handler or probe.
+        (vec!["forge", "auto-merge", "7"], None, 1, false, tmp.path()),
+        (vec!["forge", "disable-auto-merge", "7"], None, 1, false, tmp.path()),
     ] {
-        let _ = std::fs::remove_file(&log);
-        let mut c = base(TOOLS, tmp.path(), tmp.path());
+        std::fs::write(&log, "").unwrap();
+        let mut c = base(TOOLS, tmp.path(), cwd);
         c.env("PATH", &path).args(&args);
         let o = run(c, stdin);
         let err = String::from_utf8_lossy(&o.stderr);
-        assert_eq!(o.status.code(), Some(4), "{args:?}: {err}");
-        assert!(err.contains("#9548"), "{args:?} must name the write-scope refusal: {err}");
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        if !args.contains(&"--new") {
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert_eq!(o.status.code(), Some(want), "{args:?}: {err}{out}");
+        let rerun = args.starts_with(&["forge", "rerun"]);
+        if rerun {
+            assert!(
+                out.split_once('\n').is_some_and(|(line, rest)| {
+                    line.starts_with("LOOM-RERUN-ERROR ")
+                        && line.contains("#9548")
+                        && rest.is_empty()
+                }),
+                "{args:?} must print exactly one write-scope rerun error: {out:?}"
+            );
+        } else {
+            assert!(
+                err.contains("#9548"),
+                "{args:?} must name the write-scope refusal on stderr: {err}"
+            );
+        }
+        let calls = std::fs::read_to_string(&log).unwrap();
+        if args[0] == "forge" {
+            assert!(calls.is_empty(), "{args:?} made a forge call before the refusal:\n{calls}");
+            if !rerun {
+                assert!(o.stdout.is_empty(), "{args:?} must refuse with empty stdout: {out:?}");
+            }
+            continue;
+        }
+        if read {
             assert!(
                 calls
                     .lines()
@@ -886,10 +1333,73 @@ fn a_denied_target_is_read_but_never_written_on_any_online_form() {
                 "{args:?} issued a forge mutation ({mutation}):\n{calls}"
             );
         }
+        assert!(!out.contains("APPLIED=true"), "{args:?} must not report a write: {out}");
+    }
+}
+
+/// A *managed* target whose credential cannot be verified is still refused,
+/// with the probe's own reads the only `gh` traffic (rule 2 passes, rule 3
+/// fails closed, #14621). The installation listing is unavailable and the
+/// per-repo role is the all-false `none` an App token is served, so the
+/// verdict is Unverifiable — distinct from the unmanaged refusals of the
+/// table above. Covered for one `write_target` verb (`comment`), one
+/// in-handler verb (`create-issue`), and the no-`--repo` auto-merge pair
+/// (their target resolves to the checkout's managed origin; this is the only
+/// producible refusal for them beyond NoTarget, see the table above), from
+/// the tools root. Each case gets a fresh home and cache dirs (via
+/// `shim_run`) so the probe's one-minute Unknown cache, the snapshot failure
+/// backoff, and the host-global write-scope cache cannot answer a case
+/// without `gh`.
+#[test]
+fn an_unverifiable_managed_target_is_refused_without_a_write() {
+    for args in [
+        &[
+            "forge",
+            "comment",
+            "7",
+            "--body",
+            "x",
+            "--repo",
+            "acme/widgets",
+        ][..],
+        &[
+            "forge",
+            "create-issue",
+            "--title",
+            "T",
+            "--body",
+            "B",
+            "--repo",
+            "acme/widgets",
+        ][..],
+        &["forge", "auto-merge", "7"][..],
+        &["forge", "disable-auto-merge", "7"][..],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (shim, log) = unverifiable_gh(tmp.path());
+        let checkout = managed_checkout(tmp.path(), "https://github.com/acme/widgets.git");
+        let o = shim_run(TOOLS, tmp.path(), &checkout, &shim, args, None);
+        let err = String::from_utf8_lossy(&o.stderr);
+        let out = String::from_utf8_lossy(&o.stdout);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {err}{out}");
         assert!(
-            !String::from_utf8_lossy(&o.stdout).contains("APPLIED=true"),
-            "{args:?} must not report a write"
+            err.contains("#9548"),
+            "{args:?} must name the write-scope refusal: {err} | {out}"
         );
+        assert!(
+            err.contains("could not verify"),
+            "{args:?} must refuse as unverifiable, not unmanaged: {err}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls,
+            concat!(
+                "api --include installation/repositories?per_page=100&page=1\n",
+                "api repos/acme/widgets --jq .permissions // {}\n",
+            ),
+            "{args:?} must only make the two credential reads"
+        );
+        assert!(o.stdout.is_empty(), "{args:?} must refuse with empty stdout: {out:?}");
     }
 }
 
@@ -1264,6 +1774,29 @@ fn session_mode_with_inherited_fleet_variables_writes_through_the_local_credenti
     }
 }
 
+/// Publish a fake fleet gateway the way the daemon does: the base and the
+/// owner profile are private directories (0700), `gh-ok` and `hosts.yml` are
+/// private files (0600), and the marker names `gh` canonically. The router's
+/// trust checks reject group/other-writable paths, so relying on the ambient
+/// umask makes the fixture pass under 0022 and shed under 0002. Chmod each
+/// path explicitly instead of touching the process-wide umask.
+fn publish_fake_gateway(gateway: &Path, owner: &str, gh: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let private = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let profile = gateway.join(owner);
+    std::fs::create_dir_all(&profile).unwrap();
+    private(gateway, 0o700);
+    private(&profile, 0o700);
+    let marker = gateway.join("gh-ok");
+    std::fs::write(&marker, gh.canonicalize().unwrap().as_os_str().as_encoded_bytes()).unwrap();
+    private(&marker, 0o600);
+    let hosts = profile.join("hosts.yml");
+    std::fs::write(&hosts, "github.com: {}\n").unwrap();
+    private(&hosts, 0o600);
+}
+
 /// Fleet issue reads have a gateway profile. Body, label and resolution
 /// writes have no corresponding fleet broker operation. An otherwise writable
 /// checkout must never send those operations to its ambient gh credential.
@@ -1275,9 +1808,7 @@ fn fleet_park_and_decision_writes_stop_before_the_local_writer() {
     let gh = shim.join("gh");
     let gateway = tmp.path().join("gateway/.loom/gh-config-gateway");
     let reader = gateway.join("acme");
-    std::fs::create_dir_all(&reader).unwrap();
-    std::fs::write(reader.join("hosts.yml"), "github.com: {}\n").unwrap();
-    std::fs::write(gateway.join("gh-ok"), gh.to_str().unwrap()).unwrap();
+    publish_fake_gateway(&gateway, "acme", &gh);
     let state = tmp.path().join("issue.json");
     let initial = std::fs::read(&state).unwrap();
 
@@ -1405,16 +1936,12 @@ exec "$LOCAL_GH" "$@"
     assert_eq!(std::fs::read(&state).unwrap(), initial);
 }
 
-/// `apply --new` files through the workspace's real `create-issue.sh`, which
-/// calls `$LOOM_DAEMON_BIN forge create-issue`: on the daemon root that
-/// nested create runs and the URL comes back (`CREATED=`, exit 0); on the
-/// tools-only root the nested call is the #14396 write-verb refusal (exit 64),
-/// the script propagates it, and the handler surfaces exit 4 — after the
-/// write scope was vetted, with no forge write of its own. The script's own
-/// duplicate (3) and filing-lock (75) refusals pass through both binaries
-/// unchanged.
+/// `apply --new` files through the real `create-issue.sh`, which calls
+/// `$LOOM_DAEMON_BIN forge create-issue`. Both roots reach the same filing
+/// handler and return the created URL. The script's duplicate (3) and
+/// filing-lock (75) refusals also pass through both roots.
 #[test]
-fn nested_filing_runs_create_issue_sh_and_surfaces_the_refusal_in_tools_only() {
+fn nested_filing_runs_create_issue_sh_through_both_roots() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = managed_checkout(tmp.path(), "git@github.com:acme/widgets.git");
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/scripts");
@@ -1439,50 +1966,32 @@ fn nested_filing_runs_create_issue_sh_and_surfaces_the_refusal_in_tools_only() {
         "acme/widgets",
     ];
 
-    // Tools-only root: vetted, then refused at the nested call. No write of
-    // its own, no fallback create. This runs FIRST: the probe's snapshot
-    // cache (a shared on-disk store) must be cold here, so the vetting is
-    // visible as recorded gh calls. The daemon run below uses its own cache
-    // directory (`nested-daemon`), so it cannot reuse this run's cache.
-    let _ = std::fs::remove_file(&log);
-    {
-        let mut c = base(TOOLS, tmp.path(), &cwd);
+    for (bin, tag) in [(TOOLS, "nested-tools"), (DAEMON, "nested-daemon")] {
+        let _ = std::fs::remove_file(&log);
+        let mut c = base(bin, tmp.path(), &cwd);
         c.env("PATH", &path)
-            .env("LOOM_LISTING_CACHE_DIR", listing_cache_dir(tmp.path(), "nested-tools"))
-            .env("LOOM_WRITE_SCOPE_CACHE_DIR", listing_cache_dir(tmp.path(), "nested-tools"))
+            .env("LOOM_LISTING_CACHE_DIR", listing_cache_dir(tmp.path(), tag))
+            .env("LOOM_WRITE_SCOPE_CACHE_DIR", listing_cache_dir(tmp.path(), tag))
             .args(args);
-        let o = run(c, Some(DECISION));
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert_eq!(o.status.code(), Some(4), "{err}");
-        assert!(err.contains("not served by loom-tools"), "{err}");
-        let calls = std::fs::read_to_string(&log).unwrap_or_default();
-        assert!(
-            calls.contains("permissions"),
-            "the write scope must be vetted before the nested filing:\n{calls}"
-        );
-        for mutation in ["-X", "issue create"] {
-            assert!(
-                !calls.contains(mutation),
-                "the tools-only filing issued a forge mutation ({mutation}):\n{calls}"
-            );
+        if bin == DAEMON {
+            c.env("LOOM_DAEMON_BIN", DAEMON);
         }
-    }
-
-    // Daemon root: the real script, the real nested create.
-    {
-        let mut c = base(DAEMON, tmp.path(), &cwd);
-        c.env("PATH", &path)
-            .env("LOOM_DAEMON_BIN", DAEMON)
-            .env("LOOM_LISTING_CACHE_DIR", listing_cache_dir(tmp.path(), "nested-daemon"))
-            .env("LOOM_WRITE_SCOPE_CACHE_DIR", listing_cache_dir(tmp.path(), "nested-daemon"))
-            .args(args);
         let o = run(c, Some(DECISION));
         let out = String::from_utf8_lossy(&o.stdout);
-        assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
-        assert!(out.contains("CREATED=https://github.com/acme/widgets/issues/12"), "{out}");
-        assert!(out.contains("LABELS_ADD=loom:operator"), "{out}");
+        assert_eq!(o.status.code(), Some(0), "{bin}: {}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            out.contains("CREATED=https://github.com/acme/widgets/issues/12"),
+            "{bin}: {out}"
+        );
+        assert!(out.contains("LABELS_ADD=loom:operator"), "{bin}: {out}");
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert!(calls.contains("issue create"), "the nested create must reach gh:\n{calls}");
+        let scope_probe = calls
+            .find("permissions")
+            .unwrap_or_else(|| panic!("{bin}: {calls}"));
+        let create = calls
+            .find("issue create")
+            .unwrap_or_else(|| panic!("{bin}: {calls}"));
+        assert!(scope_probe < create, "{bin}: scope must be vetted before filing:\n{calls}");
     }
 
     // The script's duplicate (3) and filing-lock (75) refusals pass through

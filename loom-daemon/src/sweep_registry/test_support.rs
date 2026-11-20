@@ -1115,46 +1115,6 @@ pub(crate) fn install_fake_gh_env_logger(
     fake_gh
 }
 
-/// RAII guard that scrubs `GH_CONFIG_DIR` from the *test process's own*
-/// environment for the lifetime of the guard, restoring whatever value (or
-/// absence) preceded it on drop.
-///
-/// Mirrors `role_runner.rs`'s private `ClearedGhConfigDirEnv` (added for
-/// #5508), shared here for the `sweep_registry` "unregistered workspace root
-/// is a no-op" tests (guards.rs / quarantine.rs / watchdog.rs) that spawn
-/// [`install_fake_gh_env_logger`]'s fake `gh` and assert its child inherits
-/// `GH_CONFIG_DIR=<unset>`.
-///
-/// Without this guard, the assertion only holds on a clean CI runner. A real
-/// Loom fleet worker host runs the daemon (and any `cargo nextest` invoked
-/// directly on that host) with `GH_CONFIG_DIR` already exported
-/// host/process-wide (#4458) — that ambient value leaks straight through
-/// [`install_fake_gh_env_logger`]'s fake `gh` script, which logs its own
-/// *inherited* `GH_CONFIG_DIR`, and the "unset" assertion fails even though
-/// the production no-op behavior it exercises (`credential_preflight.rs`'s
-/// "child inherits the process-global `GH_CONFIG_DIR` untouched" contract)
-/// is unchanged (#5651). Every call site pairs this with the existing
-/// `#[serial]` attribute so the process-global scrub cannot race a
-/// concurrent test that depends on `GH_CONFIG_DIR`.
-pub(crate) struct ClearedGhConfigDirEnv(Option<String>);
-
-impl ClearedGhConfigDirEnv {
-    pub(crate) fn new() -> Self {
-        let prior = std::env::var("GH_CONFIG_DIR").ok();
-        std::env::remove_var("GH_CONFIG_DIR");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedGhConfigDirEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
-        }
-    }
-}
-
 // --- dispatch-time live-claim guard (Issue #4556) ---
 
 /// Seed the machine-level sweep journal (confined to this fixture's tempdir)
@@ -2103,11 +2063,7 @@ pub(crate) fn lease_order_dispatch_registry(
              fi\n\
              if [[ \"$1\" == \"api\" && \"$*\" == *\"/comments\"* ]]; then\n\
              if [[ -f \"{store}\" ]]; then\n\
-             while IFS= read -r line; do\n\
-             [[ -z \"$line\" ]] && continue\n\
-             [[ \"$line\" != *'\"body\":\"<!-- loom:lease host='* ]] && continue\n\
-             printf '%s\\n' \"$line\"\n\
-             done < \"{store}\"\n\
+             jq -cs \"${{@: -1}}\" < \"{store}\" || exit $?\n\
              fi\n\
              exit 0\n\
              fi\n\
@@ -2166,6 +2122,14 @@ pub(crate) fn lease_order_dispatch_registry(
     config.skip_label_flip = false; // exercise the real flip + lease-order path
     config.journal_path = Some(ws.join("test-sweeps-journal.json"));
     (SweepRegistry::new(config), gh_log, spawn_log, comments_store)
+}
+
+/// A posted yield is an issue-comment write. The read projection also names
+/// the marker, so searching the whole invocation log would match a read.
+pub(crate) fn posted_lease_yield(gh_calls: &str) -> bool {
+    gh_calls
+        .lines()
+        .any(|line| line.starts_with("issue comment ") && line.contains("<!-- loom:lease-yield "))
 }
 
 /// Like [`lease_order_dispatch_registry`], but its fake `gh` ALSO answers the

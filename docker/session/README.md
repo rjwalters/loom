@@ -449,6 +449,22 @@ next pass (every `autonomous.sessionReconcile.intervalSecs`, default 60 s)
 without a daemon restart. The full table is in
 [daemon-reference](../../defaults/docs/daemon-reference.md) (session reconcile).
 
+Several accounts serving the same repositories can share one named list
+(#14699): declare it once under `autonomous.sessionReconcile.privateCloneSets`
+and reference it per account instead of repeating the list for every seat —
+
+```json
+{ "autonomous": { "sessionReconcile": {
+  "privateCloneSets": { "fleet": [ { "repository": "https://github.com/OWNER/REPO" } ] },
+  "privateClones": { "seat-1": { "set": "fleet" }, "seat-2": { "set": "fleet" } }
+} } }
+```
+
+— the reference resolves into exactly the bindings the inline list form yields
+(same registration, drift and fail-closed rules; both forms can be mixed per
+account). A reference naming an undefined or malformed set fails closed for
+that account only.
+
 `session job` is the explicit lease-consuming primitive for future dispatch.
 `--kind role|sweep|interactive` shares one exclusion domain. It prepares the
 remote base, optionally selects an issue branch, and runs the supplied command

@@ -22,6 +22,7 @@ use super::gather_budget::{
 use super::item_draw::{weigh, ItemWeights, PoolKnobs, WeighContext};
 use super::stage_entry::{default_cache_path, StageEntryProvider, DEFAULT_EVENTS_BUDGET};
 use super::tick::{self, SeedBase, SpawnResult, StepSpawner, StepTickLimits, StepWorkspace};
+use crate::forge_bucket_book::{self, BucketKey};
 use crate::sweep_registry::step_spawn::{StepRefusal, StepSpawnRequest, StepSpawnTimings};
 use crate::sweep_registry::SweepRegistry;
 use crate::telemetry::ops::{MetricName, MetricPoint};
@@ -185,6 +186,8 @@ struct RegistrySpawner {
     parts: StepSpawnTimings,
     /// Mirror mode only (`forge.mirror.discovery = worklist`, #12318).
     recheck: Option<crate::discovery::recheck::Shared>,
+    /// Evidence captured before applying the per-route draw gate.
+    writer_holds_before_draw: HashMap<BucketKey, i64>,
 }
 
 fn refusal_reason(e: &anyhow::Error) -> String {
@@ -305,13 +308,36 @@ impl RegistrySpawner {
                     .downcast_ref::<StepRefusal>()
                     .and_then(|r| r.writer_limit.as_deref())
                 {
-                    if limited.arm_hold(Utc::now().timestamp()) {
+                    let now = Utc::now().timestamp();
+                    if let Some(key) = limited.hold_key() {
+                        let before = self.writer_holds_before_draw.get(&key).copied();
+                        if let Some(reset) =
+                            forge_bucket_book::note_missed_writer_hold(&key, before, now)
+                        {
+                            let until = chrono::DateTime::from_timestamp(reset, 0).map_or_else(
+                                || reset.to_string(),
+                                |at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            );
+                            log::warn!(
+                                "work_finder: writer hold armed (account {} owner {} installation {}) \
+                                 until {until} but a draw was refused by that writer (#14559)",
+                                key.account, key.owner, key.installation,
+                            );
+                        }
+                    }
+                    if limited.arm_hold(now) {
+                        // #14559: name the armed key so a later missed-hold
+                        // warning can be correlated with this arm.
                         log::warn!(
-                            "work_finder: writer {} route held until {} (#13746)",
+                            "work_finder: writer {} route held until {} (account {} owner {} \
+                             installation {}) (#13746)",
                             limited.stage.as_str(),
                             limited
                                 .reset_utc()
-                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string())
+                                .map_or_else(|| "unconfirmed".to_string(), |at| at.to_string()),
+                            limited.account.as_deref().unwrap_or("-"),
+                            limited.owner.as_deref().unwrap_or("-"),
+                            limited.installation.as_deref().unwrap_or("-")
                         );
                     }
                 }
@@ -322,6 +348,7 @@ impl RegistrySpawner {
                         request.item,
                         request.role,
                         &reason,
+                        e.downcast_ref::<StepRefusal>().map(|r| r.detail.as_str()),
                     );
                 }
                 self.report_stale_draw(idx, request.item, &e);
@@ -342,6 +369,7 @@ struct GatherJob {
     fixes_only: bool,
     repo: String,
     weight: u32,
+    pool_exhausted_roles: BTreeSet<String>,
     /// Starved for several ticks: the starvation count restarts after this
     /// tick (it no longer buys the writer: reads never use it, #12394).
     escalated: bool,
@@ -391,7 +419,7 @@ impl StepDriver {
         &mut self,
         root: Option<&PathBuf>,
         free_slots: usize,
-        exhausted: &BTreeSet<String>,
+        roles_ok: &[String],
     ) -> Vec<tick::Offer> {
         let Some(root) = root else {
             return Vec::new();
@@ -399,10 +427,7 @@ impl StepDriver {
         let requests = self
             .requests
             .get_or_insert_with(|| crate::fleet_dispatch::request::Loop::start(root));
-        requests.note_capacity(
-            u32::try_from(free_slots).unwrap_or(u32::MAX),
-            &crate::fleet_dispatch::worker::roles_ok(exhausted),
-        );
+        requests.note_capacity(u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok);
         let step = requests.step(root);
         crate::fleet_dispatch::worker::offer(&step.candidates);
         step.candidates
@@ -438,9 +463,6 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
-        // Roles whose pool is exhausted in any workspace, for the
-        // fleet-dispatch heartbeat's `roles_ok` (#12450).
-        let mut exhausted_roles: std::collections::BTreeSet<String> = Default::default();
         // Per workspace: (idx, failed listing, listing state, Builders held).
         let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
             Vec::new();
@@ -496,9 +518,22 @@ impl StepDriver {
                 fixes_only,
                 repo,
                 weight,
+                pool_exhausted_roles: lock(&registries[idx]).pool_exhausted_roles(now),
                 escalated: self.starvation.escalate(root),
             });
         }
+        // A host can offer a role when at least one participating workspace
+        // has no active exhaustion for it. Listing failures and truncation do
+        // not change those local pool facts.
+        let host_roles = if let Some((first, rest)) = jobs.split_first() {
+            let mut exhausted_everywhere = first.pool_exhausted_roles.clone();
+            for job in rest {
+                exhausted_everywhere.retain(|role| job.pool_exhausted_roles.contains(role));
+            }
+            crate::fleet_dispatch::worker::roles_ok(&exhausted_everywhere)
+        } else {
+            Vec::new()
+        };
         // Pass 2, the forge half, `gather_concurrency` repos at once
         // (#12256). Each worker carries the tick's read deadline, its trace
         // parent and the runtime context; a repo past the deadline is
@@ -550,6 +585,11 @@ impl StepDriver {
         crate::observability::ops::hold_age::observe(&snapshot);
         // Pass 3, serial and in walk order: stage entry, weighing, shaping.
         let filter_started = Instant::now();
+        let now_ts = now.timestamp();
+        let writer_holds_before_draw: HashMap<_, _> =
+            forge_bucket_book::writer_holds_snapshot(now_ts)
+                .into_iter()
+                .collect();
         let mut jobs: Vec<Option<GatherJob>> = jobs.into_iter().map(Some).collect();
         for (pos, result) in listed {
             let Some(job) = jobs.get_mut(pos).and_then(Option::take) else {
@@ -560,6 +600,7 @@ impl StepDriver {
                 fixes_only,
                 repo,
                 weight,
+                pool_exhausted_roles,
                 escalated,
             } = job;
             let root = &input.roots[idx];
@@ -583,15 +624,14 @@ impl StepDriver {
             if journal_state {
                 reevals.insert(idx, gathered.reevals.clone());
             }
-            let (mut cooldowns, pool_exhausted_roles, mut claims) = {
+            let (mut cooldowns, mut claims) = {
                 let reg = registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
+                (reg.step_cooldowns(now), reg.draw_claims())
             };
             // #13026: read each tick, so a change needs no roll.
             claims.merge_concurrency = crate::config_resolver::champion_merge_concurrency(root);
-            exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }
@@ -659,8 +699,9 @@ impl StepDriver {
                 // #13746: the workspace's writer route, when a confirmed
                 // exhaustion hold stands for it — its candidates wait before
                 // the draw until the reset.
-                writer_hold: crate::writer_limit::hold_note(Some(root), &repo, now.timestamp())
-                    .and_then(|until| tick::WriterHold::from_reset(until, now.timestamp())),
+                writer_hold: crate::writer_limit::WriterLimited::claim_route_key(root, &repo)
+                    .and_then(|key| writer_holds_before_draw.get(&key).copied())
+                    .and_then(|until| tick::WriterHold::from_reset(until, now_ts)),
             });
         }
         let filter_ms = millis(filter_started.elapsed());
@@ -711,6 +752,7 @@ impl StepDriver {
             concurrency: input.spawn_concurrency.max(1),
             parts: StepSpawnTimings::default(),
             recheck: input.discovery.is_worklist().then(|| self.recheck.clone()),
+            writer_holds_before_draw,
         };
         self.recheck.begin_tick();
         let minute = u64::try_from(now.timestamp() / 60).unwrap_or(0);
@@ -724,8 +766,8 @@ impl StepDriver {
         let _spawning = crate::gh_invocation::read_deadline::suspend();
         let draw_started = Instant::now();
         let free_slots = input.max_concurrent.saturating_sub(total);
-        crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
-        let offers = self.request_work(input.roots.first(), free_slots, &exhausted_roles);
+        crate::fleet_dispatch::worker::note_capacity(free_slots, &host_roles);
+        let offers = self.request_work(input.roots.first(), free_slots, &host_roles);
         // #12450: a host in fleet-dispatch fallback draws one round, with no
         // free `claim_lost`; unchanged with the flag off.
         let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {

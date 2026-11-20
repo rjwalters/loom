@@ -897,6 +897,10 @@ pub(crate) enum ForgeAction {
     #[command(name = "verdict-body-check")]
     VerdictBodyCheck,
 
+    /// Check the workflow on stdin for a workflow- or job-level write-all
+    /// permission. Exit 0 if clear, 1 if present, or 2 for unreadable YAML.
+    WorkflowWriteAllCheck,
+
     /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
     /// this verdict be posted? Reads the PR's trusted comments and labels.
     /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
@@ -1247,6 +1251,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             return super::forge_identity_cmd::promotion_author(number, repo.as_deref());
         }
         ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
+        ForgeAction::WorkflowWriteAllCheck => super::forge_workflow_permissions::run(),
         ForgeAction::VerdictGate {
             pr,
             repo,
