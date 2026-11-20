@@ -40,8 +40,8 @@ Rationale: `.loom/docs/ratification-hold.md`.
   ratification re-arms the hold, because the text the operator released may not
   be the text now on the PR.
 - Fail closed: a candidate file whose head content cannot be read is never
-  `clear`. With no hold standing the tick defers (no merge, no marker); with one
-  standing it stays.
+  `clear`. The tick defers (no merge, no marker, no writes) whether or not a
+  hold is standing — the verb exits 3 before `decide` runs.
 
 A held PR that goes CONFLICTING is served by Doctor, hold intact (#13505): Doctor resolves and pushes, leaves `loom:blocked` and `loom:pr` on, and Judge re-reviews the new head; the operator then ratifies a clean head.
 
