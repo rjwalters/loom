@@ -738,6 +738,8 @@ fn item_draw_record_carries_terms_age_source_and_exclusion_counts() {
             send_back: false,
             story_points: None,
             hold_auth: None,
+            pr_review: false,
+            operator_hold_issue: None,
         },
         step: Step::Judge,
         terms: weight_terms(

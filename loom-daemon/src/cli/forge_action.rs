@@ -147,6 +147,8 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
 /// to the `FORGE=gh` shell fallback the four scripts already understand.
 #[derive(Subcommand)]
 pub(crate) enum ForgeAction {
+    /// List staged open PRs affected by an operator hold on a linked issue.
+    OperatorHolds(super::forge_operator_holds::Args),
     /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
     /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
     ///
@@ -1182,6 +1184,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }
     }
     let cmd = match action {
+        ForgeAction::OperatorHolds(args) => return super::forge_operator_holds::run(args),
         ForgeAction::Token {
             repo,
             access,

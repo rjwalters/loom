@@ -125,7 +125,8 @@ impl ForgeAction {
     #[must_use]
     pub(crate) fn is_served(&self) -> bool {
         match self {
-            Self::Issue { .. }
+            Self::OperatorHolds(_)
+            | Self::Issue { .. }
             | Self::Pr { .. }
             | Self::Auth { .. }
             | Self::CheckOpenPr { .. }
@@ -195,6 +196,7 @@ impl ForgeAction {
     /// The verb's command name, for diagnostics.
     pub(crate) fn verb(&self) -> &'static str {
         match self {
+            Self::OperatorHolds(_) => "operator-holds",
             Self::Issue { .. } => "issue",
             Self::Pr { .. } => "pr",
             Self::Auth { .. } => "auth",

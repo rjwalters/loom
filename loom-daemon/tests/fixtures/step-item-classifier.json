@@ -2212,6 +2212,215 @@
           }
         }
       ]
+    },
+    {
+      "name": "a review PR closing a drawable child can name an operator-held tracker",
+      "inputs": {
+        "issues": [
+          {
+            "number": 201,
+            "labels": [
+              "loom:operator"
+            ]
+          },
+          {
+            "number": 202,
+            "labels": [
+              "loom:issue"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 901,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #202\nPart of #201"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 201,
+          "pr": 901,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        },
+        {
+          "issue": 202,
+          "pr": 901,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a Doctor PR joins its unheld Builder issue and names a held tracker",
+      "inputs": {
+        "issues": [
+          {
+            "number": 203,
+            "labels": [
+              "loom:operator"
+            ]
+          },
+          {
+            "number": 204,
+            "labels": [
+              "loom:building"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 902,
+            "labels": [
+              "loom:changes-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #203",
+            "head_ref": "feature/issue-204"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 203,
+          "pr": 902,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        },
+        {
+          "issue": 204,
+          "pr": 902,
+          "state": "changes_requested",
+          "verdict": {
+            "step": "doctor"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a same-repo Builder branch makes an operator hold binding on its Doctor PR",
+      "inputs": {
+        "issues": [
+          {
+            "number": 205,
+            "labels": [
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 903,
+            "labels": [
+              "loom:changes-requested"
+            ],
+            "same_repo": true,
+            "body": "Part of #205",
+            "head_ref": "feature/issue-205"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 205,
+          "pr": 903,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
+    },
+    {
+      "name": "an operator tracker mention without a closing or Builder branch join does not bind the PR",
+      "inputs": {
+        "issues": [
+          {
+            "number": 206,
+            "labels": [
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 904,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Contributes to #206"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 206,
+          "pr": 904,
+          "state": "review_requested",
+          "verdict": {
+            "step": "judge"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a second confirmed closing issue can bind its own operator hold",
+      "inputs": {
+        "issues": [
+          {
+            "number": 207,
+            "labels": [
+              "loom:issue"
+            ]
+          },
+          {
+            "number": 208,
+            "labels": [
+              "loom:operator"
+            ]
+          }
+        ],
+        "pulls": [
+          {
+            "number": 905,
+            "labels": [
+              "loom:review-requested"
+            ],
+            "same_repo": true,
+            "body": "Closes #207\nFixes #208"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "issue": 207,
+          "pr": 905,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        },
+        {
+          "issue": 208,
+          "pr": 905,
+          "state": "operator",
+          "verdict": {
+            "pass": "operator"
+          }
+        }
+      ]
     }
   ]
 }

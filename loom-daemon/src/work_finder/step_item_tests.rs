@@ -464,3 +464,33 @@ fn host_skip_label_passes_issue_triage_and_linked_pr() {
     assert!(open.iter().all(|i| i.step().is_some()), "{open:?}");
     assert_eq!(PassReason::HostSkipLabel.as_str(), "host_skip_label");
 }
+
+#[test]
+fn held_non_closing_link_waits_for_branch_metadata() {
+    let mut inputs = Inputs {
+        issues: vec![IssueInput {
+            number: 9,
+            labels: labels(&["loom:operator"]),
+            ..IssueInput::default()
+        }],
+        pulls: vec![PullInput {
+            number: 90,
+            labels: labels(&["loom:review-requested"]),
+            body: Some("Part of #9".into()),
+            linkage_unverified: true,
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::OperatorLinkUnverified));
+    assert_eq!(held[0].operator_hold_issue, None);
+    inputs.pulls[0].head_ref = Some("feature/issue-9".into());
+    inputs.pulls[0].same_repo = true;
+    inputs.pulls[0].linkage_unverified = false;
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::Operator));
+    assert_eq!(held[0].operator_hold_issue, Some(9));
+    inputs.pulls[0].head_ref = Some("topic".into());
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Judge));
+}
