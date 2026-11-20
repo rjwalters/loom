@@ -143,6 +143,32 @@ clears a hold: a published branch is never discarded, so an already-published
 hold is cleared by hand (`accounts session attach <account>`, then
 `git worktree remove <path>` in the clone — nothing unpublished is lost).
 
+### A dirty leftover worktree (`seat_dirty`)
+
+A leftover worktree with uncommitted or untracked files refuses preparation of
+**its own clone** (the account's other registered repositories prepare
+independently) with a message starting `seat_dirty:`; the step's failure is
+recorded with that reason instead of `unclassified`. The listing form of
+`accounts session recover <account>` names every dirty worktree — path,
+branch, tracked and untracked counts, and commits unpublished at its HEAD —
+even when no branch is unpublished. Save or resolve changes in the main
+checkout in place. To remove a leftover linked worktree, use
+`recover <account> --discard --worktree <path>`. Repeat `--worktree` to
+name multiple paths in one call. Recovery validates all paths across the
+account's clones before removing anything and resolves aliases to one
+worktree. It keeps branch refs and refuses primary, locked, out-of-volume,
+or unpublished worktrees. Publish or save any local commits before retrying.
+Use a separate call for `--branch` or `--issue` discards.
+
+Untracked files under `.loom/lease-renew/` and the worktree-root `.cache/`
+are ignored. Tracked changes in those directories are reported.
+Preparation can remove an unlocked linked worktree when its commits are
+reachable from the freshly fetched origin and the GitHub PR listing confirms
+a merged or closed PR for that exact repository, branch, and head commit.
+This includes squash and fast-forward merges and published PRs closed without
+merge. An open PR on the same branch, an unverifiable response, or an
+unsupported forge leaves the worktree in place.
+
 ## Rebinding a registration after a repository transfer
 
 A forge transfer changes the owner-qualified URL, and with it the registration
