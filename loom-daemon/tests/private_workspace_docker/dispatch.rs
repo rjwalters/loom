@@ -264,10 +264,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .unwrap()
         .is_none());
     }
-    // Production admission stays closed for this fixture: #8787 admits a mutable
-    // role on verified private-clone containment, but this profile has never had
-    // Codex hook trust established, so the containment claim is refused with that
-    // precise obligation. No fixture manifest is promoted anywhere.
+    // Mutable admission must name the hook-trust refusal when neither trust
+    // path is available.
+    let profile = f.root.path().join("profiles").join(name);
+    containment::make_hook_registration_unsealable(&profile);
     let mut config = loom_daemon::sweep_registry::SweepRegistryConfig::new(root.clone());
     config.journal_path = Some(root.join("sweeps.json"));
     let registry = std::sync::Arc::new(std::sync::Mutex::new(
@@ -288,7 +288,6 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     assert!(!root.join(".loom/locks/issue-8786").exists());
     // A read-only synthetic profile must fail before any role/model launch.
     // Restore its original owner-only mode before asserting or continuing.
-    let profile = f.root.path().join("profiles").join(name);
     std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o500)).unwrap();
     let inaccessible = loom_daemon::tokens_pool::private_workspace::dispatch::Selection::prepare(
         &root,
@@ -678,10 +677,28 @@ fn each_account_admission_is_bound_to_its_own_repository_clone() {
         assert_ne!(proof.provenance(Vec::new(), Default::default()).account, a.as_str());
         drop(selection);
     }
-    // Account `c` serves repository two too, but without hook trust its clone
-    // is refused with the precise obligation, so no mutable role is admitted.
+    // Account `c` has no recorded trust. Its fresh sealable registration
+    // admits only its own account and repository, then an unsealable
+    // registration is refused for the hook-trust obligation.
     {
         let _c = Environment::set(&[("LOOM_CODEX_PROFILE", Some(c.as_str().into()))]);
+        let profile = f.root.path().join("profiles").join(c);
+        assert_eq!(
+            loom_daemon::tokens_pool::private_workspace::containment::trust_state(&profile),
+            "sealed"
+        );
+        let selection = prepare("sealed-two").unwrap().unwrap();
+        let proof = selection.contain(&root).unwrap();
+        proof.require_repository(&two).unwrap();
+        assert!(proof
+            .require_repository(&one)
+            .unwrap_err()
+            .to_string()
+            .contains(wrong));
+        assert_eq!(proof.provenance(Vec::new(), Default::default()).account, c.as_str());
+        drop(selection);
+
+        containment::make_hook_registration_unsealable(&profile);
         let selection = prepare("untrusted-two").unwrap().unwrap();
         let untrusted = selection.contain(&root).unwrap_err().to_string();
         assert!(untrusted.contains("hook trust"), "{untrusted}");
