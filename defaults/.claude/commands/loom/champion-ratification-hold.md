@@ -64,8 +64,8 @@ The verb folds the state, the detector and the release comment into one
 | `none` | nothing; continue to the other criteria |
 | `hold` | post the notice, add `loom:blocked`, write the park record; **stop** |
 | `stands` | re-assert `loom:blocked` + park record, no comment; **stop** |
-| `release` | post the released marker, remove `loom:blocked`; continue (a later tick sees `none` at this head) |
-| `clear` | the head no longer declares it: post the cleared marker, remove `loom:blocked` unless another Champion hold stands; continue |
+| `release` | post the released marker, remove `loom:blocked` only if the other-holds read succeeded and said none stands; continue (a later tick sees `none` at this head) |
+| `clear` | the head no longer declares it: post the cleared marker, remove `loom:blocked` unless the other-holds read says another Champion hold stands (an unreadable read keeps the label, #14307); continue |
 | `defer` | unreadable candidate, no hold standing: do not merge this tick, write nothing; **stop** |
 
 Exit 3 or no stdout (a failed read) is `defer`; exit 2 (a `loom-daemon` older
@@ -89,11 +89,19 @@ rt_park() {
 # The label is shared with the other holds: keep it while one still STANDS —
 # per kind, the latest hold marker outdates the latest cleared notice (#14185).
 # Mere presence of a marker is not standing: a `-cleared` notice never un-matches it.
+# Fail closed (#14307): prints `true`, `false`, or `unknown` — a failed or empty
+# comments read is `unknown`, never `false`, so an unreadable read cannot strip a
+# standing hold's only label. Callers remove the shared label on `false` only.
 other_holds_standing() {
-  gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body] as $b
+  local out
+  if ! out=$(gh pr view "$PR_NUMBER" --json comments --jq '[.comments[].body] as $b
     | def stands(h; c): ($b | map(h) | rindex(true)) as $h | ($b | map(c) | rindex(true)) as $c | $h != null and ($c == null or $h > $c);
     stands(startswith("<!-- champion:merge-risk-hold -->"); contains("<!-- champion:merge-risk-hold-cleared -->"))
-    or stands(startswith("<!-- champion:critical-file-hold -->"); startswith("<!-- champion:critical-file-hold-cleared -->"))' 2>/dev/null
+    or stands(startswith("<!-- champion:critical-file-hold -->"); startswith("<!-- champion:critical-file-hold-cleared -->"))' 2>/dev/null) || [ -z "$out" ]; then
+    echo unknown
+  else
+    printf '%s\n' "$out"
+  fi
 }
 
 case "$RT_ACTION" in
@@ -136,7 +144,8 @@ A trusted \`clear the hold —\` comment released this hold at \`$RT_HEAD\`. Mer
 ---
 *Automated by Champion role*"
     # #14249: the label is shared with the other holds — move it only when none still stands.
-    [ "$(other_holds_standing)" = true ] || gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" >/dev/null 2>&1 || true
+    # #14307: `unknown` (unreadable read) keeps the label, exactly like `true`.
+    [ "$(other_holds_standing)" = false ] && gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" >/dev/null 2>&1 || true
     ;;
   clear)
     ./.loom/scripts/post-comment.sh "$PR_NUMBER" --pr --body "<!-- champion:ratification-hold-cleared -->
@@ -146,7 +155,7 @@ A later push removed every ratification-by-merge declaration from this PR. Re-ev
 
 ---
 *Automated by Champion role*"
-    [ "$(other_holds_standing)" = true ] || gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" >/dev/null 2>&1 || true
+    [ "$(other_holds_standing)" = false ] && gh pr edit "$PR_NUMBER" --remove-label "loom:blocked" >/dev/null 2>&1 || true
     ;;
 esac
 case "$RT_ACTION" in hold|stands|defer) SKIP_REMAINING=true ;; esac
