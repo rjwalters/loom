@@ -217,6 +217,102 @@ fn a_gate_read_is_shed_like_any_other_and_an_unclassified_read_is_gate() {
 }
 
 #[test]
+fn only_primary_graphql_gate_exhaustion_is_preserved_for_a_rest_fallback() {
+    const PRIMARY: &str = "echo 'GraphQL: API rate limit already exceeded' >&2; exit 1";
+    const SECONDARY: &str = "echo 'GraphQL: You have exceeded a secondary rate limit' >&2; exit 1";
+    for (label, reader, class, cause, pre, expected) in [
+        (
+            "already exhausted",
+            PRIMARY,
+            ReadClass::Gate,
+            ExhaustCause::Budget,
+            &["app-1", "app-2"][..],
+            true,
+        ),
+        (
+            "observed primary",
+            PRIMARY,
+            ReadClass::Gate,
+            ExhaustCause::Budget,
+            &[][..],
+            true,
+        ),
+        ("permission", NOT_FOUND, ReadClass::Gate, ExhaustCause::Budget, &[][..], false),
+        ("secondary", SECONDARY, ReadClass::Gate, ExhaustCause::Budget, &[][..], false),
+        ("withdrawn", PRIMARY, ReadClass::Gate, ExhaustCause::Withdrawn, &[][..], false),
+        (
+            "headroom reserve",
+            PRIMARY,
+            ReadClass::Hygiene,
+            ExhaustCause::Budget,
+            &[][..],
+            false,
+        ),
+    ] {
+        let p = pool(PRIMARY, reader, OK);
+        let read = GhInvocation::new(
+            Operation::new("parent_link.marker_children"),
+            AccessIntent::Read,
+            GhTarget::None,
+            Duration::from_secs(10),
+        )
+        .program(&p.gh)
+        .reader_only()
+        .reader_repo("acme/admission")
+        .args(["issue", "list", "--repo", "acme/admission"])
+        .read_class(class);
+        let (out, _, _) = p.run_as(read, pre, SystemTime::now(), cause);
+        assert_eq!(
+            p.who(),
+            if pre.is_empty() {
+                vec![Who::R2, Who::R1]
+            } else {
+                Vec::new()
+            },
+            "{label}: never uses the writer",
+        );
+        let outcome = super::super::outcome::classify(Ok(out), Duration::from_secs(10));
+        let CmdOutcome::Unavailable(Unavailable::Shed {
+            graphql_budget_exhausted,
+            ..
+        }) = outcome
+        else {
+            panic!("{label}: expected a shed, got {outcome:?}");
+        };
+        assert_eq!(graphql_budget_exhausted, expected, "{label}");
+    }
+}
+
+#[test]
+fn repo_scoped_rest_search_uses_the_intended_reader() {
+    let p = pool(OK, OK, "exit 76");
+    let request = GhInvocation::new(
+        Operation::new("parent_link.marker_children_rest"),
+        AccessIntent::Read,
+        GhTarget::None,
+        Duration::from_secs(10),
+    )
+    .program(&p.gh)
+    .reader_only()
+    .reader_repo("acme/admission-search")
+    .args([
+        "api",
+        "search/issues",
+        "--method",
+        "GET",
+        "-f",
+        "q=marker repo:acme/admission-search is:issue",
+    ]);
+    let (out, _, asked) = p.run(request, &[], SystemTime::now());
+    assert!(matches!(
+        out,
+        GhCompletion::Captured(Completion::Exited(out)) if out.status.success()
+    ));
+    assert_eq!(asked, ["acme/admission-search"]);
+    assert_eq!(p.calls(), vec![(Who::R2, "acme/admission-search".into())]);
+}
+
+#[test]
 fn exhausted_up_front_every_class_sheds_with_no_request() {
     for (name, class) in [
         ("up-a", ReadClass::Gate),
@@ -568,6 +664,7 @@ fn every_reader_refusing_the_repo_sheds_never_absent_and_never_the_writer() {
 fn a_shed_never_reads_as_a_rate_limit() {
     let shed = Unavailable::Shed {
         until: SystemTime::UNIX_EPOCH + Duration::from_secs(1_900_000_000),
+        graphql_budget_exhausted: false,
     };
     let text = shed.to_string();
     assert!(text.starts_with("deferred: reader budget low until 2030-"), "{text}");

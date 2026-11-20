@@ -712,12 +712,14 @@ pub(crate) fn read_claim_labels_for(
             "labels,state,url",
         ])
         .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
-    let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
-        return LabelLeg::Unknown;
+    let out = match crate::claim_reconciliation::gh_call::graphql_output(inv) {
+        Ok(Some(out)) if out.status.success() => out,
+        Ok(None) => {
+            return read_claim_labels_rest(gh_bin, root, issue, claim_owned)
+                .unwrap_or(LabelLeg::Unknown);
+        }
+        _ => return LabelLeg::Unknown,
     };
-    if !out.status.success() {
-        return LabelLeg::Unknown;
-    }
     // `gh issue view --json labels,state,url` emits
     // `{"labels":[{"name":"..."},…],"state":"OPEN","url":"https://…/issues/42"}`.
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
@@ -746,13 +748,56 @@ pub(crate) fn read_claim_labels_for(
         .iter()
         .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
-    if crate::work_finder::is_frozen(&labels) {
+    classify_claim_labels(&labels, claim_owned)
+}
+
+fn read_claim_labels_rest(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    claim_owned: bool,
+) -> Option<LabelLeg> {
+    use crate::claim_reconciliation::gh_call;
+    // The facade applies LOOM_REPO as GH_REPO for the REST placeholders,
+    // just as the GraphQL call above applies it through --repo.
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+    let read = gh_call::read("claim.labels_rest", gh_bin, root).args(["api", &path]);
+    let json: serde_json::Value = serde_json::from_slice(&gh_call::ok_stdout(read)?).ok()?;
+    if json.get("number")?.as_u64()? != u64::from(issue) {
+        return None;
+    }
+    let pull_request = json.get("pull_request");
+    if let Some(pr) = pull_request {
+        if pr.is_object() {
+            return Some(LabelLeg::IsPullRequest);
+        }
+        return None;
+    }
+    match json.get("state")?.as_str()? {
+        "closed" => return Some(LabelLeg::Closed),
+        "open" => {}
+        _ => return None,
+    }
+    let labels: Vec<String> = json
+        .get("labels")?
+        .as_array()?
+        .iter()
+        .map(|label| {
+            let name = label.get("name")?.as_str()?;
+            (!name.is_empty()).then(|| name.to_owned())
+        })
+        .collect::<Option<_>>()?;
+    Some(classify_claim_labels(&labels, claim_owned))
+}
+
+fn classify_claim_labels(labels: &[String], claim_owned: bool) -> LabelLeg {
+    if crate::work_finder::is_frozen(labels) {
         return LabelLeg::Frozen;
     }
-    if crate::work_finder::is_operator_hold(&labels) {
+    if crate::work_finder::is_operator_hold(labels) {
         return LabelLeg::OperatorHold;
     }
-    let claims = claim_labels_in(&labels);
+    let claims = claim_labels_in(labels);
     let triage = labels
         .iter()
         .any(|l| l == crate::intake_reconcile::TRIAGE_LABEL);
@@ -1838,6 +1883,115 @@ mod tests {
 
         let garbage = write_exec(dir.path(), "gh-garbage.sh", "echo 'not json'");
         assert_eq!(read_claim_labels(&garbage, dir.path(), 42), LabelLeg::Unknown);
+    }
+
+    fn claim_label_fallback(
+        directory: &Path,
+        diagnostic: &str,
+        rest_reply: &str,
+        claim_owned: bool,
+    ) -> LabelLeg {
+        let script = format!(
+            r#"case "$1 $2" in
+  "issue view") printf '%s\n' '{diagnostic}' >&2; exit 1 ;;
+  "api repos/{{owner}}/{{repo}}/issues/42") printf '%s\n' '{rest_reply}' ;;
+  *) exit 76 ;;
+esac"#,
+        );
+        let gh = write_exec(directory, "gh-label-fallback.sh", &script);
+        read_claim_labels_for(&gh, directory, 42, claim_owned)
+    }
+
+    const GRAPHQL_EXHAUSTED: &str =
+        "GraphQL: API rate limit already exceeded for installation ID 1";
+
+    #[test]
+    fn exhausted_graphql_labels_use_the_same_claim_predicates_via_rest() {
+        let dir = tempdir().unwrap();
+        let rest = |payload: &str, owned| {
+            claim_label_fallback(dir.path(), GRAPHQL_EXHAUSTED, payload, owned)
+        };
+        for (payload, expected) in [
+            (
+                r#"{"number":42,"state":"open","labels":[],"pull_request":{}}"#,
+                LabelLeg::IsPullRequest,
+            ),
+            (r#"{"number":42,"state":"closed","labels":[]}"#, LabelLeg::Closed),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:frozen"}]}"#,
+                LabelLeg::Frozen,
+            ),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:operator"}]}"#,
+                LabelLeg::OperatorHold,
+            ),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:triage"}]}"#,
+                LabelLeg::AwaitingCurator,
+            ),
+            (r#"{"number":42,"state":"open","labels":[]}"#, LabelLeg::Clean),
+        ] {
+            assert_eq!(rest(payload, false), expected);
+        }
+        for label in ["loom:building", "loom:reviewing", "loom:treating"] {
+            let payload =
+                format!(r#"{{"number":42,"state":"open","labels":[{{"name":"{label}"}}]}}"#);
+            assert_eq!(rest(&payload, false), LabelLeg::Claimed(vec![label.into()]));
+        }
+        assert_eq!(
+            rest(
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:building"},{"name":"loom:triage"}]}"#,
+                true
+            ),
+            LabelLeg::AwaitingCurator
+        );
+    }
+
+    #[test]
+    fn rest_labels_refuse_unreadable_or_incomplete_answers() {
+        let dir = tempdir().unwrap();
+        for payload in [
+            "not json",
+            r#"{"number":43,"state":"open","labels":[]}"#,
+            r#"{"number":42,"labels":[]}"#,
+            r#"{"number":42,"state":"open","labels":[{}]}"#,
+            r#"{"number":42,"state":"open","labels":[],"pull_request":false}"#,
+        ] {
+            assert_eq!(
+                claim_label_fallback(dir.path(), GRAPHQL_EXHAUSTED, payload, false),
+                LabelLeg::Unknown
+            );
+        }
+        let gh = write_exec(
+            dir.path(),
+            "gh-both-limited.sh",
+            r#"case "$1" in
+  issue) echo 'GraphQL: API rate limit exceeded' >&2 ;;
+  *) printf '%s\n' '{"number":42,"state":"open","labels":[]}'
+     echo 'HTTP 403: API rate limit exceeded' >&2 ;;
+esac
+exit 1"#,
+        );
+        assert_eq!(read_claim_labels(&gh, dir.path(), 42), LabelLeg::Unknown);
+    }
+
+    #[test]
+    fn permissions_and_secondary_limits_do_not_try_label_fallback() {
+        let dir = tempdir().unwrap();
+        for diagnostic in [
+            "HTTP 403: Resource not accessible by integration",
+            "GraphQL: You have exceeded a secondary rate limit",
+        ] {
+            assert_eq!(
+                claim_label_fallback(
+                    dir.path(),
+                    diagnostic,
+                    r#"{"number":42,"state":"open","labels":[]}"#,
+                    false,
+                ),
+                LabelLeg::Unknown
+            );
+        }
     }
 
     #[test]

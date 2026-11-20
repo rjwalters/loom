@@ -159,6 +159,7 @@ impl GhInvocation {
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
         let mut last_failure: Option<Failure> = None;
+        let mut primary_graphql_failures_only = true;
         let mut decision = lookup(&request);
         loop {
             let (dir, app_id) = match decision {
@@ -180,7 +181,15 @@ impl GhInvocation {
                     ));
                 }
                 RouteDecision::Exhausted { until, cause } => {
-                    let why = ShedWhy::Router(cause.as_str());
+                    let why = if cause == ExhaustCause::Budget
+                        && class == ReadClass::Gate
+                        && resource == Resource::Graphql
+                        && primary_graphql_failures_only
+                    {
+                        ShedWhy::GraphqlBudget
+                    } else {
+                        ShedWhy::Router(cause.as_str())
+                    };
                     return Ok(self.shed_read(
                         class,
                         &owner,
@@ -278,6 +287,15 @@ impl GhInvocation {
             // A rate limit, a refused token, or a 403/404 from a reader with
             // no evidence it can see the repo: withdraw it (for this repo
             // only on coverage) and ask the router for the next one.
+            primary_graphql_failures_only &= matches!(
+                failure,
+                Failure::RateLimited {
+                    resource: Resource::Graphql,
+                    secondary: false,
+                    remaining: None | Some(0),
+                    ..
+                }
+            );
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
@@ -398,6 +416,7 @@ impl GhInvocation {
             owner: owner.to_string(),
             resource,
             until,
+            graphql_budget_exhausted: why == ShedWhy::GraphqlBudget,
         }
     }
 
@@ -437,7 +456,7 @@ impl GhInvocation {
             // and its source), so a shed run is diagnosable from the log.
             let readers = match why {
                 ShedWhy::NoRoute => None,
-                ShedWhy::Router(_) => self
+                ShedWhy::Router(_) | ShedWhy::GraphqlBudget => self
                     .reader_slug()
                     .or_else(|| super::super::accounting::resolved_identity(self).repo)
                     .and_then(|slug| {
@@ -471,6 +490,8 @@ pub(crate) enum ShedWhy {
     /// asked (a checkout whose local sources disagree, an argv shape it does
     /// not route).
     NoRoute,
+    /// A GraphQL gate's eligible reader budget is exhausted.
+    GraphqlBudget,
     /// The router's answer: an [`crate::forge_identity::ExhaustCause`], or
     /// what the read chain found.
     Router(&'static str),
@@ -485,6 +506,7 @@ impl ShedWhy {
                               so no reader was asked"
                 .to_string(),
             Self::Router(cause) => format!("router: {cause}"),
+            Self::GraphqlBudget => "router: budget".to_string(),
         }
     }
 }

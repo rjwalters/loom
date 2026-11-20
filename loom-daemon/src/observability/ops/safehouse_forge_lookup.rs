@@ -73,6 +73,7 @@ mod tests {
         };
         let shed = Unavailable::Shed {
             until: SystemTime::now(),
+            graphql_budget_exhausted: false,
         };
         assert_eq!(reason_class(&timed_out), "timed_out");
         assert_eq!(reason_class(&shed), "shed");
