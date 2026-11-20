@@ -10,4 +10,13 @@ ignore = [
     "RUSTSEC-2025-0081",  # unmaintained
     "RUSTSEC-2025-0098",  # unmaintained
     "RUSTSEC-2025-0100",  # unmaintained
+    # unsafe-libyaml - unmaintained (repository archived 2024-03-25); transitive
+    # via serde_yaml_ng, the workflow-lint parser (loom-daemon, #14086). No known
+    # vulnerability: the soundness advisory RUSTSEC-2023-0075 is patched at the
+    # pinned 0.2.11. Remove when workflow-lint swaps to a maintained YAML parser.
+    "RUSTSEC-2024-0449",
+    # chrono 0.4.45 unmaintained (chronotope/chrono#1768), no patched release;
+    # goes away once loom-daemon no longer depends on chrono, or a maintained
+    # chrono release is published
+    "RUSTSEC-2026-0543",
 ]

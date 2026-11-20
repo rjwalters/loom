@@ -328,6 +328,43 @@ impl TrustPolicy {
         trusted_by(author, |norm| self.fleet.contains(norm), self.self_login.as_deref(), &allow)
     }
 
+    /// Whether `author` is an *operator*: a human user account with authority
+    /// over this repository (#14399). Narrower than [`Self::trusts`] on
+    /// purpose: that rule also admits fleet Apps, this daemon's own identity,
+    /// and the `forge.trustedCommenters` allowlist (which may name automation),
+    /// and none of those can attest a human's choice. An operator is a
+    /// non-App account whose forge-reported `author_association` is
+    /// `OWNER`/`MEMBER`/`COLLABORATOR`, or who is on the fleet admin roster.
+    /// A missing login or (for a non-admin) a missing association is
+    /// unverifiable, so not an operator.
+    #[must_use]
+    pub fn is_operator(&self, author: &Author) -> bool {
+        if author.app {
+            return false;
+        }
+        let Some(login) = author.login.as_deref() else {
+            return false;
+        };
+        let norm = normalise_login(login);
+        if norm.is_empty() {
+            return false;
+        }
+        if author.association.as_deref().is_some_and(|a| {
+            TRUSTED_ASSOCIATIONS
+                .iter()
+                .any(|t| a.trim().eq_ignore_ascii_case(t))
+        }) {
+            return true;
+        }
+        self.admins.iter().any(|entry| names(entry, false, &norm))
+    }
+
+    /// [`Self::is_operator`] for a comment/issue object in either shape.
+    #[must_use]
+    pub fn is_operator_json(&self, v: &Value) -> bool {
+        self.is_operator(&Author::from_json(v))
+    }
+
     /// Whether the comment/review object `v` (either shape) is believed.
     #[must_use]
     pub fn trusts_json(&self, v: &Value) -> bool {

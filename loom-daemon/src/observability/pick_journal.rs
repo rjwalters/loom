@@ -119,6 +119,22 @@ pub enum JournalEntry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         head_sha: Option<String>,
     },
+    /// A PR lease release a daemon subcommand made (`lease pr release`,
+    /// #14639): the typed outcome Champion's release records on its marker.
+    /// Written only after the release's own PATCH landed and never for a
+    /// reap, so it is the trusted record of the step's own release — a
+    /// release marker read back off the forge is untrusted prose (#9548)
+    /// and never becomes one.
+    Released {
+        at: DateTime<Utc>,
+        number: u32,
+        /// The outcome word the release recorded (`none` when it passed
+        /// none).
+        outcome: String,
+        /// The `reason=` gate a requeue or skip named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// A hold-label transition a daemon subcommand or the Champion prompt
     /// made on a PR (#12665): the source of `hold.transition`. `confirmed` is
     /// `false` for a write that was attempted and failed.
@@ -204,23 +220,34 @@ fn attach_in(command: &mut Command, root: &Path, role: &str, dir: &Path) {
 
 /// A step's journal file (#11906). A step runs detached from the tick that
 /// drew it, not on a role tick's blocking thread, so its journal is named by
-/// its sweep id rather than held thread-locally until the step ends.
+/// its repository root and sweep id rather than held thread-locally until
+/// the step ends. Different workspaces can generate the same sweep id.
 #[must_use]
-pub fn step_path(sweep_id: &str) -> PathBuf {
+pub fn step_path(root: &Path, sweep_id: &str) -> PathBuf {
+    journal_dir().join(step_file_name(root, sweep_id))
+}
+
+fn step_file_name(root: &Path, sweep_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // A release from a linked worktree uses the shared checkout root too.
+    let resolved = crate::repo_root::find_repo_root(root).or_else(|| root.canonicalize().ok());
+    let root = resolved.as_deref().unwrap_or(root);
+    let workspace = hex::encode(Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let name: String = sweep_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .collect();
-    journal_dir().join(format!("step-{name}.jsonl"))
+    format!("step-{workspace}-{name}.jsonl")
 }
 
 /// Give a step's launch its journal ([`step_path`]). A no-op without an
 /// OTLP exporter, like [`attach`].
-pub fn attach_step(command: &mut Command, sweep_id: &str) {
+pub fn attach_step(command: &mut Command, root: &Path, sweep_id: &str) {
     if super::ops::global_ops_sink().is_some()
         && crate::forge_etag_store::private_dir(&journal_dir(), true)
     {
-        command.env(PICK_JOURNAL_ENV, step_path(sweep_id));
+        command.env(PICK_JOURNAL_ENV, step_path(root, sweep_id));
     }
 }
 
@@ -710,6 +737,31 @@ pub fn record_applied_at(number: u64, is_pr: bool, action: &str, by: &str, head_
             head_sha: head_sha.filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
+}
+
+/// Journal a successful Champion merge lease release only in the journal
+/// assigned to that merge step. An explicit `--sweep-id` can release an
+/// owned lease while the caller has inherited a different step's journal,
+/// even one with the same sweep id in another workspace.
+pub fn record_released(root: &Path, pr: u64, sweep_id: &str, outcome: &str, reason: Option<&str>) {
+    use crate::step_role::StepRole;
+    let (Some(path), Ok(number)) = (journal_path(), u32::try_from(pr)) else {
+        return;
+    };
+    if StepRole::parse_sweep_id(sweep_id) != Some((StepRole::ChampionMerge, number))
+        || path.file_name() != Some(std::ffi::OsStr::new(&step_file_name(root, sweep_id)))
+    {
+        return;
+    }
+    append_to(
+        &path,
+        &JournalEntry::Released {
+            at: Utc::now(),
+            number,
+            outcome: outcome.to_string(),
+            reason: reason.filter(|s| !s.is_empty()).map(str::to_string),
+        },
+    );
 }
 
 /// Journal a hold-label transition on PR `number` (#12665). A no-op outside a

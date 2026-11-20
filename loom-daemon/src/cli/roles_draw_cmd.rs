@@ -16,13 +16,13 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(clap::Subcommand)]
-pub(crate) enum RolesCommand {
+pub enum RolesCommand {
     /// Show the weighted per-stage, per-attempt runtime draw tables (#11726).
     Draw(DrawArgs),
 }
 
 #[derive(clap::Args)]
-pub(crate) struct DrawArgs {
+pub struct DrawArgs {
     /// Show which config tier set each table and why entries are off. The
     /// view always includes this; the flag is accepted for symmetry with
     /// fleet-gitops' `--explain`.
@@ -37,7 +37,7 @@ pub(crate) struct DrawArgs {
 }
 
 impl RolesCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         match self {
             RolesCommand::Draw(args) => {
                 let _ = args.explain;

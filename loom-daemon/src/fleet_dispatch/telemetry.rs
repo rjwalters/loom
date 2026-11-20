@@ -43,7 +43,7 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 /// Span attribute keys the call span carries beyond the lifecycle allowlist.
 /// Listed in [`crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS`] and the
 /// gateway collector's `keep_keys`.
-pub const KEYS: [&str; 18] = [
+pub const KEYS: [&str; 19] = [
     "loom.fleet_dispatch.side",
     "loom.fleet_dispatch.host",
     "loom.fleet_dispatch.endpoint",
@@ -62,11 +62,15 @@ pub const KEYS: [&str; 18] = [
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
     "loom.fleet_dispatch.merge_slot_holder",
+    "loom.fleet_dispatch.hold_ms",
 ];
 
 /// `loom.fleet_dispatch.endpoint` of the span the captain emits when an
 /// assignment expires: no request, so no route (#12875).
 pub const EXPIRE_ENDPOINT: &str = "expire";
+/// `loom.fleet_dispatch.endpoint` of the span the captain emits when the
+/// filing slot's holder never unlocked and its TTL ran out (#13918).
+pub const FILING_EXPIRE_ENDPOINT: &str = "filing-expire";
 /// `loom.fleet_dispatch.result` of that span.
 pub const RESULT_EXPIRED: &str = "expired";
 /// `loom.fleet_dispatch.reason` of that span: why the assignment ended.
@@ -124,6 +128,9 @@ pub struct Call {
     pub retry_after_s: Option<u64>,
     /// The no-progress hold that refused a claim (#12707).
     pub hold: Option<HoldFacts>,
+    /// How long the filing slot was held, on its unlock and expiry spans
+    /// (#13918).
+    pub hold_ms: Option<u64>,
 }
 
 /// The span for `call`, received at `started_at`. Its own root trace; `seq`
@@ -191,6 +198,9 @@ pub fn span(call: &Call, started_at: DateTime<Utc>, seq: u64) -> SpanRecord {
             "loom.fleet_dispatch.hold_set_by_assignment_id".into(),
             hold.set_by_assignment_id.clone(),
         );
+    }
+    if let Some(ms) = call.hold_ms {
+        a.insert("loom.fleet_dispatch.hold_ms".into(), ms.to_string());
     }
     crate::telemetry::trace::provenance::stamp(&mut a);
     let ended_at = started_at
@@ -384,6 +394,20 @@ mod tests {
     }
 
     #[test]
+    fn a_filing_unlock_exports_how_long_the_slot_was_held() {
+        let mut call = claim_call();
+        call.item = None;
+        call.endpoint = "/v1/filing-unlock".into();
+        let key = "loom.fleet_dispatch.hold_ms";
+        assert!(!span(&call, Utc::now(), 1).attributes.contains_key(key));
+        call.hold_ms = Some(1500);
+        let s = span(&call, Utc::now(), 1);
+        assert_eq!(s.attributes.get(key).map(String::as_str), Some("1500"));
+        assert!(s.validate().is_ok());
+        assert!(crate::telemetry::ops::OPS_SPAN_ATTRIBUTE_KEYS.contains(&key));
+    }
+
+    #[test]
     fn a_merge_call_exports_the_slot_holder_after_it() {
         let mut call = claim_call();
         let key = "loom.fleet_dispatch.merge_slot_holder";
@@ -560,7 +584,8 @@ mod tests {
     fn an_unknown_refuse_token_is_counted_as_other() {
         let mut c = Counters::default();
         c.refused("head_moved");
-        for junk in ["x-1", "x-2", "", "claim_lost "] {
+        c.refused("seat_busy");
+        for junk in ["x-1", "x-2", "", "claim_lost ", "seat_busy_"] {
             c.refused(junk);
         }
         let labels: Vec<(&str, &str, i64)> = c
@@ -568,6 +593,13 @@ mod tests {
             .iter()
             .map(|((k, r), n)| (*k, r.as_str(), *n))
             .collect();
-        assert_eq!(labels, vec![("refuse", "head_moved", 1), ("refuse", "other", 4)]);
+        assert_eq!(
+            labels,
+            vec![
+                ("refuse", "head_moved", 1),
+                ("refuse", "other", 5),
+                ("refuse", "seat_busy", 1)
+            ]
+        );
     }
 }

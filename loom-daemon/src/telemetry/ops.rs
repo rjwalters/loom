@@ -29,9 +29,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Label keys a `metric.points` data point may carry. Low-cardinality by
-/// construction — never an issue number, sha, sweep id or path. The gateway
-/// collector's datapoint `keep_keys` must include every key (contract-tested).
+/// The reporting process's capture identity, scoped to step busy slots.
+pub(crate) const STEP_OCCUPANCY_PROCESS_ID: &str = "loom.daemon.process_instance_id";
+
+/// Label keys a `metric.points` data point may carry. The gateway collector's
+/// datapoint `keep_keys` must include every key (contract-tested). Labels
+/// exclude per-item identity and paths. The step occupancy identity is bounded
+/// to one token per reporting process.
 pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     "reason",
     "provider",
@@ -67,6 +71,7 @@ pub const OPS_METRIC_LABEL_KEYS: &[&str] = &[
     // #11906: `loom.dispatch.busy_slots{role, pool="step"}`, the step
     // engine's per-role slots beside the sweep total.
     "pool",
+    STEP_OCCUPANCY_PROCESS_ID,
     // #12038: `loom.forge.hold_items` / `hold_age_seconds`: the artifact
     // (issue | pr), the hold label's short name, how the start was known
     // (labels_at | unknown) and the age statistic (oldest | p50 | p90).
@@ -195,6 +200,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
@@ -215,6 +222,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #13873: the configured model and, when a selection-time fallback
+    // fired, what it fell back from and why.
+    "loom.step.model_configured",
+    "loom.step.model_fallback_from",
+    "loom.step.model_fallback_reason",
     // #12957: the item's story points, on `loom.dispatch.step` and on the
     // step's `loom.sweep` close (the key `sweep.started` already exports).
     "loom.story_points",
@@ -356,6 +368,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
     "loom.fleet_dispatch.merge_slot_holder",
+    "loom.fleet_dispatch.hold_ms",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
@@ -753,6 +766,18 @@ pub enum MetricName {
     /// fallback began), #12450. Host-level: the resource names the host.
     #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
     FleetDispatchFallbackTicks,
+    /// The captain's published token-probe cycle (#13942): one point per
+    /// account per distinct probe instant, by `account` and `state` (the
+    /// probe's verdict) — the fleet-side record of what every worker was
+    /// told to converge on.
+    #[serde(rename = "loom.tokens.fleet_probe_accounts")]
+    TokensFleetProbeAccounts,
+    /// Age of the fleet token-probe snapshot a worker host has applied
+    /// (#13942): sample time minus the captain's probe instant. The
+    /// fleet-convergence drift signal — equal ages across hosts mean every
+    /// worker is reading the same probe.
+    #[serde(rename = "loom.tokens.fleet_probe_age")]
+    TokensFleetProbeAge,
     // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
     /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
     /// for a claim the captain refused, `refuse` for a worker's `refuse`
@@ -902,6 +927,8 @@ impl MetricName {
             Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
             Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
+            Self::TokensFleetProbeAccounts => "loom.tokens.fleet_probe_accounts",
+            Self::TokensFleetProbeAge => "loom.tokens.fleet_probe_age",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
@@ -1037,6 +1064,8 @@ impl MetricName {
             Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
+            Self::TokensFleetProbeAccounts => "{account}",
+            Self::TokensFleetProbeAge => "s",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
             Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
@@ -1204,6 +1233,12 @@ impl MetricName {
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
             }
+            Self::TokensFleetProbeAccounts => {
+                "The captain's published token-probe cycle: one point per account per cycle, by account and state."
+            }
+            Self::TokensFleetProbeAge => {
+                "Age of the fleet token-probe snapshot this host applied (sample time minus the captain's probe)."
+            }
             Self::FleetDispatchRefusals => {
                 "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."
             }
@@ -1295,20 +1330,54 @@ pub struct MetricPointsRecord {
     pub points: Vec<MetricPoint>,
 }
 
-/// Keep only allowlisted, short, control-free labels, at most
-/// [`MAX_LABELS_PER_POINT`] of them.
+/// Keep the ordinary allowlisted, short, control-free labels, at most
+/// [`MAX_LABELS_PER_POINT`] of them. Scoped provenance is admitted separately
+/// with the point's metric and admitted pool available.
 #[must_use]
 pub fn bounded_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     labels
         .iter()
         .filter(|(key, value)| {
-            OPS_METRIC_LABEL_KEYS.contains(&key.as_str())
+            key.as_str() != STEP_OCCUPANCY_PROCESS_ID
+                && OPS_METRIC_LABEL_KEYS.contains(&key.as_str())
                 && value.len() <= MAX_LABEL_VALUE_BYTES
                 && !value.chars().any(char::is_control)
         })
         .take(MAX_LABELS_PER_POINT)
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn bounded_point_labels(point: &MetricPoint) -> BTreeMap<String, String> {
+    let mut labels = bounded_labels(&point.labels);
+    // Apply the existing budget first. Provenance can only occupy a spare
+    // slot, and only if the point retains its identifying pool dimension.
+    if point.name != MetricName::DispatchBusySlots
+        || labels.get("pool").is_none_or(|pool| pool != "step")
+        || labels.len() == MAX_LABELS_PER_POINT
+    {
+        return labels;
+    }
+    if let Some(value) = point
+        .labels
+        .get(STEP_OCCUPANCY_PROCESS_ID)
+        .filter(|value| canonical_process_id(value))
+    {
+        labels.insert(STEP_OCCUPANCY_PROCESS_ID.to_owned(), value.clone());
+    }
+    labels
+}
+
+fn canonical_process_id(value: &str) -> bool {
+    value.len() == 36
+        && uuid::Uuid::try_parse(value).is_ok_and(|id| {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id
+                    .hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer())
+                    == value
+        })
 }
 
 impl MetricPointsRecord {
@@ -1326,7 +1395,7 @@ impl MetricPointsRecord {
             .map(|point| MetricPoint {
                 name: point.name,
                 value: point.value,
-                labels: bounded_labels(&point.labels),
+                labels: bounded_point_labels(point),
             })
             .collect()
     }

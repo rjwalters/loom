@@ -86,8 +86,8 @@ impl ParkKind {
 
 /// The short, stable digest of a fingerprint (#12024): the first 16 hex
 /// characters of its SHA-256. It is what the streak, the persisted holds, the
-/// hold notice and the fleet-wide `NoopStreak` ad compare, so every host
-/// (and every daemon version from #12024 on) derives the same value.
+/// hold notice compare, so every host (and every daemon version from #12024
+/// on) derives the same value.
 #[must_use]
 pub(crate) fn digest(fingerprint: &str) -> String {
     use sha2::{Digest, Sha256};

@@ -2,8 +2,7 @@
 //! split out of `ipc/tests.rs` (#7990) so its deliberately exhaustive
 //! [`crate::types::DaemonStatusReport`] literal — every field named, so a
 //! schema change fails here rather than skewing the wire silently — can keep
-//! growing with the schema without pushing its parent past the
-//! `.loom/docs/file-size-policy.md` ratchet.
+//! growing with the schema without bloating its parent.
 
 use super::*;
 
@@ -56,6 +55,7 @@ fn test_daemon_status_request_response_round_trip() {
         per_repo: vec![crate::types::RepoStatus {
             root: std::path::PathBuf::from("/repo/a"),
             maintain_only: None,
+            installed_behind: None,
             weight: 100,
             in_flight_count: 0,
             health_gate_halted: true,
@@ -208,7 +208,6 @@ fn test_daemon_status_request_response_round_trip() {
             since: None,
             kinds: Vec::new(),
         }),
-        peer_claims: None,
         deep_clean: Vec::new(),
         idle_exit: Some(crate::types::IdleExitStatus {
             enabled: true,

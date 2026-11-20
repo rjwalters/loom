@@ -10,7 +10,7 @@ use crate::work_finder::affected_files::check::{check, EXIT_COULD_NOT_RUN};
 use anyhow::Result;
 
 #[derive(clap::Subcommand)]
-pub(crate) enum AffectedFilesCommand {
+pub enum AffectedFilesCommand {
     /// Classify each `## Affected Files` path of an issue body against the
     /// build base. No forge call.
     ///
@@ -40,7 +40,7 @@ pub(crate) enum AffectedFilesCommand {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct CheckArgs {
+pub struct CheckArgs {
     /// File holding the issue body; `-` reads stdin.
     #[arg(long = "body-file", value_name = "PATH")]
     body_file: PathBuf,
@@ -57,7 +57,7 @@ pub(crate) struct CheckArgs {
 
 impl AffectedFilesCommand {
     /// Never returns: exits with the code documented on [`Self::Check`].
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
         let Self::Check(args) = self;
         let (code, stdout) = args.evaluate();
         print!("{stdout}");

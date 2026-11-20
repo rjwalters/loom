@@ -210,7 +210,7 @@ Pick the right path before any `gh pr checkout` mutation:
   cd .loom/worktrees/pr-<PR_NUMBER>
   # pr-worktree.sh already ran `gh pr checkout` inside the worktree
   ```
-  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
+  **Honor its result.** Exit `0`: ready, reusing `pr-<N>` if present. Non-zero: stop. On a branch collision, reuse the named builder `issue-N` holder after "Verify the Worktree Matches the PR" below; otherwise stop/report or use `git merge-tree`/`gh pr diff` read-only review. If the **primary clone** holds the branch (an attended author left it checked out), the helper itself creates `pr-<N>` **detached** at the PR head sha, says so, and exits `0`: that detached worktree is sanctioned for review (no `git archive` export). Record `reviewed at detached worktree <sha>` in the verdict, and never commit or push from it. **Never** invent a `judge-*`/`review-*` directory or another naming scheme, run raw `git worktree add`, or use bare `gh pr checkout` to bypass failure.
 
 `pr-worktree.sh` writes a `.loom-managed` sentinel; `merge-pr.sh` auto-cleans it on merge. Every "no worktree exists" branch in this document routes through it, mirroring `doctor.md`.
 
@@ -446,8 +446,8 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
        # Attempt automated rebase (see detailed workflow in Rebase Check section)
    fi
    ```
-4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
-4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist, skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
+4. **Understand context** (first capture `REVIEW_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)`, before reading anything — and for each linked issue `N` the hash of the body you read: `ISSUE_HASH_N=$(printf %s "$(gh api repos/<owner>/<repo>/issues/N --jq .body)" | sha256sum | cut -d' ' -f1)` (a hash that keeps jq's trailing newline is accepted too, as is the raw body's own hash with or without that newline); see "Stale-Read Gate" under Verdict SHA Marker): Read PR description and linked issues, and run the "Spec Reconciliation" step below on each `Closes`/`Fixes`/`Resolves`/`Part of`/`Contributes to` reference (current body + trusted comments, not the PR's account of them)
+4b. **Check docs-only fast-path eligibility** (see "Docs-Only Fast Path (WORK_LOG / WORK_PLAN / README, #6134)" below) — if the changed-file list is an exact match against the fast-path allowlist **and the PR has no closing-issue reference** (Step 3 below, #14182 — both conditions are required, and a failed closing-reference read counts as a reference), skip steps 5-7b and the "Evaluation Focus Areas" review entirely; go straight to CI Status Check (step 8), the formal-review reconciliation gate (step 8b — **not** skipped: a docs-only diff can still carry an unresolved formal review, #7647) and the fast-path approval write. Otherwise continue normally.
 5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below). Capture `REVIEW_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')` here — step 11's recheck compares against it, and your verdict marker records it.
 6. **Rebase check**: Verify PR has no merge conflicts with main (see Rebase Check section below)
 7. **Targeted checks only**: read the diff and trust the green CI from step 2b. At most run scoped tests for a specific doubt (Scoped Test Execution below); never the full suite or `buildGate.command`. If the *environment* cannot run a command you need for a verdict, see "Environment Gap: Cannot Verify Here" below
@@ -1346,7 +1346,7 @@ Branch on the first stdout line:
 
 - **Run the repo's documented test command on the PR head**, in your review worktree (step 5's checkout), at the PR head SHA. "Documented" is whatever the repo itself names — its CLAUDE.md / README test section, or its package manifest (`scripts.test`, Makefile target); no new config key. A targeted run of what the repo documents is enough; this does not license the full suite or `buildGate.command` (#11690 still applies).
 - **The verdict must state the command and its result** — e.g. "`pnpm test` — pass" or "`make check` — 2 failures (names in the verdict)". A verdict that neither states a run nor says the repo documents no command is incomplete for a no-checks PR.
-- **No documented test command anywhere?** The verdict must say plainly "unverified by any test" — never "safe", never a silent pass.
+- **No documented test command anywhere?** The verdict must say plainly "unverified by any test" — never "safe", never a silent pass. The same fallback covers the case where a documented command exists but the only one the repo documents is a full-suite / `buildGate.command` command that #11690 keeps out of bounds and no targeted subset is nameable: the verdict must then say, e.g., "unverified by any test: only documented command is `<cmd>` (full suite, out of bounds per #11690)" — again never "safe", never a silent pass.
 
 A failing local run is "When CI Fails"-grade evidence: do not approve on it.
 
@@ -1729,10 +1729,49 @@ docs_only_fast_path_check() {
 ELIGIBILITY=$(printf '%s\n' "$FILES" | docs_only_fast_path_check)
 ```
 
+**Step 3: Require an empty closing-issue set (#14182).** The file list answers
+"what could this diff break?"; it says nothing about the PR **body**, and a
+closing keyword in the body mutates repository state on merge (GitHub
+auto-closes the linked issue). A docs-only diff that closes an issue is a
+contradiction in terms, so a PR with any closing reference is not eligible,
+however clean its file list. This check is hardcoded like the allowlist — no
+config key, no judgment axis — and fails closed: a read that errored, or
+returned nothing recognisable, is NOT ELIGIBLE, never "no closers".
+
+```bash
+docs_only_fast_path_closing_check() {
+  # $1 = PR number. Echoes "ELIGIBLE" only when the closing-reference read
+  # SUCCEEDED (positively proven by the "closers=" prefix) and returned an
+  # empty set. A failed or malformed read is NOT ELIGIBLE, never "no closers"
+  # (fail closed, #14182). Deliberately not forge_pr_close_targets: that helper
+  # swallows read errors into an empty list, which would read as "no closers".
+  local out refs
+  if ! out=$(gh pr view "$1" --json closingIssuesReferences \
+      --jq '"closers=" + ([.closingIssuesReferences[].number | tostring] | join(","))' 2>/dev/null); then
+    echo "NOT ELIGIBLE: closing-reference read failed"
+    return 0
+  fi
+  case "$out" in
+    closers=*) refs="${out#closers=}" ;;
+    *) echo "NOT ELIGIBLE: closing-reference read returned no proof"; return 0 ;;
+  esac
+  if [ -n "$refs" ]; then
+    echo "NOT ELIGIBLE: closes #${refs//,/, #}"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$ELIGIBILITY" = "ELIGIBLE" ]; then
+  ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")
+fi
+```
+
 If `$ELIGIBILITY` is anything other than the literal string `ELIGIBLE`
-(including an empty diff, or a diff that mixes an allowlisted file with
+(including an empty diff, a diff that mixes an allowlisted file with
 anything else — a source file, a nested README, `.github/workflows/*.yml`,
-`.loom/config.json`, or any other path) — **do not use this fast path.**
+`.loom/config.json`, or any other path — or a PR whose body carries a closing
+reference such as `Closes #N`, or whose closing-reference read failed) — **do not use this fast path.**
 Proceed with the normal Primary Queue steps 5-11 (checkout, quality checks,
 test plan execution, full code evaluation).
 
@@ -1753,8 +1792,7 @@ code evaluation, never review reconciliation. `post-verdict.sh` enforces it on
 the approval write below regardless (#7647).
 
 **2. Still verify CI status** (step 8, "CI Status Check" above) — a docs-only
-diff can still fail a structural CI job (`claude-md-budget`,
-`agents-md-sync`, `docs-defaults-parity`, `dangling-links`,
+diff can still fail a structural CI job (`agents-md-sync`, `dangling-links`,
 `gitignore-convergence`) even though the build/test matrix is skipped by the
 path filter. Apply the same When CI Fails / When CI is Pending handling as
 the normal flow — this fast path shortcuts code review, not CI verification.
@@ -1769,6 +1807,9 @@ immediately before the `gh pr edit` below):
 This PR's entire changed-file list was verified — via the paginated files
 API, not the PR's stated intent or any marker — to be an exact match against
 {WORK_LOG.md, WORK_PLAN.md, README.md}: $FILES
+
+The closing-issue set was verified empty via the closing-reference read
+(no closing references, #14182).
 
 A diff confined to this exact set needs no full code evaluation (no lint,
 type-check, tests, or functional review apply). All CI checks pass.
@@ -1789,6 +1830,9 @@ EOF
   same check against its own fresh paginated-files read — it never trusts
   this comment's claim, so a compromised or buggy Judge pass cannot smuggle a
   non-docs change through Champion.
+- **No closing links**: a PR that would auto-close any issue on merge is
+  ineligible (Step 3), so a free-form generated body cannot close an unrelated
+  issue past a review that never reads it. Champion re-checks this itself.
 - **Narrowly scoped**: the allowlist is three exact root-level filenames — no
   glob, no directory prefix, no "looks like docs" heuristic. A diff that adds
   a fourth file of any kind, anywhere, including another `.md` file, is
@@ -2132,7 +2176,7 @@ gh pr view <number> --json body --jq '.body'
 | **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm test:unit -- path/to/one.test.ts`" | Execute and capture output |
 | **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed — **except** when the diff touches browser-driving / scraper / DOM-parsing code, or the PR's linked issue reports a silent-omission failure (#6883), where "manually test in browser" is not sufficient on its own: see "Live Verification and the Circular-Fixture Smell" below |
 | **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
-| **Full suite / build gate** | "run `pnpm check:ci`", "run `buildGate.command`", "run `cargo test --workspace`", "run `build-gate.sh`" | Skip: CI already ran it — cite the green CI from step 2b (#11690) |
+| **Full suite / build gate** | "run `pnpm check:ci`", "run `buildGate.command`", "run `cargo test --workspace`", "run `build-gate.sh`" | Skip: CI already ran it — cite the green CI from step 2b (#11690) (on a no-checks PR there is no green CI: the skip stands — this row is out of bounds locally per #11690 — and the verdict records "unverified by any test", see "No-Checks PRs") |
 | **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
 | **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
 

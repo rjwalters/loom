@@ -268,7 +268,7 @@ impl GhWorkSource {
 /// `dispatch()` calls the registry's own `dispatch()` — reusing its
 /// idempotency key, `mkdir`-atomic claim lock, and `loom:issue →
 /// loom:building` label flip — so the finder never reimplements the race
-/// guard. `in_flight()` reads the registry's `Running` / `Pending` entries.
+/// guard. `in_flight()` reads the registry's `Running` entries.
 pub struct RegistryDispatcher {
     registry: Arc<Mutex<SweepRegistry>>,
 }
@@ -313,12 +313,10 @@ impl WorkDispatcher for RegistryDispatcher {
             // against the concurrency budget and defer legitimate new dispatch.
             reg.reap_liveness();
             let mut set = HashSet::new();
-            for state in [SweepState::Running, SweepState::Pending] {
-                for info in reg.list(Some(&state)) {
-                    // A step holds its item's slot like a sweep (#11898).
-                    if let Some(n) = info.kind.item_number() {
-                        set.insert(n);
-                    }
+            for info in reg.list(Some(&SweepState::Running)) {
+                // A step holds its item's slot like a sweep (#11898).
+                if let Some(n) = info.kind.item_number() {
+                    set.insert(n);
                 }
             }
             set
@@ -344,15 +342,7 @@ impl WorkDispatcher for RegistryDispatcher {
             let now = chrono::Utc::now();
             reg.dispatch_backoff_issues(now)
                 .into_iter()
-                .filter_map(|issue| {
-                    // The skip lasts until the later of the two windows.
-                    let local = reg.dispatch_backoff_until(issue, now);
-                    let until = local
-                        .into_iter()
-                        .chain(reg.peer_dispatch_backoff_until(issue, now))
-                        .max();
-                    until.map(|u| (issue, u))
-                })
+                .filter_map(|issue| reg.dispatch_backoff_until(issue, now).map(|u| (issue, u)))
                 .collect()
         })
     }
@@ -380,15 +370,7 @@ impl WorkDispatcher for RegistryDispatcher {
             let now = chrono::Utc::now();
             reg.noop_cooldown_issues(now)
                 .into_iter()
-                .filter_map(|issue| {
-                    // The skip lasts until the later of the two windows.
-                    let local = reg.noop_cooldown_until(issue, now);
-                    let until = local
-                        .into_iter()
-                        .chain(reg.peer_noop_cooldown_until(issue, now))
-                        .max();
-                    until.map(|u| (issue, u))
-                })
+                .filter_map(|issue| reg.noop_cooldown_until(issue, now).map(|u| (issue, u)))
                 .collect()
         })
     }
@@ -470,10 +452,6 @@ impl WorkDispatcher for RegistryDispatcher {
 
     fn collisions(&self) -> u64 {
         self.with_registry(|reg| reg.collision_count())
-    }
-
-    fn peer_claimed(&self) -> HashSet<u32> {
-        self.with_registry(|reg| reg.peer_claimed_issues())
     }
 
     /// Additional skip-label list for this workspace (Issue #6685),

@@ -470,8 +470,9 @@ acting on it.
 Only the *interactive* half is missing. Daemon-dispatched OpenCode work is
 already on the wire: issue #8507 folds OpenCode session tokens into
 `sweep.outcome` / `role_tick.outcome`'s `tokens_by_model`, and
-`loom.tokens_by_model`, `loom.models_used`, `loom.runtime`, `loom.provider` and
-`loom.model` are already allowlisted in `config.yaml`'s `keep_keys(...)`. A
+`loom.tokens_by_model`, `loom.models_used`, `loom.runtime`, `loom.provider`,
+`loom.model`, `loom.profile` and `loom.stage` (the #14048 per-stage join keys)
+are allowlisted in `config.yaml`'s `keep_keys(...)`. A
 sweep or role tick that ran on OpenCode is queryable by runtime, model and
 duration today.
 

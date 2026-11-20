@@ -94,6 +94,11 @@ on:
         description: "Why the bump is forced (required with force; recorded in the bump commit)"
         type: string
         default: ""
+      level:
+        description: "patch (the default), or minor for a forced X.(Y+1).0 release; minor needs force, and the fleet publisher must list the version (2am github-write minor_releases)"
+        type: choice
+        options: [patch, minor]
+        default: patch
 
 # Serialize runs instead of racing them -- deliberately NOT cancel-in-progress:
 # a queued run re-checks the gate against whatever `main` looks like when it
@@ -189,11 +194,25 @@ jobs:
       # regenerate the lockfiles, which is why the toolchain actions are
       # here and not in the publish job). Nothing is committed: the
       # publisher builds the commit from the files.
+      # LEVEL is a choice input (patch|minor) and reaches the shell only
+      # through env:, like inputs.reason. minor is a forced dispatch only: the
+      # push and schedule paths always cut a patch. The publisher refuses any
+      # minor step it does not list (2am github-write LOOM_MINOR_RELEASES), so
+      # this input cannot cut a release the publisher has not been widened for.
       - name: Compute the version bump (no commit, no push)
         id: bump
         if: steps.gate.outputs.decision == 'bump'
+        env:
+          LEVEL: ${{ github.event_name == 'workflow_dispatch' && inputs.level || 'patch' }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
         run: |
           set -euo pipefail
+
+          case "$LEVEL" in
+            patch) ;;
+            minor) [ "$FORCE" = "true" ] || { echo "ERROR: level=minor needs force=true (a minor release is an operator-forced dispatch)." >&2; exit 1; } ;;
+            *) echo "ERROR: level must be patch or minor (got '$LEVEL')." >&2; exit 1 ;;
+          esac
 
           # The only paths the publisher accepts; .loom/install-metadata.json
           # only where it exists (version.sh skips it otherwise).
@@ -209,7 +228,7 @@ jobs:
             exit 1
           fi
 
-          ./scripts/version.sh bump patch
+          ./scripts/version.sh bump "$LEVEL"
           version="$(./scripts/version.sh show)"
 
           # The bump may change version files and nothing else: anything

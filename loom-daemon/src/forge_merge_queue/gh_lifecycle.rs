@@ -252,6 +252,10 @@ impl LifecycleForge for GhLifecycleForge {
         Ok(())
     }
 
+    fn confirmed_merge_issue_claims(&self, pr: u32) -> Result<(), String> {
+        self.strip_confirmed_issue_claims(pr)
+    }
+
     fn removals(&self, pr: u32) -> Result<Vec<RemovalEvent>, String> {
         let text = self.ok(
             "merge_queue.removals",

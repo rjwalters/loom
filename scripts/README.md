@@ -19,6 +19,7 @@ the same set CI's `Structural Checks` job runs.
 |--------|--------|
 | `check-structural.sh` | Runs all structural gates before anything expensive |
 | `check-dangling-links.sh` | Relative markdown links resolve |
+| `check-docs-index.sh` | `docs/README.md` indexes every `docs/` dir, top-level doc and `design/` note |
 | `check-doc-tocs.sh` | Generated TOCs in large docs (`--fix` regenerates; not run in CI) |
 | `check-hooks-defaults-parity.sh` | `defaults/hooks`/`scripts` vs installed copies |
 | `check-agents-md-sync.sh` | `defaults/.loom/AGENTS.md` is not stale |

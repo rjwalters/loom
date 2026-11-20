@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod cli;
 pub mod render;
+pub mod resolution;
+pub mod resolve;
 pub mod validate;
 
 #[cfg(test)]

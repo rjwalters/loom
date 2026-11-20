@@ -1,9 +1,6 @@
 //! Unit tests for the workspace / pool-dir resolvers in `cli::tokens`.
 //!
-//! Extracted verbatim from `cli/tokens.rs` (issue #8058) for the reason
-//! `scripts/check-file-size-budget.sh` names: an over-threshold file that
-//! needs to grow puts the new lines in a sibling instead, and a test module
-//! is the cleanest thing to move. Included from `cli/tokens.rs` with a
+//! Extracted verbatim from `cli/tokens.rs` (issue #8058). Included from `cli/tokens.rs` with a
 //! `#[path]` module declaration, so the `super::` paths these tests use
 //! still resolve to `cli::tokens` exactly as before.
 
@@ -325,5 +322,46 @@ mod pressure_tests {
             out.chars().all(|c| c.is_ascii_digit() || c == '.'),
             "output must be digits and at most one '.', got {out}"
         );
+    }
+}
+
+#[test]
+fn import_from_monitor_cli_accepts_repeated_exclude_names_and_rejects_empty() {
+    use crate::cli::{whole_cli_parse::try_parse_cli, Commands, TokensAction};
+
+    let command = ["loom-daemon", "tokens", "import-from-monitor"];
+    let parse = |args: &[&str]| {
+        let argv: Vec<_> = command.into_iter().chain(args.iter().copied()).collect();
+        try_parse_cli(&argv)
+    };
+    for (args, want) in [
+        (&[][..], &[][..]),
+        (
+            &[
+                "--exclude-name",
+                "one-example",
+                "--exclude-name=two-example",
+                "--exclude-name",
+                " exact-name ",
+            ],
+            &["one-example", "two-example", " exact-name "],
+        ),
+    ] {
+        let cli = parse(args).unwrap();
+        match cli.command {
+            Some(Commands::Tokens {
+                action: TokensAction::ImportFromMonitor { exclude_names, .. },
+            }) => assert_eq!(exclude_names, want),
+            _ => panic!("expected tokens import-from-monitor"),
+        }
+    }
+    for invalid in [
+        &["--exclude-name", ""][..],
+        &["--exclude-name="][..],
+        &["--exclude-name"][..],
+        &["--exclude-name", "   "][..],
+        &["--exclude-name", "\t"][..],
+    ] {
+        assert!(parse(invalid).is_err(), "accepted {invalid:?}");
     }
 }

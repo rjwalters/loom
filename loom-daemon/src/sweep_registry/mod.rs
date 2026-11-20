@@ -78,7 +78,6 @@
 
 use crate::capacity;
 use crate::event_bus::EventBus;
-use crate::peer_claims::{self, ClaimAd, PeerClaimView};
 use crate::telemetry;
 #[cfg(test)]
 use crate::tokens_pool::bad_tokens;
@@ -118,16 +117,19 @@ pub use model::generate_sweep_id;
 mod config_paths;
 mod decline_cooldown;
 mod dispatch;
-mod fast_fail_fleet;
 mod fast_fail_park;
 mod frozen_write;
 mod guards;
-mod heartbeat_broadcast;
 mod landed_guard;
 mod lease_episode;
 pub mod lease_step;
 mod locks;
 mod model;
+// Selection-time model fallback (`autonomous.modelFallback`, #13873) —
+// `pub(crate)` for the pool preflights (role runner, work finder, preference
+// availability) that read it from outside `sweep_registry`.
+pub(crate) mod model_fallback;
+pub(crate) mod model_limit_kill;
 mod noop_cooldown;
 mod outcome_journal;
 pub(crate) mod published_repo;
@@ -135,7 +137,6 @@ mod resolved_facts;
 // `pub`: the daemon-hold record contract (`is_daemon_hold`, #10161) is read
 // by the stale-blocked readers (#10556, #10558).
 pub mod park_hold;
-mod pool_hold_broadcast;
 mod prepared_dispatch;
 pub use prepared_dispatch::PreparedIssueDispatch;
 pub(crate) mod private_dispatch;
@@ -421,6 +422,8 @@ pub struct SweepRegistry {
     ///
     /// [`reconstruct`]: SweepRegistry::reconstruct
     children: BTreeMap<SweepId, Child>,
+    /// Pending typed results from this daemon's own step launches.
+    launch_rejections: BTreeMap<SweepId, crate::worker_spawn::rejection::Receiver>,
     /// Optional event bus for lifecycle events (Issue #3453, Phase B).
     /// When `None`, the registry behaves identically to Phase A — bus
     /// emission is best-effort and never blocks core dispatch/reaper
@@ -573,8 +576,8 @@ pub struct SweepRegistry {
     /// enabled (Issue #4085, Phase 0 of #4028; upgraded from detection-only
     /// into enforcement by #5789). When `true`, [`dispatch`](Self::dispatch)
     /// issues a pre-flip `gh issue view --json labels` read, and a confirmed
-    /// collision now backs off the dispatch (reverting the claim lock and any
-    /// peer-claim advertisement already published) instead of proceeding
+    /// collision now backs off the dispatch (reverting the claim lock already
+    /// taken) instead of proceeding
     /// unchanged. Off by default (the probe adds one extra API round-trip);
     /// `main.rs` / [`WorkspacePool`] set the resolved env > config > default
     /// value.
@@ -582,28 +585,12 @@ pub struct SweepRegistry {
     /// [`WorkspacePool`]: crate::workspace_pool::WorkspacePool
     detect_collisions: bool,
     /// Cumulative count of cross-host dispatch collisions this registry has
-    /// observed — both from the opt-in pre-flip forge-label read (Issue #4085:
+    /// observed from the opt-in pre-flip forge-label read (Issue #4085:
     /// `loom:issue` already gone, or `loom:building` already present, before
-    /// this host's own flip) and from the always-on in-memory peer-claim guard
-    /// (Issue #4028/#5789: a peer host's soft-claim advertisement was already
-    /// live). Every increment corresponds to a dispatch this host backed off
-    /// rather than duplicated (#5789 upgraded both signals from detection-only
-    /// into enforcement). Surfaced to operators via the work-finder's per-tick
-    /// summary line. Monotonic for the life of the process.
+    /// this host's own flip). Every increment corresponds to a dispatch this host
+    /// backed off rather than duplicated (#5789). Surfaced to operators via the
+    /// work-finder's per-tick summary line. Monotonic for the life of the process.
     collision_count: u64,
-    /// Outbound peer-claim advertiser (Issue #4028). When present, [`dispatch`](Self::dispatch)
-    /// publishes an `advertise` ad **before** the (non-atomic) label flip and
-    /// [`emit_event`](Self::emit_event) publishes a `retract` ad on a terminal
-    /// sweep outcome, both over the shared safehouse room via a bounded
-    /// non-blocking `try_send`. `None` (the default) is a **byte-for-byte no-op**:
-    /// no channel, no ad, no syscalls — set only when `safehouse.enabled` is true.
-    peer_claim_publisher: Option<tokio::sync::mpsc::Sender<ClaimAd>>,
-    /// Inbound peer-claim view (Issue #4028), shared with the safehouse
-    /// coordination task that feeds it. When present, [`peer_claimed_issues`](Self::peer_claimed_issues)
-    /// returns the issues a peer host has advertised as in-flight (TTL-bounded),
-    /// which the work-finder skips. `None` (default) ⇒ the work-finder sees an
-    /// empty set (no behavior change).
-    peer_claims: Option<Arc<Mutex<PeerClaimView>>>,
     /// Workspace-level claude-wrapper pre-flight-death tripwire parameters
     /// (Issue #4386). `main.rs` / [`crate::workspace_pool::WorkspacePool`] set
     /// the resolved env > config > default value at provision time, mirroring
@@ -1036,7 +1023,7 @@ pub struct CancelOutcome {
     /// `true` when the child did not exit within the grace window and
     /// a SIGKILL was issued.
     pub sigkill_sent: bool,
-    /// `true` when the sweep was in `Running`/`Pending` state at the
+    /// `true` when the sweep was in `Running` state at the
     /// moment of the call; `false` when it was already terminal.
     pub was_running: bool,
 }
@@ -1067,6 +1054,7 @@ impl SweepRegistry {
             config,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
+            launch_rejections: BTreeMap::new(),
             bus: None,
             dispatch_stagger: Duration::ZERO,
             last_spawn_at: None,
@@ -1092,8 +1080,6 @@ impl SweepRegistry {
             test_force_rate_limited: false,
             detect_collisions: false,
             collision_count: 0,
-            peer_claim_publisher: None,
-            peer_claims: None,
             preflight_tripwire_config: PreflightTripwireConfig::default(),
             preflight_death_streak: 0,
             preflight_death_last_marker: None,
@@ -1399,7 +1385,7 @@ impl SweepRegistry {
         })
     }
 
-    /// For a `Running`/`Pending` entry with no `latest_phase` yet (i.e. every
+    /// For a `Running` entry with no `latest_phase` yet (i.e. every
     /// live sweep — see the [`SweepInfo::latest_phase`] doc comment), overlay
     /// the phase read live from the on-disk checkpoint
     /// (`.loom/sweep-checkpoint/issue-<N>.json`), the same source
@@ -1484,17 +1470,6 @@ impl SweepRegistry {
     /// repos' issue #N — the topic string is unchanged; `repo` lives in the
     /// payload only.
     pub(crate) fn emit_event(&self, mut event: Event) {
-        // Peer-claim early retraction (Issue #4028): a terminal outcome for one
-        // of THIS host's sweeps retracts its soft claim over the room so peers
-        // free the issue before its TTL would lapse. Centralized here so every
-        // Exited/Crashed emit site is covered by one insertion. Best-effort /
-        // non-blocking / fail-open (a no-op when no publisher is attached).
-        match &event {
-            Event::SweepExited { issue, .. } | Event::SweepCrashed { issue, .. } => {
-                self.publish_peer_claim(peer_claims::ClaimKind::Retract, *issue);
-            }
-            _ => {}
-        }
         event.set_repo_if_absent(&self.config.workspace_root.display().to_string());
         if let Some(ref bus) = self.bus {
             let topic = event.topic();
@@ -1510,7 +1485,7 @@ impl SweepRegistry {
     /// Idempotency-key dedup lookup consulted first by `begin_issue_dispatch`
     /// (Issue #6592 preserves this contract unchanged across the
     /// begin/poll/finish split — see `begin_issue_dispatch_idempotency_hit_returns_done_without_spawning`
-    /// in `dispatch.rs`'s tests). Deliberately scoped to `Running`/`Pending`
+    /// in `dispatch.rs`'s tests). Deliberately scoped to `Running`
     /// only: a same-key retry arriving after the original sweep already
     /// reached a terminal state (`Exited`/`Crashed`) intentionally does NOT
     /// dedup against it and proceeds to a fresh dispatch — a finished sweep
@@ -1544,7 +1519,7 @@ impl SweepRegistry {
     /// coverage.**
     pub(crate) fn find_running_by_key(&self, key: &str) -> Option<&SweepInfo> {
         self.entries.values().find(|info| {
-            matches!(info.state, SweepState::Running | SweepState::Pending)
+            matches!(info.state, SweepState::Running)
                 && info.idempotency_key.as_deref() == Some(key)
         })
     }
@@ -1555,9 +1530,7 @@ impl SweepRegistry {
 /// body taking that path directly, usable from [`RegistrySnapshot::list`]
 /// (Issue #7526) without a `&SweepRegistry` receiver / the registry's mutex.
 fn overlay_live_phase_at(checkpoint_dir: &Path, info: &mut SweepInfo) {
-    if info.latest_phase.is_none()
-        && matches!(info.state, SweepState::Running | SweepState::Pending)
-    {
+    if info.latest_phase.is_none() && matches!(info.state, SweepState::Running) {
         match info.kind {
             SweepKind::Issue(issue) => {
                 let checkpoint = checkpoint_dir.join(format!("issue-{issue}.json"));
@@ -1741,10 +1714,9 @@ mod tests {
         inner();
     }
 
-    /// The `UNKNOWN_HOST` constant peer-claim self-recognition special-cases
-    /// (Issue #5063) must be the literal string `host_identity()` falls back
-    /// to — a drift between the two would silently reopen the self-match
-    /// hole `peer_claims::observe_at` closes.
+    /// The `UNKNOWN_HOST` constant self-recognition special-cases (Issue #5063)
+    /// must be the literal string `host_identity()` falls back to — a drift
+    /// between the two would silently reopen the self-match hole.
     #[test]
     fn unknown_host_constant_matches_the_final_fallback() {
         assert_eq!(UNKNOWN_HOST, "unknown-host");

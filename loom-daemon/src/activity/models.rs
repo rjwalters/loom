@@ -95,22 +95,6 @@ pub struct ActivityEntry {
     pub output_timestamp: Option<DateTime<Utc>>,
 }
 
-/// Git changes associated with a prompt
-/// Links individual prompts to the git commits/changes they caused
-#[derive(Debug, Clone)]
-pub struct PromptChanges {
-    #[allow(dead_code)]
-    pub id: Option<i64>,
-    pub input_id: i64,
-    pub before_commit: Option<String>,
-    pub after_commit: Option<String>,
-    pub files_changed: i32,
-    pub lines_added: i32,
-    pub lines_removed: i32,
-    pub tests_added: i32,
-    pub tests_modified: i32,
-}
-
 /// Forge event types that can be parsed from terminal output
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

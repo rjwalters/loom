@@ -109,25 +109,19 @@
 //! # Durability
 //!
 //! Every window the ledger arms is at most [`MAX_SHORT_COOLDOWN`] (24 h, the
-//! landed cooldown's own ceiling), and the registry broadcasts each one but a
-//! refusal's (host-local, #11909) on
-//! the peer channel (`ClaimKind::StepCooldownArmed`), so peers keep honouring
-//! a window after this host restarts. A host never gets its own windows back
-//! from peers (they never re-send them, and a host ignores its own ads), so
-//! the registry mirrors each pair's runs and window to a file in the
+//! landed cooldown's own ceiling), and the registry mirrors each pair's runs and
+//! window to a file in the
 //! workspace's logs directory after every change and reloads it when it is
 //! built (#12251): the restarted host keeps its own windows and its repeat-cap
 //! history. Lapsed runs and windows are dropped on reload. The refusal and
-//! fast-fail streaks and the counters stay in memory. Nothing
-//! longer rides the broadcast: the Champion ladder's
+//! fast-fail streaks and the counters stay in memory. The Champion ladder's
 //! rungs past 24 h live on the forge only (the item's body), and after a
 //! rollback those parks stay parked until a role or a human clears them.
 //!
 //! # The draw's query
 //!
 //! [`StepCooldowns`] is the pure answer to "is `(item, step)` cooling down at
-//! time T?". The registry builds one per tick from this ledger plus the peers'
-//! broadcasts; the cutover adds the forge ladder's due times
+//! time T?". The registry builds one per tick from this ledger; the cutover adds the forge ladder's due times
 //! ([`super::reeval_ladder::due`], which reads a marker from the pre-#12513
 //! ladder as due now); the draw reads it as part of `actionable`
 //! (`item_draw::WeighContext::cooldowns`).
@@ -169,6 +163,11 @@ pub const CHAMPION_LINE_PREFIX: &str = "CHAMPION-STEP";
 /// The reason a step's outcome carries when nothing said one: a missing
 /// outcome line on an unchanged item, or a verdict the forge does not show.
 pub const UNCLASSIFIED: &str = "unclassified";
+
+/// The reason of a step whose seat refused preparation over a dirty leftover
+/// worktree (#14458). Synthesized from the step's log, like the spawn-time
+/// refusals; the text names it so the failure is not `unclassified`.
+pub const SEAT_DIRTY: &str = crate::tokens_pool::private_workspace::SEAT_DIRTY_REASON;
 
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
@@ -265,11 +264,33 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
     Some(StepOutcome::new(class, &outcome.replace('-', "_")))
 }
 
-/// `key=value` fields of one outcome line.
+/// `key=value` fields of one outcome line. The value is
+/// [`token_value`]`(`v`)`: framing characters a runtime wraps the line in end
+/// the value instead of riding in it.
 fn fields(rest: &str) -> BTreeMap<&str, &str> {
     rest.split_whitespace()
-        .filter_map(|kv| kv.split_once('='))
+        .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k, token_value(v))))
         .collect()
+}
+
+/// A framing-tolerant `key=value` value: the token's first run of value
+/// characters (`A-Za-z0-9_-`, the union of every field's own shape). The
+/// three observed framings of an outcome line (#14168) — bare, backticked,
+/// inside a JSON text event — all leave the value's characters intact and
+/// glue framing onto it (`` `verdict` ``, `verdict"}`, `pr_opened\n"}` as a
+/// literal JSON escape); the run ends at the first character that cannot be
+/// part of a value, whatever the wrapper added. Shared by both outcome-line
+/// parsers (`step_spawn::capture` and this module) so they cannot diverge.
+#[must_use]
+pub fn token_value(token: &str) -> &str {
+    fn is_value_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+    }
+    let rest = token.trim_start_matches(|c| !is_value_char(c));
+    match rest.find(|c| !is_value_char(c)) {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
 }
 
 /// The outcome a step session reported for `(target, step)`: the **last**
@@ -277,6 +298,10 @@ fn fields(rest: &str) -> BTreeMap<&str, &str> {
 /// `output` that names this role and target. A line for another role, mode or
 /// target, an unknown class or Champion word, is not this step's. A
 /// `LOOM_STEP_OUTCOME` line without `reason=` reads as [`UNCLASSIFIED`].
+/// The prefix may sit anywhere in the line — a runtime that wraps the
+/// session's output in a JSON text event glues it there (#14168) — and the
+/// role / mode / target / class checks still decide whether a match is this
+/// step's.
 ///
 /// Advisory only: [`classify`] decides with the forge post-state.
 #[must_use]
@@ -284,15 +309,16 @@ pub fn parse_outcome_line(output: &str, step: StepRole, target: u32) -> Option<S
     let champion = step.role_name() == "champion";
     output.lines().rev().find_map(|line| {
         let line = line.trim();
+        let rest = |prefix: &str| line.find(prefix).map(|at| &line[at + prefix.len()..]);
         if champion {
-            let f = fields(line.strip_prefix(CHAMPION_LINE_PREFIX)?);
+            let f = fields(rest(CHAMPION_LINE_PREFIX)?);
             let want_mode = if step.acts_on_pr() { "pr" } else { "issue" };
             if f.get("mode") != Some(&want_mode) || f.get("item")?.parse::<u32>().ok()? != target {
                 return None;
             }
             champion_outcome(step.acts_on_pr(), f.get("outcome")?)
         } else {
-            let f = fields(line.strip_prefix(OUTCOME_LINE_PREFIX)?);
+            let f = fields(rest(OUTCOME_LINE_PREFIX)?);
             if f.get("role") != Some(&step.role_name())
                 || f.get("target")?.parse::<u32>().ok()? != target
             {

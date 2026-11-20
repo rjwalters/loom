@@ -501,22 +501,29 @@ fn read_monitor_credentials(
 /// re-importing overwrites in place instead of creating a parallel file.
 /// Every other provider's entry gets a `-<provider>` suffix.
 ///
-/// Includes **every** credential regardless of provider — the caller
-/// (`import_from_monitor`) is responsible for splitting this into the subset
-/// that gets materialized (`claude`) and the subset that is only recorded
-/// (design D4).
-fn credentials_to_accounts(creds: &[MonitorCredential]) -> Vec<Account> {
+/// Skip explicitly excluded Claude accounts before making a materialization
+/// or manifest row. The caller still splits the selected accounts by
+/// provider, so non-Claude rows remain recorded without writing tokens.
+fn credentials_to_accounts(creds: &[MonitorCredential], exclude_names: &[String]) -> Vec<Account> {
     creds
         .iter()
         .enumerate()
-        .map(|(i, c)| Account {
-            email: c.email.clone(),
-            key: c.token.clone(),
-            file: derive_provider_filename(&c.email, c.provider),
-            source: SOURCE_MONITOR_DB.to_string(),
-            index: (i + 1) as u32,
-            provider: c.provider,
-            upstream_id: Some(c.upstream_id.clone()),
+        .filter_map(|(i, c)| {
+            let file = derive_provider_filename(&c.email, c.provider);
+            if c.provider == AccountProvider::Claude
+                && exclude_names.contains(&name_from_file(&file))
+            {
+                return None;
+            }
+            Some(Account {
+                email: c.email.clone(),
+                key: c.token.clone(),
+                file,
+                source: SOURCE_MONITOR_DB.to_string(),
+                index: (i + 1) as u32,
+                provider: c.provider,
+                upstream_id: Some(c.upstream_id.clone()),
+            })
         })
         .collect()
 }
@@ -600,6 +607,8 @@ pub struct ImportOptions<'a> {
     pub dry_run: bool,
     /// Delete `*.token` files for accounts the store no longer reports active.
     pub prune: bool,
+    /// Exact Claude pool names to skip and preserve through prune.
+    pub exclude_names: &'a [String],
 }
 
 /// Strip a trailing `.token` suffix to derive a logical account name.
@@ -636,11 +645,7 @@ pub fn import_from_monitor(
     };
 
     let creds = read_monitor_credentials(&resolved_db, &mut result.warnings)?;
-    // Every credential regardless of provider — see the doc comment on
-    // `credentials_to_accounts` for why the split happens here, not there.
-    let accounts = credentials_to_accounts(&creds);
-
-    if accounts.is_empty() {
+    if creds.is_empty() {
         result.warnings.push(format!(
             "No active credentials in {}; nothing to import. Check that claude-monitor has \
              accounts configured.",
@@ -648,6 +653,8 @@ pub fn import_from_monitor(
         ));
         return Ok(result);
     }
+
+    let accounts = credentials_to_accounts(&creds, opts.exclude_names);
 
     // Two entries deriving the same filename would otherwise clobber each
     // other (or, for a recorded-not-materialized row, collide on the manifest
@@ -733,7 +740,14 @@ pub fn import_from_monitor(
         // Only materialized (claude) filenames are ever written; a
         // recorded-only row's derived name never has a matching `.token` file
         // to keep or prune either way.
-        let keep: BTreeSet<String> = materialize_targets.iter().map(|a| a.file.clone()).collect();
+        let mut keep: BTreeSet<String> =
+            materialize_targets.iter().map(|a| a.file.clone()).collect();
+        // The operator owns removal of exclusions, even when their monitor rows are absent.
+        keep.extend(
+            opts.exclude_names
+                .iter()
+                .map(|name| format!("{name}.token")),
+        );
         result.pruned =
             prune_stale_tokens(opts.tokens_dir, &keep, opts.dry_run, &mut result.warnings);
     }
@@ -1128,6 +1142,7 @@ mod tests {
             force: false,
             dry_run: false,
             prune: false,
+            exclude_names: &[],
         }
     }
 
@@ -1167,6 +1182,139 @@ mod tests {
         let result = import_from_monitor(&opts).unwrap();
         assert_eq!(result.written, vec!["a-x.token"]);
         assert!(!pool.exists());
+    }
+
+    #[test]
+    fn import_excludes_exact_derived_claude_names_without_filtering_other_providers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db_with_provider(
+            &db,
+            &[
+                (
+                    "one",
+                    "sk-ant-oat01-mock-excluded-one",
+                    Some("S.k-ip@GROUP.invalid"),
+                    Some("anthropic"),
+                    1,
+                ),
+                (
+                    "two",
+                    "sk-ant-oat01-mock-excluded-two",
+                    Some("other@group.invalid"),
+                    Some("anthropic"),
+                    1,
+                ),
+                (
+                    "work",
+                    "sk-ant-oat01-mock-work",
+                    Some("skip@groups.invalid"),
+                    Some("anthropic"),
+                    1,
+                ),
+                ("codex", "mock-codex-credential", Some("skip@group.invalid"), Some("openai"), 1),
+            ],
+        );
+        let pool = tmp.path().join("tokens");
+        let exclusions = ["skip-group", "other-group", "skip-group-codex"].map(str::to_owned);
+        let mut opts = import_opts(&pool, &db);
+        opts.exclude_names = &exclusions;
+        opts.dry_run = true;
+        let plan = import_from_monitor(&opts).unwrap();
+        assert_eq!(plan.written, ["skip-groups.token"]);
+        assert_eq!(plan.effective.len(), 1);
+        assert_eq!(plan.effective[0].name, "skip-groups");
+        assert!(!pool.exists());
+
+        opts.dry_run = false;
+        let applied = import_from_monitor(&opts).unwrap();
+        assert_eq!(applied.written, plan.written);
+        assert_eq!(applied.effective, plan.effective);
+        let manifest = fs::read_to_string(pool.join("index.json")).unwrap();
+        let index: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let rows = index["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "skip-groups");
+        assert_eq!(rows[0]["provider"], "claude");
+        assert_eq!(rows[1]["name"], "skip-group-codex");
+        assert_eq!(rows[1]["provider"], "codex");
+        assert_eq!(rows[1]["materialized"], false);
+        assert!(rows[1]["file"].is_null());
+        assert!(!manifest.contains("mock-excluded"));
+        assert!(!manifest.contains("mock-codex-credential"));
+        for excluded in exclusions {
+            assert!(!pool.join(format!("{excluded}.token")).exists());
+        }
+    }
+
+    #[test]
+    fn import_force_and_prune_leave_excluded_tokens_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("usage.db");
+        seed_usage_db(
+            &db,
+            &[
+                (
+                    "skip@group.invalid",
+                    "sk-ant-oat01-mock-excluded-new",
+                    Some("skip@group.invalid"),
+                    1,
+                ),
+                (
+                    "work@group.invalid",
+                    "sk-ant-oat01-mock-work-new",
+                    Some("work@group.invalid"),
+                    1,
+                ),
+            ],
+        );
+        let pool = tmp.path().join("tokens");
+        fs::create_dir(&pool).unwrap();
+        let existing = [
+            ("skip-group.token", "mock-personal-old"),
+            ("missing-group.token", "mock-personal-absent-from-monitor"),
+            ("work-group.token", "mock-work-old"),
+            ("stale-group.token", "mock-unrelated-stale"),
+            ("index.json", "old index sentinel"),
+        ];
+        for (name, contents) in existing {
+            fs::write(pool.join(name), contents).unwrap();
+        }
+        let exclusions = ["skip-group", "missing-group"].map(str::to_owned);
+        let mut opts = import_opts(&pool, &db);
+        opts.exclude_names = &exclusions;
+        opts.force = true;
+        opts.prune = true;
+        opts.dry_run = true;
+        let plan = import_from_monitor(&opts).unwrap();
+        assert_eq!(plan.written, ["work-group.token"]);
+        assert_eq!(plan.pruned, ["stale-group.token"]);
+        assert_eq!(plan.effective.len(), 1);
+        assert_eq!(plan.effective[0].name, "work-group");
+        for (name, contents) in existing {
+            assert_eq!(fs::read_to_string(pool.join(name)).unwrap(), contents);
+        }
+        assert_eq!(fs::read_dir(&pool).unwrap().count(), existing.len());
+
+        opts.dry_run = false;
+        let applied = import_from_monitor(&opts).unwrap();
+        assert_eq!(applied.written, plan.written);
+        assert_eq!(applied.pruned, plan.pruned);
+        assert_eq!(applied.effective, plan.effective);
+        for (name, contents) in &existing[..2] {
+            assert_eq!(fs::read_to_string(pool.join(name)).unwrap(), *contents);
+        }
+        assert_eq!(
+            fs::read_to_string(pool.join("work-group.token")).unwrap(),
+            "sk-ant-oat01-mock-work-new"
+        );
+        assert!(!pool.join("stale-group.token").exists());
+        let manifest = fs::read_to_string(pool.join("index.json")).unwrap();
+        let index: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let rows = index["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "work-group");
+        assert!(!manifest.contains("mock-excluded"));
     }
 
     #[test]

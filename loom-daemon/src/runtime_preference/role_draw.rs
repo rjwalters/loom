@@ -37,9 +37,13 @@
 //!   draws from the next attempt's table ([`attempts`]). A success resets to
 //!   attempt 1. Attempt `N` uses the highest configured attempt `<= N`.
 //! - No content validation: any mix is allowed. A table that is empty after
-//!   exclusions is a non-blocking **warning** (logged, shown by `loom-daemon
-//!   roles draw --explain`); the stage then has nothing to run on and its tick
-//!   is a pre-spawn skip, exactly like a wholly unavailable preference list.
+//!   exclusions does not stall the tick: the draw falls through to the next
+//!   configured attempt's table and the first non-empty one decides (#11782,
+//!   see [`DrawConfig::effective_for`]). `loom-daemon roles draw --explain`
+//!   flags every configured empty table with a non-blocking **warning**. Only
+//!   when every remaining table is empty is the stage's tick a pre-spawn skip,
+//!   exactly like a wholly unavailable preference list; that is the case that
+//!   also logs the daemon-log warning.
 //! - Malformed entries are skipped with a warning, never fatal — an older or
 //!   newer shape must not stop a daemon.
 //! - When a role has **no** `roleDraw` table for the attempt, nothing here
