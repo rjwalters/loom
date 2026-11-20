@@ -1636,6 +1636,7 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
         let fresh = repository::prepare(&f.root, &f.args).unwrap();
         assert!(fresh.reaped.is_empty(), "a no-reap preparation reports none");
         let worktree = linked_worktree(&f, "finished");
+        let expected_path = worktree.canonicalize().unwrap().display().to_string();
         for text in ["first", "second"] {
             std::fs::write(worktree.join("fixture"), text).unwrap();
             git(&worktree, &["commit", "-am", text]);
@@ -1669,11 +1670,7 @@ fn preparation_reaps_published_finished_prs_independent_of_merge_method() {
         };
         let outcome = repository::prepare_with_pr_lookup(&f.root, &f.args, &evidence).unwrap();
         assert!(!worktree.exists(), "{state} leftover removed");
-        assert_eq!(
-            outcome.reaped,
-            vec![worktree.display().to_string()],
-            "{state} reaped worktree is reported"
-        );
+        assert_eq!(outcome.reaped, vec![expected_path], "{state} reaped worktree is reported");
         assert_eq!(git(&repo, &["rev-parse", "refs/heads/finished"]), tip);
         assert_eq!(git(&f.remote, &["rev-parse", "refs/heads/finished"]), tip);
     }
