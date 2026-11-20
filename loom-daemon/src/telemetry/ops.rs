@@ -153,6 +153,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
+    // #14738: one actual workspace-resync release tag lookup.
+    "loom.workspace_resync.verify.host",
+    "loom.workspace_resync.verify.attempt",
+    "loom.workspace_resync.verify.outcome",
+    "loom.workspace_resync.verify.why",
+    "loom.workspace_resync.verify.retry_at",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
     // #12310: what a `invoke github` span was for, and why a discovery read
