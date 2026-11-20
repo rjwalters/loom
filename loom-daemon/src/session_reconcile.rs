@@ -132,7 +132,7 @@ use crate::tokens_pool::account_registry::{
     account_inventory_quiet, AccountDescriptor, AccountProvider,
 };
 use crate::tokens_pool::docker_cli::DockerTimedOut;
-use crate::tokens_pool::private_workspace;
+use crate::tokens_pool::private_workspace::{self, BindingReadiness};
 use crate::tokens_pool::session_hold::{self, LastStart, OperatorHeld};
 use crate::tokens_pool::session_image::SessionImageConfig;
 use crate::tokens_pool::session_lifecycle::{
@@ -1133,6 +1133,12 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
         .into_iter()
         .filter(|(root, _)| acting.contains(root))
         .collect();
+    let acting_inventory_complete = readable
+        && acting.iter().all(|root| {
+            acting_inventories
+                .iter()
+                .any(|(observed, _)| observed == root)
+        });
     let inventories = acting_inventories.iter().cloned();
     // One container read for the whole pass (every root), taken lazily,
     // classified with the shared drift definition (#10600).
@@ -1222,7 +1228,22 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
             all.extend(outcomes);
         }
     }
-    converge_bindings(fallback_root, &index, &acting_inventories, state, now);
+    let mut take_after = read;
+    let mut after = PassSnapshot::new(&mut take_after);
+    let mut seat_ready =
+        |account: &AccountDescriptor, seat: &private_workspace::ConfiguredSeatMissing| {
+            let snapshot = binding_snapshot(&account.id.name, &all, &mut observe, &mut after);
+            seat.observe(account, snapshot)
+        };
+    converge_bindings(
+        fallback_root,
+        &index,
+        &acting_inventories,
+        acting_inventory_complete,
+        &mut seat_ready,
+        state,
+        now,
+    );
     if all.iter().any(|o| o.outcome.started()) {
         // Selection reads the published snapshot: show it the start now.
         let started = std::time::Instant::now();
@@ -1232,6 +1253,44 @@ pub fn run_tick(fallback_root: &Path, state: &mut ReconcileState, now: u64) -> V
     all
 }
 
+/// A lifecycle action may have changed this seat since the original snapshot.
+/// Refresh at most once, only when an affected binding needs the newer view.
+fn binding_snapshot<'a>(
+    account: &str,
+    outcomes: &[AccountOutcome],
+    before: &'a mut PassSnapshot<'_>,
+    after: &'a mut PassSnapshot<'_>,
+) -> &'a Snapshot {
+    if outcomes.iter().any(|item| {
+        item.name == account
+            && (item.outcome.started()
+                || matches!(item.outcome, Outcome::DriftRemoved { .. } | Outcome::Failed { .. }))
+    }) {
+        after.get()
+    } else {
+        before.get()
+    }
+}
+
+/// The first acting root and Codex account matching a declaration's name or
+/// email. The same decision drives readiness, convergence and drift.
+fn binding_account<'a>(
+    inventories: &'a [(PathBuf, Vec<AccountDescriptor>)],
+    reference: &str,
+) -> Option<(&'a Path, &'a AccountDescriptor)> {
+    inventories.iter().find_map(|(root, inventory)| {
+        inventory
+            .iter()
+            .find(|account| {
+                account.id.provider == AccountProvider::Codex
+                    && crate::tokens_pool::account_registry::account_matches_reference(
+                        account, reference,
+                    )
+            })
+            .map(|account| (root.as_path(), account))
+    })
+}
+
 /// Make the declared private-clone bindings true ([`bindings`], #14111), after
 /// every account's own recovery so a dead container is restored first. Costs a
 /// config read when nothing is declared; skipped while Docker is backing off.
@@ -1239,6 +1298,11 @@ fn converge_bindings(
     fallback_root: &Path,
     index: &AccountIndex,
     inventories: &[(PathBuf, Vec<AccountDescriptor>)],
+    inventory_complete: bool,
+    seat_ready: &mut dyn FnMut(
+        &AccountDescriptor,
+        &private_workspace::ConfiguredSeatMissing,
+    ) -> BindingReadiness,
     state: &mut ReconcileState,
     now: u64,
 ) -> bindings::Pass {
@@ -1249,24 +1313,9 @@ fn converge_bindings(
     if state.docker_retry_at > now {
         return bindings::Pass::default();
     }
-    // The first acting root whose inventory lists the account (accounts are
-    // host-global; a machine-tier binding reaches every root).
-    let root_of = |account: &str| {
-        inventories
-            .iter()
-            .find(|(_, inventory)| {
-                inventory.iter().any(|a| {
-                    a.id.provider == AccountProvider::Codex
-                        && crate::tokens_pool::account_registry::account_matches_reference(
-                            a, account,
-                        )
-                })
-            })
-            .map(|(root, _)| root.as_path())
-    };
     let converge = |binding: &bindings::Binding, hold: &dyn Fn() -> anyhow::Result<()>| {
-        let root = root_of(&binding.account)
-            .ok_or_else(|| anyhow::anyhow!("Codex account not found in any registered root"))?;
+        let (root, _) = binding_account(inventories, &binding.account)
+            .ok_or(private_workspace::AccountAbsent::ActingRoots)?;
         private_workspace::converge(
             root,
             &binding.account,
@@ -1276,14 +1325,31 @@ fn converge_bindings(
         )
     };
     let registered = |account: &str| {
-        root_of(account)
-            .map_or(Ok(None), |root| private_workspace::registered_repositories(root, account))
+        binding_account(inventories, account)
+            .map_or(Ok(None), |(root, _)| private_workspace::registered_repositories(root, account))
+    };
+    let mut observed = HashMap::new();
+    let mut ready = |reference: &str, wait: &bindings::WaitReason| {
+        let Some((_, account)) = binding_account(inventories, reference) else {
+            return if inventory_complete {
+                BindingReadiness::Missing
+            } else {
+                BindingReadiness::Unverified
+            };
+        };
+        match wait {
+            bindings::WaitReason::AccountAbsent => BindingReadiness::Ready,
+            bindings::WaitReason::ConfiguredSeatMissing(seat) => *observed
+                .entry((&account.id.name, &account.credential_reference, seat.clone()))
+                .or_insert_with(|| seat_ready(account, seat)),
+        }
     };
     bindings::converge_pass(
         &declared,
-        &bindings::Inputs {
+        &mut bindings::Inputs {
             index,
             converge: &converge,
+            ready: &mut ready,
             registered: &registered,
         },
         state,

@@ -59,7 +59,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{backoff_secs, AccountIndex, ReconcileState};
-use crate::tokens_pool::private_workspace::{self, AccountBusy, Converged};
+use crate::tokens_pool::private_workspace::{
+    self, AccountAbsent, AccountBusy, BindingReadiness, ConfiguredSeatMissing, Converged,
+};
 use crate::tokens_pool::session_hold::OperatorHeld;
 
 /// Dotted config path of the declaration.
@@ -304,12 +306,54 @@ struct Memory {
     failures: u32,
     retry_at: u64,
     last_error: Option<String>,
+    waiting: Option<WaitReason>,
+    positive_consumed: bool,
+}
+
+impl Memory {
+    fn observe(&mut self, readiness: BindingReadiness) -> bool {
+        match readiness {
+            BindingReadiness::Ready => !std::mem::replace(&mut self.positive_consumed, true),
+            BindingReadiness::Missing => {
+                self.positive_consumed = false;
+                false
+            }
+            BindingReadiness::Unverified => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WaitReason {
+    AccountAbsent,
+    ConfiguredSeatMissing(ConfiguredSeatMissing),
+}
+
+impl WaitReason {
+    fn from_error(error: &anyhow::Error) -> Option<Self> {
+        if error.is::<AccountAbsent>() {
+            Some(Self::AccountAbsent)
+        } else {
+            error
+                .downcast_ref::<ConfiguredSeatMissing>()
+                .cloned()
+                .map(Self::ConfiguredSeatMissing)
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::AccountAbsent => "account_absent",
+            Self::ConfiguredSeatMissing(_) => "configured_seat_missing",
+        }
+    }
 }
 
 /// Carried across passes: backoff, and what was already WARNed about.
 #[derive(Debug, Default)]
 pub struct State {
     memory: HashMap<(String, String), Memory>,
+    skip_logged_until: HashMap<String, u64>,
     invalid_reported: HashSet<String>,
     drift_reported: HashMap<String, Vec<String>>,
 }
@@ -324,6 +368,8 @@ pub struct Inputs<'a> {
     /// [`private_workspace::converge`].
     pub converge:
         &'a dyn Fn(&Binding, &dyn Fn() -> anyhow::Result<()>) -> anyhow::Result<Converged>,
+    /// Observe the previously missing prerequisite in this pass.
+    pub(super) ready: &'a mut dyn FnMut(&str, &WaitReason) -> BindingReadiness,
     /// `(url, key)` of every repository the account's workspace holds; `None`:
     /// not in private-clone mode.
     pub registered: &'a dyn Fn(&str) -> anyhow::Result<Option<Vec<(String, String)>>>,
@@ -333,7 +379,7 @@ pub struct Inputs<'a> {
 /// never deletes anything.
 pub fn converge_pass(
     declared: &Declared,
-    inputs: &Inputs<'_>,
+    inputs: &mut Inputs<'_>,
     state: &mut ReconcileState,
     now: u64,
 ) -> Pass {
@@ -345,76 +391,42 @@ pub fn converge_pass(
         }
     }
     let index = inputs.index;
+    let mut skipped = HashMap::new();
     for binding in &declared.bindings {
         let account = binding.account.as_str();
         let outcome = if index.is_disabled(account) {
             Outcome::Skipped("account disabled")
         } else if index.is_held(account) {
             Outcome::Skipped("held (operator stop)")
-        } else if let Some(retry_at) = st
-            .memory
-            .get(&(binding.account.clone(), binding.key.clone()))
-            .map(|m| m.retry_at)
-            .filter(|&at| at > now)
-        {
-            Outcome::BackingOff { retry_at }
         } else {
-            let hold = || -> anyhow::Result<()> {
-                if index.is_held(account) {
-                    Err(OperatorHeld.into())
-                } else {
-                    Ok(())
-                }
-            };
             let mem = st
                 .memory
                 .entry((binding.account.clone(), binding.key.clone()))
                 .or_default();
-            match (inputs.converge)(binding, &hold) {
-                Ok(done) => {
-                    if mem.failures > 0 {
-                        log::info!(
-                            "session_reconcile: {KEY}.{account}: {} converged after failures",
-                            binding.repository
-                        );
-                    }
-                    *mem = Memory::default();
-                    if done == Converged::Registered {
-                        log::info!(
-                            "session_reconcile: {KEY}.{account}: registered {} (base {})",
-                            binding.repository,
-                            binding.base
-                        );
-                        Outcome::Registered
-                    } else {
-                        Outcome::Present
-                    }
+            let in_backoff = mem.retry_at > now;
+            let retry_early = in_backoff && {
+                let readiness = mem
+                    .waiting
+                    .as_ref()
+                    .map(|wait| (inputs.ready)(account, wait));
+                readiness.is_some_and(|readiness| mem.observe(readiness))
+            };
+            if in_backoff && !retry_early {
+                let wait = mem
+                    .waiting
+                    .as_ref()
+                    .map_or("binding_failure", WaitReason::label);
+                let skip = skipped
+                    .entry(index.canonical(account))
+                    .or_insert((mem.retry_at, wait));
+                if mem.retry_at > skip.0 {
+                    *skip = (mem.retry_at, wait);
                 }
-                Err(error) if error.downcast_ref::<OperatorHeld>().is_some() => {
-                    Outcome::Skipped("held (operator stop)")
+                Outcome::BackingOff {
+                    retry_at: mem.retry_at,
                 }
-                Err(error) if error.downcast_ref::<AccountBusy>().is_some() => {
-                    log::debug!(
-                        "session_reconcile: {KEY}.{account}: busy; will register {} on a later pass",
-                        binding.repository
-                    );
-                    Outcome::Deferred
-                }
-                Err(error) => {
-                    let message = format!("{KEY}.{account} ({}): {error:#}", binding.repository);
-                    mem.failures += 1;
-                    mem.retry_at = now + backoff_secs(mem.failures);
-                    if mem.last_error.as_deref() == Some(message.as_str()) {
-                        log::debug!("session_reconcile: {message}");
-                    } else {
-                        log::warn!(
-                            "session_reconcile: {message}; retrying in {}s",
-                            backoff_secs(mem.failures)
-                        );
-                    }
-                    mem.last_error = Some(message.clone());
-                    Outcome::Failed { error: message }
-                }
+            } else {
+                attempt(binding, inputs, mem, now, in_backoff)
             }
         };
         pass.reports.push(Report {
@@ -423,8 +435,91 @@ pub fn converge_pass(
             outcome,
         });
     }
+    st.skip_logged_until.retain(|_, until| *until > now);
+    for (account, (retry_at, wait)) in skipped {
+        if !st.skip_logged_until.contains_key(account) {
+            log::info!(
+                "session_reconcile: {KEY}.{account}: skipping binding retry ({wait}); {}s remaining",
+                retry_at - now
+            );
+            st.skip_logged_until.insert(account.to_owned(), retry_at);
+        }
+    }
     report_drift(declared, inputs, st, &mut pass);
     pass
+}
+
+fn attempt(
+    binding: &Binding,
+    inputs: &Inputs<'_>,
+    mem: &mut Memory,
+    now: u64,
+    early: bool,
+) -> Outcome {
+    let account = binding.account.as_str();
+    let hold = || -> anyhow::Result<()> {
+        if inputs.index.is_held(account) {
+            Err(OperatorHeld.into())
+        } else {
+            Ok(())
+        }
+    };
+    match (inputs.converge)(binding, &hold) {
+        Ok(done) => {
+            if mem.failures > 0 {
+                log::info!(
+                    "session_reconcile: {KEY}.{account}: {} converged after failures",
+                    binding.repository
+                );
+            }
+            *mem = Memory::default();
+            if done == Converged::Registered {
+                log::info!(
+                    "session_reconcile: {KEY}.{account}: registered {} (base {})",
+                    binding.repository,
+                    binding.base
+                );
+                Outcome::Registered
+            } else {
+                Outcome::Present
+            }
+        }
+        Err(error) if error.is::<OperatorHeld>() => Outcome::Skipped("held (operator stop)"),
+        Err(error) if error.is::<AccountBusy>() => {
+            // The missing prerequisite is now present. Let normal busy
+            // deferral decide when registration can continue.
+            mem.waiting = None;
+            mem.retry_at = 0;
+            mem.positive_consumed = false;
+            log::debug!(
+                "session_reconcile: {KEY}.{account}: busy; will register {} on a later pass",
+                binding.repository
+            );
+            Outcome::Deferred
+        }
+        Err(error) => {
+            let message = format!("{KEY}.{account} ({}): {error:#}", binding.repository);
+            let waiting = WaitReason::from_error(&error);
+            // The prerequisite can disappear between the observation and
+            // convergence. Keep the original interval if it is still missing.
+            if !early || waiting != mem.waiting {
+                mem.failures += 1;
+                mem.retry_at = now + backoff_secs(mem.failures);
+                mem.waiting = waiting;
+                mem.positive_consumed = false;
+            }
+            if mem.last_error.as_deref() == Some(message.as_str()) {
+                log::debug!("session_reconcile: {message}");
+            } else {
+                log::warn!(
+                    "session_reconcile: {message}; retrying in {}s",
+                    mem.retry_at.saturating_sub(now)
+                );
+            }
+            mem.last_error = Some(message.clone());
+            Outcome::Failed { error: message }
+        }
+    }
 }
 
 /// Drift: repositories registered on an account that still has bindings, but

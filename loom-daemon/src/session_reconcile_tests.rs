@@ -24,6 +24,164 @@ use crate::tokens_pool::session_lifecycle::{
 };
 use crate::tokens_pool::session_state::{DriftInputs, Observed};
 
+#[test]
+fn binding_account_uses_the_first_acting_codex_root_and_email_alias() {
+    use crate::tokens_pool::account_registry::{AccountId, CredentialKind, InventoryProvenance};
+
+    let codex = |path: &str| AccountDescriptor {
+        id: AccountId {
+            provider: AccountProvider::Codex,
+            name: "alice".into(),
+        },
+        credential_kind: CredentialKind::CodexHome,
+        credential_reference: path.into(),
+        enabled: true,
+        provenance: InventoryProvenance::Repo,
+        email: Some("Alice@example.test".into()),
+    };
+    let mut wrong_provider = codex("/other/provider");
+    wrong_provider.id.provider = AccountProvider::Claude;
+    let inventories = [
+        (PathBuf::from("/acting/wrong"), vec![wrong_provider]),
+        (PathBuf::from("/acting/first"), vec![codex("/profiles/first")]),
+        (PathBuf::from("/acting/other"), vec![codex("/profiles/other")]),
+    ];
+    let (root, account) = binding_account(&inventories, "ALICE@example.test").unwrap();
+    assert_eq!(root, Path::new("/acting/first"));
+    assert_eq!(account.credential_reference, Path::new("/profiles/first"));
+    assert!(binding_account(&inventories[..1], "alice").is_none());
+    assert!(binding_account(&inventories, "another@example.test").is_none());
+    assert!(binding_account(&[], "alice").is_none());
+}
+
+#[test]
+fn a_binding_needs_a_current_running_observation_of_the_recorded_private_seat() {
+    use crate::tokens_pool::account_registry::{AccountId, CredentialKind, InventoryProvenance};
+    use private_workspace::bundle::{control_destination, PROFILE_CONTROLS};
+    use serde_json::json;
+    use std::cell::Cell;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_dir = dir.path().join("alice");
+    std::fs::create_dir(&profile_dir).unwrap();
+    let account = AccountDescriptor {
+        id: AccountId {
+            provider: AccountProvider::Codex,
+            name: "alice".into(),
+        },
+        credential_kind: CredentialKind::CodexHome,
+        credential_reference: profile_dir.canonicalize().unwrap(),
+        enabled: true,
+        provenance: InventoryProvenance::Repo,
+        email: None,
+    };
+    let config = private_workspace::Config {
+        schema_version: 1,
+        account: account.id.name.clone(),
+        container: container_name(&account.id.name),
+        engine: "engine".into(),
+        docker_desktop: false,
+        repository: "https://github.com/example/primary".into(),
+        base: "main".into(),
+        repositories: Vec::new(),
+        volume: "private-volume".into(),
+        profile: account.credential_reference.clone(),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+    };
+    let state = dir.path().join(".private-sessions/alice");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("workspace.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let waiting = private_workspace::ConfiguredSeatMissing::of(&config);
+    let mut inspect = json!({
+        "State": {"Running": true, "Restarting": false},
+        "Config": {
+            "Labels": {"loom.workspace-mode":"private-clone", "loom.account":config.account,
+                       "loom.repository":config.repository, "loom.workspace":"/workspace/repo"},
+            "User":"1000:1000", "Entrypoint":["/usr/bin/tini"], "Cmd":["--","/bin/sleep","infinity"]
+        },
+        "HostConfig": {"Privileged":false,"ReadonlyRootfs":true,"CapDrop":["ALL"],
+                       "SecurityOpt":["no-new-privileges"]},
+        "Mounts":[{"Destination":"/workspace","Type":"volume","Name":config.volume,"RW":true},
+                  {"Destination":"/home/loom/.codex-profile","Type":"bind","Source":config.profile,"RW":true}]
+    });
+    for control in PROFILE_CONTROLS {
+        inspect["Mounts"].as_array_mut().unwrap().push(json!({
+            "Destination": control_destination(control), "Type": "bind",
+            "Source": config.profile.join(control), "RW": false
+        }));
+    }
+    let snapshot = |inspect| {
+        Snapshot::Available(BTreeMap::from([(
+            config.container.clone(),
+            Observed::of(inspect, &DriftInputs::new(None)),
+        )]))
+    };
+    assert_eq!(waiting.observe(&account, &snapshot(inspect.clone())), BindingReadiness::Ready);
+    for (field, label) in [
+        ("loom.account", "other"),
+        ("loom.workspace-mode", "host-mounted"),
+    ] {
+        let mut other = inspect.clone();
+        other["Config"]["Labels"][field] = label.into();
+        assert_eq!(waiting.observe(&account, &snapshot(other)), BindingReadiness::Unverified);
+    }
+    let mut restarting = inspect.clone();
+    restarting["State"]["Restarting"] = true.into();
+    assert_eq!(waiting.observe(&account, &snapshot(restarting)), BindingReadiness::Missing);
+    let counts = (Cell::new(0), Cell::new(0));
+    let mut original = || {
+        counts.0.set(counts.0.get() + 1);
+        Snapshot::Available(BTreeMap::new())
+    };
+    let mut refreshed = || {
+        counts.1.set(counts.1.get() + 1);
+        snapshot(inspect.clone())
+    };
+    let mut original = PassSnapshot::new(&mut original);
+    let mut refreshed = PassSnapshot::new(&mut refreshed);
+    let recovered = [AccountOutcome {
+        name: account.id.name.clone(),
+        container: config.container.clone(),
+        outcome: Outcome::PrivateRecovered,
+    }];
+    assert_eq!(
+        waiting.observe(
+            &account,
+            binding_snapshot("other", &recovered, &mut original, &mut refreshed)
+        ),
+        BindingReadiness::Missing,
+    );
+    assert_eq!((counts.0.get(), counts.1.get()), (1, 0));
+    for _ in 0..2 {
+        assert_eq!(
+            waiting.observe(
+                &account,
+                binding_snapshot("alice", &recovered, &mut original, &mut refreshed)
+            ),
+            BindingReadiness::Ready,
+        );
+    }
+    assert_eq!((counts.0.get(), counts.1.get()), (1, 1));
+
+    let mut stale = || snapshot(inspect.clone());
+    let mut unreadable = || Snapshot::Unavailable("fixture".into());
+    let chosen = binding_snapshot(
+        "alice",
+        &recovered,
+        &mut PassSnapshot::new(&mut stale),
+        &mut PassSnapshot::new(&mut unreadable),
+    )
+    .clone();
+    assert_eq!(waiting.observe(&account, &chosen), BindingReadiness::Unverified);
+
+    let mut replaced = config.clone();
+    replaced.engine = "other-engine".into();
+    std::fs::write(state.join("workspace.json"), serde_json::to_vec(&replaced).unwrap()).unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(inspect)), BindingReadiness::Unverified);
+}
+
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
 #[path = "session_reconcile_hold_tests.rs"]

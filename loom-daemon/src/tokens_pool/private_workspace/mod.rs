@@ -26,6 +26,7 @@ mod volume_usage;
 mod worker_setup;
 
 pub use lease::AccountBusy;
+pub(crate) use lifecycle::ConfiguredSeatMissing;
 pub use lifecycle::{
     check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
     run_job, session_recover, start, status, stop, Converged,
@@ -435,12 +436,38 @@ pub struct RebindReport {
     pub after: CloneState,
 }
 
+/// A Codex account not found in the inventories used for convergence.
+#[derive(Debug)]
+pub(crate) enum AccountAbsent {
+    ActingRoots,
+    SelectedRoot,
+}
+
+impl std::fmt::Display for AccountAbsent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ActingRoots => "Codex account not found in any registered root",
+            Self::SelectedRoot => "Codex account not found",
+        })
+    }
+}
+
+impl std::error::Error for AccountAbsent {}
+
+/// Current evidence about the account or configured seat a binding is waiting for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingReadiness {
+    Ready,
+    Missing,
+    Unverified,
+}
+
 fn account(workspace: &Path, name: &str) -> Result<super::account_registry::AccountDescriptor> {
     use super::account_registry::{account_inventory, account_matches_reference, AccountProvider};
     account_inventory(workspace, AccountProvider::Codex)?
         .into_iter()
         .find(|a| account_matches_reference(a, name))
-        .context("Codex account not found")
+        .ok_or_else(|| AccountAbsent::SelectedRoot.into())
 }
 
 fn state_dir(profile: &Path) -> Result<PathBuf> {
