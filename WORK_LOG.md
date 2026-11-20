@@ -16,6 +16,10 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **Issue #14782** (closed): Consolidate repeated issue-dispatch requests in IPC handler tests
+- **PR #14784**: test: consolidate repeated issue DispatchSweep literals into issue_dispatch helper
+- **Issue #14775** (closed): Isolate synthetic gateway state from parallel claim-label tests
+- **PR #14779**: test: run gateway publication fixtures in child processes
 - **PR #14780**: test: remove unused isTelemetryProblem, cover misconfigured relay at the renderer
 - **Issue #14719** (closed): Remove the test-only isTelemetryProblem classifier and test the daemon_status warning directly
 - **PR #14778**: refactor(cli): share usage time-window resolution
