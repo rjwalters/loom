@@ -349,3 +349,67 @@ fn a_graphql_read_that_names_its_repo_rides_the_reader() {
     assert_eq!(asked, vec!["acme/widget".to_string()]);
     assert_eq!(s.calls(), vec![true]);
 }
+
+/// #13744: the script-helper family's routed entry points ride this exact
+/// chain. With distinguishable synthetic reader/writer profiles — the stub
+/// logs which `GH_CONFIG_DIR` each call ran under — a helper read rides the
+/// reader, an exhausted pool sheds it with **zero** invocations, a host with
+/// no pool keeps its only credential, and a helper write stays on the writer.
+#[test]
+fn the_script_helper_entry_points_ride_the_reader_chain() {
+    use crate::script_helpers::gh_route::{test_read_invocation, test_write_invocation};
+    let s = stub();
+    let read_inv = || {
+        test_read_invocation(
+            "trust.comment_listing",
+            &[
+                "api",
+                "repos/{owner}/{repo}/issues/7/comments",
+                "--paginate",
+            ],
+            s.tmp.path(),
+        )
+        .program(&s.gh)
+        .parent(ParentContext::Missing)
+    };
+    assert!(read_inv().is_reader_only());
+
+    // A reader route: the call runs under the reader directory.
+    let (done, _) =
+        s.run(read_inv(), CwdAnswer::Sole("acme/widget".to_string()), &s.reader_decision());
+    assert!(!is_shed(&done));
+    assert_eq!(s.calls(), vec![true], "the reader, never the writer");
+
+    // An exhausted pool: shed, and nothing at all is sent.
+    let (done, _) = s.run(read_inv(), CwdAnswer::Sole("acme/widget".to_string()), &exhausted());
+    assert!(is_shed(&done), "{done:?}");
+    assert_eq!(s.calls(), vec![true], "no second call: the writer is not a fallback");
+
+    // A host with no reader pool: the only credential there is.
+    let (done, _) =
+        s.run(read_inv(), CwdAnswer::Sole("acme/widget".to_string()), &RouteDecision::NoPool);
+    assert!(!is_shed(&done));
+    assert_eq!(s.calls(), vec![true, false], "then the writer: no pool");
+
+    // A helper write: an allowed writer mutation, never routed to a reader.
+    let write_inv = test_write_invocation(
+        "verdict.add_labels",
+        &[
+            "api",
+            "-X",
+            "POST",
+            "repos/acme/widget/issues/7/labels",
+            "-f",
+            "labels[]=loom:pr",
+        ],
+        s.tmp.path(),
+    )
+    .program(&s.gh)
+    .parent(ParentContext::Missing);
+    assert!(!write_inv.is_reader_only());
+    let (done, asked) =
+        s.run(write_inv, CwdAnswer::Sole("acme/widget".to_string()), &s.reader_decision());
+    assert!(!is_shed(&done));
+    assert!(asked.is_empty(), "the router is not consulted for a write");
+    assert_eq!(s.calls(), vec![true, false, false], "the writer ran the mutation");
+}
