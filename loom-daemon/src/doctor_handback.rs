@@ -279,6 +279,19 @@ pub fn lock_held_outcome(
     ))
 }
 
+/// The lock-unavailable outcome (#14617): the per-PR lock directory could not
+/// be created at all (read-only filesystem, permission denied), so no verdict
+/// holds it and waiting cannot help. Names the path and the OS error instead of
+/// reporting contention.
+#[must_use]
+pub fn lock_unavailable_outcome(pr: u64, lock: &std::path::Path, err: &std::io::Error) -> Outcome {
+    Outcome::Failed(format!(
+        "lock unavailable: cannot create the per-PR verdict lock {} for PR #{pr}: {err}; no \
+         other verdict holds it; wrote nothing (set LOOM_VERDICT_LOCK_DIR to a writable directory)",
+        lock.display()
+    ))
+}
+
 /// The watchdog's line when the verb's own overall deadline passes before the
 /// hand-back answered (#14165), so it fails inside its budget — with a name —
 /// instead of being killed by a caller's shorter wrapper.

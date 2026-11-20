@@ -95,6 +95,7 @@ pub use roles_draw_cmd::RolesCommand;
 pub use skip_labels::SkipLabelsArgs;
 pub use stale_blocked::StaleBlockedArgs;
 mod forge_verdict_cmd;
+mod forge_workflow_permissions;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
@@ -122,6 +123,7 @@ pub use legacy_script_cmds::{
     handle_checkpoint_command, handle_resolve_model_command, handle_resolve_role_model_command,
     handle_strip_ansi_command, ResolveModelArgs, ResolveRoleModelArgs,
 };
+pub(crate) mod ci_docs_only;
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;

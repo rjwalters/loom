@@ -562,33 +562,67 @@ fn grant_for_another_head_is_not_a_noop() {
 }
 
 // ---- #12679: forge.mergeQueue.statusCommand replaces the writer-App gate
+// ---- #14632: ...resolved from a root verifiably of the exact target
 
 mod status_command_route {
     use super::*;
     use crate::forge_merge_queue::gh_lifecycle::GhLifecycleForge;
     use crate::forge_merge_queue::group_authz::revoke_refail_dequeue;
+    use crate::forge_merge_queue::status_route::ROUTE_LOG_RELATIVE_PATH;
+    use crate::test_git_helpers::run as git;
 
-    /// A repo root whose config routes status posts to a recording stub that
-    /// exits `exit`. The `gh` binary is a path that cannot run, so any status
-    /// call made with the daemon's own token would fail loudly.
+    /// A real git checkout of `nwo` (origin set) whose config routes status
+    /// posts to a recording stub that exits `exit`. The `gh` binary is a path
+    /// that cannot run, so any status call made with the daemon's own token
+    /// would fail loudly.
     struct Route {
         dir: tempfile::TempDir,
         forge: GhLifecycleForge,
     }
 
+    /// The recording broker argv, logging to `dir/calls.log` and exiting
+    /// `exit` for every post and probe.
+    fn broker_argv(dir: &std::path::Path, exit: i32) -> serde_json::Value {
+        let log = dir.join("calls.log");
+        let script = format!(
+            "echo \"$@\" >> '{}'; case \"$*\" in *--dry-run*) exit {exit};; esac; exit {exit}",
+            log.display()
+        );
+        serde_json::json!(["sh", "-c", script, "stub"])
+    }
+
+    /// A real git checkout of `nwo` with an (empty) committed config.
+    fn checkout_of(nwo: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        git(
+            dir.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{nwo}.git"),
+            ],
+        );
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(dir.path().join(".loom/config.json"), "{}").unwrap();
+        dir
+    }
+
     impl Route {
         fn new(exit: i32) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let log = dir.path().join("calls.log");
-            let script = format!(
-                "echo \"$@\" >> '{}'; case \"$*\" in *--dry-run*) exit {exit};; esac; exit {exit}",
-                log.display()
-            );
-            let cfg = serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
-                ["sh", "-c", script, "stub"]}}});
-            std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
-            std::fs::write(dir.path().join(".loom/config.json"), cfg.to_string()).unwrap();
-            let forge = GhLifecycleForge::new("/nonexistent/gh", dir.path(), "o/r").unwrap();
+            let dir = checkout_of("o/r");
+            std::fs::write(
+                dir.path().join(".loom/config.json"),
+                serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
+                    broker_argv(dir.path(), exit)}}})
+                .to_string(),
+            )
+            .unwrap();
+            // Registered roots supplied explicitly: hermetic, no host registry.
+            let forge =
+                GhLifecycleForge::new_with_registered("/nonexistent/gh", dir.path(), "o/r", &[])
+                    .unwrap();
             Self { dir, forge }
         }
         fn calls(&self) -> Vec<String> {
@@ -603,10 +637,10 @@ mod status_command_route {
     fn handoff_via(
         f: &FakeForge,
         s: &MemoryGrantStore,
-        r: &Route,
+        forge: &GhLifecycleForge,
     ) -> Result<EnqueueOutcome, HandoffError> {
         f.require_head_status.set(false);
-        authorize_and_enqueue(MergeMode::Queue, true, f, s, &r.forge, &|| f.read_facts(), PR, SHA1)
+        authorize_and_enqueue(MergeMode::Queue, true, f, s, forge, &|| f.read_facts(), PR, SHA1)
     }
 
     #[test]
@@ -614,7 +648,7 @@ mod status_command_route {
         let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
         // The writer would be refused (`statuses: read`); the command gate ignores it.
         f.cannot_post.set(true);
-        assert!(matches!(handoff_via(&f, &s, &r), Ok(EnqueueOutcome::Enqueued { .. })));
+        assert!(matches!(handoff_via(&f, &s, &r.forge), Ok(EnqueueOutcome::Enqueued { .. })));
         let calls = r.calls();
         assert_eq!(calls.len(), 2, "dry-run probe, then the head success: {calls:?}");
         assert!(calls[0].contains("--dry-run"));
@@ -631,7 +665,7 @@ mod status_command_route {
     fn rollback_after_a_failed_enqueue_posts_pending_through_the_command() {
         let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
         f.enqueue_fails.set(true);
-        assert!(handoff_via(&f, &s, &r).is_err());
+        assert!(handoff_via(&f, &s, &r.forge).is_err());
         let calls = r.calls();
         assert!(calls.last().unwrap().contains("--state pending"), "{calls:?}");
         assert!(calls.last().unwrap().contains(&format!("--pr {PR}")));
@@ -642,7 +676,7 @@ mod status_command_route {
         let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(0));
         f.revoke_on_enqueue.set(true);
         assert!(matches!(
-            handoff_via(&f, &s, &r),
+            handoff_via(&f, &s, &r.forge),
             Err(HandoffError::RevokedDuringEnqueue { .. })
         ));
         assert!(r.calls().last().unwrap().contains("--state failure"));
@@ -651,7 +685,7 @@ mod status_command_route {
     #[test]
     fn failing_command_refuses_the_gate_before_any_grant() {
         let (f, s, r) = (FakeForge::new(), MemoryGrantStore::default(), Route::new(1));
-        let e = handoff_via(&f, &s, &r).unwrap_err();
+        let e = handoff_via(&f, &s, &r.forge).unwrap_err();
         assert!(matches!(e, HandoffError::WriterCannotPostStatuses(_)), "{e:?}");
         assert_eq!(s.get(PR).unwrap(), None, "no grant written");
         assert!(f.queued.borrow().is_none(), "nothing enqueued");
@@ -697,8 +731,261 @@ mod status_command_route {
             r#"{"forge":{"mergeQueue":{"statusCommand":"post-it"}}}"#,
         )
         .unwrap();
-        let forge = GhLifecycleForge::new("/nonexistent/gh", dir.path(), "o/r").unwrap();
+        let forge =
+            GhLifecycleForge::new_with_registered("/nonexistent/gh", dir.path(), "o/r", &[])
+                .unwrap();
         assert!(forge.can_post_statuses().is_err());
         assert!(forge.post_status(SHA1, StatusState::Success, "x").is_err());
+    }
+
+    // ---- #14632: the route follows the target, not the invocation root ----
+
+    /// A `gh` stand-in that records its arguments, answers the status POST
+    /// with an empty object, and fails every other call (so any unexpected
+    /// forge read is loud).
+    fn gh_stub(dir: &std::path::Path) -> String {
+        let path = dir.join("gh-stub.sh");
+        let log = dir.join("gh.log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *statuses*) echo '{{}}'; exit 0;; \
+                 *) exit 1;; esac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
+
+    fn logged(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The #14632 incident shape: a registered checkout of `o/r` whose
+    /// fleet-repo tier carries the recording broker, and an isolated
+    /// checkout of `o/r` with only tracked, command-less config.
+    struct TwoRoots {
+        registered: tempfile::TempDir,
+        isolated: tempfile::TempDir,
+    }
+
+    impl TwoRoots {
+        /// `exit` is the broker stub's exit code (0 posts, 1 refuses).
+        fn new(exit: i32) -> Self {
+            let registered = checkout_of("o/r");
+            std::fs::create_dir_all(registered.path().join(".loom-local")).unwrap();
+            std::fs::write(
+                registered.path().join(".loom-local/fleet-repo.json"),
+                serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
+                    broker_argv(registered.path(), exit)}}})
+                .to_string(),
+            )
+            .unwrap();
+            let isolated = checkout_of("o/r");
+            Self {
+                registered,
+                isolated,
+            }
+        }
+        fn forge(&self) -> GhLifecycleForge {
+            GhLifecycleForge::new_with_registered(
+                "/nonexistent/gh",
+                self.isolated.path(),
+                "o/r",
+                &[self.registered.path().to_path_buf()],
+            )
+            .unwrap()
+        }
+        fn registered_calls(&self) -> Vec<String> {
+            logged(&self.registered.path().join("calls.log"))
+        }
+    }
+
+    #[test]
+    fn an_isolated_checkout_of_the_target_uses_the_registered_broker() {
+        let (f, s, t) = (FakeForge::new(), MemoryGrantStore::default(), TwoRoots::new(0));
+        let forge = t.forge();
+        assert!(matches!(handoff_via(&f, &s, &forge), Ok(EnqueueOutcome::Enqueued { .. })));
+        let calls = t.registered_calls();
+        assert_eq!(calls.len(), 2, "dry-run probe, then the head success: {calls:?}");
+        assert!(calls[0].contains("--dry-run"));
+        assert!(calls[1].contains(&format!("--sha {SHA1}")));
+        assert!(calls[1].contains("--repo o/r"));
+        assert!(calls[1].contains("--state success"));
+        assert!(f.head_status.borrow().is_empty(), "the fake writer was never used");
+        assert!(s.get(PR).unwrap().is_some(), "the grant stands");
+        assert!(f.queued.borrow().is_some(), "enqueued");
+    }
+
+    #[test]
+    fn the_registered_checkout_itself_uses_the_same_broker() {
+        let (f, s, t) = (FakeForge::new(), MemoryGrantStore::default(), TwoRoots::new(0));
+        let forge = GhLifecycleForge::new_with_registered(
+            "/nonexistent/gh",
+            t.registered.path(),
+            "o/r",
+            &[t.registered.path().to_path_buf()],
+        )
+        .unwrap();
+        assert!(matches!(handoff_via(&f, &s, &forge), Ok(EnqueueOutcome::Enqueued { .. })));
+        assert_eq!(t.registered_calls().len(), 2, "probe, then post");
+    }
+
+    #[test]
+    fn the_isolated_invocation_records_a_bounded_route_observation() {
+        let (f, s, t) = (FakeForge::new(), MemoryGrantStore::default(), TwoRoots::new(0));
+        handoff_via(&f, &s, &t.forge()).unwrap();
+        let text =
+            std::fs::read_to_string(t.isolated.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
+        assert!(!text.contains("calls.log"), "no command argv leaked: {text}");
+        assert!(!text.contains("sh -c"), "no command argv leaked: {text}");
+        assert!(
+            !text.contains(t.isolated.path().display().to_string().as_str()),
+            "no absolute path leaked: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(v["target"], "o/r");
+        assert_eq!(v["route"], "command");
+        assert_eq!(v["root_class"], "registered-other");
+        assert_eq!(v["root_matches_trusted"], false);
+        assert_eq!(v["command_tier"], "fleet-repo");
+        assert!(v["invocation_root_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert!(v["trusted_root_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+    }
+
+    #[test]
+    fn an_untrusted_local_command_in_the_isolated_root_is_ignored_for_a_registered_target() {
+        let (f, s, t) = (FakeForge::new(), MemoryGrantStore::default(), TwoRoots::new(0));
+        // A second broker only the isolated clone's local tier knows. If the
+        // route were read from the invocation root, its probe would refuse.
+        std::fs::create_dir_all(t.isolated.path().join(".loom-local")).unwrap();
+        std::fs::write(
+            t.isolated.path().join(".loom-local/local.json"),
+            serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
+                broker_argv(t.isolated.path(), 1)}}})
+            .to_string(),
+        )
+        .unwrap();
+        let forge = t.forge();
+        assert!(matches!(handoff_via(&f, &s, &forge), Ok(EnqueueOutcome::Enqueued { .. })));
+        assert_eq!(t.registered_calls().len(), 2, "the registered broker answered");
+        assert!(
+            logged(&t.isolated.path().join("calls.log")).is_empty(),
+            "the untrusted local broker was never invoked"
+        );
+    }
+
+    #[test]
+    fn a_target_intentionally_on_direct_status_keeps_it_from_an_isolated_root() {
+        // The registered root configures no broker: direct posting is the
+        // configured route and must keep working through the writer.
+        let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+        let registered = checkout_of("o/r"); // committed config is `{}`
+        let isolated = checkout_of("o/r");
+        let forge = GhLifecycleForge::new_with_registered(
+            &gh_stub(isolated.path()),
+            isolated.path(),
+            "o/r",
+            &[registered.path().to_path_buf()],
+        )
+        .unwrap();
+        assert!(matches!(handoff_via(&f, &s, &forge), Ok(EnqueueOutcome::Enqueued { .. })));
+        let calls = logged(&isolated.path().join("gh.log"));
+        let post = calls
+            .iter()
+            .find(|c| c.contains("statuses") && c.contains("POST"))
+            .unwrap_or_else(|| panic!("the direct status post went through gh: {calls:?}"));
+        assert!(post.contains("loom/merge-authorization"), "{post}");
+        let text = std::fs::read_to_string(isolated.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
+        assert!(text.contains("\"route\":\"direct\""), "{text}");
+        assert!(text.contains("\"root_class\":\"registered-other\""), "{text}");
+    }
+
+    #[test]
+    fn a_command_in_a_checkout_of_another_repo_cannot_authorize_the_target() {
+        // The invocation runs in a checkout of other/repo that configures a
+        // working broker; the target o/r is registered nowhere on this machine
+        // (the foreign checkout is registered for its own sake only).
+        let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+        let foreign = checkout_of("other/repo");
+        std::fs::write(
+            foreign.path().join(".loom/config.json"),
+            serde_json::json!({"forge": {"mergeQueue": {"statusCommand":
+                broker_argv(foreign.path(), 0)}}})
+            .to_string(),
+        )
+        .unwrap();
+        let forge = GhLifecycleForge::new_with_registered(
+            "/nonexistent/gh",
+            foreign.path(),
+            "o/r",
+            &[foreign.path().to_path_buf()],
+        )
+        .unwrap();
+        let e = handoff_via(&f, &s, &forge).unwrap_err();
+        let HandoffError::WriterCannotPostStatuses(why) = &e else {
+            panic!("expected a writer-status refusal, got {e:?}")
+        };
+        assert!(why.contains("cannot authorize"), "{why}");
+        assert_eq!(s.get(PR).unwrap(), None, "no grant written");
+        assert!(f.queued.borrow().is_none(), "nothing enqueued");
+        assert!(f.head_status.borrow().is_empty(), "no status posted");
+        assert!(
+            logged(&foreign.path().join("calls.log")).is_empty(),
+            "the foreign broker was never invoked"
+        );
+        let text = std::fs::read_to_string(foreign.path().join(ROUTE_LOG_RELATIVE_PATH)).unwrap();
+        assert!(text.contains("\"route\":\"refused\""), "{text}");
+        assert!(text.contains("\"root_class\":\"unverified\""), "{text}");
+        assert!(text.contains("\"refusal\":\"untrusted-command\""), "{text}");
+    }
+
+    #[test]
+    fn a_refused_registered_broker_stops_before_any_grant_from_an_isolated_root() {
+        let (f, s, t) = (FakeForge::new(), MemoryGrantStore::default(), TwoRoots::new(1));
+        let e = handoff_via(&f, &s, &t.forge()).unwrap_err();
+        assert!(matches!(e, HandoffError::WriterCannotPostStatuses(_)), "{e:?}");
+        assert_eq!(s.get(PR).unwrap(), None, "no grant written");
+        assert!(f.queued.borrow().is_none(), "nothing enqueued");
+        assert!(f.head_status.borrow().is_empty(), "no status posted");
+        assert_eq!(t.registered_calls().len(), 1, "only the refused probe");
+    }
+
+    #[test]
+    fn a_malformed_registered_broker_fails_closed_from_the_isolated_root() {
+        let (f, s) = (FakeForge::new(), MemoryGrantStore::default());
+        let registered = checkout_of("o/r");
+        std::fs::create_dir_all(registered.path().join(".loom-local")).unwrap();
+        std::fs::write(
+            registered.path().join(".loom-local/fleet-repo.json"),
+            r#"{"forge":{"mergeQueue":{"statusCommand":"post-it"}}}"#,
+        )
+        .unwrap();
+        let isolated = checkout_of("o/r");
+        let forge = GhLifecycleForge::new_with_registered(
+            "/nonexistent/gh",
+            isolated.path(),
+            "o/r",
+            &[registered.path().to_path_buf()],
+        )
+        .unwrap();
+        assert!(forge.can_post_statuses().is_err());
+        let e = handoff_via(&f, &s, &forge).unwrap_err();
+        assert!(matches!(e, HandoffError::WriterCannotPostStatuses(_)), "{e:?}");
+        assert_eq!(s.get(PR).unwrap(), None, "no grant written");
+        assert!(f.queued.borrow().is_none(), "nothing enqueued");
     }
 }
