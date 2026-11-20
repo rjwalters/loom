@@ -16,6 +16,8 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **PR #14770**: test: share the terminal ID rejection fixture
+- **Issue #14768** (closed): Collapse seven copy-pasted injection tests in integration_security.rs into the table-driven test
 - **PR #14764**: chore(harness): track latest CLIs — codex 0.170.0→0.171.0
 - **Issue #14759** (closed): Consolidate the collector README’s log-body policy and remove stale schema history
 - **PR #14763**: docs: consolidate collector log body guidance
