@@ -16,8 +16,8 @@
 //! handed in by the collector.
 
 use crate::telemetry::ops::{MetricName, MetricPoint};
-use crate::tokens_pool::private_workspace::{SeatVolumeSamples, SeatVolumeUsage};
-use crate::tokens_pool::{session_image, session_lifecycle::DEFAULT_SESSION_IMAGE};
+use crate::tokens_pool::private_workspace::{reader_image, SeatVolumeSamples, SeatVolumeUsage};
+use crate::tokens_pool::session_image;
 use std::path::Path;
 
 /// One host resource sample, in bytes. `None` = unmeasurable.
@@ -231,8 +231,8 @@ impl SeatVolumeSampler {
         self.active = Some(tokio::task::spawn_blocking(move || {
             match session_image::read_session_image_config(&workspace_root) {
                 Ok(config) => {
-                    let image = config.image.as_deref().unwrap_or(DEFAULT_SESSION_IMAGE);
-                    sink.emit_metrics(seat_volume_points(samples.sample(image)));
+                    let usage = samples.sample(|| reader_image(config.image.as_deref()));
+                    sink.emit_metrics(seat_volume_points(usage));
                     samples
                 }
                 Err(_) => {

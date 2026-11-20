@@ -31,7 +31,9 @@ pub use lifecycle::{
     run_job, session_recover, start, status, stop, Converged,
 };
 pub use repository::WorkerCommand;
-pub(crate) use volume_usage::{SeatVolumeSamples, SeatVolumeUsage, SEAT_VOLUME_SAMPLE_INTERVAL};
+pub(crate) use volume_usage::{
+    reader_image, SeatVolumeSamples, SeatVolumeUsage, SEAT_VOLUME_SAMPLE_INTERVAL,
+};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};

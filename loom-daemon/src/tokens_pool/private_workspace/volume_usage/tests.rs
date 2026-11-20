@@ -7,6 +7,17 @@ const IMAGE: &str = "local/session-test:fixture";
 const ENGINE_ROOT: &str = "/var/lib/docker";
 const CREATED: &str = "2026-11-19T23:30:00Z";
 
+fn trusted() -> Option<String> {
+    Some(IMAGE.into())
+}
+
+fn infos(volumes: &[&str], created: &str) -> String {
+    volumes
+        .iter()
+        .map(|volume| volume_info(volume, volume.strip_prefix(VOLUME_PREFIX).unwrap(), 0, created))
+        .collect()
+}
+
 fn volume_info(volume: &str, account: &str, options: u8, created: &str) -> String {
     format!(
         "{volume}\tlocal\t{account}\t{options}\t{ENGINE_ROOT}/volumes/{volume}/_data\t{created}\n"
@@ -20,9 +31,8 @@ fn seat_volume_usage_measures_volumes_without_a_session_and_totals_complete_inve
             ["volume", "ls", "--filter", "name=loom-codex-workspace-", "--format", "{{.Name}}"] => {
                 "unmanaged-work\nloom-codex-workspace-idle\nloom-codex-workspace-active\n".into()
             }
-            ["volume", "inspect", "--format", VOLUME_FORMAT, volume] => {
-                let account = volume.strip_prefix(VOLUME_PREFIX).unwrap();
-                volume_info(volume, account, 0, CREATED)
+            ["volume", "inspect", "--format", VOLUME_FORMAT, volumes @ ..] => {
+                infos(volumes, CREATED)
             }
             ["info", "--format", "{{.DockerRootDir}}"] => format!("{ENGINE_ROOT}\n"),
             ["run", "--rm", "--pull", "never", "--network", "none", "--user", "1000:1000", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--log-driver", "none", "--workdir", "/", "--mount", mount, "--entrypoint", "/usr/bin/timeout", "--", IMAGE, "--kill-after=1s", cap, "/usr/bin/du", "-skx", "--", ROOT] =>
@@ -44,14 +54,14 @@ fn seat_volume_usage_measures_volumes_without_a_session_and_totals_complete_inve
     }));
     let mut samples = SeatVolumeSamples::default();
     assert_eq!(
-        samples.sample(IMAGE),
+        samples.sample(trusted),
         SeatVolumeUsage {
             seats: vec![("active".into(), 12_288)],
             total: None
         }
     );
     assert_eq!(
-        samples.sample(IMAGE),
+        samples.sample(trusted),
         SeatVolumeUsage {
             seats: vec![("idle".into(), 0)],
             total: Some(12_288)
@@ -93,29 +103,115 @@ fn seat_volume_usage_rejects_nonlocal_nonowned_and_indirect_backing_paths() {
 }
 
 #[test]
-fn seat_volume_usage_drops_readings_if_volume_goes_away_or_is_replaced() {
-    let inspections = Rc::new(Cell::new(0));
-    let count = Rc::clone(&inspections);
+fn seat_volume_usage_drops_a_reading_if_the_volume_is_replaced_during_the_read() {
+    let replaced = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&replaced);
     let _fake = docker::fake::install(Box::new(move |args| match args {
         ["volume", "ls", ..] => Ok("loom-codex-workspace-alice\n".into()),
         ["info", "--format", "{{.DockerRootDir}}"] => Ok(ENGINE_ROOT.into()),
-        ["volume", "inspect", "--format", VOLUME_FORMAT, volume] => {
-            let n = count.get();
-            count.set(n + 1);
-            match n {
-                0..=2 | 4 => Ok(volume_info(volume, "alice", 0, CREATED)),
-                3 => Ok(volume_info(volume, "alice", 0, "2026-11-19T23:35:00Z")),
-                _ => anyhow::bail!("volume disappeared"),
-            }
+        ["volume", "inspect", "--format", VOLUME_FORMAT, volumes @ ..] => Ok(infos(
+            volumes,
+            if flag.get() {
+                "2026-11-19T23:35:00Z"
+            } else {
+                CREATED
+            },
+        )),
+        ["run", ..] => {
+            flag.set(true);
+            Ok("3\t/workspace\n".into())
         }
-        ["run", ..] => Ok("3\t/workspace\n".into()),
         unexpected => panic!("unexpected Docker request: {unexpected:?}"),
     }));
     let mut samples = SeatVolumeSamples::default();
-    assert_eq!(samples.sample(IMAGE).total, Some(3072));
-    assert_eq!(samples.sample(IMAGE), SeatVolumeUsage::default());
-    assert_eq!(samples.sample(IMAGE), SeatVolumeUsage::default());
-    assert_eq!(inspections.get(), 6);
+    assert_eq!(samples.sample(trusted), SeatVolumeUsage::default());
+    assert!(samples.readings.is_empty());
+}
+
+#[test]
+fn seat_volume_usage_withholds_the_total_when_a_volume_is_replaced_between_turns() {
+    let alice_created = Rc::new(std::cell::RefCell::new(CREATED.to_owned()));
+    let created = Rc::clone(&alice_created);
+    let _fake = docker::fake::install(Box::new(move |args| match args {
+        ["volume", "ls", ..] => Ok("loom-codex-workspace-alice\nloom-codex-workspace-bob\n".into()),
+        ["info", "--format", "{{.DockerRootDir}}"] => Ok(ENGINE_ROOT.into()),
+        ["volume", "inspect", "--format", VOLUME_FORMAT, volumes @ ..] => Ok(volumes
+            .iter()
+            .map(|volume| {
+                let account = volume.strip_prefix(VOLUME_PREFIX).unwrap();
+                let at = if account == "alice" {
+                    created.borrow().clone()
+                } else {
+                    CREATED.into()
+                };
+                volume_info(volume, account, 0, &at)
+            })
+            .collect()),
+        ["run", .., mount, "--entrypoint", _, "--", _, _, _, _, _, _, _] => {
+            let alice = mount.contains("-alice/");
+            let replaced = created.borrow().as_str() != CREATED;
+            Ok(match (alice, replaced) {
+                (true, false) => "100\t/workspace\n",
+                (true, true) => "1\t/workspace\n",
+                (false, _) => "2\t/workspace\n",
+            }
+            .into())
+        }
+        unexpected => panic!("unexpected Docker request: {unexpected:?}"),
+    }));
+    let mut samples = SeatVolumeSamples::default();
+    assert_eq!(samples.sample(trusted).seats, [("alice".to_owned(), 102_400)]);
+    *alice_created.borrow_mut() = "2026-11-19T23:35:00Z".into();
+    // Bob is measured while Alice's retained 100 KiB describes a replaced volume.
+    let bob = samples.sample(trusted);
+    assert_eq!(
+        bob,
+        SeatVolumeUsage {
+            seats: vec![("bob".into(), 2048)],
+            total: None
+        }
+    );
+    let alice = samples.sample(trusted);
+    assert_eq!(alice.seats, [("alice".to_owned(), 1024)]);
+    assert_eq!(alice.total, Some(3072));
+}
+
+#[test]
+fn reader_image_is_refused_before_any_workspace_is_mounted() {
+    let _fake = docker::fake::install(Box::new(|args| match args {
+        ["image", "inspect", ..] => Ok("sha256:0\n".into()),
+        // The bundle probe: an image without the sealed control bundle.
+        ["run", .., "--entrypoint", "/bin/sh", _, "-c", _] => {
+            Ok("__LOOM_BUNDLE_NO_MANIFEST__\n".into())
+        }
+        unexpected => panic!("unexpected Docker request: {unexpected:?}"),
+    }));
+    assert_eq!(reader_image(Some(IMAGE)), None);
+    let _absent = docker::fake::install(Box::new(|args| match args {
+        ["image", "inspect", ..] => anyhow::bail!("no such image"),
+        unexpected => panic!("pulled or probed an absent image: {unexpected:?}"),
+    }));
+    assert_eq!(reader_image(Some(IMAGE)), None);
+}
+
+#[test]
+fn stock_reader_candidates_include_versioned_tags_newest_first() {
+    let _fake = docker::fake::install(Box::new(|args| {
+        match args {
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "ghcr.io/rjwalters/loom-worker-session"] => Ok(
+            "ghcr.io/rjwalters/loom-worker-session:0.19.1100\nghcr.io/rjwalters/loom-worker-session:<none>\nghcr.io/rjwalters/loom-worker-session:0.19.1209\nghcr.io/rjwalters/loom-worker-session:latest\nghcr.io/rjwalters/loom-worker-session:foo\n".into(),
+        ),
+        unexpected => panic!("unexpected Docker request: {unexpected:?}"),
+    }
+    }));
+    assert_eq!(
+        local_stock_images(),
+        [
+            "ghcr.io/rjwalters/loom-worker-session:latest",
+            "ghcr.io/rjwalters/loom-worker-session:0.19.1209",
+            "ghcr.io/rjwalters/loom-worker-session:0.19.1100",
+        ]
+    );
 }
 
 #[test]
@@ -124,7 +220,7 @@ fn seat_volume_usage_does_not_measure_after_the_budget_or_fabricate_an_inventory
     {
         let _fake = docker::fake::install(Box::new(|_| panic!("budget exhausted")));
         assert_eq!(
-            samples.sample_until(Instant::now(), Instant::now, IMAGE),
+            samples.sample_until(Instant::now(), Instant::now, trusted),
             SeatVolumeUsage::default()
         );
     }
@@ -132,7 +228,7 @@ fn seat_volume_usage_does_not_measure_after_the_budget_or_fabricate_an_inventory
         assert!(matches!(args, ["volume", "ls", ..]));
         anyhow::bail!("inventory unavailable")
     }));
-    assert_eq!(samples.sample(IMAGE), SeatVolumeUsage::default());
+    assert_eq!(samples.sample(trusted), SeatVolumeUsage::default());
 }
 
 #[test]
@@ -169,9 +265,8 @@ fn seat_volume_usage_rotates_the_recorded_cold_range_into_a_total() {
                 .collect::<Vec<_>>()
                 .join("\n")),
             ["info", "--format", "{{.DockerRootDir}}"] => Ok(ENGINE_ROOT.into()),
-            ["volume", "inspect", "--format", VOLUME_FORMAT, volume] => {
-                let account = volume.strip_prefix(VOLUME_PREFIX).unwrap();
-                Ok(volume_info(volume, account, 0, CREATED))
+            ["volume", "inspect", "--format", VOLUME_FORMAT, volumes @ ..] => {
+                Ok(infos(volumes, CREATED))
             }
             ["run", .., "/usr/bin/timeout", "--", IMAGE, "--kill-after=1s", cap, "/usr/bin/du", "-skx", "--", ROOT] =>
             {
@@ -199,7 +294,7 @@ fn seat_volume_usage_rotates_the_recorded_cold_range_into_a_total() {
         let tick = start + SEAT_VOLUME_SAMPLE_INTERVAL * i;
         clock.set(tick);
         let result =
-            samples.sample_until(tick + SEAT_VOLUME_SAMPLE_INTERVAL, || clock.get(), IMAGE);
+            samples.sample_until(tick + SEAT_VOLUME_SAMPLE_INTERVAL, || clock.get(), trusted);
         assert!(clock.get() < tick + SEAT_VOLUME_SAMPLE_INTERVAL);
         assert_eq!(result.seats, [(format!("seat-{i:02}"), REPORTED_KIB * 1024)]);
         assert_eq!(
@@ -211,7 +306,7 @@ fn seat_volume_usage_rotates_the_recorded_cold_range_into_a_total() {
     inject_timeout.set(true);
     let tick = start + SEAT_VOLUME_SAMPLE_INTERVAL * SEATS;
     clock.set(tick);
-    let result = samples.sample_until(tick + SEAT_VOLUME_SAMPLE_INTERVAL, || clock.get(), IMAGE);
+    let result = samples.sample_until(tick + SEAT_VOLUME_SAMPLE_INTERVAL, || clock.get(), trusted);
     assert_eq!(result, SeatVolumeUsage::default());
     assert!(clock.get() < tick + SEAT_VOLUME_SAMPLE_INTERVAL);
 }
@@ -237,9 +332,8 @@ fn seat_volume_usage_invalidates_failed_expired_and_removed_readings() {
             Inventory::Missing => anyhow::bail!("cannot list volumes"),
         },
         ["info", "--format", "{{.DockerRootDir}}"] => Ok(ENGINE_ROOT.into()),
-        ["volume", "inspect", "--format", VOLUME_FORMAT, volume] => {
-            let account = volume.strip_prefix(VOLUME_PREFIX).unwrap();
-            Ok(volume_info(volume, account, 0, CREATED))
+        ["volume", "inspect", "--format", VOLUME_FORMAT, volumes @ ..] => {
+            Ok(infos(volumes, CREATED))
         }
         ["run", ..] if failed.get() => anyhow::bail!("file vanished during the walk"),
         ["run", ..] => Ok("3\t/workspace\n".into()),
@@ -249,7 +343,7 @@ fn seat_volume_usage_invalidates_failed_expired_and_removed_readings() {
     let mut samples = SeatVolumeSamples::default();
     let mut at = |tick| {
         let now = start + SEAT_VOLUME_SAMPLE_INTERVAL * tick;
-        samples.sample_until(now + SEAT_VOLUME_SAMPLE_INTERVAL, || now, IMAGE)
+        samples.sample_until(now + SEAT_VOLUME_SAMPLE_INTERVAL, || now, trusted)
     };
     assert_eq!(at(0).total, None);
     assert_eq!(at(1).total, Some(6144));

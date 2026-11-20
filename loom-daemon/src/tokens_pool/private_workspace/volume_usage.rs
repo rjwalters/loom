@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use super::{docker, ROOT, VOLUME_PREFIX};
+use crate::session_reconcile::skew::DaemonVersion;
 use crate::telemetry::ops::MAX_LABEL_VALUE_BYTES;
 use crate::tokens_pool::account_registry::validate_name;
+use crate::tokens_pool::session_lifecycle::DEFAULT_SESSION_IMAGE;
 
 pub(crate) const SEAT_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(180);
+const MAX_READER_CANDIDATES: usize = 4;
 const METADATA_BUDGET: Duration = Duration::from_secs(3);
 // The observed cold scans ran from 32.815 to 147.2 seconds (#14678).
 const MAX_DU_SECS: u64 = 175;
@@ -29,19 +32,25 @@ pub(crate) struct SeatVolumeUsage {
 #[derive(Default)]
 pub(crate) struct SeatVolumeSamples {
     after: String,
-    readings: BTreeMap<String, (Instant, i64)>,
+    /// Measured time, bytes and the volume identity line the bytes describe.
+    readings: BTreeMap<String, (Instant, i64, String)>,
 }
 
 impl SeatVolumeSamples {
-    pub(crate) fn sample(&mut self, image: &str) -> SeatVolumeUsage {
-        self.sample_until(Instant::now() + SEAT_VOLUME_SAMPLE_INTERVAL, Instant::now, image)
+    /// `reader_image` is resolved lazily, only once a seat is about to be
+    /// measured, and must return an image already verified as trusted.
+    pub(crate) fn sample(
+        &mut self,
+        reader_image: impl FnOnce() -> Option<String>,
+    ) -> SeatVolumeUsage {
+        self.sample_until(Instant::now() + SEAT_VOLUME_SAMPLE_INTERVAL, Instant::now, reader_image)
     }
 
     fn sample_until(
         &mut self,
         deadline: Instant,
         clock: impl Fn() -> Instant,
-        image: &str,
+        reader_image: impl FnOnce() -> Option<String>,
     ) -> SeatVolumeUsage {
         let filter = format!("name={VOLUME_PREFIX}");
         let Some(inventory) = metadata(
@@ -59,6 +68,30 @@ impl SeatVolumeSamples {
             .collect();
         self.readings
             .retain(|account, _| roster.contains(account.as_str()));
+        // A volume replaced since it was measured no longer backs its reading.
+        let volumes: Vec<String> = roster
+            .iter()
+            .map(|account| super::workspace_volume_name(account))
+            .collect();
+        if !volumes.is_empty() && !self.readings.is_empty() {
+            let mut args = vec!["volume", "inspect", "--format", VOLUME_FORMAT];
+            args.extend(volumes.iter().map(String::as_str));
+            let Some(identities) = metadata(deadline, &clock, &args) else {
+                self.readings.clear();
+                log::debug!("private workspace volume sampling skipped: identities unavailable");
+                return SeatVolumeUsage::default();
+            };
+            let current: BTreeMap<&str, &str> = identities
+                .lines()
+                .filter_map(|line| {
+                    let name = line.split('\t').next()?;
+                    Some((name.strip_prefix(VOLUME_PREFIX)?, line))
+                })
+                .collect();
+            self.readings.retain(|account, (_, _, identity)| {
+                current.get(account.as_str()) == Some(&identity.as_str())
+            });
+        }
         let Some(account) = roster
             .iter()
             .copied()
@@ -72,9 +105,14 @@ impl SeatVolumeSamples {
         let mut seats = Vec::new();
         if account.len() <= MAX_LABEL_VALUE_BYTES && validate_name(account).is_ok() {
             let volume = super::workspace_volume_name(account);
-            match seat_bytes(deadline, &clock, account, &volume, image) {
-                Ok(bytes) => {
-                    self.readings.insert(account.to_owned(), (clock(), bytes));
+            let measured = match reader_image() {
+                Some(image) => seat_bytes(deadline, &clock, account, &volume, &image),
+                None => Err("no verified local reader image"),
+            };
+            match measured {
+                Ok((bytes, identity)) => {
+                    self.readings
+                        .insert(account.to_owned(), (clock(), bytes, identity));
                     seats.push((account.to_owned(), bytes));
                 }
                 Err(reason) => {
@@ -93,11 +131,11 @@ impl SeatVolumeSamples {
         let maximum_age = SEAT_VOLUME_SAMPLE_INTERVAL
             .saturating_mul(u32::try_from(roster.len()).unwrap_or(u32::MAX));
         self.readings
-            .retain(|_, (measured, _)| now.duration_since(*measured) < maximum_age);
+            .retain(|_, (measured, _, _)| now.duration_since(*measured) < maximum_age);
         let total = if self.readings.len() == roster.len() {
             self.readings
                 .values()
-                .try_fold(0_i64, |total, (_, bytes)| total.checked_add(*bytes))
+                .try_fold(0_i64, |total, (_, bytes, _)| total.checked_add(*bytes))
         } else {
             None
         };
@@ -121,7 +159,7 @@ fn seat_bytes(
     account: &str,
     volume: &str,
     image: &str,
-) -> Result<i64, &'static str> {
+) -> Result<(i64, String), &'static str> {
     let volume_args = ["volume", "inspect", "--format", VOLUME_FORMAT, volume];
     let before = metadata(deadline, clock, &volume_args).ok_or("volume inspection failed")?;
     let root = metadata(deadline, clock, &["info", "--format", "{{.DockerRootDir}}"])
@@ -180,7 +218,60 @@ fn seat_bytes(
     if metadata(deadline, clock, &volume_args).as_deref() != Some(before.as_str()) {
         return Err("volume identity changed during read");
     }
-    parse_du(&output).ok_or("unusable du measurement")
+    let bytes = parse_du(&output).ok_or("unusable du measurement")?;
+    Ok((bytes, before.trim_end_matches(['\r', '\n']).to_owned()))
+}
+
+/// The image the reader runs from: a configured override, else the newest
+/// local stock session image. Either must already be local (never pulled) and
+/// carry this daemon's sealed control bundle, the same proof private-session
+/// creation demands before an image may see a workspace.
+pub(crate) fn reader_image(configured: Option<&str>) -> Option<String> {
+    let candidates = match configured {
+        Some(image) => vec![image.to_owned()],
+        None => local_stock_images(),
+    };
+    candidates.into_iter().find(|image| {
+        docker::image_present(image).is_ok()
+            && docker::verify_image(image)
+                .map_err(|error| log::debug!("reader image {image} rejected: {error:#}"))
+                .is_ok()
+    })
+}
+
+/// Local stock session images, `:latest` first and then versioned tags newest
+/// first, bounded so a crowded image store cannot stall a pass.
+fn local_stock_images() -> Vec<String> {
+    let repo = DEFAULT_SESSION_IMAGE
+        .rsplit_once(':')
+        .map_or(DEFAULT_SESSION_IMAGE, |(r, _)| r);
+    let args = ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", repo];
+    let Ok(listing) = docker::command_with(&args, METADATA_BUDGET) else {
+        return Vec::new();
+    };
+    let mut images: Vec<(Option<DaemonVersion>, String)> = listing
+        .lines()
+        .filter(|image| {
+            image
+                .strip_prefix(repo)
+                .is_some_and(|tag| tag.starts_with(':'))
+        })
+        .filter(|image| {
+            *image == DEFAULT_SESSION_IMAGE || DaemonVersion::from_image(image).is_some()
+        })
+        .map(|image| (DaemonVersion::from_image(image), image.to_owned()))
+        .collect();
+    images.sort_by(|a, b| {
+        (b.1 == DEFAULT_SESSION_IMAGE)
+            .cmp(&(a.1 == DEFAULT_SESSION_IMAGE))
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    images.dedup_by(|a, b| a.1 == b.1);
+    images
+        .into_iter()
+        .map(|(_, image)| image)
+        .take(MAX_READER_CANDIDATES)
+        .collect()
 }
 
 fn verified_volume<'a>(
