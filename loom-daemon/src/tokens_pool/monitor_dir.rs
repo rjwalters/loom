@@ -371,6 +371,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 prune: false,
+                exclude_names: &[],
             })
         };
         match import(None, None) {
