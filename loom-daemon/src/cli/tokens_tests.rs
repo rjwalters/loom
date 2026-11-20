@@ -324,3 +324,40 @@ mod pressure_tests {
         );
     }
 }
+
+#[test]
+fn import_from_monitor_cli_accepts_repeated_exclude_names_and_rejects_empty() {
+    use crate::cli::{whole_cli_parse::try_parse_cli, Commands, TokensAction};
+
+    let command = ["loom-daemon", "tokens", "import-from-monitor"];
+    let parse = |args: &[&str]| {
+        let argv: Vec<_> = command.into_iter().chain(args.iter().copied()).collect();
+        try_parse_cli(&argv)
+    };
+    for (args, want) in [
+        (&[][..], &[][..]),
+        (
+            &[
+                "--exclude-name",
+                "one-example",
+                "--exclude-name=two-example",
+            ],
+            &["one-example", "two-example"],
+        ),
+    ] {
+        let cli = parse(args).unwrap();
+        match cli.command {
+            Some(Commands::Tokens {
+                action: TokensAction::ImportFromMonitor { exclude_names, .. },
+            }) => assert_eq!(exclude_names, want),
+            _ => panic!("expected tokens import-from-monitor"),
+        }
+    }
+    for empty in [
+        &["--exclude-name", ""][..],
+        &["--exclude-name="][..],
+        &["--exclude-name"][..],
+    ] {
+        assert!(parse(empty).is_err());
+    }
+}

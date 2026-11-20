@@ -1936,6 +1936,11 @@ pub enum TokensAction {
         #[arg(long)]
         force: bool,
 
+        /// Skip a Claude account by its exact derived pool name, without the
+        /// `.token` suffix. Repeat for more names. Existing files are preserved.
+        #[arg(long = "exclude-name", value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        exclude_names: Vec<String>,
+
         /// Delete `*.token` files for accounts claude-monitor no longer
         /// reports active (pool state files are never touched).
         #[arg(long)]
