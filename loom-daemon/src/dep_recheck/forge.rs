@@ -176,6 +176,148 @@ pub fn fetch_refs(
         .collect()
 }
 
+/// The state of one node, verified to be the answer **for that node** (#14710).
+///
+/// Used through [`BoundReader`], which adds the rename layer: a repository
+/// that was renamed answers under its *canonical* slug (`rjwalters/loom#N`
+/// reads back as `2AMLogic/loom`), so an answer that names the requested
+/// slug exactly binds immediately, and one that does not is bound against
+/// the requested slug's resolved canonical name before being rejected. A
+/// redirect to the same repository is the same dependency; the unrelated
+/// same-numbered node in a different repository (`2AMLogic/2am#630` vs the
+/// open draft `2AMLogic/.loom#630`) still does not bind. See
+/// [`super::states::url_names_ref`] for the accepted URL shapes.
+///
+/// Like [`fetch_state`] this tries `issue view` then `pr view`, because a
+/// reference may name either — but it asks for `number,url,state` and refuses
+/// an answer that does not name the requested `repo#number`: a number that
+/// differs, or a URL for any other repository (or path shape), is treated as
+/// **no** answer, not as the state of something else. That is the read the
+/// Guide's unblock sweep needs: on 2026-11-19 a lookup for the
+/// still-OPEN cross-repo draft `2AMLogic/.loom#630` was answered "resolved"
+/// and the hold was lifted (#14710), and nothing in a bare
+/// `--json state --jq .state` read can distinguish the right node's state
+/// from a cached, shed or mismatched answer for the same number elsewhere
+/// (`2AMLogic/2am#630` is CLOSED).
+///
+/// Returns `None` when neither entity kind yields a bound answer — unreadable
+/// is a *result* here, and the caller classifies it as unknown, fail closed.
+#[must_use]
+pub fn fetch_bound_state(
+    number: i64,
+    repo: &str,
+    repo_root: &Path,
+    canonical: Option<&str>,
+) -> Option<String> {
+    #[derive(Deserialize)]
+    struct NodeView {
+        #[serde(default)]
+        number: i64,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        url: String,
+    }
+    let n = number.to_string();
+    for entity in ["issue", "pr"] {
+        let args = vec![
+            entity,
+            "view",
+            &n,
+            "--repo",
+            repo,
+            "--json",
+            "number,state,url",
+        ];
+        let q: Query<NodeView> =
+            gh_read_json("recheck.state_bound", &args, repo_root, false, |v: &NodeView| {
+                v.state.is_empty()
+            });
+        if let Query::Populated(v) = q {
+            if v.number == number
+                && (super::states::url_names_ref(&v.url, repo, number)
+                    || canonical.is_some_and(|c| super::states::url_names_ref(&v.url, c, number)))
+            {
+                return Some(v.state);
+            }
+            // A populated answer naming a DIFFERENT node is not an answer —
+            // fall through and try the other entity kind before giving up.
+        }
+    }
+    None
+}
+
+/// The canonical `owner/name` of `repo`, resolved once (#14710's rename
+/// layer). REST `repos/{owner}/{repo}` follows a rename redirect and answers
+/// with the repository's canonical `full_name` (`gh repo view`'s GraphQL
+/// lookup does not follow renames), which is exactly the identity evidence
+/// needed: binding a node's canonical URL against this name accepts a
+/// verified redirect to the same repository while still rejecting the
+/// unrelated same-numbered node in a different one.
+///
+/// `None` when the repository cannot be read — the caller fails closed on
+/// that, same as every other unreadable answer here.
+fn canonical_nwo(repo: &str, repo_root: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct FullName {
+        #[serde(rename = "full_name")]
+        full_name: String,
+    }
+    let path = format!("repos/{repo}");
+    let q: Query<FullName> = gh_read_json(
+        "recheck.repo_canonical",
+        &["api", &path],
+        repo_root,
+        false,
+        |f: &FullName| f.full_name.is_empty(),
+    );
+    match q {
+        Query::Populated(f) if super::named::is_owner_repo(&f.full_name) => Some(f.full_name),
+        _ => None,
+    }
+}
+
+/// [`fetch_bound_state`] plus the per-run canonical-name cache, shared by
+/// every dependency of one `dep-states` call (#14710).
+///
+/// Park records routinely name several dependencies in one repository; the
+/// canonical lookup is only needed for a renamed one (an exact-slug bind
+/// short-circuits it), and memoising it per distinct repository keeps the
+/// extra reads at one per renamed repo per run, never one per dependency.
+pub struct BoundReader<'a> {
+    repo_root: &'a Path,
+    canonical: std::collections::HashMap<String, Option<String>>,
+}
+
+impl<'a> BoundReader<'a> {
+    /// A reader bound to `repo_root` (the checkout the subcommand runs in).
+    #[must_use]
+    pub fn new(repo_root: &'a Path) -> Self {
+        Self {
+            repo_root,
+            canonical: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The bound state of `number` in `repo`: `Some(state)` only when an
+    /// answer provably names that `repo#number` (directly, or through a
+    /// verified rename redirect); `None` otherwise — unreadable, mismatched
+    /// and wrong-node answers are all "no answer".
+    pub fn state(&mut self, number: i64, repo: &str) -> Option<String> {
+        // Exact-slug binding first, canonical second: the rename resolution
+        // is one extra REST read, paid only when the answer's URL did not
+        // name the slug exactly as asked.
+        fetch_bound_state(number, repo, self.repo_root, None).or_else(|| {
+            let canon = self
+                .canonical
+                .entry(repo.to_string())
+                .or_insert_with(|| canonical_nwo(repo, self.repo_root))
+                .clone();
+            fetch_bound_state(number, repo, self.repo_root, canon.as_deref())
+        })
+    }
+}
+
 /// An issue's body.
 ///
 /// # Errors

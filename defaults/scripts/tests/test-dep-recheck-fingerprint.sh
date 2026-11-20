@@ -380,9 +380,33 @@ case "${1:-}" in
         echo "stub gh: missing fixture for $kind #$num (repo='${repo:-<none>}')" >&2
         exit 1
       }
+      # A fixture may carry a top-level __stub_rc: serve that exit code
+      # instead of the JSON — how the suite reproduces the loom-front read
+      # shed (exit 75) without a live front.
+      rc_stub="$(jq -r '.__stub_rc // 0' "$f")"
+      if [[ "$rc_stub" != "0" ]]; then
+        echo "gh (loom front): read shed — no reader can serve it right now" >&2
+        exit "$rc_stub"
+      fi
       if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" "$f"; else cat "$f"; fi
     else
       echo "stub gh: unhandled $kind sub '$sub'" >&2; exit 3
+    fi
+    ;;
+  api)
+    # `gh api repos/OWNER/NAME [--jq .full_name]` — the dep-states rename
+    # layer (#14710): the fixture is `repo-<owner>__<name>.json` holding the
+    # canonical `full_name` a rename redirect would answer with.
+    shift
+    if [[ "${1:-}" == repos/* ]] && [[ "$1" != */issues/* && "$1" != */pulls/* ]]; then
+      slug="${1#repos/}"
+      f="$D/repo-${slug//\//__}.json"
+      [[ -f "$f" ]] || { echo "stub gh: missing repo fixture for $slug" >&2; exit 1; }
+      jqexpr=""
+      [[ "${2:-}" == "--jq" ]] && jqexpr="${3:-}"
+      if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" "$f"; else cat "$f"; fi
+    else
+      echo "stub gh: unhandled api path '$1'" >&2; exit 3
     fi
     ;;
   *) echo "stub gh: unhandled args: $*" >&2; exit 3 ;;
@@ -979,6 +1003,150 @@ assert_eq "2" "$rc" "T36b: --prior-hash without --prior-age-hours is a usage err
 out="$("$TARGET_SCRIPT" decide --hash abc123 --prior-hash abc123 --prior-age-hours 1 --json)"
 assert_eq "skip" "$(jq -r '.action' <<<"$out")" "T37a: --json reports action"
 assert_eq "false" "$(jq -r '.claim' <<<"$out")" "T37b: --json reports claim as a JSON boolean"
+
+# --- T38: dep-states (#14710) — binding-verified terminal-state resolution --
+#
+# The Guide's unblock sweep resolves every parked dependency through this
+# subcommand instead of inline `gh issue view` reads (guide.md's
+# resolve_dep_states; defaults/docs/park-record.md's check_and_unblock_prs).
+# The incident shape: a lookup for the still-open cross-repo draft
+# 2AMLogic/.loom#630 was answered "resolved" and the hold was lifted. Every
+# fixture below carries number+url, because binding the answer to the exact
+# OWNER/REPO#N — not trusting a bare state string — is the fix.
+#
+# The invoking repo is owner/repo throughout (--repo), so a bare #N resolves
+# there; repo-qualified fixtures prove WHICH repo each cross-repo ref was
+# read in (the #8502 trap, tightened: #630 is CLOSED in owner/repo and OPEN
+# as a draft PR in example-org/other).
+
+jq -n '{number:630, state:"OPEN", url:"https://github.com/example-org/other/pull/630"}' \
+    >"$STUB_DIR/example-org__other-pr-630.json"
+# The trap: the SAME NUMBER closed in the invoking repo. An unbound lookup
+# reads this and reports the draft resolved — the #14710 failure itself.
+jq -n '{number:630, state:"CLOSED", url:"https://github.com/owner/repo/issues/630"}' \
+    >"$STUB_DIR/issue-630.json"
+jq -n '{number:575, state:"MERGED", url:"https://github.com/example-org/tool-repo/pull/575"}' \
+    >"$STUB_DIR/example-org__tool-repo-pr-575.json"
+jq -n '{number:13762, state:"CLOSED", url:"https://github.com/example-org/loom-mirror/issues/13762"}' \
+    >"$STUB_DIR/example-org__loom-mirror-issue-13762.json"
+jq -n '{number:31, state:"CLOSED", url:"https://github.com/owner/repo/issues/31"}' \
+    >"$STUB_DIR/issue-31.json"
+
+# T38a: two terminal deps + one open cross-repo draft -> false, and the OPEN
+# bucket names the draft (not the same-numbered CLOSED issue in owner/repo).
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/other#630 example-org/tool-repo#575 example-org/loom-mirror#13762" --repo owner/repo)"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" \
+    "T38a: an open cross-repo draft among the deps answers ALL_RESOLVED=false (no unblock)"
+assert_eq "example-org/other#630" "$(eval_var "$out" OPEN)" \
+    "T38a: OPEN names the open draft PR, not the same-numbered CLOSED issue in the invoking repo"
+assert_eq "" "$(eval_var "$out" UNKNOWN)" \
+    "T38a: the two terminal deps land nowhere near UNKNOWN"
+
+# T38b: a populated answer whose URL names a DIFFERENT repo than asked is not
+# an answer — fail closed into UNKNOWN.
+jq -n '{number:42, state:"CLOSED", url:"https://github.com/example-org/elsewhere/pull/42"}' \
+    >"$STUB_DIR/example-org__mismatch-pr-42.json"
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/mismatch#42" --repo owner/repo)"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" \
+    "T38b: an answer naming a different repo does not resolve the dependency"
+assert_eq "example-org/mismatch#42" "$(eval_var "$out" UNKNOWN)" \
+    "T38b: the mismatched dependency is REPORTED as unknown, never dropped"
+
+# T38c: a populated answer whose NUMBER differs from the one asked is not an
+# answer either.
+jq -n '{number:999, state:"CLOSED", url:"https://github.com/example-org/mismatch/pull/43"}' \
+    >"$STUB_DIR/example-org__mismatch-pr-43.json"
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/mismatch#43" --repo owner/repo)"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" \
+    "T38c: an answer for a different number does not resolve the dependency"
+assert_eq "example-org/mismatch#43" "$(eval_var "$out" UNKNOWN)" \
+    "T38c: the number-mismatched dependency is reported as unknown"
+
+# T38d: unreadable (no fixture -> both entity reads fail) and malformed
+# tokens are classified, not fatal: reported unknown, exit 0.
+rc=0
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/gone#77 abc" --repo owner/repo)" || rc=$?
+assert_eq "0" "$rc" "T38d: unreadable/malformed refs are a classification, not an error exit"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" "T38d: unreadable and malformed refs answer false"
+assert_eq "example-org/gone#77 abc" "$(eval_var "$out" UNKNOWN)" \
+    "T38d: the unreadable ref and the malformed token are both reported in UNKNOWN"
+
+# T38e: the positive case still unblocks — all deps terminal, one of them a
+# MERGED PR (the #10040 behavior this suite's deleted sibling
+# test-guide-unblock-merged-blocker.sh used to pin at the prompt boundary).
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/tool-repo#575 example-org/loom-mirror#13762" --repo owner/repo)"
+assert_eq "true" "$(field "$out" ALL_RESOLVED)" \
+    "T38e: all-terminal deps (MERGED PR + CLOSED issue) answer ALL_RESOLVED=true"
+assert_eq "example-org/tool-repo#575 example-org/loom-mirror#13762" "$(eval_var "$out" RESOLVED)" \
+    "T38e: RESOLVED renders the qualified refs for the unblock announcement"
+
+# T38f: a bare N resolves in the invoking repo and renders as #N.
+out="$("$TARGET_SCRIPT" dep-states --refs "31 example-org/tool-repo#575" --repo owner/repo)"
+assert_eq "true" "$(field "$out" ALL_RESOLVED)" \
+    "T38f: a bare N resolves in the invoking repo beside a qualified cross-repo ref"
+assert_eq "#31 example-org/tool-repo#575" "$(eval_var "$out" RESOLVED)" \
+    "T38f: a bare N renders as #N, a qualified one as OWNER/REPO#N"
+
+# T38g: usage errors — live-only subcommand, refs required.
+rc=0
+"$TARGET_SCRIPT" dep-states --repo owner/repo >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "T38g: dep-states without --refs is a usage error"
+rc=0
+"$TARGET_SCRIPT" dep-states --refs "31" --number 31 --repo owner/repo >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "T38g: dep-states rejects --number"
+rc=0
+echo '{}' | "$TARGET_SCRIPT" dep-states --stdin >/dev/null 2>&1 || rc=$?
+assert_eq "2" "$rc" "T38g: dep-states is live-only (--stdin is a usage error)"
+
+# T38h: --json mirrors the KEY=VALUE contract.
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/other#630 31" --repo owner/repo --json)"
+assert_eq "false" "$(jq -r '.all_resolved' <<<"$out")" "T38h: --json reports all_resolved"
+assert_eq "example-org/other#630" "$(jq -r '.open[0]' <<<"$out")" "T38h: --json reports the open bucket"
+assert_eq "#31" "$(jq -r '.resolved[0]' <<<"$out")" "T38h: --json reports the resolved bucket"
+
+# T38i: a RENAMED repository (#14710's compatibility case, from the issue
+# thread): the park record names the pre-rename slug, the forge answers under
+# the canonical one (rjwalters/loom -> 2AMLogic/loom is the live instance).
+# The answer's URL does not name the asked slug, so binding goes through the
+# canonical resolution (REST repos/{slug} follows the redirect) — a verified
+# redirect to the SAME repository resolves; it must not read as unknown.
+jq -n '{number:51, state:"CLOSED", url:"https://github.com/example-org/new-name/issues/51"}' \
+    >"$STUB_DIR/example-org__old-name-issue-51.json"
+jq -n '{full_name:"example-org/new-name"}' >"$STUB_DIR/repo-example-org__old-name.json"
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/old-name#51" --repo owner/repo)"
+assert_eq "true" "$(field "$out" ALL_RESOLVED)" \
+    "T38i: a rename redirect to the same repository still resolves the dependency"
+assert_eq "example-org/old-name#51" "$(eval_var "$out" RESOLVED)" \
+    "T38i: the resolved bucket renders the ref as the park record named it"
+
+# T38j: canonical resolution that names a DIFFERENT repository than the
+# answer's URL does not rescue the mismatch — the #14710 wrong-node shape
+# stays unknown even with the rename layer in play.
+jq -n '{number:52, state:"CLOSED", url:"https://github.com/example-org/elsewhere/issues/52"}' \
+    >"$STUB_DIR/example-org__stale-issue-52.json"
+jq -n '{full_name:"example-org/stale"}' >"$STUB_DIR/repo-example-org__stale.json"
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/stale#52" --repo owner/repo)"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" \
+    "T38j: an answer for another repository stays unresolved beside a canonical lookup"
+assert_eq "example-org/stale#52" "$(eval_var "$out" UNKNOWN)" \
+    "T38j: the cross-repo misread is reported unknown, not rescued by the rename layer"
+
+# T38k: a `#N` token (park_record::BlockerRef's accepted input shape) parses
+# as a local ref, not as malformed.
+out="$("$TARGET_SCRIPT" dep-states --refs "#31" --repo owner/repo)"
+assert_eq "true" "$(field "$out" ALL_RESOLVED)" "T38k: a #N token resolves like a bare N"
+assert_eq "#31" "$(eval_var "$out" RESOLVED)" "T38k: a #N token renders as #31"
+
+# T38l: a SHED read (the loom-front's exit-75 "no reader can serve this") is
+# an unknown dependency, never a resolved one — the exact outcome class the
+# acceptance criteria name. Both entity reads shed -> no bound answer.
+jq -n '{__stub_rc:75}' >"$STUB_DIR/example-org__loaded-issue-88.json"
+jq -n '{__stub_rc:75}' >"$STUB_DIR/example-org__loaded-pr-88.json"
+out="$("$TARGET_SCRIPT" dep-states --refs "example-org/loaded#88" --repo owner/repo)"
+assert_eq "false" "$(field "$out" ALL_RESOLVED)" \
+    "T38l: a shed (exit 75) read answers ALL_RESOLVED=false"
+assert_eq "example-org/loaded#88" "$(eval_var "$out" UNKNOWN)" \
+    "T38l: the shed dependency is reported unknown"
 
 # --- Summary ---
 echo ""

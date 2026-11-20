@@ -44,6 +44,8 @@
 #       [--json]
 #   dep-recheck-fingerprint.sh extract-refs (--number N [--repo OWNER/NAME] | --stdin)
 #       [--bot-login LOGIN] [--json]
+#   dep-recheck-fingerprint.sh dep-states --refs "N1 OWNER/REPO#N2 ..." [--repo OWNER/NAME]
+#       [--json]
 #   dep-recheck-fingerprint.sh decide --hash HASH [--prior-hash HASH]
 #       [--prior-age-hours N] [--heartbeat-hours N] [--json]
 #
@@ -95,6 +97,25 @@
 #                      `--bot-login`.
 #   decide             The four-way decision (#7617): ACTION
 #                      (none|skip|comment|heartbeat) and CLAIM (true|false).
+#   dep-states         Guide's unblock sweep (#14710): ALL_RESOLVED plus the
+#                      RESOLVED/OPEN/UNKNOWN split of --refs, each state read
+#                      live and BOUND to its qualified OWNER/REPO#N - the
+#                      answer's number and URL must name the exact node asked
+#                      about, so a cached/shed/mismatched read for the same
+#                      number in a DIFFERENT repo cannot read as resolved
+#                      (2AMLogic/.loom#630 was reported resolved on
+#                      2026-11-19 while the cross-repo draft PR was open).
+#                      A renamed repository still resolves: a URL naming the
+#                      asked slug's CANONICAL name (resolved via REST, which
+#                      follows the rename redirect) binds too - a verified
+#                      redirect to the same repository is the same
+#                      dependency (rjwalters/loom -> 2AMLogic/loom).
+#                      ALL_RESOLVED=true only when every ref is CLOSED or
+#                      MERGED; open, unreadable and mismatched all fail
+#                      closed. A bare N (or #N) resolves in the invoking repo
+#                      (--repo, else the checkout's git remote). A malformed
+#                      token is REPORTED in UNKNOWN, never dropped. Live-only
+#                      (no --stdin): the binding-verified read IS the check.
 #
 # Exit codes:
 #   0  evaluation completed (branch on VERDICT / CONCLUSION_HASH)
@@ -127,5 +148,6 @@ source "$SCRIPT_DIR/lib/script-helper.sh"
 # would replace the sourcing shell and run the subcommand with ITS arguments.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     # requires-daemon: dep-recheck-fingerprint >= 0.19.104   #7961/#7969 — the Rust port added loom-daemon/src/cli/dep_recheck.rs in 71d1fbae3, merged when VERSION read 0.19.103 (so 0.19.103 is the last version WITHOUT it); the post-merge bump that first shipped it was 0.19.104 (d3ea1a822). Hard, not `optional`: curator.md `eval`s this output, so there is nothing to degrade to. The refusal exits LOOM_SCRIPT_HELPER_MISSING_RC=2 set above, never 1 — 1 MEANS "unreadable issue/PR, fail safe" here (#8484).
+    # Subcommand-level floor only, per the resolve-role-model.sh convention: `dep-states` (#14710) merged when VERSION read 0.20.2, so 0.20.2 is the last version without it and 0.20.3 the first to ship it. A binary in between answers `dep-states` with clap's own "unrecognized subcommand" exit 2 — which its only caller (guide.md's resolve_dep_states) already treats fail-closed as ALL_RESOLVED=false, so the whole-command floor above stays untouched for the four older subcommands.
     loom_exec_script_helper dep-recheck-fingerprint "$@"
 fi

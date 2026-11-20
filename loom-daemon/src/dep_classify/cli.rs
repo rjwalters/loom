@@ -108,8 +108,13 @@ fn warn(msg: &str) {
 /// locally, so it keeps working offline and under GraphQL exhaustion — which
 /// is exactly when a Champion pass most needs to keep running. `gh repo view`
 /// is the fallback for a checkout with no origin.
+///
+/// `pub(crate)` for `dep_recheck`'s `dep-states` (#14710): a bare `#N`
+/// dependency means the invoking repo, and the invoking repo's NWO is also
+/// what the answer's URL is verified against — one resolver, not a second
+/// copy that could disagree with this one.
 #[must_use]
-fn resolve_repo(cwd: &Path) -> Option<String> {
+pub(crate) fn resolve_repo(cwd: &Path) -> Option<String> {
     if let Some(nwo) = run_git(cwd, &["remote", "get-url", "origin"])
         .ok_stdout_trimmed()
         .as_deref()
