@@ -1460,6 +1460,124 @@ fn failed_probe_round_mid_hold_does_not_readmit_the_account() {
     );
 }
 
+/// #14195, the header-less 2xx twin of the #14145 regression above: an
+/// account held under #13893 with a 7d reset days out and a 10h-old mark;
+/// one probe cycle gets a 2xx whose response carried 7d headers but no
+/// `-5h-utilization` header (the live fleet observation — 7d = 0.72, no 5h
+/// field); the next read must STILL hold the account to the recorded reset.
+/// Before the fix the round overwrote `name|exhausted||<reset>` with a bare
+/// `name|available`, the reader found no util and no reset, and the mid-window
+/// account was readmitted at the 6h fixed cooldown.
+#[test]
+#[serial]
+fn headerless_2xx_round_mid_hold_does_not_readmit_the_account() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Held, mark 10h old — past the 6h default cooldown, so any blocking
+    // below can only come from the weekly hold.
+    let marked = (Utc::now() - chrono::Duration::seconds(10 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(
+        dir.join(".bad_tokens"),
+        format!("{marked} agent-1 exhausted: hit your weekly limit\n"),
+    )
+    .unwrap();
+    let reset = (Utc::now() + chrono::Duration::seconds(4 * 24 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    // The steady-state hold row (mtime after the backdated mark — fresh).
+    fs::write(dir.join(".ranking"), format!("agent-1|exhausted||{reset}\n")).unwrap();
+    assert!(
+        blocking_entry(tmp.path(), "agent-1").is_some(),
+        "precondition: the hold is active"
+    );
+
+    // One probe cycle: a 2xx with 7d headers only — 7d utilization 0.72
+    // (under the exhausted threshold, so the verdict is `available`) and no
+    // 5h utilization. Run it through the REAL writer the daemon's periodic
+    // refresh uses.
+    let ranking_path = dir.join(".ranking");
+    let mut fresh = crate::tokens_pool::check::AccountResult::new("agent-1", "available");
+    fresh.s7d_utilization = Some(0.72);
+    fresh.s7d_reset = Some(
+        (Utc::now() + chrono::Duration::seconds(4 * 24 * 3600))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string(),
+    );
+    let report = crate::tokens_pool::check::ProbeReport {
+        ranked_at: "x".into(),
+        accounts: vec![fresh],
+    };
+    crate::tokens_pool::check::write_ranking_atomic(&report, &ranking_path).unwrap();
+
+    // The row on disk is still the exhausted hold row, not a bare
+    // `available`.
+    assert_eq!(
+        fs::read_to_string(&ranking_path).unwrap(),
+        format!("agent-1|exhausted||{reset}\n"),
+        "a header-less 2xx round must not overwrite the hold row"
+    );
+    // The next read holds the account to the recorded reset.
+    let entry = blocking_entry(tmp.path(), "agent-1")
+        .expect("a header-less 2xx round must not readmit an account under a weekly hold");
+    assert_eq!(entry.class, BadReasonClass::Exhaustion);
+    assert_eq!(entry.timestamp, marked, "the held entry is the original mark");
+    let remaining = entry
+        .cooldown_remaining_secs
+        .expect("the hold reports a countdown");
+    // ~4d to the recorded reset instant (NOT the ~0 remaining the 6h fixed
+    // cooldown would report for a 10h-old mark). #7748 convention: loose
+    // lower bound for a wall-clock jump between fixture and reader.
+    assert!(
+        ((4 * 24 * 3600) - 3600..=(4 * 24 * 3600)).contains(&remaining),
+        "expected ~4d to the recorded reset instant, got {remaining}s"
+    );
+}
+
+/// #14195 guard, #13893 AC 4 unchanged: the carry-forward never manufactures
+/// a hold out of nothing. With no previous `exhausted` row (the account was
+/// never held by a recorded reset), a header-less 2xx round writes its bare
+/// `available` row as before and the entry still clears at the 6h fixed
+/// cooldown.
+#[test]
+#[serial]
+fn headerless_2xx_without_a_previous_exhausted_row_keeps_the_fixed_cooldown() {
+    let tmp = make_pool();
+    let dir = pool_dir(tmp.path());
+    // Marked 7h ago — past the 6h default cooldown; the ranking on record
+    // is a healthy row, never an `exhausted` one.
+    let marked = (Utc::now() - chrono::Duration::seconds(7 * 3600))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    fs::write(dir.join(".bad_tokens"), format!("{marked} agent-1 exhausted: hit your limit\n"))
+        .unwrap();
+    fs::write(dir.join(".ranking"), "agent-1|available|0.20\n").unwrap();
+    assert!(
+        !is_bad(tmp.path(), "agent-1"),
+        "precondition: with no exhausted row on record the 7h-old mark is already past the 6h cooldown"
+    );
+
+    // A header-less 2xx round writes the bare available row (nothing to
+    // preserve).
+    let ranking_path = dir.join(".ranking");
+    let mut fresh = crate::tokens_pool::check::AccountResult::new("agent-1", "available");
+    fresh.s7d_utilization = Some(0.10);
+    let report = crate::tokens_pool::check::ProbeReport {
+        ranked_at: "x".into(),
+        accounts: vec![fresh],
+    };
+    crate::tokens_pool::check::write_ranking_atomic(&report, &ranking_path).unwrap();
+    assert_eq!(fs::read_to_string(&ranking_path).unwrap(), "agent-1|available\n");
+
+    assert!(
+        !is_bad(tmp.path(), "agent-1"),
+        "no previous exhausted row must still clear at the 6h fixed cooldown (#13893 AC 4); \
+         a landed bare `available` row must not resurrect or extend anything"
+    );
+    assert_eq!(blocking_entry(tmp.path(), "agent-1"), None);
+}
+
 /// #14145 guard, #13893 AC 4 unchanged: with no previous `exhausted` row at
 /// all (no hold evidence ever recorded), a failed round writes its `error`
 /// row as before and the entry still clears at the 6h fixed cooldown — the
