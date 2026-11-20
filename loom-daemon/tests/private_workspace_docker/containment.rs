@@ -13,9 +13,9 @@
 //! the operator's one-time decision is stood in for by writing a synthetic
 //! `hooks.state` entry into the disposable profile BEFORE the session binds it
 //! read-only — the same observable signal `provision-codex-hooks.sh verify`
-//! reads in production. What this module proves is the admission consequence:
-//! with that signal absent, a mutable role is refused; with it present, the
-//! mutable role runs — and every other obligation is still enforced.
+//! reads in production. A fresh managed registration can establish trust
+//! through its seal too. The refusal fixtures leave both paths unavailable,
+//! and the admission fixtures exercise the remaining runtime obligations.
 use super::*;
 use crate::dispatch::Environment;
 use loom_daemon::runtime_preference::resolve_for_dispatch_with;
@@ -55,6 +55,16 @@ pub(super) fn establish_hook_trust(profile: &std::path::Path) {
         format!("{existing}\n[hooks.state.\"{key}\"]\ntrusted_hash = \"fixture-trust-decision\"\n"),
     )
     .unwrap();
+}
+
+/// Make a fresh fixture's registration unsealable while preserving its PreToolUse entry.
+pub(super) fn make_hook_registration_unsealable(profile: &std::path::Path) {
+    assert_eq!(containment::trust_state(profile), "sealed");
+    let path = profile.join("hooks.json");
+    let mut hooks: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    hooks["hooks"]["PostToolUse"] = serde_json::json!([]);
+    std::fs::write(&path, serde_json::to_vec(&hooks).unwrap()).unwrap();
+    assert_eq!(containment::trust_state(profile), "missing");
 }
 
 pub(super) fn environment(
@@ -174,9 +184,9 @@ fn every_unverified_private_shape_is_refused_for_a_mutable_role() {
     }
 
     // ---- 2. a managed session with NO established hook trust --------------
-    // The boundary itself is Ready and the registration names the image-owned
-    // bridge; the ONLY thing missing is the operator's trust decision, without
-    // which the pinned CLI reads the registration and then silently ignores it.
+    // The boundary is ready and managed. The profile has neither a recorded
+    // trust decision nor a sealable registration.
+    make_hook_registration_unsealable(&f.root.path().join("profiles").join(name));
     let report: Value =
         serde_json::from_str(&f.exec(name, "loom-daemon private-workspace control")).unwrap();
     assert_eq!(report["status"], "ready", "{report}");
