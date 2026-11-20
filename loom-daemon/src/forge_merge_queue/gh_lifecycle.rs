@@ -16,7 +16,7 @@ use super::group_github::{group_transition_line, revoke_for_transition_groups};
 use super::lifecycle::{handoff, reconcile_pr, sweep, Ctx, HandoffFailure, Reconciled};
 use super::mode::{resolve_merge_mode, MergeMode};
 use super::ops::PrState;
-use super::status_command::{self, StatusCommand};
+use super::status_command::StatusCommand;
 use crate::cmd_out::CmdOutcome;
 use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 
@@ -36,11 +36,25 @@ pub const REMOVALS_QUERY: &str = "query($owner: String!, $name: String!, $number
 pub struct GhLifecycleForge {
     gh: String,
     root: PathBuf,
+    /// The trusted status-route root (#14632): the registered workspace for
+    /// the exact target when this machine has one, else `root` when it is
+    /// itself a checkout of the target, else `root`. Broker probe/post
+    /// invocations and the writer-identity read run with this root.
+    command_root: PathBuf,
     owner: String,
     name: String,
-    /// `forge.mergeQueue.statusCommand` as read at construction: `Ok(None)`
-    /// when unset, `Err` when set but unusable (posts then refuse, #12679).
+    /// `forge.mergeQueue.statusCommand` as read at construction **from the
+    /// trusted root for the exact target** (#14632): `Ok(None)` when unset
+    /// there, `Err` when set but unusable — or when it is configured only in
+    /// a root that cannot authorize the route for this target (posts then
+    /// refuse, #12679/#14632).
     status_command: Result<Option<StatusCommand>, String>,
+    /// The route observation made at construction, joined to each status
+    /// write by [`Self::record_handoff`] (#14636).
+    route_obs: super::status_route::RouteRecord,
+    /// The PR and approved head of the handoff in progress, set at the
+    /// handoff boundary so probe refusals carry them too (#14636).
+    handoff: std::sync::Mutex<Option<(u32, String)>>,
 }
 
 impl GhLifecycleForge {
@@ -48,14 +62,60 @@ impl GhLifecycleForge {
     ///
     /// When `nwo` is not `owner/repo`.
     pub fn new(gh: &str, root: &Path, nwo: &str) -> Result<Self, String> {
+        Self::new_with_registry(
+            gh,
+            root,
+            nwo,
+            super::status_route::default_registered_roots().as_deref(),
+        )
+    }
+
+    /// [`new`] with the machine's registered workspace roots supplied by the
+    /// caller — the hermetic seam the #14632 two-checkout fixtures drive.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`].
+    pub fn new_with_registered(
+        gh: &str,
+        root: &Path,
+        nwo: &str,
+        registered: &[PathBuf],
+    ) -> Result<Self, String> {
+        Self::new_with_registry(gh, root, nwo, Some(registered))
+    }
+
+    /// [`new`] with the registry supplied as the production loader reports it:
+    /// `None` when it could not be read (nothing is then verifiable as managed).
+    ///
+    /// # Errors
+    ///
+    /// As [`new`].
+    pub fn new_with_registry(
+        gh: &str,
+        root: &Path,
+        nwo: &str,
+        registered: Option<&[PathBuf]>,
+    ) -> Result<Self, String> {
         match GhTarget::repo(nwo) {
-            Ok(GhTarget::Repo { owner, repo }) => Ok(Self {
-                gh: gh.to_string(),
-                root: root.to_path_buf(),
-                owner,
-                name: repo,
-                status_command: status_command::resolve(root),
-            }),
+            Ok(GhTarget::Repo { owner, repo }) => {
+                let route = super::status_route::resolve_with(root, nwo, registered);
+                let route_obs = super::status_route::observe(root, &route, nwo);
+                super::status_route::record(root, &route, nwo);
+                Ok(Self {
+                    gh: gh.to_string(),
+                    root: root.to_path_buf(),
+                    command_root: route
+                        .trusted_root
+                        .clone()
+                        .unwrap_or_else(|| root.to_path_buf()),
+                    owner,
+                    name: repo,
+                    status_command: route.command,
+                    route_obs,
+                    handoff: std::sync::Mutex::new(None),
+                })
+            }
             _ => Err("repository must be an `owner/repo` slug".to_string()),
         }
     }
@@ -64,16 +124,52 @@ impl GhLifecycleForge {
         &self.gh
     }
 
-    pub(super) fn root(&self) -> &Path {
-        &self.root
-    }
-
     pub(super) fn owner(&self) -> &str {
         &self.owner
     }
 
     pub(super) fn status_command(&self) -> &Result<Option<StatusCommand>, String> {
         &self.status_command
+    }
+
+    /// The root broker invocations run from (#14632): the trusted root for
+    /// the exact target, falling back to the invocation root.
+    pub(super) fn command_root(&self) -> &Path {
+        &self.command_root
+    }
+
+    /// Remember the PR and head of the handoff in progress (#14636).
+    pub(super) fn set_handoff(&self, pr: u32, head_sha: &str) {
+        if let Ok(mut g) = self.handoff.lock() {
+            *g = Some((pr, head_sha.to_string()));
+        }
+    }
+
+    /// Record one attempt-level observation (#14636): the route and its typed
+    /// `outcome` for `operation` (`probe_status` | `post_status`), joined to
+    /// the exact PR/head — the handoff's own (set at the boundary) unless the
+    /// write names its own.
+    pub(super) fn record_attempt(
+        &self,
+        operation: &'static str,
+        outcome: &'static str,
+        pr: Option<u32>,
+        head_sha: Option<&str>,
+    ) {
+        let held = self.handoff.lock().ok().and_then(|g| g.clone());
+        let pr = pr.or(held.as_ref().map(|(p, _)| *p));
+        let head = head_sha
+            .map(str::to_string)
+            .or(held.map(|(_, h)| h))
+            .unwrap_or_default();
+        super::status_route::record_handoff(
+            &self.root,
+            &self.route_obs,
+            pr,
+            &head,
+            operation,
+            outcome,
+        );
     }
 
     pub(super) fn repo_name(&self) -> &str {
