@@ -244,55 +244,14 @@ the entire raw JSON line straight through the allowlist. Both steps were
 verified against the real pinned Collector image (see
 [Executable contract and evidence](#executable-contract-and-evidence)).
 
-New attributes this issue adds to the shared allowlist (#8669): `loom.session_id`
-and `loom.agent_id` / `loom.parent_agent_id` (subagent lineage — an
-`agent_change` record's `parentAgentId` is the *immediate* parent at that
-record's level, not the root of the chain; walking `agent_id` -> matching
-`parent_agent_id` across records reconstructs the full chain regardless of
-depth). `loom.runtime`, `loom.provider`, `loom.model` and `loom.duration_sec`
-are reused from the existing schema.
+The shared allowlist includes `loom.session_id` and the subagent lineage fields
+`loom.agent_id` and `loom.parent_agent_id` (#8669). An
+`agent_change` record's `parentAgentId` names its *immediate* parent. Follow
+the matching `agent_id` at each level to reconstruct the full chain.
 
-Issue #8760 (G3 part 2 / G4 of #8714) adds two more record kinds and six more
-allowlisted attributes: `session.analysis`'s `loom.cost_usd`,
-`loom.retry_loops`, `loom.longest_tool_call.tool`,
-`loom.longest_tool_call.duration_ms`, `loom.anomalies` (all derived from
-counts/ids/allowlisted tool names — never transcript content, same as
-`session.summary`); and `daemon.event`'s `loom.topic` /
-`loom.payload` (the latter is the already-reviewed, small, operator-facing
-`daemon.drain.*` / `daemon.capacity.advisory` / `daemon.preflight.advisory` /
-`epic.issue.*` event-bus payload, carried whole as one JSON string rather than
-re-typed per topic — see `crate::event_bus`'s frozen taxonomy).
-
-Issue #12230 adds four allowlisted attributes and no new kind: the
-`daemon.work_finder.first_tick` record's scalars as typed copies,
-`loom.payload.secs_since_start`, `loom.payload.gate_wait_secs`,
-`loom.payload.jitter_delay_secs` and
-`loom.payload.startup_reconcile_cap_fired` (durations and a flag; the same
-values are already inside `loom.payload`).
-
-Issue #9445 adds one more allowlisted attribute and no new kind:
-`session.summary`'s `loom.session_kind` (`sweep` / `role` / `interactive`), a
-fixed three-value vocabulary that says whether a row's absent `loom.issue` is
-deliberate. The same issue makes that kind's `loom.repo` an `owner/name` forge
-slug resolved from the session workspace's git remote — omitted rather than
-falling back to the cwd basename, which had made every row unjoinable.
-
-Issue #8825 (CI telemetry, phase 2) adds a fourth, `ci.job.log`: one ≤ 8 KiB
-chunk of a completed job's log, with `loom.ci.chunk_index`,
-`loom.ci.chunk_count`, `loom.ci.log_bytes_total`, `loom.ci.truncated` and
-`loom.ci.truncation_note` joining the log allowlist. It is the only kind whose
-**body** is free text, and the reason `transform/ci_log_redaction` exists —
-see ["Privacy and remote deployment"](#privacy-and-remote-deployment).
-
-Issue #8824 (CI telemetry, phase 1) adds three record kinds — `ci.run`,
-`ci.job` (log records) and `ci.duration` (the `loom.ci.run.duration_ms` /
-`loom.ci.job.duration_ms` delta histograms) — plus `loom.ci.run` /
-`loom.ci.job` spans. The log, span and datapoint allowlists gain exactly the
-constants in `loom-daemon/src/telemetry/ci.rs` (`CI_LOG_ATTRIBUTE_KEYS`,
-`CI_SPAN_ATTRIBUTE_KEYS`, `CI_METRIC_LABEL_KEYS`); the `ci_telemetry`
-contract test fails if this config and those constants ever disagree. Metric
-labels are the low-cardinality `repo`, `workflow`, `job`, `runner`,
-`conclusion` only. See `defaults/docs/ci-observability.md`.
+See [Privacy and remote deployment](#privacy-and-remote-deployment) for the
+free-text body exceptions and their redaction boundaries, and
+[CI observability](../../docs/ci-observability.md) for the CI telemetry schema.
 
 | Source | Path tailed (in-container) | `loom.*` fields populated |
 | --- | --- | --- |
@@ -300,19 +259,8 @@ labels are the low-cardinality `repo`, `workflow`, `job`, `runner`,
 | pi | `/var/lib/loom-sessions/pi/**/*.jsonl` | `runtime` (static `"pi"`), `session_id` (any record carrying `sessionId` — absent from the verified sample), `provider`/`model` (from a `model_change` record — verified 2026-09-23), `agent_id`/`parent_agent_id` (from an `agent_change` record — unverified, no such record in the sample) |
 | Claude transcripts | `/var/lib/loom-sessions/claude/**/*.jsonl` | `runtime` (static `"claude"`), `session_id` (verified 2026-09-23), `duration_sec` (`durationMs / 1000` — field absent from all 22,668 real transcripts sampled; guarded no-op until a format carries it) |
 
-**`compose.yaml` bind-mounts each of those three fixed in-container paths
-read-only from a host directory named by a required env var (#8686).** They
-were deliberately left as fixed in-container paths — not `${env:HOME}/...` —
-so wiring a real host directory in is a least-privilege bind of exactly
-`~/.codex/sessions`, `~/.pi/agent/sessions` or `~/.claude/projects`, never the
-whole home directory (SSH keys, browser profiles and other unrelated secrets
-live there too). Each mount is `:ro` and gated behind
-`LOOM_CODEX_SESSIONS_DIR` / `LOOM_PI_SESSIONS_DIR` /
-`LOOM_CLAUDE_PROJECTS_DIR` (see ["Start and validate"](#start-and-validate)),
-so a receiver can read its runtime's session store but never write it, and an
-env file that omits one fails `docker compose up` loudly instead of silently
-dropping a tail. With the mounts in place the three receivers ingest each
-mounted store retroactively from the first line (`start_at: beginning`).
+See [Start and validate](#start-and-validate) for the required environment
+variables and read-only mounts for these paths.
 
 **Field-path verification against real session files (2026-09-23, #8686).**
 The paths above were originally assumptions from #8664's field-name hints
@@ -434,20 +382,13 @@ For `ci.job.log`, concretely:
   list, the config and the test in the same PR** — the list is reviewable, and
   fails closed against silent drift rather than against unseen patterns.
 
-Extending this exception to a second record kind is a deliberate policy
-change, not a config tweak: it needs its own review, its own scope guard, and
-its own entry in the contract tests above.
+Every additional free-text body exception requires explicit policy review,
+its own scope guard and a contract-test entry.
 
-The other narrow exception — receiver-level, and about *not* forwarding free
-text rather than scrubbing it — is the `file_log/codex`, `file_log/pi` and
-`file_log/claude` receivers documented in
-["Interactive-session filelog receivers"](#interactive-session-filelog-receivers)
-below (#8669): they tail structured JSONL session stores, but never forward
-the raw parsed line. Each receiver's own `operators` pipeline moves ONLY a
-handful of named fields into `loom.*` attributes and then discards the parsed
-body (`remove: body`) before the record leaves the receiver — this is a
-second, receiver-level enforcement layer, independent of and prior to the
-`transform/privacy` allowlist below. Do not add a filelog receiver, or extend
+The [interactive-session filelog receivers](#interactive-session-filelog-receivers)
+enforce their own allowlist (#8669). Each receiver moves named fields into
+`loom.*` attributes and discards the parsed body (`remove: body`) before the
+record reaches `transform/privacy`. Do not add a filelog receiver, or extend
 one of these three, without that same discipline: an operator pipeline that
 forwards a raw parsed field (or the body) unfiltered defeats the allowlist
 the same way a directly-instrumented free-text body would.

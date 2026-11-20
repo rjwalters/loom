@@ -705,7 +705,16 @@ impl OutcomeLedger {
                 );
                 self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
-            Effect::Reclassify => self.refusal_streak(item, step, &outcome.reason, now),
+            Effect::Reclassify => {
+                // Keep the admission streak when a private-seat preparation
+                // refusal supplies the more specific diagnostic (#14521).
+                let reason = if outcome.reason == SEAT_DIRTY {
+                    "admission"
+                } else {
+                    &outcome.reason
+                };
+                self.refusal_streak(item, step, reason, now);
+            }
             Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder | Effect::Uncharged => {}
         }
         // An exhausted seat is not an outcome of the pair (#13966): it leaves

@@ -456,6 +456,32 @@ pub fn trust_at(codex_home: &Path, runtime_home: &Path) -> (bool, &'static str) 
     }
 }
 
+/// A profile's hook trust as an operator reads it (#14105): `recorded` when
+/// Codex has a trust decision for Loom's entry where a session runs it,
+/// `sealed` when it has none but the registration vets as Loom's one entry
+/// (host-mode's workspace-independent command, or `private_command`, the
+/// image-owned bridge a private clone registers), so a launch passes the
+/// waiver instead, and `missing` otherwise. Profile-level only: a clone's
+/// project layers are vetted when a session launches.
+#[must_use]
+pub fn trust_state(codex_home: &Path, private_command: &str) -> &'static str {
+    if trust_at(codex_home, Path::new(SESSION_CODEX_HOME)).0 {
+        return "recorded";
+    }
+    let sealable = |command: Option<String>| {
+        let request = seal::Request {
+            command,
+            ..seal::Request::default()
+        };
+        seal::vet_profile(codex_home, Path::new(SESSION_CODEX_HOME), &request).is_ok()
+    };
+    if sealable(None) || sealable(Some(private_command.to_owned())) {
+        "sealed"
+    } else {
+        "missing"
+    }
+}
+
 /// The `hooks.state` keys Codex looks Loom's entry up under with
 /// `CODEX_HOME=runtime_home`: one per `PreToolUse` position the entry holds.
 #[must_use]

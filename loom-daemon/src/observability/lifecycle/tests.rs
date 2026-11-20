@@ -1047,11 +1047,12 @@ fn a_swept_step_attempt_mirrors_the_observed_step_end_and_runtime() {
         assert_eq!(s.attributes["loom.result"], "success", "{name:?}");
         assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
         assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
+        assert!(!s.attributes.contains_key(FAILURE_CLASS), "{name:?}");
         assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
     }
 
-    // A failed step end is mirrored as a failure, and an unknown runtime
-    // (no engine) is carried as-is without inventing an engine.
+    // The observed failure carries its OpenCode runtime. There is no
+    // engine or root failure class to copy.
     let (dir, span) = open("step-failed");
     let failed = StepEndObserved {
         result: "failure".into(),
@@ -1073,16 +1074,22 @@ fn a_swept_step_attempt_mirrors_the_observed_step_end_and_runtime() {
     assert_eq!(attempt.attributes["loom.result"], "failure");
     assert_eq!(attempt.attributes["loom.runtime"], "opencode");
     assert!(!attempt.attributes.contains_key("loom.engine"));
+    assert!(!attempt.attributes.contains_key(FAILURE_CLASS));
 
-    // Nothing observed (kill, orphan recovery, host loss): no result, no runtime.
+    // A recovery can classify its root even though the child's actual exit
+    // was never observed.
     let (dir, span) = open("step-unobserved");
-    finish_execution(dir.path(), "step-unobserved", "success", TraceAttributes::new()).unwrap();
+    let recovery = attributes(&[(FAILURE_CLASS, "supervisor-lost")]);
+    finish_execution(dir.path(), "step-unobserved", "process_lost", recovery).unwrap();
     let spans = drained_spans(&span.journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes[FAILURE_CLASS], "supervisor-lost");
     for name in [SpanName::RoleAttempt, SpanName::Phase] {
         let s = spans.iter().find(|s| s.name == name).unwrap();
         assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
         assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
         assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+        assert!(!s.attributes.contains_key(FAILURE_CLASS), "{name:?}");
     }
 }
 

@@ -908,7 +908,10 @@ fn a_repeated_admission_refusal_arms_a_doubling_cooldown() {
     let mut lengths = Vec::new();
     for k in 1..12 {
         let at = now + chrono::Duration::days(k);
-        let rec = l.record(80, step, &refuse(admission), SLOW, at);
+        // The diagnostic for a dirty private seat keeps the original
+        // admission grouping and therefore the same mixed-refusal backoff.
+        let reason = if k % 2 == 1 { SEAT_DIRTY } else { admission };
+        let rec = l.record(80, step, &refuse(reason), SLOW, at);
         assert_eq!(rec.effect, Effect::Reclassify);
         lengths.push((rec.cooling_until.expect("cooling") - at).num_seconds());
     }

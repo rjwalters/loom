@@ -753,10 +753,12 @@ async fn the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_los
     until("the full-refresh backstop", || s.queue_len() == 4).await;
 
     // The next period finds the worklist unchanged: a 304 only advances the age.
+    let prior_not_modified = worklist_calls(Some(304));
     clock.set(400);
-    until("the conditional full read", || worklist_calls(Some(304)) >= 1).await;
+    until("the conditional full read", || worklist_calls(Some(304)) > prior_not_modified).await;
+    // The mirror logs the response before the client receives it.
+    until("the client to advance the full-refresh age", || !s.queue_refresh_due()).await;
     assert_eq!(s.queue_len(), 4);
-    assert!(!s.queue_refresh_due(), "a 304 advances the age");
 
     // A truncated cursor means changes were missed: the next full refresh
     // recovers them with no period elapsing.
