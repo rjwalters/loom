@@ -24,6 +24,233 @@ use crate::tokens_pool::session_lifecycle::{
 };
 use crate::tokens_pool::session_state::{DriftInputs, Observed};
 
+#[test]
+fn binding_account_uses_the_first_acting_codex_root_and_email_alias() {
+    use crate::tokens_pool::account_registry::{AccountId, CredentialKind, InventoryProvenance};
+
+    let codex = |path: &str| AccountDescriptor {
+        id: AccountId {
+            provider: AccountProvider::Codex,
+            name: "alice".into(),
+        },
+        credential_kind: CredentialKind::CodexHome,
+        credential_reference: path.into(),
+        enabled: true,
+        provenance: InventoryProvenance::Repo,
+        email: Some("Alice@example.test".into()),
+    };
+    let mut wrong_provider = codex("/other/provider");
+    wrong_provider.id.provider = AccountProvider::Claude;
+    let inventories = [
+        (PathBuf::from("/acting/wrong"), vec![wrong_provider]),
+        (PathBuf::from("/acting/first"), vec![codex("/profiles/first")]),
+        (PathBuf::from("/acting/other"), vec![codex("/profiles/other")]),
+    ];
+    let (root, account) = binding_account(&inventories, "ALICE@example.test").unwrap();
+    assert_eq!(root, Path::new("/acting/first"));
+    assert_eq!(account.credential_reference, Path::new("/profiles/first"));
+    assert!(binding_account(&inventories[..1], "alice").is_none());
+    assert!(binding_account(&inventories, "another@example.test").is_none());
+    assert!(binding_account(&[], "alice").is_none());
+}
+
+#[test]
+fn a_binding_needs_a_current_running_observation_of_the_recorded_private_seat() {
+    use crate::tokens_pool::account_registry::{AccountId, CredentialKind, InventoryProvenance};
+    use private_workspace::bundle::{control_destination, PROFILE_CONTROLS};
+    use serde_json::json;
+    use std::cell::Cell;
+
+    let dir = tempfile::tempdir().unwrap();
+    let profile_dir = dir.path().join("alice");
+    std::fs::create_dir(&profile_dir).unwrap();
+    let account = AccountDescriptor {
+        id: AccountId {
+            provider: AccountProvider::Codex,
+            name: "alice".into(),
+        },
+        credential_kind: CredentialKind::CodexHome,
+        credential_reference: profile_dir.canonicalize().unwrap(),
+        enabled: true,
+        provenance: InventoryProvenance::Repo,
+        email: None,
+    };
+    let config = private_workspace::Config {
+        schema_version: 1,
+        account: account.id.name.clone(),
+        container: container_name(&account.id.name),
+        engine: "engine".into(),
+        docker_desktop: false,
+        repository: "https://github.com/example/primary".into(),
+        base: "main".into(),
+        repositories: Vec::new(),
+        volume: "private-volume".into(),
+        profile: account.credential_reference.clone(),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+    };
+    let state = dir.path().join(".private-sessions/alice");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("workspace.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let waiting = private_workspace::ConfiguredSeatMissing::of(&config);
+    let mut inspect = json!({
+        "State": {"Running": true, "Restarting": false},
+        "Config": {
+            "Labels": {"loom.workspace-mode":"private-clone", "loom.account":config.account,
+                       "loom.repository":config.repository, "loom.workspace":"/workspace/repo"},
+            "User":"1000:1000", "Entrypoint":["/usr/bin/tini"], "Cmd":["--","/bin/sleep","infinity"]
+        },
+        "HostConfig": {"Privileged":false,"ReadonlyRootfs":true,"CapDrop":["ALL"],
+                       "SecurityOpt":["no-new-privileges"]},
+        "Mounts":[{"Destination":"/workspace","Type":"volume","Name":config.volume,"RW":true},
+                  {"Destination":"/home/loom/.codex-profile","Type":"bind","Source":config.profile,"RW":true}]
+    });
+    for control in PROFILE_CONTROLS {
+        inspect["Mounts"].as_array_mut().unwrap().push(json!({
+            "Destination": control_destination(control), "Type": "bind",
+            "Source": config.profile.join(control), "RW": false
+        }));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let runner = dir.path().join("fixture-docker");
+    let engine_file = dir.path().join("fixture-engine");
+    let next_engine = dir.path().join("fixture-next-engine");
+    let listed_file = dir.path().join("fixture-listed");
+    let inspect_file = dir.path().join("fixture-inspect");
+    let calls_file = dir.path().join("fixture-calls");
+    std::fs::write(
+        &runner,
+        r#"#!/bin/sh
+fixture=${0%/*}
+printf '%s\n' "$1" >> "$fixture/fixture-calls"
+case "$1" in
+  info) cat "$fixture/fixture-engine" ;;
+  ps) cat "$fixture/fixture-listed" ;;
+  inspect)
+    if [ -f "$fixture/fixture-next-engine" ]; then
+      mv "$fixture/fixture-next-engine" "$fixture/fixture-engine"
+    fi
+    cat "$fixture/fixture-inspect" ;;
+  *) exit 90 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let snapshot = |attest_engine| {
+        session_state::binding_snapshot(
+            runner.to_str().unwrap(),
+            &DriftInputs::new(None),
+            Duration::from_secs(2),
+            attest_engine,
+        )
+    };
+    inspect["Name"] = format!("/{}", config.container).into();
+    let inspect_seat = |value: &Value| {
+        std::fs::write(&inspect_file, serde_json::to_vec(&[value]).unwrap()).unwrap();
+    };
+    std::fs::write(&listed_file, &config.container).unwrap();
+    std::fs::write(&engine_file, "engine").unwrap();
+    inspect_seat(&inspect);
+    assert_eq!(waiting.observe(&account, &snapshot(false)), BindingReadiness::Unverified);
+    assert_eq!(std::fs::read_to_string(&calls_file).unwrap(), "ps\ninspect\n");
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Ready);
+
+    for (field, label) in [
+        ("loom.account", "other"),
+        ("loom.workspace-mode", "host-mounted"),
+    ] {
+        let mut other = inspect.clone();
+        other["Config"]["Labels"][field] = label.into();
+        inspect_seat(&other);
+        assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    }
+    let mut restarting = inspect.clone();
+    restarting["State"]["Restarting"] = true.into();
+    inspect_seat(&restarting);
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Missing);
+
+    // The valid list includes this name, but the raw inspect row is unreadable.
+    inspect_seat(&json!({"State":{"Running":true,"Restarting":false}}));
+    let partial = snapshot(true);
+    assert_eq!(
+        partial.snapshot.state_of(&config.container),
+        Some(session_state::SessionState::Missing)
+    );
+    assert_eq!(waiting.observe(&account, &partial), BindingReadiness::Unverified);
+
+    // A matching inspect row cannot prove the seat is up on the recorded engine.
+    inspect_seat(&inspect);
+    std::fs::write(&engine_file, "different-engine").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&engine_file, "").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+
+    // Even a known engine before the read cannot attest a switch during it.
+    std::fs::write(&engine_file, "engine").unwrap();
+    std::fs::write(&next_engine, "different-engine").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&engine_file, "engine").unwrap();
+    std::fs::write(&listed_file, [0xff]).unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+    std::fs::write(&listed_file, "").unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Missing);
+
+    let counts = (Cell::new(0), Cell::new(0));
+    let mut original = || {
+        counts.0.set(counts.0.get() + 1);
+        std::fs::write(&listed_file, "").unwrap();
+        snapshot(true)
+    };
+    let mut refreshed = || {
+        counts.1.set(counts.1.get() + 1);
+        std::fs::write(&listed_file, &config.container).unwrap();
+        snapshot(true)
+    };
+    let mut original = PassSnapshot::new(&mut original);
+    let mut refreshed = PassSnapshot::new(&mut refreshed);
+    let recovered = [AccountOutcome {
+        name: account.id.name.clone(),
+        container: config.container.clone(),
+        outcome: Outcome::PrivateRecovered,
+    }];
+    assert_eq!(
+        waiting.observe(
+            &account,
+            binding_snapshot("other", &recovered, &mut original, &mut refreshed)
+        ),
+        BindingReadiness::Missing,
+    );
+    assert_eq!((counts.0.get(), counts.1.get()), (1, 0));
+    for _ in 0..2 {
+        assert_eq!(
+            waiting.observe(
+                &account,
+                binding_snapshot("alice", &recovered, &mut original, &mut refreshed)
+            ),
+            BindingReadiness::Ready,
+        );
+    }
+    assert_eq!((counts.0.get(), counts.1.get()), (1, 1));
+
+    let mut stale = || snapshot(true);
+    let mut unreadable = || {
+        std::fs::remove_file(&listed_file).unwrap();
+        snapshot(true)
+    };
+    let mut stale = PassSnapshot::new(&mut stale);
+    let mut unreadable = PassSnapshot::new(&mut unreadable);
+    let chosen = binding_snapshot("alice", &recovered, &mut stale, &mut unreadable);
+    assert_eq!(waiting.observe(&account, chosen), BindingReadiness::Unverified);
+
+    let mut replaced = config.clone();
+    replaced.engine = "other-engine".into();
+    std::fs::write(state.join("workspace.json"), serde_json::to_vec(&replaced).unwrap()).unwrap();
+    std::fs::write(&listed_file, &config.container).unwrap();
+    assert_eq!(waiting.observe(&account, &snapshot(true)), BindingReadiness::Unverified);
+}
+
 #[path = "session_reconcile_drift_tests.rs"]
 mod drift_tests;
 #[path = "session_reconcile_hold_tests.rs"]

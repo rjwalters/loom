@@ -4,6 +4,74 @@ use super::super::session_lifecycle::{
 };
 use super::*;
 
+/// An unattended registration found the recorded seat absent. Only a fresh
+/// observation of that same seat can make its binding retry early.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ConfiguredSeatMissing {
+    account: String,
+    profile: PathBuf,
+    container: String,
+    engine: String,
+    volume: String,
+}
+
+impl ConfiguredSeatMissing {
+    pub(crate) fn of(config: &Config) -> Self {
+        Self {
+            account: config.account.clone(),
+            profile: config.profile.clone(),
+            container: config.container.clone(),
+            engine: config.engine.clone(),
+            volume: config.volume.clone(),
+        }
+    }
+
+    pub(crate) fn observe(
+        &self,
+        account: &super::super::account_registry::AccountDescriptor,
+        snapshot: &super::super::session_state::BindingSnapshot,
+    ) -> BindingReadiness {
+        use super::super::session_state::container_running;
+
+        if self.account != account.id.name
+            || account.credential_reference.canonicalize().ok().as_ref() != Some(&self.profile)
+        {
+            return BindingReadiness::Unverified;
+        }
+        let Some(current) = registrations(&self.profile).filter(|config| Self::of(config) == *self)
+        else {
+            return BindingReadiness::Unverified;
+        };
+        match snapshot.listed(&self.engine, &self.container) {
+            Some(false) => return BindingReadiness::Missing,
+            Some(true) => {}
+            None => return BindingReadiness::Unverified,
+        }
+        let Some(inspection) = snapshot.snapshot.inspect_of(&self.container) else {
+            return BindingReadiness::Unverified;
+        };
+        let state = &inspection["State"];
+        if !state["Running"].is_boolean()
+            || !state["Restarting"].is_boolean()
+            || docker::validate_settings(&current, inspection).is_err()
+        {
+            BindingReadiness::Unverified
+        } else if container_running(inspection) {
+            BindingReadiness::Ready
+        } else {
+            BindingReadiness::Missing
+        }
+    }
+}
+
+impl std::fmt::Display for ConfiguredSeatMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)")
+    }
+}
+
+impl std::error::Error for ConfiguredSeatMissing {}
+
 pub fn configured(workspace: &Path, name: &str) -> Result<bool> {
     let account = account(workspace, name)?;
     Ok(state_dir(&account.credential_reference)?
@@ -260,7 +328,7 @@ fn start_with(
         }
         check_hold()?;
         if existed && state.is_none() {
-            bail!("private session container is missing; refusing to recreate it with a default image (the reconcile recovery restores it with the recorded one)");
+            return Err(ConfiguredSeatMissing::of(&config).into());
         }
     }
     // The image and read-only mounts a NEW container gets are decided here,
