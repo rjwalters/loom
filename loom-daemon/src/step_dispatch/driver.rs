@@ -342,13 +342,7 @@ impl RegistrySpawner {
                     }
                 }
                 if let Some(root) = self.roots.get(idx) {
-                    super::step_end::record_refusal(
-                        root,
-                        registry,
-                        request.item,
-                        request.role,
-                        &reason,
-                    );
+                    super::step_end::record_refusal(root, registry, request.item, request.role, &e);
                 }
                 self.report_stale_draw(idx, request.item, &e);
                 SpawnResult::Refused(reason)

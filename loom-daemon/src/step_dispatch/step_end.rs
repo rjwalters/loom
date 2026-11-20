@@ -40,6 +40,7 @@ use super::session_ledger;
 use crate::step_role::StepRole;
 use crate::sweep_registry::step_ledger::StepRun;
 use crate::sweep_registry::step_spawn::ended::{self, EndedStep};
+use crate::sweep_registry::step_spawn::StepRefusal;
 use crate::sweep_registry::SweepRegistry;
 
 /// The role's post-state from one read of the item: the claim release's own
@@ -188,6 +189,25 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
+fn refusal_ledger_reason(refusal: &StepRefusal) -> Option<&'static str> {
+    // Match the start of the static Codex containment rejection and its
+    // preparation cause. A path, diagnostic excerpt or preference summary
+    // that mentions the marker is still an ordinary admission refusal.
+    let cause = refusal.detail.strip_prefix(concat!(
+        "unmet capabilities: worktreeIsolation; ",
+        "verified private-clone containment could not satisfy it: ",
+        "private workspace preparation refused: ",
+    ));
+    if refusal.reason == "runtime_rejected"
+        && cause
+            .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
+            .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
+    {
+        return Some(outcome_ledger::SEAT_DIRTY);
+    }
+    ledger_reason(refusal.reason)
+}
+
 /// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
 /// draw skips the pair while it cools down and the `claim_lost` counter
 /// counts (the integrated review's M1).
@@ -196,9 +216,12 @@ pub fn record_refusal(
     registry: &Arc<Mutex<SweepRegistry>>,
     item: u32,
     role: StepRole,
-    spawn_reason: &str,
+    error: &anyhow::Error,
 ) {
-    let Some(reason) = ledger_reason(spawn_reason) else {
+    let Some(reason) = error
+        .downcast_ref::<StepRefusal>()
+        .and_then(refusal_ledger_reason)
+    else {
         return;
     };
     let run = StepRun {
@@ -365,6 +388,28 @@ mod tests {
         assert_eq!(ledger_reason("admission_refused"), Some("admission"));
     }
 
+    #[test]
+    fn only_the_dirty_private_preparation_refusal_gets_the_specific_ledger_reason() {
+        let isolation = "unmet capabilities: worktreeIsolation; verified private-clone \
+                         containment could not satisfy it: ";
+        let dirty = "private workspace preparation refused: seat_dirty: private \
+                     clone/worktree is dirty; retain and recover its work before reuse\n  M file";
+        let refusal = |reason, detail| refusal_ledger_reason(&StepRefusal::new(reason, detail));
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}{dirty}")),
+            Some(outcome_ledger::SEAT_DIRTY)
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}failed to open path: {dirty}")),
+            Some("admission")
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("candidate skipped: {isolation}{dirty}")),
+            Some("admission")
+        );
+        assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
+    }
+
     /// #14458: a step that died on its seat's dirty leftover worktree wrote no
     /// outcome line; its log's refusal names the reason instead of leaving it
     /// `unclassified`, and a real outcome line still wins.
@@ -380,6 +425,31 @@ mod tests {
         // Prose that merely mentions the word is not the refusal.
         assert!(seat_dirty_line("the seat_dirty reason is documented").is_none());
         assert!(seat_dirty_line("private workspace preparation refused: base is missing").is_none());
+    }
+
+    #[test]
+    fn an_explicit_child_outcome_wins_over_the_dirty_seat_marker_in_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-curator-14521-1".into(),
+            item: 14521,
+            role: StepRole::Curator,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(1),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &step.log_path,
+            "sweep_id=step-curator-14521-1 started\n\
+             Error: private workspace preparation refused: seat_dirty: private clone/worktree is dirty;\n\
+             LOOM_STEP_OUTCOME role=curator target=14521 class=noop reason=already-curated\n",
+        )
+        .unwrap();
+        let outcome = outcome_line(&step).unwrap();
+        assert_eq!(outcome.class, OutcomeClass::Noop);
+        assert_eq!(outcome.reason, "already-curated");
     }
 
     fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {
