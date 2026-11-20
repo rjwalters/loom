@@ -679,6 +679,49 @@ fn a_failed_inventory_logs_exactly_one_warn_summary_at_normal_verbosity() {
     assert!(lines[0].1.contains("zero removals"), "{}", lines[0].1);
 }
 
+#[cfg(unix)]
+#[test]
+fn multiline_inventory_stderr_stays_on_one_warn_line() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let inputs = DockerRetentionInputs {
+        enabled: true,
+        tracked_repos: &tracked(),
+        allowlist: &[],
+        keep_last_n: 2,
+        now: t(30 * DAY),
+        pressure: Some(pressure(1)),
+    };
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(1 << 8),
+        stdout: Vec::new(),
+        stderr: format!(
+            "Cannot connect to the Docker daemon.\r\n\tIs the daemon running?\n{} beyond the limit",
+            "x".repeat(200),
+        )
+        .into_bytes(),
+    };
+    let report = run_pass(
+        &inputs,
+        &|| {
+            Err(DockerInventoryError {
+                stage: "docker image ls",
+                detail: failure_detail(&output),
+            })
+        },
+        &|_| panic!("a failed inventory must perform zero removals"),
+        &slot_free,
+    );
+    let records = capture_logs(|| log_pass_outcome(&report, Some(&pressure(1))));
+    assert_eq!(records.len(), 1, "one pass summary, got {records:?}");
+    let (level, line) = &records[0];
+    assert_eq!(*level, Level::Warn);
+    assert!(!line.contains(['\r', '\n']), "multiline outcome: {line:?}");
+    assert!(line.contains("docker image ls (exit status: 1: Cannot connect to the Docker daemon. Is the daemon running?"), "{line}");
+    assert!(!line.contains("beyond the limit"), "{line}");
+    assert!(line.ends_with("— zero removals performed"), "{line}");
+}
+
 #[test]
 fn a_zero_plan_below_the_floor_logs_exactly_one_info_summary_with_the_numbers() {
     // The incident's other silent shape: the inventory succeeds, everything

@@ -675,11 +675,13 @@ pub struct DockerInventoryError {
 
 impl std::fmt::Display for DockerInventoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "docker inventory failed at {} ({})", self.stage, self.detail)
+        // Keep the outcome on the same log line as its timestamp and stage.
+        let detail = self.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        write!(f, "docker inventory failed at {} ({detail})", self.stage)
     }
 }
 
-/// One bounded line of detail for a failed `docker` invocation: exit status
+/// Bounded detail for a failed `docker` invocation: exit status
 /// plus the first 200 chars of stderr (daemon errors are routinely
 /// multi-screen; the full text stays in Docker's own logs).
 fn failure_detail(out: &std::process::Output) -> String {
