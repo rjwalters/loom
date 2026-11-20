@@ -147,7 +147,8 @@ hold is cleared by hand (`accounts session attach <account>`, then
 
 A leftover worktree with uncommitted or untracked files refuses preparation of
 **its own clone** (the account's other registered repositories prepare
-independently) with a message starting `seat_dirty:`; the step's failure is
+independently) with a message starting `seat_dirty:` — unless the automatic
+finished-PR reap described below removes it first; the step's failure is
 recorded with that reason instead of `unclassified`. The listing form of
 `accounts session recover <account>` names every dirty worktree — path,
 branch, tracked and untracked counts, and commits unpublished at its HEAD —
@@ -168,6 +169,15 @@ a merged or closed PR for that exact repository, branch, and head commit.
 This includes squash and fast-forward merges and published PRs closed without
 merge. An open PR on the same branch, an unverifiable response, or an
 unsupported forge leaves the worktree in place.
+
+This automatic reap runs **before** the dirty check, so it wins over
+`seat_dirty`: a linked worktree whose tip is published and heads a finished
+PR is removed even when it carries uncommitted or untracked files. The
+removal is forced (`git worktree remove --force`): those uncommitted and
+untracked files are deleted with the worktree, while the branch ref and its
+commits are kept. Locked worktrees, the primary clone, and worktrees with
+unpublished commits are never reaped; when such a worktree is dirty, the
+refusal above still applies.
 
 ## Rebinding a registration after a repository transfer
 
