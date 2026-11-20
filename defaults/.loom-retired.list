@@ -224,3 +224,12 @@ scripts/generate-agents-md.sh
 # together with the generator it tested; this entry removes it from
 # already-installed repos on their next resync.
 scripts/tests/test-generate-agents-md-layouts.sh
+
+# #14710 (2026-11-20) — the Guide's per-dependency inline `gh issue view`
+# state loop is gone (replaced by resolve_dep_states over the daemon-side
+# binding-verified dep-states resolver), and with it the suite that extracted
+# that loop verbatim. Its #10040 pin (a MERGED PR dependency counts as
+# resolved) moved to test-dep-recheck-fingerprint.sh's dep-states section
+# (T38e) at the daemon boundary; the prompt boundary is pinned by
+# test-guide-unblock-open-crossrepo.sh.
+scripts/tests/test-guide-unblock-merged-blocker.sh

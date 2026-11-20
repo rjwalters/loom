@@ -233,7 +233,7 @@ fn start_with(
             repository,
             base: base.to_owned(),
             repositories: Vec::new(),
-            volume: format!("loom-codex-workspace-{}", account.id.name),
+            volume: workspace_volume_name(&account.id.name),
             profile,
             gh_config,
             session_image: None,

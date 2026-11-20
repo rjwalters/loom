@@ -24,6 +24,7 @@ command -v jq >/dev/null 2>&1 || { echo "SKIP: jq not available"; exit 0; }
 #                              real contract: 0 = a live record exists (stdout =
 #                              its blockers, one per line, possibly none),
 #                              1 = no live record, anything else = daemon failure.
+#   dep-recheck-fingerprint dep-states -> ALL_RESOLVED/RESOLVED from $DEP_558 (#14710)
 #   forge parent split-state -> NOT_SPLIT, exit 1 (an ordinary issue).
 #   anything else           -> exit 2, so an unexpected call fails loudly.
 STUB_COMMENTS='[]'
@@ -35,6 +36,15 @@ loom-daemon() {
             cat >/dev/null
             [[ -z "$STUB_PARK_OUT" ]] || printf '%s\n' "$STUB_PARK_OUT"
             return "$STUB_PARK_RC" ;;
+        "dep-recheck-fingerprint dep-states")
+            # #14710: check_and_unblock resolves dependency state through the
+            # daemon's binding-verified resolver. Answer it from $DEP_558 so the
+            # open arm stays unresolved and the closed arm lifts the hold.
+            if [[ "${DEP_558:-}" == "CLOSED" ]]; then
+                printf "ALL_RESOLVED=true\nRESOLVED='%s'\n" "$4"
+            else
+                printf "ALL_RESOLVED=false\nRESOLVED=''\n"
+            fi ;;
         "forge parent")
             [[ "$3" == "split-state" ]] && { echo "NOT_SPLIT"; return 1; }
             echo "stub loom-daemon: unexpected call: $*" >&2; return 2 ;;
@@ -136,12 +146,13 @@ for copy in "defaults/.claude/commands/loom/guide.md" "defaults/.agents/skills/l
     HS="$(sed -n '/^has_superseding_block() {$/,/^}$/p' "$f")"
     HP="$(sed -n '/^has_permanent_block() {/,/^}$/p' "$f")"
     WA="$(sed -n '/^was_previously_approved() {$/,/^}$/p' "$f")"
-    if [[ -n "$CU" && -n "$HS" && -n "$HP" && -n "$WA" ]]; then
+    RD="$(sed -n '/^resolve_dep_states() {$/,/^}$/p' "$f")"
+    if [[ -n "$CU" && -n "$HS" && -n "$HP" && -n "$WA" && -n "$RD" ]]; then
         pass "extracted check_and_unblock + gate helpers verbatim"
     else
         fail "extract check_and_unblock + gate helpers from $copy"; continue
     fi
-    eval "$HS"; eval "$HP"; eval "$WA"
+    eval "$HS"; eval "$HP"; eval "$WA"; eval "$RD"
     # post-comment.sh is invoked by path; shadow it with the recorder by
     # rewriting the call in the extracted text only (split-parent test pattern).
     CU="${CU//.\/.loom\/scripts\/post-comment.sh/post_comment}"
