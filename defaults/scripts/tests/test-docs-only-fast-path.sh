@@ -201,13 +201,13 @@ echo
 echo "--- closing-reference condition (#14182): a docs-only diff that closes an issue is ineligible ---"
 
 # Mirror of the shipped docs_only_fast_path_closing_check(), extracted from
-# judge.md so this suite exercises the documented code, not a hand copy. `gh`
+# judge-fast-paths.md so this suite exercises the documented code, not a hand copy. `gh`
 # is stubbed: GH_STUB_OUT is its stdout, GH_STUB_RC its exit status.
 gh() { printf '%s' "${GH_STUB_OUT-}"; return "${GH_STUB_RC:-0}"; }
 closing_fn_block() {
     awk '/^docs_only_fast_path_closing_check\(\) \{/{p=1} p{print} p && /^}$/{exit}' "$1"
 }
-eval "$(closing_fn_block "$JUDGE_MD")"
+eval "$(closing_fn_block "$JUDGE_FAST_MD")"
 
 GH_STUB_RC=0 GH_STUB_OUT='closers=' out="$(docs_only_fast_path_closing_check 1)"
 assert_eq "ELIGIBLE" "$out" "a PR with an empty closing set stays eligible"
@@ -232,19 +232,19 @@ assert_eq "NOT ELIGIBLE: closing-reference read returned no proof" "$out" \
 
 unset -f gh
 
-JUDGE_CLOSING="$(closing_fn_block "$JUDGE_MD" | grep -v '^[[:space:]]*#')"
+JUDGE_CLOSING="$(closing_fn_block "$JUDGE_FAST_MD" | grep -v '^[[:space:]]*#')"
 CHAMPION_CLOSING="$(closing_fn_block "$CHAMPION_MD" | grep -v '^[[:space:]]*#')"
-assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge.md ships docs_only_fast_path_closing_check()"
+assert_contains "$JUDGE_CLOSING" "docs_only_fast_path_closing_check() {" "judge-fast-paths.md ships docs_only_fast_path_closing_check()"
 assert_eq "$JUDGE_CLOSING" "$CHAMPION_CLOSING" \
-    "judge.md and champion-pr-merge.md closing-check code is identical (comments aside)"
+    "judge-fast-paths.md and champion-pr-merge.md closing-check code is identical (comments aside)"
 
-assert_doc_contains "$JUDGE_MD" \
+assert_doc_contains "$JUDGE_FAST_MD" \
     'ELIGIBILITY=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
-    "judge.md folds the closing check into ELIGIBILITY"
+    "judge-fast-paths.md folds the closing check into ELIGIBILITY"
 assert_doc_contains "$CHAMPION_MD" \
     'FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")' \
     "champion-pr-merge.md folds the closing check into FAST_PATH_RESULT"
-assert_doc_contains "$JUDGE_MD" "closingIssuesReferences" "judge.md reads closingIssuesReferences"
+assert_doc_contains "$JUDGE_FAST_MD" "closingIssuesReferences" "judge-fast-paths.md reads closingIssuesReferences"
 assert_doc_contains "$CHAMPION_MD" "closingIssuesReferences" "champion-pr-merge.md reads closingIssuesReferences"
 
 # Inline PROSE restatements of the eligibility condition (#14321). The LLM
@@ -256,7 +256,7 @@ assert_doc_contains "$CHAMPION_MD" \
     "and the PR has no closing-issue" \
     "champion-pr-merge.md fast-path lead-in states the no-closing-issue condition (#14182)"
 assert_doc_contains "$JUDGE_MD" \
-    "and the PR has no closing-issue reference" \
+    "the PR must have no closing-issue reference" \
     "judge.md Primary Queue step 4b states the no-closing-issue condition (#14182)"
 
 echo
