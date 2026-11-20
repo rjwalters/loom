@@ -214,6 +214,7 @@ mod tests {
 
     fn bearer_entry() -> ExporterEntry {
         ExporterEntry {
+            max_batch_bytes: crate::observability::DEFAULT_MAX_BATCH_BYTES,
             kind: ExporterKind::Otlp,
             endpoint: None,
             headers_file: None,
@@ -222,6 +223,7 @@ mod tests {
 
     fn otlp_entry_with_headers_file() -> ExporterEntry {
         ExporterEntry {
+            max_batch_bytes: crate::observability::DEFAULT_MAX_BATCH_BYTES,
             kind: ExporterKind::Otlp,
             endpoint: None,
             headers_file: Some("/run/secrets/otlp-headers".to_string()),
