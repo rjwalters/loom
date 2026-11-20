@@ -3692,7 +3692,22 @@ the table below is not exhaustive — `stale_sweeps`
 (#7708/#7990), and `transcript_ingest` (#8477) also always render, each
 documented at its own point in this file. `tmpfs_visibility` (#8572, split
 from #8512) is **conditional** — see "tmpfs/`shared`-RAM + OOM-kill
-visibility" below. `review_role_pins` (#11970) is conditional too: a
+visibility" below. `owner_drift` (#14223) is conditional too, in its own
+sense — appended whenever its collection ran (Green when clean), **no
+section at all** when the daemon did not answer (unknown, not an
+all-clear). It is collected client-side by the `loom-daemon health` CLI
+itself (collection step 14, `loom-daemon/src/cli/health.rs`: bounded
+`git remote` reads over the daemon-reported roots plus one cached
+`GET repos/{nwo}` per distinct repo); the in-daemon `/health` route never
+renders it — `serve.rs` threads `owner_drift: None` on purpose, because the
+canonical probe needs CLI-side git reads. It reports the canonical-name
+case only (a remote naming an owner the forge does not answer under),
+**Degraded** under the existing exit `1` — no new exit code; the
+re-pointed-after-startup shape needs the daemon's startup baseline, so it
+stays a daemon `warn!`, not a health line. A per-repo forge lookup failure
+yields no verdict for that repo, never a false drift. See
+`loom-daemon/src/health/owner_drift_section.rs`. `review_role_pins`
+(#11970) is conditional as well: a
 `WARNING:` line (Green, never moves the exit code, `detail.warning = true`)
 naming the repo and files when a managed repo's `.loom/resync-ignore` pins a
 Champion, Judge or Doctor prompt (`roles/` or `commands/loom/`
