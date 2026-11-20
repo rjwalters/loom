@@ -1016,8 +1016,10 @@ pub(crate) enum PrLeaseAction {
     /// sweep id (the claim's `--watch-pid`/`--sweep-id` was omitted; the
     /// output names it), nothing released (#13132).
     Release(ReleaseArgs),
-    /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
-    /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
+    /// Print `PR_LEASE_STATE=free|held-self|held-peer|held-backstop|unknown`.
+    /// Exit 0 free/held-self, 4 held-peer (+ holder), 5 unknown, 6 held-backstop.
+    /// A Judge backstop hold includes `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>` and,
+    /// for a gate-refusal cooldown, `PR_LEASE_BACKSTOP_REFUSED=<token>`.
     Check(Common),
     /// Internal: renew-only (#11906). Re-attach to this claimant's own live
     /// lease and start its renewer; never posts a lease. Exit 0 = attached;
@@ -1737,6 +1739,18 @@ impl Ctx {
     pub(crate) fn check(&self) -> i32 {
         let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
         let state = self.state_of(rows.as_deref());
+        if let Some((until, refused)) = rows
+            .as_deref()
+            .filter(|_| state == ClaimState::Free)
+            .and_then(|rows| self.backstop_hold(rows))
+        {
+            println!("PR_LEASE_STATE=held-backstop");
+            println!("PR_LEASE_BACKSTOP_UNTIL={}", until.to_rfc3339());
+            if let Some(token) = refused {
+                println!("PR_LEASE_BACKSTOP_REFUSED={token}");
+            }
+            return backstop::EXIT_BACKSTOP;
+        }
         println!("PR_LEASE_STATE={}", state.as_str());
         match state {
             ClaimState::HeldByPeer { holder, .. } => {

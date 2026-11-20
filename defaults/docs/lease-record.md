@@ -817,6 +817,14 @@ the same lease semantics, **keyed by role**:
   waiting out the TTL.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
+  This read-only command exits 0 for `free` or `held-self`, 4 for `held-peer`
+  (including the holder's host and sweep), and 5 for an unreadable lease list
+  (`unknown`). When a Judge has no live lease and the backstop holds the PR,
+  `check` exits 6 with `PR_LEASE_STATE=held-backstop` and
+  `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>`. A gate-refusal
+  cooldown also includes `PR_LEASE_BACKSTOP_REFUSED=<token>`. A live lease
+  takes precedence. Other roles, a disabled backstop, and an unreadable PR
+  head report `free` when the lease is free.
 - **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
   open, still `loom:review-requested` and carrying neither `loom:pr` nor
   `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`
