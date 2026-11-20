@@ -102,6 +102,12 @@ check "<!-- champion:ratification-hold -->" "$(sed -n 1p "$T/last_body")" "hold:
 check "<!-- champion:hold-state head=$HEAD_SHA -->" "$(sed -n 2p "$T/last_body")" "hold: hold-state stays the second line (recorded_head depends on it)"
 tick stands 0;  check "$PARK" "$WRITES" "stands: park re-asserted via apply, no comment"; check true "$SKIP" "stands: ends this PR's pass"
 tick release 0; check "COMMENT:ratification-release-respected;LABEL-:loom:blocked" "$WRITES" "release: marker, label removed"; check false "$SKIP" "release: continues to the other criteria"
+# #14249: the shared label moves only when no other Champion hold still stands.
+tick release 0 - "merge-risk-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while a merge-risk hold stands"
+tick release 0 - "critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while a critical-file hold stands"
+tick release 0 - "merge-risk-hold,merge-risk-hold-cleared";  check "COMMENT:ratification-release-respected;LABEL-:loom:blocked" "$WRITES" "release: label removed after a merge-risk hold was cleared"
+tick release 0 - "critical-file-hold,critical-file-hold-cleared,critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept when a hold is re-posted after its cleared notice"
+tick release 0 - "merge-risk-hold,critical-file-hold";  check "COMMENT:ratification-release-respected" "$WRITES" "release: label kept while both other kinds stand"
 CLR="COMMENT:ratification-hold-cleared;LABEL-:loom:blocked"
 tick clear 0 - "";  check "$CLR" "$WRITES" "clear: marker, label removed (no other hold markers at all)"
 tick clear 0 - "merge-risk-hold";  check "COMMENT:ratification-hold-cleared" "$WRITES" "clear: label kept while a merge-risk hold stands"
