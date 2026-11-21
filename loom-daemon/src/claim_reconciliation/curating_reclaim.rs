@@ -53,7 +53,9 @@
 //! label read: remove `loom:curating` only when the item already advanced
 //! (`loom:curated`/`loom:issue`) or is held/closed, remove-and-restore
 //! `loom:triage` otherwise. Later approvals, holds and unrelated labels are
-//! preserved by construction — the edit never touches any other label.
+//! preserved by construction — each edit touches only its own label. A restore
+//! confirms triage before removing the claim so an interrupted restore stays
+//! discoverable. Re-read lease, claim age and issue state after any first write.
 //!
 //! ## The re-curation record
 //!
@@ -88,6 +90,7 @@ use super::gh_call;
 /// The claim label this pass reconciles (also
 /// `StepRole::Curator.claim_label()`).
 const CLAIM: &str = "loom:curating";
+const READY: &str = "loom:triage";
 
 /// The role token the trusted lease family keys on (`lease pr claim --role
 /// curator`); the first token after `role=` in every record of the family.
@@ -302,11 +305,11 @@ fn needs_recuration(labels: &[String]) -> bool {
 fn recuration_record_body(lease: &CuratorLeaseEvidence, now: DateTime<Utc>) -> String {
     format!(
         "{RECURATION_MARKER_PREFIX} claim={CLAIM} -->\n\
-         Loom's claim reconciliation released a stale `{CLAIM}` claim from this issue at \
+         Loom's claim reconciliation found a stale `{CLAIM}` claim on this issue at \
          {now} ({lease}).\n\n\
          The issue also carries `loom:issue`, and the claim's history cannot establish \
-         whether that approval was earned before the claim went stale — so nothing was \
-         changed beyond the claim label itself. **A Curator must re-run curation, or a \
+         whether that approval was earned before the claim went stale. The reconciler does not \
+         change approval labels. **A Curator must re-run curation, or a \
          maintainer must confirm the approval, before this issue is built.**\n\n\
          See #14816 (parent #14811) for the incident and the recovery design."
     )
@@ -428,104 +431,74 @@ pub(super) fn reconcile_curating_claims(gh_bin: &Path, root: &Path) {
     let mut released = 0usize;
     for (number, labels) in issues {
         checked += 1;
-        let CuratorLeaseRead::Records {
-            rows,
-            recuration_recorded,
-        } = fetch_curator_lease_read(gh_bin, root, number)
-        else {
-            log::warn!(
-                "claim_reconciliation: REFUSING to release {CLAIM} on #{number} in {} — the \
-                 trusted Curator-lease read failed (unverifiable, NOT evidence of an absent \
-                 lease) (#14816)",
-                root.display(),
-            );
-            continue;
-        };
-        let lease = classify_curator_lease(&rows, now, ttl_minutes);
-        let labeled_at = super::forge::fetch_claim_labeled_at(gh_bin, root, number, CLAIM);
-        let action = decide_curating_claim(&labels, labeled_at, lease, now, stale_minutes);
-        if let CuratingAction::Keep(why) = action {
-            log::debug!(
-                "claim_reconciliation: keeping {CLAIM} on #{number} in {} — {why:?} \
-                 ({lease}) (#14816)",
-                root.display(),
-            );
+        if !labels.iter().any(|label| label == CLAIM) || crate::work_finder::is_frozen(&labels) {
             continue;
         }
-        // Fresh labels immediately before any write: the listing this pass
-        // started from can be arbitrarily stale by now (a concurrent repair,
-        // a later approval, a hold, a close). Fails safe — an unreadable
-        // issue skips the write and retries next pass.
-        let fresh = match super::forge::issue_label_names(gh_bin, root, number) {
-            Ok(v) => v,
+        let Some(labeled_at) = super::forge::fetch_claim_labeled_at(gh_bin, root, number, CLAIM)
+        else {
+            continue;
+        };
+        if (now - labeled_at).num_seconds() as f64 / 60.0 < stale_minutes {
+            continue;
+        }
+        let confirm =
+            || read_current_release(gh_bin, root, number, labeled_at, stale_minutes, ttl_minutes);
+        let Some(release) = confirm() else {
+            continue;
+        };
+        match release.plan {
+            StepReleasePlan::Nothing => continue,
+            StepReleasePlan::RemoveClaim if release.record_needed => {
+                if let Err(e) = post_recuration_record(gh_bin, root, number, &release.lease, now) {
+                    log::warn!(
+                        "claim_reconciliation: could not confirm the re-curation record for \
+                         #{number} in {}: {e}; keeping {CLAIM} for retry (#14816)",
+                        root.display(),
+                    );
+                    continue;
+                }
+                // A confirmed comment does not establish that the same claim
+                // is still stale. A renewal can land during the POST.
+                if !confirm().is_some_and(|current| current.plan == StepReleasePlan::RemoveClaim) {
+                    continue;
+                }
+            }
+            StepReleasePlan::Restore if !release.triage_present => {
+                // Keep the claim in discovery until the first write is
+                // confirmed. A rejected or lost response can be retried.
+                if let Err(e) = run_issue_edit(gh_bin, root, number, "--add-label", READY) {
+                    log::warn!(
+                        "claim_reconciliation: could not restore {READY} on #{number} in {}: {e}; \
+                         keeping {CLAIM} for retry (#14816)",
+                        root.display(),
+                    );
+                    continue;
+                }
+                if !confirm().is_some_and(|current| {
+                    current.plan == StepReleasePlan::Restore && current.triage_present
+                }) {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        match run_issue_edit(gh_bin, root, number, "--remove-label", CLAIM) {
+            Ok(()) => {
+                released += 1;
+                log::warn!(
+                    "claim_reconciliation: released stale {CLAIM} from #{number} in {} \
+                     ({}, plan={:?}) (#14816)",
+                    root.display(),
+                    release.lease,
+                    release.plan,
+                );
+            }
             Err(e) => {
                 log::warn!(
-                    "claim_reconciliation: could not re-read #{number} in {} before releasing \
-                     {CLAIM} — {e}; retrying next pass (#14816)",
-                    root.display(),
-                );
-                continue;
-            }
-        };
-        // #7367's race, shared with the building pass: only an explicit,
-        // confirmed "closed" downgrades the write (removes the claim, adds
-        // nothing); a transient failure reads open.
-        let closed = super::forge::issue_is_confirmed_closed(gh_bin, root, number);
-        match plan_step_release(StepRole::Curator, &fresh, Some(closed)) {
-            StepReleasePlan::Nothing => {
-                log::debug!(
-                    "claim_reconciliation: {CLAIM} on #{number} in {} needs no write (claim \
-                     gone or item frozen since the listing) (#14816)",
+                    "claim_reconciliation: failed to release {CLAIM} from #{number} in {}: {e}",
                     root.display(),
                 );
             }
-            StepReleasePlan::RemoveClaim => {
-                let record = needs_recuration(&fresh) && !recuration_recorded;
-                if record {
-                    if let Err(e) = post_recuration_record(gh_bin, root, number, &lease, now) {
-                        log::warn!(
-                            "claim_reconciliation: could not confirm the re-curation record for \
-                             #{number} in {}: {e}; keeping {CLAIM} for retry (#14816)",
-                            root.display(),
-                        );
-                        continue;
-                    }
-                }
-                match remove_claim_edit(gh_bin, root, number) {
-                    Ok(()) => {
-                        released += 1;
-                        log::warn!(
-                            "claim_reconciliation: released stale {CLAIM} from #{number} in {} \
-                             ({lease}, plan=remove_claim, recuration_record={record}) (#14816)",
-                            root.display(),
-                        );
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "claim_reconciliation: failed to release {CLAIM} from #{number} in \
-                             {}: {e}",
-                            root.display(),
-                        );
-                    }
-                }
-            }
-            StepReleasePlan::Restore => match restore_claim_edit(gh_bin, root, number) {
-                Ok(()) => {
-                    released += 1;
-                    log::warn!(
-                        "claim_reconciliation: released stale {CLAIM} from #{number} in {} \
-                             ({lease}, plan=restore_loom:triage) (#14816)",
-                        root.display(),
-                    );
-                }
-                Err(e) => {
-                    log::warn!(
-                        "claim_reconciliation: failed to restore {CLAIM} -> loom:triage for \
-                             #{number} in {}: {e}",
-                        root.display(),
-                    );
-                }
-            },
         }
     }
     if released > 0 {
@@ -543,73 +516,84 @@ pub(super) fn reconcile_curating_claims(gh_bin: &Path, root: &Path) {
     }
 }
 
-/// `gh issue edit N --remove-label loom:curating` — a single removeLabels
-/// mutation, atomic on its own.
-fn remove_claim_edit(gh_bin: &Path, root: &Path, issue: u32) -> anyhow::Result<()> {
-    run_issue_edit(gh_bin, root, issue, &[])
+struct CurrentRelease {
+    plan: StepReleasePlan,
+    lease: CuratorLeaseEvidence,
+    record_needed: bool,
+    triage_present: bool,
 }
 
-/// `gh issue edit N --remove-label loom:curating --add-label loom:triage`,
-/// verified and retried exactly once: `gh` applies the two halves of an
-/// add+remove pair as independent concurrent mutations (#6263), so a
-/// zero-exit edit is re-read and, on a partial landing, re-issued once
-/// (idempotent for whichever half already landed). A failed verification
-/// read fails open, treating the earlier zero exit as authoritative.
-fn restore_claim_edit(gh_bin: &Path, root: &Path, issue: u32) -> anyhow::Result<()> {
-    run_issue_edit(gh_bin, root, issue, &["loom:triage"])?;
-    match restore_confirmed(gh_bin, root, issue) {
-        Ok(true) => Ok(()),
-        Ok(false) => {
+/// Recheck the same claim and read current trusted lease evidence just
+/// before a write. A new claim, renewed lease, uncertain read or frozen
+/// item keeps the claim discoverable for another pass.
+fn read_current_release(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    expected_labeled_at: DateTime<Utc>,
+    stale_minutes: f64,
+    ttl_minutes: f64,
+) -> Option<CurrentRelease> {
+    let labels = match super::forge::issue_label_names(gh_bin, root, issue) {
+        Ok(labels) => labels,
+        Err(error) => {
             log::warn!(
-                "claim_reconciliation: {CLAIM} -> loom:triage on #{issue} only partially \
-                 applied after `gh issue edit` reported success — retrying once (#6263)",
+                "claim_reconciliation: could not read #{issue} in {} before releasing \
+                 {CLAIM}: {error}; retrying next pass (#14816)",
+                root.display(),
             );
-            run_issue_edit(gh_bin, root, issue, &["loom:triage"])?;
-            match restore_confirmed(gh_bin, root, issue) {
-                Ok(true) => Ok(()),
-                Ok(false) => anyhow::bail!(
-                    "release of #{issue} did not fully land even after one retry — \
-                     loom:curating/loom:triage may need a manual fix (#6263)"
-                ),
-                Err(e) => {
-                    log::warn!(
-                        "claim_reconciliation: could not verify retried release of #{issue} \
-                         ({e}) — treating the retried zero-exit edit as authoritative \
-                         (fail-open, #6263)",
-                    );
-                    Ok(())
-                }
-            }
+            return None;
         }
-        Err(e) => {
-            log::warn!(
-                "claim_reconciliation: could not verify release of #{issue} ({e}) — treating \
-                 the earlier zero-exit `gh issue edit` as authoritative (fail-open, #6263)",
-            );
-            Ok(())
-        }
+    };
+    if !labels.iter().any(|label| label == CLAIM) || crate::work_finder::is_frozen(&labels) {
+        return None;
     }
+    let closed = super::forge::issue_is_confirmed_closed(gh_bin, root, issue);
+    let labeled_at = super::forge::fetch_claim_labeled_at(gh_bin, root, issue, CLAIM);
+    if labeled_at != Some(expected_labeled_at) {
+        return None;
+    }
+    let CuratorLeaseRead::Records {
+        rows,
+        recuration_recorded,
+    } = fetch_curator_lease_read(gh_bin, root, issue)
+    else {
+        log::warn!(
+            "claim_reconciliation: could not verify the Curator lease on #{issue} in {} before \
+             releasing {CLAIM}; retrying next pass (#14816)",
+            root.display(),
+        );
+        return None;
+    };
+    let now = Utc::now();
+    let lease = classify_curator_lease(&rows, now, ttl_minutes);
+    if let CuratingAction::Keep(reason) =
+        decide_curating_claim(&labels, labeled_at, lease, now, stale_minutes)
+    {
+        log::debug!(
+            "claim_reconciliation: keeping {CLAIM} on #{issue} in {} — {reason:?} ({lease}) (#14816)",
+            root.display(),
+        );
+        return None;
+    }
+    Some(CurrentRelease {
+        plan: plan_step_release(StepRole::Curator, &labels, Some(closed)),
+        lease,
+        record_needed: needs_recuration(&labels) && !recuration_recorded,
+        triage_present: labels.iter().any(|label| label == READY),
+    })
 }
 
-/// `Ok(true)` = confirmed `loom:curating` absent and `loom:triage` present.
-fn restore_confirmed(gh_bin: &Path, root: &Path, issue: u32) -> anyhow::Result<bool> {
-    let labels = super::forge::issue_label_names(gh_bin, root, issue)?;
-    let has = |name: &str| labels.iter().any(|l| l == name);
-    Ok(!has(CLAIM) && has("loom:triage"))
-}
-
-fn run_issue_edit(gh_bin: &Path, root: &Path, issue: u32, add: &[&str]) -> anyhow::Result<()> {
+fn run_issue_edit(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    operation: &str,
+    label: &str,
+) -> anyhow::Result<()> {
     let n = issue.to_string();
-    let mut cmd = gh_call::write("claim.curating_release", gh_bin, root).args([
-        "issue",
-        "edit",
-        &n,
-        "--remove-label",
-        CLAIM,
-    ]);
-    for label in add {
-        cmd = cmd.args(["--add-label", label]);
-    }
+    let cmd = gh_call::write("claim.curating_release", gh_bin, root)
+        .args(["issue", "edit", &n, operation, label]);
     let out = gh_call::output(cmd.args(gh_call::loom_repo_flag()))?;
     if !out.status.success() {
         let (root, err) = (root.display(), gh_call::stderr(&out));
