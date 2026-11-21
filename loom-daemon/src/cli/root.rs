@@ -66,7 +66,9 @@ pub enum Commands {
     Init(super::misc_cmds::InitArgs),
 
     /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
-    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
+    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set (plus
+    /// the #13898 stub-conditional pnpm-artifact entries when the workspace's
+    /// root `package.json` is the `loom-workspace` stub) without
     /// running a full `init` (Issue #4280). This is the standalone entry point
     /// `defaults/scripts/resync-installed.sh` invokes so existing consumer
     /// installs pick up newly-ignored runtime paths (e.g. `.loom/sweep-checkpoint/`,

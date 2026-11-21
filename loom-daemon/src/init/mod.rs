@@ -56,7 +56,10 @@ pub use session_mode::InstallMode;
 // Re-exported so the `loom-daemon update-gitignore` subcommand (#4280) can
 // rewrite the marker-delimited managed block on its own, without running a full
 // `init`. The pattern list stays single-sourced in `post_init::EPHEMERAL_PATTERNS`.
-pub use post_init::update_gitignore;
+// `update_gitignore_in` (#13898) is the staging-tree form the daemon resync's
+// surface step uses: edit the staged `.gitignore`, detect the package.json stub
+// at the real workspace root.
+pub use post_init::{update_gitignore, update_gitignore_in};
 // The credential-bearing subset of EPHEMERAL_PATTERNS (#8005): the single
 // declared class every Loom stager must refuse regardless of `.gitignore`.
 pub use post_init::{is_credential_path, CREDENTIAL_PATTERNS};
@@ -246,9 +249,14 @@ pub fn initialize_workspace_with_mode(
     // staging tree, so a resync and an install cannot disagree about it.
     install_payload_files(workspace, &defaults, &loom_path, is_reinstall, &mut report)?;
 
-    // Update .gitignore and setup scaffolding
-    update_gitignore(workspace)?;
+    // Update .gitignore and setup scaffolding. Scaffolding runs FIRST: it is
+    // what copies the root `package.json` stub into repos that lack one, and
+    // `update_gitignore` (#13898) keys its stub-conditional pnpm-artifact
+    // entries on that file being present — refreshing the block before the
+    // stub lands would leave a fresh install's `.gitignore` without them
+    // until the next update.
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
+    update_gitignore(workspace)?;
 
     // Post-condition for the `defaults/.loom/` walk above (#9123). Run AFTER
     // scaffolding, because the two template-substituted members of that tree
