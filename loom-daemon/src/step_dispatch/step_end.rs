@@ -74,13 +74,14 @@ pub fn read_object(v: &serde_json::Value) -> Option<(Vec<String>, bool)> {
 /// other dispatches supplies no evidence at all.
 fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     let text = String::from_utf8_lossy(&std::fs::read(&step.log_path).ok()?).into_owned();
-    let section = match outcome_ledger::dispatch_section(&text, &step.sweep_id) {
-        outcome_ledger::DispatchSection::Section(section) => section,
-        outcome_ledger::DispatchSection::Headerless(all) => all,
-        outcome_ledger::DispatchSection::Absent => return None,
-    };
-    outcome_ledger::parse_outcome_line(section, step.role, step.item)
-        .or_else(|| seat_dirty_line(section))
+    match outcome_ledger::dispatch_section(&text, &step.sweep_id) {
+        outcome_ledger::DispatchSection::Section(section) => {
+            outcome_ledger::parse_outcome_line(section, step.role, step.item)
+                .or_else(|| seat_dirty_line(section))
+        }
+        outcome_ledger::DispatchSection::Headerless(all) => seat_dirty_line(all),
+        outcome_ledger::DispatchSection::Absent => None,
+    }
 }
 
 /// A step that never ran because its seat's private clone refused preparation
@@ -436,6 +437,42 @@ mod tests {
     }
 
     #[test]
+    fn headerless_routing_accepts_only_the_launch_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-judge-4-1".into(),
+            item: 4,
+            role: StepRole::Judge,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        for (text, evidence, reason) in [
+            (
+                "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n",
+                None,
+                outcome_ledger::UNCLASSIFIED,
+            ),
+            (
+                "Error: private workspace preparation refused: seat_dirty: dirty\n",
+                Some(outcome_ledger::SEAT_DIRTY),
+                outcome_ledger::SEAT_DIRTY,
+            ),
+        ] {
+            std::fs::write(&step.log_path, text).unwrap();
+            let line = outcome_line(&step);
+            assert_eq!(line.as_ref().map(|outcome| outcome.reason.as_str()), evidence);
+            let released = post_state(step.role, &labels(&["loom:review-requested"]), false);
+            let run = run_of(&step, line.as_ref(), Some(released));
+            assert_eq!(run.outcome.class, OutcomeClass::Failed);
+            assert_eq!(run.outcome.reason, reason);
+            assert!(outcome_ledger::counts_as_run(&run.outcome));
+        }
+    }
+
+    #[test]
     fn an_explicit_child_outcome_wins_over_the_dirty_seat_marker_in_its_log() {
         let dir = tempfile::tempdir().unwrap();
         let step = EndedStep {
@@ -450,7 +487,7 @@ mod tests {
         };
         std::fs::write(
             &step.log_path,
-            "sweep_id=step-curator-14521-1 started\n\
+            "==== loom-daemon dispatch: t sweep_id=step-curator-14521-1 item=14521 step=curator ====\n\
              Error: private workspace preparation refused: seat_dirty: private clone/worktree is dirty;\n\
              LOOM_STEP_OUTCOME role=curator target=14521 class=noop reason=already-curated\n",
         )
