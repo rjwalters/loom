@@ -1047,3 +1047,42 @@ fn the_pre_12524_fallback_cause_still_restores() {
         Some(CooldownCause::ForgeLadderFallback)
     );
 }
+
+// ------------------------------------------------- the dispatch section
+
+/// #14874: the section selector bounds a dispatch's own text by the next
+/// dispatch header, matches the complete `sweep_id=` field, ignores a
+/// transcript mention of one, and tells a headerless log from a log of other
+/// dispatches.
+#[test]
+fn the_section_selector_bounds_a_dispatch_by_the_next_header() {
+    use DispatchSection::{Absent, Headerless, Section};
+    let log = "\
+==== loom-daemon dispatch: t sweep_id=j-1 item=4 step=judge ====
+first run: sweep_id=j-2 mentioned in transcript
+LOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash
+==== loom-daemon dispatch: t sweep_id=j-2 item=4 step=judge ====
+LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending
+==== loom-daemon dispatch: t sweep_id=j-21 item=4 step=judge ====
+LOOM_STEP_OUTCOME role=judge target=4 class=verdict reason=reviewed
+";
+    assert_eq!(dispatch_section(log, "j-1"), Section("first run: sweep_id=j-2 mentioned in transcript\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n"));
+    assert_eq!(
+        dispatch_section(log, "j-2"),
+        Section("LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n")
+    );
+    // `j-2` is a prefix of `j-21`: each matches only its own header.
+    assert_eq!(
+        dispatch_section(log, "j-21"),
+        Section("LOOM_STEP_OUTCOME role=judge target=4 class=verdict reason=reviewed\n")
+    );
+    assert_eq!(dispatch_section(log, "j-3"), Absent);
+    assert_eq!(dispatch_section(log, "j"), Absent);
+    // A log that never carried a header is launch-time text, not absence.
+    let refusal = "Error: private workspace preparation refused: seat_dirty: dirty\n";
+    assert_eq!(dispatch_section(refusal, "j-1"), Headerless(refusal));
+    // A header must start its line; the marker indented or mid-line is
+    // transcript, not a header.
+    let indented = "  ==== loom-daemon dispatch: t sweep_id=j-1 ====\noutcome line\n";
+    assert_eq!(dispatch_section(indented, "j-1"), Headerless(indented));
+}

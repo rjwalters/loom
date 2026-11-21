@@ -570,9 +570,9 @@ fn the_staged_step_reads_only_its_own_log_section() {
     let log = dir.path().join("step.log");
     std::fs::write(
         &log,
-        "==== d sweep_id=step-champion_merge-9-1 item=9 ====\n\
+        "==== loom-daemon dispatch: t sweep_id=step-champion_merge-9-1 item=9 ====\n\
          CHAMPION-STEP mode=pr item=9 outcome=merged\n\
-         ==== d sweep_id=step-champion_merge-9-2 item=9 ====\n\
+         ==== loom-daemon dispatch: t sweep_id=step-champion_merge-9-2 item=9 ====\n\
          CHAMPION-STEP mode=pr item=9 outcome=requeued\n",
     )
     .unwrap();
@@ -589,6 +589,146 @@ fn the_staged_step_reads_only_its_own_log_section() {
     let source = staged.read();
     let text = source.log_text.unwrap();
     assert!(text.contains("outcome=requeued") && !text.contains("outcome=merged"));
+}
+
+/// #14874: the staged read is bounded by the next dispatch header, and the
+/// UTF-8-safe tail bound applies to the requested section alone: a later
+/// dispatch's bulk cannot push the section's own outcome out of the window,
+/// and a multibyte character at the cutoff cannot panic the boundary walk.
+#[test]
+fn the_detached_tail_bound_applies_to_the_requested_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    let header =
+        |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=judge ====");
+    // A requested section longer than the tail bound, so the cutoff lands
+    // inside it — across multibyte characters — with its outcome line at the
+    // section's end.
+    let padding = "日".repeat(90_000);
+    let mut text = format!(
+        "{}\n{padding}\nLOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n",
+        header("j-4-1")
+    );
+    // Then a later dispatch appending more than the tail bound after it.
+    text.push_str(&format!("\n{}\nLATERDISPATCH {}\n", header("j-4-2"), "x".repeat(300_000)));
+    std::fs::write(&log, text).unwrap();
+    let source = StagedStep {
+        sweep_id: "j-4-1".into(),
+        step: StepRole::Judge,
+        item: 4,
+        log,
+        hold_auth_before: None,
+    }
+    .read();
+    let section = source
+        .log_text
+        .expect("the requested dispatch has a section");
+    assert!(section.contains("reason=ci_pending"), "its own outcome stays visible");
+    assert!(!section.contains("LATERDISPATCH"), "a later dispatch's bulk is not read");
+}
+
+/// #14874 + #14168: a bare, backticked and JSON-framed current-dispatch
+/// outcome line all reach the projection the same way: a Judge
+/// `class=noop reason=ci_pending` with no journaled verdict projects
+/// `noop/no_change` with detail `ci_pending`.
+#[test]
+fn wrapped_judge_lines_project_like_a_bare_one() {
+    for line in [
+        "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending",
+        "`LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending`",
+        "{\"type\":\"text\",\"text\":\"LOOM_STEP_OUTCOME role=judge target=4 class=noop \
+         reason=ci_pending\\n\"}",
+    ] {
+        let source = Source::Step(StepSource {
+            sweep_id: "j-4-1".into(),
+            step: StepRole::Judge,
+            item: 4,
+            log_text: Some(format!(
+                "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n{line}\n"
+            )),
+            hold_auth_before: None,
+        });
+        let ctx = Context {
+            role: "judge",
+            repo: REPO,
+            host: "host-a",
+            now: t(5),
+        };
+        // A readable empty journal: an unchanged item, so the ledger's own
+        // view keeps the line's class.
+        let j = journal(vec![]);
+        let mut records = records_for(&ctx, &source, Some(&j), &mut RefusalStore::default());
+        assert_eq!(records.len(), 1, "{line}");
+        let r = records.remove(0);
+        assert_eq!(class_reason(&r), ("noop", "no_change"), "{line}");
+        assert_eq!(r.detail.as_deref(), Some("ci_pending"), "{line}");
+        assert_eq!(r.step.ledger_class.as_deref(), Some("noop"), "{line}");
+        assert_eq!(r.step.ledger_reason.as_deref(), Some("ci_pending"), "{line}");
+    }
+}
+
+/// #14874: the projected record reads its dispatch's own section — a later
+/// dispatch's outcome for the same item is not this step's. The selection
+/// lives in [`StagedStep::read`]; the record is built from what it read.
+#[test]
+fn the_projection_reads_only_its_own_dispatchs_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("step.log");
+    std::fs::write(
+        &log,
+        "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+         ==== loom-daemon dispatch: t sweep_id=j-4-2 item=4 step=judge ====\n\
+         LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=already_judged\n",
+    )
+    .unwrap();
+    for (id, class, reason, detail) in [
+        ("j-4-1", "failed", "failed", Some("crash")),
+        ("j-4-2", "noop", "no_change", Some("already_judged")),
+    ] {
+        let source = StagedStep {
+            sweep_id: id.into(),
+            step: StepRole::Judge,
+            item: 4,
+            log: log.clone(),
+            hold_auth_before: None,
+        }
+        .read();
+        let ctx = Context {
+            role: "judge",
+            repo: REPO,
+            host: "host-a",
+            now: t(5),
+        };
+        let mut records =
+            records_for(&ctx, &Source::Step(source), None, &mut RefusalStore::default());
+        assert_eq!(records.len(), 1, "{id}");
+        let r = records.remove(0);
+        assert_eq!(class_reason(&r), (class, reason), "{id}");
+        assert_eq!(r.detail.as_deref(), detail, "{id}");
+    }
+    // A sweep the log's headers do not name: no text, the no-evidence
+    // projection (the failed row, no detail).
+    let source = StagedStep {
+        sweep_id: "j-4-3".into(),
+        step: StepRole::Judge,
+        item: 4,
+        log: log.clone(),
+        hold_auth_before: None,
+    }
+    .read();
+    assert!(source.log_text.is_none());
+    let ctx = Context {
+        role: "judge",
+        repo: REPO,
+        host: "host-a",
+        now: t(5),
+    };
+    let mut records = records_for(&ctx, &Source::Step(source), None, &mut RefusalStore::default());
+    assert_eq!(records.len(), 1);
+    let r = records.remove(0);
+    assert_eq!(class_reason(&r), ("failed", "failed"));
+    assert_eq!(r.detail.as_deref(), None);
 }
 
 #[test]
