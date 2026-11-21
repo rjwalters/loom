@@ -384,16 +384,23 @@ esac
             role.role_name(),
             role.as_str()
         );
-        let lease_body = |body: &str| {
+        let lease_body = |id, body: &str| {
             crate::comment_trust::records::with_fleet_author(
-                &serde_json::json!({"id":1,"updated_at":now.to_rfc3339(),"body":body}).to_string(),
+                &serde_json::json!({"id":id,"updated_at":now.to_rfc3339(),"body":body}).to_string(),
             )
         };
-        std::fs::write(&lease, lease_body(&body)).unwrap();
+        let own = lease_body(5, &body);
+        std::fs::write(&lease, &own).unwrap();
+        // A Doctor's prompt can apply its claim well after the step starts.
+        let started_at = if role == StepRole::Doctor {
+            now - chrono::Duration::minutes(3)
+        } else {
+            now
+        };
         let mut item: ManifestItem = serde_json::from_value(serde_json::json!({
             "id":sweep, "kind":"sweep", "repo":root, "disposition":"requeue", "status":"planned",
             "issue":(!role.acts_on_pr()).then_some(17), "pr":role.acts_on_pr().then_some(17),
-            "step":role, "run_started_at":now,
+            "step":role, "run_started_at":started_at,
         }))
         .unwrap();
         let notice = RollRequeueNotice {
@@ -402,17 +409,20 @@ esac
             manifest_id: "rp-fixture".into(),
             ..RollRequeueNotice::default()
         };
-        if role == StepRole::Curator && extra == Some("loom:issue") {
-            let peer = body.replace(&format!("host={host} "), "host=peer-fixture ");
-            std::fs::write(&lease, lease_body(&peer)).unwrap();
+        if role == StepRole::Doctor || role == StepRole::Curator && extra == Some("loom:issue") {
+            let peer = body.replace(
+                &format!("host={host} sweep={sweep} "),
+                "host=peer-fixture sweep=peer-step ",
+            );
+            std::fs::write(&lease, format!("{}\n{own}", lease_body(3, &peer))).unwrap();
             assert_eq!(
                 registry
                     .roll_step_release_with(&mut item, &notice, reap)
                     .unwrap(),
                 "none"
             );
-            assert!(!trace.exists(), "the peer's claim and approval stay untouched");
-            std::fs::write(&lease, lease_body(&body)).unwrap();
+            assert!(!trace.exists(), "the earlier peer lease protects the item's labels");
+            std::fs::write(&lease, &own).unwrap();
         }
         if role == StepRole::Curator && extra.is_none() {
             std::fs::write(&fail_remove, "").unwrap();
