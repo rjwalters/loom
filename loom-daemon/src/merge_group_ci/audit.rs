@@ -593,6 +593,10 @@ pub fn audit(
 const DOCS_OUTPUT: &str = "needs.docs_only.outputs.docs_only";
 const DOCS_STEP_GUARD: &str =
     "needs.docs_only.result!='success'||needs.docs_only.outputs.docs_only!='true'";
+const DASHBOARD_DOCS_ONLY_JOB_CONDITION: &str = concat!(
+    "!cancelled() && (github.event_name == 'merge_group' || ",
+    "(github.event_name != 'schedule' && needs.merge-group-verified.outputs.verified != 'true'))",
+);
 
 fn uses_docs_only_output(condition: &str) -> bool {
     if let Ok(expr) = expr::parse_condition(condition) {
@@ -604,6 +608,19 @@ fn uses_docs_only_output(condition: &str) -> bool {
     } else {
         compact_expr(condition).contains(DOCS_OUTPUT)
     }
+}
+
+fn supported_docs_only_job_condition(condition: &str) -> bool {
+    // The exact Dashboard predicate bypasses implicit dependency success
+    // checks on merge groups. Preserve its push and schedule branches too.
+    compact_expr(condition) == "!cancelled()"
+        || matches!(
+            (
+                expr::parse_condition(condition),
+                expr::parse_condition(DASHBOARD_DOCS_ONLY_JOB_CONDITION),
+            ),
+            (Ok(actual), Ok(expected)) if actual == expected
+        )
 }
 
 fn supported_docs_only_step(job: &Job, wf: &Workflow, step: &Step) -> bool {
@@ -619,7 +636,7 @@ fn supported_docs_only_step(job: &Job, wf: &Workflow, step: &Step) -> bool {
         && job
             .if_cond
             .as_deref()
-            .is_some_and(|cond| compact_expr(cond) == "!cancelled()")
+            .is_some_and(supported_docs_only_job_condition)
         && wf.job("docs_only").is_some_and(|classifier| {
             classifier.outputs.iter().any(|(name, value)| {
                 name == "docs_only" && compact_expr(value) == "steps.classify.outputs.docs_only"

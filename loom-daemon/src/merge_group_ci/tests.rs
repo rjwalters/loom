@@ -879,6 +879,31 @@ fn detect_changes_fail_open_rejects_a_third_filter_step() {
 
 const DOCS_ONLY_REFERENCE: &str = include_str!("fixtures/docs_only_exception.yml");
 
+const DASHBOARD_JOB_IF: &str = concat!(
+    "!cancelled() && (github.event_name == 'merge_group' || ",
+    "(github.event_name != 'schedule' && needs.merge-group-verified.outputs.verified != 'true'))",
+);
+
+fn dashboard_docs_only_fixture(job_if: &str) -> String {
+    DOCS_ONLY_REFERENCE
+        .replace(
+            "  tests:\n",
+            r#"  merge-group-verified:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      verified: false
+    steps:
+      - run: echo fixture
+  tests:
+"#,
+        )
+        .replace(
+            "    needs: docs_only\n    if: ${{ !cancelled() }}",
+            &format!("    needs: [docs_only, merge-group-verified]\n    if: ${{{{ {job_if} }}}}"),
+        )
+}
+
 #[test]
 fn docs_only_exception_is_visible_without_claiming_full_suite_coverage() {
     let w = wf("ci.yml", DOCS_ONLY_REFERENCE);
@@ -900,6 +925,71 @@ fn docs_only_exception_is_visible_without_claiming_full_suite_coverage() {
     let report = serde_json::to_value(r).unwrap();
     assert_eq!(report["required"][0]["docs_only_exception"], true);
     assert_eq!(report["required"][0]["covered"], false);
+}
+
+#[test]
+fn dashboard_docs_only_filter_retains_conditional_required_coverage() {
+    let spaced = DASHBOARD_JOB_IF.replace("!cancelled()", "! cancelled ( )");
+    for condition in [DASHBOARD_JOB_IF, spaced.as_str()] {
+        let w = wf("ci.yml", &dashboard_docs_only_fixture(condition));
+        let report = run(&w, &["Project Tests", "CI Result"]);
+        assert_eq!(state(&report, "merge-group-verified", Event::MergeGroup), RunState::Skipped);
+        assert_eq!(state(&report, "tests", Event::MergeGroup), RunState::Runs);
+        assert!(report.qualified(), "{:#?}", report.findings);
+        assert_eq!(report.required[0].context, "Project Tests");
+        assert!(!report.required[0].covered && report.required[0].docs_only_exception);
+        assert!(report.required[1].covered && !report.required[1].docs_only_exception);
+        assert!(super::render_audit(&report, false).contains("step `Full suites` can skip"));
+
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["required"][0]["context"], "Project Tests");
+        assert_eq!(json["required"][0]["docs_only_exception"], true);
+        assert_eq!(json["required"][0]["covered"], false);
+    }
+}
+
+#[test]
+fn dashboard_docs_only_filter_does_not_credit_unproven_job_conditions() {
+    // Some near matches still run on merge groups. They are outside the
+    // recognized condition because they change the push or schedule branch.
+    for condition in [
+        DASHBOARD_JOB_IF.replace("'schedule'", "'push'"),
+        DASHBOARD_JOB_IF.replace("verified !=", "verified =="),
+        DASHBOARD_JOB_IF
+            .trim_start_matches("!cancelled() && ")
+            .to_string(),
+        "!cancelled() && github.event_name != 'merge_group'".into(),
+        "!cancelled() && inputs.confirmed".into(),
+        format!("{DASHBOARD_JOB_IF} && needs.docs_only.result == 'success'"),
+        format!("{DASHBOARD_JOB_IF} && needs.docs_only.outputs.docs_only != 'true'"),
+    ] {
+        let report = run(
+            &wf("ci.yml", &dashboard_docs_only_fixture(&condition)),
+            &["Project Tests", "CI Result"],
+        );
+        assert!(
+            !report.required[0].covered && !report.required[0].docs_only_exception,
+            "{condition}"
+        );
+        assert!(!report.qualified(), "{condition}");
+    }
+}
+
+#[test]
+fn dashboard_docs_only_filter_does_not_credit_guarded_required_steps() {
+    let fixture = dashboard_docs_only_fixture(DASHBOARD_JOB_IF);
+    let checkout_gated = fixture.replace(
+        "      - uses: actions/checkout@v4\n      - name: Conflict markers",
+        "      - uses: actions/checkout@v4\n        if: ${{ needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true' }}\n      - name: Conflict markers",
+    );
+    let authorization_gated =
+        fixture.replace("run: ./scripts/test", "run: loom-daemon forge merge-queue group-check");
+    for source in [checkout_gated, authorization_gated] {
+        let report = run(&wf("ci.yml", &source), &["Project Tests", "CI Result"]);
+        assert!(codes_for(&report, Some("tests")).contains(&Code::UnprovenDocsOnlyGuard));
+        assert!(!report.required[0].docs_only_exception);
+        assert!(!report.qualified());
+    }
 }
 
 #[test]
@@ -944,39 +1034,47 @@ fn docs_only_workflow_contract_runs_heavy_steps_and_reports_without_a_successful
                 "needs.docs_only.result" => Some(self.classifier),
                 "needs.docs_only.outputs.docs_only" => self.output,
                 "needs.tests.result" => Some(self.suites),
+                "github.event_name" => Some("merge_group"),
+                "needs.merge-group-verified.outputs.verified" => None,
                 _ => panic!("unexpected expression path {path:?}"),
             };
             value.map_or(Value::Null, |value| Value::Str(value.to_string()))
         }
     }
-    let w = wf("ci.yml", DOCS_ONLY_REFERENCE);
-    assert_eq!(w.permissions.as_deref(), Some("contents: read, actions: read"));
-    let suite = w.job("tests").unwrap();
-    let aggregate = w.job("result").unwrap();
-    let heavy = parse_condition(suite.steps.last().unwrap().if_cond.as_deref().unwrap()).unwrap();
-    let red = parse_condition(aggregate.steps[0].if_cond.as_deref().unwrap()).unwrap();
-    assert_eq!(suite.if_cond.as_deref(), Some("${{ !cancelled() }}"));
-    assert_eq!(aggregate.if_cond, suite.if_cond);
-    assert_eq!(aggregate.steps[0].run.as_deref(), Some("exit 1"));
-    for step in &suite.steps[..suite.steps.len() - 1] {
-        assert!(step.if_cond.is_none(), "always-run checkout and cheap checks: {step:?}");
-    }
-    for (classifier, output, suites, runs, fails) in [
-        ("success", Some("true"), "success", false, false),
-        ("success", Some("false"), "success", true, false),
-        ("success", None, "success", true, false),
-        ("failure", None, "success", true, true),
-        ("failure", Some("true"), "success", true, true),
-        ("cancelled", None, "success", true, true),
-        ("skipped", None, "success", true, true),
-        ("success", Some("false"), "failure", true, true),
-    ] {
-        let context = Decisions {
-            classifier,
-            output,
-            suites,
-        };
-        assert_eq!(heavy.eval(&context).truth() == Truth::True, runs);
-        assert_eq!(red.eval(&context).truth() == Truth::True, fails);
+    let dashboard = dashboard_docs_only_fixture(DASHBOARD_JOB_IF);
+    for source in [DOCS_ONLY_REFERENCE, dashboard.as_str()] {
+        let w = wf("ci.yml", source);
+        assert_eq!(w.permissions.as_deref(), Some("contents: read, actions: read"));
+        let suite = w.job("tests").unwrap();
+        let aggregate = w.job("result").unwrap();
+        let heavy =
+            parse_condition(suite.steps.last().unwrap().if_cond.as_deref().unwrap()).unwrap();
+        let red = parse_condition(aggregate.steps[0].if_cond.as_deref().unwrap()).unwrap();
+        let job_if = parse_condition(suite.if_cond.as_deref().unwrap()).unwrap();
+        assert!(job_if.has_status_function());
+        assert_eq!(aggregate.if_cond.as_deref(), Some("${{ !cancelled() }}"));
+        assert_eq!(aggregate.steps[0].run.as_deref(), Some("exit 1"));
+        for step in &suite.steps[..suite.steps.len() - 1] {
+            assert!(step.if_cond.is_none(), "always-run checkout and cheap checks: {step:?}");
+        }
+        for (classifier, output, suites, runs, fails) in [
+            ("success", Some("true"), "success", false, false),
+            ("success", Some("false"), "success", true, false),
+            ("success", None, "success", true, false),
+            ("failure", None, "success", true, true),
+            ("failure", Some("true"), "success", true, true),
+            ("cancelled", None, "success", true, true),
+            ("skipped", None, "success", true, true),
+            ("success", Some("false"), "failure", true, true),
+        ] {
+            let context = Decisions {
+                classifier,
+                output,
+                suites,
+            };
+            assert_eq!(job_if.eval(&context).truth(), Truth::True);
+            assert_eq!(heavy.eval(&context).truth() == Truth::True, runs);
+            assert_eq!(red.eval(&context).truth() == Truth::True, fails);
+        }
     }
 }
