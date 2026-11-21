@@ -95,46 +95,43 @@ assert_grep "\*\*Occupied → yield\*\*: \`lease pr release\`, drop any \`loom:t
 assert_grep "\*\*Cannot probe\*\* \(no \`pgrep\`, or neither \`/proc\` nor \`lsof\`\): treat a dirty" "$DOCTOR_MD" \
     "documents the no-pgrep/no-lsof fallback (dirty = occupied)"
 occ_line=$(grep -n "^### Occupied worktree" "$DOCTOR_MD" | head -1 | cut -d: -f1)
-pick_line=$(grep -n "^Pick the worktree by branch shape" "$DOCTOR_MD" | head -1 | cut -d: -f1)
+pick_line=$(grep -n "^# PR worktree selection" "$DOCTOR_MD" | head -1 | cut -d: -f1)
 if [[ -n "$occ_line" && -n "$pick_line" && "$occ_line" -lt "$pick_line" ]]; then
     pass "occupied-worktree check precedes worktree selection/checkout"
 else
     fail "occupied-worktree check precedes worktree selection/checkout (occ=$occ_line pick=$pick_line)"
 fi
 
-# Behavioral: run the documented probe verbatim. A missing worktree must print
-# nothing (not every process); a reparented process inside one must be reported.
+# Execute the documented probe with only a simulated process in a
+# disposable directory. The real host's process list is irrelevant.
 probe_dir=$(mktemp -d)
 awk -v h="### Occupied worktree" 'index($0,h)==1{f=1} f&&/^```bash$/{g=1;next} g&&/^```$/{exit} g' "$DOCTOR_MD" > "$probe_dir/probe.txt"
 if [[ -s "$probe_dir/probe.txt" ]]; then
-    run_probe() { (cd "$probe_dir" && mkdir -p .loom/worktrees && sed "s#\.loom/worktrees/<issue-N|pr-N>#.loom/worktrees/$1#" probe.txt | bash 2>/dev/null); }
-    if [[ -z "$(run_probe nonexistent-1)" ]]; then
-        pass "occupied-worktree probe prints nothing for a nonexistent worktree"
-    else
-        fail "occupied-worktree probe prints processes for a nonexistent worktree"
-    fi
-    mkdir -p "$probe_dir/.loom/worktrees/pr-1"
-    # `setsid` is util-linux; macOS does not ship it (#12045). The subshell
-    # exiting right after the `&` already reparents the sleeper, which is the
-    # property the probe needs, so fall back to that rather than starting
-    # nothing. The sleeper outlives the probe by a wide margin: the probe runs
-    # `lsof` once per user process on macOS, which on a busy host took >30s
-    # and let the old `sleep 30` exit before the probe reached its pid.
-    sleeper_cmd="sleep 600"
-    launcher=()
-    command -v setsid >/dev/null 2>&1 && launcher=(setsid)
-    (cd "$probe_dir/.loom/worktrees/pr-1" && {
-        ${launcher[@]+"${launcher[@]}"} $sleeper_cmd >/dev/null 2>&1 &
-        echo $! >"$probe_dir/sleeper.pid"
-    })
-    sleep 0.3
-    if run_probe pr-1 | grep -q "$sleeper_cmd"; then
-        pass "occupied-worktree probe reports a live process inside an existing worktree"
-    else
-        fail "occupied-worktree probe misses a live process inside an existing worktree"
-    fi
-    kill "$(cat "$probe_dir/sleeper.pid" 2>/dev/null)" 2>/dev/null || true
-    pkill -u "$(id -u)" -f "^$sleeper_cmd\$" 2>/dev/null || true
+    mkdir -p "$probe_dir/bin" "$probe_dir/.loom/worktrees/pr-1"
+    cat > "$probe_dir/bin/pgrep" <<'EOF'
+#!/bin/bash
+echo 4199
+EOF
+    cat > "$probe_dir/bin/readlink" <<'EOF'
+#!/bin/bash
+[[ "$1" = /proc/4199/cwd ]] || exit 1
+(cd .loom/worktrees/pr-1 && pwd -P)
+EOF
+    cat > "$probe_dir/bin/ps" <<'EOF'
+#!/bin/bash
+case "$*" in
+    '-o ppid= -p 4199') echo 1 ;;
+    '-o pid=,command= -p 4199') echo '4199 fixture-process' ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$probe_dir/bin/"*
+    run_probe() {
+        (cd "$probe_dir" && PATH="$probe_dir/bin:$PATH" \
+            WORKTREE_PATH=".loom/worktrees/$1" LOOM_AGENT_SESSION_PID=4400 bash probe.txt)
+    }
+    assert_eq "" "$(run_probe nonexistent-1)" "occupied-worktree probe prints nothing for a nonexistent worktree"
+    assert_eq "4199 fixture-process" "$(run_probe pr-1)" "occupied-worktree probe reports a foreign process in the selected worktree"
 else
     fail "could not extract the occupied-worktree probe snippet from doctor.md"
 fi
@@ -563,6 +560,136 @@ if grep -qE "use worktree\.sh instead" <<<"$HELP_OUT"; then
 else
     pass "pr-worktree.sh --help no longer contradicts judge.md"
 fi
+
+# --- Test 8: run the documented selection against disposable checkouts ---
+echo ""
+echo "Test 8: Judge and Doctor check head repository metadata before selection"
+SELECT="$TMP/selection"
+mkdir -p "$SELECT/bin"
+cat > "$SELECT/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+    "pr view 71 --repo fixture/loom --json isCrossRepository,headRefName,headRepository")
+        [[ "$FIXTURE_JSON" != unreadable ]] || exit 1
+        printf '%s\n' "$FIXTURE_JSON"
+        ;;
+    "pr view 71 --json headRefName --jq .headRefName")
+        jq -r .headRefName <<<"$FIXTURE_JSON"
+        ;;
+    "pr checkout 71 --repo fixture/loom")
+        printf 'checkout %s\n' "${PWD##*/}" >>"$FIXTURE_CALLS"
+        ;;
+    *)
+        printf 'unexpected forge command\n' >>"$FIXTURE_CALLS"
+        exit 1
+        ;;
+esac
+EOF
+chmod +x "$SELECT/bin/gh"
+
+for role in judge doctor; do
+    prompt="$REPO_ROOT/defaults/.claude/commands/loom/$role.md"
+    [[ -f "$prompt" ]] || prompt="$REPO_ROOT/.claude/commands/loom/$role.md"
+    awk '/^# PR worktree selection$/{capture=1;next}
+         /^# End PR worktree selection$/{exit}
+         capture && /^```$/{fence=1;next}
+         capture && /^```bash$/{fence=0;next}
+         capture && !fence' "$prompt" >"$SELECT/$role.sh"
+    cat >>"$SELECT/$role.sh" <<'EOF'
+printf 'entered %s\n' "${PWD##*/}" >>"$FIXTURE_CALLS"
+EOF
+done
+
+run_selection() {
+    local role="$1" name="$2" json="$3" holder="$4" alternate="$5" expected="$6"
+    local repo="$SELECT/$role-$name" calls rc=0 main
+    mkdir -p "$repo/.loom/scripts" "$repo/.loom/worktrees"
+    git init -q -b main "$repo"
+    git -C "$repo" -c user.name=Fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false \
+        commit -q --allow-empty -m fixture
+    git -C "$repo" remote add origin "$TMP/origin.git"
+    git -C "$repo" branch feature/issue-71
+    main="$(git -C "$repo" rev-parse HEAD)"
+    ln -s "$SCRIPTS_DIR/lib" "$repo/.loom/scripts/lib"
+    if [[ "$holder" = present ]]; then
+        git -C "$repo" worktree add -q "$repo/.loom/worktrees/issue-71" feature/issue-71
+    fi
+    cat >"$repo/.loom/scripts/worktree.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+printf 'issue helper\n' >>"$FIXTURE_CALLS"
+if [[ ! -d .loom/worktrees/issue-71 ]]; then
+    git worktree add -q .loom/worktrees/issue-71 feature/issue-71
+fi
+EOF
+    cat >"$repo/.loom/scripts/pr-worktree.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+printf 'PR helper\n' >>"$FIXTURE_CALLS"
+case "$FIXTURE_ALT" in
+    real) exec "$FIXTURE_PR_HELPER" "$@" ;;
+    failed) exit 1 ;;
+    detached) git worktree add -q --detach .loom/worktrees/pr-71 HEAD ;;
+    *) git worktree add -q -b fixture-pr .loom/worktrees/pr-71 HEAD ;;
+esac
+EOF
+    chmod +x "$repo/.loom/scripts/"*.sh
+    calls="$repo/calls"
+    (cd "$repo" && PATH="$SELECT/bin:$PATH" PR_NUMBER=71 PR_REPO=fixture/loom \
+        LOOM_WORKTREE_ROOT='' LOOM_DEFAULT_BRANCH=main \
+        FIXTURE_JSON="$json" FIXTURE_CALLS="$calls" FIXTURE_ALT="$alternate" \
+        FIXTURE_PR_HELPER="$PR_WORKTREE_SH" bash "$SELECT/$role.sh") >"$repo/trace" 2>&1 || rc=$?
+    assert_eq "$expected" "$(cat "$calls" 2>/dev/null || true)" "$role $name records only the expected actions"
+    assert_eq "$main" "$(git -C "$repo" rev-parse HEAD)" "$role $name preserves the primary HEAD"
+    if [[ "$expected" = *"entered "* ]]; then
+        assert_eq 0 "$rc" "$role $name succeeds"
+    else
+        assert_eq 1 "$rc" "$role $name stops before proceeding"
+    fi
+    if [[ "$holder" = present ]]; then
+        assert_eq "$main" "$(git -C "$repo/.loom/worktrees/issue-71" rev-parse HEAD)" \
+            "$role $name preserves the existing issue HEAD"
+    fi
+}
+same='{"headRefName":"feature/issue-71","isCrossRepository":false,"headRepository":{"nameWithOwner":"Fixture/Loom"}}'
+fork='{"headRefName":"feature/issue-71","isCrossRepository":true,"headRepository":{"nameWithOwner":"another/loom"}}'
+ad_hoc='{"headRefName":"fix/ad-hoc","isCrossRepository":false,"headRepository":{"nameWithOwner":"fixture/loom"}}'
+# Match the shared Forge slug validator's per-segment bounds and dot rules.
+long_segment=$(printf '%101s' '' | tr ' ' 'a')
+max_segment=${long_segment%a}
+fork_named() {
+    jq -cn --arg slug "$1" '{headRefName:"feature/issue-71",isCrossRepository:true,headRepository:{nameWithOwner:$slug}}'
+}
+for role in judge doctor; do
+    run_selection "$role" fork-collision "$fork" present real 'PR helper'
+    run_selection "$role" valid-dotted-repo "$(fork_named 'another/.github')" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" max-length-slug "$(fork_named "$max_segment/$max_segment")" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" invalid-owner-dot "$(fork_named '.team/loom')" present ready ''
+    run_selection "$role" invalid-owner-hyphen "$(fork_named '-team/loom')" present ready ''
+    run_selection "$role" invalid-repo-hyphen "$(fork_named 'another/-loom')" present ready ''
+    run_selection "$role" invalid-repo-single-dot "$(fork_named 'another/.')" present ready ''
+    run_selection "$role" invalid-repo-double-dot "$(fork_named 'another/..')" present ready ''
+    run_selection "$role" overlong-owner "$(fork_named "$long_segment/loom")" present ready ''
+    run_selection "$role" overlong-repo "$(fork_named "another/$long_segment")" present ready ''
+    run_selection "$role" fork-without-holder "$fork" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" ad-hoc "$ad_hoc" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" helper-failure "$fork" absent failed 'PR helper'
+    run_selection "$role" unreadable unreadable absent ready ''
+    run_selection "$role" malformed-json '{' absent ready ''
+    run_selection "$role" absent-branch '{"isCrossRepository":false,"headRepository":{"nameWithOwner":"fixture/loom"}}' present ready ''
+    run_selection "$role" absent-flag '{"headRefName":"feature/issue-71","headRepository":{"nameWithOwner":"fixture/loom"}}' present ready ''
+    run_selection "$role" absent-repository '{"headRefName":"feature/issue-71","isCrossRepository":false}' present ready ''
+    run_selection "$role" malformed-repository "${same/Fixture\/Loom/Fixture}" present ready ''
+    run_selection "$role" inconsistent-same "${fork/true/false}" present ready ''
+    run_selection "$role" inconsistent-cross "${same/false/true}" present ready ''
+    run_selection "$role" malformed-boolean '{"headRefName":"feature/issue-71","isCrossRepository":"false","headRepository":{"nameWithOwner":"fixture/loom"}}' present ready ''
+    run_selection "$role" invalid-ref "${same/issue-71/issue-71..}" present ready ''
+done
+run_selection judge existing-managed "$same" present ready 'entered issue-71'
+run_selection judge missing-managed "$same" absent ready $'PR helper\nentered pr-71'
+run_selection doctor managed "$same" absent ready $'issue helper\ncheckout issue-71\nentered issue-71'
+run_selection judge detached "$ad_hoc" absent detached $'PR helper\nentered pr-71'
+run_selection doctor detached "$ad_hoc" absent detached 'PR helper'
 
 # --- Summary ---
 echo ""
