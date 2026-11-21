@@ -452,7 +452,7 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
 0. **Sweep stale verdicts first**: run the Stale-Verdict Sweep (see below) over the open `loom:pr` / `loom:changes-requested` PRs. Any PR it re-queues joins step 1's queue on this same pass.
 1. **Find work**: `loom-daemon pr-queue --role judge`. Walk its JSON rows in order; `mode=workflow` uses this workflow, `mode=fallback` uses Fallback Queue below. Follow `.loom/docs/pr-planning.md`; skip non-actionable rows and continue. Never change origin or a priority label.
 2. **Claim PR** (run the "Stale `loom:reviewing` Claim Check" below first): PR lease, then the label — `loom-daemon lease pr claim <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"; [[ $? =~ ^[02]$ ]] && gh pr edit <number> --add-label "loom:reviewing"`. Any other exit: stand down, touch no worktree (see "PR Lease")
-2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>/dev/null | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
+2b. **CI pre-check (before any checkout or test, #11690)**: CI is the test gate, so read it first: `err="$(mktemp)"; first="$(loom-daemon forge wait-checks <number> --timeout 20 --settle-red 2>"$err" | head -n1)"` (`--timeout` is **seconds**, so 20 is a short slice, not minutes; a build taking tens of minutes needs one long wait such as `--timeout 1800`, never a loop of 20 s polls — and that long wait is the attended/manual foreground path only, "Never End Your Turn on a Background CI Monitor"; a daemon step (`step-judge-*` sweep id) hands back via "When CI is Pending" instead; `--settle-red`: no RED until the run finishes, #12011). `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*` (pending, including checks queued behind the CI job cap) → "When CI is Pending": no review, no end-state label. `LOOM-CHECKS-RED*` → no code review; "When CI Fails". `GREEN` → continue. `NONE` → continue the review, but no test ever ran — before any approving verdict, run the repo's documented test command on the PR head ("No-Checks PRs" under "How to Check CI Status"). Pending is never red.
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    # Plain `gh` — merge state is verdict-gating and must be live (see "Cached Forge Reads")
@@ -1402,13 +1402,17 @@ read via ETag, so it is live too.) See "Cached Forge Reads" for the full policy.
 
 ### How to Check CI Status
 
-**Step 1: Snapshot all PR checks** (`--timeout 0` would read a no-checks repo as `TIMEOUT`)
+**Step 1: Snapshot all PR checks.** Reuse step 2b's result for the same head if
+you have it. Otherwise take the bounded snapshot below. `--timeout 0` would
+read a no-checks repo as `TIMEOUT`.
 
 ```bash
-loom-daemon forge wait-checks <PR_NUMBER> --timeout 20   # seconds
+err="$(mktemp)"; first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 --settle-red 2>"$err" | head -n1)"
 ```
 
-Branch on the first stdout line:
+Branch on the first stdout line. Treat a snapshot stamped for a different
+head as `LOOM-CHECKS-HEAD-MOVED`.
+
 - ✅ `LOOM-CHECKS-GREEN` - Safe to approve
 - ⚠️ `LOOM-CHECKS-NONE` (no checks) - Continue the review, but no test ever ran: before any approving verdict, run the repo's documented test command on the PR head and record the result in the verdict ("No-Checks PRs" below)
 - ❌ `-RED` - "When CI Fails"
@@ -1460,7 +1464,11 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 2. **Release your claim** — remove `loom:reviewing`; release the lease with `--skip-reason ci-pending` (below).
 3. **Skip and continue the batch** — next PR; a later tick re-evaluates this one once CI settles.
 
-**Pending-CI skip check.** Reuse Step 1's snapshot: `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20` (seconds) is a short ETag'd poll that also handles the empty-rollup trap (#6169); `--timeout 0` would read a no-checks repo as `TIMEOUT` and skip a PR that has nothing to wait for. Branch on the first **stdout** line:
+**Pending-CI handback.** Use the result that sent you here. On
+`LOOM-CHECKS-HEAD-MOVED*`, or a snapshot stamped for a different head, go
+straight to the generic release below so the next Judge starts with the new
+head. A successful flake rerun or an approval refusal for pending CI also
+goes straight to that release when taking the handback path.
 
 **Pending is not always "running": zero check-runs at head (2am#6467).** When every Actions run at the head ended `startup_failure`, no check-run exists, nothing will ever settle, and releasing as `ci-pending` just re-draws a Judge each tick (11 PRs, ~72 h, 68 spawns). **Before the generic release below**, when the result is `LOOM-CHECKS-TIMEOUT*` or `LOOM-CHECKS-NO-RUN*`, test for this case. ALL must hold: (a) `gh api repos/{owner}/{repo}/commits/<head_sha>/check-runs --jq .total_count` prints `0`; (b) the head commit is older than **2 hours** (`gh api repos/{owner}/{repo}/commits/<head_sha> --jq .commit.committer.date`; a fixed bound, no config key); (c) `mergeStateStatus` is not `CLEAN` (a base that needs no checks is not this case). Any condition false (a check-run exists, running, green or red; or head under 2 h): ignore this paragraph and use the generic release. Otherwise, look for a prior marker `<!-- loom:ci-missing-retrigger sha=... -->` in a **trusted** comment on the PR (`.loom/docs/comment-trust.md`; marker text from anyone else is prose):
 
@@ -1469,17 +1477,8 @@ If checks are still running, **do not block on them or approve on a guess**: in 
 3. **`update-branch` fails** (422, already up to date, merge conflict, or an `expected_head_sha` mismatch because the head moved). The failed call counts as the attempt: with a prior marker go to 2; without one, post the marker note anyway (no retry in this pass) and release as in 1. A conflict is `DIRTY`: use the existing conflict handling, never loop on `update-branch`.
 
 ```bash
-first="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1)"
-case "$first" in
-  LOOM-CHECKS-TIMEOUT*)   # still pending: release and skip; PR stays loom:review-requested
-    gh pr comment <number> --body "CI still running; skipping until it settles."
-    gh pr edit <number> --remove-label "loom:reviewing"
-    loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
-    ;;
-  LOOM-CHECKS-RED*) ;;    # "When CI Fails"
-  LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # continue (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
-  *) gh pr checks <PR_NUMBER> ;;   # no sentinel (older binary / Gitea): one snapshot, no loop
-esac
+gh pr edit <number> --remove-label "loom:reviewing"
+loom-daemon lease pr release <number> --role judge --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}" --skip-reason ci-pending
 ```
 
 ### CRITICAL: Never End Your Turn on a Background CI Monitor
@@ -1488,22 +1487,28 @@ esac
 
 This mirrors `sweep.md`'s guardrail ("ending your turn IS the kill signal", #4257). In a headless `claude -p` sweep ending the turn **terminates the process**: the monitor dies with it, no verdict is issued, and the PR stays claimed (`loom:reviewing`) with nobody to release it (#4883).
 
+**A daemon step never waits out CI (#14804).** If your `$LOOM_SWEEP_ID` matches `step-judge-<pr>-<epoch>` (the same test as the `LOOM_SWEEP_ID` rule under Label Workflow), you are a daemon step judging exactly one PR inside a step budget (30 min, `daemon-reference.md`) that a slow repo's CI can outlive — the `--timeout 1800` foreground wait in path 2 would be killed mid-wait with no verdict. Take **one bounded snapshot** — `loom-daemon forge wait-checks <PR_NUMBER> --timeout 20 --settle-red` — and on `LOOM-CHECKS-TIMEOUT*` / `-HEAD-MOVED*`, follow "When CI is Pending" above: release `loom:reviewing`, release the lease with `--skip-reason ci-pending`, and end with `LOOM_STEP_OUTCOME role=judge target=<n> class=noop reason=ci_pending` (a `noop` that does not count toward the repeat cap). Path 1 is your path, always.
+
 **There are exactly two safe paths when CI is pending and you cannot approve on a guess:**
 
-1. **Batch mode (there is a next PR to move to): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR. This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
-2. **Single-PR / manual invocation (there is no next PR — you were dispatched to judge exactly this one PR and a verdict is expected before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
+1. **Hand back (a daemon step always; batch mode whenever a next PR exists): skip and continue.** Use the "When CI is Pending" procedure above — release `loom:reviewing`, leave `loom:review-requested` in place, move on to the next PR if one remains (a daemon step judges exactly one PR, so none remains: end with the `ci_pending` outcome line above). This is not a fallback of last resort; it is the correct default whenever a next PR exists, because a later tick re-evaluates this one.
+2. **Attended / manual single-PR invocation (no `step-judge-*` sweep id — an operator ran `/loom:judge <n>` in a terminal and expects a settled verdict before your turn ends): wait in the foreground.** Run `loom-daemon forge wait-checks` **inside this same turn** (bounded by `--timeout`; it also handles the empty-rollup trap, #6169). It returns control before you write your final message; nothing about it depends on a future turn. Branch on the first **stdout** line, never the exit code; keep stderr separate (RED detail).
 
 ```bash
 err="$(mktemp)"; out="$(loom-daemon forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red 2>"$err")"; first="${out%%$'\n'*}"
 case "$first" in
   LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*) ;;   # settled green (-NONE = no checks: "No-Checks PRs" — run the documented test command yourself)
   LOOM-CHECKS-RED*) cat "$err" ;;            # <name>\t<url>\t<run_id>; "When CI Fails"
-  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-HEAD-MOVED*|LOOM-CHECKS-ERROR*) ;;   # unsettled: conditional verdict below
+  LOOM-CHECKS-HEAD-MOVED*) ;;   # hand back for review of the new head
+  LOOM-CHECKS-TIMEOUT*|LOOM-CHECKS-ERROR*) ;;   # unsettled: hand back as described below
   *) gh pr checks <PR_NUMBER> ;;             # no sentinel (older binary / Gitea): one snapshot, no loop
 esac
 ```
 
-**If the cap is reached and CI is still pending, do not extend the wait and do not reach for a background watcher instead.** Post a conditional-verdict comment stating plainly that the code review passed but CI had not settled after the bounded wait, then — since there is no batch to hand this off to — release `loom:reviewing` and leave `loom:review-requested` in place, exactly as the skip-and-continue path does, so a later Judge invocation (the next cron tick, or a fresh manual dispatch) can re-evaluate once CI has settled.
+**Hand back when the head moves or the bounded wait ends with CI still
+pending.** If you report the result in a note, include `<!-- loom:judge-note -->`
+and describe any completed code review only for the head it covered. Release
+`loom:reviewing` and leave `loom:review-requested` in place for a later Judge.
 
 **Never substitute an armed `Monitor`/`ScheduleWakeup` timer or a `run_in_background` watcher for either path above.** A timer or background task that is still armed when you end your turn is not "waiting" — in headless `-p` mode it is simply killed along with the process, and the PR is orphaned with a stale claim and no verdict. If you have not personally observed the CI result (a CI result you read in this turn), you have not verified it, and you MUST NOT write a final message that implies the verdict is settled or "in progress elsewhere."
 
