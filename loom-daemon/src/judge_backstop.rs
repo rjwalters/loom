@@ -60,6 +60,16 @@
 //! CI the PR planner serves, #12003) the pass is recorded as before. A
 //! release without a skip reason (an older prompt) is unchanged.
 //!
+//! Check runs a terminal-failed workflow run left queued for good (#14128,
+//! #14415) are deliberately NOT attributed to that run here, unlike
+//! `forge wait-checks` and the merge-group check
+//! ([`crate::merge_pr::check_runs_rollup::fail_stranded_rows`]). They already
+//! land on the intended side of this module's only question: a stranded row
+//! exempts a pass only while it is young, and ages into [`CiState::Stuck`]
+//! like any CI that is not settling. Attributing them would add a
+//! workflow-runs read to every PR the planner lists and change no outcome
+//! past [`PENDING_EXEMPT_HOURS`].
+//!
 //! Only trusted authors' records count (the caller filters): a record
 //! suppresses review, so an outsider must not be able to post one.
 //!

@@ -655,6 +655,9 @@ pub(crate) enum ScriptPortCommand {
     #[command(subcommand)]
     ForgeInventory(super::forge_inventory_cmd::ForgeInventoryCommand),
 
+    /// Classify the exact GitHub CI tree using the installed docs-only policy.
+    CiDocsOnly(super::ci_docs_only::CiDocsOnlyArgs),
+
     /// Combined-tree CI qualification for the merge queue (#10257): `audit`
     /// reports relied-on suites that do not validate the merge-group commit;
     /// `eligibility` decides whether a repository may pilot queue mode.
@@ -769,6 +772,7 @@ impl ScriptPortCommand {
             ScriptPortCommand::NotifyClearedBlockers(args) => args.run(),
             ScriptPortCommand::LabelDuplicates(args) => args.run(),
             ScriptPortCommand::ForgeInventory(cmd) => cmd.run(),
+            ScriptPortCommand::CiDocsOnly(args) => args.run(),
             ScriptPortCommand::MergeGroupCi(cmd) => cmd.run(),
             ScriptPortCommand::ForgeProbe(args) => args.run(),
             ScriptPortCommand::ResyncPin(cmd) => cmd.run(),

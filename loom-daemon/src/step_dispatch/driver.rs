@@ -348,6 +348,7 @@ impl RegistrySpawner {
                         request.item,
                         request.role,
                         &reason,
+                        e.downcast_ref::<StepRefusal>().map(|r| r.detail.as_str()),
                     );
                 }
                 self.report_stale_draw(idx, request.item, &e);
@@ -368,6 +369,7 @@ struct GatherJob {
     fixes_only: bool,
     repo: String,
     weight: u32,
+    pool_exhausted_roles: BTreeSet<String>,
     /// Starved for several ticks: the starvation count restarts after this
     /// tick (it no longer buys the writer: reads never use it, #12394).
     escalated: bool,
@@ -417,7 +419,7 @@ impl StepDriver {
         &mut self,
         root: Option<&PathBuf>,
         free_slots: usize,
-        exhausted: &BTreeSet<String>,
+        roles_ok: &[String],
     ) -> Vec<tick::Offer> {
         let Some(root) = root else {
             return Vec::new();
@@ -425,10 +427,7 @@ impl StepDriver {
         let requests = self
             .requests
             .get_or_insert_with(|| crate::fleet_dispatch::request::Loop::start(root));
-        requests.note_capacity(
-            u32::try_from(free_slots).unwrap_or(u32::MAX),
-            &crate::fleet_dispatch::worker::roles_ok(exhausted),
-        );
+        requests.note_capacity(u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok);
         let step = requests.step(root);
         crate::fleet_dispatch::worker::offer(&step.candidates);
         step.candidates
@@ -464,9 +463,6 @@ impl StepDriver {
         let occupied: Vec<usize> = registries.iter().map(occupancy).collect();
         let held_capabilities = crate::capability::held_capabilities();
         let mut workspaces = Vec::new();
-        // Roles whose pool is exhausted in any workspace, for the
-        // fleet-dispatch heartbeat's `roles_ok` (#12450).
-        let mut exhausted_roles: std::collections::BTreeSet<String> = Default::default();
         // Per workspace: (idx, failed listing, listing state, Builders held).
         let mut notes: Vec<(usize, Option<anyhow::Error>, Option<ListingState>, usize)> =
             Vec::new();
@@ -522,9 +518,22 @@ impl StepDriver {
                 fixes_only,
                 repo,
                 weight,
+                pool_exhausted_roles: lock(&registries[idx]).pool_exhausted_roles(now),
                 escalated: self.starvation.escalate(root),
             });
         }
+        // A host can offer a role when at least one participating workspace
+        // has no active exhaustion for it. Listing failures and truncation do
+        // not change those local pool facts.
+        let host_roles = if let Some((first, rest)) = jobs.split_first() {
+            let mut exhausted_everywhere = first.pool_exhausted_roles.clone();
+            for job in rest {
+                exhausted_everywhere.retain(|role| job.pool_exhausted_roles.contains(role));
+            }
+            crate::fleet_dispatch::worker::roles_ok(&exhausted_everywhere)
+        } else {
+            Vec::new()
+        };
         // Pass 2, the forge half, `gather_concurrency` repos at once
         // (#12256). Each worker carries the tick's read deadline, its trace
         // parent and the runtime context; a repo past the deadline is
@@ -591,6 +600,7 @@ impl StepDriver {
                 fixes_only,
                 repo,
                 weight,
+                pool_exhausted_roles,
                 escalated,
             } = job;
             let root = &input.roots[idx];
@@ -614,15 +624,14 @@ impl StepDriver {
             if journal_state {
                 reevals.insert(idx, gathered.reevals.clone());
             }
-            let (mut cooldowns, pool_exhausted_roles, mut claims) = {
+            let (mut cooldowns, mut claims) = {
                 let reg = registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (reg.step_cooldowns(now), reg.pool_exhausted_roles(now), reg.draw_claims())
+                (reg.step_cooldowns(now), reg.draw_claims())
             };
             // #13026: read each tick, so a change needs no roll.
             claims.merge_concurrency = crate::config_resolver::champion_merge_concurrency(root);
-            exhausted_roles.extend(pool_exhausted_roles.iter().cloned());
             for (item, role, until) in &gathered.ladder {
                 cooldowns.insert(*item, *role, *until);
             }
@@ -757,8 +766,8 @@ impl StepDriver {
         let _spawning = crate::gh_invocation::read_deadline::suspend();
         let draw_started = Instant::now();
         let free_slots = input.max_concurrent.saturating_sub(total);
-        crate::fleet_dispatch::worker::note_capacity(free_slots, &exhausted_roles);
-        let offers = self.request_work(input.roots.first(), free_slots, &exhausted_roles);
+        crate::fleet_dispatch::worker::note_capacity(free_slots, &host_roles);
+        let offers = self.request_work(input.roots.first(), free_slots, &host_roles);
         // #12450: a host in fleet-dispatch fallback draws one round, with no
         // free `claim_lost`; unchanged with the flag off.
         let (free_slots, fallback) = input.roots.first().map_or((free_slots, false), |root| {

@@ -633,15 +633,11 @@ fn send_release(grant: &Grant, outcome: &str, root: Option<PathBuf>) {
     );
 }
 
-/// The step tick's view of this host: its free slots and the roles whose
-/// pools are not exhausted (`exhausted`, role names), for the heartbeat.
-///
-/// Phase 1 reports pool exhaustion only. Spec §5.2's `roles_ok` also leaves
-/// out roles behind the load brake or a disk back-off; those still run
-/// through today's admission after a grant, and the captain does not yet
-/// use `roles_ok` to pick hosts.
-pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
-    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok(exhausted)));
+/// Cache the step tick's free slots and host role list for the heartbeat.
+/// The work-request loop uses this same list. Local candidate admission still
+/// checks the workspace's own load, disk, pool and claim gates.
+pub fn note_capacity(free_slots: usize, roles_ok: &[String]) {
+    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok.to_vec()));
 }
 
 /// The role names this host can run: every step role's, but `exhausted`.

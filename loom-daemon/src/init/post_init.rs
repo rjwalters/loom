@@ -387,6 +387,89 @@ pub const EPHEMERAL_PATTERNS: &[&str] = &[
     "/.loom-local/",
 ];
 
+/// The `"name"` of the root `package.json` stub the installer's scaffolding
+/// step writes into repos that lack their own (`defaults/package.json`). The
+/// same marker `resync-installed.sh`'s `resync_workspace_stub_version` keys
+/// its version-field edit on — keep the two detections identical (#13898).
+const LOOM_WORKSPACE_STUB_NAME: &str = "loom-workspace";
+
+/// pnpm artifacts of the [`LOOM_WORKSPACE_STUB_NAME`] stub (#13898) — the
+/// companion to [`EPHEMERAL_PATTERNS`] that is emitted into the managed block
+/// ONLY in a workspace whose root `package.json` IS the stub.
+///
+/// The stub declares zero dependencies and exists purely so the documented
+/// suite entry points (`pnpm test`, `pnpm check:ci`, `pnpm check:all`) resolve.
+/// The package manager still materializes its own artifacts in the repo root:
+/// an explicit `pnpm install` creates `node_modules/` AND `pnpm-lock.yaml` on
+/// every pnpm version tested, and a plain `pnpm <script>` run creates both on
+/// pnpm <= 11 (an implicit install before the run). Unignored, those two paths
+/// are exactly the untracked dirt `check-main-clean.sh` counts (and its
+/// `--quarantine` path stashes away mid-sweep), and a `git add -A` sweeps them
+/// into a commit. A stub repo has no dependencies, so its generated lockfile
+/// pins nothing — ignoring it loses no information.
+///
+/// Both entries are root-anchored (`/`): the hazard is "package manager ran in
+/// the repo root", and anchoring keeps a nested source directory of the same
+/// name visible (#13549's anchoring rationale, applied preemptively).
+///
+/// Deliberately NOT in [`EPHEMERAL_PATTERNS`] — i.e. NOT emitted for every
+/// consumer repo — for three reasons:
+///
+/// - `pnpm-lock.yaml` must never be ignored where a real Node project's
+///   lockfile lives: a consumer with its own `package.json` commits that file,
+///   and hiding it from `git add` is a silent-dependency-drift bug (#13898's
+///   key design call).
+/// - `node_modules/` in [`EPHEMERAL_PATTERNS`] would make the markerless
+///   legacy migration's `is_legacy` predicate treat a user-authored
+///   `node_modules/` line — the single most common user ignore rule — as
+///   Loom's own and absorb it into the managed block, breaking the
+///   user-content-stays-put invariant of #3592 and handing
+///   `uninstall-loom.sh`'s marker-span deletion a rule the user wrote
+///   independently (the exact "never remove ignore rules we didn't add"
+///   hazard #5242 documents for `.loom/config.json`).
+/// - [`EPHEMERAL_PATTERNS`] reaches every consumer repo's committed
+///   `.gitignore` on the next resync; confining the entries to stub repos
+///   keeps that fleet-wide churn to the repos where Loom's own stub caused
+///   the artifacts.
+///
+/// Formatting contract: one quoted pattern per line (trailing comma optional)
+/// so `resync-installed.sh`'s `_gitignore_source_stub_patterns` can parse this
+/// const from source exactly the way `_gitignore_source_ephemeral_patterns`
+/// parses [`EPHEMERAL_PATTERNS`] — the shell stale-binary check must agree
+/// with what the binary conditionally writes, or it "repairs" the entries
+/// back out of every stub repo's block (#5294/#5991/#11323 class). That
+/// parser anchors on the `pub const STUB_WORKSPACE_PATTERNS` heading, so the
+/// `pub` (like [`EPHEMERAL_PATTERNS`] and [`CREDENTIAL_PATTERNS`]) is
+/// load-bearing for it — and so is the one-pattern-per-line layout, which
+/// rustfmt would otherwise collapse onto a single line.
+#[rustfmt::skip]
+pub const STUB_WORKSPACE_PATTERNS: &[&str] = &[
+    "/node_modules/",
+    "/pnpm-lock.yaml",
+];
+
+/// Whether the managed block for `workspace_path` must carry the
+/// [`STUB_WORKSPACE_PATTERNS`] entries: its root `package.json` has `"name"`
+/// equal to [`LOOM_WORKSPACE_STUB_NAME`].
+///
+/// False for a missing file, unparseable JSON, a non-string `name`, or any
+/// other name — always the safe direction, since the one harm these entries
+/// can do is hide a real Node repo's `pnpm-lock.yaml` from `git add`
+/// (#13898).
+fn workspace_uses_package_stub(workspace_path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(workspace_path.join("package.json")) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|v| {
+            v.get("name")
+                .and_then(|name| name.as_str())
+                .map(|name| name == LOOM_WORKSPACE_STUB_NAME)
+        })
+        .unwrap_or(false)
+}
+
 /// The credential-bearing subset of [`EPHEMERAL_PATTERNS`] (#8005) — paths that
 /// hold a live secret (OAuth token, API key, installation token, harness auth
 /// store), where a single commit is a one-way leak.
@@ -450,7 +533,11 @@ pub fn is_credential_path(path: &str) -> bool {
 
 /// Build the Loom-managed `.gitignore` block (marker lines + header + patterns),
 /// with no leading or trailing newline. Callers add surrounding newlines.
-fn managed_gitignore_block() -> String {
+///
+/// `stub_workspace` selects the [`STUB_WORKSPACE_PATTERNS`] companion entries
+/// (#13898) — see that constant for why they are conditional rather than
+/// members of [`EPHEMERAL_PATTERNS`].
+fn managed_gitignore_block(stub_workspace: bool) -> String {
     let mut block = String::new();
     block.push_str(GITIGNORE_BEGIN_MARKER);
     block.push('\n');
@@ -459,6 +546,15 @@ fn managed_gitignore_block() -> String {
     for pattern in EPHEMERAL_PATTERNS {
         block.push_str(pattern);
         block.push('\n');
+    }
+    // #13898: the stub-conditional pnpm artifacts, appended after the base
+    // list so the deterministic order matches what
+    // `_gitignore_source_stub_patterns` parses for the resync stale check.
+    if stub_workspace {
+        for pattern in STUB_WORKSPACE_PATTERNS {
+            block.push_str(pattern);
+            block.push('\n');
+        }
     }
     block.push_str(GITIGNORE_END_MARKER);
     block
@@ -615,9 +711,27 @@ pub fn generate_manifest(workspace_path: &Path) {
 ///
 /// Adds patterns for ephemeral Loom files that shouldn't be committed.
 /// Creates .gitignore if it doesn't exist.
+///
+/// The managed block is derived from this workspace's own state: the
+/// [`STUB_WORKSPACE_PATTERNS`] entries (#13898) are included when the root
+/// `package.json` is the `loom-workspace` stub.
 pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
-    let gitignore_path = workspace_path.join(".gitignore");
-    let block = managed_gitignore_block();
+    update_gitignore_in(workspace_path, workspace_path)
+}
+
+/// [`update_gitignore`] with the `.gitignore` being edited and the #13898 stub
+/// detection rooted at different trees.
+///
+/// The daemon resync refreshes a STAGING copy of the workspace's `.gitignore`
+/// (`payload::materialize_with` -> `payload::surfaces::stage_extras`), and that
+/// staging tree deliberately carries no `package.json` (an install-time-only
+/// surface, `payload::surfaces::INSTALL_TIME_ONLY`), so the stub detection must
+/// consult the real workspace root — otherwise every resync would regenerate
+/// the block without the stub entries and silently strip them from stub repos
+/// (#13898).
+pub fn update_gitignore_in(target: &Path, workspace: &Path) -> Result<(), String> {
+    let gitignore_path = target.join(".gitignore");
+    let block = managed_gitignore_block(workspace_uses_package_stub(workspace));
 
     // Create a fresh .gitignore containing only the managed block.
     if !gitignore_path.exists() {
@@ -1549,7 +1663,7 @@ mod tests {
             &gitignore,
             format!(
                 "node_modules/\n{block}\n# trailing user content\ndist/\n",
-                block = managed_gitignore_block()
+                block = managed_gitignore_block(false)
             ),
         )
         .unwrap();
@@ -1778,6 +1892,203 @@ mod tests {
         let after_two = fs::read_to_string(&gitignore).unwrap();
         assert_eq!(after_one, after_two, "orphan-END migration must converge, not grow");
         assert_eq!(after_two.matches(GITIGNORE_END_MARKER).count(), 1);
+    }
+
+    /// Shared probe helper for the #13898 tests: a git repo at `root` whose
+    /// `.gitignore` has been refreshed by [`update_gitignore`], answering
+    /// `git check-ignore` per path. Artifacts must exist on disk for a
+    /// directory-pattern probe of the bare directory name (a trailing-`/`
+    /// pattern cannot match a nonexistent path lexically), so the callers
+    /// that probe `node_modules` itself create it.
+    fn ignore_probe(root: &Path) -> impl Fn(&str) -> bool + '_ {
+        let git = move |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+        move |path: &str| git(&["check-ignore", "-q", "--", path]).status.success()
+    }
+
+    /// #13898 AC: after `update_gitignore` on a repo whose root `package.json`
+    /// is the `loom-workspace` stub, `git check-ignore node_modules
+    /// pnpm-lock.yaml` matches both — answered by real git against real
+    /// artifacts on disk, the tool that decides it in production.
+    #[test]
+    fn stub_workspace_ignores_pnpm_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        fs::write(
+            root.join("package.json"),
+            r#"{ "name": "loom-workspace", "private": true, "scripts": { "test": "echo ok" } }"#,
+        )
+        .unwrap();
+        // What an explicit `pnpm install` (any version) or a `pnpm <script>`
+        // run on pnpm <= 11 leaves behind in the repo root.
+        fs::create_dir_all(root.join("node_modules/.pnpm")).unwrap();
+        fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+
+        update_gitignore(root).unwrap();
+
+        let ignored = ignore_probe(root);
+        assert!(ignored("node_modules"), "node_modules must be ignored");
+        assert!(ignored("pnpm-lock.yaml"), "pnpm-lock.yaml must be ignored");
+        // The exact AC shape: one command, both paths reported.
+        let out = git(&["check-ignore", "node_modules", "pnpm-lock.yaml"]);
+        assert!(out.status.success(), "AC: both paths must match");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).lines().count(), 2);
+    }
+
+    /// #13898 AC: a repo with its OWN root `package.json` (name !=
+    /// `loom-workspace`) must not gain a `pnpm-lock.yaml` ignore from the
+    /// managed block — a consumer's real lockfile is never silently hidden
+    /// from `git add`.
+    #[test]
+    fn consumer_package_json_repo_keeps_pnpm_lock_visible() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("run git")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init failed");
+        fs::write(root.join("package.json"), r#"{ "name": "my-app", "version": "1.0.0" }"#)
+            .unwrap();
+        fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        fs::create_dir_all(root.join("node_modules/.pnpm")).unwrap();
+
+        update_gitignore(root).unwrap();
+
+        let ignored = ignore_probe(root);
+        assert!(
+            !ignored("pnpm-lock.yaml"),
+            "a consumer's own lockfile must stay visible to git add (#13898 AC)"
+        );
+        // The managed block must not carry the stub-only entry at all.
+        let contents = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(!contents.contains("pnpm-lock.yaml"));
+        // Their node_modules handling stays theirs too: the block emits no
+        // entry for it, so an unignored tree stays visible (this repo's own
+        // .gitignore may of course add one — that is not ours to manage).
+        assert!(
+            !contents.contains("node_modules"),
+            "the managed block must not manage node_modules for a real Node repo"
+        );
+    }
+
+    /// #13898 AC: a repo with no root `package.json` at all gets the base
+    /// block only — no stub-conditional entries.
+    #[test]
+    fn workspace_without_package_json_gets_no_stub_entries() {
+        let tmp = TempDir::new().unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!contents.contains("pnpm-lock.yaml"));
+        assert!(!contents.contains("node_modules"));
+    }
+
+    /// #13898: an unparseable root `package.json` is treated as the
+    /// consumer's (no stub entries) — the safe direction, since emitting them
+    /// could hide a real lockfile.
+    #[test]
+    fn unparseable_package_json_is_not_detected_as_stub() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("package.json"), "{ not json").unwrap();
+        assert!(!workspace_uses_package_stub(tmp.path()));
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(!contents.contains("pnpm-lock.yaml"));
+    }
+
+    /// #13898: a stub workspace that later grows a real `package.json` drops
+    /// the stub entries on the next refresh (the marked block is replaced
+    /// wholesale), so the consumer's new lockfile becomes visible again.
+    #[test]
+    fn replacing_the_stub_drops_the_stub_entries() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+        fs::write(tmp.path().join("package.json"), r#"{ "name": "loom-workspace" }"#).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let as_stub = fs::read_to_string(&gitignore).unwrap();
+        assert_eq!(as_stub.matches("/pnpm-lock.yaml").count(), 1);
+
+        fs::write(tmp.path().join("package.json"), r#"{ "name": "real-app" }"#).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let as_consumer = fs::read_to_string(&gitignore).unwrap();
+        assert!(!as_consumer.contains("pnpm-lock.yaml"));
+        assert!(!as_consumer.contains("node_modules"));
+        // Exactly one block throughout — the refresh did not duplicate.
+        assert_eq!(as_consumer.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+    }
+
+    /// #13898: the stub-conditioned block is idempotent — a second refresh is
+    /// a byte-identical no-op, and no entry duplicates.
+    #[test]
+    fn stub_workspace_update_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("package.json"), r#"{ "name": "loom-workspace" }"#).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(contents.matches("/pnpm-lock.yaml").count(), 1);
+        assert_eq!(contents.matches("/node_modules/").count(), 1);
+        assert_eq!(contents.matches(GITIGNORE_BEGIN_MARKER).count(), 1);
+    }
+
+    /// #13898 resync form: the daemon resync edits a STAGING copy of the
+    /// `.gitignore` while the stub detection must consult the real workspace
+    /// root — the stage carries no `package.json` (install-time-only surface).
+    /// Detecting at the stage would strip the entries from every stub repo on
+    /// every resync.
+    #[test]
+    fn staged_gitignore_detects_stub_at_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let stage = tmp.path().join("stage");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(workspace.join("package.json"), r#"{ "name": "loom-workspace" }"#).unwrap();
+        // A realistic staged .gitignore: user rules + an older marked block.
+        fs::write(
+            stage.join(".gitignore"),
+            format!(
+                "dist/\n{}\n{}\n.loom-in-use\n{}\n",
+                GITIGNORE_BEGIN_MARKER, GITIGNORE_BLOCK_HEADER, GITIGNORE_END_MARKER
+            ),
+        )
+        .unwrap();
+
+        update_gitignore_in(&stage, &workspace).unwrap();
+
+        let contents = fs::read_to_string(stage.join(".gitignore")).unwrap();
+        assert_eq!(contents.matches("/pnpm-lock.yaml").count(), 1);
+        assert_eq!(contents.matches("/node_modules/").count(), 1);
+        // User rule survived and still precedes the block.
+        assert!(contents.find("dist/").unwrap() < contents.find(GITIGNORE_BEGIN_MARKER).unwrap());
+        // And the workspace's own tree was not touched (no .gitignore created
+        // there by the staged refresh).
+        assert!(!workspace.join(".gitignore").exists());
     }
 
     #[test]

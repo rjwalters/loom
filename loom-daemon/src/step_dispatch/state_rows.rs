@@ -14,12 +14,13 @@ use crate::observability::dispatch_state::StateRow;
 use crate::telemetry::kinds::dispatch_state::Artifact;
 use crate::work_finder::step_item::Item;
 
-/// The number and artifact `item` is known by: the step's target, else the
-/// issue, else the PR. `None` for an item with neither (never classified).
+/// Identify a gated Judge/Doctor item by its PR, just as when it is drawn.
+/// Other items use their step target, then their issue or PR.
 fn identity(item: &Item) -> Option<(u32, Artifact)> {
     match item.step() {
         Some(step) if step.acts_on_pr() => item.pr.map(|n| (n, Artifact::Pr)),
         Some(_) => item.issue.map(|n| (n, Artifact::Issue)),
+        None if item.pr_review => item.pr.map(|n| (n, Artifact::Pr)),
         None => item
             .issue
             .map(|n| (n, Artifact::Issue))
@@ -85,6 +86,7 @@ pub fn state_rows(
             iw: Some(c.terms.weight),
             weight: Some(weight),
             issue: c.item.issue,
+            operator_hold_issue: None,
             doctor_rejections: None,
             doctor_escalated: None,
         });
@@ -108,6 +110,7 @@ pub fn state_rows(
                 iw: None,
                 weight: None,
                 issue: e.item.issue,
+                operator_hold_issue: e.item.operator_hold_issue,
                 doctor_rejections: None,
                 doctor_escalated: None,
             });

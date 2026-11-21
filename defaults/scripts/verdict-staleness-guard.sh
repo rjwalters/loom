@@ -70,7 +70,8 @@
 #  4b. FRESH (operator send-back, #13586) — `loom:changes-requested` only: the
 #                     marker is older than the head, but the latest `labeled`
 #                     timeline event for the label is by a trusted actor, newer
-#                     than the marker, with no commit / force-push after it. A
+#                     than the marker, with no commit / force-push after it, and applied by
+#                     a login other than the marker comment's author (#14516). A
 #                     human's direct label writes no marker of its own. Any
 #                     unreadable or untrusted evidence falls through to 5.
 #   5. STALE        — the newest matching marker's SHA differs from the current
@@ -503,7 +504,7 @@ COMMENTS_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate 2>
 RAW_COMMENTS_JSON="$COMMENTS_JSON"
 COMMENTS_JSON="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge trusted-comments <<<"$COMMENTS_JSON" 2>/dev/null)" && TRUSTED=1 || { COMMENTS_JSON='[]'; TRUSTED=0; }
 
-# One "<created_at>\t<sha>" line per matching marker, oldest first (matches
+# One "<created_at>\t<sha>\t<author login>" line per matching marker, oldest first (matches
 # --paginate's page order). `test(...)` guards `capture(...)` so a non-matching
 # body is filtered out via `select` rather than raising a per-item jq error.
 # A short (abbreviated) SHA is accepted defensively but never emitted by the
@@ -520,7 +521,7 @@ MARKER_CAPTURE="<!-- loom:verdict-sha sha=(?<sha>[0-9a-f]{7,40}) verdict=($VERDI
 MARKER_LINES="$(jq -r --arg t "$MARKER_TEST" --arg c "$MARKER_CAPTURE" '
   .[]
   | select(.body != null and (.body | test($t)))
-  | [.created_at, (.body | capture($c).sha)]
+  | [.created_at, (.body | capture($c).sha), (.user.login // "")]
   | @tsv
 ' <<<"$COMMENTS_JSON" 2>/dev/null || true)"
 
@@ -623,7 +624,7 @@ elif [[ -n "$MARKER_SHA" ]]; then
   fi
 fi
 
-# --- Step 4b: a trusted actor's own send-back at THIS head (#13586) ----------
+# --- Step 4b: a trusted actor's own send-back at THIS head (#13586, #14516) ---
 # A human applying `loom:changes-requested` directly writes no marker, so the
 # newest marker names an OLDER verdict's SHA and step 4 reads the operator's
 # send-back as stale. The evidence that it was applied at the current head is
@@ -633,8 +634,24 @@ fi
 # Fail closed: an unreadable timeline, an untrusted or unverifiable actor, or any
 # missing field leaves FRESH_REASON empty, so the marker-vs-head result stands.
 # Plain `gh` (no cache), like the comment read above.
+#
+# #14516: the timeline cannot, by itself, show WHICH head was present when the
+# label landed. A commit prepared locally BEFORE the verdict and pushed AFTER it
+# (a Doctor fast-forward) is listed by its commit date, i.e. before the label, and
+# GitHub emits no event for a fast-forward push — so "no commit after the label"
+# is true of a head the label never described. post-verdict.sh writes the marker
+# comment and then applies the label under the SAME identity, so a label by the
+# marker's own author is the verdict writer's label, not a send-back: it carries
+# no evidence about the head beyond the marker's SHA, and the exact-head comparison
+# (step 4) stands. A send-back is therefore recognised only when the label actor
+# is a DIFFERENT login from the newest marker's author. An operator who sends a PR
+# back while signed in as the very identity that wrote the marker cannot be told
+# apart from a verdict write using this data; that case reads STALE (one redundant
+# re-review, never a stale rejection standing). To retain such a send-back, post a
+# marker for the current head (post-verdict.sh) rather than a bare label.
 if [[ -z "$FRESH_REASON" && -n "$MARKER_SHA" && "$VERDICT_TOKEN" == changes-requested ]]; then
   MARKER_AT="$(tail -n 1 <<<"$MARKER_LINES" | cut -f1)"
+  MARKER_AUTHOR="$(tail -n 1 <<<"$MARKER_LINES" | cut -f3)"
   TIMELINE_JSON="$(gh api "repos/{owner}/{repo}/issues/$PR/timeline" --paginate 2>/dev/null)" || TIMELINE_JSON=""
   # Chronological array; take the latest matching `labeled` event, then check no
   # head-moving event follows it (by position, not by commit date, which can
@@ -649,7 +666,10 @@ if [[ -z "$FRESH_REASON" && -n "$MARKER_SHA" && "$VERDICT_TOKEN" == changes-requ
   ' <<<"$TIMELINE_JSON" 2>/dev/null || true)"
   if [[ -n "$LABEL_EVT" ]]; then
     IFS=$'\t' read -r LABEL_ACTOR LABEL_AT LABEL_MOVED <<<"$LABEL_EVT"
-    if [[ -n "$LABEL_ACTOR" && -n "$LABEL_AT" && "$LABEL_MOVED" == 0 && -n "$MARKER_AT" && "$LABEL_AT" > "$MARKER_AT" ]]; then
+    # Both logins must be known and different (case-insensitive); a missing marker
+    # author is insufficient evidence and falls through to the exact-head result.
+    if [[ -n "$LABEL_ACTOR" && -n "$LABEL_AT" && "$LABEL_MOVED" == 0 && -n "$MARKER_AT" && "$LABEL_AT" > "$MARKER_AT" \
+          && -n "$MARKER_AUTHOR" && "${LABEL_ACTOR,,}" != "${MARKER_AUTHOR,,}" ]]; then
       # Trust is the daemon's predicate (#9548), fed a one-item listing. A
       # timeline event carries no author_association, so a repo insider is
       # proved by write+ permission on the repo.

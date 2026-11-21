@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::cmd_out::CmdOutcome;
-use crate::script_helpers::run_gh;
+use crate::script_helpers::{gh_read, gh_write};
 use crate::stale_blocked::notify::{self, marker_for};
 use crate::stale_blocked::{batch, budget, classify, resolved, Artifact, Evidence, Verdict};
 
@@ -280,7 +280,7 @@ pub(super) fn pr_close_targets(
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    match run_gh(&args, root, false) {
+    match gh_read("notify.close_targets", &args, root, false) {
         CmdOutcome::Ran(o) if o.status.success() => parse_close_targets(&o.stdout),
         CmdOutcome::Ran(o) => Err(format!("gh pr view exited {}", o.status)),
         CmdOutcome::Unavailable(u) => Err(format!("gh pr view could not be run: {u:?}")),
@@ -378,7 +378,10 @@ fn post_comment(kind: Artifact, number: i64, body: &str, repo: Option<&str>, roo
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+    matches!(
+        gh_write("notify.comment", &args, root, false),
+        CmdOutcome::Ran(o) if o.status.success()
+    )
 }
 
 /// Whether a newly-cleared artifact may be unparked mechanically (#13331).
@@ -433,7 +436,10 @@ fn unpark(number: i64, repo: Option<&str>, root: &Path) -> bool {
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    matches!(run_gh(&args, root, false), CmdOutcome::Ran(o) if o.status.success())
+    matches!(
+        gh_write("notify.unpark", &args, root, false),
+        CmdOutcome::Ran(o) if o.status.success()
+    )
 }
 
 /// Stdout: what was notified (or nothing). Stderr: what could not be read or

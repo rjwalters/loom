@@ -160,31 +160,6 @@ fn had_ever_succeeded_is_independent_per_role_and_root() {
 // `LOOM_RUNTIME_<ROLE>` pins must go too.
 use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
-/// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#5508): the test
-/// process may itself be running under a `GH_CONFIG_DIR` (a developer
-/// shell, or the daemon's own #4458 process-global default), which would
-/// otherwise leak into a spawned child's environment and make the
-/// "unregistered root leaves GH_CONFIG_DIR untouched" test observe an
-/// ambient value instead of a genuine absence.
-struct ClearedGhConfigDirEnv(Option<String>);
-
-impl ClearedGhConfigDirEnv {
-    fn new() -> Self {
-        let prior = std::env::var("GH_CONFIG_DIR").ok();
-        std::env::remove_var("GH_CONFIG_DIR");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedGhConfigDirEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
-        }
-    }
-}
-
 #[test]
 #[serial]
 fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {

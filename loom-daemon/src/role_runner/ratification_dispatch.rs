@@ -1,16 +1,25 @@
 //! The ratification reviewer lane's dispatch layer (#13189, step 2 of 3 of
 //! #13186).
 //!
-//! Launches the two independent key reviews (EE and market) for one candidate
+//! Launches the independent key reviews (EE and market) for one candidate
 //! PR. Verdict posting is step 3; candidate selection is
 //! [`super::ratification_lane`]. The forge is injected ([`InstructionSource`])
 //! so every rule is unit-testable offline.
+//!
+//! # Partial-key dispatch (#14797)
+//!
+//! [`dispatch`] takes the pins of **only the keys still missing** a marker
+//! for the captured head; a `None` pin is not attempted at all: no
+//! instruction read, no visibility read, no session, no post. The
+//! EE-then-Market order of a first pass is kept.
 //!
 //! # Independence
 //!
 //! Each session's prompt is built only from (a) that key's pinned instructions
 //! and (b) the PR reference. Nothing else crosses: no shared file, env var or
-//! prior-output argument, and a session never sees the other's outcome.
+//! prior-output argument, and a session never sees the other's outcome. All
+//! selected sessions run before any marker is posted (step 3 is a separate
+//! pass), so a newly posted result is never context for the other key.
 //!
 //! # Fail closed
 //!
@@ -18,7 +27,8 @@
 //! empty body, commit that does not resolve to the pinned SHA) yields
 //! [`KeyOutcome::FailedClosed`] for that key only; the session is never
 //! launched with partial or default instructions. An unreadable repo
-//! visibility is treated as public.
+//! visibility is treated as public, and is only read at all when a market
+//! session runs (it decides nothing else).
 
 use super::ratification_lane::{Key, Pin};
 use super::{RoleInvocationRunner, RoleTickOutcome};
@@ -45,11 +55,14 @@ pub enum KeyOutcome {
     FailedClosed(String),
 }
 
-/// Per-key results for one PR.
-#[derive(Debug, Clone, PartialEq)]
+/// Per-key results for one PR. `None` means the key was **not attempted**
+/// this pass: its pin was already complete (a trusted current-head marker
+/// exists, #14797), so no instruction was read, no session launched and
+/// nothing will be posted or withheld for it.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Dispatched {
-    pub ee: KeyOutcome,
-    pub market: KeyOutcome,
+    pub ee: Option<KeyOutcome>,
+    pub market: Option<KeyOutcome>,
     /// The EE session's output, when it ran and the runner exposes it (#13502).
     pub ee_output: Option<String>,
     pub market_output: Option<String>,
@@ -57,10 +70,10 @@ pub struct Dispatched {
 
 impl Dispatched {
     #[must_use]
-    pub fn get(&self, key: Key) -> &KeyOutcome {
+    pub fn get(&self, key: Key) -> Option<&KeyOutcome> {
         match key {
-            Key::Ee => &self.ee,
-            Key::Market => &self.market,
+            Key::Ee => self.ee.as_ref(),
+            Key::Market => self.market.as_ref(),
         }
     }
 }
@@ -110,33 +123,45 @@ fn build_prompt(instructions: &str, pr_ref: &str, public_only: bool) -> String {
     p
 }
 
-/// Dispatch the EE and market sessions for one candidate PR.
+/// Launch the selected key sessions for one candidate PR (#14797): a `None`
+/// pin is a key already complete for the captured head and is not attempted
+/// — no instruction read, no visibility read, no session. When both pins are
+/// present the first-pass order is kept (EE, then market).
 ///
 /// `target_repo` is the repo the PR lives in (its visibility, not the
 /// instruction repo's, decides the market constraint); `pr_ref` is the only
-/// text the two prompts share.
+/// text the two prompts share. All selected sessions run before the caller
+/// posts any marker, so one key's result is never context for the other.
 pub fn dispatch(
-    ee: &Pin,
-    market: &Pin,
+    ee: Option<&Pin>,
+    market: Option<&Pin>,
     target_repo: &str,
     pr_ref: &str,
     src: &dyn InstructionSource,
     runner: &mut dyn RoleInvocationRunner,
 ) -> Dispatched {
-    let is_public = src.repo_is_private(target_repo) != Some(true);
-    let mut run = |key: Key, pin: &Pin| -> (KeyOutcome, Option<String>) {
+    let mut run_key = |key: Key, pin: &Pin| -> (KeyOutcome, Option<String>) {
         match fetch_pinned(src, pin) {
             Err(reason) => (KeyOutcome::FailedClosed(reason), None),
             Ok(text) => {
-                let public_only = key == Key::Market && is_public;
+                // Visibility decides the market constraint only, so it is
+                // read only when a market session actually runs (#14797).
+                let public_only =
+                    key == Key::Market && src.repo_is_private(target_repo) != Some(true);
                 let prompt = build_prompt(&text, pr_ref, public_only);
                 let outcome = runner.invoke(role_name(key), &prompt);
                 (KeyOutcome::Ran(outcome), runner.last_output())
             }
         }
     };
-    let (ee, ee_output) = run(Key::Ee, ee);
-    let (market, market_output) = run(Key::Market, market);
+    let (ee, ee_output) = ee.map_or((None, None), |pin| {
+        let (o, out) = run_key(Key::Ee, pin);
+        (Some(o), out)
+    });
+    let (market, market_output) = market.map_or((None, None), |pin| {
+        let (o, out) = run_key(Key::Market, pin);
+        (Some(o), out)
+    });
     Dispatched {
         ee,
         market,

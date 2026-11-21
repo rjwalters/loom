@@ -16,7 +16,26 @@
 //! } } } }
 //! ```
 //!
-//! `base` is optional (default `main`). Each pass, once per binding:
+//! Several accounts serving the same repositories can share one named list
+//! (#14699): declare it once under `privateCloneSets` and reference it by
+//! name, instead of repeating the list per account in every config tier:
+//!
+//! ```json
+//! { "autonomous": { "sessionReconcile": {
+//!     "privateCloneSets": { "fleet": [
+//!       { "repository": "https://github.com/OWNER/REPO", "base": "main" }
+//!     ] },
+//!     "privateClones": {
+//!       "seat-1": { "set": "fleet" },
+//!       "seat-2": { "set": "fleet" }
+//!     }
+//! } } }
+//! ```
+//!
+//! A set reference resolves into exactly the bindings the inline list form
+//! yields; a reference to an undefined (or malformed) set, or a value that is
+//! neither a list nor a `{"set": …}` object, fails closed for that account
+//! only. `base` is optional (default `main`). Each pass, once per binding:
 //!
 //! | Account | Action |
 //! |---------|--------|
@@ -45,6 +64,8 @@ use crate::tokens_pool::session_hold::OperatorHeld;
 
 /// Dotted config path of the declaration.
 pub const KEY: &str = "autonomous.sessionReconcile.privateClones";
+/// Dotted config path of the named sets a declaration may reference (#14699).
+pub const SETS_KEY: &str = "autonomous.sessionReconcile.privateCloneSets";
 /// The base a binding gets when it names none.
 pub const DEFAULT_BASE: &str = "main";
 
@@ -76,9 +97,17 @@ pub struct Declared {
 
 /// Parse [`KEY`] out of an effective config. Malformed entries are reported in
 /// [`Declared::invalid`] and never applied; the valid ones around them are.
+///
+/// An account's value may also be `{ "set": "<name>" }` (#14699), referencing
+/// a list in [`SETS_KEY`] — several accounts can then share one list. The
+/// reference resolves into the same bindings the inline list yields, so
+/// everything downstream is untouched. A malformed entry inside a shared set
+/// is reported once per referencing account, naming both the account and the
+/// set entry path.
 #[must_use]
 pub fn parse(effective: &Value) -> Declared {
     let mut out = Declared::default();
+    let sets = read_sets(effective, &mut out);
     let Some(block) = crate::config_resolver::get_path(effective, KEY) else {
         return out;
     };
@@ -95,59 +124,136 @@ pub fn parse(effective: &Value) -> Declared {
     names.sort();
     for account in names {
         let at = format!("{KEY}.{account}");
-        let Some(entries) = accounts[account].as_array() else {
+        let value = &accounts[account];
+        if let Some(entries) = value.as_array() {
+            add_entries(&mut out, account, &at, entries);
+            continue;
+        }
+        let set = value
+            .as_object()
+            .filter(|object| object.len() == 1)
+            .and_then(|object| object.get("set"))
+            .and_then(Value::as_str);
+        let Some(set) = set else {
             out.invalid.push(Invalid {
                 account: Some(account.clone()),
-                message: format!("{at}: must be a list of {{\"repository\", \"base\"}} objects"),
+                message: format!(
+                    "{at}: must be a list of {{\"repository\", \"base\"}} objects, \
+                     or an object {{\"set\": \"<name>\"}} referencing {SETS_KEY}"
+                ),
             });
             continue;
         };
-        let mut seen: HashMap<String, String> = HashMap::new();
-        for (i, entry) in entries.iter().enumerate() {
-            let at = format!("{at}[{i}]");
-            let invalid = |message: String| Invalid {
-                account: Some(account.clone()),
-                message: format!("{at}: {message}"),
-            };
-            let Some(repository) = entry.get("repository").and_then(Value::as_str) else {
-                out.invalid
-                    .push(invalid("\"repository\" (an HTTPS URL) is required".to_owned()));
-                continue;
-            };
-            let base = match entry.get("base") {
-                None | Some(Value::Null) => DEFAULT_BASE,
-                Some(Value::String(base)) => base.as_str(),
-                Some(_) => {
-                    out.invalid
-                        .push(invalid("\"base\" must be a string".to_owned()));
-                    continue;
-                }
-            };
-            let key = match private_workspace::check_binding(repository, base) {
-                Ok(key) => key,
-                Err(error) => {
-                    out.invalid.push(invalid(format!("{error:#}")));
-                    continue;
-                }
-            };
-            if let Some(first) = seen.get(&key) {
-                if first != base {
-                    out.invalid.push(invalid(format!(
-                        "{repository} is declared twice with different bases ({first}, {base})"
-                    )));
-                }
-                continue;
+        match sets.get(set) {
+            Some(Some(entries)) => {
+                let set_at = format!("{at}: {SETS_KEY}.{set}");
+                add_entries(&mut out, account, &set_at, entries);
             }
-            seen.insert(key.clone(), base.to_owned());
-            out.bindings.push(Binding {
-                account: account.clone(),
-                repository: repository.to_owned(),
-                base: base.to_owned(),
-                key,
-            });
+            Some(None) => {
+                out.invalid.push(Invalid {
+                    account: Some(account.clone()),
+                    message: format!(
+                        "{at}: \"set\" names set \"{set}\", which is not a list ({SETS_KEY}.{set})"
+                    ),
+                });
+            }
+            None => {
+                out.invalid.push(Invalid {
+                    account: Some(account.clone()),
+                    message: format!(
+                        "{at}: \"set\" names undefined set \"{set}\" (define it in {SETS_KEY})"
+                    ),
+                });
+            }
         }
     }
     out
+}
+
+/// Read [`SETS_KEY`] as `name → entries`. A set that is not a list is reported
+/// (it may never be referenced) and maps to `None`: fail closed, per set.
+fn read_sets<'a>(
+    effective: &'a Value,
+    out: &mut Declared,
+) -> HashMap<&'a str, Option<&'a Vec<Value>>> {
+    let mut sets = HashMap::new();
+    let Some(block) = crate::config_resolver::get_path(effective, SETS_KEY) else {
+        return sets;
+    };
+    let Some(objects) = block.as_object() else {
+        out.invalid.push(Invalid {
+            account: None,
+            message: format!(
+                "{SETS_KEY}: must be an object mapping set name to a list of repositories"
+            ),
+        });
+        return sets;
+    };
+    let mut names: Vec<&String> = objects.keys().collect();
+    names.sort();
+    for name in names {
+        let entries = objects[name].as_array();
+        if entries.is_none() {
+            out.invalid.push(Invalid {
+                account: None,
+                message: format!(
+                    "{SETS_KEY}.{name}: must be a list of {{\"repository\", \"base\"}} objects"
+                ),
+            });
+        }
+        sets.insert(name.as_str(), entries);
+    }
+    sets
+}
+
+/// Validate one account's entries (an inline list, or a referenced set's) into
+/// `out`. `at` prefixes each entry's diagnostic; the account appears in every
+/// message, so a shared set's malformed entry is WARNed once per account.
+fn add_entries(out: &mut Declared, account: &str, at: &str, entries: &[Value]) {
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let at = format!("{at}[{i}]");
+        let invalid = |message: String| Invalid {
+            account: Some(account.to_owned()),
+            message: format!("{at}: {message}"),
+        };
+        let Some(repository) = entry.get("repository").and_then(Value::as_str) else {
+            out.invalid
+                .push(invalid("\"repository\" (an HTTPS URL) is required".to_owned()));
+            continue;
+        };
+        let base = match entry.get("base") {
+            None | Some(Value::Null) => DEFAULT_BASE,
+            Some(Value::String(base)) => base.as_str(),
+            Some(_) => {
+                out.invalid
+                    .push(invalid("\"base\" must be a string".to_owned()));
+                continue;
+            }
+        };
+        let key = match private_workspace::check_binding(repository, base) {
+            Ok(key) => key,
+            Err(error) => {
+                out.invalid.push(invalid(format!("{error:#}")));
+                continue;
+            }
+        };
+        if let Some(first) = seen.get(&key) {
+            if first != base {
+                out.invalid.push(invalid(format!(
+                    "{repository} is declared twice with different bases ({first}, {base})"
+                )));
+            }
+            continue;
+        }
+        seen.insert(key.clone(), base.to_owned());
+        out.bindings.push(Binding {
+            account: account.to_owned(),
+            repository: repository.to_owned(),
+            base: base.to_owned(),
+            key,
+        });
+    }
 }
 
 /// Read the declarations visible from `root` (every config tier).

@@ -57,6 +57,13 @@ UNTRACK=false         # --untrack: run the git rm --cached commands (#3836)
 # short-circuits below -- one ahead of the --local-mode block's mutations, one
 # ahead of the default (worktree+PR) path's first write (create-worktree.sh).
 DRY_RUN=false
+# --repo-only / LOOM_INSTALL_REPO_ONLY=1 (issue #14570): write only the target
+# repository's files. Skips every machine-level provisioning step (daemon binary,
+# `loom` dispatcher, user-scope skills/agents, user-scope guard hooks, and the
+# user-scope MCP registration) so a workstation install does not replace the
+# machine's daemon or ~/.claude state. The env var and the flag set one variable.
+REPO_ONLY=false
+case "${LOOM_INSTALL_REPO_ONLY:-}" in 1|true|yes) REPO_ONLY=true ;; esac
 # Install-time workspace mode (--mode session, issue #8884), held as the literal
 # `loom-daemon init` argv pair so it can be spliced into the init call below
 # without re-deriving anything. Empty (the default) reproduces the pre-#8884
@@ -105,6 +112,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --untrack) UNTRACK=true; shift ;;
+    --repo-only) REPO_ONLY=true; shift ;;
     --mode)
       # `default` is accepted as an explicit no-op; it does NOT remove a
       # `"mode": "session"` marker already on disk (defaults/docs/session-mode.md).
@@ -150,6 +158,15 @@ while [[ $# -gt 0 ]]; do
       echo "                             .loom/config.json. See defaults/docs/session-mode.md."
       echo "  --dry-run                  Print what would be written and exit 0; creates, modifies, and"
       echo "                             removes nothing. Implies --yes (never prompts). Composes with --local."
+      echo "  --repo-only                Write only the target repository's files. Skips the machine-level"
+      echo "                             steps (env: LOOM_INSTALL_REPO_ONLY=1) and prints one line per skip:"
+      echo "                               - loom-daemon binary + defaults mirror (~/.local/bin, ~/.local/share)"
+      echo "                               - 'loom' dispatcher (~/.local/bin/loom, ~/.local/share/loom)"
+      echo "                               - user-scope skills + agents (~/.claude/commands, ~/.claude/agents)"
+      echo "                               - user-scope guard hooks (~/.claude/settings.json)"
+      echo "                               - user-served MCP bundle build and source config migration"
+      echo "                               - user-scope 'loom' MCP registration (claude mcp add --scope user)"
+      echo "                             Without it, those steps run and change this machine."
       echo "  -h, --help                 Show this help message"
       echo ""
       echo "Default install PR markers (always on — see .loom/docs/ci-integration.md after install):"
@@ -1386,9 +1403,13 @@ info "loom-daemon binary: $DAEMON_VERSION"
 # $LOOM_ROOT/defaults to a machine-level location so `loom-daemon init` has a
 # working recovery path even on a host with no on-host `loom` git checkout
 # to find it via cwd/git-root search (#5389).
-info "Provisioning machine-level loom-daemon binary..."
-provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
-  warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping machine-level loom-daemon provisioning (--repo-only)"
+else
+  info "Provisioning machine-level loom-daemon binary..."
+  provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaults" || \
+    warning "Machine-level loom-daemon not provisioned (see note above); autonomous daemon mode needs LOOM_DAEMON_BIN or a binary on PATH."
+fi
 
 # Provision the machine-level `loom` dispatcher (Epic #3835 Phase 3a, #4157).
 # Installs ~/.local/bin/loom and links ~/.local/share/loom -> this Loom source
@@ -1396,9 +1417,13 @@ provision_machine_daemon "$TARGET_DIR/release/loom-daemon" "" "$LOOM_ROOT/defaul
 # runtime with no per-repo copy. Best-effort: a soft failure is logged but never
 # aborts the install. It writes ONLY those two paths — it never touches the
 # ~/.local/bin/loom-* Python console-script symlinks (Epic #4081's scope).
-info "Provisioning machine-level loom dispatcher..."
-provision_loom_dispatcher "$LOOM_ROOT" || \
-  warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping machine-level loom dispatcher provisioning (--repo-only)"
+else
+  info "Provisioning machine-level loom dispatcher..."
+  provision_loom_dispatcher "$LOOM_ROOT" || \
+    warning "Machine-level loom dispatcher not fully provisioned (see note above); use ./.loom/bin/loom in-repo, or set LOOM_HOME."
+fi
 
 # Provision user-scope skills + agents (Epic #3835 Phase 4, #4261). Links
 # ~/.claude/commands/loom (whole dir) and ~/.claude/agents/loom-*.md (per file)
@@ -1408,9 +1433,13 @@ provision_loom_dispatcher "$LOOM_ROOT" || \
 # and best-effort: it never clobbers an operator's real files, and a soft failure
 # is logged but never aborts the install. (Existing per-repo copies are NOT
 # removed here — that is Phase 6 migration territory, #4254.)
-info "Provisioning user-scope loom skills + agents..."
-provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
-  warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping user-scope loom skills + agents provisioning (--repo-only)"
+else
+  info "Provisioning user-scope loom skills + agents..."
+  provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
+    warning "User-scope loom skills/agents not fully provisioned; /loom:* skills still resolve from any per-repo copy."
+fi
 
 # Provision user-scope guard hooks (Epic #3835 Phase 5, #4262). Wires the Loom
 # guard hooks into ~/.claude/settings.json so they execute from the machine
@@ -1420,9 +1449,13 @@ provision_loom_skills "${PROVISIONED_LOOM_CHECKOUT:-}" || \
 # those; until then the project copy wins, so guards run exactly once). Additive
 # and best-effort — an operator's non-Loom hook entries are preserved and a soft
 # failure is logged but never aborts the install.
-info "Provisioning user-scope loom guard hooks..."
-provision_loom_hooks || \
-  warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+if [[ "$REPO_ONLY" == "true" ]]; then
+  info "Skipping user-scope loom guard hooks provisioning (--repo-only)"
+else
+  info "Provisioning user-scope loom guard hooks..."
+  provision_loom_hooks || \
+    warning "User-scope loom guard hooks not fully provisioned; guards still fire from any per-repo .loom/hooks/ copy + project-level settings entry."
+fi
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
@@ -2115,40 +2148,48 @@ echo ""
 # — a single instance serves every repo (it resolves the invoking repo from its
 # CWD), which kills the #3803 per-repo stale-dist drift class.
 #
-# setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
-# (what the user-scope server serves), strips any legacy project-scope `loom`
-# entry so it cannot shadow the user-scope server, and emits a safehouse-only
-# .mcp.json when safehouse is enabled.
-info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
-if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
-  success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
+if [[ "$REPO_ONLY" == "true" ]]; then
+  # The source checkout may serve the existing machine registration. Its
+  # bundle and project config are both outside the consumer worktree.
+  info "Skipping machine-level loom MCP bundle build and source config migration (--repo-only)"
+  info "Skipping user-scope 'loom' MCP registration (--repo-only)"
 else
-  warning "setup-mcp.sh failed - the served bundle may be missing"
-  info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
-fi
-
-# Register the loom MCP server at USER scope, pointing at the machine-level
-# checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
-# source checkout if the machine checkout's bundle is not present yet.
-MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
-if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
-  MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
-fi
-if command -v claude >/dev/null 2>&1; then
-  info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
-  # Idempotent: drop any existing user-scope entry before re-adding.
-  claude mcp remove --scope user loom >/dev/null 2>&1 || true
-  if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
-    success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
-    info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+  # setup-mcp.sh is still run first, but in its DEMOTED role: it builds the bundle
+  # (what the user-scope server serves), strips any legacy project-scope `loom`
+  # entry so it cannot shadow the user-scope server, and emits a safehouse-only
+  # .mcp.json when safehouse is enabled.
+  info "Building the mcp-loom bundle and migrating any legacy .mcp.json (demoted setup-mcp.sh)..."
+  if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
+    success "mcp-loom bundle built; legacy .mcp.json migrated (loom is now user-scoped)"
   else
-    warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+    warning "setup-mcp.sh failed - the served bundle may be missing"
+    info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
+  fi
+
+  # Register the loom MCP server at USER scope, pointing at the machine-level
+  # checkout (~/.local/share/loom, overridable via LOOM_HOME). Fall back to the
+  # source checkout if the machine checkout's bundle is not present yet.
+  MCP_MACHINE_ENTRY="${LOOM_HOME:-$HOME/.local/share/loom}/mcp-loom/dist/index.js"
+  if [[ ! -f "$MCP_MACHINE_ENTRY" ]]; then
+    MCP_MACHINE_ENTRY="$LOOM_ROOT/mcp-loom/dist/index.js"
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    info "Registering the 'loom' MCP server at user scope (machine-level, #4230)..."
+    # Idempotent: drop any existing user-scope entry before re-adding.
+    claude mcp remove --scope user loom >/dev/null 2>&1 || true
+    if claude mcp add --scope user loom -- node "$MCP_MACHINE_ENTRY"; then
+      success "Registered user-scope 'loom' MCP server -> $MCP_MACHINE_ENTRY"
+      info "'loom update' refreshes this bundle for every repo at once (no per-repo action)."
+    else
+      warning "Failed to register the user-scope 'loom' MCP server. Register it manually:"
+      info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+    fi
+  else
+    warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
+    info "Once 'claude' is available, register it manually (one time, per machine):"
     info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
   fi
-else
-  warning "'claude' CLI not on PATH — cannot register the user-scope 'loom' MCP server now."
-  info "Once 'claude' is available, register it manually (one time, per machine):"
-  info "  claude mcp add --scope user loom -- node \"$MCP_MACHINE_ENTRY\""
+
 fi
 
 echo ""

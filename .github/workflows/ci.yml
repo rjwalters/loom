@@ -565,7 +565,14 @@ jobs:
       # Evidence for the next stall, captured before the runner tears down. Job
       # log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
       # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
-      # means install got past `write_stub`.
+      # means install got past `write_stub` — the dir CONTENTS (not just the
+      # listing) settle whether the stub was written (#14229, #14691). The
+      # per-pid /proc capture names WHICH fd a hung child is blocked on:
+      # occurrence 3 (#14691) caught the lib binary in anon_pipe_write but
+      # could not say which pipe fd or how full it was. Guard dir resolves via
+      # `${TMPDIR:-/tmp}` because `live_gh_guard` uses `std::env::temp_dir()`,
+      # which honors TMPDIR. Every command is failure-tolerant: this step is
+      # continue-on-error evidence gathering, never a verdict.
       - name: Diagnose discovery stall
         if: failure() && steps.discover.outcome == 'failure'
         continue-on-error: true
@@ -573,11 +580,43 @@ jobs:
           echo "::group::cargo-nextest / loom_daemon-* process state"
           ps -eo pid,ppid,stat,wchan:32,etime,cmd | grep -E 'cargo-nextest|loom_daemon-' | grep -v grep || echo "(no matching processes)"
           echo "::endgroup::"
-          echo "::group::df -h /tmp"
-          df -h /tmp || true
+          echo "::group::per-pid /proc evidence (wchan, kernel stack, fds, pipe fdinfo)"
+          pids="$(pgrep -f 'cargo-nextest|loom_daemon-' || true)"
+          if [ -z "$pids" ]; then echo "(no matching processes)"; fi
+          for pid in $pids; do
+            echo "--- pid ${pid}: $(tr '\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)"
+            echo "wchan: $(cat /proc/${pid}/wchan 2>/dev/null || true)"
+            echo "/proc/${pid}/stack (best effort; often root-only):"
+            cat /proc/${pid}/stack 2>/dev/null || echo "(unreadable)"
+            echo "/proc/${pid}/fd:"
+            ls -l /proc/${pid}/fd 2>/dev/null || echo "(unreadable)"
+            echo "fdinfo for pipe fds of ${pid}:"
+            found_pipe_fd=0
+            for fd in /proc/${pid}/fd/*; do
+              [ -L "$fd" ] || continue
+              target="$(readlink "$fd" 2>/dev/null || true)"
+              case "$target" in
+                pipe:*)
+                  found_pipe_fd=1
+                  echo "fdinfo ${fd##*/} -> ${target}:"
+                  cat "/proc/${pid}/fdinfo/${fd##*/}" 2>/dev/null || true
+                  ;;
+              esac
+            done
+            [ "$found_pipe_fd" -eq 1 ] || echo "(no pipe fds)"
+          done
           echo "::endgroup::"
-          echo "::group::loom-live-gh-guard temp dirs"
-          ls -la /tmp | grep loom-live-gh-guard || echo "(no loom-live-gh-guard-* dir in /tmp)"
+          echo "::group::df -h \${TMPDIR:-/tmp}"
+          df -h "${TMPDIR:-/tmp}" || true
+          echo "::endgroup::"
+          echo "::group::loom-live-gh-guard temp dirs and contents"
+          guard_root="${TMPDIR:-/tmp}"
+          ls -la "$guard_root" 2>/dev/null | grep loom-live-gh-guard || echo "(no loom-live-gh-guard-* dir in ${guard_root})"
+          for guard_dir in "$guard_root"/loom-live-gh-guard-*; do
+            [ -d "$guard_dir" ] || continue
+            echo "--- contents of ${guard_dir}:"
+            ls -la "$guard_dir" 2>/dev/null || true
+          done
           echo "::endgroup::"
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         # Includes merge_group_ci::workflow_identity_tests: native regression
@@ -2222,6 +2261,8 @@ jobs:
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
       - name: Run install --local/--gitignore mode tests (#5276)
         run: bash scripts/test-install-local-mode.sh
+      - name: Run install --repo-only tests (#14570)
+        run: bash scripts/test-install-repo-only.sh
       - name: Run migrate-consumer tests (#5276)
         run: bash scripts/test-migrate-consumer.sh
 

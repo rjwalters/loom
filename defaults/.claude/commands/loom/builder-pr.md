@@ -861,6 +861,19 @@ round-trip this step absorbs up front.
 This only moves an update that would otherwise happen reactively (Doctor,
 after `loom:changes-requested`) to before the PR opens; no gate is weakened.
 
+### Workflow-Lint Gate Before Push (#14156)
+
+Run this check after a clean update or after resolving conflicts, before the
+lease fence below. A clean merge can combine two valid changes into a workflow
+that repeats a step `id` or mapping key. GitHub rejects that workflow before it
+runs any jobs. The check blocks the push if a touched workflow fails lint or if
+the check cannot run. A diff with no touched workflows proceeds without lint.
+
+```bash
+WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files." >&2; exit 1; }
+[ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — fix the defect; do not push." >&2; exit 1; }
+```
+
 ### Lease Fencing: Confirm You Still Own the Claim (Epic #6165 Phase 3, #6309)
 
 **Immediately before `git push` + opening the PR** — the one irreversible,

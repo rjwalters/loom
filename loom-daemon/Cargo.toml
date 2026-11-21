@@ -13,6 +13,8 @@ edition = "2021"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Champion reads workflow permission values without interpreting arbitrary workflow text.
+serde-saphyr = { version = "2.2", default-features = false, features = ["deserialize"] }
 anyhow = { workspace = true }
 log = "0.4"
 env_logger = "0.11"
