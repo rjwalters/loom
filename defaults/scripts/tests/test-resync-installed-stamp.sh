@@ -422,16 +422,22 @@ make_gh_stub() {
         "$1" "$2" "$2" "$3" > "$1/gh"
     chmod +x "$1/gh"
 }
-# run_remote_case <name> <origin> <gh-stdout> <gh-exit>: sets OUT14, REMOTE14, CALLS14
+# run_remote_case <name> <origin> <gh-stdout> <gh-exit> [force-portable]:
+# sets OUT14, REMOTE14, CALLS14.
 run_remote_case() {
-    local name="$1" origin="$2" ghout="$3" ghrc="$4"
+    local name="$1" origin="$2" ghout="$3" ghrc="$4" portable="${5:-0}"
     local c src bin="$WORKDIR/gh-$1"
     rm -rf "$bin"
     make_gh_stub "$bin" "$ghout" "$ghrc"
+    if [[ "$portable" == 1 ]]; then
+        # Make an accidental direct timeout call fail even on a host that has it.
+        printf '#!/bin/bash\nexit 127\n' > "$bin/timeout"
+        chmod +x "$bin/timeout"
+    fi
     c="$(make_consumer_fixture "$name" yes yes)"
     src="$WORKDIR/$name-src"
     git -C "$src" remote add origin "$origin"
-    OUT14="$(cd "$c" && PATH="$bin:$PATH" bash "$SCRIPT" 2>&1)"
+    OUT14="$(cd "$c" && PATH="$bin:$PATH" LOOM_FORCE_PORTABLE_TIMEOUT="$portable" bash "$SCRIPT" 2>&1)"
     REMOTE14="$(read_field "$c/.loom/install-metadata.json" loom_source_remote)"
     CALLS14="$(cat "$bin/gh.calls" 2>/dev/null || true)"
 }
@@ -451,6 +457,23 @@ if [[ "$(grep -c 'origin remote is stale' <<<"$OUT14")" == 1 ]]; then
     pass "(#14222) exactly one stale-remote warning is printed"
 else
     fail "(#14222) expected one stale-remote warning; out=$OUT14"
+fi
+
+run_remote_case remote-portable "https://github.com/OldOrg/loom.git" "NewOrg/loom" 0 1
+if [[ "$REMOTE14" == "https://github.com/NewOrg/loom.git" ]] \
+    && [[ "$CALLS14" == "api repos/OldOrg/loom --jq .full_name" ]]; then
+    pass "(#14258) portable timeout path calls gh and stamps the canonical URL"
+else
+    fail "(#14258) portable lookup: remote='$REMOTE14' calls='$CALLS14'"
+fi
+
+run_remote_case remote-portable-gh-err "https://github.com/OldOrg/loom.git" "NewOrg/loom" 1 1
+if [[ "$REMOTE14" == "https://github.com/OldOrg/loom.git" ]] \
+    && [[ "$CALLS14" == "api repos/OldOrg/loom --jq .full_name" ]] \
+    && ! grep -q 'origin remote is stale' <<<"$OUT14"; then
+    pass "(#14258) failed portable lookup keeps the origin without a warning"
+else
+    fail "(#14258) failed portable lookup: remote='$REMOTE14' calls='$CALLS14' out=$OUT14"
 fi
 
 run_remote_case remote-same "https://github.com/o/r.git" "o/r" 0

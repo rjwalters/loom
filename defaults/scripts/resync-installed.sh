@@ -3251,7 +3251,13 @@ canonicalize_source_remote() {
     owner="${slug%%/*}"
     repo="${slug#*/}"
     # A non-zero exit discards whatever was printed: only a clean answer counts.
-    canonical="$(timeout 10 gh api "repos/$owner/$repo" --jq .full_name 2>/dev/null </dev/null)" || canonical=""
+    canonical="$(
+        {
+            # shellcheck source=lib/bounded-run.sh
+            source "$(dirname "${BASH_SOURCE[0]}")/lib/bounded-run.sh" &&
+                bounded_run 10 gh api "repos/$owner/$repo" --jq .full_name
+        } 2>/dev/null </dev/null
+    )" || canonical=""
     # Lower-case via tr, not ${var,,}: the script must also run under stock
     # macOS /bin/bash 3.2 (#7749), which has no case-modifier expansion and
     # aborts the helper (writing an empty loom_source_remote) on one.
