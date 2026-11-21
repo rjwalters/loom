@@ -2,6 +2,72 @@
 
 Sections moved byte-for-byte from [WORK_LOG.md](../WORK_LOG.md) by `loom-daemon work-docs archive`.
 
+### 2026-09-21
+
+- **Issue #8508** (closed): Champion cannot recover from #8248's stale-check-freshness guard (missing actions:write to re-run)
+- **PR #8548**: feat(merge-pr): automated, bounded re-date remedy for the #8248 stale-check guard
+- **Issue #8436** (closed): Ordered runtime preference with fall-through: prefer Claude/Codex accounts, backstop on a metered OpenCode endpoint when their pools are exhausted
+- **PR #8557**: feat: ordered runtime preference resolver with credential fall-through
+- **Issue #8478** (closed): Builders escape macOS background-QoS with `launchctl submit` (KeepAlive) — unowned sims respawned forever and starved a host's admission brake for 12 h
+- **PR #8547**: feat(admission-brake): attribute foreign CPU load and surface brake starvation off-host (#8478)
+- **Issue #8550** (closed): merge-pr.sh reads PR_LABELS from a cached forge fetch — the #8112 guard refused a legitimate post-label-change merge 3x until the cache TTL expired
+- **PR #8558**: fix(merge-pr): read PR labels uncached so a hold release merges
+- **Issue #8487** (closed): daemon: reset_quarantine tests call make_dirty_git_worktree with no #[serial], stomping LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES
+- **PR #8533**: fix(daemon): stop the git-worktree fixture leaking a process-global activity window
+- **Issue #8447** (closed): api-keys pool: record the selected account in the sweep journal and add a provider column to the dashboard account view
+- **PR #8534**: feat(api-keys-pool): journal the selected account and add a provider-column dashboard account view
+- **Issue #8424** (closed): api-keys pool: wire live-spawn exhaustion classification, per-model-class scoping, and per-account concurrency cap
+- **PR #8519**: feat(api-keys-pool): automatic post-hoc bad-marking, model-class scoping, and a per-account concurrency cap
+- **Issue #8502** (closed): dep-recheck-fingerprint named-dependency: cross-repo owner/repo#N checklist items produce false VERDICT=clear
+- **PR #8510**: fix(dep-recheck): accept cross-repo owner/repo#N named dependencies
+- **Issue #8401** (closed): native harness API-key account pool: rotate a fleet of Z.ai coding-plan subscriptions through OpenCode/Pi with per-account exhaustion state (the API-key analogue of the Claude token pool)
+- **PR #8428**: feat(api-keys-pool): add provider-neutral API-key account pool for native harnesses
+- **Issue #8484** (closed): Adopt the requires-daemon marker in the remaining eleven script-helper stubs
+- **PR #8493**: feat(scripts): declare requires-daemon floors in the remaining eleven script-helper stubs
+- **Issue #8499** (closed): premise-check resolves citations against the primary clone, not the invoking worktree (false exit 12)
+- **PR #8503**: fix(premise-check): resolve citations against the invoking worktree, not the primary clone (#8499)
+- **Issue #8496** (closed): daemon tests: LOOM_REPO mutated under bare #[serial] in ~11 files vs #[serial(loom_config_env)] in role_collision.rs
+- **PR #8501**: test(daemon): put every LOOM_REPO mutator on one serial_test lock key
+- **Issue #8492** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
+- **Issue #8420** (closed): Emit a premise record at proposal-filing time (Architect/Hermit/Auditor) — option 3 of #8396, deferred
+- **PR #8498**: feat(roles): emit a premise record at proposal-filing time (#8420)
+- **Issue #8477** (closed): Fleet token/cost history silently expires after 30 days: transcript ingestion is opt-in and off, while Claude Code deletes transcripts at 30 days
+- **PR #8495**: feat(daemon): default transcript token ingestion ON, with a config knob and a health section
+- **Issue #8480** (closed): daemon tests: LOOM_GH_BIN is mutated under two different serial_test lock keys (orphan_recovery bare #[serial] vs role_collision loom_config_env)
+- **PR #8497**: test(daemon): unify LOOM_GH_BIN and LOOM_SHARED_TOKENS_DIR serial_test lock keys
+- **Issue #8407** (closed): Codex per-subscription availability probe: expose quota/rate-limit state per account into provider-aware ranking (the `tokens check` analogue)
+- **PR #8490**: feat(accounts): Codex per-subscription availability probe (#8407)
+- **Issue #8465** (closed): daemon: forge_cmd::tests::gitea_basic_auth_colon_username_rejected is flaky under the full --lib run
+- **PR #8488**: test(forge_cmd): unify the module's serial_test lock key on loom_config_env
+- **Issue #8463** (closed): Seven workspace tests read host state, not fixture state — permanently red on any live-fleet host
+- **PR #8481**: fix(daemon): sandbox tmux terminal restore under LOOM_NO_RESTORE at startup
+- **Issue #8385** (closed): Auto-roll the daemon on a version-floor refusal, and adopt the requires-daemon marker in the script-helper stubs
+- **PR #8483**: feat(script-helper): refuse a below-floor daemon with the roll command, not clap's bare error
+- **Issue #8459** (closed): loom-daemon: cargo target-dir GC subcommand — prune stale incremental/deps caches, report bytes reclaimed (#8453 item 3)
+- **PR #8485**: feat(loom-daemon): cargo target-dir GC subcommand — prune stale incremental/deps caches
+- **Issue #8448** (closed): Guarded tool binding is never loaded on OpenCode 2.x: role workers start toolless, do nothing, and exit 0 (live canary FAILED safely)
+- **PR #8482**: fix(role-runner): report a toolless guarded-native role tick as a failed launch (#8448)
+- **Issue #8396** (closed): Design and wire a premise-check gate before Curator for autonomously-filed/design-reversing issues (re-file of #8310, corrected citation)
+- **PR #8425**: feat(premise-gate): refuse a self-approved design reversal before Curator enriches it
+- **Issue #8456** (closed): cargo: set CARGO_INCREMENTAL=0 for Loom-spawned workers to unblock sccache caching (#8453 item 1)
+- **PR #8475**: perf(spawn): set CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456)
+- **Issue #8285** (closed): merge-pr.sh fails closed on a daemon predating a required subcommand — name the remediation (artifact roll) and declare the minimum daemon version per script
+- **PR #8386**: fix(merge-pr): name the daemon roll in the refusal, and declare every script's daemon version floor
+- **Issue #8197** (closed): release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only
+- **PR #8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
+- **Issue #8454** (closed): native containment: no regression test pins `Selection.credential_sources`, and file-path credentials are not mounted
+- **PR #8468**: test(native-containment): pin Selection.credential_sources; document file-path credential limitation
+- **Issue #8439** (closed): daemon: reaper no_progress predicate charges productive exit-0 partial-increment sweeps to the insta-crash quarantine tally
+- **PR #8466**: fix(daemon): exempt productive exit-0 sweeps from the no-progress quarantine tally (#8439)
+- **Issue #8413** (closed): Worktree reaper hard-reset an in-flight builder's worktree mid-compile (idle-detection misfire)
+- **PR #8462**: fix(daemon): stop destructive worktree passes from wiping a live in-session build (#8413)
+- **Issue #8473** (closed): daemon-reference: the `pool_exhausted` disjoint-bucket paragraph predates #8444's permanent-hold split
+- **PR #8474**: docs(daemon-reference): the pool_exhausted disjoint bucket is self-healing-only since #8444 (#8473)
+- **Issue #8444** (closed): Codex pool gate (#8408): zero-provisioned and unreadable-state skips are reported as self-healing PoolExhausted; wording and coverage polish
+- **PR #8472**: fix(role-runner): split never-self-healing codex pool holds out of the self-healing PoolExhausted verdict (#8444)
+- **Issue #8443** (closed): Codex-runtime role ticks never record TOKEN_EXHAUSTED into account health, so #8408's pre-spawn codex gate has no holds to read
+- **PR #8464**: fix(role-runner): feed codex role-tick terminal results into account health
+
 ### 2026-09-20
 
 - **Issue #8403** (closed): run native-harness (OpenCode/Pi) sweeps in the per-sweep ephemeral container with isolated XDG/config dirs and env-only credentials — not the Codex session container
