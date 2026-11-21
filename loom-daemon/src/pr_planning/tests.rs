@@ -366,9 +366,9 @@ fn a_champion_hold_round_trip_never_strands_and_never_merges_while_held() {
         "user": {"login": "maintainer", "type": "User"}, "author_association": "OWNER"});
     stage(&at_doctor, &json!([marker[0].clone(), audit]));
     let s2b = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));
-    // 2c. A genuine trusted legacy cap record later than the hold keeps the
-    // PR out of Doctor's queue; the hold still refuses the merge.
-    let cap = json!({"body": "PR #42 blocked: doctor cycle exhausted after 2 Doctor→Judge round(s); human attention required",
+    // 2c. A genuine trusted historical sweep report (#10406) later than the
+    // hold keeps the PR out of Doctor's queue and keeps its merge refused.
+    let cap = json!({"body": "Sweep (run sweep-20261005T094112Z-3364552-5dbe0b3b): PR #42 blocked: doctor cycle exhausted after 2 Doctor→Judge rounds (one grace cycle granted); human attention required. Two Judges disagreed at head 7c03fea1c.",
         "user": {"login": "maintainer", "type": "User"}, "author_association": "OWNER"});
     stage(&at_doctor, &json!([marker[0].clone(), cap]));
     let s2c = (served_by(), probe(root, &["loom:changes-requested"]), refused(&at_doctor));

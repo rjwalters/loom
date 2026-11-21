@@ -268,7 +268,7 @@ pub const DOCTOR_CYCLE_CAP_MARKER: &str = "<!-- loom:doctor-cycle-cap -->";
 /// The phrase older cap parks logged ("PR #P blocked: doctor cycle exhausted
 /// after <k> Doctor→Judge round(s)"); a cap reason in body park records
 /// ([`body_declares_doctor_cap`]). Legacy comment records are recognised by
-/// their whole terminal line ([`legacy_doctor_cap_line`], #14862), not by
+/// their terminal report format ([`legacy_doctor_cap_line`], #14862), not by
 /// this bare phrase.
 pub const DOCTOR_CYCLE_CAP_PHRASE: &str = "doctor cycle exhausted";
 
@@ -279,19 +279,49 @@ fn strip_digits(s: &str) -> Option<&str> {
     (end > 0).then(|| &s[end..])
 }
 
-/// Whether `line` is one legacy terminal cap record, exactly as the sweep
-/// prompts emit it (`sweep-wave-lifecycle.md`, `sweep-mode-c-lifecycle.md`):
-/// `PR #P blocked: doctor cycle exhausted after <k> Doctor→Judge round(s)`,
-/// optionally with the `; human attention required` suffix. The whole line
-/// must be the record, so trusted prose that merely mentions the phrase — an
-/// audit explaining why no cap applied (#14862) — is not a cap.
+/// Match the terminal record from the sweep prompts and historical reports
+/// with a terminal period (#5397), a blocked-label lead-in (#4519), or a
+/// sweep run and a grace-cycle sentence (#10406). In the last form the report
+/// may continue after the terminal sentence. Each form is anchored at the
+/// start of the line so an audit that quotes the phrase (#14862) stays prose.
 fn legacy_doctor_cap_line(line: &str) -> bool {
-    let l = line.trim().to_ascii_lowercase();
-    let tail = strip_digits(l.strip_prefix("pr #").unwrap_or_default())
+    let line = line.trim().to_ascii_lowercase();
+    let (record, sweep_report) = if let Some(report) = line.strip_prefix("sweep (run sweep-") {
+        let Some((run_id, record)) = report.split_once("): ") else {
+            return false;
+        };
+        if run_id.is_empty()
+            || !run_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+        (record, true)
+    } else {
+        (
+            line.strip_prefix("marking `loom:blocked`. ")
+                .unwrap_or(&line),
+            false,
+        )
+    };
+    let tail = record
+        .strip_prefix("pr #")
+        .and_then(strip_digits)
         .and_then(|s| s.strip_prefix(" blocked: doctor cycle exhausted after "))
         .and_then(strip_digits)
-        .and_then(|s| s.strip_prefix(" doctor→judge round(s)"));
-    matches!(tail, Some("") | Some("; human attention required"))
+        .and_then(|s| s.strip_prefix(" doctor→judge "));
+    if sweep_report {
+        return tail
+            .and_then(|s| {
+                s.strip_prefix("rounds (one grace cycle granted); human attention required.")
+            })
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '));
+    }
+    matches!(
+        tail.map(|s| s.strip_suffix('.').unwrap_or(s)),
+        Some("round(s)" | "round(s); human attention required")
+    )
 }
 
 /// Whether the Doctor-cycle cap was hit after the latest hold notice: a
@@ -541,6 +571,25 @@ mod tests {
             "PR #7 blocked: doctor cycle exhausted after 3 Doctor→Judge round(s); human attention required";
         assert!(!doctor_may_work(&shape, &[hold.as_str(), attention]));
         assert!(doctor_may_work(&shape, &[attention, hold.as_str()]));
+    }
+
+    #[test]
+    fn historical_terminal_reports_cap_only_the_current_hold_episode() {
+        let hold = format!("{MERGE_RISK_HOLD_MARKER}\nx");
+        let shape = ["loom:changes-requested", "loom:blocked"];
+        let retained_reports = [
+            // https://github.com/2AMLogic/loom/pull/5397#issuecomment-5189526465
+            "PR #5397 blocked: doctor cycle exhausted after 2 Doctor→Judge round(s); human attention required.",
+            // https://github.com/2AMLogic/loom/pull/4519#issuecomment-5128197289
+            "Marking `loom:blocked`. PR #4519 blocked: doctor cycle exhausted after 2 Doctor→Judge round(s); human attention required.",
+            // https://github.com/2AMLogic/loom/pull/10406#issuecomment-5993105200
+            "Sweep (run sweep-20261005T094112Z-3364552-5dbe0b3b): PR #10406 blocked: doctor cycle exhausted after 2 Doctor→Judge rounds (one grace cycle granted); human attention required. Two Judges disagreed at head 7c03fea1c.",
+        ];
+        for report in retained_reports {
+            assert!(!doctor_may_work(&shape, &[hold.as_str(), report]), "{report}");
+            assert!(doctor_may_work(&shape, &[report, hold.as_str()]), "{report}");
+            assert!(doctor_may_work(&shape, &[hold.as_str(), &format!("> {report}")]), "{report}");
+        }
     }
 
     #[test]
