@@ -222,7 +222,7 @@ fn config_is_read_from_the_effective_config() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn step_warns_once_per_distinct_bad_pair_and_reads_the_given_ledger() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();
@@ -364,7 +364,7 @@ fn repo_debt_reads_only_that_roots_fresh_entries() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn a_high_debt_repo_does_not_hold_a_zero_debt_repo() {
     let cfg = primary("{}");
     let ledger = DemandLedger::default();
@@ -381,7 +381,7 @@ fn a_high_debt_repo_does_not_hold_a_zero_debt_repo() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn hysteresis_is_per_repo() {
     let cfg = primary("{}");
     let ledger = DemandLedger::default();
@@ -399,7 +399,7 @@ fn hysteresis_is_per_repo() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn the_host_ceiling_is_off_by_default() {
     // 4 repos at 30 each: 120 host-wide, which engaged the pre-#10624 back-off.
     let cfg = primary("{}");
@@ -414,7 +414,7 @@ fn the_host_ceiling_is_off_by_default() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn an_engaged_host_ceiling_holds_every_repo_and_releases_below_host_low() {
     let cfg = primary(r#"{"hostHigh": 50, "hostLow": 20}"#);
     let ledger = DemandLedger::default();
@@ -443,7 +443,7 @@ fn an_engaged_host_ceiling_holds_every_repo_and_releases_below_host_low() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn a_crossed_or_half_set_host_pair_leaves_the_ceiling_off() {
     for (block, pair) in [
         (json!({"hostHigh": 30, "hostLow": 30}), (Some(30), Some(30))),
@@ -476,7 +476,7 @@ fn a_crossed_or_half_set_host_pair_leaves_the_ceiling_off() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn a_departed_root_loses_its_state() {
     let cfg = primary("{}");
     let ledger = DemandLedger::default();
@@ -543,7 +543,7 @@ fn deferrals_are_broken_down_per_repo() {
 }
 
 #[test]
-#[serial_test::serial] // reads the effective config (LOOM_HYPERPARAMS)
+#[serial_test::serial] // reads the effective config (process-global state)
 fn a_crossed_hyperparams_overlay_keeps_the_host_ceiling_and_enabled() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".loom")).unwrap();

@@ -25,11 +25,6 @@ pub const INSTALL_VERSION: &str = "loom.install.version";
 pub const INSTALL_REVISION: &str = "loom.install.revision";
 /// `sha256:<hex>` over every installed prompt file, path and content.
 pub const PROMPTS_DIGEST: &str = "loom.prompts.digest";
-/// `sha256:<hex>` over the resolved hyperparameter vector (Issue #9683) the
-/// daemon started under — the run-provenance stamp that makes a span's
-/// telemetry reproducible from the exact tunables it ran with. Omitted when
-/// the process never ran `hyperparams::startup_init` (CLI subcommands).
-pub const HYPERPARAMS_DIGEST: &str = "loom.hyperparams.digest";
 
 /// The allowlisted provenance attribute keys.
 pub const KEYS: &[&str] = &[
@@ -39,7 +34,6 @@ pub const KEYS: &[&str] = &[
     INSTALL_VERSION,
     INSTALL_REVISION,
     PROMPTS_DIGEST,
-    HYPERPARAMS_DIGEST,
 ];
 
 /// Workspace-relative directories whose files are the prompts a sweep runs.
@@ -84,15 +78,6 @@ pub fn stamp(attributes: &mut TraceAttributes) {
     attributes
         .entry(DAEMON_TREE_STATE.into())
         .or_insert_with(|| build.tree_state.into());
-    // Issue #9683: the hyperparameter vector the daemon started under.
-    // `.or_insert` on the global — a span restored from a queue keeps the
-    // digest of the daemon that created it, same never-overwrite contract as
-    // the build stamps above. Absent when startup_init never ran.
-    if let Some(digest) = crate::hyperparams::digest_global() {
-        attributes
-            .entry(HYPERPARAMS_DIGEST.into())
-            .or_insert_with(|| digest.into());
-    }
 }
 
 /// The installed Loom surface and prompt digest for `root`. Best-effort: an

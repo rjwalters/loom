@@ -31,7 +31,7 @@ later re-renders keep them. To change a value on a host, export it and re-run
 environment. See "Changing daemon environment variables" and "Env keys carried
 forward across a re-render" in `daemon-reference.md`. For a hand-run
 `/loom:champion`, export the value in that shell. Precedence is env var >
-`LOOM_HYPERPARAMS` vector > config block > default (`hyperparameters.md`).
+config block > default (`hyperparameters.md`).
 
 ## 3. "Needs revision" goes to Curator, not to the operator
 
