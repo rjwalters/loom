@@ -448,6 +448,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "lease ensure",
     "lease co-occupancy",
     "lease release",
+    "lease read",
     "lease renewer",
     "lease pr claim",
     "lease pr check",

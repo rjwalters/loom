@@ -255,7 +255,10 @@ set -euo pipefail
 # Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
 # shellcheck source=lib/locate-daemon-bin.sh
 _lease_lib="$(dirname "${BASH_SOURCE[0]}")/lib/locate-daemon-bin.sh"
-if [[ -r "$_lease_lib" ]]; then source "$_lease_lib" && loom_select_lease_bin "$PWD" || true; fi
+LEASE_READ_API=(gh api)
+if [[ -r "$_lease_lib" ]]; then
+    source "$_lease_lib" && loom_select_lease_bin "$PWD" && loom_select_lease_read || true
+fi
 unset _lease_lib
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
@@ -530,11 +533,10 @@ check_lease() {
     # fetched together in ONE round trip so the yield-exclusion filter below
     # never needs a second `gh api` call.
     local comments_ndjson
-    if ! comments_ndjson="$(gh api "repos/${repo_path}/issues/${issue}/comments" \
+    if ! comments_ndjson="$("${LEASE_READ_API[@]}" "repos/${repo_path}/issues/${issue}/comments" \
         --paginate --jq \
-        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}" \
-        2>&1)"; then
-        echo "PASS: could not fetch comments for issue #${issue} (${comments_ndjson}) -- unverifiable, failing open (proceeding with push/PR-open)" >&2
+        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body, user: {login: .user.login, type: .user.type}, author_association: .author_association}")"; then
+        echo "PASS: could not fetch comments for issue #${issue} -- unverifiable, failing open (proceeding with push/PR-open)" >&2
         return 0
     fi
     # #9548: lease/yield markers count only from a TRUSTED author; an outsider's

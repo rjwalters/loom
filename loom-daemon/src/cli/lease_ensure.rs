@@ -122,6 +122,10 @@ pub(crate) enum LeaseCommand {
     /// `cli::lease_release`.
     Release(super::lease_release::LeaseReleaseArgs),
 
+    /// Read an issue's state or lease comments for an installed lease script.
+    #[command(hide = true)]
+    Read(super::lease_cli::LeaseReadArgs),
+
     /// Single-owner bookkeeping and the per-cycle completion gate for
     /// `sweep-lease-renew.sh`'s renewal loops (#10229). See
     /// `cli::lease_renewer`.
@@ -140,6 +144,7 @@ impl LeaseCommand {
             LeaseCommand::Ensure(args) => args.run(),
             LeaseCommand::CoOccupancy(args) => args.run(),
             LeaseCommand::Release(args) => args.run(),
+            LeaseCommand::Read(args) => args.run(),
             LeaseCommand::Renewer(action) => action.run(),
             LeaseCommand::Pr(action) => action.run(),
         }

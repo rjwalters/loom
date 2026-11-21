@@ -293,9 +293,11 @@ SELF="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
 # #14488: one binary for the whole lease chain (see loom_select_lease_bin).
 # Fail-open: a tree without the locator keeps `${LOOM_DAEMON_BIN:-loom-daemon}`.
+LEASE_READ_API=(gh api)
 if [[ -r "$SCRIPT_DIR/lib/locate-daemon-bin.sh" ]]; then
     # shellcheck source=lib/locate-daemon-bin.sh
     source "$SCRIPT_DIR/lib/locate-daemon-bin.sh" && loom_select_lease_bin "$PWD" || true
+    loom_select_lease_read
 fi
 
 # lease_gh <read|write> <gh args...> (#10229): run one forge call on this host's
@@ -344,6 +346,10 @@ _lease_gh_attempts() {
 # requires-daemon: forge optional   Without `forge token` (absent or older binary), or with no App configured, every call runs on the caller's own credential, exactly as before #10229.
 lease_gh() {
     local access="$1" tok="" out="" rc=0 diag attempts last; shift
+    if [[ "$access" == read && "${LEASE_READ_API[0]}" != gh ]]; then
+        "${LEASE_READ_API[@]}" "${@:2}"
+        return
+    fi
     tok="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge token --repo "${LOOM_REPO:-$(_forge_nwo_from_remote || true)}" --access "$access" 2> /dev/null | jq -r 'select(.status == "ok") | .token // empty' 2> /dev/null)" || tok=""
     attempts="$(mktemp)" diag="$(mktemp)"
     if [[ -n "$tok" ]] && out="$(GH_TOKEN="$tok" _lease_gh_ladder app "$attempts" "$@" 2> "$diag")"; then
