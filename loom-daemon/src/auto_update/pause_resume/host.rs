@@ -116,6 +116,14 @@ pub(crate) trait ResumeHost: Send + Sync {
         notice: &RollRequeueNotice,
         forge: bool,
     ) -> Result<(), String>;
+    /// Release the recorded step and keep verified progress for a retry.
+    fn requeue_step(
+        &self,
+        _item: &mut ManifestItem,
+        _notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        Err("resume host did not implement step release".into())
+    }
     /// Hand `item` to ordinary restart recovery.
     fn recover(&self, manifest_id: &str, item: &ManifestItem);
     /// H5 is finished with `manifest_id`: lift the recovery suppression and
@@ -318,18 +326,22 @@ pub(crate) mod sweeps {
         notice: &RollRequeueNotice,
         forge: bool,
     ) -> Result<(), String> {
-        let mut sr = locked(registry);
         if let Some(role) = item.step {
-            return requeue_step(&mut sr, item, role, forge);
+            if forge {
+                return requeue_step(registry, &mut item.clone(), notice).map(|_| ());
+            }
+            release_step_lock(registry, item, role);
+            return Ok(());
         }
         let Some(issue) = item.issue else {
-            let released = sr.release_roll_prset(&item.id);
+            let released = locked(registry).release_roll_prset(&item.id);
             log::info!("pause_resume: {}: released PR lock(s) {released:?}", item.id);
             return Ok(());
         };
         if forge {
-            match sr.roll_claim_still_ours(issue, &item.id) {
-                Ok(()) => sr
+            let detached = locked(registry).detached_for_forge_writes();
+            match detached.roll_claim_still_ours(issue, &item.id) {
+                Ok(()) => detached
                     .requeue_for_roll(issue, notice)
                     .map_err(|e| format!("{e:#}"))?,
                 Err(why) => log::warn!(
@@ -339,46 +351,37 @@ pub(crate) mod sweeps {
                 ),
             }
         }
-        sr.release_roll_item(issue, &[&item.id]);
+        locked(registry).release_roll_item(issue, &[&item.id]);
         Ok(())
     }
 
-    /// A step's requeue (#11898): its claim goes back to its role's ready
-    /// stage, and its lock (`issue-<N>` or `pr-<N>`) is released.
-    fn requeue_step(
-        sr: &mut SweepRegistry,
+    pub(crate) fn requeue_step(
+        registry: &Arc<Mutex<SweepRegistry>>,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        let role = item.step.ok_or("missing roll step role")?;
+        let released = crate::auto_update::pause_roll::host::release_step_off_registry_lock(
+            registry, item, notice,
+        )?;
+        release_step_lock(registry, item, role);
+        Ok(released)
+    }
+
+    fn release_step_lock(
+        registry: &Arc<Mutex<SweepRegistry>>,
         item: &ManifestItem,
         role: crate::step_role::StepRole,
-        forge: bool,
-    ) -> Result<(), String> {
-        let Some(number) = item.issue.or(item.pr) else {
-            return Ok(());
-        };
-        let ours = if role.acts_on_pr() {
-            sr.roll_pr_step_claim_still_ours(number, role, &item.id)
-        } else {
-            sr.roll_claim_still_ours(number, &item.id)
-        };
-        if forge {
-            match ours {
-                Ok(()) => {
-                    sr.restore_step_claim(number, role, &item.id)
-                        .map_err(|e| format!("{e:#}"))?;
-                }
-                Err(why) => log::warn!(
-                    "pause_resume: {}: #{number} is no longer this {role} step's claim ({why}); \
-                     nothing is written to the forge for it",
-                    item.id
-                ),
+    ) {
+        if role.acts_on_pr() {
+            let released = locked(registry).release_roll_prset(&item.id);
+            log::info!("pause_resume: {}: released PR lock(s) {released:?}", item.id);
+        } else if let Some(number) = item.issue {
+            let mut registry = locked(registry);
+            if registry.live_roll_resume_of(number, &item.id).is_none() {
+                registry.release_roll_item(number, &[&item.id]);
             }
         }
-        if role.acts_on_pr() {
-            let released = sr.release_roll_prset(&item.id);
-            log::info!("pause_resume: {}: released PR lock(s) {released:?}", item.id);
-        } else {
-            sr.release_roll_item(number, &[&item.id]);
-        }
-        Ok(())
     }
 
     pub(crate) fn recover(registry: &Arc<Mutex<SweepRegistry>>, item: &ManifestItem) {
@@ -647,6 +650,14 @@ impl ResumeHost for DaemonResumeHost {
         } else {
             requeue_role(item, notice, forge, &crate::write_scope::default_gh())
         }
+    }
+
+    fn requeue_step(
+        &self,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        sweeps::requeue_step(&self.registry(item), item, notice)
     }
 
     fn recover(&self, manifest_id: &str, item: &ManifestItem) {

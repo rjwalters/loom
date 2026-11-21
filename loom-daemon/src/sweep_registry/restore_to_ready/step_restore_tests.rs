@@ -290,3 +290,233 @@ fn a_revised_promote_that_died_holding_its_claim_does_not_restore_curated() {
     assert_eq!(release, ClaimRelease::Released);
     assert_eq!(edits, vec!["issue edit 607 --remove-label loom:evaluating".to_string()]);
 }
+
+/// Exercise the shared H4/H5 release operation against inert role comments,
+/// an item snapshot, and a captured exact-owner lease reap.
+#[test]
+fn roll_release_restores_each_roles_own_stage_and_reports_the_verified_action() {
+    use crate::auto_update::pause_manifest::ManifestItem;
+    use crate::sweep_registry::roll_requeue::RollRequeueNotice;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn reap(root: &Path, held: &crate::pr_lease_reap::Held, _: &Path) -> bool {
+        let path = root.join("role-lease");
+        let mut row: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let body = row["body"].as_str().unwrap();
+        assert!(body.contains(&format!("{} host={} sweep={}", held.role, held.host, held.sweep)));
+        assert_eq!(held.pr, 17);
+        row["body"] = body
+            .replacen("loom:pr-lease ", "loom:pr-lease-released ", 1)
+            .into();
+        std::fs::write(path, row.to_string()).unwrap();
+        true
+    }
+
+    for (role, extra, restored) in [
+        (StepRole::Curator, Some("loom:triage"), None),
+        (StepRole::Curator, Some("loom:issue"), None),
+        (StepRole::Curator, None, Some("loom:triage")),
+        (StepRole::ChampionPromote, None, Some("loom:curated")),
+        (StepRole::Judge, None, Some("loom:review-requested")),
+        (StepRole::Doctor, None, Some("loom:changes-requested")),
+        (StepRole::ChampionMerge, Some("loom:pr"), None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let gh = root.join("fake-gh");
+        let trace = root.join("writes");
+        let state = root.join("item");
+        let lease = root.join("role-lease");
+        let fail_remove = root.join("fail-remove");
+        let clock = root.join("claim-time");
+        let now = chrono::Utc::now();
+        std::fs::write(&clock, now.to_rfc3339()).unwrap();
+        let mut labels = vec!["operator-priority"];
+        labels.extend(extra);
+        labels.extend(role.claim_label());
+        std::fs::write(
+            &state,
+            serde_json::json!({"state":"open","labels":labels,"pr":role.acts_on_pr()}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/bash
+case "$1 $2" in
+  'repo view') echo fixture/roll ;;
+  api*'/comments')
+    if [[ "$*" == *'loom:pr-lease'* ]]; then cat '{lease}'; fi
+    exit 0 ;;
+  api*'/timeline') cat '{clock}' ;;
+  api*) cat '{state}' ;;
+  'issue edit'|'pr edit')
+    printf 'edit %s\n' "$*" >> '{trace}'
+    if [[ "$4" == '--add-label' ]]; then
+        jq --arg ready "$5" '.labels += [$ready]' '{state}' > '{state}.next'
+    else
+        [[ -e '{fail_remove}' ]] && exit 1
+        jq --arg claim "$5" '.labels |= map(select(. != $claim))' '{state}' > '{state}.next'
+    fi
+    mv '{state}.next' '{state}' ;;
+  'issue comment'|'pr comment') printf '%s\n' "$5" >> '{trace}' ;;
+  *) exit 1 ;;
+esac
+"#,
+                lease = lease.display(),
+                clock = clock.display(),
+                state = state.display(),
+                trace = trace.display(),
+                fail_remove = fail_remove.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = crate::sweep_registry::SweepRegistryConfig::new(root.clone());
+        config.gh_bin = Some(gh);
+        let registry = SweepRegistry::new(config);
+        let host = registry.published_host_id();
+        let sweep = "step-fixture";
+        let body = format!(
+            "<!-- loom:pr-lease role={} host={host} sweep={sweep} step={} -->",
+            role.role_name(),
+            role.as_str()
+        );
+        let lease_body = |id, body: &str| {
+            crate::comment_trust::records::with_fleet_author(
+                &serde_json::json!({"id":id,"updated_at":now.to_rfc3339(),"body":body}).to_string(),
+            )
+        };
+        let own = lease_body(5, &body);
+        std::fs::write(&lease, &own).unwrap();
+        // A Doctor's prompt can apply its claim well after the step starts.
+        let started_at = if role == StepRole::Doctor {
+            now - chrono::Duration::minutes(3)
+        } else {
+            now
+        };
+        let mut item: ManifestItem = serde_json::from_value(serde_json::json!({
+            "id":sweep, "kind":"sweep", "repo":root, "disposition":"requeue", "status":"planned",
+            "issue":(!role.acts_on_pr()).then_some(17), "pr":role.acts_on_pr().then_some(17),
+            "step":role, "run_started_at":started_at,
+        }))
+        .unwrap();
+        let notice = RollRequeueNotice {
+            from_version: "test".into(),
+            reason: "young-agent-reset".into(),
+            manifest_id: "rp-fixture".into(),
+            ..RollRequeueNotice::default()
+        };
+        if role == StepRole::Doctor || role == StepRole::Curator && extra == Some("loom:issue") {
+            let peer = body.replace(
+                &format!("host={host} sweep={sweep} "),
+                "host=peer-fixture sweep=peer-step ",
+            );
+            std::fs::write(&lease, format!("{}\n{own}", lease_body(3, &peer))).unwrap();
+            assert_eq!(
+                registry
+                    .roll_step_release_with(&mut item, &notice, reap)
+                    .unwrap(),
+                "none"
+            );
+            assert!(!trace.exists(), "the earlier peer lease protects the item's labels");
+            std::fs::write(&lease, &own).unwrap();
+        }
+        if role == StepRole::Curator && extra.is_none() {
+            std::fs::write(&fail_remove, "").unwrap();
+            assert!(registry
+                .roll_step_release_with(&mut item, &notice, reap)
+                .is_err());
+            let progress = item.roll_step_release().unwrap();
+            assert!(progress.queue_restored && !progress.claim_removed && !progress.lease_released);
+            let current = std::fs::read_to_string(&state).unwrap();
+            assert!(current.contains("loom:curating") && current.contains("loom:triage"));
+            std::fs::remove_file(&fail_remove).unwrap();
+        }
+        let result = registry
+            .roll_step_release_with(&mut item, &notice, reap)
+            .unwrap();
+        let expected = match (role.claim_label(), restored) {
+            (_, Some(_)) => "queue_restored_and_lease_released",
+            (Some(_), None) => "claim_and_lease_released",
+            (None, None) => "lease_released",
+        };
+        assert_eq!(result, expected, "{role}");
+        let writes = std::fs::read_to_string(&trace).unwrap();
+        assert!(writes.contains("Released this step's lease."));
+        assert_eq!(writes.contains("Restored"), restored.is_some(), "{role}");
+        assert_eq!(writes.contains("edit "), role.claim_label().is_some(), "{role}");
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        let after = after["labels"].as_array().unwrap();
+        assert!(after.contains(&"operator-priority".into()));
+        if let Some(label) = extra.or(restored) {
+            assert!(after.contains(&label.into()));
+        }
+        assert!(item.roll_step_release().unwrap().lease_released);
+    }
+}
+
+#[test]
+fn roll_release_builder_keeps_its_claim_and_lease_while_a_linked_pr_is_open() {
+    use crate::auto_update::pause_manifest::ManifestItem;
+    use crate::sweep_registry::roll_requeue::RollRequeueNotice;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let gh = root.join("fake-gh");
+    let lease = root.join("lease");
+    let writes = root.join("unexpected-writes");
+    std::fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/bash
+{open_pr}
+case "$1 $2" in
+  'repo view') echo fixture/roll ;;
+  api*'/comments') cat '{lease}' ;;
+  api*'/timeline') exit 0 ;;
+  api*) echo '{{"state":"open","labels":["loom:building"],"pr":false}}' ;;
+  'issue edit'|'issue comment') touch '{writes}' ;;
+  *) exit 1 ;;
+esac
+"#,
+            open_pr = crate::sweep_registry::test_support::fake_gh_graphql_arm("90", 0),
+            lease = lease.display(),
+            writes = writes.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = crate::sweep_registry::SweepRegistryConfig::new(root.clone());
+    config.gh_bin = Some(gh);
+    let registry = SweepRegistry::new(config);
+    let host = registry.published_host_id();
+    let id = "step-builder-17-fixture";
+    let now = chrono::Utc::now();
+    let body = format!("<!-- loom:lease host={host} sweep={id} -->");
+    std::fs::write(
+        &lease,
+        crate::comment_trust::records::with_fleet_author(
+            &serde_json::json!({"updated_at":now.to_rfc3339(),"body":body}).to_string(),
+        ),
+    )
+    .unwrap();
+    crate::sweep_registry::test_support::write_lock_owner(&registry, 17, id, 999_999);
+    let mut item: ManifestItem = serde_json::from_value(serde_json::json!({
+        "id":id, "kind":"sweep", "repo":root, "disposition":"requeue", "status":"planned",
+        "issue":17, "step":"builder", "run_started_at":now,
+    }))
+    .unwrap();
+    assert_eq!(
+        registry
+            .roll_step_release(&mut item, &RollRequeueNotice::default())
+            .unwrap(),
+        "none"
+    );
+    assert!(!writes.exists());
+    assert_eq!(item.roll_step_release().unwrap().outcome(), "none");
+}

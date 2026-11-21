@@ -13,7 +13,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::teardown::{self, TeardownReport, TreeSpec};
-use crate::auto_update::pause_manifest::{ItemKind, ResumeHandle, Runtime, WorktreeRecord};
+use crate::auto_update::pause_manifest::{
+    ItemKind, ManifestItem, ResumeHandle, Runtime, WorktreeRecord,
+};
 use crate::event_bus::EventBus;
 use crate::roll_pause;
 use crate::sweep_registry::roll_requeue::RollRequeueNotice;
@@ -141,6 +143,14 @@ pub trait PauseHost: Send + Sync {
     /// # Errors
     /// When a write failed; the item stays `planned` for the next start.
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String>;
+    /// Release the recorded step using its role and old step identity.
+    fn requeue_step(
+        &self,
+        _item: &mut ManifestItem,
+        _notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        Err("roll host did not implement step release".into())
+    }
     /// Publish an event on the daemon's bus.
     fn emit(&self, topic: &str, payload: serde_json::Value);
     /// The fleet floor re-read from the store now, not from the last sync
@@ -459,7 +469,21 @@ impl PauseHost for DaemonPauseHost {
         )
     }
 
+    fn requeue_step(
+        &self,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        let registry = self.pool.get_or_provision(Path::new(&item.repo));
+        release_step_off_registry_lock(&registry, item, notice)
+    }
+
     fn requeue(&self, c: &Candidate, notice: &RollRequeueNotice) -> Result<(), String> {
+        if c.step.is_some() {
+            return self
+                .requeue_step(&mut super::manifest_item(c, Utc::now(), 0), notice)
+                .map(|_| ());
+        }
         let Some(issue) = c.issue else {
             // A role run gives back the claim its breadcrumb names (#10832,
             // design §9). With no breadcrumb, the role's own staleness rule
@@ -507,6 +531,18 @@ pub(crate) fn requeue_off_the_registry_lock(
     forge
         .requeue_for_roll(issue, notice)
         .map_err(|e| format!("{e:#}"))
+}
+
+pub(crate) fn release_step_off_registry_lock(
+    registry: &std::sync::Mutex<crate::sweep_registry::SweepRegistry>,
+    item: &mut ManifestItem,
+    notice: &RollRequeueNotice,
+) -> Result<&'static str, String> {
+    let detached = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .detached_for_forge_writes();
+    detached.roll_step_release(item, notice)
 }
 
 /// The repo a candidate belongs to, as the manifest spells it.

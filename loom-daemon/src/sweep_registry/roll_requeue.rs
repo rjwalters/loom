@@ -24,6 +24,463 @@
 
 use super::*;
 
+use crate::auto_update::pause_manifest::{
+    ItemKind, ManifestItem, RollStepLabelRelease, RollStepRelease,
+};
+use crate::cli::pr_lease::{self, Record, Role};
+use crate::forge_check_claim::{self, LeaseRow};
+use crate::step_role::StepRole;
+use crate::worktree_ops::gh::OpenPrProbe;
+
+enum StepLease {
+    Own { role_row: Option<u64> },
+    Gone,
+    Retired,
+    Peer,
+}
+
+impl SweepRegistry {
+    /// The forge half common to H4 and H5. Only old-step sub-actions whose
+    /// write and post-state were observed enter the durable progress record.
+    pub(crate) fn roll_step_release(
+        &self,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+    ) -> std::result::Result<&'static str, String> {
+        self.roll_step_release_with(item, notice, crate::pr_lease_reap::reap_for_roll)
+    }
+
+    pub(crate) fn roll_step_release_with(
+        &self,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+        reap: fn(&Path, &crate::pr_lease_reap::Held, &Path) -> bool,
+    ) -> std::result::Result<&'static str, String> {
+        let role = item.step.ok_or("missing roll step role")?;
+        if item.kind != ItemKind::Sweep {
+            return Err("recorded step is not a step sweep".into());
+        }
+        let number = match (role.acts_on_pr(), item.issue, item.pr) {
+            (false, Some(number), None) | (true, None, Some(number)) if number != 0 => number,
+            _ => return Err("recorded roll step and item disagree".into()),
+        };
+        if self.config.skip_label_flip {
+            return Ok("none");
+        }
+        let mut progress = item.roll_step_release()?;
+        let result =
+            self.perform_roll_step_release(item, number, role, notice, &mut progress, reap);
+        item.set_roll_step_release(&progress);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn perform_roll_step_release(
+        &self,
+        item: &ManifestItem,
+        number: u32,
+        role: StepRole,
+        notice: &RollRequeueNotice,
+        progress: &mut RollStepRelease,
+        reap: fn(&Path, &crate::pr_lease_reap::Held, &Path) -> bool,
+    ) -> std::result::Result<&'static str, String> {
+        let (_, labels) = self.roll_step_labels(number, role)?;
+        if crate::work_finder::is_frozen(&labels) {
+            return Ok("none");
+        }
+        let claim = role.claim_label();
+        let ready = role.restore_label();
+        let claim_exists = claim.is_some_and(|label| labels.iter().any(|l| l == label));
+        let host = self.published_host_id();
+        if progress.lease_host.as_ref().is_some_and(|old| old != &host) {
+            return Err("the recorded lease host differs from this registry".into());
+        }
+        // Role leases are scoped to the step id. Only the Builder's sweep
+        // lease can retain the old lease identity through a relaunch.
+        let lease_id = if role == StepRole::Builder {
+            item.resume_handle
+                .as_ref()
+                .and_then(|h| h.lease_sweep_id.as_deref())
+                .unwrap_or(&item.id)
+        } else {
+            &item.id
+        };
+        let lease = self.roll_step_lease(number, role, &host, lease_id)?;
+        let role_row = match lease {
+            StepLease::Peer => return Ok("none"),
+            StepLease::Gone if claim_exists => {
+                return Err(
+                    "claim label is present without positive old-step lease ownership".into()
+                );
+            }
+            StepLease::Retired if claim_exists => return Ok("none"),
+            StepLease::Gone | StepLease::Retired => {
+                return self.roll_step_notice(item, number, role, notice, progress);
+            }
+            StepLease::Own { role_row } => role_row,
+        };
+        if progress.lease_row.is_some() && progress.lease_row != role_row {
+            return Err("the live lease differs from the recorded row".into());
+        }
+        progress.lease_host = Some(host.clone());
+        progress.lease_row = role_row;
+        if role == StepRole::Builder {
+            let Some(owner) = self.roll_lock_owner(number) else {
+                return Err("could not read the Builder lock owner".into());
+            };
+            if !Self::owner_is_run(&owner, &item.id)
+                || self.live_roll_resume_of(number, &item.id).is_some()
+            {
+                return Ok("none");
+            }
+            match self.probe_open_linked_pr(number) {
+                OpenPrProbe::Open(_) => return Ok("none"),
+                OpenPrProbe::ProbeFailed => {
+                    return Err("could not verify Builder open-PR hold".into())
+                }
+                OpenPrProbe::NoneOpen => {}
+            }
+        }
+        if let Some(claim) = claim.filter(|_| claim_exists) {
+            let started = item
+                .run_started_at
+                .or(item.agent_started_at)
+                .ok_or("missing recorded step start")?;
+            let labeled_at = self
+                .fetch_label_applied_at(number, claim)
+                .ok_or("could not verify step claim label history")?;
+            if role == StepRole::Builder
+                && super::step_reap::label_reapplied_after(labeled_at, started)
+                || role != StepRole::Builder
+                    && super::step_reap::label_reapplied_after(started, labeled_at)
+            {
+                return Ok("none");
+            }
+            // A claim present after our confirmed removal is another claim.
+            if progress.claim_removed {
+                return Ok("none");
+            }
+            let (closed, labels) = self.roll_step_labels(number, role)?;
+            if let Some(plan) = self.plan_roll_step_release(number, role, &labels, closed) {
+                let mut remove_claim = true;
+                if plan == RollStepLabelRelease::QueueRestored {
+                    // The ready-label write must complete before the old
+                    // claim is removed, including across a partial response.
+                    match self.roll_step_lease(number, role, &host, lease_id)? {
+                        StepLease::Own { role_row: row } if row == role_row => {}
+                        StepLease::Peer | StepLease::Retired => return Ok("none"),
+                        _ => {
+                            return Err("step lease changed before restoring the ready label".into())
+                        }
+                    }
+                    self.add_roll_ready_label(number, role)
+                        .map_err(|e| format!("{e:#}"))?;
+                    let (_, after) = self.roll_step_labels(number, role)?;
+                    if !ready.is_some_and(|r| after.iter().any(|l| l == r)) {
+                        return Err("could not verify the restored ready label".into());
+                    }
+                    progress.queue_restored = true;
+                    if crate::work_finder::is_frozen(&after) {
+                        return Ok("none");
+                    }
+                    remove_claim = after.iter().any(|label| label == claim);
+                }
+                if remove_claim {
+                    let current_label = self
+                        .fetch_label_applied_at(number, claim)
+                        .ok_or("could not recheck the step claim label")?;
+                    if current_label != labeled_at {
+                        return Ok("none");
+                    }
+                    match self.roll_step_lease(number, role, &host, lease_id)? {
+                        StepLease::Own { role_row: row } if row == role_row => {}
+                        StepLease::Peer | StepLease::Retired => return Ok("none"),
+                        _ => {
+                            return Err("step lease changed before removing the claim label".into())
+                        }
+                    }
+                    self.remove_roll_claim_label(number, role)
+                        .map_err(|e| format!("{e:#}"))?;
+                    let (_, after) = self.roll_step_labels(number, role)?;
+                    if after.iter().any(|label| label == claim) {
+                        return Err("could not verify removal of the step claim label".into());
+                    }
+                    progress.claim_removed = true;
+                }
+            } else if crate::work_finder::is_frozen(&labels) {
+                return Ok("none");
+            }
+        }
+        // A failed exchange is reconciled against the exact departing lease
+        // row. An already-released lease never counts as a new action.
+        match self.roll_step_lease(number, role, &host, lease_id)? {
+            StepLease::Peer => return Ok(progress.outcome()),
+            StepLease::Gone | StepLease::Retired => {}
+            StepLease::Own { role_row: current } if current != role_row => {
+                return Err("step lease changed before it could be released".into());
+            }
+            StepLease::Own { role_row: Some(id) } => {
+                let held = crate::pr_lease_reap::Held {
+                    pr: u64::from(number),
+                    role: role.role_name().into(),
+                    host: host.clone(),
+                    sweep: lease_id.into(),
+                };
+                if !reap(&self.config.workspace_root, &held, &self.resolved_gh()) {
+                    return Err("could not confirm reap of the old role lease".into());
+                }
+                let rows = self
+                    .read_roll_role_lease_rows(number)
+                    .ok_or("could not verify reaped role lease")?;
+                if !rows.iter().any(|row| {
+                    row.id == id
+                        && matches!(pr_lease::parse_record(&row.body), Some(Record::Released(owner))
+                        if owner.host == host && owner.sweep == lease_id
+                            && owner.role.as_str() == role.role_name() && owner.step == Some(role))
+                }) {
+                    return Err("old role lease release is unverified".into());
+                }
+                progress.lease_released = true;
+            }
+            StepLease::Own { role_row: None } => {
+                if !self.yield_finished_builder_lease(number, lease_id, "roll-requeue") {
+                    return Err("could not yield the old Builder lease".into());
+                }
+                let rows = self.roll_builder_lease_rows(number)?;
+                if !rows.iter().any(|row| {
+                    forge_check_claim::parse_yield_marker_line(&row.body)
+                        .is_some_and(|(owner, sweep)| owner == host && sweep == lease_id)
+                }) {
+                    return Err("Builder lease yield is unverified".into());
+                }
+                progress.lease_released = true;
+            }
+        }
+        self.roll_step_notice(item, number, role, notice, progress)
+    }
+
+    fn roll_step_labels(
+        &self,
+        number: u32,
+        role: StepRole,
+    ) -> std::result::Result<(bool, Vec<String>), String> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}");
+        let output = self
+            .gh_read(
+                "roll.step_item",
+                [
+                    "api",
+                    &path,
+                    "--jq",
+                    "{state, labels:[.labels[].name], pr:has(\"pull_request\")}",
+                ],
+            )
+            .map_err(|e| e.to_string())?
+            .filter(|response| response.status.success())
+            .ok_or("could not read step item state")?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+        if value["pr"].as_bool() != Some(role.acts_on_pr()) {
+            return Err("forge item does not match the recorded step role".into());
+        }
+        let closed = match value["state"].as_str() {
+            Some("open") => false,
+            Some("closed") => true,
+            _ => return Err("step item state is unverified".into()),
+        };
+        let labels = value["labels"]
+            .as_array()
+            .ok_or("step item labels are unverified")?
+            .iter()
+            .map(|label| label.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("step item labels are malformed")?;
+        Ok((closed, labels))
+    }
+
+    fn roll_builder_lease_rows(&self, number: u32) -> std::result::Result<Vec<LeaseRow>, String> {
+        let projection = forge_check_claim::issue_lease_comments_jq();
+        let raw = self.roll_comment_rows(number, &projection)?;
+        let rows = forge_check_claim::parse_lease_rows(&raw);
+        if rows.len() != raw.lines().count()
+            || rows.iter().any(|row| {
+                Self::parse_lease_marker_line(&row.body).is_none()
+                    && forge_check_claim::parse_yield_marker_line(&row.body).is_none()
+            })
+        {
+            return Err("malformed Builder lease record".into());
+        }
+        Ok(rows)
+    }
+
+    fn roll_step_lease(
+        &self,
+        number: u32,
+        role: StepRole,
+        host: &str,
+        sweep: &str,
+    ) -> std::result::Result<StepLease, String> {
+        if role == StepRole::Builder {
+            let rows = self.roll_builder_lease_rows(number)?;
+            let live = forge_check_claim::live_leases_by_freshness(
+                &rows,
+                Utc::now(),
+                crate::claim_reconciliation::resolve_lease_ttl_minutes(),
+            );
+            return Ok(match live.as_slice() {
+                [] if rows.iter().any(|row| {
+                    forge_check_claim::parse_yield_marker_line(&row.body)
+                        .is_some_and(|(owner, id)| owner == host && id == sweep)
+                }) =>
+                {
+                    StepLease::Retired
+                }
+                [] => StepLease::Gone,
+                [(h, s)] if h == host && s == sweep => StepLease::Own { role_row: None },
+                _ => StepLease::Peer,
+            });
+        }
+        let rows = self
+            .read_roll_role_lease_rows(number)
+            .ok_or("could not read step role leases")?
+            .into_iter()
+            .map(|row| pr_lease::Row {
+                id: row.id,
+                updated_at: row.updated_at,
+                body: row.body,
+            })
+            .collect::<Vec<_>>();
+        let key = match role {
+            StepRole::Curator => Role::Curator,
+            StepRole::Judge => Role::Judge,
+            StepRole::Doctor => Role::Doctor,
+            StepRole::ChampionPromote | StepRole::ChampionMerge => Role::Champion,
+            StepRole::Builder => unreachable!("Builder leases use issue records"),
+        };
+        let live =
+            pr_lease::live_leases(&rows, key, Utc::now(), super::step_lease_owner::lease_ttl());
+        match live.as_slice() {
+            [] if rows.iter().any(|row| {
+                matches!(
+                    pr_lease::parse_record(&row.body),
+                    Some(Record::Released(owner) | Record::Yield(owner))
+                        if owner.host == host && owner.sweep == sweep
+                            && owner.role == key && owner.step == Some(role)
+                )
+            }) =>
+            {
+                Ok(StepLease::Retired)
+            }
+            [] => Ok(StepLease::Gone),
+            [lease] if lease.holder.host == host && lease.holder.sweep == sweep => {
+                if lease.holder.step != Some(role) {
+                    return Err("live old lease does not identify the recorded step role".into());
+                }
+                Ok(StepLease::Own {
+                    role_row: Some(lease.id),
+                })
+            }
+            leases
+                if leases
+                    .iter()
+                    .any(|l| l.holder.host != host || l.holder.sweep != sweep) =>
+            {
+                Ok(StepLease::Peer)
+            }
+            _ => Err("ambiguous old role lease ownership".into()),
+        }
+    }
+
+    fn roll_comment_rows(
+        &self,
+        number: u32,
+        projection: &str,
+    ) -> std::result::Result<String, String> {
+        let path = format!("repos/{{owner}}/{{repo}}/issues/{number}/comments");
+        let output = self
+            .gh_read("roll.step_comments", ["api", &path, "--paginate", "--jq", projection])
+            .map_err(|e| e.to_string())?
+            .filter(|o| o.status.success())
+            .ok_or("could not read roll step comment records")?;
+        let raw = std::str::from_utf8(&output.stdout).map_err(|e| e.to_string())?;
+        if raw.lines().any(|line| {
+            !serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v.is_object())
+        }) {
+            return Err("malformed roll step comment records".into());
+        }
+        let policy = crate::comment_trust::TrustPolicy::for_root(&self.config.workspace_root);
+        Ok(String::from_utf8_lossy(&policy.trusted_ndjson(&output.stdout)).into_owned())
+    }
+
+    fn roll_step_notice(
+        &self,
+        item: &ManifestItem,
+        number: u32,
+        role: StepRole,
+        notice: &RollRequeueNotice,
+        progress: &RollStepRelease,
+    ) -> std::result::Result<&'static str, String> {
+        let outcome = progress.outcome();
+        if outcome == "none" {
+            return Ok(outcome);
+        }
+        // A trusted marker makes a lost POST response safe to reconcile.
+        let marker = format!(
+            "<!-- loom:roll-step-release manifest={} item={} role={} -->",
+            notice.manifest_id,
+            item.id,
+            role.as_str()
+        );
+        let projection = format!(
+            r#".[] | select(.body | startswith("<!-- loom:roll-step-release ")) | {{body, {}}}"#,
+            crate::comment_trust::records::AUTHOR_JQ,
+        );
+        let found = |rows: &str| {
+            rows.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .ok()
+                    .and_then(|row| {
+                        row["body"]
+                            .as_str()
+                            .map(|body| body.lines().next() == Some(marker.as_str()))
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        if found(&self.roll_comment_rows(number, &projection)?) {
+            return Ok(outcome);
+        }
+        let mut actions = Vec::new();
+        if let Some(claim) = role.claim_label().filter(|_| progress.claim_removed) {
+            actions.push(format!("Removed `{claim}`."));
+        }
+        if let Some(ready) = role.restore_label().filter(|_| progress.queue_restored) {
+            actions.push(format!("Restored `{ready}`."));
+        }
+        if progress.lease_released {
+            actions.push("Released this step's lease.".into());
+        }
+        let body =
+            format!(
+            "{marker}\n\nThe {role} step was interrupted while rolling from `{}` (`{}`). {}\n\n{}",
+            notice.from_version, notice.reason, actions.join(" "), ROLL_REQUEUE_COMMENT_MARKER,
+        );
+        let number_arg = number.to_string();
+        let kind = if role.acts_on_pr() { "pr" } else { "issue" };
+        let mut args = vec![kind, "comment", &number_arg, "--body", &body];
+        let repo_flag = crate::claim_reconciliation::gh_call::loom_repo_flag();
+        args.extend(repo_flag.iter().map(String::as_str));
+        let result = self.gh_write("roll.step_comment", args);
+        if matches!(result, Ok(Some(output)) if output.status.success())
+            || found(&self.roll_comment_rows(number, &projection)?)
+        {
+            Ok(outcome)
+        } else {
+            Err("could not confirm the roll step release notice".into())
+        }
+    }
+}
+
 /// Marker on every roll-requeue comment, so tooling can find them.
 pub(crate) const ROLL_REQUEUE_COMMENT_MARKER: &str = "<!-- loom:roll-requeue -->";
 

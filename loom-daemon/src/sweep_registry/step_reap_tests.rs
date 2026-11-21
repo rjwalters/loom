@@ -181,32 +181,6 @@ fn a_judge_steps_claim_is_held_elsewhere_only_when_another_sweep_holds_the_lease
     assert!(!reg.step_lease_held_elsewhere(21, StepRole::Judge, "anyone", Utc::now()));
 }
 
-/// Review item 5: a PR step's roll requeue gives back only its own claim. A
-/// peer that took the role's lease during the roll window keeps the PR.
-#[test]
-fn a_pr_step_requeue_after_a_roll_checks_the_claim_is_still_its_own() {
-    let mine = "step-doctor-22-1";
-    let dir = tempdir().unwrap();
-    let peer = format!(
-        "{}\n{}",
-        role_lease_row(3, "peer-doctor").replace("role=judge", "role=doctor"),
-        role_lease_row(5, mine).replace("role=judge", "role=doctor"),
-    );
-    let reg =
-        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &peer, 0);
-    assert!(reg
-        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
-        .is_err());
-
-    let dir = tempdir().unwrap();
-    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
-    let reg =
-        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
-    assert!(reg
-        .roll_pr_step_claim_still_ours(22, StepRole::Doctor, mine)
-        .is_ok());
-}
-
 /// A registry whose fake `gh` serves `lease_rows` for comment reads and
 /// appends every other call's arguments to the returned write log.
 fn registry_logging_writes(dir: &std::path::Path, lease_rows: &str) -> (SweepRegistry, PathBuf) {
@@ -251,21 +225,6 @@ fn a_startup_restore_leaves_a_peer_held_claim_alone() {
         !std::fs::read_to_string(&log).unwrap_or_default().is_empty(),
         "its own lease (or none) lets the restore write"
     );
-}
-
-/// Should-fix: a PR step's own claim label lands after its start (the role
-/// prompt applies it), so the roll requeue judges by the lease alone.
-#[test]
-fn a_pr_step_roll_requeue_ignores_label_time() {
-    let mine = "step-doctor-23-1";
-    let dir = tempdir().unwrap();
-    let own = role_lease_row(5, mine).replace("role=judge", "role=doctor");
-    let reg =
-        crate::sweep_registry::test_support::fixture_registry_with_lease_gh(dir.path(), &own, 0);
-    // No lease-independent label read exists any more: the lease alone decides.
-    assert!(reg
-        .roll_pr_step_claim_still_ours(23, StepRole::Doctor, mine)
-        .is_ok());
 }
 
 /// #11969: a non-Builder claim label is the step's own while its lease was

@@ -143,7 +143,7 @@ const FETCH_SITES: &[(&str, &str, &str)] = &[
     // #11898: a dead step's role-keyed lease holder.
     (
         "sweep_registry/step_lease_owner.rs",
-        "read_role_lease_rows",
+        "read_role_lease_rows_with_policy",
         "policy.trusted_ndjson(",
     ),
     // #9062: the PR timeline read carries base-conflict flag comments.

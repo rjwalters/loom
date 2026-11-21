@@ -576,3 +576,57 @@ fn a_forced_manifest_loads_like_any_pausing_manifest() {
         other => panic!("the forced manifest must load: {other:?}"),
     }
 }
+
+/// The role's unreadable lease must defer H4. The old issue-first path tries
+/// to restore Builder instead, while the old PR path reports success.
+#[tokio::test]
+async fn h4_step_requeue_defers_when_role_ownership_is_unreadable() {
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let gh = root.join("fake-gh");
+    let writes = root.join("unexpected-writes");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/bash\ncase \"$1 $2\" in\n  'repo view') echo fixture/roll ;;\n  \
+             'issue edit'|'issue comment'|'pr edit'|'pr comment') printf '%s\\n' \"$*\" >> '{}' ;;\n  \
+             api*) exit 1 ;;\nesac\n",
+            writes.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut config = SweepRegistryConfig::new(root.clone());
+    config.gh_bin = Some(gh);
+    let registry = Arc::new(Mutex::new(SweepRegistry::new(config)));
+    let bus = Arc::new(crate::event_bus::EventBus::new());
+    let pool = Arc::new(crate::workspace_pool::WorkspacePool::new(
+        Arc::clone(&bus),
+        tokio::runtime::Handle::current(),
+    ));
+    pool.seed(root.clone(), registry);
+    let host = host::DaemonPauseHost::new(pool, root.clone(), bus);
+    for role in [
+        StepRole::Curator,
+        StepRole::ChampionPromote,
+        StepRole::Judge,
+        StepRole::Doctor,
+        StepRole::ChampionMerge,
+    ] {
+        let mut candidate = cand(&root, "step-fixture", 15, 5);
+        candidate.step = Some(role);
+        if role.acts_on_pr() {
+            candidate.issue = None;
+            candidate.pr = Some(15);
+        }
+        assert!(
+            host.requeue(&candidate, &RollRequeueNotice::default())
+                .is_err(),
+            "{role}"
+        );
+    }
+    assert!(!writes.exists(), "unknown ownership attempted a Forge mutation");
+}

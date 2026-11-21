@@ -265,3 +265,94 @@ fn a_role_requeue_leaves_a_claim_someone_took_since_alone() {
 fn an_untracked_role_resume_is_not_counted_as_resumed() {
     assert!(matches!(host::role_liveness(None), Liveness::Died { .. }));
 }
+
+#[test]
+fn h5_keeps_partial_step_release_and_reconciles_a_lost_notice_response() {
+    use crate::auto_update::pause_manifest::RollStepRelease;
+    use crate::step_role::StepRole;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let plan = plan(root);
+    let mut step = sweep(root, "step-curator-71-retry", 71);
+    step.step = Some(StepRole::Curator);
+    step.disposition = Disposition::Requeue;
+    step.status = ItemStatus::Planned;
+    step.reason = Some("young-agent-reset".into());
+    let label_progress = RollStepRelease {
+        claim_removed: true,
+        ..RollStepRelease::default()
+    };
+    step.set_roll_step_release(&label_progress);
+    write(&plan, &manifest("rp-step-release", Phase::Paused, vec![step]));
+
+    let script = root.join("fake-gh");
+    let blocked = root.join("block-note");
+    let comments = root.join("accepted-notes");
+    let edits = root.join("unexpected-edits");
+    std::fs::write(&blocked, "").unwrap();
+    std::fs::write(&script, format!(r#"#!/bin/bash
+case "$1 $2" in
+  'repo view') echo fixture/roll ;;
+  api*'/comments')
+    if [[ "$*" == *'loom:roll-step-release'* ]]; then cat '{comments}' 2>/dev/null; fi
+    exit 0 ;;
+  api*) echo '{{"state":"open","labels":["loom:triage"],"pr":false}}' ;;
+  'issue comment')
+    [[ -e '{blocked}' ]] && exit 1
+    jq -cn --arg body "$5" '{{body:$body,user:{{login:"loom-fleet-dispatch[bot]",type:"Bot"}},author_association:"NONE"}}' >> '{comments}'
+    exit 1 ;;
+  'issue edit'|'pr edit') touch '{edits}' ;;
+esac
+"#, comments=comments.display(), blocked=blocked.display(), edits=edits.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let first = RegistryHost::new(real_registry(root, Some(script.clone()), "false"));
+    assert!(matches!(run_h5(first, &plan), H5Outcome::PendingStepRelease(_)));
+    assert!(!plan.manifest_path.exists(), "the next roll retains its manifest slot");
+    let deferred_path =
+        pause_manifest::pending_step_manifest_path(&plan.manifest_path, "rp-step-release");
+    assert_eq!(
+        pause_manifest::pending_step_manifests(&plan.manifest_path),
+        vec![deferred_path.clone()]
+    );
+    let LoadOutcome::Loaded(pending) = pause_manifest::load(&deferred_path, Utc::now()) else {
+        panic!("the partial H5 release must remain discoverable");
+    };
+    assert_eq!(pending.phase, Phase::Resuming);
+    let retained = item(&pending, "step-curator-71-retry");
+    assert_eq!(retained.status, ItemStatus::Planned);
+    assert_eq!(retained.roll_step_release().unwrap(), label_progress);
+    assert!(!pending.events.iter().any(|e| e.event == "recovered"));
+    assert!(!comments.exists());
+
+    // A subsequent roll can use the canonical slot without removing the
+    // pending file. Deferred H5 reads its own manifest and leaves it alone.
+    let other = manifest("rp-next", Phase::Paused, vec![]);
+    write(&plan, &other);
+    let deferred_plan = ResumePlan {
+        manifest_path: deferred_path.clone(),
+        ..plan.clone()
+    };
+    std::fs::remove_file(&blocked).unwrap();
+    let second = RegistryHost::new(real_registry(root, Some(script.clone()), "false"));
+    let H5Outcome::Finished(status) = run_h5(second, &deferred_plan) else {
+        panic!("the deferred release must finish");
+    };
+    assert!(status.requeued_by_reason.is_empty(), "claim removal is not a queue restore");
+    assert!(!deferred_path.exists());
+    assert!(plan.manifest_path.exists());
+    let notices: Vec<_> = std::fs::read_to_string(&comments)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(notices.len(), 1);
+    let body = notices[0]["body"].as_str().unwrap();
+    assert!(body.contains("Removed `loom:curating`."));
+    assert!(!body.contains("Restored"));
+    assert!(!edits.exists(), "the confirmed label action was not repeated");
+    let third = RegistryHost::new(real_registry(root, Some(script), "false"));
+    assert_eq!(run_h5(third, &deferred_plan), H5Outcome::NoManifest);
+}
