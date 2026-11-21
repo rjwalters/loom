@@ -478,14 +478,15 @@ mod tests {
         assert!(doctor.contains(r#"PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-${CLAIM_HEAD_SHA:?}}""#));
         let re_pin = "{ PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }";
         assert!(doctor.matches(re_pin).count() >= 2, "both rewrite recipes re-pin");
-        // Every fenced block that rebases onto main and pushes a pinned lease
+        // Every fenced block that rebases onto the PR base and pushes a pinned lease
         // checks ancestry first — except the one that pins `git rev-parse HEAD`
         // right before the rebase, where the check is a tautology.
         let mut guarded = 0;
         for block in doctor.split("```").skip(1).step_by(2) {
-            let (Some(rebase), true) =
-                (block.find("git rebase origin/main"), block.contains("--force-with-lease=\"$"))
-            else {
+            let (Some(rebase), true) = (
+                block.find("git rebase \"$PR_BASE_SHA\""),
+                block.contains("--force-with-lease=\"$"),
+            ) else {
                 continue;
             };
             if block.contains("PUSH_LEASE_SHA=$(git rev-parse HEAD)\n") {
@@ -531,12 +532,12 @@ mod tests {
         let pin = step9
             .find("Pin the lease")
             .expect("step 9 names Pin the lease");
-        let main = step9
-            .find("origin/main")
-            .expect("step 9 names the #7668 rebase");
-        assert!(pin < main, "step 9 must send the Doctor to Pin the lease before any rebase");
+        let base = step9
+            .find("PR's verified base")
+            .expect("step 9 names the #7668 base update");
+        assert!(pin < base, "step 9 must send the Doctor to Pin the lease before any rebase");
         for line in step9.lines() {
-            if line.contains("origin/main") {
+            if line.contains("git fetch") || line.contains("git rebase origin/") {
                 assert!(line.contains("Pin the lease"), "standalone rebase in step 9: {line}");
             }
             if line.contains("PR Has Merge Conflicts") {
@@ -577,15 +578,29 @@ mod tests {
     fn strategy_path(mode: &str) -> (tempfile::TempDir, String) {
         let bin = tempfile::tempdir().expect("tempdir");
         let stub = bin.path().join("loom-daemon");
+        let forge = bin.path().join("gh");
         std::fs::write(
             &stub,
             format!("#!/bin/sh\ncase \"$1\" in forge) exit 1;; esac\necho {mode}\n"),
         )
         .expect("write stub");
+        std::fs::write(
+            &forge,
+            r#"#!/bin/sh
+set -e
+[ "$1 $2 $3" = "pr view 1" ]
+head=$(git ls-remote origin refs/heads/feature/x | cut -f1)
+base=$(git ls-remote origin refs/heads/main | cut -f1)
+printf '1\tOPEN\tfeature/x\t%s\tmain\t%s\n' "$head" "$base"
+"#,
+        )
+        .expect("write fake forge");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            std::fs::set_permissions(&forge, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
         }
         let path =
             format!("{}:{}", bin.path().display(), std::env::var("PATH").unwrap_or_default());
@@ -597,7 +612,7 @@ mod tests {
     /// Returns (exit status ok, stderr).
     fn doctor_flow(work: &Path, pushes: &[&str]) -> (bool, String) {
         let (_bin, path) = strategy_path("rebase");
-        let mut script = String::from("set -e\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n");
+        let mut script = String::from("set -e\nN=1\nCLAIM_HEAD_SHA=$(git rev-parse HEAD)\n");
         script.push_str(&prompt_block("### Verify the pin"));
         for step in pushes {
             script.push_str(step);

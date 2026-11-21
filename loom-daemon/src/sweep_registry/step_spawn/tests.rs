@@ -1356,6 +1356,120 @@ if [[ "$1" == api && "$2" == */issues/12133 && "$*" == *'.pull_request != null'*
 
     #[test]
     #[serial]
+    fn terminal_builder_reads_the_canonical_repo_without_ambient_routing() {
+        use crate::forge_identity::{Placement, RouteDecision};
+        use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+        use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        // The router knows this checkout has a pool, but cannot derive its
+        // reader route from ambient facts. The registry has the canonical repo.
+        for args in [
+            &["init", "--quiet"][..],
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/rjwalters/loom",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        builder_claim(&mut reg, MINE).unwrap();
+        // The ordinary reaper restores the label before attempting the yield.
+        reg.restore_step_claim(BUILDER_ITEM, StepRole::Builder, MINE)
+            .unwrap();
+        let before = admission(&reg);
+        assert!(before.stdout.starts_with("LEASE_ALREADY_HELD "), "{before:?}");
+        let reader = dir.path().join("reader");
+        std::fs::create_dir(&reader).unwrap();
+        {
+            let _router = install(TestRouting {
+                decision: RouteDecision::Reader {
+                    dir: reader,
+                    app_id: "fixture-reader".into(),
+                    placement: Placement::Home,
+                },
+                env: DeriveEnv::default(),
+                checkout: CwdAnswer::Unresolved,
+            })
+            .with_program(&reg.resolved_gh());
+            assert!(reg.read_order_lease_comments(BUILDER_ITEM).is_some());
+            let yielded = reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited");
+            let calls = seen();
+            for op in ["guard.lease_comments", "guard.finished_builder_lease"] {
+                let call = calls.iter().find(|call| call.op == op).unwrap();
+                assert_eq!(call.route_slug.as_deref(), Some("rjwalters/loom"), "{call:?}");
+                assert!(!call.shed, "{call:?}");
+            }
+            assert!(yielded, "{calls:?}");
+        }
+        assert!(stored_comments(&store)
+            .contains(&format!("loom:lease-yield host={} sweep={MINE}", reg.published_host_id())));
+        assert_eq!(admission(&reg).code, guard::EX_SAFE_TO_CLAIM);
+    }
+
+    #[test]
+    #[serial]
+    fn exhausted_reader_keeps_the_terminal_builder_lease_without_a_forge_call() {
+        use crate::forge_identity::{ExhaustCause, RouteDecision};
+        use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+        use crate::gh_invocation::test_routing::{install, seen, TestRouting};
+
+        let dir = tempdir().unwrap();
+        let (mut reg, store) = fixture(dir.path());
+        builder_claim(&mut reg, MINE).unwrap();
+        reg.restore_step_claim(BUILDER_ITEM, StepRole::Builder, MINE)
+            .unwrap();
+        let log = dir.path().join("gh-invocations.log");
+        let before = std::fs::read(&log).unwrap();
+        {
+            let _router = install(TestRouting {
+                decision: RouteDecision::Exhausted {
+                    until: std::time::SystemTime::now() + Duration::from_secs(60),
+                    cause: ExhaustCause::Budget,
+                },
+                env: DeriveEnv::default(),
+                checkout: CwdAnswer::Unresolved,
+            })
+            .with_program(&reg.resolved_gh());
+            assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+            let calls = seen();
+            let [call] = calls.as_slice() else {
+                panic!("expected one cleanup read, got {calls:?}");
+            };
+            assert_eq!(call.op, "guard.finished_builder_lease");
+            assert_eq!(call.route_slug.as_deref(), Some("rjwalters/loom"));
+            assert!(call.shed, "{call:?}");
+        }
+        assert_eq!(std::fs::read(&log).unwrap(), before, "no writer fallback");
+        assert!(!stored_comments(&store).contains("loom:lease-yield"));
+        assert!(admission(&reg).stdout.ends_with(MINE));
+    }
+
+    #[test]
+    #[serial]
+    fn unresolved_terminal_builder_repo_never_reads_or_yields_a_lease() {
+        let dir = tempdir().unwrap();
+        let (reg, store) = fixture(dir.path());
+        break_gh_arm(dir.path(), "if [[ \"$1\" == \"repo\" && \"$2\" == \"view\" ]]; then\n");
+
+        assert!(!reg.yield_finished_builder_lease(BUILDER_ITEM, MINE, "exited"));
+
+        let calls = std::fs::read_to_string(dir.path().join("gh-invocations.log")).unwrap();
+        assert!(calls.starts_with("repo view "), "{calls}");
+        assert!(!calls.contains("/comments"), "{calls}");
+        assert!(stored_comments(&store).is_empty());
+    }
+
+    #[test]
+    #[serial]
     fn won_builder_claim_spawn_failure_yields_its_lease() {
         let dir = tempdir().unwrap();
         let (mut reg, _) = fixture(dir.path());

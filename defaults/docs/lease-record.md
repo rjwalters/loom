@@ -214,13 +214,19 @@ a *released* fleet sweep's lease (last renewed 12:14:54Z, claim dropped
 a fresh lease"), `lease ensure` stopped there, and no attended lease ever
 appeared; when the leftover aged out, another host's recovery correctly found
 only a stale lease and reclaimed at 12:35:51Z. Now an exit 4 or 2 spawns one
-detached **deferred publisher** per issue per checkout. It re-runs the same
-publish (same trusted format, same peer rules, so a live peer is never
-superseded) every 60 s, slowing to 300 s once the peer has outlived the TTL. It
-stops when a publish settles (then starts the normal renewer with the time left
-of the original cap), when the watched session dies, or at the cap. Every
-outcome is appended to `.loom/logs/lease-ensure/issue-<N>.log`. An attended
-lease's sweep id is stable per watched session
+detached **deferred publisher** per issue per checkout. It wakes every 60 s
+to retry the same publish (same trusted format and peer rules, so a live peer
+is never superseded), slowing to 300 s once the peer has outlived the TTL.
+Before an eligible retry, it checks for an open PR linked to the issue in the
+repository where it would publish. If it finds one, it logs the PR number and
+stops. If the probe cannot determine whether such a PR exists, it skips that
+wake without attempting a publish or starting a renewer. The publisher also
+stops when an attempt settles, the watched session ends, or the original age
+cap is reached. A renewer started after publication gets only the time
+remaining under that cap. Repeated indeterminate probes can exhaust the cap
+before any deferred publish attempt. Every outcome is appended to
+`.loom/logs/lease-ensure/issue-<N>.log`. An attended lease's sweep id is stable
+per watched session
 (`sweep-insession-s<pid>-<start-time>`), so a second `lease ensure` from the
 same session re-attaches to its own lease. Without that, the session's first
 lease would read as a live peer and block the second call. An in-session

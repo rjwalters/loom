@@ -279,6 +279,12 @@ pub mod host_optout;
 pub mod host_pressure;
 pub mod host_shape;
 pub mod host_status;
+/// The host-wide cooldown gate shared by the cleanup passes
+/// (`docker_image_clean`, `tmpfs_reclaim`, `native_state_reclaim`): one
+/// "last evaluated at" timestamp per pass, with the elapsed/record logic
+/// single-sourced (#14861). Each pass owns its own instance — a shared
+/// timestamp would let one pass suppress the other two.
+pub(crate) mod host_wide_cooldown;
 pub mod hyperparams;
 pub mod idle_exit;
 pub mod inflight;

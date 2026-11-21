@@ -85,6 +85,10 @@ fn flag_is_latest_only_when_our_flag_is_the_newest_state_marker() {
 fn flag_comment_carries_a_fresh_changes_requested_verdict_marker() {
     // The stale-verdict pass must read our label as Fresh, not anchor it.
     let body = flag_comment_body(SHA);
+    assert!(body.contains(
+        "Doctor can repair the conflict when the PR's holds and repair-cycle limit allow it."
+    ));
+    assert!(!body.contains("(routes to Doctor)"));
     assert_eq!(
         crate::claim_reconciliation::extract_latest_verdict_sha(
             &[body],

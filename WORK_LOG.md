@@ -14,8 +14,83 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - [2026-02](work_log/WORK_LOG_2026-02.md)
 - [2026-01](work_log/WORK_LOG_2026-01.md)
 
+### 2026-11-21
+
+- **Issue #14834** (closed): Ratification lane: name the effective key markers per head and flag superseded duplicates
+- **PR #14857**: feat: add read-only ratification-lane status report for effective key markers
+- **Issue #14812** (closed): merge-sequencing: a stacked follower that conflicts with its held (loom:blocked) parent's branch is never repaired, and its linked issue never draws
+- **PR #14821**: fix(loom): repair sequenced conflicts against the PR base
+- **PR #14793**: fix: route finished Builder lease reads by canonical repo
+- **Issue #14817** (closed): lease-record.md: deferred publisher's stop conditions omit the linked-PR gate
+- **PR #14853**: docs(lease): explain when deferred publication stops
+- **Issue #14847** (closed): step tick: captain_not_eligible refusals spend the pass budget and starve other roles
+- **PR #14854**: Keep ineligible captain roles from starving local draws
+- **Issue #14849** (closed): Lease: retain terminal reasons for attended Builder renewal loops
+- **PR #14852**: fix(lease): retain attended renewer exit receipts
+- **Issue #14632** (closed): Merge-queue handoff can lose the status broker route on a fleet worker
+- **Issue #14845** (closed): Builder and Doctor replicates: run the other experiment arms from the same base, capture the patch, and have the daemon run the repo's check on every patch
+- **Issue #14844** (closed): Grader lane: blind, pinned-rubric grading of experiment units by a daemon-run session, recorded as experiment.grade
+- **Issue #14843** (closed): Judge replicate step: run the other experiment arms on the same PR head with a reader credential, a run-keyed worktree and the verdict captured instead of posted
+- **Issue #14840** (closed): Stage experiments: a named experiment in config, item-keyed arm assignment for steps, and loom.experiment.* on step telemetry
+- **Issue #14742** (closed): Builder admission stops at GraphQL-only issue and split-parent reads when REST is available
+- **PR #14773**: fix(forge): recover admission reads after GraphQL exhaustion
+- **Issue #14744** (closed): session_reconcile cannot create a private-clone seat on an App-only host: the daemon's own GH_CONFIG_DIR is inside its checkout
+- **PR #14766**: fix: skip the gh-config bind for daemon-owned App credentials in new private seats
+- **Issue #14716** (closed): Prove a stable forge read authority for private seat mirror admission
+- **PR #14726**: feat: prove forge read authority for private seat mirror admission
+- **Issue #14258** (closed): canonicalize_source_remote uses bare `timeout`, so the #14222 stale-remote fix is silently inert where timeout(1) is absent
+- **PR #14749**: fix: use portable timeout for resync canonical lookup
+- **Issue #14804** (closed): Daemon Judge steps should hand pending-CI PRs back, not wait out the step budget (avoids verdict-less backstop holds)
+- **PR #14814**: docs(judge): a daemon step hands back on pending CI instead of waiting it out
+- **Issue #14838** (closed): gitignore template misses .loom/account-ranking.<runtime> (daemon account-ranking state trips check-main-clean)
+- **Issue #14677** (closed): resync-installed.sh --output has no sanctioned source path for an agent working from a managed worktree in a consumer repo
+- **PR #14681**: feat(resync): add --source <dir> to name the defaults/ source checkout
+- **Issue #14570** (closed): Installer: an option to install into a repo without replacing the machine's daemon or user-scope hooks
+- **PR #14588**: feat(install): add --repo-only to skip machine-level provisioning
+- **Issue #13898** (closed): Installer's managed .gitignore block ignores neither node_modules/ nor pnpm-lock.yaml, which the root package.json stub's documented pnpm entry points produce
+- **PR #14136**: fix: ignore pnpm artifacts in the managed gitignore block of loom-workspace stub repos
+- **Issue #14836** (closed): Merge queue audit rejects the docs-only guard under Dashboard’s event filter
+- **PR #14837**: fix(ci): recognize the Dashboard docs-only audit condition
+- **Issue #14615** (closed): accounts check --ranking still shows borrowed weekly usage for a profile whose sessions dir is a symlink, while selection now ignores it
+- **PR #14697**: Use account-local Codex usage in availability reports
+- **PR #14546**: fix: let a CLI process ask the daemon for its primary workspace root
+- **Issue #14806** (closed): recover-orphaned-shepherds reports every claim as label_age_unverifiable (age 0s) and reclaims nothing
+- **PR #14819**: fix: report an unreadable orphan-recovery label age as unreadable, not 0s
+
 ### 2026-11-20
 
+- **PR #14831**: fix(guide): preserve exact parks during Doctor handoff
+- **Issue #14807** (closed): lease pr release reports 'released 0 lease comment(s)' while the lease record is still on the PR
+- **PR #14818**: fix: rewrite a released PR lease row's prose so it no longer reads as held
+- **Issue #14803** (closed): lease pr check reports 'free' while lease pr claim refuses with a backstop hold
+- **PR #14824**: fix: report Judge backstop holds in PR lease check
+- **PR #14826**: fix: scope pull request operator holds to confirmed joins
+- **PR #14829**: test: cover both private-workspace hook trust paths
+- **PR #14827**: feat(ci): install shared docs-only suite classification
+- **PR #14825**: fix(guide): recheck named blockers on parked pull requests
+- **PR #14801**: fix(lease): stop deferred publication when its PR opens
+- **PR #14800**: fix: rerun only the ratification keys missing at the selected head
+- **PR #14794**: fix: aggregate fleet roles across participating workspaces
+- **PR #14790**: refactor: serialize shared daemon status sections directly
+- **PR #14786**: test: reuse EnvGuard in unregistered workspace fixtures
+- **PR #14662**: docs(roles): gate Judge and Builder pre-push updates on workflow-lint
+- **PR #14653**: fix(roles): pin drift recovery to the verified PR head
+- **PR #14650**: fix(champion): classify workflow write-all permission values
+- **PR #14637**: fix(merge-queue): resolve the status-command route from a root of the target
+- **PR #14620**: fix: refuse an uncreatable verdict-lock directory at once instead of waiting as contention
+- **PR #14518**: fix(verdict-guard): don't read the verdict writer's own label as an operator send-back
+- **Issue #14809** (closed): Parked PRs stay loom:blocked after their main-red blockers close: neither Guide's PR unblock sweep nor ci_gate_recovery release
+- **Issue #14805** (closed): Builders that find an issue already satisfied exit without recording it, so the issue is redispatched repeatedly
+- **Issue #14799** (closed): Stop a deferred issue lease when its implementation PR opens
+- **Issue #14797** (closed): Ratification lane reruns keys already reviewed on the same head
+- **Issue #14791** (closed): One exhausted workspace can hide another workspace’s eligible role from the fleet captain
+- **Issue #14787** (closed): Remove duplicate field mappings from eight status JSON entries
+- **Issue #14783** (closed): Reuse EnvGuard in the five tests that clear GH_CONFIG_DIR
+- **Issue #14651** (closed): judge.md's worktree drift recovery (`git pull --ff-only`) moves a PR branch onto main when upstream tracking has drifted
+- **Issue #14648** (closed): Champion workflow check mistakes write-all inside a test filename for write permissions
+- **Issue #14617** (closed): forge verdict-lock waits 90 seconds and reports contention when its lock parent is read-only
+- **Issue #14516** (closed): Verdict staleness trusts an old rejection when a prepared Doctor commit is pushed later
+- **Issue #14156** (closed): Judge's and Builder's own merge-then-push paths resolve conflicts without the workflow-lint gate #13896 adds to Doctor
 - **Issue #14782** (closed): Consolidate repeated issue-dispatch requests in IPC handler tests
 - **PR #14784**: test: consolidate repeated issue DispatchSweep literals into issue_dispatch helper
 - **Issue #14775** (closed): Isolate synthetic gateway state from parallel claim-label tests
@@ -5857,72 +5932,6 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #8537**: feat(observability): fan out OTLP to ClickStack and SigNoz
 - **Issue #8551** (closed): The manual/in-session Builder claim path lacks the #4123 open-PR guard — a hand-claim duplicated an in-flight PR (#8413/PR #8462)
 - **PR #8567**: feat(daemon): add `forge check-open-pr` so hand-claims get the #4123 open-PR guard
-
-### 2026-09-21
-
-- **Issue #8508** (closed): Champion cannot recover from #8248's stale-check-freshness guard (missing actions:write to re-run)
-- **PR #8548**: feat(merge-pr): automated, bounded re-date remedy for the #8248 stale-check guard
-- **Issue #8436** (closed): Ordered runtime preference with fall-through: prefer Claude/Codex accounts, backstop on a metered OpenCode endpoint when their pools are exhausted
-- **PR #8557**: feat: ordered runtime preference resolver with credential fall-through
-- **Issue #8478** (closed): Builders escape macOS background-QoS with `launchctl submit` (KeepAlive) — unowned sims respawned forever and starved a host's admission brake for 12 h
-- **PR #8547**: feat(admission-brake): attribute foreign CPU load and surface brake starvation off-host (#8478)
-- **Issue #8550** (closed): merge-pr.sh reads PR_LABELS from a cached forge fetch — the #8112 guard refused a legitimate post-label-change merge 3x until the cache TTL expired
-- **PR #8558**: fix(merge-pr): read PR labels uncached so a hold release merges
-- **Issue #8487** (closed): daemon: reset_quarantine tests call make_dirty_git_worktree with no #[serial], stomping LOOM_WORKTREE_ACTIVITY_WINDOW_MINUTES
-- **PR #8533**: fix(daemon): stop the git-worktree fixture leaking a process-global activity window
-- **Issue #8447** (closed): api-keys pool: record the selected account in the sweep journal and add a provider column to the dashboard account view
-- **PR #8534**: feat(api-keys-pool): journal the selected account and add a provider-column dashboard account view
-- **Issue #8424** (closed): api-keys pool: wire live-spawn exhaustion classification, per-model-class scoping, and per-account concurrency cap
-- **PR #8519**: feat(api-keys-pool): automatic post-hoc bad-marking, model-class scoping, and a per-account concurrency cap
-- **Issue #8502** (closed): dep-recheck-fingerprint named-dependency: cross-repo owner/repo#N checklist items produce false VERDICT=clear
-- **PR #8510**: fix(dep-recheck): accept cross-repo owner/repo#N named dependencies
-- **Issue #8401** (closed): native harness API-key account pool: rotate a fleet of Z.ai coding-plan subscriptions through OpenCode/Pi with per-account exhaustion state (the API-key analogue of the Claude token pool)
-- **PR #8428**: feat(api-keys-pool): add provider-neutral API-key account pool for native harnesses
-- **Issue #8484** (closed): Adopt the requires-daemon marker in the remaining eleven script-helper stubs
-- **PR #8493**: feat(scripts): declare requires-daemon floors in the remaining eleven script-helper stubs
-- **Issue #8499** (closed): premise-check resolves citations against the primary clone, not the invoking worktree (false exit 12)
-- **PR #8503**: fix(premise-check): resolve citations against the invoking worktree, not the primary clone (#8499)
-- **Issue #8496** (closed): daemon tests: LOOM_REPO mutated under bare #[serial] in ~11 files vs #[serial(loom_config_env)] in role_collision.rs
-- **PR #8501**: test(daemon): put every LOOM_REPO mutator on one serial_test lock key
-- **Issue #8492** (closed): peer-claim coordination is DEGRADED on robb-pro (#6157 Layer 3)
-- **Issue #8420** (closed): Emit a premise record at proposal-filing time (Architect/Hermit/Auditor) — option 3 of #8396, deferred
-- **PR #8498**: feat(roles): emit a premise record at proposal-filing time (#8420)
-- **Issue #8477** (closed): Fleet token/cost history silently expires after 30 days: transcript ingestion is opt-in and off, while Claude Code deletes transcripts at 30 days
-- **PR #8495**: feat(daemon): default transcript token ingestion ON, with a config knob and a health section
-- **Issue #8480** (closed): daemon tests: LOOM_GH_BIN is mutated under two different serial_test lock keys (orphan_recovery bare #[serial] vs role_collision loom_config_env)
-- **PR #8497**: test(daemon): unify LOOM_GH_BIN and LOOM_SHARED_TOKENS_DIR serial_test lock keys
-- **Issue #8407** (closed): Codex per-subscription availability probe: expose quota/rate-limit state per account into provider-aware ranking (the `tokens check` analogue)
-- **PR #8490**: feat(accounts): Codex per-subscription availability probe (#8407)
-- **Issue #8465** (closed): daemon: forge_cmd::tests::gitea_basic_auth_colon_username_rejected is flaky under the full --lib run
-- **PR #8488**: test(forge_cmd): unify the module's serial_test lock key on loom_config_env
-- **Issue #8463** (closed): Seven workspace tests read host state, not fixture state — permanently red on any live-fleet host
-- **PR #8481**: fix(daemon): sandbox tmux terminal restore under LOOM_NO_RESTORE at startup
-- **Issue #8385** (closed): Auto-roll the daemon on a version-floor refusal, and adopt the requires-daemon marker in the script-helper stubs
-- **PR #8483**: feat(script-helper): refuse a below-floor daemon with the roll command, not clap's bare error
-- **Issue #8459** (closed): loom-daemon: cargo target-dir GC subcommand — prune stale incremental/deps caches, report bytes reclaimed (#8453 item 3)
-- **PR #8485**: feat(loom-daemon): cargo target-dir GC subcommand — prune stale incremental/deps caches
-- **Issue #8448** (closed): Guarded tool binding is never loaded on OpenCode 2.x: role workers start toolless, do nothing, and exit 0 (live canary FAILED safely)
-- **PR #8482**: fix(role-runner): report a toolless guarded-native role tick as a failed launch (#8448)
-- **Issue #8396** (closed): Design and wire a premise-check gate before Curator for autonomously-filed/design-reversing issues (re-file of #8310, corrected citation)
-- **PR #8425**: feat(premise-gate): refuse a self-approved design reversal before Curator enriches it
-- **Issue #8456** (closed): cargo: set CARGO_INCREMENTAL=0 for Loom-spawned workers to unblock sccache caching (#8453 item 1)
-- **PR #8475**: perf(spawn): set CARGO_INCREMENTAL=0 for every Loom-spawned worker (#8456)
-- **Issue #8285** (closed): merge-pr.sh fails closed on a daemon predating a required subcommand — name the remediation (artifact roll) and declare the minimum daemon version per script
-- **PR #8386**: fix(merge-pr): name the daemon roll in the refusal, and declare every script's daemon version floor
-- **Issue #8197** (closed): release-fetch: a .sig download failure is indistinguishable from an unsigned release, silently downgrading to checksum-only
-- **PR #8227**: fix(release-fetch): refuse a published-but-unfetchable .sig instead of downgrading to checksum-only
-- **Issue #8454** (closed): native containment: no regression test pins `Selection.credential_sources`, and file-path credentials are not mounted
-- **PR #8468**: test(native-containment): pin Selection.credential_sources; document file-path credential limitation
-- **Issue #8439** (closed): daemon: reaper no_progress predicate charges productive exit-0 partial-increment sweeps to the insta-crash quarantine tally
-- **PR #8466**: fix(daemon): exempt productive exit-0 sweeps from the no-progress quarantine tally (#8439)
-- **Issue #8413** (closed): Worktree reaper hard-reset an in-flight builder's worktree mid-compile (idle-detection misfire)
-- **PR #8462**: fix(daemon): stop destructive worktree passes from wiping a live in-session build (#8413)
-- **Issue #8473** (closed): daemon-reference: the `pool_exhausted` disjoint-bucket paragraph predates #8444's permanent-hold split
-- **PR #8474**: docs(daemon-reference): the pool_exhausted disjoint bucket is self-healing-only since #8444 (#8473)
-- **Issue #8444** (closed): Codex pool gate (#8408): zero-provisioned and unreadable-state skips are reported as self-healing PoolExhausted; wording and coverage polish
-- **PR #8472**: fix(role-runner): split never-self-healing codex pool holds out of the self-healing PoolExhausted verdict (#8444)
-- **Issue #8443** (closed): Codex-runtime role ticks never record TOKEN_EXHAUSTED into account health, so #8408's pre-spawn codex gate has no holds to read
-- **PR #8464**: fix(role-runner): feed codex role-tick terminal results into account health
 
 ### 2026-08-09 — Residual gap notice (superseded by the 2026-08-13 notice above)
 

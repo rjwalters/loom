@@ -82,9 +82,10 @@
 //! same bases once per registered repo per tick.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+
+use crate::host_wide_cooldown::HostWideCooldown;
 
 // ============================================================================
 // Constants
@@ -540,42 +541,25 @@ pub fn log_report(report: &NativeStateReclaimReport) {
 /// Process-global "when did a pass last actually walk the bases" — host-wide
 /// (not per-repo): both directories this module reclaims are keyed outside
 /// any one repo, so a host with several registered repos ticking on the same
-/// reaper cadence must not re-walk them once per repo.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// reaper cadence must not re-walk them once per repo. The elapsed/record
+/// logic lives in the shared [`HostWideCooldown`]; the instance is this
+/// module's own, so a pass here never suppresses the Docker or tmpfs passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = None;
+    COOLDOWN.reset();
 }
 
 /// Run one production native-state-reclaim pass, honoring the host-wide
