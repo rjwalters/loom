@@ -390,7 +390,7 @@ def parse_gh_args(args: list[str]) -> dict:
                     is_mutation = True
                     break
             if arg in ("-f", "--field", "-F", "--raw-field"):
-                # POST with fields (typed -F/--raw-field included, #14011)
+                # Treat literal -f/--raw-field and typed -F/--field as writes (#14011).
                 is_mutation = True
                 break
         if not is_mutation:
@@ -449,9 +449,10 @@ def resolve_gh_timeout_s() -> float | None:
 def is_write_invocation(args: list[str]) -> bool:
     """True when this invocation may mutate state (#13930 retry policy):
     a mutation subcommand (`pr edit`, `issue comment`, …) or a `gh api` call
-    with a non-GET `-X`/`--method` or form fields (`-f`/`--field` and the
-    typed `-F`/`--raw-field` imply POST, #14011) — the same shapes
-    parse_gh_args classifies as uncacheable. A timed-out write
+    with a non-GET `-X`/`--method` or form fields, either literal
+    `-f`/`--raw-field` or typed `-F`/`--field` (#14011). Typed values
+    expand `@<path>` or `@-` to file or stdin input. These are the same
+    shapes parse_gh_args classifies as uncacheable. A timed-out write
     is never retried: it may already have landed, and a retry could
     double-post."""
     if not args:

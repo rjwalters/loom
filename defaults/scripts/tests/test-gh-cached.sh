@@ -570,22 +570,21 @@ case "$(cat "$TMP_ROOT/timeout-write.err")" in
 esac
 assert_eq "yes" "$wdiag" "…with the attempts=1 diagnostic"
 
-# `gh api -F`/`--raw-field` is a WRITE too (#14011): a raw-field POST gets
-# the mutation contract — exactly one attempt — so a timed-out POST can
-# never be double-posted by the read retry. `-F body=@-` is the documented
-# REST-fallback stdin shape, so it must classify the same way.
+# A `gh api` POST with typed `-F`/`--field` gets exactly one attempt
+# (#14011), so a timeout cannot double-post it. Typed `-F body=@-`
+# reads the body from stdin. Literal `-f`/`--raw-field` sends the value as written.
 reset_cache
 ghc_slow api repos/o/r/issues/42/comments -F body=x \
     >"$TMP_ROOT/timeout-api-F.out" 2>"$TMP_ROOT/timeout-api-F.err"
 api_f_rc=$?
 assert_eq "124" "$api_f_rc" "a stalled 'gh api … -F body=x' expires (124)"
-assert_eq "1" "$(call_count)" "…with exactly ONE attempt — a raw-field POST is a write, never retried (#14011)"
+assert_eq "1" "$(call_count)" "…with exactly ONE attempt — a typed-field POST is a write and gets no retry (#14011)"
 assert_eq "" "$(cat "$TMP_ROOT/timeout-api-F.out")" "…and no partial stdout"
 
 # Classification (#14011), asserted directly against the wrapper module:
 # BOTH predicates — parse_gh_args (cacheability) and is_write_invocation
-# (retry policy) — must treat -F/--raw-field (incl. the body=@- stdin form)
-# as a write, while field-less api calls and GET stay cacheable reads.
+# (retry policy) — must treat typed -F/--field (including -F body=@-)
+# and literal -f/--raw-field as writes. Field-less API reads stay cacheable.
 python3 -B - "$GH_CACHED" <<'PY'
 import importlib.util, sys
 from importlib.machinery import SourceFileLoader
@@ -621,7 +620,7 @@ if bad:
     print("; ".join(bad))
     sys.exit(1)
 PY
-assert_eq "0" "$?" "both predicates classify -F/--raw-field (incl. body=@-) as writes; field-less and GET api calls stay cacheable reads (#14011)"
+assert_eq "0" "$?" "both predicates classify typed and literal field flags as writes and cache field-less API reads (#14011)"
 
 # A read that stalls ONCE then succeeds: the retry returns the good output.
 FLAKY_DIR="$TMP_ROOT/flakybin"
