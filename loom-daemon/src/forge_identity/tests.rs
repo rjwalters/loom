@@ -351,6 +351,8 @@ fn only_reviewed_read_paths_request_reader_credentials() {
         // W4-C: the choke point's class-aware chain (the same reviewed
         // routing step, with the router injected).
         "gh_invocation/reader_route_v2.rs",
+        // The test-only route regression uses temporary reader directories and an inert gh.
+        "gh_invocation/reader_route_v2_tests.rs",
         // W7: the ETag store's W4-C deferrable chain (`ConditionalRead::
         // deferrable`), the same reviewed routing step with the router injected.
         "forge_etag_store/deferrable.rs",

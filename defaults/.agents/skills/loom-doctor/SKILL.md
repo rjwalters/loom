@@ -144,14 +144,8 @@ gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid'
 # the two commit SHAs above should match
 ```
 
-If they don't match, do **not** assume the worktree is simply stale and force-push
-over it — `git fetch && git reset --hard origin/feature/issue-<ISSUE_NUM>` first
-to align the local branch with the real PR history, then re-point the upstream
-(`git branch --set-upstream-to=origin/feature/issue-<ISSUE_NUM>`) before making any
-edits. A worktree whose HEAD does *not* match the PR's remote head is either
-running an older `worktree.sh` (pre-#4823) or a symptom of a genuinely diverged
-local state — either way, fixing review feedback on top of the wrong base produces
-a PR-clobbering force-push or a diff against the wrong parent.
+A mismatch means this worktree can be stale or have independent commits.
+Verify the named branch and exact forge head before advancing it.
 
 **Run the check, don't just eyeball it (#6257).** `worktree.sh <ISSUE_NUM>`'s own
 "directory already exists" fast path now performs this same fetch-and-compare and
@@ -165,24 +159,73 @@ meant for another directory (#6373: a Judge reported a worktree and the main
 checkout clean from one `cd`'d `git status`):
 
 ```bash
-WORKTREE_ABS="$(cd .loom/worktrees/issue-<ISSUE_NUM> && pwd)"
-PR_HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid')
-WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
-WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
+WORKTREE_ABS="$(pwd -P)"   # already in the isolated worktree; PR_NUMBER names the PR
+PR_HEAD=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,isCrossRepository) || exit 1
+PR_HEAD_REF=$(jq -er '.headRefName | strings | select(length > 0)' <<<"$PR_HEAD") || exit 1
+PR_HEAD_SHA=$(jq -er '.headRefOid | strings | select(test("^[0-9a-f]{40}$"))' <<<"$PR_HEAD") || exit 1
+[ "${CLAIM_HEAD_SHA:-$PR_HEAD_SHA}" = "$PR_HEAD_SHA" ] || { echo 'PR head moved. Re-evaluate the PR.'; exit 1; }
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+WT_BRANCH=$(git -C "$WORKTREE_ABS" symbolic-ref --quiet --short HEAD || true)
 
-if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
-    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
-    if [ -n "$WT_STATUS" ]; then
-        ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP (never bare `git stash`); post its path in a PR comment
-        git -C "$WORKTREE_ABS" checkout -- .
-    fi
-    git -C "$WORKTREE_ABS" pull --ff-only
+ISSUE_NUM=
+if jq -e '.isCrossRepository == false' <<<"$PR_HEAD" >/dev/null &&
+   [[ "$PR_HEAD_REF" =~ ^feature/issue-([0-9]+)$ ]] && [ -n "$WT_BRANCH" ]; then
+    [ "$WT_BRANCH" = "$PR_HEAD_REF" ] || { echo 'Unexpected local branch. Stop recovery.'; exit 1; }
+    ISSUE_NUM="${PR_HEAD_REF#feature/issue-}"
 fi
+if [ -n "$WT_STATUS" ]; then
+    if [ -n "$ISSUE_NUM" ]; then
+        (cd "$WORKTREE_ABS" && ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked) || exit 1
+    fi
+    echo 'Preserve the dirty worktree and stop recovery.'
+    exit 1
+fi
+
+if [ -n "$ISSUE_NUM" ]; then
+    PR_TRACKING_REF="refs/remotes/origin/$PR_HEAD_REF"
+    WT_UPSTREAM=$(git -C "$WORKTREE_ABS" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ "$WT_UPSTREAM" != "$PR_TRACKING_REF" ]; then
+        git -C "$WORKTREE_ABS" fetch --no-tags origin "+refs/heads/$PR_HEAD_REF:$PR_TRACKING_REF" || exit 1
+        FETCHED_SHA=$(git -C "$WORKTREE_ABS" rev-parse --verify 'FETCH_HEAD^{commit}') || exit 1
+        CURRENT_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid') || exit 1
+        [ "$FETCHED_SHA" = "$PR_HEAD_SHA" ] && [ "$CURRENT_SHA" = "$PR_HEAD_SHA" ] || {
+            echo 'Fetched branch or current PR head differs from the pinned head. Stop recovery.'
+            exit 1
+        }
+        git -C "$WORKTREE_ABS" merge-base --is-ancestor HEAD "$FETCHED_SHA" || {
+            echo 'Preserve the local commits before recovery.'
+            exit 1
+        }
+        WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+        [ -z "$WT_STATUS" ] || exit 1
+        git -C "$WORKTREE_ABS" merge --ff-only "$FETCHED_SHA" || exit 1
+        [ "$(git -C "$WORKTREE_ABS" rev-parse --verify "$PR_TRACKING_REF")" = "$FETCHED_SHA" ] || exit 1
+        git -C "$WORKTREE_ABS" branch --set-upstream-to="$PR_TRACKING_REF" "$PR_HEAD_REF" || exit 1
+    fi
+fi
+
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD) || exit 1
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain) || exit 1
+[ "$WT_HEAD_SHA" = "$PR_HEAD_SHA" ] && [ -z "$WT_STATUS" ] || exit 1
 ```
 
-Only proceed to fix review feedback once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and
-`WT_STATUS` is empty. If `git pull --ff-only` fails, fall back to the
-`fetch && reset --hard` + `set-upstream-to` sequence above.
+Proceed with editing once the final checks pass. The recovery uses the fetched
+commit object that matches both forge reads and sets tracking only after a
+successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
+cache is stale. The local branch advances by fast-forward after verification.
+
+For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
+check the exact head and clean state there. The named `origin` recovery
+applies only to the matching same-repository issue branch. If the dedicated
+checkout already has local changes or commits, preserve it before refreshing.
+The detached-checkout rules above still apply.
+
+For divergence, leave the local tip in place and report it. In a separately
+authorized manual recovery, preserve the old tip under a named backup ref and
+save any worktree changes first. Fetch and verify the named remote branch
+against the current forge head again before using `git reset --hard` to that
+verified commit and setting its upstream.
 
 If you also need to state that the main checkout is clean (e.g. after
 resolving a contamination scare), name `$WORKTREE_ABS` and the main-checkout
@@ -627,12 +670,13 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
     # alone is not a valid invocation — it needs the base + two commits).
     if [ "$(gh pr view "$UNLABELED_PR" --json mergeable --jq '.mergeable')" = "CONFLICTING" ]; then
       # Pin = the head just checked out, BEFORE the update; never the forge (#9487).
+      N=$UNLABELED_PR
       PUSH_LEASE_SHA=$(git rev-parse HEAD)
       # Now run "PR Has Merge Conflicts" (below) top to bottom: merge (or rebase,
       # per `branch-update strategy`, #10771), resolve, version gate, push.
 
       # Comment but don't add labels
-      ./.loom/scripts/post-comment.sh $UNLABELED_PR --pr --body "🔧 Fixed merge conflicts with main branch."
+      ./.loom/scripts/post-comment.sh "$UNLABELED_PR" --pr --body "🔧 Fixed conflicts with the PR's base branch."
     fi
   else
     echo "No work available - all queues empty"
@@ -734,7 +778,7 @@ loom-daemon forge doctor-handback 588 --expected-head-sha "$(git rev-parse HEAD)
 8. **Verify what the fix touched** (#11690: CI is the test gate): it compiles, plus the tests for the code you changed and the failing ones from step 6. Never the full suite or `buildGate.command`; remote CI (step 10) is the verdict.
 9. **Commit and push**: Push your fixes to the PR branch
    - **Pre-push head-SHA recheck (MANDATORY)**: before the push, re-compare the PR's `headRefOid` against the `CLAIM_HEAD_SHA` you captured in step 2 — see "Pre-Push Head-SHA Recheck" below. If the head moved, another agent pushed while you were working; re-verify the blocker is still unaddressed and stand down rather than duplicating (or clobbering) their fix.
-   - **Then run "Pin the lease" below, top to bottom**: the pre-open update from `origin/main` (MANDATORY, #7668, as `builder-pr.md` § "Pre-Push Rebase"; a merge unless `loom-daemon branch-update strategy` says rebase, #10771) and the push (#9487). Never update before it. On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`), resume at its version gate, not "PR Has Merge Conflicts". No-op if `main` hasn't moved.
+   - **Then run "Pin the lease" below, top to bottom**: update from the PR's verified base (mandatory, #7668), then push (#9487). Use a merge unless `loom-daemon branch-update strategy` says rebase (#10771). On a conflict resolve in place (`git add`, then `git commit --no-edit` or `git rebase --continue`) and resume with the pinned base at the workflow-lint gate.
    - **Lease fence (MANDATORY)**: its `lease pr fence` runs right before the push.
    - **DCO / sign-off**: never pass `--signoff` / `-s` or write a `Signed-off-by:` trailer — no role attests a DCO sign-off (operator ruling 2026-10-25, #13089). If the PR's required checks match `dco` / `sign-?off` and it lacks `loom:operator`, stop: apply `loom:operator` with a comment saying an operator-signed replacement is needed, and do not fix anything else. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
@@ -972,6 +1016,11 @@ never rebase, amend or force a commit already on the remote; add commits. A
 rejected plain push means someone pushed: redo the Head-SHA Recheck (merge
 their head in, or stand down), never force.
 
+Use `N` from the claim. The forge must still show that open PR at the pinned
+head on the checked-out branch. Fetch its named base from `origin` and use the
+verified commit for the update, workflow lint and discard guard. The same PR
+snapshot must still hold immediately before the push fence.
+
 ```bash
 BRANCH=$(git branch --show-current)
 BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # unknown = merge
@@ -980,19 +1029,27 @@ PUSH_LEASE_SHA="${PUSH_LEASE_SHA:-$CLAIM_HEAD_SHA}"
 [ -n "$PUSH_LEASE_SHA" ] || { echo "No pin: STOP. Do not push or re-read the head." >&2; exit 1; }
 # git accepts ANY full-SHA pin, even unfetched: "Verify the pin" must have run first.
 [ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { echo "Pin unverified: STOP." >&2; exit 1; }
-git fetch origin main || exit 1
-if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: update before push)" origin/main; fi || exit 1  # conflict: resolve, add, `--continue` / `git commit --no-edit`, resume here
+PR_FIELDS=number,state,headRefName,headRefOid,baseRefName,baseRefOid
+PR_FORMAT='[.number, .state, .headRefName, .headRefOid, .baseRefName, .baseRefOid] | @tsv'
+PR_SNAPSHOT=$(gh pr view "${N:?PR number required}" --json "$PR_FIELDS" --jq "$PR_FORMAT") || exit 1
+IFS=$'\t' read -r PR_NUMBER PR_STATE PR_BRANCH PR_HEAD PR_BASE PR_BASE_SHA <<< "$PR_SNAPSHOT" || exit 1
+[ "$PR_NUMBER" = "$N" ] && [ "$PR_STATE" = OPEN ] && [ -n "$BRANCH" ] && [ "$PR_BRANCH" = "$BRANCH" ] && [ "$PR_HEAD" = "$PUSH_LEASE_SHA" ] && [ -n "$PR_BASE_SHA" ] || { echo "PR identity, head or base unavailable or changed. Stop and recheck." >&2; exit 1; }
+git check-ref-format "refs/heads/$PR_BASE" && git fetch --no-tags origin "refs/heads/$PR_BASE" || exit 1
+[ "$(git rev-parse --verify 'FETCH_HEAD^{commit}')" = "$PR_BASE_SHA" ] || { echo "PR base moved during fetch. Stop and recheck." >&2; exit 1; }
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase "$PR_BASE_SHA"; else git merge --no-ff -m "Merge origin/$PR_BASE into $BRANCH (Doctor: update before push)" "$PR_BASE_SHA"; fi || exit 1  # conflict: resolve, add, `--continue` / `git commit --no-edit`, resume here
 # Workflow-lint gate (#13896): the update above — and any conflict resolution in it — can textually union two copies of one setup block, leaving a touched workflow with a duplicate step id or a duplicate mapping key. GitHub rejects such a file at validation with zero jobs, so its gate vanishes and every rollup reads green. Lint every workflow the resolved result touched BEFORE pushing; a defect — or the lint being unable to run (a stale loom-daemon without the subcommand exits non-zero) — blocks the push and any "conflict resolved" claim. Fail closed: never treat silence as a pass.
-WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
+WL_FILES=$(git diff --name-only --diff-filter=ACMR "$PR_BASE_SHA"...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
 [ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — resolve the defect; do not push and do not claim the conflict resolved." >&2; exit 1; }
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Aborting: version-bearing files out of sync after update (see BLOCKER:/Fix:)." >&2
   exit 1
 fi
 # Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
-RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+RG=0; loom-daemon forge rebase-guard --base "$PR_BASE_SHA" || RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
+PR_CURRENT=$(gh pr view "$N" --json "$PR_FIELDS" --jq "$PR_FORMAT") || exit 1
+[ "$PR_CURRENT" = "$PR_SNAPSHOT" ] || { echo "PR identity, head or base changed before push. Stop and recheck." >&2; exit 1; }
 loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 [[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
@@ -1427,7 +1484,9 @@ Fixing A's findings does not resolve B's. This list is evidence only; Judge deci
 
 ### PR Has Merge Conflicts
 
-This is a critical issue that blocks merging. Fix it immediately:
+Repair against the base named by the open PR. For a stacked follower this is
+the predecessor's branch. Keep the follower's `loom:sequenced` merge hold on.
+Use the verified PR snapshot through the repair and push fence:
 
 ```bash
 # Pin = the claim-time head, never re-read; verify BEFORE any rewrite.
@@ -1438,12 +1497,18 @@ BRANCH=$(git branch --show-current)
 [ "${PUSH_LEASE_OK:-}" = "$PUSH_LEASE_SHA" ] || { git merge-base --is-ancestor "$PUSH_LEASE_SHA" HEAD && PUSH_LEASE_OK=$PUSH_LEASE_SHA; } || { echo "Pin not in HEAD: STOP." >&2; exit 1; }
 BRANCH_UPDATE=$(loom-daemon branch-update strategy) || BRANCH_UPDATE=merge  # #10771; unknown = merge
 
-git fetch origin main
-if [ "$BRANCH_UPDATE" = rebase ]; then git rebase origin/main; else git merge --no-ff -m "Merge origin/main into $BRANCH (Doctor: resolve conflicts)" origin/main; fi
+PR_FIELDS=number,state,headRefName,headRefOid,baseRefName,baseRefOid
+PR_FORMAT='[.number, .state, .headRefName, .headRefOid, .baseRefName, .baseRefOid] | @tsv'
+PR_SNAPSHOT=$(gh pr view "${N:?PR number required}" --json "$PR_FIELDS" --jq "$PR_FORMAT") || exit 1
+IFS=$'\t' read -r PR_NUMBER PR_STATE PR_BRANCH PR_HEAD PR_BASE PR_BASE_SHA <<< "$PR_SNAPSHOT" || exit 1
+[ "$PR_NUMBER" = "$N" ] && [ "$PR_STATE" = OPEN ] && [ -n "$BRANCH" ] && [ "$PR_BRANCH" = "$BRANCH" ] && [ "$PR_HEAD" = "$PUSH_LEASE_SHA" ] && [ -n "$PR_BASE_SHA" ] || { echo "PR identity, head or base unavailable or changed. Stop and recheck." >&2; exit 1; }
+git check-ref-format "refs/heads/$PR_BASE" && git fetch --no-tags origin "refs/heads/$PR_BASE" || exit 1
+[ "$(git rev-parse --verify 'FETCH_HEAD^{commit}')" = "$PR_BASE_SHA" ] || { echo "PR base moved during fetch. Stop and recheck." >&2; exit 1; }
+if [ "$BRANCH_UPDATE" = rebase ]; then git rebase "$PR_BASE_SHA"; else git merge --no-ff -m "Merge origin/$PR_BASE into $BRANCH (Doctor: resolve conflicts)" "$PR_BASE_SHA"; fi || exit 1
 # Conflict: resolve each file, `git add` it, then `git commit --no-edit` (merge) or `git rebase --continue`.
 
 # Workflow-lint gate (#13896): the merge above — and any conflict resolution in it — can textually union two copies of one setup block, leaving a touched workflow with a duplicate step id or a duplicate mapping key. GitHub rejects such a file at validation with zero jobs, so its gate vanishes and every rollup reads green. Lint every workflow the resolved result touched BEFORE pushing; a defect — or the lint being unable to run (a stale loom-daemon without the subcommand exits non-zero) — blocks the push and any "conflict resolved" claim. Fail closed: never treat silence as a pass.
-WL_FILES=$(git diff --name-only --diff-filter=ACMR origin/main...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
+WL_FILES=$(git diff --name-only --diff-filter=ACMR "$PR_BASE_SHA"...HEAD -- '.github/workflows/') || { echo "Aborting: cannot list touched workflow files; verify .github/workflows by hand before pushing." >&2; exit 1; }
 [ -z "$WL_FILES" ] || loom-daemon workflow-lint $WL_FILES || { echo "Aborting: workflow-lint failed above — resolve the defect; do not push and do not claim the conflict resolved." >&2; exit 1; }
 
 # Version-gate: if it fires, stop and report; never hand-bump.
@@ -1453,17 +1518,19 @@ if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-che
 fi
 
 # Discard guard (#9282): rc 0 = BLOCKED, do NOT push; report its BLOCKER:/Fix:.
-RG=0; loom-daemon forge rebase-guard --base origin/main || RG=$?
+RG=0; loom-daemon forge rebase-guard --base "$PR_BASE_SHA" || RG=$?
 [ "$RG" = 0 ] && exit 1
 [ "$RG" = 1 ] || echo "WARNING: rebase-guard gave no answer (rc=$RG) - pushing UNCHECKED (#9282)" >&2
 
 # Merge: plain push (rejected: Head-SHA Recheck, never force). Rebase: PINNED lease.
-loom-daemon lease pr fence 42 --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
+PR_CURRENT=$(gh pr view "$N" --json "$PR_FIELDS" --jq "$PR_FORMAT") || exit 1
+[ "$PR_CURRENT" = "$PR_SNAPSHOT" ] || { echo "PR identity, head or base changed before push. Stop and recheck." >&2; exit 1; }
+loom-daemon lease pr fence "$N" --role doctor --watch-pid "${LOOM_AGENT_SESSION_PID:-${CLAUDE_PID:-$PPID}}"
 [[ $? =~ ^[02]$ ]] || exit 1  # lease lost: stand down
 if [ "$BRANCH_UPDATE" = rebase ]; then git push --force-with-lease="$BRANCH:$PUSH_LEASE_SHA"; else git push origin "HEAD:$BRANCH"; fi &&
   { PUSH_LEASE_SHA=$(git rev-parse HEAD); PUSH_LEASE_OK=$PUSH_LEASE_SHA; CLAIM_HEAD_SHA=$PUSH_LEASE_SHA; }
 
-loom-daemon forge wait-checks 42 --timeout 20
+loom-daemon forge wait-checks "$N" --timeout 20
 ```
 
 **Important**: never `--force`, and never a *bare* `--force-with-lease` — pin it.

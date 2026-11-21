@@ -912,6 +912,9 @@ fn only_the_step_tick_and_its_reporting_name_the_snapshot() {
         "observability/ops/hold_age.rs",
         "observability/ops/hold_age_tests.rs",
         "step_dispatch/driver.rs",
+        // The fleet-capacity fixture constructs synthetic discovery state and
+        // uses the standalone chain with fixture Forge responses.
+        "step_dispatch/driver_tests.rs",
         "step_dispatch/gather.rs",
         // Seeds `ItemExtras`/`Checks` fixtures for the Judge CI hold (#12317);
         // no claim, label-transition or merge read (invariant 3).

@@ -16,6 +16,29 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **Issue #14782** (closed): Consolidate repeated issue-dispatch requests in IPC handler tests
+- **PR #14784**: test: consolidate repeated issue DispatchSweep literals into issue_dispatch helper
+- **Issue #14775** (closed): Isolate synthetic gateway state from parallel claim-label tests
+- **PR #14779**: test: run gateway publication fixtures in child processes
+- **PR #14780**: test: remove unused isTelemetryProblem, cover misconfigured relay at the renderer
+- **Issue #14719** (closed): Remove the test-only isTelemetryProblem classifier and test the daemon_status warning directly
+- **PR #14778**: refactor(cli): share usage time-window resolution
+- **Issue #14774** (closed): Share time-window parsing across the Codex, OpenCode, and Pi usage commands
+- **PR #14772**: Price GPT-6.2 Astra usage in Loom
+- **PR #14770**: test: share the terminal ID rejection fixture
+- **Issue #14768** (closed): Collapse seven copy-pasted injection tests in integration_security.rs into the table-driven test
+- **PR #14764**: chore(harness): track latest CLIs — codex 0.170.0→0.171.0
+- **Issue #14759** (closed): Consolidate the collector README’s log-body policy and remove stale schema history
+- **PR #14763**: docs: consolidate collector log body guidance
+- **Issue #14754** (closed): Release the IPC test fixture’s temporary SQLite directory after each test
+- **PR #14762**: test: release the IPC fixture directory when tests finish
+- **Issue #14751** (closed): test flake: fleet_dispatch::server::tests::the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_lossy_stream fails on Rust Unit Tests (5/5) — "a 304 advances the age"
+- **PR #14761**: test: wait for the client to process the worklist 304
+- **Issue #14731** (closed): OTLP exporter: a 400 for an oversized body is permanent loss, and the per-batch byte bound is a fixed 4 MiB
+- **PR #14756**: fix: split oversized queued OTLP requests in order
+- **Issue #14738** (closed): workspace_resync: a failed release-tag verification at startup is never retried, so no host resyncs any workspace on 0.20.0
+- **PR #14748**: fix: report workspace resync release verification attempts
+- **PR #14745**: fix: carry observed step failure class to the attempt span
 - **PR #14743**: fix: preserve seat volume readings across sampling failures
 - **PR #14695**: fix: manual private-session exec refuses on its own busy seat
 - **PR #14243**: fix: stamp the forge's canonical repo name into loom_source_remote

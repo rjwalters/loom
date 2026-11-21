@@ -16,6 +16,9 @@ pub mod export;
 mod forge_auth;
 mod lease;
 mod lifecycle;
+pub mod read_authority;
+#[cfg(test)]
+mod read_authority_tests;
 #[cfg(test)]
 mod recover_tests;
 mod repository;
@@ -29,6 +32,13 @@ pub use lease::AccountBusy;
 pub use lifecycle::{
     check_binding, configured, converge, rebind, recover, registered_repositories, registrations,
     run_job, session_recover, start, status, stop, Converged,
+};
+/// The read-authority proof contract for host mirror admission (#14716):
+/// the stable grant a store pins, the verified credential a proof carries,
+/// and the separate attach/publication decisions over them.
+pub use read_authority::{
+    Admission, AdmissionRefusal, AuthorityGap, BorrowerAuthority, Publication, PublicationRefusal,
+    ReadGrant, ReadProof, Verification,
 };
 pub use repository::WorkerCommand;
 pub(crate) use volume_usage::{

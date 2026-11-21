@@ -296,31 +296,35 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "Test 5: previous_review_label restores the LATEST review label (ascending order)"
+EMPTY_REVIEW_LABELS='{"labels":[]}'
 
 write_fixture 4301 0 "$(labeled_event loom:changes-requested)" "$(labeled_event loom:review-requested)"
-assert_eq "$(previous_review_label 4301)" "loom:review-requested" \
+assert_eq "$(previous_review_label 4301 "$EMPTY_REVIEW_LABELS")" "loom:review-requested" \
     "changes-requested followed by a later review-requested restores loom:review-requested"
 
 write_fixture 4302 0 "$(labeled_event loom:review-requested)" "$(labeled_event loom:changes-requested)"
-assert_eq "$(previous_review_label 4302)" "loom:changes-requested" \
+assert_eq "$(previous_review_label 4302 "$EMPTY_REVIEW_LABELS")" "loom:changes-requested" \
     "review-requested followed by a later changes-requested restores loom:changes-requested"
 
 write_fixture 4303 0 "$(filler_event closed)"
-assert_eq "$(previous_review_label 4303)" "loom:review-requested" \
+assert_eq "$(previous_review_label 4303 "$EMPTY_REVIEW_LABELS")" "loom:review-requested" \
     "no review-label history defaults to loom:review-requested (the safe default)"
 
-assert_eq "$(previous_review_label 999999)" "loom:review-requested" \
+assert_eq "$(previous_review_label 999999 "$EMPTY_REVIEW_LABELS")" "loom:review-requested" \
     "empty history defaults to loom:review-requested"
 
 echo ""
 echo "Test 6: previous_review_label paginates to a review label beyond page 1"
 
 write_fixture 4401 100 "$(labeled_event loom:changes-requested)"
-assert_eq "$(previous_review_label 4401)" "loom:changes-requested" \
+assert_eq "$(previous_review_label 4401 "$EMPTY_REVIEW_LABELS")" "loom:changes-requested" \
     "a changes-requested event beyond the first 100 events is found"
 write_fixture 4402 100 "$(labeled_event loom:review-requested)"
-assert_eq "$(previous_review_label 4402)" "loom:review-requested" \
+assert_eq "$(previous_review_label 4402 "$EMPTY_REVIEW_LABELS")" "loom:review-requested" \
     "a review-requested event beyond the first 100 events is found"
+
+assert_eq "$(previous_review_label 4301 '{"labels":[{"name":"loom:changes-requested"}]}')" "loom:changes-requested" \
+    "the sole review lane in the current snapshot takes precedence over history"
 
 if grep -q 'path=repos/{owner}/{repo}/issues/events' "$GH_CALL_LOG"; then
     fail "a repo-wide issues/events path was requested at some point"

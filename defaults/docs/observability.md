@@ -83,11 +83,30 @@ Precedence is **env > config > default**, the same rule every other
 | `endpoint` | `LOOM_OBSERVABILITY_ENDPOINT` | unset (disables export) |
 | `ingestKeyFile` | `LOOM_OBSERVABILITY_INGEST_KEY_FILE` | `$HOME/.loom/observability/ingest.key` |
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
+| `maxBatchBytes` | `LOOM_OBSERVABILITY_MAX_BATCH_BYTES` | 4,194,304 bytes (4 MiB) |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | unset ⇒ no exporter; `"otlp"` (§3). The retired `"https"` is skipped with a warning (#12813) |
 | `exporters` | — (config only) | unset ⇒ `exporter` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
+
+`batchSize` limits the number of queued envelopes considered per flush.
+`maxBatchBytes` limits the **encoded OTLP JSON body** of each HTTP request,
+including its resource and scope wrappers. The first valid positive integer
+wins in this order: `LOOM_OBSERVABILITY_MAX_BATCH_BYTES`, the selected
+`observability.exporters[].maxBatchBytes` object field, the shared
+`observability.maxBatchBytes` field, then 4 MiB. A singular exporter or a
+string entry uses the shared field. For a receiver that caps requests at
+one MiB, set `"maxBatchBytes": 1048576` next to `batchSize` or on its exporter
+object.
+
+The queued exporter splits requests over the configured limit and requests
+explicitly refused for size (HTTP 413 or an explicit HTTP 400 size message).
+It processes the resulting groups in order. An irreducible oversized
+envelope records `request_too_large` in the durable loss ledger. Ordinary
+HTTP 400 responses keep their existing `status_400` behavior. This byte
+setting applies to the queued exporter. Raw worker relay forwarding keeps
+its own request policy.
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
 exporter: the OTel environment a spawned worker's own Claude Code session needs

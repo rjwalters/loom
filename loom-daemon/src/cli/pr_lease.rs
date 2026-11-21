@@ -959,6 +959,23 @@ pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>)
     body
 }
 
+/// The visible prose `release_with` leaves on a row it releases (#14807):
+/// the live record's text says the claim "is held", and a human reading the
+/// PR must not keep seeing that behind a released marker. `reaped` words it
+/// as the role runner's reap of a claimant that ended without releasing.
+pub(crate) fn released_body(holder: &Identity, pr: u64, reaped: bool) -> String {
+    format!(
+        "PR #{pr}'s `{label}` lease for the {role} of sweep `{sweep}` on host `{host}` was {verb}. \
+         This **PR lease record** (#9401) is no longer live. \
+         See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
+        verb = if reaped { "reaped" } else { "released" },
+        label = holder.claim_label_text(),
+        role = holder.role.as_str(),
+        sweep = holder.sweep,
+        host = holder.host,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -1016,8 +1033,10 @@ pub(crate) enum PrLeaseAction {
     /// sweep id (the claim's `--watch-pid`/`--sweep-id` was omitted; the
     /// output names it), nothing released (#13132).
     Release(ReleaseArgs),
-    /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
-    /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
+    /// Print `PR_LEASE_STATE=free|held-self|held-peer|held-backstop|unknown`.
+    /// Exit 0 free/held-self, 4 held-peer (+ holder), 5 unknown, 6 held-backstop.
+    /// A Judge backstop hold includes `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>` and,
+    /// for a gate-refusal cooldown, `PR_LEASE_BACKSTOP_REFUSED=<token>`.
     Check(Common),
     /// Internal: renew-only (#11906). Re-attach to this claimant's own live
     /// lease and start its renewer; never posts a lease. Exit 0 = attached;
@@ -1681,9 +1700,6 @@ impl Ctx {
                     Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
                 }
             });
-            let mut lines = row.body.lines();
-            lines.next();
-            let rest: Vec<&str> = lines.collect();
             // The released marker keeps the lease's own step.
             // A Champion merge step's release records its outcome (#12616);
             // a reaped one died without releasing, so it has none.
@@ -1697,10 +1713,14 @@ impl Ctx {
                 Some((word, reason)) => backstop::format_champion_outcome(word, reason.as_deref()),
                 None => String::new(),
             };
+            // #14807: the prose is rewritten too — the live record's text
+            // says the claim "is held", and no reader of the PR should keep
+            // seeing that behind a released marker. The renewal line, if
+            // any, goes with it: no reader parses it on a released row.
             let body = format!(
                 "{}\n{}",
                 holder.released_marker_with(&format!("{extra}{champion}")),
-                rest.join("\n")
+                released_body(&holder, self.pr(), reaped.is_some())
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
@@ -1737,6 +1757,18 @@ impl Ctx {
     pub(crate) fn check(&self) -> i32 {
         let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
         let state = self.state_of(rows.as_deref());
+        if let Some((until, refused)) = rows
+            .as_deref()
+            .filter(|_| state == ClaimState::Free)
+            .and_then(|rows| self.backstop_hold(rows))
+        {
+            println!("PR_LEASE_STATE=held-backstop");
+            println!("PR_LEASE_BACKSTOP_UNTIL={}", until.to_rfc3339());
+            if let Some(token) = refused {
+                println!("PR_LEASE_BACKSTOP_REFUSED={token}");
+            }
+            return backstop::EXIT_BACKSTOP;
+        }
         println!("PR_LEASE_STATE={}", state.as_str());
         match state {
             ClaimState::HeldByPeer { holder, .. } => {

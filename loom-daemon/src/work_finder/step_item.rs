@@ -11,7 +11,8 @@
 //!
 //! A PR joins the issue it **closes**: its lowest-numbered closing link (a
 //! closing keyword, or the Builder branch), and only when it has none, its
-//! lowest link of any kind. So a phase PR (`Closes #child`, `Part of #epic`)
+//! lowest link of any kind for grouping. Only a closing link can carry
+//! operator authority to a PR; a non-closing fallback does not. So a phase PR (`Closes #child`, `Part of #epic`)
 //! joins the child even when the epic has the lower number. An issue joins
 //! the lowest-numbered PR that joined it. A PR that joins no listed issue, or
 //! a second PR joining an issue that already has one, is its own item. An
@@ -45,13 +46,14 @@
 //! | Item state | Verdict |
 //! |---|---|
 //! | `loom:frozen` (the PR or **any** open issue it links) | pass `frozen` |
-//! | `loom:operator`, or a retired name that folds into it (the same) | pass `operator` |
+//! | `loom:operator` (the artifact itself, or an open issue a PR closes or builds) | pass `operator` |
+//! | a linked operator hold whose PR branch could not be verified | pass `operator_link_unverified` |
 //! | another hard exclusion (`external`) | pass `hard_exclusion` |
 //! | a label in this host's `extraSkipLabels` (the PR or any open issue it links; #13891) | pass `host_skip_label` |
 //! | a claim label (see below), on the PR or any open issue it links | pass `claimed` |
 //! | PR in GitHub's merge queue | pass `queued` |
 //! | issue's linked PR is another item's | pass `shared_pr` |
-//! | PR `loom:sequenced` | pass `sequenced` |
+//! | PR `loom:sequenced` without both `loom:changes-requested` and `loom:merge-conflict` | pass `sequenced` |
 //! | PR `loom:pr` + `loom:blocked` + trusted Champion hold marker | Champion hold re-evaluation |
 //! | PR `loom:changes-requested` + `loom:blocked` + hold marker, Doctor cycle not capped | Doctor |
 //! | PR `loom:review-requested` + `loom:blocked` + hold marker | Judge |
@@ -285,6 +287,10 @@ pub struct PullInput {
     /// The author is known and untrusted (the H14 rule, #9548).
     #[serde(default)]
     pub author_untrusted: bool,
+    /// The PR branch was missing from the current complete listing. A
+    /// non-closing reference to a held issue may still be the Builder join.
+    #[serde(default)]
+    pub linkage_unverified: bool,
     /// The PR is in GitHub's merge queue: it is never drawn again for merge.
     #[serde(default)]
     pub queued: bool,
@@ -368,6 +374,13 @@ pub struct Item {
     /// ([`PullMarkers::hold_auth`]); telemetry only (#13029), never a draw term.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_auth: Option<String>,
+    /// This item's PR is in the Judge or Doctor lane, even if it passes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pr_review: bool,
+    /// The issue that supplied a binding operator hold on this PR.
+    /// Absent when the label is on the PR itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_hold_issue: Option<u32>,
 }
 
 impl Item {
@@ -502,6 +515,7 @@ impl Step {
 pub enum PassReason {
     Frozen,
     Operator,
+    OperatorLinkUnverified,
     HardExclusion,
     /// A label in this host's `extraSkipLabels` (#13891): the host opted out
     /// of the item, e.g. a pilot issue reserved for another worker.
@@ -552,6 +566,7 @@ impl PassReason {
         match self {
             Self::Frozen => "frozen",
             Self::Operator => "operator",
+            Self::OperatorLinkUnverified => "operator_link_unverified",
             Self::HardExclusion => "hard_exclusion",
             Self::HostSkipLabel => "host_skip_label",
             Self::Claimed => "claimed",
@@ -652,14 +667,21 @@ pub fn classify(inputs: &Inputs) -> Vec<Item> {
             let mut linked = linked_of(pr);
             linked.retain(|i| i.number != n);
             linked.insert(0, issue);
-            let item = classify_item(Some(issue), Some(pr), false, &linked, inputs);
+            let item = classify_item(
+                Some(issue),
+                Some(pr),
+                false,
+                &linked,
+                Some(&links[&pr.number]),
+                inputs,
+            );
             (item, closes_of(pr))
         } else if let Some(pr) = linking.get(&n).and_then(|&p| pr_of(p)) {
             // Another item's PR: this item is still its own issue.
-            let item = classify_item(Some(issue), Some(pr), true, &[issue], inputs);
+            let item = classify_item(Some(issue), Some(pr), true, &[issue], None, inputs);
             (item, Some(issue))
         } else {
-            let item = classify_item(Some(issue), None, false, &[issue], inputs);
+            let item = classify_item(Some(issue), None, false, &[issue], None, inputs);
             (item, Some(issue))
         };
         item.story_points = sized.and_then(story_points);
@@ -667,7 +689,14 @@ pub fn classify(inputs: &Inputs) -> Vec<Item> {
     }
     for pr in &pulls {
         if !primary.contains(&pr.number) {
-            let mut item = classify_item(None, Some(pr), false, &linked_of(pr), inputs);
+            let mut item = classify_item(
+                None,
+                Some(pr),
+                false,
+                &linked_of(pr),
+                Some(&links[&pr.number]),
+                inputs,
+            );
             item.story_points = closes_of(pr).and_then(story_points);
             items.push(item);
         }
@@ -710,14 +739,52 @@ fn join_target(l: &BTreeMap<u32, LinkageKind>) -> Option<u32> {
         .map(|(n, _)| *n)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkedOperatorHold {
+    JoinedIssue(u32),
+    Unverified,
+    Mention(u32),
+}
+
+/// Check every confirmed join, including a second closing link. A mere
+/// mention, including when there is no actual join, has no hold authority.
+pub(crate) fn linked_operator_hold(
+    links: &BTreeMap<u32, LinkageKind>,
+    linkage_unverified: bool,
+    held: impl Fn(u32) -> bool,
+) -> Option<LinkedOperatorHold> {
+    let mut mention = None;
+    for (&number, &kind) in links {
+        if !held(number) {
+            continue;
+        }
+        if kind == LinkageKind::Closes {
+            return Some(LinkedOperatorHold::JoinedIssue(number));
+        }
+        mention.get_or_insert(number);
+    }
+    mention.map(|number| {
+        if linkage_unverified {
+            LinkedOperatorHold::Unverified
+        } else {
+            LinkedOperatorHold::Mention(number)
+        }
+    })
+}
+
+pub(crate) fn is_review_pr(labels: &[String]) -> bool {
+    has(labels, CHANGES_REQUESTED) || has(labels, REVIEW_REQUESTED)
+}
+
 /// Classify one joined item. `shared`: the PR is another issue's item.
-/// `linked`: every open issue whose holds and claims bind the item (its own
-/// issue, and every other open issue its PR links).
+/// `linked` carries the open issues read by the frozen and claim gates.
+/// `pr_links` is present only on the item that owns the PR.
 fn classify_item(
     issue: Option<&IssueInput>,
     pr: Option<&PullInput>,
     shared: bool,
     linked: &[&IssueInput],
+    pr_links: Option<&BTreeMap<u32, LinkageKind>>,
     inputs: &Inputs,
 ) -> Item {
     let issue_labels = issue
@@ -731,7 +798,23 @@ fn classify_item(
     } else {
         Lane::Normal
     };
+    let linked_hold = pr_links.and_then(|links| {
+        linked_operator_hold(links, pr.is_some_and(|p| p.linkage_unverified), |n| {
+            linked
+                .iter()
+                .any(|i| i.number == n && super::is_operator_hold(&i.labels))
+        })
+    });
+    let operator_on_pr = super::is_operator_hold(&pr_labels);
+    let holding_issue = match linked_hold {
+        Some(LinkedOperatorHold::JoinedIssue(number)) if !operator_on_pr => Some(number),
+        _ => None,
+    };
     let labels = Labels {
+        operator_held: operator_on_pr
+            || (pr_links.is_none() && super::is_operator_hold(&issue_labels))
+            || holding_issue.is_some(),
+        operator_link_unverified: linked_hold == Some(LinkedOperatorHold::Unverified),
         issue: &issue_labels,
         linked: &linked_labels,
         pr: &pr_labels,
@@ -750,6 +833,12 @@ fn classify_item(
         send_back: issue.is_some_and(|i| i.markers.send_back),
         story_points: None,
         hold_auth: pr.and_then(|p| p.markers.hold_auth.clone()),
+        pr_review: !shared && is_review_pr(&pr_labels),
+        operator_hold_issue: if verdict == Verdict::Pass(PassReason::Operator) {
+            holding_issue
+        } else {
+            None
+        },
     }
 }
 
@@ -757,8 +846,10 @@ fn classify_item(
 struct Labels<'a> {
     /// The item's own issue.
     issue: &'a [String],
-    /// Every open issue whose holds and claims bind the item.
+    /// The open issues read by the frozen, hard exclusion and claim gates.
     linked: &'a [Vec<String>],
+    operator_held: bool,
+    operator_link_unverified: bool,
     /// The item's PR.
     pr: &'a [String],
 }
@@ -778,8 +869,11 @@ fn decide(
     if any(&|l| has(l, FROZEN)) {
         return pass(ItemState::Frozen, P::Frozen);
     }
-    if any(&|l| super::is_operator_hold(l)) {
+    if labels.operator_held {
         return pass(ItemState::Operator, P::Operator);
+    }
+    if labels.operator_link_unverified {
+        return pass(ItemState::Operator, P::OperatorLinkUnverified);
     }
     if any(&crate::hard_exclusion::is_hard_excluded) {
         return pass(ItemState::Excluded, P::HardExclusion);
@@ -810,12 +904,16 @@ fn decide(
 /// The PR rows of the table.
 fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     let step = |s: ItemState, st: Step| (s, Verdict::Step(st));
-    if has(labels, SEQUENCED) {
+    let changes_requested = has(labels, CHANGES_REQUESTED);
+    let conflict_repair = changes_requested && has(labels, MERGE_CONFLICT);
+    // A conflict repair can update the follower against its base while the
+    // sequencing label continues to fence the merge (#14812).
+    if has(labels, SEQUENCED) && !conflict_repair {
         return (ItemState::Sequenced, Verdict::Pass(PassReason::Sequenced));
     }
     if super::is_blocked_hold(labels) {
         let hold = pr.markers.champion_hold;
-        if hold && has(labels, APPROVED) && !has(labels, CHANGES_REQUESTED) {
+        if hold && has(labels, APPROVED) && !changes_requested {
             return step(ItemState::Held, Step::ChampionHoldReevaluate);
         }
         if hold && !pr.markers.doctor_cycle_capped && crate::champion_hold::doctor_shape(labels) {
@@ -828,7 +926,7 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     }
     // Verdict-label precedence: `loom:pr` always loses to the other verdicts
     // (Champion's Verdict-State Janitor), so a contradictory PR is never merged.
-    if has(labels, CHANGES_REQUESTED) {
+    if changes_requested {
         step(ItemState::ChangesRequested, Step::Doctor)
     } else if has(labels, REVIEW_REQUESTED) {
         step(ItemState::ReviewRequested, Step::Judge)
@@ -1117,6 +1215,12 @@ impl PullMarkers {
     }
 }
 
+/// Without both fields the pull listing cannot confirm or rule out a
+/// same-repository Builder branch join.
+pub(crate) fn branch_metadata_unverified(row: &crate::forge_pull_listing::RestPull) -> bool {
+    row.head_ref.is_none() || row.head_repo.is_none()
+}
+
 impl PullInput {
     /// From an open-PR listing row of `owner_repo`, with the trust facts the
     /// open-PR guard reads (`policy`), merge-queue membership and markers.
@@ -1138,6 +1242,7 @@ impl PullInput {
             base_ref: row.base_ref.clone(),
             same_repo,
             author_untrusted,
+            linkage_unverified: branch_metadata_unverified(row),
             queued,
             draft: row.draft,
             markers,

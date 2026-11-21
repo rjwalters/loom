@@ -41,6 +41,15 @@ thread_local! {
 /// Installs `routing` for this thread until dropped.
 pub(crate) struct Guard;
 
+impl Guard {
+    /// Use the caller's inert Forge fixture for requests the test router admits.
+    #[must_use]
+    pub(crate) fn with_program(self, program: &Path) -> Self {
+        PROGRAM.with(|p| *p.borrow_mut() = Some(program.to_path_buf()));
+        self
+    }
+}
+
 impl Drop for Guard {
     fn drop(&mut self) {
         ROUTING.with(|r| *r.borrow_mut() = None);
@@ -56,6 +65,14 @@ pub(crate) fn install(routing: TestRouting) -> Guard {
     SEEN.with(|s| s.borrow_mut().clear());
     SHEDS.with(|c| c.set(0));
     Guard
+}
+
+/// Install routing and a test-owned executable for this thread.
+#[must_use]
+pub(crate) fn install_with_program(routing: TestRouting, program: PathBuf) -> Guard {
+    let guard = install(routing);
+    PROGRAM.with(|p| *p.borrow_mut() = Some(program));
+    guard
 }
 
 /// Exercise a real caller with a fake forge response under a healthy reader and

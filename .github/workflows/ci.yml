@@ -2261,6 +2261,8 @@ jobs:
         run: bash defaults/scripts/tests/test-install-reinstall-safety.sh
       - name: Run install --local/--gitignore mode tests (#5276)
         run: bash scripts/test-install-local-mode.sh
+      - name: Run install --repo-only tests (#14570)
+        run: bash scripts/test-install-repo-only.sh
       - name: Run migrate-consumer tests (#5276)
         run: bash scripts/test-migrate-consumer.sh
 

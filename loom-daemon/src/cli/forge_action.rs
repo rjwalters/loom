@@ -147,6 +147,8 @@ fn handle_create_issue(a: CreateIssueCli) -> Result<()> {
 /// to the `FORGE=gh` shell fallback the four scripts already understand.
 #[derive(Subcommand)]
 pub(crate) enum ForgeAction {
+    /// List staged open PRs affected by an operator hold on a linked issue.
+    OperatorHolds(super::forge_operator_holds::Args),
     /// `forge issue <args…>` — e.g. `issue view 42 --json labels --jq
     /// '.labels[].name'`. GitHub: exec `gh issue <args…>`.
     ///
@@ -897,6 +899,10 @@ pub(crate) enum ForgeAction {
     #[command(name = "verdict-body-check")]
     VerdictBodyCheck,
 
+    /// Check the workflow on stdin for a workflow- or job-level write-all
+    /// permission. Exit 0 if clear, 1 if present, or 2 for unreadable YAML.
+    WorkflowWriteAllCheck,
+
     /// `forge verdict-gate <pr> --repo R --verdict V --sha S` (#10581) — may
     /// this verdict be posted? Reads the PR's trusted comments and labels.
     /// Prints `LOOM-VERDICT-GATE PROCEED|DEDUPE|REFUSE <why>`; exits 0, 10
@@ -1182,6 +1188,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
         }
     }
     let cmd = match action {
+        ForgeAction::OperatorHolds(args) => return super::forge_operator_holds::run(args),
         ForgeAction::Token {
             repo,
             access,
@@ -1247,6 +1254,7 @@ pub(crate) fn handle_forge_command(action: ForgeAction) -> Result<()> {
             return super::forge_identity_cmd::promotion_author(number, repo.as_deref());
         }
         ForgeAction::VerdictBodyCheck => return super::forge_verdict_cmd::verdict_body_check(),
+        ForgeAction::WorkflowWriteAllCheck => super::forge_workflow_permissions::run(),
         ForgeAction::VerdictGate {
             pr,
             repo,

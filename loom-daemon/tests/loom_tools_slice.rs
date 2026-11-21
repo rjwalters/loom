@@ -403,6 +403,75 @@ fn shared_write_verbs_are_served_and_fail_identically_without_a_forge() {
     }
 }
 
+#[test]
+fn forge_operator_holds_is_daemon_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let roster = root.join("fleet.json");
+    let gh = root.join("gh");
+    let log = root.join("forge-reads.log");
+    let fixture = serde_json::json!({
+        "_generated": { "schema_version": 1 },
+        "root": root,
+        "config": { "defaults": {} },
+        "state": {},
+        "repos": [{
+            "name": "widgets",
+            "remote": "https://github.com/acme/widgets",
+            "fleet": true,
+            "weight": 1
+        }]
+    });
+    std::fs::write(&roster, fixture.to_string()).unwrap();
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$READ_LOG"
+case "$*" in
+    'api '*repos/acme/widgets/pulls\?*)
+        printf 'HTTP/2.0 200 OK\r\nx-ratelimit-remaining: 4000\r\n\r\n[]\n'
+        ;;
+    *) exit 98 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let invoke = |bin| {
+        let mut cmd = base(bin, root, root);
+        cmd.env("LOOM_GH_BIN", &gh)
+            .env("LOOM_LISTING_CACHE_DIR", root.join("listing"))
+            .env("READ_LOG", &log)
+            .args(["forge", "operator-holds", "--fleet-json"])
+            .arg(&roster);
+        run(cmd, None)
+    };
+    let refused = invoke(TOOLS);
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(loom_daemon::cli::EX_WRITE_VERB_NOT_MIGRATED),
+        "{err}"
+    );
+    assert!(err.contains("use `loom-daemon forge operator-holds`"), "{err}");
+    assert!(refused.stdout.is_empty());
+    assert!(!log.exists(), "loom-tools must refuse before reaching the forge");
+
+    let allowed = invoke(DAEMON);
+    assert!(allowed.status.success(), "{}", String::from_utf8_lossy(&allowed.stderr));
+    let output: serde_json::Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(output["complete"], true);
+    assert_eq!(output["repos_examined"], 1);
+    assert_eq!(output["repos"][0]["repo"], "acme/widgets");
+    let reads = std::fs::read_to_string(log).unwrap();
+    assert_eq!(reads.lines().count(), 1, "{reads}");
+    assert!(reads.contains("repos/acme/widgets/pulls?"), "{reads}");
+}
+
 /// Design §7.3 / §10.3: a forge-reaching read resolves `mode` first. An
 /// inherited gateway variable with `mode` unset is the actionable error, not a
 /// silently honored (or shed) route.

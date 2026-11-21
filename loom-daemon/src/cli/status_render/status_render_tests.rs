@@ -352,3 +352,248 @@ fn gate_column_label_missing_sweep_overrides_every_underlying_verdict() {
         assert_eq!(gate_column_label(true, &v), "no-sweep");
     }
 }
+
+fn status_contract_report() -> DaemonStatusReport {
+    let mut report = crate::cli::status::sample_report::sample_report();
+    // The shared fixture uses the current time. Keep the compatibility inputs
+    // deterministic so the full payload can also be compared before and after.
+    report.main_health_gate_verdict_at = None;
+    report.credential_preflight = None;
+    report.per_repo = vec![super::role_runner_diagnostic_source_render_tests::repo(
+        true,
+        &["auditor"],
+        None,
+    )];
+    report
+}
+
+fn render_status_contract(
+    report: &DaemonStatusReport,
+    worktrees: Option<&[WorktreeDiskSummary]>,
+) -> serde_json::Value {
+    let update = self_update::SelfUpdateStatus {
+        built_commit: "abc1234".into(),
+        source_commit: None,
+        update_available: None,
+        commits_behind: None,
+        hours_behind: None,
+    };
+    // The fleet-store and pending-restart sections consult local daemon files.
+    // Keep these contract fixtures independent of the machine running them.
+    let sections = SectionSet::only(
+        Section::all()
+            .iter()
+            .copied()
+            .filter(|section| !matches!(section, Section::FleetStore | Section::PendingRestart)),
+    );
+    build_status_json_value_for(report, None, &update, None, None, worktrees, &sections)
+}
+
+fn assert_status_subtrees(actual: &serde_json::Value, expected: serde_json::Value) {
+    for (key, value) in expected.as_object().unwrap() {
+        // get() distinguishes an omitted key from a key whose value is null.
+        assert_eq!(actual.get(key), Some(value), "status field {key}");
+    }
+}
+
+#[test]
+fn status_json_shared_types_keep_their_public_fields_and_values() {
+    use crate::types::{
+        IdleExitStatus, RateLimitBreakerStatus, RoleOnIdlePromotionStatus, RoleRunnerShardPosture,
+        RoleRunnerShardStatus, RosterMemberStatus, RosterStatus, SafehouseStatus,
+        UnregisteredLockedSweep,
+    };
+
+    let mut report = status_contract_report();
+    report.unregistered_locked = vec![UnregisteredLockedSweep {
+        root: "/repos/locked".into(),
+        issue: 42,
+        owner_pid: 321,
+    }];
+    report.role_runner_shard = Some(RoleRunnerShardPosture {
+        index: Some(1),
+        count: Some(3),
+        summary: "sharded by roster".into(),
+        configured: true,
+        roster: Some(RosterStatus {
+            issue: "acme/roster#55".into(),
+            live_count: 1,
+            seen_count: 2,
+            generation: Some("2026-11-20T01:02:03Z".parse().unwrap()),
+            settled_secs: Some(120),
+            fence: Some("admitted".into()),
+            members: vec![
+                RosterMemberStatus {
+                    host: "host-active".into(),
+                    fresh: true,
+                    last_beat_secs_ago: 7,
+                    serves_count: 20,
+                    is_this_host: true,
+                },
+                RosterMemberStatus {
+                    host: "host-expired".into(),
+                    fresh: false,
+                    last_beat_secs_ago: 300,
+                    serves_count: 0,
+                    is_this_host: false,
+                },
+            ],
+        }),
+    });
+    report.per_repo[0].role_runner_on_idle_promotions = vec![
+        RoleOnIdlePromotionStatus {
+            role: "auditor".into(),
+            max_wait_secs: 60,
+            age_secs: Some(70),
+            promoted: true,
+        },
+        RoleOnIdlePromotionStatus {
+            role: "hermit".into(),
+            max_wait_secs: 90,
+            age_secs: None,
+            promoted: true,
+        },
+    ];
+    report.per_repo[0].role_runner_shard = Some(RoleRunnerShardStatus {
+        owned_here: false,
+        key: "acme/repo".into(),
+        key_source: "origin".into(),
+        owning_shard: Some(2),
+        host_shard: Some(1),
+        shard_count: Some(3),
+    });
+    report.idle_exit = Some(IdleExitStatus {
+        enabled: true,
+        eligible: false,
+        trigger: None,
+        idle_minutes: 11,
+        in_flight_sweeps: 2,
+        active_role_runs: 3,
+        healthy_tokens: 4,
+        total_tokens: 5,
+        idle_elapsed_secs: 82,
+        starved_elapsed_secs: 19,
+        starvation_enabled: true,
+        observed_at: Some("2026-11-20T05:06:07Z".parse().unwrap()),
+    });
+    report.rate_limit_breaker = Some(Box::new(RateLimitBreakerStatus {
+        enabled: true,
+        phase: "cooldown".into(),
+        suppressed: true,
+        source: Some("work_finder".into()),
+        tripped_at: Some("2026-11-20T08:00:00Z".parse().unwrap()),
+        cooldown_until: Some("2026-11-20T08:02:00Z".parse().unwrap()),
+        trips_total: 2,
+        core_remaining: Some(0),
+        graphql_remaining: Some(21),
+        core_used: Some(5000),
+        graphql_used: None,
+        budget_probed_at: Some("2026-11-20T08:00:01Z".parse().unwrap()),
+    }));
+    report.safehouse = Some(SafehouseStatus {
+        state: "connected".into(),
+        socket: Some("/fixture/safehouse.sock".into()),
+        room: Some("fixture-room".into()),
+        reason: None,
+    });
+    let worktrees = [
+        WorktreeDiskSummary {
+            root: "/repos/unknown".into(),
+            total_count: 6,
+            issue_count: 1,
+            pr_count: 2,
+            other_count: 3,
+            total_bytes: None,
+        },
+        WorktreeDiskSummary {
+            root: "/repos/empty".into(),
+            total_bytes: Some(0),
+            ..WorktreeDiskSummary::default()
+        },
+    ];
+
+    let json = render_status_contract(&report, Some(&worktrees));
+    // The expected public schema is independent of the shared Rust serializers.
+    assert_status_subtrees(
+        &json,
+        serde_json::json!({
+            "unregistered_locked": [{"root": "/repos/locked", "issue": 42, "owner_pid": 321}],
+            "role_runner_shard": {
+                "index": 1, "count": 3, "configured": true, "summary": "sharded by roster",
+                "roster": {
+                    "issue": "acme/roster#55", "live_count": 1, "seen_count": 2,
+                    "generation": "2026-11-20T01:02:03Z", "settled_secs": 120, "fence": "admitted",
+                    "members": [
+                        {"host": "host-active", "fresh": true, "last_beat_secs_ago": 7, "serves_count": 20, "is_this_host": true},
+                        {"host": "host-expired", "fresh": false, "last_beat_secs_ago": 300, "serves_count": 0, "is_this_host": false}
+                    ]
+                }
+            },
+            "worktrees": [
+                {"root": "/repos/unknown", "total_count": 6, "issue_count": 1, "pr_count": 2, "other_count": 3, "total_bytes": null},
+                {"root": "/repos/empty", "total_count": 0, "issue_count": 0, "pr_count": 0, "other_count": 0, "total_bytes": 0}
+            ],
+            "idle_exit": {
+                "enabled": true, "eligible": false, "trigger": null, "idle_minutes": 11,
+                "in_flight_sweeps": 2, "active_role_runs": 3, "healthy_tokens": 4, "total_tokens": 5,
+                "idle_elapsed_secs": 82, "starved_elapsed_secs": 19, "starvation_enabled": true,
+                "observed_at": "2026-11-20T05:06:07Z"
+            },
+            "rate_limit_breaker": {
+                "enabled": true, "phase": "cooldown", "suppressed": true, "source": "work_finder",
+                "tripped_at": "2026-11-20T08:00:00Z", "cooldown_until": "2026-11-20T08:02:00Z",
+                "trips_total": 2, "core_remaining": 0, "graphql_remaining": 21, "core_used": 5000,
+                "graphql_used": null, "budget_probed_at": "2026-11-20T08:00:01Z"
+            },
+            "safehouse": {"state": "connected", "socket": "/fixture/safehouse.sock", "room": "fixture-room", "reason": null}
+        }),
+    );
+    assert_status_subtrees(
+        &json["per_repo"][0],
+        serde_json::json!({
+            "role_runner_on_idle_promotions": [
+                {"role": "auditor", "max_wait_secs": 60, "age_secs": 70, "promoted": true},
+                {"role": "hermit", "max_wait_secs": 90, "age_secs": null, "promoted": true}
+            ],
+            "role_runner_shard": {
+                "owned_here": false, "key": "acme/repo", "key_source": "origin",
+                "owning_shard": 2, "host_shard": 1, "shard_count": 3
+            }
+        }),
+    );
+}
+
+#[test]
+fn status_json_shared_types_keep_null_and_empty_distinct() {
+    let mut report = status_contract_report();
+    let uncollected = render_status_contract(&report, None);
+    assert_status_subtrees(
+        &uncollected,
+        serde_json::json!({
+            "unregistered_locked": [], "role_runner_shard": null, "worktrees": null,
+            "idle_exit": null, "rate_limit_breaker": null, "safehouse": null
+        }),
+    );
+    assert_status_subtrees(
+        &uncollected["per_repo"][0],
+        serde_json::json!({"role_runner_on_idle_promotions": [], "role_runner_shard": null}),
+    );
+
+    report.role_runner_shard = Some(crate::types::RoleRunnerShardPosture {
+        index: None,
+        count: None,
+        summary: "not configured".into(),
+        configured: false,
+        roster: None,
+    });
+    let collected_empty = render_status_contract(&report, Some(&[]));
+    assert_status_subtrees(
+        &collected_empty,
+        serde_json::json!({
+            "worktrees": [],
+            "role_runner_shard": {
+                "index": null, "count": null, "configured": false, "summary": "not configured", "roster": null
+            }
+        }),
+    );
+}

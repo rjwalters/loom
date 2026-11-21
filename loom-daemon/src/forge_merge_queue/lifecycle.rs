@@ -505,6 +505,7 @@ pub fn handoff(
     required_checks: &dyn Fn() -> Result<Vec<String>, String>,
 ) -> Result<EnqueueOutcome, HandoffFailure> {
     ops::execution_gate(ctx.mode, ctx.execution_enabled).map_err(HandoffFailure::Gate)?;
+    ctx.statuses.begin_handoff(pr, approved_sha);
     let required = required_checks().map_err(HandoffFailure::Preflight)?;
     if !required.iter().any(|c| c == REQUIRED_CHECK_CONTEXT) {
         return Err(HandoffFailure::AuthzCheckNotRequired { required });

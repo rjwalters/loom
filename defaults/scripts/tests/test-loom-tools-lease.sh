@@ -95,21 +95,47 @@ cat > "$BIN/gh" <<'STUB'
 D="${LOOM_TEST_FORGE:?stub gh: LOOM_TEST_FORGE not set}"
 [[ "$1" == "api" ]] || { echo "stub gh: unhandled: $*" >&2; exit 3; }
 shift
-method="GET"; path=""; jq_filter=""; body=""; have_body=""
+method="GET"; path=""; jq_filter=""; body=""; have_body=""; include=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --method|-X) method="$2"; shift 2 ;;
     --paginate|--silent) shift ;;
+    --include|-i) include=1; shift ;;
     --jq) jq_filter="$2"; shift 2 ;;
     -f|-F) [[ "${2:-}" == body=* ]] && { body="${2#body=}"; have_body=1; }; shift 2 ;;
-    -H|--header) shift 2 ;;
+    -H|--header|--hostname) shift 2 ;;
     *) [[ -n "$path" ]] || path="$1"; shift ;;
   esac
 done
 [[ "$body" == "@-" ]] && body="$(cat)"
 echo "$method $path" >> "$D/calls.log"
 echo "gateway=${LOOM_GH_GATEWAY_DIR-<unset>}" >> "$D/env.log"
+printf '%s %s %s\n' "$method" "$path" "${GH_CONFIG_DIR-<unset>}" >> "$D/routes.log"
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+if [[ "$method" == "GET" && "$path" == repos/*/pulls\?* ]]; then
+  [[ ! -f "$D/pulls-fail" ]] || exit 1
+  [[ "$include" -eq 0 ]] || printf 'HTTP/2 200 OK\r\n\r\n'
+  repo="${path#repos/}"; repo="${repo%%/pulls\?*}"
+  file="$D/${repo//\//-}-pulls.json"
+  if [[ -f "$file" ]]; then cat "$file"; else printf '[]\n'; fi
+  exit 0
+fi
+if [[ "$method" == "GET" && "$path" =~ ^repos/[^/]+/[^/]+$ && "$include" -eq 1 ]]; then
+  repo="${path#repos/}"
+  [[ ! -f "$D/wrong-repo" ]] || read -r repo < "$D/wrong-repo"
+  printf 'HTTP/2 200 OK\r\n\r\n'
+  jq -nc --arg repo "$repo" '{id:101,full_name:$repo,owner:{login:($repo|split("/")[0])},name:($repo|split("/")[1])}'
+  exit 0
+fi
+if [[ "$path" == graphql ]]; then
+  printf '%s\n' '{"data":{"repository":{"issue":{"closedByPullRequestsReferences":{"nodes":[]}}}}}'
+  exit 0
+fi
+if [[ "$method" == "GET" && "$path" == repos/*/issues/*/timeline ]]; then
+  [[ -f "$D/timeline.json" ]] || exit 1
+  cat "$D/timeline.json"
+  exit 0
+fi
 if [[ "$method" == "GET" && "$path" == repos/*/issues/*/comments ]]; then
   [[ ! -f "$D/comments-fail" ]] || { echo "stub gh: comments read failed" >&2; exit 1; }
   [[ -f "$D/comments.json" ]] || echo '[]' > "$D/comments.json"
@@ -174,7 +200,9 @@ assert_eq "" "$(command -v loom-daemon || true)" "the host really has no loom-da
 ISSUE=4242
 reset_forge() {
     rm -f "$FORGE"/comments.json "$FORGE"/comments-fail "$FORGE"/posts.log "$FORGE"/patches.log \
-        "$FORGE"/calls.log "$FORGE"/env.log "$FORGE"/renew-bins.log "$FORGE"/issue-state
+        "$FORGE"/calls.log "$FORGE"/env.log "$FORGE"/renew-bins.log "$FORGE"/issue-state \
+        "$FORGE"/[a-z]*-pulls.json "$FORGE"/routes.log "$FORGE"/wrong-repo \
+        "$FORGE"/pulls-fail "$FORGE"/timeline.json
     rm -rf "$LOOM_LEASE_RENEW_STATE_DIR" "$CO/.loom/logs" 2> /dev/null || true
 }
 count_lines() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
@@ -213,7 +241,7 @@ wait_for() { # <seconds> <command...>
     while ((n-- > 0)); do "$@" && return 0; sleep 0.25; done
     return 1
 }
-ensure() { CLAUDE_PID="$SESSION_PID" loom-tools lease ensure "$ISSUE" --watch-pid "$SESSION_PID" 2>&1; }
+ensure() { CLAUDE_PID="$SESSION_PID" loom-tools lease ensure "$ISSUE" --watch-pid "$SESSION_PID" "$@" 2>&1; }
 stale_peer() { # <host> <sweep> <age-seconds>
     local epoch t
     epoch=$(($(date +%s) - $3))
@@ -429,6 +457,111 @@ echo "(j) a daemon-owned PR service action is refused before mode resolution"
 OUT="$(env -u LOOM_MODE LOOM_GH_GATEWAY_DIR=/nonexistent loom-tools lease pr attach 7 --role judge 2>&1)"
 assert_eq 64 "$?" "(j) lease pr attach exits 64"
 assert_match "daemon service operations" "$OUT" "(j) ...naming why it is refused"
+
+echo "(l) a linked PR stops a real detached publisher"
+LEASE_GATEWAY="$T/routes/.loom/gh-config-gateway"
+LEASE_READER="$LEASE_GATEWAY/acme"
+LEASE_WRITER="$T/lease-writer"
+mkdir -p "$LEASE_READER" "$LEASE_WRITER"
+chmod 700 "$LEASE_GATEWAY" "$LEASE_READER" "$LEASE_WRITER"
+printf '%s' "$(readlink -f "$LOOM_GH_BIN")" > "$LEASE_GATEWAY/gh-ok"
+printf 'github.com: {}\n' > "$LEASE_READER/hosts.yml"
+chmod 600 "$LEASE_GATEWAY/gh-ok" "$LEASE_READER/hosts.yml"
+ensure_routed() {
+    LOOM_MODE=fleet LOOM_GH_GATEWAY_DIR="$LEASE_GATEWAY" GH_CONFIG_DIR="$LEASE_WRITER" ensure --retry-interval 1
+}
+lease_log="$CO/.loom/logs/lease-ensure/issue-$ISSUE.log"
+peer_yields() {
+    jq --arg host "$1" --arg sweep "$2" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '. + [{id:78,updated_at:$at,body:("<!-- loom:lease-yield host=" + $host + " sweep=" + $sweep + " earliest_host=none earliest_sweep=none -->"),user:{login:"loom-fleet-dispatch[bot]",type:"Bot"},author_association:"CONTRIBUTOR"}]' \
+      "$FORGE/comments.json" > "$FORGE/yield.json" && mv "$FORGE/yield.json" "$FORGE/comments.json"
+}
+reset_forge
+stale_peer other-host-aaaa peer-sweep 30
+session
+OUT="$(ensure_routed)"
+assert_match "deferred publisher" "$OUT" "(l) a live peer deferred the actual tools-only child"
+assert_eq 0 "$(posts)" "(l) the initial call did not post over the peer"
+jq -n --arg body "Part of #$ISSUE" '[{number:79,state:"open",body:$body,head:{ref:"feature/phase",repo:{full_name:"acme/widget"}},base:{repo:{full_name:"acme/widget"}}}]' \
+  > "$FORGE/acme-widget-pulls.json"
+peer_yields other-host-aaaa peer-sweep
+wait_for 10 no_deferred_publishers
+assert_eq 0 "$(posts)" "(l) the delayed child did not publish after its linked PR opened"
+assert_eq 0 "$(renewers)" "(l) the delayed child did not start a renewer"
+assert_match "linked PR #79" "$(cat "$lease_log")" "(l) the local diagnostic names the linked PR"
+wait_for 2 grep -Eq "^GET repos/acme/widget/pulls\?.* $LEASE_READER$" "$FORGE/routes.log"
+assert_eq 0 "$?" "(l) the child probed the exact publisher repo through the fleet reader"
+kill "$SESSION_PID" 2> /dev/null
+wait_for 15 no_renewers
+wait_for 15 no_deferred_publishers
+
+echo "(m) verified absence preserves publication and reader/writer routing"
+reset_forge
+same_host_peer="sweep-insession-s999999-fixture"
+stale_peer "$LOCAL_LEASE_HOST" "$same_host_peer" 30
+jq -n --arg mention "Discussed #$ISSUE" --arg closes "Closes #$ISSUE" '[
+    {number:80,state:"open",body:$mention,head:{ref:"feature/unrelated",repo:{full_name:"acme/widget"}}},
+    {number:81,state:"closed",body:$closes,head:{ref:"feature/closed",repo:{full_name:"acme/widget"}}}
+  ]' > "$FORGE/acme-widget-pulls.json"
+session
+OUT="$(LOOM_SWEEP_RUN_ID=fixture-distinct-sweep ensure_routed)"
+assert_match "deferred publisher" "$OUT" "(m) a different sweep on the same host defers"
+wait_for 5 grep -q 'deferred attempt: publish .*exited Some(4)' "$lease_log"
+assert_eq 0 "$?" "(m) the delayed attempt preserved peer arbitration"
+assert_eq 0 "$(posts)" "(m) a PR-free read still cannot publish over the same-host peer"
+peer_yields "$LOCAL_LEASE_HOST" "$same_host_peer"
+wait_for 10 has_renewer
+assert_eq 1 "$(posts)" "(m) exactly one publication follows the peer yield"
+assert_eq 1 "$(renewers)" "(m) the ordinary renewer starts for the PR-free issue"
+assert_eq 1 "$(grep -Fc "POST repos/acme/widget/issues/$ISSUE/comments $LEASE_WRITER" "$FORGE/routes.log" || true)" "(m) publication still uses the writer profile"
+kill "$SESSION_PID" 2> /dev/null
+wait_for 15 no_renewers
+
+echo "(n) mismatched or incomplete evidence cannot publish for an override"
+reset_forge
+stale_peer other-host-aaaa peer-sweep 30
+printf 'acme/widget\n' > "$FORGE/wrong-repo"
+session
+OUT="$(LOOM_REPO=acme/other ensure_routed)"
+assert_match "deferred publisher" "$OUT" "(n) explicit target starts a deferred child"
+peer_yields other-host-aaaa peer-sweep
+wait_for 6 grep -q 'linked-PR probe unavailable' "$lease_log"
+assert_eq 0 "$?" "(n) the wrong-target attempt was indeterminate"
+assert_eq 0 "$(posts)" "(n) metadata for a different repo does not permit publication"
+assert_eq 0 "$(renewers)" "(n) the mismatched repo starts no renewer"
+touch "$FORGE/pulls-fail"
+rm "$FORGE/wrong-repo"
+wait_for 6 grep -q "GET repos/acme/other/issues/$ISSUE/timeline" "$FORGE/routes.log"
+assert_eq 0 "$?" "(n) the delayed child attempted the explicit target fallback"
+assert_match "GET graphql $LEASE_READER" "$(cat "$FORGE/routes.log")" "(n) the GraphQL leg answered on the fleet reader"
+assert_eq 0 "$(posts)" "(n) GraphQL empty and timeline unreadable still cannot publish"
+assert_eq 0 "$(renewers)" "(n) incomplete partial-link evidence starts no renewer"
+jq -nc --arg body "Closes #$ISSUE" '{number:82,body:$body,author_association:"MEMBER"}' > "$FORGE/timeline.json"
+wait_for 10 no_deferred_publishers
+assert_match "linked PR #82" "$(cat "$lease_log")" "(n) the exact override can prove a closing link and settle"
+assert_eq 0 "$(posts)" "(n) the linked override never publishes"
+kill "$SESSION_PID" 2> /dev/null
+wait_for 15 no_deferred_publishers
+
+echo "(o) a verified PR-free override can still publish"
+OTHER="$T/other"
+WRITE_SCOPE_INNER_GH="$BIN/gh" write_scope_register "$OTHER" acme/other
+write_scope_register "$CO" acme/widget
+write_scope_workspaces "$T/deferred-workspaces.json" "$CO" "$OTHER"
+reset_forge
+stale_peer other-host-aaaa peer-sweep 30
+touch "$FORGE/pulls-fail"
+: > "$FORGE/timeline.json"
+session
+OUT="$(LOOM_REPO=acme/other ensure_routed)"
+assert_match "deferred publisher" "$OUT" "(o) a verified override defers while the peer owns the lease"
+peer_yields other-host-aaaa peer-sweep
+wait_for 10 has_renewer
+assert_eq 1 "$(posts)" "(o) a complete fallback permits one publication for the override: $(tail -5 "$lease_log")"
+assert_eq 1 "$(grep -Fc "POST repos/acme/other/issues/$ISSUE/comments $LEASE_WRITER" "$FORGE/routes.log" || true)" "(o) the publication reaches the verified override on the writer"
+kill "$SESSION_PID" 2> /dev/null
+wait_for 15 no_renewers
+wait_for 15 no_deferred_publishers
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

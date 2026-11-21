@@ -17,8 +17,9 @@
 #      scoped to exactly the repos the app installation covers, with its own
 #      rate-limit bucket separate from any personal account.
 #
-# `loom-daemon` invokes this file as an executable (`get-token` / `status`
-# subcommands below), not sourced -- see `loom-daemon/src/credential_preflight.rs`.
+# `loom-daemon` invokes this file as an executable (`get-token` /
+# `scoped-token` / `status` subcommands below), not sourced -- see
+# `loom-daemon/src/credential_preflight.rs`.
 #
 # # Config precedence (env > config > default), matching GiteaConfig (#4061)
 #
@@ -57,6 +58,10 @@
 #   ./github-app-token.sh status                 # cheap, no network
 #   ./github-app-token.sh get-token OWNER/REPO    # mints/reuses a token
 #   ./github-app-token.sh get-token --force OWNER/REPO   # ignores the cache
+#   ./github-app-token.sh scoped-token OWNER/REPO  # narrow mint: one repo,
+#                                                  # Contents read, evidence
+#                                                  # paired (#14716); never
+#                                                  # cached, never published
 #
 # Usage (sourced, for tests / advanced callers):
 #   source ".../lib/github-app-token.sh"
@@ -407,6 +412,34 @@ _github_app_api_mint_token() {
   return 1
 }
 
+# _github_app_api_mint_scoped <installation_id> <nwo> -> echoes the mint
+# response for ONE repository with Contents read (#14716): a narrow
+# issuance request whose answer pairs the token with the repository ids and
+# permissions it was bound to. Requires a fresh JWT. Used only by
+# `scoped-token`; the writer mint above stays untouched.
+_github_app_api_mint_scoped() {
+  local installation_id="$1" nwo="$2" jwt resp http_code body
+  jwt=$(github_app_jwt) || return 1
+  resp=$(curl -sS -w '\n%{http_code}' -X POST \
+    --config <(printf 'header = "Authorization: Bearer %s"\n' "$jwt") \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H "Content-Type: application/json" \
+    --data-binary "$(jq -cn --arg repo "${nwo#*/}" '{repositories:[$repo], permissions:{contents:"read"}}')" \
+    "https://api.github.com/app/installations/${installation_id}/access_tokens" 2>/dev/null) || {
+    _GH_APP_LAST_ERROR="could not reach the GitHub API to mint a scoped read token for installation ${installation_id}"
+    return 1
+  }
+  http_code=$(echo "$resp" | tail -1)
+  body=$(echo "$resp" | sed '$d')
+  if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+    echo "$body"
+    return 0
+  fi
+  _GH_APP_LAST_ERROR="could not mint a scoped read token for installation ${installation_id} (HTTP ${http_code} -- does the installation grant Contents read?)"
+  return 1
+}
+
 # --- Top-level entry point ---
 
 # github_app_get_token <owner/repo> [force] -> echoes a valid installation
@@ -482,6 +515,24 @@ github_app_get_token() {
   echo "$token"
 }
 
+# github_app_get_scoped_token <nwo> -> echoes the raw scoped mint response
+# JSON for ONE repository with Contents read, then the installation id it
+# minted from, on the final line (#14716). Always fresh: a scoped read mint
+# is per-operation and never touches the writer token cache. On failure
+# returns 1 with _GH_APP_LAST_ERROR set in THIS shell (the CLI reads it
+# back through the #5401 ok/err tail).
+github_app_get_scoped_token() {
+  local nwo="$1" owner installation_id body
+  owner="${nwo%%/*}"
+  installation_id=$(cat "$(_github_app_installation_cache_path "$owner")" 2>/dev/null || echo "")
+  if [[ ! "$installation_id" =~ ^[0-9]+$ ]]; then
+    installation_id=$(_github_app_api_get_installation "$nwo") || return 1
+    printf '%s' "$installation_id" > "$(_github_app_installation_cache_path "$owner")"
+  fi
+  body=$(_github_app_api_mint_scoped "$installation_id" "$nwo") || return 1
+  printf '%s\n%s' "$body" "$installation_id"
+}
+
 # --- Executable CLI dispatch ---
 #
 # `loom-daemon` invokes this file as a subprocess (never sourced) via the two
@@ -545,8 +596,52 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         jq -cn --arg message "$_GH_APP_LAST_ERROR" '{status:"error", message:$message}'
       fi
       ;;
+    # Narrow issuance for a mirror read proof (#14716): ONE repository,
+    # Contents read, the repository ids and permissions the issuer bound
+    # PAIRED with the token in the envelope. Always mints fresh (never the
+    # writer token cache, which stays untouched by this mode).
+    scoped-token)
+      shift || true
+      _nwo="${1:-}"
+      if [[ -z "$_nwo" || "$_nwo" != */* ]]; then
+        jq -cn '{status:"error", message:"owner/repo argument required"}'
+        exit 0
+      fi
+      if ! github_app_configured "${_nwo%%/*}"; then
+        jq -cn --arg message "$_GH_APP_LAST_ERROR" '{status:"not_configured", message:$message}'
+        exit 0
+      fi
+      # #5401 pattern: the mint runs in a command-substitution SUBSHELL, so
+      # `_GH_APP_LAST_ERROR` set inside it never propagates back out --
+      # emit an ok/err tail from INSIDE the same subshell instead.
+      _gh_app_out=$(
+        if _gh_app_two=$(github_app_get_scoped_token "$_nwo"); then
+          printf '%s\nok' "$_gh_app_two"
+        else
+          printf '\nerr\n%s' "$_GH_APP_LAST_ERROR"
+        fi
+      )
+      if [[ "${_gh_app_out##*$'\n'}" != ok ]]; then
+        _gh_app_msg="${_gh_app_out#*$'\n'}"
+        jq -cn --arg message "${_gh_app_msg#err$'\n'}" '{status:"error", message:$message}'
+        exit 0
+      fi
+      # Only the last two lines are ours. The issuer's JSON can span many lines.
+      _gh_app_out="${_gh_app_out%$'\nok'}"
+      _gh_app_installation_id="${_gh_app_out##*$'\n'}"
+      _gh_app_resp="${_gh_app_out%$'\n'*}"
+      printf '%s\n' "$_gh_app_resp" | jq -ces --arg installation_id "$_gh_app_installation_id" \
+        --arg app_id "$_GH_APP_ID" '
+        select(length == 1) | .[0]
+        | select((.token | type) == "string" and .token != "" and .token != "null")
+        | [.repositories[]?.id] as $ids | select($ids != [])
+        | {status:"ok", token, installation_id:$installation_id, app_id:$app_id,
+           expires_at, repository_ids:$ids, permissions:(.permissions // {})}
+        ' 2>/dev/null || jq -cn --arg installation_id "$_gh_app_installation_id" \
+          '{status:"error", message:("scoped mint response for installation " + $installation_id + " did not include a token and repository ids")}'
+      ;;
     *)
-      echo "Usage: github-app-token.sh {status|get-token [--force] OWNER/REPO}" >&2
+      echo "Usage: github-app-token.sh {status|get-token [--force] OWNER/REPO|scoped-token OWNER/REPO}" >&2
       exit 64
       ;;
   esac

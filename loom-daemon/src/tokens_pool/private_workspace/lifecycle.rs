@@ -211,19 +211,7 @@ fn start_with(
         register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
-        let gh_config = std::env::var_os("GH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config/gh")))
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize())
-            .transpose()?;
-        if let Some(path) = &gh_config {
-            for parent in path.ancestors() {
-                if parent.join(".git").exists() {
-                    bail!("forge credentials must be outside every repository/worktree");
-                }
-            }
-        }
+        let gh_config = resolve_gh_config(workspace)?;
         Config {
             schema_version: 1,
             account: account.id.name.clone(),
@@ -330,6 +318,81 @@ fn start_with(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// The forge configuration directory a NEW private workspace records and
+/// binds read-only at [`GH_CONFIG`], or `None` when none may be mounted.
+///
+/// The daemon-owned GitHub App directories under the workspace root's own
+/// `.loom/` are deliberately not recorded ([`daemon_owned_gh_config`]): an
+/// App-only host delivers its installation token per exec as `GH_TOKEN`
+/// (`forge_auth`, #13916), so binding the directory would only re-expose
+/// the credential inside the seat — and it lives inside the daemon's own
+/// checkout, which the ancestor check below rightly refuses. Before #14744
+/// that refusal kept unattended `session_reconcile` from ever creating a
+/// seat on an App-only host, because the daemon activates that directory
+/// as its process-global `GH_CONFIG_DIR` at startup. Every other directory
+/// at or under a git checkout keeps the refusal.
+fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
+    resolve_gh_config_with(
+        workspace,
+        std::env::var_os("GH_CONFIG_DIR"),
+        dirs::home_dir().map(|home| home.join(".config/gh")),
+        crate::credential_preflight::primary_workspace_root(),
+    )
+}
+
+/// [`resolve_gh_config`] over an injected `GH_CONFIG_DIR` value and
+/// home-default directory (tests): the same resolution and the same
+/// ancestor refusal for every directory the daemon does not own.
+pub(super) fn resolve_gh_config_with(
+    workspace: &Path,
+    gh_config_dir: Option<std::ffi::OsString>,
+    home_default: Option<PathBuf>,
+    primary_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let resolved = gh_config_dir
+        .map(PathBuf::from)
+        .or(home_default)
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize())
+        .transpose()?
+        .filter(|path| !daemon_owned_gh_config(workspace, primary_root.as_deref(), path));
+    if let Some(path) = &resolved {
+        for parent in path.ancestors() {
+            if parent.join(".git").exists() {
+                bail!("forge credentials must be outside every repository/worktree");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `true` when `path` (already canonicalized) is one of the daemon-owned
+/// GitHub App credential directories: the process-global `GH_CONFIG_DIR` the
+/// daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a per-owner
+/// sibling ([`github_app_gh_config_dir_for_owner`]), under either the daemon's
+/// primary workspace root (the credential owner: startup config belongs to it,
+/// whichever registered checkout acts) or the acting `workspace`.
+///
+/// Both sides are compared canonicalized: `path` already is, so each expected
+/// location is canonicalized too (an aliased `.loom` or `gh-config` resolves
+/// to the same place). A root that cannot be resolved owns nothing, so the
+/// caller's refusal stands.
+fn daemon_owned_gh_config(workspace: &Path, primary_root: Option<&Path>, path: &Path) -> bool {
+    std::iter::once(workspace)
+        .chain(primary_root)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            if path == canon(crate::credential_preflight::github_app_gh_config_dir(&root)) {
+                return true;
+            }
+            let owners = canon(root.join(".loom").join("gh-config-by-owner"));
+            path.strip_prefix(&owners)
+                .is_ok_and(|rest| rest.components().count() == 1)
+        })
 }
 
 /// Unattended recovery of an already-configured private session whose
@@ -524,10 +587,12 @@ pub fn session_recover(
                 );
             }
             bail!(
-                "no GitHub write credential for {}: provide the repository owner's published \
-                 App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \
-                 workspace root; set LOOM_MACHINE_CHECKOUT to that root) or GH_TOKEN in the \
-                 environment; the unpublished work is retained",
+                "no GitHub write credential for {}: no published App config for the \
+                 repository owner was found (.loom/gh-config-by-owner/<owner>/hosts.yml \
+                 under the running daemon's workspace root, which this command reads from \
+                 the daemon itself; if no daemon answered, start it or export \
+                 LOOM_MACHINE_CHECKOUT=<that root> as an override) and no GH_TOKEN is in \
+                 the environment; the unpublished work is retained",
                 target.repository
             );
         }

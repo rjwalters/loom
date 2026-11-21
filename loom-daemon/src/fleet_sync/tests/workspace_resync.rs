@@ -749,6 +749,29 @@ fn a_release_that_changes_no_installed_file_makes_no_claim_and_no_commit() {
 }
 
 #[test]
+fn committed_stub_gitignore_matches_in_resync_export() {
+    let fx = Fixture::new(Seed {
+        current: true,
+        ..STALE
+    });
+    let manifest = "{\"name\":\"loom-workspace\"}\n";
+    fx.push_from_seed("install package stub", |root| {
+        write(&root.join("package.json"), manifest);
+        crate::init::update_gitignore(root).unwrap();
+    });
+    assert!(fx.origin_file(".gitignore").contains("/pnpm-lock.yaml"));
+
+    // The checkout can have different local contents from the commit the
+    // fleet pass is evaluating. The export must use the committed stub.
+    write(&fx.seed.join("package.json"), "{\"name\":\"consumer\"}\n");
+    let exported = TempDir::new().unwrap();
+    git::export_surfaces(&fx.seed, &fx.origin_head(), exported.path()).unwrap();
+    let diff = materialize_with(&payload_from(&fx.new_defaults), exported.path()).unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+    assert_eq!(fs::read_to_string(exported.path().join("package.json")).unwrap(), manifest);
+}
+
+#[test]
 fn an_empty_diff_is_w0_whatever_the_stamp_says() {
     // Files equal to the payload under a stamp no resync will ever rewrite:
     // one with no `requires_daemon` (ResyncOwed), one below the floor (W3 by

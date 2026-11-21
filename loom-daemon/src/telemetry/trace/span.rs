@@ -142,6 +142,9 @@ pub enum SpanName {
     /// root, naming the repo, PR, head, path and outcome.
     #[serde(rename = "workspace_resync.landing")]
     WorkspaceResyncLanding,
+    /// An actual release tag lookup for workspace resync (#14738).
+    #[serde(rename = "workspace_resync.verify")]
+    WorkspaceResyncVerify,
     /// One ratification-lane tick (#13707): an instant span, its own root,
     /// with the tick's reason and selected / skipped / ran / posted counts.
     #[serde(rename = "ratification_lane.tick")]
@@ -184,6 +187,7 @@ impl SpanName {
             Self::ReaperPass => "reaper.pass",
             Self::HostInterruptionNotice => "loom.host.interruption_notice",
             Self::WorkspaceResyncLanding => "workspace_resync.landing",
+            Self::WorkspaceResyncVerify => "workspace_resync.verify",
             Self::RatificationLaneTick => "ratification_lane.tick",
         }
     }
