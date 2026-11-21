@@ -1058,6 +1058,50 @@ silently waived.
 | Control/guard integrity | #8839's boundary: guard code root-owned and `chmod a-w` on a read-only rootfs, effective policy forced through `docker exec --env` (unreachable from any config tier), the three profile control files bound **read-only over their own paths**, all hashed into one identity that is rechecked at admission, at spawn and in-container before exec | `bundle.rs`, `docker::recheck_control`, `worker_setup::control_boundary` |
 | Secondary mutation channels | Shell, patch and helper calls all route through the bridge; `write_stdin` stays denied outright; argv-level profile/path/remote-executor selectors refused | `guard-codex-bridge.sh`, `control::audit_args` |
 
+### Host repository object mirrors (#14680)
+
+Each host keeps ONE object mirror per registered forge repository
+(`~/.loom/mirrors/<slug>/`, `LOOM_MIRROR_ROOT` to relocate), populated and
+refreshed solely from that repository's canonical origin under the #14716
+read-authority contract. The operator ruling of 2026-11-19 (option b) sets
+five conditions; the host-side store implements them as follows, and the
+seat-side slice (read-only binds, the single verified alternate, idle clone
+migration) lands separately on top of this store:
+
+- **Origin only.** A mirror is created and fetched by the host daemon
+  through `forge_auth::ProvedReader` — the exact verified route and the
+  exact verified credential, in a child environment cleared wholesale (an
+  inherited `GIT_CONFIG_PARAMETERS` cannot inject `url.*.insteadOf`), with
+  `GIT_ALLOW_PROTOCOL=https`, against a mirror config verified to carry
+  only the keys the store itself wrote (`mirror::verify_mirror_config`).
+  Seat clones, seat refs and unpublished seat objects are never inputs, and
+  nothing a seat produces ever enters the mirror. A failed verification is
+  never fatal: the session keeps the fully private legacy clone path.
+- **Read-only into every seat** is the seat-side slice's obligation
+  (`docker.rs` bind validation and `containment.rs` alternate admission);
+  until it lands, the "no object alternates" rule below is unchanged and
+  fully enforced for every seat clone.
+- **Never pruned.** The fetch is `--no-prune`, the mirror sets `gc.auto=0`
+  and `fetch.prune=false`, and no code path repacks or deletes mirror
+  objects: an object whose upstream ref moved or vanished stays readable
+  for every seat that may still reference it. A failed fetch leaves the
+  previous object set and every borrower record exactly as it was.
+- **Contract rewritten, not bypassed.** Publication and admission are
+  separate fail-closed decisions (`read_authority::publish` /
+  `admit_borrower`): a store pins the FIRST proved grant it was created
+  under, rotation under the same authority passes, and a different
+  authority, scope or replacement repository (a moved provider ID at the
+  same slug) never inherits the store. A proof with no durable expiry
+  (Gitea) is in-flight only: the store persists no credential and no
+  proof, so every publication starts from a fresh verification.
+- **Measurement.** `MirrorStore::objects_bytes` reports the store's size
+  for the one-host before/after comparison this issue requires and the
+  recurring seat-volume metric of #14678.
+
+Two seats refreshing the same repository converge on one usable store
+(per-store `flock`, bounded wait), and an unproved route is skipped with a
+log line — never a refusal of the session.
+
 ### Supported combinations and evidence requirements
 
 | Component | Supported value |

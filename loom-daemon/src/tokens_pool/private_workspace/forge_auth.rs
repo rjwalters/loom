@@ -413,11 +413,6 @@ pub(super) fn read_token(dir: &Path, program: Option<&Path>) -> Option<String> {
 /// Legacy private clones and seat writer selection keep
 /// [`ExecAuth::resolve`] untouched: an unproved route never constructs one
 /// of these and stays on the legacy path.
-///
-/// `dead_code` is allowed deliberately until #14680 lands the host mirror
-/// store that fetches through it: the contract is complete, and the store
-/// is its first and only constructor.
-#[allow(dead_code)]
 pub(super) struct ProvedReader {
     url: String,
     /// The full `Authorization` header value. Private on purpose: never
@@ -425,7 +420,6 @@ pub(super) struct ProvedReader {
     header: String,
 }
 
-#[allow(dead_code)]
 impl ProvedReader {
     /// The reader for `proof` fetching from the registered canonical `url`.
     /// `None` unless `url` names the exact repository the proof verified on
@@ -470,8 +464,6 @@ impl ProvedReader {
 /// The Authorization header a proved fetch carries: HTTP Basic for git's
 /// smart protocol, the username carrying the credential per provider
 /// convention (GitHub: `x-access-token:<token>`; Gitea: `<token>:`).
-// #14680's mirror store constructs the reader that carries this header.
-#[allow(dead_code)]
 fn auth_header(proof: &super::read_authority::ReadProof) -> String {
     use base64::Engine as _;
     let pair = match proof.grant().identity.provider {

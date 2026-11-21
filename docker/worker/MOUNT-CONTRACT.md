@@ -84,7 +84,14 @@ normal daemon dispatch and Codex capability admission follow in #8786/#8787.
 - No host checkout, sibling repository, shared Git objects, or cross-account
   writable cache is mounted. Git metadata must be real private directories,
   without alternates or symlinks. Existing issue worktrees stay inside the
-  private volume and use their container paths throughout.
+  private volume and use their container paths throughout. (One exception is
+  planned, not yet mounted: per #14680's operator ruling of 2026-11-19, each
+  host keeps ONE origin-only object mirror per registered repository —
+  host-owned, never pruned, fetched only through the #14716 proved read
+  authority — whose `objects/` directory seats will later borrow through a
+  read-only bind as their single verified alternate. Until that seat-side
+  change lands, no mirror is mounted into any session and the no-alternates
+  rule above is unchanged and fully enforced.)
 - The volume MUST use Docker's ordinary `local` driver without driver options
   (a named bind-backed volume is not isolation). Actual mounts, volume ownership,
   peer attachments and containment settings are verified on every reuse/job.
