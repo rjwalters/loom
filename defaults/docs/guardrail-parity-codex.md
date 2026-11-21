@@ -373,7 +373,7 @@ it explicitly when sizing a multi-account Codex pool):
 docker run --rm -it --user 1000:1000 -w /tmp \
   -e CODEX_HOME=/home/loom/.codex-profile --entrypoint codex \
   -v ~/.loom/codex-profiles/alice:/home/loom/.codex-profile \
-  ghcr.io/rjwalters/loom-worker-session:latest                # session-managed
+  ghcr.io/2amlogic/loom-worker-session:latest                # session-managed
 CODEX_HOME=~/.loom/codex-profiles/alice codex                 # bare-metal only
 
 # 3. gate the pool: exit 0 only when EVERY profile is ready
@@ -1064,7 +1064,7 @@ silently waived.
 |---|---|
 | Control protocol | `loom-private-control-v1`, `control_version` 2 (exact match on both sides) |
 | Workspace protocol | `loom-private-workspace-v1` |
-| Session image | `ghcr.io/rjwalters/loom-worker-session:<version>` built from `docker/session/Dockerfile`, bundle sealed and digest-intact |
+| Session image | `ghcr.io/2amlogic/loom-worker-session:<version>` built from `docker/session/Dockerfile`, bundle sealed and digest-intact |
 | Codex CLI | as pinned by `CODEX_VERSION` (tracks upstream latest via `harness-pins.yml`; 0.160.0 at 2026-10-02); floor `0.146.0`, recorded by `seal-control` from the CLI observed in the image |
 | Codex hook schema | `pre_tool_use`, pinned at `0.146.0` in `guard-codex-bridge.sh`; the 0.149.1 wire evidence is in [private-control-bundle.md](private-control-bundle.md) |
 | Hook trust | Recorded once per profile (#5005, measured by the install-time trust-baseline diff), **or** a registration Loom seals (#14105, below) |

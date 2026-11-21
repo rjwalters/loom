@@ -4,7 +4,7 @@ Follow-up to #8565 (Kimi added to `docker/native/`'s per-sweep ephemeral
 containment, in the shape #8403/#8437 built for Pi/OpenCode). Host: macOS
 arm64, Docker Desktop 29.8.0. Image under test: `loom-worker-native:kimi-test`,
 built locally from this branch's `docker/native/Dockerfile`
-(`FROM ghcr.io/rjwalters/loom-worker:latest@sha256:8bb3c0fbbb4a…`), digest
+(`FROM ghcr.io/2amlogic/loom-worker:latest@sha256:8bb3c0fbbb4a…`), digest
 `sha256:25a879216b434632ba5210d8eeed3c2f38751b5f34a76d8079e145b9fd158b0d`.
 
 This is the same class of evidence #8434 asks for on the Pi/OpenCode side

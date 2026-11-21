@@ -3,7 +3,7 @@
 # ONE list, read by both sides, so a bump cannot leave CI pulling an image that
 # was never copied:
 # - .github/workflows/ci-images.yml copies each entry BY DIGEST to
-#   ghcr.io/rjwalters/loom-ci-images/<repo>:<tag> (skopeo --preserve-digests);
+#   ghcr.io/2amlogic/loom-ci-images/<repo>:<tag> (skopeo --preserve-digests);
 # - loom-daemon/tests/common/hub_image.rs pulls each entry from GHCR first,
 #   then mirror.gcr.io, then Docker Hub.
 # loom-daemon/tests/hub_image_refs.rs fails if a Docker Hub image a test or

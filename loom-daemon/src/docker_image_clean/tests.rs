@@ -62,6 +62,7 @@ fn inventory_error() -> DockerInventoryError {
 #[test]
 fn repo_of_splits_on_the_last_colon() {
     assert_eq!(repo_of("loom-worker:ci-smoke"), "loom-worker");
+    assert_eq!(repo_of("ghcr.io/2amlogic/loom-worker:ci-smoke"), "ghcr.io/2amlogic/loom-worker");
     assert_eq!(
         repo_of("ghcr.io/rjwalters/loom-worker:ci-smoke"),
         "ghcr.io/rjwalters/loom-worker"
@@ -302,6 +303,37 @@ fn fewer_than_n_tracked_images_are_all_kept() {
 }
 
 #[test]
+fn default_tracked_repos_cover_both_the_new_and_the_legacy_registry_path() {
+    // #14419: images publish under ghcr.io/2amlogic/*; hosts still hold
+    // images pulled from the pre-transfer ghcr.io/rjwalters/* path, and
+    // those must be cleaned up, not orphaned.
+    for image in ["loom-worker", "loom-worker-session", "loom-worker-native"] {
+        for prefix in ["ghcr.io/2amlogic", "ghcr.io/rjwalters"] {
+            let repo = format!("{prefix}/{image}");
+            assert!(
+                DEFAULT_TRACKED_REPOS.contains(&repo.as_str()),
+                "{repo} must be tracked by default"
+            );
+        }
+    }
+    // Stale images under either prefix are planned for removal.
+    let images = vec![
+        image("sha256:new", &["ghcr.io/2amlogic/loom-worker:ci-smoke"], 20, 1.0),
+        image("sha256:newold", &["ghcr.io/2amlogic/loom-worker:ci-smoke-old"], 10, 1.0),
+        image("sha256:leg", &["ghcr.io/rjwalters/loom-worker:ci-smoke"], 20, 1.0),
+        image("sha256:legold", &["ghcr.io/rjwalters/loom-worker:ci-smoke-old"], 10, 1.0),
+    ];
+    let plan = plan_retention(&images, &tracked(), &[], 1);
+    let mut removed: Vec<&str> = plan
+        .remove_stale_tracked
+        .iter()
+        .map(|i| i.id.as_str())
+        .collect();
+    removed.sort_unstable();
+    assert_eq!(removed, vec!["sha256:legold", "sha256:newold"]);
+}
+
+#[test]
 fn multi_tag_aliasing_is_one_unit_not_double_counted() {
     // The exact scenario from the issue: a local tag and a ghcr.io mirror
     // of the identical digest — one DockerImageRecord, one decision.
@@ -310,7 +342,7 @@ fn multi_tag_aliasing_is_one_unit_not_double_counted() {
             "sha256:newest",
             &[
                 "loom-worker:ci-smoke",
-                "ghcr.io/rjwalters/loom-worker:ci-smoke",
+                "ghcr.io/2amlogic/loom-worker:ci-smoke",
             ],
             20,
             1.0,

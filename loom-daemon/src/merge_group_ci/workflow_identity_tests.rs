@@ -277,11 +277,11 @@ fn release_guards_preserve_publish_decisions_and_exclude_pr_and_merge_group_even
 }
 
 #[test]
-fn repository_transfer_does_not_rename_the_verified_ghcr_namespace() {
+fn images_publish_under_the_lowercased_repository_owner_namespace() {
     let (ci, release) = workflows();
     assert_eq!(
         at(&ci, &["jobs", "worker-buildcache", "env", "BUILDCACHE_REF"]).as_str(),
-        Some("ghcr.io/rjwalters/loom-worker:buildcache")
+        Some("ghcr.io/2amlogic/loom-worker:buildcache")
     );
     for (job, image) in [
         ("build-worker-image", "loom-worker"),
@@ -292,8 +292,23 @@ fn repository_transfer_does_not_rename_the_verified_ghcr_namespace() {
             .as_str()
             .unwrap();
         assert_eq!(tags.lines().count(), 2);
+        // The namespace is derived from the repository owner (#14419), never
+        // a hardcoded account: the pre-transfer `rjwalters` path is denied.
         assert!(tags
             .lines()
-            .all(|tag| tag.starts_with(&format!("ghcr.io/rjwalters/{image}:"))));
+            .all(|tag| tag
+                .starts_with(&format!("ghcr.io/${{{{ steps.ghcr.outputs.owner }}}}/{image}:"))));
+        let owner_step = at(at(&release, &["jobs", job]), &["steps"])
+            .items()
+            .iter()
+            .find(|step| step.get("id").and_then(Node::as_str) == Some("ghcr"))
+            .unwrap_or_else(|| panic!("{job} must resolve the GHCR namespace"));
+        assert!(
+            at(owner_step, &["run"])
+                .as_str()
+                .unwrap()
+                .contains("${GITHUB_REPOSITORY_OWNER,,}"),
+            "{job}: the owner must be lower-cased"
+        );
     }
 }

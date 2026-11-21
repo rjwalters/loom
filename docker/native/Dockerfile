@@ -53,9 +53,9 @@
 # FROM contract: same-version pin, identical to docker/session/'s.
 # `BASE_IMAGE` defaults to `:latest` for convenient local builds; the release
 # workflow always passes
-# --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version>.
+# --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version>.
 
-ARG BASE_IMAGE=ghcr.io/rjwalters/loom-worker:latest
+ARG BASE_IMAGE=ghcr.io/2amlogic/loom-worker:latest
 FROM ${BASE_IMAGE}
 
 # SHELL (bash -o pipefail -c, #6409) is inherited from the base image's own

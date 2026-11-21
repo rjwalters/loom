@@ -211,7 +211,7 @@ See [Forge Authentication](.loom/docs/forge-authentication.md) for setup details
 - macOS or Linux. Every release publishes `loom-daemon` binaries for
   `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
   `aarch64-unknown-linux-gnu`, plus a multi-arch
-  `ghcr.io/rjwalters/loom-worker` image — macOS is the primary development
+  `ghcr.io/2amlogic/loom-worker` image — macOS is the primary development
   platform, Linux is the primary fleet-worker platform.
 - Git repository
 - tmux (`brew install tmux`)

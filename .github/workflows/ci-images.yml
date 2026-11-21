@@ -15,7 +15,7 @@
 #
 # For every entry in .github/ci-images.txt (`<repo>:<tag>@sha256:<digest>`),
 # copies that exact digest -- the whole multi-arch index -- to
-# ghcr.io/rjwalters/loom-ci-images/<repo>:<tag> with
+# ghcr.io/2amlogic/loom-ci-images/<repo>:<tag> with
 # `skopeo copy --all --preserve-digests` (preinstalled on ubuntu runners).
 # --preserve-digests refuses any copy that would change the digest, and the
 # job then reads the copy back by digest, so the GHCR reference hub_image.rs
@@ -88,7 +88,7 @@ jobs:
               echo "::error::not a <repo>:<tag>@sha256:<digest> pin: $ref"; exit 1
             fi
             [[ "$repo" == */* ]] || repo="library/$repo"
-            target="$GHCR_PREFIX/$repo"
+            target="${GHCR_PREFIX,,}/$repo"  # registry paths are lower-case; "2AMLogic" is not valid
             if skopeo inspect --raw "docker://$target@$digest" >/dev/null 2>&1; then
               echo "already present: $target@$digest"
               present=$((present + 1))

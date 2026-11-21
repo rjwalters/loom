@@ -152,7 +152,7 @@ mod tests {
     #[test]
     fn container_marker_with_limits_parses_both_axes() {
         let log = "==== loom-daemon dispatch: sweep_id=sweep-issue-3-0 issue=3 ====\n\
-                   # LOOM_DISPATCH_MODE mode=container image=ghcr.io/rjwalters/loom-worker:latest cpus=6 memory=4096m\n";
+                   # LOOM_DISPATCH_MODE mode=container image=ghcr.io/2amlogic/loom-worker:latest cpus=6 memory=4096m\n";
         let sig = parse_containment_after(log, "sweep_id=sweep-issue-3-0");
         assert!(sig.containerized);
         assert_eq!(sig.cpus.as_deref(), Some("6"));

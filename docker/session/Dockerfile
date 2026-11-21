@@ -31,12 +31,12 @@
 #
 # FROM contract: same-version pin. `BASE_IMAGE` defaults to `:latest` for
 # convenient local/manual builds, but the release workflow always passes
-# --build-arg BASE_IMAGE=ghcr.io/rjwalters/loom-worker:<version> so the pair
+# --build-arg BASE_IMAGE=ghcr.io/2amlogic/loom-worker:<version> so the pair
 # locksteps exactly the way loom-worker locksteps with loom-daemon. See
 # docker/session/README.md for the full contract, entrypoint behavior, and
 # attach/exec usage.
 
-ARG BASE_IMAGE=ghcr.io/rjwalters/loom-worker:latest
+ARG BASE_IMAGE=ghcr.io/2amlogic/loom-worker:latest
 FROM ${BASE_IMAGE}
 
 # SHELL (bash -o pipefail -c, #6409) is inherited from the base image's own

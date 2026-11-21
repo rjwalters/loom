@@ -49,7 +49,7 @@ not listed is not accepted, which is how the seam stays auditable.
 {
   "schema": "loom.run-job/v1",
   "id": "job-20260916T120000Z-a1b2c3",
-  "image": "ghcr.io/rjwalters/loom-worker:latest",
+  "image": "ghcr.io/2amlogic/loom-worker:latest",
   "command": ["bash", "-lc", "cargo build --release"],
   "workdir": "/home/loom/workspaces/loom",
   "network": "none",
@@ -182,7 +182,7 @@ spec can express), not on the mount check alone.
 ```bash
 # Build a spec from flags (the common case)
 .loom/scripts/run-job.sh \
-  --image ghcr.io/rjwalters/loom-worker:latest \
+  --image ghcr.io/2amlogic/loom-worker:latest \
   --mount "$PWD" --workdir "$PWD" \
   --cpus 4 --memory 8g --timeout 1800 \
   -- bash -lc 'cargo build --release'

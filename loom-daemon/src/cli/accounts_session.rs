@@ -16,7 +16,7 @@ pub(crate) enum SessionAction {
         #[arg(value_name = "NAME")]
         name: String,
         /// Override the session image (default:
-        /// `ghcr.io/rjwalters/loom-worker-session:latest`).
+        /// `ghcr.io/2amlogic/loom-worker-session:latest`).
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
         /// Directory to bind-mount read-write at the identical absolute

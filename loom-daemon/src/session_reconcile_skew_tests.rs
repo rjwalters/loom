@@ -119,8 +119,8 @@ fn version_output_of_the_real_flag_parses() {
 fn images_are_pinned_by_tag_and_downgrades_refused() {
     let host = v("0.19.1151");
     assert_eq!(
-        pinned_image("ghcr.io/rjwalters/loom-worker-session:latest", &host),
-        "ghcr.io/rjwalters/loom-worker-session:0.19.1151"
+        pinned_image("ghcr.io/2amlogic/loom-worker-session:latest", &host),
+        "ghcr.io/2amlogic/loom-worker-session:0.19.1151"
     );
     assert_eq!(pinned_image("localhost:5000/s:0.19.1", &host), "localhost:5000/s:0.19.1151");
     assert_eq!(pinned_image("r/s@sha256:abc", &host), "r/s:0.19.1151");
@@ -128,8 +128,8 @@ fn images_are_pinned_by_tag_and_downgrades_refused() {
     // image pulled by tag. The repository ends before the tag; re-pinning
     // must not stack a second tag onto the first.
     assert_eq!(
-        pinned_image("ghcr.io/rjwalters/loom-worker-session:0.19.1209@sha256:305364f5", &host),
-        "ghcr.io/rjwalters/loom-worker-session:0.19.1151"
+        pinned_image("ghcr.io/2amlogic/loom-worker-session:0.19.1209@sha256:305364f5", &host),
+        "ghcr.io/2amlogic/loom-worker-session:0.19.1151"
     );
     assert_eq!(
         pinned_image("localhost:5000/s:0.19.1@sha256:abc", &host),

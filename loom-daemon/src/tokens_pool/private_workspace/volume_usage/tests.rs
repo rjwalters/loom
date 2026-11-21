@@ -202,8 +202,8 @@ fn reader_image_is_refused_before_any_workspace_is_mounted() {
 fn stock_reader_candidates_include_versioned_tags_newest_first() {
     let _fake = docker::fake::install(Box::new(|args| {
         match args {
-        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "ghcr.io/rjwalters/loom-worker-session"] => Ok(
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1100\nghcr.io/rjwalters/loom-worker-session:<none>\nghcr.io/rjwalters/loom-worker-session:0.19.1209\nghcr.io/rjwalters/loom-worker-session:latest\nghcr.io/rjwalters/loom-worker-session:foo\n".into(),
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "ghcr.io/2amlogic/loom-worker-session"] => Ok(
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1100\nghcr.io/2amlogic/loom-worker-session:<none>\nghcr.io/2amlogic/loom-worker-session:0.19.1209\nghcr.io/2amlogic/loom-worker-session:latest\nghcr.io/2amlogic/loom-worker-session:foo\n".into(),
         ),
         unexpected => panic!("unexpected Docker request: {unexpected:?}"),
     }
@@ -211,9 +211,9 @@ fn stock_reader_candidates_include_versioned_tags_newest_first() {
     assert_eq!(
         local_stock_images(Instant::now() + SEAT_VOLUME_SAMPLE_INTERVAL, &Instant::now),
         [
-            "ghcr.io/rjwalters/loom-worker-session:latest",
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1209",
-            "ghcr.io/rjwalters/loom-worker-session:0.19.1100",
+            "ghcr.io/2amlogic/loom-worker-session:latest",
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1209",
+            "ghcr.io/2amlogic/loom-worker-session:0.19.1100",
         ]
     );
 }

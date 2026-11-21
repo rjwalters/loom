@@ -76,7 +76,7 @@ name: Build and Release
 # release-time verification step.
 #
 # `build-worker-image` (#5325, multi-arch #7388) publishes
-# `ghcr.io/rjwalters/loom-worker` — a pinned OCI base image for fleet workers
+# `ghcr.io/<owner>/loom-worker` — a pinned OCI base image for fleet workers
 # — alongside the raw binary/checksum artifacts above. It is a SEPARATE
 # deliverable from `build-daemon`: it needs only the already-built
 # `x86_64-unknown-linux-gnu` + `aarch64-unknown-linux-gnu` binaries (no
@@ -89,14 +89,14 @@ name: Build and Release
 # contract: docker/worker/README.md.
 #
 # `build-session-image` (#6899, Epic #6896 Phase 1, ADR-0017) publishes
-# `ghcr.io/rjwalters/loom-worker-session` — a same-version FROM layer on top
+# `ghcr.io/<owner>/loom-worker-session` — a same-version FROM layer on top
 # of loom-worker adding the Codex CLI and a persistent tmux-server entrypoint
 # for Phase 2's per-account session containers. Mirrors build-worker-image's
 # shape (build+smoke-test unconditionally, push gated to a canonical-repo
 # release) exactly; see docker/session/README.md for its own FROM contract.
 #
 # `build-native-image` (#8403, Epic #6896 Phase 3, ADR-0017) publishes
-# `ghcr.io/rjwalters/loom-worker-native` — a same-version FROM layer on top of
+# `ghcr.io/<owner>/loom-worker-native` — a same-version FROM layer on top of
 # loom-worker adding the PINNED Pi/OpenCode CLIs, for the per-sweep EPHEMERAL
 # containers native-harness sweeps run in. Same shape as build-session-image
 # (which serves the other, PERSISTENT lifetime for Codex); see
@@ -156,7 +156,7 @@ permissions:
   # the ONLY thing that grants signing authority here — there is no key to leak,
   # and no secret to provision before a release can be signed.
   id-token: write
-  # `build-worker-image` (#5325) pushes ghcr.io/rjwalters/loom-worker using the
+  # `build-worker-image` (#5325) pushes ghcr.io/<owner>/loom-worker using the
   # default GITHUB_TOKEN — no separate registry secret to provision. Read-only
   # everywhere else; only that job's own `permissions:` block actually uses this.
   packages: write
@@ -1245,6 +1245,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Registry namespace = this repository's owner, lower-cased (GHCR paths
+      # must be lower-case; `2AMLogic` is not a valid path). Derived, not
+      # hardcoded, so a future transfer needs no edit here (#14419).
+      - name: Resolve GHCR namespace
+        id: ghcr
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -1271,18 +1278,18 @@ jobs:
           push: false
           load: true
           tags: |
-            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:latest
 
       - name: Smoke-test the built image
-        run: ./docker/worker/test-image.sh "ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}"
+        run: ./docker/worker/test-image.sh "ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}"
 
       # Build AND PUSH the real multi-arch manifest (amd64 + arm64) under the
       # same tags, gated on both "this is a real release" and "this is the
       # canonical repo" — mirrors the macOS/cosign secret-gated skip pattern
       # above, but for a permissions axis instead of a secrets one: a fork
       # running this workflow (via workflow_dispatch, or its own release) has
-      # a valid GITHUB_TOKEN but no write access to ghcr.io/rjwalters/*, so
+      # a valid GITHUB_TOKEN but no write access to ghcr.io/<owner>/*, so
       # pushing there would just fail loudly mid-release. Gating this step
       # behind the smoke test above means a broken image never reaches the
       # registry — the arm64 leg itself is not independently smoke-tested in
@@ -1297,13 +1304,13 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:latest
 
   build-session-image:
     name: Build and publish loom-worker-session image
     # `build-session-image` (#6899, ADR-0017 Phase 1) publishes
-    # ghcr.io/rjwalters/loom-worker-session — a same-version FROM layer on
+    # ghcr.io/<owner>/loom-worker-session — a same-version FROM layer on
     # top of loom-worker adding the Codex CLI + a persistent tmux-server
     # entrypoint (see docker/session/README.md for the full FROM contract).
     # Depends on build-worker-image succeeding (its own smoke test already
@@ -1319,7 +1326,7 @@ jobs:
     # Multi-arch (#7388): the `needs:` dependency additionally guarantees
     # build-worker-image's own multi-arch PUSH step has already completed
     # before this job's own multi-arch push step runs, so the REGISTRY
-    # `ghcr.io/rjwalters/loom-worker:<version>` this job's BASE_IMAGE names
+    # `ghcr.io/<owner>/loom-worker:<version>` this job's BASE_IMAGE names
     # for that step is already a real amd64+arm64 manifest, not amd64-only.
     needs: [resolve, build-worker-image]
     if: needs.resolve.outputs.publish != 'skip'
@@ -1388,6 +1395,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Registry namespace = this repository's owner, lower-cased (GHCR paths
+      # must be lower-case; `2AMLogic` is not a valid path). Derived, not
+      # hardcoded, so a future transfer needs no edit here (#14419).
+      - name: Resolve GHCR namespace
+        id: ghcr
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -1411,7 +1425,7 @@ jobs:
           push: false
           load: true
           tags: |
-            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
 
       # Dry run (#11012): the `docker-container` builder set up above runs
       # its own BuildKit, which resolves `FROM ${BASE_IMAGE}` against the
@@ -1432,20 +1446,20 @@ jobs:
           push: false
           load: true
           build-args: |
-            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            BASE_IMAGE=ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
           tags: |
-            ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker-session:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-session:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-session:latest
 
       - name: Smoke-test the built image
-        run: ./docker/session/test-image.sh "ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}"
+        run: ./docker/session/test-image.sh "ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-session:${{ steps.version.outputs.version }}"
 
       # Build AND PUSH the real multi-arch manifest (amd64 + arm64), gated
       # exactly like build-worker-image's own multi-arch push step. Unlike
       # the native build above (FROM the just-built LOCAL base image),
       # `BASE_IMAGE` here names the REGISTRY tag: `needs: build-worker-image`
       # guarantees that job's own multi-arch push step already completed by
-      # the time this step runs, so `ghcr.io/rjwalters/loom-worker:<version>`
+      # the time this step runs, so `ghcr.io/<owner>/loom-worker:<version>`
       # already resolves to a real multi-arch manifest — buildx pulls the
       # matching per-arch base layer for each platform leg automatically,
       # rather than resolving from this job's amd64-only local store (which
@@ -1459,15 +1473,15 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            BASE_IMAGE=ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
           tags: |
-            ghcr.io/rjwalters/loom-worker-session:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker-session:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-session:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-session:latest
 
   build-native-image:
     name: Build and publish loom-worker-native image
     # `build-native-image` (#8403, Epic #6896 Phase 3) publishes
-    # ghcr.io/rjwalters/loom-worker-native — a same-version FROM layer on top
+    # ghcr.io/<owner>/loom-worker-native — a same-version FROM layer on top
     # of loom-worker adding the PINNED Pi/OpenCode CLIs, for the per-sweep
     # EPHEMERAL containers native-harness sweeps run in (docker/native/README.md
     # explains why this is a separate image from loom-worker-session rather
@@ -1547,6 +1561,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      # Registry namespace = this repository's owner, lower-cased (GHCR paths
+      # must be lower-case; `2AMLogic` is not a valid path). Derived, not
+      # hardcoded, so a future transfer needs no edit here (#14419).
+      - name: Resolve GHCR namespace
+        id: ghcr
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -1563,7 +1584,7 @@ jobs:
           push: false
           load: true
           tags: |
-            ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
 
       # Dry run (#11012): same `builder: default` routing as
       # build-session-image's native build, for the same reason.
@@ -1577,13 +1598,13 @@ jobs:
           push: false
           load: true
           build-args: |
-            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            BASE_IMAGE=ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
           tags: |
-            ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker-native:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-native:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-native:latest
 
       - name: Smoke-test the built image
-        run: ./docker/native/test-image.sh "ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}"
+        run: ./docker/native/test-image.sh "ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-native:${{ steps.version.outputs.version }}"
 
       - name: Build and push multi-arch loom-worker-native image
         if: needs.resolve.outputs.publish == 'true' && github.repository == '2AMLogic/loom'
@@ -1594,7 +1615,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            BASE_IMAGE=ghcr.io/rjwalters/loom-worker:${{ steps.version.outputs.version }}
+            BASE_IMAGE=ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker:${{ steps.version.outputs.version }}
           tags: |
-            ghcr.io/rjwalters/loom-worker-native:${{ steps.version.outputs.version }}
-            ghcr.io/rjwalters/loom-worker-native:latest
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-native:${{ steps.version.outputs.version }}
+            ghcr.io/${{ steps.ghcr.outputs.owner }}/loom-worker-native:latest

@@ -1814,9 +1814,9 @@ This is a pointer only — no contract-point changes ship with it.
 
 | Runtime | Lifetime | Image | Enable with | Telemetry `containment=` |
 |---|---|---|---|---|
-| Claude | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
-| Codex | per-account **persistent session** | `ghcr.io/rjwalters/loom-worker-session` | ADR-0017 Phase 2 | — |
-| Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/rjwalters/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
+| Claude | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker` | `runtimes.containment.enabled: true` (#7429) | `claude-ephemeral` |
+| Codex | per-account **persistent session** | `ghcr.io/2amlogic/loom-worker-session` | ADR-0017 Phase 2 | — |
+| Pi, OpenCode | per-sweep **ephemeral** | `ghcr.io/2amlogic/loom-worker-native` | `runtimes.containment.native: "ephemeral"` (#8403) | `native-ephemeral` |
 
 #### Why native harnesses do NOT reuse Codex's session container
 
@@ -1867,7 +1867,7 @@ purpose. That flag selects the `loom-worker` base image, which ships no Node and
 therefore neither native CLI, so inheriting it would dispatch a native sweep
 into an image that cannot run it. The image resolves
 `LOOM_NATIVE_CONTAINER_IMAGE` env → `runtimes.containment.nativeImage` config →
-`ghcr.io/rjwalters/loom-worker-native:latest`.
+`ghcr.io/2amlogic/loom-worker-native:latest`.
 
 **Mechanism.** The same one `spawn-claude.sh` uses — re-exec the dispatcher
 inside a `docker run`, guarded by the shared `LOOM_SPAWN_CONTAINERIZED=1`
@@ -2282,7 +2282,7 @@ adapter (not the `spawn-worker.sh` seam) decides whether "spawn" means
   "runtimes": {
     "containment": {
       "enabled": true,
-      "image": "ghcr.io/rjwalters/loom-worker:latest"
+      "image": "ghcr.io/2amlogic/loom-worker:latest"
     }
   }
 }
@@ -2296,7 +2296,7 @@ adapter (not the `spawn-worker.sh` seam) decides whether "spawn" means
 
 The image is resolved the same way (`LOOM_SWEEP_CONTAINER_IMAGE` env →
 `runtimes.containment.image` config → default
-`ghcr.io/rjwalters/loom-worker:latest`).
+`ghcr.io/2amlogic/loom-worker:latest`).
 
 **Mechanism.** When enabled, `spawn-claude.sh` re-execs *itself* inside
 `docker run <image> <workspace>/.loom/scripts/spawn-claude.sh <original args>`,
@@ -2619,4 +2619,4 @@ collaboration:
 - [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
   the normative container mount contract (path parity, secrets, uid mapping,
   build-cache placement) for anything that dispatches a worker runtime inside
-  a `ghcr.io/rjwalters/loom-worker`-derived container (epic #6896).
+  a `ghcr.io/2amlogic/loom-worker`-derived container (epic #6896).

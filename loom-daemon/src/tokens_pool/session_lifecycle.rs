@@ -8,7 +8,7 @@
 //! [`super::account_registry::account_inventory`] exactly the way
 //! `loom-daemon accounts status <name>` already does. What this module adds
 //! is the container half — start/stop/status/attach a long-lived
-//! `ghcr.io/rjwalters/loom-worker-session` container that mounts the
+//! `ghcr.io/2amlogic/loom-worker-session` container that mounts the
 //! account's `CODEX_HOME` profile directory, per the mount contract
 //! (`docker/worker/MOUNT-CONTRACT.md` §2/§3) and the image's own `CODEX_HOME`
 //! convention (`docker/session/README.md`).
@@ -91,7 +91,7 @@ pub use start::UndoLock;
 /// Default image this lifecycle launches session containers from
 /// (`docker/session/README.md`). Overridable per-invocation (`--image`) for
 /// tests and for an operator pinning a specific published tag.
-pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-session:latest";
+pub const DEFAULT_SESSION_IMAGE: &str = "ghcr.io/2amlogic/loom-worker-session:latest";
 
 /// The session image's fixed `CODEX_HOME` mount point
 /// (`docker/session/README.md` § "`CODEX_HOME` mount contract").

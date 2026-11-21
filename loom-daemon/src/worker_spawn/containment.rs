@@ -56,7 +56,7 @@ pub const KIND: &str = "native-ephemeral";
 /// `guardrail-parity-native.md` records as tested. Deliberately NOT the base
 /// `loom-worker` image — that one ships no Node and therefore no CLI at all,
 /// so a dispatch into it would fail at `exec` with a bare "not found".
-pub const DEFAULT_IMAGE: &str = "ghcr.io/rjwalters/loom-worker-native:latest";
+pub const DEFAULT_IMAGE: &str = "ghcr.io/2amlogic/loom-worker-native:latest";
 
 /// The container-side home directory. The image's non-root `loom` user
 /// (uid/gid 1000, `docker/worker/Dockerfile`) owns this path. Unlike the

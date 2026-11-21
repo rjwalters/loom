@@ -306,7 +306,7 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   (the tested `head_sha`, via a `workflow_run` on `CI`, #10826) and also fires on
   a hand-created GitHub Release (`/repo:release` from
   [rjwalters/repo](https://github.com/rjwalters/repo) stays the hand-cut and
-  rollback path), and publishes the `ghcr.io/rjwalters/loom-worker:<version>` base
+  rollback path), and publishes the `ghcr.io/2amlogic/loom-worker:<version>` base
   image ([`docker/worker/README.md`](docker/worker/README.md)). **Cadence**: a
   `VERSION` bump lands at most once per `RELEASE_MIN_INTERVAL` (default 24 h,
   #11174; `force` dispatch for a hotfix), and not every `VERSION` gets a tag.

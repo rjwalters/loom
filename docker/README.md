@@ -7,9 +7,9 @@ runs inside, never a containerized daemon.
 
 | Directory | Image | What it is |
 |---|---|---|
-| [`worker/`](worker/README.md) | `ghcr.io/rjwalters/loom-worker` | The base image. Ubuntu LTS + `loom-daemon` + Claude Code CLI + the `git`/`gh`/`jq` toolchain the loom scripts assume + a non-root `loom` user. Everything else here is a `FROM` layer on it. Read this README first for the full `FROM` contract, bootstrap seams, and the mount contract. |
-| [`session/`](session/README.md) | `ghcr.io/rjwalters/loom-worker-session` | The **persistent** per-account session layer (Codex): adds the Codex CLI and a tmux-server entrypoint. Serves ADR-0017's session-container lifetime, for a runtime whose credential is a mutable OAuth refresh chain needing one owning process. |
-| [`native/`](native/README.md) | `ghcr.io/rjwalters/loom-worker-native` | The **ephemeral** per-sweep native-harness layer (Pi / OpenCode): adds the two CLIs, pinned to the versions the guardrail-parity doc records as tested. Serves ADR-0017's ephemeral lifetime, for API-key credentials that have no refresh chain to own. |
+| [`worker/`](worker/README.md) | `ghcr.io/2amlogic/loom-worker` | The base image. Ubuntu LTS + `loom-daemon` + Claude Code CLI + the `git`/`gh`/`jq` toolchain the loom scripts assume + a non-root `loom` user. Everything else here is a `FROM` layer on it. Read this README first for the full `FROM` contract, bootstrap seams, and the mount contract. |
+| [`session/`](session/README.md) | `ghcr.io/2amlogic/loom-worker-session` | The **persistent** per-account session layer (Codex): adds the Codex CLI and a tmux-server entrypoint. Serves ADR-0017's session-container lifetime, for a runtime whose credential is a mutable OAuth refresh chain needing one owning process. |
+| [`native/`](native/README.md) | `ghcr.io/2amlogic/loom-worker-native` | The **ephemeral** per-sweep native-harness layer (Pi / OpenCode): adds the two CLIs, pinned to the versions the guardrail-parity doc records as tested. Serves ADR-0017's ephemeral lifetime, for API-key credentials that have no refresh chain to own. |
 
 The two overlay layers differ by **container lifetime**, not by which CLI they
 install — see [`native/README.md`](native/README.md) § "Why a third image, and
