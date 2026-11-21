@@ -525,6 +525,12 @@ fn capabilities_list_the_served_forge_verbs() {
         .filter_map(|c| c.as_str())
         .collect();
     for command in [
+        "champion-hold classify",
+        "champion-hold merge-failed-marker",
+        "champion-hold ratification",
+        "champion-hold self-release-calibration",
+        "curation-complete",
+        "notify-cleared-blockers",
         "forge check-claim",
         "forge wait-checks",
         "forge merge-queue status",
@@ -567,6 +573,10 @@ fn capabilities_list_the_served_forge_verbs() {
     let dv: serde_json::Value = serde_json::from_slice(&d.stdout).unwrap();
     assert_eq!(dv["tools_commands"], v["tools_commands"]);
 }
+
+#[cfg(unix)]
+#[path = "loom_tools_slice/workflow.rs"]
+mod workflow;
 
 // ---- #14519: the shared non-queue writes ----------------------------------
 

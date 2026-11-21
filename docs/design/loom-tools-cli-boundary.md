@@ -771,7 +771,7 @@ The remaining merge-queue verbs (#14520) are listed in §16.
 
 | Verb or family | Reason |
 | --- | --- |
-| `merge-pr*`, `champion-hold`, `curation-complete`, `notify-cleared-blockers` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
+| `merge-pr*` | writes; merge integration is #14396 / #8191 (`park-record` and `operator-decision` moved in #14464, §14) |
 | `peer-claims`, `queue`, `status` | daemon round trip (class C) |
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
@@ -891,6 +891,23 @@ or `release` leaves the owner's `claim.json` unchanged.
 `install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
 split into reads and writes, so no sub-verbs are listed). Forge claim checks
 (§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
+
+### 13.9 Hold evidence, curation and blocker notification (#14465)
+
+Both binaries dispatch these commands to the same Rust handlers. All four
+`champion-hold` verbs read evidence. The caller posts the marker printed by
+`merge-failed-marker`. A notification dry run also requires only read access.
+
+In session and local-daemon modes, `curation-complete` checks write scope on
+the explicit repository before projecting points. `notify-cleared-blockers`
+checks the scan's repository and sends each eligible label edit and comment
+to the discovered dependent. These GitHub handlers decline Gitea with exit 3.
+
+Fleet diagnostics and previews require a usable fleet reader. Fleet mutations
+remain pending on #14465. The scoped broker grants the fleet role issue creation
+and commit-status posting. Its label policy also excludes the curation and
+unpark transitions. Until a scoped operation is available, the tools entry
+point refuses these writes before contacting GitHub.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 

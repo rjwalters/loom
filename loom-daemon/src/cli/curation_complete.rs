@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
-pub(crate) struct CurationCompleteArgs {
+pub struct CurationCompleteArgs {
     /// owner/repo whose CURRENT issue body is fetched.
     #[arg(long)]
     repo: String,
@@ -34,11 +34,12 @@ pub(crate) struct CurationCompleteArgs {
     completion_id: String,
     /// Main workspace monitored by the daemon, not an issue worktree.
     #[arg(long)]
-    workspace_root: PathBuf,
+    pub workspace_root: PathBuf,
 }
 
 impl CurationCompleteArgs {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
+        crate::forge_cmd::decline_gitea(Some(&self.workspace_root));
         let policy = TrustPolicy::for_root(&self.workspace_root);
         // The label writes go to the explicit --repo; vet it first (#9548).
         let (root, repo) = (self.workspace_root.clone(), self.repo.clone());
@@ -63,6 +64,7 @@ impl CurationCompleteArgs {
             GhTarget::repo(&self.repo).map_err(anyhow::Error::msg)?,
             std::time::Duration::from_secs(30),
         )
+        .number(self.issue)
         .forge_op(forge_op)
         .program(gh)
         .current_dir(&self.workspace_root)
@@ -121,7 +123,7 @@ impl CurationCompleteArgs {
             .filter_map(|l| l.get("name").and_then(serde_json::Value::as_str))
             .filter(|name| name.starts_with(POINTS_LABEL_PREFIX) && *name != wanted);
         for name in stale {
-            let path = format!("{path}/{}", name.replace(':', "%3A"));
+            let path = format!("{path}/{}", super::labels_migrate::enc(name));
             let args = ["api", "-X", "DELETE", &path, "--silent"];
             if let Err(e) = self.gh(
                 gh,

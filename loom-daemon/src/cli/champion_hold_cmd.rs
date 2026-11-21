@@ -27,11 +27,14 @@ use crate::champion_hold::classify::{
     classify_operator, fetch_operator_adder, merge_failed_notice_due, needs_comments, stacked_base,
     stray_operator_candidate, with_stacked_base, PrClass,
 };
+use crate::cmd_out::CmdOutcome;
+use crate::comment_trust::records::parse_records;
 use anyhow::Result;
 use serde_json::Value;
+use std::path::Path;
 
 #[derive(clap::Subcommand)]
-pub(crate) enum ChampionHoldCommand {
+pub enum ChampionHoldCommand {
     /// Classify a PR for Champion (#11932): `clear` (run the criteria),
     /// `champion-hold` (Champion's own hold: leave it), `foreign-park`
     /// (`loom:blocked` from another actor: skip, no merge, no comment), or
@@ -83,7 +86,7 @@ pub(crate) enum ChampionHoldCommand {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct TargetArgs {
+pub struct TargetArgs {
     /// The pull request number.
     #[arg(long, value_name = "N")]
     pr: u64,
@@ -93,19 +96,36 @@ pub(crate) struct TargetArgs {
     repo: Option<String>,
 }
 
+/// Use the same reader routing for the evidence and its trusted comment listing.
+fn read(op: &'static str, repo: &str, args: &[&str], root: &Path) -> CmdOutcome {
+    if repo == "{owner}/{repo}" {
+        crate::script_helpers::gh_read(op, args, root, false)
+    } else {
+        crate::script_helpers::gh_route::gh_read_for_repo(op, args, root, repo)
+    }
+}
+
+fn trusted_comments(repo: &str, pr: u64, root: &Path) -> Option<Vec<Value>> {
+    let path = format!("repos/{repo}/issues/{pr}/comments");
+    let listing = crate::comment_trust::records::fetch_comment_listing_with(
+        || {
+            read("trust.comment_listing", repo, &["api", &path, "--paginate"], root)
+                .ok_output()
+                .map(|o| o.stdout.clone())
+        },
+        crate::forge_retry::thread_sleep,
+    )?;
+    crate::comment_trust::TrustPolicy::for_root(root).trusted_listing(&listing)
+}
+
 impl TargetArgs {
     fn repo(&self) -> &str {
         self.repo.as_deref().unwrap_or("{owner}/{repo}")
     }
 
     /// The PR's trusted comment bodies, oldest first. `None` when unreadable.
-    fn trusted_bodies(&self, root: &std::path::Path) -> Option<Vec<String>> {
-        let comments = crate::comment_trust::records::fetch_trusted_comments(
-            self.repo(),
-            &self.pr.to_string(),
-            root,
-            false,
-        )?;
+    fn trusted_bodies(&self, root: &Path) -> Option<Vec<String>> {
+        let comments = trusted_comments(self.repo(), self.pr, root)?;
         Some(
             comments
                 .iter()
@@ -115,18 +135,16 @@ impl TargetArgs {
     }
 
     /// The PR's label names, live. `None` when unreadable.
-    fn labels(&self, root: &std::path::Path) -> Option<Vec<String>> {
+    fn labels(&self, root: &Path) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{}/labels?per_page=100", self.repo(), self.pr);
-        let out =
-            crate::script_helpers::gh_read("champion_hold.labels", &["api", &path], root, false);
+        let out = read("champion_hold.labels", self.repo(), &["api", &path], root);
         let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
         crate::verdict_gate::label_names(&doc)
     }
 
     /// A live REST read of `path`, decoded. `None` when unreadable.
-    fn read_json(path: &str, root: &std::path::Path) -> Option<Value> {
-        let out =
-            crate::script_helpers::gh_read("champion_hold.read_json", &["api", path], root, false);
+    fn read_json(repo: &str, path: &str, root: &Path) -> Option<Value> {
+        let out = read("champion_hold.read_json", repo, &["api", path], root);
         serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()
     }
 
@@ -134,9 +152,10 @@ impl TargetArgs {
     /// One read of the PR for `base.ref`; the parent is not looked up (an
     /// open, merged or closed parent all mean "do not merge here"). `Err`
     /// when the base could not be read.
-    fn loom_stack_base(&self, root: &std::path::Path) -> Result<Option<String>, &'static str> {
-        let pull = Self::read_json(&format!("repos/{}/pulls/{}", self.repo(), self.pr), root)
-            .ok_or("base")?;
+    fn loom_stack_base(&self, root: &Path) -> Result<Option<String>, &'static str> {
+        let pull =
+            Self::read_json(self.repo(), &format!("repos/{}/pulls/{}", self.repo(), self.pr), root)
+                .ok_or("base")?;
         stacked_base(&pull).ok_or("base")
     }
 }
@@ -147,8 +166,16 @@ fn unreadable(verb: &str, pr: u64, what: &str) -> ! {
 }
 
 impl ChampionHoldCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    pub fn run(self) -> Result<()> {
+        self.run_with_gate(|_| Ok(()))
+    }
+
+    /// Let the tools entry point configure its read route for this workspace
+    /// before the handler reads from it.
+    pub fn run_with_gate(self, gate: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
         let root = super::forge_identity_cmd::workspace();
+        gate(&root)?;
+        crate::forge_cmd::decline_gitea(Some(&root));
         match self {
             ChampionHoldCommand::Classify(t) => {
                 let labels = t
@@ -229,39 +256,26 @@ impl ChampionHoldCommand {
 }
 
 /// The ratification verb's stdout line; exits 3 on any failed read.
-fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
+fn ratification_line(t: &TargetArgs, root: &Path) -> String {
     use crate::champion_hold::ratification::{
         decide, scan, unreadable_candidates, ChangedFile, Comment, Config, Verdict,
     };
     let repo = t.repo();
     let fail = |what: &str| -> ! { unreadable("ratification", t.pr, what) };
-    let pull = TargetArgs::read_json(&format!("repos/{repo}/pulls/{}", t.pr), root)
+    let pull = TargetArgs::read_json(repo, &format!("repos/{repo}/pulls/{}", t.pr), root)
         .unwrap_or_else(|| fail("head"));
     let head = pull
         .pointer("/head/sha")
         .and_then(Value::as_str)
         .unwrap_or_else(|| fail("head"))
         .to_string();
-    let listing = crate::script_helpers::gh_read(
-        "champion_hold.ratify_files",
-        &[
-            "api",
-            &format!("repos/{repo}/pulls/{}/files", t.pr),
-            "--paginate",
-            "--jq",
-            ".[]",
-        ],
-        root,
-        false,
-    );
+    let path = format!("repos/{repo}/pulls/{}/files", t.pr);
+    let listing = read("champion_hold.ratify_files", repo, &["api", &path, "--paginate"], root);
     let listing = listing.ok_output().unwrap_or_else(|| fail("file list"));
+    let records = parse_records(&listing.stdout).unwrap_or_else(|| fail("file list"));
     let cfg = Config::from_effective(&crate::config_resolver::resolve_effective_config(root));
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&listing.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-    {
-        let v: Value = serde_json::from_str(line).unwrap_or_else(|_| fail("file list"));
+    for v in records {
         let name = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         let mut f = ChangedFile {
             filename: name("filename").unwrap_or_else(|| fail("file list")),
@@ -272,11 +286,11 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
         // Contents are read only for files the path rules select.
         if f.status != "removed" && ratification_candidate(&f, &cfg) {
             let path = format!("repos/{repo}/contents/{}?ref={head}", f.filename);
-            let out = crate::script_helpers::gh_read(
+            let out = read(
                 "champion_hold.head_content",
+                repo,
                 &["api", "-H", "Accept: application/vnd.github.raw", &path],
                 root,
-                false,
             );
             f.head_content = out
                 .ok_output()
@@ -290,12 +304,11 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
     if !unreadable_candidates(&files, &cfg).is_empty() {
         fail("head content");
     }
-    let comments: Vec<Comment> =
-        crate::comment_trust::records::fetch_trusted_comments(repo, &t.pr.to_string(), root, false)
-            .unwrap_or_else(|| fail("trusted comments"))
-            .iter()
-            .filter_map(Comment::from_record)
-            .collect();
+    let comments: Vec<Comment> = trusted_comments(repo, t.pr, root)
+        .unwrap_or_else(|| fail("trusted comments"))
+        .iter()
+        .filter_map(Comment::from_record)
+        .collect();
     let verdict = scan(&files, &cfg);
     let action = decide(&verdict, &comments, &head);
     let (name, hit) = match &verdict {
@@ -340,14 +353,15 @@ fn calibration_report(
     repo: &str,
     min_age_days: i64,
     limit: u32,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<String, String> {
     use crate::champion_hold::calibration::{
         is_mature, recorded_confidence, summarize, Row, REVERT_WINDOW_DAYS,
     };
     let now = chrono::Utc::now();
-    let list = crate::script_helpers::gh_read(
+    let list = read(
         "champion_hold.merged_prs",
+        repo,
         &[
             "pr",
             "list",
@@ -361,7 +375,6 @@ fn calibration_report(
             "number,mergedAt,mergeCommit",
         ],
         root,
-        false,
     );
     let list = list.ok_output().ok_or("merged PR list could not be read")?;
     let prs: Vec<Value> =
@@ -378,13 +391,8 @@ fn calibration_report(
             .and_then(Value::as_str)
             .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
             .ok_or_else(|| format!("PR #{pr}: merge time unreadable"))?;
-        let trusted = crate::comment_trust::records::fetch_trusted_comments(
-            repo,
-            &pr.to_string(),
-            root,
-            false,
-        )
-        .ok_or_else(|| format!("PR #{pr}: comments unreadable"))?;
+        let trusted = trusted_comments(repo, pr, root)
+            .ok_or_else(|| format!("PR #{pr}: comments unreadable"))?;
         let bodies: Vec<String> = trusted
             .iter()
             .filter_map(|c| c.get("body").and_then(Value::as_str).map(str::to_string))
@@ -444,7 +452,7 @@ fn revert_in_window(
     pr: u64,
     sha: &str,
     window_end: chrono::DateTime<chrono::Utc>,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<bool, String> {
     let out = std::process::Command::new("git")
         .current_dir(root)
@@ -481,11 +489,12 @@ fn reverts_by_pr(
     pr: u64,
     sha: &str,
     window_end: chrono::DateTime<chrono::Utc>,
-    root: &std::path::Path,
+    root: &Path,
 ) -> Result<bool, String> {
     let q = format!("\"Reverts {repo}#{pr}\" in:body");
-    let out = crate::script_helpers::gh_read(
+    let out = read(
         "champion_hold.revert_search",
+        repo,
         &[
             "pr",
             "list",
@@ -501,7 +510,6 @@ fn reverts_by_pr(
             "number,body,createdAt",
         ],
         root,
-        false,
     );
     let out = out
         .ok_output()

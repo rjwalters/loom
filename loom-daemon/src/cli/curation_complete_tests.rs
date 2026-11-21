@@ -222,3 +222,13 @@ fn unwritable_repo_is_refused_before_any_read_or_write() {
     assert!(forge.log().is_empty());
     assert!(forge.journal().is_empty());
 }
+
+#[test]
+fn stale_label_names_are_a_single_path_segment() {
+    let forge = Forge::new(
+        &issue("<!-- loom:points=5 -->", "OWNER", &["points:old/label?x"]),
+        &serde_json::json!([]),
+    );
+    forge.run("retry").unwrap();
+    assert!(forge.label_writes()[1].ends_with("labels/points%3Aold%2Flabel%3Fx --silent"));
+}

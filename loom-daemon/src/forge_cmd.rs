@@ -395,6 +395,18 @@ fn forge_inv(op: &'static str, intent: AccessIntent, gh: &str) -> GhInvocation {
 /// so `forge_cmd::gh_bin` callers and the facade can never disagree.
 pub(crate) use crate::gh_invocation::gh_bin;
 
+/// Return control to the caller's Gitea adapter before any GitHub I/O.
+pub(crate) fn decline_gitea(cwd: Option<&Path>) {
+    let ft = detect_forge(cwd);
+    if ft == ForgeType::Gitea {
+        eprintln!(
+            "loom-daemon forge: gitea is not handled natively; falling back to the \
+             caller's shell path"
+        );
+        std::process::exit(EX_FORGE_DECLINED);
+    }
+}
+
 /// Passthrough the given `gh` args (entity prepended), inheriting stdio and
 /// propagating the exit code. On GitHub this is byte-identical to the scripts'
 /// `FORGE=gh` fallback. Never returns on success/failure of `gh` (calls
@@ -406,14 +418,7 @@ fn is_issue_create(entity: &str, args: &[String]) -> bool {
 }
 
 fn gh_passthrough(entity: &str, args: &[String]) -> Result<()> {
-    let ft = detect_forge(None);
-    if ft == ForgeType::Gitea {
-        eprintln!(
-            "loom-daemon forge: gitea is not handled natively; falling back to the \
-             caller's shell path"
-        );
-        std::process::exit(EX_FORGE_DECLINED);
-    }
+    decline_gitea(None);
 
     // #5047: `forge issue` is a byte-identical passthrough to `gh issue`, so
     // `forge issue create` inherits `gh issue create`'s GraphQL cost and dies

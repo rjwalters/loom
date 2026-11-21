@@ -26,7 +26,10 @@
 //! `migrate`) behind the same gate and the write forms (`labels generate
 //! --write`, `labels undeclared --prune`, `labels migrate --apply`,
 //! `forge-probe --live-write`, `forge-inventory gate --update`) refused with
-//! exit 64 before any handler runs.
+//! exit 64 before any handler runs,.
+//!
+//! `champion-hold`, `curation-complete` and `notify-cleared-blockers` (#14465, §13.9)
+//! apply the same mode gate. Workflow writes require the local route and scoped forge access.
 
 use std::io::Write;
 
@@ -37,16 +40,16 @@ use loom_daemon::cli::{
     handle_forge_probe_read_command, handle_forge_read_command, handle_labels_read_command,
     handle_lease_command, handle_operator_decision_command, handle_park_record_command,
     handle_resolve_model_command, handle_resolve_role_model_command, handle_strip_ansi_command,
-    AffectedFilesCommand, CheckPointsMarkerArgs, CheckpointAction, ConfigArgs, DuplicateScanArgs,
-    ForgeInventoryCommand, ForgeProbeArgs, ForgeReadCli, GuardsCommand, HooksHomeArgs,
-    InstallBinaryCommand, InstallCompatCommand, LabelDuplicatesArgs, LabelsArgs, LeaseCli,
-    OperatorDecisionCli, ParkRecordCli, PrQueueArgs, PremiseCheckArgs, ReleaseFetchArgs,
-    ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs, RolesCommand, SkipLabelsArgs,
-    StaleBlockedArgs,
+    AffectedFilesCommand, ChampionHoldCommand, CheckPointsMarkerArgs, CheckpointAction, ConfigArgs,
+    CurationCompleteArgs, DuplicateScanArgs, ForgeInventoryCommand, ForgeProbeArgs, ForgeReadCli,
+    GuardsCommand, HooksHomeArgs, InstallBinaryCommand, InstallCompatCommand, LabelDuplicatesArgs,
+    LabelsArgs, LeaseCli, NotifyClearedBlockersArgs, OperatorDecisionCli, ParkRecordCli,
+    PrQueueArgs, PremiseCheckArgs, ReleaseFetchArgs, ResolveModelArgs, ResolveRoleModelArgs,
+    ResyncPayloadArgs, RolesCommand, SkipLabelsArgs, StaleBlockedArgs,
 };
 use loom_daemon::install_compat;
 use loom_daemon::script_helpers;
-use loom_daemon::tools_mode;
+use loom_daemon::tools_mode::{self, Route};
 
 #[derive(Parser)]
 #[command(
@@ -101,6 +104,14 @@ enum ToolsCommands {
     /// reach the forge resolves `mode` first. Local verbs, including
     /// `verdict-lock` and `journal-ci-refusal`, run offline.
     Forge(ForgeReadCli),
+    /// Read Champion hold evidence for a pull request.
+    #[command(subcommand)]
+    ChampionHold(ChampionHoldCommand),
+    /// Project the trusted points estimate and curation labels.
+    CurationComplete(CurationCompleteArgs),
+    /// Notify dependents whose cited blockers have closed.
+    NotifyClearedBlockers(NotifyClearedBlockersArgs),
+
     /// Render, read, apply and retract the `loom:blocked` park record: the
     /// same arguments, stdin, stdout and exit codes as `loom-daemon
     /// park-record` (#14464). `render`, `parse`, `retract --file`, `released`
@@ -239,6 +250,35 @@ fn mode_gate() -> Result<()> {
     tools_mode::configure_forge_reads(&cwd).map_err(anyhow::Error::msg)
 }
 
+/// The fleet broker's role profile has no label or comment operations.
+/// Never run these mutations on an ambient gh credential in fleet mode.
+fn workflow_gate(root: &std::path::Path, writes: bool) -> Result<()> {
+    let checkout = loom_daemon::repo_root::find_repo_root(root);
+    check_workflow_route(checkout.as_deref().unwrap_or(root), writes)
+}
+
+fn check_workflow_route(root: &std::path::Path, writes: bool) -> Result<()> {
+    if writes
+        && loom_daemon::config_resolver::tier_conflicts(root)
+            .iter()
+            .any(|c| c.key == "mode")
+    {
+        anyhow::bail!(
+            "conflicting fleet and workspace mode settings; reconcile them before a workflow write"
+        );
+    }
+    if tools_mode::configure_forge_reads_with_route(root).map_err(anyhow::Error::msg)?
+        == Route::Fleet
+    {
+        anyhow::ensure!(!writes, "the scoped fleet write broker does not authorize workflow label edits or blocker comments");
+        anyhow::ensure!(
+            loom_daemon::forge_gateway::cli_reads_reader_only(),
+            "no usable fleet read route"
+        );
+    }
+    Ok(())
+}
+
 /// `apply --new` files through `create-issue.sh`, which calls `$LOOM_DAEMON_BIN
 /// forge create-issue` (default `loom-daemon`). A tools-only host has no daemon
 /// binary, so unless the caller named one, the nested call resolves to this
@@ -253,6 +293,7 @@ fn use_this_binary_for_nested_filing() {
 }
 
 fn run() -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     match ToolsCli::parse().command {
         ToolsCommands::StripAnsi { file } => handle_strip_ansi_command(file.as_deref()),
         ToolsCommands::Checkpoint { action } => {
@@ -276,6 +317,17 @@ fn run() -> Result<()> {
                 mode_gate()?;
             }
             handle_forge_read_command(cli)
+        }
+        ToolsCommands::ChampionHold(cmd) => {
+            cmd.run_with_gate(|root| check_workflow_route(root, false))
+        }
+        ToolsCommands::CurationComplete(args) => {
+            workflow_gate(&args.workspace_root, true)?;
+            args.run()
+        }
+        ToolsCommands::NotifyClearedBlockers(args) => {
+            workflow_gate(args.repo_root.as_deref().unwrap_or(&cwd), !args.dry_run)?;
+            args.run()
         }
         ToolsCommands::ParkRecord(cli) => handle_park_record_command(cli),
         ToolsCommands::OperatorDecision(cli) => {

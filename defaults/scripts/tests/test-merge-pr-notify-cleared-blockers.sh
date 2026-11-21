@@ -80,6 +80,12 @@ D="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
 LOG="$D/gh-calls.log"
 printf '%s\n' "$*" >>"$D/all-calls.log"
 
+# Answer the write-scope probe for this managed fixture only.
+if [[ "$*" == "api repos/owner/repo --jq .permissions // {}" ]]; then
+  echo '{"push":true}'
+  exit 0
+fi
+
 case "${1:-}:${2:-}" in
   pr:view)
     if [[ " $* " == *" closingIssuesReferences "* ]]; then
@@ -263,6 +269,10 @@ read_comment_body() { cat "$STUB_DIR/comment-body-issue-$1.txt" 2>/dev/null || t
 # `std::env::current_dir()` default (no --repo-root is passed by the shell
 # wrapper) resolves to a plain, harmless directory rather than this checkout.
 cd "$STUB_DIR"
+git init -q
+git remote add origin https://github.com/owner/repo.git
+mkdir -p .loom
+export LOOM_WRITE_SCOPE_CACHE_DIR="$STUB_DIR/write-scope"
 
 echo "Testing _notify_cleared_blockers behavior..."
 

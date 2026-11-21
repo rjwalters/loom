@@ -26,8 +26,7 @@ use anyhow::Result;
 
 use crate::script_helpers;
 
-#[path = "curation_complete.rs"]
-mod curation_complete;
+use super::CurationCompleteArgs;
 #[path = "record_rework.rs"]
 mod record_rework;
 #[path = "telemetry_export.rs"]
@@ -46,7 +45,7 @@ mod telemetry_overhead;
 #[derive(clap::Subcommand)]
 pub(crate) enum TelemetryCommand {
     /// Journal one Curator completion before applying curated labels.
-    CurationComplete(curation_complete::CurationCompleteArgs),
+    CurationComplete(CurationCompleteArgs),
     /// Plan or explicitly execute two bounded Pi/OpenCode GLM smoke runs.
     TelemetryLiveCanary(telemetry_live::LiveArgs),
     /// Write deterministic synthetic telemetry and an independent-query manifest.
