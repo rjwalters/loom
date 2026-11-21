@@ -1130,6 +1130,9 @@ pub fn spawn_multi_worktree_reaper_task(
                 })
                 .effective_roots(&fallback_root);
 
+            // The Codex session reaper's disabled-mode report is machine-level:
+            // made at most once per tick, not once per registered root.
+            let mut codex_sessions_reported = false;
             for root in roots.clone() {
                 // Orphaned *process* trees first (#5110): a runaway driver
                 // inside an issue worktree pins the worktree's "active
@@ -1147,6 +1150,15 @@ pub fn spawn_multi_worktree_reaper_task(
                 // traffic, and one loop per registered root is simpler to
                 // reason about than three.
                 crate::primary_checkout_reaper::reap_primary_checkout_for(&root).await;
+
+                // Codex session-history bound (#12966): the profile root is
+                // machine-level, so this is idempotent across registered roots.
+                // Opt-in: a root that has not enabled it deletes nothing.
+                crate::codex_session_reaper::reap_codex_sessions_for(
+                    &root,
+                    &mut codex_sessions_reported,
+                )
+                .await;
 
                 let config = read_worktree_reaper_config(&root);
                 if !resolve_enabled(&config) {
