@@ -77,6 +77,8 @@ struct Fake {
     posted: Vec<String>,
     swaps: Vec<(Vec<String>, Vec<String>)>,
     comments_unreadable: bool,
+    fail_label_add: bool,
+    fail_label_remove: bool,
     // #14813 fixtures.
     base_ref: Option<String>,
     default_branch: Option<String>,
@@ -89,6 +91,8 @@ struct Fake {
     updates: Vec<String>,
     /// The head a `current_head` re-read reports once (a move mid-plan).
     head_on_reread: Option<String>,
+    /// A changed PR row seen only by the fresh conflict write guard.
+    fresh_on_reread: Option<RestPull>,
 }
 
 impl Fake {
@@ -155,6 +159,9 @@ impl Forge for Fake {
             .unwrap_or_else(|| self.head.clone())
             .into()
     }
+    fn current_pr(&mut self, _: u32) -> Option<RestPull> {
+        self.fresh_on_reread.take().or_else(|| Some(self.pr()))
+    }
     fn trusted_comments(&mut self, _: u32) -> Option<Vec<String>> {
         (!self.comments_unreadable).then(|| {
             let mut all = self.comments.clone();
@@ -170,6 +177,11 @@ impl Forge for Fake {
         Ok(())
     }
     fn swap_labels(&mut self, _: u32, remove: &[&str], add: &[&str]) -> Result<()> {
+        if (!add.is_empty() && std::mem::take(&mut self.fail_label_add))
+            || (!remove.is_empty() && std::mem::take(&mut self.fail_label_remove))
+        {
+            return Err(anyhow!("temporary fixture label error"));
+        }
         self.labels.retain(|l| !remove.contains(&l.as_str()));
         self.labels.extend(add.iter().map(|a| (*a).to_string()));
         self.swaps.push((s(remove), s(add)));
@@ -429,9 +441,10 @@ fn the_same_head_and_base_pair_is_never_requested_twice() {
     f.comments.push(update_marker(HEAD_A, TIP));
     assert_eq!(run(&mut f).updated, 0);
     assert_eq!(writes(&f), (0, 0, 0));
-    // A conflict record for the same pair suppresses too.
+    // A completed handoff is no longer on the CI gate.
     let mut f = Fake::inherited(HEAD_A);
     f.comments.push(conflict_marker(HEAD_A, TIP));
+    f.labels = s(&[CHANGES_REQUESTED, MERGE_CONFLICT]);
     assert_eq!(run(&mut f).updated, 0);
     assert_eq!(writes(&f), (0, 0, 0));
 }
@@ -455,7 +468,10 @@ fn a_conflicting_update_hands_the_pr_to_the_doctor_conflict_lane() {
     assert_eq!(f.labels, s(&["loom:changes-requested", "loom:merge-conflict"]));
     assert_eq!(
         f.swaps,
-        vec![(s(&["loom:ci-failure", "loom:blocked"]), s(&["loom:merge-conflict"]))]
+        vec![
+            (vec![], s(&[MERGE_CONFLICT])),
+            (s(&[CI_FAILURE, BLOCKED]), vec![])
+        ]
     );
     // An unblocked ci-gate PR keeps only its own labels removed.
     let mut f = Fake::inherited(HEAD_A);
@@ -464,6 +480,59 @@ fn a_conflicting_update_hands_the_pr_to_the_doctor_conflict_lane() {
     f.update_outcome = Some(UpdateOutcome::Conflict("merge conflict".into()));
     assert_eq!(run(&mut f).conflicted, 1);
     assert_eq!(f.labels, s(&["loom:changes-requested", "loom:merge-conflict"]));
+}
+
+#[test]
+fn a_partial_conflict_label_handoff_is_resumed_without_another_update_or_note() {
+    for added_conflict_label in [false, true] {
+        let mut f = Fake::inherited(HEAD_A);
+        f.update_outcome = Some(UpdateOutcome::Conflict("fixture conflict".into()));
+        f.fail_label_add = !added_conflict_label;
+        f.fail_label_remove = added_conflict_label;
+        assert_eq!(run(&mut f).conflicted, 0);
+        assert_eq!(writes(&f), (1, 1, usize::from(added_conflict_label)));
+        assert!(f.posted[0].starts_with(&conflict_marker(HEAD_A, TIP)));
+        assert!(f.labels.contains(&CI_FAILURE.to_string()));
+        assert!(f.labels.contains(&BLOCKED.to_string()));
+        assert_eq!(f.labels.contains(&MERGE_CONFLICT.to_string()), added_conflict_label);
+
+        assert_eq!(run(&mut f).conflicted, 1);
+        assert_eq!(writes(&f), (1, 1, 2));
+        assert_eq!(f.labels, s(&[CHANGES_REQUESTED, MERGE_CONFLICT]));
+        assert_eq!(run(&mut f), Stats::default());
+        assert_eq!(writes(&f), (1, 1, 2));
+    }
+}
+
+#[test]
+fn a_resumed_conflict_handoff_rechecks_the_head_and_holds_before_writing() {
+    for moved_head in [false, true] {
+        let mut f = Fake::inherited(HEAD_A);
+        f.comments.push(conflict_marker(HEAD_A, TIP));
+        let mut fresh = f.pr();
+        if moved_head {
+            fresh.head_sha = Some(HEAD_B.into());
+        } else {
+            fresh.labels.push("loom:operator".into());
+        }
+        f.fresh_on_reread = Some(fresh);
+        assert_eq!(run(&mut f).conflicted, 0);
+        assert_eq!(writes(&f), (0, 0, 0));
+    }
+}
+
+#[test]
+fn a_conflict_handoff_cannot_resume_from_a_quote_or_a_different_pair() {
+    for comment in [
+        format!("> {}", conflict_marker(HEAD_A, TIP)),
+        conflict_marker(HEAD_B, TIP),
+    ] {
+        let mut f = Fake::inherited(HEAD_A);
+        f.comments.push(comment);
+        let pr = f.pr();
+        assert!(apply_conflict_handoff(&mut f, &pr, HEAD_A, TIP, None).is_err());
+        assert_eq!(writes(&f), (0, 0, 0));
+    }
 }
 
 #[test]
@@ -516,6 +585,32 @@ fn a_pr_local_failure_hiding_behind_an_inherited_name_is_not_updated() {
         .insert(TIP.into(), checks_fixture(&[], &[], &["lint"]));
     assert_eq!(run(&mut f).updated, 0);
     assert_eq!(writes(&f), (0, 0, 0));
+}
+
+#[test]
+fn a_missing_failure_title_is_not_inherited_evidence() {
+    let no_statuses = serde_json::json!({"statuses": []});
+    let no_runs = serde_json::json!({"total_count": 0, "check_runs": []});
+    let legacy_failure = serde_json::json!({"statuses": [{"context": "ci", "state": "failure"}]});
+    let mut cases = vec![checks_at(&no_runs, &legacy_failure).unwrap()];
+    for output in [
+        serde_json::Value::Null,
+        serde_json::json!({"title": ""}),
+        serde_json::json!({"title": "  "}),
+    ] {
+        let runs = serde_json::json!({
+            "total_count": 1,
+            "check_runs": [{"name": "ci", "status": "completed", "conclusion": "failure", "output": output}],
+        });
+        cases.push(checks_at(&runs, &no_statuses).unwrap());
+    }
+    for check in cases {
+        let mut f = Fake::inherited(HEAD_A);
+        f.checks_at.insert(HEAD_A.into(), check.clone());
+        f.checks_at.insert(MB.into(), check);
+        assert_eq!(run(&mut f).updated, 0);
+        assert_eq!(writes(&f), (0, 0, 0));
+    }
 }
 
 #[test]

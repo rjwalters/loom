@@ -116,8 +116,8 @@ pub fn update_marker(head: &str, base: &str) -> String {
     format!("{UPDATE_MARKER_PREFIX}{head} base={base} -->")
 }
 
-/// Written by this pass when a branch update confirmed a merge conflict and
-/// the PR was handed to Doctor's conflict lane instead (#14813, #14810).
+/// Written by this pass when a branch update confirmed a merge conflict.
+/// The marker precedes the Doctor handoff so its labels can be retried.
 pub const CONFLICT_MARKER_PREFIX: &str = "<!-- loom:ci-gate-update conflicted head=";
 
 /// The marker for one conflicted (head, base) pair.
@@ -195,6 +195,10 @@ pub enum Plan {
     /// guarded by the listing head (#14813). The gate stays on: release is
     /// still [`Plan::Recover`] on the new head, verified on a later tick.
     UpdateBranch {
+        base: String,
+    },
+    /// A trusted record already confirms the conflict for this exact pair.
+    ResumeConflictHandoff {
         base: String,
     },
     Skip(Skip),
@@ -307,6 +311,8 @@ pub trait Forge {
     fn ci(&mut self, head: &str) -> Ci;
     /// The PR's head right now, `None` when unreadable.
     fn current_head(&mut self, number: u32) -> Option<String>;
+    /// A fresh PR row for a conflict handoff's head, labels, and park body.
+    fn current_pr(&mut self, number: u32) -> Option<RestPull>;
     /// Trusted comment bodies, oldest first; `None` when unreadable.
     fn trusted_comments(&mut self, number: u32) -> Option<Vec<String>>;
     /// Stand down any armed auto-merge/queue entry; a line for the audit comment.
@@ -429,13 +435,16 @@ fn plan_update(
                 short(&compare.merge_base)
             )));
         };
-        let head_signatures = head_checks
-            .failing
-            .get(name)
-            .into_iter()
-            .flatten()
-            .collect::<BTreeSet<_>>();
-        if !head_signatures.iter().all(|s| inherited.contains(*s)) {
+        let Some(head_signatures) = head_checks.failing.get(name).filter(|s| !s.is_empty()) else {
+            return Plan::Skip(Skip::NotInherited(format!("{name} has no failure signature")));
+        };
+        if head_signatures
+            .iter()
+            .any(|(_, title)| title.trim().is_empty())
+        {
+            return Plan::Skip(Skip::NotInherited(format!("{name} has no failure title")));
+        }
+        if !head_signatures.is_subset(inherited) {
             return Plan::Skip(Skip::NotInherited(format!(
                 "{name} fails differently than the merge base"
             )));
@@ -447,15 +456,18 @@ fn plan_update(
             )));
         }
     }
-    // Idempotent for the same pair: one (head, base) request, then the new
-    // head's verified-green verdict is the only way out.
-    if comments.iter().any(|c| {
-        c.contains(&update_marker(head, &compare.base_tip))
-            || c.contains(&conflict_marker(head, &compare.base_tip))
-    }) {
+    if comments
+        .iter()
+        .any(|c| c.contains(&update_marker(head, &compare.base_tip)))
+    {
         return Plan::Skip(Skip::UpdatePending);
     }
     match f.current_head(pr.number) {
+        Some(h) if h == head && has_conflict_marker(comments, head, &compare.base_tip) => {
+            Plan::ResumeConflictHandoff {
+                base: compare.base_tip,
+            }
+        }
         Some(h) if h == head => Plan::UpdateBranch {
             base: compare.base_tip,
         },
@@ -523,15 +535,20 @@ fn update_body(head: &str, base: &str) -> String {
 
 fn conflict_body(head: &str, base: &str, why: &str) -> String {
     format!(
-        "{}\n**CI-gate update handed to Doctor** (#14813, #14810). Merging the \
+        "{}\n**CI-gate update confirmed a conflict** (#14813, #14810). Merging the \
          recovered default branch `{}` into this PR branch conflicts: {why}. The \
-         ci-gate park (`loom:blocked`) and `loom:ci-failure` are removed; \
-         `loom:changes-requested` stays and `loom:merge-conflict` is added, so \
-         Doctor's conflict lane picks the PR up and resolves the rebase. Review \
-         resumes through the normal repair flow afterwards.",
+         handoff adds `loom:merge-conflict` before lifting the CI gate and its machine \
+         park. `loom:changes-requested` stays so Doctor can resolve the conflict.",
         conflict_marker(head, base),
         short(base),
     )
+}
+
+fn has_conflict_marker(comments: &[String], head: &str, base: &str) -> bool {
+    let marker = conflict_marker(head, base);
+    comments
+        .iter()
+        .any(|comment| comment.lines().next() == Some(marker.as_str()))
 }
 
 /// What applying a [`Plan::UpdateBranch`] did.
@@ -540,6 +557,63 @@ enum UpdateDone {
     Requested,
     /// The update confirmed a conflict and the PR went to Doctor's lane.
     Conflicted,
+}
+
+fn fresh_conflict_target(
+    f: &mut impl Forge,
+    pr: &RestPull,
+    head: &str,
+    base: &str,
+) -> Result<(RestPull, bool)> {
+    let comments = f
+        .trusted_comments(pr.number)
+        .ok_or_else(|| anyhow!("unreadable trusted comments"))?;
+    verdict_gate(&comments).map_err(|why| anyhow!("conflict handoff refused: {why:?}"))?;
+    let fresh = f
+        .current_pr(pr.number)
+        .ok_or_else(|| anyhow!("unreadable PR state"))?;
+    if fresh.state != "open"
+        || fresh.head_sha.as_deref() != Some(head)
+        || fresh.base_ref != pr.base_ref
+    {
+        return Err(anyhow!("PR state, head or base changed before the conflict handoff"));
+    }
+    label_gate(&fresh.labels, fresh.body.as_deref())
+        .map_err(|why| anyhow!("conflict handoff refused: {why:?}"))?;
+    Ok((fresh, has_conflict_marker(&comments, head, base)))
+}
+
+fn apply_conflict_handoff(
+    f: &mut impl Forge,
+    pr: &RestPull,
+    head: &str,
+    base: &str,
+    reason: Option<&str>,
+) -> Result<UpdateDone> {
+    let (mut fresh, mut recorded) = fresh_conflict_target(f, pr, head, base)?;
+    if !recorded {
+        let why = reason.ok_or_else(|| anyhow!("trusted conflict record is no longer present"))?;
+        f.comment(pr.number, &conflict_body(head, base, why))?;
+        (fresh, recorded) = fresh_conflict_target(f, pr, head, base)?;
+        if !recorded {
+            return Err(anyhow!("trusted conflict record is not visible yet"));
+        }
+    }
+    // Keep the park until the conflict label is visible. If either write
+    // fails, the next tick can finish the same handoff without another merge.
+    if !fresh.has_label(MERGE_CONFLICT) {
+        f.swap_labels(pr.number, &[], &[MERGE_CONFLICT])?;
+        (fresh, recorded) = fresh_conflict_target(f, pr, head, base)?;
+        if !recorded || !fresh.has_label(MERGE_CONFLICT) {
+            return Err(anyhow!("conflict record or label is not visible"));
+        }
+    }
+    let mut remove = vec![CI_FAILURE];
+    if fresh.has_label(BLOCKED) {
+        remove.push(BLOCKED);
+    }
+    f.swap_labels(pr.number, &remove, &[])?;
+    Ok(UpdateDone::Conflicted)
 }
 
 /// Carry out one branch update: the forge request first, then the audit
@@ -552,15 +626,7 @@ fn apply_update(f: &mut impl Forge, pr: &RestPull, head: &str, base: &str) -> Re
             f.comment(pr.number, &update_body(head, base))?;
             Ok(UpdateDone::Requested)
         }
-        UpdateOutcome::Conflict(why) => {
-            f.comment(pr.number, &conflict_body(head, base, &why))?;
-            let mut remove = vec![CI_FAILURE];
-            if pr.has_label(BLOCKED) {
-                remove.push(BLOCKED);
-            }
-            f.swap_labels(pr.number, &remove, &[MERGE_CONFLICT])?;
-            Ok(UpdateDone::Conflicted)
-        }
+        UpdateOutcome::Conflict(why) => apply_conflict_handoff(f, pr, head, base, Some(&why)),
         UpdateOutcome::StaleHead => {
             Err(anyhow!("expected head {head} no longer matched — the branch moved first"))
         }
@@ -575,7 +641,8 @@ pub fn run_pass(f: &mut impl Forge, open: &[RestPull]) -> Stats {
         if label_gate(&pr.labels, pr.body.as_deref()).is_ok() {
             stats.candidates += 1;
         }
-        match plan_one(f, pr) {
+        let plan = plan_one(f, pr);
+        match plan {
             Plan::Recover { clear_blocked } => {
                 let head = pr.head_sha.clone().unwrap_or_default();
                 match apply(f, pr, &head, clear_blocked) {
@@ -594,9 +661,14 @@ pub fn run_pass(f: &mut impl Forge, open: &[RestPull]) -> Stats {
                     ),
                 }
             }
-            Plan::UpdateBranch { base } => {
+            Plan::UpdateBranch { ref base } | Plan::ResumeConflictHandoff { ref base } => {
                 let head = pr.head_sha.clone().unwrap_or_default();
-                match apply_update(f, pr, &head, &base) {
+                let outcome = if matches!(plan, Plan::ResumeConflictHandoff { .. }) {
+                    apply_conflict_handoff(f, pr, &head, base, None)
+                } else {
+                    apply_update(f, pr, &head, base)
+                };
+                match outcome {
                     Ok(UpdateDone::Requested) => {
                         stats.updated += 1;
                         log::info!(
@@ -605,7 +677,7 @@ pub fn run_pass(f: &mut impl Forge, open: &[RestPull]) -> Stats {
                              branch; the gate stays until the new head is exactly green \
                              (#14813)",
                             pr.number,
-                            short(&base)
+                            short(base)
                         );
                     }
                     Ok(UpdateDone::Conflicted) => {
@@ -614,7 +686,7 @@ pub fn run_pass(f: &mut impl Forge, open: &[RestPull]) -> Stats {
                             "claim_reconciliation: PR #{}'s ci-gate update conflicted with {} — \
                              handed to Doctor's conflict lane (#14813, #14810)",
                             pr.number,
-                            short(&base)
+                            short(base)
                         );
                     }
                     Err(e) => log::warn!(
@@ -736,6 +808,17 @@ impl Forge for GhForge<'_> {
 
     fn current_head(&mut self, number: u32) -> Option<String> {
         self.reads()?.pull(number).ok().map(|h| h.sha)
+    }
+
+    fn current_pr(&mut self, number: u32) -> Option<RestPull> {
+        let reads = self.reads()?;
+        let url = format!("repos/{}/pulls/{number}", reads.repo()?);
+        let body = reads
+            .read(&url, crate::forge_call_stats::ops::PR_VIEW_STATE)
+            .ok()?;
+        let rows = crate::forge_pull_listing::parse_rest_pulls(&format!("[{body}]")).ok()?;
+        let [pr]: [RestPull; 1] = rows.try_into().ok()?;
+        (pr.number == number).then_some(pr)
     }
 
     fn trusted_comments(&mut self, number: u32) -> Option<Vec<String>> {
