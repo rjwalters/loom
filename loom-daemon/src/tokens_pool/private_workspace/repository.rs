@@ -44,6 +44,10 @@ pub enum WorkerCommand {
     /// location, preserving every branch and file (`accounts session
     /// rebind`, issue #14357).
     Rebind(RebindArgs),
+    /// The periodic seat reclaim (#14678): remove ended step scratch and
+    /// clean, published, merged-past-grace linked worktrees inside this
+    /// volume. Host-driven, under the seat lease, while the seat is idle.
+    SeatReclaim(super::seat_reclaim::SeatReclaimArgs),
     /// Git credential-helper protocol; output goes only to Git's private pipe.
     Credential {
         operation: String,
@@ -203,6 +207,22 @@ impl WorkerCommand {
                     }
                 }
             }
+            Self::SeatReclaim(args) => {
+                let lookup = seat_reclaim::github_pr_at_head;
+                match seat_reclaim::seat_reclaim(
+                    Path::new(ROOT),
+                    &args,
+                    &lookup,
+                    chrono::Utc::now(),
+                ) {
+                    Ok(outcome) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "outcome": outcome}))
+                    }
+                    Err(error) => {
+                        println!("{}", json!({"protocol": PROTOCOL, "error": error.to_string()}))
+                    }
+                }
+            }
             Self::Credential { operation } => credential(&operation)?,
         }
         Ok(())
@@ -221,7 +241,7 @@ fn helper_cause(stderr: &[u8]) -> Option<&'static str> {
     HELPER_CAUSES.into_iter().find(|cause| text.contains(cause))
 }
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
+pub(super) fn git(root: &Path, args: &[&str]) -> Result<String> {
     let result = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -553,13 +573,12 @@ pub(super) fn unpublished_branches(repo: &Path) -> Result<Vec<UnpublishedBranch>
     Ok(unpublished)
 }
 
-fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
+pub(super) fn ahead_of_origin(repo: &Path, revision: &str) -> Result<u64> {
     git(repo, &["rev-list", "--count", revision, "--not", "--remotes=origin"])?
         .trim()
         .parse::<u64>()
         .context("workspace Git returned a non-numeric ahead count")
 }
-
 /// The clone paths a `recover` call acts on. Unlike `additional_paths` this
 /// never creates anything: a clone that was never materialized has nothing
 /// to recover.
@@ -1118,12 +1137,12 @@ fn worktrees(repo: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
-struct WorktreeEntry {
-    path: PathBuf,
-    locked: bool,
+pub(super) struct WorktreeEntry {
+    pub(super) path: PathBuf,
+    pub(super) locked: bool,
 }
 
-fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+pub(super) fn worktree_entries(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     Ok(git(repo, &["worktree", "list", "--porcelain", "-z"])?
         .split("\0\0")
         .filter_map(|record| {
@@ -1143,7 +1162,7 @@ const DIRTY_PATH_LIMIT: usize = 10;
 /// (#14458). Porcelain v1 C-quotes special path bytes, including newlines,
 /// keeping each changed path on a single line. Both prefixes are literal in
 /// a quoted path, so status of any tracked edit is preserved verbatim.
-fn worktree_status(path: &Path) -> Result<Vec<String>> {
+pub(super) fn worktree_status(path: &Path) -> Result<Vec<String>> {
     let status = git(
         path,
         &[
@@ -1292,6 +1311,25 @@ fn finished_pr(repo: &Path, repository: &str, branch: &str, tip: &str) -> bool {
         return false;
     };
     crate::worktree_ops::clean_owner::finished_pr_at_head(repo, &host, &slug, branch, tip)
+}
+
+/// `(repository, account)` recorded for one clone by its identity record
+/// (the legacy primary's at the volume root, an additional clone's under
+/// `work/.identity/`), or `None` when no record exists. A record that exists
+/// but is invalid or foreign is an error — the caller preserves the clone.
+pub(super) fn recorded_identity(record: &Path) -> Result<Option<(String, String)>> {
+    match std::fs::read(record) {
+        Ok(bytes) => {
+            let identity: Identity = serde_json::from_slice(&bytes)
+                .context("invalid private clone identity; preserve state for operator recovery")?;
+            if identity.protocol != PROTOCOL {
+                bail!("private clone identity protocol mismatch; preserve state for operator recovery");
+            }
+            Ok(Some((identity.repository, identity.account)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Reclaim only an in-volume linked checkout whose tip is published and

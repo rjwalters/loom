@@ -868,3 +868,76 @@ pub fn run_job(workspace: &Path, args: JobArgs) -> Result<i32> {
     lease.finish()?;
     Ok(code)
 }
+
+/// The leased seat maintenance pass (#14678): the periodic, all-clones idle
+/// counterpart of [`run_job`]'s admission. Same exclusive account lease and
+/// the same containment + running-and-idle proof, but **no job and no
+/// `docker::prepare_target`** — preparation runs `clean_worktrees`, which
+/// refuses a dirty worktree, while this pass must reach a dirty seat's
+/// scratch and report its dirty worktrees as preserved instead of stopping.
+///
+/// Every seat is independent: a busy, stopped or non-idle seat is skipped
+/// with a reason (a retry is the next pass's job, not a failure), never
+/// holding up the others. `.identity` records and the no-alternates /
+/// private-clone invariants are untouched — the in-container verb only ever
+/// removes step scratch and clean, published, merged-past-grace worktrees.
+pub fn seat_reclaim(
+    workspace: &Path,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Vec<(String, Result<super::seat_reclaim::SeatReclaimOutcome, String>)> {
+    use super::super::account_registry::{account_inventory, AccountProvider};
+
+    let mut out = Vec::new();
+    let Ok(accounts) = account_inventory(workspace, AccountProvider::Codex) else {
+        return out;
+    };
+    for descriptor in accounts {
+        let name = descriptor.id.name.clone();
+        // A tolerant read: an account without a private workspace is not a
+        // seat, and one whose state cannot be read is skipped below by name.
+        let Some(config) = registrations(&descriptor.credential_reference) else {
+            continue;
+        };
+        out.push((name, seat_reclaim_one(workspace, &config, max_age_secs, grace_secs)));
+    }
+    out
+}
+
+/// One seat's pass; every early return is a skip reason, not an error worth
+/// failing the host pass over.
+fn seat_reclaim_one(
+    workspace: &Path,
+    config: &Config,
+    max_age_secs: i64,
+    grace_secs: i64,
+) -> Result<super::seat_reclaim::SeatReclaimOutcome, String> {
+    let dir = state_dir(&config.profile).map_err(|e| e.to_string())?;
+    let lease = lease::Lease::acquire(&dir).map_err(|error| {
+        if error.downcast_ref::<AccountBusy>().is_some() {
+            "seat busy; a job holds the account lease (retry next pass)".to_owned()
+        } else {
+            error.to_string()
+        }
+    })?;
+    let state = docker::inspect(&config.container)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "session is stopped; nothing to reclaim this pass".to_owned())?;
+    docker::validate(config, &state).map_err(|e| e.to_string())?;
+    lease
+        .recover(config, Some(&state))
+        .map_err(|e| e.to_string())?;
+    if state["State"]["Running"] != true
+        || !docker::idle(Some(&state), &config.container).map_err(|e| e.to_string())?
+    {
+        return Err("seat is not running and idle; retry next pass".into());
+    }
+    if state["Id"].as_str().is_none() {
+        return Err("container id unavailable".into());
+    }
+    // The credential scope of the account's primary repository, the same
+    // context `recover` execs under: the verb's PR probes need a forge
+    // identity, and the scope never widens past the account's own remotes.
+    let auth = forge_auth::ExecAuth::resolve(workspace, &config.repository);
+    docker::seat_reclaim(config, max_age_secs, grace_secs, &auth).map_err(|e| e.to_string())
+}

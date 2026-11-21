@@ -183,6 +183,44 @@ repository. When preparation then refuses (for example `seat_dirty` on a
 different worktree), the removal is not reported: the refusal names only the
 worktree that caused it.
 
+### Who reaps what: preparation vs the periodic seat pass
+
+Two paths reclaim inside a seat volume, with different rules (#14483 vs
+#14678):
+
+- **Job preparation** (per admission, the one target clone only): forgives
+  untracked caches, reaps linked worktrees whose tip heads a *finished* PR —
+  merged **or closed-unmerged**, dirty ones included via the forced removal
+  above — and backs the explicit `accounts session recover` listing and
+  `--discard`/`--worktree` removal of dirty leftovers. Preparation's reap
+  runs before its dirty check (`reap_finished_worktrees` before
+  `clean_worktrees`) and can remove a dirty, unlocked worktree whose tip is
+  published at a finished PR. That behavior is preparation's own and is not
+  changed by the seat pass.
+- **The periodic seat pass** (idle, every seat and every registered clone):
+  a leased maintenance verb — the account's exclusive lease, the container
+  proven running and idle, and **no `prepare` step**, so a dirty seat still
+  gets its pass — removes step scratch (`cache/<role>-<n>.*`, top-level
+  `*-tmp` and `<role>-<n>.*` dirs) older than
+  `autonomous.worktreeReaper.scratchReclaim.maxAgeHours`, and reaps a linked
+  worktree only when it is clean, fully published, unlocked, in-volume, and
+  its branch has a confirmed **merged** PR at that exact tip past
+  `autonomous.worktreeReaper.gracePeriodSecs`. It never quarantines and
+  never takes a backup; a worktree it cannot prove finished is preserved
+  with a reason (dirty, unpublished, open PR, closed-unmerged, grace not
+  passed, state unreadable). The pass honors the existing
+  `scratchReclaim.*` surface — no new flags — and reports reclaimed bytes
+  and preserved reasons through `reaper.pass` spans (class `seat`, the span's
+  repo label the seat's account name) instead of the host reaper's blanket
+  `preserved.private_workspace` wording for what it now handles.
+
+The preservation guarantee — a dirty, unpublished, open-PR or
+closed-unmerged worktree is never removed — is the **seat pass's** rule. A
+dirty worktree whose tip is published at a merged PR past grace is the
+dividing case: preparation may force-remove it at the next admission of that
+clone, the seat pass preserves and reports it. `.identity` records and the
+no-alternates / private-clone invariants are untouched by both paths.
+
 ## Rebinding a registration after a repository transfer
 
 A forge transfer changes the owner-qualified URL, and with it the registration

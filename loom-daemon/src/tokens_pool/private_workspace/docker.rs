@@ -665,6 +665,50 @@ pub(super) fn recover_target(
         .context("private workspace recover returned an invalid report")
 }
 
+/// Drive the in-volume `private-workspace seat-reclaim` verb (#14678) under
+/// the credential scope of the account's primary repository — the same exec
+/// shape as [`recover_target`] with **no preparation step**: the verb must
+/// run in a dirty seat too, so nothing here calls [`prepare_target`].
+pub(super) fn seat_reclaim(
+    config: &Config,
+    max_age_secs: i64,
+    grace_secs: i64,
+    auth: &forge_auth::ExecAuth,
+) -> Result<super::seat_reclaim::SeatReclaimOutcome> {
+    let scope = format!("LOOM_PRIVATE_REPOSITORY={}", config.repository);
+    let max_age = max_age_secs.to_string();
+    let grace = grace_secs.to_string();
+    let mut args = vec!["exec", "--workdir", ROOT, "--env", &scope];
+    for name in auth.names() {
+        args.extend(["--env", name]);
+    }
+    args.extend([
+        &config.container,
+        "loom-daemon",
+        "private-workspace",
+        "seat-reclaim",
+        "--account",
+        &config.account,
+        "--max-age-secs",
+        &max_age,
+        "--grace-secs",
+        &grace,
+    ]);
+    let output = command_env(&args, &auth.child_env(), EXEC_TIMEOUT).context(
+        "private workspace endpoint failed; use a current session image supporting private-workspace protocol",
+    )?;
+    let result: Value = serde_json::from_str(&output)
+        .context("private workspace endpoint unavailable; update the session image before reuse")?;
+    if result["protocol"] != PROTOCOL {
+        bail!("private workspace endpoint protocol mismatch; update session image");
+    }
+    if let Some(error) = result["error"].as_str() {
+        bail!("private clone seat reclaim refused: {error}");
+    }
+    serde_json::from_value(result["outcome"].clone())
+        .context("private workspace seat-reclaim returned an invalid report")
+}
+
 /// Drive the in-volume `private-workspace rebind` verb (#14357) under the
 /// credential scope of the CANONICAL repository.
 pub(super) fn rebind_target(
