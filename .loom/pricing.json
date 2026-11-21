@@ -2,7 +2,7 @@
   "schema_version": 1,
   "verified_on": "2026-09-18",
   "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-  "notes": "Model rate card, USD per 1000 tokens (= the published $/MTok / 1000). Resync-delivered to .loom/pricing.json so a price change reaches the fleet without a Loom release (#8177, ask 2 of #8060). loom-daemon falls back to the compiled card in loom-daemon/src/activity/resource_usage.rs when this file is absent or fails validation, and the two are held in agreement by the shipped_pricing_asset_agrees_with_the_compiled_card test. Rows are an ORDERED cascade: the first row with a `match` substring contained in the (lowercased, alias-resolved) model id wins, exactly like the compiled card. Keep the trailing `claude-<family>-` catch-all of each family pointing at that family's NEWEST published row — an unrecognized id is far likelier to be newer than the card than to be a resurrected retired model. The Moonshot/Kimi rows (#8564) come from a SECOND vendor page, https://platform.moonshot.ai/docs/pricing/chat, verified 2026-09-22; `verified_on` above stays at the OLDER of the two dates so the staleness warning fires on whichever vendor has gone unchecked longest. Those rows are the platform API LIST price and are an estimate: a Kimi Code subscription is not billed per token, so for a subscription launch the derived cost is 'what these tokens would have cost on the API', not money that changed hands. The K2 table publishes no cache-write price, so the K2 rows' write rates are the published cache-miss input price rather than an invented surcharge. The OpenAI/Codex gpt-6 rows (#10750) come from a THIRD vendor page, https://platform.openai.com/docs/pricing (also served at https://developers.openai.com/api/docs/pricing), Standard tier, SHORT-context columns, read 2026-10-07; the 2026-09-18 `verified_on` above is still the older date. Published $/MTok (input / cached input / cache writes / output): gpt-6.1-sol 2 / 0.10 / 2.50 / 10; gpt-6-astra 10 / 1 / 12.50 / 50; gpt-6-sol 2 / 0.20 / 2.50 / 10; gpt-6-luna 0.10 / 0.01 / 0.125 / 0.50. The earlier rows use one published cache-write rate for both write fields. The gpt-6.2-astra row (#14741) was verified 2026-11-20 against https://developers.openai.com/api/docs/pricing, Standard tier, SHORT context: $8 input, $0.40 cached input and $40 output per MTok. The published 30m write rate ($10/MTok) supplies the default estimate in both legacy write fields; the 12h rate ($20/MTok) is not modelled. These are API LIST prices and an estimate: Codex usage under a ChatGPT subscription is not billed per token. The Long-context column (higher rates above the context threshold), the Batch/Flex/Fast/Ultrafast tiers are NOT modelled (the card has no per-tier rows). There is deliberately NO trailing gpt-6 catch-all: gpt-6 variants differ up to 100x in price, so an unrecognized variant stays unpriced (and logs a WARN) rather than getting a guessed rate.",
+  "notes": "Model rate card, USD per 1000 tokens (= the published $/MTok / 1000). Resync-delivered to .loom/pricing.json so a price change reaches the fleet without a Loom release (#8177, ask 2 of #8060). loom-daemon falls back to the compiled card in loom-daemon/src/activity/resource_usage.rs when this file is absent or fails validation, and the two are held in agreement by the shipped_pricing_asset_agrees_with_the_compiled_card test. Rows are an ORDERED cascade: the first row with a `match` substring contained in the (lowercased, alias-resolved) model id wins, exactly like the compiled card. Keep the trailing `claude-<family>-` catch-all of each family pointing at that family's NEWEST published row — an unrecognized id is far likelier to be newer than the card than to be a resurrected retired model. The Moonshot/Kimi rows (#8564) come from a SECOND vendor page, https://platform.moonshot.ai/docs/pricing/chat, verified 2026-09-22; `verified_on` above stays at the OLDER of the two dates so the staleness warning fires on whichever vendor has gone unchecked longest. Those rows are the platform API LIST price and are an estimate: a Kimi Code subscription is not billed per token, so for a subscription launch the derived cost is 'what these tokens would have cost on the API', not money that changed hands. The K2 table publishes no cache-write price, so the K2 rows' write rates are the published cache-miss input price rather than an invented surcharge. The OpenAI/Codex gpt-6 rows (#10750) come from a THIRD vendor page, https://platform.openai.com/docs/pricing (also served at https://developers.openai.com/api/docs/pricing), Standard tier, SHORT-context columns, read 2026-10-07; the 2026-09-18 `verified_on` above is still the older date. Published $/MTok (input / cached input / cache writes / output): gpt-6.1-sol 2 / 0.10 / 2.50 / 10; gpt-6-astra 10 / 1 / 12.50 / 50; gpt-6-sol 2 / 0.20 / 2.50 / 10; gpt-6-luna 0.10 / 0.01 / 0.125 / 0.50. The earlier rows use one published cache-write rate for both write fields. The gpt-6.2-astra row (#14741) was verified 2026-11-20 against https://developers.openai.com/api/docs/pricing, Standard tier, SHORT context: $8 input, $0.40 cached input and $40 output per MTok. The published 30m write rate ($10/MTok) supplies the default estimate in both legacy write fields; the 12h rate ($20/MTok) is not modelled. These are API LIST prices and an estimate: Codex usage under a ChatGPT subscription is not billed per token. The Long-context column (higher rates above the context threshold), the Batch/Flex/Fast/Ultrafast tiers are NOT modelled (the card has no per-tier rows). There is deliberately NO trailing gpt-6 catch-all: gpt-6 variants differ up to 100x in price, so an unrecognized variant stays unpriced (and logs a WARN) rather than getting a guessed rate. The Z.AI GLM and Google Gemini rows (#14842) come from a FOURTH and FIFTH vendor page — https://docs.z.ai/guides/overview/pricing and https://aistudio.google.com/docs/pricing, Standard paid text rates, read 2026-11-21 — plus Google's routing note (https://aistudio.google.com/docs/deprecations#gemini-3-models): the bundled `gemini-3.5-flash` endpoint auto-routes to `gemini-3.6-flash`, so both ids share one row and one rate. `verified_on` above stays at the OLDEST vendor check (2026-09-18, the Claude page) per the rule two sentences up. Published $/MTok (input / cached input / output): glm-5.3 1.40 / 0.26 / 4.40; glm-5.3-flash 0.15 / 0.03 / 0.50; gemini-3.5-flash and gemini-3.6-flash 0.75 / 0.075 / 3.75; gemini-4-carbon 2 / 0.10 / 10; gemini-4-neon 3 / 0.15 / 15. Neither Z.AI nor Google publishes a cache-WRITE price, so a distinct cache-write token bills once at the uncached input rate (both write fields carry it) — the same reading the K2 rows above take. These are API LIST prices and an estimate: the zai profiles ride the flat-rate z.ai coding plan (llm.billing=subscription), so their derived cost is 'what these tokens would have cost at list price', not money that changed hands. Known upcoming changes, recorded here and NOT yet applied — refresh the rates and this sentence when each takes effect: gemini-4-carbon rises 2026-12-01 to 4 / 0.20 / 20 $/MTok, and gemini-3.6-flash (and with it the 3.5 route) rises 2027-01-01 to 1.50 / 0.15 / 7.50 $/MTok. The GLM/Gemini rows are EXACT-match only, unlike every earlier family: `glm-5.3` is a substring of `glm-5.3-flash` (9x cheaper) and of the distinct FlashX SKU, and `gemini-3.5-flash` of `gemini-3.5-flash-lite`, so a substring row hands a near-miss the nearest listed rate (a fixture running the deployed v0.20.8 parser reproduced FlashX priced as Flash). Each intended id — bare and provider-qualified (`zai/`, `zai-coding-plan/`, `google/`) — is therefore an ALIAS onto a `#`-suffixed selector string no real model id can contain, and the row matches only that selector: the deployed schema-1 parser's own exact-alias-then-substring rules deliver exact matching with NO schema change (an unknown row field or a schema_version bump makes that parser reject the whole asset and strands installed daemons on the compiled card). Any other GLM/Gemini variant stays unpriced (and logs a WARN) — deliberately NO family catch-all, same reason as gpt-6.",
   "cache_multipliers": {
     "read": 0.1,
     "read_reduced": 0.025,
@@ -14,7 +14,21 @@
     "opus": "claude-opus-5",
     "haiku": "claude-haiku-4-5",
     "fable": "claude-fable-5-1",
-    "mythos": "claude-mythos-5-1"
+    "mythos": "claude-mythos-5-1",
+    "glm-5.3": "glm-5.3#",
+    "zai/glm-5.3": "glm-5.3#",
+    "zai-coding-plan/glm-5.3": "glm-5.3#",
+    "glm-5.3-flash": "glm-5.3-flash#",
+    "zai/glm-5.3-flash": "glm-5.3-flash#",
+    "zai-coding-plan/glm-5.3-flash": "glm-5.3-flash#",
+    "gemini-3.5-flash": "gemini-3.5-flash#",
+    "google/gemini-3.5-flash": "gemini-3.5-flash#",
+    "gemini-3.6-flash": "gemini-3.6-flash#",
+    "google/gemini-3.6-flash": "gemini-3.6-flash#",
+    "gemini-4-carbon": "gemini-4-carbon#",
+    "google/gemini-4-carbon": "gemini-4-carbon#",
+    "gemini-4-neon": "gemini-4-neon#",
+    "google/gemini-4-neon": "gemini-4-neon#"
   },
   "rows": [
     {
@@ -255,6 +269,61 @@
         "read_per_1k": 0.00025,
         "write_5m_per_1k": 0.0005,
         "write_1h_per_1k": 0.0005
+      }
+    },
+    {
+      "id": "glm-5.3-flash",
+      "match": ["glm-5.3-flash#"],
+      "input_per_1k": 0.00015,
+      "output_per_1k": 0.0005,
+      "cache_rates": {
+        "read_per_1k": 0.00003,
+        "write_5m_per_1k": 0.00015,
+        "write_1h_per_1k": 0.00015
+      }
+    },
+    {
+      "id": "glm-5.3",
+      "match": ["glm-5.3#"],
+      "input_per_1k": 0.0014,
+      "output_per_1k": 0.0044,
+      "cache_rates": {
+        "read_per_1k": 0.00026,
+        "write_5m_per_1k": 0.0014,
+        "write_1h_per_1k": 0.0014
+      }
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "match": ["gemini-3.5-flash#", "gemini-3.6-flash#"],
+      "input_per_1k": 0.00075,
+      "output_per_1k": 0.00375,
+      "cache_rates": {
+        "read_per_1k": 0.000075,
+        "write_5m_per_1k": 0.00075,
+        "write_1h_per_1k": 0.00075
+      }
+    },
+    {
+      "id": "gemini-4-carbon",
+      "match": ["gemini-4-carbon#"],
+      "input_per_1k": 0.002,
+      "output_per_1k": 0.01,
+      "cache_rates": {
+        "read_per_1k": 0.0001,
+        "write_5m_per_1k": 0.002,
+        "write_1h_per_1k": 0.002
+      }
+    },
+    {
+      "id": "gemini-4-neon",
+      "match": ["gemini-4-neon#"],
+      "input_per_1k": 0.003,
+      "output_per_1k": 0.015,
+      "cache_rates": {
+        "read_per_1k": 0.00015,
+        "write_5m_per_1k": 0.003,
+        "write_1h_per_1k": 0.003
       }
     }
   ]

@@ -2575,7 +2575,14 @@ counters come from one reader that dedupes streamed chunks on `message.id`
 (per-counter max) — before #9303 it summed every chunk and ran ~2x high
 (#8186). The USD estimate uses the per-model rate card (5-minute and 1-hour
 cache writes at their own rates), ignores `speed`/`service_tier`, and is an API
-list-price estimate, not a bill.
+list-price estimate, not a bill. For `llm.billing=subscription` it is therefore
+a **list-price equivalent** — what the same token buckets would have cost at
+the vendor's published per-token rate — never money that changed hands. The
+card applies at read time (#14842): a consumer may recompute any span's
+estimate from its own `loom.model` and token buckets with a newer
+`defaults/pricing.json`, so a rate correction is retroactive for analysis,
+while an already-exported `loom.cost.usd_estimate` keeps the value it was
+recorded with (it names its own `loom.pricing.verified_on`).
 
 `reason` is a closed enum and `provider` is a fixed literal or a pool
 namespace that must be a short `[a-z0-9_-]` token (anything else is

@@ -143,6 +143,30 @@ impl ModelPricing {
         }
     }
 
+    /// Build a Z.AI GLM / Google Gemini row (Issue #14842): a vendor table
+    /// that lists only input, output and cached-input prices.
+    ///
+    /// Neither vendor publishes a cache-WRITE price, so a distinct
+    /// cache-write token bills **once at the uncached input rate** — the
+    /// same reading of a write-as-miss table [`Self::kimi_k2`] documents for
+    /// the K2 rows, kept as its own constructor because the Anthropic-shaped
+    /// 1.25x/2x surcharge [`Self::from_base`] derives would be a fabricated
+    /// rate. Both TTL fields carry it, so whichever tier a future caller can
+    /// distinguish charges the same published number.
+    fn glm_gemini(
+        input_cost_per_1k: f64,
+        output_cost_per_1k: f64,
+        cache_read_cost_per_1k: f64,
+    ) -> Self {
+        Self {
+            input_cost_per_1k,
+            output_cost_per_1k,
+            cache_read_cost_per_1k,
+            cache_write_cost_per_1k: input_cost_per_1k,
+            cache_write_1h_cost_per_1k: input_cost_per_1k,
+        }
+    }
+
     /// Look up a model in the **compiled** rate card.
     ///
     /// Since #8177 this is the *fallback* tier, not the only one: the same
@@ -224,6 +248,30 @@ impl ModelPricing {
     /// | `gpt-6-astra` | 0.01 | 0.05 | 0.001 | 0.0125 |
     /// | `gpt-6-sol` | 0.002 | 0.01 | 0.0002 | 0.0025 |
     /// | `gpt-6-luna` | 0.0001 | 0.0005 | 0.00001 | 0.000125 |
+    ///
+    /// # Z.AI GLM / Google Gemini rate card (Issue #14842)
+    ///
+    /// Prices verified against <https://docs.z.ai/guides/overview/pricing>
+    /// and <https://aistudio.google.com/docs/pricing> (Standard paid text
+    /// rates) on **2026-11-21**. The bundled `gemini-3.5-flash` endpoint
+    /// auto-routes to `gemini-3.6-flash`
+    /// (<https://aistudio.google.com/docs/deprecations#gemini-3-models>), so
+    /// both ids share one row and rate. USD per 1k tokens; cache writes bill
+    /// at the uncached input rate because neither vendor publishes one (see
+    /// [`Self::glm_gemini`]). An API LIST-price estimate: the zai profiles
+    /// ride the flat-rate z.ai coding plan, so their derived cost is "what
+    /// these tokens would have cost at list price", not money that changed
+    /// hands. Known upcoming changes NOT yet applied: `gemini-4-carbon` rises
+    /// 2026-12-01 to 0.004/0.0002/0.02 and `gemini-3.6-flash` (with the 3.5
+    /// route) 2027-01-01 to 0.0015/0.00015/0.0075.
+    ///
+    /// | Row | Input | Output | Cache read | Cache write |
+    /// |---|---|---|---|---|
+    /// | `glm-5.3` | 0.0014 | 0.0044 | 0.00026 | *(= input)* |
+    /// | `glm-5.3-flash` | 0.00015 | 0.0005 | 0.00003 | *(= input)* |
+    /// | `gemini-3.5-flash` / `gemini-3.6-flash` | 0.00075 | 0.00375 | 0.000075 | *(= input)* |
+    /// | `gemini-4-carbon` | 0.002 | 0.01 | 0.0001 | *(= input)* |
+    /// | `gemini-4-neon` | 0.003 | 0.015 | 0.00015 | *(= input)* |
     ///
     /// # Matching
     ///
@@ -390,6 +438,49 @@ impl ModelPricing {
         }
         if m.contains("gpt-6-luna") {
             return Some(Self::openai(0.000_1, 0.000_5, 0.000_01, 0.000_125));
+        }
+
+        // ---- Z.AI GLM / Google Gemini (Issue #14842) -----------------------
+        // Exact-match rows, unlike everything above: `glm-5.3` is a substring
+        // of `glm-5.3-flash` (9x cheaper) and of the distinct FlashX SKU, and
+        // `gemini-3.5-flash` of `gemini-3.5-flash-lite`, so a substring row
+        // hands a near-miss the nearest listed rate (#14842's curator
+        // reproduced exactly that with the deployed v0.20.8 parser). Only the
+        // bare id and the shipped provider-qualified spellings match; any
+        // other variant stays unpriced — deliberately NO family catch-all,
+        // for the same reason the gpt-6 block has none. The shipped asset
+        // expresses the same exactness through alias-selected `#` rows (see
+        // defaults/pricing.json notes) because the deployed parser cannot
+        // change; keep the two lists in step.
+        if ["glm-5.3", "zai/glm-5.3", "zai-coding-plan/glm-5.3"].contains(&m) {
+            return Some(Self::glm_gemini(0.001_4, 0.004_4, 0.000_26));
+        }
+        if [
+            "glm-5.3-flash",
+            "zai/glm-5.3-flash",
+            "zai-coding-plan/glm-5.3-flash",
+        ]
+        .contains(&m)
+        {
+            return Some(Self::glm_gemini(0.000_15, 0.000_5, 0.000_03));
+        }
+        // The bundled 3.5 endpoint auto-routes to 3.6 Flash; one rate covers
+        // both spellings until the 2027-01-01 increase (see the card docs).
+        if [
+            "gemini-3.5-flash",
+            "google/gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "google/gemini-3.6-flash",
+        ]
+        .contains(&m)
+        {
+            return Some(Self::glm_gemini(0.000_75, 0.003_75, 0.000_075));
+        }
+        if ["gemini-4-carbon", "google/gemini-4-carbon"].contains(&m) {
+            return Some(Self::glm_gemini(0.002, 0.01, 0.000_1));
+        }
+        if ["gemini-4-neon", "google/gemini-4-neon"].contains(&m) {
+            return Some(Self::glm_gemini(0.003, 0.015, 0.000_15));
         }
 
         // ---- OpenAI --------------------------------------------------------
@@ -855,6 +946,29 @@ mod tests {
         "openai/gpt-6.1-sol",
     ];
 
+    /// Z.AI GLM and Google Gemini ids (Issue #14842): the bundled profile
+    /// models, their provider-qualified OpenCode/Pi spellings, and the
+    /// documented `gemini-3.5-flash` -> `gemini-3.6-flash` route. These rows
+    /// match EXACTLY (see the lookup block), so every spelling has to be
+    /// listed; a near-miss staying unpriced is covered by
+    /// `glm_and_gemini_rows_carry_their_published_rates_on_both_cards`.
+    const GLM_GEMINI_MODEL_IDS: &[&str] = &[
+        "glm-5.3",
+        "zai/glm-5.3",
+        "zai-coding-plan/glm-5.3",
+        "glm-5.3-flash",
+        "zai/glm-5.3-flash",
+        "zai-coding-plan/glm-5.3-flash",
+        "gemini-3.5-flash",
+        "google/gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "google/gemini-3.6-flash",
+        "gemini-4-carbon",
+        "google/gemini-4-carbon",
+        "gemini-4-neon",
+        "google/gemini-4-neon",
+    ];
+
     #[test]
     fn codex_rows_carry_their_published_rates() {
         let sol = ModelPricing::lookup("gpt-6.1-sol").unwrap();
@@ -887,6 +1001,204 @@ mod tests {
             assert!((pricing.cache_write_cost_per_1k - 0.01).abs() < f64::EPSILON, "{id}");
             assert!((pricing.cache_write_1h_cost_per_1k - 0.01).abs() < f64::EPSILON, "{id}");
         }
+    }
+
+    /// The #14842 rows against the 2026-11-21 vendor pages, on BOTH tiers,
+    /// plus the near-misses a substring cascade used to swallow.
+    #[test]
+    fn glm_and_gemini_rows_carry_their_published_rates_on_both_cards() {
+        let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
+        // (id, input, output, cache_read, cache_write) USD per 1k tokens,
+        // verified 2026-11-21 against docs.z.ai and aistudio.google.com;
+        // cache writes are the uncached input rate (no published write price).
+        let expected: &[(&str, f64, f64, f64, f64)] = &[
+            ("glm-5.3", 0.0014, 0.0044, 0.00026, 0.0014),
+            ("glm-5.3-flash", 0.00015, 0.0005, 0.00003, 0.00015),
+            ("gemini-3.5-flash", 0.00075, 0.00375, 0.000075, 0.00075),
+            ("gemini-3.6-flash", 0.00075, 0.00375, 0.000075, 0.00075),
+            ("gemini-4-carbon", 0.002, 0.01, 0.0001, 0.002),
+            ("gemini-4-neon", 0.003, 0.015, 0.00015, 0.003),
+        ];
+        for (id, input, output, read, write) in expected {
+            let tiers = [
+                (
+                    "compiled",
+                    ModelPricing::lookup(id)
+                        .unwrap_or_else(|| panic!("{id} is missing on the COMPILED card")),
+                ),
+                (
+                    "asset",
+                    card.lookup(id)
+                        .unwrap_or_else(|| panic!("{id} is missing on the shipped asset")),
+                ),
+            ];
+            for (tier, p) in tiers {
+                assert!((p.input_cost_per_1k - input).abs() < f64::EPSILON, "{id}/{tier}");
+                assert!((p.output_cost_per_1k - output).abs() < f64::EPSILON, "{id}/{tier}");
+                assert!((p.cache_read_cost_per_1k - read).abs() < f64::EPSILON, "{id}/{tier}");
+                assert!(
+                    (p.cache_write_cost_per_1k - write).abs() < f64::EPSILON
+                        && (p.cache_write_1h_cost_per_1k - write).abs() < f64::EPSILON,
+                    "{id}/{tier}: a write must bill once at the uncached input rate"
+                );
+            }
+        }
+        // Every provider-qualified spelling the profiles can emit is priced
+        // on both tiers...
+        for id in GLM_GEMINI_MODEL_IDS {
+            assert!(ModelPricing::lookup(id).is_some(), "{id} (compiled)");
+            assert!(card.lookup(id).is_some(), "{id} (asset)");
+        }
+        // ...and the near-misses stay unpriced — the FlashX-priced-as-Flash
+        // defect the curator reproduced on the deployed parser must not come
+        // back through either tier.
+        for id in [
+            "glm-5.3-flashx",
+            "zai/glm-5.3-flashx",
+            "gemini-3.5-flash-lite",
+        ] {
+            assert!(ModelPricing::lookup(id).is_none(), "{id} must stay unpriced (compiled)");
+            assert!(card.lookup(id).is_none(), "{id} must stay unpriced (asset)");
+        }
+    }
+
+    /// #14842's coverage gap, stated the way #8564's was: no GLM or Gemini id
+    /// the profiles can emit may fall through to the unknown-model default.
+    #[test]
+    fn pricing_card_knows_every_glm_and_gemini_model_id() {
+        for id in GLM_GEMINI_MODEL_IDS {
+            assert!(
+                ModelPricing::is_known_model(id),
+                "'{id}' is not on the pricing card — it would be costed at the \
+                 Anthropic unknown-model default. Add its row (rates verified \
+                 against https://docs.z.ai/guides/overview/pricing and \
+                 https://aistudio.google.com/docs/pricing)."
+            );
+        }
+    }
+
+    // ---- #14842: profile coverage ----------------------------------------
+    //
+    // The check #14741 left out: a model named by a shipped profile must be
+    // on the card (or carry an explicit exception below), so a new profile
+    // cannot silently lose its USD estimate again.
+
+    /// Concrete profile models deliberately NOT on the card: `gpt-oss-120b`
+    /// is the Pi-only Cerebras profile `quick-cerebras` (#14842 keeps
+    /// Cerebras pricing out of the card until someone verifies its rows).
+    const PROFILE_UNPRICED_EXCEPTIONS: &[&str] = &["gpt-oss-120b"];
+
+    fn shipped_profiles_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("loom-daemon/ always has a parent")
+            .join("defaults")
+            .join("model-profiles.json")
+    }
+
+    fn shipped_profiles() -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(shipped_profiles_path()).unwrap()).unwrap()
+    }
+
+    /// Profile models `is_priced` cannot price, as "profile 'x' names model
+    /// 'y'" strings. `REPLACE_WITH_…` values are operator templates, not
+    /// concrete ids, and skip the check.
+    fn uncovered_profile_models(
+        profiles: &serde_json::Value,
+        is_priced: &dyn Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let mut missing = Vec::new();
+        for (name, profile) in profiles.as_object().expect("profiles is a JSON object") {
+            let Some(model) = profile.get("model").and_then(|m| m.as_str()) else {
+                continue;
+            };
+            if model.starts_with("REPLACE_WITH") || PROFILE_UNPRICED_EXCEPTIONS.contains(&model) {
+                continue;
+            }
+            if !is_priced(model) {
+                missing.push(format!("profile '{name}' names model '{model}'"));
+            }
+        }
+        missing
+    }
+
+    #[test]
+    fn every_shipped_profile_model_is_priced_on_both_cards() {
+        let profiles = shipped_profiles();
+        let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
+        let on_asset = |m: &str| card.lookup(m).is_some();
+        assert!(
+            uncovered_profile_models(&profiles, &on_asset).is_empty(),
+            "asset tier coverage gaps"
+        );
+        let on_compiled = |m: &str| ModelPricing::lookup(m).is_some();
+        assert!(
+            uncovered_profile_models(&profiles, &on_compiled).is_empty(),
+            "compiled tier coverage gaps"
+        );
+    }
+
+    /// AC: removing a row for a bundled profile must fail coverage, naming
+    /// the missing model — even with the base GLM row still present.
+    #[test]
+    fn removing_the_glm_flash_row_fails_profile_coverage() {
+        let profiles = shipped_profiles();
+        let mut card_doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(pricing_card::shipped_asset_path()).unwrap(),
+        )
+        .unwrap();
+        // Remove the row AND the aliases that select it, or the asset would
+        // be rejected wholesale (an alias must match some row) instead of
+        // quietly losing the model — the shape a forgotten row takes.
+        card_doc["rows"] = serde_json::Value::Array(
+            card_doc["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["id"] != "glm-5.3-flash")
+                .cloned()
+                .collect(),
+        );
+        let alias_entries: Vec<(String, serde_json::Value)> = card_doc["aliases"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (alias, target) in &alias_entries {
+            if target.as_str() == Some("glm-5.3-flash#") {
+                card_doc["aliases"].as_object_mut().unwrap().remove(alias);
+            }
+        }
+        let card = PricingCard::from_str_at(
+            &serde_json::to_string(&card_doc).unwrap(),
+            std::path::Path::new("/test/pricing-sans-glm-flash.json"),
+        )
+        .expect("row + its aliases removed leaves a loadable card");
+        let on_asset = |m: &str| card.lookup(m).is_some();
+        let missing = uncovered_profile_models(&profiles, &on_asset);
+        assert!(
+            missing
+                .iter()
+                .any(|m| m.contains("glm-5.3-flash") && m.contains("zai-flash")),
+            "coverage must name the missing model and its profile, got: {missing:?}"
+        );
+    }
+
+    /// A new concrete profile with neither a row nor an exception fails too.
+    #[test]
+    fn a_new_concrete_profile_without_a_row_fails_coverage() {
+        let mut profiles = shipped_profiles();
+        profiles.as_object_mut().unwrap().insert(
+            "test-future-profile".into(),
+            serde_json::json!({"model": "glm-6", "providers": {"opencode": "zai-coding-plan"}}),
+        );
+        let on_compiled = |m: &str| ModelPricing::lookup(m).is_some();
+        let missing = uncovered_profile_models(&profiles, &on_compiled);
+        assert!(
+            missing.iter().any(|m| m.contains("glm-6")),
+            "the synthetic profile must be reported, got: {missing:?}"
+        );
     }
 
     #[test]
@@ -1168,6 +1480,7 @@ mod tests {
         let mut ids: Vec<String> = KNOWN_MODEL_IDS.iter().map(|s| (*s).to_string()).collect();
         ids.extend(KIMI_MODEL_IDS.iter().map(|s| (*s).to_string()));
         ids.extend(CODEX_MODEL_IDS.iter().map(|s| (*s).to_string()));
+        ids.extend(GLM_GEMINI_MODEL_IDS.iter().map(|s| (*s).to_string()));
         for extra in [
             "OPUS",
             "claude-opus-6",
@@ -1240,11 +1553,17 @@ mod tests {
     #[test]
     fn for_model_is_tier_agnostic() {
         let card = PricingCard::load(&pricing_card::shipped_asset_path()).unwrap();
-        for id in parity_model_ids()
-            .iter()
-            .map(String::as_str)
-            .chain(["totally-not-a-model", ""])
-        {
+        for id in parity_model_ids().iter().map(String::as_str).chain([
+            "totally-not-a-model",
+            "",
+            // #14842 near-misses: both tiers must agree they are UNKNOWN,
+            // not just agree on a rate — the asset's alias-selected exact
+            // rows and the compiled exact-match rows can only drift by
+            // one side quietly pricing a near-miss.
+            "glm-5.3-flashx",
+            "zai/glm-5.3-flashx",
+            "gemini-3.5-flash-lite",
+        ]) {
             let from_asset = ModelPricing::for_model_with(Some(&card), id);
             let from_compiled = ModelPricing::for_model_with(None, id);
             assert!(
