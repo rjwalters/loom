@@ -22,6 +22,223 @@ fn disposition_poll_preserves_snapshot_cadence_and_leaves_delivery_headroom() {
     assert_eq!(300 - worst_assumed_age, 30);
 }
 
+use crate::observability::ops::{disposition, OpsSink};
+use crate::telemetry::queue_repo::QueueRepoRef;
+use crate::telemetry::trace::SpanRecord;
+use crate::types::{QueueDisposition, ReadyQueueRow, WorkFinderTickSummary};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Notify;
+use tokio::time::{self, Instant as TokioInstant};
+
+#[derive(Default)]
+struct DispositionQueue(Mutex<Vec<(TokioInstant, SpanRecord)>>);
+
+impl QueueSink for DispositionQueue {
+    fn offer(&self, envelope: TelemetryEnvelope) {
+        if let TelemetryRecord::Span(span) = envelope.record {
+            self.0.lock().unwrap().push((TokioInstant::now(), span));
+        }
+    }
+
+    fn offer_durable(&self, envelope: TelemetryEnvelope) -> std::io::Result<()> {
+        self.offer(envelope);
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SnapshotFixture {
+    summary: Mutex<WorkFinderTickSummary>,
+    disposition: Arc<DispositionQueue>,
+    started: Notify,
+    release: Notify,
+    first_scan_completion: Mutex<Option<TokioInstant>>,
+    scans: AtomicUsize,
+    completed: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+tokio::task_local! {
+    pub(super) static SNAPSHOT_FIXTURE: Arc<SnapshotFixture>;
+}
+
+const FIXTURE_ROOT: &str = "/stage-scan-14795/warm";
+
+impl SnapshotFixture {
+    fn publish(&self, source_second: i64, present: bool) {
+        let at = DateTime::from_timestamp(source_second, 0).unwrap();
+        let row = ReadyQueueRow {
+            rank: 1,
+            repo: FIXTURE_ROOT.to_string(),
+            issue: 7,
+            workspace_weight: 1,
+            urgent: false,
+            level: Default::default(),
+            main_red_fix: false,
+            created_at: None,
+            story_points: None,
+            disposition: QueueDisposition::LeaseHeld,
+            detail: None,
+            state: String::new(),
+            reason: String::new(),
+            plan: Default::default(),
+        };
+        *self.summary.lock().unwrap() = WorkFinderTickSummary {
+            at,
+            queue: present.then_some(row).into_iter().collect(),
+            ..Default::default()
+        };
+    }
+
+    pub(super) async fn record(&self, sampler: &mut disposition::Sampler) {
+        let summary = self.summary.lock().unwrap().clone();
+        let sink = OpsSink::new(self.disposition.clone(), "fixture-host");
+        disposition::record_summary(
+            sampler,
+            None,
+            &summary,
+            &sink,
+            |root| {
+                (root == FIXTURE_ROOT).then(|| QueueRepoRef {
+                    repo: "example/warm-stage-repo".to_owned(),
+                    visibility: RepoVisibility::Public,
+                })
+            },
+            disposition::DEFAULT_REFRESH_SECS,
+        )
+        .await;
+    }
+
+    pub(super) fn stage_scan(self: &Arc<Self>) -> crate::observability::stage_occupancy::Scan {
+        let fixture = self.clone();
+        let prior_scans = self.scans.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            struct CountDrop<'a>(&'a AtomicUsize);
+            impl Drop for CountDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            let _count_drop = CountDrop(&fixture.dropped);
+            fixture.started.notify_one();
+            let deadline = *fixture.first_scan_completion.lock().unwrap();
+            if let (0, Some(deadline)) = (prior_scans, deadline) {
+                time::sleep_until(deadline).await;
+            } else {
+                fixture.release.notified().await;
+            }
+            fixture.completed.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn held_stage_scan_preserves_fast_disposition_and_has_no_backlog() {
+    let start = TokioInstant::now();
+    let fixture = Arc::new(SnapshotFixture {
+        first_scan_completion: Mutex::new(Some(start + Duration::from_secs(900))),
+        ..Default::default()
+    });
+    let bus = Arc::new(EventBus::new());
+    let workspace_pool =
+        Arc::new(WorkspacePool::new(bus.clone(), tokio::runtime::Handle::current()));
+    let tmp = tempfile::tempdir().unwrap();
+    let source_phase = Duration::from_secs(25);
+    let delivery_allowance = Duration::from_secs(45);
+    fixture.publish(0, true);
+    let collector = tokio::spawn(SNAPSHOT_FIXTURE.scope(
+        fixture.clone(),
+        run_collector(
+            bus.subscribe(["sweep"]),
+            fixture.disposition.clone(),
+            tmp.path().to_path_buf(),
+            "fixture-host".to_owned(),
+            crate::observability::SNAPSHOT_INTERVAL,
+            Instant::now(),
+            workspace_pool,
+        ),
+    ));
+    fixture.started.notified().await;
+    let before = fixture.disposition.0.lock().unwrap().clone();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1.attributes["loom.queue.transition"], "changed");
+
+    // The already-resolved row survives three complete source ticks while
+    // the stage producer is still held. Collector polls are 25s out of phase.
+    for second in [60, 120, 180] {
+        time::sleep_until(start + Duration::from_secs(second) - source_phase).await;
+        fixture.publish(second as i64, true);
+    }
+    time::sleep_until(start + Duration::from_secs(181)).await;
+    assert_eq!(fixture.completed.load(Ordering::Relaxed), 0);
+    let spans = fixture.disposition.0.lock().unwrap().clone();
+    assert_eq!(spans.len(), 2, "the held stage scan hid the quiet refresh");
+    let (refresh_at, refresh) = &spans[1];
+    assert_eq!(refresh.attributes["loom.queue.transition"], "refresh");
+    assert_eq!(refresh.started_at.timestamp(), 180);
+    let previous_age = refresh_at.duration_since(start) + source_phase + delivery_allowance;
+    assert!(previous_age < Duration::from_secs(300), "{previous_age:?}");
+
+    // Snapshot ticks at 300 and 600 must neither restart the held scan nor
+    // enqueue deferred work. Replaying an older source may not refresh it.
+    fixture.publish(120, true);
+    time::sleep_until(start + Duration::from_secs(601)).await;
+    assert_eq!(fixture.scans.load(Ordering::Relaxed), 1);
+    time::sleep_until(start + Duration::from_secs(899)).await;
+    assert_eq!(fixture.completed.load(Ordering::Relaxed), 0);
+    assert_eq!(fixture.scans.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.disposition.0.lock().unwrap().len(), 2);
+
+    // Both the first scan and the next snapshot tick become ready together.
+    // Reap the first scan before deciding whether to skip the new snapshot.
+    time::sleep_until(start + Duration::from_secs(901)).await;
+    assert_eq!(fixture.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.scans.load(Ordering::Relaxed), 2);
+    // Dropping the collector cancels that second, still pending scan.
+
+    collector.abort();
+    assert!(collector.await.unwrap_err().is_cancelled());
+    fixture.release.notify_one();
+    time::sleep(Duration::from_secs(301)).await;
+    assert_eq!(fixture.dropped.load(Ordering::Relaxed), 2);
+    assert_eq!(fixture.completed.load(Ordering::Relaxed), 1);
+    assert_eq!(fixture.scans.load(Ordering::Relaxed), 2);
+    assert_eq!(fixture.disposition.0.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn cancelling_an_owned_stage_read_aborts_work_still_queued() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let occupying = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.await.unwrap();
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_in_read = ran.clone();
+        let mut waiting = Box::pin(run_owned_blocking(move || {
+            ran_in_read.fetch_add(1, Ordering::Relaxed);
+        }));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending());
+        drop(waiting);
+
+        release_tx.send(()).unwrap();
+        occupying.await.unwrap();
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        assert_eq!(ran.load(Ordering::Relaxed), 0);
+    });
+}
+
 fn dispatch_event(issue: u32, sweep_id: &str) -> Event {
     Event::SweepGlobalDispatch {
         story_points: None,

@@ -145,6 +145,12 @@ async fn run_collector(
     daemon_started_at: Instant,
     workspace_pool: Arc<WorkspacePool>,
 ) {
+    #[cfg(test)]
+    let fixture = tests::SNAPSHOT_FIXTURE.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let sample_host = fixture.is_none();
+    #[cfg(not(test))]
+    let sample_host = true;
     let mut dispatches: HashMap<DispatchKey, DispatchState> = HashMap::new();
     let mut slug_cache: HashMap<String, String> = HashMap::new();
     let mut identities = identity::Sampler::default();
@@ -159,6 +165,7 @@ async fn run_collector(
     let mut disposition_sampler = super::ops::disposition::Sampler::default();
     let mut disposition_timer = tokio::time::interval(DISPOSITION_INTERVAL);
     disposition_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stage_scan: Option<super::stage_occupancy::Scan> = None;
     // GitHub quota gauges + breaker-skip flush (Issue #10022), OTLP-only.
     let mut ratelimit_timer = tokio::time::interval(super::ops::ratelimit::TICK);
     ratelimit_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -173,7 +180,9 @@ async fn run_collector(
     // record to reach the export queue. Blocking here is fine — this is a
     // bounded, local-disk-only read (no network, no `gh`) and runs once at
     // task startup.
-    run_backfill(&queue, &workspace_root, &workspace_pool).await;
+    if sample_host {
+        run_backfill(&queue, &workspace_root, &workspace_pool).await;
+    }
 
     loop {
         tokio::select! {
@@ -202,12 +211,12 @@ async fn run_collector(
                 }
             }
 
-            _ = identity_timer.tick() => {
+            _ = identity_timer.tick(), if sample_host => {
                 identities.sample(queue.as_ref(), &host_id, &workspace_pool, &mut slug_cache)
                     .await;
             }
 
-            _ = host_status_timer.tick() => {
+            _ = host_status_timer.tick(), if sample_host => {
                 // Sampled and published even without an OTLP exporter:
                 // admission readers (#12114) need the filtered record. Only the
                 // telemetry offer is exporter-gated.
@@ -227,36 +236,79 @@ async fn run_collector(
                 }
             }
 
-            _ = ratelimit_timer.tick() => {
+            _ = ratelimit_timer.tick(), if sample_host => {
                 super::ops::ratelimit::record(&workspace_root).await;
             }
 
+            // Reap a ready scan before a simultaneous snapshot tick. Other
+            // ready branches pause polling without discarding the future.
+            // Shutdown drops it, so no further listings or offers can start.
+            slugs = async {
+                if let Some(scan) = &mut stage_scan {
+                    scan.await
+                } else {
+                    Vec::new()
+                }
+            }, if stage_scan.is_some() => {
+                stage_scan = None;
+                for (root, slug) in slugs {
+                    slug_cache.entry(root).or_insert(slug);
+                }
+            }
+
             _ = snapshot_timer.tick() => {
-                sample_snapshots(
-                    queue.as_ref(),
-                    &workspace_root,
-                    &host_id,
-                    daemon_started_at,
-                    &workspace_pool,
-                    &mut slug_cache,
-                    &mut disposition_sampler,
-                )
-                .await;
+                if sample_host {
+                    sample_snapshots(
+                        queue.as_ref(),
+                        &workspace_root,
+                        &host_id,
+                        daemon_started_at,
+                        &workspace_pool,
+                        &mut slug_cache,
+                        &mut disposition_sampler,
+                    )
+                    .await;
+                }
+                #[cfg(test)]
+                if let Some(fixture) = &fixture {
+                    fixture.record(&mut disposition_sampler).await;
+                }
+
+                // A slow all-pages scan must not hold the snapshot arm open.
+                // Keep only the in-flight future, with no queue of old ticks.
+                if stage_scan.is_none() {
+                    #[cfg(test)]
+                    let fixture_scan = fixture.as_ref().map(|fixture| fixture.stage_scan());
+                    #[cfg(not(test))]
+                    let fixture_scan: Option<super::stage_occupancy::Scan> = None;
+                    stage_scan = match fixture_scan {
+                        Some(scan) => Some(scan),
+                        None => super::stage_occupancy::prepare(&workspace_pool, &slug_cache),
+                    };
+                }
+
                 // Periodic backfill (Issue #5084), same cadence as the host
                 // snapshot: self-heals any terminal record the live
                 // event-bus path missed or mis-attributed, not just the
                 // first-boot case above (e.g. a sweep whose terminal
                 // transition raced this task's own startup).
-                run_backfill(&queue, &workspace_root, &workspace_pool).await;
+                if sample_host {
+                    run_backfill(&queue, &workspace_root, &workspace_pool).await;
+                }
             }
 
-            _ = seat_volume_timer.tick() => {
+            _ = seat_volume_timer.tick(), if sample_host => {
                 seat_volume_sampler.record_if_due(&workspace_root).await;
             }
 
             _ = disposition_timer.tick() => {
                 // The same sampler owns both timers. Only the snapshot path
                 // can resolve repo references on the forge.
+                #[cfg(test)]
+                if let Some(fixture) = &fixture {
+                    fixture.record(&mut disposition_sampler).await;
+                    continue;
+                }
                 super::ops::disposition::record(&mut disposition_sampler, None).await;
             }
         }
@@ -902,6 +954,22 @@ fn terminal_records(
     ]
 }
 
+/// Abort a queued blocking read if its owning future goes away. Tokio
+/// cannot interrupt a read that already started, so it keeps its own bound.
+pub(super) async fn run_owned_blocking<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    struct AbortQueued(tokio::task::AbortHandle);
+    impl Drop for AbortQueued {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let task = tokio::task::spawn_blocking(read);
+    let _abort_queued = AbortQueued(task.abort_handle());
+    task.await
+}
+
 /// [`fetch_repo_slug`] with a process-lifetime cache keyed by workspace root
 /// path (a repo's slug does not change while the daemon runs — same
 /// rationale as [`crate::safehouse`]'s own `slug_cache`).
@@ -913,14 +981,26 @@ pub(super) async fn resolve_repo_slug_cached(
     cache: &mut HashMap<String, String>,
     workspace_root: &str,
 ) -> Option<String> {
+    resolve_repo_slug_with_fact(cache, workspace_root)
+        .await
+        .map(|(slug, _)| slug)
+}
+
+/// The same lookup, retaining the host and configured name when repo facts
+/// establish them. Stage occupancy needs this proof to join a listing to its
+/// canonical telemetry identity across a rename or transfer.
+pub(super) async fn resolve_repo_slug_with_fact(
+    cache: &mut HashMap<String, String>,
+    workspace_root: &str,
+) -> Option<(String, Option<crate::forge_repo_facts::Fact>)> {
     if crate::forge_repo_facts::enabled() {
         use crate::forge_repo_facts::{canonical, GhRepoEnv, Lookup};
         let root = std::path::PathBuf::from(workspace_root);
-        match tokio::task::spawn_blocking(move || canonical(&root, GhRepoEnv::Ignore)).await {
+        match run_owned_blocking(move || canonical(&root, GhRepoEnv::Ignore)).await {
             Ok(Lookup::Fact(f)) => {
                 let slug = f.full_name();
                 cache.insert(workspace_root.to_string(), slug.clone());
-                return Some(slug);
+                return Some((slug, Some(f)));
             }
             // `Unavailable` (a failed verify, or its backoff) keeps the
             // last-known slug or the legacy lookup rather than dropping
@@ -929,11 +1009,11 @@ pub(super) async fn resolve_repo_slug_cached(
         }
     }
     if let Some(slug) = cache.get(workspace_root) {
-        return Some(slug.clone());
+        return Some((slug.clone(), None));
     }
     let slug = fetch_repo_slug(Path::new(workspace_root)).await?;
     cache.insert(workspace_root.to_string(), slug.clone());
-    Some(slug)
+    Some((slug, None))
 }
 
 /// Best-effort `gh repo view --json nameWithOwner --jq .nameWithOwner` lookup
@@ -945,7 +1025,7 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
     // #10089: through the facade (counted, bounded); it also points the child
     // at the owner-correct credential for a cross-owner managed repo (#5431).
     let op = Operation::new("collector.repo_slug");
-    let outcome = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, SLUG_FETCH_TIMEOUT)
+    let invocation = GhInvocation::new(op, AccessIntent::Read, GhTarget::None, SLUG_FETCH_TIMEOUT)
         .forge_op(crate::forge_call_stats::ops::REPO_VIEW)
         .current_dir(workspace_root)
         .args([
@@ -955,9 +1035,8 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
             "nameWithOwner",
             "--jq",
             ".nameWithOwner",
-        ])
-        .run_async()
-        .await;
+        ]);
+    let outcome = run_owned_blocking(move || invocation.run()).await.ok()?;
     let output = outcome.ok_output()?;
     let slug = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!slug.is_empty() && slug.contains('/')).then_some(slug)
@@ -972,7 +1051,7 @@ async fn fetch_repo_slug(workspace_root: &Path) -> Option<String> {
 /// "repo is actually private".
 pub(super) async fn resolve_visibility(slug: &str) -> RepoVisibility {
     let owned = slug.to_string();
-    match tokio::task::spawn_blocking(move || derive_visibility(&owned)).await {
+    match run_owned_blocking(move || derive_visibility(&owned)).await {
         Ok(visibility) => visibility,
         Err(join_error) => {
             log::warn!(
@@ -1058,11 +1137,6 @@ async fn sample_snapshots(
     // work-ahead. Reads only the repo-ref cache warmed above, so
     // it makes no forge call; a no-op without the OTLP sink or a fresh tick.
     super::dispatch_eligibility::record();
-    // Per-stage occupancy gauge (Issue #12866), OTLP-only: the items still
-    // waiting in triage / approval / operator hold. Counts come from the
-    // mirror snapshot or ETag-cached all-pages label listings; a no-op
-    // without the OTLP sink.
-    super::stage_occupancy::record(workspace_pool, slug_cache).await;
     // Per-account Codex session-container state (Issue #10455): export the
     // gauge from the always-on watch's newest observations. No docker call
     // here (the watch owns the bounded snapshot), so a wedged Docker cannot

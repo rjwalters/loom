@@ -7,10 +7,9 @@
 //!
 //! # Where this runs, and what it costs
 //!
-//! Driven from the collector's periodic sample
-//! (`observability::collector::sample_snapshots`), never from a role or
-//! work-finder tick, on the same cadence and with the same listing machinery as
-//! the `loom:blocked` listing ([`super::queue_blocked`]):
+//! Scheduled by the collector's snapshot timer, never from a role or
+//! work-finder tick. At most one sample is in flight. Listing uses the same
+//! machinery as the `loom:blocked` listing ([`super::queue_blocked`]):
 //!
 //! - **Mirror mode** (#12307): the counts come from the tick's published
 //!   snapshot, which holds every open issue of each repo it read. No forge call.
@@ -24,17 +23,21 @@
 //! The work finder's own listing covers only `loom:issue`, so it cannot supply
 //! these stages; that gap is why this reads the queue labels itself.
 //!
-//! With no OTLP exporter no sink is registered and [`record`] returns before
+//! With no OTLP exporter no sink is registered and [`prepare`] returns before
 //! doing any work.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 
+use super::collector::run_owned_blocking;
 use super::queue::{DurableQueue, FanoutQueue, QueueSink};
 use super::queue_blocked::{snapshot_rows, Rows};
+use crate::forge_etag_store::{host_scope, Target};
 use crate::forge_listing::RestIssue;
 use crate::telemetry::kinds::stage_occupancy::{
     OccupancyScope, StageOccupancyRecord, StageStats, STAGES, STAGE_APPROVAL_WAIT,
@@ -75,7 +78,7 @@ impl StageOccupancySink {
 static GLOBAL_SINK: OnceLock<StageOccupancySink> = OnceLock::new();
 
 /// Register the OTLP queues (called once from [`super::spawn_task`]). With no
-/// OTLP exporter nothing is registered, and [`record`] returns before doing any
+/// OTLP exporter nothing is registered, and [`prepare`] returns before doing any
 /// work.
 pub fn register_sink(otlp_queues: Vec<Arc<DurableQueue>>, host_id: &str) {
     if otlp_queues.is_empty() {
@@ -205,18 +208,13 @@ pub fn build_records(
 
 /// One all-pages, ETag-cached listing of open items carrying `label` in the
 /// repo at `root`, off the async runtime. `None` on a failed or partial walk.
-async fn list_all(root: PathBuf, label: &'static str) -> Option<Vec<RestIssue>> {
+async fn list_all(root: PathBuf, target: Target, label: &'static str) -> Option<Vec<RestIssue>> {
     let shown = root.display().to_string();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = run_owned_blocking(move || {
         let _discovery = crate::gh_invocation::purpose::discovery();
         let gh = PathBuf::from(crate::gh_invocation::gh_bin());
-        crate::forge_listing::list_issues_cached_all_as(
-            CALLER,
-            &gh,
-            Some(&root),
-            None,
-            label,
-            "open",
+        crate::forge_listing::list_issues_cached_all_for_target_as(
+            CALLER, &gh, &root, &target, label, "open",
         )
     })
     .await;
@@ -237,64 +235,94 @@ async fn list_all(root: PathBuf, label: &'static str) -> Option<Vec<RestIssue>> 
     }
 }
 
-/// Every managed repo's occupancy as of `now`.
+/// Sample each provisioned root with the collector's normal resolver, just
+/// before reading its stage data. Hand back only newly resolved cache entries
+/// so a later result cannot overwrite another collector path's resolution.
 async fn collect(
-    workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
+    roots: Vec<PathBuf>,
+    mut slug_cache: HashMap<String, String>,
     now: DateTime<Utc>,
-) -> Vec<RepoOccupancy> {
-    let mut repos = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    for root in super::collector::provisioned_roots(workspace_pool) {
-        let root_str = root.to_string_lossy().to_string();
-        let Some(slug) = super::collector::resolve_repo_slug_cached(slug_cache, &root_str).await
+) -> (Vec<RepoOccupancy>, Vec<(String, String)>) {
+    let mut repos = Vec::with_capacity(roots.len());
+    let mut discovered = Vec::new();
+    let mut seen = BTreeSet::new();
+    let visibility_host = host_scope(&Target::default());
+    for root in roots {
+        let key = root.to_string_lossy().into_owned();
+        let warm = slug_cache.contains_key(&key);
+        let Some((slug, fact)) =
+            super::collector::resolve_repo_slug_with_fact(&mut slug_cache, &key).await
         else {
             continue;
         };
         if !seen.insert(slug.clone()) {
             continue;
         }
+
+        let (source_root, expected_slug) = (root.clone(), slug.clone());
+        let source =
+            run_owned_blocking(move || snapshot_rows(&source_root, &expected_slug, fact.as_ref()))
+                .await
+                .unwrap_or(Rows::Skip);
         let mut stages: [Option<StageStats>; 3] = [None, None, None];
-        match snapshot_rows(&root) {
+        let source_host = match source {
             Rows::Snapshot(rows) => {
                 for (i, stage) in STAGES.iter().enumerate() {
                     stages[i] = Some(stage_stats(stage, &rows, now));
                 }
+                Some("github.com".to_owned())
             }
-            // Mirror mode, and no tick has read this repo: unknown, not zero.
-            Rows::Skip => {}
-            Rows::List => {
+            Rows::Skip => None,
+            Rows::List(target) => {
                 for (i, stage) in STAGES.iter().enumerate() {
-                    if let Some(rows) = list_all(root.clone(), stage_label(stage)).await {
+                    if let Some(rows) =
+                        list_all(root.clone(), target.clone(), stage_label(stage)).await
+                    {
                         stages[i] = Some(stage_stats(stage, &rows, now));
                     }
                 }
+                target.host
             }
+        };
+        if !warm && source_host.is_some() {
+            discovered.push((key, slug.clone()));
         }
-        let visibility = super::collector::resolve_visibility(&slug).await;
+        // The visibility cache is keyed by slug on the default forge. Do
+        // not use one forge's visibility to publish facts from another.
+        let visibility =
+            if source_host.is_some_and(|host| host.eq_ignore_ascii_case(&visibility_host)) {
+                super::collector::resolve_visibility(&slug).await
+            } else {
+                RepoVisibility::Private
+            };
         repos.push(RepoOccupancy {
             slug,
             visibility,
             stages,
         });
     }
-    repos
+    (repos, discovered)
 }
 
-/// Take one occupancy sample and offer its records. A no-op without the OTLP
-/// sink.
-pub(super) async fn record(
+pub(super) type Scan = Pin<Box<dyn Future<Output = Vec<(String, String)>> + Send>>;
+
+/// Take one occupancy sample at the snapshot cadence. The collector lends
+/// its last-known slugs without sharing mutable state across listing awaits.
+pub(super) fn prepare(
     workspace_pool: &WorkspacePool,
-    slug_cache: &mut HashMap<String, String>,
-) {
-    let Some(sink) = GLOBAL_SINK.get() else {
-        return;
-    };
-    let now = Utc::now();
-    let repos = collect(workspace_pool, slug_cache, now).await;
-    for record in build_records(&sink.host_id, now, &repos) {
-        sink.push(record);
-    }
+    slug_cache: &HashMap<String, String>,
+) -> Option<Scan> {
+    let sink = GLOBAL_SINK.get()?;
+    let roots = super::collector::provisioned_roots(workspace_pool);
+    let slug_cache = slug_cache.clone();
+    Some(Box::pin(async move {
+        let now = Utc::now();
+        let (repos, discovered) = collect(roots, slug_cache, now).await;
+        for record in build_records(&sink.host_id, now, &repos) {
+            sink.push(record);
+        }
+        discovered
+    }))
 }
 
 #[cfg(test)]
