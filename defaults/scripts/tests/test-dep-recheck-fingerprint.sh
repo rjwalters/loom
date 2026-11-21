@@ -1106,7 +1106,7 @@ assert_eq "#31" "$(jq -r '.resolved[0]' <<<"$out")" "T38h: --json reports the re
 
 # T38i: a RENAMED repository (#14710's compatibility case, from the issue
 # thread): the park record names the pre-rename slug, the forge answers under
-# the canonical one (rjwalters/loom -> 2AMLogic/loom is the live instance).
+# the canonical one (the pre-transfer owner slug -> 2AMLogic/loom is the live instance).
 # The answer's URL does not name the asked slug, so binding goes through the
 # canonical resolution (REST repos/{slug} follows the redirect) — a verified
 # redirect to the SAME repository resolves; it must not read as unknown.
