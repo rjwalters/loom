@@ -302,6 +302,10 @@ fn write_fake_gh(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"api -X POST "*"issues/300/comments"*)
+    if [ -f '{log}.reject-post' ]; then exit 1; fi
+    if [ ! -f '{log}.unconfirmed-post' ]; then echo '123'; fi
+    exit 0 ;;
   *"issues/300/comments"*) printf '%s' '{comments}'; exit 0 ;;
   *"issues/300/timeline"*) {timeline}; exit 0 ;;
   *"issues?labels=loom:curating"*|*"labels=loom:curating"*)
@@ -377,6 +381,51 @@ fn the_incident_shape_releases_the_claim_posts_the_record_and_preserves_labels()
             && calls.contains("--jq .id"),
         "expected the re-curation record post: {calls}"
     );
+}
+
+#[test]
+#[serial]
+fn an_unconfirmed_recuration_record_keeps_the_claim_for_retry() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut fake = FakeIssue {
+        labels: &["loom:curating", "loom:issue"],
+        comments: released_lease_comments(&[]),
+        labeled_at: Some("\"2026-11-13T23:42:26Z\""),
+    };
+    let (gh, log) = write_fake_gh(dir.path(), &fake);
+    let release = "issue edit 300 --remove-label loom:curating";
+
+    for failure in ["reject-post", "unconfirmed-post"] {
+        let flag = log.with_extension(format!("log.{failure}"));
+        std::fs::write(&flag, "").unwrap();
+        run_pass(&gh, &root);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.matches("-X POST").count(), 1, "{calls}");
+        assert!(!calls.contains(release), "leave the claim discoverable: {calls}");
+        std::fs::remove_file(&flag).unwrap();
+        std::fs::write(&log, "").unwrap();
+    }
+
+    // A new owner can arrive between attempts. The next pass must read that
+    // lease afresh and leave both the comment and the claim alone.
+    let fresh_lease = fleet_row(12, 5, &quoted(LEASE));
+    fake.comments = released_lease_comments(&[fresh_lease]);
+    write_fake_gh(dir.path(), &fake);
+    run_pass(&gh, &root);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("-X POST") && !calls.contains(release), "{calls}");
+    std::fs::write(&log, "").unwrap();
+
+    // The intended stale claim remains discoverable and the issue is eligible
+    // again. A confirmed record must precede the release.
+    fake.comments = released_lease_comments(&[]);
+    write_fake_gh(dir.path(), &fake);
+    run_pass(&gh, &root);
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls.matches("-X POST").count(), 1, "{calls}");
+    assert!(calls.find("-X POST").unwrap() < calls.find(release).unwrap(), "{calls}");
 }
 
 #[test]

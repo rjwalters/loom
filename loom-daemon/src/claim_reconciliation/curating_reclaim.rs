@@ -63,10 +63,10 @@
 //! establish whether the approval was earned, the pass **records that the
 //! issue needs re-curation** (one marker comment,
 //! [`RECURATION_MARKER_PREFIX`]) rather than guessing the pre-claim state —
-//! it never removes or adds an approval label. The record is posted BEFORE
-//! the label edit, so a partial repair (record posted, edit failed) retries
-//! the edit on the next pass without duplicating the record; a completed
-//! repair leaves the listing for good.
+//! it never removes or adds an approval label. The record must be confirmed
+//! before the claim is removed. An unconfirmed record leaves the claim in the
+//! listing for the next pass. A confirmed record survives a failed label edit
+//! without being posted again; a completed repair leaves the listing.
 //!
 //! Runs from [`super::pass_loop`] inside the shared reconciliation cadence
 //! and its `LOOM_STALE_CLAIM_RECONCILE` kill switch — no separate knob, per
@@ -484,11 +484,11 @@ pub(super) fn reconcile_curating_claims(gh_bin: &Path, root: &Path) {
                 if record {
                     if let Err(e) = post_recuration_record(gh_bin, root, number, &lease, now) {
                         log::warn!(
-                            "claim_reconciliation: failed to post the re-curation record for \
-                             #{number} in {}: {e} (the claim release still proceeds; the \
-                             record must be added by hand if this persists) (#14816)",
+                            "claim_reconciliation: could not confirm the re-curation record for \
+                             #{number} in {}: {e}; keeping {CLAIM} for retry (#14816)",
                             root.display(),
                         );
+                        continue;
                     }
                 }
                 match remove_claim_edit(gh_bin, root, number) {
@@ -618,8 +618,7 @@ fn run_issue_edit(gh_bin: &Path, root: &Path, issue: u32, add: &[&str]) -> anyho
     Ok(())
 }
 
-/// Post the re-curation record comment. Best-effort at the call site — a
-/// failure logs and the release proceeds (see the caller).
+/// Post the re-curation record and require its Forge-assigned comment ID.
 fn post_recuration_record(
     gh_bin: &Path,
     root: &Path,
@@ -637,6 +636,13 @@ fn post_recuration_record(
     if !out.status.success() {
         let (root, err) = (root.display(), gh_call::stderr(&out));
         anyhow::bail!("re-curation record post failed for #{issue} in {root}: {err}");
+    }
+    if !String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .is_ok_and(|id| id > 0)
+    {
+        anyhow::bail!("re-curation record post returned no comment ID for #{issue}");
     }
     Ok(())
 }
