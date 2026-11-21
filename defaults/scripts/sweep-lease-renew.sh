@@ -1101,16 +1101,31 @@ cmd_start() {
     # enforces release / supersede). In-session starts keep the read.
     local have_renewer=1; "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer --help > /dev/null 2>&1 || have_renewer=0
     local cap_msg="sweep-lease-renew: renewal loop for issue #${issue} exiting: reached the ${max_age}s absolute lifetime cap (SWEEP_LEASE_RENEW_MAX_AGE_SECS / --max-age, #7825). The lease now ages out and the claim becomes reclaimable; set the cap to 0 to disable it."
+    local report_receipt=0 receipt_help
+    if ((have_renewer)) && [[ -n "$sweep_id" && "${LOOM_SWEEP_LEASE_RENEW_SOURCE:-}" != "dispatch" ]]; then
+        receipt_help="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer terminal-receipt --help 2>/dev/null)" || receipt_help=""
+        if [[ "$receipt_help" == *"--reason"* ]]; then report_receipt=1; fi
+    fi
     (
         cached_lease="" misses=0
+        terminal_reason=watch-ended observed_owner=0 last_success="" renewal_failed=0
         while pid_is_live "$watch_pid" "$watch_ident"; do
-            ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
+            ! max_age_exceeded "$loop_started_at" "$max_age" || { terminal_reason=age-cap; echo "$cap_msg" >&9; break; }
             sleep "$interval"
             pid_is_live "$watch_pid" "$watch_ident" || break
-            ! max_age_exceeded "$loop_started_at" "$max_age" || { echo "$cap_msg" >&9; break; }
+            ! max_age_exceeded "$loop_started_at" "$max_age" || { terminal_reason=age-cap; echo "$cap_msg" >&9; break; }
             gate_rc=0; issue_state="$( ((have_renewer)) && [[ "${LOOM_SWEEP_LEASE_RENEW_SOURCE:-}" != "dispatch" ]] || { echo open; exit 0; }; export LOOM_ROLE=sweep-lease-renew; [[ -z "$sweep_id" ]] || export LOOM_SWEEP_ID="$sweep_id"; lease_gh read api "repos/$(gh_repo_path)/issues/${issue}" --jq .state 2>&9)" || issue_state=""
-            ((have_renewer == 0)) || "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
-            ((gate_rc != 3)) || break
+            gate_receipt=""
+            if ((report_receipt)); then
+                gate_receipt="$("${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" --report-receipt 2>&9)" || gate_rc=$?
+            elif ((have_renewer)); then
+                "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer check "${owner_args[@]}" --issue-state "$issue_state" 2>&9 || gate_rc=$?
+            fi
+            if [[ "$gate_receipt" == "owned" ]]; then observed_owner=1; fi
+            if ((gate_rc == 3)); then
+                terminal_reason="$gate_receipt"
+                break
+            fi
             ((gate_rc != 4)) || continue
             renew_rc=0
             # The `${arr[@]+...}` guard below is mandatory -- NOT an
@@ -1126,14 +1141,27 @@ cmd_start() {
             renew_err="$("$SELF" renew-once "$issue" "${extra_args[@]+"${extra_args[@]}"}" ${cached_lease:+--cached-lease "$cached_lease"} 2>&1 > /dev/null)" || renew_rc=$?
             if [[ "$renew_rc" -eq 0 || "$renew_rc" -eq 2 ]]; then
                 cached_lease=""
-                if [[ "$renew_rc" -eq 0 && "$renew_err" =~ $lease_cache_re ]]; then cached_lease="${BASH_REMATCH[1]}"; fi
+                renewal_failed=0
+                if [[ "$renew_rc" -eq 0 && "$renew_err" =~ $lease_cache_re ]]; then
+                    cached_lease="${BASH_REMATCH[1]}"
+                    if ((report_receipt)); then last_success="$(iso_now || true)"; fi
+                fi
             elif [[ "$renew_rc" -ne 4 ]]; then
+                renewal_failed=1
                 echo "sweep-lease-renew: renewal cycle for issue #${issue} FAILED (renew-once exit ${renew_rc}): ${renew_err}" >&9
             fi
-            [[ "$renew_rc" -ne 4 ]] || break
+            [[ "$renew_rc" -ne 4 ]] || { terminal_reason=yielded; break; }
             case "$renew_rc" in 0) misses=0 ;; 2) misses=$((misses + 1)) ;; esac
-            ((misses < 2)) || { echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: no lease comment to renew on two consecutive cycles (#10229)" >&9; break; }
+            ((misses < 2)) || { terminal_reason=no-lease; echo "sweep-lease-renew: renewal loop for issue #${issue} exiting: no lease comment to renew on two consecutive cycles (#10229)" >&9; break; }
         done
+        if ((report_receipt)) && [[ -n "$terminal_reason" ]]; then
+            local -a receipt_fields=()
+            if ((observed_owner)); then receipt_fields+=(--seen-owner); fi
+            if [[ -n "$last_success" ]]; then receipt_fields+=(--last-success "$last_success"); fi
+            if ((renewal_failed)); then receipt_fields+=(--renewal-failed); fi
+            "${LOOM_DAEMON_BIN:-loom-daemon}" lease renewer terminal-receipt "${owner_args[@]}" \
+                --reason "$terminal_reason" ${receipt_fields[@]+"${receipt_fields[@]}"} >/dev/null 2>&1 || true
+        fi
     ) < /dev/null > /dev/null 2>&1 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- &
     local loop_pid=$! owner_pid=""
     # A live renewer already owns this key: drop the loop just forked (still in
