@@ -3535,13 +3535,26 @@ _gitignore_source_stub_patterns() {
 # #13898: is $WRITE_ROOT's root package.json the loom-workspace stub? Uses the
 # same "name" marker as resync_workspace_stub_version. Echoes "yes"/"no"; echoes
 # "unknown" (which callers must treat as stand-down, never as "no") only when
-# the answer cannot be determined at all -- jq absent, or jq failed on the
-# file. A package.json with no "name" is NOT ambiguous: it is determinatively
-# not the stub, matching the binary's workspace_uses_package_stub()
-# (unwrap_or(false), post_init.rs). Stripping the
-# stub entries on a genuine "unknown" would undo what a correct binary just
-# wrote, while tolerating them costs at most one stale-extra pattern surviving
-# until jq is available.
+# jq is absent from PATH -- the one case where the answer cannot be determined
+# at all. Every shape the tool can reach is answered determinatively, matching
+# the binary's workspace_uses_package_stub() (unwrap_or(false), post_init.rs):
+# a missing package.json, one with no "name", and one jq fails to parse are
+# all "no" (#14586: the unparseable case used to stand down as "unknown",
+# disabling the whole #5294/#5991/#11323 stale-binary guard on a case the
+# binary itself answers definitively as "not a stub"). Standing down on a
+# genuine "unknown" remains right: stripping the stub entries without knowing
+# would undo what a correct binary just wrote, while tolerating them costs at
+# most one stale-extra pattern surviving until jq is available.
+#
+# #14586: the stub marker this reads must be TRACKED (committed) in
+# $WRITE_ROOT for the other stub-detection sites to agree: the fleet export
+# (workspace_resync.rs) and this script's --output detached-worktree checkout
+# both see only tracked paths, so a stub repo whose package.json was never
+# committed reads "no" there and regenerates the block without the stub
+# entries on every cycle. The install writes and commits both files, so an
+# untracked stub is not a state Loom produces -- and if you are ever tempted
+# to read the marker from a tree other than the one that owns the .gitignore
+# being written, that divergence is the failure mode you are reintroducing.
 _gitignore_workspace_is_stub() {
     local pj="$WRITE_ROOT/package.json"
     [[ -f "$pj" ]] || { echo "no"; return 0; }
@@ -3550,7 +3563,7 @@ _gitignore_workspace_is_stub() {
         return 0
     fi
     local name
-    name="$(jq -r '.name // empty' "$pj" 2>/dev/null)" || { echo "unknown"; return 0; }
+    name="$(jq -r '.name // empty' "$pj" 2>/dev/null)" || { echo "no"; return 0; }
     [[ -z "$name" ]] && { echo "no"; return 0; }
     [[ "$name" == "loom-workspace" ]] && echo "yes" || echo "no"
 }
@@ -3633,7 +3646,7 @@ _gitignore_warn_if_stale() {
     while IFS= read -r pattern; do [[ -n "$pattern" ]] && stub_patterns+=("$pattern"); done < <(_gitignore_source_stub_patterns)
     local stub_state
     stub_state="$(_gitignore_workspace_is_stub)"
-    [[ "$stub_state" != "unknown" ]] || { note "  .gitignore stale-check skipped: stub detection needs jq (#13898)"; return 0; }
+    [[ "$stub_state" != "unknown" ]] || { note "  .gitignore stale-check skipped: jq not on PATH to read the workspace stub marker (#13898)"; return 0; }
     local -a expected=("${source_patterns[@]}")
     if [[ "$stub_state" == "yes" ]]; then
         expected+=("${stub_patterns[@]+"${stub_patterns[@]}"}")
