@@ -55,12 +55,14 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
         return host(args);
     }
     let (config, dir) = lifecycle::resolve(&root, &name)?;
-    let selection = if std::env::var_os("LOOM_PRIVATE_LEASE_FD").is_none() {
+    let selection = if !leased {
+        // The manual, unleased path launches on the account it resolved and
+        // no other: a busy named seat refuses with its own reason, never a
+        // different seat a pool walk would hand back (#14627).
         Some(
-            dispatch::Selection::prepare(
+            dispatch::Selection::prepare_named(
                 &root,
-                "codex",
-                None,
+                &config,
                 JobKind::Role,
                 None,
                 &format!("manual-{}", uuid::Uuid::new_v4()),
@@ -77,7 +79,14 @@ pub fn run(mut args: crate::session_exec::HostArgs) -> Result<i32> {
         .as_ref()
         .or_else(|| selection.as_ref().and_then(|s| s.lease()))
         .context("private dispatch has no owned account lease")?;
-    let job = lease::read(&dir)?.context("private dispatch lost its durable job identity")?;
+    if lease.dir != dir
+        || selection
+            .as_ref()
+            .is_some_and(|selection| selection.name != config.account)
+    {
+        bail!("{}", dispatch::WRONG_ACCOUNT);
+    }
+    let job = lease::read(&lease.dir)?.context("private dispatch lost its durable job identity")?;
     // The clone this job was prepared in, from the durable job the lease owns:
     // an empty repository is the legacy primary, anything else must still be a
     // registered clone of this account or the launch is refused.
@@ -348,6 +357,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "sweep-7".into(),
@@ -405,6 +416,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "step-builder-20-1".into(),
@@ -469,6 +482,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let id = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -510,6 +525,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         }
     }
 
@@ -646,6 +663,8 @@ mod tests {
             volume: "v".into(),
             profile: "/host/profile".into(),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "o".into(),

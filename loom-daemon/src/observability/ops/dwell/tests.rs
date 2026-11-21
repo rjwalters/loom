@@ -73,7 +73,7 @@ fn wait_class_splits_ready_blocked_and_not_waiting() {
         D::HardExclusion,
         D::Declined,
         D::HostConstraint,
-        D::PeerClaim,
+        D::LeaseHeld,
         D::OpenPr,
         D::OpenPrBackoff,
         D::RecheckInterval,

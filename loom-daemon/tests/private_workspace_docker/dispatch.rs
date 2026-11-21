@@ -66,20 +66,42 @@ test -z "${LOOM_DAEMON_SOCKET:-}"
 test -r .loom/hooks/guard-codex-bridge.sh
 test -r .claude/commands/loom/guide.md
 test -r .claude/commands/loom/sweep.md
+# The issue worktree a step uses: the namespaced base under LOOM_WORKTREE_ROOT.
+issue_worktree() { echo "$LOOM_WORKTREE_ROOT/$(basename "$PWD")/issue-$1"; }
 if [[ "$*" == *retain* ]]; then
   echo unpushed > retained.txt
+  # `retain-<N>`: the interrupted job also left an unpushed commit in issue N's
+  # existing worktree, which is what its snapshot reads (#14031). A bare
+  # `retain` job has no worktree, which snapshots as unpublished too.
+  if [[ "$*" =~ retain-([0-9]+) ]]; then
+    worktree="$(issue_worktree "${BASH_REMATCH[1]}")"
+    echo unpushed > "$worktree/retained.txt"
+    git -C "$worktree" add retained.txt
+    git -C "$worktree" commit -m 'fixture unpushed work'
+  fi
   echo fixture-retained-ready
   sleep 30
   exit 0
 fi
 if [[ "$*" == *mutate* ]]; then
-  git switch -c feature/issue-8786
-  echo 'private issue mutation' > mutation.txt
-  git add mutation.txt
-  git commit -m 'fixture issue mutation'
-  git push -u origin feature/issue-8786
-  .loom/scripts/create-pr.sh --repo github/repo --head feature/issue-8786 --base main --title 'Fixture change' --body 'Part of #8786' --label loom:review-requested
-  .loom/scripts/sweep-checkpoint.sh write 8786 builder-done --task-id fixture-sweep --pr-number 17
+  # Like a real Builder step: the issue branch lives in a worktree under the
+  # step's namespaced base (<LOOM_WORKTREE_ROOT>/<clone basename>/issue-N), which
+  # is where the job snapshot looks. Committing in the root clone would leave no
+  # worktree, and the job would (correctly) read recovery-required (#14031).
+  # `mutate-<N>` names the job's issue; a bare `mutate` is issue 8786.
+  issue=8786
+  [[ "$*" =~ mutate-([0-9]+) ]] && issue="${BASH_REMATCH[1]}"
+  worktree="$(issue_worktree "$issue")"
+  # A real repo gitignores .loom/worktrees/; this fixture clone does not, and
+  # the left-behind worktree must not make the root clone read as dirty.
+  echo '.loom/worktrees/' >> "$(git rev-parse --git-path info/exclude)"
+  git worktree add -b "feature/issue-$issue" "$worktree" HEAD
+  echo 'private issue mutation' > "$worktree/mutation.txt"
+  git -C "$worktree" add mutation.txt
+  git -C "$worktree" commit -m 'fixture issue mutation'
+  git -C "$worktree" push -u origin "feature/issue-$issue"
+  .loom/scripts/create-pr.sh --repo github/repo --head "feature/issue-$issue" --base main --title 'Fixture change' --body "Part of #$issue" --label loom:review-requested
+  .loom/scripts/sweep-checkpoint.sh write "$issue" builder-done --task-id fixture-sweep --pr-number 17
 fi
 if .loom/scripts/run-job.sh --image alpine -- true >/tmp/run-job.log 2>&1; then exit 91; fi
 grep -q 'unsupported in private-clone v1' /tmp/run-job.log
@@ -242,10 +264,10 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         .unwrap()
         .is_none());
     }
-    // Production admission stays closed for this fixture: #8787 admits a mutable
-    // role on verified private-clone containment, but this profile has never had
-    // Codex hook trust established, so the containment claim is refused with that
-    // precise obligation. No fixture manifest is promoted anywhere.
+    // Mutable admission must name the hook-trust refusal when neither trust
+    // path is available.
+    let profile = f.root.path().join("profiles").join(name);
+    containment::make_hook_registration_unsealable(&profile);
     let mut config = loom_daemon::sweep_registry::SweepRegistryConfig::new(root.clone());
     config.journal_path = Some(root.join("sweeps.json"));
     let registry = std::sync::Arc::new(std::sync::Mutex::new(
@@ -266,7 +288,6 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
     assert!(!root.join(".loom/locks/issue-8786").exists());
     // A read-only synthetic profile must fail before any role/model launch.
     // Restore its original owner-only mode before asserting or continuing.
-    let profile = f.root.path().join("profiles").join(name);
     std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o500)).unwrap();
     let inaccessible = loom_daemon::tokens_pool::private_workspace::dispatch::Selection::prepare(
         &root,
@@ -344,7 +365,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         &std::fs::read(root.join(".loom/private-jobs/issue-8786.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["outcome"], "completed", "{record}");
     assert_eq!(record["owner"], "fixture-sweep");
     assert_eq!(record["snapshot"]["published"], true);
     assert_eq!(
@@ -366,7 +387,7 @@ fn adapter_chain_pushes_private_branch_and_preserves_host_logs_and_work() {
         Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8786), "fixture-interrupted")
             .unwrap()
             .unwrap();
-    let mut retained_command = f.adapter(name, "retain");
+    let mut retained_command = f.adapter(name, "retain-8786");
     interrupted.apply(&mut retained_command);
     let result = retained_command
         .env("GH_HOST", &gh_host)
@@ -656,10 +677,28 @@ fn each_account_admission_is_bound_to_its_own_repository_clone() {
         assert_ne!(proof.provenance(Vec::new(), Default::default()).account, a.as_str());
         drop(selection);
     }
-    // Account `c` serves repository two too, but without hook trust its clone
-    // is refused with the precise obligation, so no mutable role is admitted.
+    // Account `c` has no recorded trust. Its fresh sealable registration
+    // admits only its own account and repository, then an unsealable
+    // registration is refused for the hook-trust obligation.
     {
         let _c = Environment::set(&[("LOOM_CODEX_PROFILE", Some(c.as_str().into()))]);
+        let profile = f.root.path().join("profiles").join(c);
+        assert_eq!(
+            loom_daemon::tokens_pool::private_workspace::containment::trust_state(&profile),
+            "sealed"
+        );
+        let selection = prepare("sealed-two").unwrap().unwrap();
+        let proof = selection.contain(&root).unwrap();
+        proof.require_repository(&two).unwrap();
+        assert!(proof
+            .require_repository(&one)
+            .unwrap_err()
+            .to_string()
+            .contains(wrong));
+        assert_eq!(proof.provenance(Vec::new(), Default::default()).account, c.as_str());
+        drop(selection);
+
+        containment::make_hook_registration_unsealable(&profile);
         let selection = prepare("untrusted-two").unwrap().unwrap();
         let untrusted = selection.contain(&root).unwrap_err().to_string();
         assert!(untrusted.contains("hook trust"), "{untrusted}");

@@ -589,10 +589,10 @@ fn run_gated<R: RoleInvocationRunner + ?Sized>(
     prompt: &str,
     interval: Duration,
     lane: Option<(&lanes::LaneProbe, usize)>,
-) -> RoleTickOutcome {
+) -> Option<super::invocation::InvocationOutcome> {
     if let Some(labels) = work_queue_labels(role) {
         match probe(root, labels) {
-            Ok(false) => return RoleTickOutcome::QueueEmpty,
+            Ok(false) => return None,
             Ok(true) => {}
             Err(e) => log::debug!(
                 "role_runner: {role} queue probe for {} failed ({e}) — dispatching anyway \
@@ -604,11 +604,11 @@ fn run_gated<R: RoleInvocationRunner + ?Sized>(
     // Held for the whole invocation, so no other lane takes the same PR.
     let target = lane.map(|(lane_probe, lane)| lanes::assign(lane_probe, role, root, lane));
     let prompt = match &target {
-        Some(lanes::LaneTarget::Nothing) => return RoleTickOutcome::QueueEmpty,
+        Some(lanes::LaneTarget::Nothing) => return None,
         Some(lanes::LaneTarget::Pr(hold)) => format!("{prompt} {}", hold.pr()),
         Some(lanes::LaneTarget::Unassigned) | None => prompt.to_string(),
     };
-    invoke_with_collision_probe(runner, root, role, &prompt, interval)
+    Some(invoke_with_collision_probe(runner, root, role, &prompt, interval))
 }
 
 /// One finished run, as returned by its task.
@@ -1038,27 +1038,31 @@ impl RoleDispatcher {
             } else {
                 triggers::EventTriggerConfig::default()
             };
+            let mut invocation = None;
             let outcome = triggers::run_with_trigger_gate(
                 triggers_cfg,
                 &trigger_probe,
                 trigger_ledger,
                 &task_root,
                 name,
-                || run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval, lane),
+                || {
+                    invocation =
+                        run_gated(&mut *runner, &probe, &task_root, name, &prompt, interval, lane);
+                    invocation
+                        .as_ref()
+                        .map_or(RoleTickOutcome::QueueEmpty, |run| run.outcome.clone())
+                },
             );
+            let (resolved, trace, unlaunched) = invocation
+                .map(|run| (run.resolved, run.trace, run.unlaunched))
+                .unwrap_or_default();
             if name == "champion" {
                 // Count-only, after the run: it never gates champion (#9392).
                 demand::record_merge_debt(&merge_probe, ledger, &task_root);
             }
             // Durable `role_tick.outcome` record (#8056), best-effort.
             crate::role_tick_telemetry::emit_for_tick_correlated(
-                &task_root,
-                name,
-                started_at,
-                &outcome,
-                runner.resolved_launch(),
-                runner.trace_context(),
-                runner.unlaunched_failure(),
+                &task_root, name, started_at, &outcome, resolved, trace, unlaunched,
             );
             FinishedRun {
                 root: task_root,

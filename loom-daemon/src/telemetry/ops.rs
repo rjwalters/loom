@@ -153,6 +153,12 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.discovery.live_reads.ci",
     "loom.discovery.stale_repos",
     "loom.discovery.oldest_watermark_age_secs",
+    // #14738: one actual workspace-resync release tag lookup.
+    "loom.workspace_resync.verify.host",
+    "loom.workspace_resync.verify.attempt",
+    "loom.workspace_resync.verify.outcome",
+    "loom.workspace_resync.verify.why",
+    "loom.workspace_resync.verify.retry_at",
     // #12298: the spawn half's concurrency and its sub-phases.
     "loom.dispatch.spawn_concurrency",
     // #12310: what a `invoke github` span was for, and why a discovery read
@@ -200,6 +206,8 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.pricing.verified_on",
     "loom.pricing.source",
     "loom.usage.scope",
+    // `loom.runtime.usage_missing` (#14566): why a run's usage was unreadable.
+    "loom.usage.missing_reason",
     // `loom.pool.hold` (#8931): one pool dispatch hold, armed to cleared.
     "loom.pool.hold.pool",
     "loom.pool.hold.post_mortem",
@@ -220,6 +228,11 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.step.in_flight_repo",
     "loom.step.model_selected",
     "loom.step.model_launched",
+    // #13873: the configured model and, when a selection-time fallback
+    // fired, what it fell back from and why.
+    "loom.step.model_configured",
+    "loom.step.model_fallback_from",
+    "loom.step.model_fallback_reason",
     // #12957: the item's story points, on `loom.dispatch.step` and on the
     // step's `loom.sweep` close (the key `sweep.started` already exports).
     "loom.story_points",
@@ -361,6 +374,7 @@ pub const OPS_SPAN_ATTRIBUTE_KEYS: &[&str] = &[
     "loom.fleet_dispatch.hold_set_by_assignment_id",
     "loom.fleet_dispatch.holder_assignment_id",
     "loom.fleet_dispatch.merge_slot_holder",
+    "loom.fleet_dispatch.hold_ms",
     "loom.dispatch.held_by",
     "loom.dispatch.retry_after_s",
     "loom.dispatch.hold_until",
@@ -477,6 +491,12 @@ pub enum MetricName {
     /// Capacity of the worktree-root volume.
     #[serde(rename = "loom.host.worktree_volume.total_bytes")]
     HostWorktreeVolumeTotalBytes,
+    /// Allocated bytes on a measured Codex private workspace volume, by account.
+    #[serde(rename = "loom.host.codex_workspace_volume.used_bytes")]
+    HostCodexWorkspaceVolumeUsedBytes,
+    /// Allocated bytes across all discovered Codex private workspace volumes.
+    #[serde(rename = "loom.host.codex_workspace_volume.total_used_bytes")]
+    HostCodexWorkspaceVolumeTotalUsedBytes,
     // Ready-queue depth (Issue #8852, phase 2) — one contiguous block.
     /// Ready issues on the last work-finder tick, labelled `state` and
     /// `reason` (the queue disposition). Never labelled by issue or repo.
@@ -758,6 +778,18 @@ pub enum MetricName {
     /// fallback began), #12450. Host-level: the resource names the host.
     #[serde(rename = "loom.fleet_dispatch.fallback_ticks")]
     FleetDispatchFallbackTicks,
+    /// The captain's published token-probe cycle (#13942): one point per
+    /// account per distinct probe instant, by `account` and `state` (the
+    /// probe's verdict) — the fleet-side record of what every worker was
+    /// told to converge on.
+    #[serde(rename = "loom.tokens.fleet_probe_accounts")]
+    TokensFleetProbeAccounts,
+    /// Age of the fleet token-probe snapshot a worker host has applied
+    /// (#13942): sample time minus the captain's probe instant. The
+    /// fleet-convergence drift signal — equal ages across hosts mean every
+    /// worker is reading the same probe.
+    #[serde(rename = "loom.tokens.fleet_probe_age")]
+    TokensFleetProbeAge,
     // ---- Fleet dispatch, captain side (Issue #12449) ----------------------
     /// Fleet-dispatch refusals since the previous point, by `kind` (`claim`
     /// for a claim the captain refused, `refuse` for a worker's `refuse`
@@ -835,6 +867,12 @@ impl MetricName {
             Self::HostSwapTotalBytes => "loom.host.swap.total_bytes",
             Self::HostWorktreeVolumeFreeBytes => "loom.host.worktree_volume.free_bytes",
             Self::HostWorktreeVolumeTotalBytes => "loom.host.worktree_volume.total_bytes",
+            Self::HostCodexWorkspaceVolumeUsedBytes => {
+                "loom.host.codex_workspace_volume.used_bytes"
+            }
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "loom.host.codex_workspace_volume.total_used_bytes"
+            }
             Self::QueueIssues => "loom.queue.issues",
             Self::QueueListingFailedRepos => "loom.queue.listing_failed_repos",
             Self::QueueListingIncompleteRepos => "loom.queue.listing_incomplete_repos",
@@ -907,6 +945,8 @@ impl MetricName {
             Self::CiTelemetryExportCursorOffset => "loom.ci_telemetry.export_cursor_offset",
             Self::CiTelemetryExportLag => "loom.ci_telemetry.export_lag",
             Self::FleetDispatchFallbackTicks => "loom.fleet_dispatch.fallback_ticks",
+            Self::TokensFleetProbeAccounts => "loom.tokens.fleet_probe_accounts",
+            Self::TokensFleetProbeAge => "loom.tokens.fleet_probe_age",
             Self::FleetDispatchRefusals => "loom.fleet_dispatch.refusals",
             Self::FleetDispatchExpired => "loom.fleet_dispatch.expired",
             Self::FleetDispatchClaimLostAfterGrant => "loom.fleet_dispatch.claim_lost_after_grant",
@@ -1042,6 +1082,8 @@ impl MetricName {
             Self::CiTelemetryJournalBytes | Self::CiTelemetryExportCursorOffset => "By",
             Self::AgentScopeOomKills => "{kill}",
             Self::FleetDispatchFallbackTicks => "{tick}",
+            Self::TokensFleetProbeAccounts => "{account}",
+            Self::TokensFleetProbeAge => "s",
             Self::FleetDispatchRefusals | Self::FleetDispatchClaimLostAfterGrant => "{claim}",
             Self::FleetDispatchExpired => "{assignment}",
             _ => "By",
@@ -1074,6 +1116,10 @@ impl MetricName {
             Self::HostSwapTotalBytes => "Swap space configured.",
             Self::HostWorktreeVolumeFreeBytes => "Free space on the worktree-root volume.",
             Self::HostWorktreeVolumeTotalBytes => "Capacity of the worktree-root volume.",
+            Self::HostCodexWorkspaceVolumeUsedBytes => "Allocated bytes on a Codex workspace volume.",
+            Self::HostCodexWorkspaceVolumeTotalUsedBytes => {
+                "Allocated bytes on all discovered Codex workspace volumes when fully measured."
+            }
             Self::QueueIssues => "Ready issues on the last work-finder tick, by state and reason.",
             Self::QueueListingFailedRepos => "Repos whose ready-issue listing failed last tick.",
             Self::QueueSeen => "Ready issues listed on the last work-finder tick.",
@@ -1208,6 +1254,12 @@ impl MetricName {
             }
             Self::FleetDispatchFallbackTicks => {
                 "Step ticks run in fleet-dispatch fallback, by the reason fallback began."
+            }
+            Self::TokensFleetProbeAccounts => {
+                "The captain's published token-probe cycle: one point per account per cycle, by account and state."
+            }
+            Self::TokensFleetProbeAge => {
+                "Age of the fleet token-probe snapshot this host applied (sample time minus the captain's probe)."
             }
             Self::FleetDispatchRefusals => {
                 "Fleet-dispatch refusals at the captain, by kind (claim / refuse) and reason."

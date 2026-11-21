@@ -203,6 +203,238 @@ async fn http_401_403_hold_the_batch() {
 }
 
 #[tokio::test]
+async fn oversized_receiver_refusals_are_split_without_loss() {
+    use crate::observability::queue::DurableQueue;
+    use crate::observability::sender::{try_flush, FlushOutcome};
+    use crate::observability::ExportStatus;
+
+    for (status_code, message) in [
+        (413, "arbitrary fixture body"),
+        (400, "request body too large"),
+        (400, r#"{"message":"http: request body too large"}"#),
+    ] {
+        let sink =
+            MockSink::with_responses(vec![(status_code, message.to_string(), Duration::ZERO)]);
+        let exporter = OtlpExporter::new(sink.base_url(), "fixture-key".to_string()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let queue = DurableQueue::open(dir.path().join("q.jsonl"), 10);
+        let status = ExportStatus::started("fixture", &sink.base_url(), "otlp", 30);
+        let first = sweep_started_issue(1);
+        let second = sweep_started_issue(2);
+        let first_id = sweep_id_of(&first);
+        let second_id = sweep_id_of(&second);
+        queue.push(first);
+        queue.push(second);
+
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(2));
+        assert!(queue.is_empty());
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 3, "HTTP {status_code} must split the refused request");
+        assert!(find_substring(&requests[0].body, &first_id).is_some());
+        assert!(find_substring(&requests[0].body, &second_id).is_some());
+        assert!(find_substring(&requests[1].body, &first_id).is_some());
+        assert!(find_substring(&requests[1].body, &second_id).is_none());
+        assert!(find_substring(&requests[2].body, &first_id).is_none());
+        assert!(find_substring(&requests[2].body, &second_id).is_some());
+        assert_eq!(queue.dropped_total(), 0);
+        assert_eq!(status.snapshot().consecutive_failures, 0);
+    }
+}
+
+#[tokio::test]
+async fn request_byte_limit_measures_the_exact_otlp_body() {
+    let envelopes = [sweep_started_issue(501), sweep_started_issue(502)];
+    let encode = |batch: &[TelemetryEnvelope]| {
+        serde_json::to_vec(&mapping::build_logs_request(batch).unwrap()).unwrap()
+    };
+    let combined = encode(&envelopes);
+    let limit = combined.len();
+    let singletons = vec![encode(&envelopes[..1]), encode(&envelopes[1..])];
+    assert!(singletons.iter().all(|body| body.len() < limit));
+
+    for (cap, expected) in [(limit, vec![combined]), (limit - 1, singletons)] {
+        let sink = MockSink::start();
+        let exporter = OtlpExporter::with_max_batch_bytes(
+            sink.base_url(),
+            Some("fixture-key".to_string()),
+            None,
+            cap,
+        )
+        .unwrap();
+        let result = exporter.emit_batch_outcome(&envelopes).await;
+        assert_eq!(result.acknowledged, 2);
+        assert_eq!(result.exported, 2);
+        assert!(result.error.is_none());
+        assert!(result.lost.is_empty());
+        let bodies = sink
+            .requests()
+            .into_iter()
+            .map(|request| request.body)
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, expected);
+        assert!(bodies.iter().all(|body| body.len() <= cap));
+    }
+}
+
+#[tokio::test]
+async fn oversized_singletons_record_durable_loss_and_do_not_block_the_next_envelope() {
+    use crate::observability::{
+        loss_ledger::REASON_REQUEST_TOO_LARGE,
+        queue::DurableQueue,
+        sender::{try_flush, FlushOutcome},
+        ExportStatus,
+    };
+
+    let acceptable = sweep_started_issue(602);
+    let mut oversized = sweep_started_issue(601);
+    {
+        let TelemetryRecord::SweepStarted(record) = &mut oversized.record else {
+            unreachable!()
+        };
+        // Keep the value within the mapper's attribute limit while making
+        // the encoded request larger than the acceptable singleton.
+        record.sweep_id = "oversized-fixture".repeat(8);
+    }
+
+    let cap = serde_json::to_vec(
+        &mapping::build_logs_request(std::slice::from_ref(&acceptable)).unwrap(),
+    )
+    .unwrap()
+    .len();
+    assert!(
+        serde_json::to_vec(&mapping::build_logs_request(std::slice::from_ref(&oversized)).unwrap(),)
+            .unwrap()
+            .len() > cap,
+        "the fixture must remain oversized after mapping",
+    );
+    for (byte_cap, replies, expected_requests) in [
+        (cap, Vec::new(), 1),
+        (
+            super::super::DEFAULT_MAX_BATCH_BYTES,
+            vec![
+                (413, String::new(), Duration::ZERO),
+                (400, "request body too large".to_string(), Duration::ZERO),
+            ],
+            3,
+        ),
+    ] {
+        let sink = MockSink::with_responses(replies);
+        let exporter = OtlpExporter::with_max_batch_bytes(
+            sink.base_url(),
+            Some("fixture-key".to_string()),
+            None,
+            byte_cap,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 10);
+        queue.push(oversized.clone());
+        queue.push(acceptable.clone());
+        let status = ExportStatus::started("fixture", &sink.base_url(), "otlp", 30);
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(2));
+        let requests = sink.requests();
+        assert_eq!(requests.len(), expected_requests);
+        assert!(requests
+            .iter()
+            .all(|request| request.body.len() <= byte_cap));
+        let body = &requests.last().unwrap().body;
+        assert!(find_substring(body, "sweep-issue-602-0").is_some());
+        assert!(find_substring(body, "oversized-fixture").is_none());
+        assert_eq!(status.snapshot().signal_counts["log_records"].dropped, 1);
+        assert_eq!(status.snapshot().signal_counts["log_records"].accepted, 1);
+
+        drop(queue);
+        let reopened = DurableQueue::open(path, 10);
+        assert!(reopened.is_empty());
+        assert_eq!(
+            reopened.dropped_by_reason(),
+            std::collections::BTreeMap::from([(REASON_REQUEST_TOO_LARGE.to_string(), 1)]),
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_size_and_overlong_400s_do_not_split() {
+    for body in [
+        "bad record: quoted \"request body too large\" in field fixture-marker".to_string(),
+        r#"{"message":"invalid field","detail":"request body too large","text":"fixture-marker"}"#
+            .to_string(),
+        format!("request body too large{}fixture-marker", " ".repeat(4096)),
+        format!("request body too large{}", " ".repeat(4096)),
+    ] {
+        let sink = MockSink::with_responses(vec![(400, body, Duration::ZERO)]);
+        let exporter = OtlpExporter::new(sink.base_url(), "fixture-key".to_string()).unwrap();
+        let result = exporter
+            .emit_batch_outcome(&[sweep_started_issue(701), sweep_started_issue(702)])
+            .await;
+        assert_eq!(result.acknowledged, 2);
+        assert_eq!(result.exported, 0);
+        assert_eq!(sink.requests().len(), 1);
+        assert_eq!(result.lost, std::collections::BTreeMap::from([("status_400".to_string(), 2)]));
+        assert_eq!(result.error.unwrap().to_string(), "transport error: OTLP HTTP 400");
+    }
+}
+
+#[tokio::test]
+async fn split_prefix_is_durable_when_the_right_child_needs_retry() {
+    use crate::observability::{
+        queue::DurableQueue,
+        sender::{try_flush, FlushOutcome},
+        ExportStatus,
+    };
+    for (left_response, rejected) in [
+        ("{}", 0),
+        (r#"{"partialSuccess":{"rejectedLogRecords":"1"}}"#, 1),
+    ] {
+        let sink = MockSink::with_responses(vec![
+            (413, String::new(), Duration::ZERO),
+            (200, left_response.to_string(), Duration::ZERO),
+            (503, "fixture-marker".to_string(), Duration::ZERO),
+        ]);
+        let exporter = OtlpExporter::new(sink.base_url(), "fixture-key".to_string()).unwrap();
+        let status = ExportStatus::started("fixture", &sink.base_url(), "otlp", 30);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("q.jsonl");
+        let queue = DurableQueue::open(path.clone(), 10);
+        for issue in 801..=804 {
+            queue.push(sweep_started_issue(issue));
+        }
+        assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Failed);
+        assert_eq!(queue.len(), 2);
+        let counts = &status.snapshot().signal_counts["log_records"];
+        assert_eq!(counts.accepted, 2 - rejected);
+        assert_eq!(counts.rejected, rejected);
+        assert_eq!(counts.retry_scheduled, 2);
+        assert_eq!(counts.dropped, 0);
+        assert_eq!(queue.dropped_total(), rejected);
+        drop(queue);
+
+        let reopened = DurableQueue::open(path, 10);
+        let expected = ["sweep-issue-803-0", "sweep-issue-804-0"];
+        assert_eq!(
+            reopened
+                .peek_batch(10)
+                .iter()
+                .map(sweep_id_of)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(try_flush(&reopened, &exporter, 10, &status).await, FlushOutcome::Sent(2));
+        assert!(reopened.is_empty());
+        let requests = sink.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2].body, requests[3].body);
+        for id in ["sweep-issue-801-0", "sweep-issue-802-0"] {
+            assert!(find_substring(&requests[1].body, id).is_some());
+            assert!(find_substring(&requests[3].body, id).is_none());
+        }
+        assert_eq!(reopened.dropped_total(), rejected);
+        assert_eq!(status.snapshot().signal_counts["log_records"].accepted, 4 - rejected);
+    }
+}
+
+#[tokio::test]
 async fn http_policy_drops_and_counts_poison_batches() {
     for status_code in [400, 404, 413, 500] {
         let sink =
@@ -221,7 +453,14 @@ async fn http_policy_drops_and_counts_poison_batches() {
         // feed (Issue #11527).
         assert_eq!(
             result.lost,
-            std::collections::BTreeMap::from([(format!("status_{status_code}"), 1)])
+            std::collections::BTreeMap::from([(
+                if status_code == 413 {
+                    crate::observability::loss_ledger::REASON_REQUEST_TOO_LARGE.to_string()
+                } else {
+                    format!("status_{status_code}")
+                },
+                1,
+            )])
         );
     }
     for status_code in [429, 502, 503, 504] {
@@ -349,6 +588,7 @@ async fn empty_token_snapshot_advances_without_fabricating_metrics() {
         "host",
         TelemetryRecord::TokensSnapshot(crate::telemetry::TokenSnapshotRecord {
             captured_at: chrono::Utc::now(),
+            fleet_probe_age_secs: None,
             accounts: Vec::new(),
         }),
     );

@@ -8,8 +8,9 @@
 //! test that does not observe the argv observes nothing.
 
 use super::*;
+use crate::exec_test_support::write_executable;
+use crate::worktree_ops::gh::OpenPrProbe;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -64,11 +65,6 @@ echo "$loop_pid"
 /// fixture's session identity is unreadable and publish keeps its own id.
 const NO_SUCH_PID: u32 = 4_999_999;
 
-fn write_script(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// A temp checkout that `resolve_repo_root` accepts: a `.git` directory and a
 /// `.loom/` directory, with both lease scripts in place.
 fn checkout(publish: &str, renew: &str) -> TempDir {
@@ -76,8 +72,8 @@ fn checkout(publish: &str, renew: &str) -> TempDir {
     fs::create_dir_all(dir.path().join(".git")).unwrap();
     let scripts = dir.path().join(".loom").join("scripts");
     fs::create_dir_all(&scripts).unwrap();
-    write_script(&scripts.join("sweep-lease-publish.sh"), publish);
-    write_script(&scripts.join("sweep-lease-renew.sh"), renew);
+    write_executable(&scripts.join("sweep-lease-publish.sh"), publish);
+    write_executable(&scripts.join("sweep-lease-renew.sh"), renew);
     dir
 }
 
@@ -434,8 +430,24 @@ impl FakeTime {
 }
 
 fn run_loop(a: &LeaseEnsureArgs, alive: impl FnMut() -> bool) -> (deferred::DeferredEnd, FakeTime) {
+    run_loop_with_probe(a, alive, |_, _| OpenPrProbe::NoneOpen)
+}
+
+fn run_loop_with_probe(
+    a: &LeaseEnsureArgs,
+    alive: impl FnMut() -> bool,
+    mut probe: impl FnMut(&FakeTime, u64) -> OpenPrProbe,
+) -> (deferred::DeferredEnd, FakeTime) {
     let t = FakeTime::new();
-    let end = deferred::retry_loop(a, &in_session(), || t.elapsed(), |s| t.sleep(s), alive, |_| {});
+    let end = deferred::retry_loop(
+        a,
+        &in_session(),
+        || t.elapsed(),
+        |s| t.sleep(s),
+        alive,
+        |remaining| Ok(probe(&t, remaining)),
+        |_| {},
+    );
     (end, t)
 }
 
@@ -481,19 +493,123 @@ fn a_deferred_publisher_publishes_once_the_peer_lease_ages_out() {
     );
 }
 
+#[test]
+fn a_terminal_prerequisite_never_falls_through_to_publish() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let missing = Outcome::ScriptsMissing(dir.path().to_path_buf());
+    let time = FakeTime::new();
+    let end = deferred::retry_loop(
+        &args(&dir),
+        &in_session(),
+        || time.elapsed(),
+        |s| time.sleep(s),
+        || true,
+        |_| Err(missing.clone()),
+        |_| {},
+    );
+    assert_eq!(end, deferred::DeferredEnd::Settled(missing));
+    assert_eq!(argv(&dir, "publish-argv"), None);
+    assert_eq!(argv(&dir, "renew-argv"), None);
+}
+
+#[test]
+fn a_late_linked_pr_ends_the_retry_before_publication_or_renewal() {
+    let dir = checkout(PUBLISH_DECLINES_TWICE, RENEW_OK);
+    let a = args(&dir);
+    assert_eq!(a.ensure(&in_session()), Outcome::PublishDeclined(Some(4)));
+    let (end, t) = run_loop_with_probe(&a, || true, |_, _| OpenPrProbe::Open(79));
+    assert_eq!(end, deferred::DeferredEnd::LinkedPr(79));
+    assert!(end.describe(a.issue).contains("linked PR #79"));
+    assert_eq!(*t.sleeps.borrow(), vec![60]);
+    assert_eq!(attempts(&dir), 1);
+    assert_eq!(argv(&dir, "renew-argv"), None);
+}
+
+#[test]
+fn indeterminate_wake_does_not_publish_but_later_absence_can_settle() {
+    let dir = checkout(PUBLISH_DECLINES_TWICE, RENEW_OK);
+    let a = args(&dir);
+    assert_eq!(a.ensure(&in_session()), Outcome::PublishDeclined(Some(4)));
+    let (end, t) = run_loop_with_probe(
+        &a,
+        || true,
+        |time, _| match time.elapsed() {
+            60 => OpenPrProbe::ProbeFailed,
+            120 => {
+                assert_eq!(attempts(&dir), 1);
+                assert_eq!(argv(&dir, "renew-argv"), None);
+                OpenPrProbe::NoneOpen
+            }
+            _ => OpenPrProbe::NoneOpen,
+        },
+    );
+    assert!(matches!(end, deferred::DeferredEnd::Settled(Outcome::Renewing { .. })));
+    assert_eq!(attempts(&dir), 3);
+    assert_eq!(*t.sleeps.borrow(), vec![60, 60, 60]);
+}
+
+#[test]
+fn indeterminate_probe_and_in_flight_session_or_cap_end_cannot_publish() {
+    for (expected, cap, dies) in [
+        (deferred::DeferredEnd::CapReached, 180, false),
+        (deferred::DeferredEnd::CapReached, 61, false),
+        (deferred::DeferredEnd::SessionEnded, 180, true),
+    ] {
+        let dir = checkout(PUBLISH_DECLINES_TWICE, RENEW_OK);
+        let a = LeaseEnsureArgs {
+            max_age: cap,
+            ..args(&dir)
+        };
+        let alive = std::cell::Cell::new(true);
+        let (end, _) = run_loop_with_probe(
+            &a,
+            || alive.get(),
+            |t, _| {
+                if cap == 61 {
+                    t.now.set(61);
+                    return OpenPrProbe::NoneOpen;
+                }
+                if dies {
+                    alive.set(false);
+                    return OpenPrProbe::NoneOpen;
+                }
+                OpenPrProbe::ProbeFailed
+            },
+        );
+        assert_eq!(end, expected);
+        assert_eq!(attempts(&dir), 0);
+        assert_eq!(argv(&dir, "renew-argv"), None);
+    }
+}
+
+#[test]
+fn the_renewer_inherits_only_the_time_left_after_a_probe() {
+    let dir = checkout(PUBLISH_OK, RENEW_OK);
+    let a = args(&dir);
+    let (end, _) = run_loop_with_probe(
+        &a,
+        || true,
+        |t, remaining| {
+            assert_eq!(remaining, DEFAULT_MAX_AGE_SECS - 60);
+            t.now.set(80);
+            OpenPrProbe::NoneOpen
+        },
+    );
+    assert!(matches!(end, deferred::DeferredEnd::Settled(Outcome::Renewing { .. })));
+    assert!(argv(&dir, "renew-argv")
+        .unwrap()
+        .contains(&format!("--max-age {}", DEFAULT_MAX_AGE_SECS - 80)));
+}
+
 /// A dead session stops the publisher before another attempt: it must never
 /// publish a lease for a claim nobody is working.
 #[test]
 fn a_deferred_publisher_stops_when_the_session_dies() {
-    let dir = checkout(PUBLISH_PEER_HOLDS, RENEW_OK);
-    let mut calls = 0;
-    let (end, _) = run_loop(&args(&dir), || {
-        calls += 1;
-        calls < 2
-    });
+    let dir = checkout(PUBLISH_DECLINES_TWICE, RENEW_OK);
+    let (end, _) = run_loop(&args(&dir), || attempts(&dir) == 0);
 
     assert_eq!(end, deferred::DeferredEnd::SessionEnded);
-    assert!(argv(&dir, "publish-argv").is_some(), "one attempt while alive");
+    assert_eq!(attempts(&dir), 1, "one attempt while alive");
     assert!(argv(&dir, "renew-argv").is_none());
 }
 
@@ -538,6 +654,7 @@ fn a_deferred_publisher_backs_off_once_the_peer_is_provably_live() {
         || t.elapsed(),
         |s| t.sleep(s),
         || t.elapsed() < ttl + 1_000,
+        |_| Ok(OpenPrProbe::NoneOpen),
         |_| {},
     );
 
@@ -641,7 +758,9 @@ fn a_dead_owners_lock_never_orphans_another_sessions_declined_publish() {
             workspace: args.workspace.clone(),
             ..*args
         };
-        let handle = std::thread::spawn(move || deferred::run_with(&args, &in_session(), poll));
+        let handle = std::thread::spawn(move || {
+            deferred::run_with(&args, &in_session(), poll, |_, _| OpenPrProbe::NoneOpen)
+        });
         Ok::<_, std::io::Error>(handle)
     };
 
@@ -724,7 +843,9 @@ fn a_waiting_publisher_ends_with_its_own_session_while_the_owner_lives() {
         ..args(&dir)
     };
     let waiter = std::thread::spawn(move || {
-        deferred::run_with(&a, &in_session(), std::time::Duration::from_millis(50))
+        deferred::run_with(&a, &in_session(), std::time::Duration::from_millis(50), |_, _| {
+            OpenPrProbe::NoneOpen
+        })
     });
     std::thread::sleep(std::time::Duration::from_millis(300));
     session.kill().unwrap();
@@ -881,4 +1002,32 @@ fn the_reuse_decision_follows_the_lease_ttl_env() {
         assert_eq!(reuse_ttl(), chrono::Duration::minutes(15), "{bad:?} falls back");
     }
     std::env::remove_var(env_var);
+}
+
+// #14100: the detached deferred publisher is a long-lived `loom-daemon` child;
+// its pid must be matchable to a kernel OOM line. Start line only: the parent
+// returns at once, so there is deliberately no exit/`abandoned` line.
+#[test]
+fn spawning_the_deferred_publisher_logs_a_self_spawn_start_line_only() {
+    let mut cmd = std::process::Command::new("sh");
+    cmd.args(["-c", "exit 0"]).env("SECRET_TOKEN", "hunter2");
+    let mut pid = None;
+    let logs = crate::test_log_capture::capture_logs(|| {
+        pid = Some(deferred::spawn_detached(cmd).expect("spawns"));
+    });
+    let pid = pid.unwrap();
+    let starts: Vec<_> = logs
+        .iter()
+        .filter(|(_, m)| m.contains("site=lease_ensure_deferred"))
+        .collect();
+    assert_eq!(starts.len(), 1, "{logs:?}");
+    assert!(
+        starts[0]
+            .1
+            .starts_with(&format!("self_spawn start pid={pid} ")),
+        "{}",
+        starts[0].1
+    );
+    assert!(!starts[0].1.contains("hunter2"), "{}", starts[0].1);
+    assert!(!logs.iter().any(|(_, m)| m.starts_with("self_spawn exit")), "{logs:?}");
 }

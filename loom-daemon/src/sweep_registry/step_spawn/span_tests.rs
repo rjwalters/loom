@@ -35,6 +35,7 @@ fn close_of(end: StepEnd, line: Option<&StepOutcomeLine>) -> (String, TraceAttri
         None,
         None,
         false,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ fn a_sized_steps_close_carries_its_story_points() {
             points,
             None,
             false,
+            None,
         )
         .1
     };
@@ -108,6 +110,7 @@ fn a_close_carries_the_runtime_that_ran_the_step() {
             None,
             None,
             false,
+            None,
         )
         .1
     };
@@ -295,6 +298,125 @@ fn a_step_a_roll_stopped_closes_as_interrupted_by_roll() {
     assert!(!spans[0].attributes.contains_key("loom.failure_class"));
 }
 
+/// Open the step's `loom.sweep` root plus the `loom.phase` / `loom.role_attempt`
+/// that `sweep-checkpoint begin` leaves open under it (#14407).
+fn open_step_with_attempt(root: &Path, sweep_id: &str, pid: u32, role: &str) -> Journal {
+    let span = lifecycle::begin(
+        root,
+        sweep_id,
+        SpanName::Sweep,
+        lifecycle::attributes(&[("loom.sweep_id", sweep_id)]),
+    )
+    .expect("tracing is on");
+    let attrs = lifecycle::attributes(&[
+        ("loom.role", role),
+        ("loom.timing_source", lifecycle::CHECKPOINT_BEGIN_SOURCE),
+    ]);
+    let phase = span.child(SpanName::Phase, attrs.clone()).unwrap();
+    phase.child(SpanName::RoleAttempt, attrs).unwrap();
+    drop(span);
+    lifecycle::child_spawned(root, sweep_id, pid);
+    Journal::for_context(&TraceStore::new(root).path(root, sweep_id))
+}
+
+/// #14407: a step-dispatched attempt on codex whose end was observed carries
+/// the step's result and runtime on its attempt and phase, not `exit_unobserved`.
+#[test]
+fn a_steps_end_gives_its_attempt_and_phase_the_result_and_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_407, StepRole::Builder, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "codex".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "builder");
+    assert_eq!(journal.active().unwrap().len(), 3);
+
+    reg.end_step(&id, 14_407, StepRole::Builder, Utc::now(), StepEnd::Exited(Some(2)));
+
+    assert!(journal.active().unwrap().is_empty());
+    let spans = drained(&journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes[lifecycle::FAILURE_CLASS], "exit-2");
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], sweep.attributes["loom.result"], "{name:?}");
+        assert_eq!(s.attributes["loom.result"], "failure", "{name:?}");
+        assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+        assert_eq!(
+            s.attributes.get(lifecycle::FAILURE_CLASS),
+            (name == SpanName::RoleAttempt).then_some(&sweep.attributes[lifecycle::FAILURE_CLASS]),
+            "{name:?}"
+        );
+    }
+}
+
+#[test]
+fn an_observed_failure_class_does_not_require_a_known_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_737, StepRole::Judge, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "unknown".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "judge");
+
+    reg.end_step(&id, 14_737, StepRole::Judge, Utc::now(), StepEnd::Exited(Some(2)));
+
+    let spans = drained(&journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "failure");
+    assert_eq!(
+        attempt
+            .attributes
+            .get(lifecycle::FAILURE_CLASS)
+            .map(String::as_str),
+        Some("exit-2")
+    );
+    assert!(!attempt.attributes.contains_key("loom.runtime"));
+    assert!(!attempt.attributes.contains_key("loom.engine"));
+}
+
+/// #14407: a registry entry with no known runtime stamps none (never guessed),
+/// and a step a roll stopped was not observed to end, so it stays unobserved.
+#[test]
+fn an_unknown_runtime_is_not_stamped_and_a_roll_stopped_step_stays_unobserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut reg, _) = fixture_registry(dir.path());
+    traced(dir.path());
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_408, StepRole::Judge, pid);
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "judge");
+    reg.end_step(&id, 14_408, StepRole::Judge, Utc::now(), StepEnd::Exited(Some(0)));
+    let spans = drained(&journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "success");
+    assert!(!attempt.attributes.contains_key("loom.runtime"));
+    assert!(!attempt.attributes.contains_key(lifecycle::FAILURE_CLASS));
+
+    let pid = dead_pid();
+    let id = insert_step(&mut reg, 14_409, StepRole::Doctor, pid);
+    reg.entries.get_mut(&id).unwrap().runtime = "codex".into();
+    let journal = open_step_with_attempt(dir.path(), &id, pid, "doctor");
+    note_stopped(Some(pid), "item-14409", RollDisposition::Paused);
+    reg.end_step(&id, 14_409, StepRole::Doctor, Utc::now(), StepEnd::Cancelled);
+    let spans = drained(&journal);
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
+        assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+        assert!(!s.attributes.contains_key(lifecycle::FAILURE_CLASS), "{name:?}");
+    }
+}
+
 fn write_lock(root: &Path, dir: &str, item: u32, sweep_id: &str, pid: u32, pgid: Option<u32>) {
     let lock = root.join(".loom/locks").join(dir);
     std::fs::create_dir_all(&lock).unwrap();
@@ -367,6 +489,7 @@ fn a_close_carries_the_pr_number_only_when_one_is_known() {
             None,
             pr,
             false,
+            None,
         )
         .1
     };
@@ -394,6 +517,7 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
             None,
             pr,
             false,
+            None,
         )
         .1[lifecycle::FAILURE_CLASS]
             .clone()
@@ -409,8 +533,20 @@ fn a_builder_with_no_line_splits_by_whether_it_opened_a_pr() {
 fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     let outcome = RoleTickOutcome::Failure("step exited 1".to_string());
     let class = |end, exhausted| {
-        sweep_close(end, None, &outcome, StepRole::Builder, None, None, None, None, None, exhausted)
-            .1[lifecycle::FAILURE_CLASS]
+        sweep_close(
+            end,
+            None,
+            &outcome,
+            StepRole::Builder,
+            None,
+            None,
+            None,
+            None,
+            None,
+            exhausted,
+            None,
+        )
+        .1[lifecycle::FAILURE_CLASS]
             .clone()
     };
     assert_eq!(class(StepEnd::Exited(Some(1)), true), "provider-exhausted");
@@ -420,4 +556,108 @@ fn a_provider_exhausted_step_closes_as_provider_exhausted() {
     // wins here as it does on `role_tick.outcome` (`capture::step_failure`).
     assert_eq!(class(StepEnd::TimedOut, true), "provider-exhausted");
     assert_eq!(class(StepEnd::TimedOut, false), "timeout-ceiling");
+}
+
+/// #14234: a close with a line and a noted post-state records whether the
+/// forge agreed with the class the step claimed.
+mod agrees {
+    use super::*;
+    use crate::step_dispatch::outcome_ledger::PostState;
+
+    const KEY: &str = "loom.step.outcome.agrees";
+    const MOVED: PostState = PostState {
+        moved: true,
+        closed: false,
+        claim_held: false,
+    };
+    const UNMOVED: PostState = PostState {
+        moved: false,
+        closed: false,
+        claim_held: false,
+    };
+
+    fn close(
+        line: Option<&StepOutcomeLine>,
+        post: Option<PostState>,
+        exhausted: bool,
+    ) -> TraceAttributes {
+        let end = StepEnd::Exited(Some(0));
+        let outcome = super::super::super::capture::tick_outcome(StepRole::Judge, end, line);
+        sweep_close(
+            end,
+            line,
+            &outcome,
+            StepRole::Judge,
+            None,
+            None,
+            None,
+            None,
+            None,
+            exhausted,
+            post,
+        )
+        .1
+    }
+
+    #[test]
+    fn a_verdict_the_forge_shows_agrees() {
+        let c = close(Some(&line(StepOutcomeClass::Verdict)), Some(MOVED), false);
+        assert_eq!(c[KEY], "true");
+    }
+
+    /// The step claimed `verdict`, the item did not move: the ledger says
+    /// `failed`, the claim is recorded as a disagreement, and nothing else
+    /// on the close changes.
+    #[test]
+    fn a_verdict_the_forge_does_not_show_disagrees() {
+        let verdict = line(StepOutcomeClass::Verdict);
+        let c = close(Some(&verdict), Some(UNMOVED), false);
+        assert_eq!(c[KEY], "false");
+        assert_eq!(c["loom.step.outcome.class"], "verdict");
+        let mut without = close(Some(&verdict), None, false);
+        let mut with = c;
+        with.remove(KEY);
+        without.remove(KEY);
+        assert_eq!(with, without, "the attribute is the only difference");
+    }
+
+    #[test]
+    fn a_noop_on_an_unmoved_item_agrees() {
+        let c = close(Some(&line(StepOutcomeClass::Noop)), Some(UNMOVED), false);
+        assert_eq!(c[KEY], "true");
+    }
+
+    #[test]
+    fn a_held_claim_disagrees_with_anything_but_failed() {
+        let held = PostState {
+            claim_held: true,
+            ..UNMOVED
+        };
+        assert_eq!(close(Some(&line(StepOutcomeClass::Verdict)), Some(held), false)[KEY], "false");
+        assert_eq!(close(Some(&line(StepOutcomeClass::Failed)), Some(held), false)[KEY], "true");
+    }
+
+    #[test]
+    fn absent_without_a_line_without_a_post_state_or_on_provider_exhaustion() {
+        assert!(!close(None, Some(MOVED), false).contains_key(KEY), "no line");
+        let verdict = line(StepOutcomeClass::Verdict);
+        assert!(!close(Some(&verdict), None, false).contains_key(KEY), "no post-state");
+        assert!(
+            !close(Some(&verdict), Some(MOVED), true).contains_key(KEY),
+            "provider exhausted"
+        );
+    }
+
+    /// The close reads the noted post-state without consuming it: the tick's
+    /// `take_post` still gets it.
+    #[test]
+    fn peeking_the_post_state_leaves_it_for_the_tick() {
+        use super::super::super::ended::{note_post, peek_post, take_post};
+        let root = std::path::Path::new("/tmp/peek-post-14234");
+        note_post(root, "step-judge-1-1", Some(MOVED));
+        assert_eq!(peek_post(root, "step-judge-1-1"), Some(Some(MOVED)));
+        assert_eq!(peek_post(root, "step-judge-1-1"), Some(Some(MOVED)), "peek twice");
+        assert_eq!(take_post(root, "step-judge-1-1"), Some(Some(MOVED)));
+        assert_eq!(peek_post(root, "step-judge-1-1"), None);
+    }
 }

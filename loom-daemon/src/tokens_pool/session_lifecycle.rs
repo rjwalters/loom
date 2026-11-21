@@ -71,6 +71,7 @@ use super::account_registry::{
 };
 use super::health::{self, ProbeEffect, ProbeOutcome};
 use super::session_hold;
+use super::session_image::{self, ExtraMount, SessionImageConfig};
 
 // The pass-level health refresh lives in a sibling (file-size ratchet, #7711).
 #[path = "session_health.rs"]
@@ -122,6 +123,12 @@ const DEFAULT_CODEX_SHELL_ARGS: &[&str] = &["--yolo"];
 /// and `start` can detect a mismatched re-`start` against a different
 /// workspace.
 pub(crate) const WORKSPACE_LABEL: &str = "loom.workspace";
+
+/// Container label `create` sets to the JSON list of the configured extra
+/// read-only mounts the container was created with (issue #14019), so
+/// `status` reports the mounts actually in use. Only set when there are
+/// any: without the feature the create argv is unchanged.
+pub const EXTRA_MOUNTS_LABEL: &str = "loom.extra-mounts";
 
 /// Container label recording the security posture a host-mode session
 /// container was created with (issue #9979). `spawn-codex.sh` reads it and
@@ -437,6 +444,13 @@ pub fn ensure_profile_controls(profile: &Path) -> Result<()> {
 ///   [`workspace_mount_roots`]).
 /// * each of `credentials` read-only at its own host path: the daemon's
 ///   GitHub App installation-token dirs ([`gh_credential_dirs`]).
+/// * each of `extra_mounts` **read-only** at its stated container path (the
+///   configured `accounts.session.extraMounts`, issue #14019 — data only;
+///   the denial targets are checked by
+///   [`super::session_mount_gate::check_extra_mounts`] before this runs).
+///   Their JSON is recorded in the [`EXTRA_MOUNTS_LABEL`] label, but only
+///   when the list is non-empty: without the feature the argv is exactly
+///   what it has always been.
 /// * the network, through Docker's default bridge (Codex's API, GitHub).
 ///
 /// `--restart unless-stopped` brings the container back after a Docker
@@ -462,6 +476,7 @@ pub fn host_session_run_args(
     workspace: &Path,
     roots: &[PathBuf],
     credentials: &[PathBuf],
+    extra_mounts: &[ExtraMount],
 ) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "run".into(),
@@ -495,13 +510,28 @@ pub fn host_session_run_args(
         args.push("-v".into());
         args.push(format!("{dir}:{dir}:ro"));
     }
+    for mount in extra_mounts {
+        args.push("--mount".into());
+        args.push(format!(
+            "type=bind,src={},dst={},readonly",
+            mount.host.display(),
+            mount.container.display()
+        ));
+    }
     args.extend([
         "--label".into(),
         format!("{WORKSPACE_LABEL}={}", workspace.display()),
         "--label".into(),
         format!("{SESSION_POSTURE_LABEL}={SESSION_POSTURE}"),
-        image.into(),
     ]);
+    if !extra_mounts.is_empty() {
+        args.push("--label".into());
+        args.push(format!(
+            "{EXTRA_MOUNTS_LABEL}={}",
+            session_image::extra_mounts_label_json(extra_mounts)
+        ));
+    }
+    args.push(image.into());
     args
 }
 
@@ -599,6 +629,10 @@ pub struct ContainerState {
     /// with (Issue #7389), read back from the `loom.workspace` container
     /// label. `None` for a container created before this label existed.
     pub workspace: Option<PathBuf>,
+    /// The extra read-only mounts the container was created with (issue
+    /// #14019), read back from the `loom.extra-mounts` label. Empty for a
+    /// container created before the feature or without configured mounts.
+    pub extra_mounts: Vec<ExtraMount>,
 }
 
 /// Secret-free result of one **non-interactive** `docker exec` (issue
@@ -621,7 +655,11 @@ pub struct ExecOutput {
 /// a fake instead of a real `docker` daemon (issue #6925 acceptance
 /// criterion: "test double or local docker, not just a happy-path manual
 /// run").
-pub trait ContainerRunner {
+///
+/// The [`session_image::BundleProbe`] supertrait is the seam the configured
+/// session image's bundle verification runs through (issue #14019); the
+/// default runs no probe, which fails an override image closed.
+pub trait ContainerRunner: session_image::BundleProbe {
     /// `None` when no container by this name exists at all (neither running
     /// nor stopped-but-not-removed).
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>>;
@@ -636,6 +674,10 @@ pub trait ContainerRunner {
     /// "path parity"), recorded in the [`WORKSPACE_LABEL`] container label so
     /// a later [`Self::inspect`] can report it back.
     ///
+    /// `extra_mounts` are the configured extra read-only mounts (issue
+    /// #14019), denial-checked by [`super::session_mount_gate::check_extra_mounts`]
+    /// and recorded in the [`EXTRA_MOUNTS_LABEL`] label when non-empty.
+    ///
     /// `daemon_root` is the accounts registry's workspace (the `--workspace`
     /// daemon root): one of the owners whose App-token dirs are mounted
     /// ([`gh_credential_owners`], issue #10103).
@@ -646,7 +688,26 @@ pub trait ContainerRunner {
         codex_home: &Path,
         workspace: &Path,
         daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
     ) -> Result<()>;
+
+    /// Create and start a Claude seat container (issue #14371): like
+    /// [`Self::create`], but mounting the seat's own `claude_home` at the
+    /// session image's Claude config path instead of a `CODEX_HOME` profile
+    /// (see [`super::claude_seat`]). The default refuses, so a runner with no
+    /// Claude-seat support fails closed rather than creating a Codex-shaped
+    /// container for a Claude account.
+    fn create_claude_seat(
+        &self,
+        _container: &str,
+        _image: &str,
+        _claude_home: &Path,
+        _workspace: &Path,
+        _daemon_root: &Path,
+        _extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        bail!("this container runner cannot create a Claude seat container")
+    }
 
     /// Make sure `image` is available locally (`docker image inspect`, then
     /// `docker pull`), so a caller can fail *before* tearing a container down
@@ -751,18 +812,57 @@ impl ProcessContainerRunner {
     }
 }
 
+/// The configured session image's bundle verification runs in a throwaway
+/// container from the image itself (issue #14019): no network, no mounts,
+/// read-only rootfs, every capability dropped — the same posture a session
+/// container gets, applied to a probe that runs `cat` and `sha256sum` and
+/// nothing else. `run` is bounded by [`super::docker_cli::DOCKER_RUN_TIMEOUT`],
+/// since a first use may pull the image.
+impl session_image::BundleProbe for ProcessContainerRunner {
+    fn run_image_script(&self, image: &str, script: &str) -> Result<String> {
+        let args = [
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            script,
+        ];
+        let (success, stdout, stderr) =
+            super::docker_cli::run_bounded("docker", &args, super::docker_cli::DOCKER_RUN_TIMEOUT)?;
+        if !success {
+            bail!("docker run {image} (bundle probe) failed: {}", stderr.trim());
+        }
+        Ok(stdout)
+    }
+}
+
 /// Parse [`ProcessContainerRunner::inspect`]'s tab-separated `--format` line
-/// (`Id, Running, Restarting, StartedAt, Image, workspace label`). A
-/// restarting container is reported as not running (issue #10453).
+/// (`Id, Running, Restarting, StartedAt, Image, workspace label,
+/// extra-mounts label`). A restarting container is reported as not running
+/// (issue #10453).
 #[must_use]
 pub fn parse_inspect_line(stdout: &str) -> Option<ContainerState> {
-    let mut fields = stdout.trim().splitn(6, '\t');
+    let mut fields = stdout.trim().splitn(7, '\t');
     let id = fields.next().unwrap_or_default().to_string();
     let docker_running = fields.next() == Some("true");
     let restarting = fields.next() == Some("true");
     let started_at = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
     let image = fields.next().filter(|s| !s.is_empty()).map(str::to_string);
     let workspace = fields.next().filter(|s| !s.is_empty()).map(PathBuf::from);
+    let extra_mounts = fields
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(|label| session_image::parse_extra_mounts_label(label))
+        .unwrap_or_default();
     (!id.is_empty()).then_some(ContainerState {
         id,
         running: docker_running && !restarting,
@@ -770,17 +870,19 @@ pub fn parse_inspect_line(stdout: &str) -> Option<ContainerState> {
         started_at,
         image,
         workspace,
+        extra_mounts,
     })
 }
 
 impl ContainerRunner for ProcessContainerRunner {
     fn inspect(&self, container: &str) -> Result<Option<ContainerState>> {
         let label_format = format!("{{{{index .Config.Labels \"{WORKSPACE_LABEL}\"}}}}");
+        let extra_format = format!("{{{{index .Config.Labels \"{EXTRA_MOUNTS_LABEL}\"}}}}");
         let (success, stdout, stderr) = Self::run_capture(&[
             "inspect",
             "--format",
             &format!(
-                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.Restarting}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}"
+                "{{{{.Id}}}}\t{{{{.State.Running}}}}\t{{{{.State.Restarting}}}}\t{{{{.State.StartedAt}}}}\t{{{{.Config.Image}}}}\t{label_format}\t{extra_format}"
             ),
             container,
         ])?;
@@ -800,6 +902,7 @@ impl ContainerRunner for ProcessContainerRunner {
         codex_home: &Path,
         workspace: &Path,
         daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
     ) -> Result<()> {
         // The daemon's own workspace registry is the allow-list of what the
         // container may see (issue #9979), minus the home directory and the
@@ -814,14 +917,50 @@ impl ContainerRunner for ProcessContainerRunner {
         let owners = gh_credential_owners(workspace, daemon_root, loom_workspace.as_deref());
         let env_gh = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from);
         let credentials = gh_credential_dirs(&owners, env_gh.as_deref());
-        let args =
-            host_session_run_args(container, image, codex_home, workspace, &roots, &credentials);
+        // The configured extra read-only mounts are refused when a target
+        // shadows the workspace, the profile, the bundle or a credential
+        // path (issue #14019), and their host sources pass the same denials
+        // the workspace roots do.
+        super::session_mount_gate::check_extra_mounts(
+            extra_mounts,
+            workspace,
+            &roots,
+            &credentials,
+        )?;
+        let args = host_session_run_args(
+            container,
+            image,
+            codex_home,
+            workspace,
+            &roots,
+            &credentials,
+            extra_mounts,
+        );
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (success, _stdout, stderr) = Self::run_capture(&arg_refs)?;
         if !success {
             bail!("docker run {image} failed: {}", stderr.trim());
         }
         Ok(())
+    }
+
+    fn create_claude_seat(
+        &self,
+        container: &str,
+        image: &str,
+        claude_home: &Path,
+        workspace: &Path,
+        daemon_root: &Path,
+        extra_mounts: &[ExtraMount],
+    ) -> Result<()> {
+        super::claude_seat::docker_create_seat(
+            container,
+            image,
+            claude_home,
+            workspace,
+            daemon_root,
+            extra_mounts,
+        )
     }
 
     fn ensure_image(&self, image: &str) -> Result<()> {
@@ -1113,6 +1252,10 @@ pub struct SessionStatus {
     /// The parity-mounted workspace this container was started with (Issue
     /// #7389). `None` for a container never started under this feature.
     pub workspace: Option<PathBuf>,
+    /// The extra read-only mounts this container was created with (issue
+    /// #14019), from its `loom.extra-mounts` label. Empty otherwise.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_mounts: Vec<ExtraMount>,
 }
 
 /// The container-naming convention this lifecycle owns end to end: every
@@ -1156,6 +1299,13 @@ pub struct SessionLifecycle<R> {
     /// Other registered workspaces whose profile for the same account an
     /// operator start lifts holds in, and status reads them from (#10453).
     peer_roots: Vec<PathBuf>,
+    /// The resolved `accounts.session` settings (issue #14019). Its extra
+    /// read-only mounts ride every `create`, and its digest-pinned image is
+    /// bundle-verified before any container is created from it — the
+    /// verification fires only when the effective image *is* the configured
+    /// one, so an operator's explicit `--image` keeps its historical
+    /// behaviour.
+    session_config: Option<SessionImageConfig>,
 }
 
 impl<R: ContainerRunner> SessionLifecycle<R> {
@@ -1165,6 +1315,7 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             runner,
             image: image.unwrap_or_else(|| DEFAULT_SESSION_IMAGE.to_string()),
             peer_roots: Vec::new(),
+            session_config: None,
         }
     }
 
@@ -1172,6 +1323,16 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     #[must_use]
     pub fn with_peer_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.peer_roots = roots;
+        self
+    }
+
+    /// Apply the resolved `accounts.session` settings (issue #14019): the
+    /// extra read-only mounts ride every create, and the digest-pinned
+    /// override image is bundle-verified before any create that uses it.
+    /// `None` (or an unset override) is today's behaviour.
+    #[must_use]
+    pub fn with_session_config(mut self, config: Option<SessionImageConfig>) -> Self {
+        self.session_config = config;
         self
     }
 
@@ -1187,6 +1348,37 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
     /// container state through it, issue #10453).
     pub fn runner(&self) -> &R {
         &self.runner
+    }
+
+    /// The configured extra read-only mounts (issue #14019) — empty without
+    /// the setting.
+    pub(super) fn extra_mounts(&self) -> Vec<ExtraMount> {
+        self.session_config
+            .as_ref()
+            .map(|config| config.extra_mounts.clone())
+            .unwrap_or_default()
+    }
+
+    /// Verify the configured override image carries the sealed control
+    /// bundle this daemon enforces (issue #14019) — a no-op unless the
+    /// effective image **is** the configured one (an operator's explicit
+    /// `--image` keeps its historical behaviour), and a refusal that names
+    /// the missing or altered asset otherwise. Called before any create.
+    ///
+    /// # Errors
+    /// The configured image fails its bundle verification.
+    pub(super) fn verify_session_config_image(&self) -> Result<()> {
+        let Some(config) = &self.session_config else {
+            return Ok(());
+        };
+        let Some(configured) = config.image.as_deref() else {
+            return Ok(());
+        };
+        if configured != self.image.as_str() {
+            return Ok(());
+        }
+        session_image::verify_override_bundle(&self.image, &self.runner)
+            .context("refusing to create a session container from the configured override image")
     }
 
     /// Image a later `create` launches from; `None` restores the default.
@@ -1296,6 +1488,10 @@ impl<R: ContainerRunner> SessionLifecycle<R> {
             held,
             mount_path: CONTAINER_CODEX_HOME,
             workspace: state.as_ref().and_then(|s| s.workspace.clone()),
+            extra_mounts: state
+                .as_ref()
+                .map(|s| s.extra_mounts.clone())
+                .unwrap_or_default(),
             codex_home: profile,
         })
     }

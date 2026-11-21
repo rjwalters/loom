@@ -197,6 +197,8 @@ When creating a proposal:
 > same issue URL, and falls back to a single REST POST that applies labels **atomically with
 > creation**. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`.
 > (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 > **Issue creation is serialized BY A LOCK, not by convention — and the hazard is NOT limited to one repo (#3707, #6714).** `gh issue create` returns a server-assigned number with no client-side coordination, so two issue-creating agents (two Architects, or an Architect and a Curator-decomposition / Champion epic-phase / Auditor / Hermit / Doctor run) filing at the same time **race on issue numbers and cross-contaminate bodies** — **including when they are filing into completely different repos.** #3707 shipped only a "do not run concurrent Architects" convention, and on 2026-08-08 two Architects filing 5-issue bursts into *different* repos overlapped anyway: one repo's five issue bodies were overwritten with the other's, titles untouched, undetected for 13 days. The convention could not hold — the daemon is the scheduler, so no human is in the loop at dispatch time, and cross-repo concurrency is normal operation, not misuse.
 >

@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -108,6 +108,8 @@ pub struct Memory {
     pub(super) verdicts: HashMap<PathBuf, Verdict>,
     /// Things said once per process.
     pub(super) noted: HashSet<String>,
+    /// The last log entry for an unsuccessful release tag lookup.
+    pub(super) provenance_failure_logged_at: Option<Instant>,
     /// Where the next pass starts, so a pass that ran out of time does not
     /// starve the workspaces at the end of the list.
     pub(super) cursor: usize,

@@ -47,6 +47,14 @@ assert_contains "$(cat "$SRC")" "ci_workflow_blast_eval() {" "ci_workflow_blast_
 # The fixtures and cases shared with test-champion-standing-authorization.sh (#12988).
 FIXTURE_DIR="$TEST_DIR/fixtures/champion-workflows"
 
+# The shell shard has no daemon build. Rust tests cover the native parser;
+# LOOM_TEST_REAL_DAEMON opts into running the same cases against that parser.
+workflow_permission_check() {
+    [ "$*" = "forge workflow-write-all-check" ] || return 2
+    cat >/dev/null
+    return "${WORKFLOW_WRITE_ALL_RC:-0}"
+}
+
 # entry <filename> <patch> [previous_filename] -> one files-API object
 entry() {
     if [ -n "${3:-}" ]; then
@@ -66,6 +74,7 @@ run() {
         PR_NUMBER=1
         LABELS="$labels"
         DIFF_JSON=""
+        LOOM_DAEMON_BIN="${LOOM_TEST_REAL_DAEMON:-workflow_permission_check}"
         gh() {
             [ "$api" = "FAIL" ] && return 1
             case " $* " in
@@ -144,6 +153,11 @@ while IFS=$'\t' read -r id pr_path fixture line expected note; do
     case "$expected" in covered) want=green ;; *) want=red ;; esac
     assert_eq "$want" "$(CONTENT="$fixture" run "[$(entry "$pr_path" "$patch")]" green "loom:pr")" "fixture $id ($pr_path, $fixture): $expected -- $note"
 done <"$FIXTURE_DIR/cases.tsv"
+
+echo "Workflow write-all capability (#14648)"
+assert_eq green "$(CONTENT=ci-write-all-test-name.yml run "[$CI_WF]" green "loom:pr")" "a harmless write-all test name and command are clear"
+assert_eq red "$(CONTENT=ci-write-all-permission.yml WORKFLOW_WRITE_ALL_RC=1 run "[$CI_WF]" green "loom:pr")" "a write-all job permission is held even when the diff does not touch it"
+assert_eq red "$(LOOM_TEST_REAL_DAEMON="$FIXTURE_DIR/missing-daemon" run "[$CI_WF]" green "loom:pr")" "an unavailable permission check fails closed"
 
 echo "Forbidden lines"
 # shellcheck disable=SC2016  # literal workflow text

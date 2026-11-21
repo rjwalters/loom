@@ -226,8 +226,8 @@ fn a_passed_through_gh_listing_journals_its_rows() {
     assert_eq!(gh_listing_rows("search", "{\"number\":1}"), None, "an object is not rows");
 }
 
-/// #11906: a step's journal, named by its sweep id, drains through the same
-/// `take` a role tick uses once the step's end adopts it on its thread.
+/// #11906: a step's journal drains through the same `take` a role tick uses
+/// once the step's end adopts it on its thread.
 #[test]
 fn an_adopted_step_journal_drains_like_a_role_ticks() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,7 +241,26 @@ fn an_adopted_step_journal_drains_like_a_role_ticks() {
     assert!(got.read);
     assert_eq!(got.entries.len(), 1);
     assert!(!path.exists(), "drained");
-    assert!(step_path("step-judge-7-1").ends_with("step-step-judge-7-1.jsonl"));
+    assert!(step_path(root, "step-judge-7-1")
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .ends_with("-step-judge-7-1.jsonl"));
+}
+
+#[test]
+fn step_journal_uses_the_same_root_for_the_checkout_and_its_linked_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    let gitdir = root.join(".git/worktrees/issue-42");
+    let worktree = dir.path().join("worktree");
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::create_dir_all(root.join(".loom")).unwrap();
+    std::fs::create_dir(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+
+    let sweep = "step-champion_merge-42-1";
+    assert_eq!(step_path(&root, sweep), step_path(&worktree, sweep));
 }
 
 #[test]

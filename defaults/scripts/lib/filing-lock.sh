@@ -51,17 +51,9 @@
 # avoided; unavailable on stock macOS), matching the token-pool lock, the
 # per-issue claim lock and lib/build-slot.sh.
 #
-# FLEET tier — other hosts — is a SOFT, TTL-bounded backoff. Two processes can
-# only overwrite each other's body text through shared memory or a shared
-# filesystem, i.e. on one machine, so the host tier is what actually closes the
-# 2026-08-08 hazard. The residual cross-host hazard is the weaker one #3707
-# also named: a burst binding the wrong freshly-minted issue NUMBER into a
-# `Part of #N` cross-reference. That is covered by advertising the hold over
-# the peer-claims transport (#4028) — whose own module documentation states the
-# contract plainly: "a room broadcast is eventually consistent, so this is a
-# fast backoff, not a lock". Peers' daemons observe the ad
-# (`safehouse::PeerClaimSink`) and mirror it into `<store>/peers/<host>`, which
-# is what this script reads.
+# FLEET tier — other hosts — is the captain's filing-lock slot (#13918), taken
+# after the host lock (see `_loom_filing_lock_captain_acquire`). The peer-claims
+# room broadcast that used to soften this tier was retired in #13945.
 #
 # ---------------------------------------------------------------------------
 # On-disk protocol (shared with filing_lock.rs)
@@ -69,8 +61,6 @@
 #   <store>/                  # ~/.loom/locks/issue-filing by default
 #     holder/                 # the lock itself — mkdir-atomic
 #       owner.json            # {"host","pid","label","acquired_at"}
-#     peers/
-#       <host>                # a peer's advertised hold; mtime = LOCAL receipt
 #
 # ---------------------------------------------------------------------------
 # Four safety properties (all load-bearing)
@@ -90,16 +80,33 @@
 #      role that wraps a whole burst does not deadlock against the per-call
 #      acquire inside create-issue.sh.
 #
+# ---------------------------------------------------------------------------
+# Captain tier (#13918)
+# ---------------------------------------------------------------------------
+# On a host in fleet mode, once the host lock is held the filer also takes the
+# captain's fleet-wide filing slot, so two hosts filing at once serialise
+# through the captain instead of a room broadcast. This file holds NO logic for
+# it (shell-language policy): `loom-daemon fleet-dispatch filing-lock
+# acquire|release` does the call, the TTL refresh id and the fail-open. Its
+# contract with this file is only its exit code and stdout:
+#   rc 0, a holder id on stdout — the slot is held; hand the id back on release
+#   rc 0, nothing on stdout     — fleet mode off, captain unreachable, or a
+#                                 binary without the subcommand: file under the
+#                                 host lock alone, exactly as before
+#   rc 75                       — the slot stayed held past the wait: DEFER
+# requires-daemon: fleet-dispatch optional   #13918 — a binary without it exits 2 and the filer files under the host lock alone.
 # Constants (env-tunable; keep in lock-step with filing_lock.rs):
 #   LOOM_FILING_LOCK                default 1    0/false/off/no disables
 #   LOOM_FILING_LOCK_WAIT_SECS      default 120  bounded wait before deferring
 #   LOOM_FILING_LOCK_STALE_SECS     default 300  age at which a holder is reaped
-#   LOOM_FILING_LOCK_PEER_TTL_SECS  default 60   age at which a peer hold expires
 #   LOOM_FILING_LOCK_DIR            default ~/.loom/locks/issue-filing
 #   LOOM_FILING_LOCK_HELD           re-entrancy sentinel (set by the holder)
 
 # Resolved lock dir currently held by this shell (empty = none).
 LOOM_FILING_LOCK_PATH="${LOOM_FILING_LOCK_PATH:-}"
+
+# The holder id of the captain's fleet slot held by this shell (empty = none).
+LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
 
 # The exit/return code meaning "deferred — do not file". 75 is EX_TEMPFAIL:
 # "the caller is invited to retry", which is exactly the contract.
@@ -178,23 +185,6 @@ _loom_filing_lock_age_secs() {
     if (( now > mtime )); then echo $(( now - mtime )); else echo 0; fi
 }
 
-# Echo the live peer hosts (one per line), pruning expired/unageable markers.
-# An unageable marker is DROPPED (fail-open) — the fleet tier is advisory, and
-# a marker we cannot expire must never become permanent.
-_loom_filing_lock_live_peers() {
-    local ttl="$2" peers="$1/peers" f age
-    [[ -d "$peers" ]] || return 0
-    for f in "$peers"/*; do
-        [[ -f "$f" ]] || continue
-        age="$(_loom_filing_lock_age_secs "$f")"
-        if (( age < 0 )) || (( age >= ttl )); then
-            rm -f "$f" 2>/dev/null || true
-            continue
-        fi
-        printf '%s\n' "${f##*/}"
-    done
-}
-
 # True when the current holder should be reaped as abandoned.
 #   leg 1: owner recorded on THIS host with a PID that is not running —
 #          decisive and immediate (a PID from another machine says nothing
@@ -232,32 +222,35 @@ _loom_filing_lock_blocker() {
     printf 'another filer holds the issue-filing lock'
 }
 
-# Advertise this host's hold (or its release) over the peer-claims transport,
-# so peers' daemons mirror it and their filers back off (#4028 / #6714).
-#
-# Published by the FILER itself rather than by a daemon tick: a burst lasts
-# seconds, and the reaper's 30s re-advertisement cadence would miss almost all
-# of them. fleet-send.sh exits 0 silently when the room is unreachable, so a
-# host with no safehouse simply degrades to host-only serialization.
-_loom_filing_lock_advertise() {
-    local kind="$1" label="$2" send
-    send="$(dirname "${BASH_SOURCE[0]}")/../fleet-send.sh"
-    [[ -x "$send" ]] || return 0
-    local body room_args=()
-    # Matches ClaimAd::to_body_json (peer_claims.rs): the marker/version gate,
-    # `issue` pinned to FILING_LOCK_SENTINEL_ISSUE (a burst has no issue number
-    # yet — that IS the hazard), and `repo` carried for diagnostics only.
-    body="$(printf '{"loom_claim":1,"kind":"%s","issue":0,"repo":"%s","host":"%s","pid":%s,"ts":"%s","pr":null}' \
-        "$kind" "${LOOM_REPO:-$label}" "$(loom_filing_lock_host)" "$$" \
-        "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-    # Claim ads ride the CLAIMS room (which falls back to the signal room) —
-    # the one deliberate exception to #4225's per-repo firehose routing, since
-    # every host's bot is already a member there. Omitting --room falls back to
-    # the persona's default room, which is the correct single-room behavior.
-    if [[ -n "${LOOM_SAFEHOUSE_ROOM_CLAIMS:-${LOOM_SAFEHOUSE_ROOM_SIGNAL:-}}" ]]; then
-        room_args=(--room "${LOOM_SAFEHOUSE_ROOM_CLAIMS:-$LOOM_SAFEHOUSE_ROOM_SIGNAL}")
+# Take the captain's fleet slot (#13918) within $2 remaining seconds.
+#   0  — file (slot held, or no captain to ask; see the header)
+#   75 — DEFER (the slot stayed held)
+_loom_filing_lock_captain_acquire() {
+    local label="$1" wait_secs="$2" bin="${LOOM_DAEMON_BIN:-loom-daemon}" holder rc=0
+    LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
+    command -v "$bin" >/dev/null 2>&1 || return 0
+    # stdout is the holder id; stderr is deliberately NOT redirected (#14422), so
+    # the subcommand's `warn` log lines (the fail-open and the defer reason)
+    # reach the caller. A granted acquire logs nothing at the default filter.
+    holder="$("$bin" fleet-dispatch filing-lock acquire --label "$label" \
+        --wait-secs "$wait_secs")" || rc=$?
+    if [[ "$rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
+        return "$LOOM_FILING_LOCK_DEFER_RC"
     fi
-    "$send" --type task --body "$body" "${room_args[@]+"${room_args[@]}"}" >/dev/null 2>&1 || true
+    # Any other failure (an older binary, a crash) fails open to the host lock.
+    if [[ "$rc" -eq 0 && -n "$holder" ]]; then
+        LOOM_FILING_LOCK_CAPTAIN_HOLDER="$holder"
+    fi
+    return 0
+}
+
+# Give the captain's fleet slot back (best effort; its TTL frees a lost unlock).
+_loom_filing_lock_captain_release() {
+    local bin="${LOOM_DAEMON_BIN:-loom-daemon}"
+    [[ -n "${LOOM_FILING_LOCK_CAPTAIN_HOLDER:-}" ]] || return 0
+    "$bin" fleet-dispatch filing-lock release --holder "$LOOM_FILING_LOCK_CAPTAIN_HOLDER" \
+        >/dev/null 2>&1 || true
+    LOOM_FILING_LOCK_CAPTAIN_HOLDER=""
     return 0
 }
 
@@ -277,11 +270,10 @@ loom_filing_lock_acquire() {
         return 0
     fi
 
-    local store wait_secs stale peer_ttl self_host
+    local store wait_secs stale self_host
     store="$(loom_filing_lock_store)"
     wait_secs="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_WAIT_SECS:-}" 120)"
     stale="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_STALE_SECS:-}" 300)"
-    peer_ttl="$(_loom_filing_lock_int "${LOOM_FILING_LOCK_PEER_TTL_SECS:-}" 60)"
     self_host="$(loom_filing_lock_host)"
 
     if ! mkdir -p "$store" 2>/dev/null; then
@@ -292,37 +284,43 @@ loom_filing_lock_acquire() {
     fi
 
     local holder="$store/holder"
-    local start now peers blocker logged_wait=0
+    local start now blocker logged_wait=0
     start="$(date +%s)"
     while :; do
-        peers="$(_loom_filing_lock_live_peers "$store" "$peer_ttl" | paste -sd, - 2>/dev/null || true)"
-        if [[ -z "$peers" ]]; then
-            if mkdir "$holder" 2>/dev/null; then
-                printf '{"host":"%s","pid":%s,"label":"%s","acquired_at":%s}\n' \
-                    "$self_host" "$$" "$label" "$(date +%s)" > "$holder/owner.json" 2>/dev/null || true
-                LOOM_FILING_LOCK_PATH="$holder"
-                export LOOM_FILING_LOCK_HELD=1
-                now="$(date +%s)"
-                echo "[filing-lock] acquired for '${label}' after $(( now - start ))s wait (${holder})" >&2
-                _loom_filing_lock_advertise filing_lock "$label"
-                return 0
-            fi
-            if [[ ! -d "$holder" ]]; then
-                # mkdir failed and the path is not a directory ⇒ the store is
-                # unusable (a FILE in the way, no permission). Degrade open.
-                echo "[filing-lock] WARNING: lock path ${holder} is unusable — filing '${label}' WITHOUT serialization (degrading open)" >&2
-                return 0
-            fi
-            if _loom_filing_lock_abandoned "$store" "$self_host" "$stale"; then
-                echo "[filing-lock] reaping abandoned hold at ${holder} ($(_loom_filing_lock_blocker "$store"))" >&2
+        if mkdir "$holder" 2>/dev/null; then
+            printf '{"host":"%s","pid":%s,"label":"%s","acquired_at":%s}\n' \
+                "$self_host" "$$" "$label" "$(date +%s)" > "$holder/owner.json" 2>/dev/null || true
+            now="$(date +%s)"
+            # Captain tier (#13918): the fleet slot, within what is left of
+            # the bounded wait. A slot still held means defer, and the host
+            # lock goes back so a local peer is not stuck behind us.
+            local captain_rc=0 remaining=$(( wait_secs - (now - start) ))
+            (( remaining >= 0 )) || remaining=0
+            _loom_filing_lock_captain_acquire "$label" "$remaining" || captain_rc=$?
+            if [[ "$captain_rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
                 rm -f "$holder/owner.json" 2>/dev/null || true
                 rmdir "$holder" 2>/dev/null || true
-                continue
+                echo "[filing-lock] DEFERRING '${label}': the captain's fleet filing lock stayed held for ${wait_secs}s. No issue was filed — retry on the next tick." >&2
+                return "$LOOM_FILING_LOCK_DEFER_RC"
             fi
-            blocker="$(_loom_filing_lock_blocker "$store")"
-        else
-            blocker="peer host(s) ${peers} are filing"
+            LOOM_FILING_LOCK_PATH="$holder"
+            export LOOM_FILING_LOCK_HELD=1
+            echo "[filing-lock] acquired for '${label}' after $(( now - start ))s wait (${holder})" >&2
+            return 0
         fi
+        if [[ ! -d "$holder" ]]; then
+            # mkdir failed and the path is not a directory ⇒ the store is
+            # unusable (a FILE in the way, no permission). Degrade open.
+            echo "[filing-lock] WARNING: lock path ${holder} is unusable — filing '${label}' WITHOUT serialization (degrading open)" >&2
+            return 0
+        fi
+        if _loom_filing_lock_abandoned "$store" "$self_host" "$stale"; then
+            echo "[filing-lock] reaping abandoned hold at ${holder} ($(_loom_filing_lock_blocker "$store"))" >&2
+            rm -f "$holder/owner.json" 2>/dev/null || true
+            rmdir "$holder" 2>/dev/null || true
+            continue
+        fi
+        blocker="$(_loom_filing_lock_blocker "$store")"
 
         if (( logged_wait == 0 )); then
             echo "[filing-lock] '${label}' waiting up to ${wait_secs}s — ${blocker}" >&2
@@ -341,12 +339,13 @@ loom_filing_lock_acquire() {
 # Release the lock held by this shell. Idempotent; safe to call from a trap.
 loom_filing_lock_release() {
     if [[ -n "${LOOM_FILING_LOCK_PATH:-}" ]]; then
+        # Reverse of acquire: the captain's fleet slot first, then the host lock.
+        _loom_filing_lock_captain_release
         rm -f "$LOOM_FILING_LOCK_PATH/owner.json" 2>/dev/null || true
         rmdir "$LOOM_FILING_LOCK_PATH" 2>/dev/null || true
         echo "[filing-lock] released ${LOOM_FILING_LOCK_PATH}" >&2
         LOOM_FILING_LOCK_PATH=""
         unset LOOM_FILING_LOCK_HELD
-        _loom_filing_lock_advertise filing_unlock "release"
     fi
     return 0
 }

@@ -22,6 +22,8 @@ fn item(issue: Option<u32>, pr: Option<u32>, verdict: Verdict, lane: Lane) -> It
         send_back: false,
         story_points: None,
         hold_auth: None,
+        pr_review: false,
+        operator_hold_issue: None,
     }
 }
 

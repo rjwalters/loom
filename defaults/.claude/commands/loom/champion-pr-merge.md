@@ -365,7 +365,11 @@ sticky-hold precheck above and before judging the four axes below. If the
 PR's entire changed-file list is an exact-match subset of `{WORK_LOG.md,
 WORK_PLAN.md, README.md}` (three root-level filenames, matched exactly —
 never a substring or nested path, so `docs/README.md` and
-`mcp-loom/README.md` do NOT qualify), the `merge-risk` criterion is satisfied without
+`mcp-loom/README.md` do NOT qualify) **and the PR has no closing-issue
+reference** (#14182: `docs_only_fast_path_closing_check` in the code block
+below must return `ELIGIBLE` — it fails closed on any closing reference and
+on a failed read, because a docs-only diff that auto-closes an issue on
+merge is not a docs-only change), the `merge-risk` criterion is satisfied without
 judging the axes at all: there is no "load-bearing hunk" to name, blast
 radius is provably confined to non-executing docs, and `git revert -m 1
 <merge-sha>` undoes it. This is a shortcut on **this criterion
@@ -424,6 +428,37 @@ docs_only_fast_path_check() {
 FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
 FAST_PATH_RESULT=$(printf '%s\n' "$FAST_PATH_FILES" | docs_only_fast_path_check)
 
+# Closing-link condition (#14182), mirrored from judge.md Step 3 (mirrored, not
+# shared; test-docs-only-fast-path.sh pins both copies). A docs-only diff that
+# auto-closes an issue on merge is not a docs-only change. Fails closed: a read
+# that errored or returned no "closers=" proof is NOT ELIGIBLE, never "no closers".
+docs_only_fast_path_closing_check() {
+  # $1 = PR number. Echoes "ELIGIBLE" only when the closing-reference read
+  # SUCCEEDED (positively proven by the "closers=" prefix) and returned an
+  # empty set. A failed or malformed read is NOT ELIGIBLE, never "no closers"
+  # (fail closed, #14182). Deliberately not forge_pr_close_targets: that helper
+  # swallows read errors into an empty list, which would read as "no closers".
+  local out refs
+  if ! out=$(gh pr view "$1" --json closingIssuesReferences \
+      --jq '"closers=" + ([.closingIssuesReferences[].number | tostring] | join(","))' 2>/dev/null); then
+    echo "NOT ELIGIBLE: closing-reference read failed"
+    return 0
+  fi
+  case "$out" in
+    closers=*) refs="${out#closers=}" ;;
+    *) echo "NOT ELIGIBLE: closing-reference read returned no proof"; return 0 ;;
+  esac
+  if [ -n "$refs" ]; then
+    echo "NOT ELIGIBLE: closes #${refs//,/, #}"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
+  FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")
+fi
+
 if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (docs-only fast path, #6134): merge risk covered without axis judgment — changed files: $FAST_PATH_FILES"
   # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
@@ -433,8 +468,9 @@ if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
 fi
 ```
 
-If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE`, this PR is not
-fast-path eligible — fall through to the standing-authorization check below.
+If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE` (a non-allowlisted
+file, or a closing reference such as `Closes #N`, or a failed closing-reference
+read), this PR is not fast-path eligible — fall through to the standing-authorization check below.
 
 **Standing operator authorization (#6850)** — run this check immediately
 after the docs-only fast path above (and, transitively, after the
@@ -590,6 +626,14 @@ behavior is byte-for-byte unchanged from before #6850.
   whatever its name. This classifies by capability, so a class can drop the
   `*deploy*` / `*release*` / `*publish*` name excludes. It does not replace
   `forbiddenDiffPatterns`, which still catches a PR that *adds* a privilege.
+- `checkWorkflowWriteAll` (#14648, optional boolean) — for a class covering
+  only GitHub workflow YAML, `true` checks the workflow and its jobs for an
+  actual `permissions: write-all` setting. Keep exactly one literal
+  `write-all` entry in `privilegedContentPatterns` as a fallback for older
+  Champions. An upgraded Champion substitutes the YAML check for that entry
+  only after explicit opt-in. Other patterns retain their regex semantics.
+  An unsupported checker, unreadable workflow or missing fallback entry
+  disqualifies the class.
   **Fail closed**: unreadable or empty content, a file the contents API cannot
   serve (too large), a `removed` file, an invalid regex, a head SHA that moved
   while the files were read, or a value that is not an array of non-empty
@@ -718,13 +762,13 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
-# standing_auth_content_clear <files-json> <regexes>   (#12954)
+# standing_auth_content_clear <files-json> <regexes> [<check-write-all>]  (#12954, #14648)
 # 0 = every file in <files-json> was read at the PR head SHA and no line of it
 # matches any privilegedContentPatterns regex. Anything else (a removed or
 # unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
 standing_auth_content_clear() {
-  local files_json="$1" regexes="$2" sha1 sha2 path enc body rx rc
-  [ -n "$regexes" ] || return 0
+  local files_json="$1" regexes="$2" check_write_all="${3:-false}" sha1 sha2 path enc body rx rc
+  [ -n "$regexes" ] || [ "$check_write_all" = true ] || return 0
   printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
   while IFS= read -r rx; do
     [ -z "$rx" ] && continue
@@ -739,6 +783,10 @@ standing_auth_content_clear() {
     enc=$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")') || return 1
     body=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${enc}?ref=$sha1" 2>/dev/null) || return 1
     [ -n "$body" ] || return 1
+    if [ "$check_write_all" = true ]; then
+      case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
+      printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-write-all-check >/dev/null 2>&1 || return 1
+    fi
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
       # A whole-line YAML comment grants nothing, so it is not scanned: the
@@ -813,7 +861,7 @@ standing_auth_class_hits() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
@@ -870,7 +918,16 @@ standing_auth_eval() {
     # but an array of non-empty strings is malformed and skips the entry (a
     # silently ignored key would read as "no privilege found").
     jq -e ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | type == \"array\" and all(.[]; type == \"string\" and length > 0)" "$CONFIG_FILE" >/dev/null 2>&1 || continue
-    PRIVILEGED=$(jq -r ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | .[]" "$CONFIG_FILE")
+    CHECK_WORKFLOW_WRITE_ALL=$(jq -r --argjson i "$i" '
+      .champion.standingAuthorizations[$i]
+      | if has("checkWorkflowWriteAll") then
+          .checkWorkflowWriteAll | if type == "boolean" then . else error("invalid workflow check") end
+        else false end' "$CONFIG_FILE" 2>/dev/null) || continue
+    PRIVILEGED=$(jq -r --argjson i "$i" --arg typed "$CHECK_WORKFLOW_WRITE_ALL" '
+      .champion.standingAuthorizations[$i].privilegedContentPatterns // []
+      | if $typed != "true" then .[]
+        elif ([.[] | select(. == "write-all")] | length) == 1 then .[] | select(. != "write-all")
+        else error("workflow check needs one legacy write-all guard") end' "$CONFIG_FILE" 2>/dev/null) || continue
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives the critical-files criterion for the critical-file hits
@@ -1048,10 +1105,10 @@ standing_auth_eval() {
     # privilegedContentPatterns (#12954): capability, read from each covered
     # file's full contents at the PR head SHA rather than from its name or its
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
-    if [ -n "$PRIVILEGED" ]; then
+    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -1285,12 +1342,12 @@ is red.
 ```bash
 # PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
 # regexes, one per element) a workflow's full head contents must not match.
-# Same list as #12954's privilegedContentPatterns; operators copy it into a
-# class, and test-champion-ci-workflow-blast.sh and
-# test-champion-standing-authorization.sh both extract it from here.
+# Both Champion workflow suites extract this list. For a standing class,
+# keep the legacy `write-all` regex alongside this list and set
+# `checkWorkflowWriteAll: true` to use the same structural permission check.
 PRIVILEGED_CONTENT_PATTERNS=(
   'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
-  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  ':\s*write\b' 'id-token' 'pull_request_target' 'workflow_run'
   '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
   'gh\s+release'
 )
@@ -1340,7 +1397,7 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
     || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
   if [ "$CONTENT_FILES" != "[]" ]; then
-    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
   # permissions (#13291): direction-aware. A removed line naming it is red (it
@@ -2730,7 +2787,12 @@ A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
 **A hand-released hold is listed, not dropped (#11416).** A merge-risk hold
 whose `loom:blocked` a human removed is released (precheck (e)) and merges
 next tick unless the `critical-files`, `mergeable`, `recency` and `ci-green` criteria block it; a critical-file one waits for the
-operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
+operator's own merge (`champion-critical-file-hold.md`, #9016); a ratification
+one is released only by the operator's own `clear the hold —` comment
+(`champion-ratification-hold.md`, #12992) — the label's absence never releases
+it, so `RELEASED` keys on its latest marker being
+`champion:ratification-release-respected` (a still-standing marker gets the
+label re-armed by the precheck, not listed). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
 PR still bearing a hold marker without it — never silently plain approved
 (a critical-file or ratification hold whose last family marker is `-cleared`
@@ -2765,11 +2827,12 @@ for H in loom:blocked loom:operator; do
 "
 done
 HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
-# Same marker set as Step 1's $HOLD_TABLE below (#13885) — extend both
-# together when a hold kind is added. Each kind's "no longer standing"
-# markers: merge-risk clears via a contains() block (embedded in the
-# pre-merge comment), critical-file and ratification clear/release via
-# standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
+# Same marker set as Step 1's $HOLD_TABLE below (#13885) and RELEASED's
+# per-kind selectors (#13875) — extend all three together when a hold kind is
+# added. Each kind's "no longer standing" markers: merge-risk clears via a
+# contains() block (embedded in the pre-merge comment), critical-file and
+# ratification clear/release via standalone notices (the same set doctor.md's
+# CHAMPION_HELD_CONFLICT uses).
 # #14117: a marker being present is not that hold standing — count the PR
 # when ANY kind stands (per kind, the hold marker's latest comment index
 # must outdate the kind's latest cleared/released notice: the MR_STANDS
@@ -2910,8 +2973,9 @@ held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
 hold comment via the `$HOLD_TABLE` below — one `(kind, hold marker, cleared/released test)` row per
 hold kind: the merge-risk marker of the `merge-risk` criterion, the
 critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
-and the ratification marker (#12992, #13885 — its notice has no axis bullet;
-its reason is built from the notice itself). The winner is the latest marker
+and the ratification marker (#12992, #13885, #13875 — its notice has carried
+a `**Ratification by merge**` reason bullet since #13875; an older notice's
+reason is built from its backticked file list). The winner is the latest marker
 among the kinds that still STAND — per kind, standing means the hold marker's
 latest comment outdates the kind's latest cleared/released notice (the
 `MR_STANDS` rindex idiom from `champion-critical-file-hold.md`; #14117) — so a
@@ -3010,14 +3074,19 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
   else
     case "$HOLD_KIND" in
       ratification)
-        # The ratification notice (#12992) has no axis bullet — its only
-        # bullet is a backticked file list — so build the reason from the
-        # notice itself: fixed text plus the first declared file.
-        FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
-        if [ -n "$FIRST_FILE" ]; then
-          REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
-        else
-          REASON="ratification hold (file bullet not parseable)"
+        # The ratification notice (#12992) has carried a leading
+        # "- **Ratification by merge**: ..." reason bullet since #13875 —
+        # read it like the other kinds. Notices posted before then have no
+        # axis bullet, only a backticked file list — build the reason from
+        # that (#13885): fixed text plus the first declared file.
+        REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+        if [ -z "$REASON" ]; then
+          FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+          if [ -n "$FIRST_FILE" ]; then
+            REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
+          else
+            REASON="ratification hold (file bullet not parseable)"
+          fi
         fi
         ;;
       *)

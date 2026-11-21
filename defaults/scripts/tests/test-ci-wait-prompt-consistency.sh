@@ -2,8 +2,9 @@
 # test-ci-wait-prompt-consistency.sh - Prompt-lint for issue #10574.
 #
 # Judge and Doctor must agree about CI waits:
-#   - Judge's pending-CI skip check uses the --timeout 20 snapshot, never
-#     --timeout 0 (which reads a no-checks repo as TIMEOUT).
+#   - Judge takes one bounded, settled CI snapshot before review. Pending CI
+#     and a moved head both use that result to release the claim.
+#   - The longer foreground wait is available to an attended Judge.
 #   - Doctor hands back to Judge on pending CI after a push; the bounded
 #     --timeout 1200 foreground wait is only for an invocation that
 #     explicitly requires the settled result.
@@ -17,6 +18,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$SCRIPT_DIR/lib/assert.sh"
 
+judge_section() {
+    awk -v heading="$2" '
+        $0 == heading { found = 1; next }
+        found && /^### / { exit }
+        found
+    ' "$1"
+}
+
 check() {
     local J="$1" D="$2" where="$3"
     for f in "$J" "$D"; do
@@ -29,14 +38,48 @@ check() {
     else
         pass "$where judge: no wait-checks call uses --timeout 0"
     fi
-    if grep -qF 'wait-checks <PR_NUMBER> --timeout 20 2>/dev/null | head -n1' "$J"; then
-        pass "$where judge: pending-CI skip check uses the --timeout 20 snapshot"
+    local precheck snapshot snapshot_count pending release status paths
+    precheck="$(grep -F '2b. **CI pre-check' "$J")"
+    snapshot="$(grep -oE 'loom-daemon forge wait-checks [^|`]*' <<< "$precheck")"
+    snapshot_count="$(grep -oF 'loom-daemon forge wait-checks' <<< "$precheck" | wc -l)"
+    if [[ "$snapshot_count" -eq 1 && " $snapshot " == *' --timeout 20 '* && " $snapshot " == *' --settle-red '* ]]; then
+        pass "$where judge: pre-check takes one bounded settled snapshot"
     else
-        fail "$where judge: pending-CI skip check uses the --timeout 20 snapshot"
+        fail "$where judge: pre-check takes one bounded settled snapshot"
     fi
-    for k in 'LOOM-CHECKS-TIMEOUT*)' 'LOOM-CHECKS-RED*)' 'LOOM-CHECKS-GREEN*|LOOM-CHECKS-NONE*)'; do
-        grep -qF -- "$k" "$J" && pass "$where judge: skip-check branch kept: $k" || fail "$where judge: skip-check branch kept: $k"
-    done
+    assert_grep 'LOOM-CHECKS-TIMEOUT.*HEAD-MOVED.*When CI is Pending' <(printf '%s\n' "$precheck") \
+        "$where judge: TIMEOUT and HEAD-MOVED route to pending-CI handback"
+
+    pending="$(judge_section "$J" '### When CI is Pending')"
+    assert_grep '([Uu]se|[Rr]euse) [^.!?]*(result|snapshot)' <(printf '%s\n' "$pending") \
+        "$where judge: handback uses the triggering snapshot"
+    assert_no_grep 'forge wait-checks|gh pr checks' <(printf '%s\n' "$pending") \
+        "$where judge: handback makes no new CI poll"
+    assert_contains "$pending" 'LOOM-CHECKS-HEAD-MOVED' "$where judge: a moved head uses the generic release"
+    assert_contains "$pending" 'loom:review-requested' "$where judge: handback leaves the PR queued"
+    release="$(awk '/^```bash$/ { code=1; next } code && /^```$/ { exit } code' <<< "$pending")"
+    assert_grep '^[[:space:]]*gh pr edit .*--remove-label "?loom:reviewing"?([[:space:]]|$)' \
+        <(printf '%s\n' "$release") "$where judge: generic handback removes the review claim label"
+    assert_grep '^[[:space:]]*loom-daemon lease pr release .*--role judge .*--skip-reason ci-pending([[:space:]]|$)' \
+        <(printf '%s\n' "$release") "$where judge: generic handback releases the lease as ci-pending"
+    assert_no_grep 'post-verdict\.sh|--add-label "?loom:(pr|changes-requested)"?([[:space:]]|$)' \
+        <(printf '%s\n' "$release") \
+        "$where judge: generic handback writes no verdict"
+
+    status="$(judge_section "$J" '### How to Check CI Status')"
+    assert_grep 'LOOM-CHECKS-GREEN.*(approve|continue)' <(printf '%s\n' "$status") \
+        "$where judge: GREEN allows review to proceed"
+    assert_grep 'RED.*When CI Fails' <(printf '%s\n' "$status") \
+        "$where judge: settled RED routes to CI failure handling"
+    assert_grep 'ERROR.*gh pr checks.*once' <(printf '%s\n' "$status") \
+        "$where judge: missing or error sentinel has a single-check fallback"
+
+    paths="$(judge_section "$J" '### CRITICAL: Never End Your Turn on a Background CI Monitor')"
+    assert_contains "$paths" 'class=noop reason=ci_pending' "$where judge: daemon handback ends with ci_pending"
+    assert_grep 'Attended / manual single-PR invocation \(no .*step-judge-' <(printf '%s\n' "$paths") \
+        "$where judge: foreground path is limited to attended single-PR invocations"
+    assert_contains "$paths" 'forge wait-checks <PR_NUMBER> --timeout 1800 --settle-red' \
+        "$where judge: bounded attended foreground wait is retained"
 
     # No-checks PRs (#13883): -NONE is not "safe to approve" on its own; Judge
     # runs the repo's documented test command itself, or the verdict records
@@ -55,6 +98,14 @@ check() {
     grep -qF 'unverified by any test' "$J" \
         && pass "$where judge: undocumented repo → verdict says 'unverified by any test'" \
         || fail "$where judge: undocumented repo → verdict says 'unverified by any test'"
+    grep -qF 'unverified by any test: only documented command is `<cmd>` (full suite, out of bounds per #11690)' "$J" \
+        && pass "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command" \
+        || fail "$where judge: full-suite-only documented repo → verdict names the out-of-bounds documented command"
+    local fsrow
+    fsrow="$(grep -F '| **Full suite / build gate** |' "$J")"
+    grep -qF 'No-Checks PRs' <<< "$fsrow" \
+        && pass "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback" \
+        || fail "$where judge: Full-suite/build-gate row points -NONE at the no-checks fallback"
 
     # Unknown required contexts.
     grep -qF 'Unknown is never green.' "$J" && grep -qF 'required-contexts-unknown' "$J" \

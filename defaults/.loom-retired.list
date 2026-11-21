@@ -211,3 +211,25 @@ scripts/cli/loom-scale.sh
 # next resync too.
 commands/loom/loom-iteration.md
 commands/loom/loom-parent.md
+
+# #13911 (2026-11-17) — generate-agents-md.sh is source-tree-only tooling (it
+# resolves defaults/.loom/ from the repo root) and exited 1 in every consumer;
+# it moved to the upstream-only scripts/ and stopped shipping.
+scripts/generate-agents-md.sh
+
+# #13911 (2026-11-18) — #13910's two-layout test suite rode along when
+# test-generate-agents-md-layouts.sh shipped briefly (2026-11-17..18): it
+# copies defaults/scripts/generate-agents-md.sh, which no longer ships, so
+# consumers holding it carry a permanently-failing suite. Removed upstream
+# together with the generator it tested; this entry removes it from
+# already-installed repos on their next resync.
+scripts/tests/test-generate-agents-md-layouts.sh
+
+# #14710 (2026-11-20) — the Guide's per-dependency inline `gh issue view`
+# state loop is gone (replaced by resolve_dep_states over the daemon-side
+# binding-verified dep-states resolver), and with it the suite that extracted
+# that loop verbatim. Its #10040 pin (a MERGED PR dependency counts as
+# resolved) moved to test-dep-recheck-fingerprint.sh's dep-states section
+# (T38e) at the daemon boundary; the prompt boundary is pinned by
+# test-guide-unblock-open-crossrepo.sh.
+scripts/tests/test-guide-unblock-merged-blocker.sh

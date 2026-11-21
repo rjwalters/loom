@@ -77,9 +77,14 @@ pub(super) fn classify(
             format!("passthrough completion ({status}) has no captured output"),
         )),
         // W4-C: a deferred read is "no answer", never a negative one.
-        Ok(GhCompletion::Shed { until, .. }) => {
-            CmdOutcome::Unavailable(Unavailable::Shed { until })
-        }
+        Ok(GhCompletion::Shed {
+            until,
+            graphql_budget_exhausted,
+            ..
+        }) => CmdOutcome::Unavailable(Unavailable::Shed {
+            until,
+            graphql_budget_exhausted,
+        }),
         // #12641: the tick stopped the read; not a reader shed.
         Ok(GhCompletion::DeadlineReached) => CmdOutcome::Unavailable(Unavailable::DeadlineReached),
         Err(ExecError::Spawn(e)) => CmdOutcome::Unavailable(Unavailable::Spawn(e.to_string())),

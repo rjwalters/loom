@@ -22,8 +22,10 @@
 //! * **Runtime/provider** read `runtime`/`provider` (the launch record), then
 //!   `config["runtime"]`. An absent half renders `-` — a Claude launch writes
 //!   no provider, and none is invented for it.
-//! * **Effort** is the sweep-level `effort`; `default` when none was set. It
-//!   is not recorded per phase.
+//! * **Effort** prefers each role's phases' own `effort` stamps (#14242),
+//!   falling back to the sweep-level `effort`; `default` when none was set.
+//!   Agreeing values render one `effort=<v>` (so history keeps grouping);
+//!   differing values render per role, `effort=curator:high builder:medium`.
 //!
 //! A sweep that died before a role ran has fewer `role=` parts and so forms its
 //! own row; `--exclude-spawn-deaths` removes the common case.
@@ -68,6 +70,66 @@ fn nonblank(v: Option<&str>) -> Option<&str> {
     v.map(str::trim).filter(|v| !v.is_empty())
 }
 
+/// The mix key's effort term (Issue #14242): each [`MIX_ROLES`] role's
+/// phases' own `effort` stamps first, a role without one falling back to the
+/// sweep-level `effort` — so a record with no stamps at all renders exactly
+/// the pre-#14242 label. All values agreeing renders the one `effort=<v>`
+/// the sweep level always rendered, keeping a homogeneous sweep in the same
+/// row as its own history; disagreeing values render per role
+/// (`effort=curator:high builder:medium`, a role's own attempts disagreeing
+/// joined by `/`) so two mixes that differ only in a role's effort stay
+/// separate rows. `doctor`/`merge` efforts are deliberately not read — the
+/// same exclusion rationale as their models.
+fn effort_term(record: &SweepOutcomeRecord) -> String {
+    let sweep = nonblank(record.effort.as_deref()).map(str::to_string);
+    let mut per_role: Vec<(&'static str, Vec<String>)> = Vec::new();
+    let mut distinct: Vec<String> = Vec::new();
+    for role in MIX_ROLES {
+        let role_phases: Vec<_> = record
+            .phase_durations
+            .iter()
+            .filter(|p| p.phase.eq_ignore_ascii_case(role))
+            .collect();
+        let mut efforts: Vec<String> = role_phases
+            .iter()
+            .filter_map(|p| nonblank(p.effort.as_deref()))
+            .map(str::to_string)
+            .collect();
+        efforts.sort();
+        efforts.dedup();
+        if efforts.is_empty() && !role_phases.is_empty() {
+            // Fall back per role, not per record, so one stamped role never
+            // masks another's different value. A role that never ran is
+            // omitted, never guessed — same contract as its model.
+            if let Some(e) = &sweep {
+                efforts.push(e.clone());
+            }
+        }
+        for e in &efforts {
+            if !distinct.contains(e) {
+                distinct.push(e.clone());
+            }
+        }
+        if !efforts.is_empty() {
+            per_role.push((role, efforts));
+        }
+    }
+    if per_role.is_empty() {
+        // No MIX_ROLES phase at all (none ran, or only doctor/merge did):
+        // exactly the pre-#14242 sweep-level rendering.
+        return sweep.unwrap_or_else(|| "default".to_string());
+    }
+    match distinct.len() {
+        0 => unreachable!("per_role non-empty implies at least one effort"),
+        1 => distinct.remove(0),
+        _ => per_role
+            .iter()
+            .map(|(role, efforts)| format!("{role}:{}", efforts.join("/")))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// A record's derived mix label — see the module docs for the grammar.
 #[must_use]
 pub fn resolve_mix(record: &SweepOutcomeRecord) -> String {
@@ -85,13 +147,18 @@ pub fn resolve_mix(record: &SweepOutcomeRecord) -> String {
         .or_else(|| nonblank(record.config.get("runtime").map(String::as_str)))
         .unwrap_or("-");
     let provider = nonblank(record.provider.as_deref()).unwrap_or("-");
-    let effort = nonblank(record.effort.as_deref()).unwrap_or("default");
-    format!("{models} | {runtime}/{provider} | effort={effort}")
+    format!("{models} | {runtime}/{provider} | effort={}", effort_term(record))
 }
 
 /// Fold one record's review bounces into `acc`. Same "unknown != zero"
-/// contract as `judge_verdicts`/`doctor_cycles` themselves: a record whose
-/// forge timeline was never read adds to neither the count nor the denominator.
+/// contract as `judge_verdicts`/`doctor_cycles` themselves, applied to each
+/// field on its own: `judge_verdicts` feeds `judge_rejections` and the
+/// `bounce_records` (`BNC_N`) count; `doctor_cycles` is summed on its own,
+/// outside that gate. A record carrying neither adds to nothing. The two fields
+/// are paired in every record the current writer emits, but a pre-#8222 record
+/// carries `doctor_cycles` (the retired phase-history proxy) with no
+/// `judge_verdicts`; its cycles still count, though it is not in `BNC_N`, so
+/// `doctor_cycles` can exceed what `bounce_records` alone would justify.
 pub fn accumulate_bounces(acc: &mut Accum, record: &SweepOutcomeRecord) {
     if let Some(verdicts) = &record.judge_verdicts {
         acc.bounce_records += 1;
@@ -149,9 +216,11 @@ pub fn render_rows(report: &SummaryReport) -> String {
 }
 
 /// The `render_text` footnote for the mix table.
-pub const MIX_NOTE: &str = "REJ = Judge `fail` verdicts and DR_CYC = completed Doctor cycles, \
-    both summed over the BNC_N sweeps whose PR timeline was read (an unread timeline is unknown, \
-    not zero). The mix key omits `doctor` on purpose, and a sweep that died before a role ran \
+pub const MIX_NOTE: &str = "REJ = Judge `fail` verdicts, summed over the BNC_N sweeps whose PR \
+    timeline was read (an unread timeline is unknown, not zero). DR_CYC = completed Doctor cycles, \
+    summed over every sweep carrying `doctor_cycles`: that is BNC_N plus any pre-#8222 sweep that \
+    has the cycle count but no Judge verdicts, so DR_CYC / BNC_N overstates the per-sweep rate on \
+    old history. The mix key omits `doctor` on purpose, and a sweep that died before a role ran \
     forms its own row (#14067).\n";
 
 #[cfg(test)]
@@ -234,6 +303,81 @@ mod tests {
         main.tokens_by_model.as_mut().unwrap()[0].input = 500;
         r.phase_durations = vec![rescue, main];
         assert!(resolve_mix(&r).starts_with("judge=haiku |"));
+    }
+
+    fn phase_at(name: &str, model: &str, effort: Option<&str>) -> PhaseDuration {
+        PhaseDuration {
+            tokens_by_model: Some(usage(model)),
+            effort: effort.map(str::to_string),
+            ..PhaseDuration::new(name, 10)
+        }
+    }
+
+    #[test]
+    fn a_homogeneous_per_phase_effort_keeps_the_sweep_level_label() {
+        // Back-compat (#14242): a record whose phases all carry one effort
+        // renders exactly the label the sweep-level value always rendered, so
+        // it keeps grouping with its own pre-stamp history.
+        let mut unstamped = rec();
+        unstamped.effort = Some("high".into());
+        unstamped.phase_durations = vec![
+            phase_at("curator", "opus", None),
+            phase_at("builder", "sonnet", None),
+        ];
+        let mut stamped = unstamped.clone();
+        for p in &mut stamped.phase_durations {
+            p.effort = Some("high".into());
+        }
+        assert_eq!(resolve_mix(&unstamped), resolve_mix(&stamped));
+        assert!(resolve_mix(&stamped).ends_with("| effort=high"));
+    }
+
+    #[test]
+    fn per_phase_effort_distinguishes_mixes_differing_only_in_a_role() {
+        // AC #14242: two mixes identical except one role's effort are
+        // separate rows — whether the difference is against the sweep level
+        // or between two roles.
+        let mut all_high = rec();
+        all_high.effort = Some("high".into());
+        all_high.phase_durations = vec![
+            phase_at("curator", "opus", Some("high")),
+            phase_at("builder", "sonnet", Some("high")),
+            phase_at("judge", "opus", Some("high")),
+        ];
+        let mut builder_medium = all_high.clone();
+        builder_medium.phase_durations[1] = phase_at("builder", "sonnet", Some("medium"));
+        assert_ne!(resolve_mix(&all_high), resolve_mix(&builder_medium));
+        assert_eq!(
+            resolve_mix(&all_high),
+            "curator=opus builder=sonnet judge=opus | -/- | effort=high"
+        );
+        assert_eq!(
+            resolve_mix(&builder_medium),
+            "curator=opus builder=sonnet judge=opus | -/- | effort=curator:high builder:medium judge:high"
+        );
+    }
+
+    #[test]
+    fn a_role_without_a_stamp_falls_back_to_the_sweep_level_effort() {
+        let mut r = rec();
+        r.effort = Some("high".into());
+        r.phase_durations = vec![
+            phase_at("curator", "opus", None),
+            phase_at("builder", "sonnet", Some("medium")),
+        ];
+        assert_eq!(
+            resolve_mix(&r),
+            "curator=opus builder=sonnet | -/- | effort=curator:high builder:medium"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_effort_field_is_absent_not_serialized() {
+        let p = phase_at("builder", "sonnet", None);
+        let value = serde_json::to_value(&p).unwrap();
+        assert!(value.get("effort").is_none(), "absent key, not null: {value}");
+        let p = phase_at("builder", "sonnet", Some("high"));
+        assert_eq!(serde_json::to_value(&p).unwrap()["effort"], "high");
     }
 
     #[test]

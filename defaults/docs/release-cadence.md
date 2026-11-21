@@ -61,6 +61,13 @@ direction (2026-10-09) is **at most one release a day**.
   Anyone with `workflow_dispatch` (write) access can force; it is the operator
   path. A forced bump starts a new window. `force: false` runs the normal gate,
   which is useful for checking what the next run would do.
+- **Minor releases.** Bumps are patch steps. A minor release (`X.Y.Z` →
+  `X.(Y+1).0`) is a forced dispatch with `level: minor`; the push and
+  schedule paths never take it. The fleet publisher refuses any minor step it
+  does not list, so the release is first named in 2am's `github-write`
+  (`src/publish/target.js` `LOOM_MINOR_RELEASES`, the widening that
+  2am#4617 Q26 requires), and that Worker deployed. 0.20.0, the multi-runtime
+  release, was the first.
 - **Fleet floors wait for the daily release.** A `loom_min_version` floor can
   only name a published release, so a fix the fleet needs now waits for the
   next eligible bump unless it is forced. To ship it now: dispatch `force` with
@@ -385,6 +392,14 @@ it, never at release time:
   installed files: it starts executing an installed file that older releases
   do not ship, or relies on a changed argument contract. Add any newly
   executed file to `DAEMON_INVOKED_INSTALLED_FILES` in the same PR.
+  The same goes for a fix that spans the daemon binary and `defaults/scripts`
+  (#14015): raise `SUPPORTS_INSTALLED` in that same release. It is the one
+  hard-break lever. A repo one release behind but at or above
+  `SUPPORTS_INSTALLED` is not held while it waits for its workspace resync
+  (#11052), so it runs the new daemon against the old scripts and the fix is
+  half applied (a `claim_lost` is how that showed). Raising the value holds
+  such a repo until its resync lands. `loom-daemon status` and a once-per-repo
+  INFO line show which repos are in that state, but nothing holds them.
 
 The `Compatibility contract across adjacent releases` step of CI's
 `Install Surface Checks` job (`loom-daemon install-compat check`) proves both

@@ -25,6 +25,12 @@ use crate::telemetry::trace::{SpanName, SpanRecord, SpanStatus, TraceAttributes,
 /// One call's deadline: short, so a dead server costs a spawn little.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The deadline of a call that waits out a captain-side probe run (the
+/// on-demand token refresh, #13943): the probe's own bound (the runner's
+/// `tokens check` timeout, 120 s) plus answering headroom, so the answer
+/// honestly reports the probe instead of racing it.
+pub const PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Why a call produced no answer. Every one of these fails open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
@@ -192,6 +198,55 @@ pub fn post_detached<Req, Resp>(
         let answer = post::<Req, Resp>(&http, &base, &path, &body).await;
         done(answer, started.elapsed());
     });
+}
+
+/// The probe-wait HTTP client ([`PROBE_WAIT_TIMEOUT`]), built once beside
+/// [`runtime`]'s own: the same no-redirect, no-proxy posture.
+fn probe_wait_http() -> Option<&'static reqwest::Client> {
+    static SLOW: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    SLOW.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(PROBE_WAIT_TIMEOUT)
+            .connect_timeout(CALL_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .map_err(|e| log::warn!("fleet_dispatch: no probe-wait client: {e}"))
+            .ok()
+    })
+    .as_ref()
+}
+
+/// [`post_blocking`] for a call whose answer legitimately arrives minutes
+/// later — a captain running its token-pool probe before answering (#13943).
+/// Bounded by [`PROBE_WAIT_TIMEOUT`] (plus a little) whatever the network
+/// does; the same safe-from-any-thread contract as [`post_blocking`].
+///
+/// # Errors
+///
+/// [`CallError`]; a missed deadline is [`CallError::Transport`].
+pub fn post_blocking_probe_wait<Req, Resp>(
+    base: &str,
+    path: &str,
+    body: &Req,
+) -> Result<Resp, CallError>
+where
+    Req: Serialize + Clone + Send + Sync + 'static,
+    Resp: DeserializeOwned + Send + 'static,
+{
+    let Some((rt, _)) = runtime() else {
+        return Err(CallError::Transport("no runtime".into()));
+    };
+    let Some(http) = probe_wait_http() else {
+        return Err(CallError::Transport("no probe-wait client".into()));
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (http, base, path, body) = (http.clone(), base.to_string(), path.to_string(), body.clone());
+    rt.spawn(async move {
+        let _ = tx.send(post::<Req, Resp>(&http, &base, &path, &body).await);
+    });
+    wait(&rx, PROBE_WAIT_TIMEOUT + Duration::from_millis(500))
+        .unwrap_or_else(|| Err(CallError::Transport("deadline".into())))
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +452,25 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// #13943: a token refresh waits out a captain-side probe run, so its
+    /// answer legitimately arrives far past [`CALL_TIMEOUT`].
+    #[test]
+    fn a_probe_wait_call_outlasts_the_normal_deadline() {
+        use super::super::proto::{TokensRefreshResponse, TOKENS_REFRESH_PATH};
+        let slow = TestServer::start(|_, _| {
+            std::thread::sleep(CALL_TIMEOUT + Duration::from_millis(100));
+            (
+                200,
+                json!({"server_epoch":"e1","probed_at":"2026-11-19T23:30:00Z","coalesced":false}),
+            )
+        });
+        let answer: TokensRefreshResponse =
+            post_blocking_probe_wait(&slow.url(), TOKENS_REFRESH_PATH, &json!({"host_id":"h"}))
+                .unwrap();
+        assert!(answer.probed_at.is_some(), "{answer:?}");
+        assert!(!answer.coalesced);
     }
 
     #[test]

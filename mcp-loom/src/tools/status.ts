@@ -56,16 +56,6 @@ export interface ObservabilityExportStatus {
   endpoint_loopback?: boolean | null;
 }
 
-/** States that mean telemetry is demonstrably going wrong. */
-export function isTelemetryProblem(state: ObservabilityExportState): boolean {
-  return (
-    state === "failing" ||
-    state === "never_exported" ||
-    state === "misconfigured" ||
-    state === "host_id_mismatch"
-  );
-}
-
 /**
  * Human wording for a state, mirroring `loom-daemon status`'s
  * `Observability: …` line closely enough that an agent's relay matches what

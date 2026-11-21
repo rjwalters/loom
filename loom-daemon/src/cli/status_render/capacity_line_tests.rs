@@ -27,6 +27,7 @@ fn repo(root: &str, halted: bool) -> RepoStatus {
         in_flight_count: 0,
         health_gate_halted: halted,
         maintain_only: None,
+        installed_behind: None,
         quarantined_issues: vec![],
         health_gate_not_evaluated: false,
         health_gate_not_evaluated_reason: None,

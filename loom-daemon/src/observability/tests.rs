@@ -7,6 +7,7 @@ const ALL_ENV_VARS: &[&str] = &[
     ENDPOINT_ENV,
     INGEST_KEY_FILE_ENV,
     BATCH_SIZE_ENV,
+    MAX_BATCH_BYTES_ENV,
     FLUSH_INTERVAL_SECS_ENV,
     QUEUE_CAPACITY_ENV,
     EXPORTER_ENV,
@@ -128,6 +129,7 @@ fn the_retired_https_kind_is_skipped_everywhere_it_can_be_named() {
 
 fn raw(kind: &str, endpoint: Option<&str>) -> RawExporterEntry {
     RawExporterEntry {
+        max_batch_bytes: None,
         kind: kind.to_string(),
         endpoint: endpoint.map(str::to_string),
         headers_file: None,
@@ -136,6 +138,7 @@ fn raw(kind: &str, endpoint: Option<&str>) -> RawExporterEntry {
 
 fn entry(kind: ExporterKind, endpoint: Option<&str>) -> ExporterEntry {
     ExporterEntry {
+        max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
         kind,
         endpoint: endpoint.map(str::to_string),
         headers_file: None,
@@ -315,6 +318,67 @@ fn read_config_parses_every_field_from_the_observability_block() {
     assert_eq!(config.flush_interval_secs, Some(45));
     assert_eq!(config.queue_capacity, Some(1000));
     assert_eq!(config.exporter.as_deref(), Some("otlp"));
+}
+
+#[test]
+#[serial]
+fn max_batch_bytes_precedence_for_the_selected_exporter() {
+    clear_env();
+    let selected_limit =
+        |config: &ObservabilityConfig| resolve_exporters(config)[0].max_batch_bytes;
+    let mut config = ObservabilityConfig {
+        exporter: Some("otlp".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(selected_limit(&config), DEFAULT_MAX_BATCH_BYTES);
+    config.max_batch_bytes = Some(128);
+    assert_eq!(selected_limit(&config), 128);
+
+    config.exporters = Some(vec![raw("otlp", None)]);
+    assert_eq!(selected_limit(&config), 128);
+    let entry = &mut config.exporters.as_mut().unwrap()[0];
+    entry.max_batch_bytes = Some(256);
+    assert_eq!(selected_limit(&config), 256);
+
+    std::env::set_var(MAX_BATCH_BYTES_ENV, "512");
+    assert_eq!(selected_limit(&config), 512);
+    for invalid in ["0", "-1", "4.5", "unlimited", "18446744073709551616"] {
+        std::env::set_var(MAX_BATCH_BYTES_ENV, invalid);
+        assert_eq!(selected_limit(&config), 256, "invalid {invalid}");
+    }
+    // The existing kind override replaces the exporter list. The selected
+    // entry now inherits the shared byte limit, like the singular config.
+    std::env::set_var(EXPORTER_ENV, "otlp");
+    assert_eq!(selected_limit(&config), 128);
+    clear_env();
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn read_config_accepts_only_positive_integer_byte_limits() {
+    let dir = tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+    let file = dir.path().join(".loom/config.json");
+    std::env::set_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV, "");
+    for (input, expected) in [
+        ("1048576", Some(1_048_576)),
+        ("0", None),
+        ("-1", None),
+        ("17.5", None),
+        (r#""1024""#, None),
+        ("18446744073709551616", None),
+    ] {
+        std::fs::write(
+            &file,
+            format!(
+                r#"{{"observability":{{"maxBatchBytes":{input},"exporters":[{{"kind":"otlp","maxBatchBytes":{input}}}]}}}}"#
+            ),
+        ).unwrap();
+        let config = read_config(dir.path());
+        assert_eq!(config.max_batch_bytes, expected, "shared {input}");
+        assert_eq!(config.exporters.unwrap()[0].max_batch_bytes, expected, "entry {input}");
+    }
+    std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
 }
 
 #[test]

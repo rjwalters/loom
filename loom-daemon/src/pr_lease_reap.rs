@@ -307,14 +307,20 @@ fn run_bounded(cmd: &mut Command, limit: Duration) -> bool {
     let Ok(mut child) = cmd.spawn() else {
         return false;
     };
+    // #14100: the reap child is the daemon's own binary; attribute its pid.
+    let tracked = crate::self_spawn_log::track("pr_lease_reap", cmd, child.id());
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => {
+                tracked.finish(status);
+                return status.success();
+            }
             Ok(None) if start.elapsed() < limit => std::thread::sleep(POLL),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
+                tracked.finish("timed out");
                 return false;
             }
         }

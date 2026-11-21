@@ -136,6 +136,8 @@ pub fn render_audit(r: &AuditReport, verbose: bool) -> String {
             "{PREFIX}   {} {:<28} pr={:<7} push={:<7} merge_group={:<7} {}",
             if j.covered {
                 "COVERED  "
+            } else if !j.docs_only_steps.is_empty() {
+                "DOCS-ONLY EXCEPTION"
             } else if j.relied_on {
                 "UNCOVERED"
             } else {
@@ -150,13 +152,22 @@ pub fn render_audit(r: &AuditReport, verbose: bool) -> String {
                 .map(|m| format!("(pr-only: {m})"))
                 .unwrap_or_default(),
         );
+        for step in &j.docs_only_steps {
+            let _ = writeln!(out, "{PREFIX}     step `{step}` can skip on a proven docs-only tree");
+        }
     }
     for c in &r.required {
         let _ = writeln!(
             out,
             "{PREFIX} required context `{}`: {} ({})",
             c.context,
-            if c.covered { "covered" } else { "NOT covered" },
+            if c.covered {
+                "covered"
+            } else if c.docs_only_exception {
+                "reports with conditional docs-only coverage"
+            } else {
+                "NOT covered"
+            },
             c.job.as_deref().unwrap_or("no matching job")
         );
     }
@@ -166,7 +177,9 @@ pub fn render_audit(r: &AuditReport, verbose: bool) -> String {
     let _ = writeln!(
         out,
         "{PREFIX} {}",
-        if r.qualified() {
+        if r.qualified() && r.jobs.iter().any(|job| !job.docs_only_steps.is_empty()) {
+            "QUALIFIED — required contexts report; the docs-only exception can skip the listed steps (nothing was changed)".to_string()
+        } else if r.qualified() {
             "QUALIFIED — every relied-on suite runs on the merge-group commit (nothing was changed)"
                 .to_string()
         } else {
@@ -216,3 +229,6 @@ pub fn render_eligibility(e: &Eligibility) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod workflow_identity_tests;

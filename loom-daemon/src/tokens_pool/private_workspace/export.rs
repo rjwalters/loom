@@ -473,6 +473,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let second = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -716,6 +718,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let job = lease::Job {
             owner: "fixture".into(),

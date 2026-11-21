@@ -313,6 +313,26 @@ The Full Install workflow:
 
 This runs the complete Full Install workflow automatically.
 
+**Installing into a repo without changing this machine (`--repo-only`):**
+by default the installers also provision machine-level state on the host that
+runs them. Pass `--repo-only` (or set `LOOM_INSTALL_REPO_ONLY=1`) to `./install.sh`
+or `./scripts/install-loom.sh` to write only the target repository's files; each
+skipped step is printed. Use it when installing from a workstation whose daemon,
+dispatcher or `~/.claude` settings should stay as they are.
+
+| Step | Changes | Default | With `--repo-only` |
+|------|---------|---------|--------------------|
+| Repository files (`.loom/`, `.claude/`, `CLAUDE.md`, project-level guard-hook entries in `.claude/settings.json`, ...) | the target repository | written | written (identical) |
+| `loom-daemon` binary and defaults mirror | the machine (`~/.local/bin/loom-daemon`, `~/.local/share/loom-daemon/defaults`) | replaced with a build of the source checkout's HEAD | skipped |
+| `loom` dispatcher (Full Install only) | the machine (`~/.local/bin/loom`, `~/.local/share/loom`) | provisioned | skipped |
+| User-scope skills and agents (Full Install only) | the machine (`~/.claude/commands/loom`, `~/.claude/agents/loom-*.md`) | linked | skipped |
+| User-scope guard hooks | the machine (`~/.claude/settings.json`, backed up first) | re-wired | skipped |
+| Loom MCP bundle build and legacy MCP config migration (Full Install only) | the Loom source checkout, which can serve the machine's registered MCP server | refreshed | skipped |
+| User-scope `loom` MCP registration (Full Install only) | the machine (`claude mcp add --scope user`) | re-registered | skipped |
+
+The flag does not change what the default install does, and it does not affect
+`loom update`, `loom migrate` or uninstall.
+
 **Next:** Review the output to understand what was created.
 
 ### Initialization Flags
@@ -363,7 +383,7 @@ AGENTS.md             # Technical context for OpenAI Codex and other AGENTS.md-a
 
 **What to do:**
 1. Review `CLAUDE.md` (Claude Code) and/or `AGENTS.md` (Codex) to understand the codebase structure and patterns
-2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `defaults/scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
+2. Update `CLAUDE.md` with project-specific context as you build. `AGENTS.md` is generated from `CLAUDE.md`'s `agents-md:include` ranges (via `scripts/generate-agents-md.sh`), so it stays in sync automatically — do not hand-edit it.
 
 ### Claude Code Configuration
 

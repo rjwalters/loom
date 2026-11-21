@@ -648,3 +648,101 @@ fn each_trigger_path_carries_step_session_tokens_and_emits_a_narration_record() 
         ]
     );
 }
+
+/// A step log as `worker run` writes it: the dispatch header, the launch
+/// record, and an OpenCode event stream naming `session_id` (#14018).
+fn write_opencode_step_log(root: &Path, role: &str, item: u32, session_id: &str) {
+    let logs = root.join(".loom").join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let body = format!(
+        "==== loom-daemon dispatch: 2026-11-16T23:20:57+00:00 sweep_id=step-{role}-{item}-1 \
+         item={item} step={role} ====\n\
+         # LOOM_LAUNCH {{\"schema\":1,\"runtime\":\"opencode\",\"provider\":\"zai-coding-plan\",\
+         \"model\":\"glm-5.3-flash\",\"profile\":\"zai-flash\"}}\n\
+         # LOOM_RUNTIME_RESOLVED runtime=opencode\n\
+         {{\"type\":\"step_start\",\"timestamp\":1,\"sessionID\":\"{session_id}\",\"part\":{{}}}}\n"
+    );
+    std::fs::write(logs.join(format!("step-{role}-{item}.log")), body).unwrap();
+}
+
+/// #14018: a step-dispatched merge — OpenCode Builder, Claude Judge, both on
+/// the narrating host — publishes the Builder's runtime labels and a token
+/// total and per-model breakdown covering BOTH. The OpenCode side is keyed on
+/// the session id in the step log, so a neighbouring session in the same
+/// (workspace-root) directory is not counted.
+#[test]
+#[serial]
+fn a_step_dispatched_merge_attributes_an_opencode_builder_and_a_claude_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    let root = ws.to_string_lossy().into_owned();
+    let config = dir.path().join("claude-config");
+    std::fs::create_dir_all(config.join("projects")).unwrap();
+    std::env::set_var("CLAUDE_CONFIG_DIR", &config);
+    // Claude Judge for PR 700: 10 + 20 + 300 + 40 = 370 tokens.
+    seed_step_transcript(&config, &root, "judge", "700");
+    write_opencode_step_log(&ws, "builder", 14018, "ses_mine");
+
+    let db = dir.path().join("opencode.db");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (
+                 model TEXT, tokens_input INTEGER, tokens_output INTEGER,
+                 tokens_reasoning INTEGER, tokens_cache_read INTEGER,
+                 tokens_cache_write INTEGER, directory TEXT, time_created INTEGER,
+                 id TEXT
+             );",
+        )
+        .unwrap();
+        let model = serde_json::json!({"id": "glm-5.3-flash", "providerID": "zai"}).to_string();
+        let now = Utc::now().timestamp_millis();
+        // Mine: 1000 + 200 + 50 + 10 = 1260. The neighbour shares the
+        // directory AND the window, and must contribute nothing.
+        for (id, input) in [("ses_mine", 1000), ("ses_neighbour", 9_000_000)] {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 200, 0, 50, 10, ?3, ?4, ?5)",
+                rusqlite::params![model, input, root, now, id],
+            )
+            .unwrap();
+        }
+    }
+    std::env::set_var(crate::opencode_usage::OPENCODE_DB_ENV, &db);
+
+    let gh = FakeGh::new(dir.path());
+    gh.serve_view(&pr_row(700, 14018, Some(1)));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut slug_cache = HashMap::new();
+    let mut completed = std::collections::HashSet::new();
+    let envelope = rt.block_on(forge_gate::scoped(None, async {
+        completion_for_merged_step(
+            "loom_daemon",
+            &root,
+            700,
+            &mut slug_cache,
+            &mut completed,
+            None,
+            None,
+        )
+        .await
+    }));
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    std::env::remove_var(crate::opencode_usage::OPENCODE_DB_ENV);
+
+    let meta = envelope.expect("a completion").meta.unwrap();
+    assert_eq!(meta["runtime"], "opencode");
+    assert_eq!(meta["provider"], "zai-coding-plan");
+    assert_eq!(meta["profile"], "zai-flash");
+    assert_eq!(meta["tokens"], serde_json::json!(370 + 1260), "{meta}");
+    let models: Vec<&str> = meta["tokens_by_model"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["model"].as_str())
+        .collect();
+    assert_eq!(models, vec!["claude-sonnet-4-5", "glm-5.3-flash"], "{meta}");
+}

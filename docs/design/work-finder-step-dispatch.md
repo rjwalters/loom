@@ -92,13 +92,29 @@ The design builds on these and must not duplicate them.
 
 ### 4.1 Items and steps
 
-An **item** is an open issue joined to its linked open PR, using the link rules of `worktree_ops/linked_pr_listing.rs`. A PR with no issue is its own item. A **step** is one role session that advances one item by one stage, in one slot, under one claim.
+An **item** is an open issue joined to its linked open PR, using the link
+rules of `worktree_ops/linked_pr_listing.rs`. A PR with no issue is its own
+item. A **step** is one role session that advances one item by one stage, in
+one slot, under one claim.
+
+A non-closing `Part of` or `Contributes to` reference can group a PR with an
+issue even without a closing or same-repo Builder branch join. The reference
+alone gives the issue no authority to hold the PR. Each confirmed closing
+link can bind a hold, and an operator label on the PR binds directly.
+
+A gated review or changes-requested PR uses its own PR number in
+`eta.dispatch_state`. For `exclusion=operator`, the JSON body includes
+`operator_hold_issue` when an issue supplied the hold. A direct hold uses the
+PR alone.
 
 The classifier (`work_finder/step_item.rs`, `classify`) checks these rows in order; the first that matches decides.
 
 | Item state | Step |
 |---|---|
-| `loom:frozen`, `loom:operator`, `external`, or a claim label (on the PR or any open issue it links) | none |
+| `loom:frozen` (on the PR or any open issue it links) | none |
+| `loom:operator` on the artifact itself, or an open issue the PR closes or builds | none (`operator`) |
+| Operator-held issue referenced by a PR whose branch metadata could not be verified | none (`operator_link_unverified`) |
+| `external`, host skip, or claim label (on the PR or any open issue it links) | none |
 | PR in GitHub's merge queue (`queued`) | none |
 | the issue's open PR is another item's (`shared_pr`) | none |
 | PR `loom:sequenced` | none |
@@ -129,6 +145,14 @@ Notes on the table:
 - Revise and verdict markers are read through `comment_trust`.
 - Red-main fixes keep their lane (`work_finder/main_red_fix.rs`).
 - A capability-parked item has weight 0 on a host without the capability (`capability_missing`).
+
+Run `loom-daemon forge operator-holds --fleet-json /path/to/fleet.json` to
+audit a compiled fleet roster. The JSON report lists each staged PR and issue
+number as a pair in `non_closing_only` or `held_via_join`. The inventory reads
+positive-weight GitHub repos, excludes PRs with their own park label, and
+marks unavailable or capped listings incomplete. It classifies the operator
+link gate from forge labels and linkage; live CI, claims and host gates can
+still affect dispatch.
 
 ### 4.2 The tick
 
@@ -191,7 +215,7 @@ The stage-entry provider is a three-source adapter, tried in order:
 
 A Builder restore with a verified open linked PR writes no label: the issue keeps `loom:building` while its PR is open, through the existing open-PR release hold (`ClaimRelease::HeldByOpenPr`). A step's restore keeps that hold even when `LOOM_RELEASE_OPEN_PR_VETO=0` switches the hold off for sweeps. The item join then classifies the item by its PR.
 
-**Post-state.** The ledger's post-state comes from the one read the claim release takes, before its restore write; a read after the write would always see the claim gone. A step whose claim was not released (another claimant holds the item, a merge step) is read once at the next tick (`step_dispatch::step_end`).
+**Post-state.** The ledger's post-state comes from the one read the claim release takes, before its restore write; a read after the write would always see the claim gone. The release notes that read before it decides anything — even when the release plan then leaves the claim untouched (its `Nothing` plan fires when the claim label is already gone, or the item is frozen) — so the steps with no noted read are three: the `skip_label_flip` early return, a merge step with no claim label (`ChampionMerge`), and a step whose item is held elsewhere — the caller's ownership check (`step_claim_held_elsewhere` for the reaper, startup adoption and a PR role's roll requeue; `roll_claim_still_ours` for an issue role's roll requeue) short-circuits before the release is called at all, so no read and no note happen (the "No restore runs when the item is held elsewhere" paragraph below); those are read once at the next tick (`step_dispatch::step_end`).
 
 No restore runs when the item is held elsewhere. For a Builder step that means `loom:building` re-applied more than 60 s after the step started. For every other step it means either of two things. The first is that the role's earliest live lease belongs to another sweep. The second is that the claim label was applied more than 60 s after the step started and outside the step's own lease (#11969): after that lease was released, yielded or aged out, or when the step has no lease. That second case is an attended session that claims by label alone, such as Doctor or the Curator path. A label applied while the step's own lease was live belongs to the step, because the role prompt applies it after the daemon's lease.
 

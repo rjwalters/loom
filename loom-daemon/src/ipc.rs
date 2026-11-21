@@ -750,6 +750,21 @@ async fn handle_client(
             continue;
         }
 
+        // GetPrimaryWorkspaceRoot (#14534) needs `fallback_root`, the root the
+        // daemon registered as its primary at startup, which the synchronous
+        // `handle_request` dispatcher does not receive. A managed-workspace
+        // list is deliberately not consulted: its order does not say which
+        // root the credential refresh publishes into.
+        if matches!(request, Request::GetPrimaryWorkspaceRoot) {
+            let response = Response::PrimaryWorkspaceRoot {
+                path: fallback_root.display().to_string(),
+            };
+            let response_json = serde_json::to_string(&response)?;
+            writer.write_all(response_json.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            continue;
+        }
+
         // DaemonStatus (Issue #3891) is handled here rather than in the
         // synchronous `handle_request` dispatcher because it reads the per-repo
         // `health_states` halt flags, which the dispatcher does not receive.
@@ -1604,6 +1619,7 @@ pub fn build_daemon_status_for(
         per_repo.push(crate::types::RepoStatus {
             root: root.clone(),
             maintain_only: workspace_registry.maintain_only_of(root),
+            installed_behind: crate::workspace_hold::installed_behind_for(root),
             weight: workspace_registry.weight_of(root),
             in_flight_count,
             health_gate_halted: health_states.is_halted(root),
@@ -1827,15 +1843,10 @@ pub fn build_daemon_status_for(
         // no pool is held, which is the steady state.
         pool_exhaustion_holds: crate::work_finder::pool_preflight::active_hold_statuses(),
         // Live safehouse connection state (#4345) — the pool's shared cell is
-        // updated by the narration sink / peer-coordination tasks
-        // `start_safehouse_narration`/`start_peer_coordination` spawn, and
+        // updated by the narration sink / completion-dedup tasks
+        // `start_safehouse_narration`/`start_completion_dedup` spawn, and
         // read back here on every status call (no second connection).
         safehouse: Some(workspace_pool.safehouse_status()),
-        // Peer-claim view + transport counters (Issue #5921) — same
-        // process-global-cell read-back pattern as `safehouse` above. `None`
-        // when peer-claim coordination was never established (see
-        // `WorkspacePool::peer_claim_status`'s doc comment).
-        peer_claims: workspace_pool.peer_claim_status(),
         // Whether the work-finder loop is enabled for THIS running daemon
         // process (#4693) — read from this process's own env/config, the same
         // `wf_config` already resolved above for the dynamic-cap fields, so it
@@ -2397,6 +2408,12 @@ fn handle_request(
     match request {
         Request::Ping => Response::Pong,
 
+        // Structurally unreachable: `handle_client` answers it from
+        // `fallback_root` before dispatching here (#14534).
+        Request::GetPrimaryWorkspaceRoot => Response::Error {
+            message: "GetPrimaryWorkspaceRoot is answered by handle_client".into(),
+        },
+
         Request::CreateTerminal {
             config_id,
             name,
@@ -2442,14 +2459,11 @@ fn handle_request(
             let terminal_info = tm.list_terminals().into_iter().find(|t| t.id == id);
 
             // Extract context from terminal info
-            let (raw_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
-                (info.role, info.working_dir, info.worktree_path)
+            let (raw_role, workspace_path) = if let Some(info) = terminal_info {
+                (info.role, info.working_dir)
             } else {
-                (None, None, None)
+                (None, None)
             };
-
-            // Determine workspace path (prefer worktree, fallback to working_dir)
-            let workspace_path = worktree_path.or(working_dir.clone());
 
             // Resolve the real Loom role (e.g. "judge", "curator") from the
             // terminal's own `roleConfig.roleFile` in `.loom/config.json`,
@@ -2634,60 +2648,12 @@ fn handle_request(
             }
         }
 
-        Request::ResizeTerminal { id, cols, rows } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.resize_terminal(&id, cols, rows) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
         Request::CheckSessionHealth { id } => {
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.has_tmux_session(&id) {
                 Ok(has_session) => Response::SessionHealth { has_session },
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::ListAvailableSessions => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            let sessions = tm.list_available_sessions();
-            Response::AvailableSessions { sessions }
-        }
-
-        Request::AttachToSession { id, session_name } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.attach_to_session(&id, session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::KillSession { session_name } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.kill_session(&session_name) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::StructuredError(DaemonError::from(e)),
-            }
-        }
-
-        Request::SetWorktreePath { id, worktree_path } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            match tm.set_worktree_path(&id, &worktree_path) {
-                Ok(()) => Response::Success,
                 Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }

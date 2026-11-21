@@ -390,6 +390,28 @@ fn an_approved_conflicting_pr_is_not_a_merge_step() {
     assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
 }
 
+#[test]
+fn guide_unparked_conflict_reaches_doctor_even_with_a_ci_failure_label() {
+    let mut inputs = Inputs {
+        pulls: vec![PullInput {
+            number: 514,
+            labels: labels(&[
+                "loom:blocked",
+                "loom:changes-requested",
+                "loom:merge-conflict",
+                "loom:ci-failure",
+            ]),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    assert_eq!(classify(&inputs)[0].verdict, Verdict::Pass(PassReason::Blocked));
+    inputs.pulls[0]
+        .labels
+        .retain(|label| label != "loom:blocked");
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Doctor));
+}
+
 /// #13737: an approved, unheld PR on a Loom stack branch is a pass (the janitor
 /// would only skip it); any other base, and any held/contradictory/conflicting
 /// stacked PR, keeps its existing verdict.
@@ -463,4 +485,34 @@ fn host_skip_label_passes_issue_triage_and_linked_pr() {
     let open = classify(&inputs(&HostInput::default()));
     assert!(open.iter().all(|i| i.step().is_some()), "{open:?}");
     assert_eq!(PassReason::HostSkipLabel.as_str(), "host_skip_label");
+}
+
+#[test]
+fn held_non_closing_link_waits_for_branch_metadata() {
+    let mut inputs = Inputs {
+        issues: vec![IssueInput {
+            number: 9,
+            labels: labels(&["loom:operator"]),
+            ..IssueInput::default()
+        }],
+        pulls: vec![PullInput {
+            number: 90,
+            labels: labels(&["loom:review-requested"]),
+            body: Some("Part of #9".into()),
+            linkage_unverified: true,
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::OperatorLinkUnverified));
+    assert_eq!(held[0].operator_hold_issue, None);
+    inputs.pulls[0].head_ref = Some("feature/issue-9".into());
+    inputs.pulls[0].same_repo = true;
+    inputs.pulls[0].linkage_unverified = false;
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::Operator));
+    assert_eq!(held[0].operator_hold_issue, Some(9));
+    inputs.pulls[0].head_ref = Some("topic".into());
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Judge));
 }

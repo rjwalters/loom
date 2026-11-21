@@ -422,3 +422,59 @@ fn the_actions_bot_stays_untrusted_for_comments_and_markers() {
         assert!(!p.trusts_json(&v), "{v}");
     }
 }
+
+// ---- #14399: operator authority -------------------------------------------
+
+mod operator_authority {
+    use super::*;
+
+    fn policy() -> TrustPolicy {
+        TrustPolicy::new(
+            FleetLogins::of(&crate::forge_identity::Roster::default()),
+            Some("loom-self[bot]".to_string()),
+            vec!["ci-user".to_string(), "helper[bot]".to_string()],
+        )
+        .with_admins(crate::fleet_store::admins::Admins {
+            logins: vec!["fleet-admin".to_string()],
+            apps: vec!["trusted-app[bot]".to_string()],
+            state: "test".to_string(),
+        })
+    }
+
+    fn author(login: &str, assoc: Option<&str>) -> Author {
+        Author::new(Some(login), assoc)
+    }
+
+    #[test]
+    fn insiders_and_fleet_admins_are_operators() {
+        let p = policy();
+        for a in ["OWNER", "member", "COLLABORATOR"] {
+            assert!(p.is_operator(&author("someone", Some(a))), "{a}");
+        }
+        assert!(p.is_operator(&author("fleet-admin", Some("NONE"))));
+        assert!(p.is_operator(&author("Fleet-Admin", None)));
+    }
+
+    #[test]
+    fn apps_self_allowlist_and_outsiders_are_not() {
+        let p = policy();
+        // Generic trust admits all of these; an operator is narrower.
+        for a in [
+            author("loom-self[bot]", Some("NONE")),
+            author("trusted-app[bot]", Some("NONE")),
+            author("helper[bot]", Some("OWNER")),
+            author("ci-user", Some("CONTRIBUTOR")),
+            author("drive-by", Some("CONTRIBUTOR")),
+            author("drive-by", None),
+        ] {
+            assert!(!p.is_operator(&a), "{a:?}");
+        }
+        assert!(p.trusts(&author("ci-user", Some("CONTRIBUTOR"))), "still a trusted commenter");
+        assert!(!p.is_operator(&Author::default()), "a missing author is nobody");
+        // An App-typed author with an insider association is still an App.
+        let typed = serde_json::json!({
+            "user": {"login": "svc", "type": "Bot"}, "author_association": "OWNER"
+        });
+        assert!(!p.is_operator_json(&typed));
+    }
+}

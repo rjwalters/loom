@@ -58,7 +58,7 @@ pub(crate) enum ChampionHoldCommand {
     /// Decide the ratification hold's tick for a PR (#12992): reads the head
     /// contents of every spec/decision file the PR changes and the trusted
     /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold|
-    /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
+    /// unreadable> action=<none|hold|stands|release|clear> pr=<N>
     /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
     Ratification(TargetArgs),
 
@@ -117,14 +117,16 @@ impl TargetArgs {
     /// The PR's label names, live. `None` when unreadable.
     fn labels(&self, root: &std::path::Path) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{}/labels?per_page=100", self.repo(), self.pr);
-        let out = crate::script_helpers::run_gh(&["api", &path], root, false);
+        let out =
+            crate::script_helpers::gh_read("champion_hold.labels", &["api", &path], root, false);
         let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
         crate::verdict_gate::label_names(&doc)
     }
 
     /// A live REST read of `path`, decoded. `None` when unreadable.
     fn read_json(path: &str, root: &std::path::Path) -> Option<Value> {
-        let out = crate::script_helpers::run_gh(&["api", path], root, false);
+        let out =
+            crate::script_helpers::gh_read("champion_hold.read_json", &["api", path], root, false);
         serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()
     }
 
@@ -240,7 +242,8 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
         .and_then(Value::as_str)
         .unwrap_or_else(|| fail("head"))
         .to_string();
-    let listing = crate::script_helpers::run_gh(
+    let listing = crate::script_helpers::gh_read(
+        "champion_hold.ratify_files",
         &[
             "api",
             &format!("repos/{repo}/pulls/{}/files", t.pr),
@@ -269,7 +272,8 @@ fn ratification_line(t: &TargetArgs, root: &std::path::Path) -> String {
         // Contents are read only for files the path rules select.
         if f.status != "removed" && ratification_candidate(&f, &cfg) {
             let path = format!("repos/{repo}/contents/{}?ref={head}", f.filename);
-            let out = crate::script_helpers::run_gh(
+            let out = crate::script_helpers::gh_read(
+                "champion_hold.head_content",
                 &["api", "-H", "Accept: application/vnd.github.raw", &path],
                 root,
                 false,
@@ -342,7 +346,8 @@ fn calibration_report(
         is_mature, recorded_confidence, summarize, Row, REVERT_WINDOW_DAYS,
     };
     let now = chrono::Utc::now();
-    let list = crate::script_helpers::run_gh(
+    let list = crate::script_helpers::gh_read(
+        "champion_hold.merged_prs",
         &[
             "pr",
             "list",
@@ -479,7 +484,8 @@ fn reverts_by_pr(
     root: &std::path::Path,
 ) -> Result<bool, String> {
     let q = format!("\"Reverts {repo}#{pr}\" in:body");
-    let out = crate::script_helpers::run_gh(
+    let out = crate::script_helpers::gh_read(
+        "champion_hold.revert_search",
         &[
             "pr",
             "list",

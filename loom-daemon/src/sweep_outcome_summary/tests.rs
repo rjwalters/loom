@@ -1,9 +1,7 @@
 //! Unit tests for [`crate::sweep_outcome_summary`] (Issue #8057).
 //!
 //! Extracted to a sibling file rather than left as an inline `#[cfg(test)]`
-//! module: `scripts/check-file-size-budget.sh` counts the whole file
-//! including its tests, on the argument that an agent editing the production
-//! half still pays for the test half sitting in the same buffer.
+//! module.
 
 use super::*;
 
@@ -1187,4 +1185,40 @@ fn group_by_mix_compares_two_mixes_on_merges_bounces_and_cost() {
     let text = render_text(&report);
     assert!(text.contains("grouped by mix"));
     assert!(text.contains(&a.group) && text.contains("REJ") && text.contains("DR_CYC"));
+}
+
+/// #14241: a pre-#8222 record carries `doctor_cycles` with no `judge_verdicts`.
+/// Its cycles are summed (they are not gated on the `BNC_N` denominator), and the
+/// footnote must say so rather than claim both columns share `BNC_N`.
+#[test]
+fn mix_sums_legacy_doctor_cycles_outside_the_bnc_n_denominator() {
+    let mut acc = Accum::default();
+
+    let mut legacy = record("legacy", "o/r", None, SweepResult::Success, 60);
+    legacy.doctor_cycles = Some(2);
+    mix::accumulate_bounces(&mut acc, &legacy);
+    assert_eq!((acc.bounce_records, acc.judge_rejections, acc.doctor_cycles), (0, 0, 2));
+
+    // A current record has both fields and counts toward the denominator.
+    let mut current = record("current", "o/r", None, SweepResult::Success, 60);
+    current.judge_verdicts = Some(vec![crate::telemetry::JudgeVerdict {
+        attempt: 1,
+        verdict: "fail".into(),
+    }]);
+    current.doctor_cycles = Some(1);
+    mix::accumulate_bounces(&mut acc, &current);
+    assert_eq!((acc.bounce_records, acc.judge_rejections, acc.doctor_cycles), (1, 1, 3));
+
+    // `judge_verdicts` alone: counted as a bounce record, adds no cycles.
+    let mut verdicts_only = record("verdicts", "o/r", None, SweepResult::Success, 60);
+    verdicts_only.judge_verdicts = Some(Vec::new());
+    mix::accumulate_bounces(&mut acc, &verdicts_only);
+    assert_eq!((acc.bounce_records, acc.judge_rejections, acc.doctor_cycles), (2, 1, 3));
+
+    // Neither field: unknown, adds to nothing.
+    mix::accumulate_bounces(&mut acc, &record("none", "o/r", None, SweepResult::Success, 60));
+    assert_eq!((acc.bounce_records, acc.judge_rejections, acc.doctor_cycles), (2, 1, 3));
+
+    assert!(mix::MIX_NOTE.contains("every sweep carrying `doctor_cycles`"));
+    assert!(!mix::MIX_NOTE.contains("both summed over the BNC_N"));
 }

@@ -41,8 +41,7 @@ const INCIDENT_RENEWED_SECS_AGO: i64 = 8;
 /// The harness's own `&[&str]` seeding form always stamps both timestamps
 /// at "now", which cannot express the one shape these tests need: a record
 /// created long ago and renewed **in place** moments ago. Writing the store
-/// directly keeps `test_support.rs` untouched (it is over the file-size
-/// ratchet) while modeling exactly what the forge returned during the
+/// directly keeps `test_support.rs` untouched while modeling exactly what the forge returned during the
 /// incident.
 ///
 /// `id` is 1, so this dispatcher's own lease write — which the fake `gh`
@@ -123,7 +122,7 @@ fn dispatch_yields_to_a_renewed_in_session_lease_created_before_the_lookback() {
 
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        gh_calls.contains("loom:lease-yield"),
+        posted_lease_yield(&gh_calls),
         "a standdown annotation must record the yield; gh log: {gh_calls}"
     );
     assert!(
@@ -163,7 +162,7 @@ fn dispatch_yields_to_a_never_renewed_in_session_lease_in_its_first_interval() {
     assert_eq!(lease_err.earliest_host, "in-session-host");
     assert!(!spawn_log.exists(), "the yield must land before any builder spawn");
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-    assert!(gh_calls.contains("loom:lease-yield"), "gh log: {gh_calls}");
+    assert!(posted_lease_yield(&gh_calls), "gh log: {gh_calls}");
 }
 
 /// The anti-wedge complement, and the property
@@ -194,7 +193,7 @@ fn dispatch_proceeds_past_an_old_never_renewed_lease() {
     );
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "no standdown may be posted when nothing live was racing; gh log: {gh_calls}"
     );
 }
@@ -227,7 +226,7 @@ fn dispatch_proceeds_past_a_lease_whose_last_renewal_aged_out_of_the_ttl() {
     );
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "an aged-out lease must not produce a standdown; gh log: {gh_calls}"
     );
 }
@@ -264,8 +263,8 @@ fn a_yield_annotation_is_never_read_back_as_a_lease_record() {
 /// Rewrite the harness's fake `gh` so its `issue view --json labels` arm
 /// reports `labels`, instead of the empty set it hardcodes.
 ///
-/// Patching the generated script in place keeps `test_support.rs` — which is
-/// over the file-size ratchet — untouched, and keeps every other arm
+/// Patching the generated script in place keeps `test_support.rs` untouched,
+/// and keeps every other arm
 /// (comment write, comment read-back, edit, repo view) byte-for-byte the
 /// shared harness's.
 fn set_preflip_labels(ws: &Path, labels: &[&str]) {
@@ -297,7 +296,7 @@ fn set_preflip_labels(ws: &Path, labels: &[&str]) {
 /// the timeline path also matches that glob, and that arm prints an empty line
 /// (the "no label event" fail-open shape every other test in this file relies
 /// on). Patched in place for the same reason `set_preflip_labels` is — keeping
-/// `test_support.rs`, which is over the file-size ratchet, untouched.
+/// `test_support.rs` untouched.
 fn set_claim_labeled_at(ws: &Path, secs_ago: i64) {
     let fake_gh = ws.join("fake-gh.sh");
     let script = std::fs::read_to_string(&fake_gh).unwrap();
@@ -377,7 +376,7 @@ fn dispatch_yields_to_a_young_leaseless_foreign_building_claim() {
 
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        gh_calls.contains("loom:lease-yield"),
+        posted_lease_yield(&gh_calls),
         "a standdown annotation must record the yield; gh log: {gh_calls}"
     );
     assert!(
@@ -475,7 +474,7 @@ fn dispatch_proceeds_past_its_own_truncated_building_flip() {
     assert_eq!(registry.len(), 1, "the dispatched sweep must remain live");
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield")
+        !posted_lease_yield(&gh_calls)
             && !gh_calls.contains("--remove-label loom:building")
             && !gh_calls.contains("--add-label loom:issue"),
         "an own claim must stay building without yielding or resetting; gh log: {gh_calls}"
@@ -519,7 +518,7 @@ fn own_window_fleet_label_does_not_override_a_foreign_lease() {
     assert_eq!(lease_err.earliest_host, "peer-host");
     assert!(!spawn_log.exists());
     let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-    assert!(calls.contains("loom:lease-yield"));
+    assert!(posted_lease_yield(&calls));
     assert!(!calls.contains("--remove-label loom:building"));
 }
 
@@ -555,7 +554,7 @@ fn own_window_label_keeps_yield_when_fresh_lease_evidence_changes() {
         assert!(err.downcast_ref::<LeaseOrderDispatchError>().is_some(), "{mode}: {err:#}");
         assert!(!spawn_log.exists(), "{mode}: must not spawn");
         let calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
-        assert!(calls.contains("loom:lease-yield"), "{mode}: must yield");
+        assert!(posted_lease_yield(&calls), "{mode}: must yield");
         assert!(!calls.contains("--remove-label loom:building"), "{mode}: retain label");
     }
 }
@@ -601,7 +600,7 @@ fn dispatch_proceeds_past_a_leaseless_building_label_older_than_the_grace() {
     );
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "no standdown may be posted for a claim label past the grace; gh log: {gh_calls}"
     );
 }
@@ -719,7 +718,7 @@ fn an_unreadable_forge_fails_closed_without_spawning() {
     assert!(!spawn_log.exists(), "the stand-down must land before any builder spawn");
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "no standdown may be posted when no peer won; gh log: {gh_calls}"
     );
 }

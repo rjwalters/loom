@@ -392,17 +392,21 @@ held_census() {
 #   - unknown_hold_marker: the latest `champion:<X>-hold` comment body whose
 #     marker is NOT in the table ("" when there is none).
 #   - digest_reason_from_body: the per-kind reason rule — merge-risk /
-#     critical-file parse the shared axis bullet; ratification (#12992's
-#     notice has no axis bullet, only a backticked file list) builds the
-#     reason from the notice itself.
+#     critical-file parse the shared axis bullet; ratification reads its
+#     '**Ratification by merge**:' reason bullet (#13875) and falls back to
+#     the backticked file list of pre-#13875 notices (#13885).
 #   - digest_reason_for: the whole Step-1 extraction for one PR's comments,
 #     with the three-way fallback (#14117) — an unknown hold marker is
 #     NAMED, a known-but-fully-cleared hold set is reported as such, and
 #     only a genuine absence reports "no champion hold marker found" (#13885).
 #   - held_at_doctor_count: the census HELD_AT_DOCTOR jq (same marker set as
 #     HOLD_TABLE) over a canned `gh pr list --json labels,comments` payload.
-#   - released_holds: the census RELEASED jq over a canned payload —
-#     including the ratification family (#14117).
+#   - released_holds: the census RELEASED jq over a canned
+#     `gh pr list --json number,comments` payload — merge-risk by any
+#     standing marker, critical-file by its latest marker standing,
+#     ratification by its latest marker being release-respected
+#     (#14117 shipped the family leg; #13875's Test 10D exercises each
+#     kind's own release rule).
 #   - digest_row: format one digest table row (PR number, reason, status),
 #     appending ", out at Doctor" only when the PR carries
 #     loom:changes-requested — same as $HELD_JSON's label check.
@@ -446,13 +450,20 @@ digest_reason_from_body() {
     local reason
     case "$kind" in
         ratification)
-            # The ratification notice's only bullet is a backticked file list —
-            # no axis bullet to parse; build the reason from the notice itself.
-            reason=$(printf '%s\n' "$hold_body" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+            # #13875: the notice's first bullet is a '**Ratification by
+            # merge**: ...' reason line — read it like the other kinds.
+            # Pre-#13875 notices have no axis bullet, only the backticked
+            # file list — build the reason from that (#13885 fallback).
+            reason=$(printf '%s\n' "$hold_body" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
             if [[ -z "$reason" ]]; then
-                echo "ratification hold (file bullet not parseable)"
+                reason=$(printf '%s\n' "$hold_body" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+                if [[ -z "$reason" ]]; then
+                    echo "ratification hold (file bullet not parseable)"
+                else
+                    echo "ratification hold — merging ratifies; operator approves ($reason)"
+                fi
             else
-                echo "ratification hold — merging ratifies; operator approves ($reason)"
+                echo "$reason"
             fi
             ;;
         *)
@@ -1047,6 +1058,24 @@ assert_eq "ratification hold (file bullet not parseable)" \
     "$(digest_reason_for "$(jq -n --arg h "$RAT_NO_FILE_BODY" '[$h]')")" \
     "a ratification hold whose file bullet can't be parsed still names its kind, never 'unrecorded'"
 
+# #13875: the notice gained a leading '**Ratification by merge**:' reason
+# bullet (files folded in; the standalone file-list bullet is gone) — the
+# bullet is read directly, and only a bullet-less notice falls back to the
+# #13885 file-list construction above.
+RATIFICATION_NEW_BODY="<!-- champion:ratification-hold -->
+<!-- champion:hold-state head=def5678 -->
+**Champion: Holding for the Operator — merging ratifies; the operator approves**
+
+This PR adds or changes a spec or decision record that declares it is ratified by merging:
+
+- **Ratification by merge**: declared in \`docs/adr/0042-ratify.md\`, \`docs/specs/thing.md\`; only the operator can release (comment \`clear the hold — <why>\`)
+
+Champion will not merge it, and nothing but you can release it: no standing authorization covers this hold."
+
+assert_eq "**Ratification by merge**: declared in \`docs/adr/0042-ratify.md\`, \`docs/specs/thing.md\`; only the operator can release (comment \`clear the hold — <why>\`)" \
+    "$(digest_reason_for "$(jq -n --arg h "$RATIFICATION_NEW_BODY" '[$h]')")" \
+    "a #13875 notice's reason bullet is read directly — the digest row states kind, files and release path (#13875 AC #2)"
+
 # #13885: an unknown `champion:*-hold` marker is NAMED — the table, not the
 # PR, is what's missing an entry.
 UNKNOWN_HOLD_BODY="<!-- champion:experimental-hold -->
@@ -1183,6 +1212,43 @@ RELEASED_FIXTURE='[
 ]'
 assert_eq "#9001 #9002 #9005" "$(printf '%s\n' "$RELEASED_FIXTURE" | released_holds)" \
     "RELEASED: released ratification hold lists (#9001, #14117), standing merge-risk (#9002) and critical-file (#9005) keep listing; ratification cleared (#9003), bare-held (#9004), quoted (#9006), auto-cleared critical-file (#9007), re-armed ratification (#9008) and marker-less (#9009) do not"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 10D: RELEASED lists every hold kind's released-not-merged PRs, by each kind's own release rule (#13875)"
+# Mirrors the census's RELEASED jq over a canned `gh pr list --json
+# number,comments` payload (the search flags have already narrowed it to
+# open loom:pr PRs without loom:blocked). Merge-risk lists on any standing
+# marker (label removal is its release, precheck (e)); critical-file lists
+# when its LATEST marker still stands (#9016 hand-release; -cleared was an
+# auto-clear, not listed); ratification lists only when its latest marker
+# is release-respected — the label's absence never releases it, and a
+# still-standing marker gets loom:blocked re-armed by the precheck.
+RELEASED_FIXTURE='[
+  {"number":7101,
+   "comments":[{"body":"<!-- champion:ratification-hold -->\n<!-- champion:hold-state head=abc -->"},{"body":"<!-- champion:ratification-release-respected -->\n<!-- champion:hold-state head=abc -->"}]},
+  {"number":7102,
+   "comments":[{"body":"<!-- champion:ratification-hold -->"},{"body":"<!-- champion:ratification-hold-cleared -->"}]},
+  {"number":7103,
+   "comments":[{"body":"<!-- champion:ratification-hold -->\n<!-- champion:hold-state head=abc -->"}]},
+  {"number":7104,
+   "comments":[{"body":"<!-- champion:merge-risk-hold -->\n**Recency**: base moved"}]},
+  {"number":7105,
+   "comments":[{"body":"<!-- champion:critical-file-hold -->"}]},
+  {"number":7106,
+   "comments":[{"body":"<!-- champion:critical-file-hold -->"},{"body":"<!-- champion:critical-file-hold-cleared -->"}]},
+  {"number":7107,
+   "comments":[{"body":"text quoting \"<!-- champion:ratification-release-respected -->\" mid-comment"},{"body":"<!-- champion:ratification-hold -->\n<!-- champion:hold-state head=abc -->"}]}
+]'
+assert_eq "#7101 #7104 #7105" "$(printf '%s\n' "$RELEASED_FIXTURE" | released_holds)" \
+    "RELEASED: operator-released ratification (#7101), hand-released merge-risk (#7104) and #9016 critical-file (#7105) are listed; ratification-hold-cleared (#7102), standing ratification without the label (#7103, precheck re-arms it), critical-file-cleared (#7106) and a quoted marker mid-comment (#7107, startswith #5371) are not (#13875 AC #3)"
+
+# Regression: the pre-#13875 RELEASED selector (merge-risk + critical-file
+# legs only) missed the operator-released ratification PR — pin the delta.
+OLD_RELEASED_JQ='"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
+    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")'
+assert_eq "#7104 #7105" "$(printf '%s\n' "$RELEASED_FIXTURE" | jq -r "$OLD_RELEASED_JQ")" \
+    "pre-#13875 selector missed the operator-released ratification PR (the defect this fix removes)"
 echo
 
 # ---------------------------------------------------------------------

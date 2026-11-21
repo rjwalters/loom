@@ -28,7 +28,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 
 use crate::pi_usage::{self, PiMessageUsage};
 
@@ -81,7 +80,8 @@ impl PiUsageArgs {
     /// Propagates an invalid `--since`/`--until`, or a current-directory
     /// lookup failure when `--directory` was not given.
     pub(crate) fn run(self) -> Result<()> {
-        let window = self.window()?;
+        let window =
+            super::usage_window::resolve(&self.since, self.until.as_deref(), self.all_time)?;
         let log = self.log_path()?;
         let messages = pi_usage::messages_in_log(&log, window);
         let readable = messages.is_some();
@@ -163,23 +163,6 @@ impl PiUsageArgs {
             (None, Some(issue)) => crate::launch_record::sweep_log_path(&root, issue),
             (None, None) => anyhow::bail!("pass --issue <N> or --role <ROLE>"),
         })
-    }
-
-    /// Identical to `opencode-usage`'s and `codex-usage`'s window resolution,
-    /// so one window has one spelling across every runtime.
-    fn window(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        if self.all_time {
-            return Ok(None);
-        }
-        let now = Utc::now();
-        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
-        let until = match &self.until {
-            Some(raw) => DateTime::parse_from_rfc3339(raw)
-                .with_context(|| format!("--until {raw:?} is not RFC3339"))?
-                .with_timezone(&Utc),
-            None => now,
-        };
-        Ok(Some((since, until)))
     }
 }
 

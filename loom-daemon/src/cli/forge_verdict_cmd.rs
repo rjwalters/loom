@@ -29,7 +29,7 @@ const fn journal_action(kind: VerdictKind) -> &'static str {
 /// The PR's label names, live (uncached). `None` when the read failed.
 fn read_labels(repo: &str, pr: u64, root: &Path) -> Option<Vec<String>> {
     let path = format!("repos/{repo}/issues/{pr}/labels?per_page=100");
-    let out = crate::script_helpers::run_gh(&["api", &path], root, false);
+    let out = crate::script_helpers::gh_read("verdict.labels", &["api", &path], root, false);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     gate::label_names(&doc)
 }
@@ -73,7 +73,8 @@ fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit
         format!("i={n}"),
     ];
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = crate::script_helpers::run_gh(&argv, root, false);
+    let out =
+        crate::script_helpers::gh_route::gh_read_for_repo("verdict.body_edits", &argv, root, repo);
     let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
     let nodes = doc
         .pointer("/data/repository/issueOrPullRequest/userContentEdits/nodes")?
@@ -94,6 +95,17 @@ fn read_body_edits(repo: &str, n: u64, root: &Path) -> Option<Vec<gate::BodyEdit
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+#[test]
+fn body_edits_use_the_named_repositorys_reader() {
+    let response = serde_json::json!({
+        "data": {"repository": {"issueOrPullRequest": {"userContentEdits": {"nodes": []}}}}
+    });
+    crate::gh_invocation::test_routing::assert_pooled_query("target/widget", &response, |root| {
+        read_body_edits("target/widget", 7, root).is_some_and(|edits| edits.is_empty())
+    });
 }
 
 /// The issues an approval is checked against for a stale read (#12614): those
@@ -248,9 +260,14 @@ pub(crate) fn verdict_reconcile(
     // exactly one stands. A failed delete is an unconfirmed state, not a pass.
     if let gate::Reconciled::Duplicate(id) = &outcome {
         let path = format!("repos/{repo}/issues/comments/{id}");
-        let deleted = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false)
-            .ok_output()
-            .is_some();
+        let deleted = crate::script_helpers::gh_write(
+            "verdict.withdraw_comment",
+            &["api", "-X", "DELETE", &path],
+            &root,
+            false,
+        )
+        .ok_output()
+        .is_some();
         if !deleted {
             println!(
                 "{} UNREAD duplicate comment {id} could not be withdrawn",
@@ -281,7 +298,7 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     // Never delete the source/claim labels unless the add landed: a failed
     // POST followed by the DELETEs would drop the PR out of its queue with
     // no verdict label to replace it.
-    if crate::script_helpers::run_gh(&argv, &root, false)
+    if crate::script_helpers::gh_write("verdict.add_labels", &argv, &root, false)
         .ok_output()
         .is_none()
     {
@@ -297,7 +314,12 @@ pub(crate) fn verdict_labels(pr: u64, repo: &str, verdict: &str, sha: Option<&st
     // is what decides success, so the individual results are not consulted.
     for l in remove {
         let path = format!("{base}/{}", l.replace(':', "%3A"));
-        let _ = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], &root, false);
+        let _ = crate::script_helpers::gh_write(
+            "verdict.remove_label",
+            &["api", "-X", "DELETE", &path],
+            &root,
+            false,
+        );
     }
     let problems = match read_labels(repo, pr, &root) {
         Some(labels) => gate::label_problems(kind, &labels),
@@ -355,7 +377,12 @@ impl GhHandback<'_> {
 impl crate::doctor_handback::Forge for GhHandback<'_> {
     fn read(&mut self) -> Option<crate::doctor_handback::Snapshot> {
         // One `pulls/{n}` read carries both labels and head, so they agree.
-        let out = crate::script_helpers::run_gh(&["api", &self.pull], self.root, false);
+        let out = crate::script_helpers::gh_read(
+            "verdict.handback_read",
+            &["api", &self.pull],
+            self.root,
+            false,
+        );
         if !out.succeeded() {
             self.note("pull read (labels+head)", &out);
             return None;
@@ -382,7 +409,7 @@ impl crate::doctor_handback::Forge for GhHandback<'_> {
     fn add(&mut self, label: &str) -> bool {
         let field = format!("labels[]={label}");
         let argv = ["api", "-X", "POST", &self.labels, "-f", &field];
-        let out = crate::script_helpers::run_gh(&argv, self.root, false);
+        let out = crate::script_helpers::gh_write("verdict.handback_add", &argv, self.root, false);
         if !out.succeeded() {
             self.note(&format!("label add {label}"), &out);
         }
@@ -390,7 +417,12 @@ impl crate::doctor_handback::Forge for GhHandback<'_> {
     }
     fn remove(&mut self, label: &str) -> bool {
         let path = format!("{}/{}", self.labels, label.replace(':', "%3A"));
-        let out = crate::script_helpers::run_gh(&["api", "-X", "DELETE", &path], self.root, false);
+        let out = crate::script_helpers::gh_write(
+            "verdict.handback_remove",
+            &["api", "-X", "DELETE", &path],
+            self.root,
+            false,
+        );
         if !out.succeeded() {
             self.note(&format!("label remove {label}"), &out);
         }
@@ -582,7 +614,8 @@ pub(crate) fn doctor_handback(
                 (outcome, _) => outcome,
             }
         }
-        Err(holder_age) => hb::lock_held_outcome(pr, holder_age, wait),
+        Err(LockError::Held(holder_age)) => hb::lock_held_outcome(pr, holder_age, wait),
+        Err(LockError::Unavailable(err)) => hb::lock_unavailable_outcome(pr, &lock, &err),
     };
     ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
     let (line, code) = outcome.render();
@@ -603,19 +636,41 @@ fn lock_path(pr: u64, repo: &str) -> std::path::PathBuf {
     base.join(format!("{}-{pr}", repo.replace('/', "_")))
 }
 
+/// Why [`acquire_lock`] refused.
+#[derive(Debug)]
+enum LockError {
+    /// Another verdict holds the lock; carries the held directory's age when it
+    /// could be read (#14165).
+    Held(Option<std::time::Duration>),
+    /// The lock directory cannot be created at all (read-only filesystem,
+    /// permission denied, a parent that is not a directory): waiting cannot
+    /// help, so this is reported at once and never as contention (#14617).
+    Unavailable(std::io::Error),
+}
+
 /// Take the lock: `mkdir` is the atomic step. A holder that never released
 /// (crashed) is reaped once its directory is older than [`LOCK_STALE`].
-/// `Err(holder_age)` — the held directory's age when it could be read —
-/// names the refusal for the caller's message (#14165).
-fn acquire_lock(dir: &Path, wait: std::time::Duration) -> Result<(), Option<std::time::Duration>> {
+/// `Err(Held(age))` names the contention refusal for the caller's message
+/// (#14165); `Err(Unavailable(e))` is a lock that could never be taken, refused
+/// without waiting (#14617).
+fn acquire_lock(dir: &Path, wait: std::time::Duration) -> Result<(), LockError> {
     const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(300);
     if let Some(parent) = dir.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        // Another verdict may create the parent first; only a parent that is
+        // still missing afterwards makes the lock unavailable.
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            if !parent.is_dir() {
+                return Err(LockError::Unavailable(err));
+            }
+        }
     }
     let deadline = std::time::Instant::now() + wait;
     loop {
-        if std::fs::create_dir(dir).is_ok() {
-            return Ok(());
+        match std::fs::create_dir(dir) {
+            Ok(()) => return Ok(()),
+            // The only contention signal: someone else's lock is there.
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(LockError::Unavailable(err)),
         }
         let age = std::fs::metadata(dir)
             .and_then(|m| m.modified())
@@ -626,7 +681,7 @@ fn acquire_lock(dir: &Path, wait: std::time::Duration) -> Result<(), Option<std:
             continue;
         }
         if std::time::Instant::now() >= deadline {
-            return Err(age);
+            return Err(LockError::Held(age));
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
@@ -641,19 +696,30 @@ pub(crate) fn verdict_lock(action: &str, pr: u64, repo: &str) -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(90);
-            if let Err(holder_age) = acquire_lock(&dir, std::time::Duration::from_secs(wait)) {
-                let age = holder_age.map_or_else(
-                    || "an unknown age".to_string(),
-                    |a| format!("{:.0}s", a.as_secs_f32()),
-                );
-                eprintln!(
-                    "forge verdict-lock: lock held (holder age {age}); could not take {} within \
-                     {wait}s; another verdict on PR #{pr} is in flight",
-                    dir.display()
-                );
-                std::process::exit(9)
+            match acquire_lock(&dir, std::time::Duration::from_secs(wait)) {
+                Ok(()) => Ok(()),
+                Err(LockError::Held(holder_age)) => {
+                    let age = holder_age.map_or_else(
+                        || "an unknown age".to_string(),
+                        |a| format!("{:.0}s", a.as_secs_f32()),
+                    );
+                    eprintln!(
+                        "forge verdict-lock: lock held (holder age {age}); could not take {} \
+                         within {wait}s; another verdict on PR #{pr} is in flight",
+                        dir.display()
+                    );
+                    std::process::exit(9)
+                }
+                Err(LockError::Unavailable(err)) => {
+                    eprintln!(
+                        "forge verdict-lock: cannot create the lock directory {}: {err}; no other \
+                         verdict holds it, so waiting would not help (set LOOM_VERDICT_LOCK_DIR \
+                         to a writable directory)",
+                        dir.display()
+                    );
+                    std::process::exit(1)
+                }
             }
-            Ok(())
         }
         "release" => {
             let _ = std::fs::remove_dir(&dir);
@@ -692,10 +758,39 @@ mod lock_tests {
         let _ = std::fs::remove_dir_all(&lock);
         std::fs::create_dir(&lock).unwrap();
         match acquire_lock(&lock, Duration::from_millis(0)) {
-            Err(Some(age)) => assert!(age.as_nanos() > 0, "the holder's age must be reported"),
+            Err(LockError::Held(Some(age))) => {
+                assert!(age.as_nanos() > 0, "the holder's age must be reported");
+            }
             other => panic!("a held lock must refuse with its age, got {other:?}"),
         }
         std::fs::remove_dir(&lock).unwrap();
+    }
+
+    #[test]
+    fn an_uncreatable_lock_parent_is_refused_at_once_not_as_contention() {
+        // A parent beneath a regular file fails portably (ENOTDIR) and does not
+        // depend on the test user's privileges (#14617).
+        let file = std::env::temp_dir().join(format!("loom-vlock-file-{}", std::process::id()));
+        std::fs::write(&file, b"not a directory").unwrap();
+        let lock = file.join("locks").join("owner_repo-1");
+        let started = std::time::Instant::now();
+        let outcome = acquire_lock(&lock, Duration::from_secs(30));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "an unavailable lock must not wait out the contention deadline"
+        );
+        match outcome {
+            Err(LockError::Unavailable(err)) => {
+                let (line, code) =
+                    crate::doctor_handback::lock_unavailable_outcome(9, &lock, &err).render();
+                assert_eq!(code, crate::doctor_handback::EXIT_FAILED);
+                assert!(line.contains("owner_repo-1"), "the path must be named: {line}");
+                assert!(line.contains(&err.to_string()), "the OS error must be named: {line}");
+                assert!(!line.contains("lock held"), "not contention wording: {line}");
+            }
+            other => panic!("an uncreatable parent must be Unavailable, got {other:?}"),
+        }
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]

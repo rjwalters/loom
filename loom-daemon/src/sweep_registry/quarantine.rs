@@ -425,9 +425,6 @@ impl SweepRegistry {
         // dispatch-backoff window — otherwise a cleared quarantine could still
         // be held back for up to `DispatchBackoffConfig::max`, making the
         // operator command look like it did nothing.
-        // #11930: and the fleet's fast-failure streak, here and on the peers;
-        // otherwise the first failure after the clear re-parks on stale counts.
-        self.break_fleet_fast_fail_streak(issue);
         // #13919: and the captain's count and park order, which is what
         // refuses the item fleet-wide while a captain-ordered park stands.
         // Sent whether or not this host holds the park: the operator may run
@@ -1175,6 +1172,7 @@ impl SweepRegistry {
 )]
 mod tests {
     use super::*;
+    use crate::env_test_support::EnvGuard;
     use crate::sweep_registry::test_support::*;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
@@ -2530,7 +2528,7 @@ exit 0
         // process-wide for the daemon, #4458) and the assertion below fails
         // even though the no-op production behavior it exercises is
         // unaffected.
-        let _env_guard = ClearedGhConfigDirEnv::new();
+        let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
         crate::credential_preflight::clear_owner_root_registry();
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh.log");

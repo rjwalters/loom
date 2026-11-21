@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::operator_decision::cli::WorkflowWriter;
 use crate::park_record::{self, BlockerRef, ParkRecord, Withdrawn};
 
 #[derive(clap::Subcommand)]
@@ -55,6 +56,10 @@ pub(crate) enum ParkRecordCommand {
     /// no-op outside a role tick. Exit 0 always.
     Decision(DecisionArgs),
 
+    /// Report whether Guide may route a parked conflict to Doctor for this
+    /// base. Prints enabled, disabled, or stacked. Unreadable policy fails.
+    GuideConflictRoute(GuideConflictRouteArgs),
+
     /// Withdraw one declared blocker (#13895): wrap every live park marker
     /// naming `--blocked-by` in an inline code span — marker text unchanged,
     /// so `parse`/`blockers` stop reading it — and append one visible
@@ -65,6 +70,35 @@ pub(crate) enum ParkRecordCommand {
     /// the caller or Guide's unblock sweep does. Re-parking appends a fresh
     /// record with `apply --blocked-by`.
     Retract(RetractArgs),
+}
+
+#[derive(clap::Args)]
+pub(crate) struct GuideConflictRouteArgs {
+    /// The exact base ref name from a direct PR snapshot.
+    #[arg(long)]
+    base_ref: String,
+
+    /// Repository whose effective policy applies.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+}
+
+impl GuideConflictRouteArgs {
+    fn run(self) -> Result<()> {
+        if self.base_ref.trim().is_empty() {
+            anyhow::bail!("the direct PR base ref is unknown");
+        }
+        let disposition =
+            if crate::merge_pr::stacked_children::is_stackable_parent_branch(&self.base_ref) {
+                "stacked"
+            } else if crate::stale_blocked::guide_conflict_route_enabled(&self.workspace)? {
+                "enabled"
+            } else {
+                "disabled"
+            };
+        println!("{disposition}");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -234,12 +268,61 @@ pub(crate) struct ParseArgs {
     pub json: bool,
 }
 
+/// `loom-tools park-record <action>`: the [`ParkRecordCommand`] tree, unchanged
+/// (#14464, epic #12708 Phase 3b). `loom-tools` and `loom-daemon park-record`
+/// parse the one clap family and run the one handler in-process, so there is no
+/// second implementation to drift. The field is private so the crate-private
+/// command type does not leak into the public API.
+#[derive(clap::Args)]
+pub struct ParkRecordCli {
+    #[command(subcommand)]
+    command: ParkRecordCommand,
+}
+
+impl ParkRecordCli {
+    /// Whether this invocation can reach the forge, and so must pass the mode
+    /// gate (design §10.3) before it runs. Classified by effect, not by verb:
+    /// `render`, `parse`, `retract --file`, `released` and `decision` touch only
+    /// argv, stdin, a file or the local role journal; `apply` (a dry-run still
+    /// reads the target and any blocker) and a forge `retract` do reach it.
+    #[must_use]
+    pub fn reaches_forge(&self) -> bool {
+        self.command.reaches_forge()
+    }
+}
+
+/// Run the park-record action through the one shared handler.
+///
+/// # Errors
+/// Whatever the handler returns; most actions exit the process themselves with
+/// their documented exit codes.
+pub fn handle_park_record_command(cli: ParkRecordCli) -> Result<()> {
+    let writer = WorkflowWriter::for_tools(cli.reaches_forge())?;
+    cli.command.run(writer)
+}
+
 impl ParkRecordCommand {
-    pub(crate) fn run(self) -> Result<()> {
+    /// See [`ParkRecordCli::reaches_forge`]. An exhaustive `match` with no
+    /// wildcard: a new action does not compile until its author says whether it
+    /// reaches the forge.
+    pub(crate) fn reaches_forge(&self) -> bool {
+        match self {
+            ParkRecordCommand::Render(_)
+            | ParkRecordCommand::Parse(_)
+            | ParkRecordCommand::Released(_)
+            | ParkRecordCommand::Decision(_)
+            | ParkRecordCommand::GuideConflictRoute(_) => false,
+            ParkRecordCommand::Apply(_) => true,
+            // `--file` composes against a local body: the forge is never read.
+            ParkRecordCommand::Retract(args) => args.file.is_none(),
+        }
+    }
+
+    pub(crate) fn run(self, writer: WorkflowWriter) -> Result<()> {
         match self {
             ParkRecordCommand::Render(args) => args.run(),
             ParkRecordCommand::Parse(args) => args.run(),
-            ParkRecordCommand::Apply(args) => args.run(),
+            ParkRecordCommand::Apply(args) => args.run(writer),
             ParkRecordCommand::Released(args) => {
                 args.run();
                 Ok(())
@@ -248,7 +331,8 @@ impl ParkRecordCommand {
                 args.run();
                 Ok(())
             }
-            ParkRecordCommand::Retract(args) => args.run(),
+            ParkRecordCommand::Retract(args) => args.run(writer),
+            ParkRecordCommand::GuideConflictRoute(args) => args.run(),
         }
     }
 }
@@ -329,8 +413,8 @@ impl DecisionArgs {
 
 impl ApplyArgs {
     /// Never returns: exits with the command's own code.
-    fn run(self) -> Result<()> {
-        use crate::operator_decision::cli::{default_repo_root, GhForge};
+    fn run(self, writer: WorkflowWriter) -> Result<()> {
+        use crate::operator_decision::cli::default_repo_root;
         use crate::park_record::apply::{apply, ApplyRequest};
         let is_pr = self.issue.is_none() && self.pr.is_some();
         let req = ApplyRequest {
@@ -346,7 +430,7 @@ impl ApplyArgs {
             transient: self.transient,
             jitter: random_unit(),
         };
-        let mut forge = GhForge::new(default_repo_root(), self.repo);
+        let mut forge = writer.forge(default_repo_root(), self.repo);
         let code = apply(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr());
         crate::park_record::apply::journal_applied(&req, is_pr, code);
         std::process::exit(code)
@@ -355,8 +439,8 @@ impl ApplyArgs {
 
 impl RetractArgs {
     /// Never returns: exits with the command's own code.
-    fn run(self) -> Result<()> {
-        use crate::operator_decision::cli::{default_repo_root, GhForge};
+    fn run(self, writer: WorkflowWriter) -> Result<()> {
+        use crate::operator_decision::cli::default_repo_root;
         use crate::park_record::apply::{retract, RetractRequest};
         let req = RetractRequest {
             number: self.issue.or(self.pr).unwrap_or_default(),
@@ -385,7 +469,7 @@ impl RetractArgs {
                 )
             }
             None => {
-                let mut forge = GhForge::new(default_repo_root(), self.repo);
+                let mut forge = writer.forge(default_repo_root(), self.repo);
                 retract(&mut forge, &req, &mut std::io::stdout(), &mut std::io::stderr())
             }
         };

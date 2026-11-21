@@ -100,6 +100,15 @@ const TABLE: &[(&str, Reloadability)] = &[
     // Read from the workspace's effective config on every landed pre-filter
     // call (#12205) — `work_finder::landed_prefilter::prefilter_enabled`, never cached.
     ("autonomous.workFinder.landedPrefilter", Reloadability::Live),
+    // Re-read from the daemon root's effective config on every session
+    // reconcile pass (#14111) — `session_reconcile::converge_bindings` calls
+    // `bindings::read` each tick. The rest of `autonomous.sessionReconcile`
+    // (`enabled`, `intervalSecs`) is resolved once in `spawn_from_config`, so
+    // it keeps the restart-required default. `privateCloneSets` (#14699) is
+    // read by the same `bindings::parse` call, so it is live for the same
+    // reason.
+    ("autonomous.sessionReconcile.privateClones", Reloadability::Live),
+    ("autonomous.sessionReconcile.privateCloneSets", Reloadability::Live),
     // #12246: the per-agent-scope `MemoryMax` knobs are resolved by
     // `loom-daemon ram-scope-limit`, a fresh process per agent spawn
     // (`ram_scope_limit::resolve`), never cached by the daemon.
@@ -231,6 +240,13 @@ mod tests {
     fn fleet_dispatch_flag_and_url_are_live() {
         assert_eq!(classify("fleetDispatch.enabled"), Reloadability::Live);
         assert_eq!(classify("fleetDispatch.url"), Reloadability::Live);
+    }
+
+    #[test]
+    fn session_reconcile_bindings_and_sets_are_live() {
+        // #14111/#14699: `bindings::read` re-reads both keys every pass.
+        assert_eq!(classify("autonomous.sessionReconcile.privateClones"), Reloadability::Live);
+        assert_eq!(classify("autonomous.sessionReconcile.privateCloneSets"), Reloadability::Live);
     }
 
     #[test]
