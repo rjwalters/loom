@@ -121,6 +121,14 @@ pub const RELEASE_RESOLVE_AND_FETCH: ForgeOp = ForgeOp::inventoried("release.res
 /// Re-run a workflow run or job in place (`forge rerun`, #10633).
 pub const CI_RERUN: ForgeOp = ForgeOp::inventoried("ci.rerun");
 
+/// `GET repos/{o}/{r}/compare/{base}...{head}` — the compare read the
+/// ci-gate update path uses for a PR's merge base and base tip (#14813).
+pub const PR_COMMITS_AND_COMPARE: ForgeOp = ForgeOp::inventoried("pr.commits-and-compare");
+
+/// `PUT repos/{o}/{r}/pulls/{n}/update-branch` — the server-side,
+/// expected-head-guarded update of a PR branch from its base (#14813).
+pub const BRANCH_UPDATE_FROM_BASE: ForgeOp = ForgeOp::inventoried("branch.update-from-base");
+
 /// Every inventoried constant above — the set the inventory test checks.
 pub const ALL_INVENTORIED: &[ForgeOp] = &[
     ISSUE_LIST,
@@ -156,4 +164,6 @@ pub const ALL_INVENTORIED: &[ForgeOp] = &[
     COMMENT_EDIT_DELETE,
     PR_DIFF_AND_FILES,
     RELEASE_RESOLVE_AND_FETCH,
+    PR_COMMITS_AND_COMPARE,
+    BRANCH_UPDATE_FROM_BASE,
 ];

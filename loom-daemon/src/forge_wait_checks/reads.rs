@@ -166,6 +166,15 @@ impl GhReads {
         self.target.repo.as_deref().unwrap_or_default()
     }
 
+    /// The repository this reader resolved (`owner/repo`), so a caller can
+    /// build the same absolute REST URL the reader would (the compare read,
+    /// #14813); `None` before resolution — never the case behind
+    /// [`Self::new`]'s `Ok`.
+    #[must_use]
+    pub fn repo(&self) -> Option<&str> {
+        self.target.repo.as_deref()
+    }
+
     /// `GET repos/{o}/{r}/pulls/{n}` → head SHA and base branch.
     pub fn pull(&mut self, number: u32) -> Result<PullHead, ReadError> {
         let url = crate::forge_cached_view::build_view_url("pr", Some(self.nwo()), number);
