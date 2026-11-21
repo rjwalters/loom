@@ -74,6 +74,7 @@
 
 pub mod apply;
 mod code;
+pub(crate) use code::blank_block_code;
 
 use regex::Regex;
 use std::collections::BTreeSet;
