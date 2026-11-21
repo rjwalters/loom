@@ -654,8 +654,23 @@ EOF
 same='{"headRefName":"feature/issue-71","isCrossRepository":false,"headRepository":{"nameWithOwner":"Fixture/Loom"}}'
 fork='{"headRefName":"feature/issue-71","isCrossRepository":true,"headRepository":{"nameWithOwner":"another/loom"}}'
 ad_hoc='{"headRefName":"fix/ad-hoc","isCrossRepository":false,"headRepository":{"nameWithOwner":"fixture/loom"}}'
+# Match the shared Forge slug validator's per-segment bounds and dot rules.
+long_segment=$(printf '%101s' '' | tr ' ' 'a')
+max_segment=${long_segment%a}
+fork_named() {
+    jq -cn --arg slug "$1" '{headRefName:"feature/issue-71",isCrossRepository:true,headRepository:{nameWithOwner:$slug}}'
+}
 for role in judge doctor; do
     run_selection "$role" fork-collision "$fork" present real 'PR helper'
+    run_selection "$role" valid-dotted-repo "$(fork_named 'another/.github')" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" max-length-slug "$(fork_named "$max_segment/$max_segment")" absent ready $'PR helper\nentered pr-71'
+    run_selection "$role" invalid-owner-dot "$(fork_named '.team/loom')" present ready ''
+    run_selection "$role" invalid-owner-hyphen "$(fork_named '-team/loom')" present ready ''
+    run_selection "$role" invalid-repo-hyphen "$(fork_named 'another/-loom')" present ready ''
+    run_selection "$role" invalid-repo-single-dot "$(fork_named 'another/.')" present ready ''
+    run_selection "$role" invalid-repo-double-dot "$(fork_named 'another/..')" present ready ''
+    run_selection "$role" overlong-owner "$(fork_named "$long_segment/loom")" present ready ''
+    run_selection "$role" overlong-repo "$(fork_named "another/$long_segment")" present ready ''
     run_selection "$role" fork-without-holder "$fork" absent ready $'PR helper\nentered pr-71'
     run_selection "$role" ad-hoc "$ad_hoc" absent ready $'PR helper\nentered pr-71'
     run_selection "$role" helper-failure "$fork" absent failed 'PR helper'

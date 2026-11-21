@@ -116,7 +116,8 @@ PR_BRANCH=$(jq -ers --arg base "$BASE_REPO" '
   | select((.isCrossRepository | type) == "boolean")
   | . as $pr
   | .headRepository.nameWithOwner | strings
-  | select(test("^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+\\z"))
+  | select(test("^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,99}/[a-zA-Z0-9_.][a-zA-Z0-9_.-]{0,99}\\z"))
+  | select((split("/")[1]) as $repo | $repo != "." and $repo != "..")
   | select(((ascii_downcase) != ($base | ascii_downcase)) == $pr.isCrossRepository)
   | $pr.headRefName | strings | select(test("[[:cntrl:]]") | not)
 ' <<<"$PR_HEAD") || exit 1
