@@ -59,10 +59,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 pub use crate::fs_util::human_size;
 use crate::fs_util::newest_mtime_and_size;
+use crate::host_wide_cooldown::HostWideCooldown;
 use chrono::{DateTime, Utc};
 
 // ============================================================================
@@ -613,41 +613,26 @@ pub fn log_report(report: &TmpfsReclaimReport) {
 /// Process-global "when did a pass last actually evaluate the mount table" —
 /// host-wide (not per-repo): a `tmpfs` mount is not scoped to any one
 /// registered repo, and a host with several repos ticking on the same reaper
-/// cadence must not re-walk `/proc/mounts` once per repo per tick.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// cadence must not re-walk `/proc/mounts` once per repo per tick. The
+/// elapsed/record logic lives in the shared [`HostWideCooldown`]; the
+/// instance is this module's own, so a pass here never suppresses the
+/// Docker or native-state passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    *last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    COOLDOWN.reset();
 }
 
 /// Run one production pass, honoring the host-wide cooldown, and log the
@@ -1213,32 +1198,8 @@ overlay /var/lib/docker/overlay2/abc overlay rw 0 0
     // ===================================================================
     // Cooldown (host-wide, not per-repo)
     // ===================================================================
-
-    #[test]
-    #[serial(tmpfs_reclaim_env)]
-    fn cooldown_elapsed_is_true_before_any_evaluation() {
-        reset_state_for_test();
-        assert!(cooldown_elapsed(t(0), 1_800));
-        reset_state_for_test();
-    }
-
-    #[test]
-    #[serial(tmpfs_reclaim_env)]
-    fn a_recent_evaluation_holds_the_cooldown() {
-        reset_state_for_test();
-        record_evaluated(t(0));
-        assert!(!cooldown_elapsed(t(60), 1_800));
-        reset_state_for_test();
-    }
-
-    #[test]
-    #[serial(tmpfs_reclaim_env)]
-    fn the_cooldown_expires() {
-        reset_state_for_test();
-        record_evaluated(t(0));
-        assert!(cooldown_elapsed(t(1_801), 1_800));
-        reset_state_for_test();
-    }
+    // The elapsed/record calculation itself is unit-tested once in
+    // `host_wide_cooldown`; what remains here is this pass's own behavior.
 
     #[test]
     #[serial(tmpfs_reclaim_env)]

@@ -949,7 +949,18 @@ same key and the same rules, so step duration and load can be read by size:
   key, `none` when nothing could launch) and `loom.role_draw.attempt` (#14233)
   on a spawned step a `runtimes.roleDraw` table decided; neither key on a step
   no table decided, or one refused before launch, never `0` or `none` as a
-  stand-in. They are the role tick's keys, same names and spelling. **Not
+  stand-in. The same span adds `loom.role_draw.first_pick` (candidate key),
+  `.layer` (config tier), `.table_attempt` (configured attempt table), `.table`
+  (compact ordered JSON pairs `[["codex","999"],["claude","1"]]`), and
+  `.passed_over` (walk-order pairs `[["codex","no-credential"]]`). Weights are
+  decimal strings so the complete unsigned 64-bit value survives decoding.
+  The skip reasons are `not-admitted`, `no-credential`, `launch-hold`,
+  `ceiling` and `runtime-unavailable` (missing executable). No diagnostic text,
+  excluded entries or seed inputs are sent. A first pick, table or skip list
+  that cannot be represented safely within the 256-byte span attribute limit
+  is omitted in full. A missing table, or a missing skip list when the first
+  and final picks differ, is unavailable for comparison. The skip list is
+  also absent when the first roll won and nothing was skipped. **Not
   `loom.step.draw_attempt`**: that is the 1-based item redraw count within a
   dispatch slot. Stage steps draw attempt 1 (no failure feed, #14235), so
   `loom.role_draw.attempt` on this span stays `1` until one lands.
