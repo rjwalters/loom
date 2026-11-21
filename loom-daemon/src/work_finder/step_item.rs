@@ -53,7 +53,7 @@
 //! | a claim label (see below), on the PR or any open issue it links | pass `claimed` |
 //! | PR in GitHub's merge queue | pass `queued` |
 //! | issue's linked PR is another item's | pass `shared_pr` |
-//! | PR `loom:sequenced` | pass `sequenced` |
+//! | PR `loom:sequenced` without both `loom:changes-requested` and `loom:merge-conflict` | pass `sequenced` |
 //! | PR `loom:pr` + `loom:blocked` + trusted Champion hold marker | Champion hold re-evaluation |
 //! | PR `loom:changes-requested` + `loom:blocked` + hold marker, Doctor cycle not capped | Doctor |
 //! | PR `loom:review-requested` + `loom:blocked` + hold marker | Judge |
@@ -904,12 +904,16 @@ fn decide(
 /// The PR rows of the table.
 fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     let step = |s: ItemState, st: Step| (s, Verdict::Step(st));
-    if has(labels, SEQUENCED) {
+    let changes_requested = has(labels, CHANGES_REQUESTED);
+    let conflict_repair = changes_requested && has(labels, MERGE_CONFLICT);
+    // A conflict repair can update the follower against its base while the
+    // sequencing label continues to fence the merge (#14812).
+    if has(labels, SEQUENCED) && !conflict_repair {
         return (ItemState::Sequenced, Verdict::Pass(PassReason::Sequenced));
     }
     if super::is_blocked_hold(labels) {
         let hold = pr.markers.champion_hold;
-        if hold && has(labels, APPROVED) && !has(labels, CHANGES_REQUESTED) {
+        if hold && has(labels, APPROVED) && !changes_requested {
             return step(ItemState::Held, Step::ChampionHoldReevaluate);
         }
         if hold && !pr.markers.doctor_cycle_capped && crate::champion_hold::doctor_shape(labels) {
@@ -922,7 +926,7 @@ fn decide_pr(pr: &PullInput, labels: &[String]) -> (ItemState, Verdict) {
     }
     // Verdict-label precedence: `loom:pr` always loses to the other verdicts
     // (Champion's Verdict-State Janitor), so a contradictory PR is never merged.
-    if has(labels, CHANGES_REQUESTED) {
+    if changes_requested {
         step(ItemState::ChangesRequested, Step::Doctor)
     } else if has(labels, REVIEW_REQUESTED) {
         step(ItemState::ReviewRequested, Step::Judge)
