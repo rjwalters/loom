@@ -65,7 +65,7 @@ pub mod relay;
 mod traces;
 mod transport;
 
-use transport::{post, Signal};
+use transport::{post_batch, BatchResponse, ResponseOutcome, Signal};
 
 use std::fmt;
 use std::path::Path;
@@ -97,6 +97,7 @@ pub struct OtlpExporter {
     logs_endpoint: String,
     metrics_endpoint: String,
     traces_endpoint: String,
+    max_batch_bytes: usize,
     /// The Bearer ingest key, when this exporter was built with one. `None`
     /// on an entry whose `headers_file` supplies all its credentials
     /// (#11555): no `Authorization: Bearer` is sent unless the file itself
@@ -136,6 +137,20 @@ impl OtlpExporter {
         ingest_key: Option<String>,
         headers_file: Option<&str>,
     ) -> Result<Self, ExportError> {
+        Self::with_max_batch_bytes(
+            base_endpoint,
+            ingest_key,
+            headers_file,
+            super::DEFAULT_MAX_BATCH_BYTES,
+        )
+    }
+
+    pub(super) fn with_max_batch_bytes(
+        base_endpoint: String,
+        ingest_key: Option<String>,
+        headers_file: Option<&str>,
+        max_batch_bytes: usize,
+    ) -> Result<Self, ExportError> {
         if !super::endpoint_policy::valid_otlp_endpoint(&base_endpoint) {
             return Err(ExportError::Transport(
                 "OTLP base URL must be HTTP(S), without credentials, query or fragment".to_string(),
@@ -153,6 +168,7 @@ impl OtlpExporter {
             logs_endpoint: format!("{base}/v1/logs"),
             metrics_endpoint: format!("{base}/v1/metrics"),
             traces_endpoint: format!("{base}/v1/traces"),
+            max_batch_bytes,
             ingest_key,
             extra_headers,
         })
@@ -370,174 +386,198 @@ impl Exporter for OtlpExporter {
 
     async fn emit_batch_outcome(&self, envelopes: &[TelemetryEnvelope]) -> BatchOutcome {
         let mut outcome = BatchOutcome::default();
-        let mut offset = 0;
-        while offset < envelopes.len() {
-            let signal = signal_for(&envelopes[offset]);
-            let count = envelopes[offset..]
+        while outcome.acknowledged < envelopes.len() {
+            let remaining = &envelopes[outcome.acknowledged..];
+            let signal = signal_for(&remaining[0]);
+            let count = remaining
                 .iter()
                 .take_while(|e| signal_for(e) == signal)
                 .count();
-            let group = &envelopes[offset..offset + count];
-            // The headers (and their file, when there is one) are re-checked
-            // before every post (#11555), so a rotated credential reaches
-            // the very next request.
-            let extra_headers = self.extra_headers.current();
-            let mut exported_envelopes = count;
-            let response = match signal {
-                Signal::Logs => {
-                    let Some(request) = mapping::build_logs_request(group) else {
-                        outcome.acknowledged += count;
-                        offset += count;
+            let mut pending = vec![&remaining[..count]];
+            while let Some(group) = pending.pop() {
+                let Some((response, mapped, items)) = self.send_mapped(signal, group).await else {
+                    account_unmappable_traces(&mut outcome, signal, group.len());
+                    outcome.acknowledged += group.len();
+                    continue;
+                };
+                let response = match response {
+                    BatchResponse::Outcome(response) => response,
+                    BatchResponse::TooLarge if group.len() > 1 => {
+                        // LIFO but left first: only a resolved prefix may
+                        // advance the durable queue. Every split shrinks.
+                        let (left, right) = group.split_at(group.len() / 2);
+                        pending.push(right);
+                        pending.push(left);
                         continue;
-                    };
-                    let items = request
-                        .resource_logs
-                        .iter()
-                        .flat_map(|r| &r.scope_logs)
-                        .map(|s| s.log_records.len() as u64)
-                        .sum();
-                    post(
-                        &self.client,
-                        &self.logs_endpoint,
-                        self.ingest_key.as_deref(),
-                        &extra_headers,
-                        signal,
+                    }
+                    BatchResponse::TooLarge => ResponseOutcome::failure(
                         items,
-                        &request,
-                    )
-                    .await
+                        false,
+                        "OTLP request is too large for one envelope",
+                        Some(super::loss_ledger::REASON_REQUEST_TOO_LARGE.to_string()),
+                    ),
+                };
+                outcome
+                    .signals
+                    .entry(signal.unit().to_string())
+                    .or_default()
+                    .accumulate(&response.counts);
+                if let Some(error) = response.error {
+                    outcome.error = Some(error);
                 }
-                Signal::Metrics => {
-                    let Some(request) = mapping::build_metrics_request(group) else {
-                        outcome.acknowledged += count;
-                        offset += count;
-                        continue;
-                    };
-                    let items = request
-                        .resource_metrics
-                        .iter()
-                        .flat_map(|r| &r.scope_metrics)
-                        .flat_map(|s| &s.metrics)
-                        .map(|m| match &m.data {
-                            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(
-                                g,
-                            )) => g.data_points.len() as u64,
-                            Some(
-                                opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(h),
-                            ) => h.data_points.len() as u64,
-                            Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(s)) => {
-                                s.data_points.len() as u64
-                            }
-                            _ => 0,
-                        })
-                        .sum();
-                    post(
-                        &self.client,
-                        &self.metrics_endpoint,
-                        self.ingest_key.as_deref(),
-                        &extra_headers,
-                        signal,
-                        items,
-                        &request,
-                    )
-                    .await
+                if response.retry {
+                    return outcome;
                 }
-                Signal::Traces => {
-                    let request = traces::build_traces_request(group);
-                    let items = request.as_ref().map_or(0, |request| {
-                        request
-                            .resource_spans
-                            .iter()
-                            .flat_map(|r| &r.scope_spans)
-                            .map(|s| s.spans.len())
-                            .sum::<usize>()
-                    });
-                    exported_envelopes = items;
-                    outcome
-                        .signals
-                        .entry(signal.unit().to_string())
-                        .or_default()
-                        .dropped += (count - items) as u64;
-                    let Some(request) = request else {
-                        // Every envelope in the group is unmappable and the
-                        // group is acknowledged without ever being posted:
-                        // the loss is decided here, not on a later retry.
-                        *outcome
-                            .lost
-                            .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
-                            .or_default() += count as u64;
-                        outcome.acknowledged += count;
-                        offset += count;
-                        continue;
-                    };
-                    post(
-                        &self.client,
-                        &self.traces_endpoint,
-                        self.ingest_key.as_deref(),
-                        &extra_headers,
-                        signal,
-                        items as u64,
-                        &request,
-                    )
-                    .await
+                // A transport drop counts envelopes, except partial success
+                // where the receiver only reports rejected signal items.
+                if let Some(reason) = response.loss_reason {
+                    *outcome.lost.entry(reason).or_default() += mapped as u64;
                 }
-            };
-            let fully_accepted =
-                response.counts.rejected == 0 && response.counts.dropped == 0 && !response.retry;
-            outcome
-                .signals
-                .entry(signal.unit().to_string())
-                .or_default()
-                .accumulate(&response.counts);
-            // Permanently lost groups get a durable, by-reason count (Issue
-            // #11527): envelope units for a refused/unreadable response,
-            // signal units for partial rejection (the receiver counts items
-            // and does not identify the envelopes that carried them).
-            if !response.retry && response.counts.dropped > 0 {
-                if let Some(reason) = &response.loss_reason {
-                    // A traces group's `count - exported_envelopes`
-                    // unmappable envelopes were never submitted — they are
-                    // counted under `trace_unmappable`, so the status reason
-                    // counts only the envelopes actually sent (#11588).
-                    let lost = if signal == Signal::Traces {
-                        exported_envelopes
-                    } else {
-                        count
-                    };
-                    *outcome.lost.entry(reason.clone()).or_default() += lost as u64;
+                if response.counts.rejected > 0 {
+                    *outcome
+                        .lost
+                        .entry(super::loss_ledger::REASON_RECEIVER_REJECTED.to_string())
+                        .or_default() += response.counts.rejected;
+                }
+                // On a retry these envelopes remain queued, so do not charge
+                // unmappable traces until their whole subgroup is resolved.
+                account_unmappable_traces(&mut outcome, signal, group.len() - mapped);
+                outcome.acknowledged += group.len();
+                if response.counts.rejected == 0 && response.counts.dropped == 0 {
+                    outcome.exported += mapped;
                 }
             }
-            if response.counts.rejected > 0 {
-                *outcome
-                    .lost
-                    .entry(super::loss_ledger::REASON_RECEIVER_REJECTED.to_string())
-                    .or_default() += response.counts.rejected;
-            }
-            if response.error.is_some() {
-                outcome.error = response.error;
-            }
-            if response.retry {
-                break;
-            }
-            // Unmappable trace envelopes are a permanent, counted loss (Issue
-            // #11527) — the mapping will never send them. Recorded only once
-            // the group's fate is decided: a held batch (401/403, transient
-            // statuses, timeouts) is still queued at this point, and counting
-            // before the retry decision would charge the same envelope on
-            // every retry attempt (#11588).
-            if signal == Signal::Traces && exported_envelopes < count {
-                *outcome
-                    .lost
-                    .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
-                    .or_default() += (count - exported_envelopes) as u64;
-            }
-            outcome.acknowledged += count;
-            if fully_accepted {
-                outcome.exported += exported_envelopes;
-            }
-            offset += count;
         }
         outcome
+    }
+}
+
+impl OtlpExporter {
+    async fn send_mapped(
+        &self,
+        signal: Signal,
+        group: &[TelemetryEnvelope],
+    ) -> Option<(BatchResponse, usize, u64)> {
+        let (encoded, mapped, items, endpoint) = match signal {
+            Signal::Logs => {
+                let request = mapping::build_logs_request(group)?;
+                let items = request
+                    .resource_logs
+                    .iter()
+                    .flat_map(|r| &r.scope_logs)
+                    .map(|s| s.log_records.len() as u64)
+                    .sum();
+                (self.encode(&request), group.len(), items, &self.logs_endpoint)
+            }
+            Signal::Metrics => {
+                use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+                let request = mapping::build_metrics_request(group)?;
+                let items = request
+                    .resource_metrics
+                    .iter()
+                    .flat_map(|r| &r.scope_metrics)
+                    .flat_map(|s| &s.metrics)
+                    .map(|m| match &m.data {
+                        Some(Data::Gauge(g)) => g.data_points.len() as u64,
+                        Some(Data::Histogram(h)) => h.data_points.len() as u64,
+                        Some(Data::Sum(s)) => s.data_points.len() as u64,
+                        _ => 0,
+                    })
+                    .sum();
+                (self.encode(&request), group.len(), items, &self.metrics_endpoint)
+            }
+            Signal::Traces => {
+                let request = traces::build_traces_request(group)?;
+                let mapped = request
+                    .resource_spans
+                    .iter()
+                    .flat_map(|r| &r.scope_spans)
+                    .map(|s| s.spans.len())
+                    .sum::<usize>();
+                (self.encode(&request), mapped, mapped as u64, &self.traces_endpoint)
+            }
+        };
+        let response = match encoded {
+            EncodedBody::Ready(body) => {
+                // Reload credentials before every request, including children,
+                // so a rotated header is honored on the very next POST.
+                let headers = self.extra_headers.current();
+                post_batch(
+                    &self.client,
+                    endpoint,
+                    self.ingest_key.as_deref(),
+                    &headers,
+                    signal,
+                    items,
+                    body,
+                )
+                .await
+            }
+            EncodedBody::TooLarge => BatchResponse::TooLarge,
+            EncodedBody::Invalid => BatchResponse::Outcome(ResponseOutcome::failure(
+                items,
+                true,
+                "OTLP request could not be encoded",
+                None,
+            )),
+        };
+        Some((response, mapped, items))
+    }
+
+    fn encode(&self, request: &impl serde::Serialize) -> EncodedBody {
+        let mut body = BoundedBody {
+            bytes: Vec::new(),
+            limit: self.max_batch_bytes,
+            too_large: false,
+        };
+        match serde_json::to_writer(&mut body, request) {
+            Ok(()) => EncodedBody::Ready(body.bytes),
+            Err(_) if body.too_large => EncodedBody::TooLarge,
+            Err(_) => EncodedBody::Invalid,
+        }
+    }
+}
+
+enum EncodedBody {
+    Ready(Vec<u8>),
+    TooLarge,
+    Invalid,
+}
+
+/// Accumulate only bytes that can be sent, rather than allocating the complete
+/// encoding of a group that must split. A successful body is sent verbatim.
+struct BoundedBody {
+    bytes: Vec<u8>,
+    limit: usize,
+    too_large: bool,
+}
+
+impl std::io::Write for BoundedBody {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit - self.bytes.len() {
+            self.too_large = true;
+            return Err(std::io::Error::other("OTLP request exceeds byte limit"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn account_unmappable_traces(outcome: &mut BatchOutcome, signal: Signal, count: usize) {
+    if signal == Signal::Traces && count > 0 {
+        outcome
+            .signals
+            .entry(signal.unit().to_string())
+            .or_default()
+            .dropped += count as u64;
+        *outcome
+            .lost
+            .entry(super::loss_ledger::REASON_TRACE_UNMAPPABLE.to_string())
+            .or_default() += count as u64;
     }
 }
 

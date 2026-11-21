@@ -545,7 +545,8 @@ fn gate_outcome(role: &'static str, probe: QueueProbe) -> (RoleTickOutcome, usiz
         "/loom:x",
         Duration::from_secs(300),
         None,
-    );
+    )
+    .map_or(RoleTickOutcome::QueueEmpty, |run| run.outcome);
     (outcome, calls.load(Ordering::SeqCst))
 }
 

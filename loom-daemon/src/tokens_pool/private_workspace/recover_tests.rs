@@ -36,6 +36,11 @@ struct Engine {
     images: Vec<String>,
     /// The account profile a control report is cross-checked against.
     profile: PathBuf,
+    /// Per-container profiles (#14578): a control report is cross-checked
+    /// against the profile of the CONTAINER it addresses, so a draw over
+    /// several seats sees each seat's own boundary. Containers absent here
+    /// fall back to `profile`.
+    profiles: BTreeMap<String, PathBuf>,
     /// `docker start` leaves the container stopped (its process exits at once).
     start_dies: bool,
     /// `docker start` hits its deadline (a wedged engine).
@@ -187,13 +192,17 @@ impl Engine {
                 // Addressed by immutable id, never by name.
                 assert_eq!(target.len(), 64, "control probe must address the container id");
                 self.find(target).context("no such container")?;
+                let profile = self
+                    .find_name(target)
+                    .and_then(|name| self.profiles.get(&name).cloned())
+                    .unwrap_or_else(|| self.profile.clone());
                 let report = bundle::Report {
                     protocol: bundle::CONTROL_PROTOCOL.into(),
                     control_version: bundle::CONTROL_VERSION,
                     status: bundle::Status::Ready,
                     codex_cli: "codex 0.0.0".into(),
                     identity: "ab".repeat(32),
-                    profile: bundle::profile_digests(&self.profile),
+                    profile: bundle::profile_digests(&profile),
                     managed: true,
                 };
                 Ok(serde_json::to_string(&report)?)
@@ -931,7 +940,7 @@ fn recover_session(
 ) -> Result<RecoverReport> {
     let mut attempt = 0;
     loop {
-        match session_recover(workspace, name, action, issue, branches) {
+        match session_recover(workspace, name, action, issue, branches, &[]) {
             Err(error) if attempt < 20 && error.to_string().contains("busy") => {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1278,6 +1287,66 @@ fn session_recover_surfaces_worker_refusals_and_scoped_noops() {
     let report =
         recover_session(env.workspace.path(), "alice", RecoverAction::Publish, None, &[]).unwrap();
     assert!(report.clones[0].published.is_empty());
+}
+
+#[test]
+#[serial]
+fn a_worktree_refusal_in_a_second_clone_prevents_any_discard_exec() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    let mut config = env.config.clone();
+    let second = identify("https://forge.example/a/c").unwrap();
+    config.schema_version = 2;
+    config.repositories.push(Registered {
+        repository: second.url,
+        base: "main".into(),
+        slug: second.slug,
+    });
+    save(&env.dir.join("workspace.json"), &config).unwrap();
+
+    let engine = env.engine.clone();
+    let _wrap = docker::fake::install(Box::new(move |args| {
+        let mut engine = engine.borrow_mut();
+        if args.contains(&"recover") {
+            assert!(args.contains(&"--validate-worktrees"), "removal ran before validation");
+            engine.recover_response = Some(
+                if args.contains(&"--slug") {
+                    json!({"protocol": PROTOCOL, "error": "the main checkout is ineligible"})
+                } else {
+                    json!({
+                        "protocol": PROTOCOL,
+                        "outcome": {
+                            "repository": "https://forge.example/a/b", "cloned": true,
+                            "ignored": ["/workspace/work/second"], "branches": [],
+                            "published": [], "discarded": [], "detached": []
+                        }
+                    })
+                }
+                .to_string(),
+            );
+        }
+        engine.handle(args)
+    }));
+
+    let result = session_recover(
+        env.workspace.path(),
+        "alice",
+        RecoverAction::Discard,
+        None,
+        &[],
+        &[
+            PathBuf::from("/workspace/leftover"),
+            PathBuf::from("/workspace/work/second"),
+        ],
+    );
+    assert!(result.unwrap_err().to_string().contains("main checkout"));
+    let engine = env.engine();
+    let validations = engine
+        .calls
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "--validate-worktrees"));
+    assert_eq!(validations.count(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1820,41 @@ fn recorded(env: &Env) -> Config {
 
 #[test]
 #[serial]
+fn private_status_reports_the_profile_hold_with_running_precedence() {
+    let env = setup();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, false);
+    let read = || status(env.workspace.path(), &env.config.account).unwrap();
+
+    let stopped = read();
+    assert_eq!(stopped.state_label(), "stopped");
+    assert_eq!(serde_json::to_value(&stopped).unwrap()["held"], false);
+
+    session_hold::write_hold(&env.config.profile, 1).unwrap();
+    let held = read();
+    assert_eq!(held.state_label(), "stopped, held (operator stop)");
+    assert_eq!(serde_json::to_value(&held).unwrap()["held"], true);
+
+    env.seed_container(CONTAINER_ID, true);
+    let running = read();
+    assert_eq!(running.state_label(), "running");
+    assert_eq!(serde_json::to_value(&running).unwrap()["held"], true);
+
+    assert!(env.engine().calls.iter().all(|call| {
+        let args = call.iter().map(String::as_str).collect::<Vec<_>>();
+        matches!(
+            args.as_slice(),
+            ["info", "--format", "{{.ID}}"]
+                | ["container", "ls", "-a", "--format", "{{.Names}}"]
+                | ["inspect", _]
+                | ["volume", "inspect", _]
+                | ["ps", "-a", "--filter", _, "--format", "{{.Names}}"]
+        )
+    }));
+}
+
+#[test]
+#[serial]
 fn a_private_start_creates_from_the_configured_image_and_read_only_mounts() {
     let env = setup();
     env.seed_volume();
@@ -1992,6 +2096,331 @@ fn without_the_configuration_a_private_start_is_unchanged() {
     assert!(!text.contains("extra_mounts") && !text.contains("session_image"), "{text}");
 }
 
+/// Give a disposable workspace the same Codex provider manifest as a launch.
+fn install_codex_dispatch_manifest(root: &Path) {
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults/runtimes/codex.json");
+    let dest = root.join(".loom/runtimes/codex.json");
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(shipped, dest).unwrap();
+}
+
+#[test]
+#[serial]
+fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
+    use crate::tokens_pool::health::{self, TerminalClassification};
+    use crate::tokens_pool::session_lifecycle::liveness::test_support::set_selector_docker;
+
+    let _environment = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let root = env.workspace.path();
+    install_codex_dispatch_manifest(root);
+    crate::test_git_helpers::run(root, &["init", "-q"]);
+    crate::test_git_helpers::run(root, &["remote", "add", "origin", &env.config.repository]);
+    super::super::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    health::record_terminal(root, &env.account.id, TerminalClassification::TokenExpired, "fixture")
+        .unwrap();
+
+    let registry = crate::tokens_pool::paths::per_repo_accounts_file(root);
+    let profile = env.dir.join("workspace.json");
+    let mut unrelated = env.config.clone();
+    unrelated.repository = "https://forge.example/unrelated/repo".into();
+    let changed_profile = serde_json::to_vec(&unrelated).unwrap();
+    for (file, changed) in [
+        (registry.as_path(), b"invalid fixture registry".as_slice()),
+        (profile.as_path(), changed_profile.as_slice()),
+    ] {
+        let original = std::fs::read(file).unwrap();
+        let replacement = root.join("replacement-data");
+        std::fs::write(&replacement, changed).unwrap();
+        let fake_docker = root.join("selection-snapshot");
+        // Liveness is observed only after the selector collected its
+        // inventory and evaluated its repository predicate.
+        crate::exec_test_support::write_executable(
+            &fake_docker,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = ps ] || exit 88\ncp '{}' '{}'\n",
+                replacement.display(),
+                file.display(),
+            ),
+        );
+        let _liveness = set_selector_docker(fake_docker.to_str().unwrap(), false);
+
+        let result =
+            dispatch::Selection::prepare_idle(root, None, JobKind::Sweep, None, "fixture", false);
+        assert_eq!(std::fs::read(file).unwrap(), changed, "snapshot must have run");
+        let error = result.err().expect("the matching account is not healthy");
+        assert!(error.is::<health::NoHealthyAccountError>(), "{error:#}");
+        assert_eq!(error.to_string(), dispatch::NO_IDLE_SEAT);
+        std::fs::write(file, original).unwrap();
+    }
+    assert!(env.engine().calls.is_empty(), "health filtering made no target calls");
+}
+
+#[test]
+#[serial]
+fn legacy_sweep_prepares_one_target_and_hands_its_selection_to_launch() {
+    use crate::sweep_registry::{
+        private_dispatch, DispatchModel, SweepRegistry, SweepRegistryConfig,
+    };
+    use crate::types::SweepKind;
+
+    let _environment = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_RUNTIME_SWEEP_LIFECYCLE",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let _defaults = crate::env_test_support::EnvGuard::set("LOOM_CONFIG_DEFAULTS_FILE", "");
+    // The write-scope fixture uses a synthetic GitHub origin and gh; do
+    // not give private preparation a matching forge credential host.
+    let _forge_host = crate::env_test_support::EnvGuard::set("GH_HOST", "fixture.invalid");
+    let mut env = setup();
+    let root = env.workspace.path();
+    let scope = crate::write_scope_test_support::WritableRoot::register(root);
+    env.config.repository = format!("https://github.com/{}.git", scope.repo);
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    super::super::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    env.seed_container(CONTAINER_ID, true);
+    env.seed_volume();
+    install_codex_dispatch_manifest(root);
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../defaults");
+    std::fs::copy(shipped.join("runtimes/claude.json"), root.join(".loom/runtimes/claude.json"))
+        .unwrap();
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let mut config = SweepRegistryConfig::new(root.to_owned());
+    config.gh_bin = Some(scope.gh.clone());
+    config.journal_path = Some(root.join("test-sweeps-journal.json"));
+    let registry = SweepRegistry::shared(config);
+    let roles = root.join(".loom/roles");
+    std::fs::create_dir_all(&roles).unwrap();
+    for runtime in ["codex", "claude"] {
+        crate::exec_test_support::write_executable(
+            &root.join(format!(".loom/scripts/spawn-{runtime}.sh")),
+            "#!/bin/sh\nexit 0\n",
+        );
+    }
+    let controls = tempfile::tempdir().unwrap();
+    let trusted = super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
+    for name in bundle::PROFILE_CONTROLS {
+        std::fs::copy(trusted.join(name), env.config.profile.join(name)).unwrap();
+    }
+
+    for (issue, runtime, capabilities, contained, preference_walk) in [
+        (17_u32, "codex", &[][..], false, true),
+        (18, "codex", &["worktreeIsolation"][..], true, true),
+        (19, "claude", &[][..], false, true),
+        (20, "codex", &[][..], false, false),
+    ] {
+        let runtimes = if preference_walk {
+            json!({"preference": [runtime]})
+        } else {
+            json!({"default": runtime})
+        };
+        save(&root.join(".loom/config.json"), &json!({"runtimes": runtimes})).unwrap();
+        save(&roles.join("builder.json"), &json!({"runtimeRequirements": capabilities})).unwrap();
+        env.with(|engine| engine.calls.clear());
+        let launch = private_dispatch::prepare(
+            &registry,
+            &SweepKind::Issue(issue),
+            None,
+            DispatchModel::Request(Some("fixture-model")),
+        )
+        .unwrap()
+        .unwrap();
+        let admitted = launch.admission.admitted.as_ref().unwrap();
+        assert_eq!(admitted.runtime, runtime);
+        assert_eq!(admitted.preference.is_some(), preference_walk);
+        if let Some(preference) = &admitted.preference {
+            assert_eq!(preference.tap, runtime);
+            assert_eq!(preference.tier, 0);
+        }
+        assert_eq!(admitted.execution.is_some(), contained);
+        assert_eq!(launch.model.as_deref(), Some("fixture-model"));
+        let prepare_count = env
+            .engine()
+            .calls
+            .iter()
+            .filter(|args| {
+                args.first().is_some_and(|arg| arg == "exec")
+                    && args
+                        .windows(2)
+                        .any(|pair| pair[0] == "private-workspace" && pair[1] == "prepare")
+            })
+            .count();
+        if runtime == "codex" {
+            assert_eq!(prepare_count, 1, "legacy sweep #{issue} prepares its target once");
+            let selection = launch
+                .selection
+                .as_ref()
+                .expect("the launch owns the prepared seat");
+            assert_eq!(selection.name, "alice");
+            let lease = selection
+                .lease()
+                .expect("the original lease reaches launch");
+            assert_eq!(lease.dir, env.dir);
+            let job = lease::read(&lease.dir).unwrap().unwrap();
+            assert_eq!(job.container_id, CONTAINER_ID);
+            assert_eq!(job.issue, Some(u64::from(issue)));
+            assert!(matches!(job.kind, JobKind::Sweep));
+            assert_eq!(job.base_revision, "a".repeat(40));
+            assert!(lease::Lease::acquire(&env.dir)
+                .err()
+                .unwrap()
+                .is::<AccountBusy>());
+        } else {
+            assert_eq!(prepare_count, 0, "non-Codex fallback performs no target work");
+            assert!(launch.selection.is_none());
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease() {
+    use crate::env_test_support::EnvGuard;
+    use crate::tokens_pool::{paths::SHARED_ACCOUNTS_ROOT_ENV, session_lifecycle};
+    use std::ffi::OsStr;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let _fork = super::tests::fork_guard();
+    let home = tempfile::tempdir().unwrap();
+    let _runtime_env = EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_PRIVATE_LEASE_FD",
+        "LOOM_SPAWN_NO_EXPORT",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ])
+    .and_set("HOME", Some(home.path().as_os_str()))
+    .and_set("GH_HOST", Some(OsStr::new("fixture.invalid")))
+    .and_set(SHARED_ACCOUNTS_ROOT_ENV, Some(OsStr::new("")))
+    .and_set("LOOM_CODEX_DEFAULT_HOME", Some(OsStr::new("")))
+    .and_set("LOOM_CODEX_SESSION_PROBE", Some(OsStr::new("0")));
+    let mut env = setup();
+    let root = env.workspace.path().to_path_buf();
+    let alice = env.config.clone();
+    let alice_dir = env.dir.clone();
+    env.seed_volume();
+    env.seed_container(CONTAINER_ID, true);
+    session_lifecycle::mark_session_managed(&alice.profile, &alice.container).unwrap();
+
+    let service = AccountLifecycle::new(&root, ProcessCodexRunner).unwrap();
+    service
+        .import_with_email("bob", &alice.profile.join("auth.json"), None)
+        .unwrap();
+    env.account = account_inventory(&root, AccountProvider::Codex)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id.name == "bob")
+        .unwrap();
+    env.config.account = "bob".into();
+    env.config.container = container_name("bob");
+    env.config.volume = "loom-codex-workspace-bob".into();
+    env.config.profile = env.account.credential_reference.canonicalize().unwrap();
+    env.dir = state_dir(&env.config.profile).unwrap();
+    std::fs::create_dir_all(&env.dir).unwrap();
+    save(&env.dir.join("workspace.json"), &env.config).unwrap();
+    session_lifecycle::mark_session_managed(&env.config.profile, &env.config.container).unwrap();
+    for name in bundle::PROFILE_CONTROLS {
+        std::fs::copy(alice.profile.join(name), env.config.profile.join(name)).unwrap();
+    }
+    env.seed_volume();
+    env.seed_container(OTHER_ID, true);
+
+    for (profile, weekly) in [(&alice.profile, 5), (&env.config.profile, 30)] {
+        let sessions = profile.join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let line = json!({"rate_limits": {"secondary": {
+            "used_percent": weekly, "window_minutes": 10_080, "resets_in_seconds": 400_000,
+        }}});
+        std::fs::write(sessions.join("rollout-fixture.jsonl"), format!("{line}\n")).unwrap();
+    }
+    crate::test_git_helpers::run(&root, &["init", "-q"]);
+    crate::test_git_helpers::run(&root, &["remote", "add", "origin", &alice.repository]);
+    let runtimes = root.join(".loom/runtimes");
+    std::fs::create_dir_all(&runtimes).unwrap();
+    save(&runtimes.join("codex.json"), &json!({"accountProvider": "codex"})).unwrap();
+
+    let reserve = |issue, owner| {
+        dispatch::Selection::prepare_idle(&root, None, JobKind::Sweep, Some(issue), owner, false)
+            .unwrap()
+            .unwrap()
+    };
+    // Advance the cursor past Alice with a real locked draw. The next draw
+    // would still favor Alice on usage, independent of the cursor.
+    let preferred = reserve(6, "unheld-control");
+    assert_eq!(preferred.name, "alice");
+    drop(preferred);
+    let busy = super::tests::reacquire(&alice_dir);
+
+    env.with(|e| e.profile = env.config.profile.clone());
+    let next = reserve(7, "busy-favorite");
+    assert_eq!(next.name, "bob");
+    assert_eq!(next.lease().unwrap().dir, env.dir);
+    let job = lease::read(&env.dir).unwrap().unwrap();
+    assert_eq!(job.owner, "busy-favorite");
+    assert_eq!(job.issue, Some(7));
+    assert_eq!(job.container_id, OTHER_ID);
+    assert_eq!(job.base_revision, "a".repeat(40));
+
+    let mut command = Command::new("/bin/sh");
+    command
+        .env_clear()
+        .arg("-c")
+        .arg(concat!(
+            "test -e \"/dev/fd/${LOOM_PRIVATE_LEASE_FD:?}\" || exit 3; ",
+            "printf '%s\\n' \"$LOOM_ACCOUNT_NAME\"; read -r release || :",
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    next.apply(&mut command);
+    let mut child = command.spawn().unwrap();
+    next.spawned();
+    drop(next);
+    let mut name = String::new();
+    let read = BufReader::new(child.stdout.take().unwrap()).read_line(&mut name);
+    let held_by_child = lease::Lease::acquire(&env.dir)
+        .err()
+        .is_some_and(|error| error.is::<lease::AccountBusy>());
+    drop(child.stdin.take());
+    let exit = child.wait().unwrap();
+    assert!(read.is_ok() && exit.success());
+    assert_eq!(name.trim_end(), "bob");
+    assert!(held_by_child, "the child must retain Bob's lease");
+    drop(super::tests::reacquire(&env.dir));
+    drop(busy);
+}
+
 #[test]
 #[serial]
 fn concurrent_judge_draws_share_one_idle_seat() {
@@ -2077,9 +2506,15 @@ fn concurrent_judge_draws_share_one_idle_seat() {
         else {
             panic!("expected the role draw");
         };
-        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), preparer.take())
+        // The launch consumes the held reservation as `private_dispatch`
+        // does for a host-admitted Codex candidate (#14512): it is handed
+        // over whole, so nothing is re-prepared.
+        let held = crate::sweep_registry::private_dispatch::take_held(&mut preparer, false)
+            .unwrap()
+            .map(|(selection, _)| selection);
+        (resolution.chosen.unwrap().admitted.runtime, draw.unwrap(), held)
     };
-    let assert_falls_through = |case: &str| {
+    let assert_falls_through_with = |case: &str, reason: &str| {
         let (runtime, record, selection) = draw(case.to_owned());
         assert_eq!(runtime, "claude", "{case}: {record:?}");
         assert!(selection.is_none(), "{case}");
@@ -2087,10 +2522,11 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             record
                 .passed_over
                 .iter()
-                .any(|reason| reason == "codex: not-admitted(no idle seat)"),
-            "{record:?}"
+                .any(|passed| passed == &format!("codex: not-admitted({reason})")),
+            "{case}: {record:?}"
         );
     };
+    let assert_falls_through = |case: &str| assert_falls_through_with(case, "no idle seat");
 
     assert_falls_through("hook trust unproven");
     let controls = tempfile::tempdir().unwrap();
@@ -2108,7 +2544,9 @@ fn concurrent_judge_draws_share_one_idle_seat() {
             "https://forge.example/other/repo",
         ],
     );
-    assert_falls_through("repository unregistered");
+    // No inventoried account serves the resolved repository: a routing miss,
+    // reported apart from contention (#14512).
+    assert_falls_through_with("repository unregistered", "no seat serves this repository");
     crate::test_git_helpers::run(root, &["remote", "set-url", "origin", &env.config.repository]);
 
     env.seed_container(CONTAINER_ID, false);
@@ -2222,4 +2660,502 @@ fn concurrent_judge_draws_share_one_idle_seat() {
     assert!(!forge_marker.exists());
     drop(held);
     worker::reset_for_test();
+}
+
+// ---------------------------------------------------------------------------
+// #14578: a Builder draw passes a busy seat over instead of refusing — the
+// bounded walk admits any eligible idle seat whose containment can be proven.
+// ---------------------------------------------------------------------------
+
+/// A second private-clone seat for the SAME repository as alice's (`setup()`),
+/// with its own container, volume, profile control files and registry entry,
+/// so a draw can pass a busy seat over (#14578).
+struct Seat {
+    dir: PathBuf,
+}
+
+fn seed_seat(env: &Env, name: &str, id: &str, trusted: bool) -> Seat {
+    let workspace = env.workspace.path().to_path_buf();
+    let service = AccountLifecycle::new(&workspace, ProcessCodexRunner).unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("auth.json");
+    std::fs::write(&source, "fake-secret").unwrap();
+    service.import_with_email(name, &source, None).unwrap();
+    let account = account_inventory(&workspace, AccountProvider::Codex)
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id.name == name)
+        .unwrap();
+    let profile = account.credential_reference.canonicalize().unwrap();
+    if trusted {
+        let controls = tempfile::tempdir().unwrap();
+        let trusted_profile =
+            super::containment_tests::profile(controls.path(), Some(&[]), &["fresh"]);
+        for file in bundle::PROFILE_CONTROLS {
+            std::fs::copy(trusted_profile.join(file), profile.join(file)).unwrap();
+        }
+    } else {
+        // A valid managed registration with NO established trust: the proof
+        // fails on hook trust, the failure mode the field report shows.
+        let controls = tempfile::tempdir().unwrap();
+        let untrusted = super::containment_tests::profile(controls.path(), Some(&[]), &[]);
+        for file in bundle::PROFILE_CONTROLS {
+            std::fs::copy(untrusted.join(file), profile.join(file)).unwrap();
+        }
+        // The seal now admits a sealable registration without recorded trust,
+        // so the proof fails only for one the seal refuses (#14181).
+        super::containment_tests::unsealable(&profile);
+    }
+    let config = Config {
+        schema_version: 1,
+        account: name.into(),
+        container: container_name(name),
+        engine: ENGINE.into(),
+        docker_desktop: false,
+        repository: env.config.repository.clone(),
+        base: "main".into(),
+        repositories: vec![],
+        volume: format!("loom-codex-workspace-{name}"),
+        profile: profile.clone(),
+        gh_config: None,
+        session_image: None,
+        extra_mounts: Vec::new(),
+    };
+    let dir = state_dir(&account.credential_reference).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    save(&dir.join("workspace.json"), &config).unwrap();
+    // An adopted session: `adapter::check` refuses a private profile without
+    // its marker before any seat is drawn.
+    crate::tokens_pool::session_lifecycle::mark_session_managed(&profile, &config.container)
+        .unwrap();
+    env.with(|e| {
+        // The control report must be measured against THIS container's own
+        // profile, not the fixture's primary one.
+        e.profiles.insert(config.container.clone(), profile.clone());
+        e.containers
+            .insert(config.container.clone(), session_container(&config, id, true, IMAGE));
+        e.processes
+            .insert(config.container.clone(), idle_processes());
+        let mut labels = BTreeMap::new();
+        labels.insert("loom.account".to_owned(), name.to_owned());
+        labels.insert("loom.repository".to_owned(), config.repository.clone());
+        labels.insert("loom.profile".to_owned(), profile.to_string_lossy().into_owned());
+        e.volumes
+            .insert(config.volume.clone(), volume_json(&config.volume, &labels));
+    });
+    Seat { dir }
+}
+
+/// The `concurrent_judge_draws_share_one_idle_seat` fixture, with a Builder
+/// draw table and a second seat whose controls are (`trusted`) or are not
+/// (`!trusted`) hook-trusted.
+fn builder_draw_env(env: &Env, trusted: bool) -> Seat {
+    // The fixture's own seat is an adopted session too.
+    crate::tokens_pool::session_lifecycle::mark_session_managed(
+        &env.config.profile,
+        &env.config.container,
+    )
+    .unwrap();
+    let bob = seed_seat(env, "bob", OTHER_ID, trusted);
+    let root = env.workspace.path();
+    crate::test_git_helpers::run(root, &["init", "-q"]);
+    crate::test_git_helpers::run(root, &["remote", "add", "origin", &env.config.repository]);
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("defaults");
+    for file in [
+        "roles/builder.json",
+        "runtimes/codex.json",
+        "runtimes/claude.json",
+    ] {
+        let dest = root.join(".loom").join(file);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(shipped.join(file), dest).unwrap();
+    }
+    for runtime in ["codex", "claude"] {
+        let dest = root.join(format!(".loom/scripts/spawn-{runtime}.sh"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    save(
+        &root.join(".loom/config.json"),
+        &json!({"runtimes":{"roleDraw":{"builder":{"1":{"codex":1000,"claude":1}}}}}),
+    )
+    .unwrap();
+    bob
+}
+
+/// The shared two-seat test fixture: environment guards, the codex credential
+/// pool, and the Builder draw over the fixture's Builder table.
+fn builder_draw(
+    root: &Path,
+) -> impl FnMut(
+    String,
+) -> (
+    String,
+    std::boxed::Box<crate::runtime_preference::role_draw::RoleDrawRecord>,
+    Option<crate::tokens_pool::private_workspace::dispatch::Selection>,
+    bool,
+) + '_ {
+    let draw = |owner: String| {
+        let mut preparer =
+            containment::Preparer::new(root, JobKind::Role, None, owner, Box::new(|_, _| None));
+        let result = crate::runtime_preference::role_draw::with_seed(1, || {
+            crate::runtime_preference::resolve_runtime_contained(
+                root,
+                "builder",
+                None,
+                1_800_000_000,
+                crate::runtime_preference::DispatchContext {
+                    intent: crate::runtime_preference::Intent::Dispatch,
+                    role_tick: true,
+                },
+                &mut preparer,
+            )
+        });
+        let crate::runtime_preference::Decision::Preference {
+            resolution, draw, ..
+        } = result.unwrap()
+        else {
+            panic!("expected the role draw");
+        };
+        let seat_unavailable = preparer.seat_unavailable();
+        (
+            resolution.chosen.unwrap().admitted.runtime,
+            draw.unwrap(),
+            preparer.take().map(|(selection, _)| selection),
+            seat_unavailable,
+        )
+    };
+    move |owner| draw(owner)
+}
+
+fn builder_stage_of(doc: &serde_json::Value) -> &serde_json::Value {
+    doc["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stage| stage["stage"] == "builder")
+        .unwrap()
+}
+
+#[test]
+#[serial]
+fn a_builder_draw_admits_the_idle_seat_while_another_seat_is_busy() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+
+    // Alice's seat is exclusively held by another step; Bob's is idle.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+
+    let mut draw = builder_draw(root);
+    let (runtime, _, selection, seat_unavailable) = draw("builder-7".into());
+    assert_eq!(runtime, "codex");
+    // The busy seat never won: the draw admitted the idle one.
+    assert_eq!(selection.as_ref().unwrap().name, "bob");
+    assert!(!seat_unavailable, "an admitted draw has no unavailable seat");
+    // The winning seat stays exclusively leased through the handoff, and the
+    // busy seat's lease is untouched by the draw.
+    assert!(lease::Lease::acquire(&bob.dir).is_err());
+    assert!(lease::Lease::acquire(&env.dir).is_err());
+    // The containment provenance records the seat the launch would run on.
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(bob.dir.join(lease::ADMISSION)).unwrap()).unwrap();
+    assert_eq!(record["role"], "builder");
+    assert_eq!(record["runtime"], "codex");
+    assert_eq!(record["execution"]["account"], "bob");
+    drop(selection);
+    drop(super::tests::reacquire(&bob.dir));
+
+    // `roles draw` names the account it measured, and releases the temporary
+    // lease before returning (#14578).
+    let doc = role_draw::explain::explain_json(root);
+    let codex = &builder_stage_of(&doc)["roleDraw"][0]["candidates"][0];
+    assert_eq!(codex["candidate"], "codex");
+    assert_eq!(codex["admitted"], true);
+    assert_eq!(codex["account"], "bob");
+    drop(super::tests::reacquire(&bob.dir));
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn a_builder_draw_names_every_tried_seat_when_all_are_busy() {
+    use crate::runtime_preference::role_draw;
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXEC",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+    let held_a = lease::Lease::acquire(&env.dir).unwrap();
+    let held_b = lease::Lease::acquire(&bob.dir).unwrap();
+
+    // The real dispatch falls through to the configured fallback with the
+    // walk's per-seat report.
+    let mut draw = builder_draw(root);
+    let (runtime, record, selection, seat_unavailable) = draw("builder-8".into());
+    assert_eq!(runtime, "claude");
+    assert!(selection.is_none());
+    assert!(seat_unavailable, "every seat was busy");
+    let passed = record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("no eligible seat could be prepared"))
+        .expect("the codex refusal names the walk");
+    assert!(passed.contains("busy"), "{passed}");
+    assert!(passed.contains("0 of 2 eligible seats idle"), "{passed}");
+
+    // The explain row reads the same: both seats named, zero idle.
+    let doc = role_draw::explain::explain_json(root);
+    let attempt = &builder_stage_of(&doc)["roleDraw"][0];
+    let codex = &attempt["candidates"][0];
+    assert_eq!(codex["candidate"], "codex");
+    assert_eq!(codex["admitted"], false);
+    let reason = codex["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with(
+            "not-admitted(worktreeIsolation: verified private-clone containment could not \
+             satisfy it: no eligible seat could be prepared (0 of 2 eligible seats idle): "
+        ),
+        "{reason}"
+    );
+    assert!(reason.contains("alice busy"), "{reason}");
+    assert!(reason.contains("bob busy"), "{reason}");
+    assert!(!reason.contains("failed"), "{reason}");
+    // Claude was never refused, and the effective table renormalises to it.
+    assert_eq!(attempt["candidates"][1]["candidate"], "claude");
+    assert_eq!(attempt["candidates"][1]["admitted"], true);
+    assert_eq!(attempt["effective"]["candidates"][0]["candidate"], "claude");
+    // The probe never kept a seat: both leases are still only the test's.
+    drop(reacquire_probe(&env.dir, held_a));
+    drop(reacquire_probe(&bob.dir, held_b));
+}
+
+/// A held lease this test owns is re-acquirable only by dropping the holder;
+/// the bounded retry waits out unrelated forks (#9409) without hiding a leak.
+fn reacquire_probe(dir: &Path, holder: lease::Lease) -> lease::Lease {
+    drop(holder);
+    super::tests::reacquire(dir)
+}
+
+#[test]
+#[serial]
+fn an_explicit_profile_pin_keeps_binding_while_its_seat_is_busy() {
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let _pin = crate::env_test_support::EnvGuard::set("LOOM_CODEX_PROFILE", "alice");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+
+    let mut draw = builder_draw(root);
+    let (_, record, selection, _) = draw("builder-9".into());
+    assert!(selection.is_none(), "a pinned seat never walks to another");
+    let passed = record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("busy"))
+        .expect("the pin's busy refusal is reported");
+    assert!(
+        passed.contains(
+            "role, sweep, interactive and lifecycle operations share one exclusive lease"
+        ),
+        "{passed}"
+    );
+    // The pinned draw never touched the idle seat.
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn an_idle_seat_that_cannot_prove_containment_is_never_counted_as_busy() {
+    let _runtime_env = crate::env_test_support::EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+    ]);
+    let _probe = crate::env_test_support::EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let env = setup();
+    let bob = builder_draw_env(&env, false);
+    let tokens = tempfile::tempdir().unwrap();
+    std::fs::write(tokens.path().join("fixture.token"), "sk-ant-oat-fixture\n").unwrap();
+    let _tokens_env = crate::env_test_support::EnvGuard::set(
+        crate::tokens_pool::paths::SHARED_TOKENS_DIR_ENV,
+        tokens.path(),
+    );
+    let root = env.workspace.path();
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+
+    // Bob is idle but untrusted: the walk reports his own containment
+    // refusal, never "busy", and counts his seat idle (#14578).
+    let mut draw = builder_draw(root);
+    let (_, record, selection, seat_unavailable) = draw("builder-10".into());
+    assert!(selection.is_none());
+    assert!(!seat_unavailable, "a proof failure is not a busy pool");
+    let passed = record
+        .passed_over
+        .iter()
+        .find(|reason| reason.contains("no eligible seat could be prepared"))
+        .expect("the codex refusal names the walk");
+    assert!(
+        passed.contains("no eligible seat could be prepared (1 of 2 eligible seats idle): "),
+        "{passed}"
+    );
+    assert!(passed.contains("alice busy"), "{passed}");
+    assert!(passed.contains("bob failed: "), "{passed}");
+    assert!(!passed.contains("bob busy"), "{passed}");
+    drop(super::tests::reacquire(&bob.dir));
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
+}
+
+#[test]
+#[serial]
+fn a_named_manual_exec_refuses_on_its_own_busy_seat_never_another() {
+    use crate::env_test_support::EnvGuard;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+
+    let _runtime_env = EnvGuard::clear(&[
+        "CODEX_HOME",
+        "LOOM_CODEX_HOME",
+        "LOOM_CODEX_PROFILE",
+        "LOOM_CODEX_NO_EXEC",
+        "LOOM_CODEX_SESSION_EXEC",
+        "LOOM_MACHINE_CHECKOUT",
+        "LOOM_PRIVATE_LEASE_FD",
+        "LOOM_RUNTIME",
+        "LOOM_RUNTIME_BUILDER",
+        "LOOM_SPAWN_NO_EXPORT",
+        "LOOM_WORKSPACE",
+    ]);
+    let _probe = EnvGuard::set("LOOM_CODEX_SESSION_PROBE", "0");
+    let _name = EnvGuard::set("LOOM_ACCOUNT_NAME", "alice");
+    let env = setup();
+    let bob = builder_draw_env(&env, true);
+    let bob_config = load(&bob.dir).unwrap();
+    let root = env.workspace.path();
+    // Even a regression into the legacy host transport must use no real
+    // engine. Preparation itself runs through the fake installed by setup.
+    let bin = tempfile::tempdir().unwrap();
+    let docker = bin.path().join("docker");
+    std::fs::write(&docker, "#!/bin/sh\nexit 91\n").unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.path().to_owned()).chain(std::env::split_paths(&path)),
+    )
+    .unwrap();
+    let _path = EnvGuard::set("PATH", path);
+    // The named account's seat is exclusively held; Bob's is idle.
+    let held = lease::Lease::acquire(&env.dir).unwrap();
+    let run = || {
+        transport::run(crate::session_exec::HostArgs {
+            owner_pid: None,
+            container: env.config.container.clone(),
+            workdir: REPO.into(),
+            env: vec![format!("LOOM_WORKSPACE={}", root.display())],
+            child_env: vec![],
+            stderr_file: None,
+            command: vec!["true".into()],
+        })
+        .expect_err("the manual launch must be refused")
+    };
+
+    assert!(run().is::<AccountBusy>());
+    for (key, matching) in [
+        ("LOOM_CODEX_PROFILE", OsStr::new("alice")),
+        ("LOOM_CODEX_HOME", env.config.profile.as_os_str()),
+        ("CODEX_HOME", env.config.profile.as_os_str()),
+    ] {
+        let _pin = EnvGuard::set(key, matching);
+        let error = run();
+        assert!(error.is::<AccountBusy>(), "matching {key}: {error:#}");
+    }
+    let conflicts = [
+        ("LOOM_CODEX_PROFILE", OsStr::new("bob")),
+        ("LOOM_CODEX_HOME", bob_config.profile.as_os_str()),
+        ("CODEX_HOME", bob_config.profile.as_os_str()),
+    ];
+    let errors: Vec<_> = conflicts
+        .iter()
+        .map(|(key, profile)| {
+            let _pin = EnvGuard::set(key, profile);
+            run().to_string()
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        ["private dispatch account or profile does not match the named account"; 3]
+    );
+    assert!(env.engine().calls.iter().flatten().all(|arg| {
+        arg != &bob_config.container && arg != &bob_config.volume && arg != OTHER_ID
+    }));
+    drop(lease::Lease::acquire(&bob.dir).unwrap());
+    assert!(lease::read(&bob.dir).unwrap().is_none());
+    assert!(!bob.dir.join("last-job.json").exists());
+    assert!(!bob.dir.join(lease::ADMISSION).exists());
+    drop(held);
+    drop(super::tests::reacquire(&env.dir));
 }

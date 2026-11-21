@@ -7,9 +7,9 @@ on:
     types: [opened, synchronize, reopened]
   # Merge queue (#10257, Phase C of #9978): validate the COMBINED merge-group
   # tree. Dormant until a repository enables a merge queue -- GitHub only
-  # emits this event for a queue-enabled branch, and this repository is
-  # user-owned, so today it never fires here. Every job a merge group needs
-  # runs on `merge_group` with no path filter (`changes` skips merge_group):
+  # emits this event for a queue-enabled branch, and `main` has no active
+  # `merge_queue` rule, so today it never fires here. Every job a merge group
+  # needs runs on `merge_group` with no path filter (`changes` skips merge_group):
   # the full suite, a superset of `push`, which path-filters only the image
   # jobs (#10825). `loom-daemon merge-group-ci audit` proves that statically;
   # see defaults/docs/merge-queue-ci.md.
@@ -132,26 +132,19 @@ jobs:
         backend:
           - 'loom-daemon/**'
           - 'loom-api/**'
-          # The observability artifacts are Rust-tested seams, not inert
-          # config: signoz_trial_artifacts.rs, signoz_deployment_contract.rs,
-          # signoz_topology_shape.rs (the render + gateway allowlist the
-          # Service Map conclusion rests on) and cycle_time_artifacts.rs all
-          # `include_str!` these files and
-          # fail on drift, and cycle_time_clickhouse.rs / signoz_usage_queries.rs /
-          # signoz_cycle_time.rs execute the SQL verbatim against a real ClickHouse.
-          # An artifact-only PR must
-          # re-run those, or the only tests that can catch the regression
-          # are skipped on exactly the PRs that cause one (#8665).
-          - 'defaults/observability/**'
-          # Same reason: label_registry `include_str!`s defaults/labels.json
-          # and its tests read both labels.yml copies from disk; a
-          # label-file-only PR skipped them and turned main red (#10083).
-          - 'defaults/labels.json'
+          # `defaults/` is Rust-tested surface, not inert config: code and
+          # tests `include_str!` or read it from disk across many subtrees.
+          # The observability artifacts' SQL is executed verbatim against a
+          # real ClickHouse (#8665); label_registry reads labels.json and
+          # both labels.yml copies from disk (#10083); forge_inventory fails
+          # on manifest drift (#10181); and scripts/lib, hooks, roles,
+          # runtimes and more are read the same way (#14301, found judging
+          # PR #14291, where a defaults/scripts-only diff skipped the Rust
+          # matrix). Each past fix added one subtree after a red main; the
+          # glob covers the class so the next `include_str!` cannot reopen
+          # the gap.
+          - 'defaults/**'
           - '.github/labels.yml'
-          - 'defaults/.github/labels.yml'
-          # forge_inventory `include_str!`s the manifest, operations/*.toml
-          # and call-bypass-baseline.toml and fails on drift (#10181).
-          - 'defaults/forge/**'
           - 'Cargo.toml'
           - 'Cargo.lock'
           - 'rust-toolchain.toml'
@@ -352,7 +345,8 @@ jobs:
     # optimisation-only link failures) before merge. Since #11966 it no longer
     # runs on every backend PR: that observation is owed by the push run of the
     # merge commit and ci-daily.yml's release-matrix (and merge_group where a
-    # queue is enabled; it is dormant on this user-owned repo).
+    # queue is enabled; it is dormant while `main` has no active `merge_queue`
+    # rule).
     #
     # It is ALSO the one release build per CI run (#10824): the binary is
     # uploaded as `loom-daemon-release-linux-amd64` and `worker-base-image`
@@ -558,6 +552,72 @@ jobs:
       # job-level timeout.
       - name: Compile tests (no run)
         run: cargo nextest run --workspace --features loom-daemon/otlp --profile ci --no-run
+      # Discovery on its own named step (#14066). The #11121 cap bounds the run
+      # step, but a discovery stall (the per-binary `--list` pass hanging before
+      # nextest prints `Starting N tests`) and a real test failure both just
+      # turned the leg red; this step makes a stall name itself. Healthy
+      # discovery is ~1s, so 3 minutes is generous. Same selection as the run
+      # step below, so it lists exactly the binaries that step will list.
+      - name: Discover tests (nextest list, partition ${{ matrix.partition }}/${{ strategy.job-total }})
+        id: discover
+        timeout-minutes: 3
+        run: cargo nextest list --workspace --features loom-daemon/otlp --profile ci --partition count:${{ matrix.partition }}/${{ strategy.job-total }}
+      # Evidence for the next stall, captured before the runner tears down. Job
+      # log only; no artifact. `loom-live-gh-guard-*` is the per-process dir
+      # `live_gh_guard::install` creates pre-`main`: present with a `gh` stub
+      # means install got past `write_stub` — the dir CONTENTS (not just the
+      # listing) settle whether the stub was written (#14229, #14691). The
+      # per-pid /proc capture names WHICH fd a hung child is blocked on:
+      # occurrence 3 (#14691) caught the lib binary in anon_pipe_write but
+      # could not say which pipe fd or how full it was. Guard dir resolves via
+      # `${TMPDIR:-/tmp}` because `live_gh_guard` uses `std::env::temp_dir()`,
+      # which honors TMPDIR. Every command is failure-tolerant: this step is
+      # continue-on-error evidence gathering, never a verdict.
+      - name: Diagnose discovery stall
+        if: failure() && steps.discover.outcome == 'failure'
+        continue-on-error: true
+        run: |
+          echo "::group::cargo-nextest / loom_daemon-* process state"
+          ps -eo pid,ppid,stat,wchan:32,etime,cmd | grep -E 'cargo-nextest|loom_daemon-' | grep -v grep || echo "(no matching processes)"
+          echo "::endgroup::"
+          echo "::group::per-pid /proc evidence (wchan, kernel stack, fds, pipe fdinfo)"
+          pids="$(pgrep -f 'cargo-nextest|loom_daemon-' || true)"
+          if [ -z "$pids" ]; then echo "(no matching processes)"; fi
+          for pid in $pids; do
+            echo "--- pid ${pid}: $(tr '\0' ' ' < /proc/${pid}/cmdline 2>/dev/null || true)"
+            echo "wchan: $(cat /proc/${pid}/wchan 2>/dev/null || true)"
+            echo "/proc/${pid}/stack (best effort; often root-only):"
+            cat /proc/${pid}/stack 2>/dev/null || echo "(unreadable)"
+            echo "/proc/${pid}/fd:"
+            ls -l /proc/${pid}/fd 2>/dev/null || echo "(unreadable)"
+            echo "fdinfo for pipe fds of ${pid}:"
+            found_pipe_fd=0
+            for fd in /proc/${pid}/fd/*; do
+              [ -L "$fd" ] || continue
+              target="$(readlink "$fd" 2>/dev/null || true)"
+              case "$target" in
+                pipe:*)
+                  found_pipe_fd=1
+                  echo "fdinfo ${fd##*/} -> ${target}:"
+                  cat "/proc/${pid}/fdinfo/${fd##*/}" 2>/dev/null || true
+                  ;;
+              esac
+            done
+            [ "$found_pipe_fd" -eq 1 ] || echo "(no pipe fds)"
+          done
+          echo "::endgroup::"
+          echo "::group::df -h \${TMPDIR:-/tmp}"
+          df -h "${TMPDIR:-/tmp}" || true
+          echo "::endgroup::"
+          echo "::group::loom-live-gh-guard temp dirs and contents"
+          guard_root="${TMPDIR:-/tmp}"
+          ls -la "$guard_root" 2>/dev/null | grep loom-live-gh-guard || echo "(no loom-live-gh-guard-* dir in ${guard_root})"
+          for guard_dir in "$guard_root"/loom-live-gh-guard-*; do
+            [ -d "$guard_dir" ] || continue
+            echo "--- contents of ${guard_dir}:"
+            ls -la "$guard_dir" 2>/dev/null || true
+          done
+          echo "::endgroup::"
       - name: Run tests (process-per-test, partition ${{ matrix.partition }}/${{ strategy.job-total }})
         # Includes merge_group_ci::workflow_identity_tests: native regression
         # coverage for this repo's cache/release identity guards (#14158).
@@ -674,7 +734,7 @@ jobs:
           import glob, sys, yaml
           PARSE_ONLY = 'defaults/optional/github-workflows/*.y*ml'
           INSTALLED = 'defaults/.github/ISSUE_TEMPLATE/*.y*ml'
-          FORBIDDEN = ('github.com/rjwalters/loom', '{' * 2)
+          FORBIDDEN = ('github.com/rjwalters/loom', 'github.com/2amlogic/loom', '{' * 2)
           bad = 0
           for pattern in (PARSE_ONLY, INSTALLED):
               files = sorted(glob.glob(pattern))
@@ -706,6 +766,19 @@ jobs:
       - name: Check AGENTS.md is in sync with its source
         if: ${{ !cancelled() }}
         run: bash scripts/check-agents-md-sync.sh
+
+      # component: Agent Skills Sync Check
+      # Cheap daemon-run check; always runs. defaults/.agents/skills/loom-<name>/SKILL.md
+      # mirrors are generated from defaults/roles/<name>.md by
+      # `loom-daemon generate-agent-skills` (runtime-adapters.md §5: the
+      # cross-vendor instruction surface Codex / Kimi Code / Mistral Vibe /
+      # Grok read natively). Before this gate, a corrected role prompt could
+      # land with both mirrors stale and a fully green CI (#14248, live in
+      # PR #14106), leaving every non-Claude runtime reading superseded
+      # text — enforced only by author discipline.
+      - name: Check .agents/skills mirrors are in sync with role prompts (#14248)
+        if: ${{ !cancelled() }}
+        run: ./target/debug/loom-daemon generate-agent-skills --check
 
       # component: Config Host-Path Guard
       # Cheap structural check; always runs. #6504: a per-host absolute path
@@ -917,6 +990,19 @@ jobs:
       - name: Check for dangling internal markdown links
         if: ${{ !cancelled() }}
         run: bash scripts/check-dangling-links.sh
+
+      # component: Docs Index Check
+      # Cheap structural check; always runs. docs/README.md is a hand-maintained
+      # enumeration of the docs/ tree that drifted once already (#13879); this
+      # fails the PR that adds a docs/ directory, a top-level docs/*.md or a
+      # docs/design/*.md note without a matching index link (#14075). The
+      # self-test regression-tests the checker against a synthetic docs/ tree.
+      - name: Self-test the docs index checker
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-docs-index.sh --self-test
+      - name: Check docs/README.md indexes the docs tree
+        if: ${{ !cancelled() }}
+        run: bash scripts/check-docs-index.sh
 
       # component: PRs Must Not Hand-Edit Version-Bearing Files
       # PR-only: needs the PR's base commit to diff against, which only exists
@@ -2333,7 +2419,7 @@ jobs:
     # no `--cache-to`, checkout with `persist-credentials: false`), so no PR
     # or merge_group token holds `packages: write` (#10846). The cache is
     # WRITTEN only by `worker-buildcache` below, a separate job gated at job
-    # level to a push to main in rjwalters/loom (mirrors rust-cache's
+    # level to a push to main in 2AMLogic/loom (mirrors rust-cache's
     # `save-if`): a fork PR's token cannot push to ghcr.io/rjwalters/*, and a
     # same-repo PR must not be able to seed the cache main builds from. The
     # published `:latest` is not used as cache-from: CI passes APT_MIRROR and

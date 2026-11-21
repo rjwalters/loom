@@ -66,8 +66,8 @@ the next person to add one will have an equally good argument.
    "must NOT be path-filtered — the corruption can land in any file, including
    one whose path group the PR did not otherwise touch."
 
-   A push to `main` runs every job with no path filter, with **one
-   operator-approved exception** (#10825, 2026-10-07): the image jobs
+   A push to `main` runs every job with no path filter, with an
+   operator-approved image exception (#10825, 2026-10-07): the image jobs
    (`worker-base-image` and the three `*-image-smoke` jobs). On push they run
    only when `Detect Changes` finds an image input in the diff, as defined by
    `scripts/ci-image-inputs.sh`, the one definition the PR filter shares.
@@ -82,8 +82,18 @@ the next person to add one will have an equally good argument.
    turn `CI Result` red. The loom-daemon **source** is deliberately not an
    image input, though the images ship it. That observation is owed to
    `ci-daily.yml`'s `docker-smokes`, which builds the daemon from the commit
-   and runs every smoke unfiltered (rule 10). Adding a second push-time
-   filter needs its own operator approval.
+   and runs every smoke unfiltered (rule 10).
+
+   The second operator-approved exception (#14823, 2026-11-20) lets a
+   successful shared docs-only classifier skip designated heavy steps inside
+   required jobs. It compares the exact tested Git trees against a proven
+   green base. Required job contexts, conflict marker checks, applicable
+   Markdown and link checks, and existing repo-wide guards keep running.
+   A false or missing decision runs the full suites. A failed or cancelled
+   classifier also turns `CI Result` red while the workflow is active.
+   Keep the policy shared and require operator approval for another
+   exception. See [Docs-only CI](merge-queue-ci.md#docs-only-ci) for adoption
+   and verification.
 
 4. **One mechanism per behaviour.** If two mechanisms implement cancellation,
    skipping, or retry, their interaction is owned by nobody and will surprise
@@ -154,12 +164,18 @@ the next person to add one will have an equally good argument.
     Its run is never cancelled once started (rule 2). Its concurrency group is
     keyed on its own head SHA, so no other run can supersede it while it is
     still pending. Without that key the queue would wait on a check that never
-    reports. A suite that is skipped on `merge_group` is not coverage
-    (rule 6), and path filters do not apply there (rule 3). `merge_group` runs
-    the full suite: everything `push` runs, plus the image jobs that `push`
-    path-filters under rule 3's one exception. `loom-daemon merge-group-ci audit` checks all of
-    this statically, and it counts any suite it cannot prove runs as
-    uncovered. See [merge-queue-ci](merge-queue-ci.md).
+    reports. A suite that is skipped on `merge_group` is not coverage (rule 6).
+    Merge groups run the full image suites. The second exception
+    (#14823, 2026-11-20) allows the same designated docs-only steps to skip
+    on a proven `ALLGREEN` merge-queue first parent, including a recognized
+    speculative predecessor whose required checks must pass before landing.
+    Missing policy, an unrecognized predecessor, or a failed classifier
+    runs the full suites. Required contexts and merge authorization still
+    apply. `loom-daemon merge-group-ci audit` checks static job eligibility
+    and reports any supported docs-only guards as conditional coverage. Equal unknown
+    step conditions can pass that comparison even when runtime outputs differ.
+    Verify full-suite execution from the actual job and step results on the
+    merge-group SHA. See the [step comparison example](merge-queue-ci.md#reproduce-the-step-comparison).
 
 ## The daily backstop and its tracking issues
 

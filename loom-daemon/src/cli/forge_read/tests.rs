@@ -1,5 +1,5 @@
-//! `ForgeAction::is_read` against the clap tree and the capability list
-//! (#14395): a verb is served by `loom-tools` exactly when
+//! `ForgeAction::is_served` against the clap tree and the capability list
+//! (#14395, #14519): a verb is served by `loom-tools` exactly when
 //! [`TOOLS_COMMANDS`] names it, and every verb `ForgeAction` declares is
 //! classified one way or the other.
 
@@ -50,8 +50,8 @@ fn parse(argv: &[String]) -> ForgeReadCli {
     })
 }
 
-/// Every `(verb path, is_read_expected)` the clap tree declares: leaf commands
-/// only, so `merge-queue` and `parent` contribute their sub-verbs.
+/// Every `(verb path, command)` the clap tree declares: leaf commands only,
+/// so `merge-queue` and `parent` contribute their sub-verbs.
 fn declared_verbs() -> Vec<(Vec<String>, Command)> {
     on_stack("forge-read-verbs-8MiB", MAIN_THREAD_STACK, || {
         let root = forge_command();
@@ -73,7 +73,7 @@ fn declared_verbs() -> Vec<(Vec<String>, Command)> {
 }
 
 #[test]
-fn is_read_matches_the_capability_list_for_every_declared_verb() {
+fn is_served_matches_the_capability_list_for_every_declared_verb() {
     let verbs = declared_verbs();
     assert!(verbs.len() > 40, "the forge tree has lost verbs: {}", verbs.len());
     for (path, cmd) in verbs {
@@ -81,9 +81,9 @@ fn is_read_matches_the_capability_list_for_every_declared_verb() {
         let listed = TOOLS_COMMANDS.contains(&format!("forge {}", names.join(" ")).as_str());
         let cli = parse(&argv_for(&names, &cmd));
         assert_eq!(
-            cli.is_read(),
+            cli.is_served(),
             listed,
-            "`forge {}`: is_read() and TOOLS_COMMANDS disagree",
+            "`forge {}`: is_served() and TOOLS_COMMANDS disagree",
             names.join(" ")
         );
         if names.len() == 1 {
@@ -104,21 +104,50 @@ fn every_listed_forge_command_is_a_declared_verb() {
 }
 
 #[test]
-fn the_write_verbs_are_refused_and_the_split_verbs_are_split() {
-    for (argv, read) in [
-        (&["comment", "1", "--body", "x"][..], false),
-        (&["create-issue", "--title", "t", "--body", "b"], false),
-        (&["auto-merge", "1"], false),
-        // #14520: the whole queue family is served.
+fn shared_and_queue_verbs_are_served() {
+    for (argv, served) in [
+        (&["comment", "1", "--body", "x"][..], true),
+        (&["create-issue", "--title", "t", "--body", "b"], true),
+        (&["rerun", "1"], true),
+        (&["auto-merge", "1"], true),
+        (&["disable-auto-merge", "1"], true),
+        (
+            &[
+                "verdict-labels",
+                "1",
+                "--repo",
+                "o/r",
+                "--verdict",
+                "approved",
+            ],
+            true,
+        ),
+        (
+            &[
+                "verdict-reconcile",
+                "1",
+                "--repo",
+                "o/r",
+                "--verdict",
+                "approved",
+                "--sha",
+                "a",
+            ],
+            true,
+        ),
+        (&["verdict-lock", "acquire", "1", "--repo", "o/r"], true),
+        (&["journal-ci-refusal", "1", "--class", "ci_red"], true),
+        (&["doctor-handback", "1", "--expected-head-sha", "a"], true),
+        (&["parent", "link", "--parent", "1", "--child", "2"], true),
         (&["merge-queue", "enqueue", "1", "--approved-sha", "a"], true),
+        (&["merge-queue", "dequeue", "1"], true),
         (&["merge-queue", "status", "1"], true),
-        (&["parent", "link", "--parent", "1", "--child", "2"], false),
         (&["parent", "split-state", "--parent", "1"], true),
         (&["check-claim", "1"], true),
     ] {
         let mut full: Vec<String> = vec!["forge".into()];
         full.extend(argv.iter().map(|a| (*a).to_string()));
-        assert_eq!(parse(&full).is_read(), read, "{argv:?}");
+        assert_eq!(parse(&full).is_served(), served, "{argv:?}");
     }
 }
 
@@ -141,7 +170,7 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
         // (the environment decides, so they are pinned by
         // `merge_queue_verbs_reach_the_forge_by_effect` with an injected mode).
         .filter(|(name, _)| !name.starts_with("merge-queue "))
-        .filter(|(_, cli)| cli.is_read() && !cli.reaches_forge())
+        .filter(|(_, cli)| cli.is_served() && !cli.reaches_forge())
         .map(|(name, _)| name)
         .collect();
     local.sort();
@@ -150,8 +179,11 @@ fn only_verbs_without_a_forge_call_skip_the_mode_gate() {
         [
             "calls",
             "dashboard-link",
+            "journal-ci-refusal",
             "rebase-guard",
-            "verdict-body-check"
+            "verdict-body-check",
+            "verdict-lock",
+            "workflow-write-all-check"
         ]
     );
 }
@@ -202,7 +234,7 @@ fn merge_queue_verbs_reach_the_forge_by_effect() {
         let mut argv: Vec<String> = vec!["forge".into(), "merge-queue".into()];
         argv.extend(tail.iter().map(|a| (*a).to_string()));
         let cli = parse(&argv);
-        assert!(cli.is_read(), "{argv:?} must be served");
+        assert!(cli.is_served(), "{argv:?} must be served");
         let ForgeAction::MergeQueue { action } = &cli.action else {
             panic!("{argv:?}: not a merge-queue verb");
         };

@@ -157,6 +157,11 @@ pub struct StepRefusal {
     /// Seconds the captain says its hold lasts (`retry_after_s`), for a
     /// `captain_cooldown` refusal that carried one (#12704).
     pub hold_secs: Option<u32>,
+    /// The confirmed writer rate limit behind a `writer_rate_limited`
+    /// refusal (#13746): the typed handoff the claim child emitted, with the
+    /// facts the spawn records as a route hold. `None` for every other
+    /// refusal.
+    pub writer_limit: Option<Box<crate::writer_limit::WriterLimited>>,
     seat_unavailable: bool,
 }
 
@@ -169,6 +174,7 @@ impl StepRefusal {
             assignment_id: None,
             captain: None,
             hold_secs: None,
+            writer_limit: None,
             seat_unavailable: false,
         }
     }
@@ -263,6 +269,7 @@ pub struct PreparedStep {
     pub child: Child,
     pub header_anchor: String,
     pub log_path: PathBuf,
+    rejection: Option<crate::worker_spawn::rejection::Receiver>,
     request: StepSpawnRequest,
     sweep_id: SweepId,
     launch: StepLaunch,
@@ -480,9 +487,10 @@ impl SweepRegistry {
             spawn(self)
         };
         match spawned {
-            Ok((child, header_anchor)) => Ok(PreparedStep {
-                child,
-                header_anchor,
+            Ok(spawned) => Ok(PreparedStep {
+                child: spawned.child,
+                header_anchor: spawned.header_anchor,
+                rejection: spawned.rejection,
                 log_path,
                 request: request.clone(),
                 sweep_id,
@@ -670,6 +678,7 @@ impl SweepRegistry {
         let PreparedStep {
             child,
             log_path,
+            rejection,
             request,
             sweep_id,
             mut launch,
@@ -719,6 +728,9 @@ impl SweepRegistry {
             );
         }
         self.children.insert(sweep_id.clone(), child);
+        if let Some(receiver) = rejection {
+            self.launch_rejections.insert(sweep_id.clone(), receiver);
+        }
         let admitted = launch.admission.admitted.as_ref();
         self.entries.insert(
             sweep_id.clone(),
@@ -1126,7 +1138,7 @@ pub(crate) fn apply_step_env(
         crate::host_identity::LEASE_HOST_ID_ENV,
         crate::host_identity::lease_host_identity(),
     );
-    crate::observability::pick_journal::attach_step(cmd, sweep_id);
+    crate::observability::pick_journal::attach_step(cmd, root, sweep_id);
     // The admitted runtime can differ from the configured preference. Leave
     // an inherited tier in place when there is no matching configuration.
     if let Some((tier, _)) = runtime.and_then(|runtime| {

@@ -43,6 +43,9 @@ pub enum Code {
     /// A job's or step's condition cannot be decided statically on
     /// `merge_group`; counted as uncovered.
     UndeterminedCondition,
+    /// A docs-only output gates a whole job or is read without the supported
+    /// fail-open-to-full-suite step condition and classifier.
+    UnprovenDocsOnlyGuard,
     /// A step of a covered job runs on `pull_request` but is skipped on
     /// `merge_group`, so that gate silently does not run on the combined tree.
     PrOnlyStep,
@@ -83,6 +86,7 @@ impl Code {
             Code::SkippedDependency => "SKIPPED_DEPENDENCY",
             Code::PathFilterSkip => "PATH_FILTER_SKIP",
             Code::UndeterminedCondition => "UNDETERMINED_CONDITION",
+            Code::UnprovenDocsOnlyGuard => "UNPROVEN_DOCS_ONLY_GUARD",
             Code::PrOnlyStep => "PR_ONLY_STEP",
             Code::NonMergeGroupCheckout => "NON_MERGE_GROUP_CHECKOUT",
             Code::GroupCheckWithoutCheckout => "GROUP_CHECK_WITHOUT_CHECKOUT",
@@ -141,8 +145,11 @@ pub struct JobReport {
     pub relied_on: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_only_marker: Option<String>,
-    /// Relied-on, runs on `merge_group`, and no finding against it.
+    /// Fully covered, without the approved conditional docs-only exception.
     pub covered: bool,
+    /// Supported docs-only guarded steps in an otherwise covered job.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub docs_only_steps: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions: Option<String>,
 }
@@ -153,6 +160,12 @@ pub struct RequiredCoverage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub job: Option<String>,
     pub covered: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub docs_only_exception: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -492,10 +505,20 @@ pub fn audit(
             if job_relied && mg_trigger {
                 audit_job(job, wf, &ctx, &pr_states, &mg_states, &mut job_findings);
             }
-            let covered = job_relied
+            let otherwise_covered = job_relied
                 && mg_trigger
                 && mg_states[&job.id] == RunState::Runs
                 && job_findings.is_empty();
+            let docs_only_steps = if otherwise_covered {
+                job.steps
+                    .iter()
+                    .filter(|step| supported_docs_only_step(job, wf, step))
+                    .map(Step::label)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let covered = otherwise_covered && docs_only_steps.is_empty();
             let mut states = BTreeMap::new();
             states.insert(Event::PullRequest, pr_state);
             states.insert(Event::Push, push_states[&job.id]);
@@ -508,6 +531,7 @@ pub fn audit(
                 relied_on: job_relied,
                 pr_only_marker: job.pr_only.clone(),
                 covered,
+                docs_only_steps,
                 permissions: job.permissions.clone(),
             });
             wf_findings.extend(job_findings);
@@ -531,7 +555,7 @@ pub fn audit(
                     "required context `{ctx_name}` matches no job name in any workflow, so the merge group can never satisfy it"
                 ),
             }),
-            Some(j) if !j.covered => {
+            Some(j) if !j.covered && j.docs_only_steps.is_empty() => {
                 let line = workflows
                     .iter()
                     .find(|w| w.file == j.workflow)
@@ -554,6 +578,7 @@ pub fn audit(
             context: ctx_name.clone(),
             job: hit.map(|j| format!("{}#{}", j.workflow, j.id)),
             covered: hit.is_some_and(|j| j.covered),
+            docs_only_exception: hit.is_some_and(|j| !j.docs_only_steps.is_empty()),
         });
     }
 
@@ -563,6 +588,49 @@ pub fn audit(
         required: required_out,
         findings,
     }
+}
+
+const DOCS_OUTPUT: &str = "needs.docs_only.outputs.docs_only";
+const DOCS_STEP_GUARD: &str =
+    "needs.docs_only.result!='success'||needs.docs_only.outputs.docs_only!='true'";
+
+fn uses_docs_only_output(condition: &str) -> bool {
+    if let Ok(expr) = expr::parse_condition(condition) {
+        let mut paths = Vec::new();
+        expr.paths(&mut paths);
+        paths
+            .iter()
+            .any(|path| path.eq_ignore_ascii_case(DOCS_OUTPUT))
+    } else {
+        compact_expr(condition).contains(DOCS_OUTPUT)
+    }
+}
+
+fn supported_docs_only_step(job: &Job, wf: &Workflow, step: &Step) -> bool {
+    step.if_cond
+        .as_deref()
+        .is_some_and(|cond| compact_expr(cond) == DOCS_STEP_GUARD)
+        && !step.is_checkout()
+        && step
+            .run
+            .as_deref()
+            .is_none_or(|run| !run.contains("merge-queue group-check"))
+        && job.needs.iter().any(|need| need == "docs_only")
+        && job
+            .if_cond
+            .as_deref()
+            .is_some_and(|cond| compact_expr(cond) == "!cancelled()")
+        && wf.job("docs_only").is_some_and(|classifier| {
+            classifier.outputs.iter().any(|(name, value)| {
+                name == "docs_only" && compact_expr(value) == "steps.classify.outputs.docs_only"
+            }) && classifier.steps.iter().any(|s| {
+                s.id.as_deref() == Some("classify")
+                    && s.run.as_ref().is_some_and(|script| {
+                        script.contains("loom-daemon ci-docs-only ")
+                            || script.contains("/ci-docs-only.sh ")
+                    })
+            })
+        })
 }
 
 fn audit_job(
@@ -582,6 +650,15 @@ fn audit_job(
         detail,
     };
     let cond_text = job.if_cond.as_deref().unwrap_or("success()");
+    if uses_docs_only_output(cond_text) {
+        out.push(finding(
+            Code::UnprovenDocsOnlyGuard,
+            job.line,
+            None,
+            "docs-only may skip heavy steps inside a required job, never the job itself"
+                .to_string(),
+        ));
+    }
     match mg_states[&job.id] {
         RunState::Runs => {}
         RunState::Skipped => {
@@ -646,7 +723,16 @@ fn audit_job(
         let pr = eval_condition(step.if_cond.as_deref(), &pr_scope).truth();
         let mg = eval_condition(step.if_cond.as_deref(), &mg_scope).truth();
         let cond = step.if_cond.as_deref().unwrap_or("success()");
-        if mg < pr {
+        if uses_docs_only_output(cond) {
+            if !supported_docs_only_step(job, wf, step) {
+                out.push(finding(
+                    Code::UnprovenDocsOnlyGuard,
+                    step.line,
+                    Some(step),
+                    "docs-only step does not establish the supported fail-closed classifier and heavy step guard".to_string(),
+                ));
+            }
+        } else if mg < pr {
             let deps = path_filter_deps(cond, wf, mg_states);
             let (code, detail) = match (mg, deps.is_empty()) {
                 (Truth::False, _) => (

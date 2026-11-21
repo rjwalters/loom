@@ -74,7 +74,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::park_record;
-use crate::stale_blocked::{batch, budget, classify, undeclared, Artifact, Verdict};
+use crate::stale_blocked::{
+    batch, budget, classify, resolved, undeclared, Artifact, PrResweepState, Verdict,
+};
 
 /// How many open `loom:blocked` issues to examine by default.
 ///
@@ -115,6 +117,11 @@ pub struct StaleBlockedArgs {
     /// restoring the issues-only behaviour this check shipped with.
     #[arg(long)]
     pub no_prs: bool,
+
+    /// Report what Guide's named-blocker PR sweep can release or must leave
+    /// parked. Read-only; unnamed parks and issue rows are outside this mode.
+    #[arg(long, conflicts_with = "no_prs")]
+    pub pr_resweep: bool,
 
     /// GraphQL points that must remain after this run (#10480). If the free
     /// budget probe says the run would go below it, nothing is gathered and
@@ -167,11 +174,32 @@ impl StaleBlockedArgs {
                 core: self.min_core_remaining,
             },
         };
+        if self.pr_resweep {
+            let gathering = batch::gather_pr_resweep(&mut forge, &fleet, opts);
+            let conflict_route_enabled =
+                match crate::stale_blocked::guide_conflict_route_enabled(&root) {
+                    Ok(enabled) => enabled,
+                    Err(error) => {
+                        eprintln!("Doctor conflict routing policy unavailable: {error:#}");
+                        false
+                    }
+                };
+            report_pr_resweep(
+                &gathering,
+                forge.repo_slug(),
+                self.limit,
+                self.json,
+                self.quiet,
+                conflict_route_enabled,
+            );
+            return Ok(());
+        }
         let batch::Gathering {
             items: gathered,
             enumerate_error,
             cost,
             archived,
+            ..
         } = batch::gather_checked(&mut forge, &fleet, opts);
 
         let mut stale: Vec<Finding> = Vec::new();
@@ -234,6 +262,167 @@ impl StaleBlockedArgs {
 
         report(&sections, self.quiet);
         Ok(())
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PrResweepRow {
+    number: i64,
+    disposition: &'static str,
+    reason: String,
+    blockers: Vec<String>,
+}
+
+fn pr_resweep_row(pr: &batch::Gathered, conflict_route_enabled: bool) -> PrResweepRow {
+    let blockers = park_record::blockers(&pr.body);
+    let row = |disposition, reason: String| PrResweepRow {
+        number: pr.number,
+        disposition,
+        reason,
+        blockers: blockers.iter().map(ToString::to_string).collect(),
+    };
+    if blockers.is_empty() {
+        return row("outside-scope", "no named park record".into());
+    }
+    let e = match &pr.evidence {
+        Ok(e) => e,
+        Err(why) => return row("unevaluated", why.clone()),
+    };
+    for blocker in &blockers {
+        let number = i64::try_from(blocker.number).unwrap_or(-1);
+        let state = match &blocker.repo {
+            Some(repo) => e
+                .remote
+                .iter()
+                .find(|r| r.number == number && r.repo.eq_ignore_ascii_case(repo))
+                .map(|r| r.state.as_str()),
+            None => e
+                .prose
+                .iter()
+                .find(|r| r.number == number)
+                .map(|r| r.state.as_str()),
+        };
+        match state {
+            Some(state) if resolved(state) => {}
+            Some(state @ ("OPEN" | "CLOSED_UNMERGED")) => {
+                return row("still-blocked", format!("{blocker} is {state}"))
+            }
+            _ => return row("unevaluated", format!("{blocker} has no known state")),
+        }
+    }
+    if let Some(hold) = e.champion_hold {
+        return row("held", hold.reason().into());
+    }
+    if crate::work_finder::is_operator_hold(&pr.labels)
+        || pr.labels.iter().any(|l| l == "loom:frozen")
+    {
+        return row("held", "operator or frozen hold".into());
+    }
+    if let Some(held) = &e.held {
+        return row("held", held.reason.clone());
+    }
+    if park_record::parse(&pr.body)
+        .iter()
+        .any(|record| record.blocker.is_none())
+    {
+        return row("held", "additional park record without a named blocker".into());
+    }
+    if let Verdict::Superseded { block, .. } = classify(e) {
+        return row("held", block);
+    }
+    match &e.pr_resweep_state {
+        Some(PrResweepState::Held(reason)) => row("held", reason.clone()),
+        Some(PrResweepState::Conflict(conflict)) => {
+            if conflict_route_enabled {
+                row(
+                    "routable-to-doctor",
+                    format!("{conflict}; Guide can hand off to Doctor with loom:merge-conflict"),
+                )
+            } else {
+                row("held", format!("{conflict}; Doctor conflict routing is disabled"))
+            }
+        }
+        Some(PrResweepState::Mergeable) => row("releasable", "all named blockers resolved".into()),
+        None => row("unevaluated", "the PR has no confirmed mergeability".into()),
+    }
+}
+
+#[derive(serde::Serialize, Debug, PartialEq, Eq)]
+struct ConflictDependency {
+    issue: u32,
+    blocked_pr: u64,
+}
+
+fn conflict_dependencies(
+    prs: &[PrResweepRow],
+    issue_parks: &[(u32, Vec<park_record::BlockerRef>)],
+    repo: &str,
+) -> Vec<ConflictDependency> {
+    let conflicts: std::collections::BTreeSet<_> = prs
+        .iter()
+        .filter(|pr| pr.disposition == "routable-to-doctor")
+        .filter_map(|pr| u64::try_from(pr.number).ok())
+        .collect();
+    issue_parks
+        .iter()
+        .flat_map(|(issue, blockers)| {
+            blockers
+                .iter()
+                .filter(|b| b.is_local(Some(repo)) && conflicts.contains(&b.number))
+                .map(|b| (*issue, b.number))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|(issue, blocked_pr)| ConflictDependency { issue, blocked_pr })
+        .collect()
+}
+
+fn report_pr_resweep(
+    gathering: &batch::Gathering,
+    repo: &str,
+    limit: u32,
+    json: bool,
+    quiet: bool,
+    conflict_route_enabled: bool,
+) {
+    let prs: Vec<_> = gathering
+        .items
+        .iter()
+        .filter(|g| g.kind == Artifact::Pr)
+        .map(|pr| pr_resweep_row(pr, conflict_route_enabled))
+        .collect();
+    let reached_limit = prs.len() == limit as usize;
+    let dependent_issues = conflict_dependencies(&prs, &gathering.issue_parks, repo);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pr_resweep": prs,
+                "dependent_issues": dependent_issues,
+                "reached_limit": reached_limit,
+                "enumerate_error": gathering.enumerate_error,
+                "archived": gathering.archived,
+                "forge_cost": gathering.cost,
+            })
+        );
+        return;
+    }
+    if let Some(error) = &gathering.enumerate_error {
+        eprintln!("Parked PR listing could not be evaluated: {error}");
+    } else if prs.is_empty() && !quiet {
+        println!("No parked PRs to resweep.");
+    }
+    if reached_limit {
+        eprintln!("Parked PR resweep reached its {limit} limit; additional PRs may be unexamined.");
+    }
+    for pr in prs {
+        println!("PR #{} {} — {}", pr.number, pr.disposition, pr.reason);
+    }
+    for link in dependent_issues {
+        println!(
+            "Issue #{} is waiting on the parked conflict at PR #{} (Guide → Doctor).",
+            link.issue, link.blocked_pr
+        );
     }
 }
 
@@ -619,6 +808,101 @@ fn print_json(s: &Sections<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn named_pr_resweep_distinguishes_release_conflict_holds_and_unreadable() {
+        use crate::champion_hold::HoldKind;
+        use crate::dep_recheck::premise::Ref;
+        use crate::stale_blocked::Evidence;
+
+        let mut pr = batch::Gathered {
+            kind: Artifact::Pr,
+            number: 5991,
+            title: String::new(),
+            evidence: Ok(Evidence {
+                prose: [(6343, "CLOSED"), (6348, "MERGED"), (6354, "MERGED")]
+                    .into_iter()
+                    .map(|(number, state)| Ref {
+                        number,
+                        state: state.into(),
+                    })
+                    .collect(),
+                pr_resweep_state: Some(PrResweepState::Mergeable),
+                ..Evidence::default()
+            }),
+            cause: None,
+            labels: vec![
+                "loom:blocked".into(),
+                "loom:changes-requested".into(),
+                "loom:ci-failure".into(),
+            ],
+            body: "<!-- loom:park Blocked by: #6343 by=judge -->\n\
+                   <!-- loom:park Blocked by: #6348 by=judge -->\n\
+                   <!-- loom:park Blocked by: #6354 by=judge -->"
+                .into(),
+        };
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "releasable");
+        let eligible = pr.evidence.clone();
+
+        for (state, disposition) in [
+            ("OPEN", "still-blocked"),
+            ("CLOSED_UNMERGED", "still-blocked"),
+            ("UNKNOWN", "unevaluated"),
+        ] {
+            pr.evidence.as_mut().unwrap().prose[0].state = state.into();
+            assert_eq!(pr_resweep_row(&pr, true).disposition, disposition);
+        }
+        pr.evidence = eligible;
+        pr.evidence.as_mut().unwrap().pr_resweep_state = None;
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "unevaluated");
+        pr.evidence.as_mut().unwrap().pr_resweep_state =
+            Some(PrResweepState::Conflict("merge conflict".into()));
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "routable-to-doctor");
+        let disabled = pr_resweep_row(&pr, false);
+        assert_eq!(disabled.disposition, "held");
+        assert!(disabled.reason.contains("routing is disabled"));
+        let issue_parks = vec![(
+            694,
+            vec![
+                park_record::BlockerRef::local(5991),
+                "fixture/loom#5991".parse().unwrap(),
+                "other/loom#5991".parse().unwrap(),
+                park_record::BlockerRef::local(90),
+            ],
+        )];
+        assert_eq!(
+            conflict_dependencies(&[pr_resweep_row(&pr, true)], &issue_parks, "fixture/loom"),
+            [ConflictDependency {
+                issue: 694,
+                blocked_pr: 5991
+            }]
+        );
+        assert!(conflict_dependencies(&[disabled], &issue_parks, "fixture/loom").is_empty());
+        for hold in [
+            HoldKind::Ratification,
+            HoldKind::MergeRisk,
+            HoldKind::CriticalFile,
+        ] {
+            pr.evidence.as_mut().unwrap().champion_hold = Some(hold);
+            assert_eq!(pr_resweep_row(&pr, true).reason, hold.reason());
+        }
+        pr.evidence.as_mut().unwrap().champion_hold = None;
+        pr.labels.push("loom:operator-blocked".into());
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "held");
+        pr.labels.pop();
+        let named = pr.body.clone();
+        let own_diff =
+            "<!-- loom:park Blocked by: (unstated) by=judge reason=\"defect in this diff\" -->";
+        pr.body.push('\n');
+        pr.body.push_str(own_diff);
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "held");
+        pr.body = own_diff.into();
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "outside-scope");
+
+        pr.body = named;
+        pr.evidence = Err("forge read failed".into());
+        assert_eq!(pr_resweep_row(&pr, true).disposition, "unevaluated");
+    }
 
     /// #9191: the command examines one repository per invocation, and its
     /// help must say so. "Fleet-wide" invited a hand-rolled loop over many

@@ -61,12 +61,10 @@ This starts both the Vite dev server and the Tauri development window with hot r
 ## Project Structure
 
 ```
-├── .loom/
-│   ├── roles/
-│   │   ├── builder.md      # Tauri-specific build guidance
-│   │   └── judge.md        # Desktop app review criteria
-│   └── scripts/
-│       └── worktree.sh
+├── .loom/              # Loom config (scripts/ come from the Loom installer)
+│   └── roles/
+│       ├── builder.md      # Tauri-specific build guidance
+│       └── judge.md        # Desktop app review criteria
 ├── src-tauri/
 │   ├── src/
 │   │   ├── main.rs         # Tauri app entry point

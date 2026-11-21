@@ -742,6 +742,31 @@ the same lease semantics, **keyed by role**:
   unverifiable it marks its own lease released (one PATCH, no read) and exits
   5, which the engine records as `claim_unverified` and cools down for that
   item alone (#12252).
+- **A confirmed writer rate limit is named, not misreported (#13746).** Two
+  stand-downs used to read as something else when the writer credential was
+  rate-limited: an unverifiable write-scope probe answered "refusing to
+  write here", and a refused comment POST answered "could not post the lease
+  comment" — both `claim_unverified`, naming a read problem while the reads
+  were healthy. Now a confirmed primary rate limit at either writer call —
+  the permission probe or the POST — keeps exit 5 and writes nothing, but
+  says so: the final stderr line (and with it
+  `loom.dispatch.claim_stderr_tail`) names the stage
+  (`permission_probe`/`comment_post`), the HTTP status, the resource, the
+  safe credential ids (`app-<id>`, the installation id, when attributable)
+  and the UTC reset when one was confirmed from the scoped budget evidence
+  (the persisted bucket-book reading, else one free `rate_limit` probe of
+  the writer directory — never a poll per candidate). A secondary throttle,
+  a bare auth denial and an ordinary permission refusal keep their own
+  diagnostics. The claim also prints one bounded, typed handoff line on
+  stdout (`loom-claim-writer-limited <json>` — vendor output reaches only
+  stderr, so it cannot forge one); the daemon's preclaim parses that — and
+  nothing else — into the distinct `writer_rate_limited` refusal reason
+  (`loom.dispatch.reason`, the fleet worker-to-captain `refuse` token), which
+  cools no item down and arms a **route hold**: the work finder stops
+  drawing the held writer installation's candidates until the reset (rows
+  wait as `deferred_capacity`, naming the reason and reset), while healthy
+  other owners, read-only discovery and the global rate-limit breaker keep
+  their own behavior.
 - **Doctor activity guard (#12105).** The role key means a Doctor's `claim`
   sees only other Doctors. So before it posts, a Doctor also stands down
   (exit 7, nothing written) when another actor is working the PR: a live
@@ -787,11 +812,22 @@ the same lease semantics, **keyed by role**:
   earliest live lease, or if there is no evidence either way (an unreadable
   list, or a claimant on an older prompt that never leased). Exit 3 if its own
   lease is no longer live. Exit 4 if a peer's live lease is earliest.
-- **`release`** tombstones and signals the renewer, then rewrites the lease's
-  first line to `loom:pr-lease-released`. The claim frees at once, without
-  waiting out the TTL.
+- **`release`** tombstones and signals the renewer, then rewrites the lease
+  comment: its first line to `loom:pr-lease-released`, and its prose to the
+  released wording (#14807) — `reaped` when the role runner released it for a
+  claimant that ended without releasing — so a human reading the PR never sees
+  a live-looking claim behind a released marker. That lease stops blocking
+  immediately. Other live leases and any Judge no-verdict hold still apply.
 - **`check`** prints `PR_LEASE_STATE=free|held-self|held-peer|unknown`: the
   PR-phase shape of #11118's `claim_state(item)`.
+  This read-only command exits 0 for `free` or `held-self`, 4 for `held-peer`
+  (including the holder's host and sweep), and 5 for an unreadable lease list
+  (`unknown`). When a Judge has no live lease and the backstop holds the PR,
+  `check` exits 6 with `PR_LEASE_STATE=held-backstop` and
+  `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>`. A gate-refusal
+  cooldown also includes `PR_LEASE_BACKSTOP_REFUSED=<token>`. A live lease
+  takes precedence. Other roles, a disabled backstop, and an unreadable PR
+  head report `free` when the lease is free.
 - **Judge no-verdict backstop (#11855).** A Judge `release` that finds the PR
   open, still `loom:review-requested` and carrying neither `loom:pr` nor
   `loom:changes-requested` appends `head=<sha> verdict=none labels=<digest>`

@@ -122,6 +122,20 @@ pub fn read_outcome_line(log: &Path, sweep_id: &str) -> Option<StepOutcomeLine> 
     text[start..].lines().rev().find_map(parse_outcome_line)
 }
 
+/// A typed report belongs to the launch's own child. Keep the existing
+/// process-status and agent-outcome precedence before using it in the ledger.
+#[must_use]
+pub(crate) fn launch_rejection_of(
+    end: StepEnd,
+    line: Option<&StepOutcomeLine>,
+    reported: Option<&'static str>,
+) -> Option<&'static str> {
+    if !matches!(end, StepEnd::Exited(Some(78))) || line.is_some() {
+        return None;
+    }
+    reported
+}
+
 /// The `reason`s held as `ci_wait`: Judge's `ci_pending` (written
 /// `ci-pending` on the line; the parser folds it, #13500), and the Champion
 /// `requeued` outcome word. The captain is fed the outcome line's own reason,
@@ -408,6 +422,7 @@ pub(crate) struct StepCapture {
     /// record, resolved-runtime marker and native session ids. The per-role
     /// log a role tick reads is wrong for a step.
     pub(crate) log_path: PathBuf,
+    pub(crate) runtime: Option<String>,
 }
 
 /// Emit the role tick's capture for one finished step: its journal drained
@@ -415,7 +430,7 @@ pub(crate) struct StepCapture {
 pub(crate) fn emit_step_capture(capture: &StepCapture) {
     crate::observability::pick_journal::adopt(
         &capture.root,
-        crate::observability::pick_journal::step_path(&capture.sweep_id),
+        crate::observability::pick_journal::step_path(&capture.root, &capture.sweep_id),
     );
     crate::role_tick_telemetry::emit_for_step(
         &capture.root,
@@ -431,6 +446,7 @@ pub(crate) fn emit_step_capture(capture: &StepCapture) {
             item: (capture.item, capture.role.acts_on_pr()),
             stage: &capture.stage,
             log_path: &capture.log_path,
+            runtime: capture.runtime.as_deref(),
         },
     );
 }
@@ -473,7 +489,7 @@ impl SweepRegistry {
     /// entry): reap the leases it still listed, then emit its capture off the
     /// lock. Returns its outcome line.
     pub(crate) fn end_step(
-        &self,
+        &mut self,
         sweep_id: &str,
         item: u32,
         role: StepRole,
@@ -485,6 +501,10 @@ impl SweepRegistry {
         } else {
             end
         };
+        let rejection = self
+            .launch_rejections
+            .remove(sweep_id)
+            .and_then(crate::worker_spawn::rejection::Receiver::reason);
         let info = self.entries.get(sweep_id);
         let log_path =
             info.map_or_else(|| self.compute_step_log_path(item, role), |i| i.log_path.clone());
@@ -568,6 +588,7 @@ impl SweepRegistry {
                     ran_for: (Utc::now() - started_at).to_std().unwrap_or_default(),
                     timed_out: end == StepEnd::TimedOut,
                     provider_exhausted,
+                    launch_rejection: launch_rejection_of(end, line.as_ref(), rejection),
                 },
             );
         }
@@ -625,6 +646,7 @@ impl SweepRegistry {
                 effort: info.and_then(|i| i.effort.clone()).unwrap_or_default(),
                 stage: role.as_str().to_string(),
                 log_path: log_path.clone(),
+                runtime: info.map(|i| i.runtime.clone()),
             };
             // #12027: the step's verdict record reads its log at the drain.
             let staged = crate::observability::step_verdict::StagedStep {

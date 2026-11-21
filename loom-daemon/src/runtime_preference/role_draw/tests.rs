@@ -564,7 +564,7 @@ impl ContainmentPreparer for FakePreparer {
 fn fake_probe<'a>(
     root: &'a Path,
     fake: &'a std::cell::RefCell<FakePreparer>,
-) -> impl FnMut(&str, &Tap, usize) -> Result<(), SkipReason> + 'a {
+) -> impl FnMut(&str, &Tap, usize) -> Result<Option<String>, SkipReason> + 'a {
     move |role: &str, tap: &Tap, tier: usize| {
         let mut fake = fake.borrow_mut();
         crate::runtime_preference::probe_candidate(
@@ -576,7 +576,12 @@ fn fake_probe<'a>(
             DispatchContext::default(),
             &mut *fake,
         )
-        .map(|_| ())
+        .map(|admitted| {
+            admitted
+                .execution
+                .as_ref()
+                .map(|execution| execution.account.clone())
+        })
     }
 }
 
@@ -691,11 +696,14 @@ fn with_containment_satisfiable_the_candidate_renders_admitted_and_no_lease_is_k
     let builder = stage_of(&doc, "builder");
     let candidate = &builder["roleDraw"][0]["candidates"][0];
     assert_eq!(candidate["admitted"], true);
+    // The row names the account the admission selected (#14578).
+    assert_eq!(candidate["account"], "seat");
     let effective = &builder["roleDraw"][0]["effective"];
     assert_eq!(effective["total"], 100);
     assert_eq!(effective["candidates"][0]["candidate"], "codex");
     assert_eq!(effective["candidates"][0]["p"], 1.0);
     assert!(text.contains("effective on this host: Σw=100 — codex 100.0%"), "{text}");
+    assert!(text.contains("admitted (on seat)"), "{text}");
     assert!(!text.contains("no runtime can serve this role here"), "{text}");
     assert_eq!(fake.contained, vec!["builder:codex".to_string()]);
     // The admitted contained selection is released too: the view never

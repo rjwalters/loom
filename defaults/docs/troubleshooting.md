@@ -2016,13 +2016,12 @@ as "which branch happened to be checked out at quarantine time," not as
 
 ### Finding outstanding quarantine stashes (#5185)
 
-**Symptom**: none — that is the problem. A quarantine is loud at the moment it
-happens (a `main-clean.quarantine` line on stderr and in
-`.loom/logs/main-quarantine.log`) and silent forever afterwards. Nothing drops
-the rescue stash, nothing reminds anyone it exists, so entries pile up: 29 on
-one host, oldest 7 days; five in a consumer repo inside 24 hours, none
-reconciled. They were noticed only because an unrelated hygiene command
-happened to count stashes.
+**Symptom**: a quarantine is loud at the moment it happens (a
+`main-clean.quarantine` line on stderr and in `.loom/logs/main-quarantine.log`).
+Its `loom-quarantine:` stash then waits for operator reconciliation. Entries
+piled up before this report existed: 29 on one host, oldest 7 days, and five
+in a consumer repo inside 24 hours with none reconciled. An unrelated hygiene
+command happened to count them.
 
 **List them**:
 
@@ -2037,10 +2036,15 @@ discoverable without knowing one happened. The report is read-only — it never
 pops, drops, or reorders anything — and exits 0 whether or not anything is
 outstanding.
 
-It covers every Loom producer that pushes to the stash stack, not just
-`check-main-clean.sh --quarantine`'s `loom-quarantine:` entries (the Auditor's
-`auditor-tmp-drift-stash-<epoch>` shelf is the other one), and flags any entry
+The report lists `loom-quarantine:` entries from `check-main-clean.sh --quarantine`
+and the Auditor's `auditor-tmp-drift-stash-<epoch>` entries. It flags entries
 that captured **nothing** — those are pure noise and safe to drop.
+
+Fleet checkout self-heal also creates `loom-rescue-<ts>` stashes. These are
+outside `--list-quarantined` and the `Quarantined work` section of `loom status`.
+The daemon automatically prunes them once they are older than the
+`LOOM_RESCUE_REF_RETAIN_DAYS` window (14 days by default). See the
+[Rescue refs note under Self-heal](daemon-reference.md#self-heal-of-a-loom-only-blockage-11425).
 
 **Reconciling an entry**:
 

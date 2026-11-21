@@ -341,10 +341,8 @@ mod tests {
         }
     }
 
-    /// Save/restore guard for the knob a live daemon on this host may have
-    /// exported into this very process (#8328) — the `ClearedGhConfigDirEnv`
-    /// pattern from `role_runner::tests`: pin the exact hostile value, put
-    /// back whatever was there afterward.
+    /// Pin the knob a live daemon may have exported into this process
+    /// (#8328), and restore its previous value on drop.
     struct PinnedEscalateKnob(Option<String>);
 
     impl PinnedEscalateKnob {
