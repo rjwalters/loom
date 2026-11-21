@@ -266,11 +266,72 @@ pub fn champion_outcome(on_pr: bool, outcome: &str) -> Option<StepOutcome> {
 
 /// `key=value` fields of one outcome line. The value is
 /// [`token_value`]`(`v`)`: framing characters a runtime wraps the line in end
-/// the value instead of riding in it.
-fn fields(rest: &str) -> BTreeMap<&str, &str> {
+/// the value instead of riding in it. Shared with the semantic projector's
+/// own line scan (#14874), so a wrapped line reads the same there as it does
+/// here.
+pub(crate) fn fields(rest: &str) -> BTreeMap<&str, &str> {
     rest.split_whitespace()
         .filter_map(|kv| kv.split_once('=').map(|(k, v)| (k, token_value(v))))
         .collect()
+}
+
+/// One dispatch's own text in an append-mode per-item log (#14874). Each
+/// dispatch's spawn writes a header line
+/// ([`crate::sweep_registry::DISPATCH_HEADER_MARKER`]) naming its
+/// `sweep_id`, then the launch's output; the next dispatch appends its own
+/// header after it. An outcome read bounded by the next header reads only
+/// the dispatch that produced it; unbounded, it takes a later dispatch's
+/// result for the requested one, the defect this closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSection<'a> {
+    /// The requested dispatch's own section: from its header line to the
+    /// next header or end of log.
+    Section(&'a str),
+    /// The log carries dispatch headers; none names this sweep. No evidence
+    /// may be read — not another dispatch's outcome, not its refusal text.
+    Absent,
+    /// The log carries no dispatch header at all: launch-time text written
+    /// before any dispatch (a seat-preparation refusal), which routing's
+    /// headerless launch-refusal fallback reads whole.
+    Headerless(&'a str),
+}
+
+/// Select `sweep_id`'s own section of an append-mode per-item log: the text
+/// after its dispatch header, bounded by the next header or end of text. A
+/// line is a header only where it **starts with**
+/// [`crate::sweep_registry::DISPATCH_HEADER_MARKER`] — a transcript mention
+/// of `sweep_id=` is transcript, not a header — and it names the sweep only
+/// where the complete `sweep_id=` field equals `sweep_id`, so an id that is
+/// a prefix of another's does not match. Pure.
+#[must_use]
+pub fn dispatch_section<'a>(text: &'a str, sweep_id: &str) -> DispatchSection<'a> {
+    let marker = crate::sweep_registry::DISPATCH_HEADER_MARKER;
+    let names = |line: &str| {
+        line.split_whitespace()
+            .any(|kv| kv.strip_prefix("sweep_id=").is_some_and(|v| v == sweep_id))
+    };
+    let mut section: Option<usize> = None;
+    let mut any_header = false;
+    let mut cursor = 0;
+    for raw in text.split_inclusive('\n') {
+        let next = cursor + raw.len();
+        let line = raw.trim_end_matches(['\r', '\n']);
+        if line.starts_with(marker) {
+            if let Some(start) = section {
+                return DispatchSection::Section(&text[start..cursor]);
+            }
+            any_header = true;
+            if names(line) {
+                section = Some(next);
+            }
+        }
+        cursor = next;
+    }
+    match section {
+        Some(start) => DispatchSection::Section(&text[start..]),
+        None if any_header => DispatchSection::Absent,
+        None => DispatchSection::Headerless(text),
+    }
 }
 
 /// A framing-tolerant `key=value` value: the token's first run of value
