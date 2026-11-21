@@ -122,6 +122,7 @@
 //!
 //! [`EXIT_RESTART`]: crate::ipc::EXIT_RESTART
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -1022,16 +1023,27 @@ fn detached_verifier_survival_caveat(supervisor: Supervisor) -> &'static str {
 /// race and be SIGKILLed with its parent (still attempted — see the module
 /// doc's "What this actually closes" section).
 ///
-/// Best-effort and silent-on-failure by design: a spawn failure here must
-/// never block, delay, or fail the exit it exists to backstop — the
-/// unattended watchdog poll remains the ultimate backstop regardless. One
-/// known benign failure mode: the child is exec'd from
-/// [`std::env::current_exe`], which on the auto-update path is the *newly
-/// installed* binary. If a rollback ever restores an older binary at that path
-/// before the child starts, `restart --verify-only` fails clap parsing and
-/// exits non-zero — a stderr line in the supervisor's log and nothing more,
-/// since nothing waits on the child and the watchdog still bounds the
-/// relaunch. The
+/// The child is exec'd from the path [`crate::daemon_bin_resolve::
+/// resolve_daemon_bin`] resolves — **not** a raw [`std::env::current_exe`]:
+/// on Linux, the moment `auto_update` replaces the running inode,
+/// `/proc/self/exe` grows a literal ` (deleted)` suffix and no longer names a
+/// file that exists, so a raw read spawns nothing and fails `ENOENT` (#14835
+/// — whose host log could not even say which path had been tried). The
+/// resolver prefers the installed replacement at the stripped path, then a
+/// `$PATH` lookup. If resolution fails, [`unresolved_verifier_diag`] carries
+/// the resolver's own diagnostic; if the spawn of the resolved path then
+/// fails, [`failed_verifier_spawn_diag`] names that exact path and the OS
+/// error.
+///
+/// Best-effort and silent-on-failure by design: either failure must never
+/// block, delay, or fail the exit it exists to backstop — the unattended
+/// watchdog poll remains the ultimate backstop regardless, and both
+/// diagnostics say so. One known benign failure mode: on the auto-update path
+/// the resolved binary is the *newly installed* one. If a rollback ever
+/// restores an older binary at that path before the child starts,
+/// `restart --verify-only` fails clap parsing and exits non-zero — a stderr
+/// line in the supervisor's log and nothing more, since nothing waits on the
+/// child and the watchdog still bounds the relaunch. The
 /// child's stdio is deliberately left **inherited** (not redirected to
 /// `/dev/null`): under a supervisor that redirects the daemon's own
 /// stdout/stderr to a persistent log file (launchd's `StandardErrorPath`,
@@ -1039,17 +1051,58 @@ fn detached_verifier_survival_caveat(supervisor: Supervisor) -> &'static str {
 /// future gap is attributable from the log alone even though the process that
 /// observed it has, by definition, already exited.
 pub fn spawn_detached_verifier(supervisor: Supervisor, pre_pid: u32) {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "restart_verify: could not resolve current_exe to spawn a detached post-exit \
-                 verifier ({e}) — the unattended watchdog poll remains the only bound on this \
-                 relaunch."
-            );
-            return;
-        }
-    };
+    if let Err(diagnostic) = try_spawn_detached_verifier(
+        supervisor,
+        pre_pid,
+        crate::daemon_bin_resolve::resolve_daemon_bin,
+    ) {
+        eprintln!("{diagnostic}");
+    }
+}
+
+/// The "could not resolve the daemon binary at all" diagnostic — carries the
+/// resolver's own diagnostic verbatim (it names every path that was tried)
+/// plus the watchdog fallback. A pure function so tests can assert on the
+/// exact text a host operator would see (#14835).
+#[must_use]
+fn unresolved_verifier_diag(resolver_diagnostic: &str) -> String {
+    format!(
+        "restart_verify: could not resolve the daemon binary to spawn a detached post-exit \
+         verifier ({resolver_diagnostic}) — the unattended watchdog poll remains the only bound \
+         on this relaunch."
+    )
+}
+
+/// The "resolved path would not spawn" diagnostic — names the EXACT path
+/// handed to [`Command::new`], the underlying OS error, and the watchdog
+/// fallback. The pre-#14835 message carried only the OS error (`No such file
+/// or directory (os error 2)`), so an operator could not tell a missing
+/// binary from a wrong path from a vanished working directory.
+#[must_use]
+fn failed_verifier_spawn_diag(exe: &Path, err: &std::io::Error) -> String {
+    format!(
+        "restart_verify: failed to spawn the detached post-exit verifier at `{}` ({err}) — the \
+         unattended watchdog poll remains the only bound on this relaunch.",
+        exe.display()
+    )
+}
+
+/// Testable core of [`spawn_detached_verifier`]: resolve the daemon binary
+/// with the injected resolver (production uses
+/// [`crate::daemon_bin_resolve::resolve_daemon_bin`], which survives a
+/// deleted-inode `current_exe()`; tests inject synthetic outcomes), spawn the
+/// detached verifier child, and return `Err(diagnostic)` — never panic, never
+/// abort — on either failure, so the pending restart the caller is exiting
+/// for always proceeds. Success-side logging happens here; the failure
+/// diagnostic is returned rather than printed so a test can assert on exactly
+/// what the wrapper would log.
+fn try_spawn_detached_verifier(
+    supervisor: Supervisor,
+    pre_pid: u32,
+    resolve: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<(), String> {
+    let exe =
+        resolve().map_err(|resolver_diagnostic| unresolved_verifier_diag(&resolver_diagnostic))?;
     let mut cmd = Command::new(&exe);
     cmd.args(verify_only_args(supervisor, pre_pid));
     cmd.stdin(std::process::Stdio::null());
@@ -1088,13 +1141,9 @@ pub fn spawn_detached_verifier(supervisor: Supervisor, pre_pid: u32) {
             // same-pgid sweep from killing it anyway), is the detachment this
             // function exists to produce. Dropping the `Child` handle here
             // does not send it any signal.
+            Ok(())
         }
-        Err(e) => {
-            eprintln!(
-                "restart_verify: failed to spawn the detached post-exit verifier ({e}) — the \
-                 unattended watchdog poll remains the only bound on this relaunch."
-            );
-        }
+        Err(e) => Err(failed_verifier_spawn_diag(&exe, &e)),
     }
 }
 
@@ -1120,6 +1169,24 @@ pub fn detect_and_spawn_verifier(pre_pid: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// Create a minimal executable at `path` (the stand-in "installed daemon
+    /// binary" for spawn tests). Mirrors `daemon_bin_resolve`'s same-named
+    /// helper — test mods are isolated, so it is duplicated rather than shared.
+    fn touch_executable(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     #[test]
     fn diagnostic_snapshot_withholds_the_environment_block() {
@@ -1683,5 +1750,109 @@ com.rjwalters.loom-daemon = {
             systemd.contains("loom-daemon-watchdog.sh"),
             "the caveat must name the actual bound on systemd: {systemd}"
         );
+    }
+
+    // ========================================================================
+    // Detached verifier resolution + spawn diagnostics (#14835)
+    // ========================================================================
+
+    /// #14835 regression: the host-visible spawn-failure diagnostic must name
+    /// the EXACT path handed to `Command::new` — the message that motivated
+    /// the issue carried only `No such file or directory (os error 2)`, so an
+    /// operator could not tell a missing binary from a wrong path — plus the
+    /// underlying OS error and the watchdog fallback that remains the only
+    /// bound on the relaunch.
+    #[test]
+    fn verifier_spawn_failure_diagnostic_names_the_exact_path_os_error_and_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("loom-daemon");
+        // Deliberately NOT created: an absolute path naming no file at all.
+        assert!(!missing.exists());
+
+        let diagnostic =
+            try_spawn_detached_verifier(Supervisor::Systemd, 4242, || Ok(missing.clone()))
+                .expect_err("spawning a nonexistent absolute path must fail");
+
+        assert!(
+            diagnostic.contains(&format!("`{}`", missing.display())),
+            "the diagnostic must name the exact path passed to Command::new: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("(os error"),
+            "the diagnostic must carry the underlying OS error: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("unattended watchdog poll remains the only bound"),
+            "the diagnostic must keep naming the watchdog fallback: {diagnostic}"
+        );
+    }
+
+    /// #14835: when the daemon binary cannot be resolved at all, the logged
+    /// diagnostic must carry the resolver's own diagnostic verbatim (it names
+    /// every path that was tried) plus the same watchdog fallback — and the
+    /// failure must be an ordinary `Err` return, never a panic or abort, so
+    /// the pending restart the caller is exiting for still proceeds.
+    #[test]
+    fn verifier_resolution_failure_carries_the_resolver_diagnostic_without_failing() {
+        let resolver_diagnostic = "current_exe() resolved to a deleted inode \
+             (/opt/loom/loom-daemon (deleted)) — neither the replacement nor a `loom-daemon` on \
+             $PATH could be found";
+        let diagnostic = try_spawn_detached_verifier(Supervisor::Systemd, 4242, || {
+            Err(resolver_diagnostic.to_string())
+        })
+        .expect_err("an unresolvable daemon binary must be an Err, not a spawn attempt");
+
+        assert!(diagnostic.contains("could not resolve the daemon binary"), "{diagnostic}");
+        assert!(
+            diagnostic.contains(resolver_diagnostic),
+            "the resolver's own diagnostic must be carried verbatim: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("unattended watchdog poll remains the only bound"),
+            "{diagnostic}"
+        );
+    }
+
+    /// #14835: the verifier resolves through `daemon_bin_resolve`, which — on
+    /// Linux, once `auto_update` has replaced the running inode — prefers the
+    /// installed replacement over the raw ` (deleted)` `current_exe()` path
+    /// that a raw read would try to exec. Drive the REAL resolution strategy
+    /// (`resolve_from_current_exe`) on the deleted-inode shape with a
+    /// replacement present and no daemon on `$PATH` (mirroring
+    /// `runtime_admission`'s #8707 tests): the spawn must go through the
+    /// replacement and succeed.
+    #[test]
+    fn verifier_spawns_the_replacement_when_the_running_inode_is_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replacement = tmp.path().join("loom-daemon");
+        touch_executable(&replacement);
+        let deleted = tmp.path().join("loom-daemon (deleted)");
+
+        let resolved =
+            crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None).unwrap();
+        assert_eq!(
+            resolved, replacement,
+            "precondition: this is the resolver's deleted-inode-with-replacement answer"
+        );
+
+        let outcome = try_spawn_detached_verifier(Supervisor::Launchd, 4242, || {
+            crate::daemon_bin_resolve::resolve_from_current_exe(&deleted, |_| None)
+        });
+        assert!(
+            outcome.is_ok(),
+            "the verifier must spawn the replacement, not the deleted path: {outcome:?}"
+        );
+    }
+
+    /// #14835: the ordinary install shape (a live binary at an ordinary path,
+    /// no deleted marker) still resolves to that same path and spawns.
+    #[test]
+    fn verifier_spawns_the_ordinary_install_path_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("loom-daemon");
+        touch_executable(&bin);
+
+        let outcome = try_spawn_detached_verifier(Supervisor::Launchd, 4242, || Ok(bin.clone()));
+        assert!(outcome.is_ok(), "spawning a live binary must succeed: {outcome:?}");
     }
 }
