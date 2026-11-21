@@ -1074,8 +1074,8 @@ pub struct MarkerFound {
     pub block: Option<String>,
 }
 
-/// Every standalone key marker in `body` outside fenced code and block
-/// quotes (#14834). A hand marker must carry a full 40-hex `sha` attribute.
+/// Every standalone key marker in `body` outside indented or fenced code
+/// and block quotes (#14834). A hand marker must carry a full 40-hex `sha` attribute.
 #[must_use]
 pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
     let lane_re = Regex::new(r"^<!--\s*ratify:key=(ee|market)\s+sha=([0-9a-fA-F]{40})\s*-->$")
@@ -1085,6 +1085,11 @@ pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
     let mut out = Vec::new();
     let mut fenced = false;
     for line in body.lines() {
+        let after_spaces = line.trim_start_matches(' ');
+        // A leading tab reaches the four-column code indentation boundary.
+        if line.len() - after_spaces.len() >= 4 || after_spaces.starts_with('\t') {
+            continue;
+        }
         let t = line.trim();
         if t.starts_with("```") || t.starts_with("~~~") {
             fenced = !fenced;

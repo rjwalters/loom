@@ -1424,6 +1424,31 @@ fn quoted_and_fenced_lookalikes_never_establish_a_head_or_key() {
 }
 
 #[test]
+fn indented_markdown_code_cannot_select_a_marker() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for marker in [lane, hand.as_str()] {
+        assert_eq!(scan_markers(&format!("   {marker}")).len(), 1);
+        for indent in ["    ", "     ", "\t", " \t", "   \t"] {
+            assert!(scan_markers(&format!("{indent}{marker}")).is_empty());
+        }
+        assert_eq!(scan_markers(&format!("    ```\n\n{marker}")).len(), 1);
+        assert!(scan_markers(&format!("```\n    ```\n{marker}\n```")).is_empty());
+    }
+
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &format!("{lane}\n{hand}")),
+        mc(2, "2026-11-20T19:01:00Z", &format!("Example:\n\n    {lane}\n\n\t{hand}")),
+    ];
+    let status = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    for key in [status.ee, status.market] {
+        assert_eq!(key.effective.unwrap().comment_id, 1);
+        assert!(key.superseded.is_empty());
+    }
+}
+
+#[test]
 fn a_hand_marker_without_a_full_matching_sha_is_not_a_marker() {
     let short = format!("<!-- RATIFY-KEY: ee verdict=approve sha={} -->", "abc".repeat(7));
     let no_sha = "<!-- RATIFY-KEY: ee verdict=approve -->\n";
