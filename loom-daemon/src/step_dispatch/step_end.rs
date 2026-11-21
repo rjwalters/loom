@@ -66,13 +66,22 @@ pub fn read_object(v: &serde_json::Value) -> Option<(Vec<String>, bool)> {
     Some((labels, closed))
 }
 
-/// The session's outcome line in its log, after its own dispatch header.
+/// The session's outcome line in its log, read only in its own dispatch's
+/// section of the append-mode per-item log (#14874): text after the next
+/// dispatch header is a later dispatch's, not this step's. A log that never
+/// carried a header is a launch-time refusal's whole text (the headerless
+/// fallback [`seat_dirty_line`] exists for); a log whose headers name only
+/// other dispatches supplies no evidence at all.
 fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     let text = String::from_utf8_lossy(&std::fs::read(&step.log_path).ok()?).into_owned();
-    let anchor = format!("sweep_id={} ", step.sweep_id);
-    let from = text.rfind(&anchor).unwrap_or(0);
-    let text = &text[from..];
-    outcome_ledger::parse_outcome_line(text, step.role, step.item).or_else(|| seat_dirty_line(text))
+    match outcome_ledger::dispatch_section(&text, &step.sweep_id) {
+        outcome_ledger::DispatchSection::Section(section) => {
+            outcome_ledger::parse_outcome_line(section, step.role, step.item)
+                .or_else(|| seat_dirty_line(section))
+        }
+        outcome_ledger::DispatchSection::Headerless(all) => seat_dirty_line(all),
+        outcome_ledger::DispatchSection::Absent => None,
+    }
 }
 
 /// A step that never ran because its seat's private clone refused preparation
@@ -428,6 +437,42 @@ mod tests {
     }
 
     #[test]
+    fn headerless_routing_accepts_only_the_launch_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-judge-4-1".into(),
+            item: 4,
+            role: StepRole::Judge,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        for (text, evidence, reason) in [
+            (
+                "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n",
+                None,
+                outcome_ledger::UNCLASSIFIED,
+            ),
+            (
+                "Error: private workspace preparation refused: seat_dirty: dirty\n",
+                Some(outcome_ledger::SEAT_DIRTY),
+                outcome_ledger::SEAT_DIRTY,
+            ),
+        ] {
+            std::fs::write(&step.log_path, text).unwrap();
+            let line = outcome_line(&step);
+            assert_eq!(line.as_ref().map(|outcome| outcome.reason.as_str()), evidence);
+            let released = post_state(step.role, &labels(&["loom:review-requested"]), false);
+            let run = run_of(&step, line.as_ref(), Some(released));
+            assert_eq!(run.outcome.class, OutcomeClass::Failed);
+            assert_eq!(run.outcome.reason, reason);
+            assert!(outcome_ledger::counts_as_run(&run.outcome));
+        }
+    }
+
+    #[test]
     fn an_explicit_child_outcome_wins_over_the_dirty_seat_marker_in_its_log() {
         let dir = tempfile::tempdir().unwrap();
         let step = EndedStep {
@@ -442,7 +487,7 @@ mod tests {
         };
         std::fs::write(
             &step.log_path,
-            "sweep_id=step-curator-14521-1 started\n\
+            "==== loom-daemon dispatch: t sweep_id=step-curator-14521-1 item=14521 step=curator ====\n\
              Error: private workspace preparation refused: seat_dirty: private clone/worktree is dirty;\n\
              LOOM_STEP_OUTCOME role=curator target=14521 class=noop reason=already-curated\n",
         )
@@ -450,6 +495,137 @@ mod tests {
         let outcome = outcome_line(&step).unwrap();
         assert_eq!(outcome.class, OutcomeClass::Noop);
         assert_eq!(outcome.reason, "already_curated");
+    }
+
+    /// #14874: routing reads its outcome line only in its own dispatch's
+    /// section of the append-mode per-item log. A later dispatch's result
+    /// for the same item is not this step's, and a log whose headers name
+    /// only other dispatches supplies no evidence at all — not another
+    /// dispatch's outcome, not its dirty-seat message.
+    #[test]
+    fn routing_reads_only_its_own_dispatchs_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header =
+            |id: &str| format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=judge ====");
+        let step = |id: &str| EndedStep {
+            sweep_id: id.into(),
+            item: 4,
+            role: StepRole::Judge,
+            log_path: log.clone(),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &log,
+            format!(
+                "{}\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+                 {}\nLOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending\n\
+                 {}\nError: private workspace preparation refused: seat_dirty: dirty\n",
+                header("j-4-1"),
+                header("j-4-2"),
+                header("j-4-3"),
+            ),
+        )
+        .unwrap();
+        // The requested dispatch's own result — the earlier failure stays
+        // the earlier sweep's, the later dirty-seat message the later one's.
+        let outcome = outcome_line(&step("j-4-2")).unwrap();
+        assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
+        assert_eq!(outcome_line(&step("j-4-1")).unwrap().class, OutcomeClass::Failed);
+        // An empty requested section: the later dispatch's dirty-seat text
+        // is not evidence, so there is no line at all.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\nLOOM_STEP_OUTCOME role=judge target=4 class=failed reason=crash\n\
+                 {}\n{}",
+                header("j-4-1"),
+                header("j-4-2"),
+                header("j-4-3"),
+            ),
+        )
+        .unwrap();
+        assert!(outcome_line(&step("j-4-2")).is_none());
+        assert!(outcome_line(&step("j-4-4")).is_none(), "no such dispatch");
+        // The no-line run keeps the ledger's own classification.
+        let run = run_of(&step("j-4-2"), None, None);
+        assert_eq!(
+            (run.outcome.class.as_str(), run.outcome.reason.as_str()),
+            ("failed", outcome_ledger::PROBE_FAILED)
+        );
+    }
+
+    /// #14874: a Champion `requeued` in its own dispatch yields the routing
+    /// line `noop/requeued`; with the line only in a later dispatch and the
+    /// requested section empty, routing gets no line.
+    #[test]
+    fn a_champion_requeued_routes_from_its_own_dispatch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header = |id: &str| {
+            format!("==== loom-daemon dispatch: t sweep_id={id} item=4 step=champion_merge ====")
+        };
+        let step = |id: &str| EndedStep {
+            sweep_id: id.into(),
+            item: 4,
+            role: StepRole::ChampionMerge,
+            log_path: log.clone(),
+            ran_for: std::time::Duration::from_secs(60),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+        };
+        std::fs::write(
+            &log,
+            format!("{}\nCHAMPION-STEP mode=pr item=4 outcome=requeued\n", header("c-4-1")),
+        )
+        .unwrap();
+        let run = run_of(&step("c-4-1"), outcome_line(&step("c-4-1")).as_ref(), None);
+        assert_eq!((run.outcome.class.as_str(), run.outcome.reason.as_str()), ("noop", "requeued"));
+        // The `requeued` only in the later dispatch: no line for the
+        // requested one.
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{}\nCHAMPION-STEP mode=pr item=4 outcome=requeued\n",
+                header("c-4-1"),
+                header("c-4-2"),
+            ),
+        )
+        .unwrap();
+        assert!(outcome_line(&step("c-4-1")).is_none());
+    }
+
+    /// #14874 + #14168: a bare, backticked and JSON-framed current-dispatch
+    /// outcome line all classify the same through routing.
+    #[test]
+    fn wrapped_outcome_lines_read_through_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("step.log");
+        let header = "==== loom-daemon dispatch: t sweep_id=j-4-1 item=4 step=judge ====\n";
+        for line in [
+            "LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci-pending",
+            "`LOOM_STEP_OUTCOME role=judge target=4 class=noop reason=ci_pending`",
+            "{\"type\":\"text\",\"text\":\"LOOM_STEP_OUTCOME role=judge target=4 class=noop \
+             reason=ci_pending\\n\"}",
+        ] {
+            std::fs::write(&log, format!("{header}{line}\n")).unwrap();
+            let step = EndedStep {
+                sweep_id: "j-4-1".into(),
+                item: 4,
+                role: StepRole::Judge,
+                log_path: log.clone(),
+                ran_for: std::time::Duration::from_secs(60),
+                timed_out: false,
+                provider_exhausted: false,
+                launch_rejection: None,
+            };
+            let outcome = outcome_line(&step).unwrap_or_else(|| panic!("no line read: {line}"));
+            assert_eq!((outcome.class.as_str(), outcome.reason.as_str()), ("noop", "ci_pending"));
+        }
     }
 
     fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {

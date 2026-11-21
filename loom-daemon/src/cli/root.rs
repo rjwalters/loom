@@ -836,6 +836,14 @@ pub enum Commands {
         action: ForgeAction,
     },
 
+    /// Read-only ratification-lane inspection (#14834): `ratification-lane
+    /// status <PR>` names the effective ee/market key markers for a PR's
+    /// current head and flags superseded duplicates.
+    RatificationLane {
+        #[command(subcommand)]
+        action: super::ratification_lane_cmd::Action,
+    },
+
     /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
     /// the `merge-risk` criterion (issue #8545) — read-only telemetry, never a merge
     /// decision. Prints a JSON object with four calibrated
@@ -2480,6 +2488,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Forge { action } => handle_forge_command(action),
+        Commands::RatificationLane { action } => super::ratification_lane_cmd::handle(action),
         Commands::Status(_) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.

@@ -112,12 +112,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
 use crate::fs_util::human_size;
+use crate::host_wide_cooldown::HostWideCooldown;
 use serde::Deserialize;
 
 // ============================================================================
@@ -1129,43 +1129,27 @@ pub fn log_pass_outcome(report: &DockerRetentionReport, pressure: Option<&Pressu
 /// deliberately host-wide (not per-repo, unlike `deep_clean`'s state map):
 /// Docker images are not scoped to any one registered repo, and a host with
 /// several repos ticking on the same reaper cadence must not re-shell to
-/// `docker` once per repo per tick.
-static LAST_EVALUATED_AT: OnceLock<Mutex<Option<DateTime<Utc>>>> = OnceLock::new();
-
-fn last_evaluated_slot() -> &'static Mutex<Option<DateTime<Utc>>> {
-    LAST_EVALUATED_AT.get_or_init(|| Mutex::new(None))
-}
+/// `docker` once per repo per tick. The elapsed/record logic lives in the
+/// shared [`HostWideCooldown`]; the instance is this module's own, so a
+/// pass here never suppresses the tmpfs or native-state passes.
+static COOLDOWN: HostWideCooldown = HostWideCooldown::new();
 
 /// Whether enough time has passed since the last evaluation to run another —
 /// the cooldown gate `run_for` applies before touching `docker` at all.
 #[must_use]
 fn cooldown_elapsed(now: DateTime<Utc>, min_interval_secs: u64) -> bool {
-    let guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match *guard {
-        None => true,
-        Some(last) => {
-            let since = (now - last).num_seconds();
-            since < 0 || since >= i64::try_from(min_interval_secs).unwrap_or(i64::MAX)
-        }
-    }
+    COOLDOWN.elapsed(now, min_interval_secs)
 }
 
 fn record_evaluated(now: DateTime<Utc>) {
-    let mut guard = last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some(now);
+    COOLDOWN.record(now);
 }
 
 /// Drop cooldown state. Test-only seam (the process-global would otherwise
 /// leak between `#[serial]` tests in the same binary).
 #[doc(hidden)]
 pub fn reset_state_for_test() {
-    *last_evaluated_slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    COOLDOWN.reset();
 }
 
 /// Arm the host-wide cooldown as if a pass had just evaluated at `now`.
