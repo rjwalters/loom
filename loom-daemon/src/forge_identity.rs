@@ -1252,6 +1252,95 @@ fn refresh_pass(ws: &Path, primary: Option<String>) {
     );
 }
 
+/// Mint-and-publish a reader installation token for `owner_repo` on a host
+/// whose daemon has never published one (#14730): the bootstrap a standalone
+/// online store read — `fleet-config render` before the first daemon start —
+/// needs, because nothing else refreshes reader tokens there. Only the
+/// readers the routing would pick for the store's owner are minted
+/// ([`route::eligible_readers`]), through the same `github-app-token.sh`
+/// seam and the same [`reader_dir`] publication [`refresh_reader_credentials`]
+/// uses, so every later process, the daemon included, reuses the token while
+/// it stays fresh.
+///
+/// `Ok(())` asks the caller to retry routing. If a credential was already
+/// published for an eligible reader, skip minting and let routing decide
+/// whether it can serve the read. `Err` names the reader setup to fix before
+/// starting the daemon, including when the workspace has no mint helper. A mint failure
+/// never withdraws the reader (owner-level coverage, exactly as in
+/// [`refresh_reader_credentials`]).
+pub fn provision_bootstrap_reader(
+    workspace_root: &Path,
+    roster: &Roster,
+    owner_repo: &str,
+    make_minter: Option<&impl Fn(&Identity) -> Box<dyn GithubAppMinter>>,
+) -> std::result::Result<(), String> {
+    let owner = crate::credential_preflight::owner_of_nwo(owner_repo);
+    if owner.is_empty() {
+        return Err(format!("{owner_repo} is not OWNER/REPO"));
+    }
+    let eligible: Vec<&Identity> = route::eligible_readers(roster, owner);
+    if eligible.is_empty() {
+        return Err(format!(
+            "no reader in the workspace's pool serves owner {owner} — check the reader's \
+             `owners` list covers the store repository",
+        ));
+    }
+    if eligible.iter().any(|reader| {
+        reader_dir(workspace_root, owner, reader)
+            .join("hosts.yml")
+            .is_file()
+    }) {
+        return Ok(());
+    }
+
+    let Some(make_minter) = make_minter else {
+        return Err(
+            "the workspace's github-app-token.sh is missing (installed and source paths). \
+             Restore the Loom helper and retry"
+                .to_string(),
+        );
+    };
+
+    let mut failures: Vec<String> = Vec::new();
+    for reader in eligible {
+        let minted = match make_minter(reader).mint(owner_repo) {
+            GithubAppOutcome::Minted {
+                token,
+                installation_id,
+                expires_at,
+                ..
+            } => {
+                let dir = reader_dir(workspace_root, owner, reader);
+                publish(&dir, &token, reader, owner, &installation_id, &expires_at)
+                    .map_err(|e| format!("could not publish to {}: {e}", dir.display()))
+            }
+            GithubAppOutcome::Error(reason) => Err(reason),
+            GithubAppOutcome::NotConfigured => {
+                Err("github-app-token.sh is not configured for this reader (no app id or private \
+                 key)"
+                    .to_string())
+            }
+        };
+        if let Err(reason) = minted {
+            log::warn!(
+                "forge_identity: bootstrap reader app {} could not mint for {owner_repo} \
+                 ({reason}) — #14730",
+                reader.app_id
+            );
+            failures.push(format!("reader app {}: {reason}", reader.app_id));
+        }
+    }
+    if read_credential_in(workspace_root, roster, owner_repo, SystemTime::now()).is_some() {
+        return Ok(());
+    }
+    if failures.is_empty() {
+        return Err(format!(
+            "published bootstrap credentials still cannot route a read of {owner_repo}"
+        ));
+    }
+    Err(failures.join("; "))
+}
+
 /// The production minter factory: [`IdentityMinter`] over the workspace's
 /// `github-app-token.sh`. `None` when the script is not installed.
 #[must_use]
