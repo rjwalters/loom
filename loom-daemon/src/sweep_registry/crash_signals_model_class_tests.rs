@@ -2,10 +2,8 @@
 //! field (#8277) — the producer side of #8058 Phase 2's class-scoped health
 //! marks.
 //!
-//! In its own sibling module rather than `crash_signals.rs`'s `mod tests`:
-//! that file sits just under the file-size ratchet's 1000-line threshold and
-//! adding these cases inline would push it over (see
-//! `.loom/docs/file-size-policy.md`). Mirrors the existing
+//! In its own sibling module rather than `crash_signals.rs`'s `mod tests`.
+//! Mirrors the existing
 //! `crash_signals_empty_pool_tests.rs` precedent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
@@ -30,6 +28,9 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             category: TerminalClassification::ModelCreditsExhausted,
             exit_code: 1,
             model: Some("gpt-5-codex".into()),
+            requested_model: None,
+            effort: None,
+            tier: None,
         })
     );
     // `model=none` — the sentinel the adapter emits when no model was in
@@ -46,6 +47,9 @@ fn terminal_result_parser_threads_the_model_field_on_v2() {
             category: TerminalClassification::Success,
             exit_code: 0,
             model: None,
+            requested_model: None,
+            effort: None,
+            tier: None,
         })
     );
     // v1 (5 fields, no model=) still parses, with model always None.

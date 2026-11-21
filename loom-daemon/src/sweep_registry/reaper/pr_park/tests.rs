@@ -1,10 +1,8 @@
 //! Reaper tests for the PR-side park check on the #4256 resume decision
 //! (Issue #8689) — see the sibling `pr_park` module for the rationale.
 //!
-//! In their own module rather than in `tests.rs`: that file is over the
-//! file-size ratchet's 1000-line threshold and therefore frozen at its current
-//! size (`.loom/docs/file-size-policy.md`), the same reason
-//! `claim_restore_tests.rs` exists.
+//! In their own module rather than in the already-large `tests.rs`, the same
+//! reason `claim_restore_tests.rs` exists.
 
 use crate::sweep_registry::reaper::*;
 use crate::sweep_registry::test_support::*;

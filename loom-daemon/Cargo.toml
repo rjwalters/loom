@@ -13,6 +13,8 @@ edition = "2021"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
+# Champion reads workflow permission values without interpreting arbitrary workflow text.
+serde-saphyr = { version = "2.2", default-features = false, features = ["deserialize"] }
 anyhow = { workspace = true }
 log = "0.4"
 env_logger = "0.11"
@@ -55,6 +57,12 @@ opentelemetry-proto = { version = "0.33.0", default-features = false, features =
 prost = { version = "0.14", default-features = false }
 
 tempfile = "3.27"
+# Workflow YAML structural lint (`workflow-lint`, #13896): parses each file
+# through a duplicate-key-rejecting visitor and walks `jobs.*.steps[].id`.
+# `serde_yaml` itself is archived upstream, so this is its drop-in maintained
+# fork; the duplicate detection does not rely on the crate's own map behavior
+# (the visitor keeps every key pair and compares them itself).
+serde_yaml_ng = "0.10"
 # `.tar.zst` transcript archiving (#8494): `tar` builds/reads the archive
 # container, `zstd` (bundled C library, same "vendor the native dep" pattern
 # `rusqlite`'s `bundled` feature above already uses) compresses it. Default

@@ -184,29 +184,44 @@ impl Facts {
 
     fn absorb_graphql(&mut self, repo: &Value) {
         if let Some(pr) = repo.get("pullRequest").filter(|v| v.is_object()) {
-            fill(&mut self.merged_at, text(pr.get("mergedAt")));
-            fill(&mut self.pr_number, pr.get("number").and_then(Value::as_u64));
-            self.pr_commits.extend(text(pr.pointer("/mergeCommit/oid")));
-            if let Some(nodes) = pr.pointer("/commits/nodes").and_then(Value::as_array) {
-                self.pr_commits
-                    .extend(nodes.iter().filter_map(|n| text(n.pointer("/commit/oid"))));
-            }
+            self.absorb_pull_request(pr);
         }
         if let Some(issue) = repo.get("issue").filter(|v| v.is_object()) {
-            fill(&mut self.state, text(issue.get("state")).map(|s| s.to_lowercase()));
-            fill(&mut self.closed_at, text(issue.get("closedAt")));
-            fill(&mut self.issue_number, issue.get("number").and_then(Value::as_u64));
-            let latest = issue
-                .pointer("/timelineItems/nodes")
-                .and_then(Value::as_array)
-                .and_then(|n| n.last());
-            // Only a node that actually carries a `closer` key is a close
-            // event that was read; `{}` (a fragment that matched nothing) and
-            // an empty list stay `Unavailable`.
-            if let Some(closer) = latest.and_then(|n| n.get("closer")) {
-                if self.closer == Closer::Unavailable {
-                    self.closer = parse_closer(closer);
-                }
+            self.absorb_issue(issue);
+        }
+    }
+
+    pub(crate) fn from_graphql_pair(pr: &Value, issue: &Value) -> Self {
+        let mut facts = Self::default();
+        facts.absorb_pull_request(pr);
+        facts.absorb_issue(issue);
+        facts
+    }
+
+    fn absorb_pull_request(&mut self, pr: &Value) {
+        fill(&mut self.merged_at, text(pr.get("mergedAt")));
+        fill(&mut self.pr_number, pr.get("number").and_then(Value::as_u64));
+        self.pr_commits.extend(text(pr.pointer("/mergeCommit/oid")));
+        if let Some(nodes) = pr.pointer("/commits/nodes").and_then(Value::as_array) {
+            self.pr_commits
+                .extend(nodes.iter().filter_map(|n| text(n.pointer("/commit/oid"))));
+        }
+    }
+
+    fn absorb_issue(&mut self, issue: &Value) {
+        fill(&mut self.state, text(issue.get("state")).map(|s| s.to_lowercase()));
+        fill(&mut self.closed_at, text(issue.get("closedAt")));
+        fill(&mut self.issue_number, issue.get("number").and_then(Value::as_u64));
+        let latest = issue
+            .pointer("/timelineItems/nodes")
+            .and_then(Value::as_array)
+            .and_then(|n| n.last());
+        // Only a node that actually carries a `closer` key is a close
+        // event that was read; `{}` (a fragment that matched nothing) and
+        // an empty list stay `Unavailable`.
+        if let Some(closer) = latest.and_then(|n| n.get("closer")) {
+            if self.closer == Closer::Unavailable {
+                self.closer = parse_closer(closer);
             }
         }
     }

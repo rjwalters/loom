@@ -63,15 +63,43 @@ caller-supplied set) plus the caller's wall-clock window:
   issue's worktree is excluded, so two concurrent sweeps in one workspace never
   fold each other in (the window alone cannot separate them).
 - **A role tick**: the workspace root alone; a tick never gets a worktree.
+- **A step** (#14048): the exact session ids the step's own log names, when it
+  names any — OpenCode's event stream carries `sessionID` on every event and
+  Codex prints a `session id: <uuid>` banner, both captured in the step's
+  per-item log. For OpenCode the id is the whole key (no directory, no window:
+  it cannot name another launch's session); the Codex arm still ANDs the
+  workspace directory and window on top of the ids. This is what separates two concurrent
+  same-role steps dispatched in one workspace. No ids in the log (a Claude
+  step, an unreadable log, a Kimi launch) falls back to directory+window on
+  the workspace root, the role-tick key.
 
 A session row whose five counters are all zero is skipped: OpenCode writes the
 row at creation, so a launch that produced no turns would otherwise publish a
 zero-token badge for a model that was never called.
 
-The exact `sessionID`s a launch used are carried on its native JSON event
-stream and would be a more precise key than directory+window. That refinement is
-follow-up work; directory+window attributes correctly for every launch shape the
-fleet runs today (one runtime process per directory at a time).
+**Dispatched steps key on session id (#14018).** Every step runs from the
+workspace root, so directory+window would fold in whichever neighbouring session
+overlapped. A step's log (`.loom/logs/step-<role>-<item>.log`) captures the
+launch's native JSON event stream, whose events carry a top-level
+`"sessionID":"ses_…"`; a step-dispatched completion reads exactly those sessions
+(`opencode_usage::tokens_by_session_ids`) and sums them with the Claude
+transcripts of the same PR's Judge/Doctor/`champion --pr` steps. **Builder
+retries vs. PR rounds (#14210).** Step logs are append-mode, with one
+`==== loom-daemon dispatch:` region per dispatch, and the two keyings mean
+different things. The Builder log is keyed by *issue*: an earlier region is an
+abandoned retry (its Claude transcript predates the PR's `createdAt`, so the
+Claude side drops it too), so only the **last** region
+(`launch_record::opencode_session_ids_last_dispatch`) counts. The Doctor, Judge and
+`champion_merge` logs are keyed by *PR*: an earlier region is a completed round on
+this PR (e.g. a Doctor run after a changes-requested verdict), inside the Claude
+side's `(PR createdAt, mergedAt)` window, so **every** region counts
+(`launch_record::opencode_session_ids`) — the same stance as the Claude side. A
+Builder log with no dispatch header is read whole. The published
+`runtime`/`provider`/`profile` come from the first step log present on the
+narrating host (Builder, else Doctor, Judge, `champion_merge`). Steps that ran
+on another host left nothing here, so the total stays partial until the
+cross-host per-stage report exists. A legacy `/loom:sweep` (no step logs) keeps
+directory+window.
 
 ## Reading the Kimi session store (Issue #8564)
 

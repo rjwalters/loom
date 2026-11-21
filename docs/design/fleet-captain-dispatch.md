@@ -119,7 +119,7 @@ What the captain is **not**: an owner of work, a forge writer, or a second lease
 | `POST /v1/refuse` | 1 | The worker's pre-check or forge claim refused a granted item. |
 | `POST /v1/release` | 1 | The step ended. |
 | `POST /v1/next` | 2 (proposal) | Up to the host's free slots in assignments from the fleet queue. |
-| `POST /v1/park_ended` | 2 (#13919) | `{"host_id", "repo", "item"}`: a worker's park of the item ended (TTL expiry, operator clear) or it made none. The captain forgets the item's fast-fail streak and park order (ADR-0027 amendment). |
+| `POST /v1/park_ended` | 2 (#13919) | `{"host_id", "repo", "item", "cause"}`: a worker's park of the item ended or it made none. `cause` is `expired` (TTL expiry, no park made; the default when absent) or `cleared` (operator `quarantine clear`). Either way the captain forgets the item's fast-fail streak and park order; only `cleared` also lifts its no-progress hold, for every step (#14047, ADR-0027 amendment). |
 
 ### 5.2 `heartbeat`
 
@@ -249,7 +249,7 @@ The peer channel was more than claims. Each of its signals either moves to the c
 | PR-less retry tally (`PrlessReleaseArmed`, #9292) | per-host count, summed | **The fleet ledger.** |
 | Pool-exhaustion hold (`PoolHoldArmed`/`Cleared`, `pool_hold_broadcast.rs`, #8001) | broadcast per token pool | **Host state.** A host leaves the role out of `roles_ok`. A pool shared by several hosts is reported by each; no fleet copy needed. |
 | Completion narration (`ClaimKind::Completed`, #6352) | stops two hosts narrating the same public-feed completion | **Not a dispatch signal; not moved.** It is dark with the channel today. This design does not host it; Phase 3 deletes only the channel's dispatch use, and its owner decides its home. |
-| Issue-filing lock (`ClaimKind::FilingLock` / `FilingUnlock`, #6714) | fleet-wide hold on `gh issue create` bursts | **Not a dispatch signal; not moved.** Dark with the channel today. A fleet-wide lock fits the captain naturally, but hosting it is out of scope here; its owner decides. |
+| Issue-filing lock (`ClaimKind::FilingLock` / `FilingUnlock`, #6714) | fleet-wide hold on `gh issue create` bursts | **The captain hosts it (#13918, operator ruling 2026-11-15).** Not a dispatch signal, but the last machine signal the claims room carried. One in-memory slot with the assignment rows' TTL expiry, behind `/v1/filing-lock` and `/v1/filing-unlock`: identity from the same `whois`, release scoped to the holder, the same holder re-asking refreshes the TTL. A worker takes it after its host-local lock and fails open to that lock plus its pacing (counted), as for claims (§9). The room broadcast and `ClaimKind::FilingLock` go with the claims-room retirement (#13945). |
 | Heartbeat (`heartbeat_broadcast.rs`, #8736) | liveness ad | **Dies** for dispatch: every captain call is a heartbeat. Other consumers of host liveness keep their telemetry source. |
 
 Workers keep their local copies of these for the fallback path, so a fallback tick still honours its own host's cooldowns. In Phase 3 the broadcasts are deleted; the local ledgers stay.
@@ -454,7 +454,7 @@ The worker's closed-issue read refuses it with `already_closed` (or `already_lan
 2. **Phase 3 threshold.** Is under 1% fallback ticks over 14 days the right gate?
 3. **Fallback constants.** 3 failures in, 5 minutes of successful probes out, one round per tick, a 5% fallback-share alert: acceptable as starting constants?
 4. **Heartbeat consumers.** Does anything besides dispatch read the peer heartbeat (#8736), and does it need a replacement?
-5. **Non-dispatch peer signals.** Completion narration (#6352) and the issue-filing lock (#6714) are dark with the peer channel and not moved by this design. Should the captain host the filing lock later?
+5. **Non-dispatch peer signals.** Completion narration (#6352) is dark with the peer channel and not moved by this design. **Resolved (#13918, operator ruling 2026-11-15): the captain hosts the issue-filing lock (#6714)** (§8). Its broadcast is deleted by #13945.
 
 ## 18. Review log
 

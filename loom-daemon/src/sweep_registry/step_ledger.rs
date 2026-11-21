@@ -5,14 +5,14 @@
 //!
 //! | Effect | Applied here as |
 //! |---|---|
-//! | `Advance` | the item's local history and cooldowns are dropped; so is every peer copy in this host's view, and every peer is told to drop its own (a zero-length `StepCooldownArmed` for **every** step of the item, whoever armed it); a Champion verdict also removes its step's forge ladder |
-//! | `Landed` | the same, plus the #11853 landed cooldown on the issue (fleet-wide, every consumer) and a 24 h Builder cooldown on `(item, builder)` |
-//! | `Cooldown` | the window, broadcast |
-//! | `FastFailLadder` (Builder steps only) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` and broadcast |
-//! | `FastFailWindow` (every other step: PR steps, Curator, Champion promotion) | the ledger's own doubling window, broadcast; **no** forge write: the park's release restores `loom:issue`, which is only right for an issue Builder was building (#11969) |
-//! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h) and broadcast. When the write fails, that rung's window is held locally (persisted, restored on restart) and broadcast, and the run counts toward the repeat cap (#12516) |
-//! | `Redraw` | counted; a second in a row on the pair arms the ledger's doubling refusal cooldown, broadcast (#11969) |
-//! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, broadcast. Not a repeat-cap run |
+//! | `Advance` | the item's local history and cooldowns are dropped; a Champion verdict also removes its step's forge ladder |
+//! | `Landed` | the same, plus the #11853 landed cooldown on the issue and a 24 h Builder cooldown on `(item, builder)` |
+//! | `Cooldown` | the window |
+//! | `FastFailLadder` (Builder steps only) | [`SweepRegistry::charge_fast_failure`] (the #11854 ladder and park), and the ladder's window mirrored onto `(item, step)` |
+//! | `FastFailWindow` (every other step: PR steps, Curator, Champion promotion) | the ledger's own doubling window; **no** forge write: the park's release restores `loom:issue`, which is only right for an issue Builder was building (#11969) |
+//! | `ForgeLadder` | the next rung written to the item's body ([`reeval_ladder::record`]), its due time mirrored locally (capped at 24 h). When the write fails, that rung's window is held locally (persisted, restored on restart) and the run counts toward the repeat cap (#12516) |
+//! | `Redraw` | counted; a second in a row on the pair arms the ledger's doubling refusal cooldown, host-local (#11909, #11969) |
+//! | `Reclassify` | nothing for the first; a second identical state refusal in a row arms the ledger's doubling refusal cooldown, host-local, not broadcast (#11909). Not a repeat-cap run |
 //! | `Uncharged` (a provider-exhausted launch, #13966) | nothing: no window, no streak, no run |
 //! | `Failed` (slow) | counted toward the repeat cap |
 //!
@@ -23,8 +23,7 @@
 //! [`SweepRegistry::note_builder_step_noop`]). The ledger's own history
 //! cannot bound a promote / Builder-no-op cycle: Champion's promotion is a
 //! verdict, and a verdict clears every step's history and cooldown on the
-//! item. The hold's streak lives outside the ledger, is counted across the
-//! fleet, and survives the promotion (the fingerprint ignores the
+//! item. The hold's streak lives outside the ledger, is counted on this host, and survives the promotion (the fingerprint ignores the
 //! `loom:curated` / `loom:issue` lane churn), so the third no-op on an
 //! unchanged issue parks it on `loom:blocked` + a `no-op hold` park record,
 //! which the step draw passes (`Blocked`) until its fingerprint changes.
@@ -34,20 +33,15 @@
 //! registry is built (#12251), so a restart or roll keeps the repeat cap's
 //! history and this host's own windows.
 //!
-//! Whenever the repeat cap arms, its window is broadcast like any other,
-//! except a refusal's: a pool gate or a claim race is this host's own, so a
-//! `Refused` outcome's window stays local (#11909).
-//! Nothing broadcast is longer than 24 h: the peer receiver caps it too.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::{host_identity, SweepRegistry, LANDED_COOLDOWN};
+use super::{SweepRegistry, LANDED_COOLDOWN};
 
 /// The ledger's durable part in the workspace's logs directory (#12251).
 pub const STEP_LEDGER_FILE: &str = "step-ledger.json";
-use crate::peer_claims::{self, ClaimAd};
 use crate::step_dispatch::outcome_ledger::{
     CooldownCause, Effect, LedgerCounters, OutcomeClass, PersistedPair, Recorded, StepCooldowns,
     StepOutcome,
@@ -99,19 +93,15 @@ impl SweepRegistry {
             }
         }
         let champion = step.role_name() == "champion";
-        if matches!(rec.effect, Effect::Advance | Effect::Landed) {
-            self.lift_item_step_cooldowns(item);
-            if champion {
-                if let Err(e) = reeval_ladder::clear(forge, item, step) {
-                    log::warn!("step_ledger: clearing the re-evaluation ladder on #{item}: {e}");
-                }
+        if matches!(rec.effect, Effect::Advance | Effect::Landed) && champion {
+            if let Err(e) = reeval_ladder::clear(forge, item, step) {
+                log::warn!("step_ledger: clearing the re-evaluation ladder on #{item}: {e}");
             }
         }
         let mut capped = rec.repeat_capped;
         match rec.effect {
             Effect::Landed => {
                 self.arm_landed_cooldown(item, LANDED_COOLDOWN);
-                self.broadcast_step_cooldown(item, StepRole::Builder, now);
             }
             Effect::FastFailLadder => {
                 let class = run
@@ -169,12 +159,6 @@ impl SweepRegistry {
             | Effect::Uncharged
             | Effect::Failed => {}
         }
-        // A refusal is host-local (#11909): this host's exhausted pool or its
-        // claim race says nothing about a peer's, so its cooldown is not
-        // broadcast. Every other window is.
-        if run.outcome.class != OutcomeClass::Refused {
-            self.broadcast_step_cooldown(item, step, now);
-        }
         let cooling_until = self.step_ledger.cooling_until(item, step, now);
         self.persist_step_ledger();
         Recorded {
@@ -187,9 +171,9 @@ impl SweepRegistry {
     /// A Builder step on `item` was refused because the issue's work already
     /// landed (#12251, `work_finder::landed_prefilter::landed_at_spawn`): the
     /// issue's landed cooldown (fleet-wide, every consumer) and a
-    /// [`LANDED_COOLDOWN`] Builder window on `(item, builder)`, broadcast, so
-    /// no host draws the Builder again while Curator decides. Curator's
-    /// verdict on the item lifts the window everywhere, as every verdict does.
+    /// [`LANDED_COOLDOWN`] Builder window on `(item, builder)`, so this host
+    /// does not draw the Builder again while Curator decides. Curator's
+    /// verdict on the item lifts the window, as every verdict does.
     pub fn hold_landed_builder(&mut self, item: u32) {
         let now = Utc::now();
         self.arm_landed_cooldown(item, LANDED_COOLDOWN);
@@ -198,7 +182,6 @@ impl SweepRegistry {
                 .unwrap_or_else(|_| chrono::Duration::hours(6));
         self.step_ledger
             .arm(item, StepRole::Builder, until, CooldownCause::Landed, now);
-        self.broadcast_step_cooldown(item, StepRole::Builder, now);
         self.persist_step_ledger();
     }
 
@@ -320,24 +303,11 @@ impl SweepRegistry {
         self.note_noop_for_hold(item, sweep, Some(reason));
     }
 
-    /// The draw's query at `now`: this host's ledger, plus every live peer
-    /// step cooldown for this workspace. The cutover adds the forge ladder's
-    /// due times ([`reeval_ladder::due`]) from the listing's bodies.
+    /// The draw's query at `now`: this host's ledger. The cutover adds the forge
+    /// ladder's due times ([`reeval_ladder::due`]) from the listing's bodies.
     #[must_use]
     pub fn step_cooldowns(&self, now: DateTime<Utc>) -> StepCooldowns {
-        let mut out = self.step_ledger.snapshot(now);
-        if let Some(view) = &self.peer_claims {
-            let repo = peer_claims::repo_slug(&self.config.workspace_root);
-            let view = view
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (item, step, remaining) in view.step_cooldowns_at(&repo, Instant::now()) {
-                if let Ok(d) = chrono::Duration::from_std(remaining) {
-                    out.insert(item, step, now + d);
-                }
-            }
-        }
-        out
+        self.step_ledger.snapshot(now)
     }
 
     /// The ledger's counters.
@@ -350,50 +320,6 @@ impl SweepRegistry {
     pub fn prune_step_ledger(&mut self) {
         self.step_ledger.prune(Utc::now());
         self.persist_step_ledger();
-    }
-
-    /// A verdict changed `item`'s state: drop every peer copy of its step
-    /// cooldowns from this host's view, and tell every peer to drop theirs,
-    /// for every step, whoever armed it (a zero-length ad lifts it).
-    fn lift_item_step_cooldowns(&self, item: u32) {
-        if let Some(view) = &self.peer_claims {
-            let repo = peer_claims::repo_slug(&self.config.workspace_root);
-            view.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clear_step_cooldowns(&repo, item);
-        }
-        for step in StepRole::ALL {
-            self.publish_step_cooldown(item, step, Duration::ZERO);
-        }
-    }
-
-    /// Broadcast `(item, step)`'s local window in force at `now`, if any.
-    fn broadcast_step_cooldown(&self, item: u32, step: StepRole, now: DateTime<Utc>) {
-        if let Some(until) = self.step_ledger.cooling_until(item, step, now) {
-            let remaining = (until - now).to_std().unwrap_or_default();
-            self.publish_step_cooldown(item, step, remaining);
-        }
-    }
-
-    /// Send one [`peer_claims::ClaimKind::StepCooldownArmed`] ad (zero lifts
-    /// it), fail-open like every other brake publisher.
-    fn publish_step_cooldown(&self, item: u32, step: StepRole, remaining: Duration) {
-        let Some(tx) = &self.peer_claim_publisher else {
-            return;
-        };
-        let remaining = remaining.min(peer_claims::MAX_PEER_STEP_COOLDOWN);
-        let ad = ClaimAd::step_cooldown_armed(
-            item,
-            step,
-            peer_claims::repo_slug(&self.config.workspace_root),
-            host_identity(),
-            std::process::id(),
-            Utc::now().to_rfc3339(),
-            remaining.as_secs(),
-        );
-        if let Err(e) = tx.try_send(ad) {
-            log::debug!("step_ledger: step cooldown ad for #{item} {step} dropped ({e})");
-        }
     }
 }
 

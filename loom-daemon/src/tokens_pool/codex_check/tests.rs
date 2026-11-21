@@ -512,6 +512,111 @@ fn ranking_mode_writes_the_provider_namespaced_file_in_the_shared_format() {
     assert!(!text.contains("auth"));
 }
 
+#[cfg(unix)]
+#[test]
+#[serial]
+fn ranking_uses_only_account_local_rollouts_for_reports_and_holds() {
+    use std::os::unix::fs::symlink;
+
+    let options = CheckOptions {
+        write_ranking: true,
+        live: false,
+    };
+    let observed = "2026-09-21T10:00:00Z";
+    let now = at(1_789_984_860);
+    let now_epoch = u64::try_from(now.timestamp()).unwrap();
+    for directory_link in [true, false] {
+        let (workspace, profiles) = two_account_workspace();
+        let shared = profiles.path().join("shared");
+        let borrowed = write_rollout(
+            &shared,
+            "rollout-borrowed.jsonl",
+            &[rollout_line(observed, 100.0, 100.0)],
+        );
+        let alpha_sessions = profiles.path().join("alpha/sessions");
+        if directory_link {
+            symlink(shared.join("sessions"), alpha_sessions).unwrap();
+        } else {
+            fs::create_dir_all(&alpha_sessions).unwrap();
+            symlink(&borrowed, alpha_sessions.join("rollout-borrowed.jsonl")).unwrap();
+        }
+        let beta = profiles.path().join("beta");
+        let local =
+            write_rollout(&beta, "rollout-local.jsonl", &[rollout_line(observed, 3.0, 0.0)]);
+        set_mtime(&local, now_epoch - 60);
+        symlink(&borrowed, local.with_file_name("rollout-newer.jsonl")).unwrap();
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let alpha = AccountId {
+            provider: AccountProvider::Codex,
+            name: "alpha".into(),
+        };
+
+        let (report, effects) = run_check(workspace.path(), options, now).unwrap();
+        let alpha_row = report
+            .accounts
+            .iter()
+            .find(|row| row.name == "alpha")
+            .unwrap();
+        let beta_row = report
+            .accounts
+            .iter()
+            .find(|row| row.name == "beta")
+            .unwrap();
+        let alpha_json = alpha_row.to_json_at(now);
+        assert_eq!(alpha_row.status, STATUS_UNKNOWN, "directory link: {directory_link}");
+        assert_eq!(alpha_json.get("5h_utilization"), Some(&serde_json::Value::Null));
+        assert_eq!(alpha_json.get("7d_utilization"), Some(&serde_json::Value::Null));
+        let table = format_table(&report);
+        let alpha_line = table
+            .lines()
+            .find(|line| line.starts_with("alpha"))
+            .unwrap();
+        assert_eq!(
+            alpha_line.split_whitespace().take(4).collect::<Vec<_>>(),
+            ["alpha", "-", "-", STATUS_UNKNOWN]
+        );
+        assert_eq!(beta_row.status, "available");
+        assert_eq!(beta_row.s7d_utilization, Some(0.0));
+        assert_eq!(weekly_utilization_at(&beta, now_epoch), Some(0.0));
+        assert!(effects.marked_exhausted.is_empty());
+        assert!(health::account_health(workspace.path(), &alpha)
+            .unwrap()
+            .is_none());
+        let ranking = fs::read_to_string(ranking_path(workspace.path())).unwrap();
+        assert!(ranking.lines().any(|line| line == "alpha|unknown"));
+
+        let until = now_epoch + 3_600;
+        health::record_availability_at(
+            workspace.path(),
+            &alpha,
+            AvailabilityOutcome::Exhausted { until },
+            AVAILABILITY_PROVENANCE,
+            now_epoch - 600,
+        )
+        .unwrap();
+        // Even newer borrowed headroom cannot clear alpha's recorded hold.
+        fs::write(&borrowed, rollout_line(observed, 3.0, 5.0)).unwrap();
+        let (report, effects) = run_check(workspace.path(), options, now).unwrap();
+        let alpha_row = report
+            .accounts
+            .iter()
+            .find(|row| row.name == "alpha")
+            .unwrap();
+        assert_eq!(alpha_row.status, "exhausted");
+        assert_eq!(alpha_row.s7d_utilization, None);
+        assert!(effects.cleared.is_empty());
+        let stored = health::account_health(workspace.path(), &alpha)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.cooldown_until, Some(until));
+        let ranking = fs::read_to_string(ranking_path(workspace.path())).unwrap();
+        assert!(ranking
+            .lines()
+            .any(|line| line.starts_with("alpha|exhausted|")));
+    }
+}
+
 #[test]
 #[serial]
 fn selection_lands_on_the_healthy_account_after_the_probe_marks_the_other() {

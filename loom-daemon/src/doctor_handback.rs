@@ -260,6 +260,49 @@ impl Outcome {
     }
 }
 
+/// The lock-wait expiry outcome (#14165): a *named* reason — lock held, plus
+/// the holder's age — printed before the wait gives up, instead of silence
+/// until a caller's shorter wrapper kills the verb. `holder_age` is the held
+/// directory's age when it could be read (`None` names that instead).
+#[must_use]
+pub fn lock_held_outcome(
+    pr: u64,
+    holder_age: Option<std::time::Duration>,
+    waited: std::time::Duration,
+) -> Outcome {
+    let age = holder_age
+        .map_or_else(|| "an unknown age".to_string(), |a| format!("{:.0}s", a.as_secs_f32()));
+    Outcome::Failed(format!(
+        "lock held: another verdict on PR #{pr} has held the per-PR verdict lock for {age} \
+         (waited {:.0}s); wrote nothing, retry",
+        waited.as_secs_f32()
+    ))
+}
+
+/// The lock-unavailable outcome (#14617): the per-PR lock directory could not
+/// be created at all (read-only filesystem, permission denied), so no verdict
+/// holds it and waiting cannot help. Names the path and the OS error instead of
+/// reporting contention.
+#[must_use]
+pub fn lock_unavailable_outcome(pr: u64, lock: &std::path::Path, err: &std::io::Error) -> Outcome {
+    Outcome::Failed(format!(
+        "lock unavailable: cannot create the per-PR verdict lock {} for PR #{pr}: {err}; no \
+         other verdict holds it; wrote nothing (set LOOM_VERDICT_LOCK_DIR to a writable directory)",
+        lock.display()
+    ))
+}
+
+/// The watchdog's line when the verb's own overall deadline passes before the
+/// hand-back answered (#14165), so it fails inside its budget — with a name —
+/// instead of being killed by a caller's shorter wrapper.
+#[must_use]
+pub fn deadline_exceeded_line(secs: u64) -> String {
+    format!(
+        "{SENTINEL} FAILED deadline of {secs}s exceeded before the hand-back answered; released \
+         the per-PR lock; a label write may still land in flight — re-run, it re-reads live state"
+    )
+}
+
 /// Remove only the claim, then confirm it is gone.
 fn release_claim(forge: &mut impl Forge) -> Result<(), String> {
     forge.remove(CLAIM);

@@ -2,7 +2,7 @@
 //! invisible to the gate, the same record from a trusted author must count,
 //! and an author the forge did not report is untrusted.
 
-use super::{parse_graphql_comments, strip_markers, trusted_inputs};
+use super::{graphql_listing_and_object, parse_graphql_comments, strip_markers, trusted_inputs};
 use crate::comment_trust::TrustPolicy;
 use crate::forge_identity::FleetLogins;
 use crate::premise_check::record::last_chunk_with_marker;
@@ -107,6 +107,27 @@ fn an_empty_or_unparseable_listing_is_unreadable_not_empty() {
         let got = trusted_inputs(&policy(), "t".into(), "b".into(), vec![], bad, &owner());
         assert!(got.is_none(), "{:?}", String::from_utf8_lossy(bad));
     }
+}
+
+#[test]
+fn graphql_recovery_uses_the_named_repositorys_reader() {
+    let response = json!({
+        "data": {"repository": {"issue": {
+            "authorAssociation": "OWNER",
+            "author": {"login": "fixture-owner", "__typename": "User"},
+            "comments": {"nodes": [], "pageInfo": {"hasNextPage": false, "endCursor": null}}
+        }}}
+    });
+    crate::gh_invocation::test_routing::assert_pooled_query("target/widget", &response, |root| {
+        graphql_listing_and_object("target/widget", 7, root).is_some_and(|(listing, author)| {
+            listing == b"[]"
+                && author
+                    == json!({
+                        "author": {"login": "fixture-owner", "__typename": "User"},
+                        "authorAssociation": "OWNER"
+                    })
+        })
+    });
 }
 
 #[test]

@@ -365,7 +365,11 @@ sticky-hold precheck above and before judging the four axes below. If the
 PR's entire changed-file list is an exact-match subset of `{WORK_LOG.md,
 WORK_PLAN.md, README.md}` (three root-level filenames, matched exactly —
 never a substring or nested path, so `docs/README.md` and
-`mcp-loom/README.md` do NOT qualify), the `merge-risk` criterion is satisfied without
+`mcp-loom/README.md` do NOT qualify) **and the PR has no closing-issue
+reference** (#14182: `docs_only_fast_path_closing_check` in the code block
+below must return `ELIGIBLE` — it fails closed on any closing reference and
+on a failed read, because a docs-only diff that auto-closes an issue on
+merge is not a docs-only change), the `merge-risk` criterion is satisfied without
 judging the axes at all: there is no "load-bearing hunk" to name, blast
 radius is provably confined to non-executing docs, and `git revert -m 1
 <merge-sha>` undoes it. This is a shortcut on **this criterion
@@ -424,6 +428,37 @@ docs_only_fast_path_check() {
 FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
 FAST_PATH_RESULT=$(printf '%s\n' "$FAST_PATH_FILES" | docs_only_fast_path_check)
 
+# Closing-link condition (#14182), mirrored from judge.md Step 3 (mirrored, not
+# shared; test-docs-only-fast-path.sh pins both copies). A docs-only diff that
+# auto-closes an issue on merge is not a docs-only change. Fails closed: a read
+# that errored or returned no "closers=" proof is NOT ELIGIBLE, never "no closers".
+docs_only_fast_path_closing_check() {
+  # $1 = PR number. Echoes "ELIGIBLE" only when the closing-reference read
+  # SUCCEEDED (positively proven by the "closers=" prefix) and returned an
+  # empty set. A failed or malformed read is NOT ELIGIBLE, never "no closers"
+  # (fail closed, #14182). Deliberately not forge_pr_close_targets: that helper
+  # swallows read errors into an empty list, which would read as "no closers".
+  local out refs
+  if ! out=$(gh pr view "$1" --json closingIssuesReferences \
+      --jq '"closers=" + ([.closingIssuesReferences[].number | tostring] | join(","))' 2>/dev/null); then
+    echo "NOT ELIGIBLE: closing-reference read failed"
+    return 0
+  fi
+  case "$out" in
+    closers=*) refs="${out#closers=}" ;;
+    *) echo "NOT ELIGIBLE: closing-reference read returned no proof"; return 0 ;;
+  esac
+  if [ -n "$refs" ]; then
+    echo "NOT ELIGIBLE: closes #${refs//,/, #}"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
+  FAST_PATH_RESULT=$(docs_only_fast_path_closing_check "$PR_NUMBER")
+fi
+
 if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
   echo "PASS (docs-only fast path, #6134): merge risk covered without axis judgment — changed files: $FAST_PATH_FILES"
   # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
@@ -433,8 +468,9 @@ if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
 fi
 ```
 
-If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE`, this PR is not
-fast-path eligible — fall through to the standing-authorization check below.
+If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE` (a non-allowlisted
+file, or a closing reference such as `Closes #N`, or a failed closing-reference
+read), this PR is not fast-path eligible — fall through to the standing-authorization check below.
 
 **Standing operator authorization (#6850)** — run this check immediately
 after the docs-only fast path above (and, transitively, after the
@@ -590,6 +626,14 @@ behavior is byte-for-byte unchanged from before #6850.
   whatever its name. This classifies by capability, so a class can drop the
   `*deploy*` / `*release*` / `*publish*` name excludes. It does not replace
   `forbiddenDiffPatterns`, which still catches a PR that *adds* a privilege.
+- `checkWorkflowWriteAll` (#14648, optional boolean) — for a class covering
+  only GitHub workflow YAML, `true` checks the workflow and its jobs for an
+  actual `permissions: write-all` setting. Keep exactly one literal
+  `write-all` entry in `privilegedContentPatterns` as a fallback for older
+  Champions. An upgraded Champion substitutes the YAML check for that entry
+  only after explicit opt-in. Other patterns retain their regex semantics.
+  An unsupported checker, unreadable workflow or missing fallback entry
+  disqualifies the class.
   **Fail closed**: unreadable or empty content, a file the contents API cannot
   serve (too large), a `removed` file, an invalid regex, a head SHA that moved
   while the files were read, or a value that is not an array of non-empty
@@ -718,13 +762,13 @@ standing_auth_fetch_diff() {
   DIFF_JSON=$(printf '%s' "$raw" | jq -s -c 'add // []' 2>/dev/null) || return 1
 }
 
-# standing_auth_content_clear <files-json> <regexes>   (#12954)
+# standing_auth_content_clear <files-json> <regexes> [<check-write-all>]  (#12954, #14648)
 # 0 = every file in <files-json> was read at the PR head SHA and no line of it
 # matches any privilegedContentPatterns regex. Anything else (a removed or
 # unreadable or empty file, an invalid regex, a head SHA that moved) = 1.
 standing_auth_content_clear() {
-  local files_json="$1" regexes="$2" sha1 sha2 path enc body rx rc
-  [ -n "$regexes" ] || return 0
+  local files_json="$1" regexes="$2" check_write_all="${3:-false}" sha1 sha2 path enc body rx rc
+  [ -n "$regexes" ] || [ "$check_write_all" = true ] || return 0
   printf '%s' "$files_json" | jq -e 'length > 0 and all(.[]; (.status // "") != "removed")' >/dev/null 2>&1 || return 1
   while IFS= read -r rx; do
     [ -z "$rx" ] && continue
@@ -739,6 +783,10 @@ standing_auth_content_clear() {
     enc=$(jq -rn --arg p "$path" '$p | split("/") | map(@uri) | join("/")') || return 1
     body=$(gh api -H "Accept: application/vnd.github.raw" "repos/{owner}/{repo}/contents/${enc}?ref=$sha1" 2>/dev/null) || return 1
     [ -n "$body" ] || return 1
+    if [ "$check_write_all" = true ]; then
+      case "$path" in .github/workflows/*.yml|.github/workflows/*.yaml) ;; *) return 1 ;; esac
+      printf '%s' "$body" | "${LOOM_DAEMON_BIN:-loom-daemon}" forge workflow-write-all-check >/dev/null 2>&1 || return 1
+    fi
     while IFS= read -r rx; do
       [ -z "$rx" ] && continue
       # A whole-line YAML comment grants nothing, so it is not scanned: the
@@ -813,7 +861,7 @@ standing_auth_class_hits() {
 # read_ci_checks (greenCi) and, in "any" mode, FAST_PATH_FILES. In critical
 # mode $2 is the critical-files criterion's own $FILES and CRITICAL_PATTERNS its pattern list.
 standing_auth_eval() {
-  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED
+  local mode="$1" crit_files="${2:-}" i NUM_CLASSES CLASS_ID PATTERNS CONDITIONS EXCLUDES FORBIDDEN PRIVILEGED CHECK_WORKFLOW_WRITE_ALL
   local MATCH_FILES CHANGED_COUNT CRIT_DIFF="" CRIT_PATS_JSON CRIT_MATCH_FILES="" CFO ONLY_CRIT CLASS_FILES CLASS_DIFF
   local CLASS_HITS UNION_HITS="[]" USED_IDS="" CRIT_NAMES UNCOVERED
   local ADD_MIG ADD_MIG_STATE="" ADD_MIG_LIFTED=0 LOCKED_DEPS LOCKED_STATE="" LOCKED_USED=0
@@ -870,7 +918,16 @@ standing_auth_eval() {
     # but an array of non-empty strings is malformed and skips the entry (a
     # silently ignored key would read as "no privilege found").
     jq -e ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | type == \"array\" and all(.[]; type == \"string\" and length > 0)" "$CONFIG_FILE" >/dev/null 2>&1 || continue
-    PRIVILEGED=$(jq -r ".champion.standingAuthorizations[$i].privilegedContentPatterns // [] | .[]" "$CONFIG_FILE")
+    CHECK_WORKFLOW_WRITE_ALL=$(jq -r --argjson i "$i" '
+      .champion.standingAuthorizations[$i]
+      | if has("checkWorkflowWriteAll") then
+          .checkWorkflowWriteAll | if type == "boolean" then . else error("invalid workflow check") end
+        else false end' "$CONFIG_FILE" 2>/dev/null) || continue
+    PRIVILEGED=$(jq -r --argjson i "$i" --arg typed "$CHECK_WORKFLOW_WRITE_ALL" '
+      .champion.standingAuthorizations[$i].privilegedContentPatterns // []
+      | if $typed != "true" then .[]
+        elif ([.[] | select(. == "write-all")] | length) == 1 then .[] | select(. != "write-all")
+        else error("workflow check needs one legacy write-all guard") end' "$CONFIG_FILE" 2>/dev/null) || continue
 
     # criticalFilesOnly (#12648): `null` (absent) or `false` is today's class.
     # `true` makes a class that waives the critical-files criterion for the critical-file hits
@@ -1048,10 +1105,10 @@ standing_auth_eval() {
     # privilegedContentPatterns (#12954): capability, read from each covered
     # file's full contents at the PR head SHA rather than from its name or its
     # changed lines. Any privileged line, or any unreadable file, disqualifies.
-    if [ -n "$PRIVILEGED" ]; then
+    if [ -n "$PRIVILEGED" ] || [ "$CHECK_WORKFLOW_WRITE_ALL" = true ]; then
       [ -n "$DIFF_JSON" ] || standing_auth_fetch_diff || continue
       [ "$ONLY_CRIT" -eq 1 ] || CLASS_DIFF="$DIFF_JSON"
-      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
+      standing_auth_content_clear "$CLASS_DIFF" "$PRIVILEGED" "$CHECK_WORKFLOW_WRITE_ALL" || { STANDING_AUTH_WHY+="class '$CLASS_ID': privilegedContentPatterns hit or unreadable content in a covered file"$'\n'; continue; }
     fi
 
     # File list matches this class and every condition is recognized --
@@ -1192,24 +1249,30 @@ It is eligible only when **all** hold, each read live in this pass:
   renders (a `{{PLACEHOLDER}}` substituted on copy) never byte-matches and holds.
   `.claude/settings.json` has no upstream counterpart, so a bump that changes it holds, which
   keeps the rjwalters/repo#733 guard-wiring PRs held;
-- every changed file is under `.loom/` or `.claude/`, and none is a merge-gate path
-  (the daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
-  comment-trust files, `config.json`): the gate never waives a change to itself (#12945). A file
-  under `.loom/scripts/tests/` (name and previous name both) is not a gate path, since no merge
-  path sources it: it is compared byte-for-byte like any kept-set file (#13486);
-  (This is Champion's proof. The daemon's own strict landing of its resync PR instead lets
-  byte-identical gate files land without a Judge when the tag is a published release, per
-  operator ruling r7-q33, #13665; a PR the daemon left for the lane still takes this rule.)
+- every changed file is under `.loom/`, `.claude/` or `.agents/skills/`. A merge-gate path (the
+  daemon's `GATE` list: `champion*`, `judge*`, `merge-pr.sh`, `merge_pr*`, `verdict*`,
+  comment-trust files, `config.json`) is no longer refused outright: it is byte-checked like any
+  kept-set file, and when any gate path is among the changed files the tag must additionally be a
+  published, non-draft release upstream — fail closed if the release cannot be read (operator
+  ruling 2026-11-17, #13982). The gate never waives a change to itself (#12945): a gate file that
+  differs from the tag by even one byte, has no upstream counterpart, or is renamed or removed,
+  holds. A file under `.loom/scripts/tests/` (name and previous name both) is not a gate path,
+  since no merge path sources it: it is compared byte-for-byte like any kept-set file (#13486).
+  The Repo Skills variant keeps refusing gate paths outright (the ruling concerns Loom's own
+  gate). Both proofs — the daemon's strict landing and Champion's non-strict waiver — apply this
+  same gate rule; they differ only in scope (strict byte-checks every changed file, not just the
+  kept set);
 - `.loom/install-metadata.json` at the PR head has `loom_version` equal to `<X.Y.Z>`, and
   `refs/tags/v<X.Y.Z>` exists in `rjwalters/loom`;
 - the files read is complete (count equals `changed_files`) and at least one changed file is a
   kept-set path;
 - **every** kept-set file is `added` or `modified` (a removal, rename or copy holds), maps to a
-  `defaults/` counterpart through the surface map in `resync-installed.sh` (`.loom/hooks`,
+  `defaults/` counterpart — through the surface map in `resync-installed.sh` (`.loom/hooks`,
   `.loom/scripts`, `.loom/docs`, `.loom/runtimes`, `.loom/bin`, `.claude/commands/loom`,
-  `.claude/agents`; any other kept-set path, such as `.claude/settings.json`, `.githooks/*` or
-  `.loom/config.json`, has none and holds), and its head blob SHA equals that counterpart's blob SHA
-  at the tag;
+  `.claude/agents`) plus the proof's own mappings for `.loom/roles` (→ `defaults/roles`) and
+  `.agents/skills` (→ `defaults/.agents/skills`, #13665); any other kept-set path, such as
+  `.claude/settings.json`, `.githooks/*` or `.loom/config.json`, has none and holds — and its
+  head blob SHA equals that counterpart's blob SHA at the tag;
 - the PR head did not move while it was read.
 
 A differing byte, a local-only file, a missing or unparsable tag, or any failed read gives
@@ -1279,12 +1342,12 @@ is red.
 ```bash
 # PRIVILEGED_CONTENT_PATTERNS (#12988): the capability list (jq/Oniguruma
 # regexes, one per element) a workflow's full head contents must not match.
-# Same list as #12954's privilegedContentPatterns; operators copy it into a
-# class, and test-champion-ci-workflow-blast.sh and
-# test-champion-standing-authorization.sh both extract it from here.
+# Both Champion workflow suites extract this list. For a standing class,
+# keep the legacy `write-all` regex alongside this list and set
+# `checkWorkflowWriteAll: true` to use the same structural permission check.
 PRIVILEGED_CONTENT_PATTERNS=(
   'secrets\.(?!GITHUB_TOKEN\b)' 'secrets:\s*inherit' '^\s*environment:'
-  ':\s*write\b' 'write-all' 'id-token' 'pull_request_target' 'workflow_run'
+  ':\s*write\b' 'id-token' 'pull_request_target' 'workflow_run'
   '^\s*release:' 'types:.*released' 'wrangler\s+deploy' 'npm\s+publish'
   'gh\s+release'
 )
@@ -1334,7 +1397,7 @@ ci_workflow_blast_eval() {
     [.[] | select(((.filename | ascii_downcase) | startswith(".github/workflows/")) and ((.status // "") != "removed"))]' 2>/dev/null) \
     || { WF_BLAST_REASON="workflow files unparseable"; return 0; }
   if [ "$CONTENT_FILES" != "[]" ]; then
-    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" \
+    standing_auth_content_clear "$CONTENT_FILES" "$(printf '%s\n' "${PRIVILEGED_CONTENT_PATTERNS[@]}")" true \
       || { WF_BLAST_REASON="a workflow's head contents are privileged or unreadable"; return 0; }
   fi
   # permissions (#13291): direction-aware. A removed line naming it is red (it
@@ -2724,11 +2787,19 @@ A pre-#11861 hold still on `loom:operator` (not yet migrated by `labels migrate
 **A hand-released hold is listed, not dropped (#11416).** A merge-risk hold
 whose `loom:blocked` a human removed is released (precheck (e)) and merges
 next tick unless the `critical-files`, `mergeable`, `recency` and `ci-green` criteria block it; a critical-file one waits for the
-operator's own merge (`champion-critical-file-hold.md`, #9016). Either way the
+operator's own merge (`champion-critical-file-hold.md`, #9016); a ratification
+one is released only by the operator's own `clear the hold —` comment
+(`champion-ratification-hold.md`, #12992) — the label's absence never releases
+it, so `RELEASED` keys on its latest marker being
+`champion:ratification-release-respected` (a still-standing marker gets the
+label re-armed by the precheck, not listed). Either way the
 PR no longer carries the label, so `RELEASED` below lists every open `loom:pr`
 PR still bearing a hold marker without it — never silently plain approved
-(a critical-file hold whose last marker is `-cleared` was auto-cleared, not listed).
-A sticky hold missing its label with no removal on record gets the label back
+(a critical-file or ratification hold whose last family marker is `-cleared`
+was auto-cleared, not listed; a released ratification hold — last marker
+`ratification-release-respected`, #14117 — IS listed, since "only a human
+releases this, then merges by hand" is exactly its design). A sticky hold
+missing its label with no removal on record gets the label back
 (precheck), so it stays in `HELD_COUNT`.
 
 ```bash
@@ -2758,14 +2829,23 @@ for H in loom:blocked loom:operator; do
 "
 done
 HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
-# Same marker set as Step 1's $HOLD_TABLE below (#13885) — extend both
-# together when a hold kind is added. Each kind's "no longer standing"
-# markers: merge-risk clears via a contains() block (embedded in the
-# pre-merge comment), critical-file and ratification clear/release via
-# standalone notices (the same set doctor.md's CHAMPION_HELD_CONFLICT uses).
+# Same marker set as Step 1's $HOLD_TABLE below (#13885) and RELEASED's
+# per-kind selectors (#13875) — extend all three together when a hold kind is
+# added. Each kind's "no longer standing" markers: merge-risk clears via a
+# contains() block (embedded in the pre-merge comment), critical-file and
+# ratification clear/release via standalone notices (the same set doctor.md's
+# CHAMPION_HELD_CONFLICT uses).
+# #14117: a marker being present is not that hold standing — count the PR
+# when ANY kind stands (per kind, the hold marker's latest comment index
+# must outdate the kind's latest cleared/released notice: the MR_STANDS
+# rindex idiom from champion-critical-file-hold.md). The previous selector
+# excluded a PR on ANY cleared marker, dropping a held PR whose *other*
+# hold still stands.
 if ! HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
-  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->") or startswith("<!-- champion:critical-file-hold -->") or startswith("<!-- champion:ratification-hold -->"))
-    and (any(.comments[].body; contains("<!-- champion:merge-risk-hold-cleared -->") or startswith("<!-- champion:critical-file-hold-cleared -->") or startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | not))] | length'); then
+  --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
+      ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length'); then
   HELD_STRUCTURAL_UNAVAILABLE=1   # the at-Doctor read stalled too (#14011) — the 0 below is degraded, not a fact
   HELD_AT_DOCTOR=0   # never feed a failed read's partial stdout to the arithmetic
 fi
@@ -2786,10 +2866,14 @@ fi
 HELD_NOTE=""
 [ "$HELD_STRUCTURAL_UNAVAILABLE" = 1 ] && HELD_NOTE=" — census read stalled: enumeration may be partial, structural fields unavailable (#13930)"
 echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d${HELD_NOTE}"
+# #14117: the ratification family is listed here too — its released state is
+# a LATEST `ratification-release-respected` marker (the one hold kind whose
+# design is "only a human releases this, then merges by hand"); a ratification
+# hold whose last family marker is `-cleared` was auto-cleared, not listed.
 RELEASED=""
 if ! RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
-  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->"))
-    or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->"))) | "#\(.number)"] | join(" ")'); then
+  --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
+    | "#\(.number)"] | join(" ")'); then
   HELD_STRUCTURAL_UNAVAILABLE=1   # the released read stalled too (#14011) — "none" below may be an artifact, not a fact
   RELEASED=""   # never echo a failed read's partial stdout
 fi
@@ -2823,7 +2907,14 @@ reason, `mergeable` status, base-staleness), persisted **durably across
 passes** under the same idempotency-marker convention already used for
 `champion:merge-risk-hold` / `champion:held-pr-conflict-notice` /
 `champion:stale-pr-notice` above: a single pinned tracking issue this pass
-**edits in place**, never a fresh comment or issue every tick.
+**edits in place**, never a fresh comment or issue every tick. That tracking
+issue is **singleton state** — exactly one open digest per install, and the
+only actor that reads it is the one that can create a second one (#13876) —
+so Step 0 reconciles duplicates and Step 2 re-checks before creating; the
+Step 0 reconcile (closing Champion's own duplicate digest losers, nothing
+else) is the narrow, bookkeeping-only exception to Champion's close authority
+and does not widen `champion-issue-promo.md` Step 4's premise-false close
+gate.
 
 **Step 0 — locate the existing digest issue and read its current body
 (#7020).** Step 1 below needs the *previous* pass's digest body to carry a
@@ -2844,9 +2935,39 @@ DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"
 # digest issue predating the marker convention — fall back to
 # the oldest (lowest-numbered) open title match instead of returning empty
 # and letting a duplicate get created (#7338).
-DIGEST_ISSUE=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
-  --state open --json number,body --limit 10 \
-  --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+DIGEST_LIST=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
+  --state open --json number,body --limit 10)
+DIGEST_ISSUE=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+
+# #13876 — reconcile duplicates here, where they are already visible. Two
+# concurrent passes can both read DIGEST_ISSUE empty and both create a digest
+# (Step 2's recheck narrows that window but cannot close it), and selection
+# above is deterministic, so every OTHER marker-tagged match is a write-frozen
+# loser: never read, never updated, still open, possibly pinned, drifting
+# further from reality while still looking like the digest. Point each loser
+# at the winner once (marker-guarded, so a close that failed and retried next
+# pass does not re-comment), unpin it, and close it "not planned" — closing
+# Champion's own duplicate bookkeeping artifact here is the narrow exception
+# named in the intro, NOT new close authority. Marker-less matches (the
+# #7338 fallback candidates) are never touched. Unpin is best-effort like
+# the pin in Step 2; a failed close just retried next pass.
+DIGEST_WINNER=$(printf '%s\n' "$DIGEST_LIST" | jq -r \
+  "[.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] | min_by(.number) | .number // empty")
+if [ -n "$DIGEST_WINNER" ]; then
+  for DIGEST_LOSER in $(printf '%s\n' "$DIGEST_LIST" | jq -r \
+      "[.[] | select(.body | startswith(\"$DIGEST_MARKER\")) | select(.number != $DIGEST_WINNER) | .number] | .[]"); do
+    if ! "$GH_READ" issue view "$DIGEST_LOSER" --json comments \
+        --jq "any(.comments[].body; startswith(\"<!-- champion:digest-duplicate-of:\"))" | grep -q true; then
+      ./.loom/scripts/post-comment.sh "$DIGEST_LOSER" --body "<!-- champion:digest-duplicate-of:$DIGEST_WINNER -->
+Duplicate \`$DIGEST_TITLE\` issue created by a concurrent Champion pass (#13876): both passes found no digest open and both created one. The live digest is #$DIGEST_WINNER — it is edited in place every pass. This duplicate is closed and will not be updated.
+
+*Automated by Champion role*"
+    fi
+    gh issue unpin "$DIGEST_LOSER" 2>/dev/null || true   # best-effort, like the pin in Step 2
+    gh issue close "$DIGEST_LOSER" --reason "not planned"
+  done
+fi
 
 if [ -n "$DIGEST_ISSUE" ]; then
   OLD_DIGEST_BODY=$("$GH_READ" issue view "$DIGEST_ISSUE" --json body --jq '.body')
@@ -2858,12 +2979,17 @@ fi
 **Step 1 — per-PR hold reason, and conflict-duration tracking (#7020).**
 `$HELD_JSON` carries `mergeable` and out-at-Doctor state, not *why* the PR was
 held or *how long* it has been `CONFLICTING`. Read the reason from the PR's own
-hold comment via the `$HOLD_TABLE` below — one `(marker, reason rule)` pair per
+hold comment via the `$HOLD_TABLE` below — one `(kind, hold marker, cleared/released test)` row per
 hold kind: the merge-risk marker of the `merge-risk` criterion, the
 critical-file marker of the `critical-files` and `ci-green` criteria (#6879),
-and the ratification marker (#12992, #13885 — its notice has no axis bullet;
-its reason is built from the notice itself). The latest standing marker among
-the table wins; a hold comment whose marker is not in the table is reported as
+and the ratification marker (#12992, #13885, #13875 — its notice has carried
+a `**Ratification by merge**` reason bullet since #13875; an older notice's
+reason is built from its backticked file list). The winner is the latest marker
+among the kinds that still STAND — per kind, standing means the hold marker's
+latest comment outdates the kind's latest cleared/released notice (the
+`MR_STANDS` rindex idiom from `champion-critical-file-hold.md`; #14117) — so a
+cleared kind never beats a standing one posted earlier; a hold comment whose
+marker is not in the table is reported as
 an unknown marker, never as an unrecorded reason. One cached read per held PR, never a second
 bulk `gh pr list`. Conflict duration rides a per-PR
 `<!-- champion:conflict-since:PR=<n> TS=<iso> -->` marker carried forward from
@@ -2882,17 +3008,26 @@ census's structural fields, and the loop above already renders the Base cell
 as "structural fields unavailable: census read stalled".
 
 ```bash
-# #13885: hold kinds are a TABLE of (marker, reason rule) pairs — the one
-# place a hold kind is registered for this digest, so adding one is a single
-# edit. #12992 added the ratification kind; merge-risk and critical-file
-# share the axis-bullet rule ("The latest standing marker among the table
-# wins" is the selection rule below).
+# #13885: hold kinds are a TABLE of (kind, hold marker, cleared/released
+# test) rows — the one place a hold kind is registered for this digest, so
+# adding one is a single edit. #12992 added the ratification kind; merge-risk
+# and critical-file share the axis-bullet rule. #14117: the third field is
+# the per-kind "no longer standing" jq test the selection below applies —
+# a marker being present is not that hold standing; the kind's latest hold
+# marker must outdate its latest cleared/released notice (the MR_STANDS
+# rindex idiom). The cleared-marker asymmetry is deliberate: merge-risk's
+# cleared marker is embedded in the pre-merge comment (contains), the other
+# kinds' notices are standalone (startswith).
 HOLD_TABLE=(
-  "merge-risk|<!-- champion:merge-risk-hold -->"
-  "critical-file|<!-- champion:critical-file-hold -->"
-  "ratification|<!-- champion:ratification-hold -->"
+  "merge-risk|<!-- champion:merge-risk-hold -->|contains(\"<!-- champion:merge-risk-hold-cleared -->\")"
+  "critical-file|<!-- champion:critical-file-hold -->|startswith(\"<!-- champion:critical-file-hold-cleared -->\")"
+  "ratification|<!-- champion:ratification-hold -->|startswith(\"<!-- champion:ratification-hold-cleared -->\") or startswith(\"<!-- champion:ratification-release-respected -->\")"
 )
 CONFLICT_SINCE_PREFIX="<!-- champion:conflict-since:PR="
+# The table's bare hold markers as a JSON array — lets the fallback below
+# tell "a marker this table does not know" from "a known kind whose hold is
+# cleared" (#14117).
+KNOWN_MARKERS_JSON=$(printf '%s\n' "${HOLD_TABLE[@]}" | cut -d'|' -f2 | jq -R . | jq -s -c .)
 ROT_THRESHOLD_DAYS=3   # continuously CONFLICTING at least this long -> "rotting"
 DIGEST_ROWS=""
 CONFLICT_SINCE_MARKERS=""
@@ -2907,44 +3042,60 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r "sort_by(-($LVL)) | .[].numbe
 
   # Cached ("$GH_READ") — an observation read, same rule as the aggregate
   # query above: this digest never gates a merge decision. ONE comment read
-  # per held PR; the hold kind is picked locally from $HOLD_TABLE by latest
-  # standing marker (a held PR carries one standing hold; cleared/released
-  # notices never startswith-match their hold marker, so they do not win —
-  # and a held PR's loom:blocked means one does stand).
+  # per held PR; the hold kind is the latest STANDING kind in $HOLD_TABLE —
+  # per kind, the hold marker's latest index must outdate the kind's latest
+  # cleared/released notice (the MR_STANDS rindex idiom), so a cleared kind
+  # never beats a standing one posted earlier (#14117). A held PR's
+  # loom:blocked means at least one kind stands; if the table finds none,
+  # the fallback below reports the anomaly.
   COMMENTS=$("$GH_READ" pr view "$PR_NUM" --json comments --jq '[.comments[].body]')
   HOLD_KIND=""; HOLD_BODY=""; WINNING_IDX=-1
   for TABLE_ENTRY in "${HOLD_TABLE[@]}"; do
-    KIND="${TABLE_ENTRY%%|*}"; MARKER="${TABLE_ENTRY#*|}"
+    KIND="${TABLE_ENTRY%%|*}"; T="${TABLE_ENTRY#*|}"
+    MARKER="${T%%|*}"; CLEAR="${T#*|}"
     IDX=$(jq --arg m "$MARKER" 'to_entries | map(select(.value | startswith($m))) | last | .key // -1' <<<"$COMMENTS")
-    if [ "$IDX" -gt "$WINNING_IDX" ]; then
+    [ "$IDX" -ge 0 ] || continue
+    STANDS=$(jq --arg m "$MARKER" '(map(startswith($m)) | rindex(true)) as $h | (map('"$CLEAR"') | rindex(true)) as $c | $h != null and ($c == null or $h > $c)' <<<"$COMMENTS")
+    if [ "$STANDS" = true ] && [ "$IDX" -gt "$WINNING_IDX" ]; then
       WINNING_IDX=$IDX; HOLD_KIND=$KIND
       HOLD_BODY=$(jq -r --argjson i "$IDX" '.[$i]' <<<"$COMMENTS")
     fi
   done
   if [ -z "$HOLD_KIND" ]; then
-    # Two distinct fallbacks (#13885): a held PR should always carry a
-    # champion hold comment, but distinguish HOW this table failed. A hold
-    # comment whose marker is NOT in $HOLD_TABLE means this prompt predates
-    # a hold kind — name the marker so the reader knows which table entry
-    # is missing. No champion hold comment at all is the real anomaly.
-    UNKNOWN_MARKER=$(jq -r 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->"))) | last // ""' <<<"$COMMENTS" \
+    # Three distinct fallbacks (#13885, #14117): a held PR should always
+    # carry a STANDING champion hold, but distinguish HOW this table failed.
+    # A hold comment whose marker is NOT in $HOLD_TABLE means this prompt
+    # predates a hold kind — name the marker so the reader knows which table
+    # entry is missing. A known kind whose every marker is cleared/released
+    # while loom:blocked persists is reported as such (#14117) — the table
+    # found no standing kind, so naming the cleared marker as "unknown"
+    # would be wrong. No champion hold comment at all is the real anomaly.
+    UNKNOWN_MARKER=$(jq -r --argjson known "$KNOWN_MARKERS_JSON" 'map(select(test("^<!-- champion:[a-z0-9-]+-hold -->") and (([. as $b | $known[] as $k | select($b | startswith($k))] | length) == 0))) | last // ""' <<<"$COMMENTS" \
       | head -1 | sed -nE 's/^(<!-- champion:[a-z0-9-]+-hold -->).*/\1/p')
+    KNOWN_HOLD_PRESENT=$(jq --argjson known "$KNOWN_MARKERS_JSON" '([.[] as $b | $known[] as $k | $b | startswith($k)] | any)' <<<"$COMMENTS")
     if [ -n "$UNKNOWN_MARKER" ]; then
       REASON="unknown hold marker $UNKNOWN_MARKER (digest prompt needs updating)"
+    elif [ "$KNOWN_HOLD_PRESENT" = true ]; then
+      REASON="no standing hold — every known hold marker on this PR is cleared/released (#14117)"
     else
       REASON="reason unrecorded (no champion hold marker found)"
     fi
   else
     case "$HOLD_KIND" in
       ratification)
-        # The ratification notice (#12992) has no axis bullet — its only
-        # bullet is a backticked file list — so build the reason from the
-        # notice itself: fixed text plus the first declared file.
-        FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
-        if [ -n "$FIRST_FILE" ]; then
-          REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
-        else
-          REASON="ratification hold (file bullet not parseable)"
+        # The ratification notice (#12992) has carried a leading
+        # "- **Ratification by merge**: ..." reason bullet since #13875 —
+        # read it like the other kinds. Notices posted before then have no
+        # axis bullet, only a backticked file list — build the reason from
+        # that (#13885): fixed text plus the first declared file.
+        REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+        if [ -z "$REASON" ]; then
+          FIRST_FILE=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- `' | sed -E 's/^- `([^`]+)`.*/\1/')
+          if [ -n "$FIRST_FILE" ]; then
+            REASON="ratification hold — merging ratifies; operator approves ($FIRST_FILE)"
+          else
+            REASON="ratification hold (file bullet not parseable)"
+          fi
         fi
         ;;
       *)
@@ -3008,7 +3159,9 @@ it). It splits "held, clean" (`$HELD_CONFLICTING_CLEAN`) from "held, rotting"
 **Step 2 — write the digest to a durable tracking issue, and pin it.** Champion
 edits this issue's **body** in place every pass (not a comment thread) — the
 current pile belongs at the top of the issue, not buried in a comment
-scrollback. `$DIGEST_ISSUE` came from Step 0; this step only builds the new
+scrollback. `$DIGEST_ISSUE` came from Step 0 (or from the pre-create recheck
+below, when Step 0 read empty and a concurrent pass created the digest in
+between, #13876); this step only builds the new
 body (including the hidden `champion:conflict-since` markers Step 1 collected,
 which is how the clock survives into the *next* pass) and writes it:
 
@@ -3041,6 +3194,20 @@ $DIGEST_TABLE
 $CONFLICT_SINCE_MARKERS---
 *Automated by Champion role*"
 
+# #13876 — re-check immediately before creating. The digest is singleton
+# state, and the only actor that reads it is the one that can create a
+# second one: two passes can both read Step 0's DIGEST_ISSUE empty. Re-run
+# the title search UNCACHED (gh, not $GH_READ — Step 0's read may be a
+# cache hit from before the other pass's create landed) with the same
+# selector; a number now means the other pass won the race — adopt it and
+# take the edit branch below instead of creating. Same recheck shape as the
+# verdict-time recheck in champion-issue-promo.md: it narrows the race
+# window, and Step 0's reconcile repairs what still slips through.
+if [ -z "$DIGEST_ISSUE" ]; then
+  DIGEST_ISSUE=$(gh issue list --search "\"$DIGEST_TITLE\" in:title" \
+    --state open --json number,body --limit 10 \
+    --jq "([.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] as \$tagged | if (\$tagged | length) > 0 then (\$tagged | min_by(.number)) else min_by(.number) end) | .number // empty")
+fi
 if [ -z "$DIGEST_ISSUE" ]; then
   # loom:blocked keeps this out of every role's work queue (Curator's
   # Priority 2 fallback excludes it outright, and no `loom:issue` /
@@ -4508,7 +4675,7 @@ A granted PR leaves the parked set at once, so this outcome is self-idempotent.
 
 ### Step 4b: Outcome — keep parked
 
-Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, guard the comment with a marker keyed to the rejection that is being ruled on, so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
+Comment the **specific** reason a human is still needed (not a generic "still blocked"), and change no labels. Because the parked PR stays in the query, the verdict is guarded per rejection **episode** — skip while a keep-parked verdict already covers the newest rejection — so the 10-minute cron does not re-post the same verdict every tick while a genuinely new rejection still gets a fresh decision:
 
 ```bash
 PR_NUMBER=<number>
@@ -4521,10 +4688,12 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
          | select((.body | contains("champion:capped-pr")) | not)
          | select(.body | test("Changes Requested"; "i"))]
         | last | .id // "none"')
-# The key is the id printed by the command above, copied VERBATIM. A head SHA,
-# an abbreviation, or any other spelling is NOT a key: on gf180-parasynth#647
-# four passes keyed on four spellings of one head SHA, so the exact-match guard
-# never fired and five identical verdicts landed on one rejection (#13903).
+# The key written into the marker is informational only — suppression never
+# matches on its spelling (#13903, #13880): on gf180-parasynth#647 four passes
+# keyed on four spellings of one head SHA, so the exact-match guard never fired
+# and five identical verdicts landed on one rejection. Prefer the rejection id
+# printed by the command above (`none` when there is no rejection) for the
+# audit trail.
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
 # Key-spelling-tolerant guard (#13903) — this is the ONLY suppression guard.
@@ -4547,14 +4716,19 @@ PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 # `$rejected` takes `updated_at | max` across ALL rejections, deliberately
 # NOT the key's `last`: an older rejection edited today also opens a fresh
 # episode, which errs toward posting — do not "align" the two selectors.
+# No rejection in the thread at all ($rejected == null — a PR parked without
+# any Judge rejection, where the marker key reads `none`): no new episode can
+# start, so ANY existing park comment suppresses and none has posted yet
+# allows one. Without this arm the whole guard is false on such PRs and the
+# 10-minute cron re-posts the same verdict every tick (#13880, observed shape:
+# gf180-parasynth#534).
 PARKED_SINCE_REJECTION=$(gh api --paginate "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[]' \
   | jq -s '([.[]
              | select((.body | contains("champion:capped-pr")) | not)
              | select(.body | test("Changes Requested"; "i"))
              | .updated_at] | max) as $rejected
-           | $rejected != null
-             and any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
-                          and .created_at >= $rejected)')
+           | any(.[]; (.body | startswith("<!-- champion:capped-pr-parked:"))
+                      and (($rejected == null) or (.created_at >= $rejected)))')
 
 if [ "$PARKED_SINCE_REJECTION" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"

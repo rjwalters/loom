@@ -33,6 +33,7 @@
 //! has none.
 
 use super::{LeaseEnsureArgs, Outcome, SessionEnv, DEFAULT_MAX_AGE_SECS};
+use crate::worktree_ops::gh::{probe_open_linked_pr_for_lease, OpenPrProbe};
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,8 @@ const BACKOFF_FACTOR: u64 = 5;
 pub(crate) enum DeferredEnd {
     /// An attempt settled; `Renewing` is the success case.
     Settled(Outcome),
+    /// A linked implementation PR appeared after the initial decline.
+    LinkedPr(u32),
     /// The watched session process is gone: nothing left to lease.
     SessionEnded,
     /// The age cap passed with every attempt still declined.
@@ -63,13 +66,16 @@ impl DeferredEnd {
     pub(crate) fn describe(&self, issue: u64) -> String {
         match self {
             Self::Settled(o) => format!("deferred publisher settled: {}", o.describe(issue)),
+            Self::LinkedPr(pr) => {
+                format!("deferred publisher for issue #{issue} stopped: linked PR #{pr} is open")
+            }
             Self::SessionEnded => format!(
                 "deferred publisher for issue #{issue} stopped: the watched session ended before \
                  a lease could be published"
             ),
             Self::CapReached => format!(
-                "deferred publisher for issue #{issue} stopped at its age cap with every publish \
-                 still declined — the claim has no lease"
+                "deferred publisher for issue #{issue} stopped at its age cap before a lease \
+                 could be published — the claim has no lease"
             ),
         }
     }
@@ -181,17 +187,38 @@ fn launch_process(args: &LeaseEnsureArgs) -> std::io::Result<u32> {
     if args.force {
         command.arg("--force");
     }
+    spawn_detached(command)
+}
+
+/// Spawn `command` detached (own process group, inherited fds close-on-exec)
+/// and log its pid.
+///
+/// #14100: a `loom-daemon` child with no `self_spawn start` line cannot be
+/// matched to a kernel OOM line. Start line only, mirroring
+/// `pr_lease_renewer` (`cli/pr_lease/renew.rs`): this parent returns at once,
+/// so a `Tracked` here would log a misleading `abandoned` exit immediately and
+/// stop the sampler.
+pub(crate) fn spawn_detached(mut command: Command) -> std::io::Result<u32> {
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
     super::mark_inherited_fds_cloexec();
-    command.spawn().map(|child| child.id())
+    let child = command.spawn()?;
+    log::info!(
+        "{}",
+        crate::self_spawn_log::start_line(
+            "lease_ensure_deferred",
+            child.id(),
+            &crate::fleet_sync::git_spawn_log::argv_of(&command)
+        )
+    );
+    Ok(child.id())
 }
 
 /// The `--deferred` entry point.
 pub(crate) fn run(args: &LeaseEnsureArgs) {
-    run_with(args, &SessionEnv::from_process(), DEFAULT_POLL);
+    run_with(args, &SessionEnv::from_process(), DEFAULT_POLL, probe_open_linked_pr_for_lease);
 }
 
 /// Take this session's lock, wait (bounded) for the issue's owner lock, then
@@ -206,6 +233,7 @@ pub(crate) fn run_with(
     args: &LeaseEnsureArgs,
     env: &SessionEnv,
     poll: Duration,
+    mut probe: impl FnMut(&Path, u32) -> OpenPrProbe,
 ) -> Option<DeferredEnd> {
     let root = crate::repo_root::resolve_repo_root(&args.workspace).ok()?;
     let note = |line: &str| record(&args.workspace, args.issue, line);
@@ -268,6 +296,27 @@ pub(crate) fn run_with(
         || since.elapsed().as_secs(),
         |secs| sleep_while(Duration::from_secs(secs), poll, alive),
         alive,
+        |remaining| {
+            // Keep these terminal outcomes on the no-Forge path. A later
+            // appearance of installed scripts is not proof of PR absence.
+            if let Some(outcome) = owned.settled_early(env) {
+                return Err(outcome);
+            }
+            if !root.join(".loom/scripts/sweep-lease-publish.sh").is_file()
+                || !root.join(".loom/scripts/sweep-lease-renew.sh").is_file()
+            {
+                return Err(Outcome::ScriptsMissing(root.clone()));
+            }
+            let _deadline = Instant::now()
+                .checked_add(Duration::from_secs(remaining))
+                .map(crate::gh_invocation::read_deadline::enter);
+            let verdict = u32::try_from(owned.issue)
+                .map_or(OpenPrProbe::ProbeFailed, |issue| probe(&root, issue));
+            if verdict == OpenPrProbe::ProbeFailed {
+                note("deferred linked-PR probe unavailable; skipping this wake");
+            }
+            Ok(verdict)
+        },
         |o| note(&format!("deferred attempt: {}", o.describe(args.issue))),
     );
     note(&end.describe(args.issue));
@@ -306,6 +355,7 @@ pub(crate) fn retry_loop(
     mut elapsed: impl FnMut() -> u64,
     mut sleep: impl FnMut(u64),
     mut session_alive: impl FnMut() -> bool,
+    mut probe: impl FnMut(u64) -> Result<OpenPrProbe, Outcome>,
     mut on_attempt: impl FnMut(&Outcome),
 ) -> DeferredEnd {
     // A deferred publisher is always bounded, even under `--max-age 0`.
@@ -330,9 +380,25 @@ pub(crate) fn retry_loop(
         if now >= cap {
             return DeferredEnd::CapReached;
         }
+        let verdict = probe(cap - now);
+        if !session_alive() {
+            return DeferredEnd::SessionEnded;
+        }
+        let now = elapsed();
+        if now >= cap {
+            return DeferredEnd::CapReached;
+        }
+        match verdict {
+            Ok(OpenPrProbe::Open(pr)) => return DeferredEnd::LinkedPr(pr),
+            Ok(OpenPrProbe::ProbeFailed) => continue,
+            Ok(OpenPrProbe::NoneOpen) => {}
+            Err(outcome) => {
+                on_attempt(&outcome);
+                return DeferredEnd::Settled(outcome);
+            }
+        }
         let attempt = LeaseEnsureArgs {
-            // The renewer inherits what is left, so the whole claim stays
-            // inside the original cap.
+            // The renewer inherits what is left, including time spent probing.
             max_age: cap - now,
             deferred: false,
             workspace: args.workspace.clone(),

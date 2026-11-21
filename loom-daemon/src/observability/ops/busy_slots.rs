@@ -59,12 +59,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
+use uuid::Uuid;
 
-use crate::telemetry::ops::{MetricName, MetricPoint};
+use crate::telemetry::ops::{MetricName, MetricPoint, STEP_OCCUPANCY_PROCESS_ID};
 use crate::work_finder::TickReport;
 
 /// The `role` label value of the work finder's issue-sweep slots. No
@@ -133,10 +134,17 @@ pub const STEP_POOL: &str = "step";
 /// Each step role name's live steps, as their start times (#12873).
 pub type StepStarts = BTreeMap<&'static str, Vec<DateTime<Utc>>>;
 
-/// The step points for live steps by role name: one per step role name,
-/// `0` included, counted from each role's start times. Pure.
+static REPORTING_PROCESS_ID: OnceLock<Uuid> = OnceLock::new();
+
+pub(crate) fn reporting_process_id() -> Uuid {
+    *REPORTING_PROCESS_ID.get_or_init(Uuid::new_v4)
+}
+
+/// The step points for live steps by role name, including explicit zeros.
+/// The process identity comes from the observer at capture.
 #[must_use]
-pub fn step_points(running: &StepStarts) -> Vec<MetricPoint> {
+pub fn step_points(running: &StepStarts, process_id: Uuid) -> Vec<MetricPoint> {
+    let process_id = process_id.to_string();
     let mut by_role: BTreeMap<&str, usize> = step_role_names().map(|role| (role, 0)).collect();
     for (role, starts) in running {
         *by_role.entry(role).or_insert(0) += starts.len();
@@ -147,6 +155,7 @@ pub fn step_points(running: &StepStarts) -> Vec<MetricPoint> {
             MetricPoint::int(MetricName::DispatchBusySlots, int(count))
                 .label("role", role)
                 .label("pool", STEP_POOL)
+                .label(STEP_OCCUPANCY_PROCESS_ID, &process_id)
         })
         .collect()
 }
@@ -366,7 +375,7 @@ pub fn record_tick(report: &TickReport, roots: &[PathBuf]) {
     let mut points = busy_points(report.occupancy, roles);
     if let Some(live) = published_steps() {
         let steps = step_starts(&live);
-        points.extend(step_points(&steps));
+        points.extend(step_points(&steps, reporting_process_id()));
         points.extend(age_points(Utc::now(), &steps));
         points.extend(size_points(&live));
     }

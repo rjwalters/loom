@@ -353,12 +353,71 @@ impl ResourceScope {
     }
 }
 
-/// `(app id, owner lowercased, scope)` -> the instant it becomes eligible.
+/// `(app id, owner lowercased, scope)` -> the current withdrawal and its evidence.
 type ScopedKey = (String, String, ResourceScope);
 
-fn scoped_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
-    static SCOPED: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
+#[derive(Clone, Copy)]
+struct PrimaryGraphql {
+    until: SystemTime,
+    observed_at: SystemTime,
+}
+
+struct ScopedWithdrawal {
+    until: SystemTime,
+    budget_until: Option<SystemTime>,
+    primary_graphql: Option<PrimaryGraphql>,
+    other_until: Option<SystemTime>,
+}
+
+enum ScopedCause {
+    Other,
+    Budget,
+    PrimaryGraphql { observed_at: SystemTime },
+}
+
+fn scoped_withdrawals() -> &'static Mutex<HashMap<ScopedKey, ScopedWithdrawal>> {
+    static SCOPED: OnceLock<Mutex<HashMap<ScopedKey, ScopedWithdrawal>>> = OnceLock::new();
     SCOPED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_scoped_withdrawal(
+    app_id: &str,
+    owner: &str,
+    scope: ResourceScope,
+    until: SystemTime,
+    cause: ScopedCause,
+) -> SystemTime {
+    let Ok(mut map) = scoped_withdrawals().lock() else {
+        return until; // a poisoned lock must not take reads down
+    };
+    let held = map
+        .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
+        .or_insert(ScopedWithdrawal {
+            until,
+            budget_until: None,
+            primary_graphql: None,
+            other_until: None,
+        });
+    held.until = held.until.max(until);
+    if !matches!(cause, ScopedCause::Other) {
+        // Keep the generic budget hold at the effective withdrawal end.
+        held.budget_until = held.budget_until.max(Some(held.until));
+    }
+    if let ScopedCause::PrimaryGraphql { observed_at } = cause {
+        let evidence = held
+            .primary_graphql
+            .get_or_insert(PrimaryGraphql { until, observed_at });
+        // A newer observation may describe a different, shorter window.
+        // Keep its time and expiry together even while the generic hold stays longer.
+        if observed_at > evidence.observed_at {
+            *evidence = PrimaryGraphql { until, observed_at };
+        } else if observed_at == evidence.observed_at {
+            evidence.until = evidence.until.min(until);
+        }
+    } else {
+        held.other_until = held.other_until.max(Some(until));
+    }
+    held.until
 }
 
 /// Withdraw reader `app_id` from `owner`'s `scope` until `until`. Like
@@ -371,24 +430,7 @@ pub fn withdraw_scoped_until(
     scope: ResourceScope,
     until: SystemTime,
 ) -> SystemTime {
-    let Ok(mut map) = scoped_withdrawals().lock() else {
-        return until; // a poisoned lock must not take reads down
-    };
-    let held = map
-        .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
-        .or_insert(until);
-    if until > *held {
-        *held = until;
-    }
-    *held
-}
-
-/// The scoped withdrawals that are about **budget** (a primary or secondary
-/// rate limit), as opposed to a refused credential. Same key and end as the
-/// entry [`withdraw_scoped_budget_until`] also writes to the scoped table.
-fn budget_withdrawals() -> &'static Mutex<HashMap<ScopedKey, SystemTime>> {
-    static BUDGET: OnceLock<Mutex<HashMap<ScopedKey, SystemTime>>> = OnceLock::new();
-    BUDGET.get_or_init(|| Mutex::new(HashMap::new()))
+    record_scoped_withdrawal(app_id, owner, scope, until, ScopedCause::Other)
 }
 
 /// [`withdraw_scoped_until`] for a rate limit: the reader is out of
@@ -401,16 +443,43 @@ pub fn withdraw_scoped_budget_until(
     scope: ResourceScope,
     until: SystemTime,
 ) -> SystemTime {
-    let held = withdraw_scoped_until(app_id, owner, scope, until);
-    if let Ok(mut map) = budget_withdrawals().lock() {
-        let slot = map
-            .entry((app_id.to_string(), owner.to_ascii_lowercase(), scope))
-            .or_insert(held);
-        if held > *slot {
-            *slot = held;
-        }
+    record_scoped_withdrawal(app_id, owner, scope, until, ScopedCause::Budget)
+}
+
+/// Record a positively observed primary GraphQL refusal. Its proof expires at
+/// its own end, even when other withdrawals keep the bucket ineligible longer.
+pub(crate) fn withdraw_primary_graphql_until(
+    app_id: &str,
+    owner: &str,
+    until: SystemTime,
+    observed_at: SystemTime,
+) -> SystemTime {
+    record_scoped_withdrawal(
+        app_id,
+        owner,
+        ResourceScope::Graphql,
+        until,
+        ScopedCause::PrimaryGraphql { observed_at },
+    )
+}
+
+/// A live primary-only proof for this installation. An overlapping All-scope
+/// or unqualified GraphQL hold prevents the narrower fallback authorization.
+pub(crate) fn primary_graphql_observed_at(
+    app_id: &str,
+    owner: &str,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    let map = scoped_withdrawals().lock().ok()?;
+    let mut key = (app_id.to_string(), owner.to_ascii_lowercase(), ResourceScope::All);
+    if map.get(&key).is_some_and(|held| now < held.until) {
+        return None;
     }
-    held
+    key.2 = ResourceScope::Graphql;
+    let held = map.get(&key)?;
+    let proof = held.primary_graphql?;
+    (now < proof.until && !held.other_until.is_some_and(|until| now < until))
+        .then_some(proof.observed_at)
 }
 
 /// Whether reader `app_id` is withdrawn from `owner`'s `resource` at `now`
@@ -423,7 +492,7 @@ pub fn is_budget_withdrawn_at(
     resource: Resource,
     now: SystemTime,
 ) -> bool {
-    let Ok(map) = budget_withdrawals().lock() else {
+    let Ok(map) = scoped_withdrawals().lock() else {
         return false; // unknown cause: never shed on it
     };
     let owner = owner.to_ascii_lowercase();
@@ -431,7 +500,8 @@ pub fn is_budget_withdrawn_at(
         .into_iter()
         .any(|scope| {
             map.get(&(app_id.to_string(), owner.clone(), scope))
-                .is_some_and(|&until| now < until)
+                .and_then(|held| held.budget_until)
+                .is_some_and(|until| now < until)
         })
 }
 
@@ -452,7 +522,7 @@ pub fn is_withdrawn_scoped_at(
         .into_iter()
         .any(|scope| {
             map.get(&(app_id.to_string(), owner.clone(), scope))
-                .is_some_and(|&until| now < until)
+                .is_some_and(|held| now < held.until)
         })
 }
 
@@ -481,7 +551,7 @@ pub fn scoped_withdrawal_until(
         .into_iter()
         .filter_map(|scope| {
             map.get(&(app_id.to_string(), owner.clone(), scope))
-                .copied()
+                .map(|held| held.until)
         })
         .filter(|&until| now < until)
         .max()
@@ -498,8 +568,8 @@ pub fn live_scoped_withdrawals(
     };
     let mut out: Vec<_> = map
         .iter()
-        .filter(|(_, &until)| now < until)
-        .map(|((app, owner, scope), &until)| (app.clone(), owner.clone(), *scope, until))
+        .filter(|(_, held)| now < held.until)
+        .map(|((app, owner, scope), held)| (app.clone(), owner.clone(), *scope, held.until))
         .collect();
     out.sort_by(|a, b| (&a.0, &a.1, a.2).cmp(&(&b.0, &b.1, b.2)));
     out

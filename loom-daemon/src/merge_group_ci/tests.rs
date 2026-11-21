@@ -193,6 +193,81 @@ fn group_check_without_checkout_is_flagged_and_the_shipped_template_is_clean() {
 }
 
 #[test]
+fn group_check_workflow_run_without_the_job_gate_is_flagged() {
+    let src = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    let r = run(&wf("merge-group-check.yml", src), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(!r.qualified());
+    let detail = &r.findings[0].detail;
+    assert!(detail.contains("workflow_run.event == 'merge_group'"), "{detail}");
+    assert!(detail.contains("head_repository.full_name == github.repository"), "{detail}");
+    assert!(detail.contains("merge-queue-ci.md"), "{detail}");
+    assert_eq!(r.findings[0].code.as_str(), "GROUP_CHECK_UNGATED_WORKFLOW_RUN");
+}
+
+#[test]
+fn group_check_gate_with_only_one_clause_names_the_missing_one() {
+    let base = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    let with_if = |cond: &str| {
+        base.replace(
+            "    name: Merge authorization\n",
+            &format!("    name: Merge authorization\n    if: {cond}\n"),
+        )
+    };
+    let only_event = with_if(
+        "github.event_name == 'merge_group' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'merge_group')",
+    );
+    let r = run(&wf("merge-group-check.yml", &only_event), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(r.findings[0].detail.contains("head_repository"), "{}", r.findings[0].detail);
+    assert!(!r.findings[0]
+        .detail
+        .contains("is missing `github.event.workflow_run.event"));
+
+    let only_repo = with_if(
+        "github.event_name == 'merge_group' || (github.event.workflow_run.head_repository.full_name == github.repository)",
+    );
+    let r = run(&wf("merge-group-check.yml", &only_repo), &[]);
+    assert_eq!(codes_for(&r, Some("group-check")), vec![Code::GroupCheckUngatedWorkflowRun]);
+    assert!(
+        r.findings[0]
+            .detail
+            .contains("workflow_run.event == 'merge_group'"),
+        "{}",
+        r.findings[0].detail
+    );
+}
+
+#[test]
+fn group_check_intact_gate_is_clean_whatever_its_spacing_or_quoting() {
+    let base = include_str!("fixtures/group_check_ungated_workflow_run.yml");
+    for cond in [
+        // Folded scalar, as the shipped template writes it.
+        ">-\n      github.event_name == 'merge_group' ||\n      (github.event_name == 'workflow_run' &&\n      github.event.workflow_run.event == 'merge_group' &&\n      github.event.workflow_run.head_repository.full_name == github.repository)",
+        // `${{ }}` wrapper, double quotes, no spaces, swapped repo operands.
+        "${{ github.event.workflow_run.event==\"merge_group\" && github.repository==github.event.workflow_run.head_repository.full_name }}",
+    ] {
+        let src = base.replace(
+            "    name: Merge authorization\n",
+            &format!("    name: Merge authorization\n    if: {cond}\n"),
+        );
+        let r = run(&wf("merge-group-check.yml", &src), &[]);
+        assert!(r.findings.is_empty(), "{cond}: {:?}", r.findings);
+    }
+}
+
+#[test]
+fn group_check_without_a_workflow_run_trigger_needs_no_gate() {
+    let src = include_str!("fixtures/group_check_ungated_workflow_run.yml").replace(
+        "  workflow_run:\n    workflows: [\"CI\"]\n    types: [completed]\n    branches: ['gh-readonly-queue/**']\n",
+        "",
+    );
+    assert!(!src.contains("workflow_run"));
+    let r = run(&wf("merge-group-check.yml", &src), &[]);
+    assert!(r.findings.is_empty(), "{:?}", r.findings);
+}
+
+#[test]
 fn shipped_group_check_template_pins_permissions_and_recheck_trigger() {
     let template =
         include_str!("../../../defaults/optional/github-workflows/merge-group-check.yml");
@@ -652,4 +727,354 @@ fn installation_permissions_fixture_decides_the_statuses_level() {
     assert_eq!(installation_statuses(&body, "11", None).as_deref(), Some("write"));
     assert_eq!(installation_statuses(&body, "99", None), None, "not listed: unknown");
     assert_eq!(installation_statuses(&json!({"message": "x"}), "42", None), None);
+}
+
+/// Static shape of the `changes` job's fail-open Detect Changes (#13969):
+/// two `paths-filter` attempts pinned identically, both reading the shared
+/// `PR_PATH_FILTERS`, and every path-group output falling open to `'true'`.
+/// String shapes only; the GitHub-side expression semantics are not evaluated.
+fn detect_changes_fail_open_violations(w: &Workflow) -> Vec<String> {
+    const GROUPS: [&str; 4] = ["backend", "mcp", "quickstarts", "scripts"];
+    let mut bad = Vec::new();
+    let Some(job) = w.job("changes") else {
+        return vec!["no `changes` job".to_string()];
+    };
+
+    let filters: Vec<_> = job.steps.iter().filter(|s| s.is_paths_filter()).collect();
+    let ids: Vec<_> = filters.iter().map(|s| s.id.as_deref()).collect();
+    if ids != [Some("filter"), Some("filter-retry")] {
+        bad.push(format!("paths-filter step ids must be [filter, filter-retry], got {ids:?}"));
+    }
+    if filters.windows(2).any(|p| p[0].uses != p[1].uses) {
+        let uses: Vec<_> = filters.iter().map(|s| s.uses.as_deref()).collect();
+        bad.push(format!("paths-filter attempts must share one pinned `uses:`, got {uses:?}"));
+    }
+    for s in &filters {
+        if s.with_value("filters") != Some("${{ env.PR_PATH_FILTERS }}") {
+            bad.push(format!(
+                "step {:?} must read `filters: ${{{{ env.PR_PATH_FILTERS }}}}`, got {:?}",
+                s.id,
+                s.with_value("filters")
+            ));
+        }
+    }
+
+    for g in GROUPS {
+        let Some((_, expr)) = job.outputs.iter().find(|(k, _)| k == g) else {
+            bad.push(format!("output `{g}` is missing"));
+            continue;
+        };
+        // Whitespace-insensitive: collapse runs of blanks and drop the `}}`.
+        let norm = expr.split_whitespace().collect::<Vec<_>>().join(" ");
+        let body = norm.trim_end_matches("}}").trim_end();
+        for step in ["filter", "filter-retry"] {
+            let reference = format!("steps.{step}.outputs.{g}");
+            if !body.contains(&reference) {
+                bad.push(format!("output `{g}` does not name `{reference}`: {expr}"));
+            }
+        }
+        if !body.ends_with("|| 'true'") {
+            bad.push(format!("output `{g}` must fail open (end `|| 'true'`): {expr}"));
+        }
+    }
+    bad
+}
+
+const DETECT_CHANGES_OK: &str = r"
+name: CI
+on: [pull_request, push]
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.filter.outputs.backend || steps.filter-retry.outputs.backend || 'true' }}
+      mcp: ${{ steps.filter.outputs.mcp || steps.filter-retry.outputs.mcp || 'true' }}
+      quickstarts: ${{ steps.filter.outputs.quickstarts || steps.filter-retry.outputs.quickstarts || 'true' }}
+      scripts: ${{  steps.filter.outputs.scripts  ||  steps.filter-retry.outputs.scripts  ||  'true'  }}
+    steps:
+      - uses: dorny/paths-filter@aaaa # v4.0.3
+        id: filter
+        with:
+          filters: ${{ env.PR_PATH_FILTERS }}
+      - uses: dorny/paths-filter@aaaa # v4.0.3 - retry
+        id: filter-retry
+        with:
+          filters: ${{ env.PR_PATH_FILTERS }}
+";
+
+#[test]
+fn repo_ci_yml_detect_changes_keeps_the_fail_open_shape() {
+    let src = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.is_empty(), "Detect Changes fail-open drifted (#13969):\n{}", bad.join("\n"));
+}
+
+#[test]
+fn detect_changes_fail_open_fixture_is_clean() {
+    // Also covers different whitespace inside the output expression.
+    assert_eq!(
+        detect_changes_fail_open_violations(&wf("ci.yml", DETECT_CHANGES_OK)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_mismatched_pin() {
+    let src = DETECT_CHANGES_OK.replacen(
+        "paths-filter@aaaa # v4.0.3 - retry",
+        "paths-filter@bbbb # v4.0.4",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("one pinned `uses:`")), "{bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_dropped_true_tail() {
+    let src = DETECT_CHANGES_OK.replacen(
+        "steps.filter-retry.outputs.mcp || 'true'",
+        "steps.filter-retry.outputs.mcp",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(
+        bad.iter()
+            .any(|b| b.contains("output `mcp` must fail open")),
+        "{bad:?}"
+    );
+    assert_eq!(bad.len(), 1, "only the edited group may be flagged: {bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_an_output_missing_the_retry_attempt() {
+    let src = DETECT_CHANGES_OK.replacen("steps.filter-retry.outputs.backend || ", "", 1);
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(
+        bad.iter()
+            .any(|b| b.contains("steps.filter-retry.outputs.backend")),
+        "{bad:?}"
+    );
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_an_inline_filters_block() {
+    // The first attempt carries an inline filter instead of the shared env.
+    let src = DETECT_CHANGES_OK.replacen(
+        "filters: ${{ env.PR_PATH_FILTERS }}",
+        "filters: |\n            backend:\n              - 'src/**'",
+        1,
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("PR_PATH_FILTERS")), "{bad:?}");
+}
+
+#[test]
+fn detect_changes_fail_open_rejects_a_third_filter_step() {
+    let src = format!(
+        "{DETECT_CHANGES_OK}      - uses: dorny/paths-filter@aaaa # v4.0.3\n        id: extra\n        with:\n          filters: ${{{{ env.PR_PATH_FILTERS }}}}\n"
+    );
+    let bad = detect_changes_fail_open_violations(&wf("ci.yml", &src));
+    assert!(bad.iter().any(|b| b.contains("step ids must be")), "{bad:?}");
+}
+
+const DOCS_ONLY_REFERENCE: &str = include_str!("fixtures/docs_only_exception.yml");
+
+const DASHBOARD_JOB_IF: &str = concat!(
+    "!cancelled() && (github.event_name == 'merge_group' || ",
+    "(github.event_name != 'schedule' && needs.merge-group-verified.outputs.verified != 'true'))",
+);
+
+fn dashboard_docs_only_fixture(job_if: &str) -> String {
+    DOCS_ONLY_REFERENCE
+        .replace(
+            "  tests:\n",
+            r#"  merge-group-verified:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      verified: false
+    steps:
+      - run: echo fixture
+  tests:
+"#,
+        )
+        .replace(
+            "    needs: docs_only\n    if: ${{ !cancelled() }}",
+            &format!("    needs: [docs_only, merge-group-verified]\n    if: ${{{{ {job_if} }}}}"),
+        )
+}
+
+#[test]
+fn docs_only_exception_is_visible_without_claiming_full_suite_coverage() {
+    let w = wf("ci.yml", DOCS_ONLY_REFERENCE);
+    let r = run(&w, &["Project Tests", "CI Result"]);
+    assert!(r.qualified(), "{:#?}", r.findings);
+    let tests = r.jobs.iter().find(|job| job.id == "tests").unwrap();
+    assert_eq!(tests.docs_only_steps, ["Full suites"]);
+    assert!(!tests.covered);
+    assert!(!r.required[0].covered && r.required[0].docs_only_exception);
+    assert!(r.required[1].covered && !r.required[1].docs_only_exception);
+    for e in Event::ALL {
+        assert_eq!(state(&r, "tests", e), RunState::Runs);
+        assert_eq!(state(&r, "result", e), RunState::Runs);
+    }
+    let text = super::render_audit(&r, false);
+    assert!(text.contains("DOCS-ONLY EXCEPTION"));
+    assert!(text.contains("step `Full suites` can skip"));
+    assert!(text.contains("required contexts report"));
+    let report = serde_json::to_value(r).unwrap();
+    assert_eq!(report["required"][0]["docs_only_exception"], true);
+    assert_eq!(report["required"][0]["covered"], false);
+}
+
+#[test]
+fn dashboard_docs_only_filter_retains_conditional_required_coverage() {
+    let spaced = DASHBOARD_JOB_IF.replace("!cancelled()", "! cancelled ( )");
+    for condition in [DASHBOARD_JOB_IF, spaced.as_str()] {
+        let w = wf("ci.yml", &dashboard_docs_only_fixture(condition));
+        let report = run(&w, &["Project Tests", "CI Result"]);
+        assert_eq!(state(&report, "merge-group-verified", Event::MergeGroup), RunState::Skipped);
+        assert_eq!(state(&report, "tests", Event::MergeGroup), RunState::Runs);
+        assert!(report.qualified(), "{:#?}", report.findings);
+        assert_eq!(report.required[0].context, "Project Tests");
+        assert!(!report.required[0].covered && report.required[0].docs_only_exception);
+        assert!(report.required[1].covered && !report.required[1].docs_only_exception);
+        assert!(super::render_audit(&report, false).contains("step `Full suites` can skip"));
+
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["required"][0]["context"], "Project Tests");
+        assert_eq!(json["required"][0]["docs_only_exception"], true);
+        assert_eq!(json["required"][0]["covered"], false);
+    }
+}
+
+#[test]
+fn dashboard_docs_only_filter_does_not_credit_unproven_job_conditions() {
+    // Some near matches still run on merge groups. They are outside the
+    // recognized condition because they change the push or schedule branch.
+    for condition in [
+        DASHBOARD_JOB_IF.replace("'schedule'", "'push'"),
+        DASHBOARD_JOB_IF.replace("verified !=", "verified =="),
+        DASHBOARD_JOB_IF
+            .trim_start_matches("!cancelled() && ")
+            .to_string(),
+        "!cancelled() && github.event_name != 'merge_group'".into(),
+        "!cancelled() && inputs.confirmed".into(),
+        format!("{DASHBOARD_JOB_IF} && needs.docs_only.result == 'success'"),
+        format!("{DASHBOARD_JOB_IF} && needs.docs_only.outputs.docs_only != 'true'"),
+    ] {
+        let report = run(
+            &wf("ci.yml", &dashboard_docs_only_fixture(&condition)),
+            &["Project Tests", "CI Result"],
+        );
+        assert!(
+            !report.required[0].covered && !report.required[0].docs_only_exception,
+            "{condition}"
+        );
+        assert!(!report.qualified(), "{condition}");
+    }
+}
+
+#[test]
+fn dashboard_docs_only_filter_does_not_credit_guarded_required_steps() {
+    let fixture = dashboard_docs_only_fixture(DASHBOARD_JOB_IF);
+    let checkout_gated = fixture.replace(
+        "      - uses: actions/checkout@v4\n      - name: Conflict markers",
+        "      - uses: actions/checkout@v4\n        if: ${{ needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true' }}\n      - name: Conflict markers",
+    );
+    let authorization_gated =
+        fixture.replace("run: ./scripts/test", "run: loom-daemon forge merge-queue group-check");
+    for source in [checkout_gated, authorization_gated] {
+        let report = run(&wf("ci.yml", &source), &["Project Tests", "CI Result"]);
+        assert!(codes_for(&report, Some("tests")).contains(&Code::UnprovenDocsOnlyGuard));
+        assert!(!report.required[0].docs_only_exception);
+        assert!(!report.qualified());
+    }
+}
+
+#[test]
+fn docs_only_audit_rejects_noncanonical_or_job_level_gating() {
+    let no_failure_fallback = DOCS_ONLY_REFERENCE.replace(
+        "needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true'",
+        "needs.docs_only.outputs.docs_only != 'true'",
+    );
+    let gated_job = DOCS_ONLY_REFERENCE.replace(
+        "    if: ${{ !cancelled() }}\n",
+        "    if: ${{ needs.docs_only.outputs.docs_only != 'true' }}\n",
+    );
+    let bracket_guard = DOCS_ONLY_REFERENCE
+        .replace("needs.docs_only.outputs.docs_only", "needs['docs_only'].outputs['docs_only']");
+    let no_classifier = DOCS_ONLY_REFERENCE.replace("loom-daemon ci-docs-only", "other-command");
+    let auth_gated = DOCS_ONLY_REFERENCE
+        .replace("run: ./scripts/test", "run: loom-daemon forge merge-queue group-check");
+    for modified in [
+        no_failure_fallback,
+        gated_job,
+        bracket_guard,
+        no_classifier,
+        auth_gated,
+    ] {
+        let report = run(&wf("ci.yml", &modified), &["Project Tests", "CI Result"]);
+        assert!(codes_for(&report, Some("tests")).contains(&Code::UnprovenDocsOnlyGuard));
+        assert!(!report.qualified());
+    }
+}
+
+#[test]
+fn docs_only_workflow_contract_runs_heavy_steps_and_reports_without_a_successful_proof() {
+    use super::expr::{parse_condition, Context, Truth, Value};
+    struct Decisions<'a> {
+        classifier: &'a str,
+        output: Option<&'a str>,
+        suites: &'a str,
+    }
+    impl Context for Decisions<'_> {
+        fn lookup(&self, path: &[String]) -> Value {
+            let value = match path.join(".").as_str() {
+                "needs.docs_only.result" => Some(self.classifier),
+                "needs.docs_only.outputs.docs_only" => self.output,
+                "needs.tests.result" => Some(self.suites),
+                "github.event_name" => Some("merge_group"),
+                "needs.merge-group-verified.outputs.verified" => None,
+                _ => panic!("unexpected expression path {path:?}"),
+            };
+            value.map_or(Value::Null, |value| Value::Str(value.to_string()))
+        }
+    }
+    let dashboard = dashboard_docs_only_fixture(DASHBOARD_JOB_IF);
+    for source in [DOCS_ONLY_REFERENCE, dashboard.as_str()] {
+        let w = wf("ci.yml", source);
+        assert_eq!(w.permissions.as_deref(), Some("contents: read, actions: read"));
+        let suite = w.job("tests").unwrap();
+        let aggregate = w.job("result").unwrap();
+        let heavy =
+            parse_condition(suite.steps.last().unwrap().if_cond.as_deref().unwrap()).unwrap();
+        let red = parse_condition(aggregate.steps[0].if_cond.as_deref().unwrap()).unwrap();
+        let job_if = parse_condition(suite.if_cond.as_deref().unwrap()).unwrap();
+        assert!(job_if.has_status_function());
+        assert_eq!(aggregate.if_cond.as_deref(), Some("${{ !cancelled() }}"));
+        assert_eq!(aggregate.steps[0].run.as_deref(), Some("exit 1"));
+        for step in &suite.steps[..suite.steps.len() - 1] {
+            assert!(step.if_cond.is_none(), "always-run checkout and cheap checks: {step:?}");
+        }
+        for (classifier, output, suites, runs, fails) in [
+            ("success", Some("true"), "success", false, false),
+            ("success", Some("false"), "success", true, false),
+            ("success", None, "success", true, false),
+            ("failure", None, "success", true, true),
+            ("failure", Some("true"), "success", true, true),
+            ("cancelled", None, "success", true, true),
+            ("skipped", None, "success", true, true),
+            ("success", Some("false"), "failure", true, true),
+        ] {
+            let context = Decisions {
+                classifier,
+                output,
+                suites,
+            };
+            assert_eq!(job_if.eval(&context).truth(), Truth::True);
+            assert_eq!(heavy.eval(&context).truth() == Truth::True, runs);
+            assert_eq!(red.eval(&context).truth() == Truth::True, fails);
+        }
+    }
 }

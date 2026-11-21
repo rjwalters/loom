@@ -1602,6 +1602,56 @@ run_guard 287
 assert_eq "12" "$RC" "(v7) loom:pr keeps the strict marker rule"
 assert_eq "" "$(cat "$STUB_DIR/timeline-calls.log" 2>/dev/null)" "(v7) timeline not even read for an approval"
 
+# --- (w) a prepared commit pushed after the verdict (#14516) ----------------
+# The Doctor commits the correction locally BEFORE Judge's verdict, then
+# fast-forwards the branch AFTER it. The timeline lists the `committed` entry by
+# its commit date (before the label) and a fast-forward emits no event, so "no
+# commit after the label" is true of a head the label never described. The
+# verdict writer (post-verdict.sh) posts the marker and applies the label under
+# one identity; that label is the writer's, not an operator send-back. The marker
+# comment is authored by the fleet identity (verdict_comment); a send-back is only
+# recognised from a different login.
+FLEET_LOGIN='loom-fleet-dispatch[bot]'
+W_LABEL_JUDGE='{"event":"labeled","label":{"name":"loom:changes-requested"},"actor":{"login":"'"$FLEET_LOGIN"'"},"created_at":"2026-11-01T10:00:02Z"}'
+
+# (w1) the observed ordering: commit listed before the verdict + label, both by the
+# marker's author. The rejection names SHA_A, the head is SHA_B -> STALE, and the
+# normal --clear path re-queues it for review.
+v_case 290 "$V_COMMIT,$W_LABEL_JUDGE"; echo write > "$STUB_DIR/perm-$FLEET_LOGIN"
+run_guard 290 --clear
+assert_eq "12/STALE/1" "$RC/$(get_field "$OUT" DECISION)/$(get_field "$OUT" CLEARED)" "(w1) Judge's own label after a prepared commit -> STALE and cleared"
+assert_eq "$SHA_A" "$(get_field "$OUT" MARKER_SHA)" "(w1) the rejection names the earlier head"
+assert_contains "$WRITES" "--add-label loom:review-requested" "(w1) re-review label added"
+assert_contains "$WRITES" "--remove-label loom:changes-requested" "(w1) stale rejection removed"
+
+# (w2) same identity, spelled with different case -> still the writer's label.
+v_case 291 "$V_COMMIT,${W_LABEL_JUDGE/loom-fleet-dispatch/Loom-Fleet-Dispatch}"; echo write > "$STUB_DIR/perm-Loom-Fleet-Dispatch[bot]"
+run_guard 291
+assert_eq "12" "$RC" "(w2) label actor matches the marker author case-insensitively -> STALE"
+
+# (w3) an explicit hold still suppresses the clear on the new STALE path.
+v_case 292 "$V_COMMIT,$W_LABEL_JUDGE"; echo write > "$STUB_DIR/perm-$FLEET_LOGIN"
+pr_json 292 "$SHA_B" "loom:changes-requested" "loom:blocked"
+run_guard 292 --clear
+assert_eq "12/STALE/0" "$RC/$(get_field "$OUT" DECISION)/$(get_field "$OUT" CLEARED)" "(w3) hold label -> STALE reported, nothing cleared"
+assert_eq "" "$WRITES" "(w3) no label writes under a hold"
+
+# (w4) marker author unreadable (a trusted comment carrying no login) is insufficient
+# evidence: the operator send-back is not assumed -> STALE.
+reset_state
+pr_json 293 "$SHA_B" "loom:changes-requested"
+printf '[{"author_association":"MEMBER","created_at":"2026-11-01T10:00:00Z","body":"<!-- loom:verdict-sha sha=%s verdict=changes-requested -->"}]' "$SHA_A" > "$STUB_DIR/comments-293.json"
+printf '[%s]' "$V_COMMIT,$V_LABEL_OP" > "$STUB_DIR/timeline-293.json"; echo write > "$STUB_DIR/perm-operator1"
+run_guard 293
+assert_eq "12" "$RC" "(w4) marker author unknown -> STALE"
+
+# (w5) the real operator send-back is kept even when the judge labelled first: the
+# LATEST labeled event is a trusted human's, a different login than the marker's.
+v_case 294 "$V_COMMIT,$W_LABEL_JUDGE,$V_LABEL_OP"; echo write > "$STUB_DIR/perm-operator1"; echo write > "$STUB_DIR/perm-$FLEET_LOGIN"
+run_guard 294 --clear
+assert_eq "0/FRESH/0" "$RC/$(get_field "$OUT" DECISION)/$(get_field "$OUT" CLEARED)" "(w5) later trusted human send-back on the current head -> FRESH"
+assert_eq "" "$WRITES$COMMENTS_POSTED$DAEMON" "(w5) nothing cleared or written"
+
 # --- Summary -------------------------------------------------------------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

@@ -46,6 +46,10 @@ pub const REASON_TRACE_UNMAPPABLE: &str = "trace_unmappable";
 /// rather than retried forever. Envelope units.
 pub const REASON_NON_JSON_RESPONSE: &str = "non_json_response";
 
+/// Loss reason: one envelope exceeds the OTLP request byte limit, or the
+/// receiver refused a single-envelope request as too large. Envelope units.
+pub const REASON_REQUEST_TOO_LARGE: &str = "request_too_large";
+
 /// Loss reason: an OTLP response exceeded the bounded read of 4096 bytes.
 /// Envelope units.
 pub const REASON_RESPONSE_TOO_LARGE: &str = "response_too_large";

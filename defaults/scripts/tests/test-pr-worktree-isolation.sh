@@ -17,6 +17,9 @@
 #      does a real `git checkout`, so a mis-directed `cd` visibly moves the
 #      orchestrator's branch/HEAD. The helper (not the test) writes the sentinel.
 #   6. judge.md and `pr-worktree.sh --help` agree on the Judge fallback (#11194).
+#   7. When the PR branch is checked out in the PRIMARY clone, pr-worktree.sh
+#      creates pr-<N> detached at the PR head sha and exits 0 (#14391), both via
+#      the up-front check and via the checkout-failure path.
 #
 # Tests 3-5 run the real pr-worktree.sh against a throwaway git repo with a
 # mocked `gh`, since there is no live forge in CI. Branch-shape classification
@@ -374,6 +377,166 @@ if grep -qx "# PR: 999" ".loom/worktrees/pr-999/.loom-managed" 2>/dev/null; then
     pass "pr-999 worktree has the .loom-managed sentinel written by the helper"
 else
     fail "pr-999 worktree is missing the helper-written .loom-managed sentinel with '# PR: 999'"
+fi
+
+# --- Test 7: branch held by the primary clone -> detached pr-<N> (#14391) ---
+echo ""
+echo "Test 7: pr-worktree.sh creates a detached pr-<N> when the primary clone holds the PR branch (#14391)"
+
+cd "$TMP/repo"
+PRIMARY_ABS="$(pwd -P)"
+
+MOCKBIN4=$(mktemp -d /tmp/loom-pr-iso-mockbin4.XXXXXX)
+trap 'rm -rf "$TMP" "$MOCKBIN" "$MOCKBIN2" "$MOCKBIN3" "$MOCKBIN4"; cd "$REPO_ROOT" 2>/dev/null || true' EXIT
+cat > "$MOCKBIN4/gh" <<'MOCKEOF'
+#!/usr/bin/env bash
+# LOOM_TEST_VIEW=none makes `gh pr view` resolve nothing (exercises the
+# checkout-failure path); otherwise it returns the head branch or, for
+# --json headRefOid, the head sha. `gh pr checkout` fails the way git does
+# when the primary clone holds the branch.
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+    [[ "${LOOM_TEST_VIEW:-}" == "none" ]] && exit 1
+    if [[ "$*" == *headRefOid* ]]; then echo "$LOOM_TEST_HEAD_SHA"; else echo "$LOOM_TEST_HEAD_BRANCH"; fi
+    exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "checkout" ]]; then
+    echo "fatal: '$LOOM_TEST_HEAD_BRANCH' is already used by worktree at '$LOOM_TEST_PRIMARY'" >&2
+    exit 1
+fi
+exit 0
+MOCKEOF
+chmod +x "$MOCKBIN4/gh"
+
+# 7a: up-front path (gh pr view resolves the branch and the sha).
+P_BRANCH="feature/issue-996"
+git checkout -q -b "$P_BRANCH" main
+git commit --allow-empty -q -m "pr 996 change"
+P_SHA="$(git rev-parse HEAD)"   # primary clone stays on $P_BRANCH
+set +e
+PR_OUT7=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$P_SHA" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7=$?
+set -e
+if [[ "$PR_RC7" -eq 0 ]]; then
+    pass "primary-clone holder: pr-worktree.sh exits 0"
+else
+    fail "primary-clone holder: expected exit 0, got $PR_RC7: $PR_OUT7"
+fi
+if grep -q "Detached at $P_SHA" <<<"$PR_OUT7" && grep -q "primary clone" <<<"$PR_OUT7"; then
+    pass "primary-clone holder: output says it detached, at which sha, and why"
+else
+    fail "primary-clone holder: missing detach explanation; got: $PR_OUT7"
+fi
+if [[ -z "$(git -C .loom/worktrees/pr-996 symbolic-ref -q HEAD || true)" ]] \
+    && [[ "$(git -C .loom/worktrees/pr-996 rev-parse HEAD)" == "$P_SHA" ]]; then
+    pass "primary-clone holder: pr-996 is detached at the PR head sha"
+else
+    fail "primary-clone holder: pr-996 is not detached at $P_SHA"
+fi
+if grep -qx "# PR: 996" ".loom/worktrees/pr-996/.loom-managed" 2>/dev/null; then
+    pass "primary-clone holder: .loom-managed sentinel written"
+else
+    fail "primary-clone holder: .loom-managed sentinel missing"
+fi
+if [[ "$(git rev-parse --abbrev-ref HEAD)" == "$P_BRANCH" ]]; then
+    pass "primary-clone holder: primary clone checkout is untouched"
+else
+    fail "primary-clone holder: primary clone moved off $P_BRANCH"
+fi
+
+# 7b: re-run reuses the existing pr-996 and follows a new PR head sha.
+git commit --allow-empty -q -m "pr 996 follow-up"
+P_SHA2="$(git rev-parse HEAD)"
+set +e
+PR_OUT7B=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$P_SHA2" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7B=$?
+set -e
+if [[ "$PR_RC7B" -eq 0 ]] && grep -q "reusing" <<<"$PR_OUT7B" \
+    && [[ "$(git -C .loom/worktrees/pr-996 rev-parse HEAD)" == "$P_SHA2" ]]; then
+    pass "re-run reuses the detached pr-996 and moves it to the new head sha"
+else
+    fail "re-run did not reuse/refresh pr-996 (rc=$PR_RC7B): $PR_OUT7B"
+fi
+
+# 7c: checkout-failure path (gh pr view unresolved); head sha comes from the
+#     pull/<N>/head ref fetched from origin.
+Q_BRANCH="feature/issue-995"
+git checkout -q -b "$Q_BRANCH" main
+git commit --allow-empty -q -m "pr 995 change"
+Q_SHA="$(git rev-parse HEAD)"
+git push -q origin "$Q_SHA:refs/pull/995/head"
+set +e
+PR_OUT7C=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_VIEW=none LOOM_TEST_HEAD_BRANCH="$Q_BRANCH" \
+    LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 995 2>&1)
+PR_RC7C=$?
+set -e
+if [[ "$PR_RC7C" -eq 0 ]] && [[ "$(git -C .loom/worktrees/pr-995 rev-parse HEAD 2>/dev/null)" == "$Q_SHA" ]] \
+    && grep -q "Detached at $Q_SHA" <<<"$PR_OUT7C"; then
+    pass "checkout-failure path: primary-clone holder also yields a detached pr-995"
+else
+    fail "checkout-failure path: expected detached pr-995 at $Q_SHA (rc=$PR_RC7C): $PR_OUT7C"
+fi
+if [[ "$(git worktree list --porcelain | grep -c 'worktrees/pr-995$')" -eq 1 ]]; then
+    pass "checkout-failure path: exactly one pr-995 worktree registered"
+else
+    fail "checkout-failure path: unexpected pr-995 worktree registrations"
+fi
+git checkout -q main
+
+# 7d: primary clone AND the builder's issue worktree both hold the branch ->
+#     the builder wins: exit 1, builder path named, no detached pr-<N> created.
+B_BRANCH="feature/issue-994"
+git checkout -q -b "$B_BRANCH" main
+git commit --allow-empty -q -m "pr 994 change"
+B_SHA="$(git rev-parse HEAD)"
+git worktree add -q --force .loom/worktrees/issue-994 "$B_BRANCH"
+set +e
+PR_OUT7D=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$B_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$B_SHA" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 994 2>&1)
+PR_RC7D=$?
+set -e
+if [[ "$PR_RC7D" -eq 1 ]] && grep -q "worktrees/issue-994" <<<"$PR_OUT7D" \
+    && [[ ! -e .loom/worktrees/pr-994 ]]; then
+    pass "builder + primary both hold the branch: exit 1, builder path named, no pr-994 created"
+else
+    fail "builder + primary: expected exit 1 naming issue-994 and no pr-994 (rc=$PR_RC7D): $PR_OUT7D"
+fi
+git worktree remove --force .loom/worktrees/issue-994
+git checkout -q main
+
+# 7e: existing detached pr-996 is NOT reused once the builder holds the branch.
+git worktree add -q .loom/worktrees/issue-996 "$P_BRANCH"
+set +e
+PR_OUT7E=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$P_SHA2" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7E=$?
+set -e
+if [[ "$PR_RC7E" -eq 1 ]] && grep -q "worktrees/issue-996" <<<"$PR_OUT7E"; then
+    pass "existing detached pr-996 + builder holder: exit 1, builder path named"
+else
+    fail "reuse path: expected exit 1 naming issue-996 (rc=$PR_RC7E): $PR_OUT7E"
+fi
+git worktree remove --force .loom/worktrees/issue-996
+
+# 7f: a failed refresh of the detached pr-996 returns nonzero and keeps the local edit.
+git checkout -q -b tmp-14391-b "$P_SHA2"
+echo base > t14391.txt; git add t14391.txt; git commit -q -m "base t"
+T_B="$(git rev-parse HEAD)"
+echo new > t14391.txt; git commit -q -am "new t"
+T_C="$(git rev-parse HEAD)"
+git checkout -q main
+git -C .loom/worktrees/pr-996 checkout -q --detach "$T_B"
+echo local > .loom/worktrees/pr-996/t14391.txt
+set +e
+PR_OUT7F=$(PATH="$MOCKBIN4:$PATH" LOOM_DEFAULT_BRANCH=main LOOM_TEST_HEAD_BRANCH="$P_BRANCH" \
+    LOOM_TEST_HEAD_SHA="$T_C" LOOM_TEST_PRIMARY="$PRIMARY_ABS" "$PR_WORKTREE_SH" 996 2>&1)
+PR_RC7F=$?
+set -e
+if [[ "$PR_RC7F" -ne 0 ]] && [[ "$(cat .loom/worktrees/pr-996/t14391.txt)" == "local" ]]; then
+    pass "failed detached refresh: nonzero exit and local edit preserved"
+else
+    fail "failed refresh: expected nonzero + preserved edit (rc=$PR_RC7F): $PR_OUT7F"
 fi
 
 cd "$REPO_ROOT"

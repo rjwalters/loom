@@ -387,6 +387,7 @@ pub(crate) fn api_failure(
                 secondary,
                 retry_after: retry_after_secs.map(Duration::from_secs),
                 remaining: None,
+                graphql_primary_message: false,
             })
         }
         Err(ApiError::Http { status: 401, .. }) => Some(Failure::Credential),

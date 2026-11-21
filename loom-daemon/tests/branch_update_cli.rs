@@ -16,16 +16,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_loom-daemon");
+mod exec_support;
+use exec_support::write_executable;
 
-fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    }
-}
+const BIN: &str = env!("CARGO_BIN_EXE_loom-daemon");
 
 fn git(dir: &Path, args: &[&str]) -> Output {
     Command::new("git")
@@ -50,9 +44,8 @@ fn ok(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A scratch dir holding a fake `gh` (answers `api repos/...` with the
-/// contents of `repo.json`, or fails when it is absent; logs every call) and a
-/// `loom-daemon` symlink to the binary under test.
+/// A scratch dir holding a fake `gh` for repository settings and the PR
+/// snapshot, and a `loom-daemon` symlink to the binary under test.
 struct Tools {
     dir: tempfile::TempDir,
 }
@@ -62,15 +55,29 @@ impl Tools {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = dir.path().join("gh-calls.log");
         let answer = dir.path().join("repo.json");
-        write_exec(
+        let pr_base = dir.path().join("pr-base");
+        std::fs::write(&pr_base, "main\n").expect("default PR base");
+        write_executable(
             &dir.path().join("gh"),
-            &format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\n\
-                 if [ \"$1\" = api ] && [ -f '{}' ]; then cat '{}'; exit 0; fi\n\
-                 echo 'HTTP 403: Resource not accessible' >&2; exit 1\n",
+            format!(
+                r#"#!/bin/sh
+set -e
+echo "$*" >> '{}'
+if [ "$1" = api ] && [ -f '{}' ]; then cat '{}'; exit 0; fi
+if [ "$1 $2 $3" = 'pr view 1' ]; then
+    base=$(cat '{}')
+    [ -n "$base" ]
+    head=$(git ls-remote origin refs/heads/feature/x | cut -f1)
+    base_sha=$(git ls-remote origin "refs/heads/$base" | cut -f1)
+    printf '1\tOPEN\tfeature/x\t%s\t%s\t%s\n' "$head" "$base" "$base_sha"
+    exit 0
+fi
+echo 'HTTP 403: Resource not accessible' >&2; exit 1
+"#,
                 log.display(),
                 answer.display(),
-                answer.display()
+                answer.display(),
+                pr_base.display()
             ),
         );
         #[cfg(unix)]
@@ -86,6 +93,10 @@ impl Tools {
                 let _ = std::fs::remove_file(p);
             }
         }
+    }
+
+    fn pr_base(&self, base: &str) {
+        std::fs::write(self.dir.path().join("pr-base"), base).expect("PR base");
     }
 
     fn gh_calls(&self) -> usize {
@@ -407,7 +418,67 @@ fn the_doctor_merges_a_conflicting_branch_and_pushes_without_force() {
 }
 
 #[test]
-fn a_sibling_push_rejects_the_plain_push_and_survives() {
+fn doctor_conflict_recipe_repairs_the_stacked_base_and_leaves_parent_untouched() {
+    let tools = Tools::new();
+    tools.pr_base("feature/issue-10");
+    let (_tmp, _origin, work, claim) = merge_only_fixture(&tools);
+    let common = ok(&work, &["merge-base", "HEAD", "origin/main"]);
+    ok(&work, &["checkout", "-qb", "feature/issue-10", &common]);
+    std::fs::write(work.join("f.txt"), "parent's version\n").expect("parent edit");
+    ok(&work, &["add", "f.txt"]);
+    ok(&work, &["commit", "-qm", "parent edit"]);
+    ok(&work, &["push", "-q", "origin", "feature/issue-10"]);
+    let parent = ok(&work, &["rev-parse", "HEAD"]);
+    ok(&work, &["checkout", "-q", "feature/x"]);
+
+    let conflict_recipe = prompt_block("### PR Has Merge Conflicts");
+    let (repair_and_push, _) = conflict_recipe
+        .split_once("\nloom-daemon forge wait-checks")
+        .expect("the recipe asks for forge CI after pushing");
+    let script = format!("set -e\nN=1\nCLAIM_HEAD_SHA={claim}\n{repair_and_push}");
+    let first = bash(&tools, &work, &script);
+    assert!(!first.status.success(), "the parent conflicts with the follower");
+    assert_eq!(ok(&work, &["rev-parse", "MERGE_HEAD"]), parent);
+    assert!(ok(&work, &["ls-remote", "origin", "refs/heads/feature/x"]).starts_with(&claim));
+
+    std::fs::write(work.join("f.txt"), "resolved\n").expect("resolve");
+    ok(&work, &["add", "f.txt"]);
+    ok(&work, &["commit", "-q", "--no-edit"]);
+    let second = bash(&tools, &work, &script);
+    assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+    let repaired = ok(&work, &["rev-parse", "HEAD"]);
+    assert!(git(&work, &["merge-base", "--is-ancestor", &parent, &repaired])
+        .status
+        .success());
+    assert!(!git(&work, &["merge-base", "--is-ancestor", "origin/main", &repaired])
+        .status
+        .success());
+    assert!(ok(&work, &["ls-remote", "origin", "refs/heads/feature/x"]).starts_with(&repaired));
+    assert!(ok(&work, &["ls-remote", "origin", "refs/heads/feature/issue-10"]).starts_with(&parent));
+}
+
+#[test]
+fn doctor_update_recipes_stop_before_merging_when_pr_snapshot_is_unreadable() {
+    let tools = Tools::new();
+    tools.pr_base("");
+    let (_tmp, _origin, work, claim) = merge_only_fixture(&tools);
+    for script in [
+        doctor_push_script(":"),
+        format!(
+            "set -e\nN=1\nCLAIM_HEAD_SHA={claim}\n{}",
+            prompt_block("### PR Has Merge Conflicts")
+        ),
+    ] {
+        let result = bash(&tools, &work, &script);
+        assert!(!result.status.success(), "an unreadable snapshot cannot update the branch");
+        assert_eq!(ok(&work, &["rev-parse", "HEAD"]), claim);
+        assert!(ok(&work, &["status", "--porcelain"]).is_empty());
+        assert!(ok(&work, &["ls-remote", "origin", "refs/heads/feature/x"]).starts_with(&claim));
+    }
+}
+
+#[test]
+fn a_sibling_push_after_claim_is_detected_and_survives() {
     let tools = Tools::new();
     let (tmp, origin, work, _their_merge) = merge_only_fixture(&tools);
     // Make main non-conflicting for this case: the block's merge succeeds.
@@ -438,7 +509,9 @@ fn a_sibling_push_rejects_the_plain_push_and_survives() {
         sib.display()
     );
     let out = bash(&tools, &work, &doctor_push_script(&fix));
-    assert!(!out.status.success(), "a plain push over a sibling's commit is rejected");
+    assert!(!out.status.success(), "a moved claim head refuses the update");
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("PR identity, head or base unavailable or changed"));
     let live = ok(&work, &["ls-remote", "origin", "refs/heads/feature/x"]);
     assert!(live.starts_with(&sibling), "the sibling's commit survives: {live}");
 }
@@ -447,8 +520,8 @@ fn a_sibling_push_rejects_the_plain_push_and_survives() {
 // Prompt scan
 // ---------------------------------------------------------------------------
 
-/// Every role prompt: inside fenced blocks, a `git rebase origin/` must be on
-/// a line guarded by the strategy answer in a block that asks for it, and no
+/// Every role prompt: inside fenced blocks, rebasing onto origin or a pinned
+/// PR base must be guarded by the strategy answer in that block, and no
 /// push may be a bare `--force-with-lease` or a `--force`/`-f` (#10771,
 /// #10069). Rebase mode keeps working; an unconditional rebase cannot return.
 #[test]
@@ -469,7 +542,9 @@ fn role_prompts_never_rebase_or_force_unconditionally() {
                 if code.starts_with('#') {
                     continue;
                 }
-                if code.contains("git rebase origin/") {
+                if code.contains("git rebase origin/")
+                    || code.contains("git rebase \"$PR_BASE_SHA\"")
+                {
                     if code.contains("\"$BRANCH_UPDATE\" = rebase")
                         && block.contains("branch-update strategy")
                     {

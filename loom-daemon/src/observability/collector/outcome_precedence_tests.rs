@@ -22,7 +22,7 @@
 //! by the precedence rule too, not just the dispatched-here one.
 //!
 //! In its own sibling module so `collector.rs`'s existing test file does not
-//! grow (`scripts/check-file-size-budget.sh`).
+//! grow.
 
 use super::*;
 use crate::sweep_registry::TrackedSweepIdentity;

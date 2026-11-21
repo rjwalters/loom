@@ -83,11 +83,30 @@ Precedence is **env > config > default**, the same rule every other
 | `endpoint` | `LOOM_OBSERVABILITY_ENDPOINT` | unset (disables export) |
 | `ingestKeyFile` | `LOOM_OBSERVABILITY_INGEST_KEY_FILE` | `$HOME/.loom/observability/ingest.key` |
 | `batchSize` | `LOOM_OBSERVABILITY_BATCH_SIZE` | 50 |
+| `maxBatchBytes` | `LOOM_OBSERVABILITY_MAX_BATCH_BYTES` | 4,194,304 bytes (4 MiB) |
 | `flushIntervalSecs` | `LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS` | 30 |
 | `queueCapacity` | `LOOM_OBSERVABILITY_QUEUE_CAPACITY` | 2000 |
 | `exporter` | `LOOM_OBSERVABILITY_EXPORTER` | unset ⇒ no exporter; `"otlp"` (§3). The retired `"https"` is skipped with a warning (#12813) |
 | `exporters` | — (config only) | unset ⇒ `exporter` (§3); an `otlp` entry may carry `headers_file` (§3) |
 | `claudeCodeTelemetry` | `LOOM_CLAUDE_CODE_TELEMETRY_*` | off — a nested, separately-resolved block (#9215) |
+
+`batchSize` limits the number of queued envelopes considered per flush.
+`maxBatchBytes` limits the **encoded OTLP JSON body** of each HTTP request,
+including its resource and scope wrappers. The first valid positive integer
+wins in this order: `LOOM_OBSERVABILITY_MAX_BATCH_BYTES`, the selected
+`observability.exporters[].maxBatchBytes` object field, the shared
+`observability.maxBatchBytes` field, then 4 MiB. A singular exporter or a
+string entry uses the shared field. For a receiver that caps requests at
+one MiB, set `"maxBatchBytes": 1048576` next to `batchSize` or on its exporter
+object.
+
+The queued exporter splits requests over the configured limit and requests
+explicitly refused for size (HTTP 413 or an explicit HTTP 400 size message).
+It processes the resulting groups in order. An irreducible oversized
+envelope records `request_too_large` in the durable loss ledger. Ordinary
+HTTP 400 responses keep their existing `status_400` behavior. This byte
+setting applies to the queued exporter. Raw worker relay forwarding keeps
+its own request policy.
 
 `claudeCodeTelemetry` is the one sub-block that configures **someone else's**
 exporter: the OTel environment a spawned worker's own Claude Code session needs
@@ -757,16 +776,18 @@ out earlier (`workspace_halted`, `parked`,
 `host_constraint`, a backoff, a cooldown, …) had no per-issue SigNoz record
 at all before this. Every ready-queue row now gets a `loom.dispatch.disposition`
 span on a disposition transition (including first sight), on a periodic
-refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 600s = 10 min), or
-once as a terminal `left_queue` record when it leaves a repo whose listing
-succeeded. Sampled from the collector's periodic pass (the same cadence as
-the other queue samples), never the tick loop, so a disposition lasting less than one
-collector interval can be missed; a 10-minute-or-longer lookback still always
-contains the current state of every queued issue. Every queued row becomes a
-span (no volume cap: a cap would make which items carry facts depend on
-iteration order), and a row whose repo root never resolved to a forge slug is
-dropped and counted as `reason="unresolved"` rather than exported with a local
-path. `loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
+refresh (`LOOM_DISPATCH_DISPOSITION_REFRESH_SECS`, default 150 seconds of
+source time), or once as a terminal `left_queue` record when it leaves a repo
+whose listing succeeded. A 30-second timer checks for a newer completed tick
+using cached identities. It shares the collector loop with host snapshots and
+backfill, whose work can delay the check. The existing five-minute host snapshot
+pass resolves repo identities and counts unresolved rows. The span
+timestamp is the source tick's completion time; the envelope records when
+the collector offered it. Warm repos can refresh while other identities are
+unresolved. Missing rows in failed or incomplete listings keep their last
+observation. The export has no row cap. Rows without a resolved forge slug
+are counted as `reason="unresolved"` and omit any local path from telemetry.
+`loom.dispatch.admission` also gained `loom.repo`/`loom.repo.visibility`
 in the same change, so `loom.issue` is no longer ambiguous on a multi-repo
 host. Full attribute table in
 [`telemetry-schema.md`](telemetry-schema.md#loomdispatchdisposition-issue-9222-per-issue-why-is-it-waiting).
@@ -993,7 +1014,7 @@ override for a stopped daemon or an opted-out reconciler.
 
 **Uncovered `gh` callers (#10343, tracked in #10618).** Spend from `safehouse.rs`,
 `auto_update`/`release_resolve`, `credential_preflight`, `sweep-lease-renew.sh`,
-`peer_coord.rs` and `main_health_gate` bypasses the `invoke github` span, so it
+and `main_health_gate` bypasses the `invoke github` span, so it
 reads as shadow spend. The span-vs-`/rate_limit` hourly reconciliation is an
 operational check on a fleet host (shadow recipe above), not a CI check.
 
@@ -1099,18 +1120,37 @@ totals match by construction. `loom.dispatch.step` is an instant span emitted
 at spawn and cannot carry them; `loom.llm.tokens.*` metrics stay unlabelled by
 repo/issue to bound cardinality.
 
+Since #14048 the record also carries the step's **launch identity**, read back
+off the step's own per-item log (`step-<role>-<item>.log`) and anchored to the
+step's `sweep_id=` dispatch header — never the per-role log a role-runner tick
+reads, which a step never writes. A native runtime's token rows are narrowed to
+the **exact session ids that log names** (OpenCode's `--format json` event
+stream `sessionID`, Codex's `session id: <uuid>` banner), which is strictly
+more precise than directory+window: two concurrent same-role steps in one
+workspace overlap in time by construction, so only the id can separate them.
+OpenCode's id is the whole key; the Codex arm still ANDs the ids with the
+workspace directory and window (the window bounds the rollout scan).
+Claude steps keep the transcript scan; a Kimi step has no id source yet and
+keeps directory+window.
+
 | Key | Meaning |
 |---|---|
 | `loom.repo`, `loom.sweep_id`, `loom.role` | the repo, step and role |
+| `loom.stage` | the step-engine stage (`builder`, `judge`, `champion_promote`, `champion_merge`, …) — finer than `loom.role`, which folds Champion's two stages to `champion` (#14048) |
+| `loom.runtime`, `loom.provider`, `loom.profile` | the launch's own `# LOOM_LAUNCH` identity (#14048): absent for a Claude/legacy-adapter spawn, never a guessed `claude` |
 | `loom.issue` / `loom.pr_number` | the step's item: a PR for Judge / Champion-merge-style steps, else an issue |
 | `loom.models_used`, `loom.tokens_by_model` | observed models and per-model rows (never inferred from config) |
 | `loom.tokens.input` / `.output` / `.cache_read` / `.cache_write` | flat sums of the rows (`cache_write` = 5m + 1h) |
 
-A step with no readable transcript carries no token keys: absent, never zero.
+A step with no readable transcript or launch record carries no token or
+identity keys: absent, never zero. Each host's daemon emits its own steps'
+records, so a **cross-host per-stage join** is `repo + issue/PR + stage` over
+these rows — the narrating host's completion envelope no longer has to see the
+other hosts' sessions.
 **Known gap:** summing per-step counts undercounts `loom.llm.tokens.*` by the
-tokens used outside steps (role-runner ticks, which have no item) and by
-runtimes whose transcripts the scan does not read. The hourly comparison
-against `loom.llm.tokens.*` is a post-roll live check and has not been run.
+tokens used outside steps (role-runner ticks, which have no item). Kimi steps
+key on directory+window, not session id. The hourly comparison against
+`loom.llm.tokens.*` is a post-roll live check and has not been run.
 
 ### Resync landings: who, which path, what result (#13674)
 

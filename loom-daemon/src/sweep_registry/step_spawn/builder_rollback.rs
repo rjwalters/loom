@@ -24,8 +24,9 @@
 //! a Builder pre-claim write nothing of their own: `label_flip_failed` fails
 //! before any write, and `roll_paused` / `claimed` / `no_token_pool` happen
 //! before the pre-claim or (`roll_paused` in the unlocked path) before the
-//! Builder's pre-claim runs. A spawn failure after a won claim already
-//! restores the label through `unwind_step_claim(.., true)`.
+//! Builder's pre-claim runs. A spawn failure after a won claim and a confirmed
+//! terminal child also yield their own issue lease (#14482). The existing
+//! step restore path still decides readiness, independently of that yield.
 
 use super::*;
 use crate::gh_invocation::AccessIntent;
@@ -50,6 +51,64 @@ pub(super) fn outcome(yielded: Option<bool>, restored: Option<bool>) -> &'static
 }
 
 impl SweepRegistry {
+    /// Yield only this confirmed-finished Builder's issue lease. Read the same
+    /// trusted lease/yield records as admission: a repeat is a no-op, and an
+    /// unreadable or failed write leaves freshness protection in force.
+    pub(crate) fn yield_finished_builder_lease(
+        &self,
+        item: u32,
+        sweep_id: &str,
+        reason: &'static str,
+    ) -> bool {
+        use crate::forge_check_claim::{
+            issue_lease_comments_jq, live_leases_by_freshness, parse_lease_rows,
+        };
+
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            log::warn!("Builder step {sweep_id} on #{item}: lease-yield repository unresolved; retaining lease protection");
+            return false;
+        };
+        let gh = self.resolved_gh();
+        let read = self
+            .gh_inv("guard.finished_builder_lease", AccessIntent::Read, &gh)
+            .args([
+                "api",
+                &format!("repos/{owner}/{repo}/issues/{item}/comments"),
+                "--paginate",
+                "--jq",
+                &issue_lease_comments_jq(),
+            ]);
+        let Some(output) = self
+            .run_counted(read)
+            .ok()
+            .flatten()
+            .filter(|o| o.status.success())
+        else {
+            log::warn!("Builder step {sweep_id} on #{item}: lease-yield read failed; retaining lease protection");
+            return false;
+        };
+        let policy = crate::comment_trust::TrustPolicy::for_root(&self.config.workspace_root);
+        let rows =
+            parse_lease_rows(&String::from_utf8_lossy(&policy.trusted_ndjson(&output.stdout)));
+        let own = (self.published_host_id(), sweep_id.to_string());
+        if !live_leases_by_freshness(
+            &rows,
+            Utc::now(),
+            crate::claim_reconciliation::resolve_lease_ttl_minutes(),
+        )
+        .contains(&own)
+        {
+            return true;
+        }
+        self.post_builder_lease_yield(
+            item,
+            sweep_id,
+            "terminal",
+            "terminal",
+            &format!("the Builder step is confirmed finished ({reason})."),
+        )
+    }
+
     /// Undo this step's pre-claim writes, then return `refusal` carrying the
     /// rollback's outcome. Best effort: a rollback that fails still returns the
     /// original refusal, and the outcome says `failed`.
@@ -92,7 +151,7 @@ impl SweepRegistry {
     /// Whether a fresh read shows no lease but this step's own live on the
     /// issue. `false` when the read fails: unknown is not "none".
     fn no_peer_lease_live(&self, item: u32, sweep_id: &str, episode_start: DateTime<Utc>) -> bool {
-        let Some(comments) = self.read_lease_comments(item) else {
+        let Some(comments) = self.read_order_lease_comments(item) else {
             return false;
         };
         let host = self.published_host_id();
@@ -109,7 +168,6 @@ impl SweepRegistry {
     /// Post a `loom:lease-yield` for this step's own lease. `true` when the
     /// forge took it. The peer's lease is never touched.
     fn post_own_lease_yield(&self, item: u32, sweep_id: &str, loss: &Loss) -> bool {
-        let host = self.published_host_id();
         let (earliest_host, earliest_sweep, why) = match loss {
             Loss::Peer { host, sweep } => (
                 host.as_str(),
@@ -126,6 +184,18 @@ impl SweepRegistry {
                 "its claim could not be verified, so no Builder was launched.".to_string(),
             ),
         };
+        self.post_builder_lease_yield(item, sweep_id, earliest_host, earliest_sweep, &why)
+    }
+
+    fn post_builder_lease_yield(
+        &self,
+        item: u32,
+        sweep_id: &str,
+        earliest_host: &str,
+        earliest_sweep: &str,
+        why: &str,
+    ) -> bool {
+        let host = self.published_host_id();
         let body = format!(
             "<!-- loom:lease-yield host={host} sweep={sweep_id} earliest_host={earliest_host} \
              earliest_sweep={earliest_sweep} -->\n\

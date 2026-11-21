@@ -445,19 +445,21 @@ assert_contains "$OUT" "BLOCKED=true PRIOR=true" "quoting champion:merge-risk-ho
 assert_contains "$OUT" "release after #12000 merges; the champion:merge-risk-hold above stays until then" "text on the marker line is quoted"
 echo
 
-echo "Test 12: census lists hand-released, unmerged holds (merge-risk and critical-file), not quoted markers"
+echo "Test 12: census lists hand-released, unmerged holds (merge-risk, critical-file, ratification), not quoted markers"
 FIX_LIST=$(jq -n '[
   {number: 10280, comments: [{body: "<!-- champion:merge-risk-hold -->\nheld"}]},
   {number: 9001,  comments: [{body: "<!-- champion:critical-file-hold -->\nheld"}]},
   {number: 9002,  comments: [{body: "LGTM"}]},
   {number: 9003,  comments: [{body: "quoting <!-- champion:merge-risk-hold --> in prose"}]},
-  {number: 9004,  comments: [{body: "<!-- champion:critical-file-hold -->\nheld"}, {body: "<!-- champion:critical-file-hold-cleared -->\nnarrowed"}]}
+  {number: 9004,  comments: [{body: "<!-- champion:critical-file-hold -->\nheld"}, {body: "<!-- champion:critical-file-hold-cleared -->\nnarrowed"}]},
+  {number: 9005,  comments: [{body: "<!-- champion:ratification-hold -->\n<!-- champion:hold-state head=abc -->"}, {body: "<!-- champion:ratification-release-respected -->\n<!-- champion:hold-state head=abc -->"}]},
+  {number: 9006,  comments: [{body: "<!-- champion:ratification-hold -->"}, {body: "<!-- champion:ratification-hold-cleared -->"}]}
 ]')
 OUT=$(
     GH_READ=gh_read
     eval "$CENSUS_RELEASED"
 )
-assert_eq "Released holds, not yet merged: #10280 #9001" "$OUT" "exactly the marker-bearing PRs are listed (auto-cleared critical-file hold #9004 excluded)"
+assert_eq "Released holds, not yet merged: #10280 #9001 #9005" "$OUT" "exactly the marker-bearing PRs are listed: operator-released ratification #9005 in, auto-cleared critical-file #9004 and ratification-cleared #9006 out (#13875)"
 FIX_LIST='[]'
 OUT=$(
     GH_READ=gh_read

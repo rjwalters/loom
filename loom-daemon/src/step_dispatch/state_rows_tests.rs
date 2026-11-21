@@ -32,6 +32,8 @@ fn input(issue: Option<u32>, pr: Option<u32>, verdict: Verdict) -> DrawInput {
             send_back: false,
             story_points: None,
             hold_auth: None,
+            pr_review: false,
+            operator_hold_issue: None,
         },
         labels: Vec::new(),
         created_at: Some(t("2026-10-01T00:00:00Z")),
@@ -59,6 +61,7 @@ fn workspace(idx: usize, inputs: &[DrawInput], cooldowns: StepCooldowns) -> Step
         merge_concurrency: 1,
         merge_eligible: 0,
         merges_in_flight: 0,
+        writer_hold: None,
     }
 }
 
@@ -201,4 +204,77 @@ fn a_halted_workspace_contributes_no_rows_and_there_is_no_row_cap() {
     let rows = state_rows(&[live, halted], &HashMap::new(), &PoolKnobs::default());
     assert_eq!(rows.len(), 600);
     assert!(rows.iter().all(|r| r.ws_idx == 0));
+}
+
+#[test]
+fn held_review_pr_names_its_gate_and_actual_holding_issue_in_telemetry() {
+    use crate::observability::dispatch_state::{build_record, ResolvedRow};
+    use crate::telemetry::kinds::dispatch_state::StateTransition;
+    use crate::work_finder::step_item::{classify, Inputs, IssueInput, PullInput};
+
+    let issues = vec![
+        IssueInput {
+            number: 7,
+            labels: vec!["loom:operator".into()],
+            ..IssueInput::default()
+        },
+        IssueInput {
+            number: 8,
+            labels: vec!["loom:operator".into()],
+            ..IssueInput::default()
+        },
+    ];
+    let pulls = vec![
+        PullInput {
+            number: 40,
+            body: Some("Part of #7".into()),
+            head_ref: Some("feature/issue-8".into()),
+            same_repo: true,
+            labels: vec!["loom:changes-requested".into()],
+            ..PullInput::default()
+        },
+        PullInput {
+            number: 41,
+            labels: vec!["loom:review-requested".into(), "loom:operator".into()],
+            ..PullInput::default()
+        },
+    ];
+    let items = classify(&Inputs {
+        issues,
+        pulls,
+        ..Inputs::default()
+    });
+    let inputs: Vec<_> = items
+        .into_iter()
+        .map(|item| DrawInput {
+            item,
+            labels: Vec::new(),
+            created_at: None,
+            stage_entry: None,
+        })
+        .collect();
+    let workspace = workspace(0, &inputs, StepCooldowns::default());
+    let rows = state_rows(&[workspace], &HashMap::new(), &PoolKnobs::default());
+    for (number, hold) in [(40, Some(8)), (41, None)] {
+        let row = find(&rows, number).clone();
+        assert_eq!(row.artifact, Artifact::Pr);
+        assert_eq!(row.step, None);
+        let record = build_record(
+            &ResolvedRow {
+                slug: "o/r".to_string(),
+                visibility: crate::telemetry::RepoVisibility::Public,
+                row,
+            },
+            StateTransition::Changed,
+            "host",
+            now(),
+            None,
+        );
+        let wire = serde_json::to_value(record).unwrap();
+        assert_eq!(wire["exclusion"], "operator");
+        assert_eq!(wire["in_pool"], false);
+        assert_eq!(wire.get("operator_hold_issue"), hold.map(serde_json::Value::from).as_ref());
+    }
+    // An issue with a held mention of its own remains an issue-only pass row.
+    assert_eq!(find(&rows, 7).artifact, Artifact::Issue);
 }

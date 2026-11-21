@@ -22,6 +22,7 @@ pub use root::{
 pub(crate) mod accounts;
 pub(crate) mod accounts_args;
 pub(crate) mod accounts_session;
+pub(crate) mod accounts_session_claude;
 mod affected_files_check;
 mod agent_skills;
 pub(crate) mod api_keys;
@@ -44,6 +45,12 @@ pub(crate) mod config_get;
 // The `loom-tools` bin (src/bin/loom_tools.rs) is a separate crate and reaches
 // the shared slice handlers only through these re-exports (#12938).
 pub use config_get::{dispatch as config_get_dispatch, ConfigArgs};
+// Test seam, not API: the ClickHouse replay proof in
+// `tests/signoz_host_export_queries.rs` executes the statement this builds
+// verbatim, so a type inversion in the SQL cannot hide behind a re-typed
+// copy (#14094).
+#[doc(hidden)]
+pub use telemetry::telemetry_hold_transitions::build_query as hold_transitions_query;
 mod daemon_start;
 mod daemon_update;
 pub(crate) mod dep_classify;
@@ -64,9 +71,32 @@ mod forge_calls_cmd;
 mod forge_identity_cmd;
 pub(crate) mod forge_inventory_cmd;
 mod forge_merge_queue_cmd;
+mod forge_operator_holds;
 mod forge_parent_cmd;
 pub(crate) mod forge_probe_cmd;
+mod forge_read;
+pub use forge_read::{handle_forge_read_command, ForgeReadCli, EX_WRITE_VERB_NOT_MIGRATED};
+// #14429: the `loom-tools` bin (src/bin/loom_tools.rs) is a separate crate
+// and serves these top-level read and config-inspection commands through the
+// same handlers `loom-daemon` runs; the Args types and entry points are
+// re-exported for it alone.
+pub use affected_files_check::AffectedFilesCommand;
+pub use duplicate_scan::DuplicateScanArgs;
+pub use forge_inventory_cmd::{handle_forge_inventory_read_command, ForgeInventoryCommand};
+pub use forge_probe_cmd::{handle_forge_probe_read_command, ForgeProbeArgs};
+pub use guards_status::GuardsCommand;
+pub use hooks_home_cmd::HooksHomeArgs;
+pub use install_compat_cli::InstallCompatCommand;
+pub use label_duplicates::LabelDuplicatesArgs;
+pub use labels_cmd::{handle_labels_read_command, LabelsArgs};
+pub use points_marker_check::CheckPointsMarkerArgs;
+pub use pr_queue::PrQueueArgs;
+pub use premise_check::PremiseCheckArgs;
+pub use roles_draw_cmd::RolesCommand;
+pub use skip_labels::SkipLabelsArgs;
+pub use stale_blocked::StaleBlockedArgs;
 mod forge_verdict_cmd;
+mod forge_workflow_permissions;
 mod git_blob_lines;
 mod guard_mcp_tools;
 mod guards_status;
@@ -83,15 +113,18 @@ pub(crate) mod labels_cmd;
 mod labels_migrate;
 mod labels_migrate_holds;
 mod labels_undeclared;
+mod lease_cli;
 pub(crate) mod lease_co_occupancy;
+pub use lease_cli::{handle_lease_command, LeaseCli};
 pub(crate) mod lease_ensure;
 pub(crate) mod lease_release;
 pub(crate) mod lease_renewer;
 pub(crate) mod legacy_script_cmds;
 pub use legacy_script_cmds::{
-    handle_checkpoint_command, handle_resolve_model_command, handle_strip_ansi_command,
-    ResolveModelArgs,
+    handle_checkpoint_command, handle_resolve_model_command, handle_resolve_role_model_command,
+    handle_strip_ansi_command, ResolveModelArgs, ResolveRoleModelArgs,
 };
+pub(crate) mod ci_docs_only;
 pub(crate) mod merge_group_ci_cmd;
 mod merge_pr_cleanup_paths;
 mod merge_pr_closed_building;
@@ -135,10 +168,11 @@ pub mod noop_cooldown;
 mod notify_cleared_blockers;
 pub(crate) mod opencode_usage_cli;
 pub(crate) mod operator_decision;
+pub use operator_decision::{handle_operator_decision_command, OperatorDecisionCli};
 pub(crate) mod orphan_replace;
 pub(crate) mod overlap_replay;
 mod park_record;
-pub mod peer_claims_cmd;
+pub use park_record::{handle_park_record_command, ParkRecordCli};
 pub(crate) mod pi_usage_cli;
 mod points_marker_check;
 mod pr_latency_cmd;
@@ -149,6 +183,7 @@ pub(crate) mod premise_check;
 pub(crate) mod push_lease;
 pub mod quarantine;
 mod ram_scope_limit;
+pub(crate) mod ratification_lane_cmd;
 pub mod ready_queue_cmd;
 pub(crate) mod reconcile_stack;
 pub(crate) mod release_explain;
@@ -185,6 +220,7 @@ pub(crate) mod tokens_weekly_points;
 pub(crate) mod transcript_archive_cli;
 pub(crate) mod transcript_ingest_cli;
 pub(crate) mod usage_report_cli;
+mod usage_window;
 pub mod watch;
 mod watchdog;
 mod work_docs_archive;

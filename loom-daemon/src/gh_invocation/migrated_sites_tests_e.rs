@@ -43,32 +43,9 @@ const UNCOUNTED: &[(&str, usize, &str)] = &[
     (
         "premise_check/cli.rs",
         1,
-        "GraphQL cursor pagination issued through the raw `script_helpers::run_gh` spawn: the \
-         walk follows REST `Link` headers only, and the call is not a facade row at all",
-    ),
-    (
-        "cli/pr_latency_cmd.rs",
-        1,
-        "operator report CLI through the raw `script_helpers::run_gh` spawn: not a facade row; \
-         the choke-point ratchet owns its migration",
-    ),
-    (
-        "cli/forge_identity_cmd.rs",
-        1,
-        "`forge verdict` CLI through the raw `script_helpers::run_gh` spawn: not a facade row; \
-         the choke-point ratchet owns its migration",
-    ),
-    (
-        "cli/champion_hold_cmd.rs",
-        1,
-        "`champion-hold ratification` CLI file-list read through the raw `script_helpers::run_gh` \
-         spawn: not a facade row; the choke-point ratchet owns its migration",
-    ),
-    (
-        "comment_trust/records.rs",
-        1,
-        "trusted-comment CLI read through the raw `script_helpers::run_gh` spawn (optionally \
-         `gh-cached`): not a facade row; the choke-point ratchet owns its migration",
+        "GraphQL cursor pagination: the walk follows REST `Link` headers only, so the \
+          `--paginate` read stays one execution even with the switch on (#13744 routed it \
+          through the facade; it is a ledger row, just not a per-page one)",
     ),
     (
         "observability/pick_journal.rs",

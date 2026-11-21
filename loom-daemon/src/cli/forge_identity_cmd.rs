@@ -318,7 +318,12 @@ pub(crate) fn verdict_stale_notice(
 fn fetch_listing(root: &Path, n: u64, repo: Option<&str>, with_body: bool) -> Option<Vec<u8>> {
     let repo = repo.unwrap_or("{owner}/{repo}");
     let get = |path: String| {
-        let out = crate::script_helpers::run_gh(&["api", &path, "--paginate"], root, false);
+        let out = crate::script_helpers::gh_read(
+            "forge_cmd.listing",
+            &["api", &path, "--paginate"],
+            root,
+            false,
+        );
         out.ok_output().map(|o| o.stdout.clone())
     };
     let comments = get(format!("repos/{repo}/issues/{n}/comments"))?;
@@ -383,7 +388,22 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     let issue =
         crate::comment_trust::records::fetch_issue_object(repo, &number.to_string(), &root, false);
     let policy = crate::comment_trust::TrustPolicy::for_root(&root);
-    let gate = classify(&policy, issue.as_ref());
+    let mut gate = classify(&policy, issue.as_ref());
+    if matches!(gate, crate::promotion_author::Gate::Untrusted(_)) {
+        // #13578: a human maintainer's earlier `loom:issue` is a durable
+        // adoption. Any read failure keeps the verdict above (fail closed). A
+        // withdrawal of the label, or an edit of the body by a non-trusted
+        // editor since the adoption, ends it. The reads below need the real
+        // `owner/name`: GraphQL does not expand the `gh` placeholder.
+        let adopted = issue
+            .as_ref()
+            .and_then(|i| real_repo(repo, i))
+            .and_then(|real| adopter(&policy, &real, number, &root));
+        if let Some(who) = adopted {
+            eprintln!("promotion-author: adopted by {who} (maintainer `labeled loom:issue`)");
+            gate = crate::promotion_author::Gate::Trusted;
+        }
+    }
     println!("{}", gate.token());
     let text = |key: &str| {
         issue
@@ -407,10 +427,232 @@ pub(crate) fn promotion_author(number: u64, repo: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `slug` is a real GitHub `owner/name`: the shared slug rule plus
+/// GitHub's stricter owner (login) rule. Anything else builds no call, which
+/// keeps the verdict `UNTRUSTED`.
+fn github_slug(slug: &str) -> bool {
+    crate::forge_slug::valid_slug(slug)
+        && slug
+            .split_once('/')
+            .is_some_and(|(owner, _)| crate::forge_bucket_book::valid_owner(owner))
+}
+
+/// The real `owner/name` the issue was read from: `repo` itself when it is
+/// one, else (the `gh` placeholder `{owner}/{repo}`, which only `gh api` REST
+/// paths expand) the repository the fetched `issue` object names in its
+/// `repository_url`. `None` when neither is a valid slug, so no later call is
+/// built from a placeholder.
+fn real_repo(repo: &str, issue: &Value) -> Option<String> {
+    if github_slug(repo) {
+        return Some(repo.to_string());
+    }
+    let url = issue.get("repository_url").and_then(Value::as_str)?;
+    let (_, slug) = url.rsplit_once("/repos/")?;
+    github_slug(slug).then(|| slug.to_string())
+}
+
+/// The maintainer whose `loom:issue` adoption of issue `number` still stands,
+/// if the whole timeline and the body's edit history could be read (#13578).
+/// Either read failing yields `None`. `repo` is a real `owner/name`.
+fn adopter(
+    policy: &crate::comment_trust::TrustPolicy,
+    repo: &str,
+    number: u64,
+    root: &Path,
+) -> Option<String> {
+    let path = format!("repos/{repo}/issues/{number}/timeline");
+    let out = crate::script_helpers::gh_read(
+        "promotion_author.timeline",
+        &["api", &path, "--paginate"],
+        root,
+        false,
+    );
+    let events = crate::comment_trust::parse_listing(&out.ok_output()?.stdout)?;
+    let edits = body_edits(repo, number, root)?;
+    // Timeline actors and editors have no association: map write access or
+    // better to one. One lookup per login; a failed lookup is no access.
+    let seen = std::cell::RefCell::new(std::collections::HashMap::<String, Option<String>>::new());
+    crate::promotion_author::standing_adoption(policy, &events, &edits, |login| {
+        if let Some(known) = seen.borrow().get(login) {
+            return known.clone();
+        }
+        let out = promotion_permission_invocation(repo, login, root)?.run();
+        let access = out.ok_output().and_then(|out| {
+            matches!(String::from_utf8_lossy(&out.stdout).trim(), "admin" | "maintain" | "write")
+                .then(|| "COLLABORATOR".to_string())
+        });
+        seen.borrow_mut().insert(login.to_string(), access.clone());
+        access
+    })
+}
+
+/// GitHub evaluates this endpoint under the asking credential. Keep only
+/// this permission probe on the writer, following `write_scope::GhProbe`.
+fn promotion_permission_invocation(
+    repo: &str,
+    login: &str,
+    root: &Path,
+) -> Option<crate::gh_invocation::GhInvocation> {
+    use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+    let path = format!("repos/{repo}/collaborators/{login}/permission");
+    Some(
+        GhInvocation::new(
+            Operation::new("promotion_author.permission"),
+            AccessIntent::Read,
+            GhTarget::repo(repo).ok()?,
+            crate::cmd_out::DEFAULT_TIMEOUT,
+        )
+        .current_dir(root)
+        .writer_identity()
+        .args(["api", &path, "--jq", ".permission"]),
+    )
+}
+
+const BODY_EDITS_QUERY: &str = "query($o:String!,$n:String!,$i:Int!){repository(owner:$o,name:$n){\
+    issue(number:$i){userContentEdits(first:100){pageInfo{hasNextPage} \
+    nodes{createdAt editedAt editor{login __typename}}}}}}";
+
+/// The `gh` arguments of the edit-history read. `None` unless `repo` is a real
+/// `owner/name`: `-f` values reach GraphQL literally, so a placeholder would
+/// name no repository.
+fn body_edits_args(repo: &str, number: u64) -> Option<Vec<String>> {
+    if !github_slug(repo) {
+        return None;
+    }
+    let (owner, name) = repo.split_once('/')?;
+    Some(vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-f".to_string(),
+        format!("query={BODY_EDITS_QUERY}"),
+        "-f".to_string(),
+        format!("o={owner}"),
+        "-f".to_string(),
+        format!("n={name}"),
+        "-F".to_string(),
+        format!("i={number}"),
+    ])
+}
+
+/// The `userContentEdits` nodes of issue `number`'s body (`createdAt`,
+/// `editedAt`, `editor`): the timeline carries no body edits. `None` on any
+/// failure, a GraphQL error, or more edits than one page (not fully read).
+fn body_edits(repo: &str, number: u64, root: &Path) -> Option<Vec<serde_json::Value>> {
+    let args = body_edits_args(repo, number)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = crate::script_helpers::gh_route::gh_read_for_repo(
+        "promotion_author.body_edits",
+        &args,
+        root,
+        repo,
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.ok_output()?.stdout).ok()?;
+    if json.get("errors").is_some() {
+        return None;
+    }
+    let edits = json.pointer("/data/repository/issue/userContentEdits")?;
+    if edits
+        .pointer("/pageInfo/hasNextPage")
+        .and_then(serde_json::Value::as_bool)
+        != Some(false)
+    {
+        return None;
+    }
+    edits.get("nodes")?.as_array().cloned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::gh_comment;
+    use super::{body_edits_args, gh_comment, promotion_permission_invocation, real_repo};
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_author_pins_the_exact_permission_read() {
+        use crate::gh_invocation::AccessIntent;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temporary fake credential and program");
+        let writer = temp.path().join("writer");
+        fs::create_dir(&writer).expect("fake writer directory");
+        let gh = temp.path().join("gh");
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+test "$*" = 'api repos/acme/widget/collaborators/maintainer/permission --jq .permission' || exit 3
+test "${GH_CONFIG_DIR##*/}" = writer || exit 4
+test -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" || exit 5
+printf 'write\n'
+"#,
+        )
+        .expect("write stub");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).expect("executable stub");
+        let inv = promotion_permission_invocation("acme/widget", "maintainer", temp.path())
+            .expect("valid repository target");
+        assert_eq!(inv.intent(), AccessIntent::Read);
+        assert_eq!(inv.target().slug().as_deref(), Some("acme/widget"));
+        assert!(!inv.is_reader_only(), "the asker's permission would be shed");
+        let out = inv
+            .program(&gh)
+            .gh_config_dir(Some(&writer))
+            .without_token_env()
+            .run();
+        assert_eq!(out.ok_stdout_trimmed().as_deref(), Some("write"));
+    }
+
+    /// Finding A (20261116-r15 q48): with no `--repo` the repository is the
+    /// `gh` placeholder, and the GraphQL call must still name a real one.
+    #[test]
+    fn the_default_repo_path_builds_a_graphql_call_with_a_real_owner_and_name() {
+        let issue = json!({
+            "number": 13171,
+            "repository_url": "https://api.github.com/repos/rjwalters/loom",
+        });
+        let repo = real_repo("{owner}/{repo}", &issue).expect("resolved from the issue");
+        assert_eq!(repo, "rjwalters/loom");
+        let args = body_edits_args(&repo, 13171).expect("a real slug builds the call");
+        assert!(args.contains(&"o=rjwalters".to_string()), "{args:?}");
+        assert!(args.contains(&"n=loom".to_string()), "{args:?}");
+        assert!(args.contains(&"i=13171".to_string()), "{args:?}");
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("o={") || a.starts_with("n={")));
+        // The default path and `--repo` build the same call.
+        assert_eq!(real_repo("rjwalters/loom", &issue).as_deref(), Some("rjwalters/loom"));
+        assert_eq!(Some(args), body_edits_args("rjwalters/loom", 13171));
+    }
+
+    /// A placeholder is never sent to GraphQL, and an issue object that names
+    /// no repository resolves to nothing (the verdict stays `UNTRUSTED`).
+    #[test]
+    fn an_unresolved_placeholder_builds_no_graphql_call() {
+        assert_eq!(body_edits_args("{owner}/{repo}", 7), None);
+        assert_eq!(real_repo("{owner}/{repo}", &json!({"number": 7})), None);
+        let odd = json!({"repository_url": "https://api.github.com/repos/{owner}/{repo}"});
+        assert_eq!(real_repo("{owner}/{repo}", &odd), None);
+        let ghes = json!({"repository_url": "https://ghe.example/api/v3/repos/Org-1/my.repo"});
+        assert_eq!(real_repo("{owner}/{repo}", &ghes).as_deref(), Some("Org-1/my.repo"));
+        // The owner half follows GitHub's login rule, stricter than the shared
+        // slug rule: no `.` or `_`, at most 39 bytes.
+        let long = format!("{}/r", "a".repeat(40));
+        for bad in [
+            "o.x/r",
+            "o_x/r",
+            "-o/r",
+            long.as_str(),
+            "o/r/x",
+            "o/-r",
+            "o/..",
+            "/r",
+            "o/",
+        ] {
+            assert_eq!(body_edits_args(bad, 7), None, "{bad}");
+            assert_eq!(real_repo(bad, &json!({"number": 7})), None, "{bad}");
+            let url = json!({"repository_url": format!("https://api.github.com/repos/{bad}")});
+            assert_eq!(real_repo("{owner}/{repo}", &url), None, "{bad}");
+        }
+    }
 
     /// `--gh-shape` renames the REST fields and keeps the App spelling.
     #[test]

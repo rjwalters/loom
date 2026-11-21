@@ -1192,6 +1192,7 @@ mod tests {
                 actions: None,
                 source: None,
                 sweep_id: None,
+                stage: None,
                 issue: None,
                 pr_number: None,
                 deferred_by: None,

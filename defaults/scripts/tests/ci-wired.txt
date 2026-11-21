@@ -57,8 +57,10 @@ test-champion-merged-before-hold.sh
 test-champion-merge-queue-step-no-fallthrough.sh
 test-champion-out-of-band-ac-gate-switch.sh
 test-champion-merge-risk-self-release.sh
+test-champion-pr-merge-digest-dedup.sh
 test-champion-pr-merge-hold-release.sh
 test-champion-pr-merge-negation-guard.sh
+test-champion-park-marker-dedupe.sh
 test-champion-post-claim-recheck.sh
 test-champion-premise-false-close.sh
 test-champion-promotion-throughput.sh
@@ -95,7 +97,9 @@ test-clean-stale-building-labels.sh
 test-config-resolver.sh
 test-config-tiers-cli-migration.sh
 test-cpu-budget.sh
+test-create-issue-body-at-path.sh
 test-create-issue-refuse-labels.sh
+test-create-pr-body-at-path.sh
 test-create-pr-priority-labels.sh
 test-create-pr-rate-limit-fallback.sh
 test-create-pr-review-gate.sh
@@ -122,12 +126,14 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-pinned-paths.sh
 test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
 test-guide-awaiting-revision-park.sh
 test-guide-blocked-unblock-limit.sh
+test-guide-pr-unblock-conflict-handoff.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
@@ -136,8 +142,9 @@ test-guide-pool-pressure-defer.sh
 test-guide-post-stage-hook.sh
 test-guide-superseding-block-merge-state.sh
 test-guide-work-log-rotation.sh
-test-guide-unblock-merged-blocker.sh
+test-guide-unblock-open-crossrepo.sh
 test-guide-split-parent-unblock.sh
+test-guide-skip-docs.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh
 test-guide-work-log-issue-pagination.sh
@@ -150,6 +157,9 @@ test-guide-work-plan-held-issue-suffix.sh
 test-guide-work-plan-operator-hold-exclude.sh
 test-guide-work-plan-provenance.sh
 test-guide-work-plan-ready-open-pr-exclude.sh
+test-guide-work-plan-receipt.sh
+test-guide-work-plan-roadmap-convention.sh
+test-guide-work-plan-stamp.sh
 test-hard-exclusion-labels.sh
 test-host-sleep-config.sh
 test-install-active-session.sh
@@ -202,12 +212,14 @@ test-resync-installed-guard-check.sh
 test-resync-installed-host-optout.sh
 test-resync-installed-labels-block.sh
 test-resync-installed-local-fix-guard.sh
+test-resync-installed-manifest-prune.sh
 test-resync-installed-retired-dry-run.sh
 test-resync-installed-retired-migrate.sh
 test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
 test-resync-installed-agents-md-create.sh
 test-resync-installed-output-staging.sh
+test-resync-installed-source.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
@@ -236,6 +248,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-sibling-no-arguments-placeholder.sh
 test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-sync-labels-migrate-retired.sh
@@ -367,3 +380,7 @@ test-create-issue-curated.sh
 # #13414: guide unblock sweep honors a park record over AC checkboxes. Hermetic.
 test-guide-park-record-precedence.sh
 test-guide-transient-first-at.sh
+# #13956: resolve-role-model.sh — tools-first slice wiring, exit-3 data-code
+# passthrough, the 0.19.1312 version floor, and the resync-keeps-the-setting
+# recheck (agents stay unpinned, config survives). Hermetic: mocks only.
+test-resolve-role-model.sh

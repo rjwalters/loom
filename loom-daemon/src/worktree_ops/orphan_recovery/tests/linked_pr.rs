@@ -2,8 +2,7 @@
 //! evidence (#5511), lease-record freshness (#6286) and stale PR-side claim
 //! recovery (#6167). Split out of `orphan_recovery.rs` when #9548 registered
 //! these fixtures as writable checkouts (the label writers run the real
-//! write-scope check), so the over-threshold parent shrinks rather than grows
-//! (`.loom/docs/file-size-policy.md`).
+//! write-scope check).
 
 use super::*;
 // #9548: gate-reaching tests hold the default serial key; see `crate::write_scope_test_support`.
@@ -113,7 +112,7 @@ impl Drop for FakeGh {
 fn evidence_without_the_issue() -> LivenessEvidence {
     LivenessEvidence {
         available: true,
-        sources: vec!["spawn-loop-state.json"],
+        sources: vec![".loom/locks"],
         ..Default::default()
     }
 }
@@ -310,6 +309,88 @@ fn the_open_pr_listing_answers_without_graphql_body() {
         assert!(calls.contains("pulls?state=open"), "{calls}");
         assert!(!calls.contains("graphql") && !calls.contains("timeline"), "{calls}");
     }
+}
+
+/// [`install_fake_gh_with_listing`], with the REST `.../events` label-age
+/// read answering `events_stdout` (the jq output `gh api --paginate` would
+/// print: one claim timestamp or `null` per page) instead of the generic
+/// 2020 fallback — the #14806 fixture: GraphQL refuses (exit 97) while the
+/// REST events feed and open-PR listing still answer.
+#[cfg(unix)]
+fn install_fake_gh_events_with_listing(
+    dir: &Path,
+    events_stdout: &str,
+    rows: &[crate::claim_reconciliation::open_pr_listing::test_support::Row],
+) -> FakeGh {
+    let gh = install_fake_gh(dir, "FORBIDDEN", 97);
+    let fake = dir.join("bin").join("gh");
+    let script = std::fs::read_to_string(&fake).unwrap();
+    let (head, rest) = script.split_once('\n').unwrap();
+    let (log_line, rest) = rest.split_once('\n').unwrap();
+    let pulls = crate::claim_reconciliation::open_pr_listing::test_support::pulls_arm(rows);
+    let events_file = dir.join("events-pages.txt");
+    std::fs::write(&events_file, events_stdout).unwrap();
+    let events_arm =
+        format!("case \"$*\" in */events*) cat '{}'; exit 0 ;; esac\n", events_file.display());
+    std::fs::write(&fake, format!("{head}\n{log_line}\n{pulls}{events_arm}{rest}")).unwrap();
+    gh
+}
+
+/// #14806 criterion: with the claim enumerated and GraphQL unavailable, the
+/// REST label event still decides. An old event passes the age check and —
+/// with the open-PR listing and lease gates clearing — dry-run reports the
+/// claim orphaned; a recent reapplication on a later page (the claim was
+/// re-taken after the stale one) still protects it.
+#[cfg(unix)]
+#[test]
+#[serial(loom_config_env)]
+fn a_rest_label_event_decides_the_age_gate_when_graphql_is_down() {
+    a_rest_label_event_decides_the_age_gate_when_graphql_is_down_body();
+}
+
+#[serial]
+fn a_rest_label_event_decides_the_age_gate_when_graphql_is_down_body() {
+    // Old claim from 2020, alone: far past every threshold.
+    let dir = tempdir().unwrap();
+    let gh = install_fake_gh_events_with_listing(dir.path(), "\"2020-01-01T00:00:00Z\"\n", &[]);
+    let mut result = OrphanRecoveryResult::default();
+    check_untracked_building(&evidence_without_the_issue(), &mut result, dir.path(), 600, false);
+    let calls = gh.calls();
+    assert!(!calls.contains("graphql"), "the listing must answer without GraphQL: {calls}");
+    assert!(calls.contains("pulls?state=open"), "{calls}");
+    assert_eq!(
+        result.orphaned.len(),
+        1,
+        "a stale REST event must still orphan the claim (dry-run): {:?}",
+        result.orphaned
+    );
+    assert_eq!(result.orphaned[0].issue, Some(5501));
+    assert!(!calls.contains("issue edit"), "dry-run must not flip labels: {calls}");
+
+    // The claim was re-applied a minute ago, on a later page: the newest
+    // event wins and the claim stays protected.
+    let dir = tempdir().unwrap();
+    let recent = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+    let gh = install_fake_gh_events_with_listing(
+        dir.path(),
+        &format!("\"2020-01-01T00:00:00Z\"\n\"{recent}\"\n"),
+        &[],
+    );
+    let mut result = OrphanRecoveryResult::default();
+    check_untracked_building(&evidence_without_the_issue(), &mut result, dir.path(), 600, false);
+    assert!(
+        result.orphaned.is_empty(),
+        "a recent reapplication on a later page must protect the claim: {:?}",
+        result.orphaned
+    );
+    assert_eq!(result.watched.len(), 1, "{:?}", result.watched);
+    assert_eq!(result.watched[0].reason, "no_spawn_loop_entry");
+    assert!(
+        result.watched[0].age_seconds.is_some_and(|a| a < 600),
+        "the measured recent age must be recorded: {:?}",
+        result.watched[0]
+    );
+    assert!(!gh.calls().contains("issue edit"), "{}", gh.calls());
 }
 
 /// #9548 negative control: the (b) fixture, but the credential only has
@@ -660,10 +741,8 @@ fn format_result_json_round_trips_totals() {
         kind: "untracked_building",
         issue: Some(1),
         pr: None,
-        pid: None,
         title: Some("t".to_string()),
         reason: "no_spawn_loop_entry".to_string(),
-        age_seconds: None,
     });
     let json = format_result_json(&result);
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -887,6 +966,20 @@ fn an_unreadable_label_age_never_flags_the_issue_orphaned_body() {
         "{:?}",
         result.watched
     );
+    // #14806: the human report must say the timeline is unreadable, never
+    // render the unmeasured age as "0s" with a countdown.
+    let human = format_result_human(&result);
+    assert!(human.contains("#5501"), "{human}");
+    assert!(human.contains("label timeline unreadable"), "{human}");
+    assert!(
+        !human.contains("label age") && !human.contains("eligible in"),
+        "no invented age or countdown: {human}"
+    );
+    // The JSON report omits the age it does not have.
+    let json: serde_json::Value = serde_json::from_str(&format_result_json(&result)).unwrap();
+    let entry = &json["watched"][0];
+    assert_eq!(entry["issue"], 5501);
+    assert!(entry.get("age_seconds").is_none(), "JSON must omit an unmeasured age: {entry}");
     assert!(!gh.calls().contains("issue edit"));
 }
 

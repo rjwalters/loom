@@ -165,6 +165,21 @@ phase — creating a PR labeled `loom:review-requested` is only the Builder stag
 the work is not complete until reviewed and merged. **`/loom:sweep` handles all
 stages automatically** — prefer it over manual orchestration to avoid skipping any.
 
+**Spawning a role subagent with its configured model (attended path,
+#13956)**: before `Task(subagent_type="loom-<role>")`, resolve the role's
+model from the config chain — `./.loom/scripts/resolve-role-model.sh <role>
+--json` (explicit `--model` > `terminals[].roleConfig.model` >
+`.loom/roles/<role>.json` `suggestedModel` > inherit, with the supplying tier
+reported as `source`) — and pass the record's `task_model` field (the
+alias-only form of `model`; a pinned ID is rejected there) as the Task tool's
+`model` parameter. `task_model: null` / `"source": "inherit"` ⇒
+omit the parameter; the subagent inherits the parent session's model, so an
+unconfigured workspace behaves exactly as before. Per-role models are set in
+`.loom/config.json` or the per-host `.loom-local/local.json` (never in the
+shipped agent files — see [`.loom/docs/model-selection.md`](.loom/docs/model-selection.md)
+§ "Attended subagents"); the Task tool has no effort knob, so `roleEfforts`
+stays a daemon-path setting.
+
 **Operator-session lane (the one Curator-skip exemption)**: an operator driving
 the session tools directly may skip Curator and label a new issue `loom:building`
 at filing time — but **only** when *both* hold: (1) the acceptance criterion is
@@ -277,6 +292,10 @@ See [credential policy](.loom/docs/credential-storage.md); `.gitignore` is insuf
   GraphQL-backed and dies on GraphQL exhaustion while the independent REST pool
   sits idle; the script falls back to one REST POST with labels applied
   atomically (#5047). See [github-authentication](.loom/docs/github-authentication.md).
+  **Exception — a foreign public repo the App is not installed on** (`forge create-issue` /
+  `create-issue.sh` refuse with `NOT_IN_INSTALLATION`, #9548): file with a raw
+  `gh issue create -R <repo>` (interim) rather than parking for an operator, per
+  [`gh-issue-create-rest-fallback.md`](.loom/docs/gh-issue-create-rest-fallback.md) (#13978).
 - **Gitea** — set `GITEA_TOKEN` or `FORGE_TOKEN` (repository read/write). See
   [forge-authentication](.loom/docs/forge-authentication.md).
 - **Releasing** — **a PR must NEVER bump `VERSION`**: a post-merge workflow does

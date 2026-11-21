@@ -794,6 +794,7 @@ mod role_tick_spans {
                 source: crate::runtime_admission::RuntimeSource::RoleConfig,
                 unmet_capabilities: vec!["isolation".into()],
                 reason: "unmet".into(),
+                exhausted_summary_line: None,
             }),
             RoleTickOutcome::ModelRuntimeMismatch(crate::role_runner::ModelRuntimeMismatch {
                 role: "doctor".into(),
@@ -999,6 +1000,99 @@ fn a_begun_phase_with_no_completion_closes_unobserved_at_execution_end() {
     assert!(!attempt.attributes.contains_key(ATTEMPT_WORKED));
 }
 
+/// #14407: a step-dispatched attempt on a non-Claude runtime. The step's end
+/// was observed, so the swept phase and attempt mirror its result and carry the
+/// launch's runtime and engine; a close that observed nothing stays unobserved.
+#[test]
+fn a_swept_step_attempt_mirrors_the_observed_step_end_and_runtime() {
+    let open = |execution: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".loom")).unwrap();
+        std::fs::write(
+            dir.path().join(".loom/config.json"),
+            r#"{"observability":{"enabled":true,"exporter":"otlp","endpoint":"http://127.0.0.1:4318"}}"#,
+        )
+        .unwrap();
+        let span = begin(dir.path(), execution, SpanName::Sweep, TraceAttributes::new()).unwrap();
+        checkpoint_begin_observation(
+            &span.journal,
+            span.context(),
+            None,
+            14407,
+            "builder",
+            None,
+            None,
+            "o/r",
+        )
+        .unwrap();
+        (dir, span)
+    };
+    let observed = StepEndObserved {
+        result: "success".into(),
+        runtime: Some("codex".into()),
+    };
+
+    let (dir, span) = open("step-observed");
+    finish_execution_observing(
+        dir.path(),
+        "step-observed",
+        "success",
+        TraceAttributes::new(),
+        Some(&observed),
+    )
+    .unwrap();
+    let spans = drained_spans(&span.journal);
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "success", "{name:?}");
+        assert_eq!(s.attributes["loom.runtime"], "codex", "{name:?}");
+        assert_eq!(s.attributes["loom.engine"], "codex", "{name:?}");
+        assert!(!s.attributes.contains_key(FAILURE_CLASS), "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+    }
+
+    // The observed failure carries its OpenCode runtime. There is no
+    // engine or root failure class to copy.
+    let (dir, span) = open("step-failed");
+    let failed = StepEndObserved {
+        result: "failure".into(),
+        runtime: Some("opencode".into()),
+    };
+    finish_execution_observing(
+        dir.path(),
+        "step-failed",
+        "failure",
+        TraceAttributes::new(),
+        Some(&failed),
+    )
+    .unwrap();
+    let spans = drained_spans(&span.journal);
+    let attempt = spans
+        .iter()
+        .find(|s| s.name == SpanName::RoleAttempt)
+        .unwrap();
+    assert_eq!(attempt.attributes["loom.result"], "failure");
+    assert_eq!(attempt.attributes["loom.runtime"], "opencode");
+    assert!(!attempt.attributes.contains_key("loom.engine"));
+    assert!(!attempt.attributes.contains_key(FAILURE_CLASS));
+
+    // A recovery can classify its root even though the child's actual exit
+    // was never observed.
+    let (dir, span) = open("step-unobserved");
+    let recovery = attributes(&[(FAILURE_CLASS, "supervisor-lost")]);
+    finish_execution(dir.path(), "step-unobserved", "process_lost", recovery).unwrap();
+    let spans = drained_spans(&span.journal);
+    let sweep = spans.iter().find(|s| s.name == SpanName::Sweep).unwrap();
+    assert_eq!(sweep.attributes[FAILURE_CLASS], "supervisor-lost");
+    for name in [SpanName::RoleAttempt, SpanName::Phase] {
+        let s = spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(s.attributes["loom.result"], "exit_unobserved", "{name:?}");
+        assert_eq!(s.attributes["loom.timing_source"], "terminal_observed", "{name:?}");
+        assert!(!s.attributes.contains_key("loom.runtime"), "{name:?}");
+        assert!(!s.attributes.contains_key(FAILURE_CLASS), "{name:?}");
+    }
+}
+
 /// Parallel builders share one orchestrator journal: each issue's checkpoint
 /// completes its own begun attempt. A re-dispatch supersedes the earlier begin
 /// with `worked` absent, and a done with no begin stays synthetic.
@@ -1118,6 +1212,7 @@ fn long_multibyte_admission_values_survive_the_export_allowlist() {
         source: crate::runtime_admission::RuntimeSource::RoleConfig,
         unmet_capabilities: vec!["isolation-\u{9694}\u{79BB}".to_owned(); 40],
         reason: "unmet".into(),
+        exhausted_summary_line: None,
     });
     for (outcome, key) in [
         (mismatch, "loom.model"),

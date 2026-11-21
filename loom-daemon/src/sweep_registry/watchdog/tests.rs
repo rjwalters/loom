@@ -46,6 +46,7 @@
 //! whole point.
 
 use super::*;
+use crate::env_test_support::EnvGuard;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
@@ -444,6 +445,42 @@ fn midbuild_recovers_dead_sweep_with_dirty_worktree_once() {
         "fake spawn ran for the re-dispatch"
     );
     assert!(reg.issue_has_active_sweep(6001), "a fresh sweep is now active for the issue");
+}
+
+#[test]
+#[serial(loom_config_env)]
+fn midbuild_retry_only_steps_down_after_a_model_limit_kill() {
+    for (log, previous, expected) in [
+        ("working...\nYou've hit your Fable limit.\n", "fable", "opus"),
+        ("working...\nYou've hit your Fable limit.\n", "sonnet", "sonnet"),
+        ("working...\nsegfault\n", "fable", "fable"),
+    ] {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        let issue = 6001;
+        let (mut reg, rec) = fixture_registry(ws);
+        write_config(
+            ws,
+            r#"{
+            "autonomous": {"model": "fable", "modelFallback": {
+                "enabled": true, "chain": ["fable", "opus", "sonnet"]
+            }}
+        }"#,
+        );
+        make_quiet_dirty_git_worktree(&mut reg, ws, issue);
+        let dead = insert_dead_running_with_log(&mut reg, issue, 0, "unknown", log);
+        reg.entries.get_mut(&dead).unwrap().model = Some(previous.into());
+        assert!(reg.reap_once() >= 1, "the reaper must observe the dead child");
+        assert_eq!(reg.midbuild_watchdog_once(), 1, "watchdog must re-dispatch once");
+        assert!(wait_for_contents(&rec, "LOOM_SWEEP_ID=", 5000), "fake dispatch ran");
+        let recorded = std::fs::read_to_string(&rec).unwrap();
+        let actual = recorded
+            .lines()
+            .skip_while(|line| *line != "arg: --model")
+            .nth(1)
+            .and_then(|line| line.strip_prefix("arg: "));
+        assert_eq!(actual, Some(expected), "watchdog retry after {previous} and {log:?}");
+    }
 }
 
 #[test]
@@ -2387,7 +2424,7 @@ fn post_watchdog_gaveup_comment_is_a_noop_for_unregistered_workspace_root() {
     // process-wide for the daemon, #4458) and the assertion below fails
     // even though the no-op production behavior it exercises is
     // unaffected.
-    let _env_guard = ClearedGhConfigDirEnv::new();
+    let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
     crate::credential_preflight::clear_owner_root_registry();
     let dir = tempdir().unwrap();
     let gh_log = dir.path().join("gh.log");
@@ -2582,7 +2619,7 @@ fn stale_sweep_watchdog_once_reaps_an_untracked_aged_sweep_exactly_once() {
     );
 
     // No double-reap: a second tick finds nothing (the entry is terminal,
-    // no longer Running/Pending).
+    // no longer Running).
     let reaped_again =
         reg.stale_sweep_watchdog_once(Duration::from_secs(3600), Duration::from_secs(2700));
     assert_eq!(reaped_again, 0, "bounded: never reaped twice");
@@ -2620,7 +2657,7 @@ fn stale_sweep_watchdog_once_leaves_a_healthy_untracked_sweep_alone() {
     assert!(
         reg.entries
             .get(&sweep_id)
-            .is_some_and(|i| matches!(i.state, SweepState::Running | SweepState::Pending)),
+            .is_some_and(|i| matches!(i.state, SweepState::Running)),
         "left running"
     );
 

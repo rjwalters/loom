@@ -354,6 +354,9 @@ path = "loom-daemon/src/fleet/add_worker.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/forge_wait_checks/reads.rs"
+[[operation.callers]]
+kind = "script"
+path = "defaults/scripts/resync-installed.sh"
 
 [[operation]]
 id = "repo.list-for-owner"
@@ -498,6 +501,7 @@ risk = "normal"
 github = { commands = [], routes = [
   "GET repos/{owner}/{repo}/commits/{ref}",
   "GET repos/{owner}/{repo}/git/ref/{ref}",
+  "GET repos/{owner}/{repo}/git/matching-refs/{ref}",
   "GET repos/{owner}/{repo}/git/trees/{sha}",
   "GET repos/{owner}/{repo}/contents/{path}",
 ] }
@@ -513,6 +517,9 @@ path = "loom-daemon/src/fleet_store/fetch.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/fleet_store/gh.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/ci_docs_only/proof.rs"
 
 [[operation]]
 id = "git.default-branch-heads"
@@ -741,6 +748,11 @@ path = "loom-daemon/src/install_compat_harness.rs"
 [[operation.callers]]
 kind = "workflow"
 path = "defaults/optional/github-workflows/merge-group-check.yml"
+# The installed copy of that template in this repo's own workflows (#14174).
+# The gate enumerates tracked files, so the installed copy is a separate caller.
+[[operation.callers]]
+kind = "workflow"
+path = ".github/workflows/merge-group-check.yml"
 # The daemon-free tools-only installer (#12940) resolves the latest release
 # and downloads the loom-tools-<triple> asset (and its .sha256).
 [[operation.callers]]

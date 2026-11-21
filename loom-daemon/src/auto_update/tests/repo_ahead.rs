@@ -168,6 +168,7 @@ fn exact_tag_roll(floor: Floor) {
         check: &check,
         tree_clean: false,
         in_flight: 0,
+        repo_source: None,
     };
     let week = Duration::from_secs(7 * 86_400);
     match state.decide(Instant::now(), &inputs, week, DEFER) {

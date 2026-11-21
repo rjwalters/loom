@@ -129,19 +129,37 @@ fn environmental_reaper_classes_stay_at_900s() {
 #[serial_test::serial]
 fn repeated_lease_order_losses_stay_at_900s() {
     let dir = tempdir().unwrap();
-    let (mut reg, _gh, _spawn, _comments) =
+    let (mut reg, _gh, spawn, comments) =
         crate::sweep_registry::test_support::lease_order_dispatch_registry(
             dir.path(),
             &["<!-- loom:lease host=peer-host sweep=sweep-issue-9823-peer -->"],
         );
-    for _ in 0..12 {
-        let _ = reg.dispatch(&SweepKind::Issue(9823), None, None, None, None);
-        expire_window(&mut reg, 9823);
+    let standing_peer = std::fs::read(&comments).unwrap();
+    let attempts = 12;
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            // The fixture skips the real backoff, so consecutive attempts may
+            // share a whole-second sweep ID. Give each an independent forge
+            // history while keeping the local backoff streak.
+            expire_window(&mut reg, 9823);
+            std::fs::write(&comments, &standing_peer).unwrap();
+        }
+        let error = reg
+            .dispatch(&SweepKind::Issue(9823), None, None, None, None)
+            .expect_err("each dispatch must lose to the earlier peer");
+        let loss = error
+            .downcast_ref::<LeaseOrderDispatchError>()
+            .unwrap_or_else(|| {
+                panic!("attempt {attempt}: expected an earlier-peer loss, got {error:#}")
+            });
+        assert_eq!(loss.issue, 9823);
+        assert_eq!(loss.earliest_host, "peer-host");
+        assert_eq!(loss.earliest_sweep_id, "sweep-issue-9823-peer");
+        assert_eq!(reg.dispatch_failure_count(9823), attempt);
     }
-    assert_eq!(reg.dispatch_failure_count(9823), 12);
-    reg.record_dispatch_failure(9823);
+    assert!(!spawn.exists());
     let left = reg.dispatch_backoff_remaining(9823, Utc::now()).unwrap();
-    assert!(left <= CAP, "{left:?}");
+    assert!(left <= CAP && left > CAP - Duration::from_secs(60), "{left:?}");
 }
 
 /// End to end: repeated synchronous token-selection deaths stay at 900 s.
@@ -506,6 +524,7 @@ fn an_operator_clear_tells_the_captain_the_park_ended() {
     assert!(reg.clear_quarantine(93));
     let sent = server.wait_for(PARK_ENDED, 1);
     assert_eq!(sent[0]["item"], 93);
+    assert_eq!(sent[0]["cause"], "cleared", "an operator's clear lifts the hold (#14047)");
     assert!(sent[0]["repo"].is_string() && sent[0]["host_id"].is_string());
     // Not parked on this host: still told.
     assert!(!reg.clear_quarantine(94));
@@ -532,6 +551,30 @@ fn a_ttl_expiry_tells_the_captain_the_park_ended() {
     let sent = server.wait_for(PARK_ENDED, 1);
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0]["item"], 95);
+    assert_eq!(sent[0]["cause"], "expired", "a TTL expiry leaves the hold (#14047)");
+}
+
+/// #14047: the park comment says what actually happens after a clear and
+/// after the TTL: the captain's no-progress backoff is lifted by the clear
+/// only.
+#[test]
+fn the_park_comment_says_a_clear_lifts_the_no_progress_backoff_but_the_ttl_does_not() {
+    let dir = tempdir().unwrap();
+    let gh_log = dir.path().join("gh.log");
+    let fake_gh =
+        crate::sweep_registry::test_support::install_fake_gh_env_logger(dir.path(), &gh_log, "", 0);
+    let mut reg = registry(dir.path());
+    reg.config.skip_label_flip = false;
+    reg.config.gh_bin = Some(fake_gh);
+    for sweep in ["a", "b", "c"] {
+        reg.charge_fast_failure(sweep, 53, UNCLASSIFIED_CLASS, false);
+    }
+    assert!(reg.is_quarantined(53));
+    let log = std::fs::read_to_string(&gh_log).unwrap_or_default();
+    assert!(log.contains("no-progress backoff"), "{log}");
+    assert!(log.contains("`loom-daemon quarantine clear 53` lifts it too"), "{log}");
+    assert!(log.contains("waiting out the TTL does not"), "{log}");
+    assert!(log.contains("refuse this issue as `cooldown`"), "{log}");
 }
 
 /// Outside fleet mode nothing is sent.

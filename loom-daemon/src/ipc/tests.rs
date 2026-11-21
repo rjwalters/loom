@@ -2,9 +2,11 @@ use super::*;
 use crate::activity::ActivityDb;
 use crate::sweep_registry::{SweepRegistry, SweepRegistryConfig};
 use crate::types::SweepKind;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 
 type TestContext = (
+    // Bind this first so the caller's fixture handles drop before the directory.
+    TempDir,
     Arc<Mutex<TerminalManager>>,
     Arc<Mutex<ActivityDb>>,
     Arc<Mutex<SweepRegistry>>,
@@ -55,16 +57,14 @@ fn setup_test_context() -> TestContext {
     let mut registry = SweepRegistry::new(sr_config);
     registry.set_event_bus(bus.clone());
     let sr = Arc::new(Mutex::new(registry));
-    // Keep dir alive so the temp directory isn't deleted
-    std::mem::forget(dir);
-    (tm, db, sr, bus)
+    (dir, tm, db, sr, bus)
 }
 
 // ===== Ping/Pong =====
 
 #[test]
 fn test_handle_request_ping() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(Request::Ping, &tm, &db, &sr, &bus, &test_pool());
     assert!(matches!(response, Response::Pong));
 }
@@ -73,7 +73,7 @@ fn test_handle_request_ping() {
 
 #[test]
 fn test_handle_request_list_terminals_empty() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     // Set LOOM_NO_RESTORE to prevent tmux restore attempts
     std::env::set_var("LOOM_NO_RESTORE", "1");
     let response = handle_request(Request::ListTerminals, &tm, &db, &sr, &bus, &test_pool());
@@ -90,7 +90,7 @@ fn test_handle_request_list_terminals_empty() {
 
 #[test]
 fn test_handle_request_get_current_commit_nonexistent_dir() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetCurrentCommit {
             working_dir: "/nonexistent/path".to_string(),
@@ -113,7 +113,7 @@ fn test_handle_request_get_current_commit_nonexistent_dir() {
 
 #[test]
 fn test_handle_request_get_terminal_activity_empty() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetTerminalActivity {
             id: "nonexistent".to_string(),
@@ -137,7 +137,7 @@ fn test_handle_request_get_terminal_activity_empty() {
 
 #[test]
 fn test_handle_request_get_all_claims_empty() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(Request::GetAllClaims, &tm, &db, &sr, &bus, &test_pool());
     match response {
         Response::Claims(claims) => {
@@ -151,7 +151,7 @@ fn test_handle_request_get_all_claims_empty() {
 
 #[test]
 fn test_handle_request_get_claims_summary() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::GetClaimsSummary {
             stale_threshold_secs: Some(3600),
@@ -170,37 +170,6 @@ fn test_handle_request_get_claims_summary() {
     }
 }
 
-// ===== CaptureGitChanges with nonexistent dir =====
-
-#[test]
-fn test_handle_request_capture_git_changes_no_repo() {
-    let (tm, db, sr, bus) = setup_test_context();
-    let response = handle_request(
-        Request::CaptureGitChanges {
-            input_id: 1,
-            working_dir: "/nonexistent/path".to_string(),
-            before_commit: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
-    match response {
-        Response::GitChangesCaptured {
-            files_changed,
-            lines_added,
-            lines_removed,
-        } => {
-            assert_eq!(files_changed, 0);
-            assert_eq!(lines_added, 0);
-            assert_eq!(lines_removed, 0);
-        }
-        other => panic!("Expected GitChangesCaptured, got: {other:?}"),
-    }
-}
-
 // ===== SendInput / GetTerminalOutput input correlation (Issue #4554) =====
 
 /// End-to-end proof that a `SendInput` turn's `agent_inputs.id` is threaded
@@ -212,7 +181,7 @@ fn test_handle_request_capture_git_changes_no_repo() {
 /// production.
 #[test]
 fn test_send_input_then_get_terminal_output_correlates_cost_by_issue() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let terminal_id = format!("ipc-test-4554-{}", std::process::id());
 
     // Seed the terminal's output file directly: `get_terminal_output` reads
@@ -350,6 +319,26 @@ fn fake_headroom(occupancy: usize, dynamic_cap: usize) -> DispatchHeadroom {
     }
 }
 
+/// Build an issue-kind [`Request::DispatchSweep`] carrying the repeated
+/// per-test option set (`idempotency_key`, `model`, `effort`, `depends_on`
+/// and `dispatch_origin` all `None`, `force: false`). Only the issue number
+/// and the workspace root — the routing inputs each test actually varies —
+/// are parameters; a supplied path keeps the lossy string conversion the
+/// replaced literals used. Tests exercising other contracts (PR-set kind,
+/// wire-format serde) keep their explicit request shapes.
+fn issue_dispatch(issue: u32, workspace_root: Option<&std::path::Path>) -> Request {
+    Request::DispatchSweep {
+        kind: SweepKind::Issue(issue),
+        idempotency_key: None,
+        model: None,
+        effort: None,
+        depends_on: None,
+        workspace_root: workspace_root.map(|root| root.to_string_lossy().into_owned()),
+        force: false,
+        dispatch_origin: None,
+    }
+}
+
 #[test]
 fn dispatch_headroom_predicate_boundary() {
     assert!(
@@ -449,7 +438,7 @@ fn dispatch_headroom_advisory_dedups_on_state_change() {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     // Absent `workspace_root` now consults the on-disk workspace registry
     // (#4299) — pin it to an empty temp registry so this test's outcome
@@ -458,25 +447,8 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
     std::env::set_var(crate::work_finder::WORK_FINDER_MAX_CONCURRENT_ENV, "1");
 
-    let dispatch_issue = |n: u32| {
-        handle_request(
-            Request::DispatchSweep {
-                kind: SweepKind::Issue(n),
-                idempotency_key: None,
-                model: None,
-                effort: None,
-                depends_on: None,
-                workspace_root: None,
-                force: false,
-                dispatch_origin: None,
-            },
-            &tm,
-            &db,
-            &sr,
-            &bus,
-            &test_pool(),
-        )
-    };
+    let dispatch_issue =
+        |n: u32| handle_request(issue_dispatch(n, None), &tm, &db, &sr, &bus, &test_pool());
 
     // First dispatch always succeeds regardless of computed headroom.
     match dispatch_issue(90_001) {
@@ -500,7 +472,7 @@ fn test_dispatch_sweep_still_dispatches_under_synthetic_low_headroom() {
 
 #[test]
 fn test_handle_request_list_sweeps_empty() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::ListSweeps {
@@ -529,7 +501,7 @@ fn test_handle_request_list_sweeps_empty() {
 #[test]
 #[serial_test::serial]
 fn test_sweep_requests_route_to_explicit_workspace_root() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     // Default workspace (repo A) and a second managed repo (repo B), each a
     // fixture registry with a fake spawn bin + skip_label_flip.
@@ -551,23 +523,8 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
     // Dispatch issue #42 into repo B explicitly.
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(42),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched =
+        handle_request(issue_dispatch(42, Some(dir_b.path())), &tm, &db, &sr_default, &bus, &pool);
     let sweep_id = match dispatched {
         Response::SweepDispatched { sweep_id, .. } => sweep_id,
         other => panic!("Expected SweepDispatched, got: {other:?}"),
@@ -669,7 +626,7 @@ fn test_sweep_requests_route_to_explicit_workspace_root() {
 #[test]
 #[serial_test::serial]
 fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
@@ -684,16 +641,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
     let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
 
     let dispatched_a = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_060),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_060, Some(dir_a.path())),
         &tm,
         &db,
         &sr_default,
@@ -706,16 +654,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
     );
 
     let dispatched_b = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_061),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_061, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -768,7 +707,7 @@ fn test_list_sweeps_all_workspaces_fans_out_across_registered_roots() {
 #[test]
 #[serial_test::serial]
 fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
@@ -783,16 +722,7 @@ fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
 
     // Dispatch into repo B only.
     let dispatched_b = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_062),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_062, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -852,7 +782,7 @@ fn test_list_sweeps_all_workspaces_false_preserves_single_workspace_behavior() {
 #[test]
 #[serial_test::serial]
 fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
@@ -866,16 +796,7 @@ fn test_list_sweeps_all_workspaces_true_ignores_explicit_workspace_root() {
     let _guard = seed_temp_registry(&[dir_a.path(), dir_b.path()]);
 
     let dispatched_a = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(60_063),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_a.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(60_063, Some(dir_a.path())),
         &tm,
         &db,
         &sr_default,
@@ -948,7 +869,7 @@ fn seed_temp_registry(roots: &[&Path]) -> RegistryEnvGuard {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
     let root_a = crate::workspace_registry::normalize_path(dir_a.path());
@@ -963,23 +884,7 @@ fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
     // registered product repo.
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     assert!(
         matches!(dispatched, Response::SweepDispatched { .. }),
         "expected SweepDispatched, got: {dispatched:?}"
@@ -1034,7 +939,7 @@ fn test_dispatch_sweep_absent_workspace_root_targets_single_registration() {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
     let (sr_c, dir_c, _rec_c) = setup_sweep_registry_in_tempdir();
@@ -1049,23 +954,7 @@ fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
 
     let _guard = seed_temp_registry(&[dir_b.path(), dir_c.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     match dispatched {
         Response::StructuredError(err) => {
             assert_eq!(err.code.0, crate::errors::ErrorCode::CONFIG_WORKSPACE_AMBIGUOUS);
@@ -1088,7 +977,7 @@ fn test_dispatch_sweep_ambiguous_registry_errors_without_explicit_param() {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let dir_unregistered = tempdir().unwrap();
     let root_a = crate::workspace_registry::normalize_path(dir_a.path());
@@ -1101,16 +990,7 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
     let _guard = seed_temp_registry(&[dir_a.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5210),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5210, Some(dir_unregistered.path())),
         &tm,
         &db,
         &sr_default,
@@ -1156,7 +1036,7 @@ fn test_dispatch_sweep_unregistered_explicit_workspace_root_is_structured_error(
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let dir_unregistered = tempdir().unwrap();
     std::fs::create_dir_all(dir_unregistered.path().join(".loom")).unwrap();
@@ -1174,16 +1054,7 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
     let _guard = seed_temp_registry(&[dir_a.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5345),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_unregistered.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5345, Some(dir_unregistered.path())),
         &tm,
         &db,
         &sr_default,
@@ -1212,7 +1083,7 @@ fn test_dispatch_sweep_unregistered_delegated_target_hint_names_delegate() {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr_default, dir_a, _rec_a) = setup_sweep_registry_in_tempdir();
     let (sr_b, dir_b, _rec_b) = setup_sweep_registry_in_tempdir();
     std::fs::write(
@@ -1231,16 +1102,7 @@ fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5345),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir_b.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
+        issue_dispatch(5345, Some(dir_b.path())),
         &tm,
         &db,
         &sr_default,
@@ -1262,7 +1124,7 @@ fn test_dispatch_sweep_succeeds_into_a_registered_delegated_workspace() {
 #[test]
 #[serial_test::serial]
 fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_error() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let dir = tempdir().unwrap();
     // Deliberately do NOT create `.loom/scripts/spawn-worker.sh` (or
     // `defaults/scripts/spawn-worker.sh`), and leave `spawn_bin` unset —
@@ -1280,23 +1142,8 @@ fn test_dispatch_sweep_registered_workspace_missing_spawn_bin_surfaces_inner_err
     // Isolate from a stray real `LOOM_SWEEP_SPAWN_BIN` in the test env.
     std::env::remove_var(crate::sweep_registry::SPAWN_BIN_ENV);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(5210),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: Some(dir.path().to_string_lossy().into_owned()),
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &pool,
-    );
+    let dispatched =
+        handle_request(issue_dispatch(5210, Some(dir.path())), &tm, &db, &sr, &bus, &pool);
     match dispatched {
         Response::Error { message } => {
             assert!(
@@ -1323,7 +1170,7 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
     // session carries `LOOM_RUNTIME=opencode`) admission rejected this fixture
     // on an unmet `mcp` capability before the wedge guard was ever reached.
     let _runtime_env = crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv::new();
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let dir_a = tempdir().unwrap();
     let dir_b = tempdir().unwrap();
     // Runtime admission is the first dispatch decision. Install a valid
@@ -1352,23 +1199,7 @@ fn test_dispatch_sweep_wedge_guard_names_resolved_workspace_not_cwd() {
 
     let _guard = seed_temp_registry(&[dir_b.path()]);
 
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4299),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr_default,
-        &bus,
-        &pool,
-    );
+    let dispatched = handle_request(issue_dispatch(4299, None), &tm, &db, &sr_default, &bus, &pool);
     match dispatched {
         Response::Error { message } => {
             // The guard message embeds `SweepRegistryConfig::workspace_root`
@@ -1396,6 +1227,7 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
         source: crate::runtime_admission::RuntimeSource::DefaultConfig,
         unmet_capabilities: vec!["worktreeIsolation".into()],
         reason: "unmet capabilities: worktreeIsolation".into(),
+        exhausted_summary_line: None,
     });
     let wire = serde_json::to_string(&response).unwrap();
     assert!(wire.contains("\"type\":\"RuntimeRejected\""));
@@ -1412,29 +1244,13 @@ fn runtime_rejection_response_is_structured_and_secret_free_on_the_wire() {
 #[test]
 #[serial_test::serial]
 fn test_handle_request_dispatch_sweep_happy_path() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     // #4299: pin the registry to empty so `workspace_root: None` resolution
     // is deterministic regardless of the host's real registry.
     let _registry_guard = seed_temp_registry(&[]);
 
-    let response = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(2024),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let response = handle_request(issue_dispatch(2024, None), &tm, &db, &sr, &bus, &test_pool());
     match response {
         Response::SweepDispatched {
             sweep_id,
@@ -1496,29 +1312,13 @@ fn test_handle_request_dispatch_sweep_happy_path() {
 #[test]
 #[serial_test::serial]
 fn test_handle_request_dispatch_sweep_exports_claim_ownership_marker() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, record_log) = setup_sweep_registry_in_tempdir();
     // #4299: pin the registry to empty so `workspace_root: None` resolution
     // is deterministic regardless of the host's real registry.
     let _registry_guard = seed_temp_registry(&[]);
 
-    let response = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(3964),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let response = handle_request(issue_dispatch(3964, None), &tm, &db, &sr, &bus, &test_pool());
     assert!(
         matches!(response, Response::SweepDispatched { .. }),
         "expected SweepDispatched, got: {response:?}"
@@ -1622,7 +1422,7 @@ mod drain_dispatch_refusal_tests {
 #[test]
 #[serial_test::serial]
 fn test_handle_request_dispatch_sweep_accepts_prset() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     // #4299: pin the registry to empty so `workspace_root: None` resolution
     // is deterministic regardless of the host's real registry.
@@ -2294,7 +2094,7 @@ fn test_dispatch_sweep_serde_round_trip_with_depends_on() {
 
 #[tokio::test]
 async fn test_handle_request_publish_event_routes_to_subscribers() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let mut sub = bus.subscribe::<[&str; 0], &str>([]);
 
     let response = handle_request(
@@ -2343,7 +2143,7 @@ async fn test_handle_request_publish_event_backfills_repo_from_dispatching_works
     // A child that omits `repo` would narrate under a bare `task_id` and
     // thread with issue #N of every other repo. The daemon dispatched it into
     // exactly one workspace, so it stamps that workspace's root.
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let root = sr
         .lock()
         .unwrap()
@@ -2379,7 +2179,7 @@ async fn test_handle_request_publish_event_backfills_repo_from_dispatching_works
 async fn test_handle_request_publish_event_upgrades_blocker_topic() {
     // Issue #4466: `sweep.issue.{N}.blocker` upgrades to `Event::SweepBlocker`
     // with the full documented payload (incl. the optional `repo`).
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let mut sub = bus.subscribe::<[&str; 0], &str>([]);
 
     handle_request(
@@ -2418,7 +2218,7 @@ async fn test_handle_request_publish_event_upgrades_blocker_topic() {
 async fn test_handle_request_publish_event_phase_carries_pr_and_repo() {
     // Issue #4466: the optional `pr_number` + `repo` fields survive the
     // typed upgrade (the phase narration line appends ` · PR #M open`).
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let mut sub = bus.subscribe::<[&str; 0], &str>([]);
 
     handle_request(
@@ -2459,7 +2259,7 @@ async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() 
     // payload (missing required `phase`), an unknown sweep sub-topic, a
     // non-integer issue segment, and an entirely unrelated topic all stay
     // `Event::Generic` with the payload passed through UNCHANGED.
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
 
     let cases: &[(&str, serde_json::Value)] = &[
         // Documented topic, but the required `phase` field is missing.
@@ -2504,7 +2304,7 @@ async fn test_handle_request_publish_event_malformed_and_unknown_stay_generic() 
 
 #[test]
 fn test_handle_request_get_sweep_status_missing() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::GetSweepStatus {
@@ -2525,7 +2325,7 @@ fn test_handle_request_get_sweep_status_missing() {
 
 #[test]
 fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::TailSweepLog {
@@ -2554,7 +2354,7 @@ fn test_handle_request_tail_sweep_log_missing_sweep_returns_error() {
 fn test_handle_request_clear_quarantine_noop() {
     // Issue #3939/#3960: clearing an issue that is not quarantined is an
     // idempotent no-op success routed through the full IPC dispatcher.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::ClearQuarantine {
@@ -2583,7 +2383,7 @@ fn test_handle_request_clear_quarantine_noop() {
 fn test_handle_request_clear_quarantine_clears_existing() {
     // Seed a quarantine directly, then clear it via the IPC dispatcher and
     // assert the in-memory state was released (was_quarantined: true).
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     {
         let mut reg = sr.lock().unwrap();
@@ -2622,7 +2422,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
     // caller with no direct registry access) records a failed dispatch
     // via IPC and gets back the resulting consecutive count + window,
     // mirroring the reaper's own automatic bookkeeping (#4485).
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::RecordDispatchFailure {
@@ -2659,7 +2459,7 @@ fn test_handle_request_record_dispatch_failure_arms_backoff() {
 fn test_handle_request_record_dispatch_failure_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the reaper
     // calling `record_dispatch_failure` on repeated failed dispatches.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     for _ in 0..2 {
         handle_request(
@@ -2701,7 +2501,7 @@ fn test_handle_request_record_dispatch_failure_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `backoff_secs` is None,
     // never a hard error — mirrors `record_dispatch_failure`'s own early
     // return when `dispatch_backoff_config.enabled` is false.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     {
         let mut reg = sr.lock().unwrap();
@@ -2743,7 +2543,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
     // access) records a self-reported no-op release via IPC and gets back
     // the resulting consecutive count + window, mirroring
     // `RecordDispatchFailure`'s own contract.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::RecordNoopRelease {
@@ -2784,7 +2584,7 @@ fn test_handle_request_record_noop_release_arms_cooldown() {
 fn test_handle_request_record_noop_release_accumulates_consecutive() {
     // Two calls for the same issue accumulate — mirrors the sweep
     // orchestrator reporting "still nothing to do" on repeated passes.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     for _ in 0..2 {
         handle_request(
@@ -2826,7 +2626,7 @@ fn test_handle_request_record_noop_release_disabled_is_noop() {
     // idempotent no-op: `consecutive` stays 0 and `cooldown_secs` is None,
     // never a hard error — mirrors `record_noop_release`'s own early
     // return when `noop_cooldown_config.enabled` is false.
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     {
         let mut reg = sr.lock().unwrap();
@@ -2896,7 +2696,7 @@ fn test_handle_request_record_noop_release_disabled_is_noop() {
 #[test]
 #[serial_test::serial]
 fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
 
     // Default workspace (repo A, e.g. `rjwalters/loom`) and a second
     // managed repo (repo B, e.g. the live report's `2AMLogic/gf180-usb2-phy`)
@@ -3000,7 +2800,7 @@ fn test_record_noop_release_routes_to_explicit_non_default_workspace() {
 /// `workspace_root` calls.
 #[test]
 fn test_record_noop_release_none_workspace_root_still_targets_default() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
 
     let response = handle_request(
@@ -3045,7 +2845,7 @@ fn test_record_noop_release_none_workspace_root_still_targets_default() {
 fn test_handle_request_list_quarantines_empty_registry() {
     use crate::workspace_registry::REGISTRY_PATH_ENV;
 
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
@@ -3079,7 +2879,7 @@ fn test_handle_request_list_quarantines_empty_registry() {
 fn test_handle_request_list_quarantines_seeded_entries() {
     use crate::workspace_registry::REGISTRY_PATH_ENV;
 
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
@@ -3127,7 +2927,7 @@ fn test_handle_request_list_quarantines_seeded_entries() {
 fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
     use crate::workspace_registry::REGISTRY_PATH_ENV;
 
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let root = dir.path().to_path_buf();
     let empty_reg = dir.path().join("no-such-workspaces.json");
@@ -3171,7 +2971,7 @@ fn test_handle_request_list_quarantines_ttl_clamps_to_zero() {
 
 #[test]
 fn test_handle_request_cancel_sweep_unknown_returns_error() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let response = handle_request(
         Request::CancelSweep {
@@ -3251,23 +3051,14 @@ fn test_cancel_sweep_cli_and_mcp_frames_are_identical_on_the_wire() {
 #[test]
 #[serial_test::serial]
 fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, dir, _rec) = setup_sweep_registry_in_tempdir();
     let _registry_guard = seed_temp_registry(&[]);
 
     let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(4980),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            // `None` resolves to the default registry `sr` — the same
-            // tempdir-rooted registry the cancel below targets.
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
+        // `None` resolves to the default registry `sr` — the same
+        // tempdir-rooted registry the cancel below targets.
+        issue_dispatch(4980, None),
         &tm,
         &db,
         &sr,
@@ -3320,30 +3111,14 @@ fn test_handle_request_cancel_sweep_from_cli_frame_runs_the_shared_path() {
 #[test]
 #[serial_test::serial]
 fn test_handle_request_get_sweep_status_returns_existing() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     // #4299: pin the registry to empty so `workspace_root: None` resolution
     // is deterministic regardless of the host's real registry.
     let _registry_guard = seed_temp_registry(&[]);
 
     // Dispatch a sweep to get a real entry in the registry.
-    let dispatched = handle_request(
-        Request::DispatchSweep {
-            kind: SweepKind::Issue(444),
-            idempotency_key: None,
-            model: None,
-            effort: None,
-            depends_on: None,
-            workspace_root: None,
-            force: false,
-            dispatch_origin: None,
-        },
-        &tm,
-        &db,
-        &sr,
-        &bus,
-        &test_pool(),
-    );
+    let dispatched = handle_request(issue_dispatch(444, None), &tm, &db, &sr, &bus, &test_pool());
     let sweep_id = match dispatched {
         Response::SweepDispatched { sweep_id, .. } => sweep_id,
         other => panic!("Expected SweepDispatched, got: {other:?}"),
@@ -3965,7 +3740,7 @@ fn test_build_daemon_status_reports_halt_and_in_flight() {
         "the cap is configured_max regardless of the empty token pool (#12406)"
     );
     // #4345: a pool that never called start_safehouse_narration /
-    // start_peer_coordination still reports a live safehouse state — the
+    // start_completion_dedup still reports a live safehouse state — the
     // cell's own default, not a missing/`None` field.
     let safehouse = report
         .safehouse
@@ -4454,7 +4229,7 @@ fn test_build_daemon_status_flags_missing_root() {
 /// be intercepted in `handle_client`), it returns a loud Error sentinel.
 #[test]
 fn test_handle_request_daemon_status_short_circuits_to_error() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(Request::DaemonStatus, &tm, &db, &sr, &bus, &test_pool());
     match response {
         Response::Error { message } => {
@@ -4472,7 +4247,7 @@ fn test_handle_request_subscribe_events_short_circuits_to_error() {
     // SubscribeEvents must be handled by stream_events (not the
     // dispatcher). If it ever reaches handle_request, the dispatcher
     // returns an Error sentinel so the bug is visible.
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let response = handle_request(
         Request::SubscribeEvents {
             topics: vec!["sweep".to_string()],
@@ -4502,7 +4277,7 @@ fn test_handle_request_subscribe_events_short_circuits_to_error() {
 #[test]
 #[serial_test::serial]
 fn test_workspace_registry_ipc_roundtrip() {
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let dir = tempdir().unwrap();
     let registry_path = dir.path().join("workspaces.json");
     let repo = dir.path().join("repo");
@@ -4611,7 +4386,7 @@ fn test_workspace_registry_ipc_roundtrip() {
 fn test_watch_registry_ipc_roundtrip() {
     use crate::watch_registry::WatchKind;
 
-    let (tm, db, sr, bus) = setup_test_context();
+    let (_context_dir, tm, db, sr, bus) = setup_test_context();
     let dir = tempdir().unwrap();
     let watches_path = dir.path().join("watches.json");
     std::env::set_var(crate::watch_registry::WATCHES_PATH_ENV, &watches_path);
@@ -5207,14 +4982,11 @@ fn test_abort_supersedes_running_supervisor_generation() {
 mod status_round_trip;
 
 // The #9194 burst-calibration helper lives in its own sibling module rather
-// than being appended here: this module is over the 1000-line ratchet
-// threshold and frozen at its current size (`.loom/docs/file-size-policy.md`
-// — "put the new code in a NEW sibling module").
+// than being appended here.
 mod dispatch_burst_calibration;
 
 // The #4666 rate-limit dispatch-refusal tests live in their own sibling
-// module (moved out of this over-threshold, frozen file, #9855):
-// `.loom/docs/file-size-policy.md` — "put the new code in a NEW sibling module".
+// module (moved out of this file, #9855).
 mod rate_limit_dispatch_refusal_tests;
 
 /// #13350: the removed `runtime` / `model_profile` fields are gone from the

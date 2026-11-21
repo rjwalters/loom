@@ -25,6 +25,7 @@ use super::group_authz::{
 };
 use super::group_github::GroupForge;
 use crate::gh_invocation::AccessIntent;
+use crate::merge_pr::check_runs_rollup::{fail_stranded_rows, is_stranded_candidate};
 use crate::telemetry::kinds::merge_authorization::MergeAuthorizationRecord;
 use crate::telemetry::kinds::merge_queue_regime::{MergeQueueRegimeRecord, QueueRegime};
 
@@ -303,6 +304,15 @@ pub fn states_from(
     Ok(out)
 }
 
+/// Whether any row of a `check-runs` document could be stranded under a
+/// failed workflow run (non-terminal, with a check-suite id).
+fn has_stranded_candidate(check_runs: &Value) -> bool {
+    check_runs
+        .get("check_runs")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| rows.iter().any(is_stranded_candidate))
+}
+
 /// GitHub [`ContextStates`]: reads the commit's check runs and statuses for
 /// the ruleset's required contexts.
 pub struct GhContextStates<'a> {
@@ -327,8 +337,25 @@ impl ContextStates for GhContextStates<'_> {
             )?;
             serde_json::from_str(&text).map_err(|e| format!("{op}: unparseable: {e}"))
         };
-        let runs = get("merge_queue.check_runs", "check-runs")?;
+        let mut runs = get("merge_queue.check_runs", "check-runs")?;
         let sts = get("merge_queue.statuses", "status")?;
+        // A terminal-failed workflow run can leave its jobs' check runs queued
+        // for good (#14415, #14128); read as `Pending` they would hold a
+        // required context open where `forge wait-checks` already says RED.
+        // Best-effort and only when some row could be stranded: a failed read
+        // changes nothing, so the context stays `Pending` exactly as before.
+        if has_stranded_candidate(&runs) {
+            let url =
+                format!("repos/{}/actions/runs?head_sha={commit}&per_page=100", self.forge.nwo());
+            if let Ok(text) =
+                self.forge
+                    .ok("merge_queue.workflow_runs", AccessIntent::Read, &["api".into(), url])
+            {
+                if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                    fail_stranded_rows(&mut runs, &payload, commit);
+                }
+            }
+        }
         states_from(&self.required, &runs, &sts)
     }
 }
@@ -935,6 +962,40 @@ mod tests {
         assert_eq!(state(base(json!(null), json!(null))), CheckState::Pending);
         assert_eq!(state(base(json!(null), done)), CheckState::Pending);
         assert_eq!(state(base(json!("success"), json!(null))), CheckState::Pending);
+    }
+
+    #[test]
+    fn a_stranded_required_context_is_failure_not_pending() {
+        // #14415: the failed run's jobs stay queued for good; once the shared
+        // attribution rewrites them, the required context reads Failure — the
+        // verdict `forge wait-checks` already gives — instead of Pending.
+        let sha = "5f72ee5c0926e69e278a65d5a36b1a561198591b";
+        let mut runs = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "queued", "conclusion": null,
+             "check_suite": {"id": 9}}]});
+        let st = json!({"total_count": 0, "statuses": []});
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Pending);
+        assert!(has_stranded_candidate(&runs));
+        let wf = json!({"total_count": 1, "workflow_runs": [
+            {"id": 5, "workflow_id": 7, "check_suite_id": 9, "event": "merge_group",
+             "head_sha": sha, "created_at": "2026-11-18T10:00:00Z",
+             "status": "completed", "conclusion": "startup_failure", "pull_requests": []}]});
+        assert_eq!(fail_stranded_rows(&mut runs, &wf, sha), 1);
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Failure);
+        // A runs payload that cannot be read leaves the context Pending.
+        let mut runs = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "queued", "conclusion": null,
+             "check_suite": {"id": 9}}]});
+        assert_eq!(
+            fail_stranded_rows(&mut runs, &json!({"total_count": 3, "workflow_runs": []}), sha),
+            0
+        );
+        assert_eq!(states_from(&req(), &runs, &st).unwrap()[0].1, CheckState::Pending);
+        // A settled-only listing never needs the extra read.
+        let settled = json!({"total_count": 1, "check_runs": [
+            {"id": 1, "name": "ci", "status": "completed", "conclusion": "success",
+             "check_suite": {"id": 9}}]});
+        assert!(!has_stranded_candidate(&settled));
     }
 
     #[test]

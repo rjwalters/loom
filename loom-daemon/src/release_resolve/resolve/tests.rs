@@ -120,6 +120,12 @@ fn repo_override_wins_over_every_lower_tier() {
     i.machine_checkout = Some(machine.path().to_path_buf());
     i.build_time_repo = Some("build-owner/build-repo".to_string());
     assert_eq!(resolve_repo(&i).as_deref(), Some("override-owner/override-repo"));
+    // #14224: the source names the tier that won, so a log line can say which
+    // answer was taken.
+    assert_eq!(
+        resolve_repo_with_source(&i),
+        Some(("override-owner/override-repo".to_string(), RepoSource::EnvOverride))
+    );
 }
 
 #[test]
@@ -133,6 +139,10 @@ fn machine_checkout_origin_wins_over_build_time_and_workspace() {
     i.machine_checkout = Some(machine.path().to_path_buf());
     i.build_time_repo = Some("build-owner/build-repo".to_string());
     assert_eq!(resolve_repo(&i).as_deref(), Some("machine-owner/machine-repo"));
+    assert_eq!(
+        resolve_repo_with_source(&i),
+        Some(("machine-owner/machine-repo".to_string(), RepoSource::MachineCheckout))
+    );
 }
 
 #[test]
@@ -147,6 +157,10 @@ fn build_time_repo_wins_over_the_workspaces_own_origin() {
     let mut i = inputs(workspace.path());
     i.build_time_repo = Some("build-owner/build-repo".to_string());
     assert_eq!(resolve_repo(&i).as_deref(), Some("build-owner/build-repo"));
+    assert_eq!(
+        resolve_repo_with_source(&i),
+        Some(("build-owner/build-repo".to_string(), RepoSource::BuildTime))
+    );
 }
 
 #[test]
@@ -155,6 +169,26 @@ fn the_workspaces_own_origin_is_the_last_resort() {
     let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
     let i = inputs(workspace.path());
     assert_eq!(resolve_repo(&i).as_deref(), Some("workspace-owner/workspace-repo"));
+    assert_eq!(
+        resolve_repo_with_source(&i),
+        Some(("workspace-owner/workspace-repo".to_string(), RepoSource::WorkspaceOrigin))
+    );
+}
+
+#[test]
+fn resolve_repo_and_resolve_repo_with_source_agree_on_the_slug() {
+    // #14224: the variant delegates to one order — the slug and its source
+    // can never drift apart. Both entry points must answer identically on a
+    // full stack and on an empty one.
+    let workspace = git_checkout_with_origin("workspace-owner/workspace-repo");
+    let machine = git_checkout_with_origin("machine-owner/machine-repo");
+    let mut i = inputs(workspace.path());
+    i.machine_checkout = Some(machine.path().to_path_buf());
+    assert_eq!(resolve_repo(&i), resolve_repo_with_source(&i).map(|(repo, _)| repo));
+    let empty_root = std::env::temp_dir();
+    let empty = inputs(&empty_root);
+    assert_eq!(resolve_repo(&empty), None);
+    assert_eq!(resolve_repo_with_source(&empty), None);
 }
 
 #[test]
@@ -810,6 +844,7 @@ fn secondary_limits_server_errors_and_shed_reads_are_unavailable() {
     }
     let shed: Query<u8> = Query::Unavailable(Unavailable::Shed {
         until: std::time::SystemTime::now(),
+        graphql_budget_exhausted: false,
     });
     assert!(is_unavailable(&shed));
 }

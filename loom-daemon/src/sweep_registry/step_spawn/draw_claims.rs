@@ -8,12 +8,12 @@
 //! it. So before the draw the tick removes:
 //!
 //! - every item this registry runs (a live sweep or step);
-//! - every item a peer advertises a live claim on
-//!   (`PeerClaimView::claimed_issues_at`);
-//! - every other Champion merge in the repo while this host and the peers are
-//!   already merging there at the repo's merge concurrency, one by default
-//!   (`PeerClaimView::merges_in_flight_at`, the best-effort per-repo merge
+//! - every other Champion merge in the repo while this host is already merging
+//!   there at the repo's merge concurrency, one by default (the per-repo merge
 //!   serialisation of design §6, `champion.mergeConcurrencyPerRepo` #13026).
+//!
+//! A peer host's claims are no longer read from a broadcast (#13945): the
+//! cross-host guard is the lease tie-break, and the captain assigns the work.
 
 use std::collections::HashSet;
 
@@ -24,8 +24,7 @@ use crate::step_role::StepRole;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrawClaims {
     pub items: HashSet<u32>,
-    /// `(PR, host)` of every live Champion merge in this repo, this host's
-    /// and the peers', by PR number.
+    /// `(PR, host)` of every live Champion merge in this repo, by PR number.
     pub merges_in_flight: Vec<(u32, String)>,
     /// `champion.mergeConcurrencyPerRepo` (#13026): the merges the repo may
     /// run at once. Set by the tick from config, not by the registry; `0`
@@ -50,25 +49,22 @@ impl DrawClaims {
 }
 
 impl SweepRegistry {
-    /// This registry's and its peers' live claims, for the draw.
+    /// This registry's live claims, for the draw.
     #[must_use]
     pub fn draw_claims(&self) -> DrawClaims {
-        let mut items: HashSet<u32> = self
+        let items: HashSet<u32> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .filter(|i| matches!(i.state, SweepState::Running))
             .filter_map(|i| match i.kind {
                 SweepKind::Issue(n) | SweepKind::Step { item: n, .. } => Some(n),
                 SweepKind::PrSet(_) => None,
             })
             .collect();
-        items.extend(self.peer_claimed_issues());
-        // This host's own live merges count toward the repo's lane too, not
-        // only a peer's.
         let mut merges_in_flight: Vec<(u32, String)> = self
             .entries
             .values()
-            .filter(|i| matches!(i.state, SweepState::Running | SweepState::Pending))
+            .filter(|i| matches!(i.state, SweepState::Running))
             .filter_map(|i| match i.kind {
                 SweepKind::Step {
                     item,
@@ -77,18 +73,6 @@ impl SweepRegistry {
                 _ => None,
             })
             .collect();
-        if let Some(view) = self.peer_claims.as_ref() {
-            let repo = peer_claims::repo_slug(&self.config.workspace_root);
-            let peers = view
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .merges_in_flight_at(&repo, Instant::now());
-            for (pr, host) in peers {
-                if !merges_in_flight.iter().any(|(own, _)| *own == pr) {
-                    merges_in_flight.push((pr, host));
-                }
-            }
-        }
         merges_in_flight.sort();
         DrawClaims {
             items,

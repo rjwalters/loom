@@ -85,7 +85,11 @@ if [[ "${GH_TOKEN:-}" == ghs_app* && -f "$D/app-fail-$method" ]]; then
 fi
 if [[ "$method" == "GET" && "$path" == repos/*/issues/*/comments* ]]; then
   echo "$path" >> "$D/list-calls.log"
-  [[ ! -f "$D/comments-fail" ]] || { echo "stub gh: HTTP 502 comments read failed" >&2; exit 1; }
+  if [[ -f "$D/comments-fail" ]]; then
+    echo "stub gh: HTTP 502 comments read failed FAKE-RECEIPT-DETAIL" >&2
+    touch "$D/renewal-failed-observed"
+    exit 1
+  fi
   cat "$D/comments.json"; exit 0
 fi
 if [[ "$method" == "GET" && "$path" == repos/*/issues/[0-9]* ]]; then
@@ -122,7 +126,7 @@ unset GH_TOKEN GITHUB_TOKEN LOOM_PERSONAL_GH_TOKEN LOOM_TERMINAL_ID LOOM_HOST_ID
 reset_state() {
     rm -f "$STUB_DIR"/comments.json "$STUB_DIR"/issue-state* "$STUB_DIR"/state-calls.log \
         "$STUB_DIR"/list-calls.log "$STUB_DIR"/patch-calls.log "$STUB_DIR"/renewer-* "$STUB_DIR"/r2-out.* \
-        "$STUB_DIR"/comments-fail "$STUB_DIR"/cred.log "$STUB_DIR"/app-* "$STUB_DIR"/forge-token-args.log "$STUB_DIR"/z-*.log
+        "$STUB_DIR"/comments-fail "$STUB_DIR"/renewal-failed-observed "$STUB_DIR"/cred.log "$STUB_DIR"/app-* "$STUB_DIR"/forge-token-args.log "$STUB_DIR"/z-*.log
     rm -rf "$LOOM_LEASE_RENEW_STATE_DIR" 2> /dev/null || true
     echo "[$Y_LEASE]" > "$STUB_DIR/comments.json"
 }
@@ -219,6 +223,8 @@ if [[ -z "${LEASE_RENEWER_DAEMON:-}" ]]; then
     assert_eq "true" "$([[ "$(patch_n)" -ge 2 ]] && echo true || echo false)" "(y7) an unknown-verb exit still renews (fail-open)"
     kill "$LOOP" "$WATCH" 2> /dev/null
 else
+    receipt_dir="$PWD/.loom/logs/lease-ensure"
+    receipt_line_count() { if [[ -f "$1" ]]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
     # (r1) open -> closed with a LIVE parent: the real gate stops it for good.
     reset_state
     sleep 30 &
@@ -231,6 +237,11 @@ else
     N="$(patch_n)"
     sleep 2
     assert_eq "$N" "$(patch_n)" "(r1) no PATCH after the close"
+    check_closed_receipt() {
+        jq -e '.issue == 10229 and .reason == "closed" and (.last_success | type == "string")' \
+            "$receipt_dir/issue-10229.terminal.jsonl" >/dev/null 2>&1
+    }
+    assert_eq "true" "$(if check_closed_receipt; then echo true; else echo false; fi)" "(r1) the closed receipt includes the last actual PATCH"
     rm -f "$STUB_DIR/issue-state"
     touch "$STUB_DIR/issue-state-fail"
     LOOP="$(start_loop 10230 "$WATCH")"
@@ -264,8 +275,10 @@ else
     assert_eq "true" "$([[ -n "$NEW" && "$NEW" != "$OWNER" ]] && yb alive "$NEW" || echo false)" "(r3) a start after release becomes a fresh owner"
 
     # (r4) a killed owner's record is recovered by the next start.
+    count_before_kill="$(receipt_line_count "$receipt_dir/issue-10229.terminal.jsonl")"
     kill -9 "$NEW" 2> /dev/null
     sleep 0.3
+    assert_eq "$count_before_kill" "$(receipt_line_count "$receipt_dir/issue-10229.terminal.jsonl")" "(r4) hard interruption left the terminal cause unknown"
     REC="$(start_loop 10229 "$WATCH")"
     assert_eq "true" "$([[ -n "$REC" && "$REC" != "$NEW" ]] && yb alive "$REC" || echo false)" "(r4) a killed owner's record is recovered"
     kill "$REC" "$O_ISSUE" "$O_SWEEP" "$O_REPO" "$WATCH" 2> /dev/null
@@ -307,9 +320,100 @@ else
         sleep 0.3
         RC=0; ERR="$("$SCRIPT" stop "$LA_PY" 2>&1 > /dev/null)" || RC=$?; sleep 0.3
         assert_eq "true" "$([[ $RC -ne 0 ]] && alive "$LA_PY" && echo true || echo false)" "(r6) a python3 look-alike is refused and survives"
-        assert_eq "true" "$([[ "$ERR" == *"program: python3"* && "$ERR" != *FAKE-SECRET-SENTINEL* ]] && echo true || echo false)" "(r6) the refusal names the program, not its arguments"
+        python_program_named() {
+            printf '%s\n' "$ERR" | grep -Eq '[(]program: (Python|python3([.][0-9]+)?)[)]' &&
+                [[ "$ERR" != *FAKE-SECRET-SENTINEL* ]]
+        }
+        assert_eq "true" "$(if python_program_named; then echo true; else echo false; fi)" "(r6) the refusal names the program, not its arguments"
         kill "$LA_PY" 2> /dev/null
     fi
+
+    # (r7) The real attended child records its own observed disposition once.
+    # An ambient forge read failure is last-attempt evidence, not a stop.
+    reset_state
+    sleep 30 &
+    WATCH=$!
+    LOOP="$(start_loop 10231 "$WATCH")"
+    assert_eq "$LOOP" "$(start_loop 10231 "$WATCH")" "(r7) a duplicate launch reuses the owning loop"
+    wait_patches 1
+    touch "$STUB_DIR/comments-fail"
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        [[ ! -f "$STUB_DIR/renewal-failed-observed" ]] || break
+        sleep 0.25
+    done
+    assert_eq "true" "$(yb test -f "$STUB_DIR/renewal-failed-observed")" "(r7) the fake forge rejected a later renewal"
+    assert_eq "true" "$(yb alive "$LOOP")" "(r7) a failed renewal leaves the owner running"
+    kill "$WATCH" 2> /dev/null
+    receipt="$receipt_dir/issue-10231.terminal.jsonl"
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        [[ ! -s "$receipt" ]] || break
+        sleep 0.25
+    done
+    assert_eq "1" "$(receipt_line_count "$receipt")" "(r7) one terminal receipt for the actual owner"
+    expected_sweep="$(printf %s y-sweep | shasum -a 256 | cut -d ' ' -f1)"
+    check_watch_receipt() {
+        jq -e --arg sweep "$expected_sweep" '
+          .issue == 10231 and .sweep_fingerprint == $sweep and .reason == "watch-ended"
+          and .last_attempt == "renewal-failed" and (.last_success | type == "string")
+          and (keys == ["issue","last_attempt","last_success","observed_at","reason","sweep_fingerprint"])
+        ' "$receipt" >/dev/null 2>&1
+    }
+    assert_eq "true" "$(if check_watch_receipt; then echo true; else echo false; fi)" "(r7) receipt distinguishes the observed exit from the failed attempt"
+    assert_eq "" "$(grep -E 'FAKE-RECEIPT-DETAIL|y-sweep|--token' "$receipt" 2>/dev/null)" "(r7) raw provider diagnostics and identities stay out"
+
+    # (r8) A classified cap is distinct from watcher loss, with no renewal.
+    reset_state
+    sleep 30 &
+    WATCH=$!
+    LOOP="$("$SCRIPT" start 10232 --interval 1 --max-age 1 --watch-pid "$WATCH" --host y-host --sweep-id y-sweep 2>/dev/null)"
+    receipt="$receipt_dir/issue-10232.terminal.jsonl"
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        [[ ! -s "$receipt" ]] || break
+        sleep 0.25
+    done
+    code="$(jq -r '.reason' "$receipt" 2>/dev/null)"
+    assert_eq "age-cap" "$code" "(r8) the loop observed its absolute lifetime cap"
+    assert_eq "true" "$(yb alive "$WATCH")" "(r8) the watched process remains alive"
+    assert_eq "0" "$(patch_n)" "(r8) a cap before the first cycle made no PATCH"
+    kill "$WATCH" 2>/dev/null
+
+    # (r9) Stop the watch target while the synchronous owner claim is paused.
+    # The deliberately held claim outlasts the child's first sleep.
+    cat > "$STUB_DIR/delayed-claim" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-} ${3:-}" == "lease renewer claim" ]]; then
+    kill "$EARLY_WATCH_PID" || exit 1
+    sleep 2
+fi
+exec "$LOOM_TEST_STUB_DIR/loom-daemon" "$@"
+SH
+    chmod 700 "$STUB_DIR/delayed-claim"
+    reset_state
+    sleep 30 &
+    WATCH=$!
+    LOOP="$(EARLY_WATCH_PID="$WATCH" LOOM_DAEMON_BIN="$STUB_DIR/delayed-claim" start_loop 10233 "$WATCH")"
+    receipt="$receipt_dir/issue-10233.terminal.jsonl"
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        [[ ! -s "$receipt" ]] || break
+        sleep 0.1
+    done
+    assert_eq "$LOOP" "$(jq -r .pid "$LOOM_LEASE_RENEW_STATE_DIR"/*.owner)" "(r9) start still reports the synchronously published owner"
+    assert_eq "watch-ended" "$(jq -r .reason "$receipt" 2>/dev/null)" "(r9) the winning launch records an exit observed before publication"
+    assert_eq "1" "$(receipt_line_count "$receipt")" "(r9) the early observation emits one receipt"
+    assert_eq "false" "$(yb test -s "$STUB_DIR/cred.log")" "(r9) the early exit made no Forge request"
+
+    reset_state
+    sleep 30 &
+    PEER_WATCH=$!
+    PEER="$("$SCRIPT" start 10234 --interval 30 --watch-pid "$PEER_WATCH" --host y-host --sweep-id y-sweep 2>/dev/null)"
+    sleep 30 &
+    WATCH=$!
+    LOOP="$(EARLY_WATCH_PID="$WATCH" LOOM_DAEMON_BIN="$STUB_DIR/delayed-claim" start_loop 10234 "$WATCH")"
+    assert_eq "$PEER" "$LOOP" "(r9) an early duplicate still reports the original owner"
+    assert_eq "0" "$(receipt_line_count "$receipt_dir/issue-10234.terminal.jsonl")" "(r9) the duplicate emits no terminal receipt"
+    assert_eq "false" "$(yb test -s "$STUB_DIR/cred.log")" "(r9) the duplicate made no Forge request"
+    pkill -P "$PEER" 2>/dev/null
+    kill "$PEER" "$PEER_WATCH" 2>/dev/null
 fi
 
 # (y6) per-cycle budget: steady state is one state read + one list/window read
@@ -485,6 +589,8 @@ assert_eq "true" "$([[ "$(patch_n)" -ge 2 ]] && yb alive "$LOOP" || echo false)"
 kill "$LOOP" "$WATCH" 2> /dev/null
 wait "$WATCH" 2> /dev/null
 
+# The compatibility probes below control and inspect the stub's CLI calls.
+unset LEASE_RENEWER_DAEMON
 # (y8) #10348: verb absent -> one probe, no state read, no check/claim, renews.
 reset_state
 touch "$STUB_DIR/renewer-absent"

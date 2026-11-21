@@ -306,6 +306,12 @@ pub trait StatusApi {
     fn can_post_statuses(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// The handoff boundary: PR `pr` is about to be authorized at `head`
+    /// (#14636). A seam that records attempt-level evidence keeps the pair so
+    /// its probe and post outcomes — refusals included — carry the exact PR
+    /// and head. The default records nothing.
+    fn begin_handoff(&self, _pr: u32, _head: &str) {}
 }
 
 /// Map a conclusion to the status Loom posts.

@@ -352,6 +352,18 @@ pub fn cli_reads_reader_only() -> bool {
     CLI_READER_ONLY.get().copied().unwrap_or(false)
 }
 
+/// A tools CLI in explicit fleet mode still expects a reader when a configured
+/// gateway is unavailable or its reader pool cannot serve this repository.
+static REQUIRE_CLI_READER: OnceLock<()> = OnceLock::new();
+
+pub(crate) fn require_cli_read_route() {
+    let _ = REQUIRE_CLI_READER.set(());
+}
+
+pub(crate) fn cli_read_route_required() -> bool {
+    REQUIRE_CLI_READER.get().is_some()
+}
+
 /// [`enable_cli`]'s decision: `program` is a path or a bare name looked up
 /// on `PATH`, as the facade will run it.
 #[cfg(test)]
@@ -501,12 +513,43 @@ pub fn route_read(req: &RouteRequest<'_>, now: SystemTime) -> RouteDecision {
     }
     let pool = crate::forge_identity::route_read(req, now);
     let owner = crate::credential_preflight::owner_of_nwo(req.owner_repo).to_ascii_lowercase();
-    let gateway_until = if owner.is_empty() || profile_for(&owner).is_none() {
-        None
-    } else {
-        withdrawn_until(&owner, req, now)
+    let gateway_configured = !owner.is_empty() && profile_for(&owner).is_some();
+    let gateway_until = gateway_configured
+        .then(|| withdrawn_until(&owner, req, now))
+        .flatten();
+    let pool = match pool {
+        // The gateway was part of this route. A non-primary gateway hold
+        // must veto the stronger proof from the readers behind it.
+        RouteDecision::Exhausted {
+            until,
+            cause: ExhaustCause::GraphqlPrimaryBudget,
+        } if gateway_configured
+            && (crate::forge_read_pool::is_withdrawn_at(GATEWAY_APP_ID, now)
+                || crate::forge_identity::repo_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    req.owner_repo,
+                    now,
+                )
+                || !crate::forge_identity::route::primary_graphql_withdrawn_at(
+                    GATEWAY_APP_ID,
+                    &owner,
+                    now,
+                )) =>
+        {
+            RouteDecision::Exhausted {
+                until,
+                cause: ExhaustCause::Budget,
+            }
+        }
+        decision => decision,
     };
-    past_withdrawn_gateway(pool, gateway_until)
+    match past_withdrawn_gateway(pool, gateway_until) {
+        RouteDecision::NoPool if cli_read_route_required() => RouteDecision::Exhausted {
+            until: now + crate::forge_read_pool::DEFAULT_WITHDRAWAL,
+            cause: ExhaustCause::Unavailable,
+        },
+        decision => decision,
+    }
 }
 
 /// The reader pool's answer `pool`, unless it is [`RouteDecision::NoPool`]

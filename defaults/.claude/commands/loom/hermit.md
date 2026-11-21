@@ -70,6 +70,26 @@ rg "export function myFunction" --files-with-matches | while read file; do
 done
 ```
 
+**Limits of a name grep.** A negative result above proves only "no explicit
+reference" — it does **not** prove "never runs". Runners reach code by
+filename/path convention without naming it: pytest/unittest collecting
+`test_*.py` under a directory argument, Rust `tests/`, Jest `*.test.ts`,
+Go `_test.go`, autoloaded plugin/`conf.d` directories, `.github/workflows/*.yml`.
+Before filing any "run by nothing" claim, run a second check that asks the
+runner or the convention, not the text:
+
+```bash
+pytest <dir> --collect-only -q | grep <name>   # does a test runner collect it?
+```
+
+Also check workflow `on:`/`run:` paths, a runner's directory arguments, and an
+adjacent `test_<name>` file. Worked example (example-org/tool-repo#202):
+`git grep` found no reference to `tools/check_m1a_selection.py` in any build
+file, but `make verify` runs `pytest … tools/ …`, which collects the adjacent
+`tools/test_check_m1a_selection.py` on every run — so the "committed but run
+by nothing" premise was false, and the proposed removal would have deleted a
+working, control-carrying gate.
+
 **Commented-Out Code:**
 ```bash
 rg "^[[:space:]]*//" -A 3 | grep -E "function|class|const|let|var"
@@ -174,9 +194,8 @@ Current hermit flags "one-method classes" but not "zero-state classes." A class 
 - **Dispatch-table pattern**: Classes that build dicts/lists of `self.method` references (e.g., `{"key": self.handle_create, ...}`) are intentional dispatch tables.
 - **Structural types and test doubles**: `@dataclass` classes (the generated `__init__` is the state), any class with a base class (Exception/NamedTuple/TypedDict/Enum/Protocol/ABC subclasses and polymorphic hierarchies), classes with declared class-level fields or a `@<x>.setter` property pair, and classes in `test_*.py` / `*_stub*.py` / `conftest.py` (duck-typed test doubles). See `hermit-patterns.md` → "9. Stateless Ceremony".
 
-The AST-based Python detector (with all three exclusions: internal method
-dispatch, the 10+-method namespace threshold, and the dispatch-table pattern) and
-its TypeScript/Rust counterparts live in the companion file so this pattern's
+The AST-based Python detector (with all the exclusions listed above) and its
+TypeScript/Rust counterparts live in the companion file so this pattern's
 detection scripts are maintained in one place. See `hermit-patterns.md` →
 "9. Stateless Ceremony → Detection scripts".
 
@@ -208,6 +227,13 @@ rg "use.*::" --type rust | cut -d':' -f3 | sort -u       # Backend
 rg "export (function|class|const|interface)" --type ts -n
 # For each export, check if it's imported elsewhere
 ```
+
+No import found is "no explicit reference", not "never runs" — a runner or
+discovery convention can still reach it. Before filing a "run by nothing"
+claim, ask the runner/convention (`pytest <dir> --collect-only -q | grep
+<name>`, workflow `on:`/`run:` paths, a runner's directory arguments, an
+adjacent `test_<name>` file). See "Limits of a name grep" under Dead Code
+above.
 
 ### 3. Complexity Metrics
 
@@ -335,6 +361,8 @@ repo's paths or lines. Full rule: `.loom/docs/citation-scope.md`.
 > same issue URL, and falls back to a single REST POST that applies labels **atomically with
 > creation**. Recipe and rationale: `.loom/docs/gh-issue-create-rest-fallback.md`.
 > (`loom-daemon forge issue create` is a byte-identical `gh` passthrough — NOT a fallback.)
+>
+> **Exception (#13978):** on a foreign public repo the App is not installed on, `create-issue.sh` is refused (`NOT_IN_INSTALLATION`, #9548). File with a raw `gh issue create -R <repo>` (interim) instead of parking the report for an operator: `.loom/docs/gh-issue-create-rest-fallback.md` § "Foreign public repo".
 
 ```bash
 # Check if similar issue already exists; exit 0 = clear to file (below)

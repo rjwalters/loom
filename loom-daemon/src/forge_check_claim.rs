@@ -252,10 +252,31 @@ impl OwnedClaim {
     /// Read the marker and this host's published lease host from the process
     /// environment.
     fn from_env(issue: u32) -> Option<Self> {
-        let marker = std::env::var(CLAIM_OWNED_ENV).ok();
-        let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
         // Resolved only for an owned claim: the host chain can shell out.
-        owned.lease_host = Some(crate::cli::pr_lease::published_host());
+        // The RAW identity decides usability — `published_host` hashes the
+        // raw value, so an unresolved chain would turn into an ordinary
+        // looking `host-<hex>` that every unresolved host publishes alike,
+        // and `from_marker`'s filter could no longer catch it (#13998).
+        Self::from_parts(
+            std::env::var(CLAIM_OWNED_ENV).ok(),
+            crate::host_identity::lease_host_identity(),
+            issue,
+        )
+    }
+
+    /// [`Self::from_env`] with the environment pre-resolved, so tests
+    /// exercise this exact path instead of the live process env. A raw chain
+    /// that ended at [`crate::host_identity::UNKNOWN_HOST`] yields
+    /// `lease_host: None` under either publishing mode, because nothing is
+    /// derived from an unusable raw value — two hosts that both fail to
+    /// resolve publish the same id, and neither could tell its own lease
+    /// from a peer's (#13998).
+    fn from_parts(marker: Option<String>, raw_host: String, issue: u32) -> Option<Self> {
+        let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
+        // Derived from `raw_host` itself, never re-resolved: the gate and the
+        // published id must be one resolution (#14069).
+        owned.lease_host = (raw_host != crate::host_identity::UNKNOWN_HOST)
+            .then(|| crate::cli::pr_lease::published_host_from_raw(&raw_host));
         Some(owned)
     }
 
@@ -691,12 +712,14 @@ pub(crate) fn read_claim_labels_for(
             "labels,state,url",
         ])
         .args(crate::claim_reconciliation::gh_call::loom_repo_flag());
-    let Ok(out) = crate::claim_reconciliation::gh_call::output(inv) else {
-        return LabelLeg::Unknown;
+    let out = match crate::claim_reconciliation::gh_call::graphql_output(inv) {
+        Ok(Some(out)) if out.status.success() => out,
+        Ok(None) => {
+            return read_claim_labels_rest(gh_bin, root, issue, claim_owned)
+                .unwrap_or(LabelLeg::Unknown);
+        }
+        _ => return LabelLeg::Unknown,
     };
-    if !out.status.success() {
-        return LabelLeg::Unknown;
-    }
     // `gh issue view --json labels,state,url` emits
     // `{"labels":[{"name":"..."},…],"state":"OPEN","url":"https://…/issues/42"}`.
     let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
@@ -725,13 +748,56 @@ pub(crate) fn read_claim_labels_for(
         .iter()
         .filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from))
         .collect();
-    if crate::work_finder::is_frozen(&labels) {
+    classify_claim_labels(&labels, claim_owned)
+}
+
+fn read_claim_labels_rest(
+    gh_bin: &Path,
+    root: &Path,
+    issue: u32,
+    claim_owned: bool,
+) -> Option<LabelLeg> {
+    use crate::claim_reconciliation::gh_call;
+    // The facade applies LOOM_REPO as GH_REPO for the REST placeholders,
+    // just as the GraphQL call above applies it through --repo.
+    let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}");
+    let read = gh_call::read("claim.labels_rest", gh_bin, root).args(["api", &path]);
+    let json: serde_json::Value = serde_json::from_slice(&gh_call::ok_stdout(read)?).ok()?;
+    if json.get("number")?.as_u64()? != u64::from(issue) {
+        return None;
+    }
+    let pull_request = json.get("pull_request");
+    if let Some(pr) = pull_request {
+        if pr.is_object() {
+            return Some(LabelLeg::IsPullRequest);
+        }
+        return None;
+    }
+    match json.get("state")?.as_str()? {
+        "closed" => return Some(LabelLeg::Closed),
+        "open" => {}
+        _ => return None,
+    }
+    let labels: Vec<String> = json
+        .get("labels")?
+        .as_array()?
+        .iter()
+        .map(|label| {
+            let name = label.get("name")?.as_str()?;
+            (!name.is_empty()).then(|| name.to_owned())
+        })
+        .collect::<Option<_>>()?;
+    Some(classify_claim_labels(&labels, claim_owned))
+}
+
+fn classify_claim_labels(labels: &[String], claim_owned: bool) -> LabelLeg {
+    if crate::work_finder::is_frozen(labels) {
         return LabelLeg::Frozen;
     }
-    if crate::work_finder::is_operator_hold(&labels) {
+    if crate::work_finder::is_operator_hold(labels) {
         return LabelLeg::OperatorHold;
     }
-    let claims = claim_labels_in(&labels);
+    let claims = claim_labels_in(labels);
     let triage = labels
         .iter()
         .any(|l| l == crate::intake_reconcile::TRIAGE_LABEL);
@@ -774,10 +840,10 @@ pub fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
 
 /// `(host, sweep)` from a yield record's first line:
 /// `<!-- loom:lease-yield host=H sweep=S earliest_host=EH earliest_sweep=ES -->`.
-/// Same shape as the publish/fence scripts' parser and
-/// `cli/lease_co_occupancy`'s — only the first line is inspected, and never
-/// the free-form prose after the closing `-->` (`lease-record.md`).
-fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
+/// Same shape as the publish/fence scripts' parser, and shared with
+/// `cli/lease_co_occupancy` (#14580) — only the first line is inspected, and
+/// never the free-form prose after the closing `-->` (`lease-record.md`).
+pub(crate) fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
     let rest = body.lines().next()?.strip_prefix(YIELD_MARKER_PREFIX)?;
     let (host, rest) = rest.split_once(" sweep=")?;
     let sweep = rest.split_whitespace().next()?;
@@ -1341,6 +1407,35 @@ mod tests {
         }
     }
 
+    /// The `from_env` path (`from_parts` with the environment pre-resolved)
+    /// filters the RAW lease identity BEFORE the opaque hash: an unresolved
+    /// chain yields `lease_host: None`. `from_marker` alone cannot catch
+    /// this — `published_host` would hand it an ordinary-looking
+    /// `host-<hex>` that every unresolved host shares, and an owned marker
+    /// would pass a peer's lease as this host's own (#13998).
+    #[test]
+    fn from_env_drops_the_host_of_an_unresolved_raw_chain() {
+        let marker = || Some("20".to_string());
+        assert_eq!(
+            OwnedClaim::from_parts(marker(), crate::host_identity::UNKNOWN_HOST.to_string(), 20,),
+            Some(OwnedClaim { lease_host: None }),
+            "raw unknown-host must yield None, never be hashed into a usable id",
+        );
+        // A resolved chain keeps a published host derived from the argument
+        // it was handed (#14069) — not from whatever this process's own
+        // environment would resolve to.
+        let owned = OwnedClaim::from_parts(marker(), "resolved-host".to_string(), 20);
+        assert_eq!(
+            owned,
+            Some(OwnedClaim {
+                lease_host: Some(crate::cli::pr_lease::published_host_from_raw("resolved-host")),
+            }),
+            "the published host must come from the raw argument",
+        );
+        let other = OwnedClaim::from_parts(marker(), "another-host".to_string(), 20);
+        assert_ne!(owned, other, "different raw hosts must publish different ids");
+    }
+
     /// The daemon pre-claimed the issue and spawned this session: its own
     /// `loom:building`, its own host's lease and its own pushed branch are
     /// not a peer's claim, so the probe answers the all-clear and says why.
@@ -1788,6 +1883,131 @@ mod tests {
 
         let garbage = write_exec(dir.path(), "gh-garbage.sh", "echo 'not json'");
         assert_eq!(read_claim_labels(&garbage, dir.path(), 42), LabelLeg::Unknown);
+
+        // #14775: direct stub-execution evidence — the classifications above
+        // came from a CLI that actually ran, not from a shed answering
+        // `Unknown` before any invocation (the parallel-fixture interference
+        // this test pins down).
+        let ran = dir.path().join("stub-ran");
+        let counting = write_exec(
+            dir.path(),
+            "gh-counting.sh",
+            &format!(
+                r#"echo ran >> '{}'; echo '{{"labels":[{{"name":"loom:issue"}}]}}'"#,
+                ran.display()
+            ),
+        );
+        assert_eq!(read_claim_labels(&counting, dir.path(), 42), LabelLeg::Clean);
+        assert!(ran.is_file(), "the stub itself executed");
+    }
+
+    fn claim_label_fallback(
+        directory: &Path,
+        diagnostic: &str,
+        rest_reply: &str,
+        claim_owned: bool,
+    ) -> LabelLeg {
+        let script = format!(
+            r#"case "$1 $2" in
+  "issue view") printf '%s\n' '{diagnostic}' >&2; exit 1 ;;
+  "api repos/{{owner}}/{{repo}}/issues/42") printf '%s\n' '{rest_reply}' ;;
+  *) exit 76 ;;
+esac"#,
+        );
+        let gh = write_exec(directory, "gh-label-fallback.sh", &script);
+        read_claim_labels_for(&gh, directory, 42, claim_owned)
+    }
+
+    const GRAPHQL_EXHAUSTED: &str =
+        "GraphQL: API rate limit already exceeded for installation ID 1";
+
+    #[test]
+    fn exhausted_graphql_labels_use_the_same_claim_predicates_via_rest() {
+        let dir = tempdir().unwrap();
+        let rest = |payload: &str, owned| {
+            claim_label_fallback(dir.path(), GRAPHQL_EXHAUSTED, payload, owned)
+        };
+        for (payload, expected) in [
+            (
+                r#"{"number":42,"state":"open","labels":[],"pull_request":{}}"#,
+                LabelLeg::IsPullRequest,
+            ),
+            (r#"{"number":42,"state":"closed","labels":[]}"#, LabelLeg::Closed),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:frozen"}]}"#,
+                LabelLeg::Frozen,
+            ),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:operator"}]}"#,
+                LabelLeg::OperatorHold,
+            ),
+            (
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:triage"}]}"#,
+                LabelLeg::AwaitingCurator,
+            ),
+            (r#"{"number":42,"state":"open","labels":[]}"#, LabelLeg::Clean),
+        ] {
+            assert_eq!(rest(payload, false), expected);
+        }
+        for label in ["loom:building", "loom:reviewing", "loom:treating"] {
+            let payload =
+                format!(r#"{{"number":42,"state":"open","labels":[{{"name":"{label}"}}]}}"#);
+            assert_eq!(rest(&payload, false), LabelLeg::Claimed(vec![label.into()]));
+        }
+        assert_eq!(
+            rest(
+                r#"{"number":42,"state":"open","labels":[{"name":"loom:building"},{"name":"loom:triage"}]}"#,
+                true
+            ),
+            LabelLeg::AwaitingCurator
+        );
+    }
+
+    #[test]
+    fn rest_labels_refuse_unreadable_or_incomplete_answers() {
+        let dir = tempdir().unwrap();
+        for payload in [
+            "not json",
+            r#"{"number":43,"state":"open","labels":[]}"#,
+            r#"{"number":42,"labels":[]}"#,
+            r#"{"number":42,"state":"open","labels":[{}]}"#,
+            r#"{"number":42,"state":"open","labels":[],"pull_request":false}"#,
+        ] {
+            assert_eq!(
+                claim_label_fallback(dir.path(), GRAPHQL_EXHAUSTED, payload, false),
+                LabelLeg::Unknown
+            );
+        }
+        let gh = write_exec(
+            dir.path(),
+            "gh-both-limited.sh",
+            r#"case "$1" in
+  issue) echo 'GraphQL: API rate limit exceeded' >&2 ;;
+  *) printf '%s\n' '{"number":42,"state":"open","labels":[]}'
+     echo 'HTTP 403: API rate limit exceeded' >&2 ;;
+esac
+exit 1"#,
+        );
+        assert_eq!(read_claim_labels(&gh, dir.path(), 42), LabelLeg::Unknown);
+    }
+
+    #[test]
+    fn permissions_and_secondary_limits_do_not_try_label_fallback() {
+        let dir = tempdir().unwrap();
+        for diagnostic in [
+            "HTTP 403: Resource not accessible by integration",
+            "GraphQL: You have exceeded a secondary rate limit",
+        ] {
+            assert_eq!(
+                claim_label_fallback(
+                    dir.path(),
+                    diagnostic,
+                    r#"{"number":42,"state":"open","labels":[]}"#,
+                    false,
+                ),
+                LabelLeg::Unknown
+            );
+        }
     }
 
     #[test]

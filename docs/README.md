@@ -17,6 +17,7 @@ as `.loom/docs/`).
 | [`mcp/`](mcp/) | MCP server documentation — see the [MCP README](mcp/README.md) and [loom-terminals](mcp/loom-terminals.md). |
 | [`migration/`](migration/) | Completed-migration history: the [v0.10.0 shepherd deprecation](migration/v0.10.0-shepherd-deprecation.md), the [v0.10.0 daemon rebuild](migration/v0.10.0-daemon-rebuild.md), and [daemon-state consumers](migration/daemon-state-consumers.md). |
 | [`notes/`](notes/) | Ad-hoc technical notes. |
+| [`merge-queue-pilot/`](merge-queue-pilot/) | Desired-state example for the merge queue pilot. |
 | [`observability/`](observability/) | Observability notes — e.g. the [landed-size (LSI) feasibility result](observability/landed-size-dialect-feasibility.md) for SigNoz/ClickHouse queries. |
 | [`philosophy/`](philosophy/) | Essays on agent archetypes, AI code smell, Loom intelligence, working with AI, and [what Loom optimizes for — and when it's the wrong tool](philosophy/latency-vs-reliability.md). |
 | [`research/`](research/) | Evaluations and measurement runbooks — builder/judge fan-out, codecast, dynamic workflows. |

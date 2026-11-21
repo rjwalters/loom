@@ -470,9 +470,14 @@ fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
     iss[0].body = Some("edited".into());
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
     assert!(matches!(&d, Decision::Refuse(m) if m.contains("body changed")), "{d:?}");
-    // The refusal says what was hashed and shows the recipe (#13600).
+    // The refusal says what was hashed and shows the recipe (#13600), and —
+    // since #13992 — names the hash form as a possible cause with the
+    // same-dispatch retry as the first remedy, not "end without a verdict".
     assert!(
-        matches!(&d, Decision::Refuse(m) if m.contains("trailing newlines trimmed")
+        matches!(&d, Decision::Refuse(m) if m.contains("body changed")
+            && m.contains("hash form is wrong")
+            && m.contains("retry in this dispatch")
+            && m.contains("trailing newlines trimmed")
             && m.contains("sha256sum")
             && m.contains("issues/12509")),
         "{d:?}"
@@ -486,6 +491,50 @@ fn trailing_newline_hash_is_accepted_but_edited_body_still_refuses() {
     iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"\n\n")));
     let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
     assert!(matches!(d, Decision::Refuse(_)), "{d:?}");
+}
+
+#[test]
+fn hash_of_a_body_that_itself_ends_in_a_newline_is_accepted() {
+    use sha2::{Digest, Sha256};
+    // #13992: the stored body ends in one newline, so `gh api … --jq .body |
+    // sha256sum` hashes TWO trailing newlines — neither of the two forms the
+    // gate accepted before #13992. That refusal dropped a finished review.
+    let mut iss = [issue(13992, "spec\n", "spec\n", vec![])];
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"spec\n\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    // The raw body hash without jq's newline is accepted the same way.
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"spec\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    // CRLF body: `--jq .body` output keeps the \r, so the hash carries \r\n\n.
+    iss[0].body = Some("spec\r\n".into());
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"spec\r\n\n")));
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    // Uppercase hex is accepted for the double-newline form too.
+    iss[0].body = Some("spec\n".into());
+    iss[0].expected_body_sha = Some(hex::encode(Sha256::digest(b"spec\n\n")).to_ascii_uppercase());
+    let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+    assert!(matches!(d, Decision::Proceed(_)), "{d:?}");
+
+    // A genuinely different body still refuses every form of the old body's hash.
+    iss[0].body = Some("edited\n".into());
+    for hash in [
+        &hex::encode(Sha256::digest(b"spec\n\n"))[..],
+        &hex::encode(Sha256::digest(b"spec\n")),
+        &hex::encode(Sha256::digest(b"spec")),
+    ] {
+        iss[0].expected_body_sha = Some(hash.to_string());
+        let d = gate(VerdictKind::Approved, &[], Some(started()), Some(&iss));
+        assert!(
+            matches!(&d, Decision::Refuse(m) if m.contains("body changed")),
+            "{hash} of the old body must refuse: {d:?}"
+        );
+    }
 }
 
 #[test]

@@ -44,10 +44,11 @@ use std::path::Path;
 use super::capture::{StepEnd, StepOutcomeClass, StepOutcomeLine};
 use crate::observability::lifecycle::{self, roll_interruption, RoleFailure};
 use crate::role_runner::RoleTickOutcome;
+use crate::step_dispatch::outcome_ledger::{self, OutcomeClass, PostState, StepOutcome};
 use crate::step_role::StepRole;
 use crate::sweep_registry::reaper::pid_identity;
 use crate::sweep_registry::{LockOwner, SweepRegistry};
-use crate::telemetry::trace::TraceAttributes;
+use crate::telemetry::trace::{TraceAttributes, TraceContext};
 
 /// Why a step failed, on its `loom.sweep` close. A step whose provider
 /// feedback said its api-key seat was exhausted (`provider_exhausted`,
@@ -118,10 +119,20 @@ pub(crate) fn step_failure(
 
 /// The `loom.result` and close attributes of a step's `loom.sweep` span.
 /// `outcome` is the tick outcome the step's `role_tick.outcome` reports
-/// ([`super::capture::tick_outcome`]), so the two agree. `story_points` are
-/// the step's spawn-time points (#12957), absent when unsized. `pr_number` is
-/// the PR a Builder step opened, absent when it opened none.
-/// `provider_exhausted` reclasses the close (#13966). Pure.
+/// ([`super::capture::tick_outcome`]), so the two agree. `runtime` is the
+/// registry's runtime for the step (#14168, the same fact
+/// `SweepInfo.runtime` records), absent for a legacy entry. `story_points`
+/// are the step's spawn-time points (#12957), absent when unsized.
+/// `pr_number` is the PR a Builder step opened, absent when it opened none.
+/// `provider_exhausted` reclasses the close (#13966). The step's own word on
+/// its work rides `loom.step.outcome.class` / `.reason` (#14168): `none`
+/// with no reason when the step wrote no parseable outcome line, so "no
+/// outcome" is countable per runtime, model and role from the span alone.
+/// `post` is the forge post-state the step's claim release noted before the
+/// close, absent when none was (#14234): with a line and a post-state the
+/// close adds `loom.step.outcome.agrees`, whether the ledger's class for the
+/// two ([`crate::step_dispatch::outcome_ledger::classify`]) is the class the
+/// step claimed. Pure.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_close(
@@ -129,15 +140,32 @@ pub(crate) fn sweep_close(
     line: Option<&StepOutcomeLine>,
     outcome: &RoleTickOutcome,
     role: StepRole,
+    runtime: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
     story_points: Option<u32>,
     pr_number: Option<u32>,
     provider_exhausted: bool,
+    post: Option<PostState>,
 ) -> (String, TraceAttributes) {
     let (result, _) = crate::role_tick_telemetry::classify(outcome);
     let result = crate::role_tick_telemetry::result_label(result);
     let mut close = lifecycle::attributes(&[("loom.role", role.role_name())]);
+    if let Some(runtime) = runtime.filter(|r| !r.is_empty()) {
+        close.insert(
+            crate::observability::lifecycle::role_runtime::RUNTIME.into(),
+            runtime.to_owned(),
+        );
+    }
+    let (outcome_class, outcome_reason) =
+        line.map_or(("none", ""), |l| (l.class.as_str(), l.reason.as_str()));
+    close.insert("loom.step.outcome.class".into(), outcome_class.to_owned());
+    if !outcome_reason.is_empty() {
+        close.insert("loom.step.outcome.reason".into(), outcome_reason.to_owned());
+    }
+    if let (Some(l), Some(post)) = (line, post.filter(|_| !provider_exhausted)) {
+        close.insert("loom.step.outcome.agrees".into(), outcome_agrees(l, post).to_string());
+    }
     for (key, value) in [("loom.configured_model", model), ("loom.effort", effort)] {
         if let Some(value) = value.filter(|v| !v.is_empty()) {
             close.insert(key.into(), value.to_owned());
@@ -160,18 +188,36 @@ pub(crate) fn sweep_close(
     (result, close)
 }
 
+/// Whether the class the ledger derives from `post` is the class the step's
+/// own line claimed (#14234). The ledger's rule is reused, not restated: a
+/// `verdict` claim the forge does not show classifies `failed`, which is a
+/// disagreement. Pure.
+fn outcome_agrees(line: &StepOutcomeLine, post: PostState) -> bool {
+    let claimed = StepOutcome::new(ledger_class(line.class), &line.reason);
+    outcome_ledger::classify(Some(&claimed), Some(post)).class == claimed.class
+}
+
+fn ledger_class(class: StepOutcomeClass) -> OutcomeClass {
+    match class {
+        StepOutcomeClass::Verdict => OutcomeClass::Verdict,
+        StepOutcomeClass::Noop => OutcomeClass::Noop,
+        StepOutcomeClass::Refused => OutcomeClass::Refused,
+        StepOutcomeClass::Failed => OutcomeClass::Failed,
+    }
+}
+
 impl SweepRegistry {
     /// Close a finished step's `loom.sweep` span with its real outcome, at
     /// the moment its end is seen. A step a roll stopped (`pid`, the leader
     /// H4 noted) closes as `interrupted_by_roll` instead. A no-op when
-    /// tracing is off, or when the span was already closed.
+    /// tracing is off. Return the root context for the asynchronous usage capture.
     pub(crate) fn close_step_span(
         &self,
         sweep_id: &str,
         pid: Option<u32>,
         result: String,
         mut close: TraceAttributes,
-    ) {
+    ) -> Option<TraceContext> {
         let result = match pid.and_then(roll_interruption::take_stopped) {
             Some(roll) => {
                 roll.apply(&mut close);
@@ -179,7 +225,28 @@ impl SweepRegistry {
             }
             None => result,
         };
-        lifecycle::finish_execution(&self.config.workspace_root, sweep_id, &result, close);
+        // #14407: this close saw the step end, so the step's phase and attempt
+        // spans mirror it (result + launch runtime) instead of reading
+        // `exit_unobserved`. Not when a roll stopped the step, or when the step
+        // exited with no observed status and no outcome line: those exits were
+        // not observed, and keep the unobserved label.
+        let observed = (result != roll_interruption::RESULT
+            && close.get(lifecycle::FAILURE_CLASS).map(String::as_str) != Some("exit-unobserved"))
+        .then(|| lifecycle::StepEndObserved {
+            result: result.clone(),
+            // The registry's word for the launch; `unknown` is no runtime.
+            runtime: close
+                .get(lifecycle::role_runtime::RUNTIME)
+                .filter(|r| r.as_str() != "unknown")
+                .cloned(),
+        });
+        lifecycle::finish_execution_observing(
+            &self.config.workspace_root,
+            sweep_id,
+            &result,
+            close,
+            observed.as_ref(),
+        )
     }
 }
 

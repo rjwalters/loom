@@ -1,8 +1,7 @@
 //! Observability **export liveness** health-section coverage (#5083 config
 //! errors #5337, first-hop scope #9015).
 //!
-//! A child module of `health::tests` rather than more lines in `tests.rs`,
-//! which is over `.loom/docs/file-size-policy.md`'s threshold and frozen —
+//! A child module of `health::tests` rather than more lines in `tests.rs` —
 //! same split as `section_inventory` and `auto_update_stale_repo`. Pure move
 //! apart from the #9015 test at the end; `use super::*` keeps every fixture
 //! (`now`, `healthy_inputs`) shared with the parent so the
@@ -45,11 +44,10 @@ fn a_healthy_exporter_still_renders_no_observability_section() {
     let report = assess(&inputs);
     assert!(report.section("observability").is_none());
     assert_eq!(report.overall, Verdict::Green);
-    // 13 always-present sections: + `peer_coordination` (#6157),
-    // `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
+    // 12 always-present sections: `role_liveness` (#6201), `stale_sweeps` (#7529), `auto_update`
     // (#7584), `worktree_reaper` (#7590), `pool_hold` (#7990), and
     // `operator_attention` (#8091).
-    assert_eq!(report.sections.len(), 13);
+    assert_eq!(report.sections.len(), 12);
 }
 
 #[test]
