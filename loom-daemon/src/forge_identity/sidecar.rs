@@ -114,6 +114,7 @@ pub(super) fn publish(
             owner: owner.to_ascii_lowercase(),
             role: SidecarRole::Reader,
             expires_at: expires_at.to_string(),
+            scoped: None,
         },
     )
 }

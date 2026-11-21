@@ -714,7 +714,8 @@ pub fn role_record(
             // #12027: read by `step_verdict`, not by the pick record.
             JournalEntry::Marker { .. }
             | JournalEntry::Applied { .. }
-            | JournalEntry::Hold { .. } => {}
+            | JournalEntry::Hold { .. }
+            | JournalEntry::Released { .. } => {}
         }
     }
     // Decisions are observed when the agent ran with a journal that was read

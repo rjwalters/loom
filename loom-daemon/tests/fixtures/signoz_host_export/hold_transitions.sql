@@ -3,7 +3,7 @@
 -- nanoseconds because the CLI inlines the window bounds; the replay builds
 -- its statement around the exact [1000000000, 5000000000) window below.
 -- Same DDL as fixture.sql: `timestamp` is UInt64 ns.
--- Columns: timestamp ns, loom.repo, loom.kind, loom.hold.reason_code, body.
+-- Columns: timestamp ns, loom.repo, loom.kind, loom.hold.reason_code, confidence.
 
 CREATE DATABASE IF NOT EXISTS signoz_logs;
 
@@ -21,19 +21,20 @@ CREATE TABLE signoz_logs.distributed_logs_v2
 INSERT INTO signoz_logs.distributed_logs_v2
     (timestamp, observed_timestamp, body, attributes_string, attributes_number,
      attributes_bool, resources_string)
-SELECT ts, 0, body,
+SELECT ts, 0, 'unused body',
        map('loom.kind', kind, 'loom.repo', repo, 'loom.hold.reason_code', code),
-       map(), map(), map()
-FROM values('ts UInt64, repo String, kind String, code String, body String',
-    -- in the window, matching repo and reason_code (kept)
-    (2000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', '{"pr":42}'),
-    -- right reason, wrong repo: dropped by the bound repo param
-    (2500000000, 'o/two', 'hold.transition', 'merge-risk-self-release', '{"pr":7}'),
-    -- right repo, wrong reason: dropped by the bound reason_code param
-    (3000000000, 'o/one', 'hold.transition', 'merge-risk-pass', '{"pr":8}'),
-    -- wrong kind: dropped by the loom.kind filter
-    (3500000000, 'o/one', 'sweep.event', 'merge-risk-self-release', '{"pr":9}'),
-    -- window edges: since is inclusive, until exclusive
-    (1000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', '{"pr":10}'),
-    (5000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', '{"pr":11}')
+       if(isNull(confidence), map(), map('loom.hold.confidence_pct', assumeNotNull(confidence))),
+       map(), map()
+FROM values('ts UInt64, repo String, kind String, code String, confidence Nullable(Float64)',
+    -- In the window, matching repo and reason (kept by both statements).
+    (2000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', 93),
+    -- Wrong repo and wrong reason are both kept only by the all-reasons statement.
+    (2500000000, 'o/two', 'hold.transition', 'merge-risk-self-release', NULL),
+    (3000000000, 'o/one', 'hold.transition', 'merge-risk-pass', 80),
+    -- Wrong kind is dropped even when the repo and reason match.
+    (3500000000, 'o/one', 'sweep.event', 'merge-risk-self-release', 20),
+    -- Inclusive since and exclusive until. Zero is distinct from absent confidence.
+    ( 999999999, 'o/one', 'hold.transition', 'merge-risk-self-release', 12),
+    (1000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', 0),
+    (5000000000, 'o/one', 'hold.transition', 'merge-risk-self-release', 26)
 );

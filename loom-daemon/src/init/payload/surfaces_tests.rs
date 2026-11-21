@@ -114,10 +114,15 @@ fn current_workspace(root: &Path, defaults: &Path) -> PathBuf {
     }
     write(&ws.join(".loom/CLAUDE.md"), &rendered_guide("claude", 1, DATE));
     write(&ws.join(".loom/AGENTS.md"), &rendered_guide("agents", 1, DATE));
+    // The root package.json stub must exist BEFORE the .gitignore refresh:
+    // the stub's presence is what adds the #13898 pnpm-artifact entries to
+    // the managed block, so seeding it after would leave the fixture's block
+    // one refresh behind (the same ordering `initialize_workspace_with_mode`
+    // guarantees on a real install).
+    write(&ws.join("package.json"), "{\"name\": \"loom-workspace\", \"version\": \"1\"}\n");
     crate::init::update_gitignore(&ws).unwrap();
     // Repo-owned files no resync may touch.
     write(&ws.join(".loom/config.json"), "{\"repo\": true}\n");
-    write(&ws.join("package.json"), "{\"name\": \"loom-workspace\", \"version\": \"1\"}\n");
     write(&ws.join("CLAUDE.md"), "**Loom Version**: 0.1\nrepo guide\n");
     write(&ws.join(".gitattributes"), "*.bin binary\n");
     ws
@@ -712,19 +717,19 @@ fn hook_wiring_surface_wires_idempotently_and_skips_non_json() {
     write(&settings, "{}");
 
     let (mut shipped, mut skipped) = (BTreeSet::new(), Vec::new());
-    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    stage_extras(defaults.path(), stage.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
     assert!(shipped.contains(".claude/settings.json"), "{shipped:?}");
     let first = read(&settings);
     assert!(first.contains("${CLAUDE_PROJECT_DIR}/.loom/hooks/gh-front-env.sh"));
     assert!(!first.contains("skill-router.sh"), "absent script must not be wired");
 
     let (mut shipped, mut skipped) = (BTreeSet::new(), Vec::new());
-    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    stage_extras(defaults.path(), stage.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
     assert!(!shipped.contains(".claude/settings.json"));
     assert_eq!(read(&settings), first);
 
     write(&settings, "not json");
-    stage_extras(defaults.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
+    stage_extras(defaults.path(), stage.path(), stage.path(), &mut shipped, &mut skipped).unwrap();
     assert_eq!(read(&settings), "not json");
     assert!(skipped.iter().any(|s| s.path == ".claude/settings.json"));
 }

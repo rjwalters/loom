@@ -43,6 +43,7 @@ pub mod table;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod test_server;
+pub mod tokens_refresh;
 pub mod worker;
 
 /// A fresh server epoch: changes on every start, so a worker can tell its

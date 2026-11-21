@@ -151,6 +151,8 @@ pub const ENDPOINT_ENV: &str = "LOOM_OBSERVABILITY_ENDPOINT";
 pub const INGEST_KEY_FILE_ENV: &str = "LOOM_OBSERVABILITY_INGEST_KEY_FILE";
 /// `observability.batchSize` env override.
 pub const BATCH_SIZE_ENV: &str = "LOOM_OBSERVABILITY_BATCH_SIZE";
+/// `observability.maxBatchBytes` and per-exporter byte-limit env override.
+pub const MAX_BATCH_BYTES_ENV: &str = "LOOM_OBSERVABILITY_MAX_BATCH_BYTES";
 /// `observability.flushIntervalSecs` env override.
 pub const FLUSH_INTERVAL_SECS_ENV: &str = "LOOM_OBSERVABILITY_FLUSH_INTERVAL_SECS";
 /// `observability.queueCapacity` env override.
@@ -158,8 +160,10 @@ pub const QUEUE_CAPACITY_ENV: &str = "LOOM_OBSERVABILITY_QUEUE_CAPACITY";
 /// `observability.exporter` env override (#4858) — `"https"` or `"otlp"`.
 pub const EXPORTER_ENV: &str = "LOOM_OBSERVABILITY_EXPORTER";
 
-/// Default batch size (envelopes per HTTP POST) when unset at every tier.
+/// Default number of queued envelopes considered per flush.
 pub const DEFAULT_BATCH_SIZE: usize = 50;
+/// Default maximum bytes of encoded OTLP JSON per HTTP POST.
+pub const DEFAULT_MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
 /// Default flush interval when unset at every tier.
 pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 30;
 /// Default queue capacity when unset at every tier.
@@ -178,6 +182,7 @@ pub struct ObservabilityConfig {
     pub endpoint: Option<String>,
     pub ingest_key_file: Option<String>,
     pub batch_size: Option<usize>,
+    pub max_batch_bytes: Option<usize>,
     pub flush_interval_secs: Option<u64>,
     pub queue_capacity: Option<usize>,
     /// Raw `observability.exporter` string, resolved by [`resolve_exporters`]
@@ -209,6 +214,7 @@ pub struct ObservabilityConfig {
 /// posture) plus an optional per-exporter endpoint override.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawExporterEntry {
+    pub max_batch_bytes: Option<usize>,
     pub kind: String,
     /// Per-exporter endpoint; `None` ⇒ this entry uses the shared
     /// `observability.endpoint`.
@@ -224,6 +230,7 @@ pub struct RawExporterEntry {
 /// per-entry endpoint override carried through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExporterEntry {
+    pub max_batch_bytes: usize,
     pub kind: ExporterKind,
     /// Per-exporter endpoint override; `None` ⇒ use the shared
     /// `observability.endpoint`.
@@ -298,6 +305,7 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
             .and_then(serde_json::Value::as_u64)
             .and_then(|v| usize::try_from(v).ok())
             .filter(|v| *v > 0),
+        max_batch_bytes: block.get("maxBatchBytes").and_then(positive_json_usize),
         flush_interval_secs: block
             .get("flushIntervalSecs")
             .and_then(serde_json::Value::as_u64)
@@ -329,6 +337,12 @@ pub fn read_config(root: &Path) -> ObservabilityConfig {
     }
 }
 
+fn positive_json_usize(value: &serde_json::Value) -> Option<usize> {
+    usize::try_from(value.as_u64()?)
+        .ok()
+        .filter(|value| *value > 0)
+}
+
 /// Parse the `observability.exporters` array (Issue #8756). Each element is
 /// either a bare kind string (`"https"`) or an object `{"kind": "otlp",
 /// "endpoint": "…", "headers_file": "…"}` (`headersFile` is accepted as an
@@ -342,6 +356,7 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
         .iter()
         .filter_map(|entry| match entry {
             serde_json::Value::String(kind) => Some(RawExporterEntry {
+                max_batch_bytes: None,
                 kind: kind.clone(),
                 endpoint: None,
                 headers_file: None,
@@ -360,6 +375,7 @@ fn parse_raw_exporters(value: &serde_json::Value) -> Option<Vec<RawExporterEntry
                     .find_map(|key| fields.get(*key))
                     .map(|value| value.as_str().unwrap_or_default().to_string());
                 Some(RawExporterEntry {
+                    max_batch_bytes: fields.get("maxBatchBytes").and_then(positive_json_usize),
                     kind,
                     endpoint,
                     headers_file,
@@ -628,6 +644,7 @@ pub fn global_export_queue_stats(
 pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
     let raw: Vec<RawExporterEntry> = if let Some(env) = env_nonempty(EXPORTER_ENV) {
         vec![RawExporterEntry {
+            max_batch_bytes: None,
             kind: env,
             endpoint: None,
             headers_file: None,
@@ -639,12 +656,17 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
             .exporter
             .iter()
             .map(|singular| RawExporterEntry {
+                max_batch_bytes: None,
                 kind: singular.clone(),
                 endpoint: None,
                 headers_file: None,
             })
             .collect()
     };
+    let env_max_batch_bytes = std::env::var(MAX_BATCH_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
     let mut resolved: Vec<ExporterEntry> = Vec::with_capacity(raw.len());
     for entry in raw {
         match ExporterKind::parse_lenient(&entry.kind) {
@@ -657,6 +679,10 @@ pub fn resolve_exporters(config: &ObservabilityConfig) -> Vec<ExporterEntry> {
                     );
                 } else {
                     resolved.push(ExporterEntry {
+                        max_batch_bytes: env_max_batch_bytes
+                            .or(entry.max_batch_bytes.filter(|value| *value > 0))
+                            .or(config.max_batch_bytes.filter(|value| *value > 0))
+                            .unwrap_or(DEFAULT_MAX_BATCH_BYTES),
                         kind,
                         endpoint: entry.endpoint,
                         headers_file: entry.headers_file,
@@ -942,10 +968,11 @@ pub fn spawn_task(
                 // `misconfigured` detail (path and line only). The ingest key
                 // is `None` when no surviving entry needed one (#11555): the
                 // file's headers are then this entry's whole authentication.
-                match otlp::OtlpExporter::with_headers_file(
+                match otlp::OtlpExporter::with_max_batch_bytes(
                     endpoint.clone(),
                     ingest_key.clone(),
                     entry.headers_file.as_deref(),
+                    entry.max_batch_bytes,
                 ) {
                     Ok(exporter) => sender::spawn_task(
                         queue.clone(),

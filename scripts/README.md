@@ -19,6 +19,7 @@ the same set CI's `Structural Checks` job runs.
 |--------|--------|
 | `check-structural.sh` | Runs all structural gates before anything expensive |
 | `check-dangling-links.sh` | Relative markdown links resolve |
+| `check-docs-index.sh` | `docs/README.md` indexes every `docs/` dir, top-level doc and `design/` note |
 | `check-doc-tocs.sh` | Generated TOCs in large docs (`--fix` regenerates; not run in CI) |
 | `check-hooks-defaults-parity.sh` | `defaults/hooks`/`scripts` vs installed copies |
 | `check-agents-md-sync.sh` | `defaults/.loom/AGENTS.md` is not stale |
@@ -38,7 +39,7 @@ the same set CI's `Structural Checks` job runs.
 | `setup-mcp.sh` | Demoted MCP bundle-rebuild / legacy-migration tool |
 | `version.sh` | Keep all version-bearing files in sync (release path only; never in a PR) |
 | `changelog.sh` | Generate/verify Keep-a-Changelog entries |
-| `test-installer.sh`, `test-install-local-mode.sh`, `test-migrate-consumer.sh`, `test-changelog.sh`, `test-daemon-liveness.sh` | Tests for the above |
+| `test-installer.sh`, `test-install-local-mode.sh`, `test-install-repo-only.sh`, `test-migrate-consumer.sh`, `test-changelog.sh`, `test-daemon-liveness.sh` | Tests for the above |
 
 ### Development / maintenance
 

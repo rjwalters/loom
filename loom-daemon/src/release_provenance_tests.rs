@@ -39,9 +39,10 @@ fn an_unstamped_build_is_never_a_release_and_never_asks_the_forge() {
         asked.set(asked.get() + 1);
         Ok(COMMIT.to_string())
     };
-    let found = checker.ensure(t0(), INTERVAL, &api);
+    let (found, attempt) = checker.ensure_with_attempt(t0(), INTERVAL, &api);
     assert!(matches!(found, Provenance::NotStamped(_)), "{found:?}");
     assert!(found.refuted());
+    assert_eq!(attempt, None);
     assert_eq!(asked.get(), 0);
 }
 
@@ -73,7 +74,7 @@ fn a_stamp_set_by_hand_on_another_commit_is_refuted_for_good() {
         asked.set(asked.get() + 1);
         Ok(COMMIT.to_string())
     };
-    let found = checker.ensure(t0(), INTERVAL, &api);
+    let (found, attempt) = checker.ensure_with_attempt(t0(), INTERVAL, &api);
     assert_eq!(
         found,
         Provenance::Mismatch {
@@ -81,7 +82,11 @@ fn a_stamp_set_by_hand_on_another_commit_is_refuted_for_good() {
         }
     );
     assert!(found.refuted());
-    checker.ensure(t0() + ChronoDuration::hours(5), INTERVAL, &api);
+    assert_eq!(attempt, Some(1));
+    assert_eq!(
+        checker.ensure_with_attempt(t0() + ChronoDuration::hours(5), INTERVAL, &api),
+        (found, None)
+    );
     assert_eq!(asked.get(), 1, "a mismatch is final");
 }
 
@@ -100,7 +105,8 @@ fn a_failed_lookup_is_unverified_and_retried_with_backoff() {
     };
     let at = |secs: i64| t0() + ChronoDuration::seconds(secs);
     // First failure: retry one interval later.
-    let found = checker.ensure(at(0), INTERVAL, &api);
+    let (found, attempt) = checker.ensure_with_attempt(at(0), INTERVAL, &api);
+    assert_eq!(attempt, Some(1));
     let Provenance::Unverified { why, retry_at } = &found else {
         panic!("{found:?}");
     };
@@ -108,13 +114,14 @@ fn a_failed_lookup_is_unverified_and_retried_with_backoff() {
     assert_eq!(*retry_at, Some(at(60)));
     assert!(!found.refuted());
     // Not due yet: no lookup.
-    checker.ensure(at(59), INTERVAL, &api);
+    assert_eq!(checker.ensure_with_attempt(at(59), INTERVAL, &api), (found, None));
     assert_eq!(asked.get(), 1);
     // Second failure doubles the wait, the third doubles it again.
-    checker.ensure(at(60), INTERVAL, &api);
+    assert_eq!(checker.ensure_with_attempt(at(60), INTERVAL, &api).1, Some(2));
     checker.ensure(at(179), INTERVAL, &api);
     assert_eq!(asked.get(), 2);
-    let third = checker.ensure(at(180), INTERVAL, &api);
+    let (third, attempt) = checker.ensure_with_attempt(at(180), INTERVAL, &api);
+    assert_eq!(attempt, Some(3));
     assert_eq!(asked.get(), 3);
     assert!(matches!(third, Provenance::Unverified { retry_at, .. } if retry_at == Some(at(420))));
     // The wait is capped: walk the backoff well past the cap, then measure
@@ -137,7 +144,14 @@ fn a_failed_lookup_is_unverified_and_retried_with_backoff() {
     assert_eq!(retry_at - last, ChronoDuration::from_std(RETRY_CAP).unwrap());
     // The forge comes back: verified on the next due lookup.
     up.set(true);
-    assert_eq!(checker.ensure(retry_at, INTERVAL, &api), Provenance::Verified);
+    assert_eq!(
+        checker.ensure_with_attempt(retry_at, INTERVAL, &api),
+        (Provenance::Verified, Some(before + 2))
+    );
+    assert_eq!(
+        checker.ensure_with_attempt(retry_at + ChronoDuration::hours(1), INTERVAL, &api),
+        (Provenance::Verified, None)
+    );
 }
 
 /// The build under test is a CI or developer build of a branch: it carries no

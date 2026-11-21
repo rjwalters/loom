@@ -44,6 +44,7 @@
 
 pub mod authz;
 pub mod clear_gate;
+mod closed_issue_claims;
 pub mod events;
 pub mod forge;
 pub mod gh_lifecycle;
@@ -59,6 +60,7 @@ pub mod ops;
 pub mod preflight;
 pub mod removal;
 pub mod status_command;
+pub mod status_route;
 
 use std::path::PathBuf;
 

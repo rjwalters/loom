@@ -143,6 +143,7 @@ github = { commands = [
   "gh run view",
 ], routes = [
   "GET repos/{owner}/{repo}/actions/runs?head_sha={sha}",
+  "GET repos/{owner}/{repo}/actions/workflows/{id}/runs",
 ] }
 platform_support = "unknown"
 adapter_coverage = "partial"
@@ -163,6 +164,9 @@ path = "loom-daemon/src/gh_state_probe.rs"
 [[operation.callers]]
 kind = "script"
 path = "scripts/ci-image-inputs.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/ci_docs_only/proof.rs"
 
 [[operation]]
 id = "ci.stale-check-freshness"
@@ -457,6 +461,7 @@ risk = "high"
 high_risk_cases = ["revoked-permissions"]
 github = { commands = [], routes = [
   "GET repos/{owner}/{repo}/rules/branches/{branch}",
+  "GET repos/{owner}/{repo}/rulesets/{id}",
   "GET repos/{owner}/{repo}/branches/{branch}/protection",
   "GET repos/{owner}/{repo}",
 ] }
@@ -477,6 +482,9 @@ path = "loom-daemon/src/branch_update.rs"
 [[operation.callers]]
 kind = "script"
 path = "defaults/scripts/land-resync-commit.sh"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/cli/ci_docs_only/proof.rs"
 
 [[operation]]
 id = "protection.write-rulesets"

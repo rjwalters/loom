@@ -85,6 +85,10 @@ pub struct Request {
     /// only (the daemon's routing gate); `spawn-codex.sh` passes the flag
     /// only after a container proof.
     pub container: Option<Container>,
+    /// The one command Loom's entry must carry. `None` is the host-mode
+    /// workspace-independent [`SHARED_COMMAND`]; a private-clone session
+    /// registers its image-owned bridge instead (#14105), so it names that.
+    pub command: Option<String>,
 }
 
 /// A session container and the docker binary that reaches it.
@@ -107,26 +111,59 @@ pub struct Seal {
 /// Whenever any hook source other than Loom's sealed entry could run, or a
 /// source cannot be read or parsed.
 pub fn vet(codex_home: &Path, runtime_home: &Path, request: &Request) -> Result<Seal, String> {
+    require_session_home(runtime_home)?;
+    let launch = request
+        .launch_dir
+        .as_deref()
+        .ok_or("no launch directory was named, so project-layer hook sources cannot be vetted")?;
+    let seal = vet_registration(codex_home, runtime_home, request)?;
+    vet_project_layers(launch)?;
+    Ok(seal)
+}
+
+/// Everything [`vet`] proves except the project layers: the profile controls
+/// and the launch's argv. A caller that cannot see the clone Codex will start
+/// in (the host, for a private clone that lives on a docker volume, #14105)
+/// uses this, and the party that can see the clone runs
+/// [`vet_project_layers`] on it before any waiver is passed. `request`'s
+/// `launch_dir` and `container` are not consulted.
+///
+/// # Errors
+/// As [`vet`], minus the project layers.
+pub fn vet_profile(
+    codex_home: &Path,
+    runtime_home: &Path,
+    request: &Request,
+) -> Result<Seal, String> {
+    require_session_home(runtime_home)?;
+    vet_registration(codex_home, runtime_home, request)
+}
+
+fn require_session_home(runtime_home: &Path) -> Result<(), String> {
     if runtime_home != Path::new(SESSION_CODEX_HOME) {
         return Err("the trust waiver is only used inside a hardened session container; this \
                     launch runs on the host, where recorded hook trust is required"
             .into());
     }
-    let launch = request
-        .launch_dir
-        .as_deref()
-        .ok_or("no launch directory was named, so project-layer hook sources cannot be vetted")?;
+    Ok(())
+}
+
+fn vet_registration(
+    codex_home: &Path,
+    runtime_home: &Path,
+    request: &Request,
+) -> Result<Seal, String> {
+    let command = request.command.as_deref().unwrap_or(SHARED_COMMAND);
     let mut bytes = BTreeMap::new();
     for name in PROFILE_CONTROLS {
         let read = std::fs::read(codex_home.join(name))
             .map_err(|_| format!("the profile's {name} is missing or unreadable"))?;
         bytes.insert(name, read);
     }
-    let hooks = vet_hooks_json(&bytes["hooks.json"])?;
-    vet_receipt(&bytes[RECEIPT])?;
+    let hooks = vet_hooks_json_for(&bytes["hooks.json"], command)?;
+    vet_receipt(&bytes[RECEIPT], command)?;
     vet_user_config(&bytes["config.toml"], &hooks, runtime_home)?;
     vet_session_flags(&request.codex_args)?;
-    vet_project_layers(launch)?;
     Ok(Seal {
         controls: bytes
             .into_iter()
@@ -176,6 +213,14 @@ struct Handler {
 /// # Errors
 /// On any byte that is not Loom's entry.
 pub fn vet_hooks_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    vet_hooks_json_for(bytes, SHARED_COMMAND)
+}
+
+/// [`vet_hooks_json`] for a registration whose one command is `command`.
+///
+/// # Errors
+/// On any byte that is not Loom's entry carrying exactly `command`.
+pub fn vet_hooks_json_for(bytes: &[u8], command: &str) -> Result<serde_json::Value, String> {
     let file: HooksFile = serde_json::from_slice(bytes).map_err(|_| {
         let installed = serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
@@ -201,8 +246,8 @@ pub fn vet_hooks_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
     let [handler] = group.hooks.as_slice() else {
         return Err("Loom's PreToolUse group carries more than Loom's one handler".into());
     };
-    if handler.kind != "command" || handler.command != SHARED_COMMAND {
-        return Err("the managed handler is not Loom's workspace-independent command".into());
+    if handler.kind != "command" || handler.command != command {
+        return Err("the managed handler is not Loom's registered command".into());
     }
     if !(MIN_TIMEOUT..=MAX_TIMEOUT).contains(&handler.timeout) {
         return Err(format!(
@@ -213,11 +258,11 @@ pub fn vet_hooks_json(bytes: &[u8]) -> Result<serde_json::Value, String> {
 }
 
 /// The receipt pins Loom's command.
-fn vet_receipt(bytes: &[u8]) -> Result<(), String> {
+fn vet_receipt(bytes: &[u8], command: &str) -> Result<(), String> {
     let receipt: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| "the managed-hook receipt is not JSON")?;
     if receipt["loomManagedHook"]["commandSha256"].as_str()
-        != Some(sha256_hex(SHARED_COMMAND.as_bytes()).as_str())
+        != Some(sha256_hex(command.as_bytes()).as_str())
     {
         return Err("the managed-hook receipt does not pin Loom's command".into());
     }

@@ -93,6 +93,7 @@ test-worktree-lease-co-occupancy.sh  Needs a built loom-daemon: worktree.sh's sh
 # runs as its own direct step in ci.yml and/or build-gate.sh; excluded here
 # (rather than wired) to avoid double-running it via run-ci-suites.sh.
 scripts/test-install-local-mode.sh  Already wired directly in ci.yml's "Installer local/gitignore mode" step and build-gate.sh; excluded here to avoid double-running it.
+scripts/test-install-repo-only.sh  Already runs in the "Installer Integration Tests" job in ci.yml.
 scripts/test-installer.sh  Already wired directly in ci.yml's "Installer Integration Tests" job and build-gate.sh; excluded here to avoid double-running it.
 scripts/test-migrate-consumer.sh  Already wired directly in ci.yml's "migrate-consumer" step and build-gate.sh; excluded here to avoid double-running it.
 scripts/test-daemon-liveness.sh  Runs in the post-Builder buildGate (.loom/config.json -> bash .loom/scripts/build-gate.sh) on a BUILDER'S HOST, not in CI — no workflow invokes build-gate.sh (#8069). Left unwired here on purpose: it spawns a decoy process named `loom-daemon` to prove `pgrep -x` rejects what `pgrep -f` accepts (#5548), so wiring it into run-ci-suites.sh should go with a deliberate LIVE_DAEMON_GUARDED_SUITES decision rather than riding along with this change.

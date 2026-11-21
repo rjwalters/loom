@@ -310,6 +310,9 @@ pub enum GhCompletion {
         owner: String,
         resource: crate::forge_bucket_book::Resource,
         until: std::time::SystemTime,
+        /// A gate read exhausted its primary GraphQL reader budget.
+        /// Other sheds give no evidence that another transport can read.
+        graphql_budget_exhausted: bool,
     },
     /// Not run (#12641): the work-finder tick stopped this read (deadline
     /// passed, or discovery ended). No request was sent and no reader budget

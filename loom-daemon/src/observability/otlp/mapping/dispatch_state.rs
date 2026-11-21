@@ -94,6 +94,7 @@ mod tests {
             step: Some("champion_merge".into()),
             in_pool: false,
             exclusion: Some("cooling_down".into()),
+            operator_hold_issue: None,
             gate_until: Some(now),
             reeval_rung: Some(2),
             reeval_next: Some(now),

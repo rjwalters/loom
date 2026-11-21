@@ -422,6 +422,8 @@ pub struct SweepRegistry {
     ///
     /// [`reconstruct`]: SweepRegistry::reconstruct
     children: BTreeMap<SweepId, Child>,
+    /// Pending typed results from this daemon's own step launches.
+    launch_rejections: BTreeMap<SweepId, crate::worker_spawn::rejection::Receiver>,
     /// Optional event bus for lifecycle events (Issue #3453, Phase B).
     /// When `None`, the registry behaves identically to Phase A — bus
     /// emission is best-effort and never blocks core dispatch/reaper
@@ -1052,6 +1054,7 @@ impl SweepRegistry {
             config,
             entries: BTreeMap::new(),
             children: BTreeMap::new(),
+            launch_rejections: BTreeMap::new(),
             bus: None,
             dispatch_stagger: Duration::ZERO,
             last_spawn_at: None,

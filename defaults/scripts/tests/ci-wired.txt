@@ -133,6 +133,7 @@ test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
 test-guide-awaiting-revision-park.sh
 test-guide-blocked-unblock-limit.sh
+test-guide-pr-unblock-conflict-handoff.sh
 test-guide-operator-hold-exclude.sh
 test-guide-plan-body-stable-sort.sh
 test-guide-pool-pressure-defer.sh
@@ -141,7 +142,7 @@ test-guide-pool-pressure-defer.sh
 test-guide-post-stage-hook.sh
 test-guide-superseding-block-merge-state.sh
 test-guide-work-log-rotation.sh
-test-guide-unblock-merged-blocker.sh
+test-guide-unblock-open-crossrepo.sh
 test-guide-split-parent-unblock.sh
 test-guide-skip-docs.sh
 test-guide-work-log-debounce.sh
@@ -218,6 +219,7 @@ test-resync-installed-dogfood-symlink.sh
 test-resync-installed-stamp.sh
 test-resync-installed-agents-md-create.sh
 test-resync-installed-output-staging.sh
+test-resync-installed-source.sh
 test-resync-installed.sh
 test-resync-installed-payload-fallback.sh
 test-review-feedback-reconciliation.sh
@@ -246,6 +248,7 @@ test-sweep-lease-renew.sh
 test-sweep-lease-renew-lifecycle.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sweep-sibling-no-arguments-placeholder.sh
 test-sweep-wave-judge-done-staleness.sh
 test-sync-labels-check.sh
 test-sync-labels-migrate-retired.sh

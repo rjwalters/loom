@@ -1172,6 +1172,7 @@ impl SweepRegistry {
 )]
 mod tests {
     use super::*;
+    use crate::env_test_support::EnvGuard;
     use crate::sweep_registry::test_support::*;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
@@ -2527,7 +2528,7 @@ exit 0
         // process-wide for the daemon, #4458) and the assertion below fails
         // even though the no-op production behavior it exercises is
         // unaffected.
-        let _env_guard = ClearedGhConfigDirEnv::new();
+        let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
         crate::credential_preflight::clear_owner_root_registry();
         let dir = tempdir().unwrap();
         let gh_log = dir.path().join("gh.log");

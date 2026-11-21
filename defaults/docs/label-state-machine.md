@@ -361,7 +361,39 @@ comments and markers stay untrusted everywhere (`forge trusted-comments`, verdic
 hold markers, PRs and non-tracker issues).
 
 Adoption is a trusted maintainer applying `loom:issue` by hand, or re-filing the
-issue; an automated Champion verdict alone is not adoption. Trusted authors see no
+issue; an automated Champion verdict alone is not adoption. **An adoption persists
+(#13578) as the body was adopted:** for an `UNTRUSTED` author, `promotion-author`
+also reads the issue timeline and returns `TRUSTED` (detail on stderr) while a
+maintainer's adoption stands, so landed-route re-curation does not re-arm the gate.
+
+- **Who can adopt** (operator ruling 20261116-r15 q48). Only a human account (the
+  forge reports its type as `User`) that is allow-listed (`forge.trustedCommenters`
+  or the fleet admin roster) or has write access or better on the repository
+  (`admin`, `maintain` or `write` from the collaborator-permission lookup; timeline
+  actors carry no association). A `loom:issue` applied by an App or bot is never an
+  adoption, the fleet's own included, whatever the trust policy says about that
+  actor's comments. Nor is one applied by a human without write access, the author
+  included.
+- **What ends it: the label is withdrawn.** An `unlabeled loom:issue` event after
+  the latest adoption ends it, unless it is a move of the state machine: the *same
+  actor* also applied `loom:building` (a Builder claim) or `loom:triage` (the
+  landed-route or a rescope) within 30 seconds of the removal, and that actor is
+  trusted (a fleet identity or a maintainer). A bare removal, a removal whose
+  successor label came from another actor, and a removal paired with any other
+  label (`loom:blocked`, `loom:curated`, ...) are withdrawals, whoever makes them.
+  `merge-pr.sh` stripping `loom:issue` from an issue its merge closes is therefore a
+  withdrawal too: a closed issue that is reopened is adopted again by hand.
+- **What ends it: the body changes** (operator ruling r7-q6). Adoption covers the
+  body as adopted. The timeline carries no body edits, so the edit history (GraphQL
+  `userContentEdits`, `editedAt` and `editor`) is compared with the latest adoption,
+  and an edit at or after it by an editor outside the trust policy returns
+  `UNTRUSTED`. An edit by a trusted actor does not.
+- **What restores it.** A later `loom:issue` applied by a maintainer. Nothing else.
+- **Fail closed.** An unreadable timeline or edit history, a repository that cannot
+  be resolved to a real `owner/name`, a removal whose time cannot be read, or an
+  edit whose time or editor cannot be read keeps `UNTRUSTED`.
+
+Trusted authors see no
 change. This is admission control for external submissions, not protection against
 a compromised trusted agent, and it adds no signed decisions or keys.
 
@@ -377,6 +409,14 @@ a compromised trusted agent, and it adds no signed decisions or keys.
   leaves every pattern, and respect a human's hand-removal at the held diff.
 - **Queues** — `pr-queue --role champion` keeps `loom:pr` + `loom:blocked`
   (and no other park); Judge's and Doctor's queues drop every park.
+- **Base conflicts after a foreign park clears (#14810)** — Guide applies
+  `loom:changes-requested` and `loom:merge-conflict`, confirms those labels and
+  the current conflict and exact blocked-label episode, then removes
+  `loom:review-requested` and `loom:blocked`. Doctor takes the PR in its
+  existing conflict lane. Named blockers must all be terminal. A reason-only
+  park needs evidence for its exact cause, head, and blocked-label episode.
+  Explicit holds, Loom stack bases, unverified state, and disabled conflict
+  routing retain the park. See [Guide's PR unblock sweep](park-record.md#the-unblock-sweeps-pr-side-functions).
 - **The stale-verdict machinery** (`verdict-staleness-guard.sh`,
   `reconcile_pr_verdicts`) reports a moved head as stale but does not clear a
   verdict on a PR carrying any hold (`loom:blocked`, `loom:operator`,

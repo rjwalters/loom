@@ -587,8 +587,8 @@ instruction-file set (e.g. Codex reads `AGENTS.md` + `.codex/` config); it must
   `defaults/.agents/skills/loom-<name>/SKILL.md` for every
   `defaults/roles/<name>.md`, each carrying `name: loom-<name>` /
   `description:` frontmatter plus a `<!-- loom-managed-skill -->` ownership
-  marker (CI `scripts/check-agent-skills-sync.sh` fails if a checked-in file is
-  stale). Install/resync tooling gates every overwrite on that marker's
+  marker (CI `loom-daemon generate-agent-skills --check` fails if a checked-in
+  file is stale). Install/resync tooling gates every overwrite on that marker's
   presence in the destination file, so a consumer-authored or hand-detached
   `SKILL.md` at the same path is left alone and logged, never silently reaped.
 

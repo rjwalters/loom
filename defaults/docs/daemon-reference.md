@@ -3692,7 +3692,22 @@ the table below is not exhaustive — `stale_sweeps`
 (#7708/#7990), and `transcript_ingest` (#8477) also always render, each
 documented at its own point in this file. `tmpfs_visibility` (#8572, split
 from #8512) is **conditional** — see "tmpfs/`shared`-RAM + OOM-kill
-visibility" below. `review_role_pins` (#11970) is conditional too: a
+visibility" below. `owner_drift` (#14223) is conditional too, in its own
+sense — appended whenever its collection ran (Green when clean), **no
+section at all** when the daemon did not answer (unknown, not an
+all-clear). It is collected client-side by the `loom-daemon health` CLI
+itself (collection step 14, `loom-daemon/src/cli/health.rs`: bounded
+`git remote` reads over the daemon-reported roots plus one cached
+`GET repos/{nwo}` per distinct repo); the in-daemon `/health` route never
+renders it — `serve.rs` threads `owner_drift: None` on purpose, because the
+canonical probe needs CLI-side git reads. It reports the canonical-name
+case only (a remote naming an owner the forge does not answer under),
+**Degraded** under the existing exit `1` — no new exit code; the
+re-pointed-after-startup shape needs the daemon's startup baseline, so it
+stays a daemon `warn!`, not a health line. A per-repo forge lookup failure
+yields no verdict for that repo, never a false drift. See
+`loom-daemon/src/health/owner_drift_section.rs`. `review_role_pins`
+(#11970) is conditional as well: a
 `WARNING:` line (Green, never moves the exit code, `detail.warning = true`)
 naming the repo and files when a managed repo's `.loom/resync-ignore` pins a
 Champion, Judge or Doctor prompt (`roles/` or `commands/loom/`
@@ -10706,6 +10721,26 @@ takes while the account is idle, so the per-host manual step goes away. It
 runs after every account's own recovery, and is skipped while Docker is backing
 off.
 
+Several accounts serving the same repositories can share one named list
+(#14699): declare it once under `privateCloneSets` and reference it by name,
+instead of repeating the list per account in every config tier:
+
+```json
+{ "autonomous": { "sessionReconcile": {
+  "privateCloneSets": { "fleet": [ { "repository": "https://github.com/OWNER/REPO" } ] },
+  "privateClones": { "seat-1": { "set": "fleet" }, "seat-2": { "set": "fleet" } }
+} } }
+```
+
+A `{"set": …}` reference resolves into exactly the bindings the inline list
+form yields, so both forms (and their fail-closed rules) behave identically
+and can be mixed per account. A set defined in one tier and referenced from
+another resolves — the pass reads the merged effective config. A reference
+naming an undefined set, a set that is not a list, or an account value that is
+neither a list nor a `{"set": …}` object fails closed for that account only,
+WARNing once per account with the key; a malformed entry inside a shared set
+is likewise WARNed once per referencing account, naming the set entry path.
+
 - An account with no binding is never read or touched.
 - A **busy** account (a job holds its lease, or a worker is alive) is retried on
   the next pass and never interrupted. A held (`session stop`) or disabled
@@ -10720,7 +10755,8 @@ off.
   with the registered one, an account running a host-mounted session (a binding
   never converts it), and a private session whose container is missing (the
   reconcile recovery restores it first, with its recorded image).
-- Live: re-read every pass, no restart.
+- Live: `privateClones` and `privateCloneSets` are re-read every pass, no
+  restart.
 
 **Seeing it: `loom-daemon status` (#10600).** `status` lists every
 session-managed Codex account across the registered roots under `Session

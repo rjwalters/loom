@@ -15,6 +15,7 @@
 //! | [`PARK_ENDED_PATH`] | [`ParkEndedRequest`] | [`AckResponse`] |
 //! | [`FILING_LOCK_PATH`] | [`FilingLockRequest`] | [`FilingLockResponse`] |
 //! | [`FILING_UNLOCK_PATH`] | [`FilingUnlockRequest`] | [`AckResponse`] |
+//! | [`TOKENS_REFRESH_PATH`] | [`TokensRefreshRequest`] | [`TokensRefreshResponse`] |
 //!
 //! A `claim` refusal is an **answer** (HTTP 200, `granted: false`), never a
 //! failure. Non-200 statuses carry an [`ErrorResponse`]: `400` malformed,
@@ -50,8 +51,12 @@ pub const FILING_LOCK_PATH: &str = "/v1/filing-lock";
 /// `POST` path of an issue-filing unlock (#13918).
 pub const FILING_UNLOCK_PATH: &str = "/v1/filing-unlock";
 
+/// `POST` path of an on-demand token-pool probe (#13943, part 3 of #13893):
+/// `loom-daemon tokens refresh --fleet`.
+pub const TOKENS_REFRESH_PATH: &str = "/v1/tokens-refresh";
+
 /// Every path.
-pub const PATHS: [&str; 8] = [
+pub const PATHS: [&str; 9] = [
     HEARTBEAT_PATH,
     CLAIM_PATH,
     REFUSE_PATH,
@@ -60,6 +65,7 @@ pub const PATHS: [&str; 8] = [
     PARK_ENDED_PATH,
     FILING_LOCK_PATH,
     FILING_UNLOCK_PATH,
+    TOKENS_REFRESH_PATH,
 ];
 
 /// The `refuse` reason that holds the item for the forge lease TTL: someone
@@ -170,12 +176,21 @@ pub struct HeartbeatRequest {
 }
 
 /// The heartbeat's answer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub server_epoch: String,
     /// `true` while the server is in its start-up grace window and refuses
     /// claims with [`RefusalReason::Grace`].
     pub grace: bool,
+    /// The captain's token-pool probe snapshot (#13942, part 2 of #13893):
+    /// every account's `{status, util_5h, limit_reset}` at one probe instant,
+    /// so fleet workers converge on the captain's evidence within one
+    /// heartbeat. Absent on an old captain (or one with no readable
+    /// `.ranking`) and ignored by an old worker — both mixed-version sides
+    /// keep today's behaviour. No token material, exactly the fields
+    /// `.ranking` already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_probe: Option<crate::tokens_pool::fleet_probe::TokenProbeSnapshot>,
 }
 
 /// `POST /v1/claim`: "may I claim this item I drew?"
@@ -409,6 +424,37 @@ pub struct FilingUnlockRequest {
     pub holder: String,
 }
 
+/// `POST /v1/tokens-refresh`: "run your token-pool probe now" (#13943, part
+/// 3 of #13893). Sent by `loom-daemon tokens refresh --fleet` after an
+/// operator buys account resets, so the fleet learns of them at the next
+/// heartbeat instead of at the captain's next scheduled probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokensRefreshRequest {
+    pub host_id: String,
+}
+
+/// The refresh answer: the probe the captain ran (or joined), not a mere
+/// acceptance — `probed_at` is the probe instant the fleet's snapshots
+/// carry after their next heartbeat.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TokensRefreshResponse {
+    pub server_epoch: String,
+    /// When the probe the captain ran measured the pool (its fresh
+    /// `.ranking` mtime, the same freshness fact the heartbeat snapshot
+    /// publishes). `None` when the probe succeeded but its result could not
+    /// be read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probed_at: Option<DateTime<Utc>>,
+    /// `true` when a probe was already running when this request arrived
+    /// and this request joined it: no second probe was started.
+    pub coalesced: bool,
+    /// Why the probe failed, when it ran and failed. The request itself was
+    /// served — a failed probe is the probe's outcome, not a protocol
+    /// error, so it rides the answer instead of an HTTP error status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// The longest `holder` the captain accepts.
 pub const MAX_HOLDER_LEN: usize = 128;
 
@@ -495,6 +541,66 @@ mod tests {
         assert_eq!(req.live[0].assignment_id.as_deref(), Some("a-1"));
         assert_eq!(req.live[1].assignment_id, None);
         assert_eq!(serde_json::to_value(&req).unwrap(), wire);
+    }
+
+    /// #13942: the snapshot rides the heartbeat answer as an optional field.
+    /// An old captain omits it (this build's writer with `None` does too), so
+    /// an old worker sees exactly the body it always did.
+    #[test]
+    fn a_heartbeat_answer_without_the_probe_field_is_the_old_contract() {
+        let resp: HeartbeatResponse =
+            serde_json::from_value(json!({"server_epoch": "e1", "grace": false})).unwrap();
+        assert_eq!(resp.token_probe, None);
+        let none = serde_json::to_value(&HeartbeatResponse {
+            server_epoch: "e1".into(),
+            grace: false,
+            token_probe: None,
+        })
+        .unwrap();
+        assert_eq!(none, json!({"server_epoch": "e1", "grace": false}));
+    }
+
+    /// #13942: a worker of this build reads the captain's snapshot back
+    /// byte-for-byte, and a *newer* captain's unknown fields do not break it.
+    #[test]
+    fn the_probe_snapshot_round_trips_and_survives_unknown_fields() {
+        let snapshot = crate::tokens_pool::fleet_probe::TokenProbeSnapshot {
+            probed_at: "2026-11-18T12:00:00Z".parse().unwrap(),
+            accounts: vec![
+                crate::tokens_pool::fleet_probe::TokenProbeAccount {
+                    name: "agent-1".into(),
+                    status: "available".into(),
+                    util_5h: Some(0.42),
+                    limit_reset: None,
+                },
+                crate::tokens_pool::fleet_probe::TokenProbeAccount {
+                    name: "agent-2".into(),
+                    status: "exhausted".into(),
+                    util_5h: None,
+                    limit_reset: Some("2026-11-20T03:00:00Z".into()),
+                },
+            ],
+        };
+        let wire = serde_json::to_value(&HeartbeatResponse {
+            server_epoch: "e1".into(),
+            grace: false,
+            token_probe: Some(snapshot.clone()),
+        })
+        .unwrap();
+        assert_eq!(
+            wire["token_probe"]["accounts"][1],
+            json!({"name": "agent-2", "status": "exhausted", "limit_reset": "2026-11-20T03:00:00Z"}),
+            "absent optional fields stay off the wire"
+        );
+        let richer = serde_json::from_value::<HeartbeatResponse>(serde_json::json!({
+            "server_epoch": "e1",
+            "grace": false,
+            "token_probe": wire["token_probe"],
+            "next_field": "unknown to this build"
+        }))
+        .unwrap();
+        assert_eq!(richer.token_probe.as_ref(), Some(&snapshot));
+        assert!(!richer.grace);
     }
 
     #[test]

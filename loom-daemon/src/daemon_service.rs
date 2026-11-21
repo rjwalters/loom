@@ -409,6 +409,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
         minted_token,
         credential_preflight,
         cross_owner_retry,
+        startup_roots,
     } = credential_startup::run_startup(&sweep_workspace);
 
     // Fleet-store sync (#9596). HERE, and not earlier or later, for two hard
@@ -442,6 +443,7 @@ pub(crate) async fn run_daemon() -> Result<()> {
             minted_token,
             github_app_gh_config_dir_active,
             cross_owner_retry,
+            startup_roots,
         );
     }
 

@@ -1,0 +1,8 @@
+name: CI
+on: push
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: test-github-write-allowlist-schedule.py
+        run: python3 scripts/tests/test-github-write-allowlist-schedule.py
