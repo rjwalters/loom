@@ -376,6 +376,44 @@ else
     assert_eq "true" "$(yb alive "$WATCH")" "(r8) the watched process remains alive"
     assert_eq "0" "$(patch_n)" "(r8) a cap before the first cycle made no PATCH"
     kill "$WATCH" 2>/dev/null
+
+    # (r9) Stop the watch target while the synchronous owner claim is paused.
+    # The deliberately held claim outlasts the child's first sleep.
+    cat > "$STUB_DIR/delayed-claim" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-} ${3:-}" == "lease renewer claim" ]]; then
+    kill "$EARLY_WATCH_PID" || exit 1
+    sleep 2
+fi
+exec "$LOOM_TEST_STUB_DIR/loom-daemon" "$@"
+SH
+    chmod 700 "$STUB_DIR/delayed-claim"
+    reset_state
+    sleep 30 &
+    WATCH=$!
+    LOOP="$(EARLY_WATCH_PID="$WATCH" LOOM_DAEMON_BIN="$STUB_DIR/delayed-claim" start_loop 10233 "$WATCH")"
+    receipt="$receipt_dir/issue-10233.terminal.jsonl"
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        [[ ! -s "$receipt" ]] || break
+        sleep 0.1
+    done
+    assert_eq "$LOOP" "$(jq -r .pid "$LOOM_LEASE_RENEW_STATE_DIR"/*.owner)" "(r9) start still reports the synchronously published owner"
+    assert_eq "watch-ended" "$(jq -r .reason "$receipt" 2>/dev/null)" "(r9) the winning launch records an exit observed before publication"
+    assert_eq "1" "$(receipt_line_count "$receipt")" "(r9) the early observation emits one receipt"
+    assert_eq "false" "$(yb test -s "$STUB_DIR/cred.log")" "(r9) the early exit made no Forge request"
+
+    reset_state
+    sleep 30 &
+    PEER_WATCH=$!
+    PEER="$("$SCRIPT" start 10234 --interval 30 --watch-pid "$PEER_WATCH" --host y-host --sweep-id y-sweep 2>/dev/null)"
+    sleep 30 &
+    WATCH=$!
+    LOOP="$(EARLY_WATCH_PID="$WATCH" LOOM_DAEMON_BIN="$STUB_DIR/delayed-claim" start_loop 10234 "$WATCH")"
+    assert_eq "$PEER" "$LOOP" "(r9) an early duplicate still reports the original owner"
+    assert_eq "0" "$(receipt_line_count "$receipt_dir/issue-10234.terminal.jsonl")" "(r9) the duplicate emits no terminal receipt"
+    assert_eq "false" "$(yb test -s "$STUB_DIR/cred.log")" "(r9) the duplicate made no Forge request"
+    pkill -P "$PEER" 2>/dev/null
+    kill "$PEER" "$PEER_WATCH" 2>/dev/null
 fi
 
 # (y6) per-cycle budget: steady state is one state read + one list/window read
