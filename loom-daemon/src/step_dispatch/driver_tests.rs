@@ -351,6 +351,164 @@ fn capacity_claim(
 
 #[test]
 #[serial_test::serial]
+fn a_positive_captain_retry_holds_local_role_draws_across_workspaces_until_expiry() {
+    use crate::fleet_dispatch::{
+        fallback::{Mode, ENTER_AFTER_FAILURES},
+        proto::{self, RefusalReason},
+        test_server::TestServer,
+        worker::{self, Ask},
+    };
+    use crate::step_role::StepRole;
+    use crate::types::QueueDisposition;
+
+    struct ResetWorker;
+    impl Drop for ResetWorker {
+        fn drop(&mut self) {
+            worker::reset_for_test();
+        }
+    }
+    #[derive(Default)]
+    struct Spawns(Vec<(usize, u32, StepRole)>);
+    impl StepSpawner for Spawns {
+        fn spawn(&mut self, idx: usize, request: &StepSpawnRequest) -> SpawnResult {
+            self.0.push((idx, request.item, request.role));
+            SpawnResult::Spawned
+        }
+    }
+
+    worker::reset_for_test();
+    let _reset = ResetWorker;
+    let _overrides = crate::env_test_support::EnvGuard::clear(&["LOOM_REPO", "LOOM_GH_BIN"]);
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let captain = TestServer::start(|path, body| {
+        assert_eq!(path, proto::CLAIM_PATH);
+        let item = body["item"].as_u64().unwrap();
+        if item >= 100 {
+            return (500, serde_json::json!({}));
+        }
+        let mut response = serde_json::json!({
+            "server_epoch": "fixture", "granted": false,
+            "reason": if item == 4 { "held" } else { "not_eligible" },
+        });
+        if item != 1 {
+            response["retry_after_s"] = serde_json::json!(if item == 2 { 0 } else { 60 });
+        }
+        (200, response)
+    });
+    let enable = |enabled| {
+        crate::sweep_registry::test_support::write_config(
+            first.path(),
+            &serde_json::json!({"fleetDispatch": {"enabled": enabled, "url": captain.url()}})
+                .to_string(),
+        );
+    };
+    enable(true);
+    worker::set_host_root(first.path());
+
+    for (item, retry) in [(1, None), (2, Some(0))] {
+        let answer = worker::claim(first.path(), item, StepRole::ChampionMerge);
+        assert!(
+            matches!(answer, Ask::Refused(RefusalReason::NotEligible, r) if r.retry_after_s == retry)
+        );
+        assert!(worker::local_role_holds(second.path(), Instant::now()).is_empty());
+    }
+    assert!(matches!(
+        worker::claim(first.path(), 4, StepRole::Judge),
+        Ask::Refused(RefusalReason::Held, _)
+    ));
+    let arm_champion = || {
+        assert!(matches!(
+            worker::claim(first.path(), 3, StepRole::ChampionMerge),
+            Ask::Refused(RefusalReason::NotEligible, r) if r.retry_after_s == Some(60)
+        ));
+        worker::role_hold_deadline_for_test(StepRole::ChampionPromote).unwrap()
+    };
+    let before_claim = Instant::now();
+    let expiry = arm_champion();
+    assert!(expiry >= before_claim + Duration::from_secs(60));
+    assert!(expiry <= Instant::now() + Duration::from_secs(60));
+    let before_expiry = expiry - Duration::from_millis(1);
+    assert_eq!(
+        worker::local_role_holds(second.path(), before_expiry),
+        BTreeSet::from(["champion"])
+    );
+    assert!(worker::roles_ok(&BTreeSet::new())
+        .iter()
+        .any(|r| r == "champion"));
+
+    let draw = |now, offers: &[tick::Offer]| {
+        let mut ws = workspace(1, "acme/second", &forge());
+        ws.weighing
+            .pool
+            .retain(|c| matches!(c.target(), 2 | 3 | 60));
+        let (free_slots, fallback) = worker::tick_budget(second.path(), 3, 3);
+        let roles = worker::local_role_holds(second.path(), now);
+        let mut spawner = Spawns::default();
+        let result = tick::run_with_role_holds(
+            vec![ws],
+            StepTickLimits {
+                free_slots,
+                spawn_concurrency: 3,
+                fallback,
+            },
+            &SeedBase {
+                minute: 29_340_000,
+                host: "fixture".into(),
+                tick_counter: 3,
+            },
+            &PoolKnobs::default(),
+            &mut spawner,
+            offers,
+            &roles,
+        );
+        (result, spawner.0)
+    };
+    let (held, spawns) = draw(before_expiry, &[]);
+    assert_eq!(spawns, vec![(1, 3, StepRole::Builder)]);
+    assert_eq!(held.report.skipped_host_constraint, 2);
+    assert!(held.passes.is_empty(), "held roles are never drawn");
+    assert_eq!(
+        held.report
+            .queue
+            .iter()
+            .filter(|r| {
+                r.disposition == Some(QueueDisposition::HostConstraint)
+                    && r.detail.as_deref() == Some(tick::REFUSAL_CAPTAIN_NOT_ELIGIBLE)
+            })
+            .count(),
+        2
+    );
+
+    let offers = [tick::Offer {
+        repo: "acme/second".into(),
+        item: 60,
+        role: StepRole::ChampionMerge,
+    }];
+    let (_, spawns) = draw(before_expiry, &offers);
+    assert_eq!(spawns, vec![(1, 60, StepRole::ChampionMerge), (1, 3, StepRole::Builder)]);
+
+    enable(false);
+    assert_eq!(draw(before_expiry, &[]).1.len(), 3, "fleet-disabled ignores the hold");
+    enable(true);
+    assert_eq!(draw(expiry, &[]).1.len(), 3, "the role can be drawn at expiry");
+    assert!(worker::role_hold_deadline_for_test(StepRole::ChampionMerge).is_none());
+
+    let expiry = arm_champion();
+    for item in 100..100 + ENTER_AFTER_FAILURES {
+        assert_eq!(worker::claim(first.path(), item, StepRole::Judge), Ask::FailOpen);
+    }
+    assert_eq!(worker::mode(), Mode::Fallback);
+    assert_eq!(
+        draw(expiry - Duration::from_millis(1), &[]).1.len(),
+        3,
+        "fallback ignores the hold"
+    );
+    assert_eq!(worker::role_hold_deadline_for_test(StepRole::ChampionMerge), Some(expiry));
+}
+
+#[test]
+#[serial_test::serial]
 fn fleet_role_capacity_advertises_champion_for_a_healthy_workspace() {
     use crate::fleet_dispatch::table::ClaimDecision;
 
