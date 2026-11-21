@@ -266,6 +266,8 @@ struct State {
     live_by_root: HashMap<PathBuf, LiveSet>,
     /// `(free_slots, roles_ok)` at the last step tick.
     capacity: Option<(u32, Vec<String>)>,
+    /// Positive captain retry intervals, shared by every workspace on this worker.
+    local_role_holds: HashMap<&'static str, Instant>,
     last_heartbeat: Option<Instant>,
     /// The `server_epoch` of the last `next` answer (#12817).
     next_epoch: Option<String>,
@@ -434,6 +436,20 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
             facts.held_by.clone_from(&refusal.held_by);
             facts.retry_after_s = refusal.retry_after_s;
             facts.hold = reason == RefusalReason::Cooldown;
+            if reason == RefusalReason::NotEligible {
+                if let Some(until) = refusal
+                    .retry_after_s
+                    .filter(|secs| *secs > 0)
+                    .and_then(|secs| Instant::now().checked_add(Duration::from_secs(secs)))
+                {
+                    let mut state = state();
+                    let hold = state
+                        .local_role_holds
+                        .entry(role.role_name())
+                        .or_insert(until);
+                    *hold = (*hold).max(until);
+                }
+            }
             if reason == RefusalReason::Grace {
                 Ask::FailOpen
             } else {
@@ -652,6 +668,19 @@ pub fn roles_ok(exhausted: &BTreeSet<String>) -> Vec<String> {
         .collect::<BTreeSet<String>>()
         .into_iter()
         .collect()
+}
+
+/// Roles a normal local draw should skip while the captain asks us to wait.
+/// Work requests and heartbeats still advertise the worker's actual capability.
+pub(crate) fn local_role_holds(root: &Path, now: Instant) -> BTreeSet<&'static str> {
+    let enabled = host_endpoint(root).is_some();
+    let mut state = state();
+    state.local_role_holds.retain(|_, until| *until > now);
+    if enabled && state.hysteresis.mode() == Mode::Normal {
+        state.local_role_holds.keys().copied().collect()
+    } else {
+        BTreeSet::new()
+    }
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
@@ -1009,6 +1038,11 @@ pub(crate) fn candidates_for_test(url: &str, resp: &NextResponse) -> Vec<Candida
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     *state() = State::default();
+}
+
+#[cfg(test)]
+pub(crate) fn role_hold_deadline_for_test(role: StepRole) -> Option<Instant> {
+    state().local_role_holds.get(role.role_name()).copied()
 }
 
 #[cfg(test)]

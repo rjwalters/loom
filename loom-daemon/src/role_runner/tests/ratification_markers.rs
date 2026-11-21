@@ -1248,3 +1248,452 @@ mod gh_failure {
         assert!(!spawn.starts_with("exit"));
     }
 }
+
+// ---- #14834: the read-only status report -------------------------------------
+
+use crate::role_runner::ratification_lane::{
+    resolve_status, scan_markers, GhPrSource, MarkerComment, MarkerFormat,
+};
+
+/// The head both real PR #98 fixture markers name.
+const DROP_HEAD: &str = "6a3cd2c43c31821fe93bbc18828c0eb6e06aa063";
+
+/// The lane's own wire marker, as the daemon posts it (PR #98 shape).
+fn lane_marker(key: &str) -> String {
+    format!("<!-- ratify:key={key} sha={DROP_HEAD} -->\nreviewer=ratification-{key}\n")
+}
+
+/// The hand-applied marker, as observed on PR #98.
+fn hand_marker(key: &str, verdict: &str) -> String {
+    format!(
+        "<!-- RATIFY-KEY: {key} verdict={verdict} block=o/r#98 \
+sha={DROP_HEAD} reviewer=01a1fa5f-0873-7071-a338-184a562cfa55 date=2026-11-20T19:14:24Z -->"
+    )
+}
+
+fn mc(id: u64, at: &str, body: &str) -> MarkerComment {
+    MarkerComment {
+        id,
+        created_at: chrono::DateTime::parse_from_rfc3339(at)
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        url: format!("https://example/pull/98#issuecomment-{id}"),
+        body: body.into(),
+    }
+}
+
+#[test]
+fn status_picks_the_newest_marker_per_key_and_links_the_rest_once_as_superseded() {
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:37Z", &lane_marker("market")),
+        mc(2, "2026-11-20T19:05:00Z", &lane_marker("market")),
+        mc(3, "2026-11-20T19:14:25Z", &hand_marker("market", "adequate-for-catalog")),
+        mc(4, "2026-11-20T18:00:00Z", &lane_marker("ee")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    let market = &s.market;
+    assert_eq!(market.effective.as_ref().unwrap().comment_id, 3);
+    assert_eq!(market.effective.as_ref().unwrap().format, MarkerFormat::Hand);
+    assert_eq!(
+        market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "superseded links are exact and oldest first"
+    );
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 4);
+    assert!(s.ee.superseded.is_empty());
+
+    // Reversing the fixture moves nothing: ordering is the forge's creation
+    // time, never the listing's order.
+    let mut reversed = comments.clone();
+    reversed.reverse();
+    assert_eq!(resolve_status(DROP_HEAD, "o/r", 98, &reversed), s);
+}
+
+#[test]
+fn equal_creation_times_are_broken_by_comment_id_across_zone_formats() {
+    // 20:00:00+01:00 is 19:00:00Z: same instant, different notation — the
+    // numeric id decides.
+    let comments = vec![
+        mc(11, "2026-11-20T19:00:00Z", &lane_marker("ee")),
+        mc(12, "2026-11-20T20:00:00+01:00", &lane_marker("ee")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 12);
+    assert_eq!(
+        s.ee.superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![11]
+    );
+}
+
+#[test]
+fn a_more_favorable_verdict_gives_a_comment_no_priority() {
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &hand_marker("ee", "approve")),
+        mc(2, "2026-11-20T19:30:00Z", &hand_marker("ee", "request-changes")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 2);
+}
+
+#[test]
+fn both_marker_formats_compete_on_the_same_terms_in_either_direction() {
+    let nwo = "o/r";
+    // The real #98 pair: the lane marker came first, the hand marker later.
+    let a = vec![
+        mc(7048105117, "2026-11-20T19:00:37Z", &lane_marker("market")),
+        mc(
+            7048390167,
+            "2026-11-20T19:14:25Z",
+            &hand_marker("market", "adequate-for-catalog"),
+        ),
+    ];
+    let s = resolve_status(DROP_HEAD, nwo, 98, &a);
+    assert_eq!(s.market.effective.as_ref().unwrap().comment_id, 7048390167);
+    assert_eq!(
+        s.market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105117]
+    );
+    // The mirror: a lane marker newer than a hand marker wins the same way.
+    let b = vec![
+        mc(1, "2026-11-20T19:00:37Z", &hand_marker("market", "competitive")),
+        mc(2, "2026-11-20T19:14:25Z", &lane_marker("market")),
+    ];
+    let s = resolve_status(DROP_HEAD, nwo, 98, &b);
+    assert_eq!(s.market.effective.as_ref().unwrap().format, MarkerFormat::Lane);
+}
+
+#[test]
+fn stale_head_and_foreign_pr_markers_are_neither_effective_nor_superseded() {
+    let stale = format!("<!-- ratify:key=ee sha={} -->", "f".repeat(40));
+    let foreign_repo =
+        format!("<!-- RATIFY-KEY: ee verdict=approve block=other/repo#98 sha={DROP_HEAD} -->");
+    let foreign_pr =
+        format!("<!-- RATIFY-KEY: ee verdict=approve block=o/r#99 sha={DROP_HEAD} -->");
+    let own = format!("<!-- RATIFY-KEY: ee verdict=approve block=o/r#98 sha={DROP_HEAD} -->");
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &stale),
+        mc(2, "2026-11-20T19:01:00Z", &foreign_repo),
+        mc(3, "2026-11-20T19:02:00Z", &foreign_pr),
+        mc(4, "2026-11-20T19:03:00Z", &own),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 4);
+    assert!(
+        s.ee.superseded.is_empty(),
+        "markers for another head or PR are not this head's markers"
+    );
+}
+
+#[test]
+fn quoted_and_fenced_lookalikes_never_establish_a_head_or_key() {
+    let quoted = format!("> quoted example:\n> <!-- ratify:key=ee sha={DROP_HEAD} -->");
+    let fenced = format!("```\n<!-- RATIFY-KEY: ee verdict=approve sha={DROP_HEAD} -->\n```");
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("ee", "approve");
+    let examples = [
+        quoted,
+        fenced,
+        format!("Example: `{lane}`"),
+        format!("`{hand}`"),
+        format!("{lane} trailing prose"),
+        format!("{hand} {lane}"),
+    ];
+    for example in &examples {
+        assert!(scan_markers(example).is_empty(), "{example}");
+    }
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &lane_body),
+        mc(2, "2026-11-20T19:01:00Z", &examples.join("\n")),
+    ];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.unwrap().comment_id, 1);
+    assert!(s.ee.superseded.is_empty());
+    assert_eq!(scan_markers(&hand).len(), 1);
+}
+
+#[test]
+fn indented_markdown_code_cannot_select_a_marker() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for marker in [lane, hand.as_str()] {
+        assert_eq!(scan_markers(&format!("   {marker}")).len(), 1);
+        for indent in ["    ", "     ", "\t", " \t", "   \t"] {
+            assert!(scan_markers(&format!("{indent}{marker}")).is_empty());
+        }
+        assert_eq!(scan_markers(&format!("    ```\n\n{marker}")).len(), 1);
+        assert!(scan_markers(&format!("```\n    ```\n{marker}\n```")).is_empty());
+    }
+
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &format!("{lane}\n{hand}")),
+        mc(2, "2026-11-20T19:01:00Z", &format!("Example:\n\n    {lane}\n\n\t{hand}")),
+    ];
+    let status = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    for key in [status.ee, status.market] {
+        assert_eq!(key.effective.unwrap().comment_id, 1);
+        assert!(key.superseded.is_empty());
+    }
+}
+
+#[test]
+fn fenced_examples_end_only_at_a_matching_markdown_close() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for (opening, example, closing) in [
+        ("````text", "~~~~", "`````  "),
+        ("````text", "```", "````"),
+        ("~~~~text", "~~~~ ordinary text", "~~~~\t"),
+        ("~~~text", "~~~\u{a0}", "~~~"),
+        ("- ````text", "  ```", "  ````"),
+    ] {
+        let indent = if opening.starts_with('-') { "  " } else { "" };
+        let inside = format!("{opening}\n{example}\n{indent}{lane}\n{indent}{hand}");
+        assert!(scan_markers(&inside).is_empty(), "{opening} / {example}");
+        let marks = scan_markers(&format!("{inside}\n{closing}\n\n{lane}\n{hand}"));
+        assert_eq!(marks.len(), 2, "{opening} / {closing}");
+        assert_eq!(marks[0].format, MarkerFormat::Lane);
+        assert_eq!(marks[1].format, MarkerFormat::Hand);
+    }
+}
+
+#[test]
+fn markdown_context_does_not_create_or_hide_a_standalone_marker() {
+    let hand = hand_marker("market", "approve");
+    assert!(scan_markers(&format!("`inline example` {hand}")).is_empty());
+    assert_eq!(
+        scan_markers(&format!("Ordinary paragraph `\n{hand}\nNext paragraph `")).len(),
+        1
+    );
+    assert_eq!(scan_markers(&format!("```invalid ` fence opener\n{hand}")).len(), 1);
+}
+
+#[test]
+fn a_hand_marker_without_a_full_matching_sha_is_not_a_marker() {
+    let short = format!("<!-- RATIFY-KEY: ee verdict=approve sha={} -->", "abc".repeat(7));
+    let no_sha = "<!-- RATIFY-KEY: ee verdict=approve -->\n";
+    assert!(scan_markers(&short).is_empty());
+    assert!(scan_markers(no_sha).is_empty());
+}
+
+#[test]
+fn a_missing_key_is_explicit_and_a_verified_empty_history_is_no_marker() {
+    let empty = resolve_status(DROP_HEAD, "o/r", 98, &[]);
+    assert!(empty.ee.effective.is_none() && empty.market.effective.is_none());
+    let comments = vec![mc(1, "2026-11-20T19:00:00Z", &lane_marker("market"))];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert!(s.ee.effective.is_none(), "ee is missing at this head");
+    assert!(s.market.effective.is_some());
+}
+
+#[test]
+fn a_comment_carrying_several_markers_for_one_key_links_once() {
+    let body = format!("{}\n{}", lane_marker("ee"), hand_marker("ee", "approve"));
+    let comments = vec![mc(1, "2026-11-20T19:00:00Z", &body)];
+    let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 1);
+    assert!(s.ee.superseded.is_empty());
+}
+
+#[test]
+fn status_reads_head_and_history_through_the_forge_and_performs_only_reads() {
+    use crate::cli::ratification_lane_cmd::{handle, Action};
+    use crate::comment_trust::TrustPolicy;
+    use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
+    use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
+    use crate::gh_invocation::{test_routing, test_support};
+
+    let dir = tempfile::tempdir().unwrap();
+    let reader = dir.path().join("reader");
+    std::fs::create_dir(&reader).unwrap();
+    let calls = dir.path().join("calls");
+    let program = test_support::stub(
+        dir.path(),
+        "gh-status",
+        &format!(
+            r#"printf '%s\n' "$*" >> '{calls}'
+test "$1" = api || exit 64
+case "$2" in
+  repos/o/r/pulls/98) test ! -f "${{0%/*}}/prfail" || exit 1; cat "${{0%/*}}/pr" ;;
+  'repos/o/r/issues/98/comments?per_page=100') test "$3" = --paginate || exit 64; cat "${{0%/*}}/reply"; test ! -f "${{0%/*}}/failed" ;;
+  *) exit 64 ;;
+esac"#,
+            calls = calls.display(),
+        ),
+    );
+    let _routing = test_routing::install_with_program(
+        test_routing::TestRouting {
+            decision: RouteDecision::Reader {
+                dir: reader,
+                app_id: "fixture-reader".into(),
+                placement: Placement::Home,
+            },
+            env: DeriveEnv::default(),
+            checkout: CwdAnswer::Unresolved,
+        },
+        program,
+    );
+    let policy = TrustPolicy::new(FleetLogins::single("fleet-bot"), None, Vec::new());
+    let source = GhPrSource::new(dir.path(), "o/r", &policy);
+
+    let record = |id: u64, at: &str, login: &str, assoc: &str, r#type: &str, body: &str| {
+        json!({
+            "id": id,
+            "created_at": at,
+            "html_url": format!("https://example/o/r/pull/98#issuecomment-{id}"),
+            "user": {"login": login, "type": r#type},
+            "author_association": assoc,
+            "body": body,
+        })
+    };
+    let pr = json!({"number": 98, "head": {"sha": DROP_HEAD}, "base": {"sha": "0".repeat(40)}});
+
+    // Two pages carrying several market AND ee markers. The newest market
+    // marker (the hand marker) is on page one, the newest ee marker on page
+    // two: page and listing position never decide, creation time does.
+    let page_one = json!([
+        record(3, "2026-11-20T19:14:25Z", "fixture-owner", "OWNER", "User", &hand_marker("market", "adequate-for-catalog")),
+        { "id": 4, "created_at": "2026-11-20T19:20:00Z", "html_url": "u4",
+          "user": {"login": "unknown[bot]", "type": "Bot"}, "author_association": "NONE",
+          "body": lane_marker("market") },
+        { "id": 5, "created_at": "2026-11-20T19:21:00Z", "html_url": "u5",
+          "user": null, "author_association": "NONE", "body": lane_marker("ee") }
+    ]);
+    let page_two = json!([
+        record(
+            7048105117,
+            "2026-11-20T19:00:37Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &lane_marker("market")
+        ),
+        record(
+            7048105999,
+            "2026-11-20T18:30:00Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &hand_marker("ee", "approve")
+        ),
+        record(
+            7048106111,
+            "2026-11-20T18:40:00Z",
+            "fixture-owner",
+            "OWNER",
+            "User",
+            &lane_marker("ee")
+        )
+    ]);
+    std::fs::write(dir.path().join("pr"), pr.to_string()).unwrap();
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n{page_two}")).unwrap();
+
+    let head = source.pr_head(98).expect("head");
+    assert_eq!(head, DROP_HEAD);
+    let comments = source.marker_comments(98).expect("comments");
+    // Untrusted and deleted-author rows are gone; trusted identity survives.
+    assert_eq!(
+        comments.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![3, 7048105117, 7048105999, 7048106111]
+    );
+    assert_eq!(comments[0].url, "https://example/o/r/pull/98#issuecomment-3");
+    let s = resolve_status(&head, "o/r", 98, &comments);
+    // Market: the hand marker on page one is newer than the lane marker on
+    // page two — creation time, not page or listing position, decides.
+    assert_eq!(s.market.effective.as_ref().unwrap().comment_id, 3);
+    assert_eq!(
+        s.market
+            .superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105117]
+    );
+    // EE: the newest ee marker is on page two and wins; the deleted-author
+    // ee marker (id 5) never counted.
+    assert_eq!(s.ee.effective.as_ref().unwrap().comment_id, 7048106111);
+    assert_eq!(
+        s.ee.superseded
+            .iter()
+            .map(|l| l.comment_id)
+            .collect::<Vec<_>>(),
+        vec![7048105999]
+    );
+
+    // A torn second page fails the whole read closed.
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n[{{")).unwrap();
+    assert!(source.marker_comments(98).is_err());
+
+    // A verified empty listing reads as empty — both keys genuinely missing,
+    // not unreadable.
+    std::fs::write(dir.path().join("reply"), "[]").unwrap();
+    let empty = source
+        .marker_comments(98)
+        .expect("empty history is readable");
+    assert!(empty.is_empty());
+    let s = resolve_status(&head, "o/r", 98, &empty);
+    assert!(s.ee.effective.is_none() && s.market.effective.is_none());
+
+    // A malformed trusted record (no id to link) fails the read closed.
+    let malformed = json!([
+        { "created_at": "2026-11-20T19:00:00Z", "html_url": "u9",
+          "user": {"login": "fixture-owner", "type": "User"},
+          "author_association": "OWNER", "body": lane_marker("market") }
+    ]);
+    std::fs::write(dir.path().join("reply"), malformed.to_string()).unwrap();
+    let err = source.marker_comments(98).unwrap_err();
+    assert!(err.contains("malformed"), "{err}");
+
+    // A failed gh read of either endpoint is an error, never empty.
+    std::fs::write(dir.path().join("reply"), format!("{page_one}\n{page_two}")).unwrap();
+    std::fs::write(dir.path().join("failed"), "").unwrap();
+    assert!(source.marker_comments(98).is_err());
+    std::fs::remove_file(dir.path().join("failed")).unwrap();
+    std::fs::write(dir.path().join("prfail"), "").unwrap();
+    assert!(source.pr_head(98).is_err());
+    std::fs::remove_file(dir.path().join("prfail")).unwrap();
+
+    // A malformed captured head stops the actual status command before it
+    // reads comment history, even when that history is readable.
+    std::fs::write(dir.path().join("reply"), "[]").unwrap();
+    for invalid in [
+        "".to_string(),
+        "a".repeat(39),
+        "a".repeat(41),
+        "g".repeat(40),
+    ] {
+        let pr = json!({"head": {"sha": invalid}});
+        std::fs::write(dir.path().join("pr"), pr.to_string()).unwrap();
+        let before = std::fs::read_to_string(&calls).unwrap();
+        let error = handle(Action::Status {
+            pr: 98,
+            repo: Some("o/r".to_string()),
+            root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("head could not be read") && error.contains("40-hex"), "{error}");
+        let after = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(after.strip_prefix(&before), Some("api repos/o/r/pulls/98\n"));
+    }
+
+    // Every forge call was a read: `gh api <endpoint>` with no method verb.
+    let seen = std::fs::read_to_string(&calls).unwrap();
+    for line in seen.lines() {
+        assert!(line.starts_with("api "), "non-api call: {line}");
+        assert!(!line.contains("-X") && !line.contains("--method"), "write call: {line}");
+    }
+}

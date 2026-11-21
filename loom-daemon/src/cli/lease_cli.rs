@@ -25,7 +25,7 @@ impl LeaseCli {
     /// print their message and start nothing, with `mode` unset. `co-occupancy`
     /// reads the issue's lease comments, `release` reads them and posts the
     /// yield. Every `renewer` action touches only the renewer ownership files
-    /// and process table; `check` is handed the issue state by its caller.
+    /// and process table or local diagnostics. `check` receives the issue state from its caller.
     #[must_use]
     pub fn needs_issue_mode_gate(&self) -> bool {
         match &self.command {
@@ -36,7 +36,8 @@ impl LeaseCli {
                 | RenewerAction::Check { .. }
                 | RenewerAction::Release { .. }
                 | RenewerAction::Stop { .. }
-                | RenewerAction::SanitizeExec { .. } => false,
+                | RenewerAction::SanitizeExec { .. }
+                | RenewerAction::TerminalReceipt(_) => false,
             },
             LeaseCommand::Pr(_) => false,
         }

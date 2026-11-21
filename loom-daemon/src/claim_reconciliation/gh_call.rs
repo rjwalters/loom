@@ -96,6 +96,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "guard.open_pr_graphql" => ops::PR_CLOSING_ISSUE_REFERENCES,
         "claim.lease_comments"
         | "guard.lease_comments"
+        | "guard.finished_builder_lease"
         | "claim.curating_comments"
         | "claim.pr_activity_comments"
         | "verdict.pr_comments"

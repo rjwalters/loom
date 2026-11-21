@@ -21,6 +21,7 @@ pub(crate) fn draw(pick: Option<&str>, model: Option<&str>) -> RoleDrawRecord {
         seed_inputs: None,
         steps: Vec::new(),
         passed_over: Vec::new(),
+        passed_over_for_span: Vec::new(),
         pick: pick.map(str::to_owned),
         model: model.map(str::to_owned),
     }
@@ -132,8 +133,11 @@ mod role_invocation_close {
         assert_eq!(span.attributes[MODEL], "opus");
         // The export path bounds a span to the daemon allowlist first.
         let bounded = span.bounded();
-        for key in KEYS {
+        for key in [PICK, ATTEMPT, TABLE_ATTEMPT, LAYER, MODEL] {
             assert!(bounded.attributes.contains_key(key), "daemon allowlist drops {key}");
+        }
+        for key in [FIRST_PICK, TABLE, PASSED_OVER] {
+            assert!(!bounded.attributes.contains_key(key), "{key} on a role tick");
         }
     }
 
