@@ -20,6 +20,7 @@
 //! | `refused`, reason `pool_gate` or `claimed` | [`Effect::Cooldown`] for [`LedgerConfig::refusal_cooldown`] |
 //! | `refused`, reason `claim_lost` | [`Effect::Redraw`], counted ([`LedgerCounters::claim_lost`]); a **second** one in a row arms a cooldown (below) |
 //! | `refused`, reason `provider_exhausted` ([`PROVIDER_EXHAUSTED`], #13966) | [`Effect::Uncharged`]: nothing, however many in a row |
+//! | `failed`, reason `sandbox_unavailable` ([`SANDBOX_UNAVAILABLE`], #14455) | [`Effect::Uncharged`]: the seat's sandbox ran nothing, not the item's fault |
 //! | any other `refused` (a state refusal) | [`Effect::Reclassify`]; a **second identical** one in a row arms a cooldown (below) |
 //! | `failed` inside the fast-fail window, Builder step | [`Effect::FastFailLadder`]: the #11854/#11872 ladder |
 //! | `failed` inside the fast-fail window, any other step | [`Effect::FastFailWindow`]: a ledger-local doubling window, never the issue quarantine |
@@ -181,6 +182,15 @@ pub const PROBE_FAILED: &str = "probe_failed";
 /// outcome-line token: the daemon synthesizes it, like the spawn-time
 /// `pool_gate` refusals it mirrors.
 pub const PROVIDER_EXHAUSTED: &str = "provider_exhausted";
+
+/// The failure reason of a Codex step whose runtime sandbox refused every
+/// tool call (`SANDBOX_UNAVAILABLE`, #14455): the session exited 0 having run
+/// nothing. The class is `failed` (it is not a no-op and not a verdict), but
+/// the cause is the seat's and the host's, never the item's, so it is
+/// [`Effect::Uncharged`] and no run for the repeat cap, like
+/// [`PROVIDER_EXHAUSTED`]. Daemon-synthesized from the step's terminal
+/// record, not an outcome-line token.
+pub const SANDBOX_UNAVAILABLE: &str = "sandbox_unavailable";
 
 /// `noop` reasons that waited on something outside the item; they are not
 /// runs for the repeat cap, and they cool down for
@@ -496,6 +506,9 @@ pub fn effect_of(
     if step.role_name() == "champion" && matches!(reason, "held" | "blocked") {
         return Effect::ForgeLadder;
     }
+    if outcome.class == OutcomeClass::Failed && reason == SANDBOX_UNAVAILABLE {
+        return Effect::Uncharged;
+    }
     match outcome.class {
         OutcomeClass::Verdict if reason == "closed" && !step.acts_on_pr() => Effect::Landed,
         OutcomeClass::Verdict => Effect::Advance,
@@ -569,6 +582,9 @@ struct Entry {
 /// Whether `outcome` is a run for the repeat cap (module doc).
 #[must_use]
 pub fn counts_as_run(outcome: &StepOutcome) -> bool {
+    if outcome.class == OutcomeClass::Failed && outcome.reason == SANDBOX_UNAVAILABLE {
+        return false;
+    }
     match outcome.class {
         OutcomeClass::Refused => false,
         OutcomeClass::Noop => !EXTERNAL_WAIT_NOOPS.contains(&outcome.reason.as_str()),

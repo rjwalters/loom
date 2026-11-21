@@ -303,14 +303,26 @@ fn codex_pool_state_counts_only_holds_the_selector_cannot_release() {
     for name in ["class-held", "session-reauth", "hard-reauth", "cooling"] {
         fs::create_dir(profiles.path().join(name)).unwrap();
     }
-    fs::write(
-        profiles
-            .path()
-            .join("session-reauth")
-            .join(crate::tokens_pool::session_lifecycle::SESSION_MARKER_FILE),
-        "{}",
-    )
-    .unwrap();
+    // #14455: a bare-metal profile beside container seats is passed over
+    // before its health is read, so every account here is a container seat.
+    // `hard-reauth` is a private clone, which is not session-managed: its
+    // re-auth hold stays one the selector's probe cannot release.
+    for name in ["class-held", "session-reauth", "cooling"] {
+        fs::write(
+            profiles
+                .path()
+                .join(name)
+                .join(crate::tokens_pool::session_lifecycle::SESSION_MARKER_FILE),
+            "{}",
+        )
+        .unwrap();
+    }
+    let private = profiles
+        .path()
+        .join(".private-sessions")
+        .join("hard-reauth");
+    fs::create_dir_all(&private).unwrap();
+    fs::write(private.join("workspace.json"), "{}").unwrap();
     let root = workspace.path();
     fs::create_dir_all(root.join(".loom")).unwrap();
     let now = epoch_now();
@@ -1188,8 +1200,8 @@ fn mark_session_managed(profiles: &Path, name: &str) {
 }
 
 /// The count: a down session is not spawnable even with NO health entry (the
-/// check runs before the no-health `continue`); a live session and a bare-metal
-/// account are unaffected; and an unobservable Docker marks nothing down.
+/// check runs before the no-health `continue`); a live session is unaffected, and
+/// a bare-metal account beside container seats is not admitted (#14455); and an unobservable Docker marks nothing down.
 #[test]
 #[serial]
 fn codex_pool_state_counts_a_down_session_as_not_spawnable() {
@@ -1205,13 +1217,18 @@ fn codex_pool_state_counts_a_down_session_as_not_spawnable() {
 
     let live = set(running(&["live"]));
     let state = codex_pool_state(workspace.path(), now);
-    assert_eq!((state.enabled, state.spawnable, state.session_down), (3, 2, 1), "{state:?}");
+    // #14455: the bare-metal profile beside container seats is not admitted.
+    assert_eq!(
+        (state.enabled, state.spawnable, state.session_down, state.unprovisioned),
+        (3, 1, 1, 1),
+        "{state:?}"
+    );
     assert!(codex_exhausted_reason(&state).contains("SessionDown"));
     drop(live);
 
     let _unobservable = set(None);
     let state = codex_pool_state(workspace.path(), now);
-    assert_eq!((state.spawnable, state.session_down), (3, 0), "fail open: {state:?}");
+    assert_eq!((state.spawnable, state.session_down), (2, 0), "fail open: {state:?}");
 }
 
 /// The pinned-runtime skip names `SessionDown` when every session is down.

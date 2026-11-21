@@ -42,6 +42,14 @@
 //!   account is marked down. A running container with stale mounts is not
 //!   down. An account the operator stopped (`accounts session stop`) is
 //!   reported as held, with no hint to start it.
+//! - **A bare-metal profile beside container seats** (#14455) is NOT counted
+//!   spawnable: on a host whose other enabled seats are session containers, a
+//!   profile never `accounts session start`ed runs on the host's own sandbox,
+//!   which refuses every command (`SANDBOX_UNAVAILABLE`). Unlike `SessionDown`
+//!   this needs no snapshot, so it does not fail open; a host with no
+//!   container seat is never gated. A seat held by its own
+//!   `SANDBOX_UNAVAILABLE` step (`tokens_pool::sandbox_seat_hold`) is a
+//!   cooldown like any other and is named in the skip text.
 //!
 //! An inventory or health-state read error is the one fail-closed case: the
 //! selector reads the same files and fails the same way (exit `78`).
@@ -354,6 +362,14 @@ pub(crate) struct CodexPoolState {
     /// How many of `session_down` the operator holds down (`accounts session
     /// stop`, #10453). Only changes the skip text (#10660).
     pub session_held: usize,
+    /// Enabled bare-metal profiles on a host whose other seats run in session
+    /// containers: never provisioned as one, so never counted spawnable
+    /// (#14455; `liveness::is_unprovisioned_bare_seat`). Needs no snapshot,
+    /// so unlike `session_down` it does not fail open.
+    pub unprovisioned: usize,
+    /// Enabled seats held by a `SANDBOX_UNAVAILABLE` tick of their own
+    /// (`sandbox_seat_hold`, #14455), a subset of the seats in cooldown.
+    pub sandbox_held: usize,
     /// Earliest account-wide cooldown deadline (epoch seconds) among the
     /// blocked accounts, when any has one.
     pub earliest_clear: Option<u64>,
@@ -377,6 +393,8 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
         spawnable: 0,
         session_down: 0,
         session_held: 0,
+        unprovisioned: 0,
+        sandbox_held: 0,
         earliest_clear: None,
         read_error: None,
     };
@@ -417,11 +435,22 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
                 usize::from(crate::tokens_pool::session_lifecycle::liveness::is_held(account));
             continue;
         }
+        // #14455: a bare-metal profile beside container seats never ran
+        // `accounts session start`; the sandbox on it refuses every command.
+        if crate::tokens_pool::session_lifecycle::liveness::is_unprovisioned_bare_seat(
+            account, &inventory,
+        ) {
+            state.unprovisioned += 1;
+            continue;
+        }
         let Some(health) = health_state.get(&account.id) else {
             state.spawnable += 1;
             continue;
         };
         if let Some(deadline) = health.cooldown_until.filter(|deadline| *deadline > now) {
+            state.sandbox_held += usize::from(
+                health.signal_provenance == crate::tokens_pool::sandbox_seat_hold::PROVENANCE,
+            );
             state.earliest_clear = Some(
                 state
                     .earliest_clear
@@ -445,8 +474,29 @@ pub(crate) fn codex_pool_state(root: &Path, now: u64) -> CodexPoolState {
 /// both name `SessionDown` (#10454) the same way.
 pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
     use crate::tokens_pool::session_hold::HOLD_REASON_OPERATOR_STOP;
+    // #14455: seats the pool passes over before any claim, each named so the
+    // skip line says why, in the form the write-role `not-admitted(...)` line
+    // has.
+    let mut named = Vec::new();
+    if state.unprovisioned > 0 {
+        named.push(format!(
+            "{}/{} not-admitted(sessionSeat: bare-metal profile on a host whose other seats run in session containers; never `loom-daemon accounts session start`ed, so its sandbox is unprovisioned; #14455)",
+            state.unprovisioned, state.enabled
+        ));
+    }
+    if state.sandbox_held > 0 {
+        named.push(format!(
+            "{}/{} held(sandbox-unavailable: its last step ran no tool call; re-tested when the hold ages out; #14455)",
+            state.sandbox_held, state.enabled
+        ));
+    }
+    let named = if named.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", named.join("; "))
+    };
     if state.session_down == 0 {
-        return "every enabled account is cooling down or needs re-auth".to_string();
+        return format!("every enabled account is cooling down or needs re-auth{named}");
     }
     // #10660: never tell the operator to start a container they stopped.
     let (down, held) = (state.session_down, state.session_held);
@@ -463,7 +513,7 @@ pub(crate) fn codex_exhausted_reason(state: &CodexPoolState) -> String {
     };
     format!(
         "every enabled account is cooling down, needs re-auth, or is {} ({down}/{} session \
-         container(s) not running{remedy}; #10454)",
+         container(s) not running{remedy}; #10454){named}",
         crate::tokens_pool::session_lifecycle::liveness::SESSION_DOWN,
         state.enabled
     )

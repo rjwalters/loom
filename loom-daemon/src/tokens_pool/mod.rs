@@ -98,6 +98,7 @@ pub mod ranking_weekly;
 pub mod rng;
 pub mod rotation;
 pub mod round_summary;
+pub mod sandbox_seat_hold;
 pub mod select;
 pub mod session_dispatch_lock;
 pub mod session_drift_removal;

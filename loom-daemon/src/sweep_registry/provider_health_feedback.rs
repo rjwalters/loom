@@ -102,6 +102,32 @@ impl SweepRegistry {
             .ok()
             .flatten()
             .is_some_and(|health| health.reason == tokens_pool::HealthReason::ReauthRequired);
+        // #14455: a sandbox that ran nothing holds THIS seat, not the runtime
+        // and not the account's credentials: the next draw passes it over
+        // (in-process walk and the `tokens select` child alike, through the
+        // shared health file) until the hold ages out or a tick on it runs.
+        if result.category == tokens_pool::TerminalClassification::SandboxUnavailable {
+            let secs = crate::runtime_preference::sandbox_hold::hold_secs();
+            let now = crate::script_helpers::now_epoch_secs();
+            match crate::tokens_pool::sandbox_seat_hold::hold_seat(
+                &self.config.workspace_root,
+                &id,
+                secs,
+                now,
+            ) {
+                Ok(true) => log::warn!(
+                    "sweep_registry: {sweep_id} ran no tool call on Codex seat {}: sandbox \
+                     unavailable, seat held {secs}s (#14455)",
+                    id.name
+                ),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "sweep_registry: failed to hold Codex seat {} after {sweep_id}'s sandbox \
+                     refused every command: {error} (#14455)",
+                    id.name
+                ),
+            }
+        }
         match tokens_pool::record_terminal_for_model_with_reset(
             &self.config.workspace_root,
             &id,

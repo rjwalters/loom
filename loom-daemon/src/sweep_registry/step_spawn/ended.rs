@@ -63,6 +63,11 @@ pub struct EndedStep {
     /// `unclassified`; ownership release, the `failed` class and the
     /// fast-fail ladder are unchanged.
     pub launch_rejection: Option<&'static str>,
+    /// The step's own Codex terminal record said the runtime's sandbox
+    /// refused every tool call (`SANDBOX_UNAVAILABLE`, #14455): nothing ran,
+    /// so the ledger records `failed` / `sandbox_unavailable` and charges the
+    /// item nothing.
+    pub sandbox_unavailable: bool,
 }
 
 type Queue = HashMap<PathBuf, Vec<EndedStep>>;

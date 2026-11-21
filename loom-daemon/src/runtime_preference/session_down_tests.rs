@@ -37,8 +37,8 @@ fn curator_walk(root: &Path) -> (String, Vec<String>) {
 
 /// All four AC cases against the ordered resolver: every session down falls
 /// through to Claude naming `SessionDown`; some up keeps Codex; an unqueryable
-/// Docker keeps Codex (fail open); and a bare-metal account is never gated on
-/// a container at all.
+/// Docker keeps Codex (fail open); and a bare-metal account never keeps a pool of
+/// down containers alive (#14455).
 #[test]
 #[serial_test::serial]
 fn a_codex_pool_of_down_sessions_falls_through_but_fails_open() {
@@ -67,9 +67,13 @@ fn a_codex_pool_of_down_sessions_falls_through_but_fails_open() {
         let _unobservable = set(None);
         assert_eq!(curator_walk(dir.path()), ("codex".to_string(), vec![]), "fail open");
     }
+    // #14455: a bare-metal profile beside container seats is no longer a way
+    // around a pool of down containers (see `seat_readiness_tests`).
     provision_codex_account("bare-metal", false);
     let _down = set(running(&[]));
-    assert_eq!(curator_walk(dir.path()), ("codex".to_string(), vec![]), "bare metal");
+    let (chosen, skipped) = curator_walk(dir.path());
+    assert_eq!(chosen, "claude");
+    assert!(skipped[0].contains("not-admitted(sessionSeat"), "{skipped:?}");
 }
 
 /// #10660: the same walk over the shared snapshot's states. A restarting
