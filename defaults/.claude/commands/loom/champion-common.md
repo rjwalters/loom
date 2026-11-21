@@ -238,10 +238,22 @@ parse_blocker_ref() {
 # "Blocked by: #1 (x), #3 (y)" would yield only #1) — under-parsing here is
 # the highest-severity failure mode (see champion-pr-merge.md Step 5's own
 # comment on ALL_DEPS), so the two-stage shape is load-bearing, not stylistic.
+#
+# The sed stage between them is the #14732 parent-reference rule. A mixed
+# line like "Part of #2. Depends on #4" passes the phrase gate via the real
+# dependency, and the whole-line ref scan would yield BOTH numbers — reading
+# the issue's PARENT as a blocker. That is how a phase child got walked into
+# its parent's dependency cycle and routed to an operator for a loop it was
+# not on. Masking the `Part of`-introduced reference before extraction keeps
+# the rest of the line intact: the sed keys off the introducing phrase, never
+# the number, so a parent genuinely declared again as a dependency
+# ("Depends on #2 (parent). Part of #2") still counts — matching the Rust
+# side (loom-daemon/src/dep_classify/refs.rs, part_of_spans).
 extract_blocker_refs() {
   local body="$1"
   printf '%s\n' "$body" \
     | grep -E '(Blocked by|Depends on|Requires)[*_:[:space:]]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
+    | sed -E 's/[Pp]art of[*_:.[:space:]]*([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#[0-9]+/ /g' \
     | grep -Eo '([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+|#[0-9]+)' \
     | sort -u
 }

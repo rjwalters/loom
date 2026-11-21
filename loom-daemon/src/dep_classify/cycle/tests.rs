@@ -56,6 +56,25 @@ fn a_blocks_line_quoting_the_other_issues_dependency_is_not_a_cycle() {
     assert_eq!(w.run("o/r#27"), Outcome::NoCycle);
 }
 
+// #14732: the incident shape end to end — a mixed "Part of" line whose parent
+// sits on a cycle the issue under evaluation is not on, with its one real
+// dependency closed. Both halves are needed: the parent reference must not
+// become an edge, and the loop it would reach must not implicate this issue.
+#[test]
+fn a_part_of_parent_on_a_cycle_does_not_route_this_issue_to_an_operator() {
+    let mut w = Walk::new(
+        bodies(&[
+            ("o/r#1", "Part of #2. Depends on #4"),
+            ("o/r#2", "Depends on #3"),
+            ("o/r#3", "Depends on #2"),
+            ("o/r#4", "Done."),
+        ]),
+        Budgets::default(),
+    );
+    assert_eq!(w.run("o/r#1"), Outcome::NoCycle);
+    assert!(w.is_complete(), "the whole graph was readable and in budget");
+}
+
 #[test]
 fn a_cycle_reports_the_line_that_declared_each_edge() {
     let mut w = Walk::new(
@@ -107,7 +126,11 @@ fn a_direct_loop_is_found() {
 }
 
 #[test]
-fn a_longer_loop_is_found_and_reported_from_its_first_recurrence() {
+fn a_loop_the_root_is_not_on_is_not_the_roots_cycle() {
+    // #14732: only issues that are NODES on the closed loop are escalated for
+    // it. The root's dependency on #2 is real, but the deadlock belongs to
+    // #2 and #3 — for the root it is an ordinary dependency wait, and the
+    // loop is surfaced when a walk starts from #2 or #3 themselves.
     let mut w = Walk::new(
         graph(&[
             ("o/r#1", "OPEN", &["o/r#2"]),
@@ -116,16 +139,59 @@ fn a_longer_loop_is_found_and_reported_from_its_first_recurrence() {
         ]),
         Budgets::default(),
     );
+    assert_eq!(w.run("o/r#1"), Outcome::NoCycle);
+}
+
+#[test]
+fn a_root_on_a_longer_loop_reports_the_whole_loop() {
+    // Walked from a member, the segment starts at the root (its first
+    // recurrence is position 0) and closes on it.
+    let mut w = Walk::new(
+        graph(&[
+            ("o/r#1", "OPEN", &["o/r#2"]),
+            ("o/r#2", "OPEN", &["o/r#3"]),
+            ("o/r#3", "OPEN", &["o/r#1"]),
+        ]),
+        Budgets::default(),
+    );
     match w.run("o/r#1") {
-        // #1 is not part of the loop, so the segment starts at #2.
         Outcome::Cycle(c) => assert_eq!(
             c,
             vec![
+                "o/r#1".to_string(),
                 "o/r#2".to_string(),
                 "o/r#3".to_string(),
-                "o/r#2".to_string()
+                "o/r#1".to_string()
             ],
-            "the segment must start at the first recurrence, not the root"
+            "a loop through the root must name every member and close"
+        ),
+        other => panic!("expected a cycle, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_loop_elsewhere_does_not_stop_the_search_for_the_roots_own_loop() {
+    // The walk meets the #2 -> #3 -> #2 loop first (it sorts ahead of #9),
+    // must not treat it as the answer, and must keep searching to find the
+    // #1 -> #9 -> #1 loop.
+    let mut w = Walk::new(
+        graph(&[
+            ("o/r#1", "OPEN", &["o/r#2", "o/r#9"]),
+            ("o/r#2", "OPEN", &["o/r#3"]),
+            ("o/r#3", "OPEN", &["o/r#2"]),
+            ("o/r#9", "OPEN", &["o/r#1"]),
+        ]),
+        Budgets::default(),
+    );
+    match w.run("o/r#1") {
+        Outcome::Cycle(c) => assert_eq!(
+            c,
+            vec![
+                "o/r#1".to_string(),
+                "o/r#9".to_string(),
+                "o/r#1".to_string()
+            ],
+            "the loop through the root must be found after the loop elsewhere"
         ),
         other => panic!("expected a cycle, got {other:?}"),
     }
@@ -228,21 +294,22 @@ fn the_step_budget_truncates_and_is_recorded() {
 /// explored, because a later path may reach it with budget to spare — and
 /// skipping it there would miss a real cycle.
 ///
-/// `#2` is reachable twice: once at depth 2 (where the depth budget truncates
-/// beneath it) and once directly from the root at depth 1, where the loop
-/// `#2 -> #5 -> #2` is inside budget. Memoising on return marks `#2` explored
-/// during the first visit and the second never looks — reporting NO CYCLE for a
-/// graph that plainly has one.
+/// `#9` is entered twice: first at depth 2, where the depth budget truncates
+/// beneath it, then directly from the root at depth 1, where the loop
+/// `#9 -> #5 -> #1 -> #9` is inside budget. Memoising on return marks `#9`
+/// explored during the first visit and the second never looks — reporting NO
+/// CYCLE for a graph that plainly has one through the root.
 #[test]
 fn a_truncated_subtree_is_not_memoised() {
     let mut w = Walk::new(
         graph(&[
-            // First branch reaches #2 deep, where depth runs out beneath it.
-            ("o/r#1", "OPEN", &["o/r#9", "o/r#2"]),
-            ("o/r#9", "OPEN", &["o/r#2"]),
-            // The loop, reachable within budget from the root's second ref.
-            ("o/r#2", "OPEN", &["o/r#5"]),
-            ("o/r#5", "OPEN", &["o/r#2"]),
+            // First branch reaches #9 deep, where depth runs out beneath it.
+            ("o/r#1", "OPEN", &["o/r#2", "o/r#9"]),
+            ("o/r#2", "OPEN", &["o/r#9"]),
+            // The loop through the root, reachable within budget from the
+            // root's second ref.
+            ("o/r#9", "OPEN", &["o/r#5"]),
+            ("o/r#5", "OPEN", &["o/r#1"]),
         ]),
         Budgets {
             max_depth: 3,
@@ -252,7 +319,7 @@ fn a_truncated_subtree_is_not_memoised() {
     let outcome = w.run("o/r#1");
     assert!(
         matches!(outcome, Outcome::Cycle(_)),
-        "the #2 -> #5 -> #2 loop must still be found via the shallower path; \
+        "the #1 -> #9 -> #5 -> #1 loop must still be found via the shallower path; \
          memoising the truncated deep visit would hide it. got {outcome:?}"
     );
 }

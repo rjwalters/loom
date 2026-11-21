@@ -1,9 +1,22 @@
 //! Dependency-cycle detection — the Rust port of `detect-dependency-cycle.sh`'s
 //! graph walk (epic #7810, PR 3).
 //!
-//! An issue blocked by a dependency can be waited on. An issue in a **cycle**
+//! An issue blocked by a dependency can be waited on. An issue **on** a cycle
 //! cannot — waiting is the one thing that will never resolve it — so Champion
 //! must tell the two apart before deferring anything.
+//!
+//! # Escalation is membership-scoped (#14732)
+//!
+//! A loop closed somewhere **downstream** of the starting issue is not that
+//! issue's cycle. Its dependency on the loop's members is real, but for the
+//! starting issue it is an ordinary wait (the members are the ones the
+//! deadlock belongs to, and a walk from them reports it). Reading every
+//! reachable loop as the root's own routed buildable issues to `loom:operator`
+//! for a decision they are not part of — the incident behind #14732 was a
+//! `Part of` parent reference walking a child into its parent's cycle. The
+//! walk therefore only returns a loop that passes **through the issue it
+//! started from**, and keeps searching within its budgets when a branch closes
+//! a loop elsewhere: a later edge may still close a loop through the start.
 //!
 //! # The invariant most at risk in a rewrite
 //!
@@ -87,11 +100,12 @@ impl Truncation {
 /// What a walk found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// No cycle reachable within budget. Check [`Walk::is_complete`] before
-    /// treating this as "no cycle exists".
+    /// No cycle through the starting issue reachable within budget. Check
+    /// [`Walk::is_complete`] before treating this as "no cycle exists".
     NoCycle,
     /// The closed loop, from its first recurrence, with the repeated node at
-    /// both ends.
+    /// both ends. The loop passes through the issue the walk started from
+    /// (#14732) — the start is its first node.
     Cycle(Vec<String>),
 }
 
@@ -212,7 +226,9 @@ where
             .collect()
     }
 
-    /// Walk from `root`, returning the first cycle reachable within budget.
+    /// Walk from `root`, returning the first cycle **through `root`** reachable
+    /// within budget. A loop elsewhere in the graph is not `root`'s cycle
+    /// (#14732): the search continues past it.
     pub fn run(&mut self, root: &str) -> Outcome {
         // The root must be in the cache before its body can be read.
         if self.fetch_node(root).is_none() {
@@ -224,8 +240,9 @@ where
         }
     }
 
-    /// One DFS level. `Some(cycle)` propagates a find straight to the caller,
-    /// matching the shell's `return 1`.
+    /// One DFS level. `Some(cycle)` propagates a loop through the starting
+    /// issue straight to the caller, matching the shell's `return 1`; a loop
+    /// closed elsewhere is stepped over, not returned (#14732).
     fn walk(&mut self, node: &str, depth: usize, path: &[String]) -> Option<Vec<String>> {
         let body = self
             .cache
@@ -248,7 +265,18 @@ where
             }
 
             if path.contains(&r) {
-                return Some(cycle_segment(&r, path));
+                // A closed loop. It implicates the issue under evaluation
+                // only when that issue is ON it (#14732): the walk's path
+                // always starts at that issue and is simple, so the loop
+                // runs through it exactly when the closing reference IS the
+                // start. A loop closed elsewhere belongs to its own members —
+                // keep examining the remaining references within the
+                // existing budgets, because a later edge may still close a
+                // loop through the start.
+                if path.first() == Some(&r) {
+                    return Some(cycle_segment(&r, path));
+                }
+                continue;
             }
 
             if self.explored.contains(&r) {

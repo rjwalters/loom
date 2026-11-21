@@ -26,6 +26,16 @@
 //! per-phrase-family proximity window — a different function with a different
 //! job. #7877 widened that window; it does not apply here.)
 //!
+//! **One reference on a mixed line is NOT a dependency, even under that
+//! scan: the one `Part of` introduces (#14732).** `Part of #2. Depends on #4`
+//! names the issue's *parent* and its one real blocker on one line; reading
+//! the parent as an edge walked a phase child into its parent's cycle and
+//! routed it to an operator for a loop it was not on. The exclusion is
+//! structural — it keys off `Part of` introducing the reference, never off
+//! the number, so a parent genuinely declared again as a dependency
+//! (`Depends on #2 … Part of #2`) is still a blocker. See
+//! [`part_of_spans`].
+//!
 //! **The phrase match is case-sensitive.** `grep -E` without `-i`, so
 //! `blocked by #3` in lower case does not register. Preserved deliberately.
 //!
@@ -54,6 +64,19 @@ fn ref_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(r"([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+|https?://[^\s),]+/issues/[0-9]+")
             .expect("static reference pattern")
+    })
+}
+
+/// The `Part of #N` parent-reference shape: optional markdown emphasis around
+/// the phrase, then punctuation/emphasis/whitespace, then the reference —
+/// bare `#N` or `owner/repo#N` — that phrase introduces (#14732).
+fn part_of_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)(?:\*\*|__|\*|_)*part of(?:\*\*|__|\*|_)*[*_:\s]*(?:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+",
+        )
+        .expect("static part-of pattern")
     })
 }
 
@@ -92,7 +115,9 @@ pub fn parse_dependency_refs(body: &str, default_repo: &str) -> Vec<String> {
 /// report can quote the line that produced an edge. Double-quoted and
 /// backticked spans are masked first ([`mask_quoted_spans`]): a phrase or
 /// reference inside them describes some other issue rather than declaring a
-/// dependency of this one (#13303).
+/// dependency of this one (#13303). A reference `Part of` introduces is then
+/// dropped ([`part_of_spans`]): on a mixed line it is the parent, not a
+/// blocker (#14732).
 #[must_use]
 pub fn dependency_lines(body: &str, default_repo: &str) -> Vec<(String, Vec<String>)> {
     let mut out = Vec::new();
@@ -101,13 +126,37 @@ pub fn dependency_lines(body: &str, default_repo: &str) -> Vec<(String, Vec<Stri
         if !line_re().is_match(&masked) {
             continue;
         }
+        let parents = part_of_spans(&masked);
         let refs: Vec<String> = ref_re()
             .find_iter(&masked)
+            .filter(|m| {
+                !parents
+                    .iter()
+                    .any(|&(open, close)| m.start() >= open && m.start() < close)
+            })
             .filter_map(|m| normalise(m.as_str(), default_repo))
             .collect();
         out.push((line.to_string(), refs));
     }
     out
+}
+
+/// Byte spans of the `Part of #N` parent references in `line` — the regions
+/// [`dependency_lines`] ignores when collecting blockers (#14732).
+///
+/// Like the `(Epic #M …)` exclusion in [`extract_refs`], the filter is
+/// **structural, not positional**: it keys off `Part of` introducing a
+/// reference and never off which number follows, so a parent named again by a
+/// dependency phrase on the same line is still a blocker. Unlike that filter
+/// the span is the phrase-plus-reference match itself (there is no
+/// parenthetical to balance), and the exclusion never applies to the URL form
+/// — `Part of` declarations cite issue numbers, and widening to URLs would
+/// only add untested surface.
+fn part_of_spans(line: &str) -> Vec<(usize, usize)> {
+    part_of_re()
+        .find_iter(line)
+        .map(|m| (m.start(), m.end()))
+        .collect()
 }
 
 /// Replace every closed `"…"` and `` `…` `` span in `line` with spaces.
