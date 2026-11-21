@@ -498,7 +498,9 @@ echo ""
 echo "Testing the #13930 gh timeout bound + bounded read retry..."
 
 # Resolver edge cases, exercised directly against the wrapper module.
-python3 - "$GH_CACHED" <<'PY'
+# -B: SourceFileLoader exec would otherwise drop a __pycache__/ directory
+# next to the wrapper, leaving the repo tree dirty after a test run (#14011).
+python3 -B - "$GH_CACHED" <<'PY'
 import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
 loader = SourceFileLoader("gh_cached", sys.argv[1])
@@ -567,6 +569,58 @@ case "$(cat "$TMP_ROOT/timeout-write.err")" in
   *) wdiag="no: $(cat "$TMP_ROOT/timeout-write.err")" ;;
 esac
 assert_eq "yes" "$wdiag" "…with the attempts=1 diagnostic"
+
+# A `gh api` POST with typed `-F`/`--field` gets exactly one attempt
+# (#14011), so a timeout cannot double-post it. Typed `-F body=@-`
+# reads the body from stdin. Literal `-f`/`--raw-field` sends the value as written.
+reset_cache
+ghc_slow api repos/o/r/issues/42/comments -F body=x \
+    >"$TMP_ROOT/timeout-api-F.out" 2>"$TMP_ROOT/timeout-api-F.err"
+api_f_rc=$?
+assert_eq "124" "$api_f_rc" "a stalled 'gh api … -F body=x' expires (124)"
+assert_eq "1" "$(call_count)" "…with exactly ONE attempt — a typed-field POST is a write and gets no retry (#14011)"
+assert_eq "" "$(cat "$TMP_ROOT/timeout-api-F.out")" "…and no partial stdout"
+
+# Classification (#14011), asserted directly against the wrapper module:
+# BOTH predicates — parse_gh_args (cacheability) and is_write_invocation
+# (retry policy) — must treat typed -F/--field (including -F body=@-)
+# and literal -f/--raw-field as writes. Field-less API reads stay cacheable.
+python3 -B - "$GH_CACHED" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("gh_cached", sys.argv[1])
+spec = importlib.util.spec_from_loader("gh_cached", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+writes = [
+    ["api", "repos/o/r/issues/42/comments", "-F", "body=x"],
+    ["api", "repos/o/r/issues/42/comments", "--raw-field", "body=x"],
+    ["api", "repos/o/r/issues/42/comments", "-F", "body=@-"],
+    ["api", "repos/o/r/issues/42/comments", "-f", "body=x"],
+    ["api", "repos/o/r/issues/42/labels", "-X", "POST", "-f", "labels[]=loom:pr"],
+    ["issue", "comment", "42", "--body", "x"],
+]
+reads = [
+    ["api", "repos/o/r/issues/42/comments"],
+    ["api", "repos/o/r/issues/42", "-X", "GET"],
+    ["pr", "list", "--state", "open"],
+]
+bad = []
+for args in writes:
+    if not mod.is_write_invocation(args):
+        bad.append(f"is_write_invocation=True expected: {' '.join(args[:4])}")
+    if mod.parse_gh_args(args)["cacheable"]:
+        bad.append(f"cacheable=False expected: {' '.join(args[:4])}")
+for args in reads:
+    if mod.is_write_invocation(args):
+        bad.append(f"is_write_invocation=False expected: {' '.join(args[:4])}")
+    if not mod.parse_gh_args(args)["cacheable"]:
+        bad.append(f"cacheable=True expected: {' '.join(args[:4])}")
+if bad:
+    print("; ".join(bad))
+    sys.exit(1)
+PY
+assert_eq "0" "$?" "both predicates classify typed and literal field flags as writes and cache field-less API reads (#14011)"
 
 # A read that stalls ONCE then succeeds: the retry returns the good output.
 FLAKY_DIR="$TMP_ROOT/flakybin"

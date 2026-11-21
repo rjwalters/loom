@@ -2810,9 +2810,11 @@ missing its label with no removal on record gets the label back
 #
 # #13930 degraded census: every "$GH_READ" call is bounded by gh-cached's
 # LOOM_GH_TIMEOUT_S — a stalled query fails fast (exit 124, diagnostic on
-# stderr) instead of hanging this pass. A failed query contributes nothing
-# and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR Digest below then marks
-# structural fields unavailable instead of silently dropping the digest.
+# stderr) instead of hanging this pass. Any failed census read — the two
+# bulk holds queries, the at-Doctor count, or the released list (#14011) —
+# contributes nothing and raises HELD_STRUCTURAL_UNAVAILABLE; the Per-PR
+# Digest below then marks structural fields unavailable instead of silently
+# dropping the digest.
 # Never issue a second bulk `pr list` to "recover" — the deliberate
 # single-read pin stands; a degraded digest beats a duplicated census read.
 HELD_JSON=""
@@ -2839,11 +2841,14 @@ HELD_JSON=$(printf '%s' "$HELD_JSON" | jq -s 'add // [] | unique_by(.number)')
 # rindex idiom from champion-critical-file-hold.md). The previous selector
 # excluded a PR on ANY cleared marker, dropping a held PR whose *other*
 # hold still stands.
-HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
+if ! HELD_AT_DOCTOR=$("$GH_READ" pr list --label "loom:changes-requested" --label "loom:blocked" --state open --limit 500 --json number,labels,comments \
   --jq '[.[] | select(any(.labels[]?.name; . == "loom:frozen") | not) | select(
       ([.comments[].body] | (map(startswith("<!-- champion:merge-risk-hold -->")) | rindex(true)) as $h | (map(contains("<!-- champion:merge-risk-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
       or ([.comments[].body] | (map(startswith("<!-- champion:critical-file-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:critical-file-hold-cleared -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c))
-      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length')
+      or ([.comments[].body] | (map(startswith("<!-- champion:ratification-hold -->")) | rindex(true)) as $h | (map(startswith("<!-- champion:ratification-hold-cleared -->") or startswith("<!-- champion:ratification-release-respected -->")) | rindex(true)) as $c | $h != null and ($c == null or $h > $c)))] | length'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the at-Doctor read stalled too (#14011) — the 0 below is degraded, not a fact
+  HELD_AT_DOCTOR=0   # never feed a failed read's partial stdout to the arithmetic
+fi
 HELD_AT_DOCTOR=${HELD_AT_DOCTOR:-0}   # a bounded-but-failed read degrades to 0, never breaks the arithmetic (#13930)
 
 HELD_COUNT=$(( $(printf '%s\n' "$HELD_JSON" | jq 'length') + HELD_AT_DOCTOR ))
@@ -2865,9 +2870,13 @@ echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting
 # a LATEST `ratification-release-respected` marker (the one hold kind whose
 # design is "only a human releases this, then merges by hand"); a ratification
 # hold whose last family marker is `-cleared` was auto-cleared, not listed.
-RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
+RELEASED=""
+if ! RELEASED=$("$GH_READ" pr list --label "loom:pr" --search "-label:loom:blocked -label:loom:operator -label:loom:frozen" --state open --limit 500 --json number,comments \
   --jq '"<!-- champion:critical-file-hold" as $cf | [.[] | select(any(.comments[].body; startswith("<!-- champion:merge-risk-hold -->")) or ([.comments[].body | select(startswith($cf))] | last // "" | startswith($cf + " -->")) or ([.comments[].body | select(startswith("<!-- champion:ratification-hold") or startswith("<!-- champion:ratification-release-respected"))] | last // "" | startswith("<!-- champion:ratification-release-respected -->")))
-    | "#\(.number)"] | join(" ")')
+    | "#\(.number)"] | join(" ")'); then
+  HELD_STRUCTURAL_UNAVAILABLE=1   # the released read stalled too (#14011) — "none" below may be an artifact, not a fact
+  RELEASED=""   # never echo a failed read's partial stdout
+fi
 echo "Released holds, not yet merged: ${RELEASED:-none}"
 ```
 
