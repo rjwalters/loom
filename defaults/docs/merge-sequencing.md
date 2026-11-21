@@ -146,6 +146,19 @@ or the conflict. Pending CI, a `cancelled` run, and unknown mergeability change
 nothing, so a freshly re-dated head does not churn holds. Human holds (no
 `source=pass`), stacked bases and consolidation reservations are unaffected.
 
+A stacked follower can enter the Doctor draw while its parent is held when
+it already carries both `loom:changes-requested` and `loom:merge-conflict`
+(#14812). Doctor repairs it against the parent's branch, which remains its PR
+base. The `StackedBase` hold and `loom:sequenced` still gate the merge
+(`merge-pr.sh`, #9378). The conflict pass still defers a new automatic flag
+while a trusted sequence is in flight at the recorded heads (#9686).
+
+The follower's linked issue can show a Doctor step in the pick record.
+Without both repair labels, the pass reason is `sequenced` unless a prior
+guard applies. A follower's own `frozen`, `operator` and `blocked` reasons
+still apply, including `blocked` for a Doctor-cycle cap on a held PR.
+`sequence-plan` continues to show the landing constraint.
+
 ## A pinned head that moves
 
 By default a hold whose follower head moved since the marker was written is

@@ -42,7 +42,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 
 use crate::codex_usage::{self, CodexSessionUsage, SessionFilter};
 
@@ -95,7 +94,8 @@ impl CodexUsageArgs {
     /// Propagates an invalid `--since`/`--until`, or a current-directory
     /// lookup failure when neither `--directory` nor `--session-id` was given.
     pub(crate) fn run(self) -> Result<()> {
-        let window = self.window()?;
+        let window =
+            super::usage_window::resolve(&self.since, self.until.as_deref(), self.all_time)?;
         let filter = self.filter()?;
         let homes = codex_usage::codex_homes(None);
         let rollouts = codex_usage::discover_rollouts(None, window);
@@ -177,26 +177,6 @@ impl CodexUsageArgs {
             }
         }
         Ok(())
-    }
-
-    /// `None` under `--all-time`; otherwise the resolved `[since, until]`.
-    ///
-    /// Identical to `opencode-usage`'s own window resolution, deliberately:
-    /// an operator reconciling one window across both runtimes must not have
-    /// to learn two spellings of it.
-    fn window(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        if self.all_time {
-            return Ok(None);
-        }
-        let now = Utc::now();
-        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
-        let until = match &self.until {
-            Some(raw) => DateTime::parse_from_rfc3339(raw)
-                .with_context(|| format!("--until {raw:?} is not RFC3339"))?
-                .with_timezone(&Utc),
-            None => now,
-        };
-        Ok(Some((since, until)))
     }
 
     /// The exact session key to attribute.

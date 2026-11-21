@@ -28,6 +28,24 @@ pub struct Minted {
     pub role: SidecarRole,
     /// The token's expiry (RFC 3339, from the minter).
     pub expires_at: String,
+    /// Narrow-issuance evidence PAIRED with this token (#14716): the
+    /// repository IDs and permissions the issuer bound to it at mint. `None`
+    /// for the ordinary writer mint, which posts no narrowing body. `Some`
+    /// marks a read-authority mint: token and evidence stay together in
+    /// memory, and [`publish_minted`] refuses it outright, so the paired
+    /// proof can never degrade into a credential published in one write and
+    /// an accounting identity in another.
+    pub scoped: Option<ScopedIssuance>,
+}
+
+/// Narrow-issuance evidence bound to one minted token at mint time
+/// (#14716): the repository IDs the token was restricted to, and the
+/// permissions it carries on them (`{"contents": "read"}`). Secret-free:
+/// it describes the scope, never the credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopedIssuance {
+    pub repository_ids: Vec<String>,
+    pub permissions: std::collections::BTreeMap<String, String>,
 }
 
 impl fmt::Debug for Minted {
@@ -39,6 +57,7 @@ impl fmt::Debug for Minted {
             .field("owner", &self.owner)
             .field("role", &self.role)
             .field("expires_at", &self.expires_at)
+            .field("scoped", &self.scoped)
             .finish_non_exhaustive()
     }
 }
@@ -66,7 +85,35 @@ impl Minted {
             owner: super::owner_of_nwo(owner_repo).to_ascii_lowercase(),
             role: SidecarRole::Writer,
             expires_at: expires_at.clone(),
+            scoped: None,
         })
+    }
+
+    /// A read-authority mint (#14716): one repository, Contents read, the
+    /// issuance evidence PAIRED with the token in this one in-memory value.
+    /// Built only from the authorized issuer's narrow-issuance answer; never
+    /// published ([`publish_minted`] refuses it), never cached — the
+    /// credential travels only through the private transport that asked for
+    /// it, and the evidence stays beside it.
+    #[must_use]
+    pub fn read_authority(
+        token: String,
+        app_id: String,
+        installation_id: String,
+        owner: String,
+        expires_at: String,
+        scoped: ScopedIssuance,
+    ) -> Self {
+        Self {
+            token,
+            app_id,
+            slug: None,
+            installation_id,
+            owner,
+            role: SidecarRole::Reader,
+            expires_at,
+            scoped: Some(scoped),
+        }
     }
 
     /// The sidecar this token is published with.
@@ -107,6 +154,17 @@ fn publish_minted_with(
     minted: &Minted,
     write: impl FnOnce(&Path, &Sidecar) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    // A scoped read-authority mint is never published (#14716): its whole
+    // value is that the credential and the evidence the issuer bound to it
+    // stay PAIRED. Publishing would split them into a token in one write
+    // and an accounting identity in another — exactly the shape that
+    // cannot prove a mirror's read authority.
+    if minted.scoped.is_some() {
+        return Err(std::io::Error::other(
+            "a scoped read-authority mint is never published; its evidence stays paired with \
+             the token in memory (#14716)",
+        ));
+    }
     super::publish_github_app_token(dir, &minted.token)?;
     if let Err(e) = write(dir, &minted.sidecar()) {
         remove_sidecar(dir);
@@ -243,5 +301,42 @@ mod tests {
         let shown = format!("{m:?}");
         assert!(!shown.contains("ghs_minted_secret"), "{shown}");
         assert!(shown.contains("151241341"), "{shown}");
+    }
+
+    /// #14716: a scoped read-authority mint stays paired in memory and is
+    /// never split into a published token plus a separate identity write.
+    #[test]
+    fn a_scoped_read_authority_mint_is_never_published() {
+        let scoped = ScopedIssuance {
+            repository_ids: vec!["907216439".into()],
+            permissions: [("contents".to_owned(), "read".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let minted = Minted::read_authority(
+            "ghs_scoped_secret".into(),
+            "4486636".into(),
+            "151241341".into(),
+            "acme".into(),
+            "2030-01-01T00:00:00Z".into(),
+            scoped,
+        );
+        assert_eq!(minted.role, SidecarRole::Reader);
+        assert!(minted
+            .scoped
+            .as_ref()
+            .is_some_and(|s| s.repository_ids == ["907216439".to_owned()]));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("gh-config");
+        let refused = publish_minted(&dir, &minted).unwrap_err();
+        assert!(
+            refused.to_string().contains("never published"),
+            "the refusal names the pairing rule: {refused}"
+        );
+        assert!(!dir.exists(), "no byte of the scoped mint reached the disk");
+        // Its Debug carries the evidence but never the credential.
+        let shown = format!("{minted:?}");
+        assert!(!shown.contains("ghs_scoped_secret"), "{shown}");
+        assert!(shown.contains("907216439"), "{shown}");
     }
 }

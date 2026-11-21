@@ -16,6 +16,55 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-11-20
 
+- **PR #14829**: test: cover both private-workspace hook trust paths
+- **PR #14827**: feat(ci): install shared docs-only suite classification
+- **PR #14825**: fix(guide): recheck named blockers on parked pull requests
+- **PR #14801**: fix(lease): stop deferred publication when its PR opens
+- **PR #14800**: fix: rerun only the ratification keys missing at the selected head
+- **PR #14794**: fix: aggregate fleet roles across participating workspaces
+- **PR #14790**: refactor: serialize shared daemon status sections directly
+- **PR #14786**: test: reuse EnvGuard in unregistered workspace fixtures
+- **PR #14662**: docs(roles): gate Judge and Builder pre-push updates on workflow-lint
+- **PR #14653**: fix(roles): pin drift recovery to the verified PR head
+- **PR #14650**: fix(champion): classify workflow write-all permission values
+- **PR #14637**: fix(merge-queue): resolve the status-command route from a root of the target
+- **PR #14620**: fix: refuse an uncreatable verdict-lock directory at once instead of waiting as contention
+- **PR #14518**: fix(verdict-guard): don't read the verdict writer's own label as an operator send-back
+- **Issue #14809** (closed): Parked PRs stay loom:blocked after their main-red blockers close: neither Guide's PR unblock sweep nor ci_gate_recovery release
+- **Issue #14805** (closed): Builders that find an issue already satisfied exit without recording it, so the issue is redispatched repeatedly
+- **Issue #14799** (closed): Stop a deferred issue lease when its implementation PR opens
+- **Issue #14797** (closed): Ratification lane reruns keys already reviewed on the same head
+- **Issue #14791** (closed): One exhausted workspace can hide another workspace’s eligible role from the fleet captain
+- **Issue #14787** (closed): Remove duplicate field mappings from eight status JSON entries
+- **Issue #14783** (closed): Reuse EnvGuard in the five tests that clear GH_CONFIG_DIR
+- **Issue #14651** (closed): judge.md's worktree drift recovery (`git pull --ff-only`) moves a PR branch onto main when upstream tracking has drifted
+- **Issue #14648** (closed): Champion workflow check mistakes write-all inside a test filename for write permissions
+- **Issue #14617** (closed): forge verdict-lock waits 90 seconds and reports contention when its lock parent is read-only
+- **Issue #14516** (closed): Verdict staleness trusts an old rejection when a prepared Doctor commit is pushed later
+- **Issue #14156** (closed): Judge's and Builder's own merge-then-push paths resolve conflicts without the workflow-lint gate #13896 adds to Doctor
+- **Issue #14782** (closed): Consolidate repeated issue-dispatch requests in IPC handler tests
+- **PR #14784**: test: consolidate repeated issue DispatchSweep literals into issue_dispatch helper
+- **Issue #14775** (closed): Isolate synthetic gateway state from parallel claim-label tests
+- **PR #14779**: test: run gateway publication fixtures in child processes
+- **PR #14780**: test: remove unused isTelemetryProblem, cover misconfigured relay at the renderer
+- **Issue #14719** (closed): Remove the test-only isTelemetryProblem classifier and test the daemon_status warning directly
+- **PR #14778**: refactor(cli): share usage time-window resolution
+- **Issue #14774** (closed): Share time-window parsing across the Codex, OpenCode, and Pi usage commands
+- **PR #14772**: Price GPT-6.2 Astra usage in Loom
+- **PR #14770**: test: share the terminal ID rejection fixture
+- **Issue #14768** (closed): Collapse seven copy-pasted injection tests in integration_security.rs into the table-driven test
+- **PR #14764**: chore(harness): track latest CLIs — codex 0.170.0→0.171.0
+- **Issue #14759** (closed): Consolidate the collector README’s log-body policy and remove stale schema history
+- **PR #14763**: docs: consolidate collector log body guidance
+- **Issue #14754** (closed): Release the IPC test fixture’s temporary SQLite directory after each test
+- **PR #14762**: test: release the IPC fixture directory when tests finish
+- **Issue #14751** (closed): test flake: fleet_dispatch::server::tests::the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_lossy_stream fails on Rust Unit Tests (5/5) — "a 304 advances the age"
+- **PR #14761**: test: wait for the client to process the worklist 304
+- **Issue #14731** (closed): OTLP exporter: a 400 for an oversized body is permanent loss, and the per-batch byte bound is a fixed 4 MiB
+- **PR #14756**: fix: split oversized queued OTLP requests in order
+- **Issue #14738** (closed): workspace_resync: a failed release-tag verification at startup is never retried, so no host resyncs any workspace on 0.20.0
+- **PR #14748**: fix: report workspace resync release verification attempts
+- **PR #14745**: fix: carry observed step failure class to the attempt span
 - **PR #14743**: fix: preserve seat volume readings across sampling failures
 - **PR #14695**: fix: manual private-session exec refuses on its own busy seat
 - **PR #14243**: fix: stamp the forge's canonical repo name into loom_source_remote

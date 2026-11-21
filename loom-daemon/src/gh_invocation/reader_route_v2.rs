@@ -166,6 +166,7 @@ impl GhInvocation {
         let mut tried: HashSet<String> = HashSet::new();
         let mut last_app: Option<String> = None;
         let mut last_failure: Option<Failure> = None;
+        let mut primary_graphql_failures_only = true;
         let mut decision = lookup(&RouteRequest {
             reader_cooldowns: &cooldowns,
             ..request
@@ -194,7 +195,15 @@ impl GhInvocation {
                     ));
                 }
                 RouteDecision::Exhausted { until, cause } => {
-                    let why = ShedWhy::Router(cause.as_str());
+                    let why = if cause == ExhaustCause::GraphqlPrimaryBudget
+                        && class == ReadClass::Gate
+                        && resource == Resource::Graphql
+                        && primary_graphql_failures_only
+                    {
+                        ShedWhy::GraphqlBudget
+                    } else {
+                        ShedWhy::Router(cause.as_str())
+                    };
                     return Ok(self.shed_read(
                         class,
                         &owner,
@@ -245,6 +254,7 @@ impl GhInvocation {
                 if fault == crate::forge_gateway::outage::Fault::Withdraw {
                     super::withdraw_gateway_outage(self.operation.as_str());
                 }
+                primary_graphql_failures_only = false;
                 tried.insert(app_id.clone());
                 last_app = Some(app_id);
                 last_failure = None;
@@ -311,6 +321,7 @@ impl GhInvocation {
             // A rate limit, a refused token, or a 403/404 from a reader with
             // no evidence it can see the repo: withdraw it (for this repo
             // only on coverage) and ask the router for the next one.
+            primary_graphql_failures_only &= failure.is_primary_graphql();
             withdraw(&app_id, &slug, failure, &why);
             tried.insert(app_id.clone());
             last_app = Some(app_id);
@@ -436,6 +447,7 @@ impl GhInvocation {
             owner: owner.to_string(),
             resource,
             until,
+            graphql_budget_exhausted: why == ShedWhy::GraphqlBudget,
         }
     }
 
@@ -475,7 +487,7 @@ impl GhInvocation {
             // and its source), so a shed run is diagnosable from the log.
             let readers = match why {
                 ShedWhy::NoRoute => None,
-                ShedWhy::Router(_) => self
+                ShedWhy::Router(_) | ShedWhy::GraphqlBudget => self
                     .reader_slug()
                     .or_else(|| super::super::accounting::resolved_identity(self).repo)
                     .and_then(|slug| {
@@ -509,6 +521,8 @@ pub(crate) enum ShedWhy {
     /// asked (a checkout whose local sources disagree, an argv shape it does
     /// not route).
     NoRoute,
+    /// A GraphQL gate's eligible reader budget is exhausted.
+    GraphqlBudget,
     /// The router's answer: an [`crate::forge_identity::ExhaustCause`], or
     /// what the read chain found.
     Router(&'static str),
@@ -523,6 +537,7 @@ impl ShedWhy {
                               so no reader was asked"
                 .to_string(),
             Self::Router(cause) => format!("router: {cause}"),
+            Self::GraphqlBudget => "router: budget".to_string(),
         }
     }
 }
@@ -612,28 +627,25 @@ pub(super) mod checksum_retry {
         let Some(response) = crate::forge_listing::parse_http_response(&raw) else {
             return false;
         };
-        if response.gateway.refusal.is_some() {
+        if response.gateway.refusal.is_some() || response.gateway.answered {
             return false;
         }
-        match (failure, response.status) {
-            (Failure::Coverage, 403 | 404) => true,
-            (Failure::Credential, 401) => {
-                // gh api --include prints only the final response. A 401 from
-                // GitHub's API or the gateway is still an API credential
-                // failure. The delivery response carries neither API marker.
-                !response.gateway.answered
-                    && !raw
-                        .lines()
-                        .skip(1)
-                        .take_while(|line| !line.trim().is_empty())
-                        .any(|line| {
-                            line.split_once(':').is_some_and(|(name, value)| {
-                                name.eq_ignore_ascii_case("x-github-request-id")
-                                    && !value.trim().is_empty()
-                            })
-                        })
-            }
-            _ => false,
-        }
+        // gh api --include prints only the final response. GitHub API
+        // failures retain their normal credential or coverage rules; asset
+        // delivery responses carry neither the API nor gateway marker.
+        let api_answered = raw
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.trim().is_empty())
+            .any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-github-request-id") && !value.trim().is_empty()
+                })
+            });
+        !api_answered
+            && matches!(
+                (failure, response.status),
+                (Failure::Credential, 401) | (Failure::Coverage, 403 | 404)
+            )
     }
 }

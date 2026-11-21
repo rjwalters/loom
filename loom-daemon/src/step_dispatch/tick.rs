@@ -50,8 +50,8 @@
 //! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
 //! its limit.
 //!
-//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` and
-//! `captain_cooldown` (the no-progress hold, #12581) are cheap passes made
+//! A **captain refusal** (#12450, fleet dispatch on): `captain_held`,
+//! `captain_cooldown` and `captain_not_eligible` are cheap passes made
 //! with no forge call. They draw on their own bound,
 //! [`MAX_FREE_CAPTAIN_REFUSALS_PER_TICK`], not on the lost-claim one (#12700):
 //! the captain's highest-weight cooled-down items are drawn first every tick,
@@ -102,7 +102,7 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
 /// claim subprocess.
 pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
-/// At most this many captain refusals (`captain_held`, `captain_cooldown`) in
+/// At most this many captain refusals (`held`, `cooldown`, `not_eligible`) in
 /// one tick are free (#12700): they spend no pass and no slot draw. Unlike a
 /// lost claim, a captain refusal makes no forge call (one RPC to the
 /// captain), so its bound is separate and larger; the lost-claim bound, and
@@ -161,6 +161,8 @@ pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
 /// The fleet-dispatch server's refusal of an item under the no-progress
 /// hold (#12541, #12581): a cheap pass like [`REFUSAL_CAPTAIN_HELD`] (#12700).
 pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
+/// A captain does not consider this worker eligible for the requested role.
+pub const REFUSAL_CAPTAIN_NOT_ELIGIBLE: &str = "captain_not_eligible";
 /// The fleet-dispatch server's refusal of a host at its cap (#12450): every
 /// later claim this tick would be refused the same way, so the draw ends.
 /// The captain no longer sends it (#12864); kept for an older captain in a
@@ -436,7 +438,7 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "backstop_hold"
         | REFUSAL_CAPTAIN_HELD
         | REFUSAL_CAPTAIN_COOLDOWN => Qd::LeaseHeld,
-        "captain_not_eligible" => Qd::HostConstraint,
+        REFUSAL_CAPTAIN_NOT_ELIGIBLE => Qd::HostConstraint,
         REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
         // #13746: a writer rate limit is a waiting state, not an error — the
         // route holds until its reset, and the row names it.
@@ -583,7 +585,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::HeldAtHead
                 | PassReason::AuthorGateHeld
                 | PassReason::Conflicting
-                | PassReason::Stacked,
+                | PassReason::Stacked
+                | PassReason::OperatorLinkUnverified,
             ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
@@ -679,14 +682,28 @@ fn take_offered(
 /// is taken from the pool before the draw, spawned through the same spawner
 /// as a draw, and counts against the tick's free slots. The rest of the
 /// slots draw as before.
-#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
 pub fn run_with_offers(
+    workspaces: Vec<StepWorkspace>,
+    limits: StepTickLimits,
+    seed: &SeedBase,
+    knobs: &PoolKnobs,
+    spawner: &mut dyn StepSpawner,
+    offers: &[Offer],
+) -> StepTick {
+    run_with_role_holds(workspaces, limits, seed, knobs, spawner, offers, &BTreeSet::new())
+}
+
+/// As above, also skip worker-held roles in the local draw. A fresh captain
+/// offer may still take its candidate through the ordinary gates.
+#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
+pub(crate) fn run_with_role_holds(
     mut workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     seed: &SeedBase,
     knobs: &PoolKnobs,
     spawner: &mut dyn StepSpawner,
     offers: &[Offer],
+    local_role_holds: &BTreeSet<&str>,
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
@@ -757,6 +774,25 @@ pub fn run_with_offers(
     }
     let by_idx: BTreeMap<usize, &StepWorkspace> = workspaces.iter().map(|w| (w.idx, w)).collect();
     let offered = take_offered(&mut pool, &workspaces, offers, limits.free_slots);
+    if !limits.fallback && !local_role_holds.is_empty() {
+        let mut held_rows = BTreeSet::new();
+        pool.retain(|c| {
+            let held = local_role_holds.contains(StepRole::from(c.step).role_name());
+            if held {
+                held_rows.insert((c.workspace_idx, c.target()));
+            }
+            !held
+        });
+        for row in &mut report.queue {
+            if row.disposition.is_none()
+                && held_rows.contains(&(row.key.workspace_idx, row.key.number))
+            {
+                row.disposition = Some(Qd::HostConstraint);
+                row.detail = Some(REFUSAL_CAPTAIN_NOT_ELIGIBLE.to_string());
+                report.skipped_host_constraint += 1;
+            }
+        }
+    }
     let mut draw = ItemDraw::new(
         pool,
         repos,
@@ -1071,8 +1107,12 @@ pub fn run_with_offers(
                     // In fleet-dispatch fallback no loss is free (#12450).
                     // A captain refusal is cheaper still (#12700): no forge
                     // call, so it has its own, larger bound.
-                    let captain =
-                        reason == REFUSAL_CAPTAIN_HELD || reason == REFUSAL_CAPTAIN_COOLDOWN;
+                    let captain = matches!(
+                        reason.as_str(),
+                        REFUSAL_CAPTAIN_HELD
+                            | REFUSAL_CAPTAIN_COOLDOWN
+                            | REFUSAL_CAPTAIN_NOT_ELIGIBLE
+                    );
                     let (spent, bound) = if captain {
                         (&mut free_captain, MAX_FREE_CAPTAIN_REFUSALS_PER_TICK)
                     } else {

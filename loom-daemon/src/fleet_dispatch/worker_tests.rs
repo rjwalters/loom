@@ -62,7 +62,7 @@ fn with_the_flag_off_nothing_is_asked_or_sent() {
     enable(dir.path(), &server.url(), false);
     assert_eq!(claim(dir.path(), 7, StepRole::Judge), Ask::Off);
     assert_eq!(tick_budget(dir.path(), 9, 2), (9, false));
-    note_capacity(9, &BTreeSet::new());
+    note_capacity(9, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(dir.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     release("step-judge-7-1", "verdict");
     std::thread::sleep(Duration::from_millis(100));
@@ -208,7 +208,7 @@ fn the_heartbeat_and_the_release_reach_the_server() {
         panic!("granted");
     };
     note_spawned(a.path(), "step-judge-7-1", grant);
-    note_capacity(5, &BTreeSet::from(["builder".to_string()]));
+    note_capacity(5, &roles_ok(&BTreeSet::from(["builder".to_string()])));
     on_reaper_tick(b.path(), &[("step-doctor-9-1".into(), 9, StepRole::Doctor, started())]);
     on_reaper_tick(a.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
@@ -293,7 +293,7 @@ fn a_repo_whose_reaper_stopped_ages_out_and_its_grants_are_released() {
     let server = granting();
     enable(a.path(), &server.url(), true);
     enable(b.path(), &server.url(), true);
-    note_capacity(5, &BTreeSet::new());
+    note_capacity(5, &roles_ok(&BTreeSet::new()));
     let Ask::Granted(grant) = claim(a.path(), 7, StepRole::Judge) else {
         panic!("granted");
     };
@@ -364,7 +364,7 @@ fn a_long_reaper_interval_does_not_age_out_a_live_repo() {
     let server = granting();
     enable(a.path(), &server.url(), true);
     enable(b.path(), &server.url(), true);
-    note_capacity(5, &BTreeSet::new());
+    note_capacity(5, &roles_ok(&BTreeSet::new()));
     let Ask::Granted(grant) = claim(a.path(), 7, StepRole::Judge) else {
         panic!("granted");
     };
@@ -389,7 +389,7 @@ fn a_long_reaper_interval_does_not_age_out_a_live_repo() {
 #[serial]
 fn roles_ok_names_each_role_once() {
     reset_for_test();
-    note_capacity(1, &BTreeSet::new());
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
     let roles = state().capacity.clone().unwrap().1;
     let unique: BTreeSet<&String> = roles.iter().collect();
     assert_eq!(unique.len(), roles.len(), "{roles:?}");
@@ -498,7 +498,7 @@ fn a_flag_in_the_host_tier_reaches_a_step_in_another_repo() {
     assert_eq!(claims[0]["item"], 7);
 
     note_spawned(repo.path(), "step-judge-7-1", grant);
-    note_capacity(3, &BTreeSet::new());
+    note_capacity(3, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     let beats = server.wait_for(proto::HEARTBEAT_PATH, 1);
     assert_eq!(beats[0]["live"][0]["assignment_id"], "a-1");
@@ -519,7 +519,7 @@ fn the_host_tier_flag_off_asks_nothing_whatever_the_repo_says() {
     set_host_root(host.path());
     assert_eq!(claim(repo.path(), 7, StepRole::Judge), Ask::Off);
     assert_eq!(tick_budget(repo.path(), 9, 2), (9, false));
-    note_capacity(9, &BTreeSet::new());
+    note_capacity(9, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(repo.path(), &[("step-judge-7-1".into(), 7, StepRole::Judge, started())]);
     std::thread::sleep(Duration::from_millis(100));
     assert!(server.requests().is_empty(), "{:?}", server.requests());
@@ -607,7 +607,7 @@ fn a_snapshot_on_the_heartbeat_answer_becomes_the_fleet_sidecar() {
     let root = rooted_pool();
     let server = probing();
     enable(root.path(), &server.url(), true);
-    note_capacity(1, &BTreeSet::new());
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(root.path(), &[]);
     server.wait_for(proto::HEARTBEAT_PATH, 1);
 
@@ -649,7 +649,7 @@ fn an_answer_without_the_snapshot_writes_nothing() {
     let root = rooted_pool();
     let server = granting(); // answers carry no token_probe field
     enable(root.path(), &server.url(), true);
-    note_capacity(1, &BTreeSet::new());
+    note_capacity(1, &roles_ok(&BTreeSet::new()));
     on_reaper_tick(root.path(), &[]);
     server.wait_for(proto::HEARTBEAT_PATH, 1);
     std::thread::sleep(Duration::from_millis(200));

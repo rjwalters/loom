@@ -32,6 +32,23 @@
 /// unchanged, so a match found in the result indexes the original text.
 #[must_use]
 pub(super) fn blank(text: &str) -> String {
+    blank_regions(text, Scope::ParkRecord)
+}
+
+/// Blanks code blocks and quotes for callers that recognize complete raw lines.
+/// A standalone HTML comment starts a block and cannot belong to an inline span.
+#[must_use]
+pub(crate) fn blank_block_code(text: &str) -> String {
+    blank_regions(text, Scope::MarkdownBlocks)
+}
+
+#[derive(Clone, Copy)]
+enum Scope {
+    ParkRecord,
+    MarkdownBlocks,
+}
+
+fn blank_regions(text: &str, scope: Scope) -> String {
     let mut out = String::with_capacity(text.len());
     // An open fence: its character, its length, and the content column of the
     // list item it sits in (0 outside a list).
@@ -53,7 +70,14 @@ pub(super) fn blank(text: &str) -> String {
                 // A closing fence is indented at most 3 columns past the item.
                 let trimmed = line.trim_start_matches([' ', '\t']);
                 let r = trimmed.bytes().take_while(|b| *b == c).count();
-                if indent_width(line) - fcol < 4 && r >= n && trimmed[r..].trim().is_empty() {
+                let tail = &trimmed[r..];
+                let closing_tail = match scope {
+                    Scope::ParkRecord => tail.trim().is_empty(),
+                    Scope::MarkdownBlocks => {
+                        tail.trim_end_matches([' ', '\t', '\r', '\n']).is_empty()
+                    }
+                };
+                if indent_width(line) - fcol < 4 && r >= n && closing_tail {
                     fence = None;
                 }
                 out.push_str(&spaces(line));
@@ -65,7 +89,7 @@ pub(super) fn blank(text: &str) -> String {
         // A lone `-` under a top-level paragraph is a setext underline, not an
         // empty list item (which cannot interrupt a paragraph).
         if !para.is_empty() && list_col == 0 && indent_width(line) < 4 && line.trim() == "-" {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
             out.push_str(&spaces(line));
             continue;
         }
@@ -75,7 +99,7 @@ pub(super) fn blank(text: &str) -> String {
         let run = |c: u8| trimmed.bytes().take_while(|b| *b == c).count();
         let blank_line = trimmed.trim().is_empty();
         if blank_line {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
             in_quote = false;
             if item {
                 list_col = col;
@@ -85,7 +109,7 @@ pub(super) fn blank(text: &str) -> String {
             continue;
         }
         if item {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
         }
         if col > 0 {
             list_col = col;
@@ -108,7 +132,7 @@ pub(super) fn blank(text: &str) -> String {
         let quoted = indent < 4 && trimmed.starts_with('>');
         let lazy = in_quote && para.is_empty() && opener.is_none() && !trimmed.starts_with("<!--");
         if quoted || lazy {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
             in_quote = true;
             if col == 0 {
                 list_col = 0;
@@ -118,7 +142,7 @@ pub(super) fn blank(text: &str) -> String {
         }
         in_quote = false;
         if let Some((c, n)) = opener {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
             fence = Some((c, n, col));
             out.push_str(&spaces(line));
             continue;
@@ -133,10 +157,10 @@ pub(super) fn blank(text: &str) -> String {
         let closes = ends_paragraph(trimmed, !para.is_empty());
         para.push_str(line);
         if closes {
-            flush(&mut para, &mut out);
+            flush(&mut para, &mut out, scope);
         }
     }
-    flush(&mut para, &mut out);
+    flush(&mut para, &mut out, scope);
     out
 }
 
@@ -236,9 +260,12 @@ fn indent_width(line: &str) -> usize {
         .sum()
 }
 
-fn flush(para: &mut String, out: &mut String) {
+fn flush(para: &mut String, out: &mut String, scope: Scope) {
     if !para.is_empty() {
-        out.push_str(&blank_inline(para));
+        match scope {
+            Scope::ParkRecord => out.push_str(&blank_inline(para)),
+            Scope::MarkdownBlocks => out.push_str(para),
+        }
         para.clear();
     }
 }

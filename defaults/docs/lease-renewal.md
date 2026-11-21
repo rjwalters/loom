@@ -434,6 +434,25 @@ the hard way (#7876):
   "$PPID" --host H --sweep-id S 2>/dev/null)` — with stderr redirected, never
   piped. If a call blocks, stdout/stderr is still attached to a pipe.
 
+### Attended renewal terminal receipts
+
+When an attended issue renewer reaches an observed exit branch, it writes one
+local JSON line to `.loom/logs/lease-ensure/issue-<N>.terminal.jsonl` at the
+resolved workspace root. The line contains the issue number, a SHA-256
+fingerprint of its sweep ID, the observation time and a bounded reason. It
+includes the last observed successful renewal time when available. A failed
+renewal attempt can be present as `last_attempt=renewal-failed` evidence even
+when the loop kept running and later exited for another reason. The workspace's
+existing ensure log carries the matching startup outcome.
+
+The sidecar has owner-only file permissions and rotates at 64 KiB with two
+retained generations. The writer does not keep the launcher's pipes open.
+A missing terminal entry means the outcome is unknown. A process can be
+interrupted before it reaches the writer, including a hard stop, or its
+local log may be unavailable or already rotated away. An external release
+still uses its existing Forge yield. The receipt does not change ownership,
+renewal or recovery decisions.
+
 ## What this does not do (Phase 1 scope)
 
 This document was written for Phase 1, when nothing read the lease. Phases 2

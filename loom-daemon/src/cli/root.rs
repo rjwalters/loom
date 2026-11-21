@@ -66,7 +66,9 @@ pub enum Commands {
     Init(super::misc_cmds::InitArgs),
 
     /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
-    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
+    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set (plus
+    /// the #13898 stub-conditional pnpm-artifact entries when the workspace's
+    /// root `package.json` is the `loom-workspace` stub) without
     /// running a full `init` (Issue #4280). This is the standalone entry point
     /// `defaults/scripts/resync-installed.sh` invokes so existing consumer
     /// installs pick up newly-ignored runtime paths (e.g. `.loom/sweep-checkpoint/`,
@@ -832,6 +834,14 @@ pub enum Commands {
     Forge {
         #[command(subcommand)]
         action: ForgeAction,
+    },
+
+    /// Read-only ratification-lane inspection (#14834): `ratification-lane
+    /// status <PR>` names the effective ee/market key markers for a PR's
+    /// current head and flags superseded duplicates.
+    RatificationLane {
+        #[command(subcommand)]
+        action: super::ratification_lane_cmd::Action,
     },
 
     /// Shadow-mode Jev (TypeSafe) pre-score for Champion's PR auto-merge
@@ -2478,6 +2488,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             verbose,
         } => handle_recover_orphans_command(&workspace, recover, json, verbose),
         Commands::Forge { action } => handle_forge_command(action),
+        Commands::RatificationLane { action } => super::ratification_lane_cmd::handle(action),
         Commands::Status(_) => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.

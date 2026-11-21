@@ -256,11 +256,7 @@ pub(crate) fn build_status_json_value_for(
         // dead, and reconcile rather than re-dispatching. Empty in the
         // overwhelmingly common case.
         "unregistered_locked_count": report.unregistered_locked.len(),
-        "unregistered_locked": report.unregistered_locked.iter().map(|u| serde_json::json!({
-            "root": u.root,
-            "issue": u.issue,
-            "owner_pid": u.owner_pid,
-        })).collect::<Vec<_>>(),
+        "unregistered_locked": report.unregistered_locked,
         // Stale-untracked-sweep backstop (Issue #7529): in-flight sweeps
         // unreachable by either the startup-hang (#3887) or review-stall
         // (#3910) watchdog — see `DaemonStatusReport::stale_sweeps`'s doc.
@@ -415,32 +411,11 @@ pub(crate) fn build_status_json_value_for(
         // daemon binary, which a consumer must NOT read as "unsharded" — an
         // older daemon does not shard, but that is not something this payload
         // asserts.
-        "role_runner_shard": report.role_runner_shard.as_ref().map(|s| serde_json::json!({
-            "index": s.index,
-            "count": s.count,
-            "configured": s.configured,
-            "summary": s.summary,
-            // Roster section (Issue #7690 / #7691, #6704) — `null` when the
-            // roster is disabled (the default) or has never completed a
-            // heartbeat cycle. With `roster.enabled` it is also the source of
-            // `index`/`count` above (`summary` says so), and `fence` names
-            // the admission verdict.
-            "roster": s.roster.as_ref().map(|r| serde_json::json!({
-                "issue": r.issue,
-                "live_count": r.live_count,
-                "seen_count": r.seen_count,
-                "generation": r.generation,
-                "settled_secs": r.settled_secs,
-                "fence": r.fence,
-                "members": r.members.iter().map(|m| serde_json::json!({
-                    "host": m.host,
-                    "fresh": m.fresh,
-                    "last_beat_secs_ago": m.last_beat_secs_ago,
-                    "serves_count": m.serves_count,
-                    "is_this_host": m.is_this_host,
-                })).collect::<Vec<_>>(),
-            })),
-        })),
+        // A configured roster can supply index/count once it has completed a
+        // heartbeat (#7690, #7691, #6704); its fence records the admission
+        // verdict. The roster itself is null when disabled or still awaiting
+        // its first heartbeat.
+        "role_runner_shard": report.role_runner_shard,
         // Startup forge-credential preflight (#4005) — resolved once at
         // daemon boot, before the daemon's first `gh` consumer. Never
         // contains a token value; `null` only from a pre-#4005 daemon binary
@@ -483,12 +458,7 @@ pub(crate) fn build_status_json_value_for(
             // Per-role `onIdleMaxWait` age/promoted status (issue #7511) —
             // one entry per role that is both `onIdle` and has a configured
             // max-wait; empty when the key is unconfigured.
-            "role_runner_on_idle_promotions": r.role_runner_on_idle_promotions.iter().map(|p| serde_json::json!({
-                "role": p.role,
-                "max_wait_secs": p.max_wait_secs,
-                "age_secs": p.age_secs,
-                "promoted": p.promoted,
-            })).collect::<Vec<_>>(),
+            "role_runner_on_idle_promotions": r.role_runner_on_idle_promotions,
             // Which tier decided `role_runner_enabled` (#6470): `Some(v)`
             // only when the host-wide `LOOM_ROLE_RUNNER` env override (not
             // this root's own config) is the cause — see
@@ -501,14 +471,7 @@ pub(crate) fn build_status_json_value_for(
             // one failure mode deterministic sharding cannot rule out
             // structurally — two hosts resolving *different keys* for the
             // same workspace, which would let both (or neither) own it.
-            "role_runner_shard": r.role_runner_shard.as_ref().map(|s| serde_json::json!({
-                "owned_here": s.owned_here,
-                "key": s.key,
-                "key_source": s.key_source,
-                "owning_shard": s.owning_shard,
-                "host_shard": s.host_shard,
-                "shard_count": s.shard_count,
-            })),
+            "role_runner_shard": r.role_runner_shard,
             // Fleet-wide quarantine-stash visibility (#5692): per-repo
             // `refs/stash` counts, aggregated by
             // `quarantine_stash_status::collect_stash_summary`. Builds on
@@ -534,14 +497,7 @@ pub(crate) fn build_status_json_value_for(
         // from "collected, and the repo has none". `total_bytes` is itself
         // `null` when the worktree root could not be read at all, so an
         // unmeasurable repo never reads as a genuine 0 bytes.
-        "worktrees": worktree_disk.map(|summaries| summaries.iter().map(|w| serde_json::json!({
-            "root": w.root,
-            "total_count": w.total_count,
-            "issue_count": w.issue_count,
-            "pr_count": w.pr_count,
-            "other_count": w.other_count,
-            "total_bytes": w.total_bytes,
-        })).collect::<Vec<_>>()),
+        "worktrees": worktree_disk,
         // Forge-side pipeline snapshot (#3977) — present only when `--pipeline`
         // was passed; `null` otherwise so a consumer can tell "not requested"
         // apart from "requested but empty".
@@ -633,46 +589,15 @@ pub(crate) fn build_status_json_value_for(
         // `enabled: false` (feature never spawned) MUST be read as
         // "cannot determine here", never as eligible. `null` only from a
         // pre-#5565 daemon binary that never computed one.
-        "idle_exit": report.idle_exit.as_ref().map(|i| serde_json::json!({
-            "enabled": i.enabled,
-            "eligible": i.eligible,
-            "trigger": i.trigger,
-            "idle_minutes": i.idle_minutes,
-            "in_flight_sweeps": i.in_flight_sweeps,
-            "active_role_runs": i.active_role_runs,
-            "healthy_tokens": i.healthy_tokens,
-            "total_tokens": i.total_tokens,
-            "idle_elapsed_secs": i.idle_elapsed_secs,
-            "starved_elapsed_secs": i.starved_elapsed_secs,
-            "starvation_enabled": i.starvation_enabled,
-            "observed_at": i.observed_at,
-        })),
-        "rate_limit_breaker": report.rate_limit_breaker.as_ref().map(|r| serde_json::json!({
-            "enabled": r.enabled,
-            "phase": r.phase,
-            "suppressed": r.suppressed,
-            "source": r.source,
-            "tripped_at": r.tripped_at,
-            "cooldown_until": r.cooldown_until,
-            "trips_total": r.trips_total,
-            "core_remaining": r.core_remaining,
-            "graphql_remaining": r.graphql_remaining,
-            "core_used": r.core_used,
-            "graphql_used": r.graphql_used,
-            "budget_probed_at": r.budget_probed_at,
-        })),
+        "idle_exit": report.idle_exit,
+        "rate_limit_breaker": report.rate_limit_breaker,
         // Per-caller forge call accounting (#9251); `null` from an older daemon.
         "forge_calls": report.forge_calls,
         // Live safehouse fleet-comms connection state (#4345) — `null` only
         // from a pre-#4345 daemon binary that never computed one. `state` is
         // one of "not_configured" / "unreachable" / "connected" /
         // "send_rejected" (#4464, carries `reason`).
-        "safehouse": report.safehouse.as_ref().map(|s| serde_json::json!({
-            "state": s.state,
-            "socket": s.socket,
-            "room": s.room,
-            "reason": s.reason,
-        })),
+        "safehouse": report.safehouse,
         // Watchdog protection state (#4354) — client-side, host-local, read-only.
         // `state` is one of "protected" / "no-marker" /
         // "watchdog-not-provisioned" / "unknown". `marker_present` and

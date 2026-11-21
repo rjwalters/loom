@@ -32,6 +32,10 @@ const CASES: &[&str] = &[
     "claude-fable-5",
     "claude-haiku-4-5",
     "claude-haiku-4-5-20251001",
+    "gpt-6-astra",
+    "gpt-6.2-astra",
+    "openai/gpt-6.2-astra",
+    "codex/gpt-6.2-astra",
     "mystery",
 ];
 

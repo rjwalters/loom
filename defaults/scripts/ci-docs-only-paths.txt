@@ -1,0 +1,3 @@
+# Exact root paths. A consuming repo may narrow this set in its installed copy.
+WORK_LOG.md
+WORK_PLAN.md
