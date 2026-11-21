@@ -1076,6 +1076,13 @@ commit object that matches both forge reads and sets tracking only after a
 successful fast-forward. The `+` refreshes only the named remote-tracking ref when its
 cache is stale. The local branch advances by fast-forward after verification.
 
+For a dirty worktree, the refusal is the disposition: the snapshot (when one was
+taken) preserved the WIP as a patch under
+`<worktree-root>/.snapshots/issue-<N>-<UTC-timestamp>.patch` — post its path in
+a PR comment so the preserved WIP is findable — then fall back to read-only
+review (`gh pr diff` / `git merge-tree`) per "PR Branch Isolation", or park the
+PR per "Environment Gap: Cannot Verify Here".
+
 For a fork or a nonstandard head, use the existing `pr-worktree.sh` route and
 check the exact head and clean state there. The named `origin` recovery
 applies only to the matching same-repository issue branch. If the dedicated
