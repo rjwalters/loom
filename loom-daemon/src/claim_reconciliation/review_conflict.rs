@@ -16,9 +16,9 @@
 //! - **Flag.** An open `loom:review-requested` PR GitHub reports as
 //!   `mergeable=CONFLICTING` gets the exact transition Judge applies by hand
 //!   when it finds a DIRTY PR: `loom:review-requested` → `loom:changes-requested`
-//!   + `loom:merge-conflict`. That routes it to Doctor and, because Judge's
-//!   find-work query is `--label loom:review-requested`, Judge no longer claims
-//!   it. The comment written first carries both [`BASE_CONFLICT_MARKER`] and a
+//!   + `loom:merge-conflict`. Doctor can repair it if the PR's gates allow it. Judge's
+//!   find-work query is `--label loom:review-requested`, so Judge no longer
+//!   claims it. The comment written first carries both [`BASE_CONFLICT_MARKER`] and a
 //!   `loom:verdict-sha … verdict=changes-requested` marker for the current head,
 //!   so the stale-verdict pass reads the new `loom:changes-requested` as
 //!   `Fresh` (never anchors it) and clears it on its own the moment a Doctor
@@ -295,9 +295,10 @@ pub fn flag_comment_body_removing(head_sha: &str, removed: &[&str]) -> String {
          **Merge conflict with the base branch — {heading}**\n\n\
          GitHub reports this PR as `mergeable=CONFLICTING` at head `{head_sha}`: {why}.\n\n\
          - Removed: {removed_list}\n\
-         - Added: `{CHANGES_REQUESTED}` + `{MERGE_CONFLICT}` (routes to Doctor)\n\n\
-         This implies no judgment about the code. Rebase onto the base branch and resolve the \
-         conflicts; a head move re-queues it for review automatically, and if the conflict \
+         - Added: `{CHANGES_REQUESTED}` + `{MERGE_CONFLICT}`\n\n\
+         Doctor can repair the conflict when the PR's holds and repair-cycle limit allow it. \
+         Resolve against the PR's base branch. This implies no judgment about the code. \
+         A head move re-queues it for review automatically, and if the conflict \
          clears without one (e.g. the conflicting change is reverted) this pass returns it to \
          `{REVIEW_REQUESTED}` itself.\n\n\
          ---\n\
