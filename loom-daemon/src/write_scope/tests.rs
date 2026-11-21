@@ -934,6 +934,10 @@ fn daemon_write_paths_are_scoped() {
         ),
         ("tokens_pool/check.rs", NotAWrite("Anthropic API, not the forge")),
         (
+            "tokens_pool/private_workspace/read_authority.rs",
+            NotAWrite("read probe: its only curl call is `-X GET`, never a forge write"),
+        ),
+        (
             "remote_fleet_exec/mod.rs",
             NotAWrite("scp's `-X` option in a guard's argv vocabulary, runs none"),
         ),
