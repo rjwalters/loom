@@ -105,6 +105,25 @@ impl Pool {
         )
     }
 
+    fn read_checksum(&self, repo: &str) -> GhInvocation {
+        let slug = format!("acme/{repo}");
+        GhInvocation::new(
+            Operation::new("release.checksum"),
+            AccessIntent::Read,
+            GhTarget::repo(&slug).unwrap(),
+            Duration::from_secs(10),
+        )
+        .program(&self.gh)
+        .current_dir(self._tmp.path())
+        .args([
+            "api",
+            &format!("repos/{slug}/releases/assets/773"),
+            "--include",
+            "-H",
+            "Accept: application/octet-stream",
+        ])
+    }
+
     /// Run `inv` against a two-reader router (`reader-2` home, `reader-1`
     /// next) that honours this run's withdrawals; `pre` readers start
     /// withdrawn. With every reader withdrawn the router answers a
@@ -136,7 +155,7 @@ impl Pool {
             asked.borrow_mut().push(req.owner_repo.to_string());
             let w = withdrawn.borrow();
             for (app, dir) in [("app-2", &r2), ("app-1", &r1)] {
-                if !w.contains(app) {
+                if !w.contains(app) && req.cooldown(app, now).is_none() {
                     return RouteDecision::Reader {
                         dir: dir.clone(),
                         app_id: app.to_string(),
@@ -145,7 +164,12 @@ impl Pool {
                 }
             }
             RouteDecision::Exhausted {
-                until: now + Duration::from_secs(900),
+                until: req
+                    .reader_cooldowns
+                    .iter()
+                    .map(|(_, until)| *until)
+                    .min()
+                    .unwrap_or(now + Duration::from_secs(900)),
                 cause,
             }
         };
@@ -768,6 +792,100 @@ fn a_non_credential_failure_is_returned_without_spill_or_writer() {
         p.run(p.read("five-oh-two", ReadClass::Hygiene), &[], SystemTime::now());
     assert_eq!(p.who(), vec![Who::R2]);
     assert!(withdrawn.is_empty());
+}
+
+#[test]
+fn a_checksum_delivery_refusal_spills_without_withdrawing_the_readers_credential() {
+    // Only the numeric checksum asset is unavailable; the same profile
+    // answers ordinary reads of the same repo immediately.
+    const DELIVERY_401: &str = r#"
+case "$2" in
+    */releases/assets/*)
+        printf 'HTTP/2 401 Unauthorized\r\n\r\n'
+        echo 'gh: Delivery refused (HTTP 401)' >&2
+        exit 1 ;;
+    *) echo '{}'; exit 0 ;;
+esac"#;
+    let now = SystemTime::now();
+    let expiry = now + super::v2::checksum_retry::DELAY;
+    let p = pool(OK, DELIVERY_401, "exit 90");
+    let (out, withdrawn, _) = p.run(p.read_checksum("checksum-delivery"), &[], now);
+    assert!(
+        matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+        "{out:?}"
+    );
+    assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+    assert!(
+        withdrawn.is_empty(),
+        "asset refusal changed credential withdrawal: {withdrawn:?}"
+    );
+    let (out, withdrawn, _) = p.run(p.read("checksum-delivery", ReadClass::Gate), &[], now);
+    assert!(
+        matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+        "{out:?}"
+    );
+    assert!(withdrawn.is_empty());
+    let _ = p.run(p.read_checksum("checksum-delivery"), &[], now);
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::R2, Who::R1]);
+
+    let p = pool(DELIVERY_401, DELIVERY_401, "exit 90");
+    let (out, withdrawn, _) = p.run(p.read_checksum("checksum-exhausted"), &[], now);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until == expiry), "{out:?}");
+    assert!(withdrawn.is_empty());
+    let (out, _, _) = p.run(p.read_checksum("checksum-exhausted"), &[], now);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until == expiry), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1], "no more calls before expiry");
+    let (out, _, _) = p.run(p.read_checksum("checksum-exhausted"), &[], expiry);
+    assert!(matches!(out, GhCompletion::Shed { until, .. } if until > expiry), "{out:?}");
+    assert_eq!(p.who(), vec![Who::R2, Who::R1, Who::R2, Who::R1], "retry at expiry");
+}
+
+#[test]
+fn checksum_preserves_marked_api_refusals_and_rate_limits() {
+    for (status, message, failure) in [
+        (401, "Bad credentials", Failure::Credential),
+        (403, "Resource not accessible by integration", Failure::Coverage),
+        (404, "Not Found", Failure::CoverageUnproven),
+    ] {
+        for (marker, name) in [
+            ("proxy", "X-GitHub-Proxy-Version"),
+            ("github", "X-GitHub-Request-Id"),
+        ] {
+            let denied = format!(
+                "printf 'HTTP/2 {status} {message}\r\n{name}: fixture\r\n\r\n'; echo 'gh: {message} (HTTP {status})' >&2; exit 1"
+            );
+            let p = pool(OK, &denied, "exit 90");
+            let repo = format!("checksum-api-{marker}-{status}");
+            let (_, withdrawn, _) = p.run(p.read_checksum(&repo), &[], SystemTime::now());
+            assert_eq!(
+                withdrawn.first().map(|entry| entry.2),
+                Some(failure),
+                "{repo}: {withdrawn:?}"
+            );
+            assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+        }
+    }
+    let p = pool(OK, LIMITED, "exit 90");
+    let (_, withdrawn, _) = p.run(p.read_checksum("checksum-limit"), &[], SystemTime::now());
+    assert!(is_rate_limited(&withdrawn[0].2), "{withdrawn:?}");
+}
+
+#[test]
+fn checksum_keeps_unmarked_delivery_coverage_refusals_local() {
+    for (status, message) in [(403, "Forbidden"), (404, "Not Found")] {
+        let denied = format!(
+            "printf 'HTTP/2 {status} {message}\r\n\r\n'; echo 'gh: {message} (HTTP {status})' >&2; exit 1"
+        );
+        let p = pool(OK, &denied, "exit 90");
+        let repo = format!("checksum-delivery-{status}");
+        let (out, withdrawn, _) = p.run(p.read_checksum(&repo), &[], SystemTime::now());
+        assert!(
+            matches!(out, GhCompletion::Captured(Completion::Exited(ref done)) if done.status.success()),
+            "{out:?}"
+        );
+        assert!(withdrawn.is_empty(), "{repo}: {withdrawn:?}");
+        assert_eq!(p.who(), vec![Who::R2, Who::R1]);
+    }
 }
 
 #[test]

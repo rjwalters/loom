@@ -118,6 +118,8 @@ pub struct RouteRequest<'a> {
     /// conditional read's URL). `None` keeps the home placement.
     pub affinity_key: Option<&'a str>,
     pub class: ReadClass,
+    /// Temporary exclusions for this operation, independent of reader budgets.
+    pub reader_cooldowns: &'a [(String, SystemTime)],
 }
 
 impl<'a> RouteRequest<'a> {
@@ -130,6 +132,7 @@ impl<'a> RouteRequest<'a> {
             resource,
             affinity_key: None,
             class: ReadClass::Gate,
+            reader_cooldowns: &[],
         }
     }
 
@@ -138,6 +141,13 @@ impl<'a> RouteRequest<'a> {
     pub fn affinity(mut self, key: Option<&'a str>) -> Self {
         self.affinity_key = key;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn cooldown(&self, app_id: &str, now: SystemTime) -> Option<SystemTime> {
+        self.reader_cooldowns
+            .iter()
+            .find_map(|(app, until)| (app == app_id && *until > now).then_some(*until))
     }
 }
 
@@ -847,7 +857,8 @@ pub fn route_read_in(
         return RouteDecision::NoPool;
     };
     let eligible = |r: &Identity| {
-        !forge_read_pool::is_withdrawn_at(&r.app_id, now)
+        req.cooldown(&r.app_id, now).is_none()
+            && !forge_read_pool::is_withdrawn_at(&r.app_id, now)
             && !super::repo_withdrawn_at(&r.app_id, req.owner_repo, now)
             && (legacy
                 || !forge_read_pool::is_withdrawn_scoped_at(&r.app_id, owner, req.resource, now))
@@ -1040,6 +1051,10 @@ pub fn route_read_in(
             }
             continue;
         }
+        if req.cooldown(&r.app_id, now).is_some() {
+            withdrawn += 1;
+            continue;
+        }
         let dir = super::reader_dir(workspace_root, owner, r);
         if !super::dir_is_fresh(&dir, now) {
             other += 1;
@@ -1096,6 +1111,7 @@ fn exhausted_until(
         .iter()
         .map(|r| {
             let ends = [
+                req.cooldown(&r.app_id, now),
                 forge_read_pool::withdrawn_until(&r.app_id, now),
                 super::repo_withdrawn_until(&r.app_id, req.owner_repo, now),
                 if legacy {

@@ -414,6 +414,8 @@ EOF
 # fetch_resolve_latest() / fetch_and_verify_artifact() make:
 #   gh release view --json tagName  -R <slug> --jq '.tagName'         -> $2
 #   gh release view --json assets   -R <slug> --jq '.assets[].name'   -> `ls $3`
+#   gh api repos/<slug>/releases/tags/<tag>                          -> asset names and fake IDs
+#   gh api repos/<slug>/releases/assets/<id> --include ...           -> checksum bytes
 #   gh release download <tag> -R <slug> -p <name> [-p <name> ...] -D <dir> --clobber
 #       -> copies each matching file from $3 into <dir>; exits 1 if NONE of
 #          the -p patterns matched anything under $3 (mirrors real gh's
@@ -433,6 +435,23 @@ TAG_VAL="$tag"
 EXTRA_LISTED="$extra_listed"
 FAKEGH
     cat >> "$path" <<'FAKEGH'
+if [[ "${1:-}" == api ]]; then
+    case "${2:-}" in
+        repos/*/releases/tags/*)
+            LC_ALL=C ls "$ASSETS_DIR" | jq -R -s -c '
+                split("\n") | map(select(length > 0)) | to_entries |
+                {assets: map({id:(.key + 1),name:.value})}'
+            exit
+            ;;
+    esac
+    if [[ "${2:-}" =~ ^repos/[^/]+/[^/]+/releases/assets/([1-9][0-9]*)$ ]]; then
+        asset="$(LC_ALL=C ls "$ASSETS_DIR" | sed -n "${BASH_REMATCH[1]}p")"
+        [[ "$asset" == *.sha256 && -f "$ASSETS_DIR/$asset" ]] || exit 1
+        printf 'HTTP/2 200\r\nContent-Type: application/octet-stream\r\n\r\n'
+        cat "$ASSETS_DIR/$asset"
+        exit
+    fi
+fi
 # Real `gh --json <fields>` emits an OBJECT, and `--jq` then filters it. This
 # stub used to skip to the post-`--jq` scalar, indistinguishable only because
 # every caller passed `--jq`. #7810 PR 5 has one that does not (the #7922
