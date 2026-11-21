@@ -4032,6 +4032,12 @@ if command -v jq >/dev/null 2>&1; then
     mkdir -p "$target/.loom"
   done
 
+  # Stock Bash 3.2 cannot reliably source these process-substituted slices.
+  quick_writer="$TEST_DIR/stamp-quick-writer.sh"
+  full_writer="$TEST_DIR/stamp-full-writer.sh"
+  sed -n '/^finalize_quick_install() {/,/^# Verify critical installation files/p' "$WRAPPER_SCRIPT" > "$quick_writer"
+  sed -n '/^LOOM_SOURCE_REMOTE=""$/,/^METADATA$/p' "$INSTALL_SCRIPT" > "$full_writer"
+
   # The Quick metadata write must also work without jq on PATH.
   stamp_tools="$TEST_DIR/stamp-tools"
   mkdir "$stamp_tools"
@@ -4043,15 +4049,15 @@ if command -v jq >/dev/null 2>&1; then
     info() { :; }
     success() { :; }
     warning() { :; }
-    source <(sed -n '/^finalize_quick_install() {/,/^# Verify critical installation files/p' "$WRAPPER_SCRIPT")
+    source "$quick_writer"
     LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" finalize_quick_install "$stamp_source" "$1"
   )
   write_quick_metadata "$quick_target"
   (
     cd "$full_target"
-    # shellcheck disable=SC2034  # consumed by the sourced METADATA block below (shellcheck cannot follow process-substitution source)
-    LOOM_ROOT="$stamp_source" LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" INSTALLED_FILES_JSON='[]'
-    source <(sed -n '/^LOOM_SOURCE_REMOTE=""$/,/^METADATA$/p' "$INSTALL_SCRIPT")
+    # The sourced Full Install writer consumes these fixture inputs.
+    export LOOM_ROOT="$stamp_source" LOOM_VERSION="$stamp_version" LOOM_COMMIT="$stamp_commit" INSTALLED_FILES_JSON='[]'
+    source "$full_writer"
   )
 
   jq 'del(.requires_daemon)' "$full_target/.loom/install-metadata.json" > "$resync_target/.loom/install-metadata.json"
