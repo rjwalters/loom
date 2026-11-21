@@ -66,20 +66,23 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/assert.sh"
 [[ -f "$JUDGE_MD" ]] || { echo "FATAL: subject not found: $JUDGE_MD" >&2; exit 1; }
 
 # =====================================================================
-# Extract the shipped ```bash``` fence under "If DIRTY: Attempt Automated
-# Rebase" -- the real code a Judge session runs, not a local mirror.
+# Extract the shipped Bash fences through the guarded update under
+# "If DIRTY: Attempt Automated Rebase". They share one shell between the
+# merge-state probe and the continuation in the selected worktree.
 # =====================================================================
 FENCE_SRC="$(awk '
-    /^### If DIRTY: Attempt Automated Rebase$/ { insec = 1 }
-    insec && /^```bash$/ && !infence { infence = 1; depth = 1; next }
-    infence && /^```bash$/ { depth++; print; next }
+    /^### If DIRTY: Attempt Automated Rebase$/ { insec = 1; next }
+    insec && /^### / { exit }
+    insec && !infence && /^```bash$/ { infence = 1; next }
     infence && /^```$/ {
-        depth--
-        if (depth == 0) exit
-        print
+        infence = 0
+        if (guard) exit
         next
     }
-    infence { print }
+    infence {
+        if (index($0, "forge rebase-guard --base origin/main")) guard = 1
+        print
+    }
 ' "$JUDGE_MD")"
 
 if [[ -z "$FENCE_SRC" || "$FENCE_SRC" != *"forge rebase-guard --base origin/main"* ]]; then
@@ -120,15 +123,15 @@ run_dirty_block() {
         cd "$repo" || exit 1
         export PATH="$repo/.loom/stub-bin:$PATH"
         export STUB_BRANCH_UPDATE="$strategy"
+        # This disposable repo is the already-selected checkout for PR 999.
+        export WORKTREE_PR=999 WORKTREE_ABS="$(pwd -P)"
         bash -c "$FENCE_SRC"
     )
 }
 
 make_fixture() {
-    # make_fixture <workdir> -- sets up a bare "origin" plus a working repo
-    # on branch feature/issue-999, with .loom/worktrees/issue-999 symlinked
-    # back to the repo root (so the block's own worktree-cd is a no-op) and
-    # stubs for `gh` and `./.loom/scripts/post-verdict.sh`.
+    # make_fixture <workdir> -- sets up a bare "origin" plus the selected
+    # working repo on feature/issue-999, with stubs for gh and post-verdict.sh.
     local base="$1"
     local repo="$base/repo"
     mkdir -p "$base/origin.git"
@@ -142,8 +145,7 @@ make_fixture() {
         git remote add origin "$base/origin.git"
     )
 
-    mkdir -p "$repo/.loom/worktrees" "$repo/.loom/scripts" "$repo/.loom/stub-bin"
-    ln -s "../.." "$repo/.loom/worktrees/issue-999"
+    mkdir -p "$repo/.loom/scripts" "$repo/.loom/stub-bin"
 
     cat > "$repo/.loom/scripts/post-verdict.sh" <<'STUB'
 #!/usr/bin/env bash

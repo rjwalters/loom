@@ -150,10 +150,17 @@ assert_ge 1 "$(call_site_count "$RECONCILE_STACK_SH")" \
 # floor is two gated recipes PLUS a delegating path that never pushes itself.
 assert_ge 2 "$(call_site_count "$DOCTOR_MD")" \
   "doctor.md gates its Step 9 pre-push update path and its 'PR Has Merge Conflicts' recipe"
-# The unlabeled path's CONFLICTING branch: from its mergeable probe to its `fi`.
-OTHER_PRS_SECTION="$(awk '/UNLABELED_PR" --json mergeable/{on=1} on{print} on && /^    fi$/{exit}' "$DOCTOR_MD")"
+# Check the whole unlabeled-PR section, including its prose delegation and
+# the conflict probe, and require that the section cannot push directly.
+OTHER_PRS_SECTION="$(awk '
+  /^### Other PRs Needing Attention$/ { on = 1; next }
+  on && /^##+ / { exit }
+  on { print }
+' "$DOCTOR_MD")"
 OTHER_PRS_MSG="doctor.md's unlabeled conflict path delegates to the gated 'PR Has Merge Conflicts' recipe and never pushes directly (#10771)"
-if [[ "$OTHER_PRS_SECTION" == *'"PR Has Merge Conflicts"'* && "$OTHER_PRS_SECTION" != *"git push"* ]]; then
+if [[ "$OTHER_PRS_SECTION" == *"gh pr view \"\$UNLABELED_PR\" --json mergeable"* &&
+      "$OTHER_PRS_SECTION" == *'[PR Has Merge Conflicts](#pr-has-merge-conflicts)'* &&
+      "$OTHER_PRS_SECTION" != *"git push"* ]]; then
   TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); echo -e "  ${GREEN}PASS${NC}: $OTHER_PRS_MSG"
 else
   TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); echo -e "  ${RED}FAIL${NC}: $OTHER_PRS_MSG"
