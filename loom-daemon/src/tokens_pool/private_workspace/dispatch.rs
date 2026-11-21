@@ -276,9 +276,13 @@ impl Selection {
                 }
             }
         }
+        let contained = matches!(policy, SeatPolicy::Contained);
         if runtime != "codex" || !uses_private(root)? {
             export::check_failover(root, issue, "unavailable")?;
-            return Ok(None);
+            // A contained draw still diagnoses a pool made up entirely of hosts.
+            if !contained {
+                return Ok(None);
+            }
         }
         use super::super::account_registry::{
             account_inventory, select_codex_account_where, AccountBinding, AccountProvider,
@@ -359,15 +363,20 @@ impl Selection {
             // account disappears from a later selection snapshot. Unknown
             // routes also prevent a definite routing-miss diagnosis.
             let routing_miss = Cell::new(logical.is_some() && tried.is_empty());
+            let host_mode = Cell::new(0);
             let account = select_codex_account_where(root, model, |account| {
                 if tried.contains(&account.id.name) {
                     return false;
                 }
                 let route = repository_route(&account.credential_reference, logical.as_deref());
-                if route != Some(false) {
+                if matches!(route, RepositoryRoute::Host) {
+                    host_mode.set(host_mode.get() + 1);
+                }
+                let eligible = route.serves(contained);
+                if eligible != Some(false) {
                     routing_miss.set(false);
                 }
-                route == Some(true)
+                eligible == Some(true)
             });
             let account = match account {
                 Err(error) if error.is::<super::super::health::NoHealthyAccountError>() => {
@@ -376,6 +385,11 @@ impl Selection {
                     // own diagnosis on every policy. It is judged from the
                     // selector's snapshot, before health/model filtering, and
                     // can only hold while nothing has been tried yet.
+                    if contained && tried.is_empty() && (logical.is_none() || routing_miss.get()) {
+                        return Err(
+                            error.context(contained_refusal(logical.as_deref(), host_mode.get()))
+                        );
+                    }
                     if routing_miss.get() {
                         return Err(error.context(NO_SEAT_SERVES_REPOSITORY));
                     }
@@ -638,18 +652,50 @@ pub(super) fn logical_repository(root: &Path) -> Option<String> {
     Some(normalized.trim_end_matches(".git").to_owned())
 }
 
-/// Whether this profile can serve the logical repository, or `None` when
-/// private routing evidence cannot be read. Only a confirmed match enters the
-/// draw. Accounts without private-clone state remain eligible as shared seats.
-fn repository_route(profile: &Path, logical: Option<&str>) -> Option<bool> {
+/// Distinguish a shared host profile from a registered private clone before
+/// drawing the account. An unreadable private registration remains unknown.
+enum RepositoryRoute {
+    Host,
+    Private(Option<bool>),
+    UnresolvedProfile,
+}
+
+impl RepositoryRoute {
+    fn serves(&self, contained: bool) -> Option<bool> {
+        match self {
+            Self::Host => Some(!contained),
+            Self::Private(registered) => *registered,
+            // Existing host-admitted launches accept a profile without resolved
+            // state. Containment requires positive evidence of a registration.
+            Self::UnresolvedProfile => (!contained).then_some(true),
+        }
+    }
+}
+
+fn repository_route(profile: &Path, logical: Option<&str>) -> RepositoryRoute {
     let Ok(dir) = state_dir(profile) else {
-        return Some(true);
+        return RepositoryRoute::UnresolvedProfile;
     };
     if !dir.join("workspace.json").exists() {
-        return Some(true);
+        return RepositoryRoute::Host;
     }
-    let config = load(&dir).ok()?;
-    Some(config.target(Some(logical?)).is_ok())
+    let registered = logical.and_then(|repo| load(&dir).ok().map(|c| c.target(Some(repo)).is_ok()));
+    RepositoryRoute::Private(registered)
+}
+
+/// Report the hosts from the same inventory snapshot as the failed draw.
+fn contained_refusal(logical: Option<&str>, host_mode: usize) -> String {
+    let host_note = if host_mode > 0 {
+        format!("; {host_mode} host-mode account(s) cannot provide containment")
+    } else {
+        String::new()
+    };
+    match logical {
+        Some(repository) => format!("no private-clone account registers {repository}{host_note}"),
+        None => format!(
+            "the workspace repository cannot be resolved, so no private-clone account is known to register it{host_note}"
+        ),
+    }
 }
 
 /// What a durable job records for `target`: the canonical repository of an
@@ -744,17 +790,21 @@ mod tests {
         std::fs::create_dir_all(&shared).unwrap();
         let same = private_profile(root.path(), "same", &format!("{here}.git"));
         let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
-        assert_eq!(repository_route(&shared, Some(here)), Some(true));
-        assert_eq!(repository_route(&same, Some(here)), Some(true), ".git suffix is not identity");
-        assert_eq!(repository_route(&other, Some(here)), Some(false));
+        assert_eq!(repository_route(&shared, Some(here)).serves(false), Some(true));
+        assert_eq!(
+            repository_route(&same, Some(here)).serves(false),
+            Some(true),
+            ".git suffix is not identity"
+        );
+        assert_eq!(repository_route(&other, Some(here)).serves(false), Some(false));
         // An unresolvable workspace repository matches no private clone, but
         // shared accounts still serve it.
-        assert_eq!(repository_route(&shared, None), Some(true));
-        assert_eq!(repository_route(&same, None), None);
+        assert_eq!(repository_route(&shared, None).serves(false), Some(true));
+        assert_eq!(repository_route(&same, None).serves(false), None);
         // Unreadable private state is left out, never guessed.
         let corrupt = private_profile(root.path(), "corrupt", here);
         std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
-        assert_eq!(repository_route(&corrupt, Some(here)), None);
+        assert_eq!(repository_route(&corrupt, Some(here)).serves(false), None);
     }
 
     /// A seat holding several private clones serves each of its repositories
@@ -777,10 +827,13 @@ mod tests {
         });
         save(&dir.join("workspace.json"), &config).unwrap();
 
-        assert_eq!(repository_route(&profile, Some(primary)), Some(true));
-        assert_eq!(repository_route(&profile, Some(&format!("{second}.git"))), Some(true));
+        assert_eq!(repository_route(&profile, Some(primary)).serves(false), Some(true));
         assert_eq!(
-            repository_route(&profile, Some("https://github.com/2AMLogic/other")),
+            repository_route(&profile, Some(&format!("{second}.git"))).serves(false),
+            Some(true)
+        );
+        assert_eq!(
+            repository_route(&profile, Some("https://github.com/2AMLogic/other")).serves(false),
             Some(false)
         );
 
@@ -842,14 +895,16 @@ mod tests {
         let mut drawn = std::collections::BTreeSet::new();
         for _ in 0..40 {
             let account = select_codex_account_where(ws.path(), None, |account| {
-                repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
+                repository_route(&account.credential_reference, logical.as_deref()).serves(false)
+                    == Some(true)
             })
             .unwrap();
             drawn.insert(account.id.name);
         }
         // Nothing but the private clones of another repository: empty pool.
         let none = select_codex_account_where(ws.path(), None, |account| {
-            repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
+            repository_route(&account.credential_reference, logical.as_deref()).serves(false)
+                == Some(true)
                 && account.id.name.starts_with("agent-1")
         });
         std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
@@ -915,13 +970,159 @@ mod tests {
         let mut order = Vec::new();
         while let Ok(account) = select_codex_account_where(ws.path(), None, |account| {
             !tried.contains(&account.id.name)
-                && repository_route(&account.credential_reference, logical.as_deref()) == Some(true)
+                && repository_route(&account.credential_reference, logical.as_deref()).serves(false)
+                    == Some(true)
         }) {
             tried.insert(account.id.name.clone());
             order.push(account.id.name);
         }
         std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
         assert_eq!(order, ["agent-3", "agent-4", "agent-5"]);
+    }
+    /// The private-clone-only arm (#14110): a host-mode seat never registers
+    /// a repository, a private seat of this repository does (a `.git` suffix
+    /// is not identity), a seat bound elsewhere does not, a multi-repository
+    /// seat registers through its additional registrations too, and
+    /// unreadable private state is refused rather than guessed.
+    #[test]
+    fn only_private_clone_accounts_register_a_repository() {
+        let _fork = super::super::tests::fork_guard();
+        let root = tempfile::tempdir().unwrap();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let registers_repository = |profile: &Path, logical: Option<&str>| {
+            repository_route(profile, logical).serves(true) == Some(true)
+        };
+        let host = root.path().join("host");
+        std::fs::create_dir_all(&host).unwrap();
+        let same = private_profile(root.path(), "same", &format!("{here}.git"));
+        let other = private_profile(root.path(), "other", "https://github.com/2AMLogic/vibesql");
+        assert!(!registers_repository(&host, Some(here)));
+        assert!(registers_repository(&same, Some(here)), ".git suffix is not identity");
+        assert!(!registers_repository(&same, None));
+        assert!(!registers_repository(&other, Some(here)));
+        // Unreadable private state is left out, never guessed.
+        let corrupt = private_profile(root.path(), "corrupt", here);
+        std::fs::write(state_dir(&corrupt).unwrap().join("workspace.json"), "{not json").unwrap();
+        assert!(!registers_repository(&corrupt, Some(here)));
+        // A multi-repository seat registers each of its clones (#10796).
+        let seat = private_profile(root.path(), "seat", here);
+        let dir = state_dir(&seat).unwrap();
+        let mut seat_config = load(&dir).unwrap();
+        let id = identify("https://github.com/2AMLogic/vibesql").unwrap();
+        seat_config.repositories.push(Registered {
+            repository: id.url.clone(),
+            base: "main".into(),
+            slug: id.slug.clone(),
+        });
+        save(&dir.join("workspace.json"), &seat_config).unwrap();
+        assert!(registers_repository(&seat, Some(here)));
+        assert!(registers_repository(&seat, Some("https://github.com/2AMLogic/vibesql.git")));
+        assert!(!registers_repository(&seat, Some("https://github.com/2AMLogic/other")));
+    }
+
+    /// The contained-launch refusal (#14110): one line, naming the
+    /// repository and — when any exist — the host-mode seats that cannot
+    /// provide containment.
+    #[test]
+    fn contained_refusal_names_the_repository_and_host_mode_seats() {
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let refusal = contained_refusal(Some(here), 1);
+        assert_eq!(
+            refusal,
+            format!(
+                "no private-clone account registers {here}; \
+                 1 host-mode account(s) cannot provide containment"
+            )
+        );
+        // Host-mode seats absent: the refusal names only the missing registration.
+        let refusal = contained_refusal(Some(here), 0);
+        assert_eq!(refusal, format!("no private-clone account registers {here}"));
+        // An unresolvable workspace repository still refuses in one line.
+        let refusal = contained_refusal(None, 1);
+        assert!(!refusal.contains('\n'), "{refusal}");
+        assert!(refusal.contains("cannot be resolved"), "{refusal}");
+    }
+
+    /// The contained draw (#14110): in a mixed inventory of host-mode seats
+    /// and private clones, a contained launch only ever draws the private
+    /// clone of this repository — never a host-mode seat and never a private
+    /// clone of another repository. (The unchanged non-contained filter is
+    /// covered by
+    /// [`pool_selection_never_draws_a_private_clone_of_another_repository`].)
+    #[test]
+    #[serial_test::serial]
+    fn a_contained_draw_never_picks_a_host_mode_account() {
+        use super::super::super::account_registry::select_codex_account_where;
+        use super::super::super::paths::SHARED_ACCOUNTS_ROOT_ENV;
+        let _fork = super::super::tests::fork_guard();
+        let here = "https://github.com/2AMLogic/gf180-parasynth";
+        let ws = workspace_with_origin(&format!("{here}.git"));
+        let shared_root = tempfile::tempdir().unwrap();
+        let profiles = tempfile::tempdir().unwrap();
+        for name in ["host-a", "host-b"] {
+            std::fs::create_dir_all(profiles.path().join(name)).unwrap();
+        }
+        private_profile(profiles.path(), "clone-here", &format!("{here}.git"));
+        private_profile(profiles.path(), "clone-other", "https://github.com/2AMLogic/vibesql");
+        let names = ["clone-here", "clone-other", "host-a", "host-b"];
+        let accounts = names
+            .iter()
+            .map(|name| {
+                format!(
+                    r#"{{"provider":"codex","name":"{name}","credential_kind":"codex_home","credential_reference":"{name}","enabled":true}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::create_dir_all(ws.path().join(".loom")).unwrap();
+        std::fs::write(
+            ws.path().join(".loom/accounts.json"),
+            format!(r#"{{"version":1,"accounts":[{accounts}]}}"#),
+        )
+        .unwrap();
+        let _shared =
+            crate::env_test_support::EnvGuard::set(SHARED_ACCOUNTS_ROOT_ENV, shared_root.path());
+        let _pins = crate::env_test_support::EnvGuard::clear(&[
+            "CODEX_HOME",
+            "LOOM_CODEX_HOME",
+            "LOOM_CODEX_PROFILE",
+            "LOOM_CODEX_NO_EXEC",
+            "LOOM_PRIVATE_LEASE_FD",
+            "LOOM_SPAWN_NO_EXPORT",
+        ]);
+        let _profile_root =
+            crate::tokens_pool::profile_root_env::ProfileRootEnv::set(profiles.path());
+        let logical = logical_repository(ws.path());
+        let mut drawn = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let account = select_codex_account_where(ws.path(), None, |account| {
+                repository_route(&account.credential_reference, logical.as_deref()).serves(true)
+                    == Some(true)
+            })
+            .unwrap();
+            drawn.insert(account.id.name);
+        }
+        assert!(drawn.iter().all(|name| name == "clone-here"), "{drawn:?}");
+
+        // Drive the production walk with no matching registration, then with
+        // only host accounts. Both refusals count the hosts in the draw.
+        let missing = "https://github.com/2AMLogic/missing";
+        git(ws.path(), &["remote", "set-url", "origin", missing]);
+        let manifests = ws.path().join(".loom/runtimes");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(manifests.join("codex.json"), r#"{"accountProvider":"codex"}"#).unwrap();
+        let refusal = || {
+            Selection::prepare_contained(ws.path(), None, JobKind::Role, None, "fixture")
+                .err()
+                .expect("containment requires a matching private clone")
+                .to_string()
+        };
+        assert_eq!(refusal(), contained_refusal(Some(missing), 2));
+        for name in ["clone-here", "clone-other"] {
+            let dir = state_dir(&profiles.path().join(name)).unwrap();
+            std::fs::remove_file(dir.join("workspace.json")).unwrap();
+        }
+        assert_eq!(refusal(), contained_refusal(Some(missing), 4));
     }
     fn fixture_config() -> Config {
         Config {
