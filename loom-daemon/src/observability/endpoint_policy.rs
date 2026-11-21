@@ -1,7 +1,6 @@
 //! Which resolved `observability.endpoint` values are fit to export to.
 //!
-//! A separate module from [`super`] on purpose (file-size policy: new code
-//! goes in a new sibling rather than growing `mod.rs`), and a narrow one: it
+//! A separate module from [`super`] on purpose, and a narrow one: it
 //! answers exactly one question — *is this endpoint a reserved placeholder
 //! domain?* — with no config, env, or network dependencies, so the whole
 //! policy is unit-testable as pure string classification.

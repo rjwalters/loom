@@ -3,8 +3,7 @@
 //! backup of its whole state has been verified, kept otherwise.
 //!
 //! A sibling of `worktree_reaper.rs`'s own `mod tests` (whose fixtures it
-//! inherits through `use super::*`) because that file is at its file-size
-//! ratchet baseline.
+//! inherits through `use super::*`).
 
 use super::*;
 use std::process::Command;

@@ -8,8 +8,7 @@
 //! [`crate::dep_classify::cli`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
-//! reason `RestartArgs` does (#6969): `main.rs` is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen, so it keeps only a
+//! reason `RestartArgs` does (#6969): `main.rs` keeps only a
 //! flattened variant and a one-line dispatch arm.
 
 use crate::dep_classify::cli;

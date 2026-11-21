@@ -73,7 +73,7 @@ use super::health::{self, ProbeEffect, ProbeOutcome};
 use super::session_hold;
 use super::session_image::{self, ExtraMount, SessionImageConfig};
 
-// The pass-level health refresh lives in a sibling (file-size ratchet, #7711).
+// The pass-level health refresh lives in a sibling (#7711).
 #[path = "session_health.rs"]
 mod session_health;
 pub use session_health::{refresh_session_health, refresh_session_health_uncached};
@@ -83,7 +83,7 @@ pub use session_health::{refresh_session_health, refresh_session_health_uncached
 pub mod liveness;
 
 // `stop`, and the reconciler's hold-respecting start, with their race
-// handling (file-size ratchet, #7711; #10661).
+// handling (#7711; #10661).
 mod start;
 mod stop;
 pub use start::UndoLock;

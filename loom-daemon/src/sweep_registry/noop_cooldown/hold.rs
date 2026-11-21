@@ -155,8 +155,7 @@ const RECONCILE_PER_TICK: usize = 2;
 ///
 /// Dereferences to the window map so the pre-#10156 call sites (`get`,
 /// `insert`, `remove`, `iter`) are unchanged. It is a wrapper rather than a
-/// second field only because the registry's `mod.rs` is size-ratcheted
-/// (`.loom/docs/file-size-policy.md`).
+/// second field on the registry.
 #[derive(Debug, Default)]
 pub(crate) struct NoopCooldownTable {
     cooldowns: HashMap<u32, NoopCooldownState>,

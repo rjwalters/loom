@@ -4,8 +4,7 @@
 //!
 //! # Why a sibling file
 //!
-//! `claim_reconciliation.rs` is frozen by the file-size ratchet
-//! (`.loom/docs/file-size-policy.md`). #9258 adds a new branch to this arm, so
+//! #9258 adds a new branch to this arm of `claim_reconciliation.rs`, so
 //! the arm and the `anchor_verdict` write it already made move here with it,
 //! leaving one dispatch call behind, the same treatment
 //! [`super::verdict_invalidation`] got for the `Invalidate` arm.

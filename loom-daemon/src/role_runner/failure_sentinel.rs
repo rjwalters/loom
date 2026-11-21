@@ -1,6 +1,5 @@
 //! Classification of a failed role invocation's `role-<role>.log`, split out
-//! of `role_runner.rs` so the over-threshold parent file shrinks rather than
-//! grows (`.loom/docs/file-size-policy.md`).
+//! of `role_runner.rs`.
 //!
 //! `defaults/scripts/claude-wrapper.sh` writes purpose-built, machine-readable
 //! `# SENTINEL` lines to stderr immediately before a child terminates for a

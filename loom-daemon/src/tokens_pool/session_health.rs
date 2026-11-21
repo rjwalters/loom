@@ -1,6 +1,6 @@
 //! Best-effort session-container health refresh over an inventory (issue
-//! #6927), split out of `session_lifecycle.rs` for the file-size ratchet
-//! (#7711). Re-exported from there, so callers' paths are unchanged.
+//! #6927), split out of `session_lifecycle.rs` (#7711). Re-exported from
+//! there, so callers' paths are unchanged.
 
 use std::path::Path;
 

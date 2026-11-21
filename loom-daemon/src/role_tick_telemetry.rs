@@ -102,8 +102,7 @@ pub const ROLE_TICK_WINDOW_SLACK: Duration = Duration::from_secs(5 * 60);
 
 /// Everything the role runner knows about a just-finished tick — the input to
 /// [`emit`]. Deliberately a struct rather than a long argument list: the
-/// runner assembles it at one site and the size ratchet on `role_runner.rs`
-/// leaves no room for an eight-parameter call there.
+/// runner assembles it at one site rather than passing an eight-parameter call.
 #[derive(Debug, Clone)]
 pub struct RoleTickTelemetry {
     /// Workspace root the tick ran for.
@@ -198,10 +197,8 @@ impl TickExtras {
 /// the runner hands to [`emit_for_tick`].
 ///
 /// A struct rather than the `(model, effort)` tuple #8056 started with: the
-/// runner's accessor lives in `role_runner.rs`, which is at its
-/// `file-size-baseline.txt` ceiling, so widening the tuple for #8599's
-/// preference tier would have cost lines that file has none of. Adding a field
-/// here costs `role_runner.rs` nothing.
+/// runner's accessor lives in `role_runner.rs`; a struct lets #8599's
+/// preference tier add a field here without widening the tuple there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedLaunch {
     /// The model the invocation resolved (empty ⇒ reported as absent).
@@ -345,8 +342,8 @@ pub fn classify(outcome: &RoleTickOutcome) -> (RoleTickResult, Option<String>) {
 /// The role runner's whole entry point: it owns only the four facts it has in
 /// scope (root, role, start instant, outcome) plus the runner's own
 /// [`ResolvedLaunch`]; every projection, attribution, and write decision lives
-/// here. Keeping the mapping on this side is what lets `role_runner.rs` —
-/// which is at its `file-size-baseline.txt` ceiling — carry a single call.
+/// here. Keeping the mapping on this side is what lets `role_runner.rs` carry
+/// a single call.
 ///
 /// **Blocking**; best-effort. See [`emit`].
 pub fn emit_for_tick(

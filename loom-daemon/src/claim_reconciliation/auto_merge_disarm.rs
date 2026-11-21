@@ -13,9 +13,8 @@
 //! label said "back in the review queue" and the forge merged it anyway —
 //! #8694, #8847 and #8843 all merged that way on 2026-09-25.
 //!
-//! Split into its own file rather than inlined into `claim_reconciliation.rs`
-//! per the file-size ratchet (`.loom/docs/file-size-policy.md`), same as
-//! [`super::pr_label_info`]. The mutation itself lives one level further out,
+//! Split into its own file rather than inlined into `claim_reconciliation.rs`,
+//! same as [`super::pr_label_info`]. The mutation itself lives one level further out,
 //! in [`crate::forge_disable_auto_merge`], so the CLI verb
 //! (`loom-daemon forge disable-auto-merge`) and this hook cannot drift apart.
 

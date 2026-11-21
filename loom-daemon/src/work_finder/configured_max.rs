@@ -123,7 +123,7 @@ impl ConfiguredMaxReloader {
 }
 
 /// The multi-workspace loop's one-time startup line (moved here from
-/// `spawn_multi_work_finder_task`, which is at its file-size ratchet).
+/// `spawn_multi_work_finder_task`).
 pub fn log_loop_start(interval: Duration, initial: ConfiguredMax) {
     log::info!(
         "work_finder: starting multi-workspace loop (interval={}s, cap = maxConcurrent = {} \

@@ -29,9 +29,8 @@
 //!
 //! `loom-daemon record-rework` (`cli::record_rework`) is the entry point, and
 //! `merge-pr.sh` is its first caller — the shell-language policy points new
-//! executable logic at a subcommand rather than at a script already frozen by
-//! the file-size ratchet, and a subcommand is also what makes the marker
-//! writable from a doctor/CI path later without a third copy of this format.
+//! executable logic at a subcommand rather than at a script, and a subcommand
+//! is also what makes the marker writable from a doctor/CI path later without a third copy of this format.
 //!
 //! # Two sources, one vocabulary — and what a writer must NOT mark
 //!

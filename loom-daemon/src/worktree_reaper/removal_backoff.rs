@@ -2,9 +2,8 @@
 //! orphan-record prune that lets a stuck record clear when the operator
 //! resolves the condition by hand (#7709).
 //!
-//! Extracted from [`super`] rather than living inline: `worktree_reaper.rs` is
-//! over the file-size ratchet's threshold (`scripts/file-size-baseline.txt`),
-//! so the rule is "put the new code in a NEW sibling module". The public
+//! Extracted from [`super`] rather than living inline in `worktree_reaper.rs`.
+//! The public
 //! surface is unchanged — [`super`] re-exports everything callers already name
 //! as `crate::worktree_reaper::…`.
 //!
@@ -32,8 +31,7 @@ use crate::worktree_ops::clean::WorktreeDecision;
 /// [`WorktreeDecision::Remove`].
 ///
 /// Lives here, rather than in [`super`] where every one of its match arms was
-/// introduced, purely to make room (#7939): [`super`] is over the file-size
-/// ratchet's threshold and may not grow, and #7939's fix needs a couple of new
+/// introduced, purely to make room (#7939): #7939's fix needs a couple of new
 /// lines right at this function's one call site in
 /// [`super::reap_worktrees_generic`]. Logic and wording are unchanged from
 /// before the move.

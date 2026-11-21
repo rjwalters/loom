@@ -1,6 +1,5 @@
 //! The watch-monitor loop's runtime wiring (Issue #3971), split out of
-//! [`super`] so the module that grew a second input in #8766 is not the same
-//! one already at the file-size ratchet's threshold.
+//! [`super`], which grew a second input in #8766.
 //!
 //! Nothing here decides anything: the tick body lives in
 //! [`super::run_one_tick`], and this file is the timer, the blocking-thread

@@ -58,8 +58,7 @@ use crate::types::{Event, SweepKind};
 
 /// Runtime attribution on a `completion-v1` payload (Issue #8507): the
 /// `runtime`/`provider`/`profile` label emit + validation, and the
-/// runtime-dispatched per-model token lookup. A sibling module because this
-/// file is over `.loom/docs/file-size-policy.md`'s threshold and frozen.
+/// runtime-dispatched per-model token lookup. A sibling module of this file.
 mod completion_runtime;
 mod forge_gate;
 mod reconcile_tick;

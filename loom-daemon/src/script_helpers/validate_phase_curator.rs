@@ -1,7 +1,6 @@
 //! Curator recovery for the `validate-phase` contract (#11787).
 //!
-//! Split out of [`super::validate_phase`] (a file-size-ratchet-frozen module):
-//! the `loom:curated` label is applied *only* by `curation-complete`, never bare.
+//! Split out of [`super::validate_phase`]: the `loom:curated` label is applied *only* by `curation-complete`, never bare.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

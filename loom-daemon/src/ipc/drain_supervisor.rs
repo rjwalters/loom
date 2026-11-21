@@ -6,9 +6,8 @@
 //! `crate::auto_update::pause_roll`, so the only drain that reaches a deadline
 //! here is an operator drain, and its deadline always holds dispatch paused.
 //!
-//! Moved out of `ipc.rs` because that file is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen. Re-exported from
-//! `crate::ipc` verbatim, so every existing caller is unchanged.
+//! Moved out of `ipc.rs`. Re-exported from `crate::ipc` verbatim, so every
+//! existing caller is unchanged.
 
 use super::evaluate_drain_tick;
 use super::{

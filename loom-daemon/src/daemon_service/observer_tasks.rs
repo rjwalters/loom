@@ -7,10 +7,8 @@
 //! shared property reviewable in one place instead of implied by two
 //! adjacent blocks in `daemon_service.rs`.
 //!
-//! A sibling module rather than more lines in `daemon_service.rs` (an
-//! over-threshold ledger entry under `.loom/docs/file-size-policy.md`), which
-//! is exactly the "new code goes in a new sibling module, leave a small
-//! dispatch behind" shape the policy prescribes.
+//! A sibling module rather than more lines in `daemon_service.rs`, leaving a
+//! small dispatch behind.
 
 use std::path::Path;
 use std::sync::Arc;

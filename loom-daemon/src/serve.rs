@@ -120,8 +120,8 @@ const PEERS_PATH: &str = "/api/peers";
 /// Path the consolidated health-verdict endpoint answers (Issue #4761).
 const HEALTH_PATH: &str = "/api/health";
 
-/// The API-key pool account view (Issue #8447) — its own module so this file,
-/// already over the file-size ratchet's threshold, keeps only the route.
+/// The API-key pool account view (Issue #8447) — its own module so this file
+/// keeps only the route.
 pub mod api_keys;
 
 /// Every route this listener answers (used for the 404 dispatch check).
@@ -287,9 +287,7 @@ pub fn build_snapshot(report: DaemonStatusReport) -> StatusSnapshot {
 #[cfg(test)]
 mod dashboard_queue_tests;
 /// The `DaemonStatus` round-trip and its root-scaled budget (Issue #8224),
-/// extracted to a sibling module because this file is frozen by the file-size
-/// ratchet (`scripts/check-file-size-budget.sh`; see
-/// `.loom/docs/file-size-policy.md`).
+/// extracted to a sibling module.
 mod status_fetch;
 use status_fetch::fetch_report;
 

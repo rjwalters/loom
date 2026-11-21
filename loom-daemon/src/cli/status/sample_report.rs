@@ -1,8 +1,7 @@
 //! The fully-populated [`DaemonStatusReport`] fixture shared by the status
 //! client tests in `status.rs` and the reachable-path status-rendering tests
 //! (#4354), split out of `status.rs` (#7990) so the fixture can keep listing
-//! every field explicitly without pushing its parent past the
-//! `.loom/docs/file-size-policy.md` ratchet.
+//! every field explicitly without growing its parent.
 
 use crate::types::{CapacityReport, CredentialPreflightReport, DaemonStatusReport};
 use chrono::Utc;

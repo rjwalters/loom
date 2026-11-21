@@ -1,8 +1,7 @@
 //! Sub-actions for `loom-daemon sweep-experiment` (issue #4275).
 //!
 //! Split out of `main.rs` (#8081) so a new sub-action — like `Fleet`
-//! (#8055 phases 1-2) — costs `main.rs` nothing: that file is frozen by the
-//! file-size ratchet (`.loom/docs/file-size-policy.md`), the same reason
+//! (#8055 phases 1-2) — costs `main.rs` nothing, the same reason
 //! `cli::script_ports` exists.
 
 use clap::Subcommand;
@@ -108,8 +107,8 @@ pub(crate) enum SweepExperimentAction {
 
     /// Fleet-wide, repo-stratified model A/B: `plan`, `start`, `stop`
     /// (#8055 phases 1-2). Flattened in from `cli::fleet_experiment` so they
-    /// are direct sub-actions of `sweep-experiment` while `main.rs` — frozen
-    /// by the file-size ratchet — carries one variant for all three.
+    /// are direct sub-actions of `sweep-experiment` while `main.rs` carries
+    /// one variant for all three.
     #[command(flatten)]
     Fleet(super::fleet_experiment::FleetExperimentAction),
 

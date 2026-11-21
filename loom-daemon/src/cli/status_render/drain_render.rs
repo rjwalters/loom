@@ -8,8 +8,7 @@
 //! from any single `status --json`, and [`roll_line`] says the same thing in
 //! the human renderer.
 //!
-//! Rendering lives here rather than in `status_render.rs` (over
-//! `.loom/docs/file-size-policy.md`'s threshold, and frozen) and returns its
+//! Rendering lives here rather than in `status_render.rs` and returns its
 //! line instead of printing it, so tests assert on the text directly —
 //! the same shape as the [`super::holds`] sibling.
 

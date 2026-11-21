@@ -5,9 +5,7 @@
 //!
 //! # Why a sibling file
 //!
-//! Per the file-size ratchet (`.loom/docs/file-size-policy.md`,
-//! `scripts/file-size-baseline.txt`), `claim_reconciliation.rs` is frozen at
-//! its current size: it may shrink, not grow. The #9124 carve-out is new
+//! The #9124 carve-out is new
 //! production logic, so it goes in a new module with a thin dispatch left
 //! behind — the same treatment [`super::pr_label_info`],
 //! [`super::auto_merge_disarm`] and [`super::verdict_stale_comment`] already
@@ -199,8 +197,7 @@ pub(super) fn handle_invalidate(
 /// Only [`VerdictKind::ChangesRequested`] is asked about — an approval is
 /// never a CI gate, so an approved verdict pays nothing and behaves exactly as
 /// it did before. The comment fetch is deliberately made here rather than
-/// carried on [`VerdictPr`]: `claim_reconciliation.rs` is frozen by the
-/// file-size ratchet, and this way the call happens only on the rare
+/// carried on [`VerdictPr`], so the call happens only on the rare
 /// equivalent-head-move path instead of once per listed PR.
 ///
 /// # Fail closed

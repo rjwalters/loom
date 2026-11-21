@@ -1,7 +1,6 @@
 //! Z.ai api-keys seat sampling for `tokens.snapshot` (Issue #11396).
 //!
-//! Split out of `collector.rs`, which is frozen by the file-size ratchet
-//! (`scripts/check-file-size-budget.sh`); the collector keeps only the
+//! Split out of `collector.rs`; the collector keeps only the
 //! [`sample_zai_accounts`] call.
 
 use std::path::Path;

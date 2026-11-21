@@ -6,8 +6,7 @@
 //! What each answers is documented on [`crate::dep_recheck`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
-//! reason `RestartArgs` and `DepClassifyCommand` do (#6969): `main.rs` is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen.
+//! reason `RestartArgs` and `DepClassifyCommand` do (#6969).
 
 use crate::dep_recheck::cli;
 use anyhow::Result;

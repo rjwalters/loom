@@ -1692,8 +1692,7 @@ systemctl --user restart loom-daemon.service
 mod tests;
 
 // The fleet-feed egress group lives in its own sibling file rather than in
-// `tests.rs`, which is over the file-size ratchet's threshold (#7814; see
-// `.loom/docs/file-size-policy.md`).
+// `tests.rs` (#7814).
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod feed_egress_tests;

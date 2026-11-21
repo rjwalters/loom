@@ -35,9 +35,9 @@
 //! then the labels are swapped. Nothing is approved or merged here: the Judge
 //! reviews normally afterwards.
 //!
-//! A sibling file because `claim_reconciliation.rs` is frozen by the file-size
-//! ratchet. The decision functions are pure; every forge touch goes through
-//! [`Forge`], so the #10073 replay runs against an in-memory fake.
+//! A sibling file of `claim_reconciliation.rs`. The decision functions are
+//! pure; every forge touch goes through [`Forge`], so the #10073 replay runs
+//! against an in-memory fake.
 
 use std::path::Path;
 use std::time::Duration;

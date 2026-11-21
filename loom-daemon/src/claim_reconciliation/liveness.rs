@@ -1,9 +1,8 @@
 //! Claimant-liveness evidence for PR-side claims (`loom:reviewing` /
 //! `loom:treating`): the claim-activity marker, Judge-progress comments and
 //! claimant head force-pushes (Issue #10235), plus the best-effort forge
-//! fetches that feed them. Split out of the parent module so it can grow
-//! without growing the file-size-ratcheted `claim_reconciliation.rs`; the
-//! public items are re-exported there unchanged.
+//! fetches that feed them. Split out of the parent module `claim_reconciliation.rs`;
+//! the public items are re-exported there unchanged.
 
 use std::path::Path;
 

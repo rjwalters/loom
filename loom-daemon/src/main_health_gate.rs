@@ -98,17 +98,15 @@ use crate::cmd_out::run_command;
 use crate::workspace_registry::WorkspaceRegistry;
 
 // The dirty-tree ignore list (#3778 transient paths + build-artifact
-// lockfiles, #3950) lives in a sibling module: this file is frozen by the
-// file-size ratchet, and a data table that grows with the repo cannot live in
-// a file that is not allowed to grow (#8243).
+// lockfiles, #3950) lives in a sibling module, since a data table that grows
+// with the repo does not belong in this file (#8243).
 mod owned_paths;
 use owned_paths::{
     BUILD_ARTIFACT_LOCKFILE_BASENAMES, INSTALLED_SURFACE_PREFIXES, INSTALL_METADATA_PATH,
     LOOM_OWNED_PREFIXES,
 };
 
-// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module for
-// the same reason: this file is frozen by the file-size ratchet.
+// `WorkspaceHealthStates::find` (#11565) lives in its own sibling module.
 mod workspace_find;
 
 /// Ceiling for a `git` invocation made by the main-health gate.

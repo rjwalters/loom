@@ -3,8 +3,7 @@
 //!
 //! Args live here rather than in `main.rs`'s `Commands` enum for the same
 //! reason every other entry in `cli::script_ports::ScriptPortCommand` does:
-//! `main.rs` is over `.loom/docs/file-size-policy.md`'s threshold and
-//! frozen, so a new subcommand must cost it nothing.
+//! a new subcommand must cost it nothing.
 
 use anyhow::Result;
 use std::path::PathBuf;

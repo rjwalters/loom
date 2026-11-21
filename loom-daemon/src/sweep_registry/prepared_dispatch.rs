@@ -1,5 +1,5 @@
 //! The value that crosses a split `Issue` dispatch's begin -> poll -> finish
-//! seam (Issue #6592), moved out of the ratcheted `mod.rs`.
+//! seam (Issue #6592), moved out of `mod.rs`.
 
 use std::path::PathBuf;
 use std::process::Child;

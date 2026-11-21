@@ -1,8 +1,7 @@
 //! The ETag-cached REST listing of open `loom:building` issues that claim
 //! reconciliation walks (#4428).
 //!
-//! A sibling module rather than inline in `claim_reconciliation.rs`, which is
-//! frozen by the file-size ratchet (`.loom/docs/file-size-policy.md`). Calls
+//! A sibling module rather than inline in `claim_reconciliation.rs`. Calls
 //! are recorded against the `claim_reconciliation` caller in the #9251
 //! forge-call accounting.
 

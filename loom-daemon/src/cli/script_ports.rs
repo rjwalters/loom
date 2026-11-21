@@ -8,8 +8,7 @@
 //!
 //! They are gathered into one flattened enum for two reasons. They are one
 //! family, added and reviewed together as the epic lands each port; and
-//! `main.rs` is over `.loom/docs/file-size-policy.md`'s threshold and frozen,
-//! so each new port must cost it nothing. Flattening keeps every subcommand
+//! each new port must cost `main.rs` nothing. Flattening keeps every subcommand
 //! top-level on the CLI (`loom-daemon classify-dependency-block`, not
 //! `loom-daemon script-ports classify-dependency-block`) while `main.rs` holds
 //! a single variant and a single dispatch arm for all of them.

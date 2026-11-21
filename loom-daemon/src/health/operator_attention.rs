@@ -6,10 +6,9 @@
 //! across every managed repo — answering "what is waiting on me?" without a
 //! separate `gh` query.
 //!
-//! Split into its own file, mirroring [`super::holds`] (#7990): `health.rs`
-//! sits at its `.loom/docs/file-size-policy.md` ratchet, so new assessment
-//! logic goes in a sibling module and the parent keeps only the dispatch
-//! line and re-export.
+//! Split into its own file, mirroring [`super::holds`] (#7990): new assessment
+//! logic goes in a sibling module and the parent `health.rs` keeps only the
+//! dispatch line and re-export.
 
 use super::{accumulate_observed, repo_label, HealthInputs, HealthSection, Verdict};
 

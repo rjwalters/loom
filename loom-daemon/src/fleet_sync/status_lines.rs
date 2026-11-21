@@ -1,6 +1,6 @@
 //! The floor and run-state lines of `loom-daemon status`'s `Fleet store:`
-//! block, split out of `fleet_sync.rs` (at its file-size threshold) when
-//! #11740 added the host-identity line there.
+//! block, split out of `fleet_sync.rs` when #11740 added the host-identity
+//! line there.
 
 use super::{floor, Enforcement, FleetSyncStatus, FloorPass};
 

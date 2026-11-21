@@ -792,8 +792,7 @@ pub fn resolve_expiry(config: &WatchMonitorConfig) -> Duration {
 // Runtime wiring
 // ============================================================================
 
-/// The monitor loop itself, split into a sibling module per the file-size
-/// ratchet (`.loom/docs/file-size-policy.md`).
+/// The monitor loop itself, split into a sibling module.
 mod monitor_loop;
 
 pub use monitor_loop::spawn_watch_monitor_task;

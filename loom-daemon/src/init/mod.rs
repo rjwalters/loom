@@ -1273,16 +1273,11 @@ mod credential_class_tests;
 #[cfg(test)]
 mod resync_surface_parity_tests;
 
-// #9123 tests live in their own file rather than in `tests.rs`: that module is
-// over the `scripts/check-file-size-budget.sh` threshold and frozen at its
-// recorded size, so additions go to a sibling module.
+// #9123 tests live in their own file rather than in `tests.rs`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod loom_payload_tree_tests;
-// Session-mode init tests live in their own file rather than in `tests.rs`:
-// that file is frozen at its current size by the file-size ratchet
-// (.loom/docs/file-size-policy.md), and a sibling module is the remedy the
-// policy names first.
+// Session-mode init tests live in their own file rather than in `tests.rs`.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod session_mode_init_tests;
@@ -1290,8 +1285,8 @@ mod session_mode_init_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod payload_tests;
-// #9129: the `defaults/config/` install step, in its own file for the same
-// file-size-ratchet reason as the modules above.
+// #9129: the `defaults/config/` install step, in its own file like the modules
+// above.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod config_dir_tests;

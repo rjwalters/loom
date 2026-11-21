@@ -22,7 +22,7 @@
 //! landing, and self-healing expiry of abandoned attempts are all inherited
 //! from the #9378 gate and the #9686 pass — this module writes markers and
 //! labels, and the existing machinery does the rest. No new merge-path
-//! surface; the ratchet-frozen script is untouched.
+//! surface; the shell script is untouched.
 //!
 //! # Identity and convergence (ADR-0023 §4)
 //!

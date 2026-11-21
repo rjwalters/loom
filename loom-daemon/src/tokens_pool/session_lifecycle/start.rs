@@ -1,7 +1,7 @@
 //! The start paths of `SessionLifecycle`: the shared `start_inner`, and the
 //! session reconciler's hold-respecting `start_unless_held`, which closes its
-//! race with an operator `stop` (issues #10453, #10661). A child module for
-//! the file-size ratchet (#7711).
+//! race with an operator `stop` (issues #10453, #10661). A child module of
+//! `session_lifecycle` (#7711).
 //!
 //! # Why the hold is checked again after `docker start`/`run` returns
 //!

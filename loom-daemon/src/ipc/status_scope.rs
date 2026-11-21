@@ -9,8 +9,8 @@
 //! itself lives in [`crate::status_section::SectionSet`] so the CLI's
 //! client-side collectors consult the same answers.
 //!
-//! A sibling of `ipc.rs` (an over-threshold file frozen by the file-size
-//! ratchet), so the full-build entry point and the drain overlay live here.
+//! A sibling of `ipc.rs`: the full-build entry point and the drain overlay
+//! live here.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

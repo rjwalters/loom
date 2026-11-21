@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use crate::role_validation;
 
 /// Arguments for `loom-daemon init [PATH]`. Lives here rather than inline in
-/// `main.rs`'s `Commands` enum so `main.rs` stays under its file-size ratchet.
+/// `main.rs`'s `Commands` enum.
 #[derive(clap::Args, Debug)]
 pub(crate) struct InitArgs {
     /// Target workspace directory (must be a git repository)

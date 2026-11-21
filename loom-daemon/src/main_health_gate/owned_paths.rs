@@ -1,12 +1,9 @@
 //! Which repo paths are Loom-owned or regenerable (#8243).
 //!
-//! Extracted from `main_health_gate.rs` because that file is over
-//! `.loom/docs/file-size-policy.md`'s threshold and therefore FROZEN — it may
-//! shrink, not grow. #8078 needed to add one entry (`.loom-local/`) to
-//! `LOOM_OWNED_PREFIXES` and the gate refused it, which is the policy working
-//! as designed: the answer to "this table needs another row" is to give the
-//! table its own file, not to shave a line off somewhere else in a
-//! 1,800-line module.
+//! Extracted from `main_health_gate.rs`: the answer to "this table needs
+//! another row" is to give the table its own file, not to grow a 1,800-line
+//! module. #8078 needed to add one entry (`.loom-local/`) to
+//! `LOOM_OWNED_PREFIXES`.
 //!
 //! This is a pure move. Every constant keeps its name, its value and its
 //! documentation, so `git log -M` follows it and the reasoning recorded
@@ -131,9 +128,8 @@ mod tests {
     #[test]
     fn the_host_local_overlay_is_loom_owned() {
         // The one line that broke `main`. #8078 added `.loom-local/` to this
-        // table and shipped it with no test — the file it lived in was frozen
-        // by the size ratchet, which is also why adding one could not land.
-        // This module can grow, so the entry gets its coverage here.
+        // table and shipped it with no test. This module has room for one,
+        // so the entry gets its coverage here.
         assert!(loom_owned(".loom-local/config.json"));
         assert!(loom_owned(".loom-local/anything/nested.txt"));
     }

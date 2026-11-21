@@ -1,6 +1,6 @@
 //! Last-tick publication (Issue #4761) and per-tick OTLP export (Issue
-//! #8860), split out of `work_finder.rs` (which is frozen by the file-size
-//! ratchet) so both tick loops share one publication seam.
+//! #8860), split out of `work_finder.rs` so both tick loops share one
+//! publication seam.
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -88,9 +88,7 @@ pub fn tick_summary(
         skipped_noop_cooldown: report.skipped_noop_cooldown,
         skipped_declined: report.skipped_declined,
         // #7972: `skipped_prless_retry` is deliberately NOT carried on the
-        // cross-process `WorkFinderTickSummary` yet — `types.rs` is over the
-        // file-size ratchet's threshold and frozen at its current size
-        // (.loom/docs/file-size-policy.md), and a wire field is not worth
+        // cross-process `WorkFinderTickSummary` yet — a wire field is not worth
         // displacing unrelated code for. The counter IS on `TickReport` and
         // appears as `prless-retry-skip` on the per-tick summary log line.
         skipped_recheck_interval: report.skipped_recheck_interval,

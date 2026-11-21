@@ -14,7 +14,7 @@ use crate::transcript_tokens::claude_projects_dir;
 /// `loom-daemon ingest-transcripts` — reached through
 /// [`super::telemetry::TelemetryCommand`], which is flattened, so this is a
 /// top-level subcommand with no `telemetry` prefix. The args live here rather
-/// than in `main.rs` because that file is frozen by the file-size ratchet.
+/// than in `main.rs`.
 #[derive(clap::Args)]
 pub(crate) struct IngestTranscriptsArgs {
     /// Only transcripts modified since: `7d`, `12h`, `90m`, an RFC-3339

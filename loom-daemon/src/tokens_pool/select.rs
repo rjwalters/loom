@@ -1398,8 +1398,7 @@ fn select_inner(
 mod tests;
 
 /// Integration tests for the cache-affinity preference tier (#8146). A sibling
-/// of [`tests`] rather than a section of it: that file is over the file-size
-/// ratchet, so new tests go in a new module instead of growing it.
+/// of [`tests`] rather than a section of it.
 #[cfg(test)]
 #[path = "select_affinity_tests.rs"]
 mod affinity_tests;

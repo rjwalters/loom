@@ -6,9 +6,7 @@
 //! 1. **Cross-host claim-ownership verification before release/reclaim**
 //!    (Issues #5017/#5282) — [`SweepRegistry::fetch_claim_labeled_at`] and
 //!    [`SweepRegistry::claim_superseded_on_forge`], moved verbatim out of
-//!    `guards.rs` (which is frozen at its current size by
-//!    `scripts/file-size-baseline.txt`) so this module's own additions do not
-//!    grow it.
+//!    `guards.rs`.
 //! 2. **The dispatch-time yield to a young *leaseless* foreign claim**
 //!    (Issue #9453 Phase 3.1) — [`SweepRegistry::resolve_leaseless_claim_order`],
 //!    the second leg of [`SweepRegistry::resolve_lease_order`]'s

@@ -1682,7 +1682,6 @@ mod degraded_journal_tests {
 }
 
 /// Issue #8224: the root-scaled floor `resolve_status_timeout` applies, in a
-/// sibling file so the over-threshold parent (`scripts/check-file-size-budget.sh`)
-/// does not grow — see `.loom/docs/file-size-policy.md`.
+/// sibling file.
 #[cfg(test)]
 mod root_scaled_timeout_tests;

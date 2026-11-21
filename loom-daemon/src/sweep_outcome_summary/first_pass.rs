@@ -1,8 +1,6 @@
 //! Group-label resolution for `--group-by model` and the first-pass Judge
 //! approval-rate fold (Issue #8542), plus the render-time footnote helper.
-//! Split out of `sweep_outcome_summary.rs` to stay under the file-size ratchet
-//! threshold (`scripts/check-file-size-budget.sh`, #7711) rather than growing
-//! that file past it. The `complexity` / `model-complexity` dimensions that
+//! Split out of `sweep_outcome_summary.rs` (#7711). The `complexity` / `model-complexity` dimensions that
 //! once lived here were retired in #11665.
 
 use super::{Accum, GroupRow};

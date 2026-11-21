@@ -19,8 +19,7 @@
 //! deletes them (design §8), and the kept checkpoint lets the requeued sweep's
 //! next dispatch skip the phases it already finished.
 //!
-//! Lives beside `restore_to_ready.rs` rather than in `guards.rs`, which is
-//! size-ratcheted.
+//! Lives beside `restore_to_ready.rs` rather than in `guards.rs`.
 
 use super::*;
 

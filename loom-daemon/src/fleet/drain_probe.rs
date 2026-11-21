@@ -1,7 +1,6 @@
 //! Parsing a remote `loom-daemon status --json` for `fleet drain`'s
-//! `wait-remote-exit` phase (#4343), moved out of `drain.rs` (frozen by
-//! `.loom/docs/file-size-policy.md`) when #9588 added the timed-out-hold
-//! verdict.
+//! `wait-remote-exit` phase (#4343), moved out of `drain.rs` when #9588 added
+//! the timed-out-hold verdict.
 
 use super::super::CommandOutput;
 

@@ -5,9 +5,8 @@
 //! `workspace_halted` row could previously say only "repo dispatch held
 //! (red main, gate, token pool or drain)" — never which one. This
 //! seam module owns the named-cause counterpart: a small closed vocabulary
-//! plus the per-root fold that computes it. It lives in its own file for the
-//! same file-size-ratchet reason `tick_report.rs` and `pool_preflight.rs`
-//! were split out of the frozen `work_finder.rs`.
+//! plus the per-root fold that computes it. It lives in its own file, as
+//! `tick_report.rs` and `pool_preflight.rs` were split out of `work_finder.rs`.
 //!
 //! The bool fold stays authoritative for *routing* (a root is held or it is
 //! not); the cause is the *attribution* layered on top. Deriving the bool as
@@ -208,8 +207,8 @@ fn main_red_or_billing(root: &std::path::Path) -> HaltCause {
 /// row naming its cause (#9017). `causes` is optional and parallel to the
 /// tick's `halted` slice; a missing entry (or a legacy no-cause caller passing
 /// `None`) records a cause-less row, byte-for-byte the pre-#9017 behaviour.
-/// Lives here rather than inline in the tick loop for the same file-size
-/// ratchet reason as the rest of this module.
+/// Lives here rather than inline in the tick loop, like the rest of this
+/// module.
 pub fn record_halted(
     rows: &mut Vec<TickQueueRow>,
     ready: &[WorkItem],

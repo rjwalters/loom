@@ -1,5 +1,5 @@
 //! Journal-path resolvers for [`SweepRegistryConfig`], split out of `mod.rs`
-//! (file-size ratchet, #9999).
+//! (#9999).
 
 use super::{sweep_journal, sweep_outcomes, SweepRegistryConfig};
 use anyhow::Result;

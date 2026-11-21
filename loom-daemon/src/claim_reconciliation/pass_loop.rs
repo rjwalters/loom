@@ -2,9 +2,7 @@
 //! mid-pass rate-limit-breaker re-check Issue #8953 added to it.
 //!
 //! Lives in its own sibling module rather than inline in
-//! `claim_reconciliation.rs`: that file is already over the file-size
-//! ratchet's threshold and therefore frozen at its current size (see
-//! `.loom/docs/file-size-policy.md`), and the loop is the one piece of
+//! `claim_reconciliation.rs`: the loop is the one piece of
 //! `run_reconciliation_pass` worth unit-testing on its own — everything else
 //! in that function is env-gating and summary logging.
 

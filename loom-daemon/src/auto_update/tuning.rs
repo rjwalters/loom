@@ -11,10 +11,8 @@
 //! parameter threaded through `daemon_service.rs`. (#8998's and #9010's stall
 //! knobs lived here until #10831 removed the wait-for-zero roll they tuned;
 //! the pause-and-roll budgets are resolved per roll by
-//! [`super::pause_roll::PauseRollTuning`].) That matters because
-//! `daemon_service.rs` and `auto_update.rs` are both over
-//! `.loom/docs/file-size-policy.md`'s ratchet threshold, and the sanctioned way
-//! to add to a frozen file is a new sibling module like this one.
+//! [`super::pause_roll::PauseRollTuning`].) The tuning lives in a sibling
+//! module like this one rather than in `daemon_service.rs` or `auto_update.rs`.
 //!
 //! Resolution itself is not reimplemented here: each field delegates to the
 //! existing `resolve_*` function, so the **env > config > default** precedence

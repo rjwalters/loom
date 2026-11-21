@@ -8,8 +8,7 @@
 //! [`crate::retry_classify::cli`].
 //!
 //! The args live here rather than in `main.rs`'s `Commands` enum for the same
-//! reason `DepRecheckCommand` does (#6969): `main.rs` is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen.
+//! reason `DepRecheckCommand` does (#6969).
 
 use crate::retry_classify::cli;
 use anyhow::Result;

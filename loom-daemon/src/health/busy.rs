@@ -1,9 +1,8 @@
 //! The `indeterminate-busy` roll-up verdict and the evidence it requires
 //! (#6191, corroboration tightened by #8163).
 //!
-//! Split into its own file because `health.rs` sits at its
-//! `.loom/docs/file-size-policy.md` ratchet: new assessment logic goes in a
-//! sibling module and the parent keeps only the dispatch line.
+//! Split into its own file: new assessment logic goes in a sibling module and
+//! the parent `health.rs` keeps only the dispatch line.
 //!
 //! # Why the load reading was added (#8163)
 //!

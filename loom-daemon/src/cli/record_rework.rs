@@ -8,8 +8,8 @@
 //! re-done. This is that writer.
 //!
 //! **Why a subcommand rather than three lines of shell.** The first caller is
-//! `merge-pr.sh`'s stale-base handling, and that script is (a) frozen by the
-//! file-size ratchet and (b) `contract`-category shell whose logic the
+//! `merge-pr.sh`'s stale-base handling, and that script is
+//! `contract`-category shell whose logic the
 //! shell-language policy points into `loom-daemon`. A subcommand is also what
 //! lets the doctor and CI-fix paths mark an event later without a second copy
 //! of the marker format. The format itself lives in

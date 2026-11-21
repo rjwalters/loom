@@ -20,8 +20,7 @@
 //!    through [`crate::usage_source`], so an OpenCode launch reads OpenCode's
 //!    own session store instead of the Claude transcripts it never wrote.
 //!
-//! A sibling module rather than more lines in `safehouse.rs`, which is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen.
+//! A sibling module rather than more lines in `safehouse.rs`.
 //!
 //! # The omission contract, restated
 //!
@@ -134,8 +133,7 @@ pub(super) async fn fetch_tokens_by_model(
 
 /// A valid `completion-v1` source, tweaked per-test.
 ///
-/// Lives here rather than in `safehouse/tests.rs` (also frozen by the
-/// file-size ratchet) and is shared with it. The three #8507 labels are
+/// Lives here rather than in `safehouse/tests.rs` and is shared with it. The three #8507 labels are
 /// populated so every test over this sample exercises the populated,
 /// non-Claude shape; the Claude shape is all-absent, asserted explicitly in
 /// `safehouse::tests::completion_meta_omits_absent_optional_fields`.

@@ -7,9 +7,7 @@
 //! [`crate::epic_supervisor::forge`]).
 //!
 //! Extracted from the inline `pub mod forge { … }` block in `work_finder.rs`
-//! into its own file (#8572) for the same file-size-ratchet reason as
-//! [`super::registry_refresh`]: `work_finder.rs` is over the threshold
-//! (`.loom/docs/file-size-policy.md`) and may not grow. Pure move — the
+//! into its own file (#8572), like [`super::registry_refresh`]. Pure move — the
 //! module's position in the module tree, and therefore every `super::` path
 //! inside it, is unchanged.
 

@@ -16,8 +16,7 @@
 //!
 //! This module holds the extracted refresh the tick loop now calls
 //! unconditionally, **before** that breaker check. It lives in its own file
-//! rather than in `work_finder.rs` because that file is over the file-size
-//! ratchet threshold (`.loom/docs/file-size-policy.md`) and may not grow.
+//! rather than in `work_finder.rs`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

@@ -1,7 +1,6 @@
 //! Issue #6969 AC2 — append the expected relaunch path + detached-verifier
 //! bound to an auto-update roll's own "drain-and-restart triggered" outcome
-//! note, split out of `auto_update.rs` to keep that file under the file-size
-//! ratchet (`.loom/docs/file-size-policy.md`).
+//! note, split out of `auto_update.rs`.
 
 /// Append the expected relaunch path + detached-verifier bound (Issue #6969
 /// AC2) to a roll's outcome note when this tick actually triggered a

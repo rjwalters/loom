@@ -10,8 +10,7 @@
 //! causes and words the line after the ones that are actually active. When
 //! it can attribute nothing, it says "halted" neutrally.
 //!
-//! It lives in its own file for the same file-size-ratchet reason as
-//! `tick_report.rs`: `work_finder.rs` may not grow. It reads only the inputs
+//! It lives in its own file, like `tick_report.rs`. It reads only the inputs
 //! that already exist at the log site, so it composes with #9017's typed
 //! `HaltCause` rather than competing with it.
 
@@ -40,7 +39,7 @@ pub struct HaltTally {
 
 /// Tally the per-cause counts from the same inputs the tick's `halted` fold
 /// reads. `flags` is `(suppress_dispatch_during_gate, draining)`, bundled so
-/// that the call site in the size-ratcheted `work_finder.rs` stays short.
+/// that the call site in `work_finder.rs` stays short.
 #[must_use]
 pub fn tally(
     halted: &[bool],

@@ -1,5 +1,5 @@
 //! Low-priority (`nice`) setup for the rebuild subprocess (split out of
-//! `auto_update.rs` to keep it under the file-size budget, #11042).
+//! `auto_update.rs`, #11042).
 
 use std::process::Command;
 

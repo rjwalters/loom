@@ -3,9 +3,8 @@
 //!
 //! Moved out of `ipc.rs` unchanged apart from #9588's additions (drain origin,
 //! the operator timed-out hold, the startup operator-stop hold, and the
-//! durable operator-stop record) because that file is over
-//! `.loom/docs/file-size-policy.md`'s threshold and frozen. Re-exported from
-//! `crate::ipc` verbatim, so every existing caller is unchanged.
+//! durable operator-stop record). Re-exported from `crate::ipc` verbatim, so
+//! every existing caller is unchanged.
 //!
 //! #10831 removed #6007's retained-roll bookkeeping (a refused roll deadline
 //! re-armed on a widening window, then abandoned): every automatic roll is now

@@ -13,10 +13,7 @@
 //! native launch is the only possibility at all — it `exec`s, so no Loom
 //! process survives to watch the child (see [`crate::api_keys_pool::ingest`]
 //! for that design decision). Keeping them behind one call keeps the reaper's
-//! own call site unchanged, which matters twice over: `reaper.rs` sits one
-//! code line under the file-size ratchet's threshold, and `quarantine.rs`
-//! (this file's parent) is already over it and therefore frozen — see
-//! `.loom/docs/file-size-policy.md`.
+//! own call site unchanged.
 //!
 //! The Codex half is the only production caller of
 //! `tokens_pool::record_terminal_for_model`, and the sole producer for
@@ -36,8 +33,7 @@ struct InRunWatch {
 }
 
 /// Per-sweep in-run watchers, keyed by sweep id. Process-global rather than a
-/// [`SweepRegistry`] field because `mod.rs` is frozen by the file-size
-/// ratchet; an entry is dropped when its sweep's exit-time feedback runs
+/// [`SweepRegistry`] field; an entry is dropped when its sweep's exit-time feedback runs
 /// ([`forget_in_run_watch`]), so the map holds only live native sweeps.
 static IN_RUN_WATCHES: std::sync::Mutex<std::collections::BTreeMap<String, InRunWatch>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -237,8 +233,7 @@ impl SweepRegistry {
 
     /// The Claude insta-crash seam's account mark (#4122), plus its
     /// reason-classified `loom.pool.account_marks` point (#8931). A method
-    /// here, not in `quarantine.rs`, because that file is frozen by the
-    /// file-size ratchet.
+    /// here, not in `quarantine.rs`.
     pub(crate) fn mark_exhausted_account(
         &self,
         token_name: &str,

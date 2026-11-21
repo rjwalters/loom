@@ -3,9 +3,8 @@
 //! is enabled, and whether it is keeping up with transcripts actually on
 //! disk.
 //!
-//! Split into its own file because `health.rs` sits at its
-//! `.loom/docs/file-size-policy.md` ratchet: assessment logic that grows goes
-//! in a sibling module and the parent keeps only the `mod` line plus the
+//! Split into its own file: assessment logic that grows goes in a sibling
+//! module and the parent `health.rs` keeps only the `mod` line plus the
 //! re-export, exactly as [`super::calibration_section`] already does.
 //!
 //! Unlike [`super::assess_limit_calibration`] or [`super::assess_observability`],

@@ -1,6 +1,5 @@
 //! The work finder's per-tick wire summary (Issue #4761), moved out of
-//! `types.rs` (frozen by the file-size ratchet) when #9288 added its `plan`
-//! block.
+//! `types.rs` when #9288 added its `plan` block.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
