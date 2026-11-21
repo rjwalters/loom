@@ -1449,6 +1449,39 @@ fn indented_markdown_code_cannot_select_a_marker() {
 }
 
 #[test]
+fn fenced_examples_end_only_at_a_matching_markdown_close() {
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("market", "approve");
+    for (opening, example, closing) in [
+        ("````text", "~~~~", "`````  "),
+        ("````text", "```", "````"),
+        ("~~~~text", "~~~~ ordinary text", "~~~~\t"),
+        ("~~~text", "~~~\u{a0}", "~~~"),
+        ("- ````text", "  ```", "  ````"),
+    ] {
+        let indent = if opening.starts_with('-') { "  " } else { "" };
+        let inside = format!("{opening}\n{example}\n{indent}{lane}\n{indent}{hand}");
+        assert!(scan_markers(&inside).is_empty(), "{opening} / {example}");
+        let marks = scan_markers(&format!("{inside}\n{closing}\n\n{lane}\n{hand}"));
+        assert_eq!(marks.len(), 2, "{opening} / {closing}");
+        assert_eq!(marks[0].format, MarkerFormat::Lane);
+        assert_eq!(marks[1].format, MarkerFormat::Hand);
+    }
+}
+
+#[test]
+fn markdown_context_does_not_create_or_hide_a_standalone_marker() {
+    let hand = hand_marker("market", "approve");
+    assert!(scan_markers(&format!("`inline example` {hand}")).is_empty());
+    assert_eq!(
+        scan_markers(&format!("Ordinary paragraph `\n{hand}\nNext paragraph `")).len(),
+        1
+    );
+    assert_eq!(scan_markers(&format!("```invalid ` fence opener\n{hand}")).len(), 1);
+}
+
+#[test]
 fn a_hand_marker_without_a_full_matching_sha_is_not_a_marker() {
     let short = format!("<!-- RATIFY-KEY: ee verdict=approve sha={} -->", "abc".repeat(7));
     let no_sha = "<!-- RATIFY-KEY: ee verdict=approve -->\n";

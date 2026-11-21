@@ -29,6 +29,7 @@
 //! nothing, so its head stays marker-less for that key and it is retried.
 
 use crate::champion_hold::ratification::{self, ChangedFile, Comment, Verdict};
+use crate::park_record::blank_block_code;
 use regex::Regex;
 use serde_json::Value;
 
@@ -1083,21 +1084,17 @@ pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
     let hand_re = Regex::new(r"^<!--\s*RATIFY-KEY:\s*(ee|market)((?:\s+[a-z-]+=[^\s<>]+)+)\s*-->$")
         .expect("static");
     let mut out = Vec::new();
-    let mut fenced = false;
-    for line in body.lines() {
+    let visible = blank_block_code(body);
+    for (line, visible_line) in body.lines().zip(visible.lines()) {
         let after_spaces = line.trim_start_matches(' ');
-        // A leading tab reaches the four-column code indentation boundary.
-        if line.len() - after_spaces.len() >= 4 || after_spaces.starts_with('\t') {
+        // Match original standalone lines only. The mask cannot create one.
+        if line != visible_line
+            || line.len() - after_spaces.len() >= 4
+            || after_spaces.starts_with('\t')
+        {
             continue;
         }
         let t = line.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fenced = !fenced;
-            continue;
-        }
-        if fenced || t.starts_with('>') {
-            continue;
-        }
         if let Some(cap) = lane_re.captures(t) {
             out.push(MarkerFound {
                 key: wire_key(&cap[1]),
