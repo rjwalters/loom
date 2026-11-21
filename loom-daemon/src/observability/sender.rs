@@ -19,7 +19,6 @@ use crate::tokens_pool::rng::Rng;
 use super::exporter::Exporter;
 use super::queue::DurableQueue;
 use super::ExportStatus;
-use crate::telemetry::TelemetryEnvelope;
 
 /// Starting backoff after a failed export attempt.
 pub const MIN_BACKOFF: Duration = Duration::from_secs(5);
@@ -39,49 +38,6 @@ pub const ESCALATE_AFTER_FAILURES: u32 = 12;
 /// daemon produced trapped locally while nothing said so) keeps a heartbeat
 /// in daemon.log without re-firing per flush.
 pub const ESCALATE_EVERY_FAILURES: u32 = 24;
-
-/// Most bytes of envelopes (as the JSON array the HTTPS exporter POSTs) one
-/// batch carries (#10928), under `/ingest`'s 5 MiB body limit. `batch_size`
-/// counts envelopes, and a few large queued records (the since-removed
-/// `eta.snapshot` was capped at 1 MiB each, one per 5-minute pass
-/// while the sink was down) would otherwise make a batch the sink answers
-/// 413 to on every retry, wedging the queue for good.
-pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
-
-/// Bytes of `value`'s compact JSON, counted without buffering it.
-pub(crate) fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
-    struct Count(usize);
-    impl std::io::Write for Count {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut count = Count(0);
-    // Writing to a counter cannot fail, and a value that fails to serialize
-    // is rejected by the exporter itself; its partial length is harmless.
-    let _ = serde_json::to_writer(&mut count, value);
-    count.0
-}
-
-/// How many envelopes from the front of `batch` fit in `budget` bytes of
-/// JSON array. Always at least one: a lone envelope over the budget is still
-/// offered, and the sink decides. Stops serializing at the first that does
-/// not fit.
-fn byte_bounded_len(batch: &[TelemetryEnvelope], budget: usize) -> usize {
-    // `[` and `]`, then each envelope plus its comma.
-    let mut used = 2;
-    for (i, envelope) in batch.iter().enumerate() {
-        used += json_len(envelope) + usize::from(i > 0);
-        if i > 0 && used > budget {
-            return i;
-        }
-    }
-    batch.len()
-}
 
 /// Whether the `consecutive_failures`-th failed flush should fire the
 /// escalated warning. Pure so the cadence is unit-testable: first at
@@ -103,8 +59,8 @@ pub enum FlushOutcome {
     Failed,
 }
 
-/// Attempt to send one batch (up to `batch_size` envelopes and
-/// [`MAX_BATCH_BYTES`], peeked from the front of `queue`) via `exporter`. Only acks (removes) the batch from
+/// Attempt to send up to `batch_size` envelopes from the front of `queue`.
+/// Each exporter bounds the size of its own encoded requests. Only acks the batch from
 /// `queue` for the prefix acknowledged by the exporter. A retryable failure
 /// preserves the suffix; permanent OTLP rejection/drop advances the prefix.
 ///
@@ -121,10 +77,7 @@ pub async fn try_flush<E: Exporter>(
     batch_size: usize,
     status: &ExportStatus,
 ) -> FlushOutcome {
-    let mut snapshot = queue.peek_snapshot(batch_size);
-    // Only the prefix is sent, so only the prefix can be acked.
-    let fit = byte_bounded_len(&snapshot.envelopes, MAX_BATCH_BYTES);
-    snapshot.envelopes.truncate(fit);
+    let snapshot = queue.peek_snapshot(batch_size);
     let batch = &snapshot.envelopes;
     if batch.is_empty() {
         return FlushOutcome::Empty;

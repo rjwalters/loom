@@ -85,6 +85,20 @@ pub(crate) mod renew;
 pub(crate) const LEASE_PREFIX: &str = "<!-- loom:pr-lease role=";
 /// First-line prefix of a tie-break loser's standdown record.
 pub(crate) const YIELD_PREFIX: &str = "<!-- loom:pr-lease-yield role=";
+/// The one-line `release`/`reap` summary. A release that patched nothing
+/// because this identity's own rows already carry the released marker (the
+/// verdict step released first) says so, rather than "released 0" (#14392);
+/// no own row at all keeps the plain zero count.
+fn release_summary(verb: &str, released: usize, already_released: usize, stopped: usize) -> String {
+    if released == 0 && already_released > 0 {
+        format!(
+            "already released ({already_released} lease comment(s)); stopped {stopped} renewer(s)"
+        )
+    } else {
+        format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)")
+    }
+}
+
 /// First-line prefix a released lease's marker is rewritten to.
 pub(crate) const RELEASED_PREFIX: &str = "<!-- loom:pr-lease-released role=";
 /// The common prefix all three share — the read's `--jq` pre-filter.
@@ -649,6 +663,27 @@ fn unreadable_claim_line(why: Option<&str>) -> String {
     }
 }
 
+/// The writer credential directory this process inherited
+/// (`GH_CONFIG_DIR`): the daemon resolved it for this claim
+/// (`lease_command` sets it from its own per-root registry, or the child
+/// inherits the daemon's process-global one), so its `identity.json` sidecar
+/// names the effective writer — app and installation ids only, no credential
+/// read.
+fn writer_dir_from_env() -> Option<PathBuf> {
+    std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from)
+}
+
+/// Why a lease comment POST failed, with the two causes `claim` tells apart
+/// (#13746): a confirmed rate limit of the writer the POST ran on, and
+/// everything else (a bounded diagnostic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostFailure {
+    /// A confirmed primary rate limit of the effective writer.
+    WriterLimited(crate::writer_limit::WriterLimited),
+    /// Anything else: the bounded failure reason.
+    Other(String),
+}
+
 impl Gh {
     /// The `owner/repo` a read names explicitly (#13743): the vetted write
     /// target if there is one, else this checkout's `origin`. An untargeted
@@ -758,9 +793,21 @@ impl Gh {
         Err(last)
     }
 
-    /// Post a comment; its forge `id` on success.
+    /// Post a comment; its forge `id` on success. A failure keeps its cause:
+    /// a confirmed rate limit of the writer this POST runs on is
+    /// [`PostFailure::WriterLimited`], anything else is a bounded reason.
     pub(crate) fn post(&self, pr: u64, body: &str) -> Option<u64> {
-        let nwo = self.write_repo.as_ref().ok()?;
+        self.post_detail(pr, body).ok()
+    }
+
+    /// [`post`](Self::post) with the failure kept, so `claim` can classify a
+    /// writer rate limit (#13746) instead of dropping it through
+    /// `ok_output()`.
+    pub(crate) fn post_detail(&self, pr: u64, body: &str) -> Result<u64, PostFailure> {
+        let nwo = self
+            .write_repo
+            .as_ref()
+            .map_err(|_| PostFailure::Other("no vetted write target".to_string()))?;
         let out = self
             .inv("pr_lease.comment", AccessIntent::Write, ops::COMMENT_CREATE)
             .args([
@@ -774,10 +821,34 @@ impl Gh {
                 ".id",
             ])
             .run();
-        String::from_utf8_lossy(&out.ok_output()?.stdout)
-            .trim()
-            .parse()
-            .ok()
+        match out.into_result() {
+            Ok(o) if o.status.success() => {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                stdout.trim().parse().map_err(|_| {
+                    PostFailure::Other(bounded_reason(&format!(
+                        "the comment id was not a number ({})",
+                        bounded_reason(stdout.trim())
+                    )))
+                })
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let line = stderr
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                match crate::writer_limit::WriterLimited::classify(
+                    crate::writer_limit::WriterStage::LeasePost,
+                    None,
+                    line,
+                ) {
+                    Some(limited) => Err(PostFailure::WriterLimited(limited)),
+                    None => Err(PostFailure::Other(bounded_reason(line))),
+                }
+            }
+            Err(u) => Err(PostFailure::Other(bounded_reason(&u.to_string()))),
+        }
     }
 
     /// Replace a comment's body. `Err(true)` = the comment is gone (404).
@@ -888,6 +959,23 @@ pub(crate) fn lease_body(me: &Identity, pr: u64, renewed: Option<DateTime<Utc>>)
     body
 }
 
+/// The visible prose `release_with` leaves on a row it releases (#14807):
+/// the live record's text says the claim "is held", and a human reading the
+/// PR must not keep seeing that behind a released marker. `reaped` words it
+/// as the role runner's reap of a claimant that ended without releasing.
+pub(crate) fn released_body(holder: &Identity, pr: u64, reaped: bool) -> String {
+    format!(
+        "PR #{pr}'s `{label}` lease for the {role} of sweep `{sweep}` on host `{host}` was {verb}. \
+         This **PR lease record** (#9401) is no longer live. \
+         See `defaults/docs/lease-record.md` § \"PR-phase leases\".",
+        verb = if reaped { "reaped" } else { "released" },
+        label = holder.claim_label_text(),
+        role = holder.role.as_str(),
+        sweep = holder.sweep,
+        host = holder.host,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -945,8 +1033,10 @@ pub(crate) enum PrLeaseAction {
     /// sweep id (the claim's `--watch-pid`/`--sweep-id` was omitted; the
     /// output names it), nothing released (#13132).
     Release(ReleaseArgs),
-    /// Print `PR_LEASE_STATE=free|held-self|held-peer|unknown` (+ holder).
-    /// Exit 0 free/held-self, 4 held-peer, 5 unknown.
+    /// Print `PR_LEASE_STATE=free|held-self|held-peer|held-backstop|unknown`.
+    /// Exit 0 free/held-self, 4 held-peer (+ holder), 5 unknown, 6 held-backstop.
+    /// A Judge backstop hold includes `PR_LEASE_BACKSTOP_UNTIL=<RFC3339>` and,
+    /// for a gate-refusal cooldown, `PR_LEASE_BACKSTOP_REFUSED=<token>`.
     Check(Common),
     /// Internal: renew-only (#11906). Re-attach to this claimant's own live
     /// lease and start its renewer; never posts a lease. Exit 0 = attached;
@@ -1180,11 +1270,37 @@ impl Ctx {
         eprintln!("lease pr {} #{}: {line}", self.me.role.as_str(), self.pr());
     }
 
+    /// The stand-down of a confirmed writer rate limit (#13746): confirm the
+    /// reset from the scoped budget evidence — the persisted bucket book,
+    /// else one bounded free probe of the writer directory, never a poll per
+    /// candidate — put the bounded facts on the final stderr line (the last
+    /// line, so `loom.dispatch.claim_stderr_tail` keeps them), and print the
+    /// typed handoff the daemon's preclaim parses. The public exit contract
+    /// is unchanged: unverified, nothing written.
+    fn writer_limited_exit(&self, limited: &mut crate::writer_limit::WriterLimited) -> i32 {
+        limited.confirm_reset(Some(&self.gh.root), None);
+        self.say(&limited.stderr_line());
+        println!("{}", limited.handoff_line());
+        EXIT_UNVERIFIED
+    }
+
     /// `claim`: pre-check, publish, verify order, start renewal. With
     /// `--step`, an ordering that stays unverifiable is refused (exit 5)
     /// rather than held ([`verify_claim_order`](Self::verify_claim_order)).
     pub(crate) fn claim(&self) -> i32 {
         if let Err(why) = &self.gh.write_repo {
+            // The write-scope probe could not verify the write: a confirmed
+            // rate limit of the writer it probed is named as such (#13746);
+            // every other refusal keeps its own diagnostic.
+            if let Some(mut limited) = crate::writer_limit::WriterLimited::classify(
+                crate::writer_limit::WriterStage::PermissionProbe,
+                None,
+                why,
+            ) {
+                let nwo = self.gh.read_slug().unwrap_or_default();
+                limited = limited.with_identity(writer_dir_from_env().as_deref(), &nwo);
+                return self.writer_limited_exit(&mut limited);
+            }
             self.say(&format!("refusing to write here (#9548): {why} — stand down"));
             return EXIT_UNVERIFIED;
         }
@@ -1233,9 +1349,21 @@ impl Ctx {
         // Before the post, so the renewer's guard never overestimates the
         // lease's remaining life.
         let leased_at = (self.now)();
-        let Some(own_id) = self.gh.post(self.pr(), &body) else {
-            self.say("could not post the lease comment; no claim taken — stand down");
-            return EXIT_UNVERIFIED;
+        let own_id = match self.gh.post_detail(self.pr(), &body) {
+            Ok(id) => id,
+            Err(PostFailure::WriterLimited(mut limited)) => {
+                // The POST named the writer rate-limited: say so, hand the
+                // facts to the preclaim, and stand down (#13746).
+                let nwo = self.gh.write_repo.clone().unwrap_or_default();
+                limited = limited.with_identity(writer_dir_from_env().as_deref(), &nwo);
+                return self.writer_limited_exit(&mut limited);
+            }
+            Err(PostFailure::Other(why)) => {
+                self.say(&format!(
+                    "could not post the lease comment; no claim taken — stand down: {why}"
+                ));
+                return EXIT_UNVERIFIED;
+            }
         };
         match self.verify_claim_order() {
             Ordering::Unverified if self.common.step.is_some() => {
@@ -1537,12 +1665,19 @@ impl Ctx {
             }
         };
         let mut released = 0;
+        // #14392: own rows already carrying the released marker (the verdict
+        // step released first); counted only to word the summary line.
+        let mut already_released = 0;
         // #11855: a Judge leaving the PR still waiting for review records it.
         let mut extra = None;
         for row in rows {
             // Our own lease, whatever step it named (ownership ignores it).
             let holder = match parse_record(&row.body) {
                 Some(Record::Lease(holder)) if holder == self.me => holder,
+                Some(Record::Released(holder)) if holder == self.me => {
+                    already_released += 1;
+                    continue;
+                }
                 _ => continue,
             };
             let extra = extra.get_or_insert_with(|| {
@@ -1565,28 +1700,48 @@ impl Ctx {
                     Some(reason) => backstop::reaped_release_fields(self.me.role, head, reason),
                 }
             });
-            let mut lines = row.body.lines();
-            lines.next();
-            let rest: Vec<&str> = lines.collect();
             // The released marker keeps the lease's own step.
             // A Champion merge step's release records its outcome (#12616);
             // a reaped one died without releasing, so it has none.
-            let champion = if holder.step == Some(StepRole::ChampionPromote) {
-                String::new()
-            } else {
-                backstop::champion_outcome_fields(
-                    self.me.role,
-                    outcome.filter(|_| reaped.is_none()),
-                    stop_reason.filter(|_| reaped.is_none()),
-                )
+            let typed = backstop::champion_outcome(
+                self.me.role,
+                holder.step,
+                outcome.filter(|_| reaped.is_none()),
+                stop_reason.filter(|_| reaped.is_none()),
+            );
+            let champion = match &typed {
+                Some((word, reason)) => backstop::format_champion_outcome(word, reason.as_deref()),
+                None => String::new(),
             };
+            // #14807: the prose is rewritten too — the live record's text
+            // says the claim "is held", and no reader of the PR should keep
+            // seeing that behind a released marker. The renewal line, if
+            // any, goes with it: no reader parses it on a released row.
             let body = format!(
                 "{}\n{}",
                 holder.released_marker_with(&format!("{extra}{champion}")),
-                rest.join("\n")
+                released_body(&holder, self.pr(), reaped.is_some())
             );
             if self.gh.patch(row.id, &body).is_ok() {
                 released += 1;
+                // Ownership ignores step tags so older leases can still be
+                // released. Telemetry requires a confirmed merge step on
+                // both sides, and a journal belonging to that repository
+                // and exact sweep.
+                if reaped.is_none()
+                    && holder.step == Some(StepRole::ChampionMerge)
+                    && self.me.step == holder.step
+                {
+                    if let Some((word, reason)) = &typed {
+                        crate::observability::pick_journal::record_released(
+                            &self.gh.root,
+                            self.pr(),
+                            &holder.sweep,
+                            word,
+                            reason.as_deref(),
+                        );
+                    }
+                }
             }
         }
         let verb = if reaped.is_some() {
@@ -1594,7 +1749,7 @@ impl Ctx {
         } else {
             "released"
         };
-        self.say(&format!("{verb} {released} lease comment(s); stopped {stopped} renewer(s)"));
+        self.say(&release_summary(verb, released, already_released, stopped));
         (EXIT_HELD, released)
     }
 
@@ -1602,6 +1757,18 @@ impl Ctx {
     pub(crate) fn check(&self) -> i32 {
         let rows = self.gh.read_rows_retrying(self.pr(), &self.policy);
         let state = self.state_of(rows.as_deref());
+        if let Some((until, refused)) = rows
+            .as_deref()
+            .filter(|_| state == ClaimState::Free)
+            .and_then(|rows| self.backstop_hold(rows))
+        {
+            println!("PR_LEASE_STATE=held-backstop");
+            println!("PR_LEASE_BACKSTOP_UNTIL={}", until.to_rfc3339());
+            if let Some(token) = refused {
+                println!("PR_LEASE_BACKSTOP_REFUSED={token}");
+            }
+            return backstop::EXIT_BACKSTOP;
+        }
         println!("PR_LEASE_STATE={}", state.as_str());
         match state {
             ClaimState::HeldByPeer { holder, .. } => {

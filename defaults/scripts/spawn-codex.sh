@@ -468,8 +468,16 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         -c=*|--config=*)
-            case "$1" in
-                *model_reasoning_effort=*) HAS_EFFORT_OVERRIDE=true; EXPLICIT_EFFORT_VALUE="${1##*model_reasoning_effort=}" ;;
+            config_assignment="${1#*=}"
+            case "$config_assignment" in
+                *model_reasoning_effort=*)
+                    # Keep mixed-key text out of the legacy service_tier arm below.
+                    # Only the assignment key itself can override effort.
+                    if [[ "$config_assignment" == model_reasoning_effort=* ]]; then
+                        HAS_EFFORT_OVERRIDE=true
+                        EXPLICIT_EFFORT_VALUE="${config_assignment#model_reasoning_effort=}"
+                    fi
+                    ;;
                 *service_tier=*) HAS_TIER_OVERRIDE=true; EXPLICIT_TIER_VALUE="${1##*service_tier=}" ;;
             esac
             PASSTHROUGH_ARGS+=("$1")
@@ -1147,7 +1155,11 @@ if [[ -n "${LOOM_PRIVATE_LEASE_FD:-}" && "$CODEX_SESSION_EXEC" == "true" ]]; the
     #     has established Codex hook trust. That is a strictly stronger form of
     #     exactly the obligation checked below.
     #
-    # The trust waiver (#10102) is never used for a private-clone session.
+    # This script never passes the trust waiver (#10102) for a private-clone
+    # session: the clone's project layers are only visible inside the
+    # container, so `private-workspace execute` vets them there and adds
+    # `--dangerously-bypass-hook-trust` itself, for a sealed registration only
+    # (#14105). Recorded trust works as before.
     _hook_status="verified-in-private-session"; _hook_reason="proven inside the account's private session, against the image-owned bridge for /workspace/repo (#8787)"
 elif [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
     _hook_status="unavailable"

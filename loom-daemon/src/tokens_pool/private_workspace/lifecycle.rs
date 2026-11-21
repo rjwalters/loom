@@ -211,19 +211,7 @@ fn start_with(
         register(workspace, &mut existing, &repository, base)?;
         existing
     } else {
-        let gh_config = std::env::var_os("GH_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|home| home.join(".config/gh")))
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize())
-            .transpose()?;
-        if let Some(path) = &gh_config {
-            for parent in path.ancestors() {
-                if parent.join(".git").exists() {
-                    bail!("forge credentials must be outside every repository/worktree");
-                }
-            }
-        }
+        let gh_config = resolve_gh_config(workspace)?;
         Config {
             schema_version: 1,
             account: account.id.name.clone(),
@@ -233,7 +221,7 @@ fn start_with(
             repository,
             base: base.to_owned(),
             repositories: Vec::new(),
-            volume: format!("loom-codex-workspace-{}", account.id.name),
+            volume: workspace_volume_name(&account.id.name),
             profile,
             gh_config,
             session_image: None,
@@ -330,6 +318,81 @@ fn start_with(
     docker::setup(&config)?;
     docker::control(&config, id)?;
     snapshot(config, &dir)
+}
+
+/// The forge configuration directory a NEW private workspace records and
+/// binds read-only at [`GH_CONFIG`], or `None` when none may be mounted.
+///
+/// The daemon-owned GitHub App directories under the workspace root's own
+/// `.loom/` are deliberately not recorded ([`daemon_owned_gh_config`]): an
+/// App-only host delivers its installation token per exec as `GH_TOKEN`
+/// (`forge_auth`, #13916), so binding the directory would only re-expose
+/// the credential inside the seat — and it lives inside the daemon's own
+/// checkout, which the ancestor check below rightly refuses. Before #14744
+/// that refusal kept unattended `session_reconcile` from ever creating a
+/// seat on an App-only host, because the daemon activates that directory
+/// as its process-global `GH_CONFIG_DIR` at startup. Every other directory
+/// at or under a git checkout keeps the refusal.
+fn resolve_gh_config(workspace: &Path) -> Result<Option<PathBuf>> {
+    resolve_gh_config_with(
+        workspace,
+        std::env::var_os("GH_CONFIG_DIR"),
+        dirs::home_dir().map(|home| home.join(".config/gh")),
+        crate::credential_preflight::primary_workspace_root(),
+    )
+}
+
+/// [`resolve_gh_config`] over an injected `GH_CONFIG_DIR` value and
+/// home-default directory (tests): the same resolution and the same
+/// ancestor refusal for every directory the daemon does not own.
+pub(super) fn resolve_gh_config_with(
+    workspace: &Path,
+    gh_config_dir: Option<std::ffi::OsString>,
+    home_default: Option<PathBuf>,
+    primary_root: Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let resolved = gh_config_dir
+        .map(PathBuf::from)
+        .or(home_default)
+        .filter(|path| path.is_dir())
+        .map(|path| path.canonicalize())
+        .transpose()?
+        .filter(|path| !daemon_owned_gh_config(workspace, primary_root.as_deref(), path));
+    if let Some(path) = &resolved {
+        for parent in path.ancestors() {
+            if parent.join(".git").exists() {
+                bail!("forge credentials must be outside every repository/worktree");
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// `true` when `path` (already canonicalized) is one of the daemon-owned
+/// GitHub App credential directories: the process-global `GH_CONFIG_DIR` the
+/// daemon activates at startup
+/// ([`crate::credential_preflight::github_app_gh_config_dir`]) or a per-owner
+/// sibling ([`github_app_gh_config_dir_for_owner`]), under either the daemon's
+/// primary workspace root (the credential owner: startup config belongs to it,
+/// whichever registered checkout acts) or the acting `workspace`.
+///
+/// Both sides are compared canonicalized: `path` already is, so each expected
+/// location is canonicalized too (an aliased `.loom` or `gh-config` resolves
+/// to the same place). A root that cannot be resolved owns nothing, so the
+/// caller's refusal stands.
+fn daemon_owned_gh_config(workspace: &Path, primary_root: Option<&Path>, path: &Path) -> bool {
+    std::iter::once(workspace)
+        .chain(primary_root)
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+            if path == canon(crate::credential_preflight::github_app_gh_config_dir(&root)) {
+                return true;
+            }
+            let owners = canon(root.join(".loom").join("gh-config-by-owner"));
+            path.strip_prefix(&owners)
+                .is_ok_and(|rest| rest.components().count() == 1)
+        })
 }
 
 /// Unattended recovery of an already-configured private session whose
@@ -470,7 +533,13 @@ pub fn session_recover(
     action: RecoverAction,
     issue: Option<u64>,
     branches: &[String],
+    worktrees: &[PathBuf],
 ) -> Result<RecoverReport> {
+    if !worktrees.is_empty()
+        && (action != RecoverAction::Discard || !branches.is_empty() || issue.is_some())
+    {
+        bail!("discard accepts a worktree scope or a branch/issue scope, separately");
+    }
     let (config, dir) = resolve(workspace, name)?;
     let targets = {
         let mut targets = vec![config.primary()];
@@ -496,14 +565,13 @@ pub fn session_recover(
     // for a GitHub clone the in-container helper can only fail, so refuse
     // before ANY exec and name what to provide (#14433). List and discard
     // never push.
-    let auths: Vec<_> = targets
+    let recovery_targets: Vec<_> = targets
         .iter()
-        .map(|target| forge_auth::ExecAuth::resolve(workspace, &target.repository))
+        .map(|target| (target, forge_auth::ExecAuth::resolve(workspace, &target.repository)))
         .collect();
     if action == RecoverAction::Publish {
-        if let Some((target, auth)) = targets
+        if let Some((target, auth)) = recovery_targets
             .iter()
-            .zip(&auths)
             .find(|(_, auth)| auth.github_token_missing())
         {
             // An owner whose only published credential is provably expired
@@ -519,35 +587,87 @@ pub fn session_recover(
                 );
             }
             bail!(
-                "no GitHub write credential for {}: provide the repository owner's published \
-                 App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \
-                 workspace root; set LOOM_MACHINE_CHECKOUT to that root) or GH_TOKEN in the \
-                 environment; the unpublished work is retained",
+                "no GitHub write credential for {}: no published App config for the \
+                 repository owner was found (.loom/gh-config-by-owner/<owner>/hosts.yml \
+                 under the running daemon's workspace root, which this command reads from \
+                 the daemon itself; if no daemon answered, start it or export \
+                 LOOM_MACHINE_CHECKOUT=<that root> as an override) and no GH_TOKEN is in \
+                 the environment; the unpublished work is retained",
                 target.repository
             );
         }
     }
+    let paths_by_clone = if worktrees.is_empty() {
+        vec![Vec::new(); targets.len()]
+    } else {
+        // Check every path across all clones while holding the same account
+        // lease. A refusal in a later clone must not follow a removal in an
+        // earlier one. The worker revalidates its scope before executing it.
+        let mut validations = Vec::new();
+        for (target, auth) in &recovery_targets {
+            validations.push(docker::recover_target(
+                &config,
+                target,
+                RecoverAction::ValidateWorktrees,
+                None,
+                &[],
+                worktrees,
+                auth,
+            )?);
+        }
+        plan_worktree_discard(worktrees, &validations)?
+    };
     let mut clones = Vec::new();
-    for (target, auth) in targets.iter().zip(&auths) {
-        clones.push(docker::recover_target(&config, target, action, issue, branches, auth)?);
+    for ((target, auth), paths) in recovery_targets.into_iter().zip(paths_by_clone) {
+        let action = if !worktrees.is_empty() && paths.is_empty() {
+            RecoverAction::List
+        } else {
+            action
+        };
+        clones
+            .push(docker::recover_target(&config, target, action, issue, branches, &paths, &auth)?);
     }
     let report = RecoverReport {
         account: config.account.clone(),
         clones,
     };
     if action != RecoverAction::List
-        && (issue.is_some() || !branches.is_empty())
-        && report
-            .clones
-            .iter()
-            .all(|clone| clone.published.is_empty() && clone.discarded.is_empty())
+        && (issue.is_some() || !branches.is_empty() || !worktrees.is_empty())
+        && report.clones.iter().all(|clone| {
+            clone.published.is_empty()
+                && clone.discarded.is_empty()
+                && clone.removed_worktrees.is_empty()
+        })
     {
         bail!(
-            "no clone of this account has unpublished commits on the named branches; \
-             run the listing form (`accounts session recover {name}`) to see what is unpublished"
+            "no clone of this account has unpublished commits on the named branches or a \
+             worktree at the named paths; run the listing form (`accounts session recover \
+             {name}`) to see what is unpublished and which worktrees are dirty"
         );
     }
     Ok(report)
+}
+
+pub(super) fn plan_worktree_discard(
+    worktrees: &[PathBuf],
+    validations: &[RecoverOutcome],
+) -> Result<Vec<Vec<PathBuf>>> {
+    let mut by_clone = vec![Vec::new(); validations.len()];
+    for path in worktrees {
+        let name = path.display().to_string();
+        let mut owners = validations
+            .iter()
+            .enumerate()
+            .filter(|(_, clone)| clone.cloned && !clone.ignored.contains(&name));
+        let Some((index, _)) = owners.next() else {
+            bail!("no clone of this account owns worktree {}; nothing removed", path.display());
+        };
+        if owners.next().is_some() {
+            bail!("multiple clones claim worktree {}; nothing removed", path.display());
+        }
+        by_clone[index].push(path.clone());
+    }
+    Ok(by_clone)
 }
 
 /// Rebind an additional private-clone registration to the repository's
@@ -697,6 +817,7 @@ fn snapshot(config: Config, dir: &Path) -> Result<Status> {
         running: state
             .as_ref()
             .is_some_and(|s| s["State"]["Running"] == true),
+        held: session_hold::held_across(std::slice::from_ref(&config.profile)),
         lease: lease::read(dir)?,
         admission: lease::admission(dir)?,
         config,

@@ -17,6 +17,7 @@ fn row(ws_idx: usize, number: u32) -> StateRow {
         step: Some("builder".into()),
         in_pool: true,
         exclusion: None,
+        operator_hold_issue: None,
         gate_until: None,
         reeval_rung: None,
         reeval_next: None,

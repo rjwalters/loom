@@ -165,6 +165,11 @@ pub const CHAMPION_LINE_PREFIX: &str = "CHAMPION-STEP";
 /// outcome line on an unchanged item, or a verdict the forge does not show.
 pub const UNCLASSIFIED: &str = "unclassified";
 
+/// The reason of a step whose seat refused preparation over a dirty leftover
+/// worktree (#14458). Synthesized from the step's log, like the spawn-time
+/// refusals; the text names it so the failure is not `unclassified`.
+pub const SEAT_DIRTY: &str = crate::tokens_pool::private_workspace::SEAT_DIRTY_REASON;
+
 /// The reason of a step whose forge post-state could not be read.
 pub const PROBE_FAILED: &str = "probe_failed";
 
@@ -716,7 +721,16 @@ impl OutcomeLedger {
                 );
                 self.arm(item, step, add(now, delay), CooldownCause::FastFail, now);
             }
-            Effect::Reclassify => self.refusal_streak(item, step, &outcome.reason, now),
+            Effect::Reclassify => {
+                // Keep the admission streak when a private-seat preparation
+                // refusal supplies the more specific diagnostic (#14521).
+                let reason = if outcome.reason == SEAT_DIRTY {
+                    "admission"
+                } else {
+                    &outcome.reason
+                };
+                self.refusal_streak(item, step, reason, now);
+            }
             Effect::FastFailLadder | Effect::Failed | Effect::ForgeLadder | Effect::Uncharged => {}
         }
         // An exhausted seat is not an outcome of the pair (#13966): it leaves

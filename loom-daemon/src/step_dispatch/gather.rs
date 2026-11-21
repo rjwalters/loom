@@ -223,6 +223,7 @@ pub fn pull_from_row(row: &RestIssue, markers: PullMarkers) -> PullInput {
         base_ref: None,
         same_repo: false,
         author_untrusted: false,
+        linkage_unverified: true,
         queued: false,
         draft: row.draft,
         markers,
@@ -737,7 +738,11 @@ pub fn list(
         .map(|r| {
             let m = markers.get(&r.number).cloned().unwrap_or_default();
             match full.get(&r.number) {
-                Some(p) => PullInput::from_rest(p, &slug, &policy, false, m),
+                Some(p) => {
+                    let mut pull = PullInput::from_rest(p, &slug, &policy, false, m);
+                    pull.linkage_unverified |= !pulls_complete || stale_listing;
+                    pull
+                }
                 None => pull_from_row(r, m),
             }
         })

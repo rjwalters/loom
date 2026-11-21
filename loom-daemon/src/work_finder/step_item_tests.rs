@@ -165,6 +165,106 @@ fn labels(v: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn sequenced_conflicting_follower_enters_the_doctor_draw_behind_a_held_parent() {
+    use crate::step_dispatch::item_draw::{weigh, DrawInput, ItemWeights, WeighContext};
+
+    let parent_branch = "feature/issue-10";
+    let follower_labels = labels(&[SEQUENCED, CHANGES_REQUESTED, MERGE_CONFLICT]);
+    let inputs = Inputs {
+        issues: vec![IssueInput {
+            number: 11,
+            labels: labels(&[READY]),
+            ..IssueInput::default()
+        }],
+        pulls: vec![
+            PullInput {
+                number: 20,
+                labels: labels(&[APPROVED, "loom:blocked"]),
+                head_ref: Some(parent_branch.into()),
+                same_repo: true,
+                markers: PullMarkers::from_trusted(&trusted(&[MERGE_RISK_HOLD_MARKER])),
+                ..PullInput::default()
+            },
+            PullInput {
+                number: 21,
+                labels: follower_labels.clone(),
+                body: Some("Closes #11".into()),
+                head_ref: Some("feature/issue-11".into()),
+                base_ref: Some(parent_branch.into()),
+                same_repo: true,
+                ..PullInput::default()
+            },
+        ],
+        ..Inputs::default()
+    };
+    let items = classify(&inputs);
+    let parent = items.iter().find(|item| item.pr == Some(20)).unwrap();
+    assert_eq!(parent.step(), Some(Step::ChampionHoldReevaluate));
+    let follower = items.into_iter().find(|item| item.pr == Some(21)).unwrap();
+    assert_eq!(follower.issue, Some(11));
+    assert_eq!(follower.verdict, Verdict::Step(Step::Doctor));
+
+    let draw = weigh(
+        &[DrawInput {
+            item: follower,
+            labels: labels(&[READY]),
+            created_at: None,
+            stage_entry: None,
+        }],
+        &WeighContext {
+            now: chrono::DateTime::UNIX_EPOCH,
+            build_backoff_engaged: false,
+            pool_exhausted_roles: Default::default(),
+            workspace_idx: 0,
+            cooldowns: Default::default(),
+        },
+        &ItemWeights::default(),
+    );
+    assert_eq!(draw.pool.len(), 1);
+    assert_eq!(draw.pool[0].step, Step::Doctor);
+    assert_eq!(draw.pool[0].target(), 21);
+    assert_eq!(inputs.pulls[1].labels, follower_labels);
+}
+
+#[test]
+fn sequencing_exception_preserves_follower_holds_and_requires_both_labels() {
+    for extras in [
+        &[][..],
+        &[CHANGES_REQUESTED],
+        &[MERGE_CONFLICT],
+        &[APPROVED],
+    ] {
+        let pr = PullInput::default();
+        let mut pr_labels = labels(&[SEQUENCED]);
+        pr_labels.extend(labels(extras));
+        assert_eq!(decide_pr(&pr, &pr_labels).1, Verdict::Pass(PassReason::Sequenced));
+    }
+
+    for (hold, comments, expected) in [
+        ("loom:frozen", &[][..], Verdict::Pass(PassReason::Frozen)),
+        ("loom:operator", &[][..], Verdict::Pass(PassReason::Operator)),
+        ("loom:blocked", &[][..], Verdict::Pass(PassReason::Blocked)),
+        ("loom:blocked", &[MERGE_RISK_HOLD_MARKER][..], Verdict::Step(Step::Doctor)),
+        (
+            "loom:blocked",
+            &[MERGE_RISK_HOLD_MARKER, DOCTOR_CYCLE_CAP_MARKER][..],
+            Verdict::Pass(PassReason::Blocked),
+        ),
+    ] {
+        let items = classify(&Inputs {
+            pulls: vec![PullInput {
+                number: 21,
+                labels: labels(&[SEQUENCED, CHANGES_REQUESTED, MERGE_CONFLICT, hold]),
+                markers: PullMarkers::from_trusted(&trusted(comments)),
+                ..PullInput::default()
+            }],
+            ..Inputs::default()
+        });
+        assert_eq!(items[0].verdict, expected, "{hold} {comments:?}");
+    }
+}
+
+#[test]
 fn park_kind_reads_each_record_kind_from_the_body() {
     let blocked = labels(&["loom:curated", "loom:blocked"]);
     let at = "2026-10-14T00:00:00Z";
@@ -390,6 +490,28 @@ fn an_approved_conflicting_pr_is_not_a_merge_step() {
     assert_eq!(clean[0].step(), Some(Step::ChampionMerge));
 }
 
+#[test]
+fn guide_unparked_conflict_reaches_doctor_even_with_a_ci_failure_label() {
+    let mut inputs = Inputs {
+        pulls: vec![PullInput {
+            number: 514,
+            labels: labels(&[
+                "loom:blocked",
+                "loom:changes-requested",
+                "loom:merge-conflict",
+                "loom:ci-failure",
+            ]),
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    assert_eq!(classify(&inputs)[0].verdict, Verdict::Pass(PassReason::Blocked));
+    inputs.pulls[0]
+        .labels
+        .retain(|label| label != "loom:blocked");
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Doctor));
+}
+
 /// #13737: an approved, unheld PR on a Loom stack branch is a pass (the janitor
 /// would only skip it); any other base, and any held/contradictory/conflicting
 /// stacked PR, keeps its existing verdict.
@@ -463,4 +585,34 @@ fn host_skip_label_passes_issue_triage_and_linked_pr() {
     let open = classify(&inputs(&HostInput::default()));
     assert!(open.iter().all(|i| i.step().is_some()), "{open:?}");
     assert_eq!(PassReason::HostSkipLabel.as_str(), "host_skip_label");
+}
+
+#[test]
+fn held_non_closing_link_waits_for_branch_metadata() {
+    let mut inputs = Inputs {
+        issues: vec![IssueInput {
+            number: 9,
+            labels: labels(&["loom:operator"]),
+            ..IssueInput::default()
+        }],
+        pulls: vec![PullInput {
+            number: 90,
+            labels: labels(&["loom:review-requested"]),
+            body: Some("Part of #9".into()),
+            linkage_unverified: true,
+            ..PullInput::default()
+        }],
+        ..Inputs::default()
+    };
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::OperatorLinkUnverified));
+    assert_eq!(held[0].operator_hold_issue, None);
+    inputs.pulls[0].head_ref = Some("feature/issue-9".into());
+    inputs.pulls[0].same_repo = true;
+    inputs.pulls[0].linkage_unverified = false;
+    let held = classify(&inputs);
+    assert_eq!(held[0].verdict, Verdict::Pass(PassReason::Operator));
+    assert_eq!(held[0].operator_hold_issue, Some(9));
+    inputs.pulls[0].head_ref = Some("topic".into());
+    assert_eq!(classify(&inputs)[0].step(), Some(Step::Judge));
 }

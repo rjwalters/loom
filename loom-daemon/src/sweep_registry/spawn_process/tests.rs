@@ -33,7 +33,7 @@ fn child_env(
     resume: Option<&RollResumeLaunch>,
 ) -> String {
     let log = tempfile::NamedTempFile::new_in(&registry.config.workspace_root).unwrap();
-    let (mut child, _) = registry
+    let mut spawned = registry
         .spawn_child_process_for(
             kind,
             log.path(),
@@ -46,7 +46,7 @@ fn child_env(
             resume,
         )
         .unwrap();
-    assert!(child.wait().unwrap().success());
+    assert!(spawned.child.wait().unwrap().success());
     std::fs::read_to_string(log.path()).unwrap()
 }
 

@@ -747,6 +747,7 @@ mod tests {
             plan: None,
             removed: Vec::new(),
             deferred: None,
+            inventory_error: None,
             at: now,
         }
     }

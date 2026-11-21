@@ -403,6 +403,11 @@ pub fn extract_usage_snapshot(
 /// `(path, mtime)`. The walk is bounded by depth and entry count, like before.
 fn rollout_logs_newest_first(profile: &Path) -> Vec<(PathBuf, DateTime<Utc>)> {
     let sessions = profile.join("sessions");
+    // Provisioning links the default profile's sessions for resuming work.
+    // Those rollouts cannot establish which account consumed the quota.
+    if !sessions.symlink_metadata().is_ok_and(|meta| meta.is_dir()) {
+        return Vec::new();
+    }
     let mut stack = vec![(sessions, 0usize)];
     let mut visited = 0usize;
     let mut found: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
@@ -424,6 +429,9 @@ fn rollout_logs_newest_first(profile: &Path) -> Vec<(PathBuf, DateTime<Utc>)> {
             };
             if file_type.is_dir() {
                 stack.push((path, depth + 1));
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
             let name = entry.file_name();
@@ -472,8 +480,8 @@ fn read_tail(path: &Path) -> Option<String> {
     )
 }
 
-/// The freshest availability reading for one account's `CODEX_HOME`, or
-/// `None` when the profile carries no usable one.
+/// The freshest availability reading from the account's own session files.
+/// Linked history does not establish which account supplied a reading.
 #[must_use]
 pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
     // The newest session often carries no `rate_limits` line at all (it ended
@@ -489,6 +497,29 @@ pub fn latest_usage_snapshot(profile: &Path) -> Option<UsageSnapshot> {
 
 /// How many rollout files, newest first, `latest_usage_snapshot` examines.
 const MAX_ROLLOUT_FILES_EXAMINED: usize = 8;
+
+/// The **weekly** (long-window) utilization in the freshest account-local
+/// snapshot at `now_epoch`, as a 0..1 fraction when usable (#14585).
+///
+/// Ranking uses the same window normalization as [`assess_account`]. It
+/// requires account-local history and a future reported reset or a reading
+/// younger than its known window. A measured `0.0` is a reading.
+#[must_use]
+pub fn weekly_utilization_at(profile: &Path, now_epoch: u64) -> Option<f64> {
+    let now = epoch_to_utc(now_epoch)?;
+    let snapshot = latest_usage_snapshot(profile)?;
+    let weekly = snapshot.secondary?;
+    let expiry = weekly.resets_at.or_else(|| {
+        if snapshot.observed_at > now {
+            return None;
+        }
+        let minutes = i64::try_from(weekly.window_minutes?).ok()?;
+        snapshot
+            .observed_at
+            .checked_add_signed(chrono::Duration::try_minutes(minutes)?)
+    })?;
+    (expiry > now && weekly.used_fraction.is_finite()).then_some(weekly.used_fraction)
+}
 
 // ---------------------------------------------------------------------------
 // Assessment
@@ -702,13 +733,9 @@ pub fn run_check_with<T: super::codex_probe::ProbeTransport + ?Sized>(
 /// Feed each account's *measured* availability into the account-health state
 /// selection already filters on (issue #8407 AC3).
 ///
-/// Only a live measurement is conclusive, and only in the two directions a
-/// measurement can actually establish: at/over the ceiling (hold until the
-/// window rolls over) and demonstrably below it (release an exhaustion hold
-/// this measurement post-dates). Everything else — no snapshot, a snapshot
-/// whose window already rolled over, an account with no live reading — leaves
-/// the record untouched, exactly as #6927's auth probe leaves it untouched
-/// when it could not tell.
+/// An account-local snapshot or a live probe can establish a hold until
+/// the constrained window resets, or clear a hold older than its headroom
+/// reading. Missing or expired evidence leaves the health record unchanged.
 fn apply_health_feedback(
     workspace: &Path,
     inventory: &[AccountDescriptor],

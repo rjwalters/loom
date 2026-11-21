@@ -23,7 +23,6 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 
 use crate::opencode_usage::{self, OpencodeSessionUsage};
 
@@ -69,7 +68,8 @@ impl OpencodeUsageArgs {
     /// Propagates an invalid `--since`/`--until`, or a current-directory
     /// lookup failure when no `--directory` was given.
     pub(crate) fn run(self) -> Result<()> {
-        let window = self.window()?;
+        let window =
+            super::usage_window::resolve(&self.since, self.until.as_deref(), self.all_time)?;
         let directories = self.directories()?;
         let dbs = opencode_usage::discover_opencode_dbs(None);
         let sessions = opencode_usage::sessions(&directories, window, None);
@@ -132,22 +132,6 @@ impl OpencodeUsageArgs {
             }
         }
         Ok(())
-    }
-
-    /// `None` under `--all-time`; otherwise the resolved `[since, until]`.
-    fn window(&self) -> Result<Option<(DateTime<Utc>, DateTime<Utc>)>> {
-        if self.all_time {
-            return Ok(None);
-        }
-        let now = Utc::now();
-        let since = crate::sweep_outcome_summary::parse_since(&self.since, now)?;
-        let until = match &self.until {
-            Some(raw) => DateTime::parse_from_rfc3339(raw)
-                .with_context(|| format!("--until {raw:?} is not RFC3339"))?
-                .with_timezone(&Utc),
-            None => now,
-        };
-        Ok(Some((since, until)))
     }
 
     /// The exact directory set to attribute.

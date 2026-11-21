@@ -1107,6 +1107,117 @@ fn a_toolless_guarded_completion_is_classified_as_a_failed_launch() {
     assert!(!used.observed_a_toolless_run());
 }
 
+/// #14634: a known launcher preflight rejection carries the typed
+/// `# LOOM_LAUNCH_REJECTED` marker (exit 78 + boundary stage) on the same
+/// stream the step log captures, names the runtime it resolved before
+/// rejecting, and never reaches the harness: stdout stays empty (the fake
+/// harness's own sentinel — every real launch prints its argv there).
+#[test]
+fn a_rejected_preflight_writes_the_typed_marker_and_never_launches() {
+    let d = tempfile::tempdir().unwrap();
+    // Worker-options rejection (an unsupported flag fails the argv parser).
+    let out = worker(d.path(), "pi")
+        .args(["-p", "hello", "--api-key", "never-print-this"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=worker_options"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("never-print-this"));
+    // An argv-parse rejection precedes the launch record by contract (the
+    // parser cannot have read `--log` yet); the record itself is asserted on
+    // the post-parse rejections below.
+    assert!(
+        out.stdout.is_empty(),
+        "the harness never ran: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Runner-missing rejection: a legacy runtime with no spawn script.
+    let out = worker(d.path(), "grail")
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=runner_missing"),
+        "{stderr}"
+    );
+    let resolved_at = stderr
+        .find("# LOOM_RUNTIME_RESOLVED runtime=grail")
+        .expect("resolved runtime recorded");
+    let rejected_at = stderr.find("# LOOM_LAUNCH_REJECTED").unwrap();
+    assert!(
+        resolved_at < rejected_at,
+        "the resolved runtime precedes the rejection: {stderr}"
+    );
+    assert!(out.stdout.is_empty());
+
+    // A missing harness binary is 127 (spawn mechanics, not preflight): no
+    // rejection marker, or the step end would classify a post-start-shaped
+    // failure as a preflight rejection.
+    let out = worker(d.path(), "pi")
+        .env("LOOM_PI_BIN", d.path().join("missing"))
+        .args(["-p", "hello"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(127), "{stderr}");
+    assert!(!stderr.contains("LOOM_LAUNCH_REJECTED"), "{stderr}");
+}
+
+/// #14634: the OpenCode CLI-qualification guard (an unqualified major, or a
+/// version probe that fails) is a typed preflight boundary, so the recurrence
+/// receipt can name it instead of `unclassified`.
+#[test]
+fn an_unqualified_opencode_cli_refuses_at_the_cli_qualification_stage() {
+    let d = tempfile::tempdir().unwrap();
+    // A version the launcher cannot qualify (unsupported major), and a
+    // version probe that fails outright.
+    for (version, exit) in [("3.0.0", "0"), (OPENCODE_V1, "1")] {
+        let out = worker(d.path(), "opencode")
+            .env("FIXTURE_VERSION", version)
+            .env("FIXTURE_VERSION_EXIT", exit)
+            .args(["-p", "hello"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "{version:?}: {stderr}");
+        assert!(
+            stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+            "{version:?}: {stderr}"
+        );
+        assert!(stderr.contains("# LOOM_RUNTIME_RESOLVED runtime=opencode"), "{stderr}");
+        assert!(out.stdout.is_empty(), "{version:?}");
+    }
+    // The guarded-2.x refusal (no live guarded-canary receipt) is the same
+    // typed boundary — the shape the observed exit-78 receipts could not
+    // name.
+    let d2 = tempfile::tempdir().unwrap();
+    builder_role(d2.path());
+    std::fs::write(d2.path().join(".loom/roles/builder.md"), "Role task: $ARGUMENTS").unwrap();
+    let out = worker(d2.path(), "opencode")
+        .env("FIXTURE_VERSION", OPENCODE_V2)
+        .args([
+            "--dangerously-skip-permissions",
+            "-p",
+            "/loom:builder 14634",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(78), "{stderr}");
+    assert!(
+        stderr.contains("# LOOM_LAUNCH_REJECTED code=78 stage=cli_qualification"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty());
+}
+
 #[path = "worker_spawn/cargo_debuginfo.rs"]
 mod cargo_debuginfo;
 #[path = "worker_spawn/excluded_roles.rs"]

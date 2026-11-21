@@ -7,10 +7,9 @@
 //!
 //! One bound SQL statement over `hold.transition` log records through the
 //! telemetry-reader ([`crate::signoz_read`]), modeled on
-//! [`super::telemetry_join`]. The record rides whole in the log `body` (the
-//! mapping writes the record JSON there), so every field is parsed in Rust
-//! from the body and the SQL depends only on the two map reads every other
-//! reader query already proves (`loom.kind`, `loom.repo`) plus `timestamp`.
+//! [`super::telemetry_join`]. The rollup reads its three projected attributes
+//! in JSONEachRow format. Reading the full log body exceeds the reader's
+//! memory limit for the same window (#14569).
 //! Success prints per-repo counts with a self-release confidence breakout,
 //! as JSON (`--json`) or text; every failure exits non-zero — unset
 //! endpoint, unreachable reader, malformed rows, a row-capped window — and
@@ -22,10 +21,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::signoz_read::{EndpointConfig, TelemetryReader};
-use crate::telemetry::kinds::hold_transition::{reason, HoldTransitionRecord};
+use crate::telemetry::kinds::hold_transition::reason;
 
 /// The SigNoz log table the reader's store account serves; the same table
 /// every shipped reader query reads (`host-export-queries.sql`, PROBE_QUERY).
@@ -121,7 +120,10 @@ pub fn build_query(
     max_rows: usize,
 ) -> (String, Vec<(String, String)>) {
     let mut sql = format!(
-        "SELECT body \
+        "SELECT attributes_string['loom.repo'] AS repo, \
+                attributes_string['loom.hold.reason_code'] AS reason_code, \
+                if(mapContains(attributes_number, 'loom.hold.confidence_pct'), \
+                   attributes_number['loom.hold.confidence_pct'], NULL) AS confidence_pct \
          FROM {LOGS_TABLE} \
          WHERE attributes_string['loom.kind'] = '{LOG_KIND}' \
            AND timestamp >= {since_ns} \
@@ -143,20 +145,30 @@ pub fn build_query(
     }
     // One extra row: a full cap+1 fetch proves truncation (the caller
     // refuses rather than printing a capped total).
-    sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {}", max_rows + 1));
+    sql.push_str(&format!(" ORDER BY timestamp ASC LIMIT {} FORMAT JSONEachRow", max_rows + 1));
     (sql, params)
 }
 
-/// Parse one `JSONEachRow` line into its `hold.transition` record (the log
-/// `body`; the mapping writes the record JSON there).
-fn parse_row(line: &str) -> std::result::Result<HoldTransitionRecord, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|e| format!("malformed row: {e}"))?;
-    let body = value
-        .get("body")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "row has no body string".to_string())?;
-    serde_json::from_str(body).map_err(|e| format!("body is not a hold.transition record: {e}"))
+/// The three attributes the rollup consumes from a projected reader row.
+#[derive(Debug, Deserialize)]
+struct HoldTransitionRow {
+    repo: String,
+    reason_code: String,
+    confidence_pct: Option<u8>,
+}
+
+fn parse_row(line: &str) -> std::result::Result<HoldTransitionRow, String> {
+    let row: HoldTransitionRow = serde_json::from_str(line).map_err(|error| {
+        format!("malformed row at column {} ({:?})", error.column(), error.classify())
+    })?;
+    // Missing string map entries arrive as empty strings.
+    if row.repo.trim().is_empty() {
+        return Err("row has no repo".to_string());
+    }
+    if row.reason_code.trim().is_empty() {
+        return Err("row has no reason code".to_string());
+    }
+    Ok(row)
 }
 
 /// Parse the reader's `JSONEachRow` response into records, refusing rather
@@ -165,7 +177,7 @@ fn parse_row(line: &str) -> std::result::Result<HoldTransitionRecord, String> {
 /// line that did not decode is a record-shape drift, counted with its first
 /// reason. Both are non-zero exits; an unparseable line can never fold into
 /// a printed (partial) total.
-fn collect_rows(body: &str, max_rows: usize) -> Result<Vec<HoldTransitionRecord>> {
+fn collect_rows(body: &str, max_rows: usize) -> Result<Vec<HoldTransitionRow>> {
     let mut rows = Vec::new();
     let mut unparseable = 0usize;
     let mut first_reason: Option<String> = None;
@@ -225,7 +237,7 @@ fn confidence_stats(count: usize, values: impl Iterator<Item = Option<u8>>) -> C
 }
 
 /// Roll the parsed rows into the printed outcome.
-pub(crate) fn aggregate(rows: &[HoldTransitionRecord], outcome: &mut Outcome) {
+fn aggregate(rows: &[HoldTransitionRow], outcome: &mut Outcome) {
     #[derive(Default)]
     struct Bucket {
         records: usize,

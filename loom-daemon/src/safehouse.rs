@@ -3758,16 +3758,6 @@ async fn run_sink(
     }
 }
 
-// ============================================================================
-// Peer-claim coordination (Issue #4028, Phase 1)
-// ============================================================================
-
-/// Bounded outbound claim-ad channel capacity. Ads are tiny and rare (one per
-/// dispatch / terminal outcome); the bound only matters during a safehoused
-/// outage, where [`SweepRegistry`](crate::sweep_registry::SweepRegistry)'s
-/// `try_send` drops on `Full` (fail-open) rather than blocking the dispatch path.
-pub const PEER_CLAIM_CHANNEL_CAP: usize = 256;
-
 /// A generic sink for inbound room events. Kept intentionally generic so the
 /// shared inbound read task can later fan an event out to additional consumers — e.g. inbound human steering (the
 /// follow-up noted at `.loom/docs/safehouse.md`) — without another connection.

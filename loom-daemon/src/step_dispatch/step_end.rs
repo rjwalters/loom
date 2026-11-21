@@ -71,7 +71,23 @@ fn outcome_line(step: &EndedStep) -> Option<outcome_ledger::StepOutcome> {
     let text = String::from_utf8_lossy(&std::fs::read(&step.log_path).ok()?).into_owned();
     let anchor = format!("sweep_id={} ", step.sweep_id);
     let from = text.rfind(&anchor).unwrap_or(0);
-    outcome_ledger::parse_outcome_line(&text[from..], step.role, step.item)
+    let text = &text[from..];
+    outcome_ledger::parse_outcome_line(text, step.role, step.item).or_else(|| seat_dirty_line(text))
+}
+
+/// A step that never ran because its seat's private clone refused preparation
+/// over a dirty leftover worktree wrote no outcome line (#14458): name the
+/// failure `seat_dirty` instead of leaving it `unclassified`. Only the
+/// refusal's own prefix counts, so a transcript that merely mentions the
+/// word does not.
+fn seat_dirty_line(text: &str) -> Option<outcome_ledger::StepOutcome> {
+    let marker = format!("preparation refused: {}", outcome_ledger::SEAT_DIRTY);
+    text.contains(&marker).then(|| {
+        outcome_ledger::StepOutcome::new(
+            outcome_ledger::OutcomeClass::Failed,
+            outcome_ledger::SEAT_DIRTY,
+        )
+    })
 }
 
 /// The run the ledger records for `step`, given its post-state read. A step
@@ -98,6 +114,35 @@ pub fn run_of(
         )
     } else {
         let outcome = outcome_ledger::classify(line, post);
+        // #14634: the observed classification gap. A step whose launcher
+        // rejected its preflight (exit 78, no outcome line, nothing else
+        // moved the item) classifies `failed`/`unclassified` — the receipt
+        // then says `unclassified` though the launcher's own typed marker
+        // names the boundary. Spend that typed signal ONLY on the exact
+        // shape it proves — the class stays `failed` (same cooldowns, same
+        // fast-fail ladder, same release), only the reason names the cause.
+        // An agent's line, a verdict, a timeout, a provider exhaustion or a
+        // probe failure never reaches this arm.
+        if line.is_none()
+            && outcome.class == outcome_ledger::OutcomeClass::Failed
+            && outcome.reason == outcome_ledger::UNCLASSIFIED
+        {
+            if let Some(reason) = step.launch_rejection {
+                return StepRun {
+                    item: step.item,
+                    step: step.role,
+                    sweep_id: step.sweep_id.clone(),
+                    outcome: outcome_ledger::StepOutcome::new(
+                        outcome_ledger::OutcomeClass::Failed,
+                        reason,
+                    ),
+                    ran_for: step.ran_for,
+                    failure_class: step
+                        .timed_out
+                        .then(|| crate::pr_lease_reap::REASON_TIMEOUT.to_string()),
+                };
+            }
+        }
         // #14455: a sandbox that ran nothing cannot have produced a verdict,
         // so the flag overrides whatever the forge read or the session's own
         // prose claims, short of a verdict the forge shows.
@@ -153,6 +198,27 @@ pub fn ledger_reason(spawn_reason: &str) -> Option<&'static str> {
     }
 }
 
+fn refusal_ledger_reason(spawn_reason: &str, detail: Option<&str>) -> Option<&'static str> {
+    // Match the start of the static Codex containment rejection and its
+    // preparation cause. A path, diagnostic excerpt or preference summary
+    // that mentions the marker is still an ordinary admission refusal.
+    if spawn_reason == "runtime_rejected"
+        && detail
+            .and_then(|detail| {
+                detail.strip_prefix(concat!(
+                    "unmet capabilities: worktreeIsolation; ",
+                    "verified private-clone containment could not satisfy it: ",
+                    "private workspace preparation refused: ",
+                ))
+            })
+            .and_then(|cause| cause.strip_prefix(outcome_ledger::SEAT_DIRTY))
+            .is_some_and(|detail| detail.starts_with(": private clone/worktree is dirty;"))
+    {
+        return Some(outcome_ledger::SEAT_DIRTY);
+    }
+    ledger_reason(spawn_reason)
+}
+
 /// Record a spawn-time refusal of `(item, role)` in the ledger, so the next
 /// draw skips the pair while it cools down and the `claim_lost` counter
 /// counts (the integrated review's M1).
@@ -162,8 +228,9 @@ pub fn record_refusal(
     item: u32,
     role: StepRole,
     spawn_reason: &str,
+    detail: Option<&str>,
 ) {
-    let Some(reason) = ledger_reason(spawn_reason) else {
+    let Some(reason) = refusal_ledger_reason(spawn_reason, detail) else {
         return;
     };
     let run = StepRun {
@@ -330,6 +397,78 @@ mod tests {
         assert_eq!(ledger_reason("admission_refused"), Some("admission"));
     }
 
+    #[test]
+    fn only_the_dirty_private_preparation_refusal_gets_the_specific_ledger_reason() {
+        let isolation = "unmet capabilities: worktreeIsolation; verified private-clone \
+                         containment could not satisfy it: ";
+        let dirty = "private workspace preparation refused: seat_dirty: private \
+                     clone/worktree is dirty; retain and recover its work before reuse\n  M file";
+        let refusal = |reason, detail: String| refusal_ledger_reason(reason, Some(&detail));
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}{dirty}")),
+            Some(outcome_ledger::SEAT_DIRTY)
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("{isolation}failed to open path: {dirty}")),
+            Some("admission")
+        );
+        assert_eq!(
+            refusal("runtime_rejected", format!("candidate skipped: {isolation}{dirty}")),
+            Some("admission")
+        );
+        assert_eq!(refusal("roll_paused", format!("{isolation}{dirty}")), None);
+        assert_eq!(refusal_ledger_reason("spawn_failed", None), Some("pool_gate"));
+    }
+
+    /// #14458: a step that died on its seat's dirty leftover worktree wrote no
+    /// outcome line; its log's refusal names the reason instead of leaving it
+    /// `unclassified`, and a real outcome line still wins.
+    #[test]
+    fn a_dirty_seat_refusal_in_the_log_classifies_as_seat_dirty() {
+        let refusal = "Error: private workspace preparation refused: seat_dirty: private \
+                       clone/worktree is dirty; retain and recover its work before reuse";
+        let line = seat_dirty_line(refusal).expect("the refusal names seat_dirty");
+        assert_eq!(line.class, OutcomeClass::Failed);
+        assert_eq!(line.reason, "seat_dirty");
+        let run = classify_with(Some(&line));
+        assert_eq!(run.reason, "seat_dirty");
+        // Prose that merely mentions the word is not the refusal.
+        assert!(seat_dirty_line("the seat_dirty reason is documented").is_none());
+        assert!(seat_dirty_line("private workspace preparation refused: base is missing").is_none());
+    }
+
+    #[test]
+    fn an_explicit_child_outcome_wins_over_the_dirty_seat_marker_in_its_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = EndedStep {
+            sweep_id: "step-curator-14521-1".into(),
+            item: 14521,
+            role: StepRole::Curator,
+            log_path: dir.path().join("step.log"),
+            ran_for: std::time::Duration::from_secs(1),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: None,
+            sandbox_unavailable: false,
+        };
+        std::fs::write(
+            &step.log_path,
+            "sweep_id=step-curator-14521-1 started\n\
+             Error: private workspace preparation refused: seat_dirty: private clone/worktree is dirty;\n\
+             LOOM_STEP_OUTCOME role=curator target=14521 class=noop reason=already-curated\n",
+        )
+        .unwrap();
+        let outcome = outcome_line(&step).unwrap();
+        assert_eq!(outcome.class, OutcomeClass::Noop);
+        assert_eq!(outcome.reason, "already_curated");
+    }
+
+    fn classify_with(line: Option<&outcome_ledger::StepOutcome>) -> outcome_ledger::StepOutcome {
+        // An unchanged item whose claim is still held: the dead step's shape.
+        let post = post_state(StepRole::Curator, &labels(&["loom:curating"]), false);
+        outcome_ledger::classify(line, Some(post))
+    }
+
     /// #13966: a step whose provider feedback said its api-key seat was
     /// exhausted records a refusal, not a run — the fast-fail ladder and the
     /// repeat cap never see it, and no item cooldown is armed.
@@ -343,6 +482,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(80),
             timed_out: false,
             provider_exhausted: true,
+            launch_rejection: None,
             sandbox_unavailable: false,
         };
         // The post-state of a crashed step (claim restored, item unchanged)
@@ -393,6 +533,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(20),
             timed_out: false,
             provider_exhausted: false,
+            launch_rejection: None,
             sandbox_unavailable: true,
         };
         // Exit 0, item unchanged, no outcome line: unflagged this is
@@ -434,6 +575,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(20),
             timed_out: false,
             provider_exhausted: false,
+            launch_rejection: None,
             sandbox_unavailable: true,
         };
         let post = post_state(StepRole::Curator, &labels(&["loom:curated"]), false);
@@ -450,6 +592,7 @@ mod tests {
             ran_for: std::time::Duration::from_secs(60),
             timed_out: false,
             provider_exhausted: false,
+            launch_rejection: None,
             sandbox_unavailable: false,
         };
         let run = run_of(&step, None, None);
@@ -457,5 +600,106 @@ mod tests {
         assert_eq!(run.outcome.reason, outcome_ledger::PROBE_FAILED);
         let obj = serde_json::json!({"state": "closed", "labels": [{"name": "loom:pr"}]});
         assert_eq!(read_object(&obj), Some((labels(&["loom:pr"]), true)));
+    }
+
+    /// #14634: a step whose launcher rejected its preflight (the typed
+    /// marker carried on `EndedStep`) classifies `failed` with the typed
+    /// reason instead of `unclassified`. Everything about the effect — the
+    /// `failed` class, the fast-fail ladder, the cooldowns — is unchanged;
+    /// only the receipt's reason names the boundary.
+    #[test]
+    fn a_launch_rejected_step_names_the_preflight_boundary_not_unclassified() {
+        let step = |rejection| EndedStep {
+            sweep_id: "step-builder-14634-1".into(),
+            item: 14634,
+            role: StepRole::Builder,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(7),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: rejection,
+            sandbox_unavailable: false,
+        };
+        // The crashed-step shape: claim still held, no outcome line.
+        let post = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        assert!(post.claim_held, "fixture: a crashed step's shape");
+        let typed = run_of(&step(Some("preflight_credential")), None, Some(post));
+        assert_eq!(typed.outcome.class, OutcomeClass::Failed);
+        assert_eq!(typed.outcome.reason, "preflight_credential");
+        assert_eq!(typed.failure_class, None);
+        // The coarse marker (boundary proven, subcause unknown) classifies
+        // too.
+        let coarse = run_of(&step(Some("preflight_rejected")), None, Some(post));
+        assert_eq!(coarse.outcome.reason, "preflight_rejected");
+        // Without the typed signal the shape stays `unclassified` — the
+        // exact gap this fixes.
+        let untyped = run_of(&step(None), None, Some(post));
+        assert_eq!(untyped.outcome.class, OutcomeClass::Failed);
+        assert_eq!(untyped.outcome.reason, outcome_ledger::UNCLASSIFIED);
+        // Same class ⇒ the same ledger effect: the fast-fail ladder the
+        // `unclassified` failure took is exactly what the typed reason takes.
+        for run in [&typed, &coarse, &untyped] {
+            assert_eq!(
+                outcome_ledger::effect_of(
+                    StepRole::Builder,
+                    &run.outcome,
+                    run.ran_for,
+                    &outcome_ledger::LedgerConfig::default(),
+                ),
+                outcome_ledger::Effect::FastFailLadder
+            );
+        }
+    }
+
+    /// #14634: the typed signal is spent only on the shape it proves. An
+    /// agent's own line, a moved item, a timeout, a provider exhaustion or a
+    /// probe failure never reads as a launcher rejection.
+    #[test]
+    fn the_launch_rejection_never_overrides_a_more_specific_classification() {
+        let base = EndedStep {
+            sweep_id: "step-builder-14634-2".into(),
+            item: 14634,
+            role: StepRole::Builder,
+            log_path: "/nonexistent".into(),
+            ran_for: std::time::Duration::from_secs(600),
+            timed_out: false,
+            provider_exhausted: false,
+            launch_rejection: Some("preflight_credential"),
+            sandbox_unavailable: false,
+        };
+        // An agent's line outranks: the launcher never rejected a launch the
+        // agent ran in.
+        let held = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        let line = outcome_ledger::StepOutcome::new(OutcomeClass::Failed, "no_pr");
+        let agent = run_of(&base, Some(&line), Some(held));
+        assert_eq!(agent.outcome.reason, "no_pr");
+        // A moved item is a verdict whatever the launcher said.
+        let moved = post_state(StepRole::Builder, &labels(&["loom:building"]), false);
+        let open_pr = crate::step_dispatch::outcome_ledger::PostState {
+            moved: true,
+            closed: false,
+            claim_held: false,
+        };
+        assert!(!moved.moved, "fixture: claim-held is not a move");
+        let verdict = run_of(&base, None, Some(open_pr));
+        assert_eq!(verdict.outcome.class, OutcomeClass::Verdict);
+        // Provider exhaustion keeps its own refusal.
+        let exhausted = EndedStep {
+            provider_exhausted: true,
+            ..base.clone()
+        };
+        let run = run_of(&exhausted, None, Some(held));
+        assert_eq!(run.outcome.class, OutcomeClass::Refused);
+        assert_eq!(run.outcome.reason, outcome_ledger::PROVIDER_EXHAUSTED);
+        // A timeout keeps its failure class.
+        let timed_out = EndedStep {
+            timed_out: true,
+            ..base.clone()
+        };
+        let run = run_of(&timed_out, None, Some(held));
+        assert_eq!(run.failure_class.as_deref(), Some(crate::pr_lease_reap::REASON_TIMEOUT));
+        // A probe failure (forge read failed) is not the launcher's word.
+        let probe = run_of(&base, None, None);
+        assert_eq!(probe.outcome.reason, outcome_ledger::PROBE_FAILED);
     }
 }

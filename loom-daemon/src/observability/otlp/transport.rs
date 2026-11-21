@@ -40,7 +40,12 @@ pub(super) struct ResponseOutcome {
     pub loss_reason: Option<String>,
 }
 impl ResponseOutcome {
-    fn failure(items: u64, retry: bool, detail: &str, loss_reason: Option<String>) -> Self {
+    pub(super) fn failure(
+        items: u64,
+        retry: bool,
+        detail: &str,
+        loss_reason: Option<String>,
+    ) -> Self {
         Self {
             counts: if retry {
                 SignalCounts {
@@ -77,6 +82,51 @@ pub(super) async fn post<T: Serialize + Sync>(
         .json(body)
         .send()
         .await;
+    read_outcome(result, signal, items).await
+}
+
+pub(super) enum BatchResponse {
+    Outcome(ResponseOutcome),
+    TooLarge,
+}
+
+/// Post the exact bytes the queued exporter measured. Raw relay forwarding
+/// keeps its existing response policy through `post`, since the relay cannot
+/// split a request into queue envelopes.
+pub(super) async fn post_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    key: Option<&str>,
+    extra_headers: &super::RequestHeaders,
+    signal: Signal,
+    items: u64,
+    body: Vec<u8>,
+) -> BatchResponse {
+    let mut result = extra_headers
+        .apply(client.post(endpoint), key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await;
+    if let Ok(response) = &mut result {
+        let status = response.status().as_u16();
+        let too_large = status == 413
+            || (status == 400
+                && read_bounded_body(response)
+                    .await
+                    .is_ok_and(|body| size_refusal(&body)));
+        if too_large {
+            return BatchResponse::TooLarge;
+        }
+    }
+    BatchResponse::Outcome(read_outcome(result, signal, items).await)
+}
+
+async fn read_outcome(
+    result: Result<reqwest::Response, reqwest::Error>,
+    signal: Signal,
+    items: u64,
+) -> ResponseOutcome {
     let mut response = match result {
         Ok(response) => response,
         Err(error) => {
@@ -134,34 +184,64 @@ pub(super) async fn post<T: Serialize + Sync>(
             Some(super::super::loss_ledger::REASON_NON_JSON_RESPONSE.to_string()),
         );
     }
-    let mut bytes = Vec::new();
-    loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) if chunk.len() <= MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) => {
-                bytes.extend_from_slice(&chunk)
-            }
-            Ok(Some(_)) => {
-                return ResponseOutcome::failure(
-                    items,
-                    false,
-                    "OTLP response exceeds 4096 bytes; acceptance unknown",
-                    Some(super::super::loss_ledger::REASON_RESPONSE_TOO_LARGE.to_string()),
-                )
-            }
-            Ok(None) => break,
-            // The receiver may already have accepted the request. We cannot
-            // claim success; retry preserves the documented at-least-once policy.
-            Err(_) => {
-                return ResponseOutcome::failure(
-                    items,
-                    true,
-                    "OTLP response read failed; acceptance unknown",
-                    None,
-                )
-            }
-        }
+    match read_bounded_body(&mut response).await {
+        Ok(bytes) => parse_response(signal, items, &bytes),
+        Err(BodyReadError::TooLarge) => ResponseOutcome::failure(
+            items,
+            false,
+            "OTLP response exceeds 4096 bytes; acceptance unknown",
+            Some(super::super::loss_ledger::REASON_RESPONSE_TOO_LARGE.to_string()),
+        ),
+        // The receiver may already have accepted the request. We cannot
+        // claim success; retry preserves the documented at-least-once policy.
+        Err(BodyReadError::ReadFailed) => ResponseOutcome::failure(
+            items,
+            true,
+            "OTLP response read failed; acceptance unknown",
+            None,
+        ),
     }
-    parse_response(signal, items, &bytes)
+}
+
+enum BodyReadError {
+    TooLarge,
+    ReadFailed,
+}
+
+async fn read_bounded_body(response: &mut reqwest::Response) -> Result<Vec<u8>, BodyReadError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BodyReadError::ReadFailed)?
+    {
+        if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(BodyReadError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn size_refusal(bytes: &[u8]) -> bool {
+    fn explicit_message(message: &str) -> bool {
+        let lower = message.trim().trim_end_matches('.').to_ascii_lowercase();
+        let message = lower.strip_prefix("http: ").unwrap_or(&lower);
+        matches!(
+            message,
+            "request body too large" | "request entity too large" | "payload too large"
+        )
+    }
+
+    // Full short messages, including a JSON error's top-level message, avoid
+    // interpreting a record's quoted contents or a truncated reply as a size
+    // refusal. The receiver's text never leaves this classifier.
+    std::str::from_utf8(bytes).is_ok_and(explicit_message)
+        || serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|body| {
+            body.get("message")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(explicit_message)
+        })
 }
 
 fn parse_response(signal: Signal, items: u64, bytes: &[u8]) -> ResponseOutcome {

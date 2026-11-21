@@ -845,23 +845,48 @@ pub fn format_result_human(result: &OrphanRecoveryResult) -> String {
 
     if !result.watched.is_empty() {
         lines.push(String::new());
-        lines.push(format!(
-            "{} claim(s) seen but not yet stale enough to reclaim:",
-            result.watched.len()
-        ));
+        // #14806: the summary must accommodate claims whose age is unknown
+        // (or whose skip is a fresh lease, not young age) — "not yet stale
+        // enough" described an age this pass never measured.
+        lines.push(format!("{} claim(s) seen but not reclaimed this pass:", result.watched.len()));
         for w in &result.watched {
-            let age = w.age_seconds.unwrap_or(0);
-            let threshold = w.threshold_seconds as i64;
-            let remaining = (threshold - age).max(0);
-            lines.push(format!(
-                "  [watched] #{}: {} -- skipped ({}): label age {}, threshold {}, eligible in {}",
-                w.issue,
-                w.title.as_deref().unwrap_or("no title"),
-                w.reason,
-                format_duration(age),
-                format_duration(threshold),
-                format_duration(remaining)
-            ));
+            // #14806: render from the evidence available. A numeric age and
+            // an eligibility countdown are printed only when the label age
+            // was measured; `unwrap_or(0)` here printed "label age 0s" for
+            // an unreadable timeline, reading a claim of unknown age as
+            // brand new and promising a countdown this pass cannot know.
+            let line = match w.age_seconds {
+                Some(age) => {
+                    let threshold = w.threshold_seconds as i64;
+                    let remaining = (threshold - age).max(0);
+                    format!(
+                        "  [watched] #{}: {} -- skipped ({}): label age {}, threshold {}, \
+                         eligible in {}",
+                        w.issue,
+                        w.title.as_deref().unwrap_or("no title"),
+                        w.reason,
+                        format_duration(age),
+                        format_duration(threshold),
+                        format_duration(remaining)
+                    )
+                }
+                None if w.reason == "label_age_unverifiable" => format!(
+                    "  [watched] #{}: {} -- skipped ({}): label timeline unreadable",
+                    w.issue,
+                    w.title.as_deref().unwrap_or("no title"),
+                    w.reason
+                ),
+                // Any other skip without a measured age (e.g. `lease_fresh`,
+                // which is gated on lease freshness, not label age) keeps
+                // its own reason and invents neither an age nor a countdown.
+                None => format!(
+                    "  [watched] #{}: {} -- skipped ({})",
+                    w.issue,
+                    w.title.as_deref().unwrap_or("no title"),
+                    w.reason
+                ),
+            };
+            lines.push(line);
         }
     }
 
@@ -1078,6 +1103,78 @@ mod tests {
         assert!(msg.contains("exiting 2"), "{msg}");
         assert!(msg.contains("not a failure"), "{msg}");
         assert!(msg.contains("--recover"), "{msg}");
+    }
+
+    /// #14806: an unmeasured label age must never be rendered as a numeric
+    /// age or a countdown — `unwrap_or(0)` printed "label age 0s … eligible
+    /// in <full threshold>", reading a claim whose timeline could not be read
+    /// as brand new and promising an eligibility time this pass cannot know.
+    #[test]
+    fn format_result_human_says_label_timeline_unreadable_for_an_unmeasured_age() {
+        let mut result = OrphanRecoveryResult::default();
+        result.watched.push(WatchedEntry {
+            issue: 5501,
+            title: Some("live work".to_string()),
+            reason: "label_age_unverifiable",
+            age_seconds: None,
+            threshold_seconds: 600.0,
+        });
+        let out = format_result_human(&result);
+        assert!(out.contains("#5501"), "must identify the issue: {out}");
+        assert!(
+            out.contains("label timeline unreadable"),
+            "must say the timeline is unreadable: {out}"
+        );
+        assert!(
+            !out.contains("label age") && !out.contains("eligible in"),
+            "no numeric age, no countdown, for an unmeasured age: {out}"
+        );
+    }
+
+    /// #14806: a measured age — including a genuine zero — keeps the age and
+    /// the eligibility countdown.
+    #[test]
+    fn format_result_human_keeps_a_measured_age_including_a_genuine_zero() {
+        let mut result = OrphanRecoveryResult::default();
+        result.watched.push(WatchedEntry {
+            issue: 5501,
+            title: Some("live work".to_string()),
+            reason: "no_spawn_loop_entry",
+            age_seconds: Some(0),
+            threshold_seconds: 600.0,
+        });
+        result.watched.push(WatchedEntry {
+            issue: 5502,
+            title: Some("more work".to_string()),
+            reason: "no_spawn_loop_entry",
+            age_seconds: Some(120),
+            threshold_seconds: 600.0,
+        });
+        let out = format_result_human(&result);
+        assert!(out.contains("label age 0s"), "genuine zero: {out}");
+        assert!(out.contains("eligible in 10m"), "full threshold remains: {out}");
+        assert!(out.contains("label age 2m"), "measured age: {out}");
+        assert!(out.contains("eligible in 8m"), "countdown: {out}");
+    }
+
+    /// #14806: a `lease_fresh` skip has no measured age in its entry and must
+    /// keep its own reason — not be folded into "label timeline unreadable".
+    #[test]
+    fn format_result_human_keeps_the_lease_fresh_reason_without_an_invented_age() {
+        let mut result = OrphanRecoveryResult::default();
+        result.watched.push(WatchedEntry {
+            issue: 5501,
+            title: Some("live work".to_string()),
+            reason: "lease_fresh",
+            age_seconds: None,
+            threshold_seconds: 900.0,
+        });
+        let out = format_result_human(&result);
+        assert!(out.contains("(lease_fresh)"), "own reason kept: {out}");
+        assert!(
+            !out.contains("label age") && !out.contains("eligible in"),
+            "no invented age or countdown: {out}"
+        );
     }
 
     #[test]

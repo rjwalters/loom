@@ -55,7 +55,12 @@ case "$operation" in
     permissions) echo '{"push":true}' ;;
     comments) cat "$fixture/rows" ;;
     state) echo '{"state":"open","labels":["loom:reviewing","loom:review-requested"]}' ;;
-    head) echo '{"state":"open","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","labels":["loom:reviewing","loom:review-requested"]}' ;;
+    head)
+        if [ -f "$fixture/head" ]; then
+            cat "$fixture/head"
+        else
+            echo '{"state":"open","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","labels":["loom:reviewing","loom:review-requested"]}'
+        fi ;;
     checks) echo '{"check_runs":[],"statuses":[]}' ;;
     post)
         [ "$backend" = writer ] || exit 2

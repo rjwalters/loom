@@ -70,7 +70,6 @@ impl Fixture {
         fs::create_dir_all(root.join(".loom")).unwrap();
         fs::create_dir(&launcher).unwrap();
         fs::create_dir(path.join("writer")).unwrap();
-        fs::create_dir_all(gateway.join("acme")).unwrap();
         for args in [
             ["init", "--quiet", "", ""],
             ["remote", "add", "origin", "https://github.com/acme/widgets"],
@@ -91,9 +90,7 @@ impl Fixture {
 
         fs::write(&gh, include_str!("pr_lease_forge.sh")).unwrap();
         fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(gateway.join("gh-ok"), gh.canonicalize().unwrap().as_os_str().as_encoded_bytes())
-            .unwrap();
-        fs::write(gateway.join("acme/hosts.yml"), b"github.com: {}\n").unwrap();
+        super::publish_fake_gateway(&gateway, "acme", &gh);
         fs::write(path.join("rows"), "").unwrap();
         fs::write(path.join("next"), "500\n").unwrap();
         Self {
@@ -136,12 +133,16 @@ impl Fixture {
     }
 
     fn seed(&self, id: u64, role: &str, sweep: &str, minutes: i64) -> String {
-        use std::io::Write as _;
         let body = format!("<!-- loom:pr-lease role={role} host=host-00000012 sweep={sweep} -->");
+        self.seed_row(id, &body, Utc::now() - chrono::Duration::minutes(minutes));
+        body
+    }
+
+    fn seed_row(&self, id: u64, body: &str, updated_at: chrono::DateTime<Utc>) {
+        use std::io::Write as _;
         let row = json!({
             "id": id,
-            "updated_at": (Utc::now() - chrono::Duration::minutes(minutes))
-                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            "updated_at": updated_at.to_rfc3339_opts(SecondsFormat::Secs, true),
             "body": body,
             "user": {"login": "loom-fleet-dispatch[bot]", "type": "Bot"},
             "author_association": "NONE",
@@ -151,7 +152,14 @@ impl Fixture {
             .open(self.tmp.path().join("rows"))
             .unwrap();
         writeln!(rows, "{row}").unwrap();
-        body
+    }
+
+    fn check(&self, role: &str, sweep: &str, backstop: &str) -> Output {
+        let mut command = self.command(TOOLS, "check");
+        command
+            .env("LOOM_JUDGE_BACKSTOP", backstop)
+            .args(["--role", role, "--sweep-id", sweep]);
+        run(command, None)
     }
 
     fn renewer_log(&self) -> String {
@@ -326,6 +334,85 @@ fn selected_workspace_routes_real_renewal_and_release_in_all_modes() {
         assert_code(&claim("attended"), 6);
         f.assert_routes(reader);
     }
+}
+
+#[test]
+fn judge_check_reports_backstop_holds_and_lapse_without_writes() {
+    let at = chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).unwrap();
+    for (refused, cooldown) in [(None, 60), (Some("stale-read"), 15)] {
+        let f = Fixture::new("fleet");
+        let refused_field = refused.map_or(String::new(), |token| format!(" refused={token}"));
+        let body = format!(
+            "<!-- loom:pr-lease-released role=judge host=old sweep=prior \
+             head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa verdict=none \
+             labels=review-requested{refused_field} -->"
+        );
+        f.seed_row(100, &body, at);
+        let before = f.read("rows");
+
+        let check = f.check("judge", "me", "1");
+        assert_code(&check, 6);
+        let until = at + chrono::Duration::minutes(cooldown);
+        let mut expected = format!(
+            "PR_LEASE_STATE=held-backstop\nPR_LEASE_BACKSTOP_UNTIL={}\n",
+            until.to_rfc3339()
+        );
+        if let Some(token) = refused {
+            expected.push_str(&format!("PR_LEASE_BACKSTOP_REFUSED={token}\n"));
+        }
+        assert_eq!(check.stdout, expected.as_bytes());
+        assert_eq!(f.read("calls"), "gateway comments\ngateway head\n");
+        assert_eq!(f.read("rows"), before);
+        assert!(f.owners().is_empty());
+    }
+}
+
+#[test]
+fn judge_check_keeps_live_lease_precedence_and_free_controls() {
+    let f = Fixture::new("fleet");
+    f.seed_row(
+        100,
+        "<!-- loom:pr-lease-released role=judge host=old sweep=prior \
+         head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa verdict=none labels=review-requested -->",
+        Utc::now(),
+    );
+
+    for (role, enabled) in [("doctor", "1"), ("judge", "0")] {
+        let check = f.check(role, "me", enabled);
+        assert_code(&check, 0);
+        assert_eq!(check.stdout, b"PR_LEASE_STATE=free\n");
+    }
+    assert_eq!(f.read("calls"), "gateway comments\ngateway comments\n");
+
+    let head = f.tmp.path().join("head");
+    for reply in [
+        r#"{"state":"open","head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","labels":["loom:review-requested"]}"#,
+        r#"{"state":"open","head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","labels":["loom:review-requested","loom:important"]}"#,
+        "unreadable",
+    ] {
+        fs::write(&head, reply).unwrap();
+        let check = f.check("judge", "me", "1");
+        assert_code(&check, 0);
+        assert_eq!(check.stdout, b"PR_LEASE_STATE=free\n");
+    }
+    fs::remove_file(head).unwrap();
+
+    f.seed(110, "judge", "earliest", 0);
+    f.seed(120, "judge", "later", 0);
+    let before = f.read("calls");
+    let own = f.check("judge", "earliest", "1");
+    assert_code(&own, 0);
+    assert_eq!(own.stdout, b"PR_LEASE_STATE=held-self\n");
+    let peer = f.check("judge", "later", "1");
+    assert_code(&peer, 4);
+    assert_eq!(
+        peer.stdout,
+        b"PR_LEASE_STATE=held-peer\nPR_LEASE_HOLDER_HOST=host-00000012\nPR_LEASE_HOLDER_SWEEP=earliest\n"
+    );
+    assert_eq!(
+        f.read("calls").strip_prefix(&before),
+        Some("gateway comments\ngateway comments\n")
+    );
 }
 
 #[test]

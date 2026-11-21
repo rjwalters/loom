@@ -5,9 +5,8 @@ enqueue a Judge-approved PR rather than merging it directly. That
 only protects `main` if every suite Loom relies on validates the **combined
 merge-group tree**, meaning the base plus every PR queued ahead of this one. A
 workflow can list `merge_group` as a trigger and still skip the suites that
-matter on it. This document covers the read-only tooling that proves a
-repository's workflows are qualified, the prerequisites for enabling queue mode,
-and how to roll back.
+matter on it. This document covers the read-only qualification checks, the
+prerequisites for enabling queue mode, and how to roll back.
 
 **Status:** queue execution is compiled on (#12323) but opt-in via
 `champion.mergeMode=queue`. Phases A and B, #10255 and #10256, provide the queue
@@ -31,7 +30,7 @@ branch protection, and neither writes to any repository.
 
 | Verb | Exit 0 | Exit 1 | Exit 2 |
 |---|---|---|---|
-| `audit` | every relied-on suite and required context covers `merge_group` | a finding | could not run |
+| `audit` | the static audit passes | a finding | could not run |
 | `eligibility` | the repository may pilot queue mode | a named prerequisite failed | could not run |
 
 ```bash
@@ -49,9 +48,27 @@ path-filtered PR workflow is listed as advisory: a skipped required check never
 reports, so such a workflow cannot be a required gate. The audit evaluates each
 job and step of a relied-on workflow under synthetic `pull_request`, `push` and
 `merge_group` contexts with a small GitHub-expression evaluator. A value the
-evaluator cannot know statically, such as `matrix`, `steps`, or a `needs`
-output of a job that actually ran, counts as **unknown**, and an unknown
-counts as uncovered.
+evaluator cannot know statically, such as a `steps` output, is **unknown**.
+
+A relied-on job with an unknown `merge_group` condition is uncovered. For
+steps inside a job that is statically runnable on `merge_group`, the audit
+compares the `pull_request` and `merge_group` truth values in the order
+`false < unknown < true`. A lower value on `merge_group` produces a finding.
+Equal unknown values produce no step finding even when runtime outputs differ.
+
+The shared docs-only guard is explicitly recognized. A supported guard is
+reported as a **docs-only exception** with its guarded steps. Its required
+context has `covered: false` and `docs_only_exception: true` in JSON, and can
+satisfy the static audit with the required job still reporting. Inspect the
+exact hosted step results to see which work ran. Whole-job gating and a
+malformed docs-only guard are findings.
+
+`covered: true` for a required context means its matching job is relied on,
+its workflow has a `merge_group` trigger, and the job is statically evaluated
+to run and passes the per-job checks, including step checks. A workflow-wide
+finding can still name that job or one of its steps and cause the overall
+audit to fail. Verify suite execution from the job and step results on the
+exact merge-group SHA.
 
 | Code | Meaning |
 |---|---|
@@ -59,8 +76,9 @@ counts as uncovered.
 | `PR_ONLY_CONDITION` | a job's `if:` is false on `merge_group` (`github.event_name == 'pull_request'`, …) |
 | `SKIPPED_DEPENDENCY` | a job `needs:` a job skipped on `merge_group` and has no status function (`!cancelled() && …`) |
 | `PATH_FILTER_SKIP` | a job/step runs on `merge_group` only if a path-filter job's output says so |
-| `UNDETERMINED_CONDITION` | the condition cannot be decided on `merge_group` |
-| `PR_ONLY_STEP` | a step of a covered job runs on PRs but is skipped on `merge_group` |
+| `UNDETERMINED_CONDITION` | a job condition is unknown on `merge_group`, or a step condition is true on `pull_request` and unknown on `merge_group`, with no path-filter finding |
+| `UNPROVEN_DOCS_ONLY_GUARD` | the docs-only output gates a job or a step lacks the shared fallback guard |
+| `PR_ONLY_STEP` | a step condition is false on `merge_group` and true or unknown on `pull_request` |
 | `NON_MERGE_GROUP_CHECKOUT` | `actions/checkout` `ref:` resolves to something other than the merge-group commit |
 | `GROUP_CHECK_WITHOUT_CHECKOUT` | a job runs `forge merge-queue group-check` with no `actions/checkout` step, so `write_scope` refuses the status write and `loom/merge-authorization` never posts |
 | `GROUP_CHECK_UNGATED_WORKFLOW_RUN` | a `group-check` job in a workflow with a `workflow_run` trigger lacks a job-level `if:` that contains both `github.event.workflow_run.event == 'merge_group'` and `github.event.workflow_run.head_repository.full_name == github.repository` (a text check for both clauses, not an evaluation of the condition; see Trust boundary below) |
@@ -72,6 +90,146 @@ counts as uncovered.
 
 The output records each workflow's and job's `permissions:` for review, but
 permissions do not produce findings.
+
+### Docs-only CI
+
+The approved exception in [CI principles](ci-principles.md) (#14823,
+2026-11-20) applies to heavy steps that do not read the allowed documents.
+Before adoption, verify that the repo's build, suites, bundle and generators
+have no dependency on those paths. Keep conflict markers, Markdown and link
+checks where available, and existing repo-wide guards outside the skip.
+Leave authorization, release, and deploy jobs on their existing conditions.
+
+The resynced `.loom/scripts/ci-docs-only-paths.txt` defines the shared exact
+root paths. A repo can use the standard resync-ignore mechanism to keep a
+narrower committed copy on the protected branch. Widening or malformed policy,
+workflow changes, changed classifier inputs, unknown or incomplete history,
+empty diffs, and operations other than content modifications to existing
+regular files all run the full suites. The classifier reads policy from
+protected Git objects, independent of the candidate checkout's files.
+
+Use a read-only job named `docs_only`, with Actions and Contents read access.
+Use the approved Loom binary at a pinned revision and a full-history,
+credential-free checkout of the exact event SHA. A dirty or unreadable index
+or tracked worktree runs the full suites. Do not build or source the
+classifier from that checkout. With the job's scoped token in `GH_TOKEN`,
+the step named `classify` runs the native command below. The installed thin
+entry point `.loom/scripts/ci-docs-only.sh` forwards the same arguments to
+`LOOM_DAEMON_BIN` or `loom-daemon`. With a supported older daemon that lacks
+the command, this entry point returns `docs_only=false`. Other invocation
+failures retain their exit status. Use only a protected copy of that entry
+point and the pinned binary in CI.
+
+```bash
+/path/to/pinned/loom-daemon ci-docs-only --root "$GITHUB_WORKSPACE" \
+  --event "$GITHUB_EVENT_NAME" --event-path "$GITHUB_EVENT_PATH" \
+  --head "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY" \
+  --workflow-id 123456 >> "$GITHUB_OUTPUT"
+```
+
+Use the ID of the existing trusted CI workflow. For a PR, the classifier
+validates the checked-out merge commit's parents and uses the unique Git
+merge base with the target, with an exact successful push for that base.
+For a push to `main` it takes the last successful push of that workflow and
+branch. The event's `before` SHA is not used. Both compare against the
+actual checkout, including any changes combined into the tested tree.
+
+For a merge group, use an operator-reviewed, repository-owned attestation at
+`.loom/ci-docs-only-queue.json` on the protected branch. Record the repository,
+workflow ID, the effective repo-local ruleset ID and revision timestamp,
+a green seed commit under that policy, and the complete required check list
+with the integrations recorded by GitHub. Confirm the active ruleset uses
+`ALLGREEN`, merge commits, and an explicitly empty bypass actor array when
+recording `no_bypass`. An example shape is:
+
+```json
+{
+  "repository": "OWNER/REPO",
+  "workflow_id": 123456,
+  "ruleset_id": 7890,
+  "ruleset_updated_at": "2026-11-20T19:00:00Z",
+  "no_bypass": true,
+  "green_seed": "1111111111111111111111111111111111111111",
+  "required_checks": [
+    {"context": "Project Tests", "integration_id": 15368},
+    {"context": "loom/merge-authorization"}
+  ]
+}
+```
+
+The read-only job reads the effective branch rules and compares the current
+ruleset with that attested revision. GitHub may omit bypass actors from
+read-only responses. An absent array alone supplies no proof, so the job
+requires the reviewed attestation for the matching ruleset revision and
+refuses a reported bypass. Any change or unavailable proof runs the full
+suite until it is verified again. The classifier verifies the first parent
+of the exact group. A speculative parent must be identified by a current
+queue ref and trace to the protected branch. Under this policy the queue
+requires its checks before landing the group. No lookup of a preceding
+group's Actions result is needed. A new or unverifiable queue uses full CI.
+[Ruleset API](https://docs.github.com/en/rest/repos/rules#get-a-repository-ruleset),
+[Merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
+
+Export the step output as `jobs.docs_only.outputs.docs_only` with value
+`${{ steps.classify.outputs.docs_only }}`. A heavy job retains its name,
+declares `needs: docs_only` and uses `if: ${{ !cancelled() }}` so classifier
+failure or cancellation does not suppress the required job in an active
+workflow. Guard only the heavy steps:
+
+```yaml
+if: ${{ needs.docs_only.result != 'success' || needs.docs_only.outputs.docs_only != 'true' }}
+```
+
+Keep the existing result job and add the classifier to its prerequisites.
+It must fail for any nonsuccess classifier result while the workflow is
+active. A completed classifier with an unavailable proof returns
+`docs_only=false` and runs the suites. A failed classifier job still fails
+the aggregate even if the fallback suites pass.
+
+The classifier writes one `docs_only=true|false` output and logs
+`CI_DOCS_ONLY` with the event, decision and fixed reason. Use the decision
+and designated step conclusions for hosted savings evidence. Check an
+ordinary qualifying group and a cross-path control on their exact SHAs,
+including required contexts, cheap checks, suite results, and runner time.
+
+#### Reproduce the step comparison
+
+In a disposable checkout, save this example as `.github/workflows/ci.yml` and
+run the audit locally.
+
+```yaml
+name: Audit example
+on: [pull_request, merge_group]
+jobs:
+  tests:
+    name: Dashboard Tests
+    runs-on: ubuntu-latest
+    steps:
+      - id: guide
+        if: github.event_name == 'merge_group'
+        run: echo "reuse=true" >> "$GITHUB_OUTPUT"
+      - name: Run suite
+        run: echo "suite ran"
+```
+
+```bash
+loom-daemon merge-group-ci audit --workflow ci.yml --required 'Dashboard Tests' --json
+```
+
+Run the same command after placing each `if:` in turn on `Run suite`.
+
+| Condition on `Run suite` | Exit | Required context | Step finding |
+|---|---:|---|---|
+| Omitted | 0 | Covered | None |
+| `github.event_name == 'pull_request'` | 1 | Uncovered | `PR_ONLY_STEP` |
+| `steps.guide.outputs.reuse != 'true'` | 0 | Covered | None |
+| `github.event_name != 'merge_group' \|\| steps.guide.outputs.reuse != 'true'` | 1 | Uncovered | `UNDETERMINED_CONDITION` |
+
+In the third case, the preceding step writes `reuse=true` only on
+`merge_group`, so the suite can be skipped there even though the static
+comparison passes. For a job-level control, omit the suite condition and add
+`if: vars.SUITE_ENABLED == 'true'` to the `tests` job. The unknown job condition
+produces `UNDETERMINED_CONDITION` and leaves the required context uncovered.
 
 The shipped `merge-group-check.yml` template needs `statuses: write`,
 `pull-requests: read`, `checks: read` and `contents: read`; without the reads
@@ -320,9 +478,13 @@ Every step is a read except step 6, which is an operator action. Do not set
    loom-daemon forge merge-queue preflight --repo 2AMLogic/loom
    loom-daemon forge merge-queue mode        # must still print direct
    ```
-   `NO_MERGE_QUEUE_RULE` is expected before step 6 and is the only failure
-   allowed. The daemon on the host must include the `merge-group-ci` and
-   `forge merge-queue` subcommands. `merge-group-ci` has shipped since
+   `NO_MERGE_QUEUE_RULE` is expected before step 6. `PERMISSION_UNKNOWN` is
+   also expected when the read uses a credential whose repository permissions
+   are not visible (the fleet App token, whose `can_push` reads `null`); no
+   other failure is allowed. Step 6's admin credential should show
+   `can_push: true` and so no `PERMISSION_UNKNOWN` (inferred from the `null`
+   under the App token, not yet run with an admin PAT). The daemon on the host
+   must include the `merge-group-ci` and `forge merge-queue` subcommands. `merge-group-ci` has shipped since
    v0.19.695, `forge merge-queue preflight` since v0.19.761, `group-check`
    since v0.19.879, and the `statusCommand` route since v0.19.1185. Running the
    v0.19.1311 that `merge-group-check.yml` pins as `LOOM_VERSION` keeps the

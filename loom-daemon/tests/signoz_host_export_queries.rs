@@ -380,30 +380,48 @@ mod live_gh_guard;
 /// `loom-daemon telemetry-hold-transitions` (#14094): the statement the CLI
 /// builds, executed verbatim — not a copy retyped here — against the CI DDL
 /// (`timestamp UInt64` ns) with the same bound user-text params the reader
-/// sends. Catches a type inversion (a `DateTime64` conversion applied to the
-/// UInt64 column) offline, with no live reader.
+/// sends. Both filtered and all-reasons queries must emit JSONEachRow with
+/// their own FORMAT clause. The replay checks inclusive/exclusive bounds and
+/// distinguishes a missing confidence attribute from a reported zero.
 #[test]
 #[ignore = "requires Docker: CI explicitly invokes this test with --ignored"]
 fn replayed_hold_transitions_statement_reads_the_window_with_bound_params() {
     if !hub_image::available(CLICKHOUSE_IMAGE) {
         return;
     }
-    let (sql, params) = loom_daemon::cli::hold_transitions_query(
+    let (filtered_sql, params) = loom_daemon::cli::hold_transitions_query(
         1_000_000_000,
         5_000_000_000,
         &["o/one".to_string()],
         Some("merge-risk-self-release"),
         10,
     );
-    let mut args = vec!["--format=JSONEachRow".to_string()];
-    for (name, value) in &params {
-        args.push(format!("--param_{name}={value}"));
-    }
+    let (all_sql, all_params) =
+        loom_daemon::cli::hold_transitions_query(1_000_000_000, 5_000_000_000, &[], None, 10);
+    assert!(all_params.is_empty());
+    let args: Vec<_> = params
+        .iter()
+        .map(|(name, value)| format!("--param_{name}={value}"))
+        .collect();
     let fixture = include_str!("fixtures/signoz_host_export/hold_transitions.sql");
-    let out = rows(&clickhouse_local::clickhouse_with(&format!("{fixture}\n{sql};"), &args));
-    let bodies: Vec<&str> = out.iter().map(|r| r["body"].as_str().unwrap()).collect();
-    // Kept: the inclusive since-edge row and the in-window match, oldest
-    // first. Dropped: wrong repo, wrong reason_code, wrong kind, and the
-    // exclusive until-edge row.
-    assert_eq!(bodies, vec![r#"{"pr":10}"#, r#"{"pr":42}"#]);
+    let output = clickhouse_local::clickhouse_with(
+        &format!("{fixture}\n{filtered_sql};\n{all_sql};"),
+        &args,
+    );
+    let out = rows(&output);
+    assert_eq!(out.len(), 6, "two filtered rows and four all-reasons rows");
+    let row = |repo, reason_code, confidence_pct: Option<u8>| serde_json::json!({ "repo": repo, "reason_code": reason_code, "confidence_pct": confidence_pct });
+    let since_edge = row("o/one", "merge-risk-self-release", Some(0));
+    let in_window = row("o/one", "merge-risk-self-release", Some(93));
+    assert_eq!(&out[..2], &[since_edge.clone(), in_window.clone()], "filtered");
+    assert_eq!(
+        &out[2..],
+        &[
+            since_edge,
+            in_window,
+            row("o/two", "merge-risk-self-release", None),
+            row("o/one", "merge-risk-pass", Some(80)),
+        ],
+        "all reasons",
+    );
 }

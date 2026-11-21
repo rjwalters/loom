@@ -100,7 +100,8 @@ fn check_honours_ownership_before_state() {
     assert_eq!(check(&s, &k, "t1", Some("open")).0, EXIT_RENEW);
     claim(&s, &k, 100, "t1", &ident, &all_live).unwrap();
     assert_eq!(check(&s, &k, "t1", None).0, EXIT_RENEW);
-    let (code, why) = check(&s, &k, "t-other", Some("open"));
+    let (code, why, context) = check_with_receipt(&s, &k, "t-other", Some("open"));
+    assert_eq!(context, Some("superseded"));
     assert_eq!(code, EXIT_STOP);
     assert!(why.unwrap().contains("pid 100"));
 }
@@ -242,6 +243,9 @@ fn renewer_argv_matches_only_this_toolings_renewers() {
     )));
     assert!(is_renewer_argv(&argv("/bin/bash sweep-lease-renew.sh start 7")));
     assert!(is_renewer_argv(&argv("/usr/bin/loom-daemon lease renewer claim 7")));
+    assert!(is_renewer_argv(&argv("/usr/bin/loom-tools lease renewer claim 7")));
+    assert!(!is_renewer_argv(&argv("/usr/bin/loom-tools lease ensure 7")));
+    assert!(!is_renewer_argv(&argv("/usr/bin/loom-tools forge lease renewer")));
     assert!(!is_renewer_argv(&argv("sleep 30")));
     assert!(!is_renewer_argv(&argv("claude --resume start")));
     assert!(!is_renewer_argv(&argv("bash sweep-lease-renew.sh renew-once 7")));

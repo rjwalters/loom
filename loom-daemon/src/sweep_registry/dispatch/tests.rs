@@ -1,4 +1,5 @@
 use super::*;
+use crate::env_test_support::EnvGuard;
 use crate::sweep_registry::test_support::*;
 use serial_test::serial;
 use std::os::unix::fs::PermissionsExt;
@@ -13,32 +14,6 @@ use tempfile::tempdir;
 // local copy this alias replaced cleared only the global var, never the per-role
 // `LOOM_RUNTIME_<ROLE>` pin that decides the same binding (#9360).
 use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
-
-/// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#6529): the test
-/// process — or a PREVIOUS test in this same `#[serial]` suite — may
-/// itself have a `GH_CONFIG_DIR` set, which would otherwise leak into a
-/// spawned fixture child's environment and make the "unregistered root
-/// leaves GH_CONFIG_DIR untouched" test below observe an ambient value
-/// instead of a genuine absence. Mirrors `role_runner::tests::
-/// ClearedGhConfigDirEnv`, added for the same reason by #5522.
-struct ClearedGhConfigDirEnv(Option<String>);
-
-impl ClearedGhConfigDirEnv {
-    fn new() -> Self {
-        let prior = std::env::var("GH_CONFIG_DIR").ok();
-        std::env::remove_var("GH_CONFIG_DIR");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedGhConfigDirEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
-        }
-    }
-}
 
 #[test]
 #[serial]
@@ -314,7 +289,7 @@ fn dispatch_yields_claim_then_verify_order_tie_break_when_a_peer_lease_is_earlie
              {gh_calls}"
     );
     assert!(
-        gh_calls.contains("loom:lease-yield"),
+        posted_lease_yield(&gh_calls),
         "a standdown annotation must be posted when yielding; gh log: {gh_calls}"
     );
 
@@ -408,7 +383,7 @@ fn dispatch_proceeds_when_this_sweeps_own_lease_is_the_earliest() {
 
     let gh_calls = std::fs::read_to_string(&gh_log).unwrap_or_default();
     assert!(
-        !gh_calls.contains("loom:lease-yield"),
+        !posted_lease_yield(&gh_calls),
         "a winning tie-break must never post a standdown annotation; gh log: {gh_calls}"
     );
 
@@ -799,7 +774,7 @@ fn dispatch_forwards_owner_gh_config_dir_for_a_registered_root() {
 #[test]
 #[serial]
 fn dispatch_leaves_gh_config_dir_untouched_for_an_unregistered_root() {
-    let _env_guard = ClearedGhConfigDirEnv::new();
+    let _env_guard = EnvGuard::clear(&["GH_CONFIG_DIR"]);
     let dir = tempdir().unwrap();
     crate::credential_preflight::clear_owner_root_registry();
 

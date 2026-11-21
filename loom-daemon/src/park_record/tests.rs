@@ -279,6 +279,27 @@ fn qualified_records_round_trip() {
     assert_eq!(blockers(&park), vec![BlockerRef::local(5), q("example-org/tool-repo", 202)]);
 }
 
+/// #14683: a real incident body, kept verbatim. A Guide pass removed
+/// `loom:blocked` citing the closed prose `Blocked by #333`, while the live
+/// operator park record named still-open `2AMLogic/gf180-parasynth#558` —
+/// under #13414's precedence the park record is the gate, not the prose line.
+/// The parser's answer on this exact body is exactly the operator's blocker:
+/// the closed prose dep and the older `(unstated)` curator record contribute
+/// nothing.
+#[test]
+fn incident_body_gates_only_on_the_live_operator_park_record() {
+    let body = "Blocked by #333\n\
+        <!-- loom:park Blocked by: 2AMLogic/gf180-parasynth#558 by=human at=2026-10-29T03:00:18Z reason=\"operator ruling q93: the hold now waits on this open blocker\" -->\n\
+        <!-- loom:park Blocked by: (unstated) by=curator at=2026-10-15T23:32:21Z reason=\"tracker only while #558 owns the overlapping repair; redispatch needs a distinct measured residual (operator triage 2026-10-15)\" -->\n";
+    let records = parse(body);
+    assert_eq!(records.len(), 2, "the human and curator records are both live");
+    assert_eq!(records[0].by.as_deref(), Some("human"), "the operator's record is one of them");
+    // What `park-record parse` prints, one blocker per line — the gate list
+    // Guide's unblock sweep must read on this body.
+    let stdout: Vec<String> = blockers(body).iter().map(|b| b.to_string()).collect();
+    assert_eq!(stdout, ["2AMLogic/gf180-parasynth#558"]);
+}
+
 #[test]
 fn blocker_ref_from_str_shapes() {
     assert_eq!("7".parse::<BlockerRef>().unwrap(), BlockerRef::local(7));
