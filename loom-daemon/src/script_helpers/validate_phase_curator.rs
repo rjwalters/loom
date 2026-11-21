@@ -6,7 +6,8 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use super::run_gh;
+use super::gh_read;
+use super::gh_write;
 use super::validate_phase::{report_milestone, ValidationResult, ValidationStatus};
 
 /// Recovery branch of [`validate_curator`], split out so the policy is testable:
@@ -53,13 +54,14 @@ pub(super) fn recover_curator_with(
 /// Best-effort: a 404 (label already absent) or any failure is tolerated.
 pub(super) fn release_curating_claim(repo_root: &Path, issue: i64) {
     let path = format!("repos/{{owner}}/{{repo}}/issues/{issue}/labels/loom%3Acurating");
-    let _ = run_gh(&["api", "-X", "DELETE", &path], repo_root, false);
+    let _ = gh_write("curator.release_claim", &["api", "-X", "DELETE", &path], repo_root, false);
 }
 
 /// Run `loom-daemon curation-complete` for `issue` with the session's
 /// provenance (`LOOM_CURATION_MODEL` / `LOOM_CURATION_RUNTIME`, else `unknown`).
 pub(super) fn run_curation_complete(repo_root: &Path, issue: i64) -> Result<(), String> {
-    let nwo = run_gh(
+    let nwo = gh_read(
+        "curator.repo_view",
         &[
             "repo",
             "view",

@@ -130,6 +130,45 @@ pub(crate) async fn query_daemon_bounded(
         .map_err(|_| anyhow!("round-trip timed out after {}s", timeout.as_secs()))?
 }
 
+/// Total budget for the root request, from connect through the complete reply.
+const PRIMARY_ROOT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ask the running daemon for its primary workspace root (#14534).
+///
+/// The resolver is synchronous and can already be inside a Tokio runtime.
+/// Drive the socket on a separate thread so the caller can use the same IPC
+/// client from either context. An unavailable root leaves other routes open.
+pub(crate) fn primary_workspace_root_from_daemon() -> Option<PathBuf> {
+    let socket_path = resolve_socket_path().ok()?;
+    primary_workspace_root_at(&socket_path, PRIMARY_ROOT_LOOKUP_TIMEOUT)
+}
+
+fn primary_workspace_root_at(socket_path: &Path, timeout: Duration) -> Option<PathBuf> {
+    let response = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                runtime.block_on(async {
+                    let query = query_daemon(socket_path, &Request::GetPrimaryWorkspaceRoot);
+                    tokio::time::timeout(timeout, query).await.ok()?.ok()
+                })
+            })
+            .ok()?
+            .join()
+            .ok()?
+    })?;
+    match response {
+        Response::PrimaryWorkspaceRoot { path } => {
+            let path = PathBuf::from(path);
+            path.is_absolute().then_some(path)
+        }
+        _ => None,
+    }
+}
+
 /// Handle the two daemon-failure arms shared by every CLI subcommand that
 /// sends one request and renders one reply (Issue #13912): a daemon-reported
 /// `Response::Error` and an unreachable daemon (`Err`). Both print their
@@ -231,6 +270,100 @@ pub fn resolve_loom_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader as StdBufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream as StdUnixStream};
+
+    /// Read one root request and let the test control when the reply arrives.
+    fn fake_daemon(
+        socket: &Path,
+        reply: impl FnOnce(StdUnixStream) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            StdBufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::GetPrimaryWorkspaceRoot
+            ));
+            reply(stream);
+        })
+    }
+
+    #[test]
+    fn primary_root_lookup_returns_the_daemons_absolute_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("d.sock");
+        let reply = serde_json::to_string(&Response::PrimaryWorkspaceRoot {
+            path: "/srv/loom/primary".into(),
+        })
+        .unwrap();
+        let daemon = fake_daemon(&socket, move |mut stream| writeln!(stream, "{reply}").unwrap());
+        assert_eq!(
+            primary_workspace_root_at(&socket, Duration::from_secs(2)),
+            Some(PathBuf::from("/srv/loom/primary"))
+        );
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn primary_root_lookup_refuses_a_relative_root_and_foreign_replies() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, reply) in [
+            r#"{"type":"PrimaryWorkspaceRoot","payload":{"path":"relative/root"}}"#,
+            r#"{"type":"Pong"}"#,
+            "not json",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let socket = dir.path().join(format!("d{i}.sock"));
+            let daemon =
+                fake_daemon(&socket, move |mut stream| writeln!(stream, "{reply}").unwrap());
+            assert_eq!(primary_workspace_root_at(&socket, Duration::from_secs(2)), None, "{reply}");
+            daemon.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn primary_root_lookup_is_none_without_a_daemon_and_bounded_when_it_is_wedged() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            primary_workspace_root_at(&dir.path().join("absent.sock"), Duration::from_secs(1)),
+            None
+        );
+        let socket = dir.path().join("wedged.sock");
+        let daemon = fake_daemon(&socket, |_stream| std::thread::sleep(Duration::from_millis(600)));
+        let started = std::time::Instant::now();
+        assert_eq!(primary_workspace_root_at(&socket, Duration::from_millis(150)), None);
+        assert!(started.elapsed() < Duration::from_millis(550), "lookup must honour its bound");
+        daemon.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_root_lookup_times_out_even_while_the_reply_keeps_arriving() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slow.sock");
+        let daemon = fake_daemon(&socket, |mut stream| {
+            // Each piece arrives within the idle timeout. A client that restarts
+            // its timer on every read would accept the eventual valid reply.
+            for _ in 0..12 {
+                if stream.write_all(b" ").is_err() {
+                    return; // The client cancelled the exchange at its deadline.
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            let _ = writeln!(
+                stream,
+                r#"{{"type":"PrimaryWorkspaceRoot","payload":{{"path":"/late"}}}}"#
+            );
+        });
+        assert_eq!(primary_workspace_root_at(&socket, Duration::from_millis(200)), None);
+        daemon.join().unwrap();
+    }
 
     #[test]
     fn environ_parsing_finds_socket_path() {

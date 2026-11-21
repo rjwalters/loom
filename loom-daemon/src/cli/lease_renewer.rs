@@ -57,6 +57,8 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod terminal;
+
 /// Overrides the ownership-record directory (tests, unusual `HOME`s).
 pub(crate) const STATE_DIR_ENV: &str = "LOOM_LEASE_RENEW_STATE_DIR";
 
@@ -110,7 +112,12 @@ pub(crate) enum RenewerAction {
         /// raw issue JSON). Empty or unparseable = unverified (exit 4).
         #[arg(long, allow_hyphen_values = true)]
         issue_state: Option<String>,
+        /// Emit a bounded context token for the attended terminal receipt.
+        #[arg(long, hide = true)]
+        report_receipt: bool,
     },
+    #[command(hide = true)]
+    TerminalReceipt(terminal::TerminalReceiptArgs),
     /// End this key's renewer now. Without `--sweep-id`, the sweep is taken
     /// from `$LOOM_TERMINAL_ID` (`daemon-<id>`), else empty; without
     /// `--host`, any host on this machine matches.
@@ -120,7 +127,7 @@ pub(crate) enum RenewerAction {
     },
     /// Stop a renewer safely (#11086): `stop <PID>` signals the pid only if it
     /// is provably a lease renewer (its command line is `<bash|sh|zsh|dash>
-    /// sweep-lease-renew.sh start ...` or `loom-daemon lease renewer ...`, with a start identity
+    /// sweep-lease-renew.sh start ...` or `loom-daemon|loom-tools lease renewer ...`, with a start identity
     /// that did not change while it was checked); `stop --issue N` ends every
     /// recorded renewer of issue N in this repo (any sweep unless `--sweep-id`
     /// is given) and never a peer issue's. Anything else is refused (exit 1)
@@ -323,32 +330,45 @@ pub(crate) fn parse_state(raw: &str) -> Option<&'static str> {
     }
 }
 
-/// The per-cycle decision: `(exit code, reason to log)`.
+/// The per-cycle decision consumed by existing renewal callers.
 pub(crate) fn check(
     store: &Store,
     key: &Key,
     token: &str,
     issue_state: Option<&str>,
 ) -> (i32, Option<String>) {
+    let (code, why, _) = check_with_receipt(store, key, token, issue_state);
+    (code, why)
+}
+
+fn check_with_receipt(
+    store: &Store,
+    key: &Key,
+    token: &str,
+    issue_state: Option<&str>,
+) -> (i32, Option<String>, Option<&'static str>) {
     // An unreadable directory or a missing record is fail-open (see module docs).
+    let mut receipt_context = None;
     if let Ok(Some(rec)) = store.read(key) {
         if rec.token != token {
             let why = format!("ownership passed to renewer pid {} (#10229)", rec.pid);
-            return (EXIT_STOP, Some(why));
+            return (EXIT_STOP, Some(why), Some("superseded"));
         }
         if rec.released {
-            return (EXIT_STOP, Some("released (#10229)".into()));
+            return (EXIT_STOP, Some("released (#10229)".into()), Some("released"));
         }
+        receipt_context = Some("owned");
     }
     let Some(raw) = issue_state else {
-        return (EXIT_RENEW, None);
+        return (EXIT_RENEW, None, receipt_context);
     };
     match parse_state(raw) {
-        Some("open") => (EXIT_RENEW, None),
-        Some(_) => (EXIT_STOP, Some("issue is closed (#10229)".into())),
+        Some("open") => (EXIT_RENEW, None, receipt_context),
+        Some(_) => (EXIT_STOP, Some("issue is closed (#10229)".into()), Some("closed")),
         None => (
             EXIT_SKIP,
             Some("issue state unverified this cycle; skipping renewal (#10229)".into()),
+            receipt_context,
         ),
     }
 }
@@ -420,7 +440,7 @@ fn argv_base(a: &str) -> &str {
 /// Is this argv a lease renewer this tooling started? Either
 /// `<shell> [-flags] .../sweep-lease-renew.sh start ...` (the detached loop is
 /// a subshell of that `#!/usr/bin/env bash` script, so it shares its argv) or
-/// `.../loom-daemon lease renewer ...`. The program must be a shell
+/// `.../loom-daemon lease renewer ...` (or `loom-tools`, #14488). The program must be a shell
 /// (bash/sh/zsh/dash by basename) running the script FILE: any other program
 /// (an editor, another interpreter) and command-string / stdin forms (`-c`,
 /// `-s`) or option clusters that may consume the script path as their own
@@ -446,7 +466,11 @@ pub(crate) fn is_renewer_argv(argv: &[String]) -> bool {
                     && rest.get(i + 1).is_some_and(|a| a == "start")
             })
     };
-    let daemon = argv.first().is_some_and(|a| argv_base(a) == "loom-daemon")
+    // Either binary serves `lease renewer` (#14488), so either may be the
+    // process named in a recorded owner.
+    let daemon = argv
+        .first()
+        .is_some_and(|a| matches!(argv_base(a), "loom-daemon" | "loom-tools"))
         && argv.get(1).is_some_and(|a| a == "lease")
         && argv.get(2).is_some_and(|a| a == "renewer");
     script_start || daemon
@@ -652,12 +676,21 @@ impl RenewerAction {
                 key,
                 token,
                 issue_state,
+                report_receipt,
             } => {
-                let (code, why) = check(&store, &key_of(&key), &token, issue_state.as_deref());
+                let (code, why, receipt_context) =
+                    check_with_receipt(&store, &key_of(&key), &token, issue_state.as_deref());
+                if let (true, Some(context)) = (report_receipt, receipt_context) {
+                    println!("{context}");
+                }
                 if let Some(why) = why {
                     eprintln!("sweep-lease-renew: renewal loop for issue #{}: {why}", key.issue);
                 }
                 std::process::exit(code)
+            }
+            Self::TerminalReceipt(receipt) => {
+                receipt.record(&store, &key_of(&receipt.key), &cwd);
+                Ok(())
             }
             Self::SanitizeExec { .. } => unreachable!("handled before the store is opened"),
             Self::Stop {

@@ -58,9 +58,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::cmd_out::{CmdOutcome, DEFAULT_TIMEOUT};
-use crate::forge_call_stats::ops;
-use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
+use crate::cmd_out::CmdOutcome;
+use crate::gh_invocation::GhTarget;
+use crate::script_helpers::{gh_read, gh_write};
 use crate::stale_blocked::notify::{self, marker_for};
 use crate::stale_blocked::{batch, budget, classify, resolved, Artifact, Evidence, Verdict};
 use crate::write_scope::Verdict as Scope;
@@ -319,18 +319,7 @@ pub(super) fn pr_close_targets(
     if let Some(r) = repo {
         args.extend(["--repo", r]);
     }
-    let read = GhInvocation::new(
-        Operation::new("notify.closing_references"),
-        AccessIntent::Read,
-        repo.and_then(|r| GhTarget::repo(r).ok())
-            .unwrap_or(GhTarget::None),
-        DEFAULT_TIMEOUT,
-    )
-    .forge_op(ops::PR_CLOSING_ISSUE_REFERENCES)
-    .current_dir(root)
-    .args(args)
-    .run();
-    match read {
+    match gh_read("notify.close_targets", &args, root, false) {
         CmdOutcome::Ran(o) if o.status.success() => parse_close_targets(&o.stdout),
         CmdOutcome::Ran(o) => Err(format!("gh pr view exited {}", o.status)),
         CmdOutcome::Unavailable(u) => Err(format!("gh pr view could not be run: {u:?}")),
@@ -418,29 +407,13 @@ fn comment_body_for(
 }
 
 /// Both mutations carry the admitted repository and the discovered dependent.
-fn write(
-    number: i64,
-    repo: &str,
-    root: &Path,
-    op: crate::forge_call_stats::ForgeOp,
-    args: &[&str],
-) -> bool {
-    let (Ok(target), Ok(number)) = (GhTarget::repo(repo), u32::try_from(number)) else {
+fn write(number: i64, repo: &str, root: &Path, op: &'static str, args: &[&str]) -> bool {
+    if GhTarget::repo(repo).is_err() || u32::try_from(number).is_err() {
         return false;
-    };
-    GhInvocation::new(
-        Operation::new("notify.dependent"),
-        AccessIntent::Write,
-        target,
-        DEFAULT_TIMEOUT,
-    )
-    .forge_op(op)
-    .number(number)
-    .current_dir(root)
-    .args(args)
-    .args(["--repo", repo])
-    .run()
-    .succeeded()
+    }
+    let mut routed = args.to_vec();
+    routed.extend(["--repo", repo]);
+    gh_write(op, &routed, root, false).succeeded()
 }
 
 /// Post the notification comment. Returns whether `gh` reported success.
@@ -450,13 +423,7 @@ fn post_comment(kind: Artifact, number: i64, body: &str, repo: &str, root: &Path
         Artifact::Pr => "pr",
     };
     let n = number.to_string();
-    write(
-        number,
-        repo,
-        root,
-        ops::COMMENT_CREATE,
-        &[entity, "comment", &n, "--body", body],
-    )
+    write(number, repo, root, "notify.comment", &[entity, "comment", &n, "--body", body])
 }
 
 /// Whether a newly-cleared artifact may be unparked mechanically (#13331).
@@ -503,7 +470,7 @@ fn unpark(number: i64, repo: &str, root: &Path) -> bool {
         number,
         repo,
         root,
-        ops::ISSUE_EDIT_LABELS,
+        "notify.unpark",
         &[
             "issue",
             "edit",

@@ -531,14 +531,25 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
     }
     // Legacy claude/codex: the handed-over argv, the env tier, or absence.
     // `env_effort` is `LOOM_EFFORT`; `expect_effort` is `None` for "absent".
-    for (runtime, model_arg, env_tier, expect_model, env_effort, expect_effort) in [
-        ("claude", true, "", Some("sonnet"), "", Some("high")),
-        ("codex", true, "", Some("gpt-5.1"), "", Some("high")),
+    type LegacyRow = (
+        &'static str,
+        bool,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<&'static str>,
+        &'static [&'static str],
+    );
+    const UNRELATED_CONFIG: &str =
+        r#"--config=developer_instructions="model_reasoning_effort=low""#;
+    let legacy_rows: [LegacyRow; 14] = [
+        ("claude", true, "", Some("sonnet"), "", Some("high"), &[]),
+        ("codex", true, "", Some("gpt-5.1"), "", Some("high"), &[]),
         // Nothing on argv and nothing in the env tier: absent, never the
         // configured value (there is none to fill it with here).
-        ("claude", false, "", None, "", None),
+        ("claude", false, "", None, "", None, &[]),
         // Codex's static per-seat default is the env tier of last resort.
-        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model"), "", None),
+        ("codex", false, "LOOM_CODEX_MODEL", Some("seat-model"), "", None, &[]),
         // #14302: the adapter splits `model@effort` on the first `@`; the
         // span records the base as the model and the suffix as the effort.
         (
@@ -548,6 +559,7 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             Some("gpt-5-codex"),
             "",
             Some("high"),
+            &[],
         ),
         // `LOOM_EFFORT` outranks the suffix, as in the adapter.
         (
@@ -557,13 +569,79 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             Some("gpt-5-codex"),
             "low",
             Some("low"),
+            &[],
         ),
         // An empty suffix is no effort; an empty base is no model.
-        ("codex", false, "LOOM_CODEX_MODEL=gpt-5-codex@", Some("gpt-5-codex"), "", None),
-        ("codex", false, "LOOM_CODEX_MODEL=@high", None, "", None),
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@",
+            Some("gpt-5-codex"),
+            "",
+            None,
+            &[],
+        ),
+        ("codex", false, "LOOM_CODEX_MODEL=@high", None, "", None, &[]),
         // An explicit model arg suppresses the env split (and its suffix).
-        ("codex", true, "LOOM_CODEX_MODEL=seat@low", Some("gpt-5.1"), "", Some("high")),
-    ] {
+        (
+            "codex",
+            true,
+            "LOOM_CODEX_MODEL=seat@low",
+            Some("gpt-5.1"),
+            "",
+            Some("high"),
+            &[],
+        ),
+        // #14414: an explicit `-c model_reasoning_effort=` outranks `--effort`
+        // and `LOOM_EFFORT`, with or without a model arg, and the span records
+        // what the adapter launches rather than the lower-tier value.
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("low"),
+            &["-c", "model_reasoning_effort=low"],
+        ),
+        // An unrelated inline value suppresses the launcher's fallback but
+        // supplies no effort of its own. A genuine assignment still wins.
+        ("codex", true, "", Some("gpt-5.1"), "", None, &[UNRELATED_CONFIG]),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &["-c", "model_reasoning_effort=medium", UNRELATED_CONFIG],
+        ),
+        (
+            "codex",
+            true,
+            "",
+            Some("gpt-5.1"),
+            "",
+            Some("medium"),
+            &[
+                UNRELATED_CONFIG,
+                "--config",
+                "model_reasoning_effort=medium",
+            ],
+        ),
+        (
+            "codex",
+            false,
+            "LOOM_CODEX_MODEL=gpt-5-codex@high",
+            Some("gpt-5-codex"),
+            "medium",
+            Some("low"),
+            &["-c", "model_reasoning_effort=low"],
+        ),
+    ];
+    for (runtime, model_arg, env_tier, expect_model, env_effort, expect_effort, extra_args) in
+        legacy_rows
+    {
         let dir = root();
         let root = dir.path();
         let scripts = root.join(".loom/scripts");
@@ -593,6 +671,7 @@ fn runtime_run_spans_carry_identity_and_only_reported_launch_facts() {
             };
             cmd.args(["--model", model, "--effort", "high"]);
         }
+        cmd.args(extra_args);
         cmd.env("LOOM_RUNTIME", runtime)
             .env("LOOM_ROLE", "builder")
             .env("LOOM_SWEEP_ID", "legacy-sweep")

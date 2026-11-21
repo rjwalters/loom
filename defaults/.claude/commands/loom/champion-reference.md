@@ -572,6 +572,12 @@ contents at the PR head SHA) holds any file that carries a privilege and
 covers any file that does not, whatever it is called. `forbiddenDiffPatterns`
 still catches a PR that adds a privilege. Example list for `ci-steps`:
 `["secrets\\.(?!GITHUB_TOKEN\\b)", "secrets:\\s*inherit", "^\\s*environment:", ":\\s*write\\b", "write-all", "id-token", "pull_request_target", "workflow_run", "^\\s*release:", "types:.*released", "wrangler\\s+deploy", "npm\\s+publish", "gh\\s+release"]`.
+For a class that covers only GitHub workflow YAML, set `"checkWorkflowWriteAll": true`
+to check `write-all` at workflow and job scope instead of matching that text
+in a test name or command. Keep exactly one literal `write-all` pattern as
+the older Champion's fallback. The opt-in requires the native YAML check and
+holds when that check cannot read or classify the file. Custom regexes keep
+their ordinary matching behavior.
 Unreadable or empty content, an oversized or removed file, an invalid regex or
 a head SHA that moved fails closed. Whole-line YAML comments are not scanned
 (a comment grants nothing; the 2026-10-20 fixtures say "no id-token: write"

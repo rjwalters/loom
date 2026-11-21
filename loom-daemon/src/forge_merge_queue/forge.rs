@@ -82,6 +82,11 @@ pub trait LifecycleForge {
     ///
     /// Any label write failed.
     fn edit_labels(&self, pr: u32, add: &[&str], remove: &[&str]) -> Result<(), String>;
+    /// Best-effort claim cleanup for this confirmed queue merge.
+    ///
+    /// # Errors
+    /// The closing-issue references could not be verified.
+    fn confirmed_merge_issue_claims(&self, pr: u32) -> Result<(), String>;
     /// Queue removals on the PR timeline, oldest first.
     ///
     /// # Errors

@@ -82,6 +82,22 @@ mod tests {
         std::env::remove_var(A);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn clear_restores_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        const KEY: &str = "LOOM_ENV_TEST_SUPPORT_NON_UTF8";
+        const ORIGINAL: &[u8] = b"original-\xff-path";
+        let _seed = EnvGuard::set(KEY, OsStr::from_bytes(ORIGINAL));
+        {
+            let _clear = EnvGuard::clear(&[KEY]);
+            assert!(std::env::var_os(KEY).is_none());
+        }
+        assert_eq!(std::env::var_os(KEY).unwrap().as_bytes(), ORIGINAL);
+    }
+
     #[test]
     #[serial]
     fn set_overrides_and_repeated_keys_restore_the_original() {

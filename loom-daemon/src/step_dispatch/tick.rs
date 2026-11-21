@@ -50,8 +50,8 @@
 //! (`loom.dispatch.budget`), so a tick with free slots and few attempts names
 //! its limit.
 //!
-//! A **captain refusal** (#12450, fleet dispatch on): `captain_held` and
-//! `captain_cooldown` (the no-progress hold, #12581) are cheap passes made
+//! A **captain refusal** (#12450, fleet dispatch on): `captain_held`,
+//! `captain_cooldown` and `captain_not_eligible` are cheap passes made
 //! with no forge call. They draw on their own bound,
 //! [`MAX_FREE_CAPTAIN_REFUSALS_PER_TICK`], not on the lost-claim one (#12700):
 //! the captain's highest-weight cooled-down items are drawn first every tick,
@@ -102,7 +102,7 @@ pub const MAX_PASSES_PER_TICK: u32 = 32;
 /// `MAX_FREE_CLAIM_LOST_PER_TICK` refusals) while each loss still costs a
 /// claim subprocess.
 pub const MAX_FREE_CLAIM_LOST_PER_TICK: u32 = 16;
-/// At most this many captain refusals (`captain_held`, `captain_cooldown`) in
+/// At most this many captain refusals (`held`, `cooldown`, `not_eligible`) in
 /// one tick are free (#12700): they spend no pass and no slot draw. Unlike a
 /// lost claim, a captain refusal makes no forge call (one RPC to the
 /// captain), so its bound is separate and larger; the lost-claim bound, and
@@ -144,6 +144,14 @@ pub fn is_merge_step(step: crate::work_finder::step_item::Step) -> bool {
 /// (`sweep_registry::step_spawn::lease`): it ends the owner's draws for the
 /// tick (module docs, #12260).
 pub const REFUSAL_CLAIM_UNVERIFIED: &str = "claim_unverified";
+/// The spawn refusal of a confirmed writer rate limit
+/// (`sweep_registry::step_spawn::lease`, #13746): the owner's writer
+/// installation is exhausted until a confirmed reset, so like
+/// [`REFUSAL_CLAIM_UNVERIFIED`] every other draw of the same owner fails the
+/// same way — the owner's workspaces leave the draw for the rest of the tick,
+/// and the route hold armed from the handoff keeps the owner out of the next
+/// ticks' pools until its reset.
+pub const REFUSAL_WRITER_LIMITED: &str = crate::writer_limit::OUTCOME;
 /// The spawn refusal of a claim a peer won first: a cheap pass (module docs,
 /// #12410).
 pub const REFUSAL_CLAIM_LOST: &str = "claim_lost";
@@ -153,6 +161,8 @@ pub const REFUSAL_CAPTAIN_HELD: &str = "captain_held";
 /// The fleet-dispatch server's refusal of an item under the no-progress
 /// hold (#12541, #12581): a cheap pass like [`REFUSAL_CAPTAIN_HELD`] (#12700).
 pub const REFUSAL_CAPTAIN_COOLDOWN: &str = "captain_cooldown";
+/// A captain does not consider this worker eligible for the requested role.
+pub const REFUSAL_CAPTAIN_NOT_ELIGIBLE: &str = "captain_not_eligible";
 /// The fleet-dispatch server's refusal of a host at its cap (#12450): every
 /// later claim this tick would be refused the same way, so the draw ends.
 /// The captain no longer sends it (#12864); kept for an older captain in a
@@ -211,6 +221,37 @@ pub fn forge_owner(repo: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Close every still-open workspace of `owner` out of the tick's draw and
+/// resolve its queue rows as waiting on `reason` (#12260's close for
+/// `claim_unverified`; #13746 adds it for a confirmed writer rate limit):
+/// the first refusal suppresses the route's later requests this tick, while
+/// what already runs finishes normally. Returns the rows it resolved.
+fn close_owner(
+    workspaces: &[StepWorkspace],
+    draw: &mut ItemDraw,
+    rows: &mut [TickQueueRow],
+    owner: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0usize;
+    let held: Vec<usize> = workspaces
+        .iter()
+        .filter(|w| forge_owner(&w.repo) == owner)
+        .map(|w| w.idx)
+        .collect();
+    for idx in &held {
+        draw.close_repo(*idx);
+    }
+    for row in rows.iter_mut().filter(|r| r.disposition.is_none()) {
+        if held.contains(&row.key.workspace_idx) {
+            row.disposition = Some(Qd::DeferredCapacity);
+            row.detail = Some(reason.to_string());
+            resolved += 1;
+        }
+    }
+    resolved
+}
+
 static TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The next value of this process's tick counter, the `loom-draw/v3` seed's
@@ -252,6 +293,46 @@ pub struct StepWorkspace {
     /// Merges in flight in the repo before the tick drew (this host's and
     /// the peers'), for the span.
     pub merges_in_flight: usize,
+    /// The workspace writer route's confirmed-exhaustion hold (#13746),
+    /// resolved by the driver before the tick: candidates that need the
+    /// writer wait instead of drawing and being refused. `None` while the
+    /// route is usable or unknown.
+    pub writer_hold: Option<WriterHold>,
+}
+
+/// A workspace's writer route hold (#13746): why its write-needing
+/// candidates wait, and when the confirmed reset releases them. The queue
+/// rows carry both (`detail`, `held_until`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriterHold {
+    /// The waiting reason with the UTC reset, e.g.
+    /// `writer_rate_limited until 2026-11-19T21:39:45+00:00`.
+    pub detail: String,
+    /// The reset (epoch seconds): `held_until` on the queue rows.
+    pub until_epoch: i64,
+}
+
+impl WriterHold {
+    /// The hold `writer_limit::hold_note` found at `now`. Pure.
+    #[must_use]
+    pub fn from_reset(until_epoch: i64, now: i64) -> Option<Self> {
+        (until_epoch > now).then(|| {
+            let detail = chrono::DateTime::from_timestamp(until_epoch, 0).map_or_else(
+                || format!("{} (reset unconfirmed)", crate::writer_limit::OUTCOME),
+                |at| {
+                    format!(
+                        "{} until {}",
+                        crate::writer_limit::OUTCOME,
+                        at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    )
+                },
+            );
+            Self {
+                detail,
+                until_epoch,
+            }
+        })
+    }
 }
 
 /// The host-wide limits of one tick.
@@ -357,8 +438,11 @@ pub fn disposition_of(reason: &str) -> Qd {
         | "backstop_hold"
         | REFUSAL_CAPTAIN_HELD
         | REFUSAL_CAPTAIN_COOLDOWN => Qd::LeaseHeld,
-        "captain_not_eligible" => Qd::HostConstraint,
+        REFUSAL_CAPTAIN_NOT_ELIGIBLE => Qd::HostConstraint,
         REFUSAL_CAPTAIN_CAP | "captain_grace" | "captain_refused" => Qd::DeferredCapacity,
+        // #13746: a writer rate limit is a waiting state, not an error — the
+        // route holds until its reset, and the row names it.
+        REFUSAL_WRITER_LIMITED => Qd::DeferredCapacity,
         "pool_exhausted"
         | "no_token_pool"
         | "token_selection_failed"
@@ -501,7 +585,8 @@ fn count_exclusions(report: &mut TickReport, w: &Weighing) {
                 | PassReason::HeldAtHead
                 | PassReason::AuthorGateHeld
                 | PassReason::Conflicting
-                | PassReason::Stacked,
+                | PassReason::Stacked
+                | PassReason::OperatorLinkUnverified,
             ) => &mut report.skipped_noop_cooldown,
             E::Pass(PassReason::HardExclusion) => &mut report.skipped_declined,
             E::Pass(
@@ -597,14 +682,28 @@ fn take_offered(
 /// is taken from the pool before the draw, spawned through the same spawner
 /// as a draw, and counts against the tick's free slots. The rest of the
 /// slots draw as before.
-#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
 pub fn run_with_offers(
+    workspaces: Vec<StepWorkspace>,
+    limits: StepTickLimits,
+    seed: &SeedBase,
+    knobs: &PoolKnobs,
+    spawner: &mut dyn StepSpawner,
+    offers: &[Offer],
+) -> StepTick {
+    run_with_role_holds(workspaces, limits, seed, knobs, spawner, offers, &BTreeSet::new())
+}
+
+/// As above, also skip worker-held roles in the local draw. A fresh captain
+/// offer may still take its candidate through the ordinary gates.
+#[allow(clippy::too_many_lines)] // one loop, kept whole so the pass rules read in order.
+pub(crate) fn run_with_role_holds(
     mut workspaces: Vec<StepWorkspace>,
     limits: StepTickLimits,
     seed: &SeedBase,
     knobs: &PoolKnobs,
     spawner: &mut dyn StepSpawner,
     offers: &[Offer],
+    local_role_holds: &BTreeSet<&str>,
 ) -> StepTick {
     let mut pass_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut draws_taken = 0usize;
@@ -633,6 +732,22 @@ pub fn run_with_offers(
             .vi_demotions
             .extend(ws.weighing.demotions.iter().cloned());
         for c in &ws.weighing.pool {
+            // #13746: a workspace whose writer route is confirmed exhausted
+            // waits before the draw — no draw, no spawn, no refusal span.
+            // Its row names the reason and the reset instead.
+            if let Some(hold) = &ws.writer_hold {
+                report.queue.push(TickQueueRow {
+                    key: key_of(ws, c),
+                    disposition: Some(Qd::DeferredCapacity),
+                    detail: Some(hold.detail.clone()),
+                    updated_at: None,
+                    held_until: chrono::DateTime::from_timestamp(hold.until_epoch, 0),
+                    story_points: c.item.story_points,
+                    step: Some(c.step),
+                });
+                report.deferred_capacity += 1;
+                continue;
+            }
             report.queue.push(TickQueueRow {
                 key: key_of(ws, c),
                 disposition: ws.halted.then_some(Qd::WorkspaceHalted),
@@ -643,7 +758,10 @@ pub fn run_with_offers(
                 step: Some(c.step),
             });
         }
-        if !ws.halted {
+        // A writer-held workspace contributes no candidates to the draw
+        // (before the captain's offers are taken, too), so its route is
+        // never asked to write this tick (#13746).
+        if !ws.halted && ws.writer_hold.is_none() {
             repos.insert(
                 ws.idx,
                 RepoTerms {
@@ -656,6 +774,25 @@ pub fn run_with_offers(
     }
     let by_idx: BTreeMap<usize, &StepWorkspace> = workspaces.iter().map(|w| (w.idx, w)).collect();
     let offered = take_offered(&mut pool, &workspaces, offers, limits.free_slots);
+    if !limits.fallback && !local_role_holds.is_empty() {
+        let mut held_rows = BTreeSet::new();
+        pool.retain(|c| {
+            let held = local_role_holds.contains(StepRole::from(c.step).role_name());
+            if held {
+                held_rows.insert((c.workspace_idx, c.target()));
+            }
+            !held
+        });
+        for row in &mut report.queue {
+            if row.disposition.is_none()
+                && held_rows.contains(&(row.key.workspace_idx, row.key.number))
+            {
+                row.disposition = Some(Qd::HostConstraint);
+                row.detail = Some(REFUSAL_CAPTAIN_NOT_ELIGIBLE.to_string());
+                report.skipped_host_constraint += 1;
+            }
+        }
+    }
     let mut draw = ItemDraw::new(
         pool,
         repos,
@@ -753,6 +890,11 @@ pub fn run_with_offers(
                             draw.close_repo(other.idx);
                         }
                     }
+                }
+                if reason == REFUSAL_WRITER_LIMITED {
+                    let owner = forge_owner(&ws.repo);
+                    report.deferred_capacity +=
+                        close_owner(&workspaces, &mut draw, &mut report.queue, &owner, &reason);
                 }
                 *pass_counts.entry(reason).or_default() += 1;
             }
@@ -965,8 +1107,12 @@ pub fn run_with_offers(
                     // In fleet-dispatch fallback no loss is free (#12450).
                     // A captain refusal is cheaper still (#12700): no forge
                     // call, so it has its own, larger bound.
-                    let captain =
-                        reason == REFUSAL_CAPTAIN_HELD || reason == REFUSAL_CAPTAIN_COOLDOWN;
+                    let captain = matches!(
+                        reason.as_str(),
+                        REFUSAL_CAPTAIN_HELD
+                            | REFUSAL_CAPTAIN_COOLDOWN
+                            | REFUSAL_CAPTAIN_NOT_ELIGIBLE
+                    );
                     let (spent, bound) = if captain {
                         (&mut free_captain, MAX_FREE_CAPTAIN_REFUSALS_PER_TICK)
                     } else {
@@ -1001,6 +1147,17 @@ pub fn run_with_offers(
                                 draw.close_repo(other.idx);
                             }
                         }
+                    }
+                    if reason == REFUSAL_WRITER_LIMITED {
+                        // The writer is exhausted until a confirmed reset:
+                        // suppress this route's later requests this tick,
+                        // and name the wait on the closed rows (#13746).
+                        let owner = match by_idx.get(&idx) {
+                            Some(ws) => forge_owner(&ws.repo),
+                            None => String::new(),
+                        };
+                        report.deferred_capacity +=
+                            close_owner(&workspaces, &mut draw, &mut report.queue, &owner, &reason);
                     }
                     if reason == REFUSAL_CAPTAIN_CAP {
                         // The captain holds this host at its cap: every repo

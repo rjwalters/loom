@@ -34,7 +34,8 @@ class Forge(http.server.SimpleHTTPRequestHandler):
     do_GET=dispatch
     do_POST=dispatch
     def log_message(self,*args): pass
-s=http.server.ThreadingHTTPServer(('0.0.0.0',8443),Forge)
+# Use the standard HTTPS port so the URL is eligible for owner-scoped App auth.
+s=http.server.ThreadingHTTPServer(('0.0.0.0',443),Forge)
 c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 c.load_cert_chain('/srv/cert.pem','/srv/key.pem')
 s.socket=c.wrap_socket(s.socket,server_side=True)
@@ -115,4 +116,118 @@ fn authenticated_https_clone_and_fetch_preserve_external_forge_context() {
             assert!(!config.contains(credential), "credential stored in repository config");
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "requires Docker; explicitly run by CI"]
+async fn clean_shell_recover_publishes_the_stranded_issue_tip_with_the_daemons_credential() {
+    use loom_daemon::credential_preflight::github_app_gh_config_dir_for_owner;
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let seat = &f.names[0];
+    let remote = f.repository.replace("/gitea/", "/github/");
+    let url = reqwest::Url::parse(&remote).unwrap();
+    let host = url.host_str().unwrap();
+    checked(
+        f.command(&[
+            "session",
+            "start",
+            seat,
+            "--private-clone",
+            &remote,
+            "--image",
+            &f.image,
+        ])
+        .env("GH_HOST", host)
+        .env("GH_TOKEN", GH_TOKEN)
+        .output()
+        .unwrap(),
+    );
+    let branch = "feature/issue-7";
+    docker(&[
+        "exec",
+        &f.server,
+        "git",
+        "-C",
+        "/srv/repo.git",
+        "branch",
+        branch,
+        "main",
+    ]);
+    let remote_tip = || {
+        docker(&[
+            "exec",
+            &f.server,
+            "git",
+            "-C",
+            "/srv/repo.git",
+            "rev-parse",
+            branch,
+        ])
+    };
+    let before = remote_tip();
+    let tip = f.exec(
+        seat,
+        "cd /workspace/repo && git switch -c feature/issue-7 &&
+         git commit --allow-empty -m stranded >/dev/null && git rev-parse HEAD",
+    );
+    assert_ne!(tip, before);
+
+    let daemon = common::TestDaemon::start().await.unwrap();
+    let owner_dir = github_app_gh_config_dir_for_owner(daemon.workspace_path(), "github");
+    let other_dir = github_app_gh_config_dir_for_owner(daemon.workspace_path(), "other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    std::fs::write(other_dir.join("hosts.yml"), format!("{host}:\n  oauth_token: {GH_TOKEN}\n"))
+        .unwrap();
+    // Model the local 'gh auth token' read without consulting a personal login.
+    let gh = f.root.path().join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+[ "$#" = 2 ] && [ "$1" = auth ] && [ "$2" = token ] || exit 1
+sed -n 's/^  oauth_token: //p' "$GH_CONFIG_DIR/hosts.yml"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = f.root.path().join("operator-home");
+    std::fs::create_dir(&home).unwrap();
+    let recover = || {
+        let out = f
+            .command(&[
+                "session",
+                "recover",
+                seat,
+                "--publish",
+                "--issue",
+                "7",
+                "--json",
+            ])
+            .env_clear()
+            .current_dir(f.root.path().join("registry"))
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &home)
+            .env("LOOM_CODEX_PROFILE_ROOT", f.root.path().join("profiles"))
+            .env("LOOM_SOCKET_PATH", daemon.socket_path())
+            .env("LOOM_GH_BIN", &gh)
+            .env("GH_HOST", host)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(GH_TOKEN));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(GH_TOKEN));
+        out
+    };
+
+    let refused = recover();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("no GitHub write credential"));
+    assert_eq!(remote_tip(), before);
+    assert_eq!(f.exec(seat, "git -C /workspace/repo rev-parse feature/issue-7"), tip);
+
+    std::fs::rename(other_dir, owner_dir).unwrap();
+    let report: Value = serde_json::from_str(&checked(recover())).unwrap();
+    assert_eq!(report["clones"][0]["published"], serde_json::json!(["feature/issue-7"]));
+    assert_eq!(remote_tip(), tip);
 }

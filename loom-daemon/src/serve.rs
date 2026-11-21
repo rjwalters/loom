@@ -711,6 +711,10 @@ async fn handle_health(
         // health route raises `fleet_identity` too.
         fleet_sync: crate::fleet_sync::cached_status(),
         resync_pins,
+        // #14223: the canonical-owner drift check needs the CLI-side git
+        // reads + per-repo forge probes; this in-daemon route threads `None`
+        // ("not collected here"), like `limit_calibration` above.
+        owner_drift: None,
     });
 
     let mut body = serde_json::to_value(&health)?;

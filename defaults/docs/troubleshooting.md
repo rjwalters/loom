@@ -2016,13 +2016,12 @@ as "which branch happened to be checked out at quarantine time," not as
 
 ### Finding outstanding quarantine stashes (#5185)
 
-**Symptom**: none — that is the problem. A quarantine is loud at the moment it
-happens (a `main-clean.quarantine` line on stderr and in
-`.loom/logs/main-quarantine.log`) and silent forever afterwards. Nothing drops
-the rescue stash, nothing reminds anyone it exists, so entries pile up: 29 on
-one host, oldest 7 days; five in a consumer repo inside 24 hours, none
-reconciled. They were noticed only because an unrelated hygiene command
-happened to count stashes.
+**Symptom**: a quarantine is loud at the moment it happens (a
+`main-clean.quarantine` line on stderr and in `.loom/logs/main-quarantine.log`).
+Its `loom-quarantine:` stash then waits for operator reconciliation. Entries
+piled up before this report existed: 29 on one host, oldest 7 days, and five
+in a consumer repo inside 24 hours with none reconciled. An unrelated hygiene
+command happened to count them.
 
 **List them**:
 
@@ -2037,10 +2036,15 @@ discoverable without knowing one happened. The report is read-only — it never
 pops, drops, or reorders anything — and exits 0 whether or not anything is
 outstanding.
 
-It covers every Loom producer that pushes to the stash stack, not just
-`check-main-clean.sh --quarantine`'s `loom-quarantine:` entries (the Auditor's
-`auditor-tmp-drift-stash-<epoch>` shelf is the other one), and flags any entry
+The report lists `loom-quarantine:` entries from `check-main-clean.sh --quarantine`
+and the Auditor's `auditor-tmp-drift-stash-<epoch>` entries. It flags entries
 that captured **nothing** — those are pure noise and safe to drop.
+
+Fleet checkout self-heal also creates `loom-rescue-<ts>` stashes. These are
+outside `--list-quarantined` and the `Quarantined work` section of `loom status`.
+The daemon automatically prunes them once they are older than the
+`LOOM_RESCUE_REF_RETAIN_DAYS` window (14 days by default). See the
+[Rescue refs note under Self-heal](daemon-reference.md#self-heal-of-a-loom-only-blockage-11425).
 
 **Reconciling an entry**:
 
@@ -3213,22 +3217,29 @@ reinstall keeps the copies current too.
 
 **Where the files come from: a `defaults/` source tree, else the daemon's
 embedded payload (#6202, #8961).** `resync-installed.sh` resolves its source in
-priority order: (1) this checkout IS the Loom source repo (`defaults/hooks` or
-`defaults/scripts` present), (2) the gitignored `.loom/loom-source-path`
-sidecar (written only by a local `install.sh` / `install-loom.sh` run) points
-at a local clone of it, or (3) a legacy `install-metadata.json` `"loom_source"`
-field (dead for any post-#5624 install). **None of these exist on a checkout
-that never ran the Loom installer locally** (a fresh clone, a re-clone, a CI
-checkout). There the script hands off to `loom-daemon resync-payload`, which
-resyncs from the payload embedded in the installed daemon: same pins and
-symlink rules, exit `2` on `--dry-run` drift, never a downgrade, and only a
-verified official release build applies. It skips the script-only steps and
-names them in its output. A refusal prints its reason and exits `1`. Only with
-no source tree AND no `loom-daemon` that has that subcommand does the script
-fail with `Could not locate a defaults/ source tree to sync from`
+priority order: (0) an explicit `--source <dir>` flag (#14677) — first and
+EXCLUSIVE when given (an unusable `<dir>` is a hard error naming the path, no
+fallthrough), and the form to use from a managed worktree in a consumer repo,
+where the gitignored sidecar below lives only in the primary checkout and
+cannot be written from the worktree, (1) this checkout IS the Loom source repo
+(`defaults/hooks` or `defaults/scripts` present), (2) the gitignored
+`.loom/loom-source-path` sidecar (written only by a local `install.sh` /
+`install-loom.sh` run) points at a local clone of it, or (3) a legacy
+`install-metadata.json` `"loom_source"` field (dead for any post-#5624
+install). **None of these exist on a checkout that never ran the Loom
+installer locally** (a fresh clone, a re-clone, a CI checkout). There the
+script hands off to `loom-daemon resync-payload`, which resyncs from the
+payload embedded in the installed daemon: same pins and symlink rules, exit
+`2` on `--dry-run` drift, never a downgrade, and only a verified official
+release build applies. It skips the script-only steps and names them in its
+output. A refusal prints its reason and exits `1`. Only with no source tree
+AND no `loom-daemon` that has that subcommand does the script fail with
+`Could not locate a defaults/ source tree to sync from`
 (`check-main-freshness.sh` says which path is next). Fix for that case: install
 or update `loom-daemon`, or clone <https://github.com/rjwalters/loom> and run
-`echo /path/to/local/loom-clone > .loom/loom-source-path`.
+`echo /path/to/local/loom-clone > .loom/loom-source-path` — or name the clone
+for one invocation only with `--source /path/to/local/loom-clone`, which never
+reads or writes the sidecar and combines with `--output` staging (#14677).
 
 **`.loom/loom-source-path` is a DURABLE pointer — never point it into scratch
 space (#6780).** Every future `resync-installed.sh` / `check-main-freshness.sh`
@@ -3248,6 +3259,15 @@ resolved path to actually contain a populated `defaults/hooks` or
 `defaults/scripts` — a sidecar pointing at a directory that still exists but
 is stale/empty (rather than fully vanished) is treated as unresolvable too,
 not silently reported as "in sync" against nothing.
+
+**`--source <dir>` is the per-invocation alternative (#14677).** It names the
+source checkout for exactly one run — no sidecar is read or written, so it is
+the right form from a linked worktree (where the worktree-isolation guard
+denies writing the primary checkout's sidecar) or for a one-off sync against a
+scratch clone. It is checked before and instead of every automatic rung: a
+`--source` that does not carry a populated `defaults/hooks` or
+`defaults/scripts` is a hard error naming the path, never a fallthrough to the
+sidecar, the metadata field, or the daemon payload.
 
 The same list also declares a file **repo-owned**, so the installer's reinstall
 clean sweep never deletes it — see

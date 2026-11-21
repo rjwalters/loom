@@ -19,6 +19,11 @@ fn config(clones: &Value) -> Value {
     json!({"autonomous": {"sessionReconcile": {"privateClones": clones}}})
 }
 
+/// #14699: like [`config`], with `privateCloneSets` declared too.
+fn config_with_sets(sets: &Value, clones: &Value) -> Value {
+    json!({"autonomous": {"sessionReconcile": {"privateCloneSets": sets, "privateClones": clones}}})
+}
+
 fn descriptor(name: &str, profile: &Path, enabled: bool) -> AccountDescriptor {
     AccountDescriptor {
         id: AccountId {
@@ -163,6 +168,202 @@ fn a_non_object_key_and_a_conflicting_duplicate_are_reported() {
     assert_eq!(declared.bindings.len(), 1, "an identical spelling collapses");
     assert_eq!(declared.invalid.len(), 1, "a conflicting base is refused");
     assert!(declared.invalid[0].message.contains("different bases"));
+}
+
+#[test]
+fn a_set_reference_resolves_into_the_inline_list_s_bindings() {
+    let entries = json!([{"repository": URL}, {"repository": OTHER, "base": "develop"}]);
+    let via_set = parse(&config_with_sets(
+        &json!({"fleet": entries}),
+        &json!({
+            "alice": {"set": "fleet"},
+        }),
+    ));
+    assert!(via_set.invalid.is_empty(), "{:?}", via_set.invalid);
+    assert_eq!(via_set, parse(&config(&json!({"alice": entries}))));
+}
+
+#[test]
+fn two_accounts_referencing_one_set_each_get_every_binding() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": [{"repository": URL}, {"repository": OTHER}]}),
+        &json!({"seat-1": {"set": "fleet"}, "seat-2": {"set": "fleet"}}),
+    ));
+    assert!(declared.invalid.is_empty(), "{:?}", declared.invalid);
+    let got: Vec<_> = declared
+        .bindings
+        .iter()
+        .map(|b| (b.account.as_str(), b.repository.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("seat-1", URL),
+            ("seat-1", OTHER),
+            ("seat-2", URL),
+            ("seat-2", OTHER)
+        ]
+    );
+}
+
+#[test]
+fn an_empty_set_declares_nothing_and_is_no_error() {
+    let declared =
+        parse(&config_with_sets(&json!({"fleet": []}), &json!({"alice": {"set": "fleet"}})));
+    assert_eq!(declared, Declared::default());
+}
+
+#[test]
+fn a_set_reference_to_an_undefined_set_fails_closed_for_that_account_only() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": [{"repository": URL}]}),
+        &json!({"alice": {"set": "missing"}, "bob": [{"repository": OTHER}]}),
+    ));
+    assert_eq!(declared.bindings.len(), 1, "bob's inline list still applies");
+    assert_eq!(declared.bindings[0].account, "bob");
+    assert_eq!(declared.invalid.len(), 1);
+    assert_eq!(declared.invalid[0].account.as_deref(), Some("alice"));
+    assert!(
+        declared.invalid[0]
+            .message
+            .starts_with(&format!("{KEY}.alice: ")),
+        "{}",
+        declared.invalid[0].message
+    );
+    assert!(
+        declared.invalid[0]
+            .message
+            .contains("undefined set \"missing\""),
+        "{}",
+        declared.invalid[0].message
+    );
+}
+
+#[test]
+fn a_malformed_account_value_fails_closed() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": [{"repository": URL}]}),
+        &json!({
+            "a-string": "not a list",
+            "a-wrong-key": {"sets": "fleet"},
+            "an-extra-key": {"set": "fleet", "base": "develop"},
+            "a-non-string-set": {"set": 7},
+        }),
+    ));
+    assert!(declared.bindings.is_empty());
+    assert_eq!(declared.invalid.len(), 4);
+    for invalid in &declared.invalid {
+        assert!(
+            invalid
+                .message
+                .contains(&format!("or an object {{\"set\": \"<name>\"}} referencing {SETS_KEY}")),
+            "{}",
+            invalid.message
+        );
+    }
+}
+
+#[test]
+fn a_malformed_sets_block_is_reported_and_fails_every_reference() {
+    let declared = parse(&config_with_sets(&json!([1]), &json!({"alice": {"set": "fleet"}})));
+    assert!(declared.bindings.is_empty());
+    assert_eq!(declared.invalid.len(), 2, "the block, then the reference");
+    assert!(
+        declared.invalid[0]
+            .message
+            .starts_with(&format!("{SETS_KEY}: must be an object")),
+        "{}",
+        declared.invalid[0].message
+    );
+    assert!(
+        declared.invalid[1]
+            .message
+            .contains("undefined set \"fleet\""),
+        "{}",
+        declared.invalid[1].message
+    );
+}
+
+#[test]
+fn a_set_that_is_not_a_list_fails_only_its_referencing_accounts() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": "nope", "good": [{"repository": OTHER}]}),
+        &json!({"alice": {"set": "fleet"}, "bob": {"set": "good"}}),
+    ));
+    assert_eq!(
+        declared.bindings,
+        [Binding {
+            account: "bob".into(),
+            repository: OTHER.into(),
+            base: DEFAULT_BASE.into(),
+            key: "github.com/acme/gadgets".into(),
+        }]
+    );
+    assert_eq!(declared.invalid.len(), 2, "the set, then the reference");
+    assert!(
+        declared.invalid[0]
+            .message
+            .starts_with(&format!("{SETS_KEY}.fleet: must be a list")),
+        "{}",
+        declared.invalid[0].message
+    );
+    assert!(
+        declared.invalid[1].message.contains("is not a list"),
+        "{}",
+        declared.invalid[1].message
+    );
+}
+
+/// A malformed entry shared by two accounts: each account gets its own
+/// `Invalid`, and every message names both the account (`{KEY}.ACCOUNT`) and
+/// the set entry path — the pass WARNs by distinct message, so both reports
+/// survive its deduplication (#14699 review ask).
+#[test]
+fn a_malformed_set_entry_is_reported_once_per_referencing_account() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": [{"repository": URL}, {"repository": "http://insecure/x/y"}]}),
+        &json!({"alice": {"set": "fleet"}, "bob": {"set": "fleet"}}),
+    ));
+    let got: Vec<_> = declared
+        .bindings
+        .iter()
+        .map(|b| b.account.as_str())
+        .collect();
+    assert_eq!(got, ["alice", "bob"], "the valid entry applies for both");
+    assert_eq!(declared.invalid.len(), 2, "one Invalid per referencing account");
+    let mut messages: Vec<&str> = declared
+        .invalid
+        .iter()
+        .map(|i| i.message.as_str())
+        .collect();
+    messages.sort();
+    for (account, message) in [("alice", messages[0]), ("bob", messages[1])] {
+        assert!(message.contains(&format!("{KEY}.{account}")), "{message}");
+        assert!(
+            message.contains(&format!("{SETS_KEY}.fleet[1]: ")),
+            "the set entry path: {message}"
+        );
+    }
+    assert_ne!(messages[0], messages[1], "dedup by message keeps both reports");
+}
+
+#[test]
+fn a_duplicate_repository_in_a_set_with_different_bases_is_refused() {
+    let declared = parse(&config_with_sets(
+        &json!({"fleet": [
+            {"repository": URL},
+            {"repository": "https://GitHub.com/acme/widgets.git", "base": "develop"},
+        ]}),
+        &json!({"alice": {"set": "fleet"}}),
+    ));
+    assert_eq!(declared.bindings.len(), 1, "the first spelling still applies");
+    assert_eq!(declared.bindings[0].base, DEFAULT_BASE);
+    assert_eq!(declared.invalid.len(), 1);
+    assert!(
+        declared.invalid[0].message.contains("different bases"),
+        "{}",
+        declared.invalid[0].message
+    );
 }
 
 #[test]

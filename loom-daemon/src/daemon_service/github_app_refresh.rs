@@ -15,6 +15,10 @@ use loom_daemon::credential_preflight;
 use super::gh_token_needs_update;
 
 /// Primary (workspace-root owner) refresh tick.
+// The startup state this tick owns has grown with its responsibilities
+// (mint refresh, #11957 retry, #14223 drift watch); each arg is a distinct
+// piece of that state, matching `fleet_sync.rs`'s allow convention.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_primary_refresh(
     script_path: PathBuf,
     owner_repo: String,
@@ -23,6 +27,7 @@ pub(super) fn spawn_primary_refresh(
     minted_token: Option<String>,
     github_app_gh_config_dir_active: bool,
     mut cross_owner_retry: credential_preflight::cross_owner::CrossOwnerRetry,
+    startup_roots: Vec<(PathBuf, String)>,
 ) {
     // #4430: ticks every `GITHUB_APP_REFRESH_INTERVAL` (~5min) to keep the
     // minted installation token fresh across its ~1h lifetime for a
@@ -41,6 +46,9 @@ pub(super) fn spawn_primary_refresh(
     let mut current_token = minted_token;
     let mut config_dir_active = github_app_gh_config_dir_active;
     let (pass_workspace, pass_script) = (cwd.clone(), script_path.clone());
+    // #14223: the owner-drift watch — the startup capture is the baseline
+    // every tick compares the checkouts' current remotes against.
+    let mut drift_watch = credential_preflight::owner_drift::DriftWatch::new(startup_roots);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(credential_preflight::GITHUB_APP_REFRESH_INTERVAL).await;
@@ -176,6 +184,21 @@ pub(super) fn spawn_primary_refresh(
                 .await;
                 cross_owner_retry.record(&pass);
             }
+            // #14223: owner-drift watch — a checkout re-pointed at another
+            // owner after startup keeps the credential it was resolved for
+            // and sheds reads silently (the #14170 incident). Bounded: one
+            // `git remote get-url` per managed root; the canonical-name
+            // probe only when no owner drifted, cached per repo. Repairs
+            // what it can (one re-establish pass, plus dropping a root
+            // re-pointed back at this workspace's own owner) and warns ONCE
+            // per repo+owner pair when it cannot.
+            drift_watch = credential_preflight::owner_drift::check_off_thread(
+                pass_workspace.clone(),
+                owner_repo.clone(),
+                pass_script.clone(),
+                drift_watch,
+            )
+            .await;
         }
     });
 }

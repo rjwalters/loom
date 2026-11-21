@@ -27,9 +27,8 @@ use crate::champion_hold::classify::{
     classify_operator, fetch_operator_adder, merge_failed_notice_due, needs_comments, stacked_base,
     stray_operator_candidate, with_stacked_base, PrClass,
 };
-use crate::cmd_out::{CmdOutcome, DEFAULT_TIMEOUT};
+use crate::cmd_out::CmdOutcome;
 use crate::comment_trust::records::parse_records;
-use crate::gh_invocation::{AccessIntent, GhInvocation, GhTarget, Operation};
 use anyhow::Result;
 use serde_json::Value;
 use std::path::Path;
@@ -62,7 +61,7 @@ pub enum ChampionHoldCommand {
     /// Decide the ratification hold's tick for a PR (#12992): reads the head
     /// contents of every spec/decision file the PR changes and the trusted
     /// comments, and prints `LOOM-CHAMPION-RATIFICATION verdict=<clear|hold|
-    /// unreadable> action=<none|hold|stands|release|clear|defer> pr=<N>
+    /// unreadable> action=<none|hold|stands|release|clear> pr=<N>
     /// head=<sha> files=<a,b|->`. Exit 3 with no stdout when a read failed.
     Ratification(TargetArgs),
 
@@ -98,28 +97,19 @@ pub struct TargetArgs {
 }
 
 /// Use the same reader routing for the evidence and its trusted comment listing.
-fn read(repo: &str, args: &[&str], root: &Path) -> CmdOutcome {
-    let target = if repo == "{owner}/{repo}" {
-        GhTarget::None
+fn read(op: &'static str, repo: &str, args: &[&str], root: &Path) -> CmdOutcome {
+    if repo == "{owner}/{repo}" {
+        crate::script_helpers::gh_read(op, args, root, false)
     } else {
-        GhTarget::repo(repo).unwrap_or(GhTarget::None)
-    };
-    GhInvocation::new(
-        Operation::new("champion_hold.read"),
-        AccessIntent::Read,
-        target,
-        DEFAULT_TIMEOUT,
-    )
-    .current_dir(root)
-    .args(args)
-    .run()
+        crate::script_helpers::gh_route::gh_read_for_repo(op, args, root, repo)
+    }
 }
 
 fn trusted_comments(repo: &str, pr: u64, root: &Path) -> Option<Vec<Value>> {
     let path = format!("repos/{repo}/issues/{pr}/comments");
     let listing = crate::comment_trust::records::fetch_comment_listing_with(
         || {
-            read(repo, &["api", &path, "--paginate"], root)
+            read("trust.comment_listing", repo, &["api", &path, "--paginate"], root)
                 .ok_output()
                 .map(|o| o.stdout.clone())
         },
@@ -147,14 +137,14 @@ impl TargetArgs {
     /// The PR's label names, live. `None` when unreadable.
     fn labels(&self, root: &Path) -> Option<Vec<String>> {
         let path = format!("repos/{}/issues/{}/labels?per_page=100", self.repo(), self.pr);
-        let out = read(self.repo(), &["api", &path], root);
+        let out = read("champion_hold.labels", self.repo(), &["api", &path], root);
         let doc = serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()?;
         crate::verdict_gate::label_names(&doc)
     }
 
     /// A live REST read of `path`, decoded. `None` when unreadable.
     fn read_json(repo: &str, path: &str, root: &Path) -> Option<Value> {
-        let out = read(repo, &["api", path], root);
+        let out = read("champion_hold.read_json", repo, &["api", path], root);
         serde_json::from_slice::<Value>(&out.ok_output()?.stdout).ok()
     }
 
@@ -280,7 +270,7 @@ fn ratification_line(t: &TargetArgs, root: &Path) -> String {
         .unwrap_or_else(|| fail("head"))
         .to_string();
     let path = format!("repos/{repo}/pulls/{}/files", t.pr);
-    let listing = read(repo, &["api", &path, "--paginate"], root);
+    let listing = read("champion_hold.ratify_files", repo, &["api", &path, "--paginate"], root);
     let listing = listing.ok_output().unwrap_or_else(|| fail("file list"));
     let records = parse_records(&listing.stdout).unwrap_or_else(|| fail("file list"));
     let cfg = Config::from_effective(&crate::config_resolver::resolve_effective_config(root));
@@ -296,7 +286,12 @@ fn ratification_line(t: &TargetArgs, root: &Path) -> String {
         // Contents are read only for files the path rules select.
         if f.status != "removed" && ratification_candidate(&f, &cfg) {
             let path = format!("repos/{repo}/contents/{}?ref={head}", f.filename);
-            let out = read(repo, &["api", "-H", "Accept: application/vnd.github.raw", &path], root);
+            let out = read(
+                "champion_hold.head_content",
+                repo,
+                &["api", "-H", "Accept: application/vnd.github.raw", &path],
+                root,
+            );
             f.head_content = out
                 .ok_output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
@@ -365,6 +360,7 @@ fn calibration_report(
     };
     let now = chrono::Utc::now();
     let list = read(
+        "champion_hold.merged_prs",
         repo,
         &[
             "pr",
@@ -497,6 +493,7 @@ fn reverts_by_pr(
 ) -> Result<bool, String> {
     let q = format!("\"Reverts {repo}#{pr}\" in:body");
     let out = read(
+        "champion_hold.revert_search",
         repo,
         &[
             "pr",

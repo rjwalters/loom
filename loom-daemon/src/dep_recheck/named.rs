@@ -149,6 +149,19 @@ fn item_re() -> &'static Regex {
 /// must not be able to carry whitespace, a quote, or a leading `-`.
 const OWNER_REPO: &str = r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+";
 
+/// Is `s` a well-formed `owner/name` per [`OWNER_REPO`]?
+///
+/// Shared by the checklist matcher above and by `dep-states`' `--refs`
+/// parsing ([`super::states`]), which faces the same untrusted-forge-text
+/// constraint for the same reason: the repo half is handed to `gh --repo`
+/// verbatim, so the charset must stay one definition, not two that can drift.
+#[must_use]
+pub fn is_owner_repo(s: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(&format!("^{OWNER_REPO}$")).expect("static owner/repo pattern"))
+        .is_match(s)
+}
+
 /// The `## Dependencies` (or `### Dependencies`) section of a body.
 ///
 /// Scoped so an unrelated `#N` elsewhere in the issue is never read as a named

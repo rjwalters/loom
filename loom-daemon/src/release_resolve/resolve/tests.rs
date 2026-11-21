@@ -844,6 +844,7 @@ fn secondary_limits_server_errors_and_shed_reads_are_unavailable() {
     }
     let shed: Query<u8> = Query::Unavailable(Unavailable::Shed {
         until: std::time::SystemTime::now(),
+        graphql_budget_exhausted: false,
     });
     assert!(is_unavailable(&shed));
 }

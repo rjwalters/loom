@@ -27,14 +27,15 @@ use std::process::Command;
 /// The oldest installed Loom (`install-metadata.json` `loom_version`) this
 /// daemon works with.
 ///
-/// 0.19.0 is the first release whose installed tree carries every file in
-/// [`DAEMON_INVOKED_INSTALLED_FILES`]. No break has been declared since.
+/// 0.19.175 is the first release whose installed watchdog delegates to
+/// `loom-daemon daemon-watchdog`. The 0.19.174 watchdog still calls the
+/// retired `peer-claims` subcommand.
 ///
 /// It must name a release tag. `ci-daily.yml` (`Compatibility Floor`) runs
 /// that release's installed files against today's daemon every day (#10868).
 /// If that fails, raise this to the oldest release that passes, or restore
 /// what the old files need (`defaults/docs/release-cadence.md`).
-pub const SUPPORTS_INSTALLED: &str = "0.19.0";
+pub const SUPPORTS_INSTALLED: &str = "0.19.175";
 
 /// The oldest daemon the installed files this release ships work with. The
 /// install-metadata writers record it as `requires_daemon`.
@@ -362,8 +363,9 @@ pub const CAPABILITIES_SCHEMA_VERSION: u32 = 1;
 /// --json` both print it as `tools_commands`, so a wrapper asks the binary
 /// what it serves and carries no list of its own.
 ///
-/// Sub-verbs are listed only where the verb splits into reads and writes
-/// (`forge`, `forge merge-queue`, `forge parent`); the tests in
+/// Sub-verbs are listed only where the verb has sub-verbs (`forge`,
+/// `forge merge-queue`, `forge parent`; every `merge-queue` verb is served
+/// since #14520, `parent link` is not); the tests in
 /// `src/bin/loom_tools.rs` and `src/cli/forge_read/tests.rs` fail when this
 /// list and the clap tree disagree.
 pub const TOOLS_COMMANDS: &[&str] = &[
@@ -401,9 +403,29 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge suspect-critical-diff",
     "forge merge-method",
     "forge merge-config",
+    // #14519: the shared non-queue writes.
+    "forge comment",
+    "forge create-issue",
+    "forge rerun",
+    "forge auto-merge",
+    "forge disable-auto-merge",
+    "forge verdict-labels",
+    "forge verdict-reconcile",
+    "forge verdict-lock",
+    "forge doctor-handback",
+    "forge journal-ci-refusal",
+    "forge parent link",
     "forge merge-queue mode",
     "forge merge-queue preflight",
     "forge merge-queue status",
+    "forge merge-queue enqueue",
+    "forge merge-queue dequeue",
+    "forge merge-queue reconcile",
+    "forge merge-queue handoff",
+    "forge merge-queue step",
+    "forge merge-queue revoke",
+    "forge merge-queue group-check",
+    "forge merge-queue authorize-check",
     "forge token",
     "forge is-fleet",
     "forge trusted-comments",
@@ -411,6 +433,7 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "forge claim-liveness",
     "forge verdict-stale-notice",
     "forge verdict-body-check",
+    "forge workflow-write-all-check",
     "forge verdict-gate",
     "forge may-write",
     "forge calls",
@@ -423,17 +446,22 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "park-record apply",
     "park-record released",
     "park-record decision",
+    "park-record guide-conflict-route",
     "park-record retract",
     "operator-decision validate",
     "operator-decision apply",
     "operator-decision resolve",
+    "lease ensure",
+    "lease co-occupancy",
+    "lease release",
+    "lease renewer",
     "lease pr claim",
     "lease pr check",
     "lease pr fence",
     "lease pr release",
     // #14429: top-level reads and config inspection. The write forms inside
     // `labels`, `forge-probe` and `forge-inventory` refuse with exit 64
-    // (#14396) exactly as a `forge` write verb does.
+    // (#14396).
     "labels",
     "pr-queue",
     "premise-check",

@@ -95,6 +95,8 @@ pub enum Failure {
         /// is GitHub saying the bucket still has budget, so the refusal is
         /// not an empty pool and is not held until the pool's reset.
         remaining: Option<u64>,
+        /// The CLI reported an explicit primary GraphQL exhaustion diagnostic.
+        graphql_primary_message: bool,
     },
     /// The reader's token was refused (401, bad credentials).
     Credential,
@@ -108,6 +110,24 @@ pub enum Failure {
 }
 
 impl Failure {
+    /// Positively classified primary GraphQL exhaustion with no reported headroom.
+    pub(crate) fn is_primary_graphql(self) -> bool {
+        match self {
+            Self::RateLimited {
+                resource: Resource::Graphql,
+                secondary: false,
+                retry_after: None,
+                remaining,
+                graphql_primary_message,
+                ..
+            } => match remaining {
+                Some(n) => n == 0,
+                None => graphql_primary_message,
+            },
+            _ => false,
+        }
+    }
+
     /// A primary rate limit of `resource` with no reset known.
     #[must_use]
     pub fn rate_limited(resource: Resource) -> Self {
@@ -117,6 +137,7 @@ impl Failure {
             secondary: false,
             retry_after: None,
             remaining: None,
+            graphql_primary_message: false,
         }
     }
 
@@ -140,12 +161,14 @@ impl Failure {
                 secondary,
                 retry_after,
                 remaining,
+                graphql_primary_message,
             } => Self::RateLimited {
                 resource,
                 reset,
                 secondary,
                 retry_after,
                 remaining,
+                graphql_primary_message,
             },
             other => other,
         }
@@ -244,6 +267,12 @@ pub fn classify_failure_in(
             secondary,
             retry_after,
             remaining: headers.and_then(|h| h.remaining),
+            graphql_primary_message: s.lines().any(|line| {
+                let line = line.trim_start();
+                let line = line.strip_prefix("gh: ").unwrap_or(line);
+                line.starts_with("graphql: api rate limit already exceeded")
+                    || line.starts_with("graphql: api rate limit exceeded")
+            }),
         });
     }
     if credential {
@@ -474,12 +503,19 @@ pub fn withdraw_after_in(
     probe: ProbeReset<'_>,
 ) -> Withdrawal {
     let plan = plan_withdrawal(owner_repo, failure, now, mode, app_id, probe);
-    apply(app_id, owner_repo, failure, &plan, why);
+    apply(app_id, owner_repo, failure, &plan, why, now);
     plan
 }
 
 /// Record `plan` in the routing tables, log it, and export it.
-fn apply(app_id: &str, owner_repo: &str, failure: Failure, plan: &Withdrawal, why: &str) {
+fn apply(
+    app_id: &str,
+    owner_repo: &str,
+    failure: Failure,
+    plan: &Withdrawal,
+    why: &str,
+    now: SystemTime,
+) {
     let secs = |until: &SystemTime| {
         until
             .duration_since(SystemTime::now())
@@ -505,7 +541,9 @@ fn apply(app_id: &str, owner_repo: &str, failure: Failure, plan: &Withdrawal, wh
             // A rate limit (primary or secondary) is a budget withdrawal: the
             // one cause W4-C may shed a deferrable read on. A refused
             // credential is not — those reads still fall back to the writer.
-            let held = if matches!(failure, Failure::RateLimited { .. }) {
+            let held = if failure.is_primary_graphql() {
+                forge_read_pool::withdraw_primary_graphql_until(app_id, owner, *until, now)
+            } else if matches!(failure, Failure::RateLimited { .. }) {
                 forge_read_pool::withdraw_scoped_budget_until(app_id, owner, *scope, *until)
             } else {
                 forge_read_pool::withdraw_scoped_until(app_id, owner, *scope, *until)

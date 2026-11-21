@@ -182,6 +182,9 @@ pub enum ExhaustCause {
     /// above the headroom reserve. At least one such reader exists and no
     /// reader is excluded for any other reason.
     Budget,
+    /// A GraphQL gate whose readers are all held by proven primary limits.
+    /// This carries evidence for a reader-only fallback, with the same budget log label.
+    GraphqlPrimaryBudget,
     /// Every reader that could serve the repo is withdrawn or out of budget,
     /// and at least one withdrawal is not a rate limit (App-wide, a refused
     /// credential, the gateway's outage withdrawal). Every exclusion ends on
@@ -196,7 +199,7 @@ impl ExhaustCause {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Budget => "budget",
+            Self::Budget | Self::GraphqlPrimaryBudget => "budget",
             Self::Withdrawn => "withdrawn",
             Self::Unavailable => "unavailable",
         }
@@ -784,6 +787,17 @@ fn is_github(host: Option<&str>) -> bool {
     host.is_none_or(|h| h.eq_ignore_ascii_case("github.com"))
 }
 
+/// A live primary hold can authorize a fallback only while a newer reading
+/// for the same bucket does not contradict it with positive headroom.
+pub(crate) fn primary_graphql_withdrawn_at(app_id: &str, owner: &str, now: SystemTime) -> bool {
+    let Some(observed_at) = forge_read_pool::primary_graphql_observed_at(app_id, owner, now) else {
+        return false;
+    };
+    !bucket_key(app_id, owner, Resource::Graphql)
+        .and_then(|key| forge_bucket_book::reading(&key, epoch(now)))
+        .is_some_and(|r| r.observed_at >= epoch(observed_at) && r.remaining.is_some_and(|n| n > 0))
+}
+
 /// [`route_read`] against an explicit workspace, roster and environment.
 #[must_use]
 pub fn route_read_in(
@@ -1000,6 +1014,7 @@ pub fn route_read_in(
             .and_then(|k| forge_bucket_book::projected_used_pct(&k, now_epoch))
     };
     let (mut budget, mut withdrawn, mut other, mut first_seen) = (0_usize, 0_usize, 0_usize, false);
+    let mut primary_graphql = 0;
     for off in 0..n {
         let r = readers[(start + off) % n];
         if forge_read_pool::is_withdrawn_at(&r.app_id, now) {
@@ -1013,6 +1028,13 @@ pub fn route_read_in(
             if forge_read_pool::is_budget_withdrawn_at(&r.app_id, owner, req.resource, now) {
                 budget += 1;
                 first_seen = true;
+                if req.class == ReadClass::Gate
+                    && req.resource == Resource::Graphql
+                    && primary_graphql_withdrawn_at(&r.app_id, owner, now)
+                    && super::dir_is_fresh(&super::reader_dir(workspace_root, owner, r), now)
+                {
+                    primary_graphql += 1;
+                }
             } else {
                 withdrawn += 1;
             }
@@ -1049,6 +1071,8 @@ pub fn route_read_in(
         ExhaustCause::Unavailable
     } else if withdrawn > 0 {
         ExhaustCause::Withdrawn
+    } else if primary_graphql == n {
+        ExhaustCause::GraphqlPrimaryBudget
     } else {
         ExhaustCause::Budget
     };

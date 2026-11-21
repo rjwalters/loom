@@ -64,12 +64,16 @@ impl SweepRegistry {
             issue_lease_comments_jq, live_leases_by_freshness, parse_lease_rows,
         };
 
+        let Some((owner, repo)) = self.resolve_owner_repo() else {
+            log::warn!("Builder step {sweep_id} on #{item}: lease-yield repository unresolved; retaining lease protection");
+            return false;
+        };
         let gh = self.resolved_gh();
         let read = self
             .gh_inv("guard.finished_builder_lease", AccessIntent::Read, &gh)
             .args([
                 "api",
-                &format!("repos/{{owner}}/{{repo}}/issues/{item}/comments"),
+                &format!("repos/{owner}/{repo}/issues/{item}/comments"),
                 "--paginate",
                 "--jq",
                 &issue_lease_comments_jq(),
@@ -147,7 +151,7 @@ impl SweepRegistry {
     /// Whether a fresh read shows no lease but this step's own live on the
     /// issue. `false` when the read fails: unknown is not "none".
     fn no_peer_lease_live(&self, item: u32, sweep_id: &str, episode_start: DateTime<Utc>) -> bool {
-        let Some(comments) = self.read_lease_comments(item) else {
+        let Some(comments) = self.read_order_lease_comments(item) else {
             return false;
         };
         let host = self.published_host_id();

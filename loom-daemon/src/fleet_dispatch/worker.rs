@@ -51,7 +51,11 @@
 //! ([`on_reaper_tick`]); at most one heartbeat per [`HEARTBEAT_GAP`] goes out
 //! for the whole host, carrying every repo's live steps, the free slots and
 //! the runnable roles the last step tick noted ([`note_capacity`]). In
-//! fallback the heartbeat is the probe that ends it.
+//! fallback the heartbeat is the probe that ends it. The answer may carry the
+//! captain's token-pool probe snapshot (#13942), which the worker stores
+//! beside its pool as the fleet sidecar for the evidence readers
+//! ([`crate::tokens_pool::fleet_probe`]) — absent on an old captain or an
+//! unreachable one, where the worker keeps its own evidence untouched.
 //!
 //! A repo whose live set has not been refreshed for [`live_stale_after`]
 //! (its workspace was deregistered and its reaper aborted, so neither its
@@ -262,6 +266,8 @@ struct State {
     live_by_root: HashMap<PathBuf, LiveSet>,
     /// `(free_slots, roles_ok)` at the last step tick.
     capacity: Option<(u32, Vec<String>)>,
+    /// Positive captain retry intervals, shared by every workspace on this worker.
+    local_role_holds: HashMap<&'static str, Instant>,
     last_heartbeat: Option<Instant>,
     /// The `server_epoch` of the last `next` answer (#12817).
     next_epoch: Option<String>,
@@ -430,6 +436,20 @@ pub fn claim(root: &Path, item: u32, role: StepRole) -> Ask {
             facts.held_by.clone_from(&refusal.held_by);
             facts.retry_after_s = refusal.retry_after_s;
             facts.hold = reason == RefusalReason::Cooldown;
+            if reason == RefusalReason::NotEligible {
+                if let Some(until) = refusal
+                    .retry_after_s
+                    .filter(|secs| *secs > 0)
+                    .and_then(|secs| Instant::now().checked_add(Duration::from_secs(secs)))
+                {
+                    let mut state = state();
+                    let hold = state
+                        .local_role_holds
+                        .entry(role.role_name())
+                        .or_insert(until);
+                    *hold = (*hold).max(until);
+                }
+            }
             if reason == RefusalReason::Grace {
                 Ask::FailOpen
             } else {
@@ -629,15 +649,11 @@ fn send_release(grant: &Grant, outcome: &str, root: Option<PathBuf>) {
     );
 }
 
-/// The step tick's view of this host: its free slots and the roles whose
-/// pools are not exhausted (`exhausted`, role names), for the heartbeat.
-///
-/// Phase 1 reports pool exhaustion only. Spec §5.2's `roles_ok` also leaves
-/// out roles behind the load brake or a disk back-off; those still run
-/// through today's admission after a grant, and the captain does not yet
-/// use `roles_ok` to pick hosts.
-pub fn note_capacity(free_slots: usize, exhausted: &BTreeSet<String>) {
-    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok(exhausted)));
+/// Cache the step tick's free slots and host role list for the heartbeat.
+/// The work-request loop uses this same list. Local candidate admission still
+/// checks the workspace's own load, disk, pool and claim gates.
+pub fn note_capacity(free_slots: usize, roles_ok: &[String]) {
+    state().capacity = Some((u32::try_from(free_slots).unwrap_or(u32::MAX), roles_ok.to_vec()));
 }
 
 /// The role names this host can run: every step role's, but `exhausted`.
@@ -652,6 +668,19 @@ pub fn roles_ok(exhausted: &BTreeSet<String>) -> Vec<String> {
         .collect::<BTreeSet<String>>()
         .into_iter()
         .collect()
+}
+
+/// Roles a normal local draw should skip while the captain asks us to wait.
+/// Work requests and heartbeats still advertise the worker's actual capability.
+pub(crate) fn local_role_holds(root: &Path, now: Instant) -> BTreeSet<&'static str> {
+    let enabled = host_endpoint(root).is_some();
+    let mut state = state();
+    state.local_role_holds.retain(|_, until| *until > now);
+    if enabled && state.hysteresis.mode() == Mode::Normal {
+        state.local_role_holds.keys().copied().collect()
+    } else {
+        BTreeSet::new()
+    }
 }
 
 /// One reaper tick of the registry at `root`, whose live steps are `live`
@@ -736,7 +765,27 @@ pub fn on_reaper_tick(root: &Path, live: &[(String, u32, StepRole, DateTime<Utc>
             endpoint: proto::HEARTBEAT_PATH,
             ..CallFacts::default()
         };
-        send_detached::<_, HeartbeatResponse>(&url, proto::HEARTBEAT_PATH, request, facts);
+        // #13942: the pool the snapshot lands in is a host-level fact, so it
+        // resolves from the daemon workspace (`host_root`) the same way the
+        // endpoint does, falling back to the ticking repo's root before one
+        // is named.
+        let probe_root = state()
+            .host_root
+            .clone()
+            .unwrap_or_else(|| root.to_path_buf());
+        send_detached_then::<_, HeartbeatResponse>(
+            &url,
+            proto::HEARTBEAT_PATH,
+            request,
+            facts,
+            move |resp| {
+                let Some(snapshot) = &resp.token_probe else {
+                    return;
+                };
+                let dir = crate::tokens_pool::paths::resolve_tokens_dir(&probe_root);
+                crate::tokens_pool::fleet_probe::apply_snapshot(&dir, snapshot, Utc::now());
+            },
+        );
     }
 }
 
@@ -989,6 +1038,11 @@ pub(crate) fn candidates_for_test(url: &str, resp: &NextResponse) -> Vec<Candida
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
     *state() = State::default();
+}
+
+#[cfg(test)]
+pub(crate) fn role_hold_deadline_for_test(role: StepRole) -> Option<Instant> {
+    state().local_role_holds.get(role.role_name()).copied()
 }
 
 #[cfg(test)]
