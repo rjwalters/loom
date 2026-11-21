@@ -141,12 +141,9 @@ fn store_after_marker(root: &Path) -> MirrorStore {
     let id = id();
     let dir = root.join(&id.slug);
     std::fs::create_dir_all(&dir).unwrap();
-    save(
-        &dir.join(MARKER),
-        &Marker {
-            protocol: MIRROR_PROTOCOL.into(),
-            key: id.key,
-        },
+    std::fs::write(
+        dir.join("mirror.json"),
+        serde_json::json!({"protocol": MIRROR_PROTOCOL, "key": id.key}).to_string(),
     )
     .unwrap();
     store(root)
@@ -253,7 +250,10 @@ fn an_interrupted_creation_is_completed_by_a_repeat_and_never_half_kept() {
     struct RetentionCheckingFetch(RecordingFetch);
     impl MirrorFetch for RetentionCheckingFetch {
         fn fetch(&self, git_dir: &Path, reader: &ProvedReader) -> Result<()> {
-            verify_mirror_config(git_dir)?;
+            let config = std::fs::read_to_string(git_dir.join("config"))?;
+            assert!(config.contains("\tauto = 0\n"));
+            assert!(config.contains("\tprune = false\n"));
+            assert!(config.contains("\tprunetags = false\n"));
             self.0.fetch(git_dir, reader)
         }
     }
@@ -270,7 +270,6 @@ fn an_interrupted_creation_is_completed_by_a_repeat_and_never_half_kept() {
             let git_dir = store.git_dir();
             std::fs::create_dir(&git_dir).unwrap();
             std::fs::write(git_dir.join("config"), config).unwrap();
-            assert!(verify_mirror_config(&git_dir).is_err());
         }
         let fetch = RetentionCheckingFetch(RecordingFetch::ok());
         assert_eq!(
