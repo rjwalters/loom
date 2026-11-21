@@ -970,32 +970,8 @@ fn containerd_store_incident_shape_plans_the_expected_ids_with_default_retention
 // ===================================================================
 // Cooldown (host-wide, not per-repo)
 // ===================================================================
-
-#[test]
-#[serial]
-fn cooldown_elapsed_is_true_before_any_evaluation() {
-    reset_state_for_test();
-    assert!(cooldown_elapsed(t(0), 1_800));
-    reset_state_for_test();
-}
-
-#[test]
-#[serial]
-fn a_recent_evaluation_holds_the_cooldown() {
-    reset_state_for_test();
-    record_evaluated(t(0));
-    assert!(!cooldown_elapsed(t(60), 1_800));
-    reset_state_for_test();
-}
-
-#[test]
-#[serial]
-fn the_cooldown_expires() {
-    reset_state_for_test();
-    record_evaluated(t(0));
-    assert!(cooldown_elapsed(t(1_801), 1_800));
-    reset_state_for_test();
-}
+// The elapsed/record calculation itself is unit-tested once in
+// `host_wide_cooldown`; what remains here is this pass's own behavior.
 
 // ===================================================================
 // Config resolution defaults
