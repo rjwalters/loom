@@ -1994,6 +1994,9 @@ mod pass_loop;
 /// sibling file per the file-size ratchet, attributed to `claim_reconciliation`
 /// in the #9251 forge-call accounting.
 mod building_listing;
+/// Issue-side `loom:curating` claims left stale by the #14811 roll-requeue
+/// bug — lease-evidenced release with a re-curation record (#14816).
+mod curating_reclaim;
 /// Keep `loom:building` on an issue whose PR is open (#11852).
 pub(crate) mod open_pr_hold;
 /// The ETag-cached REST open-PR listing the PR-side passes share (#10349).
@@ -2104,8 +2107,9 @@ pub mod forge {
     }
 
     /// Fetch `issue`'s current label names (best-effort). Mirrors
-    /// `pr_label_names` below, for the issue side.
-    fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
+    /// `pr_label_names` below, for the issue side. Shared with the
+    /// `loom:curating` pass (#14816) for its pre-write fresh-label read.
+    pub(crate) fn issue_label_names(gh_bin: &Path, root: &Path, issue: u32) -> Result<Vec<String>> {
         #[derive(Debug, Deserialize)]
         struct GhLabel {
             name: String,

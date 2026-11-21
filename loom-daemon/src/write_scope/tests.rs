@@ -605,6 +605,10 @@ fn daemon_write_paths_are_scoped() {
     let reviewed: &[(&str, Scope)] = &[
         (PASS, Gated),
         ("claim_reconciliation.rs", Via(PASS, "reclaim + anchor passes")),
+        (
+            "claim_reconciliation/curating_reclaim.rs",
+            Via(PASS, "Curator claim recovery: label release and re-curation comment (#14816)"),
+        ),
         ("claim_reconciliation/verdict_invalidation.rs", Via(PASS, "verdict pass")),
         (
             "claim_reconciliation/unanchored_verdict.rs",

@@ -97,6 +97,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         "claim.lease_comments"
         | "guard.lease_comments"
         | "guard.finished_builder_lease"
+        | "claim.curating_comments"
         | "claim.pr_activity_comments"
         | "verdict.pr_comments"
         | "quarantine.issue_comments"
@@ -111,7 +112,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "release_veto.issue_labels"
         | "intake.recheck"
         | "landed.issue_labels"
-        | "claim.labels_rest" => ops::ISSUE_VIEW_STATE,
+        | "claim.labels_rest"
+        | "claim.curating_state" => ops::ISSUE_VIEW_STATE,
         "parent_link.marker_children_rest" => ops::ISSUE_SEARCH,
         "park_hold.issue_body" => ops::ISSUE_EDIT_BODY,
         "quarantine.issue_list" => ops::ISSUE_LIST,
@@ -137,7 +139,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "restore.label"
         | "prless.hold_label"
         | "park_hold.issue_labels"
-        | "orphan_stack.label" => ops::ISSUE_EDIT_LABELS,
+        | "orphan_stack.label"
+        | "claim.curating_release" => ops::ISSUE_EDIT_LABELS,
         "verdict.anchor_comment"
         | "verdict.reanchor_comment"
         | "verdict.stale_comment"
@@ -155,7 +158,8 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "prless.comment"
         | "intake.demote_comment"
         | "landed.comment"
-        | "orphan_stack.comment" => ops::COMMENT_CREATE,
+        | "orphan_stack.comment"
+        | "claim.curating_recuration_comment" => ops::COMMENT_CREATE,
         "roster.delete" | "roster.patch" | "sequence.comment_patch" | "sequence.comment_delete" => {
             ops::COMMENT_EDIT_DELETE
         }

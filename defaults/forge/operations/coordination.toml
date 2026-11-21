@@ -257,6 +257,9 @@ path = "loom-daemon/src/intake_reconcile/demote.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/epic_supervisor.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "issue.edit-body"
@@ -449,6 +452,9 @@ path = "loom-daemon/src/epic_supervisor.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "comment.list"
@@ -495,6 +501,9 @@ path = "loom-daemon/src/work_finder/main_red_autofile.rs"
 [[operation.callers]]
 kind = "rust"
 path = "loom-daemon/src/sweep_registry/step_spawn/builder_rollback.rs"
+[[operation.callers]]
+kind = "rust"
+path = "loom-daemon/src/claim_reconciliation/curating_reclaim.rs"
 
 [[operation]]
 id = "comment.edit-delete"
