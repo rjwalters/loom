@@ -654,11 +654,12 @@ finalize_quick_install() {
   # vanished/unreachable local clone can still be identified and re-cloned
   # instead of becoming an opaque dead path. Best-effort: empty when the
   # source isn't a git checkout or has no `origin` configured.
-  local loom_source_remote=""
+  local loom_source_remote="" requires_daemon_field=""
   if [[ -f "$loom_root/scripts/install/loom-source-path.sh" ]]; then
     # shellcheck source=/dev/null
     source "$loom_root/scripts/install/loom-source-path.sh"
     loom_source_remote="$(loom_source_remote_url "$loom_root")"
+    requires_daemon_field="$(loom_source_requires_daemon_field "$loom_root")"
   fi
   # Minimal JSON string escaping (backslash and double-quote) -- remote URLs
   # are not expected to contain either, but a hand-rolled heredoc doesn't get
@@ -669,7 +670,7 @@ finalize_quick_install() {
   cat > "$target/.loom/install-metadata.json" <<METADATA
 {
   "loom_version": "${LOOM_VERSION:-unknown}",
-  "loom_commit": "${LOOM_COMMIT:-unknown}",
+  "loom_commit": "${LOOM_COMMIT:-unknown}",${requires_daemon_field}
   "install_date": "${install_date}",
   "loom_source_remote": "${loom_source_remote}",
   "installed_files": ${installed_files_json}
