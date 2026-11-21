@@ -997,6 +997,300 @@ impl PrSource for GhPrSource<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Read-only status report (#14834)
+// ---------------------------------------------------------------------------
+
+/// One **trusted** PR comment with the forge identity the report links by:
+/// [`PrSource::trusted_comments`] discards id, creation time and link after
+/// the trust filter; the status report needs them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerComment {
+    /// The forge-assigned comment id — the tie-breaker between equal
+    /// creation times (newer ids are newer comments).
+    pub id: u64,
+    /// The forge comment's creation time: the **only** ordering signal that
+    /// counts. An edit, a date written inside the review, or a more
+    /// favourable verdict never re-dates or re-ranks a comment (#14834).
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// `html_url`: the link the report prints.
+    pub url: String,
+    pub body: String,
+}
+
+impl MarkerComment {
+    /// From a REST issue-comment record. `None` when the body or an identity
+    /// field the report needs (id, creation time, link) is missing or
+    /// malformed; the caller treats that as an unreadable history, the same
+    /// fail-closed contract as a malformed record in
+    /// [`PrSource::trusted_comments`].
+    #[must_use]
+    pub fn from_record(row: &Value) -> Option<Self> {
+        Some(MarkerComment {
+            id: row.get("id").and_then(Value::as_u64)?,
+            created_at: row
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())?
+                .with_timezone(&chrono::Utc),
+            url: row.get("html_url").and_then(Value::as_str)?.to_string(),
+            body: row.get("body").and_then(Value::as_str)?.to_string(),
+        })
+    }
+}
+
+/// The two wire shapes a key marker appears in (#14834). Both compete for
+/// "effective" on exactly the same terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerFormat {
+    /// The lane's own `<!-- ratify:key=<k> sha=<40-hex> -->` first line.
+    Lane,
+    /// The hand-applied `<!-- RATIFY-KEY: <k> verdict=… block=… sha=… -->`
+    /// comment.
+    Hand,
+}
+
+impl MarkerFormat {
+    /// The name the report prints beside a link.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            MarkerFormat::Lane => "ratify:key",
+            MarkerFormat::Hand => "RATIFY-KEY",
+        }
+    }
+}
+
+/// One key marker found in a comment body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerFound {
+    pub key: Key,
+    /// The full 40-hex head the marker names.
+    pub sha: String,
+    pub format: MarkerFormat,
+    /// The `block=owner/repo#<n>` PR identity the marker carries, when it has
+    /// one. A block naming another repo or PR disqualifies the marker for
+    /// this PR.
+    pub block: Option<String>,
+}
+
+/// Every key marker in `body`. Only unquoted lines count: a marker inside a
+/// fenced code block or on a block-quote line is a quoted example, and review
+/// prose cannot establish a head or a key (#14834). Both wire formats are
+/// recognized wherever they appear unquoted; a hand marker without a full
+/// 40-hex `sha` attribute is not a marker.
+#[must_use]
+pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
+    let lane_re =
+        Regex::new(r"<!--\s*ratify:key=(ee|market)\s+sha=([0-9a-fA-F]{40})\s*-->").expect("static");
+    let hand_re =
+        Regex::new(r"<!--\s*RATIFY-KEY:\s*(ee|market)((?:\s+[a-z-]+=\S+)+)\s*-->").expect("static");
+    let mut out = Vec::new();
+    let mut fenced = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced || t.starts_with('>') {
+            continue;
+        }
+        for cap in lane_re.captures_iter(line) {
+            out.push(MarkerFound {
+                key: wire_key(&cap[1]),
+                sha: cap[2].to_string(),
+                format: MarkerFormat::Lane,
+                block: None,
+            });
+        }
+        for cap in hand_re.captures_iter(line) {
+            let mut sha = None;
+            let mut block = None;
+            for attr in cap[2].split_whitespace() {
+                let Some((name, value)) = attr.split_once('=') else {
+                    continue;
+                };
+                match name {
+                    "sha" => sha = Some(value.to_string()),
+                    "block" => block = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            let Some(sha) =
+                sha.filter(|s: &String| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                continue;
+            };
+            out.push(MarkerFound {
+                key: wire_key(&cap[1]),
+                sha,
+                format: MarkerFormat::Hand,
+                block,
+            });
+        }
+    }
+    out
+}
+
+/// `ee`/`market` from a marker capture.
+fn wire_key(name: &str) -> Key {
+    if name == "ee" {
+        Key::Ee
+    } else {
+        Key::Market
+    }
+}
+
+/// The link the report prints for one marker-carrying comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkerLink {
+    pub comment_id: u64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub url: String,
+    pub format: MarkerFormat,
+}
+
+impl MarkerLink {
+    fn of(comment: &MarkerComment, format: MarkerFormat) -> Self {
+        MarkerLink {
+            comment_id: comment.id,
+            created_at: comment.created_at,
+            url: comment.url.clone(),
+            format,
+        }
+    }
+}
+
+/// What the report says about one key at one head (#14834).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyStatus {
+    pub key: Key,
+    /// The **effective** marker: the newest trusted marker naming exactly the
+    /// head — the review to read first. `None` when a complete read found
+    /// none: the key is missing at this head.
+    pub effective: Option<MarkerLink>,
+    /// Every other eligible marker comment at the same head, oldest first —
+    /// the superseded duplicates the pre-#14800 retry pileup posted. Each
+    /// comment is linked once; nothing is deleted or edited.
+    pub superseded: Vec<MarkerLink>,
+}
+
+/// The whole report: one row per key for the PR's current head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneStatus {
+    pub head_sha: String,
+    pub ee: KeyStatus,
+    pub market: KeyStatus,
+}
+
+/// Resolve the report for `head_sha` from the PR's **complete, trusted**
+/// comment history (`MarkerComment`s; the caller applied the same trust
+/// policy as every marker read). A marker is eligible when it names the exact
+/// head (a full 40-hex SHA), and its `block=` identity — when it carries one
+/// — names exactly this PR. Newest by forge comment creation time wins, the
+/// numeric comment id breaks ties, and both formats compete on the same
+/// terms. A marker naming another head or another PR is neither effective nor
+/// superseded: it is not a marker for this head.
+#[must_use]
+pub fn resolve_status(
+    head_sha: &str,
+    nwo: &str,
+    pr: u64,
+    comments: &[MarkerComment],
+) -> LaneStatus {
+    let block_id = format!("{nwo}#{pr}");
+    let row = |key: Key| {
+        let mut eligible: Vec<MarkerLink> = comments
+            .iter()
+            .filter_map(|c| {
+                let marker = scan_markers(&c.body).into_iter().find(|m| {
+                    m.key == key
+                        && m.sha.eq_ignore_ascii_case(head_sha)
+                        && m.block.as_deref().is_none_or(|b| b == block_id)
+                })?;
+                Some(MarkerLink::of(c, marker.format))
+            })
+            .collect();
+        eligible.sort_by_key(|m| (m.created_at, m.comment_id));
+        let effective = eligible.pop();
+        KeyStatus {
+            key,
+            effective,
+            superseded: eligible,
+        }
+    };
+    LaneStatus {
+        head_sha: head_sha.to_string(),
+        ee: row(Key::Ee),
+        market: row(Key::Market),
+    }
+}
+
+impl GhPrSource<'_> {
+    /// The PR's current head SHA, or why it could not be read (#14834).
+    pub fn pr_head(&self, pr: u64) -> Result<String, String> {
+        let endpoint = format!("repos/{}/pulls/{pr}", self.nwo);
+        let gh = std::path::PathBuf::from(crate::gh_invocation::gh_bin());
+        let inv =
+            crate::claim_reconciliation::gh_call::read("ratification.pr_head", &gh, self.root)
+                .args(["api", &endpoint]);
+        match inv.run() {
+            crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
+                serde_json::from_slice::<Value>(&out.stdout)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/head/sha")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "head sha missing from the PR record".to_string())
+            }
+            other => Err(super::ratification_dispatch::gh_failure_detail(&other)),
+        }
+    }
+
+    /// The PR's complete issue-comment history as [`MarkerComment`]s —
+    /// trusted authors only, identity retained. `Err` when the listing or any
+    /// readable record is unreadable: the same fail-closed contract as
+    /// [`PrSource::trusted_comments`] (#14797), because an incomplete
+    /// history cannot prove which marker is effective. A successfully read
+    /// empty history is `Ok(vec![])`.
+    pub fn marker_comments(&self, pr: u64) -> Result<Vec<MarkerComment>, String> {
+        let list = self
+            .get_detailed(&format!("repos/{}/issues/{pr}/comments?per_page=100", self.nwo))
+            .map_err(|why| format!("comments could not be read: {why}"))?;
+        let Value::Array(list) = list else {
+            return Err("comments could not be read: listing was not an array".to_string());
+        };
+        const MALFORMED: &str = "comments could not be read: malformed comment record";
+        let mut out = Vec::new();
+        for row in &list {
+            if row.get("body").and_then(Value::as_str).is_none() {
+                return Err(MALFORMED.to_string());
+            }
+            if row.get("user") == Some(&Value::Null) {
+                // A deleted author is a readable record with no marker authority.
+                continue;
+            }
+            if !row
+                .pointer("/user/login")
+                .and_then(Value::as_str)
+                .is_some_and(|login| !login.trim().is_empty())
+            {
+                return Err(MALFORMED.to_string());
+            }
+            if !self.policy.trusts_json(row) {
+                continue;
+            }
+            let comment = MarkerComment::from_record(row).ok_or(MALFORMED.to_string())?;
+            out.push(comment);
+        }
+        Ok(out)
+    }
+}
+
 /// The real [`CommentSink`]: `forge_comment::post_comment` as the fleet identity.
 pub struct GhCommentSink<'a> {
     pub root: &'a std::path::Path,
