@@ -605,7 +605,7 @@ fn shadowed_shared_pool_hint(tokens_dir: &Path) -> String {
     )
 }
 
-fn read_token_file(path: &Path) -> std::io::Result<String> {
+pub(crate) fn read_token_file(path: &Path) -> std::io::Result<String> {
     let raw = std::fs::read_to_string(path)?;
     Ok(raw.split_whitespace().collect::<Vec<_>>().join(""))
 }

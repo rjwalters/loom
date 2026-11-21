@@ -116,6 +116,29 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
     Some(base.join("projects"))
 }
 
+/// `projects` directories of the persistent Claude seats (#14371). A seat's
+/// Claude runs with its own private `CLAUDE_CONFIG_DIR`, so its transcripts
+/// are not under [`claude_projects_dir`]; host readers must look here too.
+#[must_use]
+pub fn claude_seat_projects_dirs() -> Vec<PathBuf> {
+    use crate::tokens_pool::claude_seat as seat;
+    let Some(root) = seat::seat_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| seat::is_seat(&root, name))
+        .map(|name| seat::home_dir(&root, &name).join("projects"))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
 /// Whether `head` — the leading bytes of a Claude Code session transcript —
 /// shows that session being launched as `/loom:sweep <issue> …`.
 ///
@@ -592,6 +615,24 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use std::fs;
+
+    #[test]
+    #[serial_test::serial]
+    fn seat_projects_dirs_find_each_registered_seats_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["alpha", "beta"] {
+            let seat = root.path().join(name);
+            fs::create_dir_all(seat.join("home/projects/-w")).unwrap();
+            if name == "alpha" {
+                fs::write(seat.join(".session-managed.json"), "{}").unwrap();
+            }
+        }
+        std::env::set_var("LOOM_CLAUDE_SEAT_ROOT", root.path());
+        let dirs = claude_seat_projects_dirs();
+        std::env::remove_var("LOOM_CLAUDE_SEAT_ROOT");
+        // Only the registered seat is read; an unregistered directory is not.
+        assert_eq!(dirs, vec![root.path().join("alpha/home/projects")]);
+    }
 
     fn sweep_head(issue_args: &str) -> String {
         format!(
