@@ -84,6 +84,10 @@ pub(super) fn run_reconciliation_pass_over_roots(
         let (checked, reclaimed) = forge::reconcile_workspace(gh_bin, root, is_startup);
         stats.total_checked += checked;
         stats.total_reclaimed += reclaimed;
+        // #14816 (parent #14811): stale issue-side `loom:curating` claims the
+        // roll-requeue bug left behind. Lease-evidenced release, self-logging
+        // like building_heal below — no stats plumbing here.
+        super::curating_reclaim::reconcile_curating_claims(gh_bin, root);
         let (pr_checked, pr_reclaimed) = forge::reconcile_pr_claims(gh_bin, root);
         stats.total_pr_checked += pr_checked;
         stats.total_pr_reclaimed += pr_reclaimed;

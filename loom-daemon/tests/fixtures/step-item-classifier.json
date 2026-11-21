@@ -2103,6 +2103,33 @@
       ]
     },
     {
+      "name": "an approved issue still carrying loom:curating is skipped as claimed (#14811/#14816: the pick record names the reason no role draws it)",
+      "inputs": {
+        "issues": [
+          {
+            "number": 300,
+            "labels": [
+              "loom:curating",
+              "loom:triage",
+              "loom:issue",
+              "loom:very-important"
+            ]
+          }
+        ],
+        "pulls": []
+      },
+      "expected": [
+        {
+          "issue": 300,
+          "pr": null,
+          "state": "claimed",
+          "verdict": {
+            "pass": "claimed"
+          }
+        }
+      ]
+    },
+    {
       "name": "loom:epic: pass",
       "inputs": {
         "issues": [
