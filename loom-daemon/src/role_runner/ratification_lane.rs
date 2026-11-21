@@ -1074,21 +1074,18 @@ pub struct MarkerFound {
     pub block: Option<String>,
 }
 
-/// Every key marker in `body`. Only unquoted lines count: a marker inside a
-/// fenced code block or on a block-quote line is a quoted example, and review
-/// prose cannot establish a head or a key (#14834). Both wire formats are
-/// recognized wherever they appear unquoted; a hand marker without a full
-/// 40-hex `sha` attribute is not a marker.
+/// Every standalone key marker in `body` outside fenced code and block
+/// quotes (#14834). A hand marker must carry a full 40-hex `sha` attribute.
 #[must_use]
 pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
-    let lane_re =
-        Regex::new(r"<!--\s*ratify:key=(ee|market)\s+sha=([0-9a-fA-F]{40})\s*-->").expect("static");
-    let hand_re =
-        Regex::new(r"<!--\s*RATIFY-KEY:\s*(ee|market)((?:\s+[a-z-]+=\S+)+)\s*-->").expect("static");
+    let lane_re = Regex::new(r"^<!--\s*ratify:key=(ee|market)\s+sha=([0-9a-fA-F]{40})\s*-->$")
+        .expect("static");
+    let hand_re = Regex::new(r"^<!--\s*RATIFY-KEY:\s*(ee|market)((?:\s+[a-z-]+=[^\s<>]+)+)\s*-->$")
+        .expect("static");
     let mut out = Vec::new();
     let mut fenced = false;
     for line in body.lines() {
-        let t = line.trim_start();
+        let t = line.trim();
         if t.starts_with("```") || t.starts_with("~~~") {
             fenced = !fenced;
             continue;
@@ -1096,15 +1093,14 @@ pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
         if fenced || t.starts_with('>') {
             continue;
         }
-        for cap in lane_re.captures_iter(line) {
+        if let Some(cap) = lane_re.captures(t) {
             out.push(MarkerFound {
                 key: wire_key(&cap[1]),
                 sha: cap[2].to_string(),
                 format: MarkerFormat::Lane,
                 block: None,
             });
-        }
-        for cap in hand_re.captures_iter(line) {
+        } else if let Some(cap) = hand_re.captures(t) {
             let mut sha = None;
             let mut block = None;
             for attr in cap[2].split_whitespace() {
@@ -1117,9 +1113,7 @@ pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
                     _ => {}
                 }
             }
-            let Some(sha) =
-                sha.filter(|s: &String| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-            else {
+            let Some(sha) = sha.filter(|s| is_full_sha(s)) else {
                 continue;
             };
             out.push(MarkerFound {
@@ -1131,6 +1125,10 @@ pub fn scan_markers(body: &str) -> Vec<MarkerFound> {
         }
     }
     out
+}
+
+fn is_full_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// `ee`/`market` from a marker capture.
@@ -1237,15 +1235,16 @@ impl GhPrSource<'_> {
                 .args(["api", &endpoint]);
         match inv.run() {
             crate::cmd_out::CmdOutcome::Ran(out) if out.status.success() => {
-                serde_json::from_slice::<Value>(&out.stdout)
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/head/sha")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "head sha missing from the PR record".to_string())
+                let record: Value = serde_json::from_slice(&out.stdout)
+                    .map_err(|_| "PR record was not valid JSON".to_string())?;
+                let sha = record
+                    .pointer("/head/sha")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "head sha missing from the PR record".to_string())?;
+                if !is_full_sha(sha) {
+                    return Err("head sha in the PR record is not a full 40-hex SHA".to_string());
+                }
+                Ok(sha.to_string())
             }
             other => Err(super::ratification_dispatch::gh_failure_detail(&other)),
         }

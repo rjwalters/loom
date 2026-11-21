@@ -1399,17 +1399,28 @@ fn stale_head_and_foreign_pr_markers_are_neither_effective_nor_superseded() {
 fn quoted_and_fenced_lookalikes_never_establish_a_head_or_key() {
     let quoted = format!("> quoted example:\n> <!-- ratify:key=ee sha={DROP_HEAD} -->");
     let fenced = format!("```\n<!-- RATIFY-KEY: ee verdict=approve sha={DROP_HEAD} -->\n```");
-    assert!(scan_markers(&quoted).is_empty());
-    assert!(scan_markers(&fenced).is_empty());
-    let comments = vec![mc(
-        1,
-        "2026-11-20T19:00:00Z",
-        &format!("{quoted}\n{fenced}"),
-    )];
+    let lane_body = lane_marker("ee");
+    let lane = lane_body.lines().next().unwrap();
+    let hand = hand_marker("ee", "approve");
+    let examples = [
+        quoted,
+        fenced,
+        format!("Example: `{lane}`"),
+        format!("`{hand}`"),
+        format!("{lane} trailing prose"),
+        format!("{hand} {lane}"),
+    ];
+    for example in &examples {
+        assert!(scan_markers(example).is_empty(), "{example}");
+    }
+    let comments = vec![
+        mc(1, "2026-11-20T19:00:00Z", &lane_body),
+        mc(2, "2026-11-20T19:01:00Z", &examples.join("\n")),
+    ];
     let s = resolve_status(DROP_HEAD, "o/r", 98, &comments);
-    assert!(s.ee.effective.is_none());
-    // The same marker line, unquoted, counts.
-    assert_eq!(scan_markers(&lane_marker("ee")).len(), 1);
+    assert_eq!(s.ee.effective.unwrap().comment_id, 1);
+    assert!(s.ee.superseded.is_empty());
+    assert_eq!(scan_markers(&hand).len(), 1);
 }
 
 #[test]
@@ -1441,6 +1452,7 @@ fn a_comment_carrying_several_markers_for_one_key_links_once() {
 
 #[test]
 fn status_reads_head_and_history_through_the_forge_and_performs_only_reads() {
+    use crate::cli::ratification_lane_cmd::{handle, Action};
     use crate::comment_trust::TrustPolicy;
     use crate::forge_identity::{FleetLogins, Placement, RouteDecision};
     use crate::gh_invocation::cwd_route::{CwdAnswer, DeriveEnv};
@@ -1595,6 +1607,30 @@ esac"#,
     std::fs::write(dir.path().join("prfail"), "").unwrap();
     assert!(source.pr_head(98).is_err());
     std::fs::remove_file(dir.path().join("prfail")).unwrap();
+
+    // A malformed captured head stops the actual status command before it
+    // reads comment history, even when that history is readable.
+    std::fs::write(dir.path().join("reply"), "[]").unwrap();
+    for invalid in [
+        "".to_string(),
+        "a".repeat(39),
+        "a".repeat(41),
+        "g".repeat(40),
+    ] {
+        let pr = json!({"head": {"sha": invalid}});
+        std::fs::write(dir.path().join("pr"), pr.to_string()).unwrap();
+        let before = std::fs::read_to_string(&calls).unwrap();
+        let error = handle(Action::Status {
+            pr: 98,
+            repo: Some("o/r".to_string()),
+            root: Some(dir.path().to_path_buf()),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("head could not be read") && error.contains("40-hex"), "{error}");
+        let after = std::fs::read_to_string(&calls).unwrap();
+        assert_eq!(after.strip_prefix(&before), Some("api repos/o/r/pulls/98\n"));
+    }
 
     // Every forge call was a read: `gh api <endpoint>` with no method verb.
     let seen = std::fs::read_to_string(&calls).unwrap();
