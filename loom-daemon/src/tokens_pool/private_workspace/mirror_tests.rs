@@ -137,6 +137,21 @@ fn store(root: &Path) -> MirrorStore {
     MirrorStore::open(root, &id()).unwrap()
 }
 
+fn store_after_marker(root: &Path) -> MirrorStore {
+    let id = id();
+    let dir = root.join(&id.slug);
+    std::fs::create_dir_all(&dir).unwrap();
+    save(
+        &dir.join(MARKER),
+        &Marker {
+            protocol: MIRROR_PROTOCOL.into(),
+            key: id.key,
+        },
+    )
+    .unwrap();
+    store(root)
+}
+
 // --- Creation, pinning, convergence --------------------------------------
 
 #[test]
@@ -234,29 +249,64 @@ fn a_reused_slug_whose_repository_id_moved_is_a_replacement_not_this_store() {
 #[serial_test::serial(private_workspace_fork)]
 fn an_interrupted_creation_is_completed_by_a_repeat_and_never_half_kept() {
     let _fork = tests::fork_guard();
-    let root = tempfile::tempdir().unwrap();
     let proof = default_proof();
-    // Simulate a crash after the marker but before the mirror repo and grant.
-    std::fs::create_dir_all(root.path().join(id().slug)).unwrap();
-    std::fs::write(
-        root.path().join(id().slug).join("mirror.json"),
-        serde_json::to_string(&serde_json::json!({
-            "protocol": MIRROR_PROTOCOL,
-            "key": id().key,
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    // `open` accepts the marker-only directory as ours; the repeat completes.
-    let store = store(root.path());
-    assert_eq!(
-        store
-            .refresh_with(&proof, at(1_800_000_000), &RecordingFetch::ok())
-            .unwrap(),
-        Refreshed::Fetched
-    );
-    assert!(store.git_dir().join("config").is_file());
-    assert_eq!(store.pinned_grant().unwrap().unwrap(), proof.grant().clone());
+    struct RetentionCheckingFetch(RecordingFetch);
+    impl MirrorFetch for RetentionCheckingFetch {
+        fn fetch(&self, git_dir: &Path, reader: &ProvedReader) -> Result<()> {
+            verify_mirror_config(git_dir)?;
+            self.0.fetch(git_dir, reader)
+        }
+    }
+
+    for initial_config in [
+        None,
+        Some("[core]\n\tbare = true\n"),
+        Some("[core]\n\tbare = true\n[gc]\n\tauto = 0\n[fetch]\n\tprune = false\n"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store = store_after_marker(root.path());
+        if let Some(config) = initial_config {
+            // Synthetic config from a later interruption, before pinning the grant.
+            let git_dir = store.git_dir();
+            std::fs::create_dir(&git_dir).unwrap();
+            std::fs::write(git_dir.join("config"), config).unwrap();
+            assert!(verify_mirror_config(&git_dir).is_err());
+        }
+        let fetch = RetentionCheckingFetch(RecordingFetch::ok());
+        assert_eq!(
+            store
+                .refresh_with(&proof, at(1_800_000_000), &fetch)
+                .unwrap(),
+            Refreshed::Fetched
+        );
+        assert_eq!(fetch.0.calls(), 1);
+        assert_eq!(store.pinned_grant().unwrap().unwrap(), proof.grant().clone());
+    }
+}
+
+#[test]
+#[serial_test::serial(private_workspace_fork)]
+fn an_existing_config_with_conflicting_retention_refuses_before_the_fetch_leg() {
+    let _fork = tests::fork_guard();
+    let root = tempfile::tempdir().unwrap();
+    let store = store_after_marker(root.path());
+    let git_dir = store.git_dir();
+    std::fs::create_dir(&git_dir).unwrap();
+    let path = git_dir.join("config");
+    let fetch = RecordingFetch::ok();
+    let proof = default_proof();
+    for config in [
+        "[core]\n\tbare = true\n[fetch]\n\tprune = true\n",
+        "[core]\n\tbare = true\n[gc]\n\tauto = 0\n\tauto = 0\n",
+    ] {
+        std::fs::write(&path, config).unwrap();
+        assert!(store
+            .refresh_with(&proof, at(1_800_000_000), &fetch)
+            .is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), config);
+        assert_eq!(fetch.calls(), 0);
+        assert!(store.pinned_grant().unwrap().is_none());
+    }
 }
 
 #[test]

@@ -243,11 +243,13 @@ impl MirrorStore {
                 },
             )?;
         }
-        // A partial mirror (marker present, git dir not yet created) is
-        // completed here; a complete one is left alone.
-        if !self.git_dir().join("config").exists() {
-            init_bare(&self.git_dir())?;
+        let git_dir = self.git_dir();
+        // Git can leave a bare config before our retention writes finish.
+        // Complete both steps before pinning the first grant.
+        if !git_dir.join("config").exists() {
+            store_git(&["init", "--bare", "--quiet", &git_dir.to_string_lossy()], LOCAL_TIMEOUT)?;
         }
+        ensure_mirror_retention(&git_dir)?;
         if self.pinned_grant()?.is_none() {
             // A store that pins no grant has never been borrowed from; this
             // proof's grant is the first authority, or the completion of an
@@ -469,28 +471,39 @@ fn store_git(args: &[&str], timeout: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Create the bare mirror repository with retention-first configuration:
-/// automatic gc disabled and fetch pruning off at the config level, so even
-/// a hand-run `git fetch` inside the mirror cannot drop objects a seat may
-/// still reference (operator ruling 2026-11-19, condition 3).
-fn init_bare(git_dir: &Path) -> Result<()> {
-    store_git(&["init", "--bare", "--quiet", &git_dir.to_string_lossy()], LOCAL_TIMEOUT)?;
-    let config = |key: &str, value: &str| {
-        store_git(
-            &[
-                "--git-dir",
-                &git_dir.to_string_lossy(),
-                "config",
-                key,
-                value,
-            ],
-            LOCAL_TIMEOUT,
-        )
-    };
-    config("gc.auto", "0")?;
-    config("fetch.prune", "false")?;
-    config("fetch.prunetags", "false")?;
-    Ok(())
+/// Disable automatic gc and fetch pruning, even for a hand-run fetch inside
+/// the mirror (operator ruling 2026-11-19, condition 3).
+const RETENTION: [(&str, &str, &str); 3] = [
+    ("gc", "auto", "0"),
+    ("fetch", "prune", "false"),
+    ("fetch", "prunetags", "false"),
+];
+
+/// Called under the store lock. An ordinary or partially written bare config
+/// can be completed, but an unfamiliar or conflicting config is left alone.
+fn ensure_mirror_retention(git_dir: &Path) -> Result<()> {
+    let present = inspect_mirror_config(git_dir)?;
+    if present.iter().all(|&key| key) {
+        return Ok(());
+    }
+    let config = git_dir.join("config");
+    for ((section, key, value), present) in RETENTION.into_iter().zip(present) {
+        if !present {
+            let name = format!("{section}.{key}");
+            store_git(
+                &[
+                    "config",
+                    "--file",
+                    &config.to_string_lossy(),
+                    "--no-includes",
+                    &name,
+                    value,
+                ],
+                LOCAL_TIMEOUT,
+            )?;
+        }
+    }
+    verify_mirror_config(git_dir)
 }
 
 /// The only configuration keys a mirror may carry: what `git init --bare`
@@ -498,49 +511,76 @@ fn init_bare(git_dir: &Path) -> Result<()> {
 /// `url.*.insteadOf` rewrite, an `http.*` proxy or credential route, an
 /// unknown `remote.*` — refuses the fetch: repo-local config is a separate
 /// injection channel the proved environment does not mask (#14726 release
-/// review, item 2). Key VALUES are never surfaced, only key names.
-fn verify_mirror_config(git_dir: &Path) -> Result<()> {
-    let bytes = std::fs::read(git_dir.join("config"))
+/// review, item 2). A retention setting counts only in the plain section,
+/// with the exact module-written value, and without a duplicate. Key values
+/// are never surfaced.
+fn inspect_mirror_config(git_dir: &Path) -> Result<[bool; RETENTION.len()]> {
+    let config = git_dir.join("config");
+    if !std::fs::symlink_metadata(&config)
+        .with_context(|| format!("mirror config unreadable at {}", git_dir.display()))?
+        .is_file()
+    {
+        bail!("mirror config must be a regular file");
+    }
+    let bytes = std::fs::read(config)
         .with_context(|| format!("mirror config unreadable at {}", git_dir.display()))?;
     let text = String::from_utf8_lossy(&bytes);
     let mut section = String::new();
+    let mut plain_section = false;
+    let mut present = [false; RETENTION.len()];
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
+        if line.ends_with('\\') {
+            bail!("mirror config has a continued setting, which this module never wrote");
+        }
         if let Some(header) = line.strip_prefix('[') {
-            let header = header.strip_suffix(']').unwrap_or(header);
+            let closed = header.strip_suffix(']');
+            let header = closed.unwrap_or(header);
             let (base, _) = header.split_once(" \"").unwrap_or((header, ""));
             section = base.to_ascii_lowercase();
+            plain_section = closed.is_some() && base == header;
             continue;
         }
-        let key = line
-            .split('=')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        if !allowed_config_key(&section, &key) {
+        let (key, value) = line.split_once('=').unwrap_or((line, ""));
+        let key = key.trim().to_ascii_lowercase();
+        if let Some(index) = RETENTION
+            .iter()
+            .position(|&(s, k, _)| s == section && k == key)
+        {
+            if !plain_section || present[index] || value.trim() != RETENTION[index].2 {
+                bail!("mirror retention setting {section}.{key} is invalid");
+            }
+            present[index] = true;
+        } else if !allowed_core_config_key(&section, &key) {
             bail!(
                 "mirror config carries {section}.{key}, which this module never wrote; refusing \
                  to fetch through it"
             );
         }
     }
+    Ok(present)
+}
+
+fn verify_mirror_config(git_dir: &Path) -> Result<()> {
+    let present = inspect_mirror_config(git_dir)?;
+    for ((section, key, _), present) in RETENTION.into_iter().zip(present) {
+        if !present {
+            bail!("mirror config is missing retention setting {section}.{key}");
+        }
+    }
     Ok(())
 }
 
-fn allowed_config_key(section: &str, key: &str) -> bool {
+fn allowed_core_config_key(section: &str, key: &str) -> bool {
     matches!(
         (section, key),
         ("core", "repositoryformatversion")
             | ("core", "filemode")
             | ("core", "bare")
             | ("core", "logallrefupdates")
-            | ("gc", "auto")
-            | ("fetch", "prune")
-            | ("fetch", "prunetags")
     )
 }
 
