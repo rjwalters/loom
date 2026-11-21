@@ -139,6 +139,58 @@ fn codex_models_are_priced_on_both_cards() {
     }
 }
 
+/// #14842: a GLM usage span — the 2,009-row gap the issue was filed over —
+/// carries the estimate and pricing provenance on BOTH cards, bare and
+/// provider-qualified. 1,000 uncached input + 1,000 output tokens of
+/// `glm-5.3-flash` at the 2026-11-21 list prices ($0.15/$0.50 per MTok):
+/// 0.00015 + 0.0005 = USD 0.000650.
+#[test]
+fn glm_flash_usage_spans_carry_a_usd_estimate_on_both_cards() {
+    let shipped = PricingCard::load(&shipped_asset_path()).unwrap();
+    for pricing in [Pricing::with(None), Pricing::with(Some(&shipped))] {
+        let spans = spans_for(
+            &[
+                model("glm-5.3-flash", 1000, 1000, 0, 0, 0),
+                model("zai-coding-plan/glm-5.3-flash", 1000, 1000, 0, 0, 0),
+            ],
+            &pricing,
+        );
+        assert_eq!(spans.len(), 2, "one span per model spelling");
+        for span in &spans {
+            assert_eq!(
+                span.attributes["loom.cost.usd_estimate"], "0.000650",
+                "{:?}",
+                span.attributes["loom.model"]
+            );
+            assert_eq!(span.attributes["gen_ai.cost.usd_estimate"], "0.000650");
+            assert_eq!(
+                span.attributes["loom.pricing.verified_on"], "2026-09-18",
+                "the card-wide date stays at the OLDEST vendor check"
+            );
+            assert_eq!(span.attributes["loom.pricing.source"], pricing.source());
+        }
+    }
+}
+
+/// #14842: disjoint cached-input and cache-write buckets. Neither vendor
+/// publishes a write price, so a write bills at the uncached INPUT rate while
+/// a read bills at the much cheaper cached rate — equal 1k buckets must not
+/// fold into one rate. glm-5.3: 0.00026 + 0.0014 + 0.0014 = 0.00306;
+/// gemini-4-carbon: 0.0001 + 0.002 + 0.002 = 0.0041.
+#[test]
+fn glm_and_gemini_cache_reads_and_writes_bill_at_disjoint_rates() {
+    let shipped = PricingCard::load(&shipped_asset_path()).unwrap();
+    for pricing in [Pricing::with(None), Pricing::with(Some(&shipped))] {
+        let spans = spans_for(&[model("glm-5.3", 0, 0, 1000, 1000, 1000)], &pricing);
+        assert_eq!(spans.len(), 1);
+        assert!((usd(&spans[0]) - 0.00306).abs() < 1e-9, "{}", usd(&spans[0]));
+
+        let spans = spans_for(&[model("google/gemini-4-carbon", 0, 0, 1000, 1000, 1000)], &pricing);
+        assert_eq!(spans.len(), 1);
+        assert!((usd(&spans[0]) - 0.0041).abs() < 1e-9, "{}", usd(&spans[0]));
+    }
+}
+
 const UNATTRIBUTED: &str = crate::script_helpers::sweep_experiment::UNATTRIBUTED_MODEL;
 
 #[test]

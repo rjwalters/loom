@@ -647,6 +647,176 @@ mod tests {
         assert!(shipped().lookup("totally-not-a-model").is_none());
     }
 
+    /// #14842: rate lookup and row identity are the SAME match — every id
+    /// that prices also reports which row priced it, and the GLM/Gemini
+    /// exact-match ids land on their own rows, not a neighbour's.
+    #[test]
+    fn rate_lookup_and_row_identity_agree_for_the_exact_match_rows() {
+        let card = shipped();
+        for id in [
+            "glm-5.3",
+            "zai/glm-5.3",
+            "zai-coding-plan/glm-5.3",
+            "glm-5.3-flash",
+            "zai/glm-5.3-flash",
+            "zai-coding-plan/glm-5.3-flash",
+            "gemini-3.5-flash",
+            "google/gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "google/gemini-3.6-flash",
+            "gemini-4-carbon",
+            "google/gemini-4-carbon",
+            "gemini-4-neon",
+            "google/gemini-4-neon",
+            // ...and an older substring row, which must be untouched.
+            "claude-opus-5",
+        ] {
+            assert_eq!(
+                card.lookup(id).is_some(),
+                card.matching_row_id(id).is_some(),
+                "{id}: one entry point prices it and the other does not"
+            );
+        }
+        assert_eq!(card.matching_row_id("glm-5.3-flash"), Some("glm-5.3-flash"));
+        assert_eq!(card.matching_row_id("zai/glm-5.3"), Some("glm-5.3"));
+        // The bundled 3.5 endpoint auto-routes to 3.6 Flash, so both spellings
+        // report the one shared row...
+        assert_eq!(card.matching_row_id("gemini-3.5-flash"), Some("gemini-3.5-flash"));
+        assert_eq!(card.matching_row_id("google/gemini-3.6-flash"), Some("gemini-3.5-flash"));
+        // ...and a near-miss reports no row at all, on either entry point.
+        for id in [
+            "glm-5.3-flashx",
+            "zai/glm-5.3-flashx",
+            "gemini-3.5-flash-lite",
+        ] {
+            assert!(card.matching_row_id(id).is_none(), "{id}");
+            assert!(card.lookup(id).is_none(), "{id}");
+        }
+    }
+
+    /// #14842 compatibility fixture: the shipped asset must stay loadable by
+    /// the DEPLOYED schema-1 parser (v0.20.8 — the daemons already installed
+    /// across the fleet, which resync delivers this file to). That parser's
+    /// rules are reproduced here field by field: `deny_unknown_fields` rows,
+    /// an exact-key alias map, then the ordered substring cascade. The
+    /// GLM/Gemini rows reach exact matching THROUGH those rules (aliases onto
+    /// `#`-suffixed selectors), so an unknown row field, a schema_version
+    /// bump, or a selector a real id could contain would strand every
+    /// deployed daemon on its compiled card — which is exactly what this
+    /// test exists to catch.
+    #[test]
+    fn the_shipped_asset_stays_loadable_by_the_deployed_schema1_parser() {
+        let text = std::fs::read_to_string(shipped_asset_path()).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // The deployed parser only understands schema 1 and rejects the WHOLE
+        // asset over a row field it does not know.
+        assert_eq!(
+            doc["schema_version"].as_u64(),
+            Some(u64::from(SCHEMA_VERSION)),
+            "a schema_version bump strands deployed daemons on the compiled card"
+        );
+        const DEPLOYED_ROW_FIELDS: &[&str] = &[
+            "id",
+            "match",
+            "input_per_1k",
+            "output_per_1k",
+            "cache_read",
+            "cache_rates",
+        ];
+        for row in doc["rows"].as_array().expect("rows is an array") {
+            for field in row.as_object().expect("each row is an object").keys() {
+                assert!(
+                    DEPLOYED_ROW_FIELDS.contains(&field.as_str()),
+                    "deployed v0.20.8 rejects the whole asset over unknown row field {field:?}"
+                );
+            }
+        }
+
+        // ...and its resolution rules, re-implemented: lowercase, exact alias
+        // key, then the first row whose `match` substring the id contains.
+        let aliases: std::collections::HashMap<String, String> = doc["aliases"]
+            .as_object()
+            .expect("aliases is an object")
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_lowercase(),
+                    v.as_str()
+                        .expect("alias targets are strings")
+                        .to_lowercase(),
+                )
+            })
+            .collect();
+        let deployed_rate = |model: &str| -> Option<(f64, f64)> {
+            let lowered = model.to_lowercase();
+            let resolved = aliases.get(&lowered).cloned().unwrap_or(lowered);
+            doc["rows"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .find_map(|row| {
+                    let hit =
+                        row["match"].as_array().expect("match").iter().any(|m| {
+                            resolved.contains(m.as_str().expect("match entries are strings"))
+                        });
+                    hit.then(|| {
+                        (
+                            row["input_per_1k"].as_f64().expect("input_per_1k"),
+                            row["output_per_1k"].as_f64().expect("output_per_1k"),
+                        )
+                    })
+                })
+        };
+
+        // An older row keeps its published rate through the deployed rules...
+        let opus = deployed_rate("claude-opus-5").expect("opus still prices");
+        assert!((opus.0 - 0.005).abs() < f64::EPSILON, "{}", opus.0);
+        assert!((opus.1 - 0.025).abs() < f64::EPSILON, "{}", opus.1);
+        // ...the new exact ids price bare and provider-qualified...
+        for id in [
+            "glm-5.3",
+            "zai/glm-5.3",
+            "zai-coding-plan/glm-5.3",
+            "glm-5.3-flash",
+            "zai/glm-5.3-flash",
+            "zai-coding-plan/glm-5.3-flash",
+            "gemini-3.5-flash",
+            "google/gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "google/gemini-3.6-flash",
+            "gemini-4-carbon",
+            "google/gemini-4-carbon",
+            "gemini-4-neon",
+            "google/gemini-4-neon",
+        ] {
+            assert!(
+                deployed_rate(id).is_some(),
+                "{id} must price through the deployed parser's own rules"
+            );
+        }
+        // ...at the vendor rates (spot-check one per family)...
+        let flash = deployed_rate("glm-5.3-flash").expect("glm flash prices");
+        assert!((flash.0 - 0.00015).abs() < f64::EPSILON, "{}", flash.0);
+        assert!((flash.1 - 0.0005).abs() < f64::EPSILON, "{}", flash.1);
+        // ...and the near-misses the plain substring cascade used to swallow
+        // stay unpriced rather than inheriting the nearest listed rate.
+        for id in [
+            "glm-5.3-flashx",
+            "zai/glm-5.3-flashx",
+            "gemini-3.5-flash-lite",
+        ] {
+            assert!(
+                deployed_rate(id).is_none(),
+                "{id} must stay unpriced under the deployed rules"
+            );
+        }
+
+        // The live parser — same rules as the deployed one — adopts the
+        // document whole (all-or-nothing).
+        assert!(PricingCard::from_str_at(&text, &shipped_asset_path()).is_ok());
+    }
+
     #[test]
     fn the_reduced_cache_read_multiplier_applies_only_to_the_5_1_rows() {
         let card = shipped();
