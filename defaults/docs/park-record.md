@@ -189,7 +189,7 @@ a `Blocked by`, so closing #N never lifts the hold. Worked example, PR 8314
 holds with `Blocked by: #8301` recorded, #8301 closes:
 
 ```
-check_and_unblock_prs → PR 8314: state=champion-hold → skipped (no unblock, no comment)
+check_and_unblock_prs → PR 8314: state=champion-hold → kept parked, with one notice
 ```
 
 Release stays Champion's (a release signal, `champion-pr-merge.md` "Sticky
@@ -307,10 +307,17 @@ Park withdrawn: #8860 — by=guide at=2026-11-15T12:00:00Z reason="ruling 2026-1
 `check_and_unblock` — scoped to issues only — was never a candidate list a
 parked PR could appear on at all (#8925's first defect). `check_and_unblock`
 calls `check_and_unblock_prs` once, after its own issue loop, to cover the PR
-population; the three functions below are its full definition, read on demand
+population. The functions below are its full definition, read on demand
 from `guide.md`'s "Unblocking Pull Requests (#8925)" section rather than
 inlined there (the role-prompt size ratchet: guide.md is installed at two
 depths and its whole prompt prefix is frozen at its current size).
+Dependency states come from `guide.md`'s shared `resolve_dep_states` (#14710)
+— the same `loom-daemon dep-recheck-fingerprint dep-states` resolver the
+issue side uses, so the two sweeps cannot disagree about whether a dependency
+is terminal.
+
+A frozen PR is skipped during listing. The final PR read checks again for a
+freeze before any notice or label edit.
 
 A parked PR's "restore to the queue" differs from an issue's in two ways:
 there is no `loom:issue` to restore (a PR was never curated), and the
@@ -319,61 +326,106 @@ parked PR **is** the implementation, so there is nothing else to look up.
 
 ```bash
 check_and_unblock_prs() {
-  "$GH_READ" pr list --label "loom:blocked" --state open --json number,body,title | jq -c '.[]' | while read -r pr_row; do
-    local number=$(printf '%s\n' "$pr_row" | jq -r '.number')
-    local body=$(printf '%s\n' "$pr_row" | jq -r '.body')
-    local title=$(printf '%s\n' "$pr_row" | jq -r '.title')
-
-    [ "$(has_permanent_block "$number")" = "true" ] && continue  # #8742, guide.md
-
-    # A standing Champion hold is a human evidence gate, not a dependency wait
-    # (#10937): closing a `Blocked by` number it records never releases it.
-    # Unreadable (exit 3) fails safe; foreign-park/clear/exit 2 go on.
-    local hc hrc
-    hc=$(loom-daemon champion-hold classify --pr "$number" 2>/dev/null); hrc=$?
-    case "$hrc $hc" in "0 "*" state=champion-hold "*|"3 "*) continue ;; esac
-
-    local deps=$(parse_dependencies "$body")
-
-    if [ -z "$deps" ]; then
-      # No parseable dependency in the PR's own BODY — a park record that was
-      # never written, or one that lives only in a comment (#8925's second
-      # defect). Skip rather than guess; `loom-daemon check-stale-blocked`
-      # reports this case as UNDOCUMENTED or PROSE-ONLY for a human.
-      continue
+  local listing limit=1000 focus="${1:-}"
+  if [ -n "$focus" ]; then
+    listing=$(gh pr view "$focus" --json number,state,body,labels) || return
+    listing=$(jq -c '[select(.state == "OPEN" and any(.labels[]; .name == "loom:blocked"))]' <<<"$listing") || return
+  else
+    listing=$("$GH_READ" pr list --label "loom:blocked" --state open --limit "$limit" --json number,body,labels) || return
+  fi
+  if [ "$(jq 'length' <<<"$listing")" = "$limit" ]; then
+    echo "WARNING: blocked PR listing reached its $limit limit; additional PRs may be unexamined" >&2
+  fi
+  jq -c '.[] | select(.labels | type == "array" and all(.[]; .name != "loom:frozen"))' <<<"$listing" | while read -r pr_row; do
+    local number body records deps dep_verdict resolved_deps='' pr_json trusted hold reason marker detail restore_label
+    local head park_hash episode='' handoff_marker='' handoff_status receipt='' reason_only=false base route
+    number=$(jq -r '.number' <<<"$pr_row")
+    body=$(jq -r '.body' <<<"$pr_row")
+    records=$(printf '%s' "$body" | loom-daemon park-record parse --json) || continue
+    deps=$(jq -r '[.records[] | select(.blocker != null)
+      | if .blocker_repo then "\(.blocker_repo)#\(.blocker)" else (.blocker | tostring) end]
+      | unique[]' <<<"$records") || continue
+    if [ -n "$deps" ]; then
+      dep_verdict=$(resolve_dep_states "$deps")
+      [ "$(sed -n '1p' <<<"$dep_verdict")" = true ] || continue
+      resolved_deps=$(sed -n '2p' <<<"$dep_verdict")
+    else
+      jq -e '.records | length == 1 and .[0].blocker == null' <<<"$records" >/dev/null || continue
+      reason_only=true
     fi
 
-    local all_resolved=true
-    local resolved_deps=""
-
-    for dep in $deps; do
-      # A declared blocker can itself be an issue or a PR — try both reads.
-      local dn="${dep##*#}" dr=""; [[ "$dep" == */* ]] && dr="${dep%#*}"  # OWNER/REPO#N: own repo (#10443)
-      local state
-      state=$(gh issue view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
-        || state=$(gh pr view "$dn" ${dr:+--repo "$dr"} --json state --jq '.state' 2>/dev/null) \
-        || state="UNKNOWN"
-      if [ "$state" != "CLOSED" ] && [ "$state" != "MERGED" ]; then
-        all_resolved=false
-        break
-      fi
-      resolved_deps="$resolved_deps $dr#$dn"
-    done
-
-    if [ "$all_resolved" = true ]; then
-      # #4634/#7267 gate, transposed (#8925): the parked PR's OWN state can
-      # still supersede a cleared dependency — see pr_has_superseding_block.
-      if [ "$(pr_has_superseding_block "$number")" = "true" ]; then
-        echo "Skipped PR #$number (declared blocker resolved, but the PR itself cannot proceed — leaving loom:blocked): $title"
+    trusted=$(loom-daemon forge trusted-comments --fetch "$number" --with-body) || continue
+    jq -e 'type == "array"' <<<"$trusted" >/dev/null || continue
+    hold=$(loom-daemon champion-hold classify --pr "$number") || continue
+    # Read the PR directly immediately before acting. A new park body, a missing
+    # label, a freeze, or a closed PR invalidates the listing snapshot.
+    pr_json=$(gh pr view "$number" --json state,body,labels,mergeable,mergeStateStatus,reviewDecision,headRefOid,baseRefOid,baseRefName,isDraft) || continue
+    jq -e --arg body "$body" '
+      .state == "OPEN" and ((.body | sub("\\n+$"; "")) == $body)
+      and any(.labels[]; .name == "loom:blocked") and all(.labels[]; .name != "loom:frozen")
+      and has("reviewDecision")
+      and (.reviewDecision | IN(null, "", "APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"))' <<<"$pr_json" >/dev/null || continue
+    head=$(jq -r '.headRefOid // ""' <<<"$pr_json")
+    park_hash=$(printf '%s' "$body" | git hash-object --stdin) || continue
+    if pr_conflict_snapshot "$pr_json"; then
+      episode=$(pr_park_episode "$number") || continue
+      handoff_marker="<!-- loom:guide-conflict-handoff head=$head park=$park_hash event=$episode -->"
+    fi
+    if [ "$reason_only" = true ]; then
+      # This limited path never unblocks a mergeable reason-only PR. A checker,
+      # merge, or generic green-main observation cannot supply this evidence.
+      pr_conflict_snapshot "$pr_json" || continue
+      pr_has_reason_only_park "$records" || continue
+      records='{"records":[]}'
+    fi
+    # A prior handoff may have added both Doctor labels while keeping the park.
+    # Only our exact trusted marker makes that overlap an expected retry.
+    reason=$(pr_has_superseding_block "$hold" "$records" "$trusted" "$pr_json" "$handoff_marker") || continue
+    if [ "$reason_only" = true ]; then
+      [ "$reason" = merge-conflict ] || continue
+      receipt=$(pr_park_clearance_marker "$head" "$park_hash" "$episode") || continue
+      if ! pr_trusted_marker "$receipt" "$trusted"; then
+        base=$(jq -r '.baseRefName' <<<"$pr_json") || continue
+        route=$(loom-daemon park-record guide-conflict-route --base-ref "$base") || continue
+        [ "$route" = enabled ] || continue
+        printf 'PR #%s: Guide must verify the exact recorded park cause before conflict routing. Receipt key %s\n' "$number" "$receipt"
         continue
       fi
-
-      local restore_label
-      restore_label=$(previous_review_label "$number")
-      gh pr edit "$number" --remove-label "loom:blocked" --add-label "$restore_label"
-      gh pr comment "$number" --body "🔓 **Unblocked**: Declared blocker(s) resolved ($resolved_deps). Restored \`$restore_label\`."
-      echo "Unblocked PR #$number (restored $restore_label): $title"
     fi
+    if [ "$reason" = merge-conflict ] && pr_conflict_snapshot "$pr_json"; then
+      handoff_status=0
+      route_parked_pr_conflict "$number" "$pr_json" "$trusted" "$handoff_marker" "$deps" "$receipt" "$episode" || handoff_status=$?
+      case "$handoff_status" in
+        0) continue ;;
+        3) reason=conflict-route-disabled ;;
+        *) continue ;;  # an uncertain or partial transition remains parked
+      esac
+    fi
+    [ "$reason_only" != true ] || [ "$reason" = conflict-route-disabled ] || continue
+    case "$reason" in
+      unknown) continue ;;
+      clear) ;;
+      *)
+        marker="<!-- loom:guide-pr-superseding:$reason -->"
+        if jq -e --arg m "$marker" \
+          'any(.[]; any((.body // "" | split("\n"))[]; . == $m))' <<<"$trusted" >/dev/null; then
+          continue
+        fi
+        case "$reason" in
+          additional-park-record-*) detail="a separate park reason is recorded in the PR description" ;;
+          conflict-route-disabled) detail="Doctor conflict routing is disabled; the conflict still needs an operator's attention" ;;
+          *) detail="\`$reason\`" ;;
+        esac
+        ./.loom/scripts/post-comment.sh "$number" --pr --body "$marker
+
+**Guide kept this PR parked.** The original park cleared${resolved_deps:+ ($resolved_deps)}. The PR still has a superseding block: $detail." || continue
+        continue ;;
+    esac
+
+    restore_label=$(previous_review_label "$number" "$pr_json") || continue
+    gh pr edit "$number" --remove-label "loom:blocked" --add-label "$restore_label" || continue
+    ./.loom/scripts/post-comment.sh "$number" --pr --body "🔓 **Unblocked**: Declared blocker(s) resolved ($resolved_deps). Restored \`$restore_label\`."
+    echo "Unblocked PR #$number (restored $restore_label)"
   done
 }
 ```
@@ -388,51 +440,206 @@ lane:
 
 ```bash
 pr_has_superseding_block() {
-  local number="$1"
-  local pr_json
-  pr_json=$(gh pr view "$number" --json state,labels,mergeable,mergeStateStatus 2>/dev/null) || { echo "true"; return; }  # fail safe: an unread PR is never reported ready
-
-  local pr_state=$(printf '%s\n' "$pr_json" | jq -r '.state')
-  if [ "$pr_state" != "OPEN" ]; then
-    echo "true"  # merged/closed mid-check — not this routine's to act on
-    return
+  local hold="$1" records="$2" trusted="$3" pr_json="$4"
+  local handoff_marker="${5:-}" additional digest repair_retry=false
+  case "$hold" in
+    *' state=champion-hold '*' detail=ratification') echo ratification; return ;;
+    *' state=champion-hold '*' detail=critical-file') echo champion-critical-file; return ;;
+    *' state=champion-hold '*|*' state=stray-operator '*) echo champion-hold; return ;;
+    *' state=contradiction '*) echo contradictory-verdict; return ;;
+    *' state=stacked-on-loom-branch '*) echo stacked-base; return ;;
+    *' state=foreign-park '*|*' state=clear '*) ;;
+    *) echo unknown; return ;;
+  esac
+  if jq -e 'any(.[]; (.body // "") | test("(^|\n)[ \t]*<!-- loom:permanent-block -->[ \t\r]*(\n|$)"))' <<<"$trusted" >/dev/null; then
+    echo permanent-hold; return
   fi
-
-  local pr_hold=$(printf '%s\n' "$pr_json" | jq -r \
-    '[.labels[].name] | any(. == "loom:operator" or . == "loom:frozen")')
-  if [ "$pr_hold" = "true" ]; then
-    echo "true"
-    return
+  if jq -e '[.[] | select((.body // "" | startswith("<!-- loom:guide-pr-superseding:")
+    or startswith("<!-- loom:guide-conflict-handoff ") or startswith("<!-- loom:guide-park-cause-cleared ")) | not)]
+    | (last.body // "") | test("(^|\n)[ \t]*<!-- loom:hold-restored -->[ \t\r]*(\n|$)")' <<<"$trusted" >/dev/null; then
+    echo restored-hold; return
   fi
-
-  local pr_mergeable=$(printf '%s\n' "$pr_json" | jq -r '.mergeable')
-  local pr_merge_state=$(printf '%s\n' "$pr_json" | jq -r '.mergeStateStatus')
-  if [ "$pr_mergeable" = "CONFLICTING" ] || [ "$pr_merge_state" = "DIRTY" ] || [ "$pr_merge_state" = "CONFLICTING" ]; then
-    echo "true"
-    return
+  additional=$(jq -c '[.records[] | select(.blocker == null) | .reason] | unique' <<<"$records") || return
+  if [ "$additional" != '[]' ]; then
+    digest=$(git hash-object --stdin <<<"$additional") || return
+    echo "additional-park-record-$digest"; return
   fi
-
-  echo "false"
+  if [ -n "$handoff_marker" ] && pr_trusted_marker "$handoff_marker" "$trusted" &&
+    jq -e '[.labels[].name] | index("loom:merge-conflict") and index("loom:changes-requested")' <<<"$pr_json" >/dev/null; then
+    repair_retry=true
+  fi
+  jq -r --argjson retry "$repair_retry" '
+    [ .labels[].name ] as $labels
+    | if $labels | any(. == "loom:operator" or . == "loom:operator-only" or . == "loom:operator-decision"
+                    or . == "loom:operator-mechanical" or . == "loom:operator-blocked") then "operator-hold"
+      elif ($retry | not) and ($labels | index("loom:changes-requested")) and ($labels | index("loom:review-requested")) then "contradictory-verdict"
+      elif .reviewDecision == "CHANGES_REQUESTED" then "review-changes-requested"
+      elif .mergeable == "CONFLICTING" or .mergeStateStatus == "DIRTY" or .mergeStateStatus == "CONFLICTING" then "merge-conflict"
+      elif .mergeable == "MERGEABLE" and (.mergeStateStatus | IN("BLOCKED", "BEHIND", "CLEAN", "DRAFT", "HAS_HOOKS", "UNSTABLE")) then "clear"
+      else "unknown" end' <<<"$pr_json" || echo unknown
 }
 ```
 
+The conflict handoff uses the existing Doctor pair `loom:changes-requested`
+and `loom:merge-conflict`. It records Guide's decision, applies the pair while
+the park is still in force, then lifts the park after a fresh verification.
+It never issues a Judge verdict. A trusted handoff marker lets Guide resume an
+interrupted transition for the same head, park body, and label episode. Guide
+accepts only the first-line record its producer writes. The native policy
+checks the current base at both snapshots and resolves the effective Doctor
+lane from the work finder configuration and environment. An explicit
+`autonomous.roleRunner.roles` list omitting Doctor also keeps the park.
+A disabled lane records a superseding reason for the operator. An unreadable
+policy or a Loom stack base keeps the park in place.
+
+```bash
+pr_trusted_marker() {
+  jq -e --arg marker "$1" '
+    any(.[]; .number == null and ((.body // "") | split("\n") | first) == $marker)' \
+    <<<"$2" >/dev/null
+}
+
+pr_conflict_snapshot() {
+  jq -e '
+    .state == "OPEN" and .isDraft == false and .mergeable == "CONFLICTING"
+    and (.mergeStateStatus | IN("DIRTY", "CONFLICTING"))
+    and (.headRefOid | test("^[0-9a-f]{40}$")) and (.baseRefOid | test("^[0-9a-f]{40}$"))
+    and (.baseRefName | type == "string" and length > 0)
+    and any(.labels[]; .name == "loom:blocked")
+    and all(.labels[]; (.name | IN("loom:pr", "loom:frozen", "loom:operator", "loom:operator-only",
+      "loom:operator-decision", "loom:operator-mechanical", "loom:operator-blocked", "loom:sequenced",
+      "loom:reviewing", "loom:treating") | not))
+    and has("reviewDecision") and (.reviewDecision | IN(null, "", "APPROVED", "REVIEW_REQUIRED"))' \
+    <<<"$1" >/dev/null
+}
+
+pr_has_reason_only_park() {
+  jq -e '.records | length == 1 and (.[0] | .blocker == null and (.by | IN("judge", "doctor", "curator", "guide"))
+    and (.at | type == "string") and .transient == null and
+    (.reason | type == "string" and length > 0 and (ascii_downcase | contains("ci-gate") | not)))' \
+    <<<"$1" >/dev/null
+}
+
+pr_park_episode() {
+  local number="$1" events event
+  events=$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" --jq \
+    '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "loom:blocked") | "\(.event) \(.id)"') || return 1
+  event=$(tail -1 <<<"$events")
+  [[ "$event" =~ ^labeled\ [0-9]+$ ]] || return 1
+  printf '%s\n' "${event#labeled }"
+}
+
+pr_park_clearance_marker() {
+  printf '<!-- loom:guide-park-cause-cleared head=%s park=%s event=%s -->\n' "$1" "$2" "$3"
+}
+
+pr_record_park_clearance() {
+  local number="$1" expected="$2" evidence_file="$3" pr_json body records trusted hold head park marker evidence episode base route
+  [[ "$number" =~ ^[0-9]+$ ]] && [ -s "$evidence_file" ] || return 1
+  evidence=$(cat "$evidence_file") || return 1
+  [ -n "$evidence" ] || return 1
+  pr_json=$(gh pr view "$number" --json state,body,labels,mergeable,mergeStateStatus,reviewDecision,headRefOid,baseRefOid,baseRefName,isDraft) || return 1
+  pr_conflict_snapshot "$pr_json" || return 1
+  body=$(jq -r '.body' <<<"$pr_json") || return 1
+  records=$(printf '%s' "$body" | loom-daemon park-record parse --json) || return 1
+  pr_has_reason_only_park "$records" || return 1
+  trusted=$(loom-daemon forge trusted-comments --fetch "$number" --with-body) || return 1
+  jq -e 'type == "array"' <<<"$trusted" >/dev/null || return 1
+  hold=$(loom-daemon champion-hold classify --pr "$number") || return 1
+  [ "$(pr_has_superseding_block "$hold" '{"records":[]}' "$trusted" "$pr_json")" = merge-conflict ] || return 1
+  head=$(jq -r '.headRefOid' <<<"$pr_json") || return 1
+  park=$(printf '%s' "$body" | git hash-object --stdin) || return 1
+  base=$(jq -r '.baseRefName' <<<"$pr_json") || return 1
+  route=$(loom-daemon park-record guide-conflict-route --base-ref "$base") || return 1
+  [ "$route" = enabled ] || return 1
+  episode=$(pr_park_episode "$number") || return 1
+  marker=$(pr_park_clearance_marker "$head" "$park" "$episode") || return 1
+  [ "$marker" = "$expected" ] || return 1
+  if ! pr_trusted_marker "$marker" "$trusted"; then
+    ./.loom/scripts/post-comment.sh "$number" --pr --body "$marker
+
+**Guide verified the recorded park cause cleared.**
+
+$evidence" || return 1
+  fi
+  check_and_unblock_prs "$number"
+}
+
+route_parked_pr_conflict() {
+  local number="$1" snapshot="$2" trusted="$3" marker="$4" deps="$5" receipt="$6" episode="$7"
+  local route after head same hold base current resolved
+  base=$(jq -r '.baseRefName' <<<"$snapshot") || return 1
+  route=$(loom-daemon park-record guide-conflict-route --base-ref "$base") || return 1
+  case "$route" in
+    enabled) ;;
+    disabled) return 3 ;;
+    *) return 1 ;;
+  esac
+  head=$(jq -r '.headRefOid' <<<"$snapshot") || return 1
+  if ! pr_trusted_marker "$marker" "$trusted"; then
+    ./.loom/scripts/post-comment.sh "$number" --pr --body "$marker
+<!-- loom:base-conflict flagged -->
+
+**Guide verified the original park cleared.** The remaining base conflict at \`$head\` goes to Doctor via \`loom:changes-requested\` and \`loom:merge-conflict\`. The park is kept until the lane labels are confirmed." || return 1
+  fi
+  current=$(pr_park_episode "$number") || return 1
+  [ "$current" = "$episode" ] || return 1
+  gh pr edit "$number" --add-label "loom:changes-requested" --add-label "loom:merge-conflict" || return 1
+  after=$(gh pr view "$number" --json state,body,labels,mergeable,mergeStateStatus,reviewDecision,headRefOid,baseRefOid,baseRefName,isDraft) || return 1
+  pr_conflict_snapshot "$after" || return 1
+  same=$(jq -nr --argjson old "$snapshot" --argjson after "$after" '
+    ($old | del(.labels)) == ($after | del(.labels)) and
+    ([$old.labels[].name, "loom:changes-requested", "loom:merge-conflict"] | unique) == ([$after.labels[].name] | unique)') || return 1
+  [ "$same" = true ] || return 1
+  trusted=$(loom-daemon forge trusted-comments --fetch "$number" --with-body) || return 1
+  jq -e 'type == "array"' <<<"$trusted" >/dev/null || return 1
+  hold=$(loom-daemon champion-hold classify --pr "$number") || return 1
+  [ "$(pr_has_superseding_block "$hold" '{"records":[]}' "$trusted" "$after" "$marker")" = merge-conflict ] || return 1
+  if [ -n "$receipt" ]; then
+    pr_trusted_marker "$receipt" "$trusted" || return 1
+  else
+    resolved=$(resolve_dep_states "$deps") || return 1
+    [ "$(sed -n '1p' <<<"$resolved")" = true ] || return 1
+  fi
+  base=$(jq -r '.baseRefName' <<<"$after") || return 1
+  route=$(loom-daemon park-record guide-conflict-route --base-ref "$base") || return 1
+  [ "$route" = enabled ] || return 1
+  current=$(pr_park_episode "$number") || return 1
+  [ "$current" = "$episode" ] || return 1
+  gh pr edit "$number" --remove-label "loom:review-requested" --remove-label "loom:blocked"
+}
+```
+
+When the sweep prints a reason-only candidate, Guide checks the PR's exact
+recorded cause. If concrete evidence confirms its recovery, save that evidence
+and its sources in a file and call
+`pr_record_park_clearance "$number" "$receipt_key" "$evidence_file"` with the
+key printed for the candidate. The same Guide pass supplies the trusted note
+and reruns just that PR. A changed head, park body, or label episode requires
+a new verification. Leave the park in place if evidence is unavailable. An
+unnamed `ci-gate` park belongs to its own recovery pass. A passing run on main
+alone cannot establish recovery of another actor's permission or log-read failure.
+
 **`previous_review_label`** — which review-lane label to restore
-(`loom:review-requested` or `loom:changes-requested`); the Proposal's own
-"decide and document which". Reads the label event history for the more
-recent of the two labels ever applied — a fragile heuristic in the same class
-as `guide.md`'s own "Secondary heuristic" for issues, so it defaults to the
-safer of the two outcomes when history is empty or ambiguous: re-entering
-Judge's queue on a PR that turns out to still need work costs one more read;
-silently skipping Doctor's queue on a PR that needs work does not correct
-itself.
+(`loom:review-requested` or `loom:changes-requested`). Keep the one review lane
+already present. When neither is present, read the label event history for the
+more recent of the two labels ever applied. An empty event history defaults to
+Judge and an unreadable history leaves the park in place.
 
 ```bash
 previous_review_label() {
   local number="$1"
   local label
+  label=$(jq -r '[.labels[].name | select(. == "loom:review-requested" or . == "loom:changes-requested")]
+    | if length == 1 then .[0] else empty end' <<<"$2") || return
+  if [ -n "$label" ]; then
+    echo "$label"
+    return
+  fi
   label=$(gh api --paginate "repos/{owner}/{repo}/issues/${number}/events?per_page=100" --jq \
     ".[] | select(.event == \"labeled\" and (.label.name == \"loom:review-requested\" or .label.name == \"loom:changes-requested\")) | .label.name" \
-    2>/dev/null | tail -1)  # per-issue + --paginate (#8742 review; repo-wide walk: ~300 calls on a miss, ~6-day horizon); events ascend oldest-first, so the LAST match is the latest; paging runs to the end (accepted cost)
+    2>/dev/null) || return
+  label=$(tail -1 <<<"$label")  # the per-issue event listing ascends oldest first
   if [ "$label" = "loom:changes-requested" ]; then
     echo "loom:changes-requested"
   else
@@ -449,13 +656,20 @@ previous_review_label() {
 # (a park record, not a comment).
 gh pr view 8314 --json labels,body
 
-gh issue view 8322 --json state              # → state: CLOSED ✓
-pr_has_superseding_block 8314                # → false (no operator hold, clean merge state)
-previous_review_label 8314                   # → loom:changes-requested (its most recent label event before the park)
-
-gh pr edit 8314 --remove-label "loom:blocked" --add-label "loom:changes-requested"
-gh pr comment 8314 --body "🔓 **Unblocked**: Declared blocker(s) resolved (#8322). Restored \`loom:changes-requested\`."
+loom-daemon check-stale-blocked --pr-resweep --limit 1000  # → PR #8314 releasable
+check_and_unblock_prs  # #8322 is CLOSED and #8314 is mergeable, so Guide restores loom:changes-requested
 ```
+
+Use `loom-daemon check-stale-blocked --repo OWNER/REPO --pr-resweep --limit 1000`
+for a one-off, read-only report. Add `--json` for the namespaced resweep rows.
+It distinguishes releasable named parks, a current conflict whose repair is a
+separate step, still-open dependencies, held parks and unreadable data. Unnamed
+parks need the cause review above. `dependent_issues` names parked same-repo
+issues that declare a PR eligible for the conflict handoff as their blocker.
+A releasable snapshot still goes through Guide's
+fresh PR and review checks. The report reads the current PR state, labels and
+formal review decision before reporting an eligible park. Incomplete state is
+reported as unevaluated. The report performs only forge reads.
 
 ## What this format does not do
 

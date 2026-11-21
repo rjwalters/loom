@@ -58,7 +58,16 @@ const LOCAL_TOKEN: &str = "local `gh auth token` read of the chosen credential; 
 /// to the writer. Only ever remove entries.
 const READ_ON_WRITER: &[(&str, &str)] = &[
     ("branch_update.rs", MERGE),
+    // Promotion's collaborator-permission endpoint depends on which
+    // credential asks. Timeline and body-edit reads still use readers.
+    ("cli/forge_identity_cmd.rs", ASKER),
     ("cli/lease_release.rs", WRITE),
+    // #13744: `merge-pr workflow-scope`'s `gh api -i user` probe reports the
+    // asking credential's own scopes — the credential that will do the merge,
+    // which a reader App would answer for itself. It stayed on the writer when
+    // the raw `run_gh` helper was migrated (#13744); it is the family's one
+    // identity-dependent read, built on the facade's audited pin.
+    ("cli/merge_pr_workflow_scope.rs", ASKER),
     ("credential_preflight/pool.rs", ASKER),
     ("fleet_store/gh.rs", NOPOOL),
     ("forge_bucket_book/probe.rs", ASKER),
@@ -77,6 +86,7 @@ const READ_ON_WRITER: &[(&str, &str)] = &[
     ("observability/ops/ratelimit.rs", ASKER),
     ("tokens_pool/private_workspace/forge_auth.rs", LOCAL_TOKEN),
     ("write_scope/probe.rs", ASKER),
+    ("writer_limit.rs", ASKER),
 ];
 
 /// Names that must not appear in non-test source at all.
@@ -212,6 +222,7 @@ fn a_read_is_pinned_to_the_writer_only_at_a_listed_site() {
 /// builders, each of which must mark its reads reader-only (#12555).
 const READER_ONLY_BUILDERS: &[(&str, &str)] = &[
     ("claim_reconciliation/gh_call.rs", "fn build("),
+    ("script_helpers/gh_route.rs", "fn guarded("),
     ("sweep_registry/guards/gh_exec.rs", "fn gh_inv("),
 ];
 

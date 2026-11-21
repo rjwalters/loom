@@ -753,10 +753,12 @@ async fn the_feed_follows_changes_refreshes_in_full_on_period_and_recovers_a_los
     until("the full-refresh backstop", || s.queue_len() == 4).await;
 
     // The next period finds the worklist unchanged: a 304 only advances the age.
+    let prior_not_modified = worklist_calls(Some(304));
     clock.set(400);
-    until("the conditional full read", || worklist_calls(Some(304)) >= 1).await;
+    until("the conditional full read", || worklist_calls(Some(304)) > prior_not_modified).await;
+    // The mirror logs the response before the client receives it.
+    until("the client to advance the full-refresh age", || !s.queue_refresh_due()).await;
     assert_eq!(s.queue_len(), 4);
-    assert!(!s.queue_refresh_due(), "a 304 advances the age");
 
     // A truncated cursor means changes were missed: the next full refresh
     // recovers them with no period elapsing.
@@ -809,6 +811,53 @@ fn offered(answer: &Value) -> Vec<(String, u64)> {
         .iter()
         .map(|a| (a["repo"].as_str().unwrap().to_string(), a["item"].as_u64().unwrap()))
         .collect()
+}
+
+#[test]
+fn a_local_seat_refusal_leaves_the_same_pull_request_offerable_to_a_peer() {
+    use crate::session_exec::refusal::{REFUSAL_EXIT_CODE, SEAT_BUSY_REASON};
+    use crate::step_role::StepRole;
+    use crate::sweep_registry::step_spawn::capture::{
+        parse_outcome_line, seat_busy_exit_reason, StepEnd,
+    };
+
+    let mut snapshot = refusal_queue_snapshot("2026-10-19T10:00:00Z");
+    snapshot.rows[0].is_pull_request = true;
+    snapshot.rows[0].labels = vec!["loom:review-requested".into()];
+    for early in [true, false] {
+        let s = open_server("node-a");
+        s.queue().refresh_repos([&snapshot]);
+        let first = ask_next(&s, A, 1, &["judge"]);
+        assert_eq!(offered(&first), [("acme/w".into(), 7)]);
+        let first_id = first["assignments"][0]["assignment_id"].as_str().unwrap();
+        assert!(offered(&ask_next(&s, B, 1, &["judge"])).is_empty());
+        if early {
+            assert!(refuse_assignment(&s, A, first_id, SEAT_BUSY_REASON));
+            // Counted by name, not folded into `other` (#14512).
+            let c = s.counters.lock().unwrap().clone();
+            assert_eq!(c.refusals.get(&("refuse", "seat_busy".to_string())), Some(&1));
+            assert_eq!(c.refusals.get(&("refuse", "other".to_string())), None);
+        } else {
+            let line = parse_outcome_line(
+                "LOOM_STEP_OUTCOME role=judge target=7 class=refused reason=seat_busy",
+            );
+            let outcome = seat_busy_exit_reason(
+                StepRole::Judge,
+                7,
+                StepEnd::Exited(Some(REFUSAL_EXIT_CODE)),
+                line.as_ref(),
+            )
+            .unwrap();
+            let release = json!({"host_id": A, "assignment_id": first_id, "outcome": outcome});
+            let (reply, _) = s.handle(A, "/v1/release", release.to_string().as_bytes());
+            assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], true);
+        }
+        assert_eq!((s.queue_len(), s.queue().tombstones()), (1, 0));
+        s.queue().refresh_repos([&snapshot]);
+        let second = ask_next(&s, B, 1, &["judge"]);
+        assert_eq!(offered(&second), [("acme/w".into(), 7)]);
+        assert_ne!(second["assignments"][0]["assignment_id"], first_id);
+    }
 }
 
 #[test]
@@ -1005,6 +1054,121 @@ async fn the_third_fast_fail_release_answers_park_once_over_the_wire() {
     assert_eq!(reply.status, 403);
 }
 
+// ---------------------------------------------------------------- the filing lock (#13918)
+
+fn filing_body(host: &str, holder: &str) -> Value {
+    json!({"host_id": host, "holder": holder, "label": "architect"})
+}
+
+fn filing_lock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> Value {
+    let (reply, call) =
+        s.handle(host, "/v1/filing-lock", filing_body(host, holder).to_string().as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(call.endpoint, "/v1/filing-lock");
+    serde_json::from_str(&reply.body).unwrap()
+}
+
+fn filing_unlock(s: &Server<StaticIdentity>, host: &str, holder: &str) -> bool {
+    let body = json!({"host_id": host, "holder": holder}).to_string();
+    let (reply, _) = s.handle(host, "/v1/filing-unlock", body.as_bytes());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let v: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(v["server_epoch"], "epoch-test");
+    v["known"].as_bool().unwrap()
+}
+
+/// Two hosts at once: exactly one is granted, the other is held with a retry
+/// hint, and after the first unlocks the second is granted.
+#[test]
+fn two_hosts_filing_at_once_serialise_through_the_captain() {
+    let s = open_server("node-a");
+    let a = filing_lock(&s, A, "a-1");
+    assert_eq!(a["granted"], true);
+    assert_eq!(a["ttl_s"], 60);
+    let b = filing_lock(&s, B, "b-1");
+    assert_eq!(b["granted"], false);
+    assert_eq!(b["held_by"], A);
+    assert!(b["retry_after_s"].as_u64().unwrap() >= 1);
+    assert!(b.get("ttl_s").is_none());
+
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+#[test]
+fn an_unlock_from_a_non_holder_does_not_free_the_slot() {
+    let s = open_server("node-a");
+    filing_lock(&s, A, "a-1");
+    assert!(!filing_unlock(&s, B, "a-1"), "another host naming the holder id");
+    assert!(!filing_unlock(&s, A, "stale"), "a stale holder id");
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "still held");
+    assert!(filing_unlock(&s, A, "a-1"));
+    assert!(!filing_unlock(&s, A, "a-1"), "a second unlock is a no-op");
+}
+
+/// A holder that never unlocks loses the slot at its TTL, and a refresh under
+/// the same holder id extends it.
+#[test]
+fn a_holder_that_never_unlocks_expires_and_a_refresh_extends_the_ttl() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    assert_eq!(filing_lock(&s, A, "a-1")["granted"], true);
+    clock.set(150);
+    let refreshed = filing_lock(&s, A, "a-1");
+    assert_eq!(refreshed["granted"], true, "the same holder is re-granted");
+    clock.set(200);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], false, "refreshed to 210");
+    clock.set(210);
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true, "A never unlocked: expired");
+    assert!(!filing_unlock(&s, A, "a-1"), "A's late unlock must not free B's hold");
+    assert_eq!(filing_lock(&s, A, "a-2")["granted"], false);
+}
+
+/// The sweep expires an abandoned hold without a request arriving.
+#[test]
+fn the_sweep_expires_an_abandoned_filing_hold() {
+    let clock = Arc::new(ManualClock::default());
+    let s = server(identity("node-a"), Arc::clone(&clock));
+    clock.set(100);
+    filing_lock(&s, A, "a-1");
+    clock.set(161);
+    s.sweep_points(chrono::Utc::now());
+    s.expire_filing();
+    assert_eq!(filing_lock(&s, B, "b-1")["granted"], true);
+}
+
+/// A restart empties the slot (soft state): the holder's next refresh is
+/// granted again, it does not wedge.
+#[test]
+fn a_restarted_captain_grants_a_holders_refresh_again() {
+    let first = open_server("node-a");
+    filing_lock(&first, A, "a-1");
+    let second = open_server("node-a");
+    assert_eq!(filing_lock(&second, A, "a-1")["granted"], true);
+}
+
+/// Identity is the same `whois` as for claims, and the holder id is bounded.
+#[tokio::test]
+async fn filing_calls_need_a_roster_host_and_a_bounded_holder() {
+    let clock = Arc::new(ManualClock::default());
+    let addr = listen(server(StaticIdentity::default(), Arc::clone(&clock))).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["server_epoch"], "epoch-test");
+
+    let addr = listen(open_server("node-a")).await;
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(B, "b-1")).await;
+    assert_eq!(status, 403, "host_id is not the caller's: {body}");
+    let (status, _) = post(addr, "/v1/filing-lock", &filing_body(A, "")).await;
+    assert_eq!(status, 400);
+    let long = "x".repeat(129);
+    let (status, _) = post(addr, "/v1/filing-unlock", &json!({"host_id": A, "holder": long})).await;
+    assert_eq!(status, 400);
+    let (status, body) = post(addr, "/v1/filing-lock", &filing_body(A, "a-1")).await;
+    assert_eq!((status, &body["granted"]), (200, &json!(true)));
+}
+
 /// #14047, end to end: the Builder step's no-progress hold survives a TTL
 /// expiry (`cause: expired`) and ends on an operator's clear (`cause:
 /// cleared`).
@@ -1038,4 +1202,307 @@ async fn an_operator_clear_lifts_the_no_progress_hold_but_a_ttl_expiry_does_not(
     let (reply, _) = s.handle(B, "/v1/park_ended", cleared.to_string().as_bytes());
     assert_eq!(reply.status, 200);
     assert_eq!(serde_json::from_str::<Value>(&reply.body).unwrap()["known"], json!(false));
+}
+
+// -----------------------------------------------------------------
+// #13942: the heartbeat answer publishes the captain's token probe.
+// -----------------------------------------------------------------
+
+/// A server with a token-probe pool dir holding one ranking row.
+fn probing_server(
+    node_name: &str,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir) {
+    let pool = tempfile::tempdir().unwrap();
+    std::fs::write(pool.path().join(".ranking"), ranking).unwrap();
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity(node_name),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf()),
+    );
+    clock.set(91);
+    (s, pool)
+}
+
+#[test]
+fn the_heartbeat_answer_carries_the_captains_snapshot() {
+    let (s, _pool) = probing_server(
+        "node-a",
+        "agent-1|available|0.42\nagent-2|exhausted||2026-11-20T03:00:00Z\n",
+    );
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    let probe = &body["token_probe"];
+    assert!(probe.is_object(), "the snapshot rides the answer: {body}");
+    assert_eq!(probe["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(probe["accounts"][0]["name"], "agent-1");
+    assert_eq!(probe["accounts"][0]["util_5h"], 0.42);
+    assert_eq!(probe["accounts"][1]["limit_reset"], "2026-11-20T03:00:00Z");
+    // The probe instant is recorded, not sampled: the worker's freshness
+    // comparison needs the captain's probe time, not this answer's.
+    assert!(probe["probed_at"].is_string());
+}
+
+/// A server built without a pool dir omits the field entirely — the exact
+/// body an old captain sent.
+#[test]
+fn a_server_without_a_pool_dir_omits_the_field() {
+    let s = open_server("node-a");
+    let (reply, _) = s.handle(A, "/v1/heartbeat", hb_body(A, json!([]), 1).to_string().as_bytes());
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body.get("token_probe").is_none(), "absent, not null: {body}");
+}
+
+/// The captain-side per-account record is one per distinct probe cycle, not
+/// one per heartbeat: a second heartbeat over the same `.ranking` emits
+/// nothing, a rewritten `.ranking` emits the new cycle.
+#[test]
+fn the_per_account_cycle_record_fires_once_per_cycle() {
+    let (s, pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let beat = hb_body(A, json!([]), 1).to_string();
+    let (_, first) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    let cycle = |captured: &crate::observability::ops::capture::Captured| {
+        captured
+            .metrics
+            .iter()
+            .filter(|p| p.name == crate::telemetry::ops::MetricName::TokensFleetProbeAccounts)
+            .count()
+    };
+    assert_eq!(cycle(&first), 1, "one point per account of the new cycle");
+
+    let (_, again) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&again), 0, "the same cycle is not re-emitted");
+
+    std::fs::write(pool.path().join(".ranking"), "agent-1|available|0.10\nagent-2|error\n")
+        .unwrap();
+    let (_, next) = crate::observability::ops::capture::capture(|| {
+        let _ = s.handle(A, "/v1/heartbeat", beat.as_bytes());
+    });
+    assert_eq!(cycle(&next), 2, "a new probe cycle records every account");
+}
+
+// -----------------------------------------------------------------
+// #13943: `POST /v1/tokens-refresh` — the on-demand fleet probe
+// (`tokens refresh --fleet`, part 3 of #13893).
+// -----------------------------------------------------------------
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::token_ranking_refresh::RefreshOutcome;
+
+/// A probe's `.ranking` rewrite with a pinned mtime, so the probe instant
+/// is a fact the test names rather than a race with the filesystem clock.
+fn write_ranking_at(dir: &std::path::Path, rows: &str, mtime: SystemTime) {
+    let path = dir.join(".ranking");
+    std::fs::write(&path, rows).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+/// A captain that can run an on-demand probe over `pool` (#13943): the
+/// clock is returned so a test can order arrivals and completions.
+fn refreshing_server(
+    probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync>,
+    ranking: &str,
+) -> (Arc<Server<StaticIdentity>>, tempfile::TempDir, Arc<ManualClock>) {
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), ranking, UNIX_EPOCH);
+    let clock = Arc::new(ManualClock::default());
+    let s = Arc::new(
+        Server::new(
+            identity("node-a"),
+            clock.clone(),
+            roster(),
+            Policy::default(),
+            "epoch-test".into(),
+        )
+        .with_token_probe(pool.path().to_path_buf())
+        .with_token_refresh(probe),
+    );
+    clock.set(91);
+    (s, pool, clock)
+}
+
+/// The probe the request names runs now, the answer carries the probe
+/// instant (`probed_at`), and the very next heartbeat publishes that same
+/// instant to the fleet (#13943 acceptance: the snapshot workers receive
+/// carries the new `probed_at`).
+#[tokio::test]
+async fn a_tokens_refresh_runs_the_captains_probe_and_answers_its_instant() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), "agent-1|available|0.42\n", UNIX_EPOCH);
+    let clock = Arc::new(ManualClock::default());
+    let dir = pool.path().to_path_buf();
+    let seen_runs = Arc::clone(&runs);
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(move || {
+            seen_runs.fetch_add(1, Ordering::SeqCst);
+            // What `tokens check --ranking` leaves behind: a fresh ranking
+            // with a later mtime.
+            write_ranking_at(
+                &dir,
+                "agent-1|exhausted||2026-11-21T03:00:00Z\n",
+                UNIX_EPOCH + Duration::from_secs(1_000_000_500),
+            );
+            RefreshOutcome::Success
+        });
+    let s = Arc::new(
+        Server::new(identity("node-a"), clock, roster(), Policy::default(), "epoch-test".into())
+            .with_token_probe(pool.path().to_path_buf())
+            .with_token_refresh(probe),
+    );
+    let addr = listen(Arc::clone(&s)).await;
+    let (status, body) = post(addr, "/v1/tokens-refresh", &json!({"host_id": A})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["coalesced"], json!(false));
+    let probed_at = body["probed_at"].as_str().expect("the probe instant");
+    let expected = DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_secs(1_000_000_500));
+    assert_eq!(
+        probed_at.parse::<DateTime<Utc>>().unwrap(),
+        expected,
+        "the answer names the probe the captain just ran"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one probe ran");
+
+    // The snapshot the fleet receives carries the same new probe instant
+    // and the probe's verdicts (AC: workers' snapshot carries new probed_at).
+    let (_, hb) = post(addr, "/v1/heartbeat", &hb_body(A, json!([]), 1)).await;
+    let probe_json = &hb["token_probe"];
+    assert_eq!(probe_json["probed_at"].as_str().unwrap(), probed_at);
+    assert_eq!(probe_json["accounts"][0]["status"], json!("exhausted"));
+}
+
+/// A request arriving while a probe runs joins that probe: one probe run,
+/// both requests answered with its instant, the second marked coalesced
+/// (#13943 acceptance: the coalescing rate-limit).
+#[tokio::test]
+async fn a_request_while_a_probe_runs_joins_it_without_a_second_probe() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (probe_started, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let pool = tempfile::tempdir().unwrap();
+    write_ranking_at(pool.path(), "agent-1|available|0.42\n", UNIX_EPOCH);
+    let dir = pool.path().to_path_buf();
+    let seen_runs = Arc::clone(&runs);
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(move || {
+            seen_runs.fetch_add(1, Ordering::SeqCst);
+            let _ = probe_started.send(());
+            // Hold the probe until the test has a second request arrive.
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10));
+            write_ranking_at(
+                &dir,
+                "agent-1|exhausted||2026-11-21T03:00:00Z\n",
+                UNIX_EPOCH + Duration::from_secs(1_000_000_500),
+            );
+            RefreshOutcome::Success
+        });
+    let (s, _pool, clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let body = json!({"host_id": A}).to_string();
+    clock.set(100);
+    let first = {
+        let s = Arc::clone(&s);
+        let body = body.clone();
+        tokio::spawn(async move { s.tokens_refresh(A, body.as_bytes()).await })
+    };
+    // Wait for the probe to be running, yielding to the runtime: the
+    // current-thread test runtime only polls the spawned task while this
+    // main task awaits.
+    let mut probe_running = false;
+    for _ in 0..500 {
+        if started_rx.try_recv().is_ok() {
+            probe_running = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(probe_running, "the probe is running");
+    // The second operator arrives mid-probe; the probe completes after
+    // that, so the second answer must be the first probe's.
+    clock.set(101);
+    let second = {
+        let s = Arc::clone(&s);
+        let body = body.clone();
+        tokio::spawn(async move { s.tokens_refresh(A, body.as_bytes()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    clock.set(102);
+    let _ = release_tx.send(());
+
+    let (reply_a, call_a) = first.await.unwrap();
+    let (reply_b, call_b) = second.await.unwrap();
+    assert_eq!(reply_a.status, 200);
+    assert_eq!(reply_b.status, 200);
+    let a: Value = serde_json::from_str(&reply_a.body).unwrap();
+    let b: Value = serde_json::from_str(&reply_b.body).unwrap();
+    assert_eq!(a["coalesced"], json!(false), "the first request ran the probe");
+    assert_eq!(b["coalesced"], json!(true), "the second joined it");
+    assert_eq!(a["probed_at"], b["probed_at"], "one probe, one instant");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "no second probe was started");
+    assert_eq!(call_a.reason.as_deref(), Some("probed"));
+    assert_eq!(call_b.reason.as_deref(), Some("coalesced"));
+}
+
+/// A captain built without a probe hook answers 503 with a reason — the
+/// worker exits non-zero, nothing is probed (#13943).
+#[tokio::test]
+async fn a_server_without_a_probe_hook_refuses_the_refresh() {
+    let (s, _pool) = probing_server("node-a", "agent-1|available|0.42\n");
+    let (reply, call) = s
+        .tokens_refresh(A, json!({"host_id": A}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 503);
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("probe"), "{body}");
+    assert_eq!(call.result, "error");
+}
+
+/// A probe that ran and failed is an answer carrying the failure, not a
+/// protocol error: the worker exits non-zero on the captain's own reason
+/// (#13943).
+#[tokio::test]
+async fn a_failed_probe_is_answered_with_its_reason() {
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(|| RefreshOutcome::Failure("every account errored".into()));
+    let (s, _pool, _clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let (reply, call) = s
+        .tokens_refresh(A, json!({"host_id": A}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 200, "the request was served");
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["error"], json!("every account errored"));
+    assert!(body.get("probed_at").is_none(), "no instant for a failed probe: {body}");
+    assert_eq!(call.result, "error", "the span reports the probe's failure");
+}
+
+/// A body naming another host is the same 403 every endpoint answers.
+#[tokio::test]
+async fn a_refresh_naming_another_host_is_refused() {
+    let probe: std::sync::Arc<dyn Fn() -> RefreshOutcome + Send + Sync> =
+        std::sync::Arc::new(|| RefreshOutcome::Success);
+    let (s, _pool, _clock) = refreshing_server(probe, "agent-1|available|0.42\n");
+    let (reply, _) = s
+        .tokens_refresh(A, json!({"host_id": B}).to_string().as_bytes())
+        .await;
+    assert_eq!(reply.status, 403);
 }

@@ -87,11 +87,15 @@ async fn held_trace_batches_do_not_count_unmappable_envelopes_per_retry() {
     assert_eq!(queue.len(), 2, "the held batch stays queued");
     assert_eq!(queue.dropped_total(), 0, "a held batch's unmappable envelope is not a loss yet");
     assert!(queue.dropped_by_reason().is_empty());
+    assert_eq!(status.snapshot().signal_counts["spans"].dropped, 0);
+    assert_eq!(status.snapshot().signal_counts["spans"].retry_scheduled, 2);
     // The credential is fixed (the sink defaults to 200): the group is
     // acknowledged, and only now is the unmappable envelope counted — once.
     assert_eq!(try_flush(&queue, &exporter, 10, &status).await, FlushOutcome::Sent(2));
     assert!(queue.is_empty());
     assert_eq!(queue.dropped_total(), 1);
+    assert_eq!(status.snapshot().signal_counts["spans"].dropped, 1);
+    assert_eq!(status.snapshot().signal_counts["spans"].accepted, 1);
     assert_eq!(
         queue.dropped_by_reason(),
         std::collections::BTreeMap::from([("trace_unmappable".to_string(), 1)])

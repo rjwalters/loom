@@ -164,8 +164,9 @@ and the model tier are resolved independently; a Claude-shaped alias forwarded t
 a Codex adapter is an HTTP 400 that the classifier treats as recoverable, so the
 tick retries forever. Since #5028 a pre-spawn check refuses instead — which is
 better, but still means *zero* ticks for that role. Pin both axes, or pin the
-model to the `"default"` sentinel (the only shape a ChatGPT-plan Codex seat
-accepts):
+model to the `"default"` sentinel (the guaranteed-working shape on a
+ChatGPT-plan Codex seat; an explicit pin also works there when the account's
+catalog, `codex debug models`, lists it):
 
 ```json
 {
@@ -508,6 +509,12 @@ never the shipped Claude `sonnet` alias.** So leave
 majority on flash. (If you do pin it, pin something the native runtime
 accepts — a qualified `provider/model` or the profile's model name. A Claude
 alias trips the #5028 mismatch preflight: Recipe 1's trap, same shape.)
+
+To run full-strength GLM instead, set `runtimes.defaultModelProfile` to the
+shipped `zai-full`: `zai-flash` with `glm-5.3` in place of `glm-5.3-flash`,
+the same providers, credential pool and Judge/Curator exclusion. Loom can scope
+bad marks by model class. Both profiles draw on the same seat's five-hour and
+weekly Z.ai GLM Coding Plan credit windows.
 
 ### Promotion: the native pin rule, and the judge-independence trap
 

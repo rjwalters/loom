@@ -2,9 +2,8 @@
 //! journals carry (Issue #8447).
 //!
 //! In their own sibling module rather than appended to `tests`: that module is
-//! already near the file-size ratchet's threshold
-//! (`scripts/check-file-size-budget.sh`), and the rule there is to add a new
-//! sibling rather than grow a big one — the same reason `timeline_tests` exists.
+//! already large, and a new sibling beats growing it — the same reason
+//! `timeline_tests` exists.
 
 use super::*;
 use crate::sweep_registry::test_support::*;

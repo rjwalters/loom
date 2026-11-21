@@ -258,6 +258,11 @@ fn confirm_merge(ctx: &Ctx<'_>, pr: u32, rec: &GrantRecord) -> Reconciled {
         at: merged_at,
         merged_after_revocation: after_revocation,
     });
+    if recorded && ctx.execution_enabled {
+        if let Err(e) = ctx.forge.confirmed_merge_issue_claims(pr) {
+            log::warn!("merge-queue: PR #{pr} could not reconcile closed issue claims: {e}");
+        }
+    }
     Reconciled::Merged {
         recorded,
         after_revocation,
@@ -500,6 +505,7 @@ pub fn handoff(
     required_checks: &dyn Fn() -> Result<Vec<String>, String>,
 ) -> Result<EnqueueOutcome, HandoffFailure> {
     ops::execution_gate(ctx.mode, ctx.execution_enabled).map_err(HandoffFailure::Gate)?;
+    ctx.statuses.begin_handoff(pr, approved_sha);
     let required = required_checks().map_err(HandoffFailure::Preflight)?;
     if !required.iter().any(|c| c == REQUIRED_CHECK_CONTEXT) {
         return Err(HandoffFailure::AuthzCheckNotRequired { required });

@@ -127,7 +127,7 @@ impl ModelPricing {
     }
 
     /// Build an OpenAI gpt-6 row (Issue #10750): published cached-input rate
-    /// and a single published cache-write rate used for both TTLs.
+    /// and one default write estimate stored in both of the card's TTL fields.
     fn openai(
         input_cost_per_1k: f64,
         output_cost_per_1k: f64,
@@ -213,8 +213,13 @@ impl ModelPricing {
     /// tokens. An API LIST-price estimate, not billed cost; long-context and
     /// Batch/Flex/Fast tiers are not modelled.
     ///
+    /// The `gpt-6.2-astra` row was verified on **2026-11-20** (Issue #14741).
+    /// Its published 30-minute write price supplies the default estimate in
+    /// both legacy write fields. The 12-hour write tier is not modelled.
+    ///
     /// | Row | Input | Output | Cache read | Cache write |
     /// |---|---|---|---|---|
+    /// | `gpt-6.2-astra` | 0.008 | 0.04 | 0.0004 | 0.01 |
     /// | `gpt-6.1-sol` | 0.002 | 0.01 | 0.0001 | 0.0025 |
     /// | `gpt-6-astra` | 0.01 | 0.05 | 0.001 | 0.0125 |
     /// | `gpt-6-sol` | 0.002 | 0.01 | 0.0002 | 0.0025 |
@@ -368,10 +373,12 @@ impl ModelPricing {
 
         // ---- OpenAI / Codex gpt-6 (Issue #10750) ----------------------------
         // https://platform.openai.com/docs/pricing, Standard tier, short-context
-        // columns, read 2026-10-07. Published $/MTok / 1000. One cache-write
-        // price is published; it is used for both TTLs. No trailing `gpt-6`
-        // catch-all on purpose: variants differ up to 100x in price, so an
-        // unrecognized one stays unpriced (and WARNs) rather than guessed.
+        // columns, read 2026-10-07 and 2026-11-20 (6.2 Astra). Published $/MTok
+        // / 1000; see the rate-card docs for the write estimate. No trailing
+        // `gpt-6` catch-all: variants differ up to 100x in price.
+        if m.contains("gpt-6.2-astra") {
+            return Some(Self::openai(0.008, 0.04, 0.000_4, 0.01));
+        }
         if m.contains("gpt-6.1-sol") {
             return Some(Self::openai(0.002, 0.01, 0.000_1, 0.002_5));
         }
@@ -838,6 +845,9 @@ mod tests {
     /// so none of them silently falls through to the Anthropic Sonnet default.
     /// OpenAI/Codex ids (Issue #10750).
     const CODEX_MODEL_IDS: &[&str] = &[
+        "gpt-6.2-astra",
+        "openai/gpt-6.2-astra",
+        "codex/gpt-6.2-astra",
         "gpt-6.1-sol",
         "gpt-6-astra",
         "gpt-6-sol",
@@ -858,6 +868,25 @@ mod tests {
         assert!((sol6.cache_read_cost_per_1k - 0.000_2).abs() < f64::EPSILON);
         // An unrecognized gpt-6 variant is deliberately unpriced.
         assert!(ModelPricing::lookup("gpt-6-nova").is_none());
+    }
+
+    #[test]
+    fn gpt_6_2_astra_pricing_uses_its_own_short_context_rates() {
+        let previous = ModelPricing::lookup("gpt-6-astra").unwrap();
+        assert!((previous.input_cost_per_1k - 0.01).abs() < f64::EPSILON);
+        assert!((previous.output_cost_per_1k - 0.05).abs() < f64::EPSILON);
+        for id in [
+            "gpt-6.2-astra",
+            "openai/gpt-6.2-astra",
+            "codex/gpt-6.2-astra",
+        ] {
+            let pricing = ModelPricing::lookup(id).unwrap();
+            assert!((pricing.input_cost_per_1k - 0.008).abs() < f64::EPSILON, "{id}");
+            assert!((pricing.output_cost_per_1k - 0.04).abs() < f64::EPSILON, "{id}");
+            assert!((pricing.cache_read_cost_per_1k - 0.000_4).abs() < f64::EPSILON, "{id}");
+            assert!((pricing.cache_write_cost_per_1k - 0.01).abs() < f64::EPSILON, "{id}");
+            assert!((pricing.cache_write_1h_cost_per_1k - 0.01).abs() < f64::EPSILON, "{id}");
+        }
     }
 
     #[test]

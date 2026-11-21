@@ -62,6 +62,102 @@
 
 use crate::dep_recheck::{extract, named, premise, recheck};
 
+/// Whether the configured Doctor step lane can receive a cleared park.
+pub(crate) fn guide_conflict_route_enabled(root: &std::path::Path) -> anyhow::Result<bool> {
+    use crate::claim_reconciliation::review_conflict::{
+        review_conflict_enabled, REVIEW_CONFLICT_ENABLED_ENV,
+    };
+    use crate::work_finder::{resolve_enabled, WORK_FINDER_ENABLE_ENV};
+
+    for key in [REVIEW_CONFLICT_ENABLED_ENV, WORK_FINDER_ENABLE_ENV] {
+        if matches!(std::env::var(key), Err(std::env::VarError::NotUnicode(_))) {
+            anyhow::bail!("could not read {key}");
+        }
+    }
+    if !review_conflict_enabled() {
+        return Ok(false);
+    }
+    let effective = crate::config_resolver::resolve_effective_config_checked(root)?;
+    Ok(guide_conflict_work_finder(&effective)?.is_some_and(|config| resolve_enabled(&config)))
+}
+
+fn guide_conflict_work_finder(
+    effective: &serde_json::Value,
+) -> anyhow::Result<Option<crate::work_finder::WorkFinderConfig>> {
+    use crate::config_resolver::get_path;
+    use crate::work_finder::WorkFinderConfig;
+
+    let get = |path| get_path(effective, path).filter(|value| !value.is_null());
+    for path in [
+        "autonomous",
+        "autonomous.roleRunner",
+        "autonomous.workFinder",
+    ] {
+        if get(path).is_some_and(|value| !value.is_object()) {
+            anyhow::bail!("{path} must be an object");
+        }
+    }
+    // Preserve the Guide's explicit Doctor allowlist opt-out. The actual
+    // Doctor work runs as a step, so the role runner's switch is insufficient.
+    if let Some(roles) = get("autonomous.roleRunner.roles") {
+        let roles = roles
+            .as_array()
+            .filter(|roles| roles.iter().all(serde_json::Value::is_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!("autonomous.roleRunner.roles must be an array of names")
+            })?;
+        if !roles.iter().any(|role| role.as_str() == Some("doctor")) {
+            return Ok(None);
+        }
+    }
+    let enabled = get("autonomous.workFinder.enabled")
+        .map(|enabled| {
+            enabled
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("autonomous.workFinder.enabled must be a boolean"))
+        })
+        .transpose()?;
+    Ok(Some(WorkFinderConfig {
+        enabled,
+        ..WorkFinderConfig::default()
+    }))
+}
+
+#[cfg(test)]
+mod guide_conflict_policy_tests {
+    use super::guide_conflict_work_finder;
+    use serde_json::json;
+
+    #[test]
+    fn guide_conflict_policy_preserves_explicit_role_opt_out_and_step_switch() {
+        let enabled = |value| guide_conflict_work_finder(&value).unwrap().unwrap().enabled;
+        assert_eq!(enabled(json!({})), None);
+        assert_eq!(
+            enabled(json!({"autonomous":{"roleRunner":{"enabled":true,"roles":["doctor"]}}})),
+            None,
+        );
+        assert_eq!(enabled(json!({"autonomous":{"workFinder":{"enabled":false}}})), Some(false),);
+        assert_eq!(enabled(json!({"autonomous":{"workFinder":{"enabled":true}}})), Some(true),);
+        assert!(guide_conflict_work_finder(&json!({"autonomous":{
+            "workFinder":{"enabled":true},"roleRunner":{"roles":["guide"]}
+        }}))
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn guide_conflict_policy_refuses_unreadable_policy_fields() {
+        for config in [
+            json!({"autonomous":false}),
+            json!({"autonomous":{"roleRunner":"guide"}}),
+            json!({"autonomous":{"workFinder":{"enabled":"off"}}}),
+            json!({"autonomous":{"roleRunner":{"roles":["doctor",null]}}}),
+        ] {
+            assert!(guide_conflict_work_finder(&config).is_err());
+        }
+    }
+}
+
 pub mod batch;
 pub mod budget;
 pub mod hold;
@@ -158,12 +254,45 @@ pub struct Evidence {
     /// ([`park_self_block`]). Always `None` for an issue, whose superseding-block
     /// question is answered by [`Evidence::closing`] instead.
     pub self_block: Option<String>,
+    /// Fresh PR state used by the named-park resweep.
+    pub pr_resweep_state: Option<PrResweepState>,
+    /// A standing trusted Champion hold (including ratification) on a PR.
+    pub champion_hold: Option<crate::champion_hold::HoldKind>,
     /// A body park record that names **no** blocker but states a reason
     /// (`<!-- loom:park Blocked by: (unstated) by=… reason="…" -->`, #10558).
     /// Such a hold is documented by its reason, so with no numbered reference
     /// [`classify`] reports [`Verdict::HeldWithReason`], not
     /// [`Verdict::Undocumented`]. Read from the body only.
     pub held: Option<Held>,
+    /// A trusted `<!-- loom:permanent-block -->` marker stands on the artifact
+    /// (#13889) — the same own-line marker and trust rule `guide.md`'s
+    /// `has_permanent_block()` honours, so the advisory and the unblock sweep
+    /// agree. [`classify`] reports such an artifact as
+    /// [`Verdict::Superseded`], never stale or unticked.
+    pub permanent_block: bool,
+    /// The newest trusted hold comment (#13889), see [`HoldComment`].
+    pub hold: Option<HoldComment>,
+    /// When the last resolved cited blocker closed/merged (RFC 3339); `None`
+    /// when any resolved blocker's time could not be read. Meaningful only
+    /// with [`Evidence::hold`], which treats `None` as "unknown ⇒ held".
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrResweepState {
+    Mergeable,
+    Conflict(String),
+    Held(String),
+}
+
+/// A trusted comment that states a hold (#13889): a park record, an operator
+/// decision, or a Champion/operator hold-restore note.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HoldComment {
+    /// When it was posted (RFC 3339); `None` when the forge did not say.
+    pub at: Option<String>,
+    /// Which marker made it a hold comment, e.g. `loom:operator-decision`.
+    pub marker: String,
 }
 
 /// The stated-reason park record behind [`Verdict::HeldWithReason`].
@@ -398,7 +527,36 @@ pub fn classify(e: &Evidence) -> Verdict {
     }
 
     if reasons.is_empty() {
-        return unticked.unwrap_or(Verdict::StillBlocked);
+        // A permanent-block marker keeps an otherwise-unticked artifact out of
+        // the actionable section too (#13889).
+        return match unticked {
+            Some(Verdict::Unticked { resolved_refs, .. }) if e.permanent_block => {
+                Verdict::Superseded {
+                    cleared: vec![format!(
+                        "every parseable unchecked `## Dependencies` ref is resolved: {}",
+                        resolved_refs.join(", ")
+                    )],
+                    block: PERMANENT_BLOCK.to_string(),
+                }
+            }
+            other => other.unwrap_or(Verdict::StillBlocked),
+        };
+    }
+
+    // (c) Superseded by a marker or a later hold comment (#13889). Like (d),
+    // applied over an already-computed stale reason set: it only ever
+    // downgrades "ready to unpark" to "held".
+    if e.permanent_block {
+        return Verdict::Superseded {
+            cleared: reasons,
+            block: PERMANENT_BLOCK.to_string(),
+        };
+    }
+    if let Some(block) = hold_supersedes(e) {
+        return Verdict::Superseded {
+            cleared: reasons,
+            block,
+        };
     }
 
     // (d) The #4634/#7267 superseding-block gate, PR side (#8925). Applied LAST,
@@ -412,6 +570,39 @@ pub fn classify(e: &Evidence) -> Verdict {
         },
         None => Verdict::Stale(reasons),
     }
+}
+
+/// The `block` text of a permanent-block hold.
+pub const PERMANENT_BLOCK: &str =
+    "permanent block — a trusted `<!-- loom:permanent-block -->` marker; the unblock sweep never \
+     unparks it";
+
+/// Whether the newest trusted hold comment is not older than the cited
+/// blockers' resolution (#13889), as a reportable reason.
+///
+/// Fails closed to the *held* side: a hold comment whose time, or a resolved
+/// blocker whose resolution time, is missing or unparseable counts as newer.
+fn hold_supersedes(e: &Evidence) -> Option<String> {
+    use chrono::DateTime;
+    let hold = e.hold.as_ref()?;
+    let parse = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t.trim()).ok())
+    };
+    let held_back = match (parse(&hold.at), parse(&e.resolved_at)) {
+        (Some(h), Some(r)) => h > r,
+        _ => true,
+    };
+    held_back.then(|| {
+        format!(
+            "a trusted hold comment (`<!-- {} -->`, posted {}) is newer than the cited \
+             blockers' resolution ({}) — the dependency resolved but is no longer the binding \
+             constraint",
+            hold.marker,
+            hold.at.as_deref().unwrap_or("at an unknown time"),
+            e.resolved_at.as_deref().unwrap_or("time unknown"),
+        )
+    })
 }
 
 /// Which of `closed` an artifact's body/comments cite as a blocker (issue

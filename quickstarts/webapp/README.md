@@ -77,9 +77,8 @@ Visit `http://localhost:5173` to see your app.
 │   ├── lib/            # Utility functions
 │   ├── pages/          # Page components
 │   └── styles/         # Global styles
-└── .loom/              # Loom configuration
-    ├── roles/          # Role definitions
-    └── scripts/        # Helper scripts
+└── .loom/              # Loom config (scripts/ come from the Loom installer)
+    └── roles/          # Role definitions
 ```
 
 ## Development Workflow with Loom

@@ -24,7 +24,10 @@
 # Flags are a subset of `gh issue create`'s, chosen so a role prompt's
 # existing invocation can be switched over by changing the command name:
 #   --title, -t TITLE     Issue title (required).
-#   --body, -b BODY       Issue body as literal text.
+#   --body, -b BODY       Issue body as literal text. A value that is a lone
+#                         `@path` / `@-` token is refused (exit 2, nothing
+#                         filed): `gh` would post it literally, not read it
+#                         from a file -- use --body-file instead.
 #   --body-file, -F PATH  Read the body from PATH ("-" = stdin). Mutually
 #                         exclusive with --body.
 #   --label, -l LABEL     Label to apply at creation. Repeatable. A single
@@ -152,7 +155,7 @@ source "$SCRIPT_DIR/lib/filing-lock.sh"
 usage() {
   # Line range = the whole leading comment block (keep in sync when the header
   # grows; `--help` silently truncating its own docs is its own small #8289).
-  sed -n '2,142p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,145p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -262,6 +265,23 @@ if [[ -n "$BODY_FILE" ]]; then
     echo "create-issue.sh: cannot read --body-file: $BODY_FILE" >&2
     exit 2
   fi
+fi
+
+# --- Lone `@path` body guard (#14161) ---------------------------------------
+#
+# `gh issue create --body @path` files the literal string `@path` as the
+# whole body; the same pitfall documented for `gh pr comment` / `gh api -f
+# body=@path` (#9258, comment-body-literal-path.md). The script still exits 0
+# and prints the URL, so the filed issue silently loses its real body and
+# every label/marker check below runs against a path string. Refuse before
+# any forge call, the duplicate backstop or the filing lock when the ENTIRE
+# `--body` value is one `@`-token; a body that merely CONTAINS `@` (a
+# mention, an email-shaped token, a line starting with `@` inside a longer
+# body) passes, and `--body-file` content is the author's own text, never
+# inspected.
+if [[ "$HAVE_BODY" == "true" && "$BODY" =~ ^[[:space:]]*@[^[:space:]]*[[:space:]]*$ ]]; then
+  echo "create-issue.sh: refusing --body '${BODY:0:80}': a lone '@' token is posted literally, not read from a file. Use --body-file <path> (or --body-file -). Nothing was filed." >&2
+  exit 2
 fi
 
 # --- #11787: loom:curated is only ever set by `curation-complete` ------------

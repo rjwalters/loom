@@ -373,7 +373,7 @@ fn a_proof_for_the_pre_recreate_container_is_refused_and_the_next_job_gets_a_fre
     let root = containment::registry_workspace(&f);
     let _env = containment::environment(&f, &root, a, &gh_host);
     let prepare = |owner: &str| {
-        Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8787), owner, false)
+        Selection::prepare(&root, "codex", None, JobKind::Sweep, Some(8787), owner)
             .unwrap()
             .unwrap()
     };

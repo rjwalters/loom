@@ -80,10 +80,11 @@ fn plan(config: &ObservabilityConfig, tag: &str) -> Vec<Planned> {
         if key.is_none() && entry.headers_file.is_none() {
             continue;
         }
-        match otlp::OtlpExporter::with_headers_file(
+        match otlp::OtlpExporter::with_max_batch_bytes(
             endpoint.clone(),
             key.clone(),
             entry.headers_file.as_deref(),
+            entry.max_batch_bytes,
         ) {
             Ok(exporter) => out.push(Planned {
                 index,
@@ -152,6 +153,34 @@ pub fn start(
         log::info!("{tag}: exporting ops spans and counters over OTLP");
     }
     handles
+}
+
+/// Register the process-global ops sink for a short-lived process tagged
+/// `tag`, without spawning senders: every `emit_span` / `emit_record` lands
+/// in the same tagged queue files, and a [`flush_pending`] (this process, at
+/// exit) or a later process's flush drains them. `false` when no OTLP
+/// exporter is configured: nothing was registered and emission stays a no-op.
+/// This is the one-shot counterpart of [`start`] (#14129): the worker's
+/// `filing-lock` subcommand lives for about a second, too short for senders.
+#[must_use]
+pub fn register_sink(config: &ObservabilityConfig, workspace_root: &Path, tag: &str) -> bool {
+    let planned = plan(config, tag);
+    if planned.is_empty() {
+        return false;
+    }
+    let host_id = crate::sweep_registry::host_identity();
+    let capacity = resolve_queue_capacity(config);
+    let queues = planned
+        .iter()
+        .map(|p| Arc::new(open_queue(workspace_root, tag, p.index, capacity)))
+        .collect::<Vec<_>>();
+    match ops::sink_for_otlp_queues(queues, &host_id) {
+        Some(sink) => {
+            ops::register_global_ops_sink(sink);
+            true
+        }
+        None => false,
+    }
 }
 
 /// What one [`deliver`] or [`flush_pending`] call came to.
@@ -431,6 +460,7 @@ mod tests {
         let key = dir.join("ingest.key");
         std::fs::write(&key, "k\n").unwrap();
         let raw = |endpoint: &str| RawExporterEntry {
+            max_batch_bytes: None,
             kind: "otlp".to_string(),
             endpoint: Some(endpoint.to_string()),
             headers_file: None,
@@ -599,5 +629,46 @@ mod tests {
         assert!(second.is_err());
         assert_eq!(queued(d.path(), 0), vec!["r:open"], "no record dropped or added");
         held.join().unwrap();
+    }
+
+    /// #14129: the one-shot counterpart of `start` registers the global sink
+    /// with no senders, a span emitted through the global path (the worker's
+    /// filing tier does exactly this) lands in the tagged queue file, and the
+    /// exit `flush_pending` exports it. One exporter in effect:
+    /// `resolve_exporters` dedupes by kind, so a second OTLP entry would
+    /// never be planned, and only index 0's queue file exists.
+    #[test]
+    #[serial]
+    fn register_sink_makes_a_one_shot_process_emit_and_flush_drains_it() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config(d.path(), &live_endpoint(), &dead_endpoint());
+        assert!(register_sink(&cfg, d.path(), TAG), "an OTLP config registers");
+        assert!(ops::global_ops_sink().is_some(), "the global sink is registered");
+        let facts = crate::fleet_dispatch::client::CallFacts {
+            endpoint: crate::fleet_dispatch::proto::FILING_LOCK_PATH,
+            result: "granted",
+            latency: Duration::ZERO,
+            ..Default::default()
+        };
+        ops::emit_span(crate::fleet_dispatch::client::span(&facts, chrono::Utc::now()));
+        assert!(
+            queued(d.path(), 0).iter().all(|q| q == "other"),
+            "the span was offered to the queue: {:?}",
+            queued(d.path(), 0)
+        );
+        assert_eq!(
+            flush_pending(&cfg, d.path(), TAG, T),
+            Some(Delivery::Exported),
+            "the exporter drained"
+        );
+        assert!(queued(d.path(), 0).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn register_sink_without_an_otlp_exporter_registers_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = ObservabilityConfig::default();
+        assert!(!register_sink(&cfg, d.path(), TAG));
     }
 }

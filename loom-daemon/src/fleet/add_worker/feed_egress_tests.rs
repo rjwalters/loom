@@ -3,11 +3,9 @@
 //!
 //! A sibling of `tests.rs` rather than a section inside it: the egress group
 //! is self-contained (its own config/secrets fixtures, its own operator-input
-//! placeholders) and `tests.rs` is over the file-size ratchet's threshold, so
-//! new egress coverage lands here instead of growing a frozen file
-//! (`.loom/docs/file-size-policy.md`). Shared fixtures it borrows from
-//! `tests.rs` (`base_config`, `safehouse_config`, `safehouse_secrets`) are
-//! `pub(super)` there for exactly this reason.
+//! placeholders). Shared fixtures it borrows from `tests.rs` (`base_config`,
+//! `safehouse_config`, `safehouse_secrets`) are `pub(super)` there for exactly
+//! this reason.
 
 use super::super::PlanEntry;
 use super::tests::{base_config, safehouse_config, safehouse_secrets};

@@ -66,7 +66,9 @@ pub enum Commands {
     Init(super::misc_cmds::InitArgs),
 
     /// Rewrite only the marker-delimited Loom-managed `.gitignore` block in a
-    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set without
+    /// workspace, converging it on the current `EPHEMERAL_PATTERNS` set (plus
+    /// the #13898 stub-conditional pnpm-artifact entries when the workspace's
+    /// root `package.json` is the `loom-workspace` stub) without
     /// running a full `init` (Issue #4280). This is the standalone entry point
     /// `defaults/scripts/resync-installed.sh` invokes so existing consumer
     /// installs pick up newly-ignored runtime paths (e.g. `.loom/sweep-checkpoint/`,
@@ -134,21 +136,6 @@ pub enum Commands {
     /// `--json --section <a,b,...>` (#10787) returns only those top-level
     /// sections, and the daemon builds only what they need.
     Status(super::status::sections::StatusArgs),
-
-    /// Show the peer-claim view: which issues this host currently sees a
-    /// peer host claiming, by which host and with what remaining TTL, plus
-    /// the four transport counters (advertised / received / expired /
-    /// dispatch-skipped) that make the re-advertisement heartbeat and the
-    /// #5789 duplicate-dispatch backoff observable instead of a `debug!`-only
-    /// log line (Issue #5921). A thin standalone view of the same data
-    /// `loom-daemon status` renders in its "Peer claims" section — useful for
-    /// a fleet script comparing two hosts' views directly (`ssh host-a
-    /// loom-daemon peer-claims --json` vs `ssh host-b …`).
-    PeerClaims {
-        /// Emit machine-readable JSON instead of the human-readable table.
-        #[arg(long)]
-        json: bool,
-    },
 
     /// Show the work finder's ready queue in its real dispatch order
     /// (verified red-main fixes first, then priority level, oldest first —
@@ -803,8 +790,8 @@ pub enum Commands {
     },
 
     /// Native port of `loom-recover-orphans` (Issue #4272): detects `loom:building`
-    /// issues with no live sweep tracking them and spawn-loop tasks with a
-    /// stale heartbeat + dead PID, and (with `--recover`) resets them. Also
+    /// issues with no live sweep tracking them, and (with `--recover`) resets
+    /// them. Also
     /// detects stale PR-side `loom:reviewing`/`loom:treating` claim overlays
     /// left behind by a dead Judge/Doctor (Issue #6167), sharing the same
     /// staleness threshold and liveness discipline as the daemon's periodic
@@ -965,6 +952,15 @@ pub enum Commands {
     #[command(flatten)]
     ScriptPorts(super::script_ports::ScriptPortCommand),
     Labels(super::labels_cmd::LabelsArgs),
+
+    /// Structural lint for GitHub Actions workflow YAML (#13896): duplicate
+    /// step `id` within one job and duplicate mapping keys anywhere — the two
+    /// shapes a textual conflict-merge union produces. GitHub rejects such a
+    /// file at validation with zero jobs, so its gate vanishes while every
+    /// rollup reads green. Exit 0 clean, non-zero on any defect (fail closed).
+    /// Args live in `crate::workflow_lint` because this file is frozen by the
+    /// file-size ratchet.
+    WorkflowLint(crate::workflow_lint::WorkflowLintArgs),
 
     /// Historical replay of scheduling predictions vs eventual PRs (#9785):
     /// `overlap-replay validate | outcomes | score`. Nested (not flattened)
@@ -1786,6 +1782,13 @@ pub enum StashesAction {
     BuildTrees(super::stashes::BuildTreesArgs),
 }
 
+fn parse_excluded_pool_name(value: &str) -> Result<String, &'static str> {
+    if value.trim().is_empty() {
+        return Err("expected a nonblank pool name");
+    }
+    Ok(value.to_owned())
+}
+
 /// Sub-actions for `loom-daemon tokens`.
 #[derive(Subcommand)]
 pub enum TokensAction {
@@ -1942,6 +1945,11 @@ pub enum TokensAction {
         #[arg(long)]
         force: bool,
 
+        /// Skip a Claude account by its exact derived pool name, without the
+        /// `.token` suffix. Repeat for more names. Existing files are preserved.
+        #[arg(long = "exclude-name", value_name = "NAME", value_parser = parse_excluded_pool_name)]
+        exclude_names: Vec<String>,
+
         /// Delete `*.token` files for accounts claude-monitor no longer
         /// reports active (pool state files are never touched).
         #[arg(long)]
@@ -2002,6 +2010,30 @@ pub enum TokensAction {
         /// never double-counted.
         #[arg(long)]
         all_pools: bool,
+    },
+
+    /// Run the captain's token-pool probe now and publish it fleet-wide
+    /// (`tokens refresh --fleet`, #13943, part 3 of #13893): one request
+    /// over the fleet-dispatch channel, the captain probes the pool
+    /// immediately instead of at the next `tokenRankingRefresh` tick, and
+    /// every worker applies the result on its next heartbeat (at most
+    /// ~25 s, `HEARTBEAT_GAP`). Exits 0 once the captain acknowledges the
+    /// probe it ran (or joined — a request arriving while a probe runs
+    /// coalesces into it). Never probes locally: no captain declared
+    /// (`fleetDispatch.enabled`/`fleetDispatch.url`) or an unreachable
+    /// captain exits non-zero with a one-line reason — a local probe stays
+    /// what it always was, `tokens check --ranking`.
+    Refresh {
+        /// Refresh the whole fleet through its captain. The only mode: the
+        /// verb exists for the fleet refresh, and a local ranking refresh
+        /// is `tokens check --ranking`.
+        #[arg(long, required = true)]
+        fleet: bool,
+
+        /// Repo root whose effective config names the captain (the host
+        /// tier's `fleetDispatch.enabled` / `fleetDispatch.url`).
+        #[arg(long, value_name = "PATH", default_value = ".")]
+        workspace: String,
     },
 
     /// Manage the `.allowlist` file constraining which accounts `select` may
@@ -2268,6 +2300,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
         Commands::ScriptPorts(cmd) => cmd.run(),
+        Commands::WorkflowLint(args) => args.run(),
         Commands::OverlapReplay { action } => action.run(),
         Commands::Lease { action } => action.run(),
         Commands::Inflight { action } => action.run(),
@@ -2458,10 +2491,10 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             // sync handler.
             unreachable!("Health is handled in main() before handle_cli_command")
         }
-        Commands::PeerClaims { .. } | Commands::Queue { .. } => {
+        Commands::Queue { .. } => {
             // Routed directly in `main()` (it needs the async runtime for the
             // socket round-trip), never dispatched through this sync handler.
-            unreachable!("PeerClaims/Queue are handled in main() before handle_cli_command")
+            unreachable!("Queue is handled in main() before handle_cli_command")
         }
         // Async commands are dispatched by main before reaching this sync handler.
         Commands::JevMergeRisk { .. }

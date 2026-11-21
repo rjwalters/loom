@@ -101,8 +101,7 @@ fn truncate_tail_falls_back_to_byte_cut_for_a_single_giant_token() {
 
 // `find_failure_sentinel` / `describe_role_failure` (#6757 AC1/AC2, #8123)
 // tests live with their implementation in `role_runner/failure_sentinel.rs`
-// (`.loom/docs/file-size-policy.md` — new code for an over-threshold parent
-// goes to a new sibling module, not inline here).
+// rather than inline here.
 
 // -- had_ever_succeeded / failure_history_note (#6757 AC4) --------------
 
@@ -161,31 +160,6 @@ fn had_ever_succeeded_is_independent_per_role_and_root() {
 // `LOOM_RUNTIME_<ROLE>` pins must go too.
 use crate::runtime_selection_test_support::ClearedRuntimeSelectionEnv as ClearedLoomRuntimeEnv;
 
-/// As [`ClearedLoomRuntimeEnv`] but for `GH_CONFIG_DIR` (#5508): the test
-/// process may itself be running under a `GH_CONFIG_DIR` (a developer
-/// shell, or the daemon's own #4458 process-global default), which would
-/// otherwise leak into a spawned child's environment and make the
-/// "unregistered root leaves GH_CONFIG_DIR untouched" test observe an
-/// ambient value instead of a genuine absence.
-struct ClearedGhConfigDirEnv(Option<String>);
-
-impl ClearedGhConfigDirEnv {
-    fn new() -> Self {
-        let prior = std::env::var("GH_CONFIG_DIR").ok();
-        std::env::remove_var("GH_CONFIG_DIR");
-        Self(prior)
-    }
-}
-
-impl Drop for ClearedGhConfigDirEnv {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("GH_CONFIG_DIR", v),
-            None => std::env::remove_var("GH_CONFIG_DIR"),
-        }
-    }
-}
-
 #[test]
 #[serial]
 fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
@@ -228,7 +202,10 @@ fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
     let worker = root.join(".loom/scripts/spawn-worker.sh");
     fs::write(
         &worker,
-        format!("#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" > '{}'\n", observed.display()),
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$LOOM_RUNTIME\" > '{}'\nprintf '%s\\n' 'session id: 11111111-2222-3333-4444-555555555555'\n",
+            observed.display()
+        ),
     )
     .unwrap();
     fs::set_permissions(&worker, fs::Permissions::from_mode(0o755)).unwrap();
@@ -239,6 +216,31 @@ fn mixed_runtime_role_launch_is_admitted_and_pinned_before_spawn() {
         .with_timeout(Duration::from_secs(5));
     assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
     assert_eq!(fs::read_to_string(observed).unwrap(), "codex");
+    let session_id = |runner: &ScriptRoleInvocationRunner| {
+        runner
+            .resolved_launch()
+            .and_then(|launch| launch.codex_session_id)
+    };
+    assert_eq!(session_id(&runner).as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+
+    fs::write(
+        &worker,
+        concat!(
+            "#!/bin/sh\ncat <<'EOF'\n",
+            "session id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n",
+            "quoted: ==== loom-daemon role_runner: prior invocation ====\n",
+            "session id: 11111111-2222-3333-4444-555555555555\n",
+            "EOF\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Success);
+    assert_eq!(session_id(&runner).as_deref(), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+
+    // The executable still exists, but the OS refuses its missing interpreter.
+    fs::write(&worker, "#!/nonexistent-loom-test-interpreter\n").unwrap();
+    assert!(matches!(runner.invoke("curator", "/loom:curator"), RoleTickOutcome::Failure(_)));
+    assert!(session_id(&runner).is_none());
 }
 
 /// Issue #6507: regression test pinning the `LOOM_ROLE` env-var contract
@@ -405,6 +407,8 @@ fn test_config_reads_enabled_roles_and_interval() {
             role_models: BTreeMap::new(),
             effort: None,
             role_efforts: BTreeMap::new(),
+            service_tier: None,
+            role_service_tiers: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
             champion_mode: None,
@@ -456,6 +460,8 @@ fn test_config_project_tier_only_is_honored_like_legacy() {
             role_models: BTreeMap::new(),
             effort: None,
             role_efforts: BTreeMap::new(),
+            service_tier: None,
+            role_service_tiers: BTreeMap::new(),
             architect_max_proposals: None,
             max_concurrent: None,
             champion_mode: None,
@@ -516,6 +522,8 @@ fn test_resolve_roles_empty_array_is_none() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -535,6 +543,8 @@ fn test_resolve_roles_filters_and_preserves_default_order() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -555,6 +565,8 @@ fn test_resolve_roles_ignores_unknown_names() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -587,6 +599,8 @@ fn test_missing_defaults_warns_for_default_absent_from_pinned_list() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -624,6 +638,8 @@ fn test_resolve_roles_unknown_name_and_missing_default_fire_independently() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -972,6 +988,8 @@ fn test_resolve_enabled_config_can_enable() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -992,6 +1010,8 @@ fn test_resolve_enabled_env_overrides_config() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -1007,6 +1027,8 @@ fn test_resolve_enabled_env_overrides_config() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -1241,6 +1263,8 @@ fn test_resolve_interval_for_role_precedence() {
                 role_models: BTreeMap::new(),
                 effort: None,
                 role_efforts: BTreeMap::new(),
+                service_tier: None,
+                role_service_tiers: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
                 champion_mode: None,
@@ -1264,6 +1288,8 @@ fn test_resolve_interval_for_role_precedence() {
                 role_models: BTreeMap::new(),
                 effort: None,
                 role_efforts: BTreeMap::new(),
+                service_tier: None,
+                role_service_tiers: BTreeMap::new(),
                 architect_max_proposals: None,
                 max_concurrent: None,
                 champion_mode: None,
@@ -2374,6 +2400,8 @@ fn test_resolve_on_idle_roles_parses_and_preserves_order() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -2398,6 +2426,8 @@ fn test_resolve_on_idle_roles_ignores_unknown_names() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -2418,6 +2448,8 @@ fn test_resolve_on_idle_roles_empty_array_is_empty() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -2940,7 +2972,7 @@ fn test_collision_probe_wrapper_is_transparent_to_the_invocation() {
         Duration::from_secs(600),
     );
     std::env::remove_var(crate::config_resolver::PRIVATE_DEFAULTS_ENV);
-    assert_eq!(outcome, RoleTickOutcome::Failure("boom".into()));
+    assert_eq!(outcome.outcome, RoleTickOutcome::Failure("boom".into()));
     assert_eq!(runner.calls, vec![("champion".to_string(), "/loom:champion".to_string())]);
 }
 
@@ -2992,6 +3024,8 @@ fn on_idle_config(enabled: Option<bool>, roles: Vec<&str>) -> RoleRunnerConfig {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,
@@ -3103,6 +3137,8 @@ fn test_plan_idle_runs_disabled_without_on_idle_does_not_warn() {
         role_models: BTreeMap::new(),
         effort: None,
         role_efforts: BTreeMap::new(),
+        service_tier: None,
+        role_service_tiers: BTreeMap::new(),
         architect_max_proposals: None,
         max_concurrent: None,
         champion_mode: None,

@@ -128,7 +128,11 @@ pub(super) fn run_role_with_timeout(
     // and never without one at all.
     let contained_admission = admission.is_some_and(|a| a.execution.is_some());
     let prepared = match contained {
-        Some(selection) if contained_admission => Ok(Some(selection)),
+        // A selection handed in is ALWAYS the one to launch through: either the
+        // containment proof's (#8787) or a seat reserved before the claim
+        // (#14481, `execution == None`). Re-preparing would flock the same
+        // account.lock a second time in this process and fail `AccountBusy`.
+        Some(selection) => Ok(Some(selection)),
         _ if contained_admission => Err(anyhow::anyhow!(
             "containment admission has no prepared private selection; refusing launch"
         )),
@@ -139,7 +143,6 @@ pub(super) fn run_role_with_timeout(
             crate::tokens_pool::private_workspace::JobKind::Role,
             None,
             &format!("role-{role}-{}", uuid::Uuid::new_v4()),
-            false, // not a containment admission; the filter is unchanged (#14110)
         ),
     };
     let selection = match prepared {
@@ -168,6 +171,11 @@ pub(super) fn run_role_with_timeout(
     // crate writes — `tick_anchor` is used purely as an opaque string anchor
     // (never re-parsed as a datetime), so this is a pure formatting change.
     let tick_anchor = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let service_tier = model_resolution::resolve_role_runner_service_tier_for_runtime(
+        workspace_root,
+        role,
+        admission.map(|a| a.runtime.as_str()),
+    );
 
     {
         use std::io::Write;
@@ -176,8 +184,7 @@ pub(super) fn run_role_with_timeout(
             .append(true)
             .open(&log_path)
         {
-            // Rendered by `model_resolution::role_log_header` (#4501/#8054) —
-            // the module that resolved the pair owns how it is reported.
+            // Keep the header and the child environment on the same tier resolution.
             let _ = writeln!(
                 f,
                 "\n{}",
@@ -188,6 +195,9 @@ pub(super) fn run_role_with_timeout(
                     model_source,
                     effort,
                     effort_source,
+                    service_tier
+                        .as_ref()
+                        .map(|(tier, source)| (tier.as_str(), source.as_str())),
                 )
             );
         }
@@ -251,6 +261,16 @@ pub(super) fn run_role_with_timeout(
         cmd.arg("--effort").arg(effort);
     }
     cmd.arg("--dangerously-skip-permissions");
+    // Service tier (#14454, producer for #14141): a tier has no CLI flag, so the
+    // resolved value rides the child's environment as `LOOM_SERVICE_TIER`, which
+    // the `spawn-*.sh` adapters map per runtime. Unset exports nothing — an
+    // operator-exported value in the daemon's own environment is inherited as-is.
+    if let Some((tier, tier_source)) = service_tier {
+        log::info!(
+            "role_runner: {role} service_tier={tier} (source={tier_source}) -> LOOM_SERVICE_TIER"
+        );
+        cmd.env("LOOM_SERVICE_TIER", tier);
+    }
     // Transient-error recovery (issue #4255): scheduled role spawns are the
     // same unattended class as daemon-dispatched sweeps, so route them through
     // `claude-wrapper.sh` (retry/backoff/classification, bounded by
@@ -661,5 +681,70 @@ mod tests {
             other => panic!("expected a write-scope refusal, got {other:?}"),
         }
         assert!(!marker.exists(), "nothing may be spawned on a refused root");
+    }
+
+    /// #14481: a seat reserved before the claim (`execution == None`) must be
+    /// launched through, never re-prepared. The child inheriting the lease on
+    /// fd 198 proves the reservation travelled; re-preparing would instead
+    /// flock the same account.lock a second time in-process and fail busy.
+    #[test]
+    #[serial_test::serial(private_workspace_fork)]
+    fn a_reserved_seat_without_containment_is_launched_through() {
+        let root = tempfile::tempdir().unwrap();
+        let seat = tempfile::tempdir().unwrap();
+        let selection =
+            crate::tokens_pool::private_workspace::dispatch::Selection::reserved_for_test(
+                seat.path(),
+            );
+        let admitted = crate::runtime_admission::ResolvedRuntime {
+            role: "judge".into(),
+            runtime: "codex".into(),
+            source: crate::runtime_admission::RuntimeSource::RoleConfig,
+            adapter: PathBuf::from("/nonexistent/spawn-codex.sh"),
+            role_manifest: PathBuf::from("/nonexistent/judge.json"),
+            runtime_manifest: PathBuf::from("/nonexistent/codex.json"),
+            suggested_worker_type: None,
+            preference: None,
+            execution: None,
+        };
+        let marker = root.path().join("inherited");
+        let script = root.path().join("spawn.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$LOOM_PRIVATE_LEASE_FD\" = '{}' ] && \
+                 [ -e \"/dev/fd/$LOOM_PRIVATE_LEASE_FD\" ] && touch '{}'\n",
+                crate::tokens_pool::private_workspace::dispatch::LEASE_FD,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let ws = crate::write_scope_test_support::WritableRoot::register(root.path());
+        let outcome = run_role_with_timeout(
+            &script,
+            root.path(),
+            &ws.gh,
+            "judge",
+            "/loom:judge",
+            root.path().join("logs"),
+            Duration::from_secs(5),
+            "",
+            "default",
+            "",
+            "default",
+            Some(&admitted),
+            None,
+            None,
+            Some(selection),
+            None,
+        );
+        if let RoleTickOutcome::Failure(reason) = &outcome {
+            assert!(!reason.contains("busy"), "re-prepared a held seat: {reason}");
+        }
+        assert!(marker.exists(), "the reserved lease must reach the child: {outcome:?}");
     }
 }

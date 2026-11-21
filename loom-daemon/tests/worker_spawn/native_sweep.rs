@@ -1,5 +1,5 @@
 //! Native sweep launches through `spawn-worker` (moved out of
-//! `worker_spawn.rs` to keep it under the file-size threshold, #11400).
+//! `worker_spawn.rs`, #11400).
 use super::{config, worker};
 
 #[test]

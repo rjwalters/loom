@@ -5,10 +5,9 @@
 //! without counting — while the shared GitHub API quota is exhausted.
 //!
 //! Lives in its own sibling module rather than `quarantine.rs`'s `mod tests`:
-//! that file is already over the file-size ratchet's threshold and therefore
-//! frozen at its current size (see `.loom/docs/file-size-policy.md`), and this
-//! mirrors the existing `quarantine_empty_pool_tests.rs` /
-//! `quarantine_dispatch_scope_tests.rs` precedent.
+//! that file is already large, and this mirrors the existing
+//! `quarantine_empty_pool_tests.rs` / `quarantine_dispatch_scope_tests.rs`
+//! precedent.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::{QuarantineConfig, SweepRegistry, SweepRegistryConfig};

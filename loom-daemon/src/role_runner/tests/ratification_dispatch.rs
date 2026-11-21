@@ -22,6 +22,8 @@ fn pin(path: &str, commit: &str) -> Pin {
 struct Src {
     files: HashMap<String, Result<String, String>>,
     private: Option<bool>,
+    /// Calls to `repo_is_private` (visibility is market-only work, #14797).
+    visibility_reads: std::cell::Cell<u32>,
 }
 
 impl Src {
@@ -29,7 +31,11 @@ impl Src {
         let mut files = HashMap::new();
         files.insert("ee.md".into(), Ok("EE-INSTRUCTIONS".into()));
         files.insert("market.md".into(), Ok("MARKET-INSTRUCTIONS".into()));
-        Src { files, private }
+        Src {
+            files,
+            private,
+            visibility_reads: std::cell::Cell::new(0),
+        }
     }
 }
 
@@ -41,6 +47,7 @@ impl InstructionSource for Src {
             .unwrap_or_else(|| Err("missing".into()))
     }
     fn repo_is_private(&self, _repo: &str) -> Option<bool> {
+        self.visibility_reads.set(self.visibility_reads.get() + 1);
         self.private
     }
 }
@@ -59,7 +66,7 @@ impl RoleInvocationRunner for Recorder {
 
 fn run(src: &Src, ee: &Pin, mkt: &Pin) -> (Dispatched, Recorder) {
     let mut r = Recorder::default();
-    let d = dispatch(ee, mkt, "owner/repo", PR_REF, src, &mut r);
+    let d = dispatch(Some(ee), Some(mkt), "owner/repo", PR_REF, src, &mut r);
     (d, r)
 }
 
@@ -76,8 +83,8 @@ fn one_pr_yields_two_sessions_with_disjoint_context() {
     assert!(r.calls[1].1.contains("MARKET-INSTRUCTIONS") && r.calls[1].1.contains(PR_REF));
     assert!(!r.calls[0].1.contains("MARKET-INSTRUCTIONS"));
     assert!(!r.calls[1].1.contains("EE-INSTRUCTIONS"));
-    assert_eq!(d.get(Key::Ee), &KeyOutcome::Ran(RoleTickOutcome::Success));
-    assert_eq!(d.get(Key::Market), &KeyOutcome::Ran(RoleTickOutcome::Success));
+    assert_eq!(d.get(Key::Ee), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
+    assert_eq!(d.get(Key::Market), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
 }
 
 #[test]
@@ -85,8 +92,8 @@ fn branch_or_short_ref_pin_fails_only_that_session_closed() {
     let src = Src::ok(Some(true));
     for bad in ["main", "abc1234", ""] {
         let (d, r) = run(&src, &pin("ee.md", bad), &pin("market.md", MKT_SHA));
-        assert!(matches!(d.ee, KeyOutcome::FailedClosed(_)), "{bad:?}");
-        assert!(matches!(d.market, KeyOutcome::Ran(_)));
+        assert!(matches!(d.ee, Some(KeyOutcome::FailedClosed(_))), "{bad:?}");
+        assert!(matches!(d.market, Some(KeyOutcome::Ran(_))));
         assert_eq!(r.calls.len(), 1);
         assert_eq!(r.calls[0].0, role_name(Key::Market));
     }
@@ -97,15 +104,15 @@ fn failed_or_empty_fetch_fails_closed_without_launching() {
     let mut src = Src::ok(Some(true));
     src.files.insert("market.md".into(), Err("HTTP 404".into()));
     let (d, r) = run(&src, &pin("ee.md", EE_SHA), &pin("market.md", MKT_SHA));
-    assert!(matches!(d.market, KeyOutcome::FailedClosed(_)));
-    assert!(matches!(d.ee, KeyOutcome::Ran(_)));
+    assert!(matches!(d.market, Some(KeyOutcome::FailedClosed(_))));
+    assert!(matches!(d.ee, Some(KeyOutcome::Ran(_))));
     assert_eq!(r.calls.len(), 1);
 
     src.files.insert("ee.md".into(), Ok("  \n".into()));
     src.files.insert("market.md".into(), Err("boom".into()));
     let (d, r) = run(&src, &pin("ee.md", EE_SHA), &pin("market.md", MKT_SHA));
-    assert!(matches!(d.ee, KeyOutcome::FailedClosed(_)));
-    assert!(matches!(d.market, KeyOutcome::FailedClosed(_)));
+    assert!(matches!(d.ee, Some(KeyOutcome::FailedClosed(_))));
+    assert!(matches!(d.market, Some(KeyOutcome::FailedClosed(_))));
     assert!(r.calls.is_empty());
 }
 
@@ -120,6 +127,51 @@ fn public_or_unknown_visibility_constrains_market_only() {
     let src = Src::ok(Some(true));
     let (_, r) = run(&src, &pin("ee.md", EE_SHA), &pin("market.md", MKT_SHA));
     assert!(!r.calls[1].1.contains(PUBLIC_SOURCES_ONLY));
+}
+
+// ---- #14797: only the selected key pins are dispatched -----------------------
+
+#[test]
+fn a_complete_key_pin_is_not_attempted_at_all() {
+    let src = Src::ok(Some(true));
+    let mut r = Recorder::default();
+    // Market already complete for this head: only EE is dispatched.
+    let d = dispatch(Some(&pin("ee.md", EE_SHA)), None, "owner/repo", PR_REF, &src, &mut r);
+    assert_eq!(r.calls.len(), 1);
+    assert_eq!(r.calls[0].0, role_name(Key::Ee));
+    assert_eq!(d.get(Key::Ee), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
+    assert_eq!(d.market, None, "market was not attempted");
+    assert!(d.market_output.is_none());
+    // Visibility is market-only work: a market-less pass never reads it.
+    assert_eq!(src.visibility_reads.get(), 0);
+
+    // The other direction: only market dispatched.
+    let mut r = Recorder::default();
+    let d = dispatch(None, Some(&pin("market.md", MKT_SHA)), "owner/repo", PR_REF, &src, &mut r);
+    assert_eq!(r.calls.len(), 1);
+    assert_eq!(r.calls[0].0, role_name(Key::Market));
+    assert_eq!(d.ee, None);
+    assert_eq!(src.visibility_reads.get(), 1, "a market session reads visibility once");
+
+    // Nothing selected: no fetch, no session, no visibility read.
+    let mut r = Recorder::default();
+    let d = dispatch(None, None, "owner/repo", PR_REF, &src, &mut r);
+    assert!(r.calls.is_empty());
+    assert_eq!((d.ee, d.market), (None, None));
+    assert_eq!(src.visibility_reads.get(), 1);
+}
+
+#[test]
+fn a_withheld_pin_failure_for_one_key_leaves_the_other_dispatched() {
+    // A complete key plus a failed pin for the other: only the failed key is
+    // recorded, as fail-closed, and nothing else runs.
+    let mut src = Src::ok(Some(true));
+    src.files.insert("ee.md".into(), Err("HTTP 404".into()));
+    let mut r = Recorder::default();
+    let d = dispatch(Some(&pin("ee.md", EE_SHA)), None, "owner/repo", PR_REF, &src, &mut r);
+    assert!(matches!(d.ee, Some(KeyOutcome::FailedClosed(_))));
+    assert_eq!(d.market, None);
+    assert!(r.calls.is_empty());
 }
 
 /// Issue #13749: the production runner rejects a role name that
@@ -174,8 +226,8 @@ fn lane_sessions_pass_real_runtime_admission() {
         rejected: vec![],
     };
     let out = dispatch(
-        &pin("ee.md", EE_SHA),
-        &pin("market.md", MKT_SHA),
+        Some(&pin("ee.md", EE_SHA)),
+        Some(&pin("market.md", MKT_SHA)),
         "owner/repo",
         PR_REF,
         &src,
@@ -183,6 +235,6 @@ fn lane_sessions_pass_real_runtime_admission() {
     );
     assert!(r.rejected.is_empty(), "rejected: {:?}", r.rejected);
     assert_eq!(r.admitted, vec![role_name(Key::Ee), role_name(Key::Market)]);
-    assert_eq!(out.get(Key::Ee), &KeyOutcome::Ran(RoleTickOutcome::Success));
-    assert_eq!(out.get(Key::Market), &KeyOutcome::Ran(RoleTickOutcome::Success));
+    assert_eq!(out.get(Key::Ee), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
+    assert_eq!(out.get(Key::Market), Some(&KeyOutcome::Ran(RoleTickOutcome::Success)));
 }

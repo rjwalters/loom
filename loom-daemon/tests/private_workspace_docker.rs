@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+#[allow(dead_code)]
+mod common;
+
 #[path = "private_workspace_docker/auth.rs"]
 mod auth;
 #[path = "private_workspace_docker/containment.rs"]
@@ -331,7 +334,7 @@ WORKDIR /srv
             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
             &f.server,
         ]);
-        f.repository = format!("https://{}:8443/gitea/repo.git", ip.trim());
+        f.repository = format!("https://{}/gitea/repo.git", ip.trim());
         let auth = f.root.path().join("synthetic-auth.json");
         std::fs::write(&auth, "synthetic-credential-free-fixture").unwrap();
         for name in &f.names {

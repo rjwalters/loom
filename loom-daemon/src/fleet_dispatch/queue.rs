@@ -118,6 +118,7 @@ fn pull_input(slug: &str, p: &RestPull) -> step_item::PullInput {
             .as_deref()
             .is_some_and(|h| h.eq_ignore_ascii_case(slug)),
         author_untrusted: false,
+        linkage_unverified: step_item::branch_metadata_unverified(p),
         queued: false,
         draft: p.draft,
         markers: step_item::PullMarkers::default(),

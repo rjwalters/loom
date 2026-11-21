@@ -1,5 +1,6 @@
 //! Bounded read-only control channel. Worker data never chooses a host path.
 use super::*;
+use crate::worktree_root::worktree_root;
 use serde_json::Value;
 use std::io::Read;
 use std::process::Command;
@@ -234,12 +235,26 @@ pub(super) fn update(root: &Path, config: &Config, job: &lease::Job, outcome: &s
             fresh = true;
         }
     }
-    // A previous run's snapshot cannot prove this run finished safely.
-    if outcome == "completed" && !fresh {
+    // A previous run's snapshot cannot prove this run finished safely, and a
+    // fresh one only certifies completion for an issue job when the issue
+    // branch is published and its worktree clean: work the step left behind —
+    // unpushed commits, an unclean tree, a worktree that never came to exist —
+    // needs a recovery pass even though the step exited cleanly (#14031).
+    if outcome == "completed" && !completed_certified(fresh, record.snapshot.as_ref(), job.issue) {
         record.outcome = "recovery-required".into();
     }
     // Failed read preserves the last snapshot and records uncertainty.
     save(&path, &record)
+}
+
+/// Whether this run's own snapshot certifies a `completed` outcome. A fresh
+/// snapshot of an issue-less (role) job certifies as before; an issue job's
+/// must additionally show the issue branch published and the worktree clean.
+fn completed_certified(fresh: bool, snapshot: Option<&Snapshot>, issue: Option<u64>) -> bool {
+    if !fresh {
+        return false;
+    }
+    snapshot.is_some_and(|s| issue.is_none() || (s.published && !s.dirty))
 }
 
 /// The in-container snapshot of the clone `job` ran in. The exec must name that
@@ -258,6 +273,14 @@ fn snapshot_command(config: &Config, job: &lease::Job) -> Result<Command> {
         "exec",
         "--env",
         &format!("LOOM_PRIVATE_CLONE={}", target.path),
+        // The step's worktrees live under the override its launch env carried
+        // (transport.rs `child_env` sets LOOM_WORKTREE_ROOT to this value);
+        // the session container itself is created without it (docker.rs
+        // `create`), so the snapshot exec must name it too or the worktree
+        // base resolves without the clone-basename namespace and the snapshot
+        // misses the worktree (#14031).
+        "--env",
+        &format!("LOOM_WORKTREE_ROOT={}/.loom/worktrees", target.path),
         &job.container_id,
         "loom-daemon",
         "private-workspace",
@@ -338,37 +361,61 @@ fn read_small(root: &Path, path: &Path) -> Result<Vec<u8>> {
 }
 
 pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
-    let repo = &worker_setup::selected_clone()?;
+    inspect(&worker_setup::selected_clone()?, issue)
+}
+
+/// The recovery state of the clone at `repo` — of its issue worktree when the
+/// job had one. Split out of [`snapshot`] (which only resolves the selected
+/// clone from the launch environment) so tests can drive a fixture clone.
+fn inspect(repo: &Path, issue: Option<u64>) -> Result<Snapshot> {
     let branch = issue.map(|n| format!("feature/issue-{n}"));
-    let worktree = issue
-        .map(|n| repo.join(format!(".loom/worktrees/issue-{n}")))
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| repo.to_owned());
-    let canonical = worktree.canonicalize()?;
-    if !canonical.starts_with(repo) {
-        bail!("private worktree escaped its clone");
+    // The step created its worktree through worktree-root resolution: the
+    // transport exports LOOM_WORKTREE_ROOT=<clone>/.loom/worktrees and the
+    // helper namespaces that base by the clone's basename, so the worktree
+    // lives at <clone>/.loom/worktrees/<basename>/issue-N. A literal
+    // .loom/worktrees/issue-N never exists there, and the old fallback to the
+    // root clone recorded the detached base revision — clean, unpublished and
+    // indistinguishable between a merged job and a wedged one (#14031).
+    let worktree = issue.map(|n| worktree_root(repo).join(format!("issue-{n}")));
+    let inspected = match &worktree {
+        // A role job with no issue describes the root clone itself.
+        None => Some(repo.canonicalize()?),
+        Some(path) if path.exists() => Some(path.canonicalize()?),
+        // An issue job whose worktree never came to exist has no state that
+        // can be attested published or clean. Report unknown rather than
+        // silently describing the detached root clone's base revision.
+        Some(_) => None,
+    };
+    if let Some(canonical) = &inspected {
+        if !canonical.starts_with(repo) {
+            bail!("private worktree escaped its clone");
+        }
     }
-    let git = |args: &[&str]| -> Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&canonical)
-            .args(args)
-            .output()?;
+    let git = |dir: &Path, args: &[&str]| -> Result<String> {
+        let output = Command::new("git").arg("-C").arg(dir).args(args).output()?;
         if !output.status.success() {
             bail!("private snapshot git query failed");
         }
         Ok(String::from_utf8(output.stdout)?.trim().to_owned())
     };
-    let actual_branch = git(&["branch", "--show-current"])?;
-    let revision = git(&["rev-parse", "HEAD"])?;
-    let published = branch
-        .as_ref()
-        .is_some_and(|expected| expected == &actual_branch)
-        && branch.as_ref().is_some_and(|expected| {
-            git(&["rev-parse", &format!("refs/remotes/origin/{expected}")])
-                .is_ok_and(|remote| remote == revision)
-        });
-    let dirty = !git(&["status", "--porcelain", "--untracked-files=all"])?.is_empty();
+    let (revision, published, dirty) = match &inspected {
+        Some(dir) => {
+            let actual_branch = git(dir, &["branch", "--show-current"])?;
+            let revision = git(dir, &["rev-parse", "HEAD"])?;
+            let published = branch
+                .as_ref()
+                .is_some_and(|expected| expected == &actual_branch)
+                && branch.as_ref().is_some_and(|expected| {
+                    git(dir, &["rev-parse", &format!("refs/remotes/origin/{expected}")])
+                        .is_ok_and(|remote| remote == revision)
+                });
+            let dirty = !git(dir, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
+            (Some(revision), published, dirty)
+        }
+        // Unknown, encoded so it cannot read as clean: nothing certifies it
+        // published, and the missing worktree itself needs a recovery look.
+        None => (None, false, true),
+    };
     let checkpoint = issue
         .map(|n| repo.join(format!(".loom/sweep-checkpoint/issue-{n}.json")))
         .filter(|p| p.exists())
@@ -393,7 +440,7 @@ pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
     let result = Snapshot {
         issue,
         branch,
-        revision: Some(revision),
+        revision,
         published,
         dirty,
         checkpoint,
@@ -405,6 +452,8 @@ pub(super) fn snapshot(issue: Option<u64>) -> Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_git_helpers::{configure, run};
+    use serial_test::serial;
 
     /// The snapshot exec names the clone the job ran in (#10796): an
     /// additional clone's job is snapshotted there, never at the primary the
@@ -424,6 +473,8 @@ mod tests {
             volume: "v".into(),
             profile: PathBuf::from("/nonexistent"),
             gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
         };
         let second = identify("https://example.invalid/o/second").unwrap();
         config.repositories.push(Registered {
@@ -451,10 +502,22 @@ mod tests {
 
         let primary = argv(&snapshot_command(&config, &job("")).unwrap());
         assert!(primary.contains(&format!("LOOM_PRIVATE_CLONE={REPO}")), "{primary:?}");
+        // The snapshot exec also carries the worktree root the step's launch
+        // env set — the container itself is created without it — so the
+        // in-container worktree base resolves with the clone-basename
+        // namespace (#14031).
+        assert!(
+            primary.contains(&format!("LOOM_WORKTREE_ROOT={REPO}/.loom/worktrees")),
+            "{primary:?}"
+        );
 
         let other = argv(&snapshot_command(&config, &job(&second.url)).unwrap());
         let clone = format!("{WORK_ROOT}/{}", second.slug);
         assert!(other.contains(&format!("LOOM_PRIVATE_CLONE={clone}")), "{other:?}");
+        assert!(
+            other.contains(&format!("LOOM_WORKTREE_ROOT={clone}/.loom/worktrees")),
+            "{other:?}"
+        );
         assert!(!other.iter().any(|arg| arg.contains(REPO)), "{other:?}");
         // `docker exec [OPTIONS] CONTAINER COMMAND`: the env option must precede
         // the container, and the snapshot still carries the job's issue.
@@ -473,6 +536,120 @@ mod tests {
         );
 
         assert!(snapshot_command(&config, &job("https://example.invalid/o/third")).is_err());
+    }
+
+    /// A private-clone-shaped fixture: a detached root clone at `host/repo`
+    /// with a bare `origin` remote, mirroring the layout the in-container
+    /// snapshot runs against.
+    fn clone_with_origin(host: &Path) -> PathBuf {
+        let clone = host.join("repo");
+        std::fs::create_dir_all(&clone).unwrap();
+        run(&clone, &["init", "-b", "main"]);
+        configure(&clone);
+        std::fs::write(clone.join("base"), "base\n").unwrap();
+        run(&clone, &["add", "-A"]);
+        run(&clone, &["commit", "-q", "-m", "base"]);
+        let origin = host.join("origin.git");
+        run(host, &["init", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        run(&clone, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        clone
+    }
+
+    /// Run `f` with `LOOM_WORKTREE_ROOT` set the way the private transport
+    /// sets it for the step (`<clone>/.loom/worktrees`), restoring the prior
+    /// value. Every caller carries `#[serial]` (the crate-default group,
+    /// shared with `worktree_root`'s and `worktree_reaper`'s env tests) so the
+    /// process-global mutation cannot race them (#5164).
+    fn with_step_worktree_root<T>(clone: &Path, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("LOOM_WORKTREE_ROOT").ok();
+        std::env::set_var("LOOM_WORKTREE_ROOT", clone.join(".loom/worktrees").to_str().unwrap());
+        let result = f();
+        match prev {
+            Some(p) => std::env::set_var("LOOM_WORKTREE_ROOT", p),
+            None => std::env::remove_var("LOOM_WORKTREE_ROOT"),
+        }
+        result
+    }
+
+    /// The snapshot must read the issue worktree the step used — under the
+    /// basename-namespaced base its `LOOM_WORKTREE_ROOT` resolves to — and
+    /// distinguish a job that pushed from one that left an unpushed commit
+    /// behind (#14031).
+    #[test]
+    #[serial]
+    fn issue_snapshot_reads_the_real_worktree_and_distinguishes_published() {
+        let host = tempfile::tempdir().unwrap();
+        let clone = clone_with_origin(host.path());
+        // The base the step's worktree.sh resolves: LOOM_WORKTREE_ROOT
+        // namespaced by the clone's basename.
+        let base = clone.join(".loom/worktrees/repo");
+        std::fs::create_dir_all(&base).unwrap();
+        let worktree = base.join("issue-7");
+        run(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/issue-7",
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let base_revision = run(&clone, &["rev-parse", "main"]);
+        std::fs::write(worktree.join("work"), "done\n").unwrap();
+        run(&worktree, &["add", "-A"]);
+        run(&worktree, &["commit", "-q", "-m", "work"]);
+        let worktree_revision = run(&worktree, &["rev-parse", "HEAD"]);
+
+        let unpushed = with_step_worktree_root(&clone, || inspect(&clone, Some(7)).unwrap());
+        assert_eq!(
+            unpushed.revision.as_deref(),
+            Some(worktree_revision.as_str()),
+            "the record must name the issue branch's revision"
+        );
+        assert_ne!(
+            unpushed.revision.as_deref(),
+            Some(base_revision.as_str()),
+            "the record must not describe the detached root clone"
+        );
+        assert!(!unpushed.published);
+        assert!(!unpushed.dirty);
+
+        run(&clone, &["push", "origin", "feature/issue-7"]);
+        let pushed = with_step_worktree_root(&clone, || inspect(&clone, Some(7)).unwrap());
+        assert!(pushed.published, "a pushed and an unpushed job must differ in published");
+        assert!(!pushed.dirty);
+        assert_eq!(pushed.revision, unpushed.revision);
+    }
+
+    /// An issue job whose worktree is absent must not be described by the
+    /// detached root clone's state: unknown, unpublished, not clean (#14031).
+    #[test]
+    #[serial]
+    fn issue_snapshot_without_worktree_is_unknown_not_the_root_clone() {
+        let host = tempfile::tempdir().unwrap();
+        let clone = clone_with_origin(host.path());
+        let snapshot = with_step_worktree_root(&clone, || inspect(&clone, Some(7)).unwrap());
+        assert_eq!(snapshot.issue, Some(7));
+        assert_eq!(snapshot.branch.as_deref(), Some("feature/issue-7"));
+        assert_eq!(snapshot.revision, None, "a missing worktree has no revision to certify");
+        assert!(!snapshot.published);
+        assert!(snapshot.dirty);
+    }
+
+    /// A role job with no issue still describes the root clone itself.
+    #[test]
+    fn issue_less_snapshot_still_reads_the_root_clone() {
+        let host = tempfile::tempdir().unwrap();
+        let clone = clone_with_origin(host.path());
+        let head = run(&clone, &["rev-parse", "HEAD"]);
+        let snapshot = inspect(&clone, None).unwrap();
+        assert_eq!(snapshot.issue, None);
+        assert_eq!(snapshot.branch, None);
+        assert_eq!(snapshot.revision.as_deref(), Some(head.as_str()));
+        assert!(!snapshot.published);
+        assert!(!snapshot.dirty);
     }
 
     #[test]
@@ -499,10 +676,94 @@ mod tests {
         });
         assert!(validate(&s, Some(7)).is_err());
     }
+    /// `completed` survives only a fresh snapshot that certifies an issue
+    /// job's branch published and its worktree clean; everything else reads
+    /// recovery-required (#14031).
+    #[test]
+    fn completion_requires_a_fresh_clean_published_issue_snapshot() {
+        let snap = |published: bool, dirty: bool| Snapshot {
+            issue: Some(7),
+            branch: Some("feature/issue-7".into()),
+            revision: Some("a".repeat(40)),
+            published,
+            dirty,
+            checkpoint: None,
+        };
+        assert!(completed_certified(true, Some(&snap(true, false)), Some(7)));
+        assert!(!completed_certified(false, Some(&snap(true, false)), Some(7)));
+        assert!(!completed_certified(true, Some(&snap(false, false)), Some(7)));
+        assert!(!completed_certified(true, Some(&snap(true, true)), Some(7)));
+        assert!(!completed_certified(true, None, Some(7)));
+        // A role job (no issue) keeps the fresh-snapshot-only contract.
+        assert!(completed_certified(true, Some(&snap(false, true)), None));
+        assert!(!completed_certified(false, Some(&snap(false, true)), None));
+    }
+
+    /// `update` stamps recovery-required when completion cannot be certified.
+    /// The job's container is unreachable from a test, so the snapshot is not
+    /// fresh — the pre-existing leg of the rule whose fresh leg now lives in
+    /// `completed_certified` (#14031).
+    #[test]
+    fn update_downgrades_uncertified_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            schema_version: 1,
+            account: "seat".into(),
+            container: "c".into(),
+            engine: "e".into(),
+            docker_desktop: false,
+            repository: "https://example.invalid/o/primary".into(),
+            base: "main".into(),
+            repositories: vec![],
+            volume: "v".into(),
+            profile: PathBuf::from("/nonexistent"),
+            gh_config: None,
+            session_image: None,
+            extra_mounts: Vec::new(),
+        };
+        let job = lease::Job {
+            owner: "fixture".into(),
+            kind: JobKind::Sweep,
+            issue: Some(7),
+            branch: None,
+            container_id: "a".repeat(64),
+            base_revision: "b".repeat(40),
+            host_pid: 1,
+            control: "c".repeat(64),
+            repository: String::new(),
+        };
+        let record = Record {
+            runtime: "codex".into(),
+            provider: "codex".into(),
+            account: "seat".into(),
+            repository: "https://example.invalid/o/primary".into(),
+            logical_root: root.path().into(),
+            owner: "fixture".into(),
+            issue: Some(7),
+            container_id: "a".repeat(64),
+            volume: "v".into(),
+            outcome: "prepared".into(),
+            snapshot: None,
+        };
+        std::fs::create_dir_all(root.path().join(".loom/private-jobs")).unwrap();
+        let path = record_path(root.path(), Some(7), "").unwrap();
+        save(&path, &record).unwrap();
+        update(root.path(), &config, &job, "completed").unwrap();
+        let after: Record =
+            serde_json::from_slice(&read_small(root.path(), &path).unwrap()).unwrap();
+        assert_eq!(after.outcome, "recovery-required");
+    }
+
     #[test]
     fn unfinished_record_blocks_account_failover_and_does_not_touch_host_worktree() {
         let root = tempfile::tempdir().unwrap();
-        let worktree = root.path().join(".loom/worktrees/issue-7");
+        // The real layout: the worktree base is namespaced by the clone's
+        // basename (LOOM_WORKTREE_ROOT + worktree-root resolution), not a bare
+        // .loom/worktrees/issue-N (#14031).
+        let worktree = root.path().join(format!(
+            ".loom/worktrees/{}/issue-7",
+            root.path().file_name().unwrap().to_string_lossy()
+        ));
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join("keep"), "host").unwrap();
         let record = Record {

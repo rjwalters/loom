@@ -23,7 +23,14 @@
 # macOS ships no `timeout(1)`, and for a probe an unbounded fallback is not
 # acceptable -- "the command never returns" is precisely the failure mode
 # this helper exists to bound -- so the no-`timeout` path below is a real
-# bounded implementation, not a degrade-to-unbounded.
+# bounded implementation, not a degrade-to-unbounded. It runs the command in
+# its own process group and signals the whole group (as GNU `timeout` does), so
+# a caller capturing stdout with `$(bounded_run ...)` is released on time even
+# when the bounded command has children that inherited the pipe (#14284).
+# Precondition: those children must stay in that group -- a descendant that
+# deliberately leaves it (`setsid`, `setpgid`) is out of reach of the group
+# signal and can still hold the pipe open. Consequences of the own group, same
+# as `timeout`: a terminal ^C no longer reaches the bounded command directly.
 #
 # `-k 2` is load-bearing on the `timeout(1)` path: a non-interactive bash that
 # is blocked in a foreground command defers SIGTERM, so without the KILL
@@ -47,13 +54,29 @@ bounded_run() { # <timeout_secs> <cmd> [args...]
     fi
     # Portable fallback: run the command in the background and pair it with a
     # killer subshell that TERM/KILLs it once the budget elapses.
+    #
+    # The command is launched with job control (`set -m`) on, which puts it in
+    # its OWN process group (pgid == $cmd_pid) -- the same thing GNU `timeout`
+    # does. The killer then signals the whole GROUP (`kill -- -$cmd_pid`), not
+    # one pid: a grandchild of the bounded command (e.g. the `sleep` inside a
+    # bash script) would otherwise survive the kill, keep the write end of a
+    # caller's `$(...)` pipe open, and leave the substitution blocked until the
+    # grandchild exits (#14284). `set -m` is switched on only around the launch
+    # and restored to the caller's own setting right after, so the caller's
+    # shell options are unchanged on return.
+    local restore_monitor=0
+    if [[ $- != *m* ]]; then
+        set -m
+        restore_monitor=1
+    fi
     "$@" &
     local cmd_pid=$!
+    if (( restore_monitor )); then set +m; fi
     (
         sleep "$secs"
-        kill -TERM "$cmd_pid" 2>/dev/null
+        kill -TERM -- "-$cmd_pid" 2>/dev/null || kill -TERM "$cmd_pid" 2>/dev/null
         sleep 2
-        kill -KILL "$cmd_pid" 2>/dev/null
+        kill -KILL -- "-$cmd_pid" 2>/dev/null || kill -KILL "$cmd_pid" 2>/dev/null
     ) >/dev/null 2>&1 &
     local killer_pid=$! rc=0
     wait "$cmd_pid" 2>/dev/null || rc=$?

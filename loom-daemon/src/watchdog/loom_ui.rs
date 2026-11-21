@@ -1,5 +1,5 @@
 //! The watchdog's alerts (#11295, #12806): `daemon.down` once recovery is
-//! exhausted, and `watchdog.peer-coord-degraded`, as `alert.transition` OTLP
+//! exhausted, as an `alert.transition` OTLP
 //! records beside the forge issue each already files.
 //!
 //! These are the only alerts that still work when the daemon itself is dead,
@@ -34,9 +34,6 @@ pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const QUEUE_TAG: &str = "watchdog-alerts";
 /// Rule for an outage recovery could not end.
 pub const RULE_DAEMON_DOWN: &str = "daemon.down";
-/// Rule for degraded peer-claim coordination.
-pub const RULE_PEER_COORD: &str = "watchdog.peer-coord-degraded";
-
 /// The "this open was exported" record kept beside `sentinel`.
 #[must_use]
 pub fn record_for(sentinel: &Path) -> PathBuf {
@@ -227,18 +224,6 @@ pub fn daemon_up(escalation_sentinel: &Path) {
         State::Resolved,
     );
     send(escalation_sentinel, &alert);
-}
-
-/// Peer-claim coordination degraded (`open`) or green again (`resolved`).
-pub fn peer_coord(peer_coord_sentinel: &Path, degraded: bool, hostname: &str, summary: &str) {
-    let (state, title) = if degraded {
-        (State::Open, format!("Peer-claim coordination is DEGRADED on {hostname}"))
-    } else {
-        (State::Resolved, format!("Peer-claim coordination recovered on {hostname}"))
-    };
-    let alert = Alert::new(RULE_PEER_COORD, "peer-claims", title, Severity::Critical, state)
-        .with_detail(summary);
-    send(peer_coord_sentinel, &alert);
 }
 
 #[cfg(test)]

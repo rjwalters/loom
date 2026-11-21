@@ -273,8 +273,10 @@ impl OwnedClaim {
     /// from a peer's (#13998).
     fn from_parts(marker: Option<String>, raw_host: String, issue: u32) -> Option<Self> {
         let mut owned = Self::from_marker(marker.as_deref(), issue, None)?;
+        // Derived from `raw_host` itself, never re-resolved: the gate and the
+        // published id must be one resolution (#14069).
         owned.lease_host = (raw_host != crate::host_identity::UNKNOWN_HOST)
-            .then(|| crate::cli::pr_lease::published_host());
+            .then(|| crate::cli::pr_lease::published_host_from_raw(&raw_host));
         Some(owned)
     }
 
@@ -793,10 +795,10 @@ pub fn parse_lease_rows(ndjson: &str) -> Vec<LeaseRow> {
 
 /// `(host, sweep)` from a yield record's first line:
 /// `<!-- loom:lease-yield host=H sweep=S earliest_host=EH earliest_sweep=ES -->`.
-/// Same shape as the publish/fence scripts' parser and
-/// `cli/lease_co_occupancy`'s — only the first line is inspected, and never
-/// the free-form prose after the closing `-->` (`lease-record.md`).
-fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
+/// Same shape as the publish/fence scripts' parser, and shared with
+/// `cli/lease_co_occupancy` (#14580) — only the first line is inspected, and
+/// never the free-form prose after the closing `-->` (`lease-record.md`).
+pub(crate) fn parse_yield_marker_line(body: &str) -> Option<(String, String)> {
     let rest = body.lines().next()?.strip_prefix(YIELD_MARKER_PREFIX)?;
     let (host, rest) = rest.split_once(" sweep=")?;
     let sweep = rest.split_whitespace().next()?;
@@ -1374,12 +1376,19 @@ mod tests {
             Some(OwnedClaim { lease_host: None }),
             "raw unknown-host must yield None, never be hashed into a usable id",
         );
-        // A resolved chain keeps a published host — whatever this
-        // environment derives, the usability decision came from the raw
-        // value alone.
+        // A resolved chain keeps a published host derived from the argument
+        // it was handed (#14069) — not from whatever this process's own
+        // environment would resolve to.
         let owned = OwnedClaim::from_parts(marker(), "resolved-host".to_string(), 20);
-        assert!(owned.is_some());
-        assert!(owned.unwrap().lease_host.is_some(), "a resolved chain keeps a published host",);
+        assert_eq!(
+            owned,
+            Some(OwnedClaim {
+                lease_host: Some(crate::cli::pr_lease::published_host_from_raw("resolved-host")),
+            }),
+            "the published host must come from the raw argument",
+        );
+        let other = OwnedClaim::from_parts(marker(), "another-host".to_string(), 20);
+        assert_ne!(owned, other, "different raw hosts must publish different ids");
     }
 
     /// The daemon pre-claimed the issue and spawned this session: its own
@@ -1829,6 +1838,22 @@ mod tests {
 
         let garbage = write_exec(dir.path(), "gh-garbage.sh", "echo 'not json'");
         assert_eq!(read_claim_labels(&garbage, dir.path(), 42), LabelLeg::Unknown);
+
+        // #14775: direct stub-execution evidence — the classifications above
+        // came from a CLI that actually ran, not from a shed answering
+        // `Unknown` before any invocation (the parallel-fixture interference
+        // this test pins down).
+        let ran = dir.path().join("stub-ran");
+        let counting = write_exec(
+            dir.path(),
+            "gh-counting.sh",
+            &format!(
+                r#"echo ran >> '{}'; echo '{{"labels":[{{"name":"loom:issue"}}]}}'"#,
+                ran.display()
+            ),
+        );
+        assert_eq!(read_claim_labels(&counting, dir.path(), 42), LabelLeg::Clean);
+        assert!(ran.is_file(), "the stub itself executed");
     }
 
     #[test]

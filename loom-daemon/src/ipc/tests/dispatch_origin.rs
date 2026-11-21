@@ -2,8 +2,7 @@
 //! Operator surfaces (the `loom-daemon dispatch` CLI, the `dispatch_sweep`
 //! MCP tool, Safehouse ChatOps) send `operator`; a request without the field
 //! (a legacy client, or any IPC client that does not say) records `unknown`,
-//! never `operator`. In its own sibling module because `ipc/tests.rs` is over
-//! the file-size ratchet (`.loom/docs/file-size-policy.md`).
+//! never `operator`. In its own sibling module rather than in `ipc/tests.rs`.
 
 use super::*;
 use crate::telemetry::DispatchOrigin;
@@ -40,7 +39,7 @@ fn dispatch_request(issue: u32, dispatch_origin: Option<DispatchOrigin>) -> Requ
 #[test]
 #[serial_test::serial]
 fn ipc_dispatch_records_the_requested_origin_or_unknown() {
-    let (tm, db, _, bus) = setup_test_context();
+    let (_context_dir, tm, db, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let _registry_guard = seed_temp_registry(&[]);
 
@@ -62,7 +61,7 @@ fn ipc_dispatch_records_the_requested_origin_or_unknown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn nonblocking_ipc_dispatch_records_the_operator_origin() {
-    let (_, _, _, bus) = setup_test_context();
+    let (_context_dir, _, _, _, bus) = setup_test_context();
     let (sr, _dir, _rec) = setup_sweep_registry_in_tempdir();
     let _registry_guard = seed_temp_registry(&[]);
 

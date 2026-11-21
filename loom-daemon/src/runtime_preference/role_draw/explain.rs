@@ -32,11 +32,18 @@ pub const STAGES: &[&str] = &[
     "sweep-lifecycle",
 ];
 
-/// One candidate's admission verdict as the explain view records it.
-fn verdict_fields(verdict: &Result<(), SkipReason>) -> (bool, Option<String>) {
+/// One candidate's admission verdict as the explain view records it: whether
+/// it was admitted, the refusal reason when not, and — when the real
+/// containment walk admitted it — the account the launch would have run on,
+/// so a row names the seat its verdict was measured against (#14578).
+fn verdict_fields(
+    verdict: &Result<Option<String>, SkipReason>,
+) -> (bool, Option<String>, Option<String>) {
     match verdict {
-        Ok(()) => (true, None),
-        Err(reason) => (false, Some(format!("{}({})", reason.kind(), reason.summary_capped(None)))),
+        Ok(account) => (true, None, account.clone()),
+        Err(reason) => {
+            (false, Some(format!("{}({})", reason.kind(), reason.summary_capped(None))), None)
+        }
     }
 }
 
@@ -53,7 +60,16 @@ fn verdict_fields(verdict: &Result<(), SkipReason>) -> (bool, Option<String>) {
 /// never takes the prepared selection, and [`probe_candidate`] releases after
 /// every candidate, so every selection is dropped — finishing its lease and
 /// rolling back its admission record — before the view returns.
-fn probe_on_this_host(root: &Path, role: &str, tap: &Tap, tier: usize) -> Result<(), SkipReason> {
+///
+/// Returns the account the admission selected (#14578), so the row can name
+/// the seat its verdict was measured against; `None` when the runtime is
+/// admitted without a managed seat.
+fn probe_on_this_host(
+    root: &Path,
+    role: &str,
+    tap: &Tap,
+    tier: usize,
+) -> Result<Option<String>, SkipReason> {
     let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
     let mut preparer = admission_preparer(root, role);
     crate::runtime_preference::probe_candidate(
@@ -68,7 +84,12 @@ fn probe_on_this_host(root: &Path, role: &str, tap: &Tap, tier: usize) -> Result
         },
         &mut preparer,
     )
-    .map(|_| ())
+    .map(|admitted| {
+        admitted
+            .execution
+            .as_ref()
+            .map(|execution| execution.account.clone())
+    })
 }
 
 /// The real spawn path's containment preparer, built for one stage's probe.
@@ -114,14 +135,17 @@ pub fn explain_json(root: &Path) -> Value {
     })
 }
 
+/// One candidate's admission question: does the spawn walk admit and serve
+/// this candidate on this host — with the walk's own skip reason when not,
+/// and the account a real admission selected when it does (#14578).
+pub(crate) type AdmissionProbe<'a> =
+    dyn FnMut(&str, &Tap, usize) -> Result<Option<String>, SkipReason> + 'a;
+
 /// [`explain_json`] with the per-candidate admission question injected
 /// (tests): `probe(role, tap, tier)` answers whether the spawn walk would
 /// admit and serve that candidate on this host, with the walk's own skip
-/// reason when not.
-pub(crate) fn explain_json_with(
-    root: &Path,
-    probe: &mut dyn FnMut(&str, &Tap, usize) -> Result<(), SkipReason>,
-) -> Value {
+/// reason when not and the selected account when admitted.
+pub(crate) fn explain_json_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> Value {
     let config = DrawConfig::load(root);
     let effective = crate::config_resolver::resolve_effective_config(root);
     let mut stages = Vec::new();
@@ -143,7 +167,7 @@ pub(crate) fn explain_json_with(
             .map(|table| {
                 let eff = config.effective(table);
                 let total = eff.total();
-                let verdicts: Vec<Result<(), SkipReason>> = eff
+                let verdicts: Vec<Result<Option<String>, SkipReason>> = eff
                     .active
                     .iter()
                     .enumerate()
@@ -156,13 +180,14 @@ pub(crate) fn explain_json_with(
                     .map(|(i, (c, w))| {
                         #[allow(clippy::cast_precision_loss)]
                         let p = *w as f64 / total as f64;
-                        let (admitted, reason) = verdict_fields(&verdicts[i]);
+                        let (admitted, reason, account) = verdict_fields(&verdicts[i]);
                         json!({
                             "candidate": c.key,
                             "weight": w,
                             "p": p,
                             "admitted": admitted,
                             "reason": reason,
+                            "account": account,
                         })
                     })
                     .collect();
@@ -225,10 +250,7 @@ pub fn explain_text(root: &Path) -> String {
 
 /// [`explain_text`] with the per-candidate admission question injected
 /// (tests), mirroring [`explain_json_with`].
-pub(crate) fn explain_text_with(
-    root: &Path,
-    probe: &mut dyn FnMut(&str, &Tap, usize) -> Result<(), SkipReason>,
-) -> String {
+pub(crate) fn explain_text_with(root: &Path, probe: &mut AdmissionProbe<'_>) -> String {
     let doc = explain_json_with(root, probe);
     let mut out = format!("Role draw tables for {}\n", doc["workspace"].as_str().unwrap_or(""));
     let excluded: Vec<&str> = doc["excludeProviders"]
@@ -279,7 +301,10 @@ pub(crate) fn explain_text_with(
             ));
             for c in attempt["candidates"].as_array().into_iter().flatten() {
                 let mark = if c["admitted"].as_bool() == Some(true) {
-                    "admitted".to_string()
+                    match c["account"].as_str() {
+                        Some(account) => format!("admitted (on {account})"),
+                        None => "admitted".to_string(),
+                    }
                 } else {
                     format!("not admitted: {}", c["reason"].as_str().unwrap_or("?"))
                 };

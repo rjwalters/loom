@@ -194,11 +194,10 @@ pub fn cached_forge_host(workspace: Option<&Path>) -> ForgeHostResolution {
     res
 }
 
-/// The forge host for a terminal's workspace (`worktree_path`, else
-/// `working_dir` — the same precedence the git-commit correlation uses).
+/// The forge host for a terminal's workspace (its `working_dir`).
 #[must_use]
 pub fn host_for_terminal(info: Option<&TerminalInfo>) -> Option<String> {
-    let ws = info.and_then(|i| i.worktree_path.as_ref().or(i.working_dir.as_ref()));
+    let ws = info.and_then(|i| i.working_dir.as_ref());
     cached_forge_host(ws.map(Path::new))
         .host()
         .map(str::to_string)

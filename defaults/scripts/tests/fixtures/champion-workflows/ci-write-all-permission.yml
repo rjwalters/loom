@@ -1,0 +1,9 @@
+name: CI
+on: push
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    "permissions": >-
+      write-all
+    steps:
+      - run: echo 'fixture'

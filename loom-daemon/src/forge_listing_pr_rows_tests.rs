@@ -1,5 +1,5 @@
 //! Tests for pull-request exclusion from issue listings (#9929), extracted to
-//! a sibling file so `forge_listing_tests.rs` stays under its file-size ratchet.
+//! a sibling file of `forge_listing_tests.rs`.
 
 use super::*;
 use std::path::PathBuf;
