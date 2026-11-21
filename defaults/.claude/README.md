@@ -212,7 +212,7 @@ resolved through the model-selection precedence chain (role JSON
 `suggestedModel`, workspace override, or explicit dispatch param), not the stub.
 See CLAUDE.md → "Model Selection Strategy".
 
-> **Note**: the `loom-shepherd` subagent was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md). Use `/loom:sweep <issue>` (Tier 1) for the equivalent lifecycle. The `loom-daemon` subagent is preserved and now documents the Rust `loom-daemon` binary's MCP dispatch surface (`mcp__loom__dispatch_sweep` / `mcp__loom__list_sweeps` …) rather than the deleted Python brain.
+> **Note**: the `loom-shepherd` subagent was removed in v0.10.0 along with the `/shepherd` slash command — see [the migration guide](https://github.com/2AMLogic/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md). Use `/loom:sweep <issue>` (Tier 1) for the equivalent lifecycle. The `loom-daemon` subagent is preserved and now documents the Rust `loom-daemon` binary's MCP dispatch surface (`mcp__loom__dispatch_sweep` / `mcp__loom__list_sweeps` …) rather than the deleted Python brain.
 
 ### How Subagents Work
 

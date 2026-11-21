@@ -438,7 +438,7 @@ fi
 #
 #     tooling: install Repo Skills and Loom into the map repo
 #     Upgrade Loom to 0.18.0 (resync installed surfaces + role prompts)
-#     Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)
+#     Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)
 #
 # So the moment upstream EDITED such a file, the old upstream text being
 # replaced was read as "lines unique to the installed copy" and the update was
@@ -511,7 +511,7 @@ LINEAGE_N=0
 for INSTALL_SUBJECT in \
     'tooling: install Repo Skills and Loom into the map repo' \
     'Upgrade Loom to 0.18.0 (resync installed surfaces + role prompts)' \
-    'Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)'; do
+    'Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)'; do
     LINEAGE_N=$((LINEAGE_N + 1))
     REPO11="$(make_lineage_fixture "repo-lineage-$LINEAGE_N" "$INSTALL_SUBJECT")"
     bump_upstream "$REPO11"
@@ -687,7 +687,7 @@ fi
 # metadata past the upstream commit that caused it. An exact-version-only
 # content check would leave every one of them blocked forever.
 echo "Test group 11f: a recorded version that drifted PAST the installed bytes still resolves (#8676)"
-REPO11G="$(make_lineage_fixture repo-lineage-drift 'Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)')"
+REPO11G="$(make_lineage_fixture repo-lineage-drift 'Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)')"
 bump_upstream "$REPO11G"
 # Re-stamp loom_commit to the bumped HEAD, exactly as a blocked non-dry run
 # would have. The stamp lands in its own commit so .loom/hooks/guard.sh keeps
@@ -719,7 +719,7 @@ fi
 # was never any revision of this path stays protected even though the recorded
 # version has drifted.
 echo "Test group 11g: drift does not excuse content upstream never had (#8676)"
-REPO11H2="$(make_lineage_fixture repo-lineage-drift-handedit 'Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)')"
+REPO11H2="$(make_lineage_fixture repo-lineage-drift-handedit 'Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)')"
 printf 'line-one\nline-two\nline-three\nLOCAL-HOTFIX\n' > "$REPO11H2/.loom/hooks/guard.sh"
 git -C "$REPO11H2" add .loom/hooks/guard.sh >/dev/null 2>&1
 git -C "$REPO11H2" commit -qm "fix(guard): hand-applied hotfix upstream never took" >/dev/null 2>&1
@@ -753,7 +753,7 @@ rm -rf "$REPO11P"
 mkdir -p "$REPO11P/defaults/hooks" "$REPO11P/defaults/scripts" \
          "$REPO11P/.loom/hooks" "$REPO11P/.loom/scripts"
 git -C "$REPO11P" init -q
-LONG_SUBJECT='Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)'
+LONG_SUBJECT='Install Loom orchestration (quick install from 2AMLogic/loom@cd4ab46e)'
 printf 'line-one\nline-two\nline-three\nrev-0\n' > "$REPO11P/defaults/hooks/guard.sh"
 printf 'line-one\nline-two\nline-three\nrev-0\n' > "$REPO11P/.loom/hooks/guard.sh"
 chmod +x "$REPO11P/defaults/hooks/guard.sh"

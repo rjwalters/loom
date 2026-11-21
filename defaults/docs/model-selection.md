@@ -2,7 +2,7 @@
 
 How Loom resolves each worker's model, the Judge-rejection escalation ladder, and
 the suggested-model defaults by role. Retuning these defaults is measurement-gated
-— see [`docs/model-selection-retune.md`](https://github.com/rjwalters/loom/blob/main/docs/model-selection-retune.md).
+— see [`docs/model-selection-retune.md`](https://github.com/2AMLogic/loom/blob/main/docs/model-selection-retune.md).
 
 For *task-oriented* recipes that combine these keys with the runtime, credential-pool
 and spend-bound axes ("put the expensive model on Judge", "minimize wall-clock"), see
@@ -17,7 +17,7 @@ Model selection is a first-class orchestration concern (issue #3477, Phase 1). E
 3. **Role default** — `.loom/roles/<role>.json` → `suggestedModel` (ships as an alias). The `/loom:sweep` skill passes the resolved model to role subagents via the Task tool's `model` parameter.
 4. **Session default** — when nothing above resolves, NO `--model` flag (and no Task `model` param) is emitted at all, and the worker inherits the parent session/CLI default. This is the zero-config behavior: nothing configured means nothing changes.
 
-Tier 2's keys can also be set per-host without committing them: `config_resolver.rs` merges the committed `.loom-project/project.json` and then the ungitted, highest-precedence `.loom-local/local.json` overlay over `.loom/config.json` (see [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)) — so a one-host model override belongs in `.loom-local/local.json`, which **must stay gitignored**: unignored it is untracked dirt, and `check-main-clean.sh --quarantine` stashes untracked dirt between sweep waves, silently reverting the override (#8075).
+Tier 2's keys can also be set per-host without committing them: `config_resolver.rs` merges the committed `.loom-project/project.json` and then the ungitted, highest-precedence `.loom-local/local.json` overlay over `.loom/config.json` (see [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md)) — so a one-host model override belongs in `.loom-local/local.json`, which **must stay gitignored**: unignored it is untracked dirt, and `check-main-clean.sh --quarantine` stashes untracked dirt between sweep waves, silently reverting the override (#8075).
 
 The spawn plumbing also honors a `LOOM_MODEL` environment variable (`spawn-claude.sh`, `claude-wrapper.sh`): it is injected as `--model <value>` unless an explicit `--model` is already present in the args. Retries inside `claude-wrapper.sh` always reuse the same model — transport-level failures (token exhaustion, crashes, 5xx) are not quality signals and never change the model.
 
@@ -119,7 +119,7 @@ The ladder is configured in `.loom/config.json`:
 
 > **Retuning these defaults is measurement-gated.** Whether to flip a role's
 > default `opus → sonnet` ("cheap-first") is decided by measured data, not edited
-> blind — see [`docs/model-selection-retune.md`](https://github.com/rjwalters/loom/blob/main/docs/model-selection-retune.md)
+> blind — see [`docs/model-selection-retune.md`](https://github.com/2AMLogic/loom/blob/main/docs/model-selection-retune.md)
 > (upstream Loom repo) for the decision inequality and the `agent-metrics.sh
 > --by-model` (#3482) gating procedure. Builder is the only real candidate; no
 > default has been flipped.

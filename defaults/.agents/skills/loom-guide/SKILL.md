@@ -3128,13 +3128,13 @@ Automated document maintenance by the Guide triage agent.
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
-See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
+See 2AMLogic/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
 This PR normally stages only `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
 `create_docs_pr()`'s `git add` above), so it qualifies for the docs-only fast
-path (rjwalters/loom#6134) Judge and Champion apply to any PR whose
+path (2AMLogic/loom#6134) Judge and Champion apply to any PR whose
 changed-file list matches that exact set — EXCEPT when the repo's
-`.loom/docs-post-stage.sh` hook (rjwalters/loom#13892) reported additional
+`.loom/docs-post-stage.sh` hook (2AMLogic/loom#13892) reported additional
 files (e.g. a regenerated integrity envelope): those land in the same PR,
 which simply falls off the fast path to a full review. The
 `<!-- loom:docs-only-fast-path -->` marker above is informational only —
@@ -3282,7 +3282,7 @@ it expresses it.
   would fail the repo's integrity check anyway; the next tick retries.
 - **No script** ⇒ behaviour byte-identical to a repo without the hook.
 - **Review impact**: a PR carrying hook-produced files falls off the docs-only
-  fast path (rjwalters/loom#6134) to a full review — by design; Judge and
+  fast path (2AMLogic/loom#6134) to a full review — by design; Judge and
   Champion re-derive eligibility from the PR's own file list.
 
 ### Document Maintenance Summary

@@ -15,7 +15,7 @@ reachable. That is the whole security rationale of the containment boundary
 epic #6896 Phase 3 shipped: a mounted `/var/run/docker.sock` is
 **host-root-equivalent**, so handing one to an LLM-directed agent inside a
 containment boundary defeats the boundary
-([ADR-0017](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md) Decision 3;
+([ADR-0017](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md) Decision 3;
 operator decision, 2026-08-24).
 
 But agents inside worker containers legitimately need docker-backed work done:
@@ -88,7 +88,7 @@ container:
 {"path": "/home/loom/.loom/tokens",    "mode": "ro"}   ->   -v /home/loom/.loom/tokens:/home/loom/.loom/tokens:ro
 ```
 
-This is [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
+This is [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §1 (path parity) expressed as a *data shape* rather than a rule callers are
 asked to remember: there is no non-parity mount you can express in a job spec.
 Git worktrees store absolute paths in their `.git` pointer files, so a job that
@@ -394,10 +394,10 @@ that:
 
 ## Related
 
-- [ADR-0017](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md) — Decision 3
+- [ADR-0017](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md) — Decision 3
   is the "never docker-in-docker, never socket passthrough" ruling this seam
   implements; Decision 4 is the restart-safety contract.
-- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
+- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
   the path-parity, secrets and build-cache rules job mounts follow.
 - [`runtime-adapters.md`](runtime-adapters.md) — worker dispatch, containerized
   dispatch mode, and the per-sweep resource limits this seam's job limits

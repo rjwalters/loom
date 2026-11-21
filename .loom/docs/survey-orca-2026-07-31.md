@@ -1,7 +1,7 @@
 # Survey: stablyai/orca — orchestration ideas applicable to Loom
 
 **Type**: Research / idea-extraction survey (no code change, no infrastructure adopted)
-**Source issue**: [#4775](https://github.com/rjwalters/loom/issues/4775)
+**Source issue**: [#4775](https://github.com/2AMLogic/loom/issues/4775)
 **Subject**: [stablyai/orca](https://github.com/stablyai/orca) — an "AI Agent Orchestrator" /
 Application Development Environment (Electron + TypeScript) that runs many CLI coding agents
 (Claude Code, Codex, Cursor, etc.) in parallel git worktrees, with human-in-the-loop review.
@@ -36,12 +36,12 @@ Per the issue's own framing:
 
 | # | Idea | Verdict | Follow-up |
 |---|------|---------|-----------|
-| 1 | Fan-out / best-of-N dispatch | **Adapt** | [#4776](https://github.com/rjwalters/loom/issues/4776) |
-| 2 | Diff annotation routed back to agents | **Adapt** | [#4777](https://github.com/rjwalters/loom/issues/4777) |
+| 1 | Fan-out / best-of-N dispatch | **Adapt** | [#4776](https://github.com/2AMLogic/loom/issues/4776) |
+| 2 | Diff annotation routed back to agents | **Adapt** | [#4777](https://github.com/2AMLogic/loom/issues/4777) |
 | 3 | Remote/SSH worktrees | **Reject** | — |
 | 4 | Mobile/remote monitoring and steering | **Reject** | — |
-| 5 | Broad runtime support (50+ terminal-compatible agents) | **Adapt** | [#4780](https://github.com/rjwalters/loom/issues/4780) |
-| 6 | CLI scripting surface (`orca worktree create`, `snapshot`, …) | **Adapt** | [#4778](https://github.com/rjwalters/loom/issues/4778) |
+| 5 | Broad runtime support (50+ terminal-compatible agents) | **Adapt** | [#4780](https://github.com/2AMLogic/loom/issues/4780) |
+| 6 | CLI scripting surface (`orca worktree create`, `snapshot`, …) | **Adapt** | [#4778](https://github.com/2AMLogic/loom/issues/4778) |
 
 ## Idea 1 — Fan-out / best-of-N dispatch
 
@@ -189,11 +189,11 @@ forge as shared state; nothing in this survey proposes changing that.
 
 ## References
 
-- Source issue: [#4775](https://github.com/rjwalters/loom/issues/4775).
-- Follow-ups filed from this survey: [#4776](https://github.com/rjwalters/loom/issues/4776)
-  (best-of-N Builder fan-out experiment), [#4777](https://github.com/rjwalters/loom/issues/4777)
-  (Doctor: ingest inline PR review comments), [#4778](https://github.com/rjwalters/loom/issues/4778)
-  (`worktree.sh snapshot`), [#4780](https://github.com/rjwalters/loom/issues/4780) (tier-3 generic
+- Source issue: [#4775](https://github.com/2AMLogic/loom/issues/4775).
+- Follow-ups filed from this survey: [#4776](https://github.com/2AMLogic/loom/issues/4776)
+  (best-of-N Builder fan-out experiment), [#4777](https://github.com/2AMLogic/loom/issues/4777)
+  (Doctor: ingest inline PR review comments), [#4778](https://github.com/2AMLogic/loom/issues/4778)
+  (`worktree.sh snapshot`), [#4780](https://github.com/2AMLogic/loom/issues/4780) (tier-3 generic
   passthrough runtime adapter).
 - Prior art consulted for existing Loom surfaces referenced above:
   `docs/research/judge-fanout-measurement-runbook.md`,

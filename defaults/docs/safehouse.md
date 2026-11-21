@@ -262,7 +262,7 @@ alias it asked for).
 New template keys reach existing consumer configs via the installer deep-merge
 (template is the base, existing values win) — no migration needed. The tier
 ownership of the block is noted in
-[`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
+[`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 ## Operator setup: provisioning the persona (requires a safehoused restart)
 
@@ -600,7 +600,7 @@ issue `0` for a host-level condition.
 ```
 @operator:example.org: loom#9268 · OPERATOR NEEDED · merge-refused at needs-operator
 Allow merge commits on the repository, or re-run the merge with squash.
-https://github.com/rjwalters/loom/issues/9268 · observed by host-a
+https://github.com/2AMLogic/loom/issues/9268 · observed by host-a
 ```
 
 - **The mention** comes from `safehouse.operatorMention` above; unset ⇒ the same

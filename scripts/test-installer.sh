@@ -138,7 +138,7 @@ simulate_loom_install() {
     # wrapped by wrap_loom_content() in scaffolding.rs).
     cat > "$target/CLAUDE.md" << 'ROOT_CLAUDE_EOF'
 <!-- BEGIN LOOM ORCHESTRATION -->
-This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
+This repository uses [Loom](https://github.com/2AMLogic/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.
 <!-- END LOOM ORCHESTRATION -->
 ROOT_CLAUDE_EOF
   fi

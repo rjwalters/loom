@@ -26,7 +26,7 @@
 --
 -- Since #10343 every `github.ratelimit.*` point carries `owner` and `role`,
 -- and the legacy owner-less 60 s probe series is gone (it is booked into the
--- bucket book instead). Since rjwalters/loom#10571 `account`/`owner` are the
+-- bucket book instead). Since 2AMLogic/loom#10571 `account`/`owner` are the
 -- identity actually minted into each credential directory (its sidecar), and
 -- `installation` names the App installation, so two installations no longer
 -- share one label set; older daemons' data can still carry two interleaved

@@ -397,12 +397,12 @@ while IFS='|' read -r IN WANT; do
         fail "(#11680) '$IN' -> '$GOT' (want '$WANT')"
     fi
 done <<'EOF'
-git@github.com:rjwalters/loom.git|https://github.com/rjwalters/loom.git
-git@github.com:rjwalters/loom|https://github.com/rjwalters/loom.git
-ssh://git@github.com/rjwalters/loom.git|https://github.com/rjwalters/loom.git
+git@github.com:2AMLogic/loom.git|https://github.com/2AMLogic/loom.git
+git@github.com:2AMLogic/loom|https://github.com/2AMLogic/loom.git
+ssh://git@github.com/2AMLogic/loom.git|https://github.com/2AMLogic/loom.git
 ssh://git@gitea.example:2222/o/r|https://gitea.example/o/r.git
-https://github.com/rjwalters/loom.git|https://github.com/rjwalters/loom.git
-https://github.com/rjwalters/loom|https://github.com/rjwalters/loom.git
+https://github.com/2AMLogic/loom.git|https://github.com/2AMLogic/loom.git
+https://github.com/2AMLogic/loom|https://github.com/2AMLogic/loom.git
 https://x-access-token:SECRET@github.com/o/r.git|https://github.com/o/r.git
 /Users/someone/GitHub/loom|/Users/someone/GitHub/loom
 file:///srv/loom.git|file:///srv/loom.git

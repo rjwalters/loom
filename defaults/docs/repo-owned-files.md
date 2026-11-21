@@ -141,7 +141,7 @@ An agent (Builder, Doctor, or otherwise) that finds a bug in a file under
 repo, not just Loom's own source — has exactly two valid moves, never a
 third:
 
-1. **Fix it upstream**: open a PR against `rjwalters/loom`'s `defaults/` tree.
+1. **Fix it upstream**: open a PR against `2AMLogic/loom`'s `defaults/` tree.
    The fix then returns to this repo through the normal `chore: resync
    installed Loom surfaces` flow.
 2. **Pin it**: if the change is a deliberate, repo-specific override that

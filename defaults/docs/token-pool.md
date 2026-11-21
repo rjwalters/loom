@@ -1150,7 +1150,7 @@ is visible on `kicad-tools#5333` — 287 recorded label events (142 `loom:issue`
 140 `loom:building`), 105 lease acquisitions and 12 yields across three hosts
 over ~16 h, every one of them authored by `loom-fleet-dispatch[bot]`. The same
 pattern ran **89** `loom:issue` ↔ `loom:building` label events deep on
-`rjwalters/loom#7815`.
+`2AMLogic/loom#7815`.
 
 **Which executable this was, and why that matters.** Every token-selection
 death in the 2026-09-16 window logs its own deciding binary (#4643), so the
@@ -1548,7 +1548,7 @@ first-class in *generated* systemd units; this section is for bare/unmanaged
 daemon startups and ad hoc CLI invocations from arbitrary cwds — the generated
 units already cover the managed case).
 
-Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
+Implementation: [`resolve_tokens_dir_anchored()`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens_pool/paths.rs)
 delegates step 2/3's "is this candidate a recognized Loom workspace" question
 to the same registry-membership check `#4299` established for CLI
 `--workspace` defaulting (`workspace_registry::resolve_client_workspace_default`)
@@ -1611,7 +1611,7 @@ rotation has not been configured at all.
 
 The `loom-daemon` role runner (`autonomous.roleRunner`, see
 [daemon-reference.md](daemon-reference.md)) pre-checks
-[`tokens::token_pool_size`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
+[`tokens::token_pool_size`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens.rs) for exactly this
 condition **before** it ever spawns `spawn-claude.sh` (issue #4642): a repo
 with neither pool provisioned skips the doomed spawn entirely instead of
 hitting this hard-fail on every single tick forever. The skip is logged once
@@ -2380,7 +2380,7 @@ Four properties keep a parser reading an agent's own transcript honest:
 
 The parse happens in `loom-daemon`, not in `spawn-codex.sh`, for two reasons:
 date parsing is new executable logic and belongs in the daemon
-([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)),
+([shell-language-policy.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)),
 and a new `LOOM_TERMINAL_RESULT` field
 would be dropped wholesale by an older daemon on a mixed-version host, losing
 the bad-mark along with the horizon. Parsing text the adapter already writes

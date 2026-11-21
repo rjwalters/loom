@@ -34,7 +34,7 @@ confirmed rather than assumed, per the flag the curator left on #6181:
     writes.
 - Confirmed directly rather than inferred from the above: a forge-wide
   search for the exact lease marker string,
-  `gh api search/issues -f q='repo:rjwalters/loom "loom:lease host=" in:comments'`,
+  `gh api search/issues -f q='repo:2AMLogic/loom "loom:lease host=" in:comments'`,
   returns exactly **3** hits — #6181, #6183, #6186 — all three of which are
   this epic's own issues/PRs, whose *bodies* discuss and quote the marker
   format as documentation. None of the matches is an actual comment whose
@@ -87,14 +87,14 @@ repo, with the writing host's identity embedded in the marker
 
 ```bash
 # Find every issue/PR whose comments mention the lease marker string.
-gh api search/issues -f q='repo:rjwalters/loom "loom:lease host=" in:comments' \
+gh api search/issues -f q='repo:2AMLogic/loom "loom:lease host=" in:comments' \
   --jq '.items[] | {number, title, url}'
 
 # For each candidate <N>, list only the comments whose body's FIRST LINE is
 # the marker -- a substring match on the marker text elsewhere in a comment
 # (e.g. this very document, once merged) is NOT a lease record; only
 # `startswith()` on the marker prefix is authoritative, per lease-record.md.
-gh api repos/rjwalters/loom/issues/<N>/comments --paginate \
+gh api repos/2AMLogic/loom/issues/<N>/comments --paginate \
   --jq '.[] | select(.body | startswith("<!-- loom:lease host=")) |
         {id, created_at, updated_at,
          marker: (.body | split("\n")[0]),

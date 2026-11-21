@@ -28,7 +28,7 @@
   },
   "annotations": {
     "summary": "Loom step draws mostly passing",
-    "description": "On host {{$labels.host}}, {{$value}} of the loom.dispatch.step attempts in 30 min (at least 10) were refused by the pool gate (pool_exhausted, no_token_pool, token_selection_failed) or the claim (claimed, claim_lost). Above 0.8 the redraw budget (8 per slot, 32 per tick) is spent on items that cannot run: an exhausted role pool the draw does not yet exclude, or peers contending for the same items. Break the attempts down by loom.dispatch.reason and loom.role. Issue rjwalters/loom#11909."
+    "description": "On host {{$labels.host}}, {{$value}} of the loom.dispatch.step attempts in 30 min (at least 10) were refused by the pool gate (pool_exhausted, no_token_pool, token_selection_failed) or the claim (claimed, claim_lost). Above 0.8 the redraw budget (8 per slot, 32 per tick) is spent on items that cannot run: an exhausted role pool the draw does not yet exclude, or peers contending for the same items. Break the attempts down by loom.dispatch.reason and loom.role. Issue 2AMLogic/loom#11909."
   },
   "disabled": false
 }

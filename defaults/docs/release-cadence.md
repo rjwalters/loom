@@ -363,12 +363,12 @@ emits the flat, pre-#8515 wording: it is a `contract`-category script, so the
 classification cannot be added there without first porting the resolution
 behind the daemon.
 Tracked separately in
-[#8654](https://github.com/rjwalters/loom/issues/8654).
+[#8654](https://github.com/2AMLogic/loom/issues/8654).
 
 ## Compatibility contract (#10716)
 
 Each release declares what its two halves need from each other (tracker
-[#10698](https://github.com/rjwalters/loom/issues/10698), D3/D4). Both values
+[#10698](https://github.com/2AMLogic/loom/issues/10698), D3/D4). Both values
 are constants in `loom-daemon/src/install_compat.rs`:
 
 | Constant | Meaning | Recorded where |
@@ -453,7 +453,7 @@ When it fails the claim is false, and there are two ways to make it true:
 - **Raise `SUPPORTS_INSTALLED`** to the oldest release for which the command
   above passes (try one with `--supports-installed <v> --prev-ref v<v>`), and
   update the constant's comment. This is the default. What it means: once the
-  dispatch hold ([#10719](https://github.com/rjwalters/loom/issues/10719))
+  dispatch hold ([#10719](https://github.com/2AMLogic/loom/issues/10719))
   acts on the value, a repo installed below it is held until it is resynced.
   Fleet repos are resynced by the daemon; a repo outside the fleet that old
   needs a manual resync.
@@ -474,16 +474,16 @@ does not exist, because then nothing can be run against it.
 - [`.loom/docs/release-glibc-floor.md`](release-glibc-floor.md) — the decided
   minimum glibc `build-daemon`'s Linux artifacts must run against, and why
   the build host is pinned rather than left on `ubuntu-latest`.
-- Issue [#6010](https://github.com/rjwalters/loom/issues/6010) — the original
+- Issue [#6010](https://github.com/2AMLogic/loom/issues/6010) — the original
   release-vs-`VERSION` gap and the `--check` visibility it added.
-- Issue [#8515](https://github.com/rjwalters/loom/issues/8515) — the
+- Issue [#8515](https://github.com/2AMLogic/loom/issues/8515) — the
   create-before-upload visibility race, the deferred Latest pointer, and the
   age/asset-count reporting above.
-- Issue [#10826](https://github.com/rjwalters/loom/issues/10826) — release only
+- Issue [#10826](https://github.com/2AMLogic/loom/issues/10826) — release only
   from a green `main` commit (`workflow_run` on `CI`), `release-main`
   concurrency, and versions skipped by design.
-- Issue [#8290](https://github.com/rjwalters/loom/issues/8290) — the one-off
+- Issue [#8290](https://github.com/2AMLogic/loom/issues/8290) — the one-off
   `gh release create` HTTP 403 that motivated the retry logic and the
   "accepted gap" decision above.
-- Issue [#12132](https://github.com/rjwalters/loom/issues/12132) — the bump
+- Issue [#12132](https://github.com/2AMLogic/loom/issues/12132) — the bump
   blocked by a drained dispatch-App limit, and the manual escape hatch above.

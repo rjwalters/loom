@@ -170,7 +170,7 @@ source "$HELPERS_DIR/lib/forge-helpers.sh"
 source "$GUARD_FILE"
 
 FORGE_TYPE="github"
-REPO_NWO="rjwalters/loom"
+REPO_NWO="2AMLogic/loom"
 PR_NUMBER="8462"
 DRY_RUN=false
 PR_JSON=""

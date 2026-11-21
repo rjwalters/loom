@@ -109,7 +109,7 @@
 #                      asked slug's CANONICAL name (resolved via REST, which
 #                      follows the rename redirect) binds too - a verified
 #                      redirect to the same repository is the same
-#                      dependency (rjwalters/loom -> 2AMLogic/loom).
+#                      dependency (the pre-transfer owner slug -> 2AMLogic/loom).
 #                      ALL_RESOLVED=true only when every ref is CLOSED or
 #                      MERGED; open, unreadable and mismatched all fail
 #                      closed. A bare N (or #N) resolves in the invoking repo

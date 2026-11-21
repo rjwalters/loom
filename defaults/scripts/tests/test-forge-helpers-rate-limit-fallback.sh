@@ -698,7 +698,7 @@ fi
 # `loom-daemon forge issue` must not silently look like an escape hatch: the
 # passthrough either gains the fallback or says out loud that it has none.
 # The `loom-daemon/` Rust crate is vendored only in the source repo
-# (rjwalters/loom itself) -- an installed consumer repo never has a
+# (2AMLogic/loom itself) -- an installed consumer repo never has a
 # `loom-daemon/src/` directory at all, so its absence is a legitimate,
 # SKIPpable state, not a failure (#6736). Only fail when the directory *is*
 # present but forge_cmd.rs lacks the documentation string.

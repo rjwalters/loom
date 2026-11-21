@@ -1215,7 +1215,7 @@ model)` into `tokens_pool::record_terminal_for_model` — a
 **class-scoped** `class_cooldowns` entry (`.loom/account-health.json`)
 rather than the account-wide `plan_exhausted` cooldown every other category
 (and every v1 record) still writes. See
-[`tokens_pool::health`'s module doc](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
+[`tokens_pool::health`'s module doc](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/tokens_pool/health.rs)
 for the full narrowing/fail-safe contract (#8058 Phase 2).
 
 An adapter emitting this record for the first time should start at `v=2`
@@ -1806,7 +1806,7 @@ Containers as a session-persistence and containment boundary for worker
 runtimes — per-account persistent session containers for runtimes with
 mutable interactive auth (Codex), per-sweep ephemeral containers for
 stateless-auth runtimes (Claude, Pi/OpenCode) — are specified in
-[ADR-0017: Session-Container Architecture](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md)
+[ADR-0017: Session-Container Architecture](https://github.com/2AMLogic/loom/blob/main/docs/adr/0017-session-container-architecture.md)
 (epic #6896). Both container lifetimes dispatch through the existing
 `spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
 dispatch path**; this doc's seven contract points are unchanged by that ADR.
@@ -1838,7 +1838,7 @@ Reusing the session shape here would therefore cost both of the properties the
 ephemeral shape gives for free — a guaranteed-clean filesystem per sweep, and a
 hard teardown at sweep end — in exchange for solving a problem native harnesses
 do not have. The two images differ by **lifetime**, not by which CLI they
-install; see [`docker/native/README.md`](https://github.com/rjwalters/loom/blob/main/docker/native/README.md).
+install; see [`docker/native/README.md`](https://github.com/2AMLogic/loom/blob/main/docker/native/README.md).
 
 ### Native-harness ephemeral containment (issue #8403, epic #6896 Phase 3)
 
@@ -2305,7 +2305,7 @@ re-exec'd copy runs the ordinary (now-"bare-metal-inside-a-box") dispatch
 path straight through — CPU quota (advisory-only, same as any host with no
 reachable `systemd --user` manager), sleep-inhibit, and token selection all
 execute again, this time *inside* the container. This is deliberate, not
-incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
+incidental: it is the reason [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §2 can say a worker container reads a token "via the existing rotation logic
 in `spawn-claude.sh`" — there is only one implementation of that logic, ever.
 Niceness is the one exception: the host-side `LOOM_SWEEP_NICED` sentinel is
@@ -2543,7 +2543,7 @@ container as a **job spec** sent to a host-level executor, over the
 Pointer only — none of this doc's seven contract points change. The seam sits
 *beside* worker dispatch, not inside it: `spawn-worker.sh` still decides what
 a worker is, and a job is something a worker asks for while it runs. Job
-mounts follow the same [`MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
+mounts follow the same [`MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md)
 §1 path-parity rule containerized dispatch does, and job resource limits
 mirror the per-sweep `--cpus`/`--memory` shape above. Migrating the
 docker-requiring callers (build-gate, sim/build wrappers) onto the seam is
@@ -2557,7 +2557,7 @@ sessions, never persisted) and user-scope `~/.claude/settings.json` entries; the
 project file stays repo-owned, and resync only reports hooks it does not wire
 (`report_unwired_hooks`). A hook that no non-mutating surface can carry is not
 delivered. Conflict, uninstall, malformed-file and upgrade behaviour are in
-[ADR-0026](https://github.com/rjwalters/loom/blob/main/docs/adr/0026-consumer-hook-settings-ownership.md).
+[ADR-0026](https://github.com/2AMLogic/loom/blob/main/docs/adr/0026-consumer-hook-settings-ownership.md).
 
 ## Fork mapping table
 
@@ -2605,7 +2605,7 @@ collaboration:
   `defaults/runtimes/aider.json` worked example, and the capability-manifest
   gate this section documents. Adapted from a survey of
   [stablyai/orca](https://github.com/stablyai/orca)
-  ([survey-orca-2026-07-31.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
+  ([survey-orca-2026-07-31.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/survey-orca-2026-07-31.md),
   idea 5), filed from #4775.
 - **#8671** — the tier-3 launch shape (`cliBin`, `promptFlag`, `extraArgs`,
   `modelFlag`/`modelEnv`, `effortFlag`/`effortValuePrefix`) moved out of
@@ -2614,9 +2614,9 @@ collaboration:
   `spawn-generic-launch.sh`. Field set seeded from
   [superset-sh/superset](https://github.com/superset-sh/superset)'s
   declarative registry (21 coding CLIs), used as a reference table only.
-- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/rjwalters/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
+- [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](https://github.com/2AMLogic/loom/blob/main/docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md
-- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/rjwalters/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
+- [`docker/worker/MOUNT-CONTRACT.md`](https://github.com/2AMLogic/loom/blob/main/docker/worker/MOUNT-CONTRACT.md) —
   the normative container mount contract (path parity, secrets, uid mapping,
   build-cache placement) for anything that dispatches a worker runtime inside
   a `ghcr.io/rjwalters/loom-worker`-derived container (epic #6896).

@@ -6,7 +6,7 @@
 # to `GET /repos/{nwo}/commits/{sha}/check-runs` with no `per_page` and no
 # `--paginate`, so GitHub's default page size of 30 applied:
 #
-#   $ gh api repos/rjwalters/loom/commits/c53dcaa85/check-runs \
+#   $ gh api repos/2AMLogic/loom/commits/c53dcaa85/check-runs \
 #       --jq '"\(.total_count) \(.check_runs|length)"'
 #   39 30
 #

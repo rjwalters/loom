@@ -7,7 +7,7 @@ plan-runs-on	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan
 plan-checkout	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+      - uses: actions/checkout@v4	covered	offline plan job: checkout step
 plan-dry-run	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+        run: ./scripts/render-plan.sh --dry-run	covered	offline plan job: dry-run step
 plan-job-name	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+    name: deploy plan (offline, no credentials)	covered	offline plan job: job name
-loom-12402	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+    runs-on: ubuntu-24.04	covered	rjwalters/loom#12402
+loom-12402	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+    runs-on: ubuntu-24.04	covered	2AMLogic/loom#12402
 plan-runs-on-2	.github/workflows/claude-bot-deploy-plan.yml	claude-bot-deploy-plan.yml	+    runs-on: ubuntu-24.04	covered	offline plan job: runs-on in a second consumer repo
 ci-github-token-only	.github/workflows/ci.yml	ci-github-token-only.yml	+    runs-on: ubuntu-24.04	covered	GITHUB_TOKEN and contents: read are not privileged
 ci-cloudflare-runs-on	.github/workflows/ci.yml	ci-with-cloudflare-secret.yml	+    runs-on: ubuntu-24.04	held	innocuous name, privileged content, edit avoids the diff patterns

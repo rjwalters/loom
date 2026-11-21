@@ -145,7 +145,7 @@ provision_machine_tools() {
 }
 
 provision_tools_main() {
-  local repo="${LOOM_TOOLS_REPO:-rjwalters/loom}" tag="" dest_dir="" workspace="" triple bin
+  local repo="${LOOM_TOOLS_REPO:-2AMLogic/loom}" tag="" dest_dir="" workspace="" triple bin
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo) repo="${2:?--repo needs OWNER/NAME}"; shift 2 ;;

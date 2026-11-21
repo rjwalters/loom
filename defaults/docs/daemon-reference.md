@@ -204,7 +204,7 @@ which holds the connection open and streams one `EventStream` frame per
 event. Connection framing matches the existing terminal-management IPC
 surface; no new transport is introduced.
 
-Source of truth: [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs)
+Source of truth: [`loom-daemon/src/types.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/types.rs)
 (upstream Loom repo — not shipped to consumer installs).
 
 | Request | MCP tool | Response | Phase |
@@ -339,7 +339,7 @@ In addition, the bus internally emits:
 
 Topic matching is **segment-aligned prefix** (`sweep.issue` matches
 `sweep.issue.123.phase` but not `sweep.issuetype.foo`). See
-[`event_bus::topic_matches`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs)
+[`event_bus::topic_matches`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/event_bus.rs)
 (upstream Loom repo — not shipped to consumer installs) for the
 authoritative routing rule.
 
@@ -2140,7 +2140,7 @@ embeds, so the binary must be a release's. Both of these must hold:
    in. A developer's build, a feature branch's, a CI build and
    `scripts/daemon-build.sh` carry no stamp.
 2. Once per process, the daemon asks the forge which commit tag `v<version>`
-   of `rjwalters/loom` names, and it is the commit the binary was built from.
+   of `2AMLogic/loom` names, and it is the commit the binary was built from.
 
 A binary that fails either is reported once for the host
 (`host never resyncs: this daemon is not an official release build`) and never
@@ -2315,7 +2315,7 @@ same head: every changed file is an added/modified byte-copy (blob SHA) of its
 `.agents/skills/<f>` to `defaults/.agents/skills/<f>`). Operator ruling r7-q33
 makes the release tag the review point for gate content, so **byte-identical
 merge-gate files land without a Judge**, provided the tag is a published,
-non-draft GitHub Release in `rjwalters/loom` (a bare ref is not enough). Any
+non-draft GitHub Release in `2AMLogic/loom` (a bare ref is not enough). Any
 other outcome keeps the `loom:review-requested` lane: a differing byte, a
 rename or removal, an unmapped file or one outside the install set, or a path
 pinned in `.loom/resync-ignore` at the PR head (or an unreadable pin file). The
@@ -2583,10 +2583,10 @@ blocker is Loom-owned:
   `detached=keep`, six-hour and live-`git` checks, so a checkout any of those
   refuses costs no forge read at all; only one they all pass pays for it.
   **A squash- or rebase-merged PR's head qualifies too**, measured 2026-11-13
-  against the production query on three squash-merged rjwalters/loom PRs
+  against the production query on three squash-merged 2AMLogic/loom PRs
   (#9216 head `3e0393d7`, #9240 head `5f35ef2e`, #9212 head `07af0cb5`, none
   of them an ancestor of `origin/main`):
-  `gh api repos/rjwalters/loom/commits/<sha>/pulls --jq 'any(.[]; .merged_at != null and .head.sha == "<sha>")'`
+  `gh api repos/2AMLogic/loom/commits/<sha>/pulls --jq 'any(.[]; .merged_at != null and .head.sha == "<sha>")'`
   answered `true` for each. So the endpoint does list a merged PR for a head
   commit that is not on the default branch, and a checkout left on a squashed
   branch is put back rather than held.
@@ -4750,7 +4750,7 @@ the single `loom:epic` label and are **derived** — computed each tick from two
 already-visible facts: the number of `### Phase` sections in the epic body, and
 the open/closed status of the epic's `loom:epic-phase` children. The five states
 (implemented as `EpicState` in
-[`loom-daemon/src/epic_state.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/epic_state.rs)
+[`loom-daemon/src/epic_state.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/epic_state.rs)
 (upstream Loom repo — not shipped to consumer installs)) are the derived
 epic lane (#3841):
 
@@ -4777,7 +4777,7 @@ epic:phase_join   → epic:done        (Supervisor, barrier)        [close]
 
 Every edge touching `epic:phase_join` is a **phase-boundary edge** and declares
 a non-empty fork-join barrier
-([`loom-daemon/src/phase_join.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/phase_join.rs)
+([`loom-daemon/src/phase_join.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/phase_join.rs)
 (upstream Loom repo — not shipped to consumer installs)): the
 barrier holds — degrading the plan to a no-op — until every child of the current
 phase is closed, so phase N+1 (or epic close) never fires while a current-phase
@@ -4792,7 +4792,7 @@ the epic lane (#4310) — there is no second, independently-maintained
 implementation it is checked against. Its structural invariants (exactly five
 states, `epic:done` the sole terminal state, exactly five intra-lane edges,
 non-empty barriers on every `epic:phase_join` edge) are asserted directly by
-[`loom-daemon/tests/epic_state_invariants.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/tests/epic_state_invariants.rs)
+[`loom-daemon/tests/epic_state_invariants.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/tests/epic_state_invariants.rs)
 (upstream Loom repo — not shipped to consumer installs), which always runs (no
 skip path).
 
@@ -4801,7 +4801,7 @@ skip path).
 The two issue-creating expand bursts (`decompose`'s downstream and both
 `expand`/`join` Champion dispatches that run `gh issue create`) are serialized
 through the global **#3707 issue-creation mutex**
-([`loom-daemon/src/issue_creation_mutex.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/issue_creation_mutex.rs)
+([`loom-daemon/src/issue_creation_mutex.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/issue_creation_mutex.rs)
 (upstream Loom repo — not shipped to consumer installs)).
 The supervisor holds the async guard across the whole (spawn-and-wait) dispatch
 so a burst never interleaves with any other issue-creating burst anywhere in the
@@ -4933,7 +4933,7 @@ Neither loop had a config key, so no fleet configuration needs to change.
 ## Autonomous work finder (#3810)
 
 The **work finder** (Phase A of epic #3809,
-[`loom-daemon/src/work_finder.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/work_finder.rs)
+[`loom-daemon/src/work_finder.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/work_finder.rs)
 (upstream Loom repo — not shipped to consumer installs)) is the
 daemon-native poller that turns a human-approved `loom:issue` into a dispatched
 build **without an operator** — restoring the one capability the deleted v0.10.0
@@ -7181,7 +7181,7 @@ request. `reap_once`'s `checkpoint_progress` arm reads that rewritten
 checkpoint as proof of forward progress and actively **clears** the dispatch
 backoff, the quarantine tally and the resume runway — so the next tick
 re-offers the issue immediately, and the cycle repeats with nothing counting
-it. Observed on `rjwalters/loom#7893`: **14 claims in just over four hours, 55
+it. Observed on `2AMLogic/loom#7893`: **14 claims in just over four hours, 55
 `loom:issue`/`loom:building` label events, several claim/release pairs inside
 the same minute, zero PRs** — plus an urgent label (since retired, #9244) that made a stuck
 dispatcher look like a priority item.
@@ -7215,7 +7215,7 @@ dispatch left a pull request behind** — the one thing that loop could not fake
   (`<!-- loom:prless-retry-kind=attempt -->` / `…=hold` / `…=hold-failed`,
   #9239) in addition to the shared `<!-- loom:prless-retry (#7972) -->` marker,
   so an audit never has to infer the difference from prose — before #9239 it had
-  to, and got it wrong: on `rjwalters/loom#8812` four of five "holds" were
+  to, and got it wrong: on `2AMLogic/loom#8812` four of five "holds" were
   `Attempt 2 of 3` notes, one per dispatch host.
 - **Hold (`threshold`).** The `threshold`-th consecutive PR-less release
   fleet-wide adds `loom:blocked`, removes `loom:issue`, and comments with the
@@ -10457,7 +10457,7 @@ detection, which is Builder-workflow-invoked rather than periodic. See
 ### Configured session image and extra read-only mounts (#14019)
 
 By default a contained session runs from the released
-`ghcr.io/rjwalters/loom-worker-session:<daemon version>` image, selected by
+`ghcr.io/2AMLogic/loom-worker-session:<daemon version>` image, selected by
 the daemon's own version. A repo whose checks need a domain toolchain (EDA
 tools, a Rust toolchain, simulators) can instead run its sessions from a
 **derived image** and give them **extra read-only data mounts**, via two
@@ -10931,7 +10931,7 @@ yields `not-running`.
 
 ### Autonomous periodic support-role runner (#4015)
 
-> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
+> **Step dispatch (#11894, live since #11909).** The item roles (Curator, Champion promote and merge, Judge, Doctor) are dispatched as steps by the work finder, never on these intervals: Curator, Judge and Doctor named in `roles` or `onIdle` are ignored with a warning, and `demandWidth` doesn't apply to them. Champion runs here as `/loom:champion --non-item` only; `championMode` is retired and ignored with a warning. The two concurrency budgets merge in #11911. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12. The Judge CI gate (#12003) lives on the step path too (#12042): a Judge step whose PR head has CI running is a `ci_pending` pass until CI concludes, and a `ci_pending` no-op cools down for 10 min, not the 1 h no-op window ([`pr-planning.md`](pr-planning.md)).
 
 Before this loop, the periodic **standalone** support roles — Champion,
 Curator, Judge, Auditor, Guide — ran ONLY via GitHub Actions cron
@@ -11585,7 +11585,7 @@ difference between one edit and dozens. Notes:
   `source=config:autonomous.roleRunner.intervalSecs from private/shared
   defaults (/path/to/defaults.json)`.
 - Full tier semantics and the deep-merge rules:
-  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md).
+  [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md).
 
 Either way — machine-level or per-repo — the JSON block is the same shape as
 the example above:
@@ -14049,7 +14049,7 @@ and prints exactly one JSON object on stdout (every other line the script emits
 goes to stderr in this mode):
 
 ```json
-{"ok":true,"reason":null,"repo":"rjwalters/loom","target":"aarch64-apple-darwin",
+{"ok":true,"reason":null,"repo":"2AMLogic/loom","target":"aarch64-apple-darwin",
  "tag":"v0.19.24","version":"0.19.24","published_at":"2026-09-13T12:00:00Z",
  "asset_sha256":"…","installed_bin":"/Users/you/.local/bin/loom-daemon",
  "installed_version":"0.19.21","installed_commit":"…","installed_sha256":"…",
@@ -14456,7 +14456,7 @@ same warning every tick it is active, independent of `decide()`'s gates.
 
 The goal state — "file a `loom:triage` issue, watch it build" with zero operator
 dispatch — is validated by the E2E playbook at
-[`docs/autonomous-mode-e2e.md`](https://github.com/rjwalters/loom/blob/main/docs/autonomous-mode-e2e.md)
+[`docs/autonomous-mode-e2e.md`](https://github.com/2AMLogic/loom/blob/main/docs/autonomous-mode-e2e.md)
 (upstream Loom repo — not shipped to consumer installs): it walks a
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
@@ -14870,13 +14870,13 @@ what Phase 3 deletes vs preserves".
 
 ## Related resources
 
-- **Architecture epic**: [#3449](https://github.com/rjwalters/loom/issues/3449)
+- **Architecture epic**: [#3449](https://github.com/2AMLogic/loom/issues/3449)
   (rebuild of the daemon backend).
 - **Phase A** (dispatch surface): #3452 / PR #3459.
 - **Phase B** (event bus): #3453 / PR #3460.
 - **Phase C** (monitoring + subscription tools): #3455.
 - **Migration guide**:
-  [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md)
+  [`docs/migration/v0.10.0-shepherd-deprecation.md`](https://github.com/2AMLogic/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md)
   (upstream Loom repo — not shipped to consumer installs).
 - **Config resolution layer** (#4039, Epic #3835 Phase 2): a single resolver
   over private defaults + tracked `.loom-project/project.json` + ignored
@@ -14884,7 +14884,7 @@ what Phase 3 deletes vs preserves".
   existing call site — including this doc's `.loom/config.json` references
   above — has been migrated onto it yet; see follow-up #4047). Schema,
   precedence, and how it composes with `env > config > default`:
-  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
+  [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md)
   (upstream Loom repo — not shipped to consumer installs).
 - **`loom-daemon inflight` (#8268)**: a separate, no-daemon-required CLI
   surface — a machine-wide registry that lets a coordinator and any
@@ -14893,9 +14893,9 @@ what Phase 3 deletes vs preserves".
   Not part of the IPC/MCP surface documented above (it needs no running
   daemon process). Full reference: [`verification-ownership.md`](verification-ownership.md).
 - **Source** (upstream Loom repo — not shipped to consumer installs):
-  - [`loom-daemon/src/types.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
-  - [`loom-daemon/src/sweep_registry.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
-  - [`loom-daemon/src/event_bus.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
-  - [`loom-daemon/src/ipc.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
-  - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/rjwalters/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
-  - [`loom-daemon/src/inflight.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/inflight.rs) — the in-flight registry.
+  - [`loom-daemon/src/types.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/types.rs) — IPC types.
+  - [`loom-daemon/src/sweep_registry.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/sweep_registry.rs) — registry + reaper.
+  - [`loom-daemon/src/event_bus.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/event_bus.rs) — pub/sub bus.
+  - [`loom-daemon/src/ipc.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/ipc.rs) — request dispatcher.
+  - [`mcp-loom/src/tools/sweeps.ts`](https://github.com/2AMLogic/loom/blob/main/mcp-loom/src/tools/sweeps.ts) — MCP tool definitions.
+  - [`loom-daemon/src/inflight.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/inflight.rs) — the in-flight registry.

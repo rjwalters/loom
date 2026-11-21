@@ -132,7 +132,7 @@ Loom's own credential handling:
   in a repo or worktree" policy and the safe-handoff/verification rules this
   document's provisioning flow follows.
 - The config-resolution tiers
-  ([`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md))
+  ([`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md))
   already treat a raw secret as host-local (never committed) while the *name*
   of where to find one can live in tracked config — the same distinction
   `./.loom/credentials.md` draws for task credentials outside Loom's own config

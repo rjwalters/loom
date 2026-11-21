@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-spawn-codex-sealed.sh — spawn-codex.sh passes Codex's hook-trust waiver
 # ONLY for a sealed registration in a hardened session container
-# (rjwalters/loom#10102), and fails closed on every tamper.
+# (2AMLogic/loom#10102), and fails closed on every tamper.
 #
 # The vetting rule itself is pinned clause by clause in
 # loom-daemon/src/tokens_pool/codex_hooks_seal_tests.rs. This suite pins the

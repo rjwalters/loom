@@ -1,6 +1,6 @@
 # Loom Workspace Configuration
 
-> **This project uses [Loom](https://github.com/rjwalters/loom)** - A multi-terminal desktop application that orchestrates AI-powered development agents using git worktrees and GitHub as the coordination layer.
+> **This project uses [Loom](https://github.com/2AMLogic/loom)** - A multi-terminal desktop application that orchestrates AI-powered development agents using git worktrees and GitHub as the coordination layer.
 
 This directory contains workspace-specific Loom configuration that should be committed to version control for team sharing.
 
@@ -114,7 +114,7 @@ Create `.loom/roles/my-role.json`:
 3. Configure autonomous mode if desired
 4. Save
 
-See the [Loom roles documentation](https://github.com/rjwalters/loom/blob/main/defaults/roles/README.md) for detailed role creation guide.
+See the [Loom roles documentation](https://github.com/2AMLogic/loom/blob/main/defaults/roles/README.md) for detailed role creation guide.
 
 ## Customizing Agent Configuration
 
@@ -183,7 +183,7 @@ This allows teams to share agent roles and configurations while keeping runtime 
 
 ## More Information
 
-- System roles: `.loom/roles/` (local copies) or [Loom defaults](https://github.com/rjwalters/loom/tree/main/defaults/roles)
-- Role creation guide: [Loom roles documentation](https://github.com/rjwalters/loom/blob/main/defaults/roles/README.md)
+- System roles: `.loom/roles/` (local copies) or [Loom defaults](https://github.com/2AMLogic/loom/tree/main/defaults/roles)
+- Role creation guide: [Loom roles documentation](https://github.com/2AMLogic/loom/blob/main/defaults/roles/README.md)
 - Workflow guide: [CLAUDE.md](../CLAUDE.md) (in your repository root)
-- Loom documentation: [https://github.com/rjwalters/loom](https://github.com/rjwalters/loom)
+- Loom documentation: [https://github.com/2AMLogic/loom](https://github.com/2AMLogic/loom)

@@ -87,7 +87,7 @@ back to re-reading the head, which is the "freshen" trap above.
 ## The implementation: `loom-daemon push-lease pin-flag`
 
 The pinning logic is a **daemon subcommand**, not shell — new executable logic
-belongs in Rust ([shell-language-policy.md](https://github.com/rjwalters/loom/blob/main/.loom/docs/shell-language-policy.md)
+belongs in Rust ([shell-language-policy.md](https://github.com/2AMLogic/loom/blob/main/.loom/docs/shell-language-policy.md)
 — an absolute URL because that doc is not installed into consumer repos), and a script that
 reaches it only has to find the binary, pass the arguments, and read the result
 back (`loom-daemon/src/cli/push_lease.rs` is the authoritative reference):

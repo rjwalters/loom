@@ -251,7 +251,7 @@ the OTLP wire, which would be the only way to observe an **interactive**,
 human-launched `opencode` session (it writes a different store,
 `$XDG_DATA_HOME/opencode/opencode.db`, which `discover_opencode_dbs` does not
 scan). Issue #8670 decided that gap stays open for now, and
-[`defaults/observability/collector/README.md`](https://github.com/rjwalters/loom/blob/main/defaults/observability/collector/README.md)
+[`defaults/observability/collector/README.md`](https://github.com/2AMLogic/loom/blob/main/defaults/observability/collector/README.md)
 §"Known gap: OpenCode interactive sessions" records the evidence, the extract
 design to use if it is ever built (watermark on `session.time_updated`, dedup on
 `session.id` — the rows are mutable running totals, not append-only events), and

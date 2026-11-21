@@ -314,7 +314,7 @@ A sweep began work on an issue.
 ```json
 {
   "kind": "sweep.started",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -457,7 +457,7 @@ A sweep advanced to a new lifecycle phase (mirrors `sweep.issue.{N}.phase`).
 ```json
 {
   "kind": "sweep.phase",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -499,7 +499,7 @@ paired `sweep.outcome`).
 ```json
 {
   "kind": "sweep.completed",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -601,7 +601,7 @@ is `#[serde(default)]`); the fix is at the emitters, not the readers.
 ```json
 {
   "kind": "sweep.outcome",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "issue": 4703,
   "sweep_id": "sweep-issue-4703-0",
@@ -1161,7 +1161,7 @@ the two journals:
 
 Full rationale, and why this is a prerequisite of every fleet-wide spend
 ceiling rather than one:
-[`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
+[`ADR-0020`](https://github.com/2AMLogic/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 
 `model` / `effort` likewise survive a daemon restart: the dispatch stamps both
 into the claim lock's `owner.json` (alongside the child pid and process
@@ -1334,7 +1334,7 @@ gradeable by a model or prompt experiment.
 ```json
 {
   "kind": "role_tick.outcome",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "public",
   "role": "judge",
   "started_at": "2026-07-30T12:00:00Z",
@@ -1517,7 +1517,7 @@ output, a key and an email produces a record carrying none of the four.
 ```json
 {
   "kind": "session.summary",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "private",
   "session_id": "agent-1",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
@@ -1606,7 +1606,7 @@ pinned by the redaction test suite (`otlp/mapping/metadata/tests.rs` +
 ```json
 {
   "kind": "session.analysis",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "visibility": "private",
   "session_id": "uuid-a",
   "parent_session_id": "7d8119a7-250a-48ca-a0ee-b4b2c7f14d92",
@@ -3523,7 +3523,7 @@ negative delta): only a removed or reset ledger file produces one now, but
 the defensive read stays correct for either shape. `dropped_by_reason` is
 additive (serde-defaulted), so records from before #11527 still parse and no
 `schema_version` bump is needed. The committed query is
-[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/rjwalters/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
+[`defaults/observability/signoz/host-export-queries.sql`](https://github.com/2AMLogic/loom/blob/main/defaults/observability/signoz/host-export-queries.sql):
 hosts with drops, or with no `host.export` at all, in the last 2 h. Query 3 compares a rendered `hosts.yml` roster against `host.export` to find silent hosts by absence (#11198). Query 5 combines `daemon.start`, `daemon.exit` and `host.export` into one `running` / `stopped` / `silent` row per roster host (#10023); `stopped` needs a `daemon.exit`, so a crash, kill or power loss reads as `silent`.
 
 ### `checkout.freshness`
@@ -3759,7 +3759,7 @@ splits into **queue wait** (`entered_at` → `started_at`) and **work time**
 ```json
 {
   "kind": "stage.work_started",
-  "repo": "rjwalters/loom",
+  "repo": "2AMLogic/loom",
   "issue": 11641,
   "pr_number": 11700,
   "stage": "doctor",

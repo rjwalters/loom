@@ -8,7 +8,7 @@ was the exception: "the engine has stopped and a human is the only way
 forward." Champion's merge-risk hold expressed that state as an HTML comment
 marker (`<!-- champion:merge-risk-hold -->`) buried inside a PR comment —
 invisible to `gh pr list`, the dashboard, or any label-filtered query. See
-[#5502](https://github.com/rjwalters/loom/issues/5502) for the incident that
+[#5502](https://github.com/2AMLogic/loom/issues/5502) for the incident that
 prompted this (four Judge-approved PRs sat held-but-invisible for up to 126
 hours).
 
@@ -483,7 +483,7 @@ gh issue list --state open --label loom:operator --json number --jq 'length'
 gh pr list --state open --label loom:operator --json number --jq 'length'
 ```
 
-**2. The merge-risk hold digest — [#6877](https://github.com/rjwalters/loom/issues/6877).**
+**2. The merge-risk hold digest — [#6877](https://github.com/2AMLogic/loom/issues/6877).**
 Champion's Held-PR Census (#6720 / #6851 / #7020) overwrites this issue's body
 every pass with one row per held PR — PR number, the hold's own reason, the
 `mergeable` status, how long a conflict has been rotting, and (#8552) the PR's
@@ -512,7 +512,7 @@ pairing is deliberate:
 **3. `loom-daemon serve`'s dashboard.** Surfacing these counts in
 `loom-daemon health` and as an operator-held bucket on `GET /api/pipeline` is
 tracked separately in
-[#8091](https://github.com/rjwalters/loom/issues/8091) — note that `health`
+[#8091](https://github.com/2AMLogic/loom/issues/8091) — note that `health`
 rolls `overall` up over *every* section, so a new section there interacts with
 the #4761 exit-code contract.
 
@@ -882,7 +882,7 @@ A verdict carrying a real review still re-anchors.
 
 ## Label registry: the source of truth (#10013)
 
-> **Step dispatch (#11894, live since #11909).** `stale_after_minutes` (live since #11898, see below) is the claim liveness of the five claim labels; a `queued` item state marks a PR in GitHub's merge queue, never drawn for a merge step; and a dead step's claim is restored to its own role's ready stage. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+> **Step dispatch (#11894, live since #11909).** `stale_after_minutes` (live since #11898, see below) is the claim liveness of the five claim labels; a `queued` item state marks a PR in GitHub's merge queue, never drawn for a merge step; and a dead step's claim is restored to its own role's ready stage. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 
 `defaults/labels.json` is the single source of truth for label semantics: each
 label's name, description, color, `kind`, `applied_by`/`removed_by`, and the

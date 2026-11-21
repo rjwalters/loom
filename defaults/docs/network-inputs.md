@@ -1,6 +1,6 @@
 # Network inputs to loom-daemon: audit and classification
 
-Audit for [#11711](https://github.com/rjwalters/loom/issues/11711), part of
+Audit for [#11711](https://github.com/2AMLogic/loom/issues/11711), part of
 the operator's config-only-inputs initiative. It answers one question: **what does `loom-daemon` accept
 or fetch from outside the process that can change what it does, and is each
 such input config, forge, a wake-only webhook, or removed?**
@@ -207,7 +207,7 @@ nothing to remove daemon-side.
 | Row | Covered by |
 |---|---|
 | 8 `/ingest` control fields | Daemon side done (#11104); the exporter itself was removed in #12813. Priority controls as fleet config (outside this repo's scope) |
-| 9, 10, 11 Safehouse | rjwalters/loom#11112 (safehouse removal, ADR-0025) and #11712 step 3 |
+| 9, 10, 11 Safehouse | 2AMLogic/loom#11112 (safehouse removal, ADR-0025) and #11712 step 3 |
 | 12 loom-ui GitHub mirror | Nothing daemon-side; loom-ui removes its route |
 
 Fleet config changes needed (listed in the operator's fleet tracking, not
@@ -217,7 +217,7 @@ ruled for hardening, a fleet-wide signature policy.
 
 ## Related
 
-- rjwalters/loom#11711 (this audit), #11712, #11112, #11104
+- 2AMLogic/loom#11711 (this audit), #11712, #11112, #11104
 - [`forge-events.md`](forge-events.md) (the retained state mirror) and ADR-0021 (rows 6-7, superseded)
 - [`lease-record.md`](lease-record.md) and ADR-0025 for the forge lease that replaces rows 9-10
 - [`fleet-config-lifecycle.md`](fleet-config-lifecycle.md) for rows 13-15

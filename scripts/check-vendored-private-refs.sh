@@ -52,11 +52,15 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 #
 # Owners permitted in an `owner/repo#N` cross-repo reference under defaults/:
-# this repo's own org, the RFC-2606-style placeholders used by the genericized
-# narratives, and the single-letter/obvious stand-ins used by the shell test
-# fixtures ("no"/"nowner" are artifacts of `\n`-escaped fixture strings).
+# this repo's own org (2AMLogic) plus its pre-transfer slug (rjwalters — the
+# org rename in #14170 makes either a legitimate cross-reference target, and
+# the self-test's clean fixture below asserts on `rjwalters/loom#1`), the
+# RFC-2606-style placeholders used by the genericized narratives, and the
+# single-letter/obvious stand-ins used by the shell test fixtures ("no"/
+# "nowner" are artifacts of `\n`-escaped fixture strings).
 ALLOWED_OWNERS=(
   rjwalters
+  2AMLogic
   example-org
   owner OWNER
   o a no nowner private

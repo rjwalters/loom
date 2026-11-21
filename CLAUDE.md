@@ -15,7 +15,7 @@ development workers using git worktrees and a forge (GitHub or Gitea) as the
 coordination layer, via manual roles, continuous autonomous orchestration (the
 Rust `loom-daemon` binary), and GitHub Actions cron schedules.
 
-**Loom Repository**: https://github.com/rjwalters/loom
+**Loom Repository**: https://github.com/2AMLogic/loom
 
 ## Orchestration Architecture
 

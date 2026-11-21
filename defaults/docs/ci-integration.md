@@ -182,4 +182,4 @@ your custom strings.
 | `defaults/docs/ci-integration.md` | This document (shipped with installs) |
 
 For questions or improvements, file an issue at
-<https://github.com/rjwalters/loom/issues>.
+<https://github.com/2AMLogic/loom/issues>.

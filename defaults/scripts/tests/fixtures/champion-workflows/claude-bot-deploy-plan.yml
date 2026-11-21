@@ -1,5 +1,5 @@
 # Synthetic reduction of an offline plan job edited in consumer repos,
-# plus rjwalters/loom#12402.
+# plus 2AMLogic/loom#12402.
 name: claude-bot-deploy-plan
 on:
   pull_request:

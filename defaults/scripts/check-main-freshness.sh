@@ -285,7 +285,7 @@ warn_resync_precondition_gap() {
     warn "${YELLOW}  never a downgrade). With no loom-daemon that has that subcommand it${NC}"
     warn "${YELLOW}  fails with 'Could not locate a defaults/ source tree to sync from'.${NC}"
     warn "${YELLOW}  Fix for that case: install or update loom-daemon, or clone${NC}"
-    warn "${YELLOW}  https://github.com/rjwalters/loom and point the sidecar at it:${NC}"
+    warn "${YELLOW}  https://github.com/2AMLogic/loom and point the sidecar at it:${NC}"
     warn "${YELLOW}      echo /path/to/local/loom-clone > .loom/loom-source-path${NC}"
 }
 

@@ -3,7 +3,7 @@
 #
 # judge-fallback-guard.sh moves the Judge's fallback-queue skip/evaluate
 # decision out of prompt-embedded bash into a real, testable script. It was
-# added after PR #4972 (rjwalters/loom) accumulated 199 fallback-mode Judge
+# added after PR #4972 (2AMLogic/loom) accumulated 199 fallback-mode Judge
 # comments over 37 hours — the existing SHA-based dedup (#5058) is correct in
 # spec but expressed only as prose an LLM must faithfully re-derive on every
 # pass, and a fleet propagation-lag window let ~21h of comments through even

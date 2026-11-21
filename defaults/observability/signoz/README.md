@@ -271,7 +271,7 @@ the rule's own cadence is checked too (`frequency` ≤ `evalWindow`, so no minut
 of starvation falls in a gap between evaluations; neither the rule nor its
 query ships `disabled`). What it does **not** establish: no rule evaluator ran
 and no notification was delivered — the live fire-and-resolve check is
-[#9006](https://github.com/rjwalters/loom/issues/9006).
+[#9006](https://github.com/2AMLogic/loom/issues/9006).
 
 All five queries are additionally **executed verbatim** against the pinned
 ClickHouse the telemetry store runs, by
@@ -541,7 +541,7 @@ return 0 on every row instead of erroring. Policy and pipeline:
 | Subscription quota utilization | Dashboards → New dashboard `Loom quota` → Time series panel. Metric `loom.tokens.usage_fraction` (5-hour window) and a second query on `loom.tokens.usage_fraction_weekly` (rolling 7-day window, #9005), aggregation **Max**, group by `provider`, `account`; time range 7 days. Providers with no utilization source (Codex, OpenCode/Z.ai, Kimi) have no series at all — a gap, never a `0`. Last week's used fraction per provider and the idle headroom thrown away at each weekly reset need window functions, so they live in SQL only (`quota-utilization.sql` 1–3) |
 | GitHub bucket shadow spend | Dashboards → `Loom quota` → Time series panel. Metric `github.ratelimit.used`, aggregation **Max**, group by `account`, `owner`, `resource` (`owner = '-'` is an operator's ambient login; a pre-#10571 daemon's label set can carry two interleaved windows, so the panel is a browsing surface). The per-hour increments, the attributed `loom.forge.calls` and the shadow band need window functions and a join, so they live in SQL only (`github-shadow.sql` 1–5) |
 | Ready-queue dwell | Dashboards → New dashboard `Loom queue` → Time series panel. Metric `loom.queue.oldest_wait`, aggregation **Max**, group by `host.id`, `state`; time range 7 days. A second panel on `loom.queue.starved` (Max, group by `host.id`, `state`) is the alert's own signal. Disposition reasons, mean dispatch wait and one issue's admission trail need `JSONExtractString`/span reads and stay SQL-only (`queue-dwell.sql` 1–5) |
-| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/rjwalters/loom/issues/9006)) |
+| Queue starvation alert | Alerts → Import `alerts/queue-starvation.json`. Fires when `loom.queue.starved` for `state = 'ready'` stays above threshold for the 15-minute eval window on any one host; the alert's own query is `queue-dwell.sql` 1 narrowed to that state, minus its `HAVING starved > 0` so SigNoz can still see the series recover. The embedded query plus the committed threshold are executed against the pinned ClickHouse by `signoz_queue_starvation_alert.rs` (see "Queue dwell and starvation queries" above); no rule evaluator or notification has run ([#9006](https://github.com/2AMLogic/loom/issues/9006)) |
 | Host disk alerts | Alerts → Import `alerts/host-disk-low.json` (warning) and `alerts/host-disk-critical.json` (critical). Both read the direct OTLP gauges `loom.host.worktree_root_free_gb` and `loom.host.worktree_volume.{free,total}_bytes` (no loom-ui d1-export hop), one row per host labelled `host.name`, falling back to `host.id` for series whose `host.name` is empty, over a 60-minute window. Level arm: every free-GB reading in the last 10 minutes breaches (the window's `max` is under the threshold, so one healthy reading clears it). Warning: < 30 GB or < 10% of the volume, or a least-squares slope of free GB over the hour (at least 4 readings spanning 30 minutes, the latest within 10) projecting the volume full in < 6 h; critical: < 5 GB (so 0 included) or < 3%, or full in < 1 h. The percent arm needs the byte gauges; a host without them is judged on GB alone, and a host with no free-space gauge is unknown, never 0 GB. Executed against the pinned ClickHouse over a replay of free GB falling to 0, a 20 GB/h drain (warning only), a recovering host and a host alternating 0 GB and recovered readings within each minute (must not page), by `signoz_ops_alerts.rs`; no rule evaluator or notification has run (#10973) |
 | Host export silent alert | Alerts → Import `alerts/host-export-silent.json` after rendering its roster (see "Export coverage and drops"). Fires per roster host with no `host.export` past 900 s (`always`) or 86400 s (`when_awake`) in a 48 h window; the `state` label separates `exporter_silent` from `host_silent`. Replay-tested by `signoz_host_export_queries.rs`; no rule evaluator or notification has run (#11198) |
 | Work finder stale alert | Alerts → Import `alerts/work-finder-stale.json`. Fires for a host still heartbeating (`loom.host.uptime_seconds` within 10 minutes) whose last `loom.queue.issues` sample (exported once per work-finder tick, zeros included) is older than 2x that host's own tick interval, learned as the median gap between its ticks in the 24 h window (60 s with fewer than 3), floored at 300 s. A host whose finder never ticked in the window (disabled) or that stopped heartbeating (dead, not stalled) is not judged. Replay-tested by `signoz_ops_alerts.rs`: the 2026-10-08 stall at 14:04Z pages at 14:10Z (#10973) |
@@ -584,7 +584,7 @@ as the rollup's other CT queries.
 The thirteen CI rows are **recreation steps, not yet observed**: no session has
 had an authenticated UI (or API) credential for the trial org since they were
 written, so none of the thirteen has been created there yet
-([#8946](https://github.com/rjwalters/loom/issues/8946)). Their SQL
+([#8946](https://github.com/2AMLogic/loom/issues/8946)). Their SQL
 counterparts in `ci-queries.sql` are the executed, verified form — see
 `evidence.md`'s "CI retro queries, executed live" section — and remain the
 acceptance surface until someone with the trial org's login creates the saved
@@ -659,7 +659,7 @@ real-canary comparison still needs.
 
 > **Trial-only.** This section governs the isolated trial. The live
 > harness-ops store keeps logs 3650 days and traces/metrics 10 years
-> ([#10195](https://github.com/rjwalters/loom/issues/10195)); never apply
+> ([#10195](https://github.com/2AMLogic/loom/issues/10195)); never apply
 > `retention.sql` there (#8946 item 2 stays held).
 
 Set **seven days for logs and traces and 30 days for metrics** in General
@@ -900,7 +900,7 @@ tarball it turned out not to need is left behind.
 **Status of this procedure: the overlay renders and is contract-tested, but the
 rehearsal has not been executed against real backup tarballs yet** — see
 "Backup-restore rehearsal overlay" in `evidence.md` for exactly what was and was
-not verified. [#9279](https://github.com/rjwalters/loom/issues/9279) owns the
+not verified. [#9279](https://github.com/2AMLogic/loom/issues/9279) owns the
 live run; until it lands, treat this backup as untested.
 
 ## Upgrade, wipe and Cloud

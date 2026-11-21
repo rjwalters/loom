@@ -31,7 +31,7 @@ auto-close is still how an issue gets closed) or `Part of #N` (which is what
 ## The trailer contract
 
 ```
-Loom-Issue: rjwalters/loom#9465
+Loom-Issue: 2AMLogic/loom#9465
 ```
 
 - **Owner/repo is required.** A bare `Loom-Issue: #9465` does not parse. The
@@ -52,7 +52,7 @@ one `owner/repo#N` per line, deduped and sorted).
 `loom-daemon merge-pr-refs loom-issue-trailer-warnings --pr N` reports lines
 that *look* like a trailer but will not parse — a backticked one, or one
 missing the `owner/repo` slug. Both live in
-[`loom-daemon/src/merge_pr/refs.rs`](https://github.com/rjwalters/loom/blob/main/loom-daemon/src/merge_pr/refs.rs).
+[`loom-daemon/src/merge_pr/refs.rs`](https://github.com/2AMLogic/loom/blob/main/loom-daemon/src/merge_pr/refs.rs).
 
 ## Why not `Refs #N`
 

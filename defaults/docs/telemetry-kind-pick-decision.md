@@ -206,7 +206,7 @@ SELECT
   JSONExtractUInt(body, 'candidates_total')         AS candidates_total,
   JSONExtractString(body, 'candidate_source')       AS source,
   arrayFirstIndex(
-    c -> JSONExtractString(c, 'repo') = 'rjwalters/loom'
+    c -> JSONExtractString(c, 'repo') = '2AMLogic/loom'
      AND JSONExtractUInt(c, 'number') = 10212,
     JSONExtractArrayRaw(body, 'candidates'))        AS rank
 FROM signoz_logs.distributed_logs_v2
@@ -227,7 +227,7 @@ one tick are not counted as multiple ticks.
 
 ## Record volume
 
-> **Step dispatch (#11894, live since #11909).** Item roles have left the fixed role-runner cadences, so this table no longer holds for Curator, Judge and Doctor. Work-finder records carry `item_draw` (the step, the weight terms, `age_source`, and `weight_overflow`), and each work-finder row's `stage` names its step. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/rjwalters/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
+> **Step dispatch (#11894, live since #11909).** Item roles have left the fixed role-runner cadences, so this table no longer holds for Curator, Judge and Doctor. Work-finder records carry `item_draw` (the step, the weight terms, `age_source`, and `weight_overflow`), and each work-finder row's `stage` names its step. See [`docs/design/work-finder-step-dispatch.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/work-finder-step-dispatch.md) §12.
 
 Derived from the shipped default cadences, **not measured on a live fleet**:
 

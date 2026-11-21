@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Default skill routing table for Loom agent suggestions. Routes are evaluated top-to-bottom, first match wins. Place specific patterns before general ones. Patterns are phrase/word-boundary anchored (issue #3609) so common software vocabulary ('builders', a bare 'issue', a repo path like 'rjwalters/loom') no longer mis-routes — only genuine imperatives do. Agent invocations use the namespaced `/loom:<role>` form required by Claude Code 2.1+ (subdirectory commands at `.claude/commands/loom/<role>.md` resolve via `namespace:command` syntax — see issue #3345).",
+  "description": "Default skill routing table for Loom agent suggestions. Routes are evaluated top-to-bottom, first match wins. Place specific patterns before general ones. Patterns are phrase/word-boundary anchored (issue #3609) so common software vocabulary ('builders', a bare 'issue', a repo path like '2AMLogic/loom') no longer mis-routes — only genuine imperatives do. Agent invocations use the namespaced `/loom:<role>` form required by Claude Code 2.1+ (subdirectory commands at `.claude/commands/loom/<role>.md` resolve via `namespace:command` syntax — see issue #3345).",
   "routes": [
     {
       "pattern": "\\barchitect|system design|design (a |an |the )?proposal|\\brfc\\b",

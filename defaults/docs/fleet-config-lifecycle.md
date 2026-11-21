@@ -273,7 +273,7 @@ defaults for ~70 minutes.
   is the example — simply not committing a value at all and letting the
   default resolve per host). Both tiers are read through the same
   `resolve_effective_config`/`loom_resolve_config` chain documented in
-  [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md),
+  [`docs/design/config-resolution-tiers.md`](https://github.com/2AMLogic/loom/blob/main/docs/design/config-resolution-tiers.md),
   which also carries §5's step-by-step runbook for moving an already-dirty
   key onto the local tier by hand.
 - **A CI guard rejects a newly-committed offender** before it lands:

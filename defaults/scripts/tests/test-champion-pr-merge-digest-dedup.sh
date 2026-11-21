@@ -68,7 +68,7 @@ WORK="$(mktemp -d)" && trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/.loom/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'echo "POST $*" >>"$STUB_LOG"' >"$WORK/.loom/scripts/post-comment.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'echo "CREATE $*" >>"$STUB_LOG"' \
-    'echo "https://github.com/rjwalters/loom/issues/9999"' >"$WORK/.loom/scripts/create-issue.sh"
+    'echo "https://github.com/2AMLogic/loom/issues/9999"' >"$WORK/.loom/scripts/create-issue.sh"
 chmod +x "$WORK/.loom/scripts/post-comment.sh" "$WORK/.loom/scripts/create-issue.sh"
 
 # ---- forge stubs ------------------------------------------------------------
@@ -96,7 +96,7 @@ gh() {
             echo "UNPIN $*" >>"$STUB_LOG"
             ;;
         "issue close") echo "CLOSE $*" >>"$STUB_LOG" ;;
-        "repo view") echo "rjwalters/loom" ;;
+        "repo view") echo "2AMLogic/loom" ;;
         *) echo "unexpected gh call: $*" >&2; return 99 ;;
     esac
 }

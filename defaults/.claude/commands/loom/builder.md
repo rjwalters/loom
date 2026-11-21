@@ -546,7 +546,7 @@ from `.loom/worktrees/issue-<N>` it writes into **main** (invisible in your
 stop. `--output` does not help either: it stages a copy of the *primary's*
 `defaults/`, not your unmerged edits.
 
-In `rjwalters/loom` the installed mirrors are tracked and CI requires them current
+In `2AMLogic/loom` the installed mirrors are tracked and CI requires them current
 before merge (`check-hooks-defaults-parity.sh`, `check-dangling-links.sh`). So when your diff touches one, update it by hand
 **inside your worktree** (paths via `$WORKTREE_ABS`):
 
@@ -559,13 +559,13 @@ Then run the parity scripts above. Consumer repos: next section.
 
 ### Never fix an installed Loom file in place (consumer repos)
 
-Outside `rjwalters/loom` itself, `.loom/hooks|scripts|roles|docs|bin/` and
+Outside `2AMLogic/loom` itself, `.loom/hooks|scripts|roles|docs|bin/` and
 `.claude/commands/loom/` are resync-refreshed copies of Loom's `defaults/`. An
 in-place fix there is reverted by the next resync — or, if you *added* the file,
 orphaned with no upstream counterpart — silently, after your PR merges. Only two
 dispositions are valid:
 
-1. **Upstream it** — PR `rjwalters/loom`'s `defaults/<same relative path>`; the
+1. **Upstream it** — PR `2AMLogic/loom`'s `defaults/<same relative path>`; the
    fix returns via the normal `chore: resync installed Loom surfaces` commit.
 2. **Pin it** — add the path to that repo's `.loom/resync-ignore`, with a comment
    saying why and which upstream PR retires the pin if it is temporary.

@@ -351,7 +351,7 @@ macro_rules! loom_label_workflow_pointer {
 /// Any wording change to that paragraph belongs in
 /// `loom_label_workflow_pointer!`, which [`AGENTS_ROOT_POINTER`] shares.
 pub const LOOM_ROOT_POINTER: &str = concat!(
-    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.",
+    "This repository uses [Loom](https://github.com/2AMLogic/loom) for AI-powered development orchestration — see the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of that guide to `.loom/CLAUDE.md`.",
     "\n\n",
     loom_label_workflow_pointer!(),
 );
@@ -389,7 +389,7 @@ pub const AGENTS_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION (AGENTS) -->";
 /// label workflow (issue #8846) — both pointers expand the one
 /// `loom_label_workflow_pointer!` macro, so they cannot drift apart.
 pub const AGENTS_ROOT_POINTER: &str = concat!(
-    "This repository uses [Loom](https://github.com/rjwalters/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.",
+    "This repository uses [Loom](https://github.com/2AMLogic/loom) for AI-powered development orchestration (dual-runtime: Claude Code reads `CLAUDE.md`; OpenAI Codex CLI and other AGENTS.md-aware runtimes read this file). See the Loom repository for the full guide (roles, labels, worktrees, configuration). When installed, Loom also writes a locally-substituted copy of the runtime-neutral guide to `.loom/AGENTS.md`.",
     "\n\n",
     loom_label_workflow_pointer!(),
 );

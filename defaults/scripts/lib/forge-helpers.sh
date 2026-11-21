@@ -1922,7 +1922,7 @@ _forge_gitea_paginate() {
 #
 #   Querying only (2) — which this helper did until #8103 — silently reports
 #   "no required checks" on any repo governed by rulesets. Verified live on
-#   rjwalters/loom (2026-09-17): its `main` is governed by an ACTIVE ruleset
+#   2AMLogic/loom (2026-09-17): its `main` is governed by an ACTIVE ruleset
 #   (id 8809610, `pull_request` + `required_linear_history` + `deletion` +
 #   `non_fast_forward` rules), and the GraphQL query still returns
 #   `branchProtectionRule: null` while `GET .../rules/branches/main` returns
