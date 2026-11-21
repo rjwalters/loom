@@ -99,6 +99,7 @@ fn codex_judge_workspace(
         &root.join(".loom/scripts/spawn-worker.sh"),
         format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
     );
+    guard_ready_codex_seats(root);
     (marker, pool)
 }
 
@@ -342,7 +343,7 @@ fn codex_pool_state_counts_only_holds_the_selector_cannot_release() {
     )
     .unwrap();
 
-    let state = codex_pool_state(root, now);
+    let state = codex_pool_state(root, now, false);
     assert_eq!(state.read_error, None);
     assert_eq!(state.enabled, 4);
     assert_eq!(state.spawnable, 2, "class-held and session-reauth stay spawnable: {state:?}");
@@ -361,7 +362,7 @@ fn codex_pool_state_fails_closed_on_an_unreadable_health_state() {
     fs::create_dir_all(workspace.path().join(".loom")).unwrap();
     fs::write(workspace.path().join(".loom/account-health.json"), "{not json").unwrap();
 
-    let state = codex_pool_state(workspace.path(), epoch_now());
+    let state = codex_pool_state(workspace.path(), epoch_now(), false);
     assert_eq!((state.enabled, state.spawnable), (1, 0));
     // #8444: the read error names the file that failed, so the skip text
     // cannot blame the inventory for a health-state parse error.
@@ -390,7 +391,7 @@ fn codex_pinned_role_fails_closed_on_a_malformed_account_inventory_body() {
     let (marker, _pool) = codex_judge_workspace(workspace.path(), CODEX_MANIFEST, false);
     fs::write(workspace.path().join(".loom/accounts.json"), "{not json").unwrap();
 
-    let state = codex_pool_state(workspace.path(), epoch_now());
+    let state = codex_pool_state(workspace.path(), epoch_now(), false);
     let (file, _) = state.read_error.clone().expect("a read error");
     assert_eq!(file, PoolStateFile::Inventory);
     assert_eq!((state.enabled, state.spawnable), (0, 0), "{state:?}");
@@ -1204,13 +1205,13 @@ fn codex_pool_state_counts_a_down_session_as_not_spawnable() {
     let now = epoch_now();
 
     let live = set(running(&["live"]));
-    let state = codex_pool_state(workspace.path(), now);
+    let state = codex_pool_state(workspace.path(), now, false);
     assert_eq!((state.enabled, state.spawnable, state.session_down), (3, 2, 1), "{state:?}");
     assert!(codex_exhausted_reason(&state).contains("SessionDown"));
     drop(live);
 
     let _unobservable = set(None);
-    let state = codex_pool_state(workspace.path(), now);
+    let state = codex_pool_state(workspace.path(), now, false);
     assert_eq!((state.spawnable, state.session_down), (3, 0), "fail open: {state:?}");
 }
 

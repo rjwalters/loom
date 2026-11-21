@@ -385,10 +385,19 @@ sealed verdict (`trustSignal: "sealed-registration"`, `bypassHookTrust: true`).
 Without it, `verify` reports only recorded trust, as it always has. Only a
 caller that will pass the waiver may opt in.
 
-Step 3 succeeding (`ready: true` for every profile) is what unblocks
-`LOOM_ROLE=builder .loom/scripts/spawn-codex.sh` against that profile — without
-it, the mutable-role preflight in `spawn-codex.sh` (`defaults/scripts/spawn-codex.sh:635-693`)
-exits 78 before the CLI starts. Test coverage for the readiness signal itself:
+Builder, Doctor, Champion and Judge draw from the shared profiles that report
+`ready: true`. The selector names each skipped profile. If none is eligible,
+the runtime preference can fall through to its next tap. The adapter verifies
+the selected profile again before starting Codex.
+
+The work finder probes Builder preferences for step dispatch (#13983).
+An untrusted shared Codex seat cannot make a host-admitted Builder tap
+available. A workspace with no available Builder tap holds until an eligible
+tap recovers. A rejection that private containment could lift still leaves
+dispatch eligible, and the legacy `sweep-lifecycle` preference table does
+not participate in the step hold.
+
+Test coverage for the readiness signal itself:
 `defaults/scripts/tests/test-provision-codex-hooks.sh` (trust-baseline
 scenarios). Coverage that trust is waived only behind the sealed verdict:
 `test-provision-codex-hooks.sh`'s credential-hygiene section and
@@ -528,11 +537,8 @@ spawn-codex: hooks=<ready|not-ready|unavailable|verified-in-private-session> rol
   which is what `guard-loom-workflow.sh` and `guard-destructive.sh` police. They
   exit **78** unless `hooks=ready` (or `verified-in-private-session`, where
   `private-workspace execute` re-proves the registration and trust in-container
-  for them as for a mutable role). This is the backstop: the daemon's runtime
-  preference (`runtime_preference::codex_guard`) already treats Codex as
-  *unavailable* to these roles while any enabled shared profile fails `verify`
-  for the workspace, so the walk falls through to the next tap (Claude) instead
-  of selecting Codex and failing the tick (#9390).
+  for them as for a mutable role). The runtime preference skips the Codex
+  tap when no guard-ready seat is eligible for the workspace (#9390).
 - **Read-only roles** keep the conservative sandbox fallback but are told
   explicitly that hook parity was unavailable, and are never reported as
   Builder-capable.
@@ -1216,7 +1222,8 @@ loom-daemon accounts add codex alice --device-auth
 loom-daemon accounts provision --all          # populate every pooled profile
 loom-daemon accounts import codex bob --auth-file ~/.codex/auth.json
 loom-daemon accounts status codex alice --json
-loom-daemon accounts disable codex alice
+loom-daemon accounts disable codex alice --shared   # across workspaces on this host
+loom-daemon accounts enable codex alice --shared    # lift the machine-wide disable
 loom-daemon accounts reauth codex alice --device-auth
 loom-daemon accounts remove codex alice       # recoverable quarantine
 loom-daemon accounts remove codex alice --purge
@@ -1228,6 +1235,7 @@ host: the repo-local one belonging to a checkout, and the **shared**
 machine-level one at `~/.loom/accounts.json` (override the root with
 `LOOM_SHARED_ACCOUNTS_ROOT`; an explicitly empty value disables it). Resolution:
 
+- `disable --shared` and `enable --shared` act on the machine-level registry from any checkout. A shared disable also covers locally enabled entries backed by the same profile. Local disables still apply after a shared enable.
 - An explicit `--workspace <path>` is honoured literally.
 - Otherwise the nearest enclosing Loom workspace (the first ancestor directory
   holding a `.loom/`) wins, so running from a subdirectory of a checkout still

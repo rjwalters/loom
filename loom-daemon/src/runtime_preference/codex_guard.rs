@@ -1,5 +1,5 @@
 //! Loom guard-hook readiness as a Codex availability condition for the
-//! merging roles (rjwalters/loom#9390).
+//! mutable and merging roles (#9390, #14497).
 //!
 //! # Why
 //!
@@ -22,15 +22,9 @@
 //!
 //! # The rule
 //!
-//! Every enabled, shared (host-mounted) Codex profile must be `ready` by
-//! [`codex_hooks::Check`], the same readiness `provision-codex-hooks.sh
-//! verify` reports, for this workspace: the workspace-independent
-//! registration, a readable bridge in this checkout, the pinned receipt, and
-//! trust recorded at Loom's key in the runtime location. Requiring *every*
-//! profile, not *some*, keeps selection simple: whichever profile the pool
-//! then draws is ready, so no draw can land on an unguarded seat. Once an
-//! operator readies the last profile, the gate opens by itself on the next
-//! tick, and it closes again if one later goes stale.
+//! For a role that needs the hook, availability and account selection use the
+//! same per-profile readiness check. Only ready shared profiles participate in
+//! the draw. Other roles use the whole eligible pool.
 //!
 //! A session-managed profile whose registration is **sealed** (#10102,
 //! [`codex_hooks::seal`]) is ready without a recorded trust decision:
@@ -46,55 +40,69 @@ use std::path::Path;
 
 use crate::tokens_pool::codex_hooks::{self, Check, Registration};
 
-/// Roles that act with merge or verdict authority on the forge and therefore
-/// need Loom's guards enforced on every runtime. They do not write the local
-/// repository, so they are not `spawn-codex.sh`'s mutable roles: they keep
-/// the read-only sandbox. Mirrors `LOOM_CODEX_GUARDED_ROLES` in
-/// `spawn-codex.sh`.
-pub const GUARDED_ROLES: [&str; 2] = ["champion", "judge"];
+/// Mirrors the union of mutable and merge/verdict roles in spawn-codex.sh.
+/// A full sweep can perform the builder's work.
+pub const GUARDED_ROLES: [&str; 5] = ["builder", "doctor", "champion", "judge", "sweep-lifecycle"];
 
-/// Whether `role` (any spelling `canonical_role` accepts) is a merging role
-/// that needs Loom's guard hook proven on Codex.
 #[must_use]
 pub fn guarded(role: &str) -> bool {
     crate::runtime_admission::canonical_role(role).is_some_and(|role| GUARDED_ROLES.contains(&role))
 }
 
-/// The enabled shared Codex profiles whose Loom guard hook is NOT ready for
-/// this workspace, by account name. `Ok(vec![])` means every one is ready.
-///
-/// # Errors
-/// A secret-free reason when the account inventory cannot be read. A caller
-/// must treat that as "not ready".
+/// Private clones prove the image-owned registration inside the container.
+/// Shared profiles prove their own registration in this workspace.
+pub(crate) fn ready(root: &Path, profile: &Path) -> bool {
+    codex_hooks::is_private_clone(profile)
+        || Check {
+            codex_home: profile.to_owned(),
+            workspace: Some(root.to_owned()),
+            registration: Registration::WorkspaceIndependent,
+            fallback_bridge: None,
+            runtime_home: None,
+            sealed: Some(codex_hooks::seal::Request {
+                launch_dir: Some(root.to_owned()),
+                ..Default::default()
+            }),
+        }
+        .verify()
+        .ready
+}
+
+/// The enabled shared profiles whose guard is not ready for this workspace.
 pub fn unready_profiles(root: &Path) -> Result<Vec<String>, String> {
     use crate::tokens_pool::{account_inventory_quiet, AccountProvider};
-    let accounts = account_inventory_quiet(root, AccountProvider::Codex)
-        .map_err(|error| format!("the Codex account inventory could not be read: {error}"))?;
-    Ok(accounts
+    Ok(account_inventory_quiet(root, AccountProvider::Codex)
+        .map_err(|error| format!("the Codex account inventory could not be read: {error}"))?
         .into_iter()
-        .filter(|account| account.enabled)
-        .filter(|account| !codex_hooks::is_private_clone(&account.credential_reference))
-        .filter(|account| {
-            !Check {
-                codex_home: account.credential_reference.clone(),
-                workspace: Some(root.to_path_buf()),
-                registration: Registration::WorkspaceIndependent,
-                fallback_bridge: None,
-                runtime_home: None,
-                // A sealed session seat counts as ready (#10102): spawn-codex
-                // then passes the trust waiver, after re-proving the seal for
-                // the launch's own cwd, argv and container. This gate vets the
-                // workspace root's project layers and the profile's files.
-                sealed: Some(codex_hooks::seal::Request {
-                    launch_dir: Some(root.to_path_buf()),
-                    ..Default::default()
-                }),
-            }
-            .verify()
-            .ready
-        })
+        .filter(|account| account.enabled && !ready(root, &account.credential_reference))
         .map(|account| account.id.name)
         .collect())
+}
+
+/// Restrict the draw before health and liveness ranking. A health fallback
+/// can only widen to accounts which passed the same guard and repo checks.
+pub(crate) fn select(
+    root: &Path,
+    model: Option<&str>,
+    role: Option<&str>,
+    keep: impl Fn(&crate::tokens_pool::AccountDescriptor) -> bool,
+) -> anyhow::Result<crate::tokens_pool::account_registry::SelectedAccount> {
+    let guarded_role = role.filter(|role| guarded(role));
+    crate::tokens_pool::account_registry::select_codex_account_where(root, model, |account| {
+        if !keep(account) {
+            return false;
+        }
+        if let Some(role) = guarded_role.filter(|_| account.enabled) {
+            if !ready(root, &account.credential_reference) {
+                eprintln!(
+                    "Skipping Codex account {} for {role}: guard hook is not ready",
+                    account.id.name
+                );
+                return false;
+            }
+        }
+        true
+    })
 }
 
 #[cfg(test)]

@@ -1842,7 +1842,8 @@ pub enum TokensAction {
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
 
-        /// Spawning role name — the second half of the prompt-cache affinity
+        /// Spawning role name. Narrows guarded Codex roles to hook-ready seats.
+        /// For Claude this is the second half of the prompt-cache affinity
         /// key (issue #8146). Read from the `LOOM_ROLE` env var (already in
         /// every spawner's environment, no shell-side passing needed) rather
         /// than requiring `--role` on the command line, so an older daemon

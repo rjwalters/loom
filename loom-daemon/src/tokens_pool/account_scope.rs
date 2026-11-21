@@ -123,6 +123,33 @@ pub fn resolve_accounts_registry(workspace: &Path, explicit: bool) -> Result<Acc
     })
 }
 
+/// Resolve the explicit machine-wide mutation target independently of the cwd.
+pub fn resolve_shared_registry() -> Result<AccountsRegistry> {
+    let workspace = shared_accounts_root().ok_or_else(|| {
+        anyhow!("shared account registry is unavailable; check {SHARED_ACCOUNTS_ROOT_ENV}")
+    })?;
+    if !workspace.is_absolute() {
+        anyhow::bail!("{SHARED_ACCOUNTS_ROOT_ENV} must name an absolute path for --shared");
+    }
+    let registry = AccountsRegistry {
+        workspace,
+        scope: RegistryScope::Shared,
+    };
+    let path = registry.registry_path();
+    // Resolve the nearest existing parent as the registry may be created by
+    // this mutation, including when .loom is a symlink.
+    let parent = path
+        .ancestors()
+        .skip(1)
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow!("cannot resolve shared registry directory for {}", path.display()))?
+        .canonicalize()?;
+    if super::paths::is_inside_git_worktree(&parent) {
+        anyhow::bail!("shared registry must be outside every repository: {}", path.display());
+    }
+    Ok(registry)
+}
+
 /// A workspace is "the shared registry" exactly when it *is* the shared root —
 /// the same `~/.loom/accounts.json` that a `--workspace .` from `$HOME` has
 /// always resolved to. Everything else is repo-local.
@@ -221,6 +248,20 @@ mod tests {
         assert_eq!(resolved.registry_path(), per_repo_accounts_file(shared.path()));
         assert!(resolved.describe().starts_with("shared: "), "{}", resolved.describe());
 
+        std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_shared_mutation_refuses_a_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repo.path().join(".git")).unwrap();
+        std::env::set_var(SHARED_ACCOUNTS_ROOT_ENV, repo.path());
+        assert!(resolve_shared_registry()
+            .unwrap_err()
+            .to_string()
+            .contains("outside every repository"));
+        assert!(!per_repo_accounts_file(repo.path()).exists());
         std::env::remove_var(SHARED_ACCOUNTS_ROOT_ENV);
     }
 

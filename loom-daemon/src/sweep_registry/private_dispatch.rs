@@ -108,7 +108,7 @@ pub(crate) fn prepare(
             // fall back to the unchanged preparation path.
             drop(containment);
             let resolved = model.resolve(&config, kind, admission.admitted.as_ref());
-            let selection = Selection::prepare(
+            let selection = Selection::prepare_for_role(
                 &config.workspace_root,
                 admission
                     .admitted
@@ -118,6 +118,7 @@ pub(crate) fn prepare(
                 JobKind::Sweep,
                 issue,
                 &owner,
+                Some("sweep-lifecycle"),
             )?;
             (selection, resolved)
         };

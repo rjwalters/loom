@@ -1056,6 +1056,27 @@ impl SweepRegistry {
         // runtime the configured Claude-shaped model fit.
         let (model, model_configured, model_fallback) =
             with_model_fallback(root, kind, role, model);
+        let selection = if selection.is_none()
+            && admitted.runtime == "codex"
+            && crate::runtime_preference::codex_guard::guarded(name)
+            && crate::role_runner::runtime_preflight::codex_pool_is_the_wall(root, &admitted)
+        {
+            Some(
+                crate::tokens_pool::private_workspace::dispatch::Selection::guarded_shared_step(
+                    root,
+                    name,
+                    model.as_deref(),
+                )
+                .map_err(|error| {
+                    let seat_unavailable =
+                        error.is::<crate::tokens_pool::health::NoHealthyAccountError>();
+                    StepRefusal::new("pool_exhausted", error)
+                        .with_seat_unavailable(seat_unavailable)
+                })?,
+            )
+        } else {
+            selection
+        };
         // #14017: effort is resolved once the runtime is admitted, so a
         // `roleEfforts.<role>@<runtime>` entry and the Codex default can apply.
         let effort = non_empty(

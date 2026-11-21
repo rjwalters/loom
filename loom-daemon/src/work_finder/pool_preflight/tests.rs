@@ -454,6 +454,15 @@ fn a_spawnable_lower_tap_keeps_the_hold_from_arming() {
 
     let host = PoolHoldState::new();
     assert!(
+        host.observe_root(ws.path(), chrono::Utc::now()),
+        "the host-admitted Builder cannot use an untrusted lower tap"
+    );
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        ws.path(),
+        &profiles.path().join("alice"),
+    );
+    let host = PoolHoldState::new();
+    assert!(
         !host.observe_root(ws.path(), chrono::Utc::now()),
         "a spawnable fallback tap must keep the hold from arming"
     );
@@ -640,6 +649,10 @@ fn a_wholly_unavailable_sweep_lifecycle_table_does_not_key_the_halt() {
     );
     bad_mark_all(ws.path(), &["a"]);
 
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        ws.path(),
+        &profiles.path().join("alice"),
+    );
     let host = PoolHoldState::new();
     assert!(
         !host.observe_root(ws.path(), chrono::Utc::now()),
@@ -737,8 +750,8 @@ fn a_tapless_root_does_not_flap_the_hold_shared_with_a_spawnable_root() {
 /// exists, B lists `claude` with a spawnable account. Across repeated ticks A
 /// stays held and B stays free, the hold never disappears between A's ticks
 /// (it used to be cleared by B's, flapping the arm WARN / clear INFO per
-/// tick), and nothing is ever offered for broadcast. When a Codex seat
-/// appears A releases exactly once.
+/// tick), and nothing is ever offered for broadcast. A releases once a
+/// Codex seat is both present and ready for its Builder role.
 #[test]
 #[serial]
 fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
@@ -782,8 +795,13 @@ fn a_per_workspace_preference_hold_survives_a_sibling_root_on_the_same_pool() {
     );
     assert_eq!(host.active_holds().len(), 1);
 
-    // A Codex seat logs in: the codex-only root releases, once.
+    // Login without guard trust is insufficient for a host-admitted Builder.
     fs::create_dir(profiles.path().join("alice")).unwrap();
+    assert!(host.observe_root(codex_only.path(), chrono::Utc::now()));
+    crate::tokens_pool::codex_hooks::test_support::guard_ready_in_workspace(
+        codex_only.path(),
+        &profiles.path().join("alice"),
+    );
     let obs = host.observe_root_edge(codex_only.path(), chrono::Utc::now());
     assert!(!obs.held && obs.edge.is_none());
     assert_eq!(host.held_pool_count(), 0);

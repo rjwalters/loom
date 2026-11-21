@@ -136,13 +136,14 @@ pub(super) fn run_role_with_timeout(
         _ if contained_admission => Err(anyhow::anyhow!(
             "containment admission has no prepared private selection; refusing launch"
         )),
-        _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare(
+        _ => crate::tokens_pool::private_workspace::dispatch::Selection::prepare_for_role(
             workspace_root,
             admission.map_or("claude", |a| a.runtime.as_str()),
             Some(model),
             crate::tokens_pool::private_workspace::JobKind::Role,
             None,
             &format!("role-{role}-{}", uuid::Uuid::new_v4()),
+            Some(role),
         ),
     };
     let selection = match prepared {

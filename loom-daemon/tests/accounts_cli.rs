@@ -325,6 +325,115 @@ fn accounts_disable_from_a_repo_cwd_is_repo_scoped_and_says_so() {
     );
 }
 
+/// A caller must select one scope before either registry can be written.
+#[test]
+fn shared_toggle_and_explicit_workspace_are_mutually_exclusive() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir(repo.path().join(".loom")).unwrap();
+    let shared_before = fixture.shared_registry();
+    for verb in ["disable", "enable"] {
+        let output = fixture.command(
+            repo.path(),
+            &[
+                verb,
+                "codex",
+                "alpha",
+                "--shared",
+                "--workspace",
+                repo.path().to_str().unwrap(),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{verb}: {stderr}");
+        assert!(stderr.contains("--shared") && stderr.contains("--workspace"), "{stderr}");
+        assert_eq!(fixture.shared_registry(), shared_before);
+        assert!(!repo.path().join(".loom/accounts.json").exists());
+    }
+}
+
+/// A shared disable works from a checkout and vetoes both discovered and
+/// locally enabled seats. Re-enabling the shared seat lifts that veto.
+#[test]
+fn shared_disable_is_honored_from_both_kinds_of_workspace() {
+    let fixture = RegistryFixture::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let profile = fixture.profiles.join("alpha");
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(profile.join("auth.json"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
+    let repo = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    for root in [repo.path(), other.path()] {
+        std::fs::create_dir(root.join(".loom")).unwrap();
+    }
+    let local = other.path().join(".loom/accounts.json");
+    let original =
+        registry_json("alpha", true).replace(r#""name":"alpha""#, r#""name":"local-alias""#);
+    std::fs::write(&local, &original).unwrap();
+    for (verb, selectable) in [("disable", false), ("enable", true)] {
+        let output = fixture.command(repo.path(), &[verb, "codex", "alpha", "--shared"]);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(!repo.path().join(".loom/accounts.json").exists());
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), original);
+        for root in [repo.path(), other.path()] {
+            let draw = std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+                .args(["tokens", "select", "--provider", "codex", "--workspace"])
+                .arg(root)
+                .env("LOOM_ROLE", "curator")
+                .env("LOOM_CODEX_PROFILE_ROOT", &fixture.profiles)
+                .env("LOOM_SHARED_ACCOUNTS_ROOT", &fixture.shared_root)
+                .output()
+                .unwrap();
+            assert_eq!(
+                draw.status.success(),
+                selectable,
+                "{}",
+                String::from_utf8_lossy(&draw.stderr)
+            );
+            if selectable {
+                let account: serde_json::Value = serde_json::from_slice(&draw.stdout).unwrap();
+                assert_eq!(
+                    account["name"],
+                    if root == other.path() {
+                        "local-alias"
+                    } else {
+                        "alpha"
+                    }
+                );
+            }
+        }
+    }
+}
+
+/// The launch script supplies LOOM_ROLE to the ordinary tokens selector.
+#[test]
+fn tokens_select_names_the_skipped_seat_for_guarded_roles() {
+    let fixture = RegistryFixture::new();
+    let repo = tempfile::tempdir().unwrap();
+    for role in ["builder", "doctor", "champion", "judge", "curator"] {
+        let draw = std::process::Command::new(env!("CARGO_BIN_EXE_loom-daemon"))
+            .args(["tokens", "select", "--provider", "codex", "--workspace"])
+            .arg(repo.path())
+            .env("LOOM_ROLE", role)
+            .env("LOOM_CODEX_PROFILE_ROOT", &fixture.profiles)
+            .env("LOOM_SHARED_ACCOUNTS_ROOT", &fixture.shared_root)
+            .output()
+            .unwrap();
+        assert_eq!(draw.status.success(), role == "curator");
+        if role != "curator" {
+            let stderr = String::from_utf8_lossy(&draw.stderr);
+            assert!(
+                stderr.contains(&format!("Skipping Codex account alpha for {role}")),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 // =========================================================================
 // Issue #14298: `accounts list` reports private-clone repos and session image
 // =========================================================================

@@ -1101,10 +1101,9 @@ LOOM_CODEX_MUTABLE_ROLES="builder doctor"
 # GUARDED roles (#9390) do not write the repository, so they keep the read-only
 # sandbox, but they act with merge (champion) or verdict (judge) authority on
 # the forge, which is what Loom's guards police. They need the same proven hook
-# and fail closed the same way. loom-daemon's runtime preference already passes
-# Codex over for them while any shared profile is unready
-# (runtime_preference::codex_guard, which mirrors this list); this is the
-# backstop, not the router.
+# and fail closed the same way. The runtime preference and account selection
+# skip unready shared seats for these and the mutable roles
+# (runtime_preference::codex_guard). This verifies the seat at launch.
 LOOM_CODEX_GUARDED_ROLES="champion judge"
 _hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
 case "$_hook_role" in

@@ -407,7 +407,7 @@ pub fn admit_new(
     if !rejection.containment_eligible() {
         return Err(rejection);
     }
-    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner);
+    let selection = dispatch::Selection::prepare_contained(root, model, kind, issue, owner, role);
     admit_selection(root, role, explicit, rejection, selection)
 }
 
@@ -581,6 +581,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.kind,
             self.issue,
             &self.owner,
+            role,
         );
         self.note_seat_availability(&selection);
         let (admitted, selection, proof) =
@@ -605,7 +606,7 @@ impl crate::runtime_preference::ContainmentPreparer for Preparer<'_> {
             self.kind,
             self.issue,
             &self.owner,
-            crate::runtime_preference::codex_guard::guarded(&admitted.role),
+            &admitted.role,
         );
         self.note_seat_availability(&selection);
         let selection = selection.map_err(|error| RuntimeRejection {

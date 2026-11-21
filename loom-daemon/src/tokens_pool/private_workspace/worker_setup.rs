@@ -279,7 +279,7 @@ fn admit_role(role: &str) -> Result<()> {
             containment::in_container(&account, &bound, &revision, &repository, &clone_text)
                 .map_err(|error| {
                     anyhow::anyhow!(
-                        "role {role} merges or issues verdicts, and Loom's guard hook is not \
+                        "role {role} requires Loom's guard hook, but it is not \
                          proven for this private session: {error}"
                     )
                 })?;

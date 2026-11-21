@@ -2159,8 +2159,14 @@ fn idle_refusal_uses_the_draw_snapshot_when_inventory_changes() {
         );
         let _liveness = set_selector_docker(fake_docker.to_str().unwrap(), false);
 
-        let result =
-            dispatch::Selection::prepare_idle(root, None, JobKind::Sweep, None, "fixture", false);
+        let result = dispatch::Selection::prepare_idle(
+            root,
+            None,
+            JobKind::Sweep,
+            None,
+            "fixture",
+            "curator",
+        );
         assert_eq!(std::fs::read(file).unwrap(), changed, "snapshot must have run");
         let error = result.err().expect("the matching account is not healthy");
         assert!(error.is::<health::NoHealthyAccountError>(), "{error:#}");
@@ -2375,9 +2381,16 @@ fn idle_reservation_retries_a_busy_weekly_favorite_and_hands_off_the_next_lease(
     save(&runtimes.join("codex.json"), &json!({"accountProvider": "codex"})).unwrap();
 
     let reserve = |issue, owner| {
-        dispatch::Selection::prepare_idle(&root, None, JobKind::Sweep, Some(issue), owner, false)
-            .unwrap()
-            .unwrap()
+        dispatch::Selection::prepare_idle(
+            &root,
+            None,
+            JobKind::Sweep,
+            Some(issue),
+            owner,
+            "curator",
+        )
+        .unwrap()
+        .unwrap()
     };
     // Advance the cursor past Alice with a real locked draw. The next draw
     // would still favor Alice on usage, independent of the cursor.
