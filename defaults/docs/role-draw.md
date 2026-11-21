@@ -178,7 +178,18 @@ What reaches SigNoz (#11726 follow-up):
   `loom.step.model_selected` (the model the draw's pick named) and
   `loom.step.model_launched` (the `--model` the child was given). Selected is a
   fact about the draw record only; launched is what ran. Either is absent when
-  there is none.
+  there is none. For a spawned step decided by a draw, `loom.role_draw.pick`
+  is the winning key, `.first_pick` is the first roll, and `.attempt`,
+  `.table_attempt` and `.layer` identify the table. `.table` is a compact JSON
+  array of candidate-key and decimal-weight pairs in declaration order.
+  `.passed_over` is a compact JSON array of candidate-key and reason pairs
+  in walk order. Its reasons are `not-admitted`, `no-credential`,
+  `launch-hold`, `ceiling` and `runtime-unavailable` (missing executable).
+  A walk with no skips has no `.passed_over` attribute. An unsafe or
+  oversized first pick, table or skip list is omitted as a whole. A missing
+  table, or a missing skip list when the first and final picks differ, is
+  unavailable for comparison.
+  Steps without a draw carry none of these fields.
 
 ## Explain view
 

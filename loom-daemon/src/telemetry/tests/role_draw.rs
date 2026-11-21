@@ -55,6 +55,7 @@ fn the_summary_takes_the_pick_and_never_claims_a_pinned_model() {
         seed_inputs: None,
         steps: Vec::new(),
         passed_over: Vec::new(),
+        passed_over_for_span: Vec::new(),
         pick: Some("claude/opus".into()),
         model: Some("opus".into()),
     };

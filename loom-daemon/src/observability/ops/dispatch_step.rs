@@ -71,7 +71,7 @@ pub struct StepDispatch<'a> {
     pub effort: Option<&'a str>,
     /// The `runtimes.roleDraw` draw that decided the launch (#14233);
     /// `None` when no table did, or the step was refused before launch.
-    /// Stamps `loom.role_draw.pick` and `loom.role_draw.attempt` only. The
+    /// Stamps the exported `loom.role_draw.*` facts. The
     /// attempt is the role draw's escalation count (1 + consecutive failed
     /// attempts), unrelated to `draw_attempt` above, the item redraw count.
     pub role_draw: Option<&'a RoleDrawRecord>,
@@ -214,9 +214,7 @@ pub fn span(step: &StepDispatch<'_>, repo: Option<(&str, &str)>, at: DateTime<Ut
         }
     }
     if let Some(draw) = step.role_draw {
-        attributes
-            .insert(role_draw::PICK.into(), draw.pick.clone().unwrap_or_else(|| "none".into()));
-        attributes.insert(role_draw::ATTEMPT.into(), draw.attempt.to_string());
+        attributes.extend(role_draw::step_attributes(draw));
     }
     crate::telemetry::trace::provenance::stamp(&mut attributes);
     SpanRecord {
@@ -430,6 +428,7 @@ mod tests {
             seed_inputs: None,
             steps: Vec::new(),
             passed_over: Vec::new(),
+            passed_over_for_span: Vec::new(),
             pick: Some("codex".into()),
             model: None,
         };
@@ -448,8 +447,228 @@ mod tests {
             );
         }
         let undrawn = super::span(&judge(RESULT_SPAWNED, "ok"), None, Utc::now());
-        assert!(!undrawn.attributes.contains_key("loom.role_draw.pick"));
-        assert!(!undrawn.attributes.contains_key("loom.role_draw.attempt"));
+        assert!(undrawn
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with("loom.role_draw.")));
+    }
+
+    fn draw_fixture(
+        rows: &[(&str, u64)],
+        skips: &[crate::runtime_preference::SkipReason],
+        first: &str,
+    ) -> RoleDrawRecord {
+        use crate::runtime_preference::resolve::resolve;
+        use crate::runtime_preference::role_draw::{plan, Candidate, EffectiveTable, Layer};
+
+        let table = EffectiveTable {
+            attempt: 2,
+            layer: Layer::FleetRepo,
+            active: rows
+                .iter()
+                .map(|(key, weight)| (Candidate::parse(key).unwrap(), *weight))
+                .collect(),
+            off: vec![("excluded-candidate".into(), "fixture exclusion".into())],
+        };
+        let plan = (0..100)
+            .map(|seed| plan("judge", 3, &table, seed, None))
+            .find(|plan| plan.order[0].key == first)
+            .unwrap();
+        let taps = plan.taps();
+        plan.finish(&resolve(
+            &taps,
+            |_| Ok(()),
+            |tier, _, ()| skips.get(tier).cloned().map_or(Ok(()), Err),
+        ))
+    }
+
+    fn drawn_span(draw: &RoleDrawRecord) -> SpanRecord {
+        span(
+            &StepDispatch {
+                role_draw: Some(draw),
+                ..judge(RESULT_SPAWNED, "ok")
+            },
+            None,
+            Utc::now(),
+        )
+    }
+
+    #[test]
+    fn role_draw_span_reports_first_pick_and_only_closed_skip_reasons() {
+        use crate::runtime_preference::{CeilingSkip, SkipReason};
+
+        let draw = draw_fixture(
+            &[
+                ("codex", 1),
+                ("claude", 1),
+                ("claude/opus", 1),
+                ("opencode:zai-flash", 1),
+                ("opencode/fast", 1),
+            ],
+            &[
+                SkipReason::NotAdmitted {
+                    unmet: vec!["fixture unmet".into()],
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Unavailable {
+                    source: "fixture source".into(),
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Unavailable {
+                    source: "launch-failure-hold".into(),
+                    detail: "fixture detail".into(),
+                },
+                SkipReason::Ceiling {
+                    skip: CeilingSkip::Unknown,
+                    detail: "fixture detail".into(),
+                },
+            ],
+            "codex",
+        );
+        let attrs = drawn_span(&draw).bounded().attributes;
+        assert_eq!(attrs["loom.role_draw.first_pick"], "codex");
+        assert_ne!(attrs["loom.role_draw.first_pick"], attrs["loom.role_draw.pick"]);
+        assert_eq!(attrs["loom.role_draw.attempt"], "3");
+        assert_eq!(attrs["loom.role_draw.layer"], "fleet-repo");
+        assert_eq!(attrs["loom.role_draw.table_attempt"], "2");
+        let skipped: Vec<(String, String)> =
+            serde_json::from_str(&attrs["loom.role_draw.passed_over"]).unwrap();
+        let expected: Vec<_> = draw
+            .steps
+            .iter()
+            .zip(["not-admitted", "no-credential", "launch-hold", "ceiling"])
+            .map(|(step, reason)| (step.picked.clone(), reason.to_owned()))
+            .collect();
+        assert_eq!(skipped, expected);
+        let local = serde_json::to_value(&draw).unwrap();
+        assert!(local.get("passed_over_for_span").is_none());
+        assert_eq!(local["passed_over"][0], "codex: not-admitted(fixture unmet)");
+        assert!(local["passed_over"][1]
+            .as_str()
+            .unwrap()
+            .contains("fixture detail"));
+        let restored: RoleDrawRecord = serde_json::from_value(local).unwrap();
+        assert_eq!(restored.passed_over, draw.passed_over);
+        assert!(!drawn_span(&restored)
+            .attributes
+            .contains_key("loom.role_draw.passed_over"));
+    }
+
+    #[test]
+    fn role_draw_span_keeps_exact_ordered_tables_distinct() {
+        let rows = [
+            ("opencode:fast=1,claude", 2),
+            ("opencode:zai:fast/vendor/gén-\"4", u64::MAX),
+        ];
+        let other = [("opencode:fast", 1), ("claude", 2), rows[1]];
+        for table in [&rows[..], &other[..]] {
+            let draw = draw_fixture(table, &[], rows[1].0);
+            let attrs = drawn_span(&draw).bounded().attributes;
+            let decoded: Vec<(String, String)> =
+                serde_json::from_str(&attrs["loom.role_draw.table"]).unwrap();
+            let expected: Vec<_> = table
+                .iter()
+                .map(|(key, weight)| (key.to_string(), weight.to_string()))
+                .collect();
+            assert_eq!(decoded, expected);
+            assert_eq!(attrs["loom.role_draw.first_pick"], rows[1].0);
+            assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+            assert!(!attrs["loom.role_draw.table"].contains("excluded-candidate"));
+        }
+    }
+
+    #[test]
+    fn role_draw_span_omits_whole_values_above_the_byte_limit() {
+        // The compact JSON envelope for one candidate key and one digit consumes 10 bytes.
+        let at_limit = format!("codex:{}", "a".repeat(240));
+        let fits = draw_fixture(&[(&at_limit, 1)], &[], &at_limit);
+        assert_eq!(drawn_span(&fits).bounded().attributes["loom.role_draw.table"].len(), 256);
+        let over_limit = format!("{at_limit}a");
+        let too_big = draw_fixture(&[(&over_limit, 1)], &[], &over_limit);
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.table"));
+        assert!(!drawn_span(&too_big)
+            .bounded()
+            .attributes
+            .contains_key("loom.role_draw.table"));
+        let raw_over_limit = format!("codex:{}", "a".repeat(251));
+        let too_big = draw_fixture(&[(&raw_over_limit, 1)], &[], &raw_over_limit);
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.first_pick"));
+
+        let too_big = draw_fixture(
+            &[(&at_limit, 1), ("claude", 1)],
+            &[crate::runtime_preference::SkipReason::Unavailable {
+                source: "fixture".into(),
+                detail: String::new(),
+            }],
+            &at_limit,
+        );
+        assert!(!drawn_span(&too_big)
+            .attributes
+            .contains_key("loom.role_draw.passed_over"));
+    }
+
+    #[test]
+    fn role_draw_span_drops_path_valued_keys_as_whole_attributes() {
+        use crate::runtime_preference::SkipReason;
+
+        for path_key in [
+            "codex//private/fixture-name",
+            "codex/../fixture-name",
+            "codex/.fixture/fixture-name",
+            "codex/C:/fixture-name",
+        ] {
+            let draw = draw_fixture(
+                &[(path_key, 1), ("claude", 1)],
+                &[SkipReason::Unavailable {
+                    source: "fixture".into(),
+                    detail: String::new(),
+                }],
+                path_key,
+            );
+            assert_eq!(draw.steps[0].picked, path_key);
+            assert!(draw.passed_over[0].contains("fixture-name"));
+            let span = drawn_span(&draw);
+            let bounded = span.clone().bounded();
+            for attrs in [&span.attributes, &bounded.attributes] {
+                assert_eq!(attrs["loom.role_draw.pick"], "claude");
+                assert!(!attrs.contains_key("loom.role_draw.first_pick"));
+                assert!(!attrs.contains_key("loom.role_draw.table"));
+                assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+                assert!(attrs.values().all(|value| !value.contains("fixture-name")));
+            }
+        }
+    }
+
+    #[test]
+    fn role_draw_span_omits_a_table_with_an_unrolled_path_key() {
+        let draw =
+            draw_fixture(&[("claude", 1), ("codex//private/fixture-name", 1)], &[], "claude");
+        assert_eq!(draw.steps.len(), 1);
+        let attrs = drawn_span(&draw).bounded().attributes;
+        assert_eq!(attrs["loom.role_draw.first_pick"], "claude");
+        assert!(!attrs.contains_key("loom.role_draw.table"));
+        assert!(!attrs.contains_key("loom.role_draw.passed_over"));
+        assert!(attrs.values().all(|value| !value.contains("fixture-name")));
+    }
+
+    #[test]
+    fn role_draw_span_distinguishes_a_missing_binary_from_credentials() {
+        let draw = draw_fixture(
+            &[("generic", 1), ("claude", 1)],
+            &[crate::runtime_preference::SkipReason::Unavailable {
+                source: "binary".into(),
+                detail: "fixture executable diagnostic".into(),
+            }],
+            "generic",
+        );
+        assert_eq!(
+            drawn_span(&draw).bounded().attributes["loom.role_draw.passed_over"],
+            r#"[["generic","runtime-unavailable"]]"#
+        );
     }
 
     /// #12450: a granted step carries the captain's assignment, and it
