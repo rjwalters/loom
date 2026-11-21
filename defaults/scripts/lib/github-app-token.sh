@@ -442,6 +442,18 @@ _github_app_api_mint_scoped() {
 
 # --- Top-level entry point ---
 
+# Run one API helper and append an ok/err tail FROM INSIDE the substitution
+# (#5401/#14680): a helper's failure reason lives in $_GH_APP_LAST_ERROR,
+# which dies with the subshell -- so the tail, printed in the SAME shell the
+# helper failed in, is the only channel the reason survives through. Output:
+# "<helper stdout>\nok" on success, "\nerr\n<reason>" on failure. Callers
+# parse the tail inline (last line ok -> stdout is everything before it;
+# otherwise the reason is what follows "\nerr\n") so the reason is re-set in
+# THEIR shell, never lost to another substitution.
+_gh_app_capture() {
+  "$@" 2>/dev/null && printf '\nok' || printf '\nerr\n%s' "$_GH_APP_LAST_ERROR"
+}
+
 # github_app_get_token <owner/repo> [force] -> echoes a valid installation
 # token on stdout, minting or reusing the cache as needed. On success also sets
 # GITHUB_APP_INSTALLATION_ID and GITHUB_APP_TOKEN_EXPIRES_AT (non-secret).
@@ -473,14 +485,19 @@ github_app_get_token() {
     return 1
   fi
 
-  local installation_id
+  local installation_id captured
   installation_id=$(cat "$(_github_app_installation_cache_path "$owner")" 2>/dev/null || echo "")
   # Treat a missing OR non-numeric cache value as a miss (#4456): a
   # pre-poisoned cache file holding the literal "null" (or any non-numeric
   # junk from an older build) is non-empty, so a bare `-z` test would keep
   # reusing it forever. Re-resolving self-heals such hosts.
   if [[ ! "$installation_id" =~ ^[0-9]+$ ]]; then
-    installation_id=$(_github_app_api_get_installation "$nwo") || return 1
+    captured=$(_gh_app_capture _github_app_api_get_installation "$nwo")
+    if [[ "${captured##*$'\n'}" != ok ]]; then
+      _GH_APP_LAST_ERROR="${captured#*$'\n'err$'\n'}"
+      return 1
+    fi
+    installation_id="${captured%$'\n'ok}"
     printf '%s' "$installation_id" > "$(_github_app_installation_cache_path "$owner")"
   fi
 
@@ -502,7 +519,12 @@ github_app_get_token() {
   fi
 
   local mint_resp
-  mint_resp=$(_github_app_api_mint_token "$installation_id") || return 1
+  mint_resp=$(_gh_app_capture _github_app_api_mint_token "$installation_id")
+  if [[ "${mint_resp##*$'\n'}" != ok ]]; then
+    _GH_APP_LAST_ERROR="${mint_resp#*$'\n'err$'\n'}"
+    return 1
+  fi
+  mint_resp="${mint_resp%$'\n'ok}"
   token=$(echo "$mint_resp" | jq -r '.token')
   expires_at=$(echo "$mint_resp" | jq -r '.expires_at')
   if [[ -z "$token" || "$token" == "null" ]]; then
@@ -522,21 +544,31 @@ github_app_get_token() {
 # returns 1 with _GH_APP_LAST_ERROR set in THIS shell (the CLI reads it
 # back through the #5401 ok/err tail).
 github_app_get_scoped_token() {
-  local nwo="$1" owner installation_id body
+  local nwo="$1" owner installation_id body captured
   owner="${nwo%%/*}"
   installation_id=$(cat "$(_github_app_installation_cache_path "$owner")" 2>/dev/null || echo "")
   if [[ ! "$installation_id" =~ ^[0-9]+$ ]]; then
-    installation_id=$(_github_app_api_get_installation "$nwo") || return 1
+    captured=$(_gh_app_capture _github_app_api_get_installation "$nwo")
+    if [[ "${captured##*$'\n'}" != ok ]]; then
+      _GH_APP_LAST_ERROR="${captured#*$'\n'err$'\n'}"
+      return 1
+    fi
+    installation_id="${captured%$'\n'ok}"
     printf '%s' "$installation_id" > "$(_github_app_installation_cache_path "$owner")"
   fi
-  body=$(_github_app_api_mint_scoped "$installation_id" "$nwo") || return 1
+  body=$(_gh_app_capture _github_app_api_mint_scoped "$installation_id" "$nwo")
+  if [[ "${body##*$'\n'}" != ok ]]; then
+    _GH_APP_LAST_ERROR="${body#*$'\n'err$'\n'}"
+    return 1
+  fi
+  body="${body%$'\n'ok}"
   printf '%s\n%s' "$body" "$installation_id"
 }
 
 # --- Executable CLI dispatch ---
 #
-# `loom-daemon` invokes this file as a subprocess (never sourced) via the two
-# subcommands below. Both ALWAYS exit 0 and communicate outcome through a JSON
+# `loom-daemon` invokes this file as a subprocess (never sourced) via the
+# subcommands below. All ALWAYS exit 0 and communicate outcome through a JSON
 # envelope on stdout (`status` field) -- this sidesteps relying on distinct
 # process exit codes surviving a `Command` capture, and keeps the daemon-side
 # parser to "read one line of JSON, branch on `.status`".
@@ -581,19 +613,30 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       # same subshell (`github_app_get_token` itself always emits exactly one
       # trailing-newline-terminated line -- the token), then split the
       # captured 3-line output back apart out here (#5401).
-      if _gh_app_out=$(
-        github_app_get_token "$_nwo" "$_gh_app_force" &&
-          printf '%s\n%s' "$GITHUB_APP_INSTALLATION_ID" "$GITHUB_APP_TOKEN_EXPIRES_AT"
-      ); then
+      # #5401 pattern: the mint runs in a command-substitution SUBSHELL, so
+      # `_GH_APP_LAST_ERROR` set inside it never propagates back out --
+      # emit an ok/err tail from INSIDE the same subshell instead. The
+      # function must run in THAT shell directly: wrapping it in a nested
+      # `$( )` would kill the error variable again and the envelope would
+      # report an empty message (#14680 review).
+      _gh_app_out=$(
+        if github_app_get_token "$_nwo" "$_gh_app_force"; then
+          printf '%s\n%s\nok' "$GITHUB_APP_INSTALLATION_ID" "$GITHUB_APP_TOKEN_EXPIRES_AT"
+        else
+          printf 'err\n%s' "$_GH_APP_LAST_ERROR"
+        fi
+      )
+      if [[ "${_gh_app_out##*$'\n'}" == ok ]]; then
         _gh_app_token="${_gh_app_out%%$'\n'*}"
         _gh_app_rest="${_gh_app_out#*$'\n'}"
         _gh_app_installation_id="${_gh_app_rest%%$'\n'*}"
         _gh_app_expires_at="${_gh_app_rest#*$'\n'}"
+        _gh_app_expires_at="${_gh_app_expires_at%$'\n'ok}"
         jq -cn --arg token "$_gh_app_token" --arg installation_id "$_gh_app_installation_id" \
           --arg app_id "$_GH_APP_ID" --arg expires_at "$_gh_app_expires_at" \
           '{status:"ok", token:$token, installation_id:$installation_id, app_id:$app_id, expires_at:$expires_at}'
       else
-        jq -cn --arg message "$_GH_APP_LAST_ERROR" '{status:"error", message:$message}'
+        jq -cn --arg message "${_gh_app_out#err$'\n'}" '{status:"error", message:$message}'
       fi
       ;;
     # Narrow issuance for a mirror read proof (#14716): ONE repository,
@@ -611,12 +654,13 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
         jq -cn --arg message "$_GH_APP_LAST_ERROR" '{status:"not_configured", message:$message}'
         exit 0
       fi
-      # #5401 pattern: the mint runs in a command-substitution SUBSHELL, so
-      # `_GH_APP_LAST_ERROR` set inside it never propagates back out --
-      # emit an ok/err tail from INSIDE the same subshell instead.
+      # #5401 pattern, with the #14680-review fix: the function must run in
+      # THIS subshell directly -- wrapping it in a nested `$( )` kills
+      # `_GH_APP_LAST_ERROR` and the error envelope reported an empty
+      # message even though the mint refused with a real reason.
       _gh_app_out=$(
-        if _gh_app_two=$(github_app_get_scoped_token "$_nwo"); then
-          printf '%s\nok' "$_gh_app_two"
+        if github_app_get_scoped_token "$_nwo"; then
+          printf '\nok'
         else
           printf '\nerr\n%s' "$_GH_APP_LAST_ERROR"
         fi

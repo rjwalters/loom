@@ -520,8 +520,74 @@ else
     fail "a token-less scoped mint must be an error envelope" "$cli_scoped_notok"
 fi
 
+# ============================================================================
+# A FAILED mint must carry its reason out of the subshell (#14680 review of
+# #14726): both CLI envelopes used to report status:"error" with an EMPTY
+# message — the mint failed inside a nested `$( )`, `_GH_APP_LAST_ERROR` died
+# in that inner subshell, and the envelope read the parent's empty value.
+# ============================================================================
+echo "Testing failed-mint error text survives the CLI envelope (#14680)..."
+
+export STUB_INSTALL_BODY='{"id": 55}'
+export STUB_INSTALL_CODE='200'
+export scoped_curl_body='{"token":"ghs_scopedvalue","expires_at":"2099-01-01T00:00:00Z","repositories":[{"id":907216439}],"permissions":{"contents":"read"}}'
+export scoped_curl_code='200'
+export LOOM_GITHUB_APP_ID="424242"
+export LOOM_GITHUB_APP_KEY_PATH="$KEY_PATH"
+curl() {
+    local url=""
+    for _a in "$@"; do url="$_a"; done
+    case "$url" in
+        */installation) printf '%s\n%s' "$STUB_INSTALL_BODY" "$STUB_INSTALL_CODE" ;;
+        */access_tokens) printf '%s\n%s' "$scoped_curl_body" "$scoped_curl_code" ;;
+        *) printf '%s\n%s' '{}' '404' ;;
+    esac
+}
+github_app_jwt() { echo "fake.jwt.signature"; }
+export -f curl github_app_jwt
+
+# A scoped mint the API refuses (403): the envelope must carry the helper's
+# own reason, not an empty message.
+scoped_curl_code='403'
+export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache-errtext-scoped"
+cli_scoped_refused=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+cli_scoped_message=$(echo "$cli_scoped_refused" | jq -r '.message')
+if [[ "$(echo "$cli_scoped_refused" | jq -r '.status')" == "error" \
+    && "$cli_scoped_message" == *403* && "$cli_scoped_message" == *scoped* ]]; then
+    pass "\`scoped-token\` error envelope carries the failed mint's reason"
+else
+    fail "a refused scoped mint must report a non-empty reason" "$cli_scoped_refused"
+fi
+
+# A writer mint the API refuses (403): same rule for \`get-token\`.
+export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache-errtext-writer"
+cli_writer_refused=$(bash "$LIB_DIR/github-app-token.sh" get-token cliowner/repo)
+cli_writer_message=$(echo "$cli_writer_refused" | jq -r '.message')
+if [[ "$(echo "$cli_writer_refused" | jq -r '.status')" == "error" \
+    && "$cli_writer_message" == *403* && "$cli_writer_message" == *installation* ]]; then
+    pass "\`get-token\` error envelope carries the failed mint's reason"
+else
+    fail "a refused writer mint must report a non-empty reason" "$cli_writer_refused"
+fi
+
+# An installation the API cannot resolve (404): the scoped envelope names it.
+scoped_curl_code='200'
+STUB_INSTALL_CODE='404'
+export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache-errtext-install"
+cli_install_refused=$(bash "$LIB_DIR/github-app-token.sh" scoped-token cliowner/repo)
+cli_install_message=$(echo "$cli_install_refused" | jq -r '.message')
+if [[ "$(echo "$cli_install_refused" | jq -r '.status')" == "error" \
+    && "$cli_install_message" == *installation* && -n "$cli_install_message" ]]; then
+    pass "\`scoped-token\` error envelope carries a failed installation resolve"
+else
+    fail "a failed installation resolve must report a non-empty reason" "$cli_install_refused"
+fi
+
+unset scoped_curl_code
+STUB_INSTALL_CODE='200'
 unset -f curl github_app_jwt
 unset LOOM_GITHUB_APP_ID LOOM_GITHUB_APP_KEY_PATH
+export LOOM_GITHUB_APP_CACHE_DIR="$WORK_DIR/cache"
 
 # ============================================================================
 # Installation cache is keyed by (owner, app id), not owner alone (#5912): two

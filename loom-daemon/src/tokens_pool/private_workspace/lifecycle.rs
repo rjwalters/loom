@@ -317,6 +317,11 @@ fn start_with(
     // session whose guard code lives in worker-writable paths (issue #8839).
     docker::setup(&config)?;
     docker::control(&config, id)?;
+    // Host mirrors (#14680): populate and refresh the per-repository object
+    // stores from origin under a proved read authority. Deliberately last
+    // and never a gate — a mirror that cannot be proved or fetched leaves
+    // the session and its private clones exactly as they were.
+    mirror::refresh_session_mirrors(workspace, &config);
     snapshot(config, &dir)
 }
 

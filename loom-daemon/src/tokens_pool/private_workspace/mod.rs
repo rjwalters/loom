@@ -16,6 +16,9 @@ pub mod export;
 mod forge_auth;
 mod lease;
 mod lifecycle;
+mod mirror;
+#[cfg(test)]
+mod mirror_tests;
 pub mod read_authority;
 #[cfg(test)]
 mod read_authority_tests;
