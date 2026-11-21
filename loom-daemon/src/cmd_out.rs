@@ -107,7 +107,10 @@ pub enum Unavailable {
     /// exhausted until `until`. Nothing was sent. Its text deliberately
     /// matches no rate-limit signature, so feeding it to the rate-limit
     /// breaker can never trip it.
-    Shed { until: std::time::SystemTime },
+    Shed {
+        until: std::time::SystemTime,
+        graphql_budget_exhausted: bool,
+    },
     /// Not run (#12641): a forge read the work-finder tick stopped (its
     /// deadline passed, or its discovery was ended early). Nothing was sent
     /// and the reader budget plays no part, so it is deliberately not
@@ -125,7 +128,7 @@ impl std::fmt::Display for Unavailable {
             Unavailable::RoutingBlocked(e) => write!(f, "routing_blocked: {e}"),
             Unavailable::AdapterUnavailable(e) => write!(f, "adapter_unavailable: {e}"),
             Unavailable::DeadlineReached => write!(f, "deferred: tick deadline reached"),
-            Unavailable::Shed { until } => write!(
+            Unavailable::Shed { until, .. } => write!(
                 f,
                 "deferred: reader budget low until {} (loom-shed)",
                 chrono::DateTime::<chrono::Utc>::from(*until)
