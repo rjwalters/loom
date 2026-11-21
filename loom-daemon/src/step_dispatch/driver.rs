@@ -777,7 +777,10 @@ impl StepDriver {
                 input.spawn_concurrency.max(1),
             )
         });
-        let result = tick::run_with_offers(
+        let local_role_holds = input.roots.first().map_or_else(BTreeSet::new, |root| {
+            crate::fleet_dispatch::worker::local_role_holds(root, Instant::now())
+        });
+        let result = tick::run_with_role_holds(
             workspaces,
             StepTickLimits {
                 free_slots,
@@ -788,6 +791,7 @@ impl StepDriver {
             &knobs,
             &mut spawner,
             &offers,
+            &local_role_holds,
         );
         // An offer the tick did not claim failed a gate or found no slot:
         // give it back so its row does not sit out the captain's TTL.

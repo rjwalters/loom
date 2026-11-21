@@ -1272,7 +1272,7 @@ fn a_captain_held_refusal_is_free_and_fallback_makes_no_loss_free() {
         .find(|r| r.disposition == Some(Qd::LeaseHeld));
     assert!(row.is_some(), "a held item reads as a peer's claim");
 
-    for reason in ["claim_lost", "captain_held"] {
+    for reason in ["claim_lost", "captain_held", REFUSAL_CAPTAIN_NOT_ELIGIBLE] {
         let mut spawner = FakeSpawner {
             refuse_first: Some((10, reason)),
             ..FakeSpawner::default()
@@ -1311,6 +1311,57 @@ fn a_captain_cooldown_refusal_is_free_and_does_not_end_the_tick() {
         .queue
         .iter()
         .any(|r| r.disposition == Some(Qd::LeaseHeld)));
+}
+
+#[test]
+fn captain_not_eligible_draws_do_not_starve_builders() {
+    let n = MAX_PASSES_PER_TICK + 5;
+    let builders = [n + 1, n + 2];
+    let rows: Vec<_> = (1..=n)
+        .map(|item| row(item, &["loom:curated"], "", false))
+        .chain(builders.map(|item| row(item, &["loom:issue"], "", false)))
+        .collect();
+    let mut ws = workspace(0, "acme/one", &rows);
+    for candidate in &mut ws.weighing.pool {
+        // Weight Champions ahead of Builders with this fixture's fixed seed.
+        candidate.terms.weight = if candidate.target() <= n {
+            1_000_000
+        } else {
+            1
+        };
+    }
+    let mut spawner = FakeSpawner {
+        refuse: (1..=n).map(|item| (item, "captain_not_eligible")).collect(),
+        ..FakeSpawner::default()
+    };
+    let tick = run_with(vec![ws], limits(builders.len()), &mut spawner);
+    assert!(spawner
+        .asked
+        .iter()
+        .take(n as usize)
+        .all(|(_, item, role, _)| { *item <= n && *role == StepRole::ChampionPromote }));
+    assert_eq!(tick.report.dispatched, 2, "other work fills both slots");
+    assert_eq!(tick.passes.get("captain_not_eligible"), Some(&(n as usize)));
+    assert_eq!(tick.report.errors, 0);
+    let spawned: BTreeSet<_> = tick
+        .report
+        .queue
+        .iter()
+        .filter(|row| row.disposition == Some(Qd::Dispatched))
+        .map(|row| row.key.number)
+        .collect();
+    assert_eq!(spawned, BTreeSet::from(builders));
+    assert_eq!(
+        tick.report
+            .queue
+            .iter()
+            .filter(|row| {
+                row.disposition == Some(Qd::HostConstraint)
+                    && row.detail.as_deref() == Some("captain_not_eligible")
+            })
+            .count(),
+        n as usize
+    );
 }
 
 /// #12704: the pairs a tick's captain refused as cooling down are armed on
@@ -1364,14 +1415,27 @@ fn captain_refusals_are_bounded_separately_from_lost_claims() {
     let rows: Vec<RestIssue> = (1..=MAX_FREE_CAPTAIN_REFUSALS_PER_TICK + 200)
         .map(|n| row(n, &["loom:triage"], "", false))
         .collect();
+    let reasons = [
+        REFUSAL_CAPTAIN_HELD,
+        REFUSAL_CAPTAIN_COOLDOWN,
+        REFUSAL_CAPTAIN_NOT_ELIGIBLE,
+    ];
     let mut spawner = FakeSpawner {
-        refuse_all: Some("captain_cooldown"),
+        refuse: rows
+            .iter()
+            .zip(reasons.into_iter().cycle())
+            .map(|(row, reason)| (row.number, reason))
+            .collect(),
         ..FakeSpawner::default()
     };
     let tick = run_with(vec![workspace(0, "acme/one", &rows)], limits(1), &mut spawner);
     assert_eq!(tick.report.dispatched, 0);
     // The free ones, then the slot's own draws, then it gives up.
     assert_eq!(spawner.asked.len(), cap + MAX_DRAWS_PER_SLOT as usize);
+    assert!(reasons
+        .iter()
+        .all(|reason| tick.passes.contains_key(*reason)));
+    assert_eq!(tick.report.errors, 0);
 
     // In fallback no captain refusal is free.
     let mut spawner = FakeSpawner {
