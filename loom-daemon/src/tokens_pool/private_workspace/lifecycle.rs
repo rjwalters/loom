@@ -524,10 +524,12 @@ pub fn session_recover(
                 );
             }
             bail!(
-                "no GitHub write credential for {}: provide the repository owner's published \
-                 App config (.loom/gh-config-by-owner/<owner>/hosts.yml under the daemon's \
-                 workspace root; set LOOM_MACHINE_CHECKOUT to that root) or GH_TOKEN in the \
-                 environment; the unpublished work is retained",
+                "no GitHub write credential for {}: no published App config for the \
+                 repository owner was found (.loom/gh-config-by-owner/<owner>/hosts.yml \
+                 under the running daemon's workspace root, which this command reads from \
+                 the daemon itself; if no daemon answered, start it or export \
+                 LOOM_MACHINE_CHECKOUT=<that root> as an override) and no GH_TOKEN is in \
+                 the environment; the unpublished work is retained",
                 target.repository
             );
         }
