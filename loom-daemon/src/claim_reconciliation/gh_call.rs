@@ -127,6 +127,7 @@ pub(crate) fn forge_op_for(op: &str) -> Option<ForgeOp> {
         | "landed.remove_issue"
         | "verdict.clear_labels"
         | "ci_gate.recovery_labels"
+        | "ci_gate.update_branch"
         | "verdict.requeue_unanchored"
         | "sequence.pr_edit"
         | "review_conflict.pr_edit"

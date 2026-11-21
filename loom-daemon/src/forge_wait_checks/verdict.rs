@@ -41,7 +41,7 @@ use crate::merge_pr::checks_failure::{self, Verdict as RequiredVerdict};
 
 /// Conclusions that count as success for a `completed` check-run (gh's
 /// `pass` and `skipping` buckets).
-const SUCCESS_CONCLUSIONS: [&str; 3] = ["success", "neutral", "skipped"];
+pub(crate) const SUCCESS_CONCLUSIONS: [&str; 3] = ["success", "neutral", "skipped"];
 
 /// One failing check, as printed on stderr after a `RED` sentinel:
 /// `<name>\t<html_url>\t<run_id>` so `gh run view <run_id> --log-failed`
@@ -54,7 +54,7 @@ pub struct Failed {
 }
 
 /// One poll's classified rollup.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rollup {
     /// Rows the forge reported (check-runs plus legacy statuses).
     pub total: u64,
@@ -115,36 +115,7 @@ pub fn without_authorization(names: &[String]) -> Vec<String> {
 /// A human-readable reason when either payload is outside the contract — the
 /// caller turns it into `LOOM-CHECKS-ERROR`, never a settled verdict.
 pub fn fold(check_runs: &Value, status: &Value) -> Result<Rollup, String> {
-    let mut rows: Vec<Value> = match check_runs.get("check_runs") {
-        Some(Value::Array(a)) => a.clone(),
-        _ => return Err("unreadable: `check_runs` is missing or not an array".to_string()),
-    };
-    let runs_total = check_runs
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .ok_or("unreadable: check-runs `total_count` is missing or not an integer")?;
-    let statuses: Vec<Value> = match status.get("statuses") {
-        Some(Value::Array(a)) => a.clone(),
-        None | Some(Value::Null) => Vec::new(),
-        Some(_) => return Err("unreadable: `statuses` is not an array".to_string()),
-    };
-    // A legacy status becomes a synthetic check-run row, so ONE classifier
-    // answers for both sources (gh pr checks shows both side by side).
-    for s in &statuses {
-        let state = s.get("state").and_then(Value::as_str).unwrap_or("");
-        let (st, conclusion) = match state {
-            "success" => ("completed", json!("success")),
-            "failure" | "error" => ("completed", json!("failure")),
-            _ => ("in_progress", Value::Null),
-        };
-        rows.push(json!({
-            "name": s.get("context").cloned().unwrap_or(Value::Null),
-            "status": st,
-            "conclusion": conclusion,
-            "details_url": s.get("target_url").cloned().unwrap_or(Value::Null),
-        }));
-    }
-    let total = runs_total + statuses.len() as u64;
+    let (rows, total) = combined_rows(check_runs, status)?;
     let doc = json!({ "total_count": total, "check_runs": rows });
     let rollup =
         check_runs_rollup::classify(&doc.to_string()).map_err(|r| format!("unreadable: {r}"))?;
@@ -190,11 +161,58 @@ fn conclusion_of(row: &Value) -> Option<&str> {
     row.get("conclusion").and_then(Value::as_str)
 }
 
+/// The per-row view of one poll's payloads: every check-run row plus one
+/// synthetic row per legacy commit status (so ONE classifier answers for both
+/// sources), and the total a rollup counts them under. Extracted from
+/// [`fold`] so the ci-gate update path (#14813) can extract per-name failure
+/// signatures from the same rows the rollup classified — the two can never
+/// disagree about what a row is.
+///
+/// # Errors
+///
+/// Same shape contract as [`fold`]: a human-readable reason when either
+/// payload is outside it.
+pub(crate) fn combined_rows(
+    check_runs: &Value,
+    status: &Value,
+) -> Result<(Vec<Value>, u64), String> {
+    let mut rows: Vec<Value> = match check_runs.get("check_runs") {
+        Some(Value::Array(a)) => a.clone(),
+        _ => return Err("unreadable: `check_runs` is missing or not an array".to_string()),
+    };
+    let runs_total = check_runs
+        .get("total_count")
+        .and_then(Value::as_u64)
+        .ok_or("unreadable: check-runs `total_count` is missing or not an integer")?;
+    let statuses: Vec<Value> = match status.get("statuses") {
+        Some(Value::Array(a)) => a.clone(),
+        None | Some(Value::Null) => Vec::new(),
+        Some(_) => return Err("unreadable: `statuses` is not an array".to_string()),
+    };
+    // A legacy status becomes a synthetic check-run row, so ONE classifier
+    // answers for both sources (gh pr checks shows both side by side).
+    for s in &statuses {
+        let state = s.get("state").and_then(Value::as_str).unwrap_or("");
+        let (st, conclusion) = match state {
+            "success" => ("completed", json!("success")),
+            "failure" | "error" => ("completed", json!("failure")),
+            _ => ("in_progress", Value::Null),
+        };
+        rows.push(json!({
+            "name": s.get("context").cloned().unwrap_or(Value::Null),
+            "status": st,
+            "conclusion": conclusion,
+            "details_url": s.get("target_url").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    Ok((rows, runs_total + statuses.len() as u64))
+}
+
 /// A row that is a failure verdict about the commit: `failure` /
 /// `timed_out` / `action_required` (as the classifier reads them, settled or
 /// not), or a settled row with any other non-success conclusion except
 /// `cancelled`.
-fn genuinely_failing(row: &Value) -> bool {
+pub(crate) fn genuinely_failing(row: &Value) -> bool {
     match conclusion_of(row) {
         Some("cancelled") => false,
         Some("failure" | "timed_out" | "action_required") => true,
@@ -413,7 +431,10 @@ fn lines(rendered: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn name_of(row: &Value) -> String {
+/// A row's check name, `"null"` for a row without one (the rollup's own
+/// spelling — kept identical here so a signature can never name a check the
+/// rollup classified under a different string).
+pub(crate) fn name_of(row: &Value) -> String {
     row.get("name")
         .and_then(Value::as_str)
         .unwrap_or("null")

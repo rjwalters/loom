@@ -4732,8 +4732,11 @@ Reviewed the rejection history against the forward-progress test; no qualifying 
 - **Reason**: <SAME_DEFECT_RE_LITIGATED | AMBIGUOUS_COMPARISON | ONLY_ONE_REJECTION | CHAIN_NOT_CONVERGING | APPROACH_DISAGREEMENT | NOT_CAP_PARKED | HUMAN_HOLD>
 - **Specifics**: <WHICH_DEFECT_REPEATS_ACROSS_REJECTIONS_OR_WHAT_IS_UNCLEAR>
 - **What a human needs to decide**: <THE_SPECIFIC_JUDGMENT_AUTOMATION_CANNOT_MAKE>
+- **How this park releases** (no new Judge rejection can land on a parked PR, so nothing re-opens it by itself):
+  - **Inherited-CI park only** — the verdict was a CI-only rejection AND every red check on the head fails the same way on the PR's merge base while being green on the default branch: once the default branch's required checks are green, the daemon's CI-gate recovery pass merges the recovered default branch into this PR's branch (a merge commit, never a force-push) and returns the PR to review once the new head's checks are verified exactly green (#10178, #14813). If that update conflicts, the PR is handed to Doctor's conflict lane (\`loom:merge-conflict\`) instead.
+  - **Every other reason above** — release needs exactly the condition or decision the Reason/Specifics lines name: a human decision for \`HUMAN_HOLD\`, a qualifying forward-progress record for the cap reasons. State that condition here; do not promise a re-evaluation that cannot happen.
 
-Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`). Champion will re-evaluate this PR if a new Judge rejection lands.
+Labels unchanged (\`loom:blocked\` + \`loom:changes-requested\`).
 
 ---
 *Automated by Champion role*"
