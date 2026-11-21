@@ -272,6 +272,8 @@ pub enum H5Outcome {
     Unreadable(PauseResumeStatus),
     /// Every item is resumed, requeued or released, and the manifest archived.
     Finished(PauseResumeStatus),
+    /// At least one guarded step release still needs a Forge retry.
+    PendingStepRelease(PauseResumeStatus),
 }
 
 /// What H5 does with one item.
@@ -287,6 +289,8 @@ enum Fate {
     Complete,
     /// Hand it to ordinary restart recovery.
     Recover,
+    /// Keep the step and its progress in the active manifest for H5.
+    PendingStepRelease,
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {
@@ -320,7 +324,11 @@ fn plan_item(item: &mut ManifestItem, stale: bool, safe_point: Option<SafePointR
         // was doing, it finished doing it: this is completed work, not a
         // crash to resume from a checkpoint.
         ItemStatus::Exited | ItemStatus::Completed => return Fate::Complete,
-        ItemStatus::Failed => return Fate::Recover,
+        ItemStatus::Failed if item.step.is_none() => return Fate::Recover,
+        ItemStatus::Failed => {
+            item.status = ItemStatus::Planned;
+            return Fate::Requeue { forge: true };
+        }
         ItemStatus::Planned
         | ItemStatus::Stopping
         | ItemStatus::Paused
@@ -557,7 +565,8 @@ impl Run<'_> {
                 .agent_started_at
                 .and_then(|t| u64::try_from((now - t).num_seconds()).ok()),
             "issue": item.issue,
-            "role": item.role,
+            "pr": item.pr,
+            "role": item.step.map(|role| role.as_str()).or(item.role.as_deref()),
             "from_version": self.manifest.roll.from_version,
             "to_version": self.manifest.roll.to_version,
             "trigger": self.manifest.roll.target_source.as_ref().map(|t| t.as_str().to_string()),
@@ -568,6 +577,50 @@ impl Run<'_> {
             "forge": forge,
         });
         self.host.emit("daemon.roll.item", payload);
+    }
+
+    /// Later boots only retry the recorded Forge work. The first H5 pass
+    /// already handled process residue and all other item handoffs.
+    fn retry_pending_steps(&mut self) -> usize {
+        let indices: Vec<_> = self
+            .manifest
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.step.is_some() && item.status == ItemStatus::Planned)
+            .map(|(idx, _)| idx)
+            .collect();
+        self.work = self
+            .manifest
+            .items
+            .iter()
+            .map(|_| Work {
+                fate: Fate::Done,
+                launched: None,
+                reported: false,
+            })
+            .collect();
+        let mut pending = 0;
+        for idx in indices {
+            let notice = self.notice(idx);
+            let item = &mut self.manifest.items[idx];
+            let id = item.id.clone();
+            match self.host.requeue_step(item, &notice) {
+                Ok(forge) => {
+                    item.status = ItemStatus::Requeued;
+                    self.count_requeue(idx);
+                    self.event(Some(&id), "step_release_finished", Some(forge.into()));
+                    self.report(idx, forge, None);
+                }
+                Err(why) => {
+                    pending += 1;
+                    self.event(Some(&id), "requeue_failed", Some(why));
+                    self.report(idx, "deferred", None);
+                }
+            }
+            self.save();
+        }
+        pending
     }
 
     fn notice(&self, idx: usize) -> RollRequeueNotice {
@@ -592,6 +645,14 @@ impl Run<'_> {
     }
 
     fn count_requeue(&mut self, idx: usize) {
+        let item = &self.manifest.items[idx];
+        if item.step.is_some()
+            && !item
+                .roll_step_release()
+                .is_ok_and(|release| release.queue_restored)
+        {
+            return;
+        }
         let reason = self.manifest.items[idx]
             .reason
             .clone()
@@ -781,6 +842,38 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
         run.status.finished_at = Some(Utc::now());
         run.step("done");
         return H5Outcome::Finished(run.status);
+    }
+
+    if run.manifest.pending_step_releases() {
+        let pending = run.retry_pending_steps();
+        let note = if pending == 0 {
+            run.manifest.phase = if stale {
+                Phase::Abandoned
+            } else {
+                Phase::Resumed
+            };
+            if let Err(e) = pause_manifest::save(&plan.manifest_path, &run.manifest) {
+                log::error!("pause_resume: could not record completion of deferred steps: {e}");
+            } else {
+                archive(&plan.manifest_path, &manifest_id);
+            }
+            "deferred step releases processed".to_string()
+        } else {
+            format!("{pending} interrupted step release(s) retained for H5 retry")
+        };
+        run.status.note = Some(note.clone());
+        run.status.finished_at = Some(Utc::now());
+        guard.finish(&note);
+        run.step(if pending == 0 {
+            "done"
+        } else {
+            "step-releases-pending"
+        });
+        return if pending == 0 {
+            H5Outcome::Finished(run.status)
+        } else {
+            H5Outcome::PendingStepRelease(run.status)
+        };
     }
 
     let interrupted_h4 = run.manifest.phase == Phase::Pausing;
@@ -1097,34 +1190,58 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     run.step("requeue");
     let with_forge = run.indices(|f| f == Fate::Requeue { forge: true });
     let done = fan_out(&with_forge, tuning.forge_window.saturating_mul(2), |idx| {
-        let (host, item, notice) =
+        let (host, mut item, notice) =
             (Arc::clone(&run.host), run.manifest.items[idx].clone(), run.notice(idx));
-        Box::new(move || host.requeue(&item, &notice, true))
+        Box::new(move || {
+            let result = if item.step.is_some() {
+                host.requeue_step(&mut item, &notice)
+            } else {
+                host.requeue(&item, &notice, true).map(|()| "done")
+            };
+            (result, item.claim)
+        })
     });
     for (idx, result) in done {
         let id = run.manifest.items[idx].id.clone();
+        let result = result.map(|(result, claim)| {
+            run.manifest.items[idx].claim = claim;
+            result
+        });
         match result {
-            Some(Ok(())) => {
+            Some(Ok(forge)) => {
                 run.manifest.items[idx].status = ItemStatus::Requeued;
                 run.count_requeue(idx);
-                run.event(Some(&id), "requeued", run.manifest.items[idx].reason.clone());
-                run.report(idx, "done", None);
+                if run.manifest.items[idx].step.is_some() {
+                    run.event(Some(&id), "step_release_finished", Some(forge.into()));
+                } else {
+                    run.event(Some(&id), "requeued", run.manifest.items[idx].reason.clone());
+                }
+                run.report(idx, forge, None);
             }
             failed => {
-                // The claim is not stranded: ordinary recovery takes it.
                 let why = match failed {
                     Some(Err(e)) => e,
                     _ => "no answer in the forge window".to_string(),
                 };
-                log::warn!(
-                    "pause_resume: {id}: requeue forge write failed ({why}); handing the item to \
-                     restart recovery"
-                );
-                run.manifest.items[idx].status = ItemStatus::Failed;
-                run.work[idx].fate = Fate::Recover;
+                log::warn!("pause_resume: {id}: requeue forge write failed ({why})");
+                let step = run.manifest.items[idx].step.is_some();
+                run.manifest.items[idx].status = if step {
+                    ItemStatus::Planned
+                } else {
+                    ItemStatus::Failed
+                };
+                run.work[idx].fate = if step {
+                    Fate::PendingStepRelease
+                } else {
+                    Fate::Recover
+                };
                 run.event(Some(&id), "requeue_failed", Some(why));
+                if step {
+                    run.report(idx, "deferred", None);
+                }
             }
         }
+        run.save();
     }
     for idx in run.indices(|f| f == Fate::Requeue { forge: false }) {
         let item = run.manifest.items[idx].clone();
@@ -1156,6 +1273,22 @@ pub(crate) fn run_h5(host: Arc<dyn ResumeHost>, plan: &ResumePlan) -> H5Outcome 
     }
 
     // ---- Step 7: finish ---------------------------------------------------------
+    let pending = run.indices(|f| f == Fate::PendingStepRelease).len();
+    if pending > 0 {
+        let note = format!("{pending} interrupted step release(s) retained for H5 retry");
+        run.event(None, pause_manifest::STEP_RELEASES_PENDING, Some(note.clone()));
+        if let Err(e) = pause_manifest::save(&plan.manifest_path, &run.manifest)
+            .and_then(|()| pause_manifest::retain_pending_steps(&plan.manifest_path, &manifest_id))
+        {
+            log::error!("pause_resume: could not retain pending step releases separately: {e}");
+        }
+        run.status.note = Some(note.clone());
+        run.status.finished_at = Some(Utc::now());
+        guard.finish(&note);
+        run.held = false;
+        run.step("step-releases-pending");
+        return H5Outcome::PendingStepRelease(run.status);
+    }
     run.manifest.phase = if run.stale {
         Phase::Abandoned
     } else {

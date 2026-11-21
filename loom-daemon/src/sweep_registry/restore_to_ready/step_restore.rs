@@ -285,6 +285,70 @@ impl SweepRegistry {
             "sweep_registry: {role} step on #{item} died — releasing `{claim}` ({plan:?}, \
              restore target `{ready}`, #11898)"
         );
+        self.apply_step_release_plan(item, role, plan)
+            .map(|()| match plan {
+                StepReleasePlan::Nothing if crate::work_finder::is_frozen(&signals.labels) => {
+                    ClaimRelease::Frozen
+                }
+                StepReleasePlan::Nothing => ClaimRelease::Untouched,
+                _ => ClaimRelease::Released,
+            })
+    }
+
+    pub(crate) fn plan_roll_step_release(
+        &self,
+        number: u32,
+        role: StepRole,
+        labels: &[String],
+        closed: bool,
+    ) -> Option<crate::auto_update::pause_manifest::RollStepLabelRelease> {
+        use crate::auto_update::pause_manifest::RollStepLabelRelease;
+        match plan_step_release(role, labels, Some(closed)) {
+            StepReleasePlan::Nothing => None,
+            StepReleasePlan::RemoveClaim => Some(RollStepLabelRelease::ClaimRemoved),
+            StepReleasePlan::Restore
+                if role
+                    .restore_label()
+                    .is_some_and(|ready| labels.iter().any(|label| label == ready))
+                    || role == StepRole::Builder
+                        && self.claim_took_ready_label(number) == Some(false) =>
+            {
+                Some(RollStepLabelRelease::ClaimRemoved)
+            }
+            StepReleasePlan::Restore => Some(RollStepLabelRelease::QueueRestored),
+        }
+    }
+
+    pub(crate) fn add_roll_ready_label(&self, item: u32, role: StepRole) -> Result<()> {
+        let ready = role
+            .restore_label()
+            .ok_or_else(|| anyhow::anyhow!("missing ready label for {role}"))?;
+        let kind = if role.acts_on_pr() { "pr" } else { "issue" };
+        self.run_claim_release_edit(
+            item,
+            vec![
+                kind.into(),
+                "edit".into(),
+                item.to_string(),
+                "--add-label".into(),
+                ready.into(),
+            ],
+        )
+    }
+
+    pub(crate) fn remove_roll_claim_label(&self, item: u32, role: StepRole) -> Result<()> {
+        self.apply_step_release_plan(item, role, StepReleasePlan::RemoveClaim)
+    }
+
+    fn apply_step_release_plan(
+        &self,
+        item: u32,
+        role: StepRole,
+        plan: StepReleasePlan,
+    ) -> Result<()> {
+        let (Some(claim), Some(ready)) = (role.claim_label(), role.restore_label()) else {
+            return Ok(());
+        };
         let kind = if role.acts_on_pr() { "pr" } else { "issue" };
         let mut args = vec![
             kind.to_string(),
@@ -294,17 +358,13 @@ impl SweepRegistry {
             claim.to_string(),
         ];
         match plan {
-            StepReleasePlan::Nothing if crate::work_finder::is_frozen(&signals.labels) => {
-                return Ok(ClaimRelease::Frozen)
-            }
-            StepReleasePlan::Nothing => return Ok(ClaimRelease::Untouched),
+            StepReleasePlan::Nothing => return Ok(()),
             StepReleasePlan::RemoveClaim => {}
             StepReleasePlan::Restore => {
                 args.extend(["--add-label".to_string(), ready.to_string()]);
             }
         }
         self.run_claim_release_edit(item, args)
-            .map(|()| ClaimRelease::Released)
     }
 }
 

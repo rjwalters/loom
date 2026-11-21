@@ -204,7 +204,7 @@ pub(crate) fn sandbox_mismatch(
 }
 
 impl SweepRegistry {
-    fn roll_lock_owner(&self, issue: u32) -> Option<LockOwner> {
+    pub(super) fn roll_lock_owner(&self, issue: u32) -> Option<LockOwner> {
         let path = self
             .config
             .locks_dir()
@@ -214,7 +214,7 @@ impl SweepRegistry {
     }
 
     /// Whether `owner` is the paused run `old_sweep_id`, or a resume of it.
-    fn owner_is_run(owner: &LockOwner, old_sweep_id: &str) -> bool {
+    pub(super) fn owner_is_run(owner: &LockOwner, old_sweep_id: &str) -> bool {
         owner.sweep_id == old_sweep_id
             || owner
                 .resume_handle

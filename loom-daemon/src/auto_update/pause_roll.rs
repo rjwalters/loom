@@ -547,7 +547,8 @@ impl Run<'_> {
             "safe_point_miss": w.item.safe_point_miss.as_ref().map(|m| m.cause.clone()),
             "agent_age_secs": w.cand.agent_age_secs(now),
             "issue": w.item.issue,
-            "role": w.item.role,
+            "pr": w.item.pr,
+            "role": w.item.step.map(|role| role.as_str()).or(w.item.role.as_deref()),
             "from_version": self.plan.from_version,
             "to_version": self.plan.target.to_version,
             "target_source": self.plan.target.source.as_str(),
@@ -562,13 +563,19 @@ impl Run<'_> {
         });
         let status = w.item.status.clone();
         let requeue = w.item.disposition == Disposition::Requeue;
+        let queue_restored = w.item.step.is_none()
+            || w.item
+                .roll_step_release()
+                .is_ok_and(|release| release.queue_restored);
         let reason = w.item.reason.clone();
         self.host.emit("daemon.roll.item", payload);
         self.drain.pause_update(self.gen(), |p| {
             if requeue {
-                *p.requeued_by_reason
-                    .entry(reason.unwrap_or_else(|| "unknown".to_string()))
-                    .or_insert(0) += 1;
+                if queue_restored {
+                    *p.requeued_by_reason
+                        .entry(reason.unwrap_or_else(|| "unknown".to_string()))
+                        .or_insert(0) += 1;
+                }
                 if forge == "deferred" {
                     p.deferred_forge_writes += 1;
                 }
@@ -670,7 +677,7 @@ impl Run<'_> {
 /// What one forge worker did.
 enum ForgeDone {
     Lease(usize, Result<(), String>),
-    Requeue(usize, Result<(), String>),
+    Requeue(usize, Result<&'static str, String>, Option<serde_json::Value>),
 }
 
 /// Reopens dispatch for a run that ends without restarting the daemon (it
@@ -775,6 +782,34 @@ pub(crate) fn run_h4_with(
     // From here nothing new starts. A dispatch whose child is already spawned
     // is not in the registry yet; with the gate closed that count only falls.
     enter!(1);
+    if let pause_manifest::LoadOutcome::Loaded(previous)
+    | pause_manifest::LoadOutcome::Stale(previous) =
+        pause_manifest::load(&plan.manifest_path, Utc::now())
+    {
+        if previous.pending_step_releases() {
+            if let Err(e) =
+                pause_manifest::retain_pending_steps(&plan.manifest_path, &previous.manifest_id)
+            {
+                let note =
+                    format!("could not preserve pending step releases before this roll: {e}");
+                log::error!("pause_roll: {note}");
+                return match drain.pause_ownership(plan.generation) {
+                    PauseOwnership::Ours
+                        if drain
+                            .pause_fallback_to_operator_drain(plan.generation, note.clone()) =>
+                    {
+                        H4Outcome::StoodDown { promoted: true }
+                    }
+                    PauseOwnership::Ours => {
+                        drain.resolve_timeout(note.clone());
+                        H4Outcome::Failed(note)
+                    }
+                    PauseOwnership::Promoted => H4Outcome::StoodDown { promoted: true },
+                    PauseOwnership::Gone => H4Outcome::StoodDown { promoted: false },
+                };
+            }
+        }
+    }
     run.host.close_dispatch(true, &manifest_id);
     let settle_until = started + tuning.settle_window();
     let mut unsettled = run.host.pending_dispatches();
@@ -1087,8 +1122,15 @@ pub(crate) fn run_h4_with(
         } else if disposition == Disposition::Requeue {
             outstanding += 1;
             let notice = run.notice(idx);
+            let mut item = run.work[idx].item.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(ForgeDone::Requeue(idx, host.requeue(&cand, &notice)));
+                let (result, claim) = if item.step.is_some() {
+                    let result = host.requeue_step(&mut item, &notice);
+                    (result, item.claim)
+                } else {
+                    (host.requeue(&cand, &notice).map(|()| "done"), item.claim)
+                };
+                let _ = tx.send(ForgeDone::Requeue(idx, result, claim));
             });
         }
     }
@@ -1108,14 +1150,19 @@ pub(crate) fn run_h4_with(
                     }
                 }
             }
-            Ok(ForgeDone::Requeue(idx, result)) => {
+            Ok(ForgeDone::Requeue(idx, result, claim)) => {
                 outstanding -= 1;
                 let id = run.work[idx].item.id.clone();
+                run.work[idx].item.claim = claim;
                 match result {
-                    Ok(()) => {
+                    Ok(forge) => {
                         run.work[idx].item.status = ItemStatus::Requeued;
-                        run.event(Some(&id), "requeued", run.work[idx].item.reason.clone());
-                        run.report(idx, "done");
+                        if run.work[idx].item.step.is_some() {
+                            run.event(Some(&id), "step_release_finished", Some(forge.into()));
+                        } else {
+                            run.event(Some(&id), "requeued", run.work[idx].item.reason.clone());
+                        }
+                        run.report(idx, forge);
                     }
                     Err(e) => {
                         log::warn!(
@@ -1126,6 +1173,7 @@ pub(crate) fn run_h4_with(
                         run.report(idx, "deferred");
                     }
                 }
+                run.save_best_effort();
             }
             // The window closed (or every worker is gone): stop waiting.
             Err(_) => break,

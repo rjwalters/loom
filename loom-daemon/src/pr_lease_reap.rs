@@ -303,6 +303,23 @@ impl Drop for Reaper {
     }
 }
 
+/// Reap the paused step's exact recorded lease, independent of the ephemeral
+/// lease file. The caller verifies the resulting marker on the forge.
+pub(crate) fn reap_for_roll(root: &Path, held: &Held, gh: &Path) -> bool {
+    let Ok(bin) = crate::daemon_bin_resolve::resolve_daemon_bin() else {
+        return false;
+    };
+    let mut cmd = Command::new(bin);
+    cmd.args(held.reap_args(root, "roll-requeue"))
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env("LOOM_GH_BIN", gh);
+    crate::credential_preflight::apply_gh_config_for_root(&mut cmd, root);
+    run_bounded(&mut cmd, REAP_TIMEOUT)
+}
+
 fn run_bounded(cmd: &mut Command, limit: Duration) -> bool {
     let Ok(mut child) = cmd.spawn() else {
         return false;

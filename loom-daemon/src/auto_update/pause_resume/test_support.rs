@@ -91,6 +91,14 @@ impl ResumeHost for RegistryHost {
     ) -> Result<(), String> {
         sweeps::requeue(&self.registry, item, notice, forge)
     }
+    fn requeue_step(
+        &self,
+        item: &mut ManifestItem,
+        notice: &RollRequeueNotice,
+    ) -> Result<&'static str, String> {
+        sweeps::requeue_step(&self.registry, item, notice)
+    }
+
     fn recover(&self, manifest_id: &str, item: &ManifestItem) {
         roll_pause::suppress::release_item(manifest_id, &item.id);
         sweeps::recover(&self.registry, item);

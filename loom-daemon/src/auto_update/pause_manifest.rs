@@ -308,7 +308,62 @@ pub struct ManifestItem {
     pub step: Option<crate::step_role::StepRole>,
 }
 
+/// A label edit with a successful response and confirmed post-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollStepLabelRelease {
+    ClaimRemoved,
+    QueueRestored,
+}
+
+/// Verified sub-actions of a rollback that may span the restart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RollStepRelease {
+    pub claim_removed: bool,
+    pub queue_restored: bool,
+    pub lease_released: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_row: Option<u64>,
+}
+
+impl RollStepRelease {
+    pub(crate) fn outcome(&self) -> &'static str {
+        match (self.claim_removed, self.queue_restored, self.lease_released) {
+            (false, false, false) => "none",
+            (false, false, true) => "lease_released",
+            (true, false, false) => "claim_removed",
+            (true, false, true) => "claim_and_lease_released",
+            (false, true, false) => "queue_restored",
+            (false, true, true) => "queue_restored_and_lease_released",
+            (true, true, false) => "queue_restored",
+            (true, true, true) => "queue_restored_and_lease_released",
+        }
+    }
+}
+
 impl ManifestItem {
+    /// The manifest's claim object already travels across H4 and H5. Older
+    /// manifests have no roll-release progress and start with no confirmed edits.
+    pub(crate) fn roll_step_release(&self) -> Result<RollStepRelease, String> {
+        if self.claim.as_ref().is_some_and(|claim| !claim.is_object()) {
+            return Err("recorded step claim is malformed".into());
+        }
+        self.claim
+            .as_ref()
+            .and_then(|claim| claim.get("roll_release"))
+            .map(|value| serde_json::from_value(value.clone()).map_err(|e| e.to_string()))
+            .unwrap_or_else(|| Ok(RollStepRelease::default()))
+    }
+
+    pub(crate) fn set_roll_step_release(&mut self, progress: &RollStepRelease) {
+        let claim = self.claim.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(fields) = claim.as_object_mut() {
+            fields.insert("roll_release".into(), serde_json::json!(progress));
+        }
+    }
+
     /// The disposition a reader must act on, with the reason when it is a
     /// requeue. An unknown enum value anywhere on the item forces `requeue`
     /// with `unknown-<field>-<value>` (§6): the item is never silently dropped
@@ -360,12 +415,72 @@ pub struct PauseManifest {
 }
 
 impl PauseManifest {
+    pub(crate) fn pending_step_releases(&self) -> bool {
+        self.phase == Phase::Resuming
+            && self
+                .events
+                .iter()
+                .any(|event| event.event == STEP_RELEASES_PENDING)
+    }
+
     /// Age of the pause at `now`, measured from `roll.pause_started_at`
     /// (which precedes every lease refresh, so the check is conservative).
     #[must_use]
     pub fn age_secs(&self, now: DateTime<Utc>) -> i64 {
         (now - self.roll.pause_started_at).num_seconds()
     }
+}
+
+pub(crate) const STEP_RELEASES_PENDING: &str = "step_releases_pending";
+
+pub(crate) fn pending_step_manifest_path(path: &Path, manifest_id: &str) -> PathBuf {
+    let safe: String = manifest_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    path.with_file_name(format!("roll-pause-manifest.{safe}.step-releases.json"))
+}
+
+/// Move the current H5 state aside so the next H4 can use its normal slot.
+pub(crate) fn retain_pending_steps(path: &Path, manifest_id: &str) -> std::io::Result<()> {
+    if path.file_name() != Some(std::ffi::OsStr::new(MANIFEST_FILE)) {
+        return Ok(());
+    }
+    let pending = pending_step_manifest_path(path, manifest_id);
+    if pending.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "pending step-release manifest already exists",
+        ));
+    }
+    std::fs::rename(path, pending)
+}
+
+pub(crate) fn pending_step_manifests(active: &Path) -> Vec<PathBuf> {
+    let mut paths = active
+        .parent()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (file_type.is_file()
+                && name.starts_with("roll-pause-manifest.")
+                && name.ends_with(".step-releases.json"))
+            .then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
 }
 
 /// The typed result of [`load`] (mirrors #10713). Everything except `Loaded`

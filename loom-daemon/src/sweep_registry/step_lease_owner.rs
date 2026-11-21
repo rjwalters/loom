@@ -171,7 +171,7 @@ pub fn own_lease_end(
 }
 
 /// The lease TTL (`LOOM_LEASE_TTL_MINUTES`, the bin crate's liveness rule).
-fn lease_ttl() -> chrono::Duration {
+pub(super) fn lease_ttl() -> chrono::Duration {
     let ttl_minutes = crate::claim_reconciliation::resolve_lease_ttl_minutes();
     #[allow(clippy::cast_possible_truncation)]
     chrono::Duration::seconds((ttl_minutes * 60.0) as i64)
@@ -180,6 +180,18 @@ fn lease_ttl() -> chrono::Duration {
 impl SweepRegistry {
     /// Every trusted role-lease comment on `item`; `None` when unreadable.
     pub(crate) fn read_role_lease_rows(&self, item: u32) -> Option<Vec<RoleLeaseRow>> {
+        self.read_role_lease_rows_with_policy(item, false)
+    }
+
+    pub(crate) fn read_roll_role_lease_rows(&self, item: u32) -> Option<Vec<RoleLeaseRow>> {
+        self.read_role_lease_rows_with_policy(item, true)
+    }
+
+    fn read_role_lease_rows_with_policy(
+        &self,
+        item: u32,
+        strict: bool,
+    ) -> Option<Vec<RoleLeaseRow>> {
         if self.config.skip_label_flip {
             return None;
         }
@@ -201,7 +213,28 @@ impl SweepRegistry {
         }
         // #9548: an untrusted author's lease is prose; it holds nothing.
         let policy = crate::comment_trust::TrustPolicy::for_root(&self.config.workspace_root);
-        Some(parse_role_lease_rows(&policy.trusted_ndjson(&output.stdout)))
+        if strict
+            && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                !serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v.is_object())
+            })
+        {
+            return None;
+        }
+        let trusted = policy.trusted_ndjson(&output.stdout);
+        let rows = parse_role_lease_rows(&trusted);
+        if strict
+            && (rows.len()
+                != String::from_utf8_lossy(&trusted)
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count()
+                || rows
+                    .iter()
+                    .any(|row| crate::cli::pr_lease::parse_record(&row.body).is_none()))
+        {
+            return None;
+        }
+        Some(rows)
     }
 
     /// Whether a non-Builder step `sweep_id` that started at `started_at`

@@ -55,7 +55,13 @@ fn held_items(manifest: &pause_manifest::PauseManifest) -> Vec<HeldItem> {
     manifest
         .items
         .iter()
-        .filter(|i| i.status != ItemStatus::Resumed)
+        .filter(|i| {
+            if manifest.pending_step_releases() {
+                i.step.is_some() && i.status == ItemStatus::Planned
+            } else {
+                i.status != ItemStatus::Resumed
+            }
+        })
         .map(|i| HeldItem {
             id: i.id.clone(),
             repo: PathBuf::from(&i.repo),
@@ -72,6 +78,7 @@ fn held_items(manifest: &pause_manifest::PauseManifest) -> Vec<HeldItem> {
 pub struct Startup {
     found: bool,
     armed: Option<String>,
+    pending: Vec<(PathBuf, String)>,
 }
 
 /// Arm the recovery suppression for a live pause manifest. Call before any
@@ -81,46 +88,59 @@ pub fn arm_at_startup() -> Startup {
 }
 
 fn manifest_found() -> Startup {
-    let none = Startup {
-        found: false,
-        armed: None,
-    };
     let Some(path) = pause_manifest::manifest_path() else {
-        return none;
-    };
-    match pause_manifest::load(&path, Utc::now()) {
-        LoadOutcome::Missing => none,
-        LoadOutcome::Loaded(m) | LoadOutcome::Stale(m) => {
-            if !matches!(m.phase, Phase::Resumed | Phase::Abandoned) {
-                let items = held_items(&m);
-                log::warn!(
-                    "pause_resume: found pause manifest {} (phase {}, {} item(s)) from a roll to \
-                     {}; restart recovery is held off its {} unfinished item(s) until H5 has \
-                     resumed or requeued them (#10832)",
-                    m.manifest_id,
-                    m.phase.as_str(),
-                    m.items.len(),
-                    m.roll.to_version,
-                    items.len()
-                );
-                suppress::arm(&m.manifest_id, items);
-                return Startup {
-                    found: true,
-                    armed: Some(m.manifest_id),
-                };
-            }
-            Startup {
-                found: true,
-                armed: None,
-            }
-        }
-        // Reported once by H5; nothing can be held from a manifest that
-        // cannot be read.
-        LoadOutcome::Corrupt(_) | LoadOutcome::UnknownVersion(_) => Startup {
-            found: true,
+        return Startup {
+            found: false,
             armed: None,
-        },
+            pending: Vec::new(),
+        };
+    };
+    let pending = pending_plans(&path);
+    let (found, armed) = match pause_manifest::load(&path, Utc::now()) {
+        LoadOutcome::Missing => (false, None),
+        LoadOutcome::Loaded(m) | LoadOutcome::Stale(m)
+            if !matches!(m.phase, Phase::Resumed | Phase::Abandoned) =>
+        {
+            let items = held_items(&m);
+            log::warn!(
+                "pause_resume: found pause manifest {} (phase {}, {} item(s)) from a roll to \
+                 {}; restart recovery is held off its {} unfinished item(s) until H5 has \
+                 resumed or requeued them (#10832)",
+                m.manifest_id,
+                m.phase.as_str(),
+                m.items.len(),
+                m.roll.to_version,
+                items.len()
+            );
+            suppress::arm(&m.manifest_id, items);
+            (true, Some(m.manifest_id))
+        }
+        _ => (true, None),
+    };
+    Startup {
+        found,
+        armed,
+        pending,
     }
+}
+
+fn pending_plans(active: &Path) -> Vec<(PathBuf, String)> {
+    pause_manifest::pending_step_manifests(active)
+        .into_iter()
+        .filter_map(|path| match pause_manifest::load(&path, Utc::now()) {
+            LoadOutcome::Loaded(m) | LoadOutcome::Stale(m) if m.pending_step_releases() => {
+                suppress::arm(&m.manifest_id, held_items(&m));
+                Some((path, m.manifest_id))
+            }
+            _ => {
+                log::warn!(
+                    "pause_resume: deferred step manifest {} is unreadable or has no pending steps",
+                    path.display()
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 impl Startup {
@@ -135,10 +155,12 @@ impl Startup {
         bus: &Arc<EventBus>,
         in_progress: &InProgressGuard,
     ) {
-        if let (true, Some(manifest_path)) = (self.found, pause_manifest::manifest_path()) {
+        let active = self.found.then(pause_manifest::manifest_path).flatten();
+        if active.is_some() || !self.pending.is_empty() {
             spawn_h5(
-                manifest_path,
+                active,
                 self.armed,
+                self.pending,
                 drain,
                 pool,
                 fallback_root.to_path_buf(),
@@ -149,9 +171,11 @@ impl Startup {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_h5(
-    manifest_path: PathBuf,
+    active: Option<PathBuf>,
     armed: Option<String>,
+    pending: Vec<(PathBuf, String)>,
     drain: &Arc<DrainState>,
     pool: &Arc<WorkspacePool>,
     fallback_root: PathBuf,
@@ -175,15 +199,28 @@ fn spawn_h5(
     if armed.is_some() {
         host.hold_dispatch();
     }
-    let plan = ResumePlan {
-        manifest_path,
-        running_version: env!("CARGO_PKG_VERSION").to_string(),
-        tuning: ResumeTuning::from_pause(&tuning),
-        armed,
-    };
+    let tuning = ResumeTuning::from_pause(&tuning);
     tokio::task::spawn_blocking(move || {
-        let outcome = super::run_h5(host, &plan);
-        log::info!("pause_resume: H5 ended: {outcome:?}");
+        if let Some(manifest_path) = active {
+            let plan = ResumePlan {
+                manifest_path,
+                running_version: env!("CARGO_PKG_VERSION").to_string(),
+                tuning,
+                armed,
+            };
+            let outcome = super::run_h5(Arc::clone(&host), &plan);
+            log::info!("pause_resume: H5 ended: {outcome:?}");
+        }
+        for (manifest_path, id) in pending {
+            let plan = ResumePlan {
+                manifest_path,
+                running_version: env!("CARGO_PKG_VERSION").to_string(),
+                tuning,
+                armed: Some(id),
+            };
+            let outcome = super::run_h5(Arc::clone(&host), &plan);
+            log::info!("pause_resume: deferred H5 step releases ended: {outcome:?}");
+        }
     });
 }
 
