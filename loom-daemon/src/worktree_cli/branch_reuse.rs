@@ -167,6 +167,14 @@ pub fn run(opts: &Options) -> i32 {
 /// [`run`] with the forge round-trip injected — the seam a test uses instead
 /// of a network, a `gh`, or a `loom-daemon`.
 pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProbe) -> i32 {
+    try_run_with(opts, &|branch| Ok::<_, std::convert::Infallible>(forge(branch)))
+        .unwrap_or_else(|never| match never {})
+}
+
+pub(crate) fn try_run_with<E>(
+    opts: &Options,
+    forge: &dyn Fn(&str) -> Result<branch_landed::ForgeProbe, E>,
+) -> Result<i32, E> {
     let json = opts.json();
     let out = Out::new(json);
     let repo = opts.repo.as_path();
@@ -195,10 +203,10 @@ pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProb
 
     // Step 3. The #8280 already-landed refusal.
     let answer =
-        branch_landed::probe_with(repo, &opts.branch, Some(&opts.default_branch), "", forge);
+        branch_landed::try_probe_with(repo, &opts.branch, Some(&opts.default_branch), "", forge)?;
     if decide(answer.verdict, tip_is_current_default(repo, opts)) == Decision::Refuse {
         report_refusal(opts, &out, answer.pr_number.as_deref());
-        return 1;
+        return Ok(1);
     }
 
     // Step 4. The base-ref staleness check (#13056, widening #8280's
@@ -217,7 +225,7 @@ pub fn run_with(opts: &Options, forge: &dyn Fn(&str) -> branch_landed::ForgeProb
         }
         Staleness::NoUniqueWork { behind } => reset_stale_branch(repo, opts, &out, behind),
     }
-    0
+    Ok(0)
 }
 
 /// A branch older than this (by merge-base commit date) gets the louder

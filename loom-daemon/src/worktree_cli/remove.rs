@@ -50,7 +50,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::branch_delete::{self, BranchOutcome, DeleteContext};
+use super::branch_delete::{self, DeleteContext};
+use super::pr_list::PrList;
 use super::wip::{self, Out};
 use crate::worktree_ops::{cargo_target, clean, removal_log, safety};
 
@@ -103,7 +104,7 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
             "--force" | "-f" => out.force = true,
             "--dry-run" | "-n" => out.dry_run = true,
             other if other.starts_with("--") => {
-                return Err(ArgError::UnknownFlag(other.to_string()))
+                return Err(ArgError::UnknownFlag(other.to_string()));
             }
             other => {
                 if out.issue_number.is_empty() {
@@ -133,6 +134,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args, ArgError> {
 /// looked at your worktree and declined".
 #[must_use]
 pub fn run(argv: &[String]) -> i32 {
+    run_with(argv, PrList::Legacy)
+}
+
+pub(crate) fn run_with(argv: &[String], pr_list: PrList) -> i32 {
     let args = match parse_args(argv) {
         Ok(a) => a,
         Err(ArgError::UnknownFlag(f)) => {
@@ -347,6 +352,7 @@ pub fn run(argv: &[String]) -> i32 {
     // 7. Branch cleanup (unless --keep-branch). Deferred until after removal
     //    so the worktree's checkout lock on the branch is released first.
     let mut branch_status = "none";
+    let mut branch_error = None;
     if args.keep_branch {
         if let Some(b) = &attached_branch {
             out.info(&format!("Keeping local branch '{b}' (--keep-branch)"));
@@ -361,13 +367,18 @@ pub fn run(argv: &[String]) -> i32 {
                     default_branch: default.as_deref(),
                     cleanup_primary_checkout: cleanup_primary_checkout_enabled(),
                 };
-                let _outcome: BranchOutcome =
-                    branch_delete::maybe_delete_local_branch(&ctx, &out, b, "");
+                if let Err(error) =
+                    branch_delete::maybe_delete_local_branch_with(&ctx, &out, b, "", pr_list)
+                {
+                    branch_error = Some(error);
+                }
                 // Re-read the ref rather than trusting the returned outcome:
                 // the shell reported `unmerged`/`deleted` from a fresh
                 // `show-ref`, and a status that disagrees with the repository
                 // is worse than no status at all.
-                branch_status = if branch_delete::branch_exists(&repo_root, b) {
+                branch_status = if branch_error.is_some() {
+                    "kept"
+                } else if branch_delete::branch_exists(&repo_root, b) {
                     "unmerged"
                 } else {
                     "deleted"
@@ -383,7 +394,11 @@ pub fn run(argv: &[String]) -> i32 {
     // 8. Prune the git worktree registration.
     prune(&repo_root);
 
-    if removed {
+    if let Some(error) = branch_error {
+        Out::error(&error);
+        report.emit(&out, false, true);
+        1
+    } else if removed {
         report.emit(&out, true, true);
         0
     } else {

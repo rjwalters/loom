@@ -40,7 +40,7 @@ use anyhow::Result;
 use crate::worktree_cli::{issue_lock, lock};
 
 #[derive(clap::Subcommand)]
-pub(crate) enum WorktreeLockCommand {
+pub enum WorktreeLockCommand {
     /// Take the repo-global worktree-add lock.
     Acquire {
         /// Recorded as owner metadata. The lock is repo-global, not per-issue.

@@ -25,10 +25,10 @@
 
 use anyhow::Result;
 
-use crate::worktree_cli::remove;
+use crate::worktree_cli::{pr_list::PrList, remove};
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeRemoveArgs {
+pub struct WorktreeRemoveArgs {
     /// `<issue-number>` plus any of `--keep-branch` / `--force` / `--dry-run`
     /// / `--json`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -38,7 +38,7 @@ pub(crate) struct WorktreeRemoveArgs {
 impl WorktreeRemoveArgs {
     /// Never returns: exits with the code the shell verb exited with, which
     /// operators and `CLAUDE.md`'s documented `&&` chains branch on.
-    pub(crate) fn run(self) -> Result<()> {
-        std::process::exit(remove::run(&self.args));
+    pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
+        std::process::exit(remove::run_with(&self.args, pr_list));
     }
 }

@@ -28,10 +28,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::worktree_cli::open_pr;
+use crate::worktree_cli::{open_pr, pr_list::PrList};
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeOpenPrArgs {
+pub struct WorktreeOpenPrArgs {
     /// The branch name being checked for a shadowing open PR.
     #[arg(long)]
     branch: String,
@@ -42,8 +42,10 @@ pub(crate) struct WorktreeOpenPrArgs {
 }
 
 impl WorktreeOpenPrArgs {
-    /// Never returns.
-    pub(crate) fn run(self) -> Result<()> {
-        std::process::exit(open_pr::run(&self.repo, &self.branch));
+    /// Exits with the worktree result, or returns a mode configuration error.
+    pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
+        std::process::exit(
+            open_pr::run_with(&self.repo, &self.branch, pr_list).map_err(anyhow::Error::msg)?,
+        );
     }
 }

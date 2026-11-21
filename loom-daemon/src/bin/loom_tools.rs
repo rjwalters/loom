@@ -1,13 +1,9 @@
 //! `loom-tools`: the tools-only entry point (#12938, epic #12708; design
 //! `docs/design/loom-tools-cli-boundary.md` §6.2 step 4, §7.3, §10).
 //!
-//! Only `strip-ansi`, `checkpoint`, `config get` and `capabilities` (#12939), plus the
-//! install trio `release-fetch`, `install-binary` and `resync-payload` (#12940), plus
-//! `resolve-model` (#13878) and `resolve-role-model` (#13956): the
-//! tools-only installer (`scripts/install/provision-tools.sh`) has no daemon to call. The handlers are the
-//! library's own (the same functions `loom-daemon strip-ansi|checkpoint|config|resolve-model`
-//! call), so there is no second copy. This crate links `loom_daemon` and not
-//! `daemon_service`, which is private to the `loom-daemon` bin.
+//! The tools-only installer (`scripts/install/provision-tools.sh`) can run
+//! the commands advertised by `capabilities` without a daemon. Both binaries
+//! use the library's handlers, including the worktree operations in #14474.
 //!
 //! `forge <verb>` (#14395 reads, #14519 the shared non-queue writes) is the
 //! `forge` family: the same `ForgeAction` tree and handler `loom-daemon forge`
@@ -27,6 +23,9 @@
 //! --write`, `labels undeclared --prune`, `labels migrate --apply`,
 //! `forge-probe --live-write`, `forge-inventory gate --update`) refused with
 //! exit 64 before any handler runs.
+//!
+//! Worktree commands (#14474, §13.9) resolve mode at a nested forge read.
+//! Local worktree operations remain available offline.
 
 use std::io::Write;
 
@@ -42,7 +41,7 @@ use loom_daemon::cli::{
     InstallBinaryCommand, InstallCompatCommand, LabelDuplicatesArgs, LabelsArgs, LeaseCli,
     OperatorDecisionCli, ParkRecordCli, PrQueueArgs, PremiseCheckArgs, ReleaseFetchArgs,
     ResolveModelArgs, ResolveRoleModelArgs, ResyncPayloadArgs, RolesCommand, SkipLabelsArgs,
-    StaleBlockedArgs,
+    StaleBlockedArgs, WorktreeCommands,
 };
 use loom_daemon::install_compat;
 use loom_daemon::script_helpers;
@@ -203,6 +202,8 @@ enum ToolsCommands {
         #[arg(value_name = "ARGS", trailing_var_arg = true)]
         args: Vec<String>,
     },
+    #[command(flatten)]
+    Worktree(WorktreeCommands),
     /// Print this binary's side of the install-compat contract as JSON: the
     /// same object `loom-daemon install-compat show --json` prints, so the
     /// shell wrappers carry no capability rules of their own.
@@ -356,6 +357,7 @@ fn run() -> Result<()> {
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
             std::process::exit(script_helpers::claim::run(&cwd, command.as_deref(), &args));
         }
+        ToolsCommands::Worktree(commands) => commands.run_tools(),
         ToolsCommands::Capabilities { json: _, repo } => capabilities(repo.as_deref()),
     }
 }

@@ -146,8 +146,16 @@ pub fn resolve(opts: &Options) -> Resolved {
 /// drive the #5657 merged-tip skip against a real throwaway repo, offline.
 #[must_use]
 pub fn resolve_with(opts: &Options, forge: &dyn Fn(&str) -> ForgeProbe) -> Resolved {
+    try_resolve_with(opts, &|branch| Ok::<_, std::convert::Infallible>(forge(branch)))
+        .unwrap_or_else(|never| match never {})
+}
+
+pub(crate) fn try_resolve_with<E>(
+    opts: &Options,
+    forge: &dyn Fn(&str) -> Result<ForgeProbe, E>,
+) -> Result<Resolved, E> {
     let worktree = opts.worktree.as_path();
-    let (reference, display) = match remote_reference(opts, forge) {
+    let (reference, display) = match remote_reference(opts, forge)? {
         // `origin/<branch>` is its own display name — there is no shorter
         // spelling of it that stays unambiguous next to the local branch.
         Some(remote) => (remote.clone(), remote),
@@ -155,17 +163,20 @@ pub fn resolve_with(opts: &Options, forge: &dyn Fn(&str) -> ForgeProbe) -> Resol
     };
     let ahead = rev_count(worktree, &format!("{reference}..HEAD"));
     let behind = rev_count(worktree, &format!("HEAD..{reference}"));
-    Resolved {
+    Ok(Resolved {
         reference,
         display,
         ahead,
         behind,
-    }
+    })
 }
 
 /// `Some("origin/<branch>")` when the live remote branch is the reference to
 /// use: it exists, and it is not the head of an already-merged PR.
-fn remote_reference(opts: &Options, forge: &dyn Fn(&str) -> ForgeProbe) -> Option<String> {
+fn remote_reference<E>(
+    opts: &Options,
+    forge: &dyn Fn(&str) -> Result<ForgeProbe, E>,
+) -> Result<Option<String>, E> {
     let worktree = opts.worktree.as_path();
     let remote = format!("origin/{}", opts.branch);
     if git_code(
@@ -178,13 +189,18 @@ fn remote_reference(opts: &Options, forge: &dyn Fn(&str) -> ForgeProbe) -> Optio
         ],
     ) != 0
     {
-        return None;
+        return Ok(None);
     }
     // See the module docs: the key is the REMOTE spelling, and only `landed`
     // disqualifies it.
-    let answer =
-        branch_landed::probe_with(worktree, &remote, Some(opts.default_branch.as_str()), "", forge);
-    (answer.verdict != Verdict::Landed).then_some(remote)
+    let answer = branch_landed::try_probe_with(
+        worktree,
+        &remote,
+        Some(opts.default_branch.as_str()),
+        "",
+        forge,
+    )?;
+    Ok((answer.verdict != Verdict::Landed).then_some(remote))
 }
 
 /// `git rev-list --count <range>`, or 0 when git cannot answer.

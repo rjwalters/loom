@@ -40,7 +40,7 @@ use anyhow::Result;
 use crate::worktree_cli::link;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeLinkArgs {
+pub struct WorktreeLinkArgs {
     /// The main workspace root (`git rev-parse --show-toplevel`), whose
     /// gitignored artifacts are the link sources.
     #[arg(long)]

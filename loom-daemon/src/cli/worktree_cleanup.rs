@@ -30,7 +30,7 @@ use anyhow::Result;
 use crate::worktree_cli::cleanup;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeCleanupArgs {
+pub struct WorktreeCleanupArgs {
     /// Issue number whose `issue-<N>` crash debris should be cleared.
     issue: u64,
 

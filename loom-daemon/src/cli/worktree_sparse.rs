@@ -44,7 +44,7 @@ fn issue_number(s: &str) -> std::result::Result<String, String> {
 }
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeSparseArgs {
+pub struct WorktreeSparseArgs {
     /// Which retired block this invocation is.
     #[arg(long, value_enum)]
     arm: ArmArg,

@@ -27,7 +27,7 @@ use anyhow::Result;
 use crate::worktree_cli::submodules;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeSubmodulesArgs {
+pub struct WorktreeSubmodulesArgs {
     /// The main workspace root (`git rev-parse --show-toplevel`), whose
     /// `modules/` object stores are borrowed via `--reference`.
     #[arg(long)]

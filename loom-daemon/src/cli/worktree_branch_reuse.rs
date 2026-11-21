@@ -9,10 +9,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::worktree_cli::branch_reuse;
+use crate::worktree_cli::{branch_reuse, pr_list::PrList};
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeBranchReuseArgs {
+pub struct WorktreeBranchReuseArgs {
     /// `$BRANCH_NAME` — the existing local branch under question.
     #[arg(long)]
     branch: String,
@@ -45,8 +45,8 @@ pub(crate) struct WorktreeBranchReuseArgs {
 }
 
 impl WorktreeBranchReuseArgs {
-    /// Never returns.
-    pub(crate) fn run(self) -> Result<()> {
+    /// Exits with the worktree result, or returns a mode configuration error.
+    pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
         let opts = branch_reuse::Options {
             repo: self.repo.unwrap_or_else(|| PathBuf::from(".")),
             branch: self.branch,
@@ -56,6 +56,13 @@ impl WorktreeBranchReuseArgs {
             base_display: self.base_display,
             json_output: self.json_output,
         };
-        std::process::exit(branch_reuse::run(&opts));
+        std::process::exit(
+            branch_reuse::try_run_with(&opts, &|branch| {
+                crate::worktree_cli::branch_landed::forge_probe_with(
+                    &opts.repo, &opts.repo, branch, pr_list,
+                )
+            })
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }

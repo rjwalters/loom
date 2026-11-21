@@ -472,6 +472,19 @@ pub const TOOLS_COMMANDS: &[&str] = &[
     "install-compat",
     "hooks-home",
     "claim",
+    "worktree-lock",
+    "worktree-remove",
+    "worktree-link",
+    "worktree-cleanup",
+    "worktree-branch-conflict",
+    "worktree-submodules",
+    "worktree-closed-pr-branch",
+    "worktree-sparse",
+    "worktree-base",
+    "worktree-check",
+    "worktree-existing",
+    "worktree-branch-reuse",
+    "worktree-open-pr",
 ];
 
 /// The identity of the installed-file payload this binary was built against:

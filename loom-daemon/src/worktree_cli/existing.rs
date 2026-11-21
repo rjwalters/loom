@@ -102,6 +102,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use super::pr_list::PrList;
 use super::wip::{git_ok, Out};
 
 /// Everything the arm needs, all of it already resolved by `worktree.sh`.
@@ -169,7 +170,11 @@ impl Outcome {
 /// Run the arm: print what the shell printed, do what the shell did, return its
 /// exit code.
 pub fn run(opts: &Options) -> i32 {
-    decide(opts, &|req| perform_reset_with(opts, req)).code()
+    run_with(opts, PrList::Legacy).expect("legacy reads do not resolve tools mode")
+}
+
+pub(crate) fn run_with(opts: &Options, pr_list: PrList) -> Result<i32, String> {
+    Ok(decide_with(opts, &|req| perform_reset_with(opts, req), pr_list)?.code())
 }
 
 /// [`run`] with the destructive step injected — the seam the unit tests use to
@@ -180,6 +185,14 @@ pub fn run(opts: &Options) -> i32 {
 /// returns `true` when the worktree ended up reset (the shell's `git fetch && …
 /// reset_or_rescue` succeeding as a pair).
 pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome {
+    decide_with(opts, reset, PrList::Legacy).expect("legacy reads do not resolve tools mode")
+}
+
+fn decide_with(
+    opts: &Options,
+    reset: &dyn Fn(&ResetRequest) -> bool,
+    pr_list: PrList,
+) -> Result<Outcome, String> {
     let out = Reporter {
         out: Out::new(opts.quiet),
         quiet: opts.quiet,
@@ -198,7 +211,7 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
         out.info_always("To fix this:");
         out.plain_always(&format!("  1. Remove the directory: rm -rf {shown}"));
         out.plain_always(&format!("  2. Run again: pnpm worktree {}", opts.issue));
-        return Outcome::Unregistered;
+        return Ok(Outcome::Unregistered);
     }
 
     // `local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null)`
@@ -228,19 +241,24 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
     // ONE resolution of the reference, feeding both the verdict below and the
     // reset target (#8287). `ahead`/`behind` are measured against whichever
     // reference it chose, never against `$BASE_REF` regardless.
-    let resolved = super::stale_ref::resolve(&super::stale_ref::Options {
-        worktree: opts.worktree.clone(),
-        branch: opts.branch.clone(),
-        default_branch: opts.default_branch.clone(),
-        base_ref: opts.base_ref.clone(),
-        base_display: opts.base_display.clone(),
-    });
+    let resolved = super::stale_ref::try_resolve_with(
+        &super::stale_ref::Options {
+            worktree: opts.worktree.clone(),
+            branch: opts.branch.clone(),
+            default_branch: opts.default_branch.clone(),
+            base_ref: opts.base_ref.clone(),
+            base_display: opts.base_display.clone(),
+        },
+        &|branch| {
+            super::branch_landed::forge_probe_with(&opts.repo, &opts.worktree, branch, pr_list)
+        },
+    )?;
 
     if resolved.ahead > 0 || uncommitted {
         // Real work — preserve it, after back-filling the sentinel so a resumed
         // worktree that lost its marker stays cleanup-eligible (#3548).
         if let Err(err) = write_sentinel(opts) {
-            return err;
+            return Ok(err);
         }
         out.info("Worktree is registered with git");
         if resolved.ahead > 0 {
@@ -263,7 +281,7 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
         }
         out.blank();
         out.info(&format!("To use this worktree: cd {shown}"));
-        return Outcome::Preserved;
+        return Ok(Outcome::Preserved);
     }
 
     // Stale: 0 commits ahead of the chosen reference, no uncommitted changes.
@@ -276,7 +294,7 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
     // Written BEFORE the reset attempt and on both of its outcomes, exactly as
     // the shell did: the worktree remains usable either way (#3548).
     if let Err(err) = write_sentinel(opts) {
-        return err;
+        return Ok(err);
     }
 
     let did_reset = reset(&ResetRequest {
@@ -288,12 +306,12 @@ pub fn decide(opts: &Options, reset: &dyn Fn(&ResetRequest) -> bool) -> Outcome 
         out.success(&format!("Stale worktree reset to {}", resolved.display));
         out.blank();
         out.info(&format!("To use this worktree: cd {shown}"));
-        Outcome::Reset
+        Ok(Outcome::Reset)
     } else {
         out.warning("Could not reset stale worktree (continuing to use as-is)");
         out.blank();
         out.info(&format!("To use this worktree: cd {shown}"));
-        Outcome::ResetFailed
+        Ok(Outcome::ResetFailed)
     }
 }
 

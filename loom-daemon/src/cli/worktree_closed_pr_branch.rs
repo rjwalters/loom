@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::worktree_cli::closed_pr_branch;
+use crate::worktree_cli::{closed_pr_branch, pr_list::PrList};
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeClosedPrBranchArgs {
+pub struct WorktreeClosedPrBranchArgs {
     /// `$BRANCH_NAME` — the branch whose `origin/` tip is under question.
     #[arg(long)]
     branch: String,
@@ -50,14 +50,20 @@ pub(crate) struct WorktreeClosedPrBranchArgs {
 }
 
 impl WorktreeClosedPrBranchArgs {
-    /// Never returns.
-    pub(crate) fn run(self) -> Result<()> {
-        std::process::exit(closed_pr_branch::run(&closed_pr_branch::Options {
+    /// Exits with the worktree result, or returns a mode configuration error.
+    pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
+        let opts = closed_pr_branch::Options {
             branch: self.branch,
             issue: self.issue,
             base_display: self.base_display,
             repo: self.repo_root,
             json_output: self.json_output,
-        }));
+        };
+        std::process::exit(
+            closed_pr_branch::try_run_with(&opts, &|branch| {
+                closed_pr_branch::forge_probe_with(&opts.repo, branch, pr_list)
+            })
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }

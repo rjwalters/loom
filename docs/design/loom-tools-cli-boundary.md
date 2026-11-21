@@ -776,7 +776,7 @@ The remaining merge-queue verbs (#14520) are listed in §16.
 | `fleet-config` | reaches the workspace registry (§3.6) |
 | Top-level reads `labels`, `pr-queue`, `premise-check`, `duplicate-scan`, `check-points-marker`, `label-duplicates`, `forge-probe`, `forge-inventory`, `affected-files`, `check-stale-blocked` | moved in #14429 — see §13.7 |
 | Config inspection `skip-labels`, `roles`, `guards`, `install-compat`, `hooks-home` (`config get` shipped in #12939) | moved in #14429 — see §13.7 |
-| Worktree operations | #14397 and its child issues. |
+| Worktree operations | Shared worktree commands are listed in §13.9 (#14474). |
 | Checkout-local claims | Available through `loom-tools claim` (#14487, §13.8). |
 | Issue lease commands (`lease ensure\|co-occupancy\|release\|renewer`) | Served in `loom-tools` by #14488 (§15). |
 | Role-keyed PR leases | Available through `loom-tools lease pr` (#14489, §13.6). |
@@ -891,6 +891,39 @@ or `release` leaves the owner's `claim.json` unchanged.
 `install_compat::TOOLS_COMMANDS` lists the family as `claim` (the verb is not
 split into reads and writes, so no sub-verbs are listed). Forge claim checks
 (§13.2) and role-keyed PR leases (§13.6) use their own dispatch paths.
+
+### 13.9 Phase 3c worktree operations (#14474)
+
+Both binaries mount the same Clap commands and dispatch to the same Rust
+handlers. These are the worktree entries in both capability reports.
+
+| Call site | Migrated commands |
+| --- | --- |
+| Create and enter in `worktree.sh` | `worktree-check`, `worktree-lock` (`acquire`, `release`, `check-issue`), `worktree-cleanup`, `worktree-base`, `worktree-existing`, `worktree-sparse` |
+| Local branch reuse and remote branch checks in `worktree.sh` and `lib/worktree-forge-pr-check.sh` | `worktree-branch-reuse`, `worktree-open-pr`, `worktree-closed-pr-branch` |
+| Add recovery, post-create setup and removal in `worktree.sh` | `worktree-branch-conflict`, `worktree-submodules`, `worktree-link`, `worktree-remove` |
+
+The open, merged and closed PR probes use the configured captured read in a
+tools invocation. They resolve mode when a probe actually needs forge data.
+The daemon keeps its existing executable selection. Both paths supply the
+same branch decision logic, including its handling of unavailable answers.
+
+| Other §3.1 worktree command | Caller and disposition |
+| --- | --- |
+| `worktree-reset` | The standalone `lib/worktree-race-rescue.sh` adapter remains on the daemon. `worktree-existing` calls the Rust reset guard in-process. |
+| `worktree-upstream` | Branch reuse and existing-worktree handling already call the Rust helper in-process. The standalone command remains for compatibility and differential tests. |
+| `worktree-stale-ref` | Existing-worktree handling uses the Rust reference resolver in-process. The standalone command remains for compatibility and differential tests. |
+| `worktree-wip` | The independent `worktree.sh snapshot`, `stash-push` and `stash-pop` verbs remain on the daemon. |
+| `worktree-state` | Uncommitted-work stop hook and operator reports remain on the daemon. |
+| `stack-parent` | Builder PR conflict stacking remains on the daemon. |
+| `reconcile-stack` | `reconcile-stack.sh` after parent merge remains on the daemon. |
+| `orphan-replace` | The orphan-stack Doctor workflow remains on the daemon. |
+| `push-lease` | `rebase-stacked-children.sh` and `reconcile-stack.sh` keep using the daemon to pin their push. |
+| `branch-update` | Stack scripts and role prompts keep using the daemon to select the branch update strategy. |
+
+The optional per-worktree Cargo target provisioning remains a separate
+helper. Claim and lease migration is #14475. Installed-wrapper selection and
+end-to-end switching are #14476.
 
 ## 14. Phase 3b: park records and operator decisions (#14464)
 

@@ -128,7 +128,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        self.run_inner(args, None)
+        self.run_inner(bin(), args, None)
     }
 
     /// [`Fixture::run`] with a `git` on `PATH` that fails `worktree remove`
@@ -168,11 +168,11 @@ impl Fixture {
         )
         .expect("write shim");
         make_executable(&shim);
-        self.run_inner(args, Some(&shim_dir))
+        self.run_inner(bin(), args, Some(&shim_dir))
     }
 
-    fn run_inner(&self, args: &[&str], path_prefix: Option<&Path>) -> Output {
-        let mut cmd = Command::new(bin());
+    fn run_inner(&self, binary: &str, args: &[&str], path_prefix: Option<&Path>) -> Output {
+        let mut cmd = Command::new(binary);
         cmd.arg("worktree-remove")
             .args(args)
             .current_dir(&self.repo)
@@ -369,6 +369,36 @@ fn a_sentinel_less_worktree_is_refused_even_under_a_hostile_path() {
     assert_eq!(code(&out), 1);
     assert!(wt.exists(), "a user-provisioned worktree was removed");
     assert!(stderr(&out).contains("lacks .loom-managed sentinel"));
+}
+
+#[test]
+fn both_binaries_preserve_refused_worktrees_and_report_one_json_document() {
+    let f = Fixture::new("primary checkout").with_worktree_root("root with spaces");
+    let dirty = f.add_worktree(507);
+    let unmanaged = f.add_worktree(508);
+    let file = dirty.join("unpublished work.txt");
+    std::fs::write(&file, "unpublished\n").unwrap();
+    std::fs::remove_file(unmanaged.join(".loom-managed")).unwrap();
+
+    for (args, refusal) in [
+        (&["507", "--json"][..], "uncommitted change(s)"),
+        (&["508", "--json", "--force"][..], "lacks .loom-managed sentinel"),
+    ] {
+        let daemon = f.run(args);
+        let tools = f.run_inner(env!("CARGO_BIN_EXE_loom-tools"), args, None);
+        assert_eq!(code(&tools), 1, "{tools:?}");
+        assert_eq!(code(&tools), code(&daemon));
+        assert_eq!(tools.stdout, daemon.stdout);
+        assert_eq!(tools.stderr, daemon.stderr);
+        assert!(stderr(&tools).contains(refusal));
+        assert_eq!(stdout(&tools).lines().count(), 1);
+        let report: serde_json::Value = serde_json::from_slice(&tools.stdout).unwrap();
+        assert_eq!(report["success"], false);
+        assert_eq!(report["removed"], false);
+        assert!(f.registered(&dirty) && f.registered(&unmanaged));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unpublished\n");
+        assert_eq!(std::fs::read_to_string(unmanaged.join("tracked.txt")).unwrap(), "tracked\n");
+    }
 }
 
 /// The #5177 fallback is the verb's only `rm -rf`. It fires when git has no

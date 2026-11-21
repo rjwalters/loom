@@ -30,7 +30,7 @@ use anyhow::Result;
 use crate::worktree_cli::check;
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeCheckArgs {
+pub struct WorktreeCheckArgs {
     /// Emit the create path's `LEVEL<TAB>text` record stream instead of the
     /// `--check` verb's human block, and exit 0 regardless of the answer.
     #[arg(long)]

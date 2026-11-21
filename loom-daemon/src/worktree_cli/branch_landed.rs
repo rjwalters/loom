@@ -42,13 +42,9 @@
 //!    verdict *toward* a definitive answer — it never turns a `NotLanded` into
 //!    a `Landed` the shell would have refused, because the tip-equality
 //!    requirement below is unchanged.
-//! 2. **`loom-daemon forge` is still preferred over `gh` when a `loom-daemon`
-//!    is on `PATH`.** We *are* loom-daemon, so calling the in-process forge
-//!    client would be the obvious shortcut — and it is deliberately not taken.
-//!    The shell's choice is observable behaviour (a Gitea host has no `gh` at
-//!    all, and `loom-daemon forge` is how it answers), and a port that quietly
-//!    changed which credential path a probe uses would be changing the forge
-//!    contract under cover of a refactor.
+//! 2. The daemon's transport still prefers `loom-daemon forge` over `gh`
+//!    on `PATH`. The tools transport uses the configured read route. Both
+//!    feed the same branch decision ladder.
 //!
 //! # The one Rust ladder (#8470)
 //!
@@ -76,7 +72,7 @@
 //!   from [`Answer::evidence`] so `clean --aggressive` keeps its two removal
 //!   reasons.
 
-use crate::fs_util::is_executable;
+use super::pr_list::{PrList, Read};
 use crate::git_merge_tree::merge_tree_in_version;
 use std::path::Path;
 use std::process::Command;
@@ -274,13 +270,42 @@ pub fn probe_with_caps(
     forge: &dyn Fn(&str) -> ForgeProbe,
     caps: Caps,
 ) -> Answer {
+    try_probe_with_caps(
+        repo,
+        branch,
+        default_name,
+        hint_sha,
+        &|key| Ok::<_, std::convert::Infallible>(forge(key)),
+        caps,
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+pub(crate) fn try_probe_with<E>(
+    repo: &Path,
+    branch: &str,
+    default_name: Option<&str>,
+    hint_sha: &str,
+    forge: &dyn Fn(&str) -> Result<ForgeProbe, E>,
+) -> Result<Answer, E> {
+    try_probe_with_caps(repo, branch, default_name, hint_sha, forge, Caps::detect())
+}
+
+fn try_probe_with_caps<E>(
+    repo: &Path,
+    branch: &str,
+    default_name: Option<&str>,
+    hint_sha: &str,
+    forge: &dyn Fn(&str) -> Result<ForgeProbe, E>,
+    caps: Caps,
+) -> Result<Answer, E> {
     if branch.is_empty() {
-        return Answer::unknown();
+        return Ok(Answer::unknown());
     }
 
     let tip = resolve_branch(repo, branch);
     let default_sha = resolve_default(repo, default_name);
-    ladder(
+    try_ladder(
         repo,
         tip.as_deref(),
         default_sha.as_deref(),
@@ -314,6 +339,27 @@ pub fn ladder(
     forge: &dyn Fn(&str) -> ForgeProbe,
     caps: Caps,
 ) -> Answer {
+    try_ladder(
+        repo,
+        tip,
+        default_sha,
+        forge_key,
+        hint_sha,
+        &|key| Ok::<_, std::convert::Infallible>(forge(key)),
+        caps,
+    )
+    .unwrap_or_else(|never| match never {})
+}
+
+fn try_ladder<E>(
+    repo: &Path,
+    tip: Option<&str>,
+    default_sha: Option<&str>,
+    forge_key: Option<&str>,
+    hint_sha: &str,
+    forge: &dyn Fn(&str) -> Result<ForgeProbe, E>,
+    caps: Caps,
+) -> Result<Answer, E> {
     let mut answer = Answer::unknown();
     let tip = tip.filter(|t| !t.is_empty());
     let default_sha = default_sha.filter(|d| !d.is_empty());
@@ -324,7 +370,7 @@ pub fn ladder(
         if git_ok(repo, &["merge-base", "--is-ancestor", tip, default_sha]) {
             answer.verdict = Verdict::Landed;
             answer.evidence = Evidence::Ancestor;
-            return answer;
+            return Ok(answer);
         }
     }
 
@@ -336,7 +382,7 @@ pub fn ladder(
         if tip.is_some_and(|t| t == hint_sha) {
             answer.verdict = Verdict::Landed;
             answer.evidence = Evidence::MergedHeadMatch;
-            return answer;
+            return Ok(answer);
         }
         // The caller already knows the merged head and the tip is not it; no
         // forge round-trip can add anything.
@@ -344,7 +390,7 @@ pub fn ladder(
         forge_answered_negative = true;
     } else if let Some(key) = forge_key.filter(|k| !k.is_empty()) {
         // Rung 3: the forge.
-        let p = forge(key);
+        let p = forge(key)?;
         answer.forge_status = p.status;
         match p.status {
             ForgeStatus::Found => {
@@ -357,7 +403,7 @@ pub fn ladder(
                     if tip == sha {
                         answer.verdict = Verdict::Landed;
                         answer.evidence = Evidence::ForgeMergedPr;
-                        return answer;
+                        return Ok(answer);
                     }
                 }
                 answer.evidence = Evidence::MergedHeadMismatch;
@@ -397,14 +443,14 @@ pub fn ladder(
                         answer.verdict = Verdict::NotLanded;
                         answer.evidence = Evidence::TreeDiffers;
                     }
-                    return answer;
+                    return Ok(answer);
                 }
                 MergeTree::Conflict => {
                     // Exit 1 is "merge conflicts": content that collides with
                     // the default branch definitively has not landed.
                     answer.verdict = Verdict::NotLanded;
                     answer.evidence = Evidence::TreeConflict;
-                    return answer;
+                    return Ok(answer);
                 }
                 // Any other non-zero exit (bad args, unreadable object, a
                 // pre-2.38 git) is a real failure and must NOT read as an
@@ -417,7 +463,7 @@ pub fn ladder(
     if forge_answered_negative {
         answer.verdict = Verdict::NotLanded;
     }
-    answer
+    Ok(answer)
 }
 
 /// The forge round-trip: a MERGED pull request whose head branch is `branch`.
@@ -427,27 +473,28 @@ pub fn ladder(
 /// `gh` — and its `LOOM_BRANCH_LANDED_OFFLINE=1` seam.
 #[must_use]
 pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
+    forge_probe_with(repo, repo, branch, PrList::Legacy)
+        .expect("legacy reads do not resolve tools mode")
+}
+
+pub(crate) fn forge_probe_with(
+    mode_repo: &Path,
+    git_repo: &Path,
+    branch: &str,
+    pr_list: PrList,
+) -> Result<ForgeProbe, String> {
     let branch = branch.strip_prefix("origin/").unwrap_or(branch);
     if branch.is_empty() {
-        return ForgeProbe::unavailable();
+        return Ok(ForgeProbe::unavailable());
     }
     if std::env::var("LOOM_BRANCH_LANDED_OFFLINE").as_deref() == Ok("1") {
-        return ForgeProbe::unavailable();
+        return Ok(ForgeProbe::unavailable());
     }
 
-    let (program, leading): (&str, &[&str]) = if on_path("loom-daemon") {
-        ("loom-daemon", &["forge"])
-    } else if on_path("gh") {
-        ("gh", &[])
-    } else {
-        return ForgeProbe::unavailable();
-    };
-
-    let out = Command::new(program)
-        .args(leading)
-        .args([
-            "pr",
-            "list",
+    let Read::Answered(text) = pr_list.fetch(
+        mode_repo,
+        git_repo,
+        &[
             "--head",
             branch,
             "--state",
@@ -456,19 +503,13 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
             "headRefOid,number",
             "--limit",
             "1",
-        ])
-        .current_dir(repo)
-        .output();
-    let Ok(out) = out else {
-        return ForgeProbe::unavailable();
+        ],
+    )?
+    else {
+        return Ok(ForgeProbe::unavailable());
     };
-    if !out.status.success() {
-        return ForgeProbe::unavailable();
-    }
-
-    let text = String::from_utf8_lossy(&out.stdout);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-        return ForgeProbe::unavailable();
+        return Ok(ForgeProbe::unavailable());
     };
     let first = value.get(0);
     let head_sha = first
@@ -481,7 +522,7 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
         other => other.to_string(),
     });
 
-    match head_sha {
+    Ok(match head_sha {
         // `jq -r '.[0].headRefOid // empty'` — a present SHA is `found`, and
         // anything else (empty array, null field) is a definitive `not_found`.
         Some(sha) => ForgeProbe {
@@ -494,16 +535,6 @@ pub fn forge_probe(repo: &Path, branch: &str) -> ForgeProbe {
             head_sha: None,
             number: None,
         },
-    }
-}
-
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(program);
-        candidate.is_file() && is_executable(&candidate)
     })
 }
 

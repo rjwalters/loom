@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::worktree_cli::existing;
+use crate::worktree_cli::{existing, pr_list::PrList};
 
 #[derive(clap::Args)]
-pub(crate) struct WorktreeExistingArgs {
+pub struct WorktreeExistingArgs {
     /// `$WORKTREE_PATH` — the existing directory under decision. Quoted into
     /// messages exactly as given.
     #[arg(long)]
@@ -75,19 +75,25 @@ pub(crate) struct WorktreeExistingArgs {
 }
 
 impl WorktreeExistingArgs {
-    /// Never returns.
-    pub(crate) fn run(self) -> Result<()> {
-        std::process::exit(existing::run(&existing::Options {
-            worktree: self.worktree,
-            repo: self.repo,
-            issue: self.issue,
-            branch: self.branch,
-            default_branch: self.default_branch,
-            base_ref: self.base_ref,
-            base_display: self.base_display,
-            base_branch: self.base_branch,
-            quiet: self.quiet,
-            ignore_pids: self.ignore_pid,
-        }));
+    /// Exits with the worktree result, or returns a mode configuration error.
+    pub(crate) fn run(self, pr_list: PrList) -> Result<()> {
+        std::process::exit(
+            existing::run_with(
+                &existing::Options {
+                    worktree: self.worktree,
+                    repo: self.repo,
+                    issue: self.issue,
+                    branch: self.branch,
+                    default_branch: self.default_branch,
+                    base_ref: self.base_ref,
+                    base_display: self.base_display,
+                    base_branch: self.base_branch,
+                    quiet: self.quiet,
+                    ignore_pids: self.ignore_pid,
+                },
+                pr_list,
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
     }
 }
